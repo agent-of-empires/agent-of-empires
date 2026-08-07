@@ -584,6 +584,19 @@ pub struct OpClaim {
     pub at: DateTime<Utc>,
 }
 
+/// Authoritative "a lifecycle op holds this session" signal, distinct from the
+/// multi-writer `status`. Neither the status poller nor a REST pre-mark ever
+/// writes it, so a `Status::Starting` those two produce cannot be mistaken for
+/// a live op. Set under the lifecycle flock by `reserve_lifecycle_generation`
+/// and cleared on commit or fail; `generation` lets a stale commit clear only
+/// its own reservation, and `at` bases a TTL self-heal so a crash mid-launch
+/// cannot strand a session unstartable (mirrors `OpClaim`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct LifecycleReservation {
+    pub generation: u64,
+    pub at: DateTime<Utc>,
+}
+
 /// Create-idempotency record for a plugin-created session (#2897). `key` is
 /// the plugin-supplied idempotency key, unique within the creating plugin's
 /// sessions; `payload_hash` is the host-computed hash of the semantic create
@@ -760,6 +773,13 @@ pub struct Instance {
     /// needed (mirrors `trashed_at`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub op_claim: Option<OpClaim>,
+
+    /// Busy-guard signal for concurrent start/restart/stop, keyed on by the
+    /// lifecycle guards instead of `status` (which the poller and REST
+    /// pre-marks also write, so it cannot prove an op is in flight). Additive:
+    /// `None` on legacy rows and at rest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lifecycle_reservation: Option<LifecycleReservation>,
 
     /// Namespaced per-session plugin data, keyed by plugin id. Each plugin
     /// owns only its own slot (`plugin_meta["<id>"]`), an opaque JSON value it
@@ -1513,6 +1533,7 @@ impl Instance {
             trashed_at: None,
             pre_trash_project_path: None,
             op_claim: None,
+            lifecycle_reservation: None,
             plugin_meta: std::collections::BTreeMap::new(),
             created_by_plugin: None,
             plugin_create_idempotency: None,
@@ -2160,6 +2181,17 @@ impl Instance {
         matches!(
             &self.op_claim,
             Some(c) if c.op != ClaimOp::Trash && (now - c.at) < Self::OP_CLAIM_TTL
+        )
+    }
+
+    /// True when a fresh (unexpired) lifecycle reservation holds this row. Only
+    /// `reserve_lifecycle_generation` sets it, so unlike `status` it is never
+    /// contaminated by the poller or a REST pre-mark; an expired reservation
+    /// self-heals a session left mid-launch by a crash.
+    fn has_fresh_lifecycle_reservation(&self, now: DateTime<Utc>) -> bool {
+        matches!(
+            &self.lifecycle_reservation,
+            Some(r) if (now - r.at) < Self::OP_CLAIM_TTL
         )
     }
 
@@ -3605,6 +3637,12 @@ impl Instance {
             if restart && stored.agent_session_id == self.agent_session_id {
                 stored.resume_probe_failed_sid = self.resume_probe_failed_sid.clone();
             }
+            // Ownership-guarded clear: only drop the reservation this launch
+            // owns, so a stale commit cannot clear a peer's fresh reservation.
+            if matches!(&stored.lifecycle_reservation, Some(r) if r.generation == reserved_generation)
+            {
+                stored.lifecycle_reservation = None;
+            }
             Ok(Some(committed_generation))
         })?;
         let Some(committed_generation) = committed_generation else {
@@ -3614,6 +3652,7 @@ impl Instance {
             );
         };
         self.lifecycle_generation = committed_generation;
+        self.lifecycle_reservation = None;
         Ok(())
     }
 
@@ -3623,11 +3662,15 @@ impl Instance {
         status: Option<Status>,
     ) -> Result<()> {
         let mut reserved = None;
+        let now = Utc::now();
         storage.update(|instances, _groups| {
             let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
                 return Ok(());
             };
-            if stored.status == Status::Starting {
+            // Gate on the reservation marker, not on `status`: a poller-observed
+            // or REST-pre-marked `Status::Starting` is not proof of a live op and
+            // must not self-trip this same operation.
+            if stored.has_fresh_lifecycle_reservation(now) {
                 anyhow::bail!(
                     "session {} is busy with another lifecycle operation",
                     self.id
@@ -3645,6 +3688,10 @@ impl Instance {
                 anyhow::anyhow!("lifecycle generation overflow for session {}", self.id)
             })?;
             stored.lifecycle_generation = next;
+            stored.lifecycle_reservation = Some(LifecycleReservation {
+                generation: next,
+                at: now,
+            });
             if let Some(status) = status {
                 stored.status = status;
                 if status != Status::Idle {
@@ -3658,6 +3705,10 @@ impl Instance {
             anyhow::bail!("session {} no longer exists", self.id);
         };
         self.lifecycle_generation = generation;
+        self.lifecycle_reservation = Some(LifecycleReservation {
+            generation,
+            at: now,
+        });
         if let Some(status) = status {
             self.status = status;
             if status != Status::Idle {
@@ -3688,6 +3739,12 @@ impl Instance {
             if status != Status::Idle {
                 stored.idle_entered_at = None;
             }
+            // Ownership-guarded clear: only drop the reservation this commit
+            // owns, so a stale commit cannot clear a peer's fresh reservation.
+            if matches!(&stored.lifecycle_reservation, Some(r) if r.generation == reserved_generation)
+            {
+                stored.lifecycle_reservation = None;
+            }
             Ok(Some(committed_generation))
         })?;
         let Some(committed_generation) = committed_generation else {
@@ -3697,6 +3754,7 @@ impl Instance {
             );
         };
         self.lifecycle_generation = committed_generation;
+        self.lifecycle_reservation = None;
         self.status = status;
         if status != Status::Idle {
             self.idle_entered_at = None;
@@ -3794,7 +3852,9 @@ impl Instance {
                 .iter()
                 .find(|instance| instance.id == self.id)
                 .ok_or_else(|| anyhow::anyhow!("session {} no longer exists", self.id))?;
-            if stored.status == Status::Starting {
+            // See `reserve_lifecycle_generation`: a `Status::Starting` is not a
+            // concurrency signal; the reservation marker is.
+            if stored.has_fresh_lifecycle_reservation(Utc::now()) {
                 anyhow::bail!(
                     "session {} is busy with another lifecycle operation",
                     self.id
@@ -7896,8 +7956,33 @@ mod tests {
         let profile = "lifecycle-busy-reservation";
         let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
         let now = Utc::now();
+        let stale = now - Instance::OP_CLAIM_TTL - chrono::Duration::seconds(1);
         let mut cases = [
-            ("starting", Status::Starting, None, false),
+            // A bare Starting with no reservation is the REST pre-mark / poller
+            // artifact; it must not self-trip the same operation (#3230).
+            ("premarked_only", Status::Starting, None, None, true),
+            // A fresh reservation is a genuinely live peer op: still rejected.
+            (
+                "reserved_peer",
+                Status::Starting,
+                None,
+                Some(LifecycleReservation {
+                    generation: 1,
+                    at: now,
+                }),
+                false,
+            ),
+            // An expired reservation self-heals a crash mid-launch.
+            (
+                "expired_res",
+                Status::Idle,
+                None,
+                Some(LifecycleReservation {
+                    generation: 1,
+                    at: stale,
+                }),
+                true,
+            ),
             (
                 "purge",
                 Status::Idle,
@@ -7905,6 +7990,7 @@ mod tests {
                     op: ClaimOp::Purge,
                     at: now,
                 }),
+                None,
                 false,
             ),
             (
@@ -7914,6 +8000,7 @@ mod tests {
                     op: ClaimOp::Restore,
                     at: now,
                 }),
+                None,
                 false,
             ),
             (
@@ -7923,17 +8010,19 @@ mod tests {
                     op: ClaimOp::Trash,
                     at: now,
                 }),
+                None,
                 true,
             ),
-            ("creating", Status::Creating, None, true),
-            ("idle", Status::Idle, None, true),
-            ("stopped", Status::Stopped, None, true),
+            ("creating", Status::Creating, None, None, true),
+            ("idle", Status::Idle, None, None, true),
+            ("stopped", Status::Stopped, None, None, true),
         ]
-        .map(|(title, status, claim, allowed)| {
+        .map(|(title, status, claim, reservation, allowed)| {
             let mut instance = Instance::new(title, "/tmp/test");
             instance.source_profile = profile.to_string();
             instance.status = status;
             instance.op_claim = claim;
+            instance.lifecycle_reservation = reservation;
             (instance, allowed)
         });
         storage
@@ -7948,7 +8037,9 @@ mod tests {
             assert_eq!(result.is_ok(), *allowed, "{}", instance.title);
         }
 
-        let reserved = &cases[4].0;
+        // premarked_only reserved successfully; a peer generation advance during
+        // the unlocked prepare_launch window must lose the pre-spawn CAS.
+        let reserved = &cases[0].0;
         assert!(reserved.reservation_is_current(&storage).unwrap());
         storage
             .update(|instances, _groups| {
@@ -7966,16 +8057,31 @@ mod tests {
             "a peer generation advance during hooks must lose the pre-spawn CAS"
         );
 
-        let starting = &cases[0].0;
+        // A session holding a fresh reservation (a real live lifecycle op)
+        // rejects a recursive stop/start fast, without waiting on the outer hook.
+        let mut busy = Instance::new("busy-reserved", "/tmp/test");
+        busy.source_profile = profile.to_string();
+        busy.status = Status::Starting;
+        busy.lifecycle_reservation = Some(LifecycleReservation {
+            generation: 1,
+            at: Utc::now(),
+        });
+        storage
+            .update(|instances, _groups| {
+                instances.push(busy.clone());
+                Ok(())
+            })
+            .unwrap();
+
         let began = std::time::Instant::now();
-        let error = starting.stop().unwrap_err();
+        let error = busy.stop().unwrap_err();
         assert!(error.to_string().contains("busy"));
         assert!(
             began.elapsed() < std::time::Duration::from_secs(1),
             "recursive stop must fail without waiting for the outer hook"
         );
 
-        let mut recursive_start = starting.clone();
+        let mut recursive_start = busy.clone();
         let began = std::time::Instant::now();
         let error = recursive_start
             .start_with_size_opts(None, true)
@@ -10878,10 +10984,18 @@ mod tests {
                 .args(["-c", &script])
                 .env_clear()
                 .env("PATH", "/usr/bin:/bin");
-            for key in crate::session::capture::OMP_STORE_ENV_KEYS {
-                command.env(key, "");
+            // Pin the exact routing environment a host launch installs into the
+            // pane for this HOME, so the check reproduces the fingerprint's env
+            // instead of assuming the ambient OMP_STORE_ENV_KEYS are empty. They
+            // are not on every runner, and host_launcher_environment folds them
+            // into the fingerprint, so forcing empties here would diverge from
+            // the digest on any host that exports one of those keys.
+            for (key, value) in
+                omp_host_routing_environment(&[format!("HOME={}", live_home.display())])
+            {
+                command.env(key, value);
             }
-            command.env("HOME", live_home).output().unwrap()
+            command.output().unwrap()
         };
 
         assert_eq!(run(&home).stdout, b"captured");
