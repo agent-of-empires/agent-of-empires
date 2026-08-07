@@ -2178,19 +2178,9 @@ function AppContent({
     <AcpPrefsProvider value={acpPrefs}>
       <div className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
         {headerCollapsible ? (
-          <>
-            <CollapsibleRegion collapsed={headerCollapsed} testId="collapsible-header">
-              {topBar}
-            </CollapsibleRegion>
-            <ChromeCollapseHandle
-              edge="top"
-              collapsed={headerCollapsed}
-              onToggle={() => setHeaderCollapsed((v) => !v)}
-              collapseLabel="Collapse conversation header"
-              expandLabel="Expand conversation header"
-              testId="header-collapse-toggle"
-            />
-          </>
+          <CollapsibleRegion collapsed={headerCollapsed} testId="collapsible-header">
+            {topBar}
+          </CollapsibleRegion>
         ) : (
           topBar
         )}
@@ -2198,6 +2188,21 @@ function AppContent({
         <DisconnectBanner />
         <UpdateBanner />
         <DashboardUpdateBanner />
+
+        {/* Below the banners, not directly under the bar: the handle's 32px
+            touch target is absolutely positioned at the top-right, and hanging
+            it off the bar puts it on top of the update banner's dismiss button
+            (same corner), which then cannot be tapped at all. */}
+        {headerCollapsible && (
+          <ChromeCollapseHandle
+            edge="top"
+            collapsed={headerCollapsed}
+            onToggle={() => setHeaderCollapsed((v) => !v)}
+            collapseLabel="Collapse conversation header"
+            expandLabel="Expand conversation header"
+            testId="header-collapse-toggle"
+          />
+        )}
 
         <div className="flex flex-1 min-h-0">
           {!showSettings && (
