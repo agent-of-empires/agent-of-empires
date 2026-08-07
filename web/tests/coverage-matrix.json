@@ -99,6 +99,13 @@
       "components": ["web/src/components/Dashboard.tsx"]
     },
     {
+      "id": "dashboard.mobile-recent-sessions",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["src/components/__tests__/DashboardRecentSessions.test.tsx", "tests/dashboard.spec.ts"],
+      "components": ["web/src/components/Dashboard.tsx"]
+    },
+    {
       "id": "app-shell.dashboard-update-banner",
       "kind": "vitest",
       "risk": "medium",

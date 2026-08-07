@@ -14,6 +14,7 @@ import { useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS, isSessionActive } from "./lib/session";
 import { diffSelectionStale } from "./lib/diffSelection";
 import { useSessions } from "./hooks/useSessions";
+import { useDashboardPresence } from "./hooks/useDashboardPresence";
 import { clearAcpCache } from "./hooks/useAcpSession";
 import { clearDraft, sweepOrphanDrafts } from "./lib/acpDrafts";
 import { AcpPrefsProvider } from "./lib/acpPrefs";
@@ -301,6 +302,7 @@ function AppContent({
   onLogout: () => void;
   onSettingsRefresh: () => Promise<void> | void;
 }) {
+  useDashboardPresence();
   // Wire the localStorage write chokepoint and pull the server-side UI-state
   // blob into localStorage. AppContent only mounts past auth, so this runs as
   // the authenticated user. Background (does NOT gate render): blocking first

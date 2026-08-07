@@ -24,6 +24,9 @@ function stubMatchMedia(initialMatches: boolean) {
       matches = next;
       listeners.forEach((cb) => cb());
     },
+    setWithoutEvent(next: boolean) {
+      matches = next;
+    },
     listenerCount: () => listeners.size,
   };
 }
@@ -56,5 +59,15 @@ describe("useIsWideViewport", () => {
     expect(ctl.listenerCount()).toBe(1);
     unmount();
     expect(ctl.listenerCount()).toBe(0);
+  });
+
+  it("updates on a viewport resize when the browser skips the media-query event", () => {
+    const ctl = stubMatchMedia(false);
+    const { result } = renderHook(() => useIsWideViewport());
+
+    ctl.setWithoutEvent(true);
+    act(() => window.dispatchEvent(new Event("resize")));
+
+    expect(result.current).toBe(true);
   });
 });

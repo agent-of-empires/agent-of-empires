@@ -864,14 +864,14 @@ impl App {
         // never double-stop a session when run side by side.
         const SESSION_IDLE_REAP_INTERVAL: Duration = Duration::from_secs(60);
         // A presence file counts as live while its mtime is within this window.
-        // Larger than HEARTBEAT_INTERVAL so a couple of missed beats (busy loop,
+        // Larger than the liveness heartbeat so a couple of missed beats (busy loop,
         // brief stall) don't drop an instance; matches the push consumer.
         const PRESENCE_FRESH_WINDOW: Duration = Duration::from_secs(30);
 
-        // Signal that the TUI is active so the web push consumer can
-        // suppress notifications while the user is watching the dashboard, and
-        // so other TUIs can count this instance.
+        // Register this TUI as live for the footer, and as recently interacted
+        // with for short-lived push suppression.
         crate::session::write_tui_heartbeat();
+        crate::session::write_tui_activity();
         self.home.active_tui_count = crate::session::count_active_tuis(PRESENCE_FRESH_WINDOW);
 
         // Telemetry (opt-in, no-op otherwise): announce this surface on boot,
@@ -934,6 +934,7 @@ impl App {
                             if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                                 continue;
                             }
+                            crate::session::write_tui_activity();
                             // Paste-burst detector for VoiceInk + Mosh ergonomics.
                             // Mosh strips bracketed-paste markers, so pasted
                             // dictation arrives as a stream of individual KeyEvents
@@ -1167,6 +1168,9 @@ impl App {
                             continue;
                         }
                         Some(Ok(Event::Mouse(mouse))) => {
+                            if !matches!(mouse.kind, MouseEventKind::Moved) {
+                                crate::session::write_tui_activity();
+                            }
                             // Structured preview mouse routing is deliberately
                             // thin: the transcript is ordinary preview content,
                             // so drags fall through to the home view's own
@@ -1551,6 +1555,7 @@ impl App {
                             continue;
                         }
                         Some(Ok(Event::Paste(text))) => {
+                            crate::session::write_tui_activity();
                             // An ACTIVE structured view owns pasted text (it
                             // goes to its composer, same as the full-screen
                             // view). A merely-mounted preview must NOT eat
