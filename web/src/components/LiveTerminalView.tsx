@@ -236,7 +236,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
       <div
         aria-hidden="true"
         className={`pointer-events-none absolute inset-0 z-10 ring-inset transition-shadow ${
-          inputFocused ? "ring-2 ring-terminal-active" : "ring-1 ring-surface-700/40"
+          coarse ? "" : inputFocused ? "ring-2 ring-terminal-active" : "ring-1 ring-surface-700/40"
         }`}
       />
 

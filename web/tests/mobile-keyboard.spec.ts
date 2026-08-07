@@ -166,6 +166,19 @@ test.describe("Mobile keyboard detection and layout", () => {
     await expect(page.getByRole("button", { name: "Open keyboard" })).toBeVisible();
   });
 
+  test("Claude terminal selection keeps the keyboard closed", async ({ page }) => {
+    await mockTerminalApis(page);
+    await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
+    await page.goto("/");
+    // The fixture's terminal session uses tool: "claude". Its alternate-screen
+    // startup still drops the first iOS keyboard input, so the selection must
+    // remain usable as a monitoring view until the user opens the keyboard.
+    await seedSettings(page, { mobileFontSize: 10, autoOpenKeyboard: true });
+    await page.reload();
+    await openSession(page);
+    await expect(page.getByRole("button", { name: "Open keyboard" })).toBeVisible();
+  });
+
   test("keyboard FAB tracks input focus, not viewport heuristics", async ({ page }) => {
     await setupAndOpen(page);
 
@@ -297,6 +310,35 @@ test.describe("Mobile proxy input keydown handling", () => {
     await setupWithWsSpy(page);
     const sent = await sendKeyAndGetPtySent(page, "Backspace", "Backspace");
     expect(sent).toContain("\x7f");
+  });
+
+  test("reselecting the active session preserves keyboard-proxy input", async ({ page }) => {
+    const terminal = await mockTerminalApis(page, { tool: "codex" });
+    await page.goto("/");
+    await page.waitForTimeout(300);
+    await openSession(page);
+
+    await openMobileSidebar(page);
+    await clickSidebarSession(page, "pinch-test");
+    await page.locator("[data-live-terminal]").waitFor({ state: "visible", timeout: 10_000 });
+    await page.waitForTimeout(100);
+
+    const input = await page.evaluate(() => {
+      const proxy = document.querySelector<HTMLTextAreaElement>("[data-keyboard-proxy]");
+      if (!proxy) throw new Error("keyboard proxy not found");
+      const event = new InputEvent("beforeinput", {
+        bubbles: true,
+        cancelable: true,
+        inputType: "insertText",
+        data: "reselected",
+      });
+      const delivered = proxy.dispatchEvent(event);
+      return { data: event.data, delivered, inputType: event.inputType };
+    });
+    expect(input).toEqual({ data: "reselected", delivered: false, inputType: "insertText" });
+    await expect
+      .poll(() => terminal.liveMessages.map((message) => message.toString()).join("\n"))
+      .toContain("reselected");
   });
 });
 

@@ -3,6 +3,7 @@ import type { CSSProperties, ReactNode, RefObject } from "react";
 import type { AnsiSegment, AnsiStyle } from "../lib/ansi";
 import { LineParseCache, findCursorCharIndex, splitUrls, textWidth, wrapLine } from "../lib/liveTermLines";
 import { wheelNotches } from "../lib/liveMouse";
+import { registerMobileKeyboardProxyReceiver, type MobileKeyboardProxyInput } from "../lib/mobileKeyboardProxy";
 import { writeClipboard } from "../lib/clipboard";
 import type { LiveFrame } from "../hooks/useLiveTerminal";
 import { useWebSettings } from "../hooks/useWebSettings";
@@ -72,31 +73,32 @@ const SHRINK_DELAY_MS = 1500;
  *  stays at the tight interval. */
 const LIVE_WINDOW_SCREENS = 2;
 /** Forward-mode touch scroll gain: pane lines scrolled per line-height of
- *  finger travel. 1:1 read as sluggish in the field: there is no local
- *  direct-manipulation feel to preserve (content only moves on the network
- *  round trip), and with the soft keyboard up the strip of glass available
- *  for the gesture is short, so covering a transcript took a dozen swipes.
- *  Applied to touch drags and their momentum tail only; desktop wheel deltas
- *  pass through 1:1 (the trackpad supplies its own momentum). */
-const FORWARD_TOUCH_GAIN = 2;
+ *  finger travel. The full-screen app redraws after a network round trip, so
+ *  a large gain makes the delayed response race ahead of the user's finger.
+ *  Keep a small assist for the short area left above the iOS keyboard without
+ *  turning a gentle drag into a wheel burst. */
+const FORWARD_TOUCH_GAIN = 1.25;
 /** Release velocity (px/ms) below which a forward-mode drag ends with no
  *  momentum, so a deliberate slow drag stops where the finger stops. */
 const FLICK_MIN_VELOCITY = 0.3;
-/** Release-velocity cap (px/ms). Real flicks top out around 3-4 px/ms;
- *  synthetic touch streams (e2e) arrive back-to-back with ~1ms deltas whose
- *  raw px/ms is absurd (the AGENTS.md touch-recipe gotcha), and the cap is
- *  what keeps both worlds behaving the same. */
-const FLICK_MAX_VELOCITY = 4;
+/** Release-velocity cap (px/ms). The old 4 px/ms cap created a long wheel
+ *  storm after a modest iPhone flick. A lower cap keeps release inertia as a
+ *  small continuation rather than a second, much faster scroll gesture. */
+const FLICK_MAX_VELOCITY = 1.5;
 /** The finger must have moved this recently (ms) at lift for momentum to
  *  start; a drag-hold-release stops dead, like a native scroller. */
 const FLICK_MAX_PAUSE_MS = 80;
 /** Sliding window (ms) over which the release velocity is measured. */
 const FLICK_VELOCITY_WINDOW_MS = 100;
-/** Per-millisecond exponential decay of momentum velocity, matching
- *  UIScrollView's normal deceleration rate so a flick coasts ~1-2s. */
-const MOMENTUM_DECAY_PER_MS = 0.998;
+/** Per-millisecond exponential decay of momentum velocity. This intentionally
+ *  stops sooner than a native scroller because each forwarded notch redraws a
+ *  remote full-screen app rather than moving local pixels. */
+const MOMENTUM_DECAY_PER_MS = 0.992;
 /** Momentum ends when velocity decays below this (px/ms). */
 const MOMENTUM_STOP_VELOCITY = 0.05;
+/** A full-screen app redraws remotely, so send a bounded stream of wheel
+ * reports rather than dumping an entire fast drag into one network burst. */
+const MAX_QUEUED_TOUCH_NOTCHES = 8;
 
 export interface MobileLiveTerminalProps {
   frame: LiveFrame | null;
@@ -698,6 +700,18 @@ export function MobileLiveTerminal({
   // touch Y while forwarding a single-finger drag.
   const wheelAccumRef = useRef(0);
   const touchForwardYRef = useRef<number | null>(null);
+  const touchWheelQueueRef = useRef<{ notches: number; x: number; y: number; raf: number }>({
+    notches: 0,
+    x: 0,
+    y: 0,
+    raf: 0,
+  });
+  // A custom forward-mode drag does not get native scroll cancellation, so
+  // WebKit may still synthesize a click at its end. Remember meaningful touch
+  // movement and consume that click instead of mistaking a swipe for a tap
+  // that should summon the keyboard.
+  const touchStartRef = useRef<{ x: number; y: number } | null>(null);
+  const suppressTouchClickRef = useRef(false);
   // Base button (0/1/2) of an in-progress forwarded mouse press, so drag/
   // release only forward if the press was (latches like the TUI's
   // `mouse_forward_btn`), plus the last forwarded cell so a pixel-granular
@@ -878,6 +892,10 @@ export function MobileLiveTerminal({
   // renders on desktop too). The FAB and "Back to live" button are siblings of
   // the scroller, not descendants, so tapping them never reaches this handler.
   const focusInputOnTap = useCallback(() => {
+    if (suppressTouchClickRef.current) {
+      suppressTouchClickRef.current = false;
+      return;
+    }
     if (document.activeElement === inputRef.current) return;
     const sel = window.getSelection();
     if (sel && !sel.isCollapsed) return;
@@ -910,9 +928,9 @@ export function MobileLiveTerminal({
   // anywhere on the pane means "scroll the transcript"; the middle row is
   // inside it for any plausible layout. The column keeps the finger's x.
   const forwardWheelDelta = useCallback(
-    (deltaPx: number, clientX: number, clientY: number, touchCell = false) => {
+    (deltaPx: number, clientX: number, clientY: number, touchCell = false, maxNotches = 8) => {
       wheelAccumRef.current += deltaPx;
-      const { notches, remainder } = wheelNotches(wheelAccumRef.current, lineH || 16, 8);
+      const { notches, remainder } = wheelNotches(wheelAccumRef.current, lineH || 16, maxNotches);
       wheelAccumRef.current = remainder;
       if (notches === 0) return;
       const { col, row } = pointerCell(clientX, clientY);
@@ -922,6 +940,50 @@ export function MobileLiveTerminal({
     },
     [lineH, pointerCell, forwardWheel],
   );
+
+  const cancelTouchWheelQueue = useCallback(() => {
+    const queued = touchWheelQueueRef.current;
+    if (queued.raf) cancelAnimationFrame(queued.raf);
+    queued.notches = 0;
+    queued.raf = 0;
+  }, []);
+  const enqueueTouchWheelDelta = useCallback(
+    (deltaPx: number, clientX: number, clientY: number) => {
+      wheelAccumRef.current += deltaPx;
+      const { notches, remainder } = wheelNotches(wheelAccumRef.current, lineH || 16, MAX_QUEUED_TOUCH_NOTCHES);
+      wheelAccumRef.current = remainder;
+      if (notches === 0) return;
+
+      const queued = touchWheelQueueRef.current;
+      const direction = Math.sign(notches);
+      if (queued.notches && Math.sign(queued.notches) !== direction) queued.notches = 0;
+      queued.notches = Math.max(
+        -MAX_QUEUED_TOUCH_NOTCHES,
+        Math.min(MAX_QUEUED_TOUCH_NOTCHES, queued.notches + notches),
+      );
+      queued.x = clientX;
+      queued.y = clientY;
+
+      const flushOne = () => {
+        const state = touchWheelQueueRef.current;
+        state.raf = 0;
+        if (!forwardModeRef.current || state.notches === 0) return;
+        const { col } = pointerCell(state.x, state.y);
+        const row = Math.max(1, Math.round(rowsRef.current / 2));
+        const up = state.notches < 0;
+        forwardWheel(up, mouseSgrRef.current, col, row);
+        state.notches += up ? 1 : -1;
+        if (state.notches !== 0) state.raf = requestAnimationFrame(flushOne);
+      };
+
+      // The first notch starts immediately, so a short, quick swipe is not
+      // held for a frame. The rest drain one per frame, which makes a long
+      // swipe track remote redraws instead of arriving as a wheel storm.
+      if (!queued.raf) flushOne();
+    },
+    [lineH, pointerCell, forwardWheel],
+  );
+  useEffect(() => cancelTouchWheelQueue, [cancelTouchWheelQueue]);
 
   const onWheel = useCallback(
     (e: React.WheelEvent) => {
@@ -967,7 +1029,7 @@ export function MobileLiveTerminal({
         const dt = Math.min(64, Math.max(0, now - state.lastT));
         state.lastT = now;
         // Same sign convention as the drag: finger-space delta, negated.
-        forwardWheelDelta(-state.v * dt * FORWARD_TOUCH_GAIN, state.x, state.y, true);
+        enqueueTouchWheelDelta(-state.v * dt * FORWARD_TOUCH_GAIN, state.x, state.y);
         state.v *= Math.pow(MOMENTUM_DECAY_PER_MS, dt);
         if (Math.abs(state.v) < MOMENTUM_STOP_VELOCITY) {
           momentumRef.current = null;
@@ -977,7 +1039,7 @@ export function MobileLiveTerminal({
       };
       state.raf = requestAnimationFrame(step);
     },
-    [stopMomentum, forwardWheelDelta],
+    [stopMomentum, enqueueTouchWheelDelta],
   );
   // Typed input interrupts the coast. Without this, keystrokes sent in the
   // coast's 1-2s tail interleave with the wheel storm and the app is busy
@@ -988,9 +1050,10 @@ export function MobileLiveTerminal({
   const sendData = useCallback(
     (data: string) => {
       stopMomentum();
+      cancelTouchWheelQueue();
       sendDataRaw(data);
     },
-    [sendDataRaw, stopMomentum],
+    [sendDataRaw, stopMomentum, cancelTouchWheelQueue],
   );
 
   // Mouse button (click/drag) forwarding for a full-screen mouse app, the
@@ -1066,6 +1129,7 @@ export function MobileLiveTerminal({
       // A touch anywhere halts an in-flight momentum coast, the native
       // touch-to-stop convention.
       stopMomentum();
+      cancelTouchWheelQueue();
       flickSamplesRef.current = [];
       if (e.touches.length === 2) {
         pinchRef.current = {
@@ -1078,10 +1142,13 @@ export function MobileLiveTerminal({
         };
         touchForwardYRef.current = null;
         touchScrollStartYRef.current = null;
+        touchStartRef.current = null;
       } else if (e.touches.length === 1 && forwardModeRef.current) {
         // Single-finger drag drives the app's wheel in forward mode.
         const t0 = e.touches[0]!;
         touchForwardYRef.current = t0.clientY;
+        touchStartRef.current = { x: t0.clientX, y: t0.clientY };
+        suppressTouchClickRef.current = false;
         wheelAccumRef.current = 0;
         flickSamplesRef.current = [{ x: t0.clientX, y: t0.clientY, t: performance.now() }];
       } else if (e.touches.length === 1) {
@@ -1092,9 +1159,11 @@ export function MobileLiveTerminal({
         // otherwise re-arm the pin. A tap (no scroll) re-attaches on touchend.
         liveDetachedRef.current = true;
         touchScrollStartYRef.current = e.touches[0]!.clientY;
+        touchStartRef.current = { x: e.touches[0]!.clientX, y: e.touches[0]!.clientY };
+        suppressTouchClickRef.current = false;
       }
     },
-    [fontSize, stopMomentum],
+    [fontSize, stopMomentum, cancelTouchWheelQueue],
   );
   const onTouchMove = useCallback(
     (e: React.TouchEvent) => {
@@ -1118,6 +1187,10 @@ export function MobileLiveTerminal({
         // page pan is suppressed by touch-action: none on the scroller
         // instead (see the style below).
         const t0 = e.touches[0]!;
+        const start = touchStartRef.current;
+        if (start && Math.hypot(t0.clientX - start.x, t0.clientY - start.y) > 8) {
+          suppressTouchClickRef.current = true;
+        }
         const y = t0.clientY;
         const dy = y - touchForwardYRef.current;
         touchForwardYRef.current = y;
@@ -1125,7 +1198,7 @@ export function MobileLiveTerminal({
         const samples = flickSamplesRef.current;
         samples.push({ x: t0.clientX, y, t: now });
         while (samples.length > 1 && now - samples[0]!.t > FLICK_VELOCITY_WINDOW_MS) samples.shift();
-        forwardWheelDelta(-dy * FORWARD_TOUCH_GAIN, t0.clientX, y, true);
+        enqueueTouchWheelDelta(-dy * FORWARD_TOUCH_GAIN, t0.clientX, y);
         return;
       }
       if (e.touches.length === 1 && !forwardModeRef.current && touchScrollStartYRef.current != null) {
@@ -1138,11 +1211,12 @@ export function MobileLiveTerminal({
         // is idempotent; the 8px gate keeps a tap (or a horizontal swipe) from
         // tripping it.
         if (Math.abs(e.touches[0]!.clientY - touchScrollStartYRef.current) > 8) {
+          suppressTouchClickRef.current = true;
           enterReading(rowsRef.current);
         }
       }
     },
-    [forwardWheelDelta, enterReading],
+    [enqueueTouchWheelDelta, enterReading],
   );
   const onTouchEnd = useCallback(
     (e: React.TouchEvent) => {
@@ -1151,6 +1225,26 @@ export function MobileLiveTerminal({
         // still moving. Velocity is read over the recent-sample window, so a
         // drag that paused before lifting (stale last sample) coasts nowhere.
         if (forwardModeRef.current && touchForwardYRef.current != null) {
+          // A quick iOS swipe can coalesce every move into touchend. Include
+          // its final changed touch before deriving both the last notch and
+          // release velocity, otherwise that gesture is indistinguishable
+          // from a tap and appears to have been ignored.
+          const finalTouch = e.changedTouches[0];
+          if (finalTouch) {
+            const dy = finalTouch.clientY - touchForwardYRef.current;
+            if (dy !== 0) {
+              const start = touchStartRef.current;
+              if (start && Math.hypot(finalTouch.clientX - start.x, finalTouch.clientY - start.y) > 8) {
+                suppressTouchClickRef.current = true;
+              }
+              touchForwardYRef.current = finalTouch.clientY;
+              const now = performance.now();
+              const samples = flickSamplesRef.current;
+              samples.push({ x: finalTouch.clientX, y: finalTouch.clientY, t: now });
+              while (samples.length > 1 && now - samples[0]!.t > FLICK_VELOCITY_WINDOW_MS) samples.shift();
+              enqueueTouchWheelDelta(-dy * FORWARD_TOUCH_GAIN, finalTouch.clientX, finalTouch.clientY);
+            }
+          }
           const samples = flickSamplesRef.current;
           const first = samples[0];
           const last = samples[samples.length - 1];
@@ -1164,6 +1258,7 @@ export function MobileLiveTerminal({
         touchActiveRef.current = false;
         touchForwardYRef.current = null;
         touchScrollStartYRef.current = null;
+        touchStartRef.current = null;
         // Settle the live-edge decision deferred by onScroll; momentum
         // scroll events after this keep re-evaluating via onScroll. Ending at
         // the bottom (a tap that never scrolled, or a scroll back down) must
@@ -1185,7 +1280,7 @@ export function MobileLiveTerminal({
         }, 400);
       }
     },
-    [fontKey, fontSize, update, returnToLive, atBottom, startMomentum],
+    [fontKey, fontSize, update, returnToLive, atBottom, startMomentum, enqueueTouchWheelDelta],
   );
   // touchcancel is NOT touchend: iOS fires it when it promotes the drag to
   // native scrolling, with the finger usually STILL down. Treat it as "stop
@@ -1197,6 +1292,7 @@ export function MobileLiveTerminal({
     touchActiveRef.current = false;
     touchForwardYRef.current = null;
     touchScrollStartYRef.current = null;
+    touchStartRef.current = null;
     // A cancelled touch never coasts (native convention); just drop the
     // samples. Any momentum from a PREVIOUS flick was already stopped on
     // this touch's start.
@@ -1337,28 +1433,22 @@ export function MobileLiveTerminal({
   // Native (not React-synthetic) beforeinput: React's onBeforeInput is
   // backed by keypress in Chromium and carries no inputType, so the
   // soft-keyboard input types below would never match through it.
-  useEffect(() => {
-    const ta = inputRef.current;
-    if (!ta) return;
-    const onBeforeInput = (ev: InputEvent) => {
-      if (composingRef.current || ev.isComposing) return;
-      switch (ev.inputType) {
+  const handleMobileKeyboardProxyInput = useCallback(
+    (input: MobileKeyboardProxyInput) => {
+      if (composingRef.current || input.isComposing) return;
+      switch (input.inputType) {
         case "insertText":
-          ev.preventDefault();
-          if (ev.data) sendKeys(ev.data);
+          if (input.data) sendKeys(input.data);
           break;
         case "insertLineBreak":
         case "insertParagraph":
-          ev.preventDefault();
           sendKeys("\r");
           break;
         case "deleteContentBackward":
-          ev.preventDefault();
           sendKeys("\x7f");
           break;
         case "insertFromPaste": {
-          ev.preventDefault();
-          const text = ev.data ?? "";
+          const text = input.data ?? "";
           if (text) {
             // Bracketed paste so agents treat embedded newlines as
             // pasted text, not per-line submits.
@@ -1369,14 +1459,40 @@ export function MobileLiveTerminal({
         default:
           break;
       }
-    };
-    ta.addEventListener("beforeinput", onBeforeInput);
-    return () => ta.removeEventListener("beforeinput", onBeforeInput);
-  }, [sendKeys, sendData, inputRef]);
+    },
+    [sendKeys, sendData],
+  );
+  const handleBeforeInput = useCallback(
+    (ev: InputEvent) => {
+      switch (ev.inputType) {
+        case "insertText":
+        case "insertLineBreak":
+        case "insertParagraph":
+        case "deleteContentBackward":
+        case "insertFromPaste":
+          ev.preventDefault();
+          handleMobileKeyboardProxyInput({
+            inputType: ev.inputType,
+            data: ev.data,
+            isComposing: ev.isComposing,
+          });
+          break;
+        default:
+          break;
+      }
+    },
+    [handleMobileKeyboardProxyInput],
+  );
+  useEffect(() => {
+    const ta = inputRef.current;
+    if (!ta) return;
+    ta.addEventListener("beforeinput", handleBeforeInput);
+    return () => ta.removeEventListener("beforeinput", handleBeforeInput);
+  }, [handleBeforeInput, inputRef]);
 
-  const onKeyDown = useCallback(
-    (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-      if (composingRef.current || e.nativeEvent.isComposing) return;
+  const handleKeyDown = useCallback(
+    (e: KeyboardEvent) => {
+      if (composingRef.current || e.isComposing) return;
       const seq = specialKeySequence(e);
       if (seq) {
         e.preventDefault();
@@ -1411,9 +1527,9 @@ export function MobileLiveTerminal({
     [sendData],
   );
 
-  const onKeyDownCapture = useCallback(
-    (e: React.KeyboardEvent<HTMLTextAreaElement>) => {
-      if (composingRef.current || e.nativeEvent.isComposing) return;
+  const handleKeyDownCapture = useCallback(
+    (e: KeyboardEvent) => {
+      if (composingRef.current || e.isComposing) return;
       if (!e.altKey || e.ctrlKey || e.metaKey) return;
       // Capture printable Alt chords before browser accelerators can claim
       // shortcuts like Alt+V. Special keys are handled by the normal keydown
@@ -1427,12 +1543,12 @@ export function MobileLiveTerminal({
     [sendData],
   );
 
-  const onPaste = useCallback(
-    (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+  const handlePaste = useCallback(
+    (e: ClipboardEvent) => {
       // Read clipboard data synchronously: `clipboardData` is not guaranteed
       // to survive an await in every browser.
-      const text = e.clipboardData.getData("text/plain");
-      const imageFiles = Array.from(e.clipboardData.items ?? [])
+      const text = e.clipboardData?.getData("text/plain") ?? "";
+      const imageFiles = Array.from(e.clipboardData?.items ?? [])
         .filter((it) => it.kind === "file")
         .map((it) => it.getAsFile())
         .filter((f): f is File => f != null && f.type.startsWith("image/"));
@@ -1462,17 +1578,50 @@ export function MobileLiveTerminal({
     [sendData, uploadPastedImage],
   );
 
-  const onCompositionStart = useCallback(() => {
+  const handleCompositionStart = useCallback(() => {
     composingRef.current = true;
   }, []);
-  const onCompositionEnd = useCallback(
-    (e: React.CompositionEvent<HTMLTextAreaElement>) => {
+  const handleCompositionEnd = useCallback(
+    (e: CompositionEvent) => {
       composingRef.current = false;
       if (e.data) sendKeys(e.data);
-      if (inputRef.current) inputRef.current.value = "";
+      if (e.currentTarget instanceof HTMLTextAreaElement) e.currentTarget.value = "";
     },
-    [sendKeys, inputRef],
+    [sendKeys],
   );
+
+  // Session selection focuses App's persistent, in-viewport keyboard input
+  // during the sidebar tap. Keep that focus on iOS and handle its real native
+  // events directly. Synthesizing a second event for the terminal textarea
+  // works in desktop tests but iOS can drop it as untrusted input.
+  useEffect(() => {
+    if (!active) return;
+    const proxy = document.querySelector<HTMLTextAreaElement>("[data-keyboard-proxy]");
+    if (!proxy) return;
+    const unregisterProxyInput = registerMobileKeyboardProxyReceiver(handleMobileKeyboardProxyInput);
+
+    proxy.addEventListener("keydown", handleKeyDownCapture, true);
+    proxy.addEventListener("keydown", handleKeyDown);
+    proxy.addEventListener("paste", handlePaste);
+    proxy.addEventListener("compositionstart", handleCompositionStart);
+    proxy.addEventListener("compositionend", handleCompositionEnd);
+    return () => {
+      unregisterProxyInput();
+      proxy.removeEventListener("keydown", handleKeyDownCapture, true);
+      proxy.removeEventListener("keydown", handleKeyDown);
+      proxy.removeEventListener("paste", handlePaste);
+      proxy.removeEventListener("compositionstart", handleCompositionStart);
+      proxy.removeEventListener("compositionend", handleCompositionEnd);
+    };
+  }, [
+    active,
+    handleKeyDownCapture,
+    handleKeyDown,
+    handleMobileKeyboardProxyInput,
+    handlePaste,
+    handleCompositionStart,
+    handleCompositionEnd,
+  ]);
 
   // The cursor is rendered inline by Row (see below): this is the visual row
   // to box, and the column within it. -1 means draw nothing.
@@ -1715,11 +1864,11 @@ export function MobileLiveTerminal({
         autoComplete="off"
         spellCheck={false}
         // Capture phase claims Alt+letter before browser accelerators.
-        onKeyDownCapture={onKeyDownCapture}
-        onKeyDown={onKeyDown}
-        onPaste={onPaste}
-        onCompositionStart={onCompositionStart}
-        onCompositionEnd={onCompositionEnd}
+        onKeyDownCapture={(e) => handleKeyDownCapture(e.nativeEvent)}
+        onKeyDown={(e) => handleKeyDown(e.nativeEvent)}
+        onPaste={(e) => handlePaste(e.nativeEvent)}
+        onCompositionStart={() => handleCompositionStart()}
+        onCompositionEnd={(e) => handleCompositionEnd(e.nativeEvent)}
       />
     </div>
   );

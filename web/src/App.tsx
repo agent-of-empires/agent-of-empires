@@ -1,4 +1,14 @@
-import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import {
+  lazy,
+  Suspense,
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ReactNode,
+} from "react";
 import { Puzzle } from "lucide-react";
 import { useMatch, useNavigate, useSearchParams } from "react-router-dom";
 import { IDLE_DECAY_WINDOW_MS, isSessionActive } from "./lib/session";
@@ -86,6 +96,7 @@ import { toastBus, reportError } from "./lib/toastBus";
 import { isAbsolutePath, resolveToRepoRelative, type FileRef } from "./lib/fileRef";
 import { OPEN_SESSION_EVENT } from "./lib/sessionRoute";
 import { dispatchFocusTerminal, requestSessionInputFocus, setPendingTerminalFocus } from "./lib/terminalFocus";
+import { clearMobileKeyboardProxyInput, deliverMobileKeyboardProxyInput } from "./lib/mobileKeyboardProxy";
 import { hydrateWebUiStateFromServer, initWebUiSync } from "./lib/webUiSync";
 import { WorkspaceSidebar, SnoozeModal } from "./components/WorkspaceSidebar";
 import { DeleteSessionDialog } from "./components/DeleteSessionDialog";
@@ -695,6 +706,11 @@ function AppContent({
   const [telemetryConsentKnown, setTelemetryConsentKnown] = useState(false);
   const [sidebarOpen, setSidebarOpen] = useState(() => window.innerWidth >= 768);
   const keyboardProxyRef = useRef<HTMLTextAreaElement>(null);
+  const [keyboardProxy, setKeyboardProxy] = useState<HTMLTextAreaElement | null>(null);
+  const setKeyboardProxyRef = useCallback((element: HTMLTextAreaElement | null) => {
+    keyboardProxyRef.current = element;
+    setKeyboardProxy(element);
+  }, []);
 
   const [serverAbout, setServerAbout] = useState<ServerAbout | null>(null);
   // CityHall client mode collapses the dashboard to a locked-down end-user
@@ -817,6 +833,55 @@ function AppContent({
       keyboardProxyRef.current?.focus();
     }
   };
+  const closeKeyboardProxy = () => {
+    if (window.innerWidth < 768 && navigator.maxTouchPoints > 0) {
+      keyboardProxyRef.current?.blur();
+      if (document.activeElement instanceof HTMLTextAreaElement) document.activeElement.blur();
+    }
+  };
+
+  // The keyboard proxy survives terminal mounts so iOS can retain the focus
+  // authorized by a sidebar tap. Drop its receiver only at a real session
+  // boundary: clearing it while reselecting the active session leaves that
+  // still-mounted terminal without anything to re-register it.
+  const keyboardProxySessionIdRef = useRef(activeSessionId);
+  const transitionKeyboardProxy = useCallback((nextSessionId: string | null) => {
+    if (keyboardProxySessionIdRef.current === nextSessionId) return;
+    keyboardProxySessionIdRef.current = nextSessionId;
+    clearMobileKeyboardProxyInput();
+  }, []);
+
+  // Sidebar selection clears before the proxy can accept another edit. This
+  // also covers browser history and every other route change before the next
+  // input event, without clearing an unchanged session.
+  useLayoutEffect(() => {
+    transitionKeyboardProxy(activeSessionId);
+  }, [activeSessionId, transitionKeyboardProxy]);
+
+  useEffect(() => {
+    const proxy = keyboardProxy;
+    if (!proxy) return;
+    const onBeforeInput = (e: InputEvent) => {
+      switch (e.inputType) {
+        case "insertText":
+        case "insertLineBreak":
+        case "insertParagraph":
+        case "deleteContentBackward":
+        case "insertFromPaste":
+          e.preventDefault();
+          deliverMobileKeyboardProxyInput({
+            inputType: e.inputType,
+            data: e.data,
+            isComposing: e.isComposing,
+          });
+          break;
+        default:
+          break;
+      }
+    };
+    proxy.addEventListener("beforeinput", onBeforeInput);
+    return () => proxy.removeEventListener("beforeinput", onBeforeInput);
+  }, [keyboardProxy]);
 
   // Selecting a session in the sidebar should land focus on its canonical
   // "type here" target so the user can start typing without a second click:
@@ -833,15 +898,23 @@ function AppContent({
       const ws = workspaces.find((w) => w.sessions.some((s) => s.id === sessionId));
       if (ws) {
         const picked = ws.sessions.find((s) => s.id === sessionId);
+        transitionKeyboardProxy(sessionId);
         navigate(`/session/${encodeURIComponent(sessionId)}`);
-        // On touch devices, raise the soft keyboard within the tap gesture and
-        // latch the terminal/composer to take focus once it mounts (keeping the
-        // keyboard up) — but only when the user opted into auto-open keyboard.
-        // On desktop the proxy is a no-op and we focus the real input directly.
+        // iOS does not permit a session's asynchronously mounted terminal
+        // input to inherit this sidebar tap's keyboard authorization. The
+        // persistent keyboard input keeps the gesture-authorized focus while
+        // a terminal is starting; the terminal consumes its input directly
+        // rather than attempting a second, unreliable focus transfer.
         if (isCoarse) {
-          if (webSettings.autoOpenKeyboard) {
+          // Claude's alternate-screen startup still loses the first keyboard
+          // input on iOS (#3285). Start it as a monitoring view until that
+          // separate transport race is fixed; other terminal agents remain
+          // safe to auto-open.
+          if (picked?.tool === "claude" && picked.view !== "structured") {
+            closeKeyboardProxy();
+          } else if (webSettings.autoOpenKeyboard) {
             focusKeyboardProxy();
-            setPendingTerminalFocus(picked?.view === "structured" ? "composer" : "agent");
+            if (picked?.view === "structured") setPendingTerminalFocus("composer");
           }
         } else {
           focusKeyboardProxy();
@@ -850,7 +923,7 @@ function AppContent({
         if (window.innerWidth < 768) setSidebarOpen(false);
       }
     },
-    [navigate, workspaces, focusAgentInput, isCoarse, webSettings.autoOpenKeyboard],
+    [navigate, workspaces, focusAgentInput, isCoarse, transitionKeyboardProxy, webSettings.autoOpenKeyboard],
   );
 
   const handleSelectWorkspace = (workspaceId: string) => {
@@ -859,19 +932,23 @@ function AppContent({
       const running = ws.sessions.find((s) => isSessionActive(s, idleDecayWindowMs));
       const picked = running ?? ws.sessions[0] ?? null;
       if (picked) {
+        transitionKeyboardProxy(picked.id);
         navigate(`/session/${encodeURIComponent(picked.id)}`);
-        // Mirror handleSelectSession: on touch, raise the keyboard + latch focus
-        // only when auto-open keyboard is enabled; on desktop focus directly.
+        // See handleSelectSession: keep focus on the persistent keyboard input
+        // until the selected surface can receive it.
         if (isCoarse) {
-          if (webSettings.autoOpenKeyboard) {
+          if (picked.tool === "claude" && picked.view !== "structured") {
+            closeKeyboardProxy();
+          } else if (webSettings.autoOpenKeyboard) {
             focusKeyboardProxy();
-            setPendingTerminalFocus(picked.view === "structured" ? "composer" : "agent");
+            if (picked.view === "structured") setPendingTerminalFocus("composer");
           }
         } else {
           focusKeyboardProxy();
           focusAgentInput(picked);
         }
       } else {
+        transitionKeyboardProxy(null);
         navigate("/");
       }
     }
@@ -2256,11 +2333,16 @@ function AppContent({
         )}
 
         <textarea
-          ref={keyboardProxyRef}
+          ref={setKeyboardProxyRef}
+          data-keyboard-proxy
           aria-hidden="true"
           tabIndex={-1}
-          className="fixed opacity-0 w-0 h-0 pointer-events-none"
-          style={{ top: -9999, left: -9999 }}
+          // Keep the element in the visual viewport. Focusing a zero-size
+          // textarea thousands of pixels above an iOS PWA can leave WebKit's
+          // focus scroll in a broken state until the keyboard is toggled.
+          // This matches the live terminal's hidden input geometry.
+          className="fixed bottom-0 left-0 w-px h-px opacity-0 pointer-events-none"
+          style={{ caretColor: "transparent", color: "transparent" }}
         />
       </div>
     </AcpPrefsProvider>

@@ -123,6 +123,7 @@
         "tests/mobile-fullscreen-agent-layout.spec.ts"
       ],
       "components": [
+        "web/src/App.tsx",
         "web/src/components/MobileLiveTerminal.tsx",
         "web/src/components/LiveTerminalView.tsx",
         "web/src/hooks/useLiveTerminal.ts"

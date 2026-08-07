@@ -124,6 +124,15 @@ describe("useEdgeSwipe anywhere mode", () => {
     dispatchTouch("touchmove", [{ clientX: 300, clientY: 100 }]); // dx = 100 > 90
     expect(onSwipe).toHaveBeenCalledTimes(1);
   });
+
+  it("leaves the left system-back edge alone", () => {
+    const onSwipe = vi.fn();
+    renderHook(() => useEdgeSwipe({ edge: "left", enabled: true, onSwipe, anywhere: true }));
+
+    dispatchTouch("touchstart", [{ clientX: 8, clientY: 100 }]);
+    dispatchTouch("touchmove", [{ clientX: 180, clientY: 100 }]);
+    expect(onSwipe).not.toHaveBeenCalled();
+  });
 });
 
 describe("useEdgeSwipe blurOnSwipe", () => {
