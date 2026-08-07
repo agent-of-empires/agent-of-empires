@@ -417,16 +417,18 @@ fn perform_deletion_with(
                         // rare case where prune stopped early (hop cap, or a
                         // home / main-repo boundary) yet the dir is empty here.
                         Ok(()) => messages.push("Workspace directory removed".to_string()),
-                        // A non-empty dir means it still holds files aoe did not
-                        // create (unrelated content, or an attached repo it does
-                        // not manage). The removal is non-recursive, so this is a
-                        // safe refusal, not a failure worth retrying: report it as
-                        // a message so the purge still clears the row instead of
+                        // A non-empty dir still holds something that is not one of
+                        // the managed worktrees: unrelated content under a mislaid
+                        // record, or files written at the workspace root, which is
+                        // the session's own cwd. We cannot tell which, so we keep
+                        // them. The removal is non-recursive, so this is a safe
+                        // refusal, not a failure worth retrying: report it as a
+                        // message so the purge still clears the row instead of
                         // retrying the same non-convergent refusal forever, as the
                         // default-branch guard above does (#3215).
                         Err(e) if e.kind() == std::io::ErrorKind::DirectoryNotEmpty => {
                             messages.push(format!(
-                                "Workspace directory kept: {} still contains files not created by aoe",
+                                "Workspace directory kept: {} is not empty, so it was not removed",
                                 ws_path.display()
                             ));
                         }

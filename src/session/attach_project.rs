@@ -30,10 +30,12 @@
 //!
 //! Two invariants shape the code below.
 //!
-//! **`workspace_dir` only ever contains worktrees aoe created.** That is what makes
-//! the delete path's `remove_dir_all` safe, and it is why the in-place case creates
-//! a worktree instead of adopting the user's checkout. `deletion` still verifies it
-//! with `workspace_dir_is_aoe_owned` rather than trusting the record.
+//! **`workspace_dir` only ever contains worktrees aoe created.** That is why the
+//! in-place case creates a worktree instead of adopting the user's checkout.
+//! `deletion` still verifies the layout with `workspace_dir_is_aoe_owned` rather
+//! than trusting the record, and its final removal is non-recursive, so anything
+//! else still sitting under the directory keeps it on disk instead of being
+//! deleted with it.
 //!
 //! **A branch aoe did not create is never touched.** The session's branch name is a
 //! suggestion. If the added repo already has that branch, the attach refuses unless
