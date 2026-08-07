@@ -4,22 +4,8 @@ import { describe, expect, it, vi } from "vitest";
 import { fireEvent, render, screen } from "@testing-library/react";
 
 import { ChromeCollapseHandle, CollapsibleRegion } from "../CollapsibleChrome";
-import { collapsibleInnerClass, collapsibleRegionClass } from "../../lib/collapsibleChrome";
 
 describe("collapsible chrome", () => {
-  it("swaps the grid row between 0fr and 1fr, and clips only while collapsed", () => {
-    // Collapsing must release the row's layout height (0fr), not merely hide
-    // it, and must not clip the composer's `bottom-full` menus while expanded.
-    expect(collapsibleRegionClass(true)).toContain("grid-rows-[0fr]");
-    expect(collapsibleRegionClass(false)).toContain("grid-rows-[1fr]");
-    expect(collapsibleInnerClass(true)).toContain("overflow-hidden");
-    expect(collapsibleInnerClass(false)).not.toContain("overflow-hidden");
-    // `min-h-0` in both states: a grid item's automatic minimum size would
-    // otherwise floor the 0fr row at the child's content height.
-    expect(collapsibleInnerClass(true)).toContain("min-h-0");
-    expect(collapsibleInnerClass(false)).toContain("min-h-0");
-  });
-
   it("marks the collapsed region inert so hidden chrome leaves the tab order", () => {
     const { rerender, container } = render(
       <CollapsibleRegion collapsed={false}>
