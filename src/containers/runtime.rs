@@ -204,29 +204,36 @@ impl ContainerRuntime {
                     // wrapping needed to preserve the single-line convention.
                     .map_err(|e| DockerError::InspectFailed(e.to_string()))?;
 
-                if let Some(status) = out_json.pointer("/0/status") {
-                    // as_str() guard: if Apple ever changes /0/status from a
-                    // string to a nested object, `status == "running"` would
-                    // silently return false and route to Probe::NotRunning:
-                    // exact fail-open swallowing-existence-probe (#2596) one
-                    // JSON schema shift away. Surface schema drift as Err.
-                    match status.as_str() {
-                        Some(s) => Ok(s == "running"),
-                        None => Err(DockerError::InspectFailed(
-                            "apple container inspect: /0/status present but not a string".into(),
-                        )),
-                    }
-                } else {
-                    // Exit 0 with no /0/status: schema surprise. Same
-                    // reasoning as the as_str() None branch above: Err,
-                    // not Ok(false), so gates fail closed instead of fail
-                    // open on a genuinely running container.
-                    Err(DockerError::InspectFailed(
-                        "apple container inspect: exit 0 but no /0/status in output".into(),
-                    ))
-                }
+                Self::apple_container_inspect_state(&out_json).map(|state| state == "running")
             }
         }
+    }
+
+    /// The runtime state string from Apple `container inspect` JSON.
+    ///
+    /// The CLI serialised `/0/status` as a bare string through 0.12.x; the
+    /// 1.0.0 ManagedResource cleanup nested it as an object whose `state`
+    /// field carries the same value (#3239). Both shapes are supported
+    /// because either CLI generation may be installed. Any other shape is
+    /// still Err, never Ok(false): a silently unparsed status would route to
+    /// Probe::NotRunning, the exact fail-open swallowing-existence-probe
+    /// hole (#2596) that the previous string-only guard existed to close.
+    fn apple_container_inspect_state(out_json: &Value) -> Result<&str> {
+        let Some(status) = out_json.pointer("/0/status") else {
+            return Err(DockerError::InspectFailed(
+                "apple container inspect: exit 0 but no /0/status in output".into(),
+            ));
+        };
+        status
+            .as_str()
+            .or_else(|| status.pointer("/state").and_then(Value::as_str))
+            .ok_or_else(|| {
+                DockerError::InspectFailed(
+                    "apple container inspect: /0/status is neither a string nor \
+                     an object with a string `state`"
+                        .into(),
+                )
+            })
     }
 
     /// The container's configured working directory (`Config.WorkingDir`), or
@@ -498,6 +505,42 @@ mod tests {
             assert!(rt
                 .ensure_image("nonexistent-image-that-does-not-exist:v999")
                 .is_err());
+        }
+    }
+
+    #[test]
+    fn test_apple_container_inspect_state_shapes() {
+        use serde_json::json;
+        // Both CLI generations (#3239) plus the drift shapes that must stay
+        // Err so lifecycle gates fail closed rather than fail open (#2596).
+        let cases = [
+            (json!([{"status": "running"}]), Some("running")),
+            (json!([{"status": "stopped"}]), Some("stopped")),
+            // 1.0.0 ManagedResource shape, as emitted by container CLI 1.2.0
+            (
+                json!([{"status": {"state": "running", "networks": [], "startedDate": "2026-08-04T10:36:08Z"}}]),
+                Some("running"),
+            ),
+            (json!([{"status": {"state": "stopped"}}]), Some("stopped")),
+            // object without a string `state`
+            (json!([{"status": {"state": 3}}]), None),
+            (json!([{"status": {"phase": "running"}}]), None),
+            // neither shape
+            (json!([{"status": 3}]), None),
+            (json!([{"status": null}]), None),
+            // missing entirely
+            (json!([{}]), None),
+            (json!([]), None),
+        ];
+        for (payload, expected) in cases {
+            let result = ContainerRuntime::apple_container_inspect_state(&payload);
+            match expected {
+                Some(state) => {
+                    let parsed = result.unwrap_or_else(|e| panic!("{payload}: {e}"));
+                    assert_eq!(parsed, state);
+                }
+                None => assert!(result.is_err(), "expected Err for {payload}"),
+            }
         }
     }
 
