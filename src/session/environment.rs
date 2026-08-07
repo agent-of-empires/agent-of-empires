@@ -331,9 +331,20 @@ pub(crate) fn shell_escape(val: &str) -> String {
 /// Values are passed through `shell_escape` so spaces, quotes, and shell
 /// metacharacters are preserved literally. Returns an empty string when
 /// the entry list is empty so callers can format unconditionally.
+///
+/// Keys are not escapable here (a shell assignment needs a bare name on the
+/// left), so an entry whose key is not a valid environment variable name is
+/// skipped with a warning rather than concatenated into the command line. The
+/// structured-view sibling [`resolve_host_environment_pairs`] applies the same
+/// rule, so both views drop the same entries.
 pub(crate) fn host_environment_prefix(entries: &[String]) -> String {
     let mut out = String::new();
     for entry in entries {
+        let key = entry.split_once('=').map(|(key, _)| key).unwrap_or(entry);
+        if !is_valid_env_key(key) {
+            tracing::warn!(target: "session.create", "invalid host environment key '{}'; skipping", key);
+            continue;
+        }
         if let Some((key, value)) = entry.split_once('=') {
             let resolved = if let Some(rest) = value.strip_prefix("$$") {
                 Some(format!("${}", rest))
@@ -623,8 +634,9 @@ where
         .collect()
 }
 
-/// Validate an env entry string and return a warning message if it references
-/// a host variable that doesn't exist.
+/// Validate an env entry string and return a warning message when its key is
+/// not a valid environment variable name (the entry is dropped at collection
+/// time) or when it references a host variable that doesn't exist.
 ///
 /// Entry formats:
 /// - `KEY` (bare): pass through from host
@@ -1267,6 +1279,9 @@ environment = ["GH_TOKEN=write_token"]
             (&["MARKER=$$KEEP"], "MARKER='$KEEP' "),
             // Single-quote wrapping with `'\''` escape for the apostrophe.
             (&["X=a b'c$d"], "X='a b'\\''c$d' "),
+            // A key is a bare shell name here and cannot be quoted, so an
+            // invalid one is dropped instead of concatenated into the command.
+            (&["FOO; touch /tmp/pwn; X=1", "GOOD=ok"], "GOOD='ok' "),
         ];
         for (entries, expected) in cases {
             let owned: Vec<String> = entries.iter().map(|s| s.to_string()).collect();
