@@ -14,12 +14,20 @@ use ratatui::widgets::*;
 use super::DialogResult;
 use crate::tui::styles::Theme;
 
-
-/// Style for the focused choice: `theme.selection` as foreground on the
-/// default background, matching the idiomatic terminal reversed-style
-/// selection. Bold for emphasis.
+/// Style for the focused choice: `theme.accent` bold on the dialog's own
+/// background, the same fg-only treatment `components::buttons::render_yes_no`
+/// gives its focused button. `theme.selection` is a background surface token
+/// (see DESIGN.md); as a foreground it sits within ~1.7:1 of every builtin
+/// theme's background, so the focused choice would read as the dimmest item
+/// on the row. Unfocused choices drop to `theme.dimmed` so focus is carried
+/// by the brightness gap, not by a background block.
 fn focused_choice_style(theme: &Theme) -> Style {
-    Style::default().fg(theme.selection).bold()
+    Style::default().fg(theme.accent).bold()
+}
+
+/// Style for the choices that are not focused.
+fn unfocused_choice_style(theme: &Theme) -> Style {
+    Style::default().fg(theme.dimmed)
 }
 
 /// Which of the three static choices the user picked.
@@ -119,7 +127,7 @@ impl PermissionResponseDialog {
             let style = if i == self.focused {
                 focused_choice_style(theme)
             } else {
-                Style::default().fg(theme.text)
+                unfocused_choice_style(theme)
             };
             spans.push(Span::styled(format!("[{}]", label), style));
         }
@@ -217,16 +225,38 @@ mod tests {
         assert!(matches!(result, DialogResult::Cancel));
     }
 
+    /// The focused choice paints a foreground on the dialog's own background,
+    /// so its color has to be a foreground token. Every builtin's `accent`
+    /// clears 2.5:1 against that theme's background (catppuccin-latte is the
+    /// tightest at 2.64); a background surface token such as `theme.selection`
+    /// lands between 1.10:1 and 1.71:1 and would fail here.
     #[test]
-    fn focused_choice_style_uses_selection_as_foreground() {
-        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
+    fn focused_choice_fg_stays_legible_on_every_builtin_background() {
+        const MIN_FOCUSED_CONTRAST_RATIO: f32 = 2.5;
 
-        let style = focused_choice_style(&theme);
+        for name in crate::tui::styles::builtin_theme_names() {
+            let theme = crate::tui::styles::load_theme(name);
+            let style = focused_choice_style(&theme);
 
-        assert_eq!(style.fg, Some(theme.selection));
-        assert_eq!(style.bg, None);
-        assert!(style
-            .add_modifier
-            .contains(ratatui::style::Modifier::BOLD));
+            let fg = style.fg.expect("focused choice must set a foreground");
+            assert!(
+                crate::tui::styles::has_min_contrast(
+                    fg,
+                    theme.background,
+                    MIN_FOCUSED_CONTRAST_RATIO
+                ),
+                "{name}: focused choice fg is illegible on the theme background"
+            );
+            assert_eq!(style.bg, None, "{name}: focused choice must not set a bg");
+            assert!(
+                style.add_modifier.contains(ratatui::style::Modifier::BOLD),
+                "{name}: focused choice must be bold"
+            );
+            assert_ne!(
+                unfocused_choice_style(&theme).fg,
+                style.fg,
+                "{name}: focused and unfocused choices must differ"
+            );
+        }
     }
 }
