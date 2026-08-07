@@ -1293,10 +1293,11 @@ pub fn resolve_before_session_hooks(profile: &str) -> Vec<String> {
         .before_session
 }
 
-/// Parse `KEY=VALUE` lines from a hook's stdout, ignoring blank lines, lines
-/// with no `=`, and lines whose key is not a valid env var name. Later entries
-/// override earlier ones for the same key. The value is preserved verbatim
-/// (only the line ending is stripped by [`str::lines`]).
+/// Parse `KEY=VALUE` lines from a hook's stdout, ignoring blank lines and lines
+/// with no `=`. Invalid env names are skipped with a warning before they can
+/// reach shell construction. Later entries override earlier ones for the same
+/// key. The value is preserved verbatim (only the line ending is stripped by
+/// [`str::lines`]).
 fn parse_env_kv_lines(stdout: &str) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     for line in stdout.lines() {
@@ -1305,6 +1306,10 @@ fn parse_env_kv_lines(stdout: &str) -> Vec<(String, String)> {
         };
         let key = key.trim();
         if !super::environment::is_valid_env_key(key) {
+            tracing::warn!(
+                target: "session.create",
+                "hook produced an invalid environment key; skipping"
+            );
             continue;
         }
         out.retain(|(k, _)| k != key);

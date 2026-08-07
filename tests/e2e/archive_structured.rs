@@ -13,7 +13,7 @@
 //! gap this test closes (#2185).
 //!
 //! Oracles:
-//!   - Worker shut down: `aoe acp ps --json` no longer lists the session
+//!   - Worker shut down: `aoe ps --acp --dead --json` no longer lists the session
 //!     (`shutdown()` removes the registry record). Asserted in BOTH kill_pane
 //!     modes, so it catches a regression that skips the unconditional shutdown
 //!     when `kill_pane = false`.
@@ -76,10 +76,10 @@ fn prompt_until_accepted(h: &TuiTestHarness, session_id: &str, timeout: Duration
             return;
         }
         if Instant::now() >= deadline {
-            let ps = h.run_cli(&["acp", "ps", "--json"]);
+            let ps = h.run_cli(&["ps", "--acp", "--dead", "--json"]);
             panic!(
                 "structured view worker never accepted a prompt within {timeout:?}.\n\
-                 stdout: {}\nstderr: {}\nacp ps: {}",
+                 stdout: {}\nstderr: {}\nps --acp: {}",
                 String::from_utf8_lossy(&out.stdout),
                 String::from_utf8_lossy(&out.stderr),
                 String::from_utf8_lossy(&ps.stdout),
@@ -89,9 +89,9 @@ fn prompt_until_accepted(h: &TuiTestHarness, session_id: &str, timeout: Duration
     }
 }
 
-/// True while `aoe acp ps --json` still lists `session_id` as a live worker.
+/// True while `aoe ps --acp --dead --json` still lists `session_id` as a live worker.
 fn worker_listed(h: &TuiTestHarness, session_id: &str) -> bool {
-    let out = h.run_cli(&["acp", "ps", "--json"]);
+    let out = h.run_cli(&["ps", "--acp", "--dead", "--json"]);
     let body = String::from_utf8_lossy(&out.stdout);
     let records: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::json!([]));
     records
@@ -100,7 +100,7 @@ fn worker_listed(h: &TuiTestHarness, session_id: &str) -> bool {
         .unwrap_or(false)
 }
 
-/// Poll until the worker disappears from `acp ps`. Panics with the last
+/// Poll until the worker disappears from the worker registry. Panics with the last
 /// listing on timeout.
 fn wait_for_worker_gone(h: &TuiTestHarness, session_id: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
@@ -109,9 +109,9 @@ fn wait_for_worker_gone(h: &TuiTestHarness, session_id: &str, timeout: Duration)
             return;
         }
         if Instant::now() >= deadline {
-            let ps = h.run_cli(&["acp", "ps", "--json"]);
+            let ps = h.run_cli(&["ps", "--acp", "--dead", "--json"]);
             panic!(
-                "worker {session_id} still listed after archive within {timeout:?}.\nacp ps: {}",
+                "worker {session_id} still listed after archive within {timeout:?}.\nps --acp: {}",
                 String::from_utf8_lossy(&ps.stdout),
             );
         }

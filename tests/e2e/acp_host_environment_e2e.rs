@@ -21,6 +21,11 @@
 //! configured too and must still be refused: `environment` is trusted enough
 //! to set HOME or PATH, but never aoe's own auth token.
 //!
+//! The same capture also carries the automatic desktop/session layer
+//! (`DISPLAY`, `XDG_*`), which #3079 wired into the tmux paths only and #3262
+//! reopened for the structured view. It is asserted here rather than in its own
+//! live-daemon test so the coverage costs no extra daemon spawn.
+//!
 //! Compiled only with the `serve` feature (structured view and
 //! `aoe add --structured-view` do not exist otherwise). Run via:
 //!
@@ -135,6 +140,15 @@ fn configured_host_environment_reaches_structured_worker() {
             .display()
             .to_string(),
     );
+    // The desktop/session env the daemon holds must ride along too (#3262):
+    // #3079 wired this into the tmux paths only, so a structured worker still
+    // started with no `DISPLAY`. Asserted on the same capture this test
+    // already waits for, so the coverage costs no extra daemon spawn.
+    h.set_env("DISPLAY", ":42");
+    h.set_env("XDG_RUNTIME_DIR", "/run/user/4242");
+    // The counter-case for the same default posture: an ordinary operator var
+    // stays out until `session.inherit_host_environment` is turned on.
+    h.set_env("GOPATH", "/scratch/gopath");
 
     // Global `environment` (a top-level key, above the seeded tables).
     // `AOE_TOKEN` is planted here on purpose: it must be refused.
@@ -227,6 +241,22 @@ fn configured_host_environment_reaches_structured_worker() {
         env_value(&capture, "GIT_CONFIG_GLOBAL").as_deref(),
         Some(expected_git_config.to_str().unwrap()),
         "configured GIT_CONFIG_GLOBAL must reach the adapter too"
+    );
+
+    // Same capture, the desktop/session layer: the daemon's `DISPLAY` and
+    // `XDG_*` reach the adapter, downstream of `env_clear` and the runner hop
+    // (#3262). `GOPATH` stays out with `inherit_host_environment` off.
+    for (key, expected) in [("DISPLAY", ":42"), ("XDG_RUNTIME_DIR", "/run/user/4242")] {
+        assert_eq!(
+            env_value(&capture, key).as_deref(),
+            Some(expected),
+            "{key} must reach the adapter (#3262)"
+        );
+    }
+    assert_eq!(
+        env_value(&capture, "GOPATH"),
+        None,
+        "an ordinary operator var must stay out while inherit_host_environment is off"
     );
 
     // No invocation may carry aoe's auth token, however it was configured.

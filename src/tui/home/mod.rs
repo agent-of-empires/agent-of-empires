@@ -2853,16 +2853,38 @@ impl HomeView {
     }
 
     /// Whether a daemon-sourced status may be applied to `id`, mirroring the
-    /// exclusions [`Self::pollable_instances`] applies to the tmux producer.
-    /// A row mid-restart or mid-recovery-cascade has its post-cascade
-    /// `Instance` delivered by `apply_restart_results` /
-    /// `apply_recovery_updates`; letting the daemon's copy land during that
-    /// window races those transitions. Recovery already skips structured rows
+    /// exclusions the tmux producer applies. A row mid-restart or
+    /// mid-recovery-cascade has its post-cascade `Instance` delivered by
+    /// `apply_restart_results` / `apply_recovery_updates`; letting the daemon's
+    /// copy land during that window races those transitions, so both are
+    /// excluded here just as [`Self::pollable_instances`] excludes them from the
+    /// tmux poller. Recovery already skips structured rows
     /// (`recovery::is_recovery_candidate`), so in practice this is the restart
     /// guard, but both are checked so the two producers stay symmetrical.
+    ///
+    /// Archived and trashed rows are also excluded. `/api/sessions` returns
+    /// them unfiltered, and the `is_archived()` short-circuit that keeps the
+    /// tmux producer off a sunk row lives in `update_status_with_metadata_inner`
+    /// (`instance.rs`), which this daemon path never reaches; without this a
+    /// sunk row would be restamped and re-marked unread. See #3201 / #1868 /
+    /// #2206.
+    ///
+    /// The cost of that exclusion: a sunk structured row that is already in
+    /// `Status::Error` now has no producer able to clear it. The daemon is
+    /// excluded here, the tmux poller bails on structured rows before probing
+    /// (`status_poller.rs`), and `reload_storage_only` carries `prev.status`
+    /// forward across reloads, so the stale value survives. It stays visible
+    /// because `agent_row_icon` lets `Error` and `Deleting` punch through the
+    /// sunk-row mask on purpose (a failed permanent delete has to remain
+    /// legible). The tmux producer has the same property via its own
+    /// `is_archived()` short-circuit, so this is consistent rather than new,
+    /// but unarchiving is the only way back.
     #[cfg(feature = "serve")]
-    fn daemon_status_applies_to(&self, id: &str) -> bool {
-        !self.recovery_in_flight.contains(id) && !self.restart_in_flight.contains(id)
+    fn daemon_status_applies_to(&self, inst: &Instance) -> bool {
+        !self.recovery_in_flight.contains(&inst.id)
+            && !self.restart_in_flight.contains(&inst.id)
+            && !inst.is_archived()
+            && !inst.is_trashed()
     }
 
     /// Apply any pending daemon-sourced statuses. Returns true if the
@@ -2897,8 +2919,13 @@ impl HomeView {
     }
 
     /// Fold one daemon-sourced structured status into the shared apply path,
-    /// so sounds, status hooks, unread marking, and the `sessions.json`
-    /// patch all behave exactly as they do for a tmux-derived transition.
+    /// so sounds, status hooks, and unread marking behave exactly as they do
+    /// for a tmux-derived transition. The `sessions.json` status patch is the
+    /// one deliberate exception: this path only handles structured rows, and
+    /// `persist_passive_status_transition` skips the passive status patch for
+    /// `is_structured()` (only the unread mark persists there), since a
+    /// structured row's status is a daemon-side overlay with no durable owner.
+    /// See #3201.
     ///
     /// The row is re-checked against `is_structured()` here rather than
     /// trusted from the wire: the daemon's `view` and the local row's could
@@ -2912,15 +2939,14 @@ impl HomeView {
         use crate::session::Status;
         use crate::tui::status_poller::IdleIntent;
 
-        if !self
-            .get_instance(&update.id)
-            .is_some_and(|i| i.is_structured())
-        {
+        // One lookup feeds both guards below and the Stopped-lift check.
+        let Some(inst) = self.get_instance(&update.id) else {
+            return;
+        };
+        if !inst.is_structured() || !self.daemon_status_applies_to(inst) {
             return;
         }
-        if !self.daemon_status_applies_to(&update.id) {
-            return;
-        }
+        let was_stopped = inst.status == Status::Stopped;
         // Lift a locally-`Stopped` row before the shared apply path sees it.
         // `apply_status_update`'s guard drops every update whose row is
         // `Stopped`, which is right for tmux rows (nothing but an explicit
@@ -2937,9 +2963,7 @@ impl HomeView {
         // daemon provably means a new worker epoch, never a trailing
         // post-stop event. Reproducing the daemon's own Stopped -> Idle step
         // here keeps the two ladders identical.
-        if update.status != Status::Stopped
-            && self.get_instance(&update.id).map(|i| i.status) == Some(Status::Stopped)
-        {
+        if update.status != Status::Stopped && was_stopped {
             self.mutate_instance(&update.id, |inst| inst.status = Status::Idle);
         }
         self.apply_status_update(
@@ -3006,9 +3030,24 @@ impl HomeView {
             let new_error = update.last_error;
             let new_idle_entered_at = update.idle_entered_at;
             let new_live_status_baseline = update.live_status_baseline;
+            let status_changed = old_status != Some(new_status);
             self.mutate_instance(&update.id, |inst| {
                 inst.status = new_status;
-                inst.last_error = new_error;
+                // The daemon's `last_error` is authoritative only when present:
+                // an incoming `Some` is always applied, so an `Error -> Error`
+                // tick can replace the old text. Gating that write on a status
+                // change froze the first error on the row. A `None` is not
+                // symmetric: the daemon tracks only ACP errors, so it cannot
+                // distinguish "no error" from a locally-set message such as the
+                // delete-failure text from `apply_deletion_results`, and
+                // clearing on every unchanged tick would wipe it. Clear only
+                // across a genuine transition, leaving a stale same-status
+                // message in place until then. See #3201.
+                if let Some(err) = new_error {
+                    inst.last_error = Some(err);
+                } else if status_changed {
+                    inst.last_error = None;
+                }
                 // Match on the producer's stated intent for `idle_entered_at`
                 // instead of overloading `None`. See `IdleIntent` in
                 // `status_poller` for the three-variant contract that
@@ -6333,10 +6372,32 @@ impl HomeView {
         let Some(storage) = self.storages.get(&inst.source_profile) else {
             return;
         };
-        let patch = crate::session::PassiveStatusPatch::from_instance(inst);
+        // Structured rows are not durable: their status is a daemon-side
+        // overlay rebuilt from live worker state (`apply_acp_overlay_inplace`)
+        // and re-derived at daemon boot by `seed_acp_statuses`. The daemon's
+        // own passive writer gates the status patch on exactly this predicate
+        // (`decide_passive_transition` returns `patch: None` for
+        // `is_structured()`, `server/mod.rs`). Persisting it here would strand
+        // a row at `Running` or `Error` with no producer left to heal it once
+        // the daemon is gone, since the tmux poller now bails on structured
+        // rows (`status_poller.rs`); this is the #3201 regression from #3170.
+        // The unread mark is deliberately NOT gated: the daemon marks a
+        // structured row unread on a Running -> Idle turn (its `mark_unread` is
+        // not gated on `is_structured`), so mirroring it here keeps the two
+        // producers symmetric.
+        let structured = inst.is_structured();
+        // Pure optimization, not a correctness gate: a structured row with
+        // nothing to mark unread has no patch and no unread write, so skip the
+        // empty-write flock round-trip entirely.
+        if structured && !mark_unread {
+            return;
+        }
+        let patch = (!structured).then(|| crate::session::PassiveStatusPatch::from_instance(inst));
         if let Err(e) = storage.update(|insts, _groups| {
             if let Some(disk) = insts.iter_mut().find(|i| i.id == id) {
-                disk.merge_passive_status_patch(id, &patch);
+                if let Some(patch) = &patch {
+                    disk.merge_passive_status_patch(id, patch);
+                }
                 if mark_unread {
                     disk.mark_unread();
                 }

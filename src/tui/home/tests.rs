@@ -18664,4 +18664,175 @@ mod daemon_status_apply_tests {
             Some(Status::Starting)
         );
     }
+
+    /// #3201: the daemon owns structured status and deliberately never
+    /// persists it (`decide_passive_transition` returns `patch: None` for
+    /// `is_structured()`). The TUI's passive writer must gate the same way, or
+    /// a `Running`/`Error` stamped mid-turn survives a daemon stop and a TUI
+    /// restart, with the tmux poller now bailing on structured rows so nothing
+    /// heals it. The in-memory pill must still move.
+    #[test]
+    #[serial]
+    fn daemon_status_does_not_persist_a_structured_row_to_disk() {
+        // Pin the process-global so the assertion cannot depend on it; an
+        // Idle -> Running apply never marks unread regardless.
+        crate::session::set_unread_enabled(true);
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Idle);
+        // `add_instance` only stages the row; flush it to disk as Idle so the
+        // passive writer has a durable row to (not) touch.
+        env.view.save().expect("seed the structured row on disk");
+
+        env.view
+            .apply_daemon_status_update(update(&id, Status::Running));
+
+        assert_eq!(
+            env.view.get_instance(&id).map(|i| i.status),
+            Some(Status::Running),
+            "the daemon reading must still drive the in-memory pill"
+        );
+
+        let rows = env.view.storages.get("test").unwrap().load().unwrap();
+        let disk = rows.iter().find(|i| i.id == id).expect("disk row present");
+        assert_eq!(
+            disk.status,
+            Status::Idle,
+            "structured status must not be passively persisted to sessions.json (#3201)"
+        );
+    }
+
+    /// #3201, the deliberately-ungated half: the status patch is skipped
+    /// for a structured row, but the unread mark still lands, mirroring the
+    /// daemon (`decide_passive_transition` gates only `patch` on
+    /// `is_structured()`; its `mark_unread` is ungated and
+    /// `flush_passive_transition_writes` persists it). A future refactor that
+    /// gates unread the same way it gates status would strand structured rows
+    /// as read across a restart; this locks against it.
+    #[test]
+    #[serial]
+    fn daemon_status_persists_the_unread_mark_but_not_the_status_for_structured() {
+        crate::session::set_unread_enabled(true);
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Running);
+        env.view
+            .save()
+            .expect("seed the structured row on disk as read/Running");
+
+        // A finished turn (Running -> Idle) marks the row unread.
+        env.view
+            .apply_daemon_status_update(update(&id, Status::Idle));
+
+        let rows = env.view.storages.get("test").unwrap().load().unwrap();
+        let disk = rows.iter().find(|i| i.id == id).expect("disk row present");
+        assert_eq!(
+            disk.status,
+            Status::Running,
+            "structured status must not be passively persisted (#3201)"
+        );
+        assert!(
+            disk.is_unread(),
+            "the unread mark must still persist for a structured row, mirroring the daemon (#3201)"
+        );
+    }
+
+    /// #3201: `last_error` reconciliation on a same-status daemon tick. An
+    /// incoming `Some` is authoritative and always replaces the message, even
+    /// without a status change (gating that write on a transition froze the
+    /// first error on the row). An incoming `None` is not symmetric: the daemon
+    /// tracks only ACP errors, so a same-status `None` tick must leave a
+    /// locally-set message (e.g. the delete-failure text from
+    /// `apply_deletion_results`) in place rather than wipe it. Clearing across a
+    /// genuine transition is locked by `daemon_status_clears_a_stale_error_message`.
+    #[test]
+    #[serial]
+    fn daemon_status_reconciles_last_error_on_a_same_status_tick() {
+        // (row status, seeded local error, incoming daemon error, expected)
+        let cases = [
+            // A None tick on an unchanged status keeps the local message.
+            (
+                Status::Running,
+                "delete failed: worktree busy",
+                None,
+                Some("delete failed: worktree busy"),
+            ),
+            // A present incoming Some replaces it even with no status change.
+            (
+                Status::Error,
+                "agent failed to start",
+                Some("rate limit exceeded"),
+                Some("rate limit exceeded"),
+            ),
+        ];
+        for (status, seeded, incoming, expected) in cases {
+            let mut env = create_test_env_empty();
+            let id = structured_row(&mut env, status);
+            env.view
+                .mutate_instance(&id, |inst| inst.last_error = Some(seeded.to_string()));
+
+            let mut u = update(&id, status);
+            u.last_error = incoming.map(str::to_string);
+            env.view.apply_daemon_status_update(u);
+
+            assert_eq!(
+                env.view
+                    .get_instance(&id)
+                    .and_then(|i| i.last_error.clone()),
+                expected.map(str::to_string),
+                "status={status:?} incoming={incoming:?}"
+            );
+        }
+    }
+
+    /// #3201: a snoozed row must stay live on the daemon path. Snooze is a
+    /// user-facing triage marker, not a sink like archive or trash;
+    /// `daemon_status_applies_to` deliberately excludes only archived and
+    /// trashed rows, never snoozed. This locks against a future edit that adds
+    /// a symmetric `!is_snoozed()` exclusion and silently freezes snoozed pills.
+    #[test]
+    #[serial]
+    fn daemon_status_applies_to_a_snoozed_structured_row() {
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Idle);
+        env.view.mutate_instance(&id, |inst| inst.snooze(30));
+
+        env.view
+            .apply_daemon_status_update(update(&id, Status::Running));
+
+        assert_eq!(
+            env.view.get_instance(&id).map(|i| i.status),
+            Some(Status::Running),
+            "a snoozed row is live triage, not a sink; the daemon overlay must still drive its status (#3201)"
+        );
+    }
+
+    /// #3201, reintroducing the #1868 / #2206 guard on the daemon path:
+    /// `/api/sessions` returns archived and trashed rows, and the
+    /// `is_archived()` short-circuit that protects the tmux producer lives in
+    /// `update_status_with_metadata_inner`, a path the daemon overlay never
+    /// reaches. A sunk row must not be restamped by the daemon reading.
+    #[test]
+    #[serial]
+    fn daemon_status_skips_a_sunk_structured_row() {
+        for label in ["archived", "trashed"] {
+            let mut env = create_test_env_empty();
+            let id = structured_row(&mut env, Status::Idle);
+            let now = chrono::Utc::now();
+            env.view.mutate_instance(&id, |inst| {
+                if label == "archived" {
+                    inst.archived_at = Some(now);
+                } else {
+                    inst.trashed_at = Some(now);
+                }
+            });
+
+            env.view
+                .apply_daemon_status_update(update(&id, Status::Running));
+
+            assert_eq!(
+                env.view.get_instance(&id).map(|i| i.status),
+                Some(Status::Idle),
+                "a {label} row is sunk; the daemon overlay must not drive its status (#3201)"
+            );
+        }
+    }
 }
