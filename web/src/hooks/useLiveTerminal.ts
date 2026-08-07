@@ -18,6 +18,9 @@ import { reportTelemetrySeen } from "../lib/api";
 
 /** Mirrors CLOSE_CODE_PTY_DEAD in src/server/pane.rs. */
 const CLOSE_CODE_PTY_DEAD = 4001;
+/** Keep a short burst typed while a newly selected session's socket opens.
+ * The cap prevents an offline tab from retaining unbounded paste data. */
+const MAX_PENDING_INPUT_BYTES = 64 * 1024;
 
 export interface LiveCursor {
   x: number;
@@ -106,6 +109,7 @@ export function useLiveTerminal(
   // "this terminal was opened", not "the socket reconnected N times". Ported
   // from the removed xterm useTerminal hook.
   const telemetrySeenRef = useRef(false);
+  const pendingInputRef = useRef<Uint8Array<ArrayBuffer>[]>([]);
 
   const storeRef = useRef<{
     snapshot: LiveTerminalState;
@@ -140,9 +144,13 @@ export function useLiveTerminal(
   };
 
   useEffect(() => {
-    if (!sessionId) return;
+    if (!sessionId) {
+      pendingInputRef.current = [];
+      return;
+    }
 
     wsRef.current?.close();
+    pendingInputRef.current = [];
     if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
     if (countdownRef.current) clearInterval(countdownRef.current);
     retryCountRef.current = 0;
@@ -208,6 +216,12 @@ export function useLiveTerminal(
         if (supportsFrameDeflate()) {
           ws.send(JSON.stringify({ type: "caps", deflate: true }));
         }
+        // A session selector opens the iOS keyboard inside its tap gesture,
+        // before this socket can finish connecting. Preserve that first burst
+        // instead of making the keyboard look live while silently dropping it.
+        const pending = pendingInputRef.current;
+        pendingInputRef.current = [];
+        for (const data of pending) ws.send(data);
       };
 
       let hasReceivedData = false;
@@ -375,7 +389,12 @@ export function useLiveTerminal(
     const ws = wsRef.current;
     if (ws?.readyState === WebSocket.OPEN) {
       ws.send(new TextEncoder().encode(data));
+      return;
     }
+    const bytes = new TextEncoder().encode(data);
+    const pending = pendingInputRef.current;
+    const used = pending.reduce((total, item) => total + item.byteLength, 0);
+    if (bytes.byteLength <= MAX_PENDING_INPUT_BYTES - used) pending.push(bytes);
   }, []);
 
   /** Explicit take-over from a read-only viewer: steal the size-owner lock

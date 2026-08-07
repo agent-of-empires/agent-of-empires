@@ -179,6 +179,12 @@ html {
   height: 100dvh;
   overflow: hidden;
   overscroll-behavior: none;
+  overscroll-behavior-x: none;
+  /* Claim horizontal edge drags for the app. On iOS this prevents a swipe
+     from beginning the browser-history gesture while an overlay sidebar is
+     handling the same touch. Terminal forward mode opts into `none` on its
+     own scroller, so its custom vertical gesture remains unaffected. */
+  touch-action: pan-y pinch-zoom;
   /* safe-area insets are handled by the App root, not html, to avoid
      making the document taller than the viewport (which lets iOS scroll
      the page when the keyboard opens, breaking keyboard-height math). */
@@ -199,6 +205,8 @@ body {
   background: var(--color-surface-900);
   color: var(--color-text-primary);
   overscroll-behavior: none;
+  overscroll-behavior-x: none;
+  touch-action: pan-y pinch-zoom;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
 }

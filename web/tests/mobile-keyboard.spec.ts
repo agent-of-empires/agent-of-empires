@@ -166,6 +166,19 @@ test.describe("Mobile keyboard detection and layout", () => {
     await expect(page.getByRole("button", { name: "Open keyboard" })).toBeVisible();
   });
 
+  test("Claude terminal selection keeps the keyboard closed", async ({ page }) => {
+    await mockTerminalApis(page);
+    await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
+    await page.goto("/");
+    // The fixture's terminal session uses tool: "claude". Its alternate-screen
+    // startup still drops the first iOS keyboard input, so the selection must
+    // remain usable as a monitoring view until the user opens the keyboard.
+    await seedSettings(page, { mobileFontSize: 10, autoOpenKeyboard: true });
+    await page.reload();
+    await openSession(page);
+    await expect(page.getByRole("button", { name: "Open keyboard" })).toBeVisible();
+  });
+
   test("keyboard FAB tracks input focus, not viewport heuristics", async ({ page }) => {
     await setupAndOpen(page);
 

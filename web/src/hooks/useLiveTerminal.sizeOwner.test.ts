@@ -105,6 +105,18 @@ describe("useLiveTerminal size-owner", () => {
     expect(socket.sent.some((m) => m instanceof Uint8Array)).toBe(true);
   });
 
+  it("queues the first typed bytes until a newly selected session connects", () => {
+    const { result } = renderHook(() => useLiveTerminal("s1"));
+    const socket = sockets[0];
+    act(() => result.current.sendData("first"));
+    expect(socket.sent).toHaveLength(0);
+
+    open(socket);
+    const typed = socket.sent.find((m): m is Uint8Array => m instanceof Uint8Array);
+    expect(typed).toBeDefined();
+    expect(new TextDecoder().decode(typed)).toBe("first");
+  });
+
   it("emits a claim message on explicit take-over", () => {
     const { result } = renderHook(() => useLiveTerminal("s1"));
     const socket = sockets[0];
