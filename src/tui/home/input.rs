@@ -6416,19 +6416,19 @@ impl HomeView {
         }
         let title = inst.title.clone();
         let tool = inst.tool.clone();
-        let supported = crate::agents::get_agent(&tool)
-            .and_then(|a| a.permission_response)
-            .is_some();
-        if !supported {
+        let Some(response) = crate::agents::get_agent(&tool).and_then(|a| a.permission_response)
+        else {
             self.info_dialog = Some(InfoDialog::new(
                 "Not Supported",
                 &format!("{} doesn't support quick permission responses yet.", tool),
             ));
             return;
-        }
+        };
         self.pending_permission_response_session = Some(id);
-        self.permission_response_dialog =
-            Some(crate::tui::dialogs::PermissionResponseDialog::new(&title));
+        self.permission_response_dialog = Some(crate::tui::dialogs::PermissionResponseDialog::new(
+            &title,
+            response.allow_always,
+        ));
     }
 
     /// Open the send-message dialog for the currently-selected running session.

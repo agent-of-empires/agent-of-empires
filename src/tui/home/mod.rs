@@ -5499,7 +5499,9 @@ impl HomeView {
         else {
             return;
         };
-        let tokens = permission_response_tokens(&response, choice);
+        let Some(tokens) = permission_response_tokens(&response, choice) else {
+            return;
+        };
         let tmux_session = match crate::tmux::Session::new(&inst.id, &inst.title) {
             Ok(s) => s,
             Err(e) => {
@@ -5525,12 +5527,12 @@ impl HomeView {
 fn permission_response_tokens(
     response: &crate::agents::PermissionResponse,
     choice: crate::tui::dialogs::PermissionResponseChoice,
-) -> &'static [crate::agents::KeyToken] {
+) -> Option<&'static [crate::agents::KeyToken]> {
     use crate::tui::dialogs::PermissionResponseChoice::*;
     match choice {
-        Allow => response.allow,
+        Allow => Some(response.allow),
         AllowAlways => response.allow_always,
-        Deny => response.deny,
+        Deny => Some(response.deny),
     }
 }
 
@@ -5544,12 +5546,12 @@ mod permission_response_tokens_tests {
     fn maps_each_choice_to_its_own_field() {
         let response = PermissionResponse {
             allow: &[KeyToken::Literal("1")],
-            allow_always: &[KeyToken::Literal("2")],
+            allow_always: Some(&[KeyToken::Literal("2")]),
             deny: &[KeyToken::Literal("3")],
         };
         assert_eq!(
             permission_response_tokens(&response, PermissionResponseChoice::Allow),
-            response.allow
+            Some(response.allow)
         );
         assert_eq!(
             permission_response_tokens(&response, PermissionResponseChoice::AllowAlways),
@@ -5557,7 +5559,20 @@ mod permission_response_tokens_tests {
         );
         assert_eq!(
             permission_response_tokens(&response, PermissionResponseChoice::Deny),
-            response.deny
+            Some(response.deny)
+        );
+    }
+
+    #[test]
+    fn allow_always_none_maps_to_none() {
+        let response = PermissionResponse {
+            allow: &[KeyToken::Named("Enter")],
+            allow_always: None,
+            deny: &[KeyToken::Named("Down"), KeyToken::Named("Enter")],
+        };
+        assert_eq!(
+            permission_response_tokens(&response, PermissionResponseChoice::AllowAlways),
+            None
         );
     }
 }
