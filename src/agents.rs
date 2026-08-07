@@ -340,7 +340,7 @@ pub enum KeyToken {
     Named(&'static str),
 }
 
-/// The three keystroke sequences that answer an agent's own interactive
+/// The keystroke sequences that answer an agent's own interactive
 /// permission prompt, mapped once by hand per agent and never derived from
 /// pane content. The user visually confirms a prompt is actually showing
 /// before invoking the respond-to-prompt action; the software does not detect
@@ -350,8 +350,9 @@ pub struct PermissionResponse {
     /// Keystrokes that select "allow once" / "yes" for this single request.
     pub allow: &'static [KeyToken],
     /// Keystrokes that select "allow always" / "don't ask again" for the
-    /// remainder of the session.
-    pub allow_always: &'static [KeyToken],
+    /// remainder of the session. `None` when the agent's prompt has no such
+    /// choice.
+    pub allow_always: Option<&'static [KeyToken]>,
     /// Keystrokes that select "deny" / "no".
     pub deny: &'static [KeyToken],
 }
@@ -716,7 +717,7 @@ pub const AGENTS: &[AgentDef] = &[
         install_hint: "npm install -g @anthropic-ai/claude-code",
         permission_response: Some(PermissionResponse {
             allow: &[KeyToken::Literal("1")],
-            allow_always: &[KeyToken::Literal("2")],
+            allow_always: Some(&[KeyToken::Literal("2")]),
             deny: &[KeyToken::Literal("3")],
         }),
     },
@@ -741,11 +742,11 @@ pub const AGENTS: &[AgentDef] = &[
         install_hint: "curl -fsSL https://opencode.ai/install | bash",
         permission_response: Some(PermissionResponse {
             allow: &[KeyToken::Named("Enter")],
-            allow_always: &[
+            allow_always: Some(&[
                 KeyToken::Named("Right"),
                 KeyToken::Named("Enter"),
                 KeyToken::Named("Enter"),
-            ],
+            ]),
             deny: &[
                 KeyToken::Named("Right"),
                 KeyToken::Named("Right"),
@@ -1185,7 +1186,11 @@ pub const AGENTS: &[AgentDef] = &[
         host_only: false,
         send_keys_enter_delay_ms: 0,
         install_hint: "curl -fsSL https://omp.sh/install | sh",
-        permission_response: None,
+        permission_response: Some(PermissionResponse {
+            allow: &[KeyToken::Named("Enter")],
+            allow_always: None,
+            deny: &[KeyToken::Named("Down"), KeyToken::Named("Enter")],
+        }),
     },
 ];
 

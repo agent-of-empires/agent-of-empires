@@ -18271,6 +18271,19 @@ mod permission_response_dialog {
 
     #[test]
     #[serial]
+    fn agent_without_allow_always_still_opens_dialog() {
+        let mut env = create_test_env_empty();
+        let id = add_session_with_tool(&mut env.view, "session-one", "omp");
+        env.view.selected_session = Some(id);
+        let _ = env.view.handle_key(key(KeyCode::Char('a')), None);
+        assert!(
+            env.view.permission_response_dialog.is_some(),
+            "an agent with allow_always: None must still support allow/deny"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn structured_session_is_a_no_op() {
         let mut env = create_test_env_empty();
         let id = add_session_with_tool(&mut env.view, "session-one", "claude");
