@@ -13,13 +13,16 @@ import { describe, expect, it } from "vitest";
 import {
   archivableWorkspaces,
   buildNestedSidebarGroups,
+  buildOrgGroups,
   buildSessionGroups,
   nestedSidebarGroupHasLiveWorkspace,
+  NO_ORG_GROUP_ID,
+  orgNestedGroupHasLiveWorkspace,
   repoGroupToSidebarGroup,
   sidebarGroupHasLiveWorkspace,
   UNGROUPED_GROUP_ID,
 } from "../sidebarGroups";
-import { MULTI_REPO_GROUP_ID } from "../../hooks/useRepoGroups";
+import { MULTI_REPO_GROUP_ID, SCRATCH_GROUP_ID } from "../../hooks/useRepoGroups";
 import type { SidebarSortMode } from "../sidebarSort";
 import { IDLE_DECAY_WINDOW_MS } from "../session";
 import type { RepoGroup, SessionResponse, Workspace } from "../types";
@@ -359,6 +362,119 @@ describe("buildNestedSidebarGroups", () => {
       }),
     ]);
     expect(nestedSidebarGroupHasLiveWorkspace(live[0]!)).toBe(true);
+  });
+});
+
+describe("buildOrgGroups", () => {
+  function repoGroup(over: Partial<RepoGroup> = {}): RepoGroup {
+    return {
+      id: "/repo-a",
+      repoPath: "/repo-a",
+      displayName: "repo-a",
+      defaultDisplayName: "repo-a",
+      alias: null,
+      color: null,
+      remoteOwner: null,
+      workspaces: [workspace("w1", [session({ id: "s1" })])],
+      status: "idle",
+      collapsed: false,
+      registeredProjects: [],
+      ...over,
+    };
+  }
+
+  const buildOrg = (
+    repoGroups: RepoGroup[],
+    isRepoCollapsed: (orgId: string, repoId: string) => boolean = () => false,
+    isOrgCollapsed: (orgId: string) => boolean = () => false,
+  ) => buildOrgGroups(repoGroups, { isOrgCollapsed, isRepoCollapsed });
+
+  it("buckets repos sharing the same remote owner together", () => {
+    const orgs = buildOrg([
+      repoGroup({ id: "/repo-a", repoPath: "/repo-a", remoteOwner: "acme" }),
+      repoGroup({ id: "/repo-b", repoPath: "/repo-b", remoteOwner: "acme" }),
+    ]);
+    expect(orgs).toHaveLength(1);
+    expect(orgs[0]!.org.id).toBe("acme");
+    expect(orgs[0]!.repos.map((r) => r.id)).toEqual(["/repo-a", "/repo-b"]);
+  });
+
+  it("collects a null remoteOwner, and the Multi-repo / Scratch synthetic buckets, into No organization", () => {
+    const orgs = buildOrg([
+      repoGroup({ id: "/repo-a", repoPath: "/repo-a", remoteOwner: null }),
+      repoGroup({ id: MULTI_REPO_GROUP_ID, repoPath: MULTI_REPO_GROUP_ID, remoteOwner: null }),
+      repoGroup({ id: SCRATCH_GROUP_ID, repoPath: SCRATCH_GROUP_ID, remoteOwner: null }),
+    ]);
+    expect(orgs).toHaveLength(1);
+    expect(orgs[0]!.org.id).toBe(NO_ORG_GROUP_ID);
+    expect(orgs[0]!.org.displayName).toBe("No organization");
+    expect(orgs[0]!.org.remoteOwner).toBeNull();
+    expect(orgs[0]!.repos.map((r) => r.id)).toEqual(["/repo-a", MULTI_REPO_GROUP_ID, SCRATCH_GROUP_ID]);
+  });
+
+  it("sorts org buckets alphabetically with No organization pinned last", () => {
+    const orgs = buildOrg([
+      repoGroup({ id: "/repo-z", repoPath: "/repo-z", remoteOwner: "zeta-corp" }),
+      repoGroup({ id: "/repo-none", repoPath: "/repo-none", remoteOwner: null }),
+      repoGroup({ id: "/repo-a", repoPath: "/repo-a", remoteOwner: "acme" }),
+    ]);
+    expect(orgs.map((o) => o.org.id)).toEqual(["acme", "zeta-corp", NO_ORG_GROUP_ID]);
+  });
+
+  it("respects per-(org, repo) collapse state, independent of the flat repo axis", () => {
+    const orgs = buildOrg(
+      [
+        repoGroup({ id: "/repo-a", repoPath: "/repo-a", remoteOwner: "acme", collapsed: false }),
+        repoGroup({ id: "/repo-b", repoPath: "/repo-b", remoteOwner: "acme", collapsed: true }),
+      ],
+      (orgId, repoId) => orgId === "acme" && repoId === "/repo-a",
+    );
+    const repos = orgs[0]!.repos;
+    // The lookup, not the flat-axis `collapsed` field on the input, wins.
+    expect(repos.find((r) => r.id === "/repo-a")!.collapsed).toBe(true);
+    expect(repos.find((r) => r.id === "/repo-b")!.collapsed).toBe(false);
+  });
+
+  it("collapses the org header from the isOrgCollapsed lookup", () => {
+    const orgs = buildOrg([repoGroup({ remoteOwner: "acme" })], undefined, (orgId) => orgId === "acme");
+    expect(orgs[0]!.org.collapsed).toBe(true);
+  });
+
+  it("drops manual reorder on member repos (org axis has no order)", () => {
+    const orgs = buildOrg([repoGroup({ remoteOwner: "acme" })]);
+    expect(orgs[0]!.repos[0]!.capabilities.reorder).toBe(false);
+    expect(orgs[0]!.repos[0]!.capabilities.appearance).toBe(true);
+  });
+
+  it("aggregates the org header's workspaces across its member repos", () => {
+    const orgs = buildOrg([
+      repoGroup({
+        id: "/repo-a",
+        repoPath: "/repo-a",
+        remoteOwner: "acme",
+        workspaces: [workspace("w1", [session({ id: "s1" })])],
+      }),
+      repoGroup({
+        id: "/repo-b",
+        repoPath: "/repo-b",
+        remoteOwner: "acme",
+        workspaces: [workspace("w2", [session({ id: "s2" })])],
+      }),
+    ]);
+    expect(orgs[0]!.org.workspaces.map((v) => v.workspace.id)).toEqual(["w1", "w2"]);
+  });
+
+  it("reports liveness from any member repo's live row", () => {
+    const allSunk = buildOrg([
+      repoGroup({
+        remoteOwner: "acme",
+        workspaces: [workspace("w1", [session({ id: "s1", archived_at: "2025-01-02T00:00:00Z" })])],
+      }),
+    ]);
+    expect(orgNestedGroupHasLiveWorkspace(allSunk[0]!)).toBe(false);
+
+    const live = buildOrg([repoGroup({ remoteOwner: "acme" })]);
+    expect(orgNestedGroupHasLiveWorkspace(live[0]!)).toBe(true);
   });
 });
 
