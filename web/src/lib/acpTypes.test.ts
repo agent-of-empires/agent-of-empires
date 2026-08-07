@@ -2379,6 +2379,69 @@ describe("normaliseTurnCounters (#1170 persisted-state backfill)", () => {
   });
 });
 
+describe("compaction reminder dismissal", () => {
+  const usageFrame = (seq: number, used: number, size = 200_000): AcpFrame => ({
+    session_id: "s-1",
+    seq,
+    event: { UsageUpdated: { usage: { used, size } } },
+  });
+
+  it("survives usage climbing further, and re-arms after a context boundary", async () => {
+    const { acpHookReducer } = await import("../hooks/useAcpSession");
+    let state = applyEvent(emptyAcpState(), usageFrame(1, 160_000));
+
+    state = acpHookReducer(state, { kind: "dismiss_compaction_reminder" });
+    expect(state.compactionReminderDismissed?.used).toBe(160_000);
+
+    // Still dismissed as the window keeps filling: dismiss means dismiss,
+    // not snooze until the next percentage point.
+    state = applyEvent(state, usageFrame(2, 180_000));
+    expect(state.compactionReminderDismissed?.used).toBe(160_000);
+
+    // Compaction nulls the snapshot, so the next one is a fresh window and
+    // re-arms the reminder.
+    state = applyEvent(state, { session_id: "s-1", seq: 3, event: "ConversationCompacted" });
+    expect(state.sessionUsage).toBeNull();
+    state = applyEvent(state, usageFrame(4, 20_000));
+    expect(state.compactionReminderDismissed).toBeNull();
+
+    // The regression this shape exists for: re-arming has to latch at the
+    // boundary. Deriving "used dropped below the dismissed value" at render
+    // time re-suppresses the reminder the moment usage climbs back past it.
+    state = acpHookReducer(state, { kind: "dismiss_compaction_reminder" });
+    state = applyEvent(state, usageFrame(5, 30_000));
+    expect(state.compactionReminderDismissed?.used).toBe(20_000);
+    state = applyEvent(state, { session_id: "s-1", seq: 6, event: "SessionCleared" });
+    state = applyEvent(state, usageFrame(7, 40_000));
+    expect(state.compactionReminderDismissed).toBeNull();
+  });
+
+  it("re-arms on every boundary that nulls the usage snapshot", async () => {
+    const { acpHookReducer } = await import("../hooks/useAcpSession");
+    const boundaries: AcpFrame["event"][] = [
+      "ConversationCompacted",
+      "SessionCleared",
+      { SessionContextReset: { reason: "session/load failed: bad id" } },
+      { AgentSwitched: { from: "claude", to: "codex", reason: "rate_limit" } },
+    ];
+    for (const event of boundaries) {
+      let state = applyEvent(emptyAcpState(), usageFrame(1, 160_000));
+      state = acpHookReducer(state, { kind: "dismiss_compaction_reminder" });
+      state = applyEvent(state, { session_id: "s-1", seq: 2, event });
+      state = applyEvent(state, usageFrame(3, 170_000));
+      expect(state.compactionReminderDismissed, JSON.stringify(event)).toBeNull();
+    }
+  });
+
+  it("backfills the dismissal on entries persisted before it existed", () => {
+    const persisted = { ...emptyAcpState() } as AcpState & {
+      compactionReminderDismissed?: AcpState["compactionReminderDismissed"];
+    };
+    delete persisted.compactionReminderDismissed;
+    expect(normaliseTurnCounters(persisted).compactionReminderDismissed).toBeNull();
+  });
+});
+
 describe("acpHookReducer / dismiss_primer", () => {
   // Banner dismiss used to live in component-local useState and
   // re-armed itself on every session switch. Moved into the reducer so

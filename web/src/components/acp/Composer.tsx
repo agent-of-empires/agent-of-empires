@@ -21,6 +21,9 @@ import { AtSign, ChevronUp, Paperclip, Pencil, Slash, Square, X } from "lucide-r
 import { useFilesIndex, fuzzyFilter } from "./useFilesIndex";
 import { SessionConfigControls } from "./SessionConfigControls";
 import { Tooltip } from "../Tooltip";
+import { ProvenanceBadge } from "../ProvenanceBadge";
+import { useSkillIndex } from "../../hooks/useSkillIndex";
+import { badgeLabel, badgeTone, resolveSkillSource, type SkillIndex } from "../../lib/skillProvenance";
 import { SwitchAgentModal } from "./SwitchAgentModal";
 import {
   clearPendingSwitchAgent,
@@ -495,6 +498,13 @@ export function Composer({
     [slashItems],
   );
 
+  // Provenance lookup for the `/` picker's badges (#3052): resolves a
+  // command name (which the composer indexes by the agent's advertised
+  // frontmatter name) to the skill's source, so a skill-backed slash
+  // command reads the same "AoE" / agent-root label as the skills manager
+  // and the SkillToolCard.
+  const skillIndex = useSkillIndex();
+
   const composerRuntime = useComposerRuntime();
 
   // ArrowUp/ArrowDown queue recall (shell-history style). recallRef holds
@@ -895,7 +905,7 @@ export function Composer({
                 onExecute={(item) => insertSlashCommand(composerRuntime, item)}
                 removeOnExecute
               />
-              <PopoverItems trigger="/" />
+              <PopoverItems trigger="/" skillIndex={skillIndex} />
             </ComposerPrimitive.Unstable_TriggerPopover>
 
             {/* Input area — tall by default, grows up to 200px */}
@@ -1226,34 +1236,42 @@ export function Composer({
 }
 
 /** Popover items list — same render shape for @ and / since both
- *  have a single category and we surface a flat list. */
-function PopoverItems({ trigger }: { trigger: string }) {
+ *  have a single category and we surface a flat list. `skillIndex` is only
+ *  passed for the `/` picker (#3052): when a command name resolves to a
+ *  known skill, its provenance badge renders inline with the label. */
+function PopoverItems({ trigger, skillIndex }: { trigger: string; skillIndex?: SkillIndex }) {
   return (
     <ComposerPrimitive.Unstable_TriggerPopoverItems className="max-h-64 overflow-y-auto">
       {(items) =>
         items.length === 0 ? (
           <div className="px-3 py-2 text-xs italic text-text-dim">No matches</div>
         ) : (
-          items.map((item, i) => (
-            <ComposerPrimitive.Unstable_TriggerPopoverItem
-              key={item.id}
-              item={item}
-              index={i}
-              className={[
-                "flex w-full items-start gap-2 px-3 py-2 text-left text-xs",
-                "hover:bg-surface-800/60",
-                "data-[highlighted=true]:bg-surface-800",
-              ].join(" ")}
-            >
-              <span className="font-mono text-text-dim">{trigger}</span>
-              <span className="min-w-0 flex-1">
-                <span className="block truncate font-medium text-text-primary">{item.label}</span>
-                {item.description && (
-                  <span className="block truncate text-[11px] text-text-dim">{item.description}</span>
-                )}
-              </span>
-            </ComposerPrimitive.Unstable_TriggerPopoverItem>
-          ))
+          items.map((item, i) => {
+            const source = skillIndex ? resolveSkillSource(skillIndex, item.id) : null;
+            return (
+              <ComposerPrimitive.Unstable_TriggerPopoverItem
+                key={item.id}
+                item={item}
+                index={i}
+                className={[
+                  "flex w-full items-start gap-2 px-3 py-2 text-left text-xs",
+                  "hover:bg-surface-800/60",
+                  "data-[highlighted=true]:bg-surface-800",
+                ].join(" ")}
+              >
+                <span className="font-mono text-text-dim">{trigger}</span>
+                <span className="min-w-0 flex-1">
+                  <span className="flex items-center gap-1.5">
+                    <span className="block truncate font-medium text-text-primary">{item.label}</span>
+                    {source && <ProvenanceBadge label={badgeLabel(source)} tone={badgeTone(source)} />}
+                  </span>
+                  {item.description && (
+                    <span className="block truncate text-[11px] text-text-dim">{item.description}</span>
+                  )}
+                </span>
+              </ComposerPrimitive.Unstable_TriggerPopoverItem>
+            );
+          })
         )
       }
     </ComposerPrimitive.Unstable_TriggerPopoverItems>

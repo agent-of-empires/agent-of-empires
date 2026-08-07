@@ -293,6 +293,12 @@ fn supervisor_error_response(context: &str, err: &SupervisorError) -> axum::resp
             format!("unknown structured view agent: {name}"),
         )
             .into_response(),
+        // 403, not 400: the agent exists and is spelled correctly, the
+        // operator's policy refuses it. A 400 would send the user looking for a
+        // typo or a missing binary. See #3241.
+        SupervisorError::AgentNotAllowed(_) => {
+            (StatusCode::FORBIDDEN, err.to_string()).into_response()
+        }
         SupervisorError::AlreadyRunning(_) => (
             StatusCode::CONFLICT,
             "structured view worker already running for session",
@@ -439,6 +445,7 @@ pub async fn spawn_acp(
         .spawn(crate::acp::supervisor::SpawnRequest {
             session_id: id.clone(),
             agent,
+            tool: instance.tool.clone(),
             cwd,
             additional_dirs: req.additional_dirs,
             provider_env,
@@ -834,11 +841,28 @@ pub struct AcpAgentInfo {
 /// session-tool agents like claude/codex/cursor for the wizard);
 /// this returns the *structured view* ACP backend registry so the recovery
 /// modal can show what the user can hand off to. See #1282.
+///
+/// Filtered by the operator agent allowlist (#3241), so the switch-agent modal
+/// offers only what the policy permits instead of listing a target that
+/// `/acp/switch-agent` would then refuse. This is UX, not the enforcement
+/// boundary; the supervisor is (see `crate::acp::agent_policy`).
 pub async fn list_acp_agents(State(state): State<Arc<AppState>>) -> impl IntoResponse {
     let registry = state.acp_supervisor.registry_snapshot().await;
+    let policy = super::agent_policy().await;
+    Json(acp_agent_entries(&registry, &policy)).into_response()
+}
+
+/// The `GET /api/acp/agents` response body: permitted registry entries, sorted
+/// by name. Split out from the handler so the policy filter is testable without
+/// standing up an `AppState` and a config file on disk.
+fn acp_agent_entries(
+    registry: &crate::acp::AgentRegistry,
+    policy: &crate::acp::agent_policy::AgentPolicy,
+) -> Vec<AcpAgentInfo> {
     let mut entries: Vec<AcpAgentInfo> = registry
         .list()
         .into_iter()
+        .filter(|(name, _)| policy.allows(name))
         .map(|(name, spec)| AcpAgentInfo {
             name: name.clone(),
             description: spec.description.clone(),
@@ -846,7 +870,7 @@ pub async fn list_acp_agents(State(state): State<Arc<AppState>>) -> impl IntoRes
         })
         .collect();
     entries.sort_by(|a, b| a.name.cmp(&b.name));
-    Json(entries).into_response()
+    entries
 }
 
 /// `GET /api/acp/option-catalog`: the recall cache of `config_options` each
@@ -909,6 +933,18 @@ pub async fn switch_acp_agent(
         return (
             StatusCode::BAD_REQUEST,
             format!("unknown structured view agent: {target}"),
+        )
+            .into_response();
+    }
+    // Refuse a disallowed target here, before the shutdown below tears the
+    // current worker down. The spawn choke point would refuse it anyway, but by
+    // then the session has lost the worker it was happily using and the user is
+    // left with nothing running. Same reason the registry check above is a
+    // preflight. See #3241.
+    if !super::agent_policy().await.allows(&target) {
+        return (
+            StatusCode::FORBIDDEN,
+            SupervisorError::AgentNotAllowed(target).to_string(),
         )
             .into_response();
     }
@@ -980,6 +1016,7 @@ pub async fn switch_acp_agent(
         .spawn(crate::acp::supervisor::SpawnRequest {
             session_id: id.clone(),
             agent: target.clone(),
+            tool: instance.tool.clone(),
             cwd,
             additional_dirs: vec![],
             provider_env: vec![],
@@ -1900,6 +1937,7 @@ pub async fn acp_enable(
         &instance.tool,
         &instance.command,
     );
+    let tool_for_spawn = instance.tool.clone();
     let state_for_spawn = state.clone();
     tokio::spawn(async move {
         let inst_lock = state_for_spawn.instance_lock(&session_id).await;
@@ -1927,6 +1965,7 @@ pub async fn acp_enable(
             .spawn(crate::acp::supervisor::SpawnRequest {
                 session_id: session_id.clone(),
                 agent: agent_name.clone(),
+                tool: tool_for_spawn,
                 cwd,
                 additional_dirs: vec![],
                 provider_env: vec![],
@@ -2674,6 +2713,44 @@ mod tests {
         DateTime::parse_from_rfc3339(raw)
             .unwrap()
             .with_timezone(&Utc)
+    }
+
+    /// #3241: the switch-agent modal must not offer a target the policy refuses,
+    /// so the response is filtered rather than listing everything the registry
+    /// knows. Runs the real projection, not pre-filtered input.
+    #[test]
+    fn acp_agent_entries_drop_agents_the_policy_refuses() {
+        use crate::acp::agent_policy::AgentPolicy;
+        let registry = crate::acp::AgentRegistry::with_defaults();
+        let names = |p: &AgentPolicy| -> Vec<String> {
+            acp_agent_entries(&registry, p)
+                .into_iter()
+                .map(|e| e.name)
+                .collect()
+        };
+
+        // Unrestricted: every registry entry survives, sorted.
+        let all = names(&AgentPolicy::for_test(false, &[]));
+        assert_eq!(all.len(), registry.agents.len());
+        assert!(all.windows(2).all(|w| w[0] <= w[1]), "sorted: {all:?}");
+
+        // Restricted: exactly the permitted keys. A listed name that is not in
+        // the registry does not invent an entry.
+        assert_eq!(
+            names(&AgentPolicy::for_test(
+                true,
+                &["opencode", "claude", "not-a-real-agent"]
+            )),
+            vec!["claude".to_string(), "opencode".to_string()]
+        );
+
+        // The descriptive fields still ride along for what does survive.
+        let entries = acp_agent_entries(&registry, &AgentPolicy::for_test(true, &["claude"]));
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].command, "claude-agent-acp");
+        assert!(!entries[0].description.is_empty());
+
+        assert!(names(&AgentPolicy::for_test(true, &[])).is_empty());
     }
 
     #[test]

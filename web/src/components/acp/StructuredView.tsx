@@ -27,6 +27,7 @@ import { ToolDensityToggle, ToolDisplayModeProvider, useToolDensityPref } from "
 import { AcpRuntime, SUBAGENT_TASK_NAME, TODO_GROUP_NAME, TOOL_GROUP_NAME, type AcpContext } from "./AcpRuntime";
 import { Composer } from "./Composer";
 import { ConfigOptionSwitchFailedNotice } from "./SessionConfigControls";
+import { CompactionReminderBanner } from "./CompactionReminderBanner";
 import { ContextPrimerBanner } from "./ContextPrimerBanner";
 import { SwitchAgentModal } from "./SwitchAgentModal";
 import { Markdown } from "./Markdown";
@@ -265,6 +266,7 @@ function AcpChrome({
   lastActivityRef,
   dismissError,
   dismissPrimer,
+  dismissCompactionReminder,
   removeQueuedPrompt,
   editQueuedPrompt,
   clearQueue,
@@ -695,6 +697,12 @@ function AcpChrome({
                   })
                 }
                 onDismiss={dismissPrimer}
+              />
+
+              <CompactionReminderBanner
+                state={state}
+                onCompact={() => sendPrompt("/compact")}
+                onDismiss={dismissCompactionReminder}
               />
 
               <Composer

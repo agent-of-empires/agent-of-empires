@@ -168,23 +168,68 @@ const FORWARDED_DESKTOP_VARS: &[&str] = &[
     "SSH_AUTH_SOCK",
 ];
 
-/// The desktop/session `(KEY, VALUE)` pairs present in aoe's own environment,
-/// for forwarding into a tmux session via `new-session -e` so the agent, any
-/// browser it spawns, and user-opened panes inherit them. Sourced from the
-/// running process (the daemon in structured view), so a session inherits
-/// whatever aoe itself has; a truly headless daemon has nothing to forward.
-/// Arbitrary user vars are intentionally not forwarded wholesale, the profile
-/// host-environment list ([`host_environment_prefix`]) covers those.
-pub(crate) fn forwarded_desktop_env() -> Vec<(String, String)> {
-    let vars = std::env::vars_os()
-        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
-    forwarded_desktop_env_from(vars)
+/// Why the wholesale passthrough ([`inherited_host_env`] with
+/// `session.inherit_host_environment` on) refuses a key, or `None` when it may
+/// be forwarded.
+///
+/// `AOE_`-prefixed keys are aoe's own per-process wiring and credentials
+/// (`AOE_TOKEN`, `AOE_DAEMON_TOKEN`, `AOE_ACP_SOCKET`, the runner env carrier),
+/// so the whole prefix is refused: passing them to an agent would either leak
+/// aoe's own auth or point the agent at a socket that is not its own.
+/// `AGENT_OF_EMPIRES_` is the same story under aoe's older prefix, and it is not
+/// vestigial: `AGENT_OF_EMPIRES_DEBUG` still switches on debug logging, and the
+/// detached ACP runner is itself an `aoe` process, so forwarding it would have
+/// the runner start writing `debug.log` because of a var the operator exported
+/// for their own shell. `TERM` is refused because tmux owns the pane's terminal
+/// type (`default-terminal`) and a daemon's `TERM` is routinely absent or
+/// `dumb`; forwarding that would degrade a pane the operator never asked to
+/// degrade. The ACP paths forward `TERM` through their own allowlist, so nothing
+/// loses it.
+fn passthrough_denyreason(key: &str) -> Option<&'static str> {
+    if !is_valid_env_key(key) {
+        return Some("not a valid environment variable name");
+    }
+    if key.starts_with("AOE_") || key.starts_with("AGENT_OF_EMPIRES_") {
+        return Some("aoe-internal wiring or credential");
+    }
+    if key == "TERM" {
+        return Some("terminal type is owned by tmux and the spawn allowlists");
+    }
+    None
 }
 
-/// Pure core of [`forwarded_desktop_env`], split out so it can be unit-tested
-/// without mutating the process environment. Keeps a var when it is on the
-/// explicit allowlist or has an `XDG_` prefix, drops empty values, and sorts
-/// the result so the emitted `-e` args are deterministic.
+/// The environment a host session inherits from aoe, as `(KEY, VALUE)` pairs.
+///
+/// This is the single source for every host spawn path: tmux agent sessions and
+/// host terminals set it via `new-session -e`, and the structured view applies
+/// it to the agent process after its `env_clear()`. Keeping one resolver is what
+/// stops the terminal and structured views drifting apart, which is the bug
+/// #3079 shipped: it fixed the tmux paths and left the structured view forwarding
+/// nothing, so a browser-view agent still had no `DISPLAY` (#3262).
+///
+/// Sourced from aoe's own process environment, so a session inherits whatever
+/// aoe itself holds and nothing more. A daemon launched without the operator's
+/// environment (a systemd unit with no `PassEnvironment` / `EnvironmentFile`,
+/// say) has nothing to forward, and fixing that belongs to whatever starts the
+/// daemon rather than to aoe: forwarding is a passthrough, not a store.
+///
+/// Which vars qualify depends on `session.inherit_host_environment`: off (the
+/// default) forwards only the desktop/session vars a graphical login sets, on
+/// forwards everything [`passthrough_denyreason`] permits.
+///
+/// `profile` selects the config layer, so a profile override wins over global.
+pub(crate) fn inherited_host_env(profile: &str) -> Vec<(String, String)> {
+    let passthrough =
+        super::profile_config::resolve_config_or_warn(&super::config::effective_profile(profile))
+            .session
+            .inherit_host_environment;
+    let vars = std::env::vars_os()
+        .filter_map(|(k, v)| Some((k.into_string().ok()?, v.into_string().ok()?)));
+    inherited_host_env_from(vars, passthrough)
+}
+
+/// Pure core of [`inherited_host_env`], split out so the filtering is
+/// unit-tested without mutating the process environment.
 ///
 /// Empty values are dropped on purpose. `new-session -e KEY=` overrides the
 /// tmux server's frozen base environment with an empty string, and that base
@@ -193,16 +238,23 @@ pub(crate) fn forwarded_desktop_env() -> Vec<(String, String)> {
 /// Forwarding `DISPLAY=` there would blank out a working display, so we only
 /// add values aoe positively has and never clobber an inherited one with empty
 /// (an empty desktop var is useless to a browser anyway).
-fn forwarded_desktop_env_from<I>(vars: I) -> Vec<(String, String)>
+///
+/// Sorted so the emitted `-e` args and the applied process env are
+/// deterministic.
+fn inherited_host_env_from<I>(vars: I, passthrough: bool) -> Vec<(String, String)>
 where
     I: IntoIterator<Item = (String, String)>,
 {
+    let keep = |key: &str| {
+        if passthrough {
+            passthrough_denyreason(key).is_none()
+        } else {
+            key.starts_with("XDG_") || FORWARDED_DESKTOP_VARS.contains(&key)
+        }
+    };
     let mut pairs: Vec<(String, String)> = vars
         .into_iter()
-        .filter(|(key, value)| {
-            !value.is_empty()
-                && (key.starts_with("XDG_") || FORWARDED_DESKTOP_VARS.contains(&key.as_str()))
-        })
+        .filter(|(key, value)| !value.is_empty() && keep(key))
         .collect();
     pairs.sort();
     pairs
@@ -279,9 +331,20 @@ pub(crate) fn shell_escape(val: &str) -> String {
 /// Values are passed through `shell_escape` so spaces, quotes, and shell
 /// metacharacters are preserved literally. Returns an empty string when
 /// the entry list is empty so callers can format unconditionally.
+///
+/// Keys are not escapable here (a shell assignment needs a bare name on the
+/// left), so an entry whose key is not a valid environment variable name is
+/// skipped with a warning rather than concatenated into the command line. The
+/// structured-view sibling [`resolve_host_environment_pairs`] applies the same
+/// rule, so both views drop the same entries.
 pub(crate) fn host_environment_prefix(entries: &[String]) -> String {
     let mut out = String::new();
     for entry in entries {
+        let key = entry.split_once('=').map(|(key, _)| key).unwrap_or(entry);
+        if !is_valid_env_key(key) {
+            tracing::warn!(target: "session.create", "invalid host environment key '{}'; skipping", key);
+            continue;
+        }
         if let Some((key, value)) = entry.split_once('=') {
             let resolved = if let Some(rest) = value.strip_prefix("$$") {
                 Some(format!("${}", rest))
@@ -401,6 +464,37 @@ fn resolve_hook_env_pairs(entries: &[String]) -> Vec<(String, String)> {
         }
     }
     pairs
+}
+
+/// Drop every `environment` entry whose key was minted by
+/// `host_hooks.before_session`, so the minted value is the only source for that
+/// key on a host launch.
+///
+/// Exists because the two channels have different binding strength in the
+/// terminal view: the static list becomes a `KEY='v' ` shell-assignment prefix
+/// on the pane command, which overrides whatever the pane inherited, while a
+/// minted value arrives via `tmux new-session -e` (deliberately, so a secret
+/// stays out of argv). Without this filter the stale config entry would win and
+/// `before_session` would look like it silently did nothing.
+///
+/// Entry keys are read with the same grammar the resolvers use: the part before
+/// the first `=`, or the whole entry for a bare passthrough key.
+pub(crate) fn drop_shadowed_host_entries(
+    entries: Vec<String>,
+    minted: &[(String, String)],
+) -> Vec<String> {
+    if minted.is_empty() {
+        return entries;
+    }
+    let minted_keys: std::collections::HashSet<&str> =
+        minted.iter().map(|(k, _)| k.as_str()).collect();
+    entries
+        .into_iter()
+        .filter(|entry| {
+            let key = entry.split_once('=').map(|(k, _)| k).unwrap_or(entry);
+            !minted_keys.contains(key)
+        })
+        .collect()
 }
 
 /// True when `key` is a valid environment variable name: an ASCII letter or `_`
@@ -540,8 +634,9 @@ where
         .collect()
 }
 
-/// Validate an env entry string and return a warning message if it references
-/// a host variable that doesn't exist.
+/// Validate an env entry string and return a warning message when its key is
+/// not a valid environment variable name (the entry is dropped at collection
+/// time) or when it references a host variable that doesn't exist.
 ///
 /// Entry formats:
 /// - `KEY` (bare): pass through from host
@@ -549,6 +644,13 @@ where
 /// - `KEY=literal` (no `$`): always valid
 /// - `KEY=$$...`: escaped literal `$`, always valid
 pub fn validate_env_entry(entry: &str) -> Option<String> {
+    let key = entry.split_once('=').map(|(key, _)| key).unwrap_or(entry);
+    if !is_valid_env_key(key) {
+        return Some(format!(
+            "Warning: invalid environment key '{}'; skipping",
+            key
+        ));
+    }
     if let Some((_, value)) = entry.split_once('=') {
         if value.starts_with("$$") {
             // Escaped literal $, always valid
@@ -641,6 +743,10 @@ pub(crate) fn collect_environment(
     // Placed before the configured entries so a freshly-minted secret wins over
     // any same-keyed `sandbox.environment` / `extra_env` entry (first-wins).
     for (key, value) in &sandbox_info.before_start_env {
+        if !is_valid_env_key(key) {
+            tracing::warn!(target: "session.create", "invalid before_start environment key '{}'; skipping", key);
+            continue;
+        }
         if seen_keys.insert(key.clone()) {
             result.push(EnvEntry::Inherit {
                 key: key.clone(),
@@ -650,6 +756,11 @@ pub(crate) fn collect_environment(
     }
 
     for entry in entries {
+        let key = entry.split_once('=').map(|(key, _)| key).unwrap_or(entry);
+        if !is_valid_env_key(key) {
+            tracing::warn!(target: "session.create", "invalid sandbox environment key '{}'; skipping", key);
+            continue;
+        }
         if let Some((key, value)) = entry.split_once('=') {
             if seen_keys.insert(key.to_string()) {
                 if let Some(rest) = value.strip_prefix("$$") {
@@ -822,17 +933,29 @@ mod tests {
             .collect()
     }
 
+    /// Default posture (`inherit_host_environment` off): only the desktop and
+    /// session vars a graphical login sets, sorted, empty values dropped.
     #[test]
-    fn test_forwarded_desktop_env_keeps_allowlist_and_xdg() {
-        let result = forwarded_desktop_env_from(owned(&[
-            ("DISPLAY", ":0"),
-            ("XDG_RUNTIME_DIR", "/run/user/1000"),
-            ("XDG_SESSION_TYPE", "wayland"),
-            ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
-            ("PATH", "/usr/bin"),
-            ("HOME", "/home/me"),
-            ("SECRET_TOKEN", "abc"),
-        ]));
+    fn test_inherited_host_env_desktop_only_by_default() {
+        let result = inherited_host_env_from(
+            owned(&[
+                ("DISPLAY", ":0"),
+                ("XDG_RUNTIME_DIR", "/run/user/1000"),
+                ("XDG_SESSION_TYPE", "wayland"),
+                ("DBUS_SESSION_BUS_ADDRESS", "unix:path=/run/user/1000/bus"),
+                // Empty desktop vars are dropped rather than forwarded as
+                // `KEY=`, which would blank out a working value inherited from
+                // the tmux server's frozen base env.
+                ("WAYLAND_DISPLAY", ""),
+                // Not desktop vars: unrelated to reaching the user's display,
+                // and forwarding them is what the opt-in passthrough is for.
+                ("PATH", "/usr/bin"),
+                ("HOME", "/home/me"),
+                ("GOPATH", "/home/me/go"),
+                ("SECRET_TOKEN", "abc"),
+            ]),
+            false,
+        );
         assert_eq!(
             result,
             owned(&[
@@ -840,26 +963,117 @@ mod tests {
                 ("DISPLAY", ":0"),
                 ("XDG_RUNTIME_DIR", "/run/user/1000"),
                 ("XDG_SESSION_TYPE", "wayland"),
+            ])
+        );
+        assert!(
+            inherited_host_env_from(owned(&[("PATH", "/bin")]), false).is_empty(),
+            "a process with no desktop env forwards nothing, which is the case \
+             for a daemon launched without the operator's environment"
+        );
+    }
+
+    /// With `inherit_host_environment` on, arbitrary operator vars ride along
+    /// (the `GOPATH` case in #3262) while aoe's own wiring and tmux-owned
+    /// `TERM` stay out.
+    #[test]
+    fn test_inherited_host_env_passthrough_keeps_custom_vars() {
+        let result = inherited_host_env_from(
+            owned(&[
+                ("GOPATH", "/home/me/go"),
+                ("DISPLAY", ":0"),
+                ("PATH", "/usr/bin"),
+                // aoe's own auth and per-process wiring must never reach an
+                // agent, whatever the operator opted into.
+                ("AOE_TOKEN", "secret"),
+                ("AOE_DAEMON_TOKEN", "secret"),
+                ("AOE_ACP_SOCKET", "/tmp/sock"),
+                // Same, under aoe's older prefix: the detached ACP runner is an
+                // `aoe` process, so this would switch on its debug logging.
+                ("AGENT_OF_EMPIRES_DEBUG", "1"),
+                // tmux owns the pane's terminal type; a daemon's TERM is
+                // routinely absent or `dumb`.
+                ("TERM", "dumb"),
             ]),
-            "only allowlisted + XDG_ vars are forwarded, sorted, and unrelated \
-             vars (PATH/HOME/custom) are dropped"
+            true,
+        );
+        assert_eq!(
+            result,
+            owned(&[
+                ("DISPLAY", ":0"),
+                ("GOPATH", "/home/me/go"),
+                ("PATH", "/usr/bin"),
+            ])
         );
     }
 
     #[test]
-    fn test_forwarded_desktop_env_drops_empty_values() {
-        let result = forwarded_desktop_env_from(owned(&[
-            ("DISPLAY", ""),
-            ("XDG_RUNTIME_DIR", ""),
-            ("WAYLAND_DISPLAY", "wayland-0"),
-        ]));
-        assert_eq!(result, owned(&[("WAYLAND_DISPLAY", "wayland-0")]));
+    fn test_passthrough_denyreason() {
+        for key in ["GOPATH", "DISPLAY", "PATH", "HOME", "MY_CUSTOM_VAR"] {
+            assert!(
+                passthrough_denyreason(key).is_none(),
+                "{key} should pass through"
+            );
+        }
+        for key in [
+            "AOE_TOKEN",
+            "AOE_ACP_SOCKET",
+            "AGENT_OF_EMPIRES_DEBUG",
+            "AGENT_OF_EMPIRES_PROFILE",
+            "TERM",
+            "",
+            "1BAD",
+            "HAS-DASH",
+        ] {
+            assert!(
+                passthrough_denyreason(key).is_some(),
+                "{key:?} should be refused"
+            );
+        }
     }
 
+    /// The pure core above takes `passthrough` as a bool, so it cannot catch a
+    /// resolver that reads the wrong config key or the wrong scope. Drive the
+    /// real [`inherited_host_env`] against an on-disk `config.toml` so the
+    /// setting's name, its `[session]` section, and its effect are all pinned.
+    ///
+    /// `#[serial]` because it mutates the process-wide env and `HOME`.
     #[test]
-    fn test_forwarded_desktop_env_empty_when_nothing_matches() {
-        let result = forwarded_desktop_env_from(owned(&[("PATH", "/bin"), ("TERM", "xterm")]));
-        assert!(result.is_empty());
+    #[serial_test::serial]
+    fn test_inherited_host_env_reads_the_setting_from_config() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("DISPLAY", ":7"),
+            ("ENVTEST_CUSTOM_VAR", "custom-value"),
+        ]);
+
+        let config_path = crate::session::config::config_path().expect("config path");
+        std::fs::create_dir_all(config_path.parent().expect("app dir")).expect("app dir");
+
+        // Default: the file does not mention the key, so only desktop vars.
+        std::fs::write(&config_path, "").expect("write config");
+        let default = inherited_host_env("");
+        assert!(
+            default.iter().any(|(k, _)| k == "DISPLAY"),
+            "the desktop layer is unconditional, got {default:?}"
+        );
+        assert!(
+            !default.iter().any(|(k, _)| k == "ENVTEST_CUSTOM_VAR"),
+            "an ordinary var must stay out by default, got {default:?}"
+        );
+
+        // Opted in: the same var now rides along.
+        std::fs::write(&config_path, "[session]\ninherit_host_environment = true\n")
+            .expect("write config");
+        let opted_in = inherited_host_env("");
+        assert_eq!(
+            opted_in
+                .iter()
+                .find(|(k, _)| k == "ENVTEST_CUSTOM_VAR")
+                .map(|(_, v)| v.as_str()),
+            Some("custom-value"),
+            "inherit_host_environment must widen the layer, got {opted_in:?}"
+        );
     }
 
     #[test]
@@ -1065,6 +1279,9 @@ environment = ["GH_TOKEN=write_token"]
             (&["MARKER=$$KEEP"], "MARKER='$KEEP' "),
             // Single-quote wrapping with `'\''` escape for the apostrophe.
             (&["X=a b'c$d"], "X='a b'\\''c$d' "),
+            // A key is a bare shell name here and cannot be quoted, so an
+            // invalid one is dropped instead of concatenated into the command.
+            (&["FOO; touch /tmp/pwn; X=1", "GOOD=ok"], "GOOD='ok' "),
         ];
         for (entries, expected) in cases {
             let owned: Vec<String> = entries.iter().map(|s| s.to_string()).collect();
@@ -1190,9 +1407,109 @@ environment = ["GH_TOKEN=write_token"]
         );
     }
 
+    /// An empty mint list is the overwhelmingly common case (no
+    /// `before_session` configured) and must leave the entry list untouched,
+    /// including its order.
+    #[test]
+    fn test_drop_shadowed_host_entries_no_mint_is_identity() {
+        let entries = vec![
+            "CLAUDE_CONFIG_DIR=/a".to_string(),
+            "TERM".to_string(),
+            "GH_TOKEN=$GH_TOKEN".to_string(),
+        ];
+        assert_eq!(
+            drop_shadowed_host_entries(entries.clone(), &[]),
+            entries,
+            "no minted keys must not perturb the list"
+        );
+    }
+
+    /// A minted key removes the static entry for that key regardless of which
+    /// entry form declared it: `KEY=literal`, `KEY=$REF`, or a bare passthrough
+    /// `KEY`. Unrelated entries keep their relative order.
+    #[test]
+    fn test_drop_shadowed_host_entries_removes_every_entry_form() {
+        let entries = vec![
+            "CLAUDE_CONFIG_DIR=/stale".to_string(),
+            "KEEP_LITERAL=keep".to_string(),
+            "ANTHROPIC_BASE_URL=$SOME_REF".to_string(),
+            "TERM".to_string(),
+            "KEEP_BARE".to_string(),
+        ];
+        let minted = vec![
+            ("CLAUDE_CONFIG_DIR".to_string(), "/fresh".to_string()),
+            ("ANTHROPIC_BASE_URL".to_string(), "http://x".to_string()),
+            ("TERM".to_string(), "xterm".to_string()),
+        ];
+        assert_eq!(
+            drop_shadowed_host_entries(entries, &minted),
+            vec!["KEEP_LITERAL=keep".to_string(), "KEEP_BARE".to_string()]
+        );
+    }
+
+    /// Only an exact key match shadows. A minted `FOO` must not remove `FOOBAR`
+    /// or `FOO_BAR`, which a prefix-based filter would get wrong.
+    #[test]
+    fn test_drop_shadowed_host_entries_matches_whole_key_only() {
+        let entries = vec![
+            "FOO=1".to_string(),
+            "FOOBAR=2".to_string(),
+            "FOO_BAR=3".to_string(),
+        ];
+        let minted = vec![("FOO".to_string(), "minted".to_string())];
+        assert_eq!(
+            drop_shadowed_host_entries(entries, &minted),
+            vec!["FOOBAR=2".to_string(), "FOO_BAR=3".to_string()]
+        );
+    }
+
     /// Helper to find an entry by key and check its value
     fn find_entry<'a>(entries: &'a [EnvEntry], key: &str) -> Option<&'a EnvEntry> {
         entries.iter().find(|e| e.key() == key)
+    }
+
+    #[test]
+    fn test_collect_environment_rejects_invalid_config_extra_and_hook_keys() {
+        let config = SandboxConfig {
+            environment: vec![
+                "CFG; touch /tmp/cfg_injected; #=secret".to_string(),
+                "VALID_CONFIG=ok".to_string(),
+            ],
+            ..Default::default()
+        };
+        let base = SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test".to_string(),
+            container_name: "test".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: vec![
+                (
+                    "HOOK$(touch /tmp/hook_injected)".to_string(),
+                    "secret".to_string(),
+                ),
+                ("VALID_HOOK".to_string(), "minted".to_string()),
+            ],
+            container_workdir: None,
+        };
+        let configured = collect_environment(&config, &base);
+        assert!(find_entry(&configured, "VALID_CONFIG").is_some());
+        assert!(find_entry(&configured, "VALID_HOOK").is_some());
+        assert!(!configured
+            .iter()
+            .any(|entry| { entry.key().contains("touch") || entry.key().contains(';') }));
+
+        let mut extra = base;
+        extra.extra_env = Some(vec![
+            "EXTRA`touch /tmp/extra_injected`=secret".to_string(),
+            "VALID_EXTRA=ok".to_string(),
+        ]);
+        let resolved_extra = collect_environment(&config, &extra);
+        assert!(find_entry(&resolved_extra, "VALID_EXTRA").is_some());
+        assert!(!resolved_extra
+            .iter()
+            .any(|entry| { entry.key().contains("touch") || entry.key().contains('`') }));
     }
 
     #[test]

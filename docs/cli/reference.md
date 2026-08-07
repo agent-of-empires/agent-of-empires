@@ -93,12 +93,19 @@ This document contains the help content for the `aoe` command-line program.
 * [`aoe telemetry reset-id`↴](#aoe-telemetry-reset-id)
 * [`aoe mcp`↴](#aoe-mcp)
 * [`aoe mcp list`↴](#aoe-mcp-list)
+* [`aoe skill`↴](#aoe-skill)
+* [`aoe skill list`↴](#aoe-skill-list)
+* [`aoe skill view`↴](#aoe-skill-view)
+* [`aoe skill add`↴](#aoe-skill-add)
+* [`aoe skill edit`↴](#aoe-skill-edit)
+* [`aoe skill adopt`↴](#aoe-skill-adopt)
+* [`aoe skill remove`↴](#aoe-skill-remove)
+* [`aoe skill sync`↴](#aoe-skill-sync)
 * [`aoe serve`↴](#aoe-serve)
 * [`aoe url`↴](#aoe-url)
 * [`aoe acp`↴](#aoe-acp)
 * [`aoe acp doctor`↴](#aoe-acp-doctor)
 * [`aoe acp agents`↴](#aoe-acp-agents)
-* [`aoe acp ps`↴](#aoe-acp-ps)
 * [`aoe acp stop`↴](#aoe-acp-stop)
 * [`aoe acp kill`↴](#aoe-acp-kill)
 * [`aoe acp logs`↴](#aoe-acp-logs)
@@ -149,6 +156,7 @@ Run without arguments to launch the TUI dashboard.
 * `cityhall` — Export and apply the CityHall config bundle (settings + projects)
 * `telemetry` — Manage anonymous opt-in usage telemetry
 * `mcp` — Inspect the effective MCP server set (provenance, conflicts, drift)
+* `skill` — Query and manage agent skills
 * `serve` — Start a web dashboard for remote session access
 * `url` — Print the current dashboard URL of a running `aoe serve` daemon
 * `acp` — Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
@@ -247,7 +255,7 @@ Show a substrate-agnostic runtime view of in-flight sessions (tmux agent panes a
 
 * `--json` — Output as JSON
 * `--tmux` — Show only tmux-backed sessions
-* `--acp` — Show only ACP (structured-view) workers
+* `--acp` — Show only ACP (structured-view) workers, with their ACP-specific columns (BUILD, MODEL, CWD, SOCKET); `--json` adds `substrate`, `state`, `age_secs`, and `model` to the keys the removed `aoe acp ps` emitted, but sorts by substrate, then title, then id rather than by `started_at`. Dead and orphaned workers are hidden unless `--dead` is also passed; the worker registry is global, so with an explicit `-p` the workers of other profiles surface as orphans (also hidden without `--dead`)
 * `--dead` — Include dead sessions and orphaned substrate entries (hidden by default)
 
 
@@ -1377,6 +1385,131 @@ List the merged effective MCP server set with provenance, plus any conflicts and
 
 
 
+## `aoe skill`
+
+Query and manage agent skills
+
+**Usage:** `aoe skill <COMMAND>`
+
+###### **Subcommands:**
+
+* `list` — List discovered skills and their source roots
+* `view` — Print one skill's SKILL.md
+* `add` — Create a new AoE-managed skill
+* `edit` — Edit an AoE-managed skill
+* `adopt` — Copy an external skill into AoE's managed store
+* `remove` — Delete an AoE-managed skill
+* `sync` — Copy AoE-managed skills into the agents' own skills directories
+
+
+
+## `aoe skill list`
+
+List discovered skills and their source roots
+
+**Usage:** `aoe skill list [OPTIONS]`
+
+###### **Options:**
+
+* `--json` — Output machine-readable JSON
+
+
+
+## `aoe skill view`
+
+Print one skill's SKILL.md
+
+**Usage:** `aoe skill view [OPTIONS] <DIRECTORY>`
+
+###### **Arguments:**
+
+* `<DIRECTORY>` — Skill directory name
+
+###### **Options:**
+
+* `--source <SOURCE>` — Source root id, or aoe-managed
+
+  Default value: `aoe-managed`
+* `--json` — Output metadata and content as JSON
+
+
+
+## `aoe skill add`
+
+Create a new AoE-managed skill
+
+**Usage:** `aoe skill add [OPTIONS] <DIRECTORY>`
+
+###### **Arguments:**
+
+* `<DIRECTORY>` — Skill directory name
+
+###### **Options:**
+
+* `--description <DESCRIPTION>` — Short description used in the generated SKILL.md
+
+
+
+## `aoe skill edit`
+
+Edit an AoE-managed skill
+
+**Usage:** `aoe skill edit [OPTIONS] <DIRECTORY>`
+
+###### **Arguments:**
+
+* `<DIRECTORY>` — Managed skill directory name
+
+###### **Options:**
+
+* `--file <PATH>` — Read replacement SKILL.md from this file. Use - for stdin
+
+
+
+## `aoe skill adopt`
+
+Copy an external skill into AoE's managed store
+
+**Usage:** `aoe skill adopt [OPTIONS] <SOURCE> <DIRECTORY>`
+
+###### **Arguments:**
+
+* `<SOURCE>` — External source root id, such as claude-user or agents-standard
+* `<DIRECTORY>` — Source skill directory name
+
+###### **Options:**
+
+* `--as <DESTINATION>` — Destination directory name in AoE's managed store
+
+
+
+## `aoe skill remove`
+
+Delete an AoE-managed skill
+
+**Usage:** `aoe skill remove <DIRECTORY>`
+
+###### **Arguments:**
+
+* `<DIRECTORY>` — Managed skill directory name
+
+
+
+## `aoe skill sync`
+
+Copy AoE-managed skills into the agents' own skills directories
+
+**Usage:** `aoe skill sync [OPTIONS]`
+
+###### **Options:**
+
+* `--root <ID>` — Limit the sync to these source roots. Repeatable. Defaults to all of them
+* `--replace <DIRECTORY>` — Take over this skill in the agents' directories, overwriting a skill AoE does not manage or a propagated copy that was edited there. Repeatable. Without it a sync never overwrites anything it did not itself write
+* `--only <DIRECTORY>` — Reconcile only this skill. Repeatable. Defaults to every managed skill
+* `--json` — Output the per-skill outcomes as JSON
+
+
+
 ## `aoe serve`
 
 Start a web dashboard for remote session access
@@ -1437,7 +1570,6 @@ Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 
 * `doctor` — Verify the structured view can start: Node runtime, configured agents, provider auth (claude login)
 * `agents` — List configured agents (claude-code, aoe-agent, etc.)
-* `ps` — List running agent workers (detached or attached)
 * `stop` — Gracefully stop an agent worker (SIGTERM the runner, agent receives stdin EOF). Sessions can be reattached on the next `aoe serve` only if they are still alive afterward; `stop` destroys the worker
 * `kill` — SIGKILL a worker immediately (use when `stop` doesn't take)
 * `logs` — Tail the runner's log file for an agent session
@@ -1476,18 +1608,6 @@ Verify the structured view can start: Node runtime, configured agents, provider 
 List configured agents (claude-code, aoe-agent, etc.)
 
 **Usage:** `aoe acp agents`
-
-
-
-## `aoe acp ps`
-
-List running agent workers (detached or attached)
-
-**Usage:** `aoe acp ps [OPTIONS]`
-
-###### **Options:**
-
-* `--json` — Emit machine-readable JSON instead of a table
 
 
 

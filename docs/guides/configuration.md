@@ -137,6 +137,8 @@ Notification = "waiting"
 | `custom_agents` | `{}` | User-defined agents: name to command mapping. Custom agent names appear in the TUI agent picker alongside built-in agents. |
 | `agent_detect_as` | `{}` | Status detection mapping: maps an agent name to a built-in agent whose status heuristics should be used. |
 | `agent_acp_cmd` | `{}` | ACP launch command for a custom agent, enabling it to run in structured view (e.g., `{ "oc-superpowers" = "ocp run sp acp" }`). A custom agent with an entry here is structured view-capable; without one it stays tmux-only. Unlike `custom_agents`, the value is split into argv and run directly, with no shell. |
+| `acp.restrict_agents` | `false` | Restrict structured view sessions to `acp.allowed_agents`. Off leaves every registered agent available. Read from the global config only: a profile override cannot widen it, so a shared or locked-down deployment cannot be loosened by its own users. Changing the web value requires the passphrase step-up. |
+| `acp.allowed_agents` | `[]` | ACP registry keys a structured view session may run while `acp.restrict_agents` is on, e.g. `["claude", "codex"]`. These are registry keys, not binary names, and each alias counts separately (allowing `claude` does not allow `claude-code`). With the restriction on, an empty list denies every agent. Governs the structured view only; a terminal session runs in a pane where any binary can be launched, so it is not constrained here. A policy change applies to new sessions immediately and to an already-running worker when it next respawns or when the daemon restarts, at which point a worker on a now-disallowed agent is terminated rather than reattached. |
 | `acp.acp_defaults` | `{}` | Per-agent defaults for structured view startup (under the `[acp]` section, not `[session]`). `model` is forwarded when the worker starts; `effort` (thinking) and `mode` are applied through the agent's ACP config options (`thought_level`, `mode`) when advertised, and skipped with a warning otherwise. `effort_by_model` (a `{model = effort}` map) overrides `effort` for the resolved model. Editable per agent from the web dashboard (Structured view tab, Structured View Defaults). Example: `[acp.acp_defaults.opencode] model = "openai/gpt-5.5" effort = "high" mode = "plan"`. |
 | `agents.<name>.status_map` | `{}` | Trusted global/profile-only hook event to AoE status mappings. Valid statuses are `running`, `waiting`, `idle`, and `error`. Entries apply by event name to built-in hook defaults, so duplicate event names with different matchers all receive the same status; new event names are added to the installed hooks when the agent format supports event keys. Existing hook files update on the next hook install, usually a new or restarted session. Agent processes with installed status hooks receive `AOE_PROFILE`, so hook scripts can query the resolved map with `aoe -p "$AOE_PROFILE" profile show --status-map <agent> --json`. |
 
@@ -234,6 +236,86 @@ In the terminal view every form resolves to a literal `KEY=value` prefix on the 
 
 Profile-scoped `environment` replaces the global list entirely (matching the `sandbox.environment` override semantics).
 
+### What host sessions inherit automatically
+
+Independent of the `environment` list, AoE forwards a fixed set of desktop and
+session vars from its own environment into every host session, in both the
+terminal and the structured view: `DISPLAY`, `WAYLAND_DISPLAY`, `XAUTHORITY`,
+`DBUS_SESSION_BUS_ADDRESS`, `SSH_AUTH_SOCK`, and every `XDG_*` var. Without
+this, a browser an agent launches (an OIDC login, say) has no way to reach your
+desktop, since tmux carries only its own narrow `update-environment` set and the
+structured view starts its agent from a cleared environment.
+
+Worth knowing what that grants: `DISPLAY` plus `XAUTHORITY` is X11 access to
+your whole session, which means an agent can capture the screen and inject
+input, not just open a browser window. That is the point of forwarding them, and
+it has been the terminal view's behavior since #3079, but it is the tradeoff. A
+sandboxed session never receives them.
+
+To forward everything else too, rather than naming each var in `environment`:
+
+```toml
+[session]
+inherit_host_environment = true
+```
+
+Every var AoE itself holds then reaches host sessions, so a `GOPATH` or
+`CARGO_HOME` you exported in your shell is simply there. `AOE_*` and
+`AGENT_OF_EMPIRES_*` keys are never forwarded (they are AoE's own wiring and
+credentials), and `TERM` stays owned by tmux so a pane's terminal type is not
+degraded. Off by default: it widens what every agent process can read, including
+any API token you exported in your shell, so it is opt-in per profile.
+
+In the terminal view the forwarded pairs ride the short-lived `tmux new-session`
+invocation as `-e KEY=value`, so a secret is briefly visible in `ps` while that
+command runs. That is narrower than [`environment`](#host-environment), whose
+values sit in the pane command's argv for the pane's whole life, but it is the
+reason to prefer `sandbox.environment` for genuine secrets.
+
+### When AoE has no environment to forward
+
+Both mechanisms above read AoE's *own* environment. Forwarding is a passthrough,
+not a store, so AoE can only hand a session what it holds itself. If the process
+that starts AoE has no `DISPLAY`, neither does your agent.
+
+That matters when something other than your shell starts the daemon. A systemd
+unit gets a near-empty environment by default, so give it your vars explicitly:
+
+```ini
+[Service]
+# Either name the vars to inherit from the systemd user manager...
+PassEnvironment=DISPLAY XAUTHORITY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+# ...or load them from a file you maintain.
+EnvironmentFile=%h/.config/agent-of-empires/env
+```
+
+For a user unit, run this from your graphical session to populate the manager
+AoE then inherits from, then restart the unit so it picks the values up
+(`import-environment` does not touch already-running units):
+
+```bash
+systemctl --user import-environment DISPLAY XAUTHORITY XDG_RUNTIME_DIR DBUS_SESSION_BUS_ADDRESS
+systemctl --user restart agent-of-empires
+```
+
+That is runtime-only and lost on reboot; `~/.config/environment.d/*.conf` is the
+persistent equivalent. The same principle applies to launchd, cron, and a bare
+SSH `command`: the launch context owns its environment, and AoE forwards
+whatever that is.
+
+To check what a running daemon can actually forward, read its environment
+directly. On Linux:
+
+```bash
+tr '\0' '\n' < /proc/$(cat ~/.config/agent-of-empires/serve.pid)/environ
+```
+
+macOS has no `/proc`, so use `ps` there:
+
+```bash
+ps eww -o command= -p "$(cat ~/.agent-of-empires/serve.pid)"
+```
+
 ## Worktree
 
 The `[worktree]` block controls automatic git worktree creation for new sessions. Common keys:
@@ -262,19 +344,42 @@ See [Docker Sandbox](sandbox.md) for the full key reference (`cpu_limit`, `memor
 
 ## Host Hooks
 
-The `[host_hooks]` block declares hooks that run on the **host** (not inside the sandbox container). Unlike `[hooks]`, which for sandboxed sessions runs inside the container, host hooks run in your host shell and can compute a value with host-only tooling and credentials, then hand only that value to the container.
+The `[host_hooks]` block declares hooks that run on the **host** (not inside the sandbox container). Unlike `[hooks]`, which for sandboxed sessions runs inside the container, host hooks run in your host shell and can compute a value with host-only tooling and credentials, then hand only that value to the agent.
 
 ```toml
 [host_hooks]
-before_start = ['echo "GH_TOKEN=$(my-mint-tool "$AOE_REPO_SLUG")"']
+before_start   = ['echo "GH_TOKEN=$(my-mint-tool "$AOE_REPO_SLUG")"']  # sandboxed sessions
+before_session = ['my-account-switcher env']                            # host sessions
 ```
+
+The two fields mirror the split the static env lists already make: `before_start` serves sandboxed sessions (the dynamic counterpart of `sandbox.environment`), `before_session` serves host sessions (the counterpart of the top-level [`environment`](#host-environment)). A launch runs exactly one of them, chosen by whether the session is sandboxed, so the same key is never minted twice.
 
 `before_start` runs each time a sandbox container comes up (on create and on restart, so short-lived values are refreshed before the agent launches). It re-mints when the container is created fresh or restarted from a stopped state (including after a Docker daemon restart leaves it stopped); attaching to an already-running container reuses the values from the last run and only backfills if none are stashed yet, so it is not re-run on every reattach. Each `KEY=VALUE` line the command prints to stdout is injected into the container environment as an **inherited** variable: the value is passed to the `docker` invocation through the process environment, never in argv, so it does not appear in `ps`. Lines that are not `KEY=VALUE` are ignored, and the hook's stdout is never logged, so it is safe to print a secret. A non-zero exit aborts bringing the container up.
 
+`before_session` runs each time a **host** (non-sandboxed) session is launched, before the agent starts, and applies its `KEY=VALUE` lines to the agent's own environment. Same stdout contract as `before_start`: other lines are ignored, stdout is never logged, and a non-zero exit aborts the launch. It re-runs on every host launch, including restart and a view switch that respawns the agent, and nothing is persisted between launches, so a short-lived value is refreshed rather than replayed.
+
+Minted pairs are applied **after** the static `environment` list, so a freshly minted value wins over a same-keyed config entry. Both views honor that: the structured view appends the pairs to the agent process's environment, and the terminal view passes them through `tmux new-session -e` while dropping any same-keyed `environment` entry, which would otherwise shadow them via the shell-assignment prefix.
+
+On secrecy, the terminal view is better than the static `environment` list but not airtight: a static entry becomes a shell-assignment prefix on the pane command and is therefore visible in `ps` for the pane's whole life, whereas a minted value rides `tmux new-session -e` instead, so it never enters the pane command's argv. That value is still not private, though: `tmux` stores it in the session's own environment for as long as the session exists, and any client with access to the tmux server can read it back with `tmux show-environment -t <session>`, so it is only as secret as access to that tmux server. For a value that must stay out of both argv and the tmux session environment, use a sandboxed session and `before_start`, which passes values to `docker` through the process environment.
+
+The canonical use case is resolving *which* identity a session runs as at spawn time rather than pinning it in config: an account or provider switcher prints the config dir and endpoint for the account currently selected, refreshing a rotated token in the same step.
+
+```toml
+[host_hooks]
+before_session = ['my-account-switcher env --profile "$AOE_PROFILE"']
+```
+
+```text
+CLAUDE_CONFIG_DIR=/Users/me/.claude-accounts/profiles/work
+ANTHROPIC_BASE_URL=http://127.0.0.1:8317
+```
+
+Scope note: `before_session` applies to the **agent** launch, matching the static `environment` list. A plain tool session (the extra shell terminal in a session) is not an agent launch and does not run it.
+
 The command's environment carries:
 
-- **Lifecycle vars:** `AOE_SESSION_ID`, `AOE_SESSION_TITLE`, `AOE_PROJECT_PATH`, `AOE_PROFILE`, `AOE_TOOL`, `AOE_GROUP_PATH`, `AOE_SESSION_BRANCH` (worktree sessions only), and `AOE_REPO_SLUG` (the `owner/repo` of the project's `origin` remote, when it parses; useful for minting a repo-scoped credential without parsing the path yourself).
-- **The session's sandbox environment**, so a per-session value reaches the hook. Set `TEST_VAR=foo` in the session's sandbox env (the new-session dialog's env list accepts `KEY=VALUE`), and the hook reads `$TEST_VAR`; a different session can set a different value. This is the per-session input channel (the host process env, e.g. `TEST_VAR=foo aoe add ...`, only varies per CLI invocation, so in the long-running TUI it would otherwise be fixed for every session). This env is resolved from the per-session list (or profile/global `sandbox.environment`) but **not** from a repo's `.agent-of-empires/config.toml`, keeping the same host/repo trust boundary as `host_hooks` itself.
+- **Lifecycle vars:** `AOE_SESSION_ID`, `AOE_SESSION_TITLE`, `AOE_PROJECT_PATH`, `AOE_PROFILE`, `AOE_TOOL`, `AOE_GROUP_PATH`, `AOE_SESSION_BRANCH` (worktree sessions only), and `AOE_REPO_SLUG` (the `owner/repo` of the project's `origin` remote, when it parses; useful for minting a repo-scoped credential without parsing the path yourself). In the structured view `before_session` receives the subset available at that spawn site: `AOE_SESSION_ID`, `AOE_PROFILE`, `AOE_TOOL`, and `AOE_PROJECT_PATH`.
+- **The session's sandbox environment** (`before_start` only), so a per-session value reaches the hook. Set `TEST_VAR=foo` in the session's sandbox env (the new-session dialog's env list accepts `KEY=VALUE`), and the hook reads `$TEST_VAR`; a different session can set a different value. This is the per-session input channel (the host process env, e.g. `TEST_VAR=foo aoe add ...`, only varies per CLI invocation, so in the long-running TUI it would otherwise be fixed for every session). This env is resolved from the per-session list (or profile/global `sandbox.environment`) but **not** from a repo's `.agent-of-empires/config.toml`, keeping the same host/repo trust boundary as `host_hooks` itself.
 
 The canonical use case is per-session, repo-scoped, short-lived credentials: mint a one-hour, single-repo token on the host (where the broad credential lives) and inject only the narrow token, so the minting tool and host credential never enter the container.
 

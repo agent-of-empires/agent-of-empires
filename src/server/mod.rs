@@ -1674,6 +1674,20 @@ fn build_router(state: Arc<AppState>) -> Router {
         )
         .route("/api/mcp/servers/{name}/keep", post(api::keep_mcp_server))
         .route("/api/mcp/servers/{name}/drop", post(api::drop_mcp_server))
+        // Unified skills management surface (#3050).
+        .route("/api/skills", get(api::list_skills).post(api::create_skill))
+        // Static, so it wins over `/api/skills/{directory}` and a managed skill
+        // may still be named "sync" (that route is PUT/DELETE only).
+        .route("/api/skills/sync", post(api::sync_skills))
+        .route("/api/skills/{source}/{directory}", get(api::read_skill))
+        .route(
+            "/api/skills/{source}/{directory}/adopt",
+            post(api::adopt_skill),
+        )
+        .route(
+            "/api/skills/{directory}",
+            put(api::edit_skill).delete(api::delete_skill),
+        )
         .route(
             "/api/sessions/{id}",
             patch(api::rename_session).delete(api::delete_session),
@@ -2462,6 +2476,12 @@ const CITYHALL_MUTATION_DENY: &[(&str, &str)] = &[
     ("POST", "/api/mcp/servers/{name}/drop"),
     ("POST", "/api/mcp/servers/{name}/keep"),
     ("POST", "/api/mcp/servers/{name}/resolve"),
+    // Skills mutations.
+    ("POST", "/api/skills"),
+    ("POST", "/api/skills/sync"),
+    ("PUT", "/api/skills/{directory}"),
+    ("DELETE", "/api/skills/{directory}"),
+    ("POST", "/api/skills/{source}/{directory}/adopt"),
     // Plugin lifecycle.
     ("POST", "/api/plugins/install"),
     ("POST", "/api/plugins/install/preview"),

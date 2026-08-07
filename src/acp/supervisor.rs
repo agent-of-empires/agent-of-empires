@@ -32,6 +32,7 @@ use tracing::{debug, info, warn};
 use super::acp_client::{
     AcpClient, AcpError, DeleteSessionOutcome, ResetSessionOutcome, SpawnConfig,
 };
+use super::agent_policy::AgentPolicy;
 use super::agent_registry::{AgentRegistry, AgentSpec};
 use super::approvals::{ApprovalDecision, Nonce};
 use super::elicitations::{ElicitationOutcome, ElicitationResolution};
@@ -152,6 +153,15 @@ pub enum SupervisorError {
     Acp(#[from] AcpError),
     #[error("agent {0:?} not in registry")]
     UnknownAgent(String),
+    /// The agent is registered but `[acp] allowed_agents` does not permit it.
+    /// Distinct from `UnknownAgent` on purpose: the operator's policy refused a
+    /// real agent, so the caller should surface a 403 rather than a 400, and a
+    /// user reading the message should not go hunting for a missing binary.
+    /// See #3241.
+    #[error(
+        "agent {0:?} is not permitted by [acp] allowed_agents; ask the operator to allow it or pick a permitted agent"
+    )]
+    AgentNotAllowed(String),
     #[error("{0}")]
     InvalidAgentCommand(String),
     #[error("session {0:?} already has a running structured view worker")]
@@ -490,6 +500,17 @@ pub struct AgentCommandOverride {
 pub struct SpawnRequest {
     pub session_id: String,
     pub agent: String,
+    /// The logical session tool (e.g. `"claude"`, `"codex"`, a custom agent's
+    /// name), as it would appear on `Instance.tool` for a terminal-view
+    /// session. Distinct from [`Self::agent`]: `agent` is what
+    /// `pick_agent_for_tool` resolved the tool to for ACP spawning, and can
+    /// differ from the tool on an explicit override, a custom agent with no
+    /// configured ACP command (falls back to `"aoe-agent"`), or the
+    /// `switch-agent` path (the tool stays fixed while `agent` becomes the new
+    /// backend). Tool-scoped `host_hooks.before_session` env (`AOE_TOOL`) uses
+    /// this field so it agrees with the terminal view rather than with
+    /// whatever ACP backend happened to serve the request.
+    pub tool: String,
     pub cwd: PathBuf,
     pub additional_dirs: Vec<PathBuf>,
     pub provider_env: Vec<(String, String)>,
@@ -788,11 +809,26 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// registry (vs an `agent_acp_cmd` custom spec); callers use it
     /// to decide whether a command override may overlay the spec without
     /// taking the registry lock a second time. See #1766.
+    ///
+    /// `policy` gates both resolution branches, making this the choke point for
+    /// the operator agent allowlist: every fresh spawn reaches it, so a
+    /// disallowed agent cannot start whichever caller asked for it. It must come
+    /// from [`AgentPolicy::load`] (global config), not from `config`'s section
+    /// of a profile-resolved `Config`; see the `agent_policy` module docs for
+    /// why. Reattach is the other half and is enforced in [`Self::attach`].
+    /// See #3241.
     pub async fn resolve_agent_spec(
         &self,
         name: &str,
         config: &crate::session::config::SessionConfig,
+        policy: &AgentPolicy,
     ) -> Result<(AgentSpec, bool), SupervisorError> {
+        // Before resolution, so a disallowed custom `agent_acp_cmd` agent
+        // reports the policy refusal rather than falling through to
+        // `UnknownAgent` and reading as a misconfiguration.
+        if !policy.allows(name) {
+            return Err(SupervisorError::AgentNotAllowed(name.into()));
+        }
         if let Some(spec) = self.registry.lock().await.get(name).cloned() {
             return Ok((spec, true));
         }
@@ -1397,6 +1433,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         let SpawnRequest {
             session_id,
             agent,
+            tool,
             cwd,
             additional_dirs,
             provider_env,
@@ -1439,12 +1476,19 @@ impl<S: BroadcastSink> Supervisor<S> {
         // registry, custom agents from this session's profile + repo
         // resolved `agent_acp_cmd`. Read off-thread; config
         // resolution touches disk.
+        // The agent policy rides along in the same closure: it reads the GLOBAL
+        // config, deliberately not `resolved_cfg.acp`, so a profile override
+        // cannot widen the operator's allowlist (#3241). Both reads touch disk,
+        // so sharing one blocking hop keeps the spawn path's cost unchanged.
         let profile_for_cfg = source_profile.clone().unwrap_or_default();
         let cwd_for_cfg = cwd.clone();
-        let resolved_cfg = tokio::task::spawn_blocking(move || {
-            crate::session::repo_config::resolve_config_with_repo_or_warn(
-                &profile_for_cfg,
-                &cwd_for_cfg,
+        let (resolved_cfg, policy) = tokio::task::spawn_blocking(move || {
+            (
+                crate::session::repo_config::resolve_config_with_repo_or_warn(
+                    &profile_for_cfg,
+                    &cwd_for_cfg,
+                ),
+                AgentPolicy::load(),
             )
         })
         .await
@@ -1457,7 +1501,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         // full argv already). Returned by `resolve_agent_spec` so the
         // registry is locked once, not raced across two reads.
         let (mut spec, spec_from_registry) = self
-            .resolve_agent_spec(&agent, &resolved_cfg.session)
+            .resolve_agent_spec(&agent, &resolved_cfg.session, &policy)
             .await?;
         // Overlay the instance command override (e.g. opencode →
         // opencode-plannotator from `session.agent_command_override`)
@@ -1492,11 +1536,77 @@ impl<S: BroadcastSink> Supervisor<S> {
         // overrides cannot contribute it. Mirror terminal-view behavior for
         // host agents, while sandboxed agents continue to use the separate
         // `sandbox.environment` namespace.
-        let host_environment = if sandbox_info.is_none() {
+        let mut host_environment = if sandbox_info.is_none() {
             crate::session::environment::resolve_host_environment_pairs(&resolved_cfg.environment)
         } else {
             Vec::new()
         };
+
+        // `host_hooks.before_session` mints env for a host agent at spawn time,
+        // the structured-view counterpart of the terminal view's tmux `-e`
+        // channel, so both views agree on what a host session's environment is.
+        //
+        // Deliberately re-resolved from global + profile via
+        // `resolve_before_session_hooks` rather than read off `resolved_cfg`,
+        // which is repo-aware: a checked-out repo must never contribute a host
+        // command. Appended AFTER the static list so a freshly minted value wins
+        // over a same-keyed `environment` entry (last-wins, matching
+        // `resolve_host_environment_pairs`).
+        //
+        // `resolved_cfg` gates the whole block first, so a deployment with no
+        // hook configured pays nothing: no `spawn_blocking` hop and no config
+        // read on a path every structured spawn takes. Sound as a gate because
+        // `host_hooks` is absent from `REPO_OVERRIDABLE_SECTIONS`, so
+        // `merge_repo_config` has already dropped any repo contribution and what
+        // is left here is the same global+profile value the re-resolve below
+        // computes. It can only be empty when the trusted value is empty; the
+        // re-resolve stays as the belt-and-suspenders that actually enforces the
+        // boundary.
+        if sandbox_info.is_none() && !resolved_cfg.host_hooks.before_session.is_empty() {
+            let profile_for_hook = source_profile.clone().unwrap_or_default();
+            let cwd_for_hook = cwd.clone();
+            let session_for_hook = session_id.clone();
+            let tool_for_hook = tool.clone();
+            let minted = tokio::task::spawn_blocking(move || {
+                let commands =
+                    crate::session::repo_config::resolve_before_session_hooks(&profile_for_hook);
+                if commands.is_empty() {
+                    return Ok(Vec::new());
+                }
+                // The lifecycle subset available at this spawn site. The terminal
+                // view passes the full `lifecycle_env_vars` off an `Instance`;
+                // there is no `Instance` here, so a hook that needs more than
+                // these should read it from `AOE_PROJECT_PATH`.
+                let hook_env: Vec<(&'static str, String)> = vec![
+                    ("AOE_SESSION_ID", session_for_hook),
+                    ("AOE_PROFILE", profile_for_hook.clone()),
+                    ("AOE_TOOL", tool_for_hook),
+                    (
+                        "AOE_PROJECT_PATH",
+                        cwd_for_hook.to_string_lossy().to_string(),
+                    ),
+                ];
+                crate::session::repo_config::run_before_session_hooks(
+                    &commands,
+                    &cwd_for_hook,
+                    &hook_env,
+                    &[],
+                )
+            })
+            .await
+            .map_err(|e| {
+                SupervisorError::InvalidAgentCommand(format!(
+                    "before_session hook task failed: {e}"
+                ))
+            })?
+            .map_err(|e| {
+                SupervisorError::Acp(AcpError::Spawn(format!("before_session hook: {e}")))
+            })?;
+            for (key, value) in minted {
+                host_environment.retain(|(k, _)| k != &key);
+                host_environment.push((key, value));
+            }
+        }
 
         let mut env = provider_env;
         if let Some(model) = model {
@@ -1541,6 +1651,7 @@ impl<S: BroadcastSink> Supervisor<S> {
 
         let config = SpawnConfig {
             agent_key: agent.clone(),
+            tool: tool.clone(),
             spec,
             cwd,
             additional_dirs,
@@ -2054,6 +2165,74 @@ impl<S: BroadcastSink> Supervisor<S> {
                         );
                         Vec::new()
                     });
+
+                    // Re-run `host_hooks.before_session` before the respawn, the
+                    // same way `spawn_inner` runs it on first spawn: a
+                    // non-sandboxed worker respawns often (crash, cancel
+                    // watchdog, transport break), and reusing the value minted
+                    // at the original spawn would defeat the hook's whole
+                    // purpose of refreshing a short-lived value (e.g. a rotated
+                    // token) on every launch. Sandboxed agents keep using
+                    // `sandbox.environment`, resolved once at container
+                    // bring-up, so this is skipped for them.
+                    if respawn_config.sandbox_info.is_none() {
+                        let profile_for_hook =
+                            respawn_config.source_profile.clone().unwrap_or_default();
+                        let cwd_for_hook = respawn_config.cwd.clone();
+                        let session_for_hook = session_id.clone();
+                        let tool_for_hook = respawn_config.tool.clone();
+                        let minted = tokio::task::spawn_blocking(move || {
+                            let commands =
+                                crate::session::repo_config::resolve_before_session_hooks(
+                                    &profile_for_hook,
+                                );
+                            if commands.is_empty() {
+                                return Ok(Vec::new());
+                            }
+                            let hook_env: Vec<(&'static str, String)> = vec![
+                                ("AOE_SESSION_ID", session_for_hook),
+                                ("AOE_PROFILE", profile_for_hook.clone()),
+                                ("AOE_TOOL", tool_for_hook),
+                                (
+                                    "AOE_PROJECT_PATH",
+                                    cwd_for_hook.to_string_lossy().to_string(),
+                                ),
+                            ];
+                            crate::session::repo_config::run_before_session_hooks(
+                                &commands,
+                                &cwd_for_hook,
+                                &hook_env,
+                                &[],
+                            )
+                        })
+                        .await;
+                        match minted {
+                            Ok(Ok(pairs)) => {
+                                for (key, value) in pairs {
+                                    respawn_config.host_environment.retain(|(k, _)| k != &key);
+                                    respawn_config.host_environment.push((key, value));
+                                }
+                            }
+                            Ok(Err(e)) => {
+                                warn!(
+                                    target: "acp.supervisor",
+                                    session = %session_id,
+                                    error = %e,
+                                    "before_session hook failed on respawn; reusing the \
+                                     environment from the prior launch"
+                                );
+                            }
+                            Err(e) => {
+                                warn!(
+                                    target: "acp.supervisor",
+                                    session = %session_id,
+                                    error = %e,
+                                    "before_session hook task failed on respawn; reusing the \
+                                     environment from the prior launch"
+                                );
+                            }
+                        }
+                    }
 
                     let acp_session_id = AcpSessionId(session_id.clone());
                     let mut new_client =
@@ -2658,6 +2837,74 @@ impl<S: BroadcastSink> Supervisor<S> {
             }
         };
 
+        // Prefer the persisted registry key; fall back to the legacy
+        // `agent_name` field for records written before `agent_key`
+        // existed. A truly stale entry without either resolves to
+        // DEFAULT inside `agent_profiles::resolve`, which is the safe
+        // pass-through behavior.
+        let attach_agent_key = if record.agent_key.is_empty() {
+            record.agent_name.clone()
+        } else {
+            record.agent_key.clone()
+        };
+
+        // Enforce the operator agent allowlist on reattach, not just on spawn
+        // (#3241). Workers are detached rather than killed when the daemon stops
+        // (`detach_all`), so without this a runner started under a permissive
+        // policy would be reconnected verbatim after the policy tightened, and
+        // the allowlist would only ever constrain new processes.
+        //
+        // Refusing to attach is not enough on its own: the disallowed runner
+        // would keep running, still holding whatever credentials it was spawned
+        // with, and the next reconciler tick would attach it again. So terminate
+        // it. `worker_registry::terminate` is the canonical teardown already
+        // used by the shutdown paths: it SIGTERMs the whole process group and
+        // clears the record plus socket generation-aware, so it will not strand a
+        // replacement runner that rebound the socket meanwhile.
+        //
+        // The legacy fallback above yields a binary name (`claude-agent-acp`),
+        // which matches no registry key, so an old record fails closed under a
+        // restrictive policy and the reconciler respawns under current policy.
+        // That is the behavior we want; a record we cannot identify is not one we
+        // can prove is permitted.
+        let agent_allowed = {
+            let key = attach_agent_key.clone();
+            tokio::task::spawn_blocking(move || AgentPolicy::load().allows(&key))
+                .await
+                .map_err(|e| {
+                    SupervisorError::InvalidAgentCommand(format!(
+                        "agent policy load task failed: {e}"
+                    ))
+                })?
+        };
+        if !agent_allowed {
+            warn!(
+                target: "acp.supervisor",
+                session = %session_id,
+                agent = %attach_agent_key,
+                "detached structured view worker runs an agent that [acp] allowed_agents no longer \
+                 permits; terminating it instead of reattaching"
+            );
+            let id_for_terminate = session_id.clone();
+            if let Err(e) = tokio::task::spawn_blocking(move || {
+                crate::process::worker_registry::terminate(&id_for_terminate)
+            })
+            .await
+            {
+                // The runner and its record can both survive a panicked or
+                // runtime-shutdown terminate task while we still refuse the
+                // attach. The next reconciler tick retries this path, so it
+                // self-heals; log it so the transient failure is not silent.
+                warn!(
+                    target: "acp.supervisor",
+                    session = %session_id,
+                    "terminate task for a disallowed worker failed: {e}; the next \
+                     reconciler tick retries"
+                );
+            }
+            return Err(SupervisorError::AgentNotAllowed(attach_agent_key));
+        }
+
         // Resume requires a known ACP session id (the runner was holding
         // the agent loaded against it). If the registry doesn't carry
         // one yet, e.g. the previous daemon crashed before the first
@@ -2696,16 +2943,6 @@ impl<S: BroadcastSink> Supervisor<S> {
                 )
             }
             None => None,
-        };
-        // Prefer the persisted registry key; fall back to the legacy
-        // `agent_name` field for records written before `agent_key`
-        // existed. A truly stale entry without either resolves to
-        // DEFAULT inside `agent_profiles::resolve`, which is the safe
-        // pass-through behavior.
-        let attach_agent_key = if record.agent_key.is_empty() {
-            record.agent_name.clone()
-        } else {
-            record.agent_key.clone()
         };
         let mut client = AcpClient::attach(
             record.socket_path.clone(),
@@ -3438,6 +3675,214 @@ mod tests {
         }
     }
 
+    /// #3241: the allowlist gates both resolution branches, and a refusal is
+    /// reported as `AgentNotAllowed` rather than `UnknownAgent`, so an operator
+    /// policy does not read as a missing binary. Asserting the exact variant is
+    /// the point: a disallowed custom agent would otherwise pass an `is_err()`
+    /// check by falling through to `UnknownAgent`.
+    #[tokio::test]
+    async fn resolve_agent_spec_honors_the_agent_allowlist() {
+        let sup = Supervisor::new(VecSink::new());
+        // A custom agent so the second resolution branch is exercised too.
+        let mut cfg = crate::session::config::SessionConfig::default();
+        cfg.agent_acp_cmd
+            .insert("oc-superpowers".into(), "ocp run sp acp".into());
+
+        #[derive(Debug)]
+        enum Want {
+            Registry,
+            Custom,
+            NotAllowed,
+            Unknown,
+        }
+        let cases = [
+            // Unrestricted: both branches resolve as before.
+            (false, &[][..], "claude", Want::Registry),
+            (false, &[][..], "oc-superpowers", Want::Custom),
+            (false, &[][..], "no-such-agent", Want::Unknown),
+            // Restricted: only listed keys resolve, on either branch.
+            (true, &["claude"][..], "claude", Want::Registry),
+            (true, &["claude"][..], "codex", Want::NotAllowed),
+            (
+                true,
+                &["oc-superpowers"][..],
+                "oc-superpowers",
+                Want::Custom,
+            ),
+            (true, &["claude"][..], "oc-superpowers", Want::NotAllowed),
+            // Policy is checked before resolution, so an agent that is both
+            // unlisted and unregistered reports the policy refusal. The
+            // operator's list is the reason it will not run.
+            (true, &["claude"][..], "no-such-agent", Want::NotAllowed),
+            // Restricted with an empty list denies everything.
+            (true, &[][..], "claude", Want::NotAllowed),
+        ];
+        for (restrict, allowed, name, want) in cases {
+            let policy = AgentPolicy::for_test(restrict, allowed);
+            let got = sup.resolve_agent_spec(name, &cfg, &policy).await;
+            let label = format!("restrict={restrict} allowed={allowed:?} name={name:?}");
+            match want {
+                Want::Registry => {
+                    let (_, from_registry) = got.unwrap_or_else(|e| panic!("{label}: {e}"));
+                    assert!(from_registry, "{label}: expected a registry spec");
+                }
+                Want::Custom => {
+                    let (spec, from_registry) = got.unwrap_or_else(|e| panic!("{label}: {e}"));
+                    assert!(!from_registry, "{label}: expected a custom spec");
+                    assert_eq!(spec.command, "ocp", "{label}");
+                }
+                Want::NotAllowed => assert!(
+                    matches!(got, Err(SupervisorError::AgentNotAllowed(ref n)) if n == name),
+                    "{label}: expected AgentNotAllowed, got {got:?}"
+                ),
+                Want::Unknown => assert!(
+                    matches!(got, Err(SupervisorError::UnknownAgent(_))),
+                    "{label}: expected UnknownAgent, got {got:?}"
+                ),
+            }
+        }
+    }
+
+    /// #3241: the reattach half of the enforcement. Workers are detached rather
+    /// than killed on daemon shutdown, so a runner started under a permissive
+    /// policy is still alive when the policy tightens. Attaching it would let it
+    /// outlive the restriction, so it must be terminated and its registry
+    /// record cleared instead. This is the test that would have caught the
+    /// original plan's bypass.
+    ///
+    /// `#[serial]` because it mutates `HOME` / `XDG_CONFIG_HOME` to point the
+    /// app dir (config + worker registry) at a temp dir.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn attach_terminates_a_worker_whose_agent_is_no_longer_allowed() {
+        // Root under /tmp, not $TMPDIR: on macOS the latter is deep enough that
+        // <app_dir>/acp-workers/<id>.sock blows past the sun_path limit.
+        let tmp = tempfile::TempDir::with_prefix_in("aoe-attach-policy-", "/tmp").unwrap();
+        let original_home = std::env::var_os("HOME");
+        let original_xdg = std::env::var_os("XDG_CONFIG_HOME");
+        // SAFETY: serialized via `#[serial]`; restored before returning.
+        unsafe {
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+        }
+
+        // A stand-in runner: `is_record_live` requires a live pid, and the
+        // terminate path signals the pid's whole process group. `process_group(0)`
+        // makes the child its own group leader so the killpg lands on it alone;
+        // using our own pid here would SIGTERM the test process.
+        use std::os::unix::process::CommandExt as _;
+        let mut fake_runner = std::process::Command::new("sleep")
+            .arg("60")
+            .process_group(0)
+            .spawn()
+            .expect("spawn stand-in runner");
+
+        let result = async {
+            let sup = Supervisor::new(VecSink::new());
+            let socket = crate::process::worker_registry::socket_path_for("s-policy").unwrap();
+            std::fs::write(&socket, b"").unwrap();
+            let mut record = crate::process::worker_registry::WorkerRecord::new(
+                "s-policy".into(),
+                fake_runner.id(),
+                socket,
+                "codex-acp".into(),
+                "codex".into(),
+                tmp.path().to_path_buf(),
+                None,
+                vec![],
+                vec![],
+                Some("acp-session".into()),
+                None,
+            );
+            record.detached_at = Some(1);
+
+            // Control first, while the stand-in runner is still alive: a policy
+            // that permits `codex` clears the gate and the attach proceeds to
+            // dial, failing only because the socket path is a plain file rather
+            // than a listening runner. This is what proves the denial below
+            // comes from the policy and not from the fixture.
+            crate::session::config::update_config(|c| {
+                c.acp.restrict_agents = true;
+                c.acp.allowed_agents = vec!["claude".to_string(), "codex".to_string()];
+            })
+            .unwrap();
+            crate::process::worker_registry::save(&record).unwrap();
+            let allowed = sup
+                .attach(
+                    "s-policy".into(),
+                    tmp.path().to_path_buf(),
+                    vec![],
+                    false,
+                    None,
+                )
+                .await;
+            assert!(
+                !matches!(allowed, Err(SupervisorError::AgentNotAllowed(_))),
+                "a permitted agent must clear the policy gate, got {allowed:?}"
+            );
+
+            // Now tighten the policy so `codex` is no longer permitted.
+            crate::session::config::update_config(|c| {
+                c.acp.allowed_agents = vec!["claude".to_string()];
+            })
+            .unwrap();
+            crate::process::worker_registry::save(&record).unwrap();
+
+            let got = sup
+                .attach(
+                    "s-policy".into(),
+                    tmp.path().to_path_buf(),
+                    vec![],
+                    false,
+                    None,
+                )
+                .await;
+
+            // Refused as a policy decision; the record is gone so the next
+            // reconciler tick cannot reattach the same runner; and the runner
+            // itself was signalled rather than left holding its credentials.
+            assert!(
+                matches!(got, Err(SupervisorError::AgentNotAllowed(ref n)) if n == "codex"),
+                "expected AgentNotAllowed(codex), got {got:?}"
+            );
+            assert!(
+                crate::process::worker_registry::load("s-policy")
+                    .unwrap()
+                    .is_none(),
+                "the disallowed worker's registry record must be cleared"
+            );
+            // Poll rather than `wait()`: the child is a `sleep 60`, so a
+            // terminate path that stops signalling would block this test for a
+            // full minute before reporting.
+            let exit = (0..50)
+                .find_map(|_| {
+                    let got = fake_runner.try_wait().unwrap();
+                    if got.is_none() {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    got
+                })
+                .expect("the disallowed runner must be signalled, not left running");
+            assert!(
+                exit.code().is_none(),
+                "the runner must exit from a signal, not a normal exit: {exit:?}"
+            );
+        }
+        .await;
+
+        unsafe {
+            match original_home {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+            match original_xdg {
+                Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+                None => std::env::remove_var("XDG_CONFIG_HOME"),
+            }
+        }
+        result
+    }
+
     #[tokio::test]
     async fn spawn_unknown_agent_errors_cleanly() {
         let sink = VecSink::new();
@@ -3446,6 +3891,7 @@ mod tests {
             .spawn(SpawnRequest {
                 session_id: "s-1".into(),
                 agent: "no-such-agent".into(),
+                tool: "no-such-agent".into(),
                 cwd: std::env::temp_dir(),
                 additional_dirs: vec![],
                 provider_env: vec![],
@@ -3489,6 +3935,7 @@ mod tests {
             .spawn(SpawnRequest {
                 session_id: "s-1".into(),
                 agent: "claude-code".into(),
+                tool: "claude-code".into(),
                 cwd: std::env::temp_dir(),
                 additional_dirs: vec![],
                 provider_env: vec![],
@@ -3706,6 +4153,7 @@ mod tests {
         let socket_path = tmp.path().join("budget.sock");
         let dummy_config = SpawnConfig {
             agent_key: "claude".into(),
+            tool: "claude".into(),
             spec: dummy_spec,
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
@@ -3802,6 +4250,7 @@ mod tests {
         };
         let dummy_config = SpawnConfig {
             agent_key: "claude".into(),
+            tool: "claude".into(),
             spec: dummy_spec,
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
@@ -3881,6 +4330,7 @@ mod tests {
         };
         let dummy_config = SpawnConfig {
             agent_key: "claude".into(),
+            tool: "claude".into(),
             spec: dummy_spec,
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
@@ -3960,6 +4410,7 @@ mod tests {
         };
         let dummy_config = SpawnConfig {
             agent_key: "claude".into(),
+            tool: "claude".into(),
             spec: dummy_spec,
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
@@ -4093,6 +4544,7 @@ mod tests {
         };
         let dummy_config = SpawnConfig {
             agent_key: "claude".into(),
+            tool: "claude".into(),
             spec: dummy_spec,
             cwd: std::env::temp_dir(),
             additional_dirs: vec![],
@@ -5475,6 +5927,7 @@ mod tests {
             .spawn(SpawnRequest {
                 session_id: "s-2".into(),
                 agent: "claude-code".into(),
+                tool: "claude-code".into(),
                 cwd: std::env::temp_dir(),
                 additional_dirs: vec![],
                 provider_env: vec![],
@@ -5552,6 +6005,7 @@ mod tests {
             .spawn(SpawnRequest {
                 session_id: "fresh".into(),
                 agent: "claude-code".into(),
+                tool: "claude-code".into(),
                 cwd: std::env::temp_dir(),
                 additional_dirs: vec![],
                 provider_env: vec![],
@@ -5808,6 +6262,7 @@ mod tests {
             .spawn(SpawnRequest {
                 session_id: "s-c".into(),
                 agent: "claude".into(),
+                tool: "claude".into(),
                 cwd: std::env::temp_dir(),
                 additional_dirs: vec![],
                 provider_env: vec![],
@@ -5864,6 +6319,7 @@ mod tests {
             .spawn(SpawnRequest {
                 session_id: "s-spawn".into(),
                 agent: "definitely-not-a-real-agent-xyz".into(),
+                tool: "definitely-not-a-real-agent-xyz".into(),
                 cwd: std::env::temp_dir(),
                 additional_dirs: vec![],
                 provider_env: vec![],

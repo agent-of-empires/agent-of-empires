@@ -815,7 +815,68 @@ fn prepare_sandbox_dir(mount: &AgentConfigMount, home: &Path) -> Result<std::pat
         }
     }
 
+    let config = crate::session::config::Config::load_or_warn();
+    let app_dir = crate::session::get_app_dir().ok();
+    if let Some(app_dir) = app_dir {
+        sync_managed_skills_into_sandbox(
+            mount,
+            &sandbox_dir,
+            &app_dir,
+            config.skills.auto_propagate,
+        );
+    }
+
     Ok(sandbox_dir)
+}
+
+/// Reconcile AoE-managed skills into this agent's sandbox skills dir (#3053).
+///
+/// Deliberately not folded into `copy_dirs`: that path is host-to-sandbox and
+/// runs only on a sandbox's first launch, so a skill authored after the
+/// container first ran would never reach it. Managed skills are a small,
+/// AoE-owned tree, so reconciling them on every launch is cheap and safe in a
+/// way re-copying the whole config tree is not. `copy_dirs` keeps doing its own
+/// job of importing the user's hand-written host skills on first run.
+///
+/// The sandbox target is derived from the agent's own skills root, which must
+/// live under the dir the sandbox mirrors. Codex reads `~/.agents/skills`, which
+/// is outside its `.codex` mount, so it has no sandbox target and is host-only
+/// for now.
+/// `auto_propagate` is passed in rather than read here so the opt-in gate is
+/// directly testable; a leaf function that reaches for global config cannot be.
+fn sync_managed_skills_into_sandbox(
+    mount: &AgentConfigMount,
+    sandbox_dir: &Path,
+    app_dir: &Path,
+    auto_propagate: bool,
+) {
+    if !auto_propagate {
+        return;
+    }
+    let Some(root) = crate::session::skills_model::primary_root_for_agent(mount.tool_name) else {
+        return;
+    };
+    let Some(suffix) = root.relative_path.strip_prefix(mount.host_rel) else {
+        tracing::debug!(target: "session.skills",
+            agent = mount.tool_name,
+            root = root.id,
+            "skills root is outside the sandboxed config dir; host only"
+        );
+        return;
+    };
+    let target = sandbox_dir.join(suffix.trim_start_matches('/'));
+    // Never replaces: a container starting must not overwrite a skill the user
+    // put in the sandbox by hand.
+    let outcomes = crate::session::skills_model::sync_skills_into(
+        &target,
+        app_dir,
+        root.id,
+        &crate::session::skills_model::SyncOptions::default(),
+    );
+    crate::session::skills_model::log_sync_outcomes(
+        &format!("sandbox:{}", mount.tool_name),
+        &outcomes,
+    );
 }
 
 /// Compute volume mount paths for Docker container.
@@ -3160,6 +3221,62 @@ mod tests {
         copy_dir_recursive(&src, &dest).unwrap();
         assert_eq!(fs::read_to_string(dest.join("good.txt")).unwrap(), "good");
         assert!(!dest.join("dangling").exists());
+    }
+
+    /// Propagation writes into the user's agent config dirs, so nothing may be
+    /// written until they opt in. Also covers the sandbox reconcile actually
+    /// landing once they have.
+    #[test]
+    fn test_sandbox_skills_sync_requires_opt_in() {
+        let dir = TempDir::new().unwrap();
+        let app_dir = dir.path().join("app");
+        let sandbox = dir.path().join("sandbox");
+        crate::session::skills_model::create_skill(&app_dir, "shared", Some("d")).unwrap();
+        let mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|m| m.tool_name == "claude")
+            .unwrap();
+
+        sync_managed_skills_into_sandbox(mount, &sandbox, &app_dir, false);
+        assert!(
+            !sandbox.join("skills").exists(),
+            "must not write into an agent config dir before the user opts in"
+        );
+
+        sync_managed_skills_into_sandbox(mount, &sandbox, &app_dir, true);
+        assert!(sandbox.join("skills/shared/SKILL.md").is_file());
+    }
+
+    /// The sandbox skills target is derived by stripping an agent's config dir
+    /// off its skills root, so the two static tables have to stay in agreement.
+    /// This fails when someone edits `SKILL_ROOTS` or `AGENT_CONFIG_MOUNTS`
+    /// without the other, which would silently drop sandbox propagation.
+    #[test]
+    fn test_sandbox_skills_target_derives_from_the_agent_mount() {
+        use crate::session::skills_model::primary_root_for_agent;
+
+        // (agent, expected suffix under the sandbox dir, or None for host-only)
+        let cases = [
+            ("claude", Some("skills")),
+            ("gemini", Some("skills")),
+            ("opencode", Some("skills")),
+            ("kimi", Some("skills")),
+            // Codex reads ~/.agents/skills, which is not under its .codex mount.
+            ("codex", None),
+        ];
+        for (agent, expected) in cases {
+            let root = primary_root_for_agent(agent)
+                .unwrap_or_else(|| panic!("no skills root for {agent}"));
+            let mount = AGENT_CONFIG_MOUNTS
+                .iter()
+                .find(|m| m.tool_name == agent && root.relative_path.starts_with(m.host_rel));
+            let suffix = mount.and_then(|m| {
+                root.relative_path
+                    .strip_prefix(m.host_rel)
+                    .map(|s| s.trim_start_matches('/'))
+            });
+            assert_eq!(suffix, expected, "{agent}");
+        }
     }
 
     #[test]

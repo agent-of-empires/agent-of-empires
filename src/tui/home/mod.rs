@@ -537,6 +537,7 @@ pub struct HomeView {
     pub(super) project_session_picker_dialog: Option<ProjectSessionPickerDialog>,
     pub(super) projects_dialog: Option<ProjectsDialog>,
     pub(super) plugin_manager_dialog: Option<crate::tui::dialogs::PluginManagerDialog>,
+    pub(super) skills_manager_dialog: Option<crate::tui::dialogs::SkillsManagerDialog>,
     pub(super) command_palette: Option<CommandPaletteDialog>,
     #[cfg(feature = "serve")]
     pub(super) serve_view: Option<ServeView>,
@@ -2180,6 +2181,7 @@ impl HomeView {
             project_session_picker_dialog: None,
             projects_dialog: None,
             plugin_manager_dialog: None,
+            skills_manager_dialog: None,
             command_palette: None,
             #[cfg(feature = "serve")]
             serve_view: None,
@@ -4407,6 +4409,13 @@ impl HomeView {
             }
         }
 
+        // Poll the skills manager's in-flight share.
+        if let Some(dialog) = &mut self.skills_manager_dialog {
+            if dialog.tick() {
+                changed = true;
+            }
+        }
+
         // Drain hook progress into the creating buffer when no dialog is open
         if self.new_dialog.is_none() {
             if let Some(ref stub_id) = self.creating_stub_id {
@@ -4501,6 +4510,7 @@ impl HomeView {
             || self.projects_dialog.is_some()
             || self.attach_project_dialog.is_some()
             || self.plugin_manager_dialog.is_some()
+            || self.skills_manager_dialog.is_some()
             || self.command_palette.is_some()
             || self.tool_picker_dialog.is_some()
             || self.send_message_dialog.is_some()
@@ -4567,6 +4577,7 @@ impl HomeView {
             || self.projects_dialog.is_some()
             || self.attach_project_dialog.is_some()
             || self.plugin_manager_dialog.is_some()
+            || self.skills_manager_dialog.is_some()
             || self.command_palette.is_some()
             || self.tool_picker_dialog.is_some()
             || self.send_message_dialog.is_some()
@@ -5526,7 +5537,9 @@ impl HomeView {
         else {
             return;
         };
-        let tokens = permission_response_tokens(&response, choice);
+        let Some(tokens) = permission_response_tokens(&response, choice) else {
+            return;
+        };
         let tmux_session = match crate::tmux::Session::new(&inst.id, &inst.title) {
             Ok(s) => s,
             Err(e) => {
@@ -5552,12 +5565,12 @@ impl HomeView {
 fn permission_response_tokens(
     response: &crate::agents::PermissionResponse,
     choice: crate::tui::dialogs::PermissionResponseChoice,
-) -> &'static [crate::agents::KeyToken] {
+) -> Option<&'static [crate::agents::KeyToken]> {
     use crate::tui::dialogs::PermissionResponseChoice::*;
     match choice {
-        Allow => response.allow,
+        Allow => Some(response.allow),
         AllowAlways => response.allow_always,
-        Deny => response.deny,
+        Deny => Some(response.deny),
     }
 }
 
@@ -5571,12 +5584,12 @@ mod permission_response_tokens_tests {
     fn maps_each_choice_to_its_own_field() {
         let response = PermissionResponse {
             allow: &[KeyToken::Literal("1")],
-            allow_always: &[KeyToken::Literal("2")],
+            allow_always: Some(&[KeyToken::Literal("2")]),
             deny: &[KeyToken::Literal("3")],
         };
         assert_eq!(
             permission_response_tokens(&response, PermissionResponseChoice::Allow),
-            response.allow
+            Some(response.allow)
         );
         assert_eq!(
             permission_response_tokens(&response, PermissionResponseChoice::AllowAlways),
@@ -5584,7 +5597,20 @@ mod permission_response_tokens_tests {
         );
         assert_eq!(
             permission_response_tokens(&response, PermissionResponseChoice::Deny),
-            response.deny
+            Some(response.deny)
+        );
+    }
+
+    #[test]
+    fn allow_always_none_maps_to_none() {
+        let response = PermissionResponse {
+            allow: &[KeyToken::Named("Enter")],
+            allow_always: None,
+            deny: &[KeyToken::Named("Down"), KeyToken::Named("Enter")],
+        };
+        assert_eq!(
+            permission_response_tokens(&response, PermissionResponseChoice::AllowAlways),
+            None
         );
     }
 }

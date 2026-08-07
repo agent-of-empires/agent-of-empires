@@ -119,6 +119,12 @@ pub struct StructuredViewState {
     /// before moving. Interior-mutable so the render (which borrows the
     /// state immutably) can record it. See `apply_scroll`.
     pub last_scroll_max: std::cell::Cell<u16>,
+    /// Context-window percentage at which the status line nudges the user
+    /// to run `/compact`, or `None` when the daemon has the reminder off
+    /// (the default) or its config fetch failed. Read from the daemon's
+    /// `/api/about`, not local config, so a view attached to a remote
+    /// daemon honours that daemon's setting. See #3253.
+    pub compaction_reminder_percent: Option<u8>,
 }
 
 /// One open choice-picker: a titled option list plus what accepting the
@@ -285,6 +291,7 @@ impl StructuredViewState {
             choice: None,
             auto_presented_elicitation: None,
             last_scroll_max: std::cell::Cell::new(0),
+            compaction_reminder_percent: None,
         }
     }
 

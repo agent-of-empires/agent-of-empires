@@ -2389,6 +2389,16 @@ impl HomeView {
             return None;
         }
 
+        if let Some(dialog) = &mut self.skills_manager_dialog {
+            match dialog.handle_key(key) {
+                DialogResult::Continue => {}
+                DialogResult::Cancel | DialogResult::Submit(()) => {
+                    self.skills_manager_dialog = None;
+                }
+            }
+            return None;
+        }
+
         if let Some(dialog) = &mut self.group_picker_dialog {
             match dialog.handle_key(key) {
                 DialogResult::Continue => {}
@@ -2866,6 +2876,9 @@ impl HomeView {
             }
             ActionId::Plugins => {
                 self.plugin_manager_dialog = Some(crate::tui::dialogs::PluginManagerDialog::new());
+            }
+            ActionId::Skills => {
+                self.skills_manager_dialog = Some(crate::tui::dialogs::SkillsManagerDialog::new());
             }
             ActionId::Restart => self.open_restart_dialog(),
             ActionId::Update => return self.run_update(update_info),
@@ -5920,6 +5933,14 @@ impl HomeView {
                 return;
             }
         }
+        // Before send_message_dialog below: with the skills manager open and
+        // its editor focused, a paste that fell through to that branch would
+        // open a message dialog aimed at whatever session was selected before
+        // the panel opened, and render both overlays at once.
+        if let Some(ref mut dialog) = self.skills_manager_dialog {
+            dialog.handle_paste(text);
+            return;
+        }
         if let Some(ref mut dialog) = self.rename_dialog {
             dialog.handle_paste(text);
             return;
@@ -6395,19 +6416,19 @@ impl HomeView {
         }
         let title = inst.title.clone();
         let tool = inst.tool.clone();
-        let supported = crate::agents::get_agent(&tool)
-            .and_then(|a| a.permission_response)
-            .is_some();
-        if !supported {
+        let Some(response) = crate::agents::get_agent(&tool).and_then(|a| a.permission_response)
+        else {
             self.info_dialog = Some(InfoDialog::new(
                 "Not Supported",
                 &format!("{} doesn't support quick permission responses yet.", tool),
             ));
             return;
-        }
+        };
         self.pending_permission_response_session = Some(id);
-        self.permission_response_dialog =
-            Some(crate::tui::dialogs::PermissionResponseDialog::new(&title));
+        self.permission_response_dialog = Some(crate::tui::dialogs::PermissionResponseDialog::new(
+            &title,
+            response.allow_always,
+        ));
     }
 
     /// Open the send-message dialog for the currently-selected running session.

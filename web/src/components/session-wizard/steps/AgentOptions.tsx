@@ -1,7 +1,7 @@
 import { useCallback, useState } from "react";
 import type { AgentInfo, ProfileInfo } from "../../../lib/types";
 import { fetchSettings } from "../../../lib/api";
-import { isAcpCapable } from "../../../lib/acpCapableTools";
+import { isAcpEligible } from "../../../lib/acpCapableTools";
 import { resolveLaunchCommand } from "../../../lib/launchCommand";
 import { commandMapsFromSettings, EMPTY_COMMAND_MAPS, type CommandMaps } from "../commandMaps";
 import { Toggle } from "./Toggle";
@@ -52,10 +52,18 @@ interface Props {
 }
 
 /** Read-only callout when the selected tool cannot run in the structured view. This
- *  includes built-in tools without ACP support and custom agents that do
- *  not provide `agent_acp_cmd`. ACP-capable tools render
- *  `ViewPickerCard` instead. */
-function ViewNotice({ tool, customAgent }: { tool: string; customAgent: boolean }) {
+ *  includes built-in tools without ACP support, custom agents that do
+ *  not provide `agent_acp_cmd`, and agents the operator's allowlist refuses
+ *  (#3241). ACP-capable and permitted tools render `ViewPickerCard` instead. */
+function ViewNotice({
+  tool,
+  customAgent,
+  policyDenied,
+}: {
+  tool: string;
+  customAgent: boolean;
+  policyDenied: boolean;
+}) {
   return (
     <div className="mb-5 rounded-lg border border-surface-700 bg-surface-950 px-3 py-2.5">
       <div className="flex items-center gap-2">
@@ -65,9 +73,11 @@ function ViewNotice({ tool, customAgent }: { tool: string; customAgent: boolean 
         </span>
       </div>
       <p className="mt-1 text-xs text-text-dim leading-snug">
-        {customAgent
-          ? "Custom agents run in the terminal unless they define agent_acp_cmd in config or TUI settings."
-          : `${tool} has no ACP adapter yet, so this session runs in the terminal view. Pick a tool with an ACP adapter (e.g. claude, opencode, gemini) to use the structured view.`}
+        {policyDenied
+          ? `${tool} is not on the operator's allowed agents list, so this session runs in the terminal view. Pick a permitted agent to use the structured view.`
+          : customAgent
+            ? "Custom agents run in the terminal unless they define agent_acp_cmd in config or TUI settings."
+            : `${tool} has no ACP adapter yet, so this session runs in the terminal view. Pick a tool with an ACP adapter (e.g. claude, opencode, gemini) to use the structured view.`}
       </p>
     </div>
   );
@@ -129,7 +139,7 @@ export function AgentOptions({
 }: Props) {
   const selectedAgent = agents.find((a) => a.name === data.tool);
   const selectedCustomAgent = selectedAgent?.kind === "custom";
-  const acpCapable = isAcpCapable(data.tool, selectedAgent?.acp_capable);
+  const acpCapable = isAcpEligible(data.tool, selectedAgent);
   const isHostOnly = selectedAgent?.host_only ?? false;
   const [showAdvanced, setShowAdvanced] = useState(data.advancedEnabled);
   const showProfilePicker = profiles.length > 1;
@@ -309,7 +319,11 @@ export function AgentOptions({
           sandboxEnabled={data.sandboxEnabled}
         />
       ) : (
-        <ViewNotice tool={data.tool} customAgent={selectedCustomAgent} />
+        <ViewNotice
+          tool={data.tool}
+          customAgent={selectedCustomAgent}
+          policyDenied={selectedAgent?.acp_allowed === false}
+        />
       )}
 
       {/* Profile selector. We render a card list (rather than a native

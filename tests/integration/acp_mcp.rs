@@ -23,6 +23,7 @@ fn base_config(cwd: std::path::PathBuf, record_path: &std::path::Path) -> SpawnC
     let shim = shim_path();
     SpawnConfig {
         agent_key: "claude".into(),
+        tool: "claude".into(),
         spec: AgentSpec {
             command: "node".into(),
             args: vec![shim.to_string_lossy().to_string()],
