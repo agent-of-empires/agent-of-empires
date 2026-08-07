@@ -2868,6 +2868,17 @@ impl HomeView {
     /// (`instance.rs`), which this daemon path never reaches; without this a
     /// sunk row would be restamped and re-marked unread. See #3201 / #1868 /
     /// #2206.
+    ///
+    /// The cost of that exclusion: a sunk structured row that is already in
+    /// `Status::Error` now has no producer able to clear it. The daemon is
+    /// excluded here, the tmux poller bails on structured rows before probing
+    /// (`status_poller.rs`), and `reload_storage_only` carries `prev.status`
+    /// forward across reloads, so the stale value survives. It stays visible
+    /// because `agent_row_icon` lets `Error` and `Deleting` punch through the
+    /// sunk-row mask on purpose (a failed permanent delete has to remain
+    /// legible). The tmux producer has the same property via its own
+    /// `is_archived()` short-circuit, so this is consistent rather than new,
+    /// but unarchiving is the only way back.
     #[cfg(feature = "serve")]
     fn daemon_status_applies_to(&self, inst: &Instance) -> bool {
         !self.recovery_in_flight.contains(&inst.id)
