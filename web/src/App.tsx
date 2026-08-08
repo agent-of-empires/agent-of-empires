@@ -45,6 +45,7 @@ import { usePluginCommands } from "./hooks/usePluginCommands";
 import { useSettingsCommands } from "./hooks/useSettingsCommands";
 import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
 import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
+import { useMobileViewportLock } from "./hooks/useMobileViewportLock";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
 import type { RightPanelView } from "./lib/rightPanelView";
 import { usePaneLayout, dockTabs, dockGroups, dockOf, isActiveTab, isDockCollapsed } from "./lib/paneLayout";
@@ -162,6 +163,7 @@ import { DashboardUpdateBanner } from "./components/DashboardUpdateBanner";
 const LEGACY_TOUR_SEEN_KEY = "aoe-tour-seen";
 
 export default function App() {
+  useMobileViewportLock();
   // Apply the user-selected theme as CSS custom properties on the root
   // element. Runs once on mount + on settings-driven theme changes.
   // The pre-React /theme-bootstrap.js (referenced from index.html)

@@ -211,6 +211,19 @@ body {
   -moz-osx-font-smoothing: grayscale;
 }
 
+#root {
+  height: 100%;
+}
+
+@media (pointer: coarse) {
+  #root {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    overflow: hidden;
+  }
+}
+
 /* Structured view markdown — assistant-ui's MarkdownTextPrimitive renders
    raw <p>/<ul>/<ol>/<h*>/<blockquote>/<code> elements (no class
    names). Style them via descendant selectors so the prose looks
