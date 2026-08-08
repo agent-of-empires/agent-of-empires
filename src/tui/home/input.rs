@@ -3324,7 +3324,7 @@ impl HomeView {
     /// Pick a representative repo path for a selected group so "New Session"
     /// from a project/org/group can prefill the working directory. In
     /// project mode the group label is a derived repo basename, so match
-    /// members by `project_group_name`; in org mode it's a derived GitHub
+    /// members by `project_group_name`; in org mode it's a derived remote
     /// owner, so match by `org_group_name`; in manual mode match by the
     /// stored `group_path`, including nested subgroups. Returns `None` for
     /// an empty group (no member to borrow a path from), leaving the dialog

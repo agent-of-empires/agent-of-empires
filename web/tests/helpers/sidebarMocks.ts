@@ -16,7 +16,7 @@ export interface MockSessionInput {
   created_at?: string;
   /** User group (`aoe add -g`); empty means Ungrouped on the group axis. */
   group?: string;
-  /** Parsed GitHub owner of the repo's `origin` remote; null/omitted means
+  /** Parsed remote owner of the repo's `origin` remote; null/omitted means
    *  the repo has no resolvable owner and buckets into "No organization"
    *  on the org axis (#3283). */
   remote_owner?: string | null;

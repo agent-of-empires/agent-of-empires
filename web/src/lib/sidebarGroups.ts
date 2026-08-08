@@ -16,7 +16,7 @@ import { MULTI_REPO_GROUP_ID, SCRATCH_GROUP_ID } from "../hooks/useRepoGroups";
 export const UNGROUPED_GROUP_ID = "__ungrouped__";
 
 // Synthetic id for the bucket that collects repos with no resolvable
-// GitHub owner on their `origin` remote (scratch sessions, local-only
+// owner on their `origin` remote (scratch sessions, local-only
 // repos, non-hosted remotes). Distinct from any real owner login, so it
 // can double as a localStorage collapse key. See #3283.
 export const NO_ORG_GROUP_ID = "__no_org__";
@@ -319,12 +319,12 @@ export function nestedSidebarGroupShouldRender(group: NestedSidebarGroup): boole
 }
 
 // The org axis (#3283). Every repo belongs to exactly one bucket, keyed by
-// its remote owner (the GitHub org/user login parsed from `origin`), so
-// unlike the nested `repo+group` axis this is a partition of the repo list
-// rather than a further split of each repo's workspaces. Repos with no
-// resolvable owner (scratch sessions, local-only repos, non-hosted
-// remotes) collect into the `NO_ORG_GROUP_ID` bucket, displayed as "No
-// organization".
+// its remote owner (the org/user login parsed from `origin`, on any
+// hosted git remote, not just GitHub), so unlike the nested `repo+group`
+// axis this is a partition of the repo list rather than a further split
+// of each repo's workspaces. Repos with no resolvable owner (scratch
+// sessions, local-only repos, non-hosted remotes) collect into the
+// `NO_ORG_GROUP_ID` bucket, displayed as "No organization".
 export interface OrgNestedGroup {
   org: SidebarGroup;
   repos: SidebarGroup[];

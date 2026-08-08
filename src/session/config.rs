@@ -811,7 +811,7 @@ pub struct AppStateConfig {
 
     /// Paths of org-mode sidebar folders the user has collapsed. Same shape
     /// and rationale as `project_group_collapsed`: org headers are derived
-    /// from each session's resolved GitHub owner rather than a persisted
+    /// from each session's resolved remote owner rather than a persisted
     /// group record, so their collapse state has nowhere else to live.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub org_group_collapsed: Vec<String>,

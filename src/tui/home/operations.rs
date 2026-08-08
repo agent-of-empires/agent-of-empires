@@ -1940,7 +1940,7 @@ impl HomeView {
                 .filter(|i| super::project_group_name(i) == group_path)
                 .map(|i| i.id.clone())
                 .collect(),
-            // Org headers are derived from each session's resolved GitHub
+            // Org headers are derived from each session's resolved remote
             // owner, same unification-across-profiles rationale as Project.
             crate::session::config::GroupByMode::Org => self
                 .instances

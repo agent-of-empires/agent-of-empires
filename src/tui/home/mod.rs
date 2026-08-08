@@ -5153,7 +5153,7 @@ impl HomeView {
     }
 
     /// Org-mode counterpart of `build_flat_items_by_project`: groups sessions
-    /// by their repo's resolved GitHub owner instead of by repo basename.
+    /// by their repo's resolved remote owner instead of by repo basename.
     /// Unlike project mode, there is no org registry to surface empty
     /// "pinned" headers for (#3283 explicitly scopes org grouping to live
     /// sessions only), so the tree is seeded with `&[]` rather than

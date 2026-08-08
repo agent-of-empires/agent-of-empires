@@ -3922,7 +3922,7 @@ fn test_project_group_collapsed_prunes_stale_paths() {
 
 /// Org-mode counterpart of `test_project_group_collapsed_state_persists_to_config`:
 /// org folder collapse state has no group record either (headers are derived
-/// from each session's resolved GitHub owner), so it must round-trip through
+/// from each session's resolved remote owner), so it must round-trip through
 /// `app_state.org_group_collapsed` the same way.
 #[test]
 #[serial]
@@ -9924,8 +9924,9 @@ fn create_test_env_two_projects_mixed_attention() -> TestEnv {
 }
 
 /// Build a HomeView seeded with three sessions: two live in real git repos
-/// with distinct hosted `origin` remotes (different orgs), and one live in a
-/// real git repo with no `origin` remote at all. Helper for
+/// with distinct hosted `origin` remotes on different hosts entirely
+/// (GitHub, GitLab) to prove owner resolution isn't GitHub-specific, and one
+/// live in a real git repo with no `origin` remote at all. Helper for
 /// `build_flat_items_by_org` grouping tests, which (unlike project mode)
 /// need an actual `.git` directory since `get_remote_owner` reads the
 /// on-disk remote configuration rather than parsing the path string.
@@ -9945,7 +9946,7 @@ fn create_test_env_two_orgs() -> TestEnv {
     std::fs::create_dir_all(&repo_b).unwrap();
     git2::Repository::init(&repo_b)
         .unwrap()
-        .remote("origin", "git@github.com:org-b/repo-b.git")
+        .remote("origin", "git@gitlab.com:org-b/repo-b.git")
         .unwrap();
 
     let repo_no_remote = temp.path().join("repo-no-remote");
@@ -9980,8 +9981,9 @@ fn create_test_env_two_orgs() -> TestEnv {
 }
 
 /// `build_flat_items_by_org` must group sessions by each repo's resolved
-/// GitHub owner, and fall a session with no resolvable owner into the
-/// synthetic "No organization" bucket.
+/// remote owner (any hosted git remote, not just GitHub), and fall a
+/// session with no resolvable owner into the synthetic "No organization"
+/// bucket.
 #[test]
 #[serial]
 fn build_flat_items_by_org_groups_by_resolved_owner() {

@@ -3063,7 +3063,7 @@ function workspaceMatchesFilter(ws: Workspace, q: string): boolean {
 }
 
 // The grouping toggle cycles through the four axes on each click. Order is
-// chosen so the first click off the default lands on the GitHub-org axis,
+// chosen so the first click off the default lands on the org axis,
 // then the flat user-group axis (preserving the pre-#1720 repo -> group
 // step), then adds nesting. See #3283.
 const NEXT_AXIS: Record<SidebarAxis, SidebarAxis> = {
