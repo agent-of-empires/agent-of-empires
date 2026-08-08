@@ -1635,14 +1635,17 @@ fn capture_omp_session_id_from_terminal(
     let (content, modified_at_ms) =
         read_host_breadcrumb(&metadata.layout.terminal_sessions, terminal_id)?;
     let breadcrumb = parse_breadcrumb(&content)?;
-    let marker_proves_rewrite =
-        validate_launch_marker(metadata, terminal_id, breadcrumb.session_path)?;
-    if !marker_proves_rewrite {
-        anyhow::ensure!(
-            modified_at_ms > metadata.launched_at_ms,
-            "unproven OMP breadcrumb predates the active pane"
-        );
-    }
+    // The marker proves the breadcrumb is no longer the pre-launch sentinel,
+    // but not that THIS pane produced it after launch: a stale breadcrumb that
+    // lands at the tty after launch also satisfies `pending != session_path`.
+    // A post-launch write (freshness) is the only evidence of post-launch
+    // authorship, so it is required unconditionally; the marker stays a
+    // necessary, not sufficient, guard against adopting the sentinel itself.
+    validate_launch_marker(metadata, terminal_id, breadcrumb.session_path)?;
+    anyhow::ensure!(
+        modified_at_ms > metadata.launched_at_ms,
+        "unproven OMP breadcrumb predates the active pane"
+    );
     // Resolve the target lexically, then canonicalize and re-check store
     // membership BEFORE opening it, matching the in-container script which
     // realpath-validates the store before reading a header. Gating the open
@@ -2648,6 +2651,61 @@ mod tests {
     }
 
     #[test]
+    fn prelaunch_stale_breadcrumb_is_rejected_even_when_marker_differs() {
+        // A modern marker records the pre-launch pending SENTINEL (no breadcrumb
+        // existed at launch). A stale pre-launch breadcrumb then lands at the tty
+        // pointing at another project's old session: internally consistent, but
+        // its mtime predates the launch. It differs from the sentinel, so the
+        // marker "proves rewrite"; only the freshness guard can reject it, so
+        // freshness must apply even when the marker matches (#3230).
+        let tmp = tempfile::tempdir().unwrap();
+        let mut meta = metadata(tmp.path(), 100_000);
+        let old_project = tmp.path().join("unrelated-old-project");
+        let id = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
+        let session = meta
+            .layout
+            .managed_sessions
+            .join("old-project")
+            .join(format!("2020-01-01T00-00-00-000Z_{id}.jsonl"));
+        std::fs::create_dir_all(&old_project).unwrap();
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(
+            &session,
+            format!(
+                "{{\"type\":\"session\",\"id\":\"{id}\",\"cwd\":\"{}\"}}\n",
+                old_project.display()
+            ),
+        )
+        .unwrap();
+        let sentinel = meta
+            .layout
+            .managed_sessions
+            .join(format!(".aoe-pending-{}", meta.launch_id))
+            .join(format!("aoe-pending_{}.jsonl", meta.launch_id));
+        let marker = tmp.path().join("launch-marker");
+        std::fs::write(
+            &marker,
+            launch_marker(&meta, "pts-7", &sentinel.to_string_lossy()),
+        )
+        .unwrap();
+        meta.launch_marker = marker.to_string_lossy().into_owned();
+
+        let crumb = write_breadcrumb(&meta, "pts-7", &old_project, &session, false);
+        set_mtime_ms(&crumb, meta.launched_at_ms - 1);
+        assert!(
+            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-7").is_err(),
+            "a stale pre-launch breadcrumb must not be accepted merely because it \
+             differs from the marker's pending sentinel"
+        );
+        set_mtime_ms(&crumb, meta.launched_at_ms + 1);
+        assert_eq!(
+            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-7").unwrap(),
+            id,
+            "a genuine post-launch rewrite of the same target is still accepted"
+        );
+    }
+
+    #[test]
     fn materialized_breadcrumb_accepts_cross_project_but_requires_header_pair() {
         let tmp = tempfile::tempdir().unwrap();
         let meta = metadata(tmp.path(), 100_000);
@@ -2732,10 +2790,16 @@ mod tests {
 
         write_breadcrumb(&meta, "pts-1", &cwd, &session, false);
         set_mtime_ms(&crumb, 100_000);
+        assert!(
+            capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1").is_err(),
+            "even a marker-proven rewrite must be a post-launch write; otherwise a stale \
+             pre-launch breadcrumb that merely differs from the sentinel is adopted (#3230)"
+        );
+        set_mtime_ms(&crumb, meta.launched_at_ms + 1);
         assert_eq!(
             capture_omp_session_id_from_terminal(&meta, &HashSet::new(), "pts-1").unwrap(),
             id,
-            "a rewritten modern breadcrumb does not depend on mtime"
+            "a fresh marker-proven rewrite is accepted"
         );
 
         std::fs::write(&marker, launch_marker(&meta, "pts-1", "")).unwrap();

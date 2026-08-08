@@ -4030,6 +4030,22 @@ impl Instance {
             prepared.expected_prior_omp_generation.as_deref(),
         );
         if let Some(metadata) = omp_capture_metadata.as_ref() {
+            // The launch preamble (`wrap_omp_launch`) rewrites OMP's breadcrumb
+            // and writes the capture marker only if the store's terminal-sessions
+            // directory already exists; it otherwise falls through to a raw
+            // launch and capture silently no-ops. A first-ever OMP launch (or a
+            // freshly routed store) has no such directory yet, so ensure it here
+            // for the host store. Sandboxed launches resolve a container-side
+            // path the host must not create.
+            if !self.is_sandboxed() {
+                if let Err(error) = std::fs::create_dir_all(&metadata.layout.terminal_sessions) {
+                    tracing::warn!(
+                        target: "session.store",
+                        instance = %self.id,
+                        "OMP capture may no-op: could not ensure terminal-sessions dir: {error}"
+                    );
+                }
+            }
             prepared.launch_env.push((
                 crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY.to_string(),
                 metadata.launch_id.clone(),
