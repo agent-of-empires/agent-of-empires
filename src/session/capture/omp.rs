@@ -25,6 +25,14 @@
 //!   1. cwd (absolute)
 //!   2. session path
 //!   3. optional literal `fresh`
+//!
+//! The two marker CAS anchors (launch id, routing fingerprint) prove the marker
+//! belongs to this generation, but NOT that the breadcrumb was authored after
+//! launch: a stale pre-launch breadcrumb also differs from the pending sentinel.
+//! Post-launch authorship is a third, necessary invariant, proven by freshness:
+//! the breadcrumb must be newer than the launch (host: `modified_at_ms >
+//! launched_at_ms`; container: the breadcrumb is `-nt` the launch marker, which
+//! `wrap_omp_launch` writes just before exec). See `#3230`.
 
 use std::collections::{HashMap, HashSet};
 use std::io::Read;
@@ -1758,7 +1766,8 @@ f="$TERM_DIR/$terminal"
 # the marker was written after launch. Without this, a stale pre-launch
 # breadcrumb pointing at another project's session satisfies the
 # `session_path != marker_pending` CAS below and gets mis-adopted (#3230).
-# `-nt` is POSIX and BusyBox-safe, avoiding the GNU/BSD `stat` format split.
+# `-nt` is a `test` extension implemented by every realistic container shell
+# (dash, BusyBox ash, bash), avoiding the GNU/BSD `stat` format split.
 [ "$f" -nt "$LAUNCH_MARKER" ] || exit 0
 breadcrumb_bytes=$(head -c 16385 "$f" 2>/dev/null | wc -c) || exit 0
 [ "$breadcrumb_bytes" -le 16384 ] || exit 0
@@ -3131,7 +3140,7 @@ mod tests {
         let id = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
         let cwd = "/workspace/project";
         let tmp = tempfile::tempdir().unwrap();
-        let mut meta = metadata(tmp.path(), 100_000);
+        let meta = metadata(tmp.path(), 100_000);
         let session = meta
             .layout
             .sessions
@@ -3147,7 +3156,6 @@ mod tests {
         let marker = tmp.path().join("launch-marker");
         std::fs::write(&marker, launch_marker(&meta, "pts-7", "/pending")).unwrap();
         set_mtime_ms(&marker, 100_000);
-        meta.launch_marker = marker.to_string_lossy().into_owned();
 
         let run = || {
             let mut command = std::process::Command::new("sh");

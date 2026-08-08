@@ -3030,7 +3030,7 @@ pub async fn restore_session(
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
                     "error": "purge_in_progress",
-                    "message": "Session was claimed by a purge mid-restore; restore was refused"
+                    "message": "Session was claimed by a purge mid-restore, so it was not restored"
                 })),
             )
                 .into_response();
