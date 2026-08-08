@@ -1867,12 +1867,14 @@ impl Instance {
     /// `status` and `idle_entered_at` ARE generation-governed: a strictly newer
     /// disk snapshot (a peer's `commit_reserved_lifecycle_status`) must win over
     /// the stale in-memory copy. `last_error`/`last_error_check` are NOT: no
-    /// lifecycle writer (`reserve_/commit_/advance_lifecycle_generation`) ever
-    /// writes `last_error` to disk, so there is no authoritative peer value to
-    /// defer to. Only the live status poller derives it, in memory. Gating it on
-    /// the generation would let an unrelated generation bump (stop/unarchive,
-    /// which pass `status: None`) discard a freshly poller-derived
-    /// `TMUX_SESSION_GONE_ERROR`, leaving the row stuck at `Error`+`None`.
+    /// lifecycle writer (`reserve_/commit_/advance_lifecycle_generation`)
+    /// produces an authoritative peer value for them. The only on-disk value is
+    /// the one `reconcile_from_disk` round-trips back from this same in-memory
+    /// poller state, so there is nothing to defer to and the in-memory value
+    /// always wins. Gating it on the generation would let an unrelated
+    /// generation bump (stop/unarchive, which pass `status: None`) discard a
+    /// freshly poller-derived `TMUX_SESSION_GONE_ERROR`, leaving the row stuck
+    /// at `Error`+`None`.
     pub(crate) fn merge_runtime_from_reload(&mut self, previous: &Self) {
         if self.lifecycle_generation <= previous.lifecycle_generation {
             self.status = previous.status;

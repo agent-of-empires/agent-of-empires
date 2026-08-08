@@ -1752,6 +1752,14 @@ case "$terminal" in ''|.|..|*[!A-Za-z0-9._-]*) exit 0 ;; esac
 [ -n "$marker_pending" ] || exit 0
 f="$TERM_DIR/$terminal"
 [ -f "$f" ] && [ ! -L "$f" ] || exit 0
+# Post-launch authorship proof, mirroring the host guard (capture reads
+# modified_at_ms > launched_at_ms). The launch marker is written by
+# wrap_omp_launch just before exec of the agent, so a breadcrumb newer than
+# the marker was written after launch. Without this, a stale pre-launch
+# breadcrumb pointing at another project's session satisfies the
+# `session_path != marker_pending` CAS below and gets mis-adopted (#3230).
+# `-nt` is POSIX and BusyBox-safe, avoiding the GNU/BSD `stat` format split.
+[ "$f" -nt "$LAUNCH_MARKER" ] || exit 0
 breadcrumb_bytes=$(head -c 16385 "$f" 2>/dev/null | wc -c) || exit 0
 [ "$breadcrumb_bytes" -le 16384 ] || exit 0
 # These sed reads keep a trailing CR while the host `str::lines()` strips it,
@@ -2885,7 +2893,10 @@ mod tests {
         set_mtime_ms(&marker, 100_000);
         let breadcrumb = meta.layout.terminal_sessions.join("pts-9");
         std::fs::write(&breadcrumb, format!("{cwd}\n{}\n", session.display())).unwrap();
-        set_mtime_ms(&breadcrumb, 100_000);
+        // Newer than the launch marker for every run below: the `-nt` freshness
+        // guard requires a post-launch breadcrumb, and marker rewrites here bump
+        // the marker mtime, so pin the breadcrumb far ahead of any of them.
+        set_mtime_ms(&breadcrumb, 4_000_000_000_000);
         std::fs::write(
             meta.layout.terminal_sessions.join("pts-decoy"),
             format!("{cwd}\n{}\nfresh\n", session.display()),
@@ -2928,6 +2939,7 @@ mod tests {
         std::fs::write(&marker, launch_marker(&meta, "pts-9", "/pending")).unwrap();
 
         std::fs::write(&breadcrumb, vec![b'x'; MAX_BREADCRUMB_BYTES + 1]).unwrap();
+        set_mtime_ms(&breadcrumb, 4_000_000_000_000);
         assert!(run(&marker).stdout.is_empty());
 
         std::fs::write(&breadcrumb, format!("{cwd}\n{}\n", session.display())).unwrap();
@@ -3105,6 +3117,72 @@ mod tests {
         .expect("a header within the host scan window must not exceed the container cap");
         assert_eq!(
             select_omp_session_in_container(&output, &meta, &HashSet::new()).unwrap(),
+            id
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn container_rejects_a_pre_launch_stale_breadcrumb_but_accepts_a_post_launch_rewrite() {
+        // Container parity with the host freshness guard (#3230): a breadcrumb
+        // older than the launch marker predates launch and must be rejected even
+        // though it satisfies the `session_path != marker_pending` CAS; a
+        // breadcrumb newer than the marker is a post-launch write and captures.
+        let id = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";
+        let cwd = "/workspace/project";
+        let tmp = tempfile::tempdir().unwrap();
+        let mut meta = metadata(tmp.path(), 100_000);
+        let session = meta
+            .layout
+            .sessions
+            .join("bucket")
+            .join(format!("2026-01-01T00-00-00-000Z_{id}.jsonl"));
+        std::fs::create_dir_all(session.parent().unwrap()).unwrap();
+        std::fs::write(
+            &session,
+            format!("{{\"type\":\"session\",\"id\":\"{id}\",\"cwd\":\"{cwd}\"}}\n"),
+        )
+        .unwrap();
+        let breadcrumb = write_breadcrumb(&meta, "pts-7", Path::new(cwd), &session, false);
+        let marker = tmp.path().join("launch-marker");
+        std::fs::write(&marker, launch_marker(&meta, "pts-7", "/pending")).unwrap();
+        set_mtime_ms(&marker, 100_000);
+        meta.launch_marker = marker.to_string_lossy().into_owned();
+
+        let run = || {
+            let mut command = std::process::Command::new("sh");
+            command.args([
+                "-c",
+                CONTAINER_BREADCRUMB_SCRIPT,
+                "aoe-omp-freshness",
+                meta.layout.terminal_sessions.to_str().unwrap(),
+                marker.to_str().unwrap(),
+                &meta.launch_id,
+                meta.layout.sessions.to_str().unwrap(),
+                meta.layout.managed_sessions.to_str().unwrap(),
+                "managed",
+                &meta.routing_fingerprint,
+            ]);
+            super::super::run_with_timeout_limit(
+                command,
+                COMMAND_TIMEOUT,
+                "container exec (freshness test)",
+                MAX_CONTAINER_CAPTURE_BYTES,
+            )
+            .unwrap()
+        };
+
+        // Stale: breadcrumb older than the marker -> script emits no record.
+        set_mtime_ms(&breadcrumb, 1_000);
+        assert!(
+            select_omp_session_in_container(&run(), &meta, &HashSet::new()).is_err(),
+            "a breadcrumb predating the launch marker must not be captured in-container"
+        );
+
+        // Fresh: breadcrumb written after the marker -> captured.
+        set_mtime_ms(&breadcrumb, 200_000);
+        assert_eq!(
+            select_omp_session_in_container(&run(), &meta, &HashSet::new()).unwrap(),
             id
         );
     }
