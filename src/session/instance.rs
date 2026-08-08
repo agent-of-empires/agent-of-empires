@@ -3872,17 +3872,27 @@ impl Instance {
         })
     }
 
-    fn reservation_is_current(&self, storage: &super::storage::Storage) -> Result<bool> {
+    /// Base ownership predicate (our generation, no fresh peer claim), with
+    /// `extra` layering the caller's additional clause onto the stored row.
+    fn reservation_ownership_holds(
+        &self,
+        storage: &super::storage::Storage,
+        extra: impl Fn(&Instance) -> bool,
+    ) -> Result<bool> {
         storage.update(|instances, _groups| {
             Ok(instances
                 .iter()
                 .find(|instance| instance.id == self.id)
                 .is_some_and(|stored| {
                     stored.lifecycle_generation == self.lifecycle_generation
-                        && stored.status == Status::Starting
                         && !stored.is_seized_by_fresh_peer_claim(Utc::now())
+                        && extra(stored)
                 }))
         })
+    }
+
+    fn reservation_is_current(&self, storage: &super::storage::Storage) -> Result<bool> {
+        self.reservation_ownership_holds(storage, |stored| stored.status == Status::Starting)
     }
 
     /// Ownership check for releasing a failed reservation, keyed on generation
@@ -3893,15 +3903,7 @@ impl Instance {
     /// reservation stranded until its TTL. Generation match plus no fresh peer
     /// claim still proves no peer took the launch over.
     fn reservation_generation_is_ours(&self, storage: &super::storage::Storage) -> Result<bool> {
-        storage.update(|instances, _groups| {
-            Ok(instances
-                .iter()
-                .find(|instance| instance.id == self.id)
-                .is_some_and(|stored| {
-                    stored.lifecycle_generation == self.lifecycle_generation
-                        && !stored.is_seized_by_fresh_peer_claim(Utc::now())
-                }))
-        })
+        self.reservation_ownership_holds(storage, |_| true)
     }
 
     fn ensure_reservation_current(&self, storage: &super::storage::Storage) -> Result<()> {
