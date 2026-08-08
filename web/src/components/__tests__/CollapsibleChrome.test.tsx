@@ -8,7 +8,7 @@ import { ChromeCollapseHandle, CollapsibleRegion } from "../CollapsibleChrome";
 describe("collapsible chrome", () => {
   it("marks the collapsed region inert so hidden chrome leaves the tab order", () => {
     const { rerender, container } = render(
-      <CollapsibleRegion collapsed={false}>
+      <CollapsibleRegion id="conversation-composer" collapsed={false}>
         <button type="button">send</button>
       </CollapsibleRegion>,
     );
@@ -17,7 +17,7 @@ describe("collapsible chrome", () => {
     const inner = () => container.firstElementChild!.firstElementChild as HTMLElement & { inert?: boolean };
     expect(inner().inert || inner().hasAttribute("inert")).toBe(false);
     rerender(
-      <CollapsibleRegion collapsed>
+      <CollapsibleRegion id="conversation-composer" collapsed>
         <button type="button">send</button>
       </CollapsibleRegion>,
     );
@@ -41,6 +41,7 @@ describe("collapsible chrome", () => {
           onToggle={onToggle}
           collapseLabel={edge === "top" ? "Collapse conversation header" : "Collapse message composer"}
           expandLabel={edge === "top" ? "Expand conversation header" : "Expand message composer"}
+          controlsId={edge === "top" ? "conversation-header" : "conversation-composer"}
           testId="handle"
         />,
       );

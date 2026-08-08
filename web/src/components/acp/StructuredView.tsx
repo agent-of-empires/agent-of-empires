@@ -23,6 +23,7 @@ import { AskUserQuestionCard } from "./AskUserQuestionCard";
 import { AcpFileRefContext } from "./AcpFileRefContext";
 import type { FileRef, FileRefSession } from "../../lib/fileRef";
 import { anchorIsStale, autoLoadDecision, scrollRestoreDelta } from "../../lib/historyScroll";
+import { repinOnResize } from "../../lib/repinOnResize";
 import { ToolDensityToggle, ToolDisplayModeProvider, useToolDensityPref } from "./ToolDisplayMode";
 import { AcpRuntime, SUBAGENT_TASK_NAME, TODO_GROUP_NAME, TOOL_GROUP_NAME, type AcpContext } from "./AcpRuntime";
 import { Composer } from "./Composer";
@@ -458,26 +459,15 @@ function AcpChrome({
     };
     sample();
     vp.addEventListener("scroll", sample, { passive: true });
-    // Re-pin a bottom-pinned transcript whenever `el` changes height. Watched
-    // on two elements: the chrome below the viewport (composer, strips) and
-    // the viewport itself, because chrome *outside* this view can also resize
-    // it (the App's header collapse). Growing is self-correcting since the
-    // browser clamps scrollTop; shrinking silently un-pins without this.
-    const repinOnResize = (el: HTMLElement, readHeight: () => number) => {
-      let prevHeight = readHeight();
-      const ro = new ResizeObserver(() => {
-        const nextHeight = readHeight();
-        if (nextHeight === prevHeight) return;
-        prevHeight = nextHeight;
-        if (wasAtBottomRef.current) {
-          vp.scrollTop = vp.scrollHeight;
-        }
-      });
-      ro.observe(el);
-      return ro;
+    // Re-pin on two elements: the chrome below the viewport (composer, queued
+    // strips) and the viewport itself, because chrome *outside* this view can
+    // resize it too (the App's header collapse).
+    const wasAtBottom = () => wasAtBottomRef.current;
+    const repin = () => {
+      vp.scrollTop = vp.scrollHeight;
     };
-    const ro = repinOnResize(below, () => below.offsetHeight);
-    const vpRo = repinOnResize(vp, () => vp.clientHeight);
+    const ro = repinOnResize({ target: below, readHeight: () => below.offsetHeight, wasAtBottom, repin });
+    const vpRo = repinOnResize({ target: vp, readHeight: () => vp.clientHeight, wasAtBottom, repin });
     // Freeze the read position when older rows grow the transcript at the
     // top: add the height delta to scrollTop so the row the user was
     // reading stays under the cursor instead of jumping. Skipped while
@@ -733,6 +723,7 @@ function AcpChrome({
                   onToggle={() => setComposerCollapsed((v) => !v)}
                   collapseLabel="Collapse message composer"
                   expandLabel="Expand message composer"
+                  controlsId="conversation-composer"
                   testId="composer-collapse-toggle"
                 />
               )}
@@ -740,7 +731,7 @@ function AcpChrome({
               {/* Only the composer folds away; the strips above it carry
                   actionable state (queued / rejected prompts, switch failures)
                   that must not vanish behind a collapse the user forgot about. */}
-              <CollapsibleRegion collapsed={composerCollapsible && composerCollapsed} testId="collapsible-composer">
+              <CollapsibleRegion id="conversation-composer" collapsed={composerCollapsible && composerCollapsed}>
                 <Composer
                   sessionId={sessionId}
                   currentAgent={state.agent ?? acpAgent}

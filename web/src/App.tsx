@@ -2149,50 +2149,48 @@ function AppContent({
     activeSession?.view === "structured" &&
     rightPanelView === "agent";
 
-  const topBar = (
-    <TopBar
-      activeWorkspace={activeWorkspace}
-      activeSession={activeSession ?? null}
-      onToggleSidebar={handleToggleSidebar}
-      onOpenPalette={() => setShowPalette(true)}
-      onToggleDiff={toggleDiff}
-      paneIds={allPaneIds}
-      paneDescriptor={paneDescriptor}
-      isPaneOpen={isPaneOpen}
-      onTogglePane={togglePaneAny}
-      onOpenHelp={handleOpenHelp}
-      onOpenAbout={handleOpenAbout}
-      onStartTutorial={tour.startTour}
-      onLogout={onLogout}
-      loginRequired={loginRequired}
-      isOffline={!!error}
-      isDevBuild={isDebugBuild(serverAbout)}
-      onOpenTips={tips.open}
-      onGoDashboard={handleGoDashboard}
-      sidebarColumnVisible={!showSettings && sidebarOpen}
-      rightColumnVisible={isMdUp && !showSettings && !!activeWorkspace && !!activeSession && !rightDockCollapsed}
-    />
-  );
-
   return (
     <AcpPrefsProvider value={acpPrefs}>
       <div className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
-        {headerCollapsible ? (
-          <CollapsibleRegion collapsed={headerCollapsed} testId="collapsible-header">
-            {topBar}
-          </CollapsibleRegion>
-        ) : (
-          topBar
-        )}
+        {/* Wrapped unconditionally, not behind the `headerCollapsible`
+            ternary: swapping the element type at this position would remount
+            `TopBar` (and reset its overflow menu) every time the boundary
+            flips, e.g. opening settings on a phone. An expanded region is a
+            `1fr` grid row around a fixed-height bar, so the wrapper is inert
+            for every view that cannot collapse. */}
+        <CollapsibleRegion id="conversation-header" collapsed={headerCollapsible && headerCollapsed}>
+          <TopBar
+            activeWorkspace={activeWorkspace}
+            activeSession={activeSession ?? null}
+            onToggleSidebar={handleToggleSidebar}
+            onOpenPalette={() => setShowPalette(true)}
+            onToggleDiff={toggleDiff}
+            paneIds={allPaneIds}
+            paneDescriptor={paneDescriptor}
+            isPaneOpen={isPaneOpen}
+            onTogglePane={togglePaneAny}
+            onOpenHelp={handleOpenHelp}
+            onOpenAbout={handleOpenAbout}
+            onStartTutorial={tour.startTour}
+            onLogout={onLogout}
+            loginRequired={loginRequired}
+            isOffline={!!error}
+            isDevBuild={isDebugBuild(serverAbout)}
+            onOpenTips={tips.open}
+            onGoDashboard={handleGoDashboard}
+            sidebarColumnVisible={!showSettings && sidebarOpen}
+            rightColumnVisible={isMdUp && !showSettings && !!activeWorkspace && !!activeSession && !rightDockCollapsed}
+          />
+        </CollapsibleRegion>
 
         <DisconnectBanner />
         <UpdateBanner />
         <DashboardUpdateBanner />
 
-        {/* Below the banners, not directly under the bar: the handle's 32px
-            touch target is absolutely positioned at the top-right, and hanging
-            it off the bar puts it on top of the update banner's dismiss button
-            (same corner), which then cannot be tapped at all. */}
+        {/* Below the banners, not directly under the bar: the handle is
+            absolutely positioned at the top-right, and hanging it off the bar
+            puts it on top of the update banner's dismiss button (same corner),
+            which then cannot be tapped at all. */}
         {headerCollapsible && (
           <ChromeCollapseHandle
             edge="top"
@@ -2200,6 +2198,7 @@ function AppContent({
             onToggle={() => setHeaderCollapsed((v) => !v)}
             collapseLabel="Collapse conversation header"
             expandLabel="Expand conversation header"
+            controlsId="conversation-header"
             testId="header-collapse-toggle"
           />
         )}

@@ -31,8 +31,8 @@ test.describe("mobile conversation chrome collapse", () => {
     const viewportHeight = () => heightOf("acp-viewport");
 
     await expect(page.getByTestId("composer-footer")).toBeVisible();
-    const headerHeight = await heightOf("collapsible-header");
-    const composerHeight = await heightOf("collapsible-composer");
+    const headerHeight = await heightOf("conversation-header");
+    const composerHeight = await heightOf("conversation-composer");
     expect(headerHeight).toBeGreaterThan(0);
     expect(composerHeight).toBeGreaterThan(0);
     const bothExpanded = await viewportHeight();
@@ -40,15 +40,15 @@ test.describe("mobile conversation chrome collapse", () => {
     // Composer collapsed, header still expanded.
     await expect(composerToggle).toHaveAttribute("aria-label", "Collapse message composer");
     await composerToggle.click();
-    await expect.poll(() => heightOf("collapsible-composer")).toBe(0);
-    expect(await heightOf("collapsible-header")).toBe(headerHeight);
+    await expect.poll(() => heightOf("conversation-composer")).toBe(0);
+    expect(await heightOf("conversation-header")).toBe(headerHeight);
     await expect(composerToggle).toHaveAttribute("aria-label", "Expand message composer");
     const composerOnly = await viewportHeight();
     expect(composerOnly).toBeCloseTo(bothExpanded + composerHeight, 0);
 
     // Both collapsed: the handles are still on screen and tappable.
     await headerToggle.click();
-    await expect.poll(() => heightOf("collapsible-header")).toBe(0);
+    await expect.poll(() => heightOf("conversation-header")).toBe(0);
     await expect(headerToggle).toBeVisible();
     await expect(composerToggle).toBeVisible();
     const bothCollapsed = await viewportHeight();
@@ -56,13 +56,13 @@ test.describe("mobile conversation chrome collapse", () => {
 
     // Header collapsed, composer restored: the two states are independent.
     await composerToggle.click();
-    await expect.poll(() => heightOf("collapsible-composer")).toBe(composerHeight);
-    expect(await heightOf("collapsible-header")).toBe(0);
+    await expect.poll(() => heightOf("conversation-composer")).toBe(composerHeight);
+    expect(await heightOf("conversation-header")).toBe(0);
     expect(await viewportHeight()).toBeLessThan(bothCollapsed);
 
     // Back to both expanded, and the composer still works after the round trip.
     await headerToggle.click();
-    await expect.poll(() => heightOf("collapsible-header")).toBe(headerHeight);
+    await expect.poll(() => heightOf("conversation-header")).toBe(headerHeight);
     expect(await viewportHeight()).toBeCloseTo(bothExpanded, 0);
 
     await page.getByRole("textbox").first().fill("still typing");

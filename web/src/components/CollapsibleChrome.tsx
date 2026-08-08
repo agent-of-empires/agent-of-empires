@@ -4,21 +4,23 @@ import { collapsibleInnerClass, collapsibleRegionClass } from "../lib/collapsibl
 
 /** Chrome region (top bar, composer) that collapses to zero layout height.
  *
- *  `testId` lands on the *outer* row: that is the element whose measured height
- *  is the feature's contract (0 when collapsed). The collapsed child keeps a
- *  non-zero box of its own, clipped by the row, so asserting on the child would
- *  report it as visible. */
+ *  `id` lands on the *outer* row, and doubles as the test id, because that one
+ *  element is both the `aria-controls` target of the region's handle and the
+ *  element whose measured height is the feature's contract (0 when collapsed).
+ *  The collapsed child keeps a non-zero box of its own, clipped by the row, so
+ *  pointing either at the child would be wrong. */
 export function CollapsibleRegion({
+  id,
   collapsed,
   children,
-  testId,
 }: {
+  /** Stable unique id; pass the same value as the handle's `controlsId`. */
+  id: string;
   collapsed: boolean;
   children: ReactNode;
-  testId?: string;
 }) {
   return (
-    <div className={collapsibleRegionClass(collapsed)} data-testid={testId}>
+    <div id={id} data-testid={id} className={collapsibleRegionClass(collapsed)}>
       {/* `inert` keeps the hidden region out of the tab order and off the
           accessibility tree; the toggle itself lives outside so it survives. */}
       <div className={collapsibleInnerClass(collapsed)} inert={collapsed}>
@@ -36,6 +38,8 @@ interface HandleProps {
   onToggle: () => void;
   collapseLabel: string;
   expandLabel: string;
+  /** `id` of the {@link CollapsibleRegion} this handle collapses. */
+  controlsId: string;
   testId: string;
 }
 
@@ -45,8 +49,21 @@ interface HandleProps {
  *  the collapsing element would disappear with it and strand the user in the
  *  collapsed state. The host is zero-height and the button is absolutely
  *  positioned, so the handle costs the layout nothing in either state; it
- *  overlays a 16px strip of the transcript edge instead. */
-export function ChromeCollapseHandle({ edge, collapsed, onToggle, collapseLabel, expandLabel, testId }: HandleProps) {
+ *  overlays a 28x16 corner of the transcript edge instead.
+ *
+ *  Hit area and visible area are the same box deliberately. An invisible hit
+ *  area larger than the tab reads as an empty patch of transcript that eats
+ *  taps meant for whatever is underneath (a banner's dismiss button, a link in
+ *  a message), which is worse here than a small target the user can see. */
+export function ChromeCollapseHandle({
+  edge,
+  collapsed,
+  onToggle,
+  collapseLabel,
+  expandLabel,
+  controlsId,
+  testId,
+}: HandleProps) {
   // Expanded top chrome points up (tap to fold it away upward); expanded
   // bottom chrome points down. Collapsed flips both.
   const pointsUp = edge === "top" ? !collapsed : collapsed;
@@ -57,6 +74,7 @@ export function ChromeCollapseHandle({ edge, collapsed, onToggle, collapseLabel,
         type="button"
         onClick={onToggle}
         aria-expanded={!collapsed}
+        aria-controls={controlsId}
         aria-label={label}
         title={label}
         data-testid={testId}
