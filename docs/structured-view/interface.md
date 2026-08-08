@@ -177,6 +177,13 @@ and brings up the soft keyboard, so you do not have to reach for the
 composer field to start typing. Tapping a control inside a message (a
 tool-call card, a link, a button) still does its own thing instead.
 
+This applies while the composer is showing. On a phone the composer can
+be folded away with the tab above it (see [the dashboard
+guide](../guides/web/dashboard.md#on-mobile)); while it is collapsed it
+cannot be typed into or focused, so tapping the transcript does nothing
+and the composer is skipped when tabbing through the page. Tap the same
+tab to bring it back, draft text and all.
+
 ## Composer attachments (images, audio, files)
 
 The web composer can send attachments alongside the prompt text when the
