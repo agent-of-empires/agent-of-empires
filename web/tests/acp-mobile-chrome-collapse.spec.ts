@@ -69,4 +69,75 @@ test.describe("mobile conversation chrome collapse", () => {
     await page.getByRole("button", { name: "Send message" }).click();
     await expect.poll(() => mock.promptBodies.map((b) => b.text)).toContain("still typing");
   });
+
+  // Regression for the hit-target hazard: the handles are overlays, so any
+  // clickable area wider than the tab the user can see silently eats taps on
+  // whatever sits underneath. An earlier revision wrapped the 28x16 tab in an
+  // invisible 32x32 button and made the update banner's dismiss control (same
+  // corner) untappable for as long as a release was pending.
+  test("each handle's clickable area is the tab you can see, so it intercepts nothing around it", async ({ page }) => {
+    const mock = await mockAcpSession(page, {
+      title: "story-collapse-hit",
+      initialEvents: [agentMessageChunk("hello from the agent")],
+    });
+    await page.route("**/api/system/update-status", (r) =>
+      r.fulfill({
+        json: {
+          update_check_mode: "notify",
+          current_version: "0.5.0",
+          latest_version: "0.6.0",
+          update_available: true,
+          release_url: "https://example.invalid/releases/v0.6.0",
+          error: null,
+        },
+      }),
+    );
+    await openStructuredSession(page, mock);
+    await waitForComposerConnected(page);
+
+    // What `elementFromPoint` reports at a viewport point, as a handle test id
+    // (the SVG glyph is a child of the button, so walk up to the button).
+    const handleAt = (x: number, y: number) =>
+      page.evaluate(
+        ([px, py]) =>
+          document
+            .elementFromPoint(px, py)
+            ?.closest<HTMLElement>("[data-testid$='-collapse-toggle']")
+            ?.getAttribute("data-testid") ?? null,
+        [x, y],
+      );
+
+    for (const testId of ["header-collapse-toggle", "composer-collapse-toggle"]) {
+      const box = (await page.getByTestId(testId).boundingBox())!;
+      // The 28x16 tab of the accepted design. Asserted because the geometry is
+      // the behavior: this is what the user aims at and all they can hit.
+      expect({ width: box.width, height: box.height }).toEqual({ width: 28, height: 16 });
+      // The clickable element is the painted one. Without this, a transparent
+      // button wrapping a smaller painted tab would still measure "as big as
+      // it looks" below, because every measurement would be the wrapper's.
+      const painted = await page
+        .getByTestId(testId)
+        .evaluate((el) => getComputedStyle(el).backgroundColor !== "rgba(0, 0, 0, 0)");
+      expect(painted, `${testId} paints its own hit area`).toBe(true);
+      // Inside the tab it is the handle; a few pixels outside it, on every
+      // side, the handle is already out of the way.
+      expect(await handleAt(box.x + box.width / 2, box.y + box.height / 2)).toBe(testId);
+      const outside = [
+        [box.x + box.width / 2, box.y - 6],
+        [box.x + box.width / 2, box.y + box.height + 6],
+        [box.x - 6, box.y + box.height / 2],
+        [box.x + box.width + 6, box.y + box.height / 2],
+      ] as const;
+      for (const [x, y] of outside) {
+        expect(await handleAt(x, y), `${testId} at ${x},${y}`).toBeNull();
+      }
+    }
+
+    // The concrete collision: the banner's dismiss control shares the header
+    // handle's corner. A real click asserts interception, which a geometry
+    // check alone would not (Playwright fails the click if anything covers it).
+    const dismiss = page.getByRole("button", { name: "Dismiss update notice" });
+    await dismiss.click({ timeout: 5_000 });
+    await expect(page.getByRole("status", { name: /Update available/i })).toHaveCount(0);
+  });
 });

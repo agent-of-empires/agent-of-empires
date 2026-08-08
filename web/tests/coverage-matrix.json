@@ -615,11 +615,16 @@
       "id": "app-shell.mobile-chrome-collapse",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/acp-mobile-chrome-collapse.spec.ts", "src/components/__tests__/CollapsibleChrome.test.tsx"],
+      "specs": [
+        "tests/acp-mobile-chrome-collapse.spec.ts",
+        "src/components/__tests__/CollapsibleChrome.test.tsx",
+        "src/lib/repinOnResize.test.ts"
+      ],
       "components": [
         "web/src/components/CollapsibleChrome.tsx",
         "web/src/App.tsx",
-        "web/src/components/acp/StructuredView.tsx"
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/lib/repinOnResize.ts"
       ]
     },
     {

@@ -24,6 +24,29 @@ describe("collapsible chrome", () => {
     expect(inner().inert || inner().hasAttribute("inert")).toBe(true);
   });
 
+  it("points the handle's aria-controls at the region element it collapses", () => {
+    render(
+      <>
+        <ChromeCollapseHandle
+          edge="bottom"
+          collapsed={false}
+          onToggle={() => {}}
+          collapseLabel="Collapse message composer"
+          expandLabel="Expand message composer"
+          controlsId="conversation-composer"
+          testId="handle"
+        />
+        <CollapsibleRegion id="conversation-composer" collapsed={false}>
+          <button type="button">send</button>
+        </CollapsibleRegion>
+      </>,
+    );
+    const controls = screen.getByTestId("handle").getAttribute("aria-controls")!;
+    // The referenced element must exist, and be the row that releases its
+    // height, not the clipped child inside it.
+    expect(document.getElementById(controls)).toBe(screen.getByTestId("conversation-composer"));
+  });
+
   it("labels the handle for the action it performs and points the triangle at it", () => {
     // (edge, collapsed) -> (accessible label, triangle points up)
     const cases = [
