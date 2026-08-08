@@ -1307,9 +1307,11 @@ fn parse_env_kv_lines(stdout: &str) -> Vec<(String, String)> {
         let key = key.trim();
         if !super::environment::is_valid_env_key(key) {
             if warn_on_malformed_key(key) {
+                // Hook stdout is the documented secret channel, so never log a
+                // malformed key derived from it.
                 tracing::warn!(
                     target: "session.create",
-                    "hook produced an invalid environment key '{key}'; skipping"
+                    "hook produced an invalid environment key; skipping"
                 );
             }
             continue;
@@ -1632,6 +1634,7 @@ pub const INIT_TEMPLATE: &str = r#"# Agent of Empires - Repository Configuration
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing_test::traced_test;
 
     #[test]
     fn test_hooks_config_empty() {
@@ -1696,6 +1699,23 @@ mod tests {
                 "warn_on_malformed_key({key:?})"
             );
         }
+    }
+
+    #[traced_test]
+    #[test]
+    fn test_parse_env_kv_lines_does_not_log_malformed_key() {
+        // Hook stdout is a secret channel. A no-whitespace diagnostic can look
+        // like a malformed assignment, so the warning must not repeat it.
+        tracing::callsite::rebuild_interest_cache();
+        let parsed = parse_env_kv_lines("https://token:topsecret@example.test?x=ignored\n");
+        assert!(parsed.is_empty());
+        logs_assert(|lines: &[&str]| {
+            if lines.iter().any(|line| line.contains("topsecret")) {
+                Err("hook stdout secret leaked into logs".to_string())
+            } else {
+                Ok(())
+            }
+        });
     }
 
     #[test]
