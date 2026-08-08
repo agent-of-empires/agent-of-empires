@@ -105,3 +105,5 @@ Lifecycle hooks are shown **read-only** here, each labeled with its source (prof
 ## On mobile
 
 Below the `md` breakpoint the dashboard shows a single full-viewport pane instead of the desktop split. The right-panel button opens a picker that swaps the main pane between **Agent terminal**, **Diff**, and **Paired terminal**; a back chip in the diff and paired views returns to the agent terminal. The agent terminal and paired shell stay alive in the background when you switch away, preserving scrollback and focus.
+
+In a structured-view conversation, the top bar and the message composer can each be folded away to give the transcript their height back. A small tab sits at the top right, below the bar and any banners under it, and another at the bottom right, just above the composer; tap one to collapse that region and tap it again to bring it back. The two are independent, so you can hide either or both, and both tabs stay on screen while collapsed so you are never stranded. Leaving the conversation for the dashboard, settings, or the diff pane shows the top bar again, since it is the only navigation those views have.

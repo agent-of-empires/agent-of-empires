@@ -103,6 +103,26 @@ test.describe("Mobile keyboard detection and layout", () => {
     await openSession(page);
   }
 
+  test("mobile shell is fixed and rejects document-level scroll", async ({ page }) => {
+    await setupAndOpen(page);
+
+    const result = await page.evaluate(() => {
+      const calls: Array<[number, number]> = [];
+      const original = window.scrollTo;
+      Object.defineProperty(window, "scrollTo", {
+        configurable: true,
+        value: (x: number, y: number) => calls.push([x, y]),
+      });
+      Object.defineProperty(document.documentElement, "scrollTop", { configurable: true, value: 120 });
+      window.dispatchEvent(new Event("scroll"));
+      Object.defineProperty(window, "scrollTo", { configurable: true, value: original });
+      return { calls, rootPosition: getComputedStyle(document.getElementById("root")!).position };
+    });
+
+    expect(result.rootPosition).toBe("fixed");
+    expect(result.calls).toContainEqual([0, 0]);
+  });
+
   test("auto-resizes when keyboard opens in Safari browser mode (innerHeight constant)", async ({ page }) => {
     await setupAndOpen(page);
 

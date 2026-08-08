@@ -61,6 +61,16 @@ test("swipe over a full-screen SGR-mouse app forwards SGR wheel bytes", async ({
   // React's delegated touch listeners are passive, so the component cannot
   // preventDefault the native pan (the keyboard-open page-scroll clunk).
   await expect.poll(() => scroller(page).evaluate((el) => getComputedStyle(el).touchAction)).toBe("none");
+  // A direct, non-passive listener backs this up if WebKit decided the
+  // gesture's touch-action before the frame switched into forward mode.
+  await expect
+    .poll(() =>
+      scroller(page).evaluate((el) => {
+        const move = new Event("touchmove", { cancelable: true });
+        return el.dispatchEvent(move);
+      }),
+    )
+    .toBe(false);
   await swipeUp(page);
   await expect.poll(() => texts(handle).some((s) => s.includes("\x1b[<65;"))).toBe(true);
 

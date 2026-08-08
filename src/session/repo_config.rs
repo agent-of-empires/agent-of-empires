@@ -1306,16 +1306,30 @@ fn parse_env_kv_lines(stdout: &str) -> Vec<(String, String)> {
         };
         let key = key.trim();
         if !super::environment::is_valid_env_key(key) {
-            tracing::warn!(
-                target: "session.create",
-                "hook produced an invalid environment key; skipping"
-            );
+            if warn_on_malformed_key(key) {
+                // Hook stdout is the documented secret channel, so never log a
+                // malformed key derived from it.
+                tracing::warn!(
+                    target: "session.create",
+                    "hook produced an invalid environment key; skipping"
+                );
+            }
             continue;
         }
         out.retain(|(k, _)| k != key);
         out.push((key.to_string(), value.to_string()));
     }
     out
+}
+
+/// True when a malformed env key should still raise a warning. A multi-word key
+/// (e.g. `fetching token from url`) is a hook diagnostic, not an env assignment;
+/// the documented contract ignores non-KEY=VALUE lines, so it is dropped
+/// silently. A single-token key that fails the grammar (e.g. `FOO-BAR`, `9BAD`)
+/// looks like an intended assignment and is worth surfacing, so a real config
+/// mistake is not buried under per-diagnostic log noise.
+fn warn_on_malformed_key(key: &str) -> bool {
+    !key.chars().any(|c| c.is_whitespace())
 }
 
 /// Run `host_hooks.before_start` commands on the host and collect the
@@ -1620,6 +1634,7 @@ pub const INIT_TEMPLATE: &str = r#"# Agent of Empires - Repository Configuration
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing_test::traced_test;
 
     #[test]
     fn test_hooks_config_empty() {
@@ -1662,6 +1677,45 @@ mod tests {
         // last value.
         let parsed = parse_env_kv_lines("K=first\r\nK=second\r\n");
         assert_eq!(parsed, vec![("K".to_string(), "second".to_string())]);
+    }
+
+    #[test]
+    fn test_warn_on_malformed_key() {
+        // Single-token keys that look like intended assignments warn; multi-word
+        // diagnostic lines stay silent so a hook printing `fetching token from
+        // url=...` does not spam the log.
+        let cases = [
+            ("FOO-BAR", true),
+            ("9BAD", true),
+            ("foo.bar", true),
+            ("fetching token from url", false),
+            ("error: token invalid", false),
+            ("", true),
+        ];
+        for (key, expected) in cases {
+            assert_eq!(
+                warn_on_malformed_key(key),
+                expected,
+                "warn_on_malformed_key({key:?})"
+            );
+        }
+    }
+
+    #[traced_test]
+    #[test]
+    fn test_parse_env_kv_lines_does_not_log_malformed_key() {
+        // Hook stdout is a secret channel. A no-whitespace diagnostic can look
+        // like a malformed assignment, so the warning must not repeat it.
+        tracing::callsite::rebuild_interest_cache();
+        let parsed = parse_env_kv_lines("https://token:topsecret@example.test?x=ignored\n");
+        assert!(parsed.is_empty());
+        logs_assert(|lines: &[&str]| {
+            if lines.iter().any(|line| line.contains("topsecret")) {
+                Err("hook stdout secret leaked into logs".to_string())
+            } else {
+                Ok(())
+            }
+        });
     }
 
     #[test]

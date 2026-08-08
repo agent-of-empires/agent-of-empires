@@ -8,6 +8,7 @@ import { writeClipboard } from "../lib/clipboard";
 import type { LiveFrame } from "../hooks/useLiveTerminal";
 import { useWebSettings } from "../hooks/useWebSettings";
 import { useIsCoarsePointer } from "../hooks/useIsCoarsePointer";
+import { useTerminalGestureBoundary } from "../hooks/useTerminalGestureBoundary";
 
 // Mobile rendering of a tmux agent pane, mirroring the TUI's live mode:
 // the server streams `capture-pane` snapshots (src/server/live_ws.rs)
@@ -695,12 +696,7 @@ export function MobileLiveTerminal({
   const forwardMode = (frame?.altScreen ?? false) && (frame?.mouse ?? false);
   const mouseSgr = frame?.mouseSgr ?? false;
   const effectiveSpacerLines = forwardMode ? 0 : spacerLines;
-  const forwardModeRef = useRef(forwardMode);
-  const mouseSgrRef = useRef(mouseSgr);
-  useEffect(() => {
-    forwardModeRef.current = forwardMode;
-    mouseSgrRef.current = mouseSgr;
-  }, [forwardMode, mouseSgr]);
+  const { forwardModeRef, mouseSgrRef } = useTerminalGestureBoundary({ scrollerRef, forwardMode, mouseSgr });
   // Sub-notch scroll remainder (px) carried across events, and the last
   // touch Y while forwarding a single-finger drag.
   const wheelAccumRef = useRef(0);
@@ -886,7 +882,7 @@ export function MobileLiveTerminal({
     if (el.scrollHeight - el.clientHeight - el.scrollTop < 2 && !movingUp) {
       liveDetachedRef.current = false;
     }
-  }, [atBottom, enterReading, reading, returnToLive, scheduleViewSync]);
+  }, [atBottom, enterReading, forwardModeRef, reading, returnToLive, scheduleViewSync]);
 
   const jumpToLatest = useCallback(() => {
     const el = scrollerRef.current;
@@ -950,7 +946,7 @@ export function MobileLiveTerminal({
       const up = notches < 0;
       for (let i = 0; i < Math.abs(notches); i++) forwardWheel(up, mouseSgrRef.current, col, wheelRow);
     },
-    [lineH, pointerCell, forwardWheel],
+    [lineH, pointerCell, forwardWheel, mouseSgrRef],
   );
 
   const cancelTouchWheelQueue = useCallback(() => {
@@ -993,7 +989,7 @@ export function MobileLiveTerminal({
       // swipe track remote redraws instead of arriving as a wheel storm.
       if (!queued.raf) flushOne();
     },
-    [lineH, pointerCell, forwardWheel],
+    [lineH, pointerCell, forwardWheel, forwardModeRef, mouseSgrRef],
   );
   useEffect(() => cancelTouchWheelQueue, [cancelTouchWheelQueue]);
 
@@ -1004,7 +1000,7 @@ export function MobileLiveTerminal({
       const factor = e.deltaMode === 1 ? lineH || 16 : e.deltaMode === 2 ? (lineH || 16) * (rowsRef.current || 1) : 1;
       forwardWheelDelta(e.deltaY * factor, e.clientX, e.clientY);
     },
-    [lineH, forwardWheelDelta],
+    [lineH, forwardWheelDelta, forwardModeRef],
   );
 
   // --- forward-mode touch momentum -----------------------------------------
@@ -1051,7 +1047,7 @@ export function MobileLiveTerminal({
       };
       state.raf = requestAnimationFrame(step);
     },
-    [stopMomentum, enqueueTouchWheelDelta],
+    [stopMomentum, enqueueTouchWheelDelta, forwardModeRef],
   );
   // Typed input interrupts the coast. Without this, keystrokes sent in the
   // coast's 1-2s tail interleave with the wheel storm and the app is busy
@@ -1091,7 +1087,7 @@ export function MobileLiveTerminal({
         // jsdom / unsupported: capture is a nicety, not required.
       }
     },
-    [pointerCell, forwardButton, inputRef],
+    [pointerCell, forwardButton, inputRef, forwardModeRef, mouseSgrRef],
   );
   const onPointerMove = useCallback(
     (e: React.PointerEvent) => {
@@ -1103,7 +1099,7 @@ export function MobileLiveTerminal({
       lastForwardCellRef.current = { col, row };
       forwardButton(forwardBtnRef.current, false, true, mouseSgrRef.current, col, row);
     },
-    [pointerCell, forwardButton],
+    [pointerCell, forwardButton, mouseSgrRef],
   );
   const endPointerForward = useCallback(
     (e: React.PointerEvent) => {
@@ -1126,7 +1122,7 @@ export function MobileLiveTerminal({
         // Capture may never have been taken (see onPointerDown).
       }
     },
-    [pointerCell, forwardButton, armAgentClipboard],
+    [pointerCell, forwardButton, armAgentClipboard, mouseSgrRef],
   );
 
   // --- pinch zoom (two-finger) ---------------------------------------------
@@ -1175,7 +1171,7 @@ export function MobileLiveTerminal({
         suppressTouchClickRef.current = false;
       }
     },
-    [fontSize, stopMomentum, cancelTouchWheelQueue],
+    [fontSize, stopMomentum, cancelTouchWheelQueue, forwardModeRef],
   );
   const onTouchMove = useCallback(
     (e: React.TouchEvent) => {
@@ -1228,7 +1224,7 @@ export function MobileLiveTerminal({
         }
       }
     },
-    [enqueueTouchWheelDelta, enterReading],
+    [enqueueTouchWheelDelta, enterReading, forwardModeRef],
   );
   const onTouchEnd = useCallback(
     (e: React.TouchEvent) => {
@@ -1292,7 +1288,7 @@ export function MobileLiveTerminal({
         }, 400);
       }
     },
-    [fontKey, fontSize, update, returnToLive, atBottom, startMomentum, enqueueTouchWheelDelta],
+    [fontKey, fontSize, update, returnToLive, atBottom, startMomentum, enqueueTouchWheelDelta, forwardModeRef],
   );
   // touchcancel is NOT touchend: iOS fires it when it promotes the drag to
   // native scrolling, with the finger usually STILL down. Treat it as "stop

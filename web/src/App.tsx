@@ -45,6 +45,7 @@ import { usePluginCommands } from "./hooks/usePluginCommands";
 import { useSettingsCommands } from "./hooks/useSettingsCommands";
 import { useEdgeSwipe } from "./hooks/useEdgeSwipe";
 import { useIsCoarsePointer } from "./hooks/useIsCoarsePointer";
+import { useMobileViewportLock } from "./hooks/useMobileViewportLock";
 import { useIsWideViewport } from "./hooks/useIsWideViewport";
 import type { RightPanelView } from "./lib/rightPanelView";
 import { usePaneLayout, dockTabs, dockGroups, dockOf, isActiveTab, isDockCollapsed } from "./lib/paneLayout";
@@ -131,6 +132,7 @@ import { PairedShellPane } from "./components/PairedTerminal";
 import { BUILTIN_PANES, isTerminalTabId, terminalIndexOf, terminalTabId, type DockLocation } from "./lib/panes";
 import { MobileRightPanelPicker } from "./components/MobileRightPanelPicker";
 import { MobileMainPane } from "./components/MobileMainPane";
+import { ChromeCollapseHandle, CollapsibleRegion } from "./components/CollapsibleChrome";
 import { DiffFileViewer } from "./components/diff/DiffFileViewer";
 import { SettingsView } from "./components/SettingsView";
 import { ProjectFormModal } from "./components/ProjectFormModal";
@@ -162,6 +164,7 @@ import { DashboardUpdateBanner } from "./components/DashboardUpdateBanner";
 const LEGACY_TOUR_SEEN_KEY = "aoe-tour-seen";
 
 export default function App() {
+  useMobileViewportLock();
   // Apply the user-selected theme as CSS custom properties on the root
   // element. Runs once on mount + on settings-driven theme changes.
   // The pre-React /theme-bootstrap.js (referenced from index.html)
@@ -672,6 +675,14 @@ function AppContent({
   const singlePane = !isMdUp;
   const [rightPanelView, setRightPanelView] = useState<RightPanelView>("agent");
   const [pickerOpen, setPickerOpen] = useState(false);
+  // Reading mode for the phone conversation view: the top bar folds away so the
+  // transcript gets its 48px back (the composer has its own, independent
+  // handle inside StructuredView). Kept here rather than in the structured view
+  // because the top bar is the App shell's own child. State is App-level, so it
+  // survives switching sessions; the collapse only *applies* on the mobile
+  // conversation view, so leaving it on and navigating to settings or the
+  // dashboard shows the bar again.
+  const [headerCollapsed, setHeaderCollapsed] = useState(false);
   // The paired shell mounts lazily on first activation, then stays mounted
   // (kept alive but hidden) so its PTY, scrollback, and focus survive view
   // switches. Mounting it eagerly would spawn a shell for every mobile
@@ -2130,35 +2141,69 @@ function AppContent({
     return <div className="h-dvh bg-surface-900 safe-area-inset" />;
   }
 
+  // The header collapse is a phone affordance for the conversation view only:
+  // at md and up there is room for both the bar and the transcript, and on the
+  // dashboard / settings / diff panes the bar is the only navigation there is.
+  const headerCollapsible =
+    singlePane &&
+    !showSettings &&
+    !!activeWorkspace &&
+    activeSession?.view === "structured" &&
+    rightPanelView === "agent";
+
   return (
     <AcpPrefsProvider value={acpPrefs}>
       <div className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
-        <TopBar
-          activeWorkspace={activeWorkspace}
-          activeSession={activeSession ?? null}
-          onToggleSidebar={handleToggleSidebar}
-          onOpenPalette={() => setShowPalette(true)}
-          onToggleDiff={toggleDiff}
-          paneIds={allPaneIds}
-          paneDescriptor={paneDescriptor}
-          isPaneOpen={isPaneOpen}
-          onTogglePane={togglePaneAny}
-          onOpenHelp={handleOpenHelp}
-          onOpenAbout={handleOpenAbout}
-          onStartTutorial={tour.startTour}
-          onLogout={onLogout}
-          loginRequired={loginRequired}
-          isOffline={!!error}
-          isDevBuild={isDebugBuild(serverAbout)}
-          onOpenTips={tips.open}
-          onGoDashboard={handleGoDashboard}
-          sidebarColumnVisible={!showSettings && sidebarOpen}
-          rightColumnVisible={isMdUp && !showSettings && !!activeWorkspace && !!activeSession && !rightDockCollapsed}
-        />
+        {/* Wrapped unconditionally, not behind the `headerCollapsible`
+            ternary: swapping the element type at this position would remount
+            `TopBar` (and reset its overflow menu) every time the boundary
+            flips, e.g. opening settings on a phone. An expanded region is a
+            `1fr` grid row around a fixed-height bar, so the wrapper is inert
+            for every view that cannot collapse. */}
+        <CollapsibleRegion id="conversation-header" collapsed={headerCollapsible && headerCollapsed}>
+          <TopBar
+            activeWorkspace={activeWorkspace}
+            activeSession={activeSession ?? null}
+            onToggleSidebar={handleToggleSidebar}
+            onOpenPalette={() => setShowPalette(true)}
+            onToggleDiff={toggleDiff}
+            paneIds={allPaneIds}
+            paneDescriptor={paneDescriptor}
+            isPaneOpen={isPaneOpen}
+            onTogglePane={togglePaneAny}
+            onOpenHelp={handleOpenHelp}
+            onOpenAbout={handleOpenAbout}
+            onStartTutorial={tour.startTour}
+            onLogout={onLogout}
+            loginRequired={loginRequired}
+            isOffline={!!error}
+            isDevBuild={isDebugBuild(serverAbout)}
+            onOpenTips={tips.open}
+            onGoDashboard={handleGoDashboard}
+            sidebarColumnVisible={!showSettings && sidebarOpen}
+            rightColumnVisible={isMdUp && !showSettings && !!activeWorkspace && !!activeSession && !rightDockCollapsed}
+          />
+        </CollapsibleRegion>
 
         <DisconnectBanner />
         <UpdateBanner />
         <DashboardUpdateBanner />
+
+        {/* Below the banners, not directly under the bar: the handle is
+            absolutely positioned at the top-right, and hanging it off the bar
+            puts it on top of the update banner's dismiss button (same corner),
+            which then cannot be tapped at all. */}
+        {headerCollapsible && (
+          <ChromeCollapseHandle
+            edge="top"
+            collapsed={headerCollapsed}
+            onToggle={() => setHeaderCollapsed((v) => !v)}
+            collapseLabel="Collapse conversation header"
+            expandLabel="Expand conversation header"
+            controlsId="conversation-header"
+            testId="header-collapse-toggle"
+          />
+        )}
 
         <div className="flex flex-1 min-h-0">
           {!showSettings && (
