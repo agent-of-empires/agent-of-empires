@@ -119,10 +119,13 @@ impl PurgeTransaction {
             if decision != crate::session::claim::PurgeClaimDecision::Claimed {
                 let retained = instances.iter().find(|instance| instance.id == id).cloned();
                 let (disposition, message) = match decision {
-                    crate::session::claim::PurgeClaimDecision::Restored
-                    | crate::session::claim::PurgeClaimDecision::RestoreInProgress => (
+                    crate::session::claim::PurgeClaimDecision::Restored => (
                         DeletionDisposition::KeptRestored,
                         "Session is being restored, so it was not purged",
+                    ),
+                    crate::session::claim::PurgeClaimDecision::RestoreInProgress => (
+                        DeletionDisposition::KeptRestored,
+                        "Session is being restored by another process, so it was not purged",
                     ),
                     crate::session::claim::PurgeClaimDecision::Busy => (
                         DeletionDisposition::Busy,

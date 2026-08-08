@@ -1863,13 +1863,23 @@ impl Instance {
 
     /// Carry runtime-only state across a storage reload without constructing a
     /// lifecycle snapshot from two different generations.
+    ///
+    /// `status` and `idle_entered_at` ARE generation-governed: a strictly newer
+    /// disk snapshot (a peer's `commit_reserved_lifecycle_status`) must win over
+    /// the stale in-memory copy. `last_error`/`last_error_check` are NOT: no
+    /// lifecycle writer (`reserve_/commit_/advance_lifecycle_generation`) ever
+    /// writes `last_error` to disk, so there is no authoritative peer value to
+    /// defer to. Only the live status poller derives it, in memory. Gating it on
+    /// the generation would let an unrelated generation bump (stop/unarchive,
+    /// which pass `status: None`) discard a freshly poller-derived
+    /// `TMUX_SESSION_GONE_ERROR`, leaving the row stuck at `Error`+`None`.
     pub(crate) fn merge_runtime_from_reload(&mut self, previous: &Self) {
         if self.lifecycle_generation <= previous.lifecycle_generation {
             self.status = previous.status;
-            self.last_error = previous.last_error.clone();
-            self.last_error_check = previous.last_error_check;
             self.idle_entered_at = previous.idle_entered_at;
         }
+        self.last_error = previous.last_error.clone();
+        self.last_error_check = previous.last_error_check;
         self.last_start_time = previous.last_start_time;
         self.session_id_poller = previous.session_id_poller.clone();
         self.retroactive_capture_excludes = previous.retroactive_capture_excludes.clone();
@@ -6358,7 +6368,7 @@ impl Instance {
             return;
         }
 
-        if self.status == Status::Error {
+        if self.status == Status::Error && self.last_error.is_some() {
             if let Some(last_check) = self.last_error_check {
                 if last_check.elapsed().as_secs() < 30 {
                     return;
@@ -8279,10 +8289,36 @@ mod tests {
         reloaded.last_error = None;
         reloaded.merge_runtime_from_reload(&previous);
 
+        // Generation-governed fields: the strictly-newer disk snapshot wins.
         assert_eq!(reloaded.lifecycle_generation, 4);
         assert_eq!(reloaded.status, Status::Stopped);
         assert_eq!(reloaded.idle_entered_at, None);
-        assert_eq!(reloaded.last_error, None);
+        // last_error is runtime-only: the in-memory poller value survives even a
+        // newer generation, since no lifecycle writer persists last_error.
+        assert_eq!(reloaded.last_error.as_deref(), Some("old observation"));
+    }
+
+    #[test]
+    fn runtime_reload_preserves_poller_gone_error_across_generation_bump() {
+        // A stop/unarchive bumps the disk generation with status: None, so the
+        // reloaded row carries no last_error. The poller's freshly derived
+        // TMUX_SESSION_GONE_ERROR (in memory) must survive, or the row freezes
+        // at Error+None and the stopped preview never renders (#3230).
+        let mut previous = Instance::new("session", "/tmp/test");
+        previous.lifecycle_generation = 7;
+        previous.status = Status::Error;
+        previous.last_error = Some(TMUX_SESSION_GONE_ERROR.to_string());
+
+        let mut reloaded = previous.clone();
+        reloaded.lifecycle_generation = 8;
+        reloaded.status = Status::Error;
+        reloaded.last_error = None;
+        reloaded.merge_runtime_from_reload(&previous);
+
+        assert_eq!(
+            reloaded.last_error.as_deref(),
+            Some(TMUX_SESSION_GONE_ERROR)
+        );
     }
 
     #[test]
