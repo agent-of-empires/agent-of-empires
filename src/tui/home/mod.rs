@@ -2521,11 +2521,8 @@ impl HomeView {
             for inst in &mut instances {
                 inst.source_profile = profile_name.clone();
                 if let Some(prev) = self.instances.get(&inst.id) {
-                    // Generation-governed status (status/idle_entered_at) wins
-                    // only when the disk snapshot's generation is strictly
-                    // newer; runtime-only fields, including the poller-derived
-                    // last_error, survive every reload (no lifecycle writer
-                    // persists last_error, so there is no peer value to defer to).
+                    // Field-ownership rules (generation-governed vs runtime-only)
+                    // live on merge_runtime_from_reload.
                     inst.merge_runtime_from_reload(prev);
                 }
             }
