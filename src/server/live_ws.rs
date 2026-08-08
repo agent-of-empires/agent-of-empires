@@ -171,6 +171,11 @@ enum LiveControlMessage {
     Window { lines: usize },
     #[serde(rename = "cadence")]
     Cadence { fast: bool },
+    /// Request the lock when it is vacant, without resizing or displacing a
+    /// live owner. Mobile startup uses this while the soft keyboard prevents a
+    /// safe grid measurement.
+    #[serde(rename = "claim_if_vacant")]
+    ClaimIfVacant,
     /// Explicit "take over" from a non-owner client: steal the size-owner
     /// lock even from a live holder (a user tap is intentional, unlike the
     /// passive flap the heartbeat guards against).
@@ -1028,6 +1033,28 @@ async fn handle_live_ws(
                                     nudge.notify_one();
                                 }
                             }
+                            LiveControlMessage::ClaimIfVacant => {
+                                // A keyboard-open mobile pane intentionally
+                                // postpones its first resize so it never sends
+                                // keyboard-shrunk rows to tmux. It still needs
+                                // an ownership decision before its gesture-
+                                // bound input buffer can flush. Claim only an
+                                // unheld or stale lock; unlike `claim`, this
+                                // never takes control from another viewer.
+                                let name = tmux_name.clone();
+                                let who = owner_id.clone();
+                                let owned = tokio::task::spawn_blocking(move || {
+                                    crate::tmux::Session::from_name(&name)
+                                        .claim_size_owner(&who, SIZE_OWNER_TTL)
+                                })
+                                .await
+                                .unwrap_or(false);
+                                settings.is_owner.store(owned, Ordering::Relaxed);
+                                let _ = out_tx
+                                    .send(Message::Text(size_owner_json(owned).into()))
+                                    .await;
+                                nudge.notify_one();
+                            }
                             LiveControlMessage::Claim => {
                                 // Explicit take-over: steal the lock even from
                                 // a live holder, then size the window to our
@@ -1318,6 +1345,8 @@ mod tests {
         assert!(matches!(m, LiveControlMessage::Cadence { fast: false }));
         let m: LiveControlMessage = serde_json::from_str(r#"{"type":"claim"}"#).unwrap();
         assert!(matches!(m, LiveControlMessage::Claim));
+        let m: LiveControlMessage = serde_json::from_str(r#"{"type":"claim_if_vacant"}"#).unwrap();
+        assert!(matches!(m, LiveControlMessage::ClaimIfVacant));
         let m: LiveControlMessage =
             serde_json::from_str(r#"{"type":"caps","deflate":true}"#).unwrap();
         assert!(matches!(m, LiveControlMessage::Caps { deflate: true }));

@@ -152,9 +152,12 @@ export async function mockTerminalApis(
       handle.liveMessages.push(Buffer.from(msg));
       try {
         const control = JSON.parse(String(msg)) as { type?: string; rows?: number; lines?: number };
-        if (control.type === "resize" && control.rows) {
+        if (control.type === "claim_if_vacant") {
+          ws.send(JSON.stringify({ type: "size_owner", is_owner: true }));
+        } else if (control.type === "resize" && control.rows) {
           rows = control.rows;
           window = Math.max(window, rows);
+          ws.send(JSON.stringify({ type: "size_owner", is_owner: true }));
           reply();
         } else if (control.type === "window" && control.lines) {
           const shrinking = control.lines < window;
