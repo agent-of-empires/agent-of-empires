@@ -219,13 +219,13 @@ impl DiffView {
     /// Build one side of a split row: right-justified line number, a +/-/space
     /// marker, and content truncated to `content_w` columns. `None` renders an
     /// empty cell of the same width.
-    fn split_cell<'a>(
-        line: Option<&'a crate::git::diff::DiffLine>,
+    fn split_cell(
+        line: Option<&crate::git::diff::DiffLine>,
         is_left: bool,
         num_width: usize,
         content_w: usize,
         theme: &Theme,
-    ) -> Vec<Span<'a>> {
+    ) -> Vec<Span<'static>> {
         // Every cell occupies exactly this width (line number + space + marker
         // + padded content) so both columns line up and the divider draws as a
         // straight vertical line regardless of content length.
@@ -280,9 +280,19 @@ impl DiffView {
     }
 
     fn render_diff_content(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
+        let markdown_mode = self
+            .markdown_available()
+            .then_some(if self.markdown_rendered {
+                "Rendered"
+            } else {
+                "Raw"
+            });
         let title = self
             .selected_file()
-            .map(|f| format!(" {} ", f.path.display()))
+            .map(|f| match markdown_mode {
+                Some(mode) => format!(" {} · {mode} ", f.path.display()),
+                None => format!(" {} ", f.path.display()),
+            })
             .unwrap_or_else(|| " Diff ".to_string());
 
         let block = Block::default()
@@ -293,6 +303,14 @@ impl DiffView {
 
         let inner = block.inner(area);
         frame.render_widget(block, area);
+
+        let markdown_lines = self
+            .current_markdown_source()
+            .map(|source| crate::tui::markdown::render_wrapped(source, inner.width));
+        if let Some(lines) = markdown_lines {
+            self.render_scrollable_lines(frame, area, inner, lines);
+            return;
+        }
 
         if let Some(file) = self.files.get(self.selected_file) {
             if let Some(diff) = self.diff_cache.get(&file.path) {
@@ -373,7 +391,7 @@ impl DiffView {
                                     Style::default().fg(theme.dimmed),
                                 ),
                                 Span::styled(prefix, style),
-                                Span::styled(content, style),
+                                Span::styled(content.to_string(), style),
                             ]));
                         }
                     }
@@ -381,40 +399,7 @@ impl DiffView {
                     lines.push(Line::from(""));
                 }
 
-                // Update dimensions from actual content
-                let total_lines = lines.len();
-                let visible_lines = inner.height as usize;
-                self.total_lines = total_lines as u16;
-                self.visible_lines = visible_lines as u16;
-
-                // Clamp scroll offset to valid range
-                let max_scroll = total_lines.saturating_sub(visible_lines);
-                if (self.scroll_offset as usize) > max_scroll {
-                    self.scroll_offset = max_scroll as u16;
-                }
-
-                // Apply scrolling
-                let scroll = self.scroll_offset as usize;
-                let visible: Vec<Line> =
-                    lines.into_iter().skip(scroll).take(visible_lines).collect();
-
-                let paragraph = Paragraph::new(visible);
-                frame.render_widget(paragraph, inner);
-
-                // Render scrollbar
-                if total_lines > visible_lines {
-                    let scrollbar_area = Rect {
-                        x: area.x + area.width - 1,
-                        y: area.y + 1,
-                        width: 1,
-                        height: area.height.saturating_sub(2),
-                    };
-                    let mut scrollbar_state = ScrollbarState::new(max_scroll + 1).position(scroll);
-                    let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
-                        .begin_symbol(Some("↑"))
-                        .end_symbol(Some("↓"));
-                    frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
-                }
+                self.render_scrollable_lines(frame, area, inner, lines);
             } else {
                 let msg =
                     Paragraph::new("Loading diff...").style(Style::default().fg(theme.dimmed));
@@ -423,6 +408,42 @@ impl DiffView {
         } else {
             let msg = Paragraph::new("No file selected").style(Style::default().fg(theme.dimmed));
             frame.render_widget(msg, inner);
+        }
+    }
+
+    fn render_scrollable_lines<'a>(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        inner: Rect,
+        lines: Vec<Line<'a>>,
+    ) {
+        let total_lines = lines.len();
+        let visible_lines = inner.height as usize;
+        self.total_lines = total_lines.min(u16::MAX as usize) as u16;
+        self.visible_lines = inner.height;
+
+        let max_scroll = total_lines.saturating_sub(visible_lines);
+        if (self.scroll_offset as usize) > max_scroll {
+            self.scroll_offset = max_scroll.min(u16::MAX as usize) as u16;
+        }
+
+        let scroll = self.scroll_offset as usize;
+        let visible: Vec<Line> = lines.into_iter().skip(scroll).take(visible_lines).collect();
+        frame.render_widget(Paragraph::new(visible), inner);
+
+        if total_lines > visible_lines {
+            let scrollbar_area = Rect {
+                x: area.x + area.width - 1,
+                y: area.y + 1,
+                width: 1,
+                height: area.height.saturating_sub(2),
+            };
+            let mut scrollbar_state = ScrollbarState::new(max_scroll + 1).position(scroll);
+            let scrollbar = Scrollbar::new(ScrollbarOrientation::VerticalRight)
+                .begin_symbol(Some("↑"))
+                .end_symbol(Some("↓"));
+            frame.render_stateful_widget(scrollbar, scrollbar_area, &mut scrollbar_state);
         }
     }
 
@@ -447,6 +468,22 @@ impl DiffView {
                 Span::styled(": resize  ", Style::default().fg(theme.dimmed)),
                 Span::styled("scroll", Style::default().fg(theme.accent)),
                 Span::styled(": diff  ", Style::default().fg(theme.dimmed)),
+                Span::styled(
+                    if self.markdown_available() { "m" } else { "" },
+                    Style::default().fg(theme.accent),
+                ),
+                Span::styled(
+                    if self.markdown_available() {
+                        if self.markdown_rendered {
+                            ": raw  "
+                        } else {
+                            ": rendered  "
+                        }
+                    } else {
+                        ""
+                    },
+                    Style::default().fg(theme.dimmed),
+                ),
                 Span::styled("e/Enter", Style::default().fg(theme.accent)),
                 Span::styled(": edit  ", Style::default().fg(theme.dimmed)),
                 Span::styled("b", Style::default().fg(theme.accent)),
@@ -645,6 +682,7 @@ impl DiffView {
                     ("r", "Refresh diff"),
                     ("y", "Copy file path to clipboard"),
                     ("s", "Toggle side-by-side (split) layout"),
+                    ("m", "Toggle Markdown rendered/raw"),
                 ],
             ),
             (
@@ -777,6 +815,111 @@ mod tests {
             additions: 1,
             deletions: 0,
         }
+    }
+
+    fn markdown_contents(
+        path: &str,
+        status: FileStatus,
+        old_content: &str,
+        new_content: &str,
+    ) -> crate::git::diff::FileContents {
+        crate::git::diff::FileContents {
+            path: std::path::PathBuf::from(path),
+            old_path: None,
+            status,
+            old_content: old_content.to_string(),
+            new_content: new_content.to_string(),
+            patch: String::new(),
+            is_binary: false,
+        }
+    }
+
+    #[test]
+    fn markdown_file_renders_formatted_content_by_default() {
+        let path = std::path::PathBuf::from("README.md");
+        let mut view = DiffView::test_default();
+        view.files = vec![diff_file("README.md")];
+        view.file_contents_cache.insert(
+            path,
+            markdown_contents(
+                "README.md",
+                FileStatus::Modified,
+                "",
+                "# Preview\n\n- first item\n\n**bold** and `code`",
+            ),
+        );
+
+        let out = render_diff_to_string(&mut view, 120, 24);
+
+        assert!(out.contains("README.md · Rendered"), "got:\n{out}");
+        assert!(out.contains("Preview"), "got:\n{out}");
+        assert!(out.contains("• first item"), "got:\n{out}");
+        assert!(!out.contains("# Preview"), "heading marker leaked:\n{out}");
+        assert!(!out.contains("**bold**"), "strong marker leaked:\n{out}");
+        assert!(!out.contains('`'), "code marker leaked:\n{out}");
+    }
+
+    #[test]
+    fn raw_markdown_mode_renders_the_existing_diff() {
+        use crate::git::diff::{DiffHunk, DiffLine, FileDiff};
+
+        let path = std::path::PathBuf::from("README.md");
+        let file = diff_file("README.md");
+        let mut view = DiffView::test_default();
+        view.files = vec![file.clone()];
+        view.markdown_rendered = false;
+        view.file_contents_cache.insert(
+            path.clone(),
+            markdown_contents("README.md", FileStatus::Modified, "", "# Raw heading"),
+        );
+        view.diff_cache.insert(
+            path,
+            FileDiff {
+                file,
+                hunks: vec![DiffHunk {
+                    old_start: 1,
+                    old_lines: 0,
+                    new_start: 1,
+                    new_lines: 1,
+                    lines: vec![DiffLine {
+                        tag: ChangeTag::Insert,
+                        old_line_num: None,
+                        new_line_num: Some(1),
+                        content: "# Raw heading\n".to_string(),
+                    }],
+                }],
+                is_binary: false,
+            },
+        );
+
+        let out = render_diff_to_string(&mut view, 120, 24);
+
+        assert!(out.contains("README.md · Raw"), "got:\n{out}");
+        assert!(out.contains("# Raw heading"), "got:\n{out}");
+        assert!(out.contains("@@ -1,0 +1,1 @@"), "got:\n{out}");
+    }
+
+    #[test]
+    fn deleted_markdown_file_renders_its_base_content() {
+        let path = std::path::PathBuf::from("removed.markdown");
+        let mut file = diff_file("removed.markdown");
+        file.status = FileStatus::Deleted;
+        let mut view = DiffView::test_default();
+        view.files = vec![file];
+        view.file_contents_cache.insert(
+            path,
+            markdown_contents(
+                "removed.markdown",
+                FileStatus::Deleted,
+                "# Before deletion",
+                "",
+            ),
+        );
+
+        let out = render_diff_to_string(&mut view, 120, 24);
+
+        assert!(out.contains("Before deletion"), "got:\n{out}");
+        assert!(!out.contains("# Before deletion"), "got:\n{out}");
     }
 
     #[test]

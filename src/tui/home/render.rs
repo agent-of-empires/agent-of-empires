@@ -715,6 +715,9 @@ impl HomeView {
         if let Some(ref mut diff) = self.diff_view {
             // Compute diff for selected file if not cached
             let _ = diff.get_current_diff();
+            if diff.selected_file_is_markdown() {
+                let _ = diff.get_current_file_contents();
+            }
 
             // No list/preview divider exists while the diff takeover owns
             // the screen; clear it so a stale value from the previous frame
