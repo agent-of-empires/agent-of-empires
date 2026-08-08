@@ -1010,10 +1010,10 @@ impl Session {
         process::get_foreground_pid(pane_pid).or(Some(pane_pid))
     }
 
-    pub fn detect_status(&self, tool: &str) -> Result<Status> {
+    pub fn detect_status(&self, profile: &str, tool: &str) -> Result<Status> {
         let content = self.capture_pane(50)?;
-        Ok(super::status_detection::detect_status_from_content(
-            &content, tool,
+        Ok(super::status_detection::detect_status_from_content_in(
+            profile, &content, tool,
         ))
     }
 

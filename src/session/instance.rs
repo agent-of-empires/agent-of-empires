@@ -5676,9 +5676,11 @@ impl Instance {
 
         // Pane-fallback identity: the session's own configured status rules
         // outrank the `agent_detect_as` alias; without rules the alias applies.
-        let pane_tool = tmux::status_rules::detection_tool(&self.tool, &self.detect_as);
+        let pane_tool =
+            tmux::status_rules::detection_tool(&self.source_profile, &self.tool, &self.detect_as);
         let pane_content = session.capture_pane(50).unwrap_or_default();
-        let detected = tmux::detect_status_from_content(&pane_content, pane_tool);
+        let detected =
+            tmux::detect_status_from_content_in(&self.source_profile, &pane_content, pane_tool);
         tracing::trace!(target: "session.store",
             "status '{}': detected={:?}, cmd_override={}, custom_cmd={}",
             self.title,

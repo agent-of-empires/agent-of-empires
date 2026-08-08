@@ -1563,6 +1563,11 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
         }
     };
 
+    // Resolving the profile config installs the declarative status-rule
+    // registry for this profile; the status detection below never loads config
+    // itself, so a rules-having custom agent would otherwise report Idle.
+    crate::session::profile_config::resolve_config_or_warn(profile);
+
     // Refresh status from tmux so the output reflects current state
     // rather than the stale persisted value.
     crate::tmux::refresh_session_cache();
@@ -1624,6 +1629,11 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
         }
     };
 
+    // Resolving the profile config installs the declarative status-rule
+    // registry for this profile; the status detection below never loads config
+    // itself, so a rules-having custom agent would otherwise report Idle.
+    crate::session::profile_config::resolve_config_or_warn(profile);
+
     let tmux_session = crate::tmux::Session::new(&inst.id, &inst.title)?;
 
     let (content, status) = if !tmux_session.exists() {
@@ -1652,7 +1662,7 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
             }
         } else {
             tmux_session
-                .detect_status(detection_tool)
+                .detect_status(profile, detection_tool)
                 .unwrap_or_default()
         };
         let content = if args.strip_ansi {
