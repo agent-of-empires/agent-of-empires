@@ -11093,6 +11093,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial]
     fn omp_routing_fingerprint_accepts_matching_live_env_and_rejects_drift() {
         let tmp = tempfile::tempdir().unwrap();
         let home = tmp.path().join("home");
