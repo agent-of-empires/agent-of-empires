@@ -43,7 +43,7 @@ function session(): SessionResponse {
     notify_on_error: null,
     claude_fullscreen: false,
     workspace_repos: [],
-  } as SessionResponse;
+  };
 }
 
 function workspace(): Workspace {
@@ -56,7 +56,7 @@ function workspace(): Workspace {
     primaryAgent: "claude",
     status: "idle",
     sessions: [session()],
-  } as Workspace;
+  };
 }
 
 function repoGroup(over: Partial<RepoGroup> = {}): RepoGroup {

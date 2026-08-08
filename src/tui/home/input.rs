@@ -1246,7 +1246,7 @@ impl HomeView {
     }
 
     /// Confirm before archiving every active session under the focused group.
-    /// Archiving a whole project at once is a bigger hammer than the single-row
+    /// Archiving a whole project or organization at once is a bigger hammer than the single-row
     /// `z`, so it routes through a prompt. Archiving is reversible, hence the
     /// calmer neutral tone rather than the destructive red. No-ops silently
     /// (no prompt) when the group has no active sessions left to archive.
@@ -5277,7 +5277,7 @@ impl HomeView {
     }
 
     /// Open the rename dialog for whatever the sidebar has selected (a
-    /// session row, or a manual-mode group). Project-mode groups can't be
+    /// session row, or a manual-mode group). Project and organization-mode groups can't be
     /// renamed, so they raise an info dialog explaining how to switch
     /// modes. No-op when nothing is selected, or when the selected session
     /// is mid-create or mid-delete (renaming under those states would race
@@ -5422,7 +5422,7 @@ impl HomeView {
     ///   - Terminal view rejects deletion with an info dialog,
     ///   - Creating sessions are inert,
     ///   - Stuck-Deleting sessions get a force-remove confirm,
-    ///   - Project-mode groups can't be deleted (info dialog).
+    ///   - Project and organization-mode groups can't be deleted (info dialog).
     ///
     /// Shared by the `'d'` / `'D'` key handlers and the right-click
     /// context menu.

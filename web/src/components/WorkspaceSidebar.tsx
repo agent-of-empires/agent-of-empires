@@ -4079,7 +4079,7 @@ export function WorkspaceSidebar({
                     offline={offline}
                   />
                   {orgExpanded &&
-                    og.repos.filter(sidebarGroupHasLiveWorkspace).map((repo) => {
+                    og.repos.filter(sidebarGroupShouldRender).map((repo) => {
                       const repoExpanded = hasFilter ? true : !repo.collapsed;
                       const repoHasActiveChild = repo.workspaces.some((v) => v.workspace.id === displayedActiveId);
                       // Sunk rows are pulled into the single global
