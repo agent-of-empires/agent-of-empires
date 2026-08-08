@@ -1415,9 +1415,9 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         // its prior task. Poll capture-pane for steady-state output instead
         // of a blind sleep, so the keys land as soon as the agent is at a
         // prompt and don't get stranded mid-banner on slow machines.
-        wait_for_pane_ready(&session_id, &title, std::time::Duration::from_secs(5)).await;
-
         let tmux_session = crate::tmux::Session::new(&session_id, &title)?;
+        tmux_session.wait_until_content_settles(std::time::Duration::from_secs(5));
+
         if tmux_session.exists() {
             let delay = crate::agents::send_keys_enter_delay(&tool);
             match tmux_session.send_keys_with_delay(&wake_msg, delay) {
@@ -1491,32 +1491,6 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Poll the tmux pane until capture-pane content stops changing for two
-/// consecutive samples (the agent has finished printing its startup banner
-/// and is sitting at a prompt) or `max_wait` elapses. Failsafe: always
-/// returns by `max_wait` so the caller's send-keys still runs even if the
-/// pane never settles.
-async fn wait_for_pane_ready(session_id: &str, title: &str, max_wait: std::time::Duration) {
-    let Ok(tmux) = crate::tmux::Session::new(session_id, title) else {
-        return;
-    };
-    let poll_interval = std::time::Duration::from_millis(200);
-    let start = std::time::Instant::now();
-    let mut last: Option<String> = None;
-    while start.elapsed() < max_wait {
-        tokio::time::sleep(poll_interval).await;
-        let Ok(now) = tmux.capture_pane(5) else {
-            continue;
-        };
-        if now.trim().len() > 20 {
-            if last.as_deref() == Some(&now) {
-                return;
-            }
-            last = Some(now);
-        }
-    }
 }
 
 async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {

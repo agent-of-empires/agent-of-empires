@@ -60,12 +60,9 @@ fn test_respond_to_permission_allow_sends_bare_digit() {
 
     let project = h.project_path();
     // `--launch` starts the tmux session (spawning the fake claude script)
-    // and then tries to attach the CLI process's own terminal to it; that
-    // attach fails here because `run_cli` has no tty, but the tmux session
-    // is already live by that point, which is all this test needs. Don't
-    // assert success; asserting on it would depend on that terminal-attach
-    // side effect, not on session creation/launch.
-    h.run_cli(&[
+    // and skips the interactive terminal-attach step, since `run_cli` has no
+    // controlling terminal; the exit status is asserted to cover that.
+    let output = h.run_cli(&[
         "add",
         project.to_str().unwrap(),
         "-t",
@@ -76,6 +73,11 @@ fn test_respond_to_permission_allow_sends_bare_digit() {
         fake_claude.to_str().unwrap(),
         "--launch",
     ]);
+    assert!(
+        output.status.success(),
+        "aoe add --launch should succeed without a controlling terminal: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     h.spawn_tui();
     h.wait_for(" aoe ");
@@ -107,8 +109,8 @@ fn test_respond_to_permission_deny_sends_bare_digit() {
     let fake_claude = install_fake_claude_prompt(&h);
 
     let project = h.project_path();
-    // See the allow test above for why the add-launch output isn't asserted.
-    h.run_cli(&[
+    // See the allow test above: the exit status now IS asserted.
+    let output = h.run_cli(&[
         "add",
         project.to_str().unwrap(),
         "-t",
@@ -119,6 +121,11 @@ fn test_respond_to_permission_deny_sends_bare_digit() {
         fake_claude.to_str().unwrap(),
         "--launch",
     ]);
+    assert!(
+        output.status.success(),
+        "aoe add --launch should succeed without a controlling terminal: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     h.spawn_tui();
     h.wait_for(" aoe ");

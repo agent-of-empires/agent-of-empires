@@ -615,6 +615,34 @@ impl Session {
         }
     }
 
+    /// Poll the pane until captured content stops changing across two
+    /// consecutive samples (the agent has finished printing its startup
+    /// banner and is sitting idle) or `max_wait` elapses. Failsafe: always
+    /// returns by `max_wait`, so a caller's next action (e.g. `send-keys`)
+    /// still runs even if the pane's content never settles, such as an agent
+    /// that is genuinely still streaming output.
+    ///
+    /// Shared by `aoe session restart`'s post-restart wake message and `aoe
+    /// send`'s pre-send wait: both need to avoid typing into a pane whose
+    /// agent has not finished rendering yet.
+    pub fn wait_until_content_settles(&self, max_wait: std::time::Duration) {
+        let poll_interval = std::time::Duration::from_millis(200);
+        let deadline = std::time::Instant::now() + max_wait;
+        let mut last: Option<String> = None;
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(poll_interval);
+            let Ok(now) = self.capture_pane(5) else {
+                continue;
+            };
+            if now.trim().len() > 20 {
+                if last.as_deref() == Some(now.as_str()) {
+                    return;
+                }
+                last = Some(now);
+            }
+        }
+    }
+
     /// Capture the whole first window, panes composited, for the passive
     /// preview.
     ///
@@ -1077,9 +1105,10 @@ impl Session {
         if use_paste_buffer {
             Self::send_via_paste_buffer(&target, text)?;
         } else {
+            let payload = pad_slash_command_for_autocomplete(text);
             // `--` ends option parsing so lines beginning with `-` (markdown
             // bullets, CLI flags in prompts) are not misread as tmux flags.
-            Self::tmux_send(&target, &["-l", "--", text])?;
+            Self::tmux_send(&target, &["-l", "--", &payload])?;
         }
 
         if enter_delay_ms > 0 {
@@ -1521,6 +1550,23 @@ fn raw_byte_batches(bytes: &[u8]) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// Whether `text` should get a trailing space appended before being typed
+/// via the literal (non-paste-buffer) keystroke path in
+/// [`Session::send_keys_with_delay`]. A message that opens with `/` triggers
+/// some agents' own slash-command autocomplete dropdown (e.g. opencode); the
+/// dropdown then consumes the terminating `Enter` sent after this payload as
+/// navigation instead of submit, leaving the command typed but never
+/// delivered. A trailing space closes the dropdown as it's typed, so the
+/// following `Enter` submits normally instead. Every other message keeps its
+/// exact bytes. Pure so the padding decision is unit-testable without tmux.
+fn pad_slash_command_for_autocomplete(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.trim_start().starts_with('/') {
+        std::borrow::Cow::Owned(format!("{text} "))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
 /// Build the argument list for tmux new-session command. Shared by the
 /// agent session and the paired/container terminal sessions (their
 /// invocations are identical; only the session-name prefix differs).
@@ -1686,6 +1732,25 @@ mod tests {
     #[test]
     fn raw_byte_batches_empty_payload_sends_nothing() {
         assert!(raw_byte_batches(&[]).is_empty());
+    }
+
+    #[test]
+    fn pads_slash_prefixed_messages_only() {
+        let cases = [
+            ("/audit", "/audit "),
+            ("/", "/ "),
+            ("  /audit", "  /audit "),
+            ("audit", "audit"),
+            ("please run /audit", "please run /audit"),
+            ("", ""),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                pad_slash_command_for_autocomplete(input),
+                expected,
+                "input {input:?}"
+            );
+        }
     }
 
     #[test]

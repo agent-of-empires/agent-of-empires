@@ -91,12 +91,13 @@ fn pane_start_command(sock: &std::path::Path, session: &str) -> String {
 }
 
 /// Run `aoe add --launch ...` for a kiro session and return the command tmux
-/// was told to run. `--launch` creates the tmux session and then attempts a
-/// foreground attach, which fails under the test's non-TTY stdio; that attach
-/// failure is expected and irrelevant here, so the exit status is not asserted.
-/// The session (and its recorded pane command) is created regardless, and
-/// `launched_tmux_name` fails loudly if it wasn't. The returned guard kills the
-/// session when the caller's scope ends, including on assertion panic.
+/// was told to run. `--launch` starts the tmux session and, since the test
+/// harness's `run_cli` has no controlling terminal, skips the interactive
+/// attach step instead of failing because of it; the exit status IS asserted
+/// here to cover that behavior. The session (and its recorded pane command)
+/// is created regardless, and `launched_tmux_name` fails loudly if it
+/// wasn't. The returned guard kills the session when the caller's scope
+/// ends, including on assertion panic.
 fn launch_kiro_and_read_command(
     h: &mut TuiTestHarness,
     title: &str,
@@ -121,7 +122,12 @@ fn launch_kiro_and_read_command(
         "--launch",
     ];
     args.extend_from_slice(extra);
-    let _ = h.run_cli(&args);
+    let output = h.run_cli(&args);
+    assert!(
+        output.status.success(),
+        "aoe add --launch should succeed without a controlling terminal: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let session = launched_tmux_name(h, title);
     let socket = h.home_path().join("tmux.sock");

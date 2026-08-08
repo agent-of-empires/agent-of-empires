@@ -1177,11 +1177,25 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 }
 
                 let tmux_session = crate::tmux::Session::new(&instance.id, &instance.title)?;
-                tmux_session.attach()?;
+                if std::io::stdout().is_terminal() {
+                    tmux_session.attach()?;
+                } else {
+                    // No controlling terminal (LaunchAgent, cron, or any
+                    // other headless caller): `tmux attach-session` needs a
+                    // TTY and would fail even though the session above
+                    // started fine. Skip the attach instead of letting that
+                    // failure roll a successful launch back to an error.
+                    println!(
+                        "(no controlling terminal; session started without attaching. \
+                         Use `aoe session attach {}` to view it.)",
+                        final_title
+                    );
+                }
 
-                // The poller ran throughout the attached session but the CLI
-                // never drained it, dropping the observed id on detach. Drain it
-                // now (short bound: it is almost always already queued).
+                // The poller ran throughout the attach (or the launch above,
+                // headless) but the CLI never drained it, dropping the
+                // observed id. Drain it now (short bound: it is almost
+                // always already queued).
                 let file_watch = crate::file_watch::FileWatchService::noop();
                 crate::session::sync::capture_launched_session_id_blocking(
                     &mut instance,
