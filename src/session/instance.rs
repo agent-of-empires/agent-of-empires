@@ -6831,13 +6831,13 @@ fn omp_routing_fingerprint_check(plan: &OmpCapturePlan) -> String {
              else printf '%s\\0000\\000\\000' \"$k\"; fi; \
            done; \
          }}; \
-         if command -v sha256sum >/dev/null 2>&1; then \
-           route_digest=$(route_payload | command sha256sum) || launch_raw; \
-         elif command -v shasum >/dev/null 2>&1; then \
-           route_digest=$(route_payload | command shasum -a 256) || launch_raw; \
-         else launch_raw; fi; \
-         route_digest=${{route_digest%% *}}; \
-         [ \"$route_digest\" = {} ] || launch_raw; ",
+          if command -v sha256sum >/dev/null 2>&1; then \
+           route_fingerprint=$(route_payload | command sha256sum) || launch_raw; \
+          elif command -v shasum >/dev/null 2>&1; then \
+           route_fingerprint=$(route_payload | command shasum -a 256) || launch_raw; \
+          else launch_raw; fi; \
+          route_fingerprint=${{route_fingerprint%% *}}; \
+          [ \"$route_fingerprint\" = {} ] || launch_raw; ",
         shell_escape(&plan.routing_fingerprint)
     )
 }
@@ -6957,7 +6957,7 @@ fn wrap_omp_launch(tool_cmd: &str, plan: &OmpCapturePlan) -> String {
          marker_tmp_dir={}.tmp.$$; \
          (umask 077; mkdir \"$marker_tmp_dir\") || launch_raw; \
          marker_tmp=\"$marker_tmp_dir/marker\"; \
-         (umask 077; set -C; printf '%s\\n%s\\n%s\\n%s\\n' \"$terminal_id\" {} \"$pending\" \"$route_digest\" > \"$marker_tmp\") || launch_raw; \
+         (umask 077; set -C; printf '%s\\n%s\\n%s\\n%s\\n' \"$terminal_id\" {} \"$pending\" \"$route_fingerprint\" > \"$marker_tmp\") || launch_raw; \
          mv -f -- \"$marker_tmp\" {} || launch_raw; \
          rmdir \"$marker_tmp_dir\" 2>/dev/null || :; \
          exec sh -c \"$tool_cmd\"",
@@ -11145,7 +11145,7 @@ mod tests {
             );
         }
         assert!(command.contains("route_payload"));
-        assert!(command.contains("route_digest"));
+        assert!(command.contains("route_fingerprint"));
         assert!(command.contains("tty_path=$(tty) || launch_raw"));
         assert!(command.contains("terminal_id=${tty_path#/dev/}"));
         assert!(command.contains("tr"));
