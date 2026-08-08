@@ -93,9 +93,19 @@ describe("MobileLiveTerminal wheel forwarding", () => {
     expect(scroller.style.touchAction).toBe("none");
   });
 
+  it("cancels a native touch move in forward mode as a WebKit fallback", () => {
+    const { scroller } = renderTerm(frame({ altScreen: true, mouse: true, mouseSgr: true }));
+    const move = new Event("touchmove", { cancelable: true });
+    scroller.dispatchEvent(move);
+    expect(move.defaultPrevented).toBe(true);
+  });
+
   it("leaves touch-action unset outside forward mode (native capture scroll)", () => {
     const { scroller } = renderTerm(frame({ altScreen: false, mouse: false }));
     expect(scroller.style.touchAction).toBe("");
+    const move = new Event("touchmove", { cancelable: true });
+    scroller.dispatchEvent(move);
+    expect(move.defaultPrevented).toBe(false);
   });
 
   it("normalizes line-mode wheel deltas (deltaMode 1)", () => {

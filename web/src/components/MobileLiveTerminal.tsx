@@ -701,6 +701,23 @@ export function MobileLiveTerminal({
     forwardModeRef.current = forwardMode;
     mouseSgrRef.current = mouseSgr;
   }, [forwardMode, mouseSgr]);
+  // WebKit usually honors `touch-action: none` below, but it only decides
+  // that at the start of a gesture. If a fresh frame switches Claude Code
+  // into its alternate-screen mouse mode while a finger is already down,
+  // Safari can keep the root page's pan active and move the whole app under
+  // the fixed terminal input. React's delegated touch listeners are passive,
+  // so install this narrowly scoped native fallback on the terminal itself.
+  // It is intentionally always registered: checking the ref at event time
+  // also covers that between-frame mode transition.
+  useEffect(() => {
+    const el = scrollerRef.current;
+    if (!el) return;
+    const stopForwardModePagePan = (event: TouchEvent) => {
+      if (forwardModeRef.current && event.cancelable) event.preventDefault();
+    };
+    el.addEventListener("touchmove", stopForwardModePagePan, { passive: false });
+    return () => el.removeEventListener("touchmove", stopForwardModePagePan);
+  }, []);
   // Sub-notch scroll remainder (px) carried across events, and the last
   // touch Y while forwarding a single-finger drag.
   const wheelAccumRef = useRef(0);
