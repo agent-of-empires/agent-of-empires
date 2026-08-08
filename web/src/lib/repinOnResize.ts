@@ -3,7 +3,6 @@
 // the assistant-ui runtime (the #1282 pattern).
 
 export interface RepinOnResizeOptions {
-  /** Element to observe. */
   target: Element;
   /** Height that matters for this target, read at subscribe time and again on
    *  every callback. `ResizeObserver` also fires for width-only changes and for
@@ -14,16 +13,16 @@ export interface RepinOnResizeOptions {
    *  already settled at the new height, so reading pinned-ness now would report
    *  false for exactly the case worth catching. */
   wasAtBottom: () => boolean;
-  /** Put the scroller back at the bottom. */
   repin: () => void;
 }
 
 /** Observe `target` and re-pin whenever its height actually changes.
  *
- *  Only shrinking needs this: growing is self-correcting because the browser
- *  clamps `scrollTop` to the new maximum, while shrinking silently leaves the
- *  transcript a few hundred pixels short of the bottom. The pin is skipped
- *  when the user had scrolled away, so a resize never yanks them back down.
+ *  Shrinking is the case that needs it: the transcript is silently left a few
+ *  hundred pixels short of the bottom. Growing is already self-correcting
+ *  because the browser clamps `scrollTop`, so re-pinning there is a no-op
+ *  rather than a second code path. The pin is skipped when the user had
+ *  scrolled away, so a resize never yanks them back down.
  *
  *  Returns the observer; the caller disconnects it on cleanup. */
 export function repinOnResize({ target, readHeight, wasAtBottom, repin }: RepinOnResizeOptions): ResizeObserver {

@@ -31,6 +31,13 @@ test.describe("mobile conversation chrome collapse", () => {
     const viewportHeight = () => heightOf("acp-viewport");
 
     await expect(page.getByTestId("composer-footer")).toBeVisible();
+
+    // Type before collapsing: the draft has to survive the round trip, which is
+    // what keeps the composer mounted rather than unmounted while hidden. Done
+    // before the baseline heights because the textarea sizes to its content.
+    const draft = page.getByRole("textbox").first();
+    await draft.fill("half-written prompt");
+
     const headerHeight = await heightOf("conversation-header");
     const composerHeight = await heightOf("conversation-composer");
     expect(headerHeight).toBeGreaterThan(0);
@@ -43,6 +50,17 @@ test.describe("mobile conversation chrome collapse", () => {
     await expect.poll(() => heightOf("conversation-composer")).toBe(0);
     expect(await heightOf("conversation-header")).toBe(headerHeight);
     await expect(composerToggle).toHaveAttribute("aria-label", "Expand message composer");
+    // `inert` in a real browser, not just the property jsdom can report: the
+    // hidden composer takes neither a tap on the transcript (which normally
+    // focuses it) nor a direct focus() call. Driven through the DOM because an
+    // inert subtree is off the accessibility tree, so role queries cannot see
+    // it while collapsed.
+    await page.mouse.click(150, 250);
+    const focusedAfter = await page.evaluate(() => {
+      document.querySelector<HTMLTextAreaElement>("textarea")?.focus();
+      return document.activeElement?.tagName ?? null;
+    });
+    expect(focusedAfter).not.toBe("TEXTAREA");
     const composerOnly = await viewportHeight();
     expect(composerOnly).toBeCloseTo(bothExpanded + composerHeight, 0);
 
@@ -60,12 +78,14 @@ test.describe("mobile conversation chrome collapse", () => {
     expect(await heightOf("conversation-header")).toBe(0);
     expect(await viewportHeight()).toBeLessThan(bothCollapsed);
 
-    // Back to both expanded, and the composer still works after the round trip.
+    // Back to both expanded, and the composer still works after the round trip:
+    // the draft is intact and sends.
     await headerToggle.click();
     await expect.poll(() => heightOf("conversation-header")).toBe(headerHeight);
     expect(await viewportHeight()).toBeCloseTo(bothExpanded, 0);
 
-    await page.getByRole("textbox").first().fill("still typing");
+    await expect(draft).toHaveValue("half-written prompt");
+    await draft.fill("still typing");
     await page.getByRole("button", { name: "Send message" }).click();
     await expect.poll(() => mock.promptBodies.map((b) => b.text)).toContain("still typing");
   });
@@ -139,5 +159,54 @@ test.describe("mobile conversation chrome collapse", () => {
     const dismiss = page.getByRole("button", { name: "Dismiss update notice" });
     await dismiss.click({ timeout: 5_000 });
     await expect(page.getByRole("status", { name: /Update available/i })).toHaveCount(0);
+  });
+
+  // The feature is phone-only, and the header region is now wrapped on every
+  // view rather than only the collapsible ones, so "desktop is untouched" is a
+  // claim this branch has to keep making. Crossing the breakpoint is the same
+  // behavior from the other side: the chrome must come back, unforced, without
+  // dropping what the user had typed.
+  test("desktop renders no handles, and crossing the breakpoint restores the chrome", async ({ page }) => {
+    const mock = await mockAcpSession(page, {
+      title: "story-collapse-desktop",
+      initialEvents: [agentMessageChunk("hello from the agent")],
+    });
+    await openStructuredSession(page, mock);
+    await waitForComposerConnected(page);
+
+    const headerToggle = page.getByTestId("header-collapse-toggle");
+    const composerToggle = page.getByTestId("composer-collapse-toggle");
+    const heightOf = async (testId: string) => (await page.getByTestId(testId).boundingBox())!.height;
+
+    // Type, collapse both on the phone, then cross `md`. A collapsed composer
+    // is off the accessibility tree, so its value is read through the DOM.
+    await page.getByRole("textbox").first().fill("typed on the phone");
+    const draftValue = () => page.evaluate(() => document.querySelector("textarea")?.value ?? null);
+    await headerToggle.click();
+    await composerToggle.click();
+    await expect.poll(() => heightOf("conversation-header")).toBe(0);
+    await expect.poll(() => heightOf("conversation-composer")).toBe(0);
+
+    await page.setViewportSize({ width: 1280, height: 800 });
+    await expect(headerToggle).toHaveCount(0);
+    await expect(composerToggle).toHaveCount(0);
+    // Neither region stays folded: desktop has room for both, and the top bar
+    // is the only navigation the other views have.
+    await expect.poll(() => heightOf("conversation-header")).toBeGreaterThan(0);
+    await expect.poll(() => heightOf("conversation-composer")).toBeGreaterThan(0);
+    await expect(page.getByRole("textbox").first()).toHaveValue("typed on the phone");
+
+    // Back under `md`: the handles return, and the draft is still there. The
+    // two collapse states are deliberately scoped differently, so they come
+    // back differently. Header state lives in `App`, which spans the
+    // breakpoint, so it is still collapsed. Composer state is local to the
+    // structured view, and crossing `md` swaps App's whole mobile pane for the
+    // desktop split, so the view remounts and the composer returns expanded.
+    await page.setViewportSize({ width: 390, height: 664 });
+    await expect(headerToggle).toBeVisible();
+    await expect(composerToggle).toBeVisible();
+    await expect.poll(() => heightOf("conversation-header")).toBe(0);
+    await expect.poll(() => heightOf("conversation-composer")).toBeGreaterThan(0);
+    expect(await draftValue()).toBe("typed on the phone");
   });
 });
