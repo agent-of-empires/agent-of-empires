@@ -2778,6 +2778,20 @@ mod tests {
     use crate::session::test_support::EnvGuard;
     use serial_test::serial;
 
+    /// Pin a modification time so mtime ordering in tests never depends on the
+    /// host filesystem's timestamp resolution. Opened read-only, which lets the
+    /// same call set the mtime of both files and directories on Unix.
+    fn set_mtime_secs(path: &Path, secs: u64) {
+        std::fs::File::options()
+            .read(true)
+            .open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+            ))
+            .unwrap();
+    }
+
     #[test]
     fn canonicalize_or_raw_normalizes_deleted_dirs_lexically() {
         // A stopped worktree session's directory is often deleted while its
@@ -3423,17 +3437,20 @@ mod tests {
         let uuid_old = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
         let uuid_new = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
 
+        let old_path = project_dir.join(format!("2024-12-01T10-00-00-000Z_{uuid_old}.jsonl"));
+        let new_path = project_dir.join(format!("2024-12-03T14-00-00-000Z_{uuid_new}.jsonl"));
         std::fs::write(
-            project_dir.join(format!("2024-12-01T10-00-00-000Z_{uuid_old}.jsonl")),
+            &old_path,
             format!(r#"{{"type":"session","id":"{uuid_old}","cwd":"/home/user/project"}}"#),
         )
         .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(50));
         std::fs::write(
-            project_dir.join(format!("2024-12-03T14-00-00-000Z_{uuid_new}.jsonl")),
+            &new_path,
             format!(r#"{{"type":"session","id":"{uuid_new}","cwd":"/home/user/project"}}"#),
         )
         .unwrap();
+        set_mtime_secs(&old_path, 1_700_000_000);
+        set_mtime_secs(&new_path, 1_700_000_100);
 
         let old_val = std::env::var("PI_CODING_AGENT_DIR").ok();
         std::env::set_var("PI_CODING_AGENT_DIR", tmp.path());
@@ -3489,6 +3506,51 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_capture_pi_session_id_all_cwd_matches_excluded_errs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+
+        // Only session whose cwd matches the project, in a non-encoded dir so it
+        // is reached via the cwd-fallback scan; its id is excluded.
+        let target_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let target_dir = sessions_dir.join("--wrong-name--");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(
+            target_dir.join(format!("2024-12-01T10-00-00-000Z_{target_id}.jsonl")),
+            format!(r#"{{"type":"session","id":"{target_id}","cwd":"/home/user/project"}}"#),
+        )
+        .unwrap();
+
+        // A different project's session, newer: the newest-dir fallback would
+        // resume it if the cwd-match bail did not fire first.
+        let decoy_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let decoy_dir = sessions_dir.join("--decoy--");
+        std::fs::create_dir_all(&decoy_dir).unwrap();
+        std::fs::write(
+            decoy_dir.join(format!("2024-12-09T10-00-00-000Z_{decoy_id}.jsonl")),
+            format!(r#"{{"type":"session","id":"{decoy_id}","cwd":"/home/user/other"}}"#),
+        )
+        .unwrap();
+
+        let old_val = std::env::var("PI_CODING_AGENT_DIR").ok();
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.path());
+
+        let mut exclusion = HashSet::new();
+        exclusion.insert(target_id.to_string());
+        let result = capture_pi_session_id("/home/user/project", &exclusion);
+
+        match old_val {
+            Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+
+        let err =
+            result.expect_err("all cwd matches excluded must error, not cross-project resume");
+        assert!(err.to_string().contains("are excluded"), "{err:?}");
+    }
+
+    #[test]
+    #[serial]
     fn test_capture_pi_session_id_cwd_fallback_most_recent_wins() {
         let tmp = tempfile::tempdir().unwrap();
         let sessions_dir = tmp.path().join("sessions");
@@ -3498,21 +3560,23 @@ mod tests {
 
         let dir_a = sessions_dir.join("--wrong-name-a--");
         std::fs::create_dir_all(&dir_a).unwrap();
+        let path_a = dir_a.join(format!("2024-12-01T10-00-00-000Z_{uuid_old}.jsonl"));
         std::fs::write(
-            dir_a.join(format!("2024-12-01T10-00-00-000Z_{uuid_old}.jsonl")),
+            &path_a,
             format!(r#"{{"type":"session","id":"{uuid_old}","cwd":"/home/user/project"}}"#),
         )
         .unwrap();
 
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
         let dir_b = sessions_dir.join("--wrong-name-b--");
         std::fs::create_dir_all(&dir_b).unwrap();
+        let path_b = dir_b.join(format!("2024-12-03T14-00-00-000Z_{uuid_new}.jsonl"));
         std::fs::write(
-            dir_b.join(format!("2024-12-03T14-00-00-000Z_{uuid_new}.jsonl")),
+            &path_b,
             format!(r#"{{"type":"session","id":"{uuid_new}","cwd":"/home/user/project"}}"#),
         )
         .unwrap();
+        set_mtime_secs(&path_a, 1_700_000_000);
+        set_mtime_secs(&path_b, 1_700_000_100);
 
         let old_val = std::env::var("PI_CODING_AGENT_DIR").ok();
         std::env::set_var("PI_CODING_AGENT_DIR", tmp.path());
@@ -3577,8 +3641,6 @@ mod tests {
         )
         .unwrap();
 
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
         let dir_new = sessions_dir.join("--new-dir--");
         std::fs::create_dir_all(&dir_new).unwrap();
         std::fs::write(
@@ -3586,6 +3648,8 @@ mod tests {
             "also not valid json\n",
         )
         .unwrap();
+        set_mtime_secs(&dir_old, 1_700_000_000);
+        set_mtime_secs(&dir_new, 1_700_000_100);
 
         let old_val = std::env::var("PI_CODING_AGENT_DIR").ok();
         std::env::set_var("PI_CODING_AGENT_DIR", tmp.path());
