@@ -429,7 +429,7 @@ fn expansion_cannot_produce_flag(word: &str) -> bool {
         .first()
         .is_some_and(|byte| !matches!(byte, b'-' | b'*' | b'?' | b'[' | b'{' | b'}'))
 }
-/// Resolve OMP 17.2.10's host store. Bun's cwd dotenv autoload is applied
+/// Resolve OMP 17.2.12's host store. Bun's cwd dotenv autoload is applied
 /// before profile selection, then OMP's four literal dotenv files are merged.
 pub(crate) fn resolve_omp_store_layout(
     environment: &[String],
@@ -638,26 +638,25 @@ fn host_launcher_environment(entries: &[String]) -> HashMap<String, String> {
             values.insert(key.to_string(), value);
         }
     }
-    // Make absence authoritative too. Exporting an empty value gives OMP the
-    // same routing behavior as an unset value, while preventing a stale value
-    // in tmux's long-lived server environment from selecting another store.
-    for key in OMP_STORE_ENV_KEYS {
-        values.entry(key.to_string()).or_default();
-    }
+    // Preserve absence separately from an explicit empty value. OMP_PROFILE
+    // only falls back to PI_PROFILE when it is absent, while an empty value
+    // explicitly selects the default profile.
     values
 }
 
-/// Routing values that must be pinned into a host pane so the resolver and the
-/// launched OMP process start from the same environment snapshot.
-pub(crate) fn omp_host_routing_environment(entries: &[String]) -> Vec<(String, String)> {
+/// Routing mutations that must be applied in a host pane so the resolver and
+/// launched OMP process start from the same environment snapshot. An explicit
+/// unset prevents tmux's long-lived server environment from reviving a stale
+/// routing value.
+pub(crate) fn omp_host_routing_environment(
+    entries: &[String],
+) -> Vec<crate::tmux::PaneEnvMutation> {
     let values = host_launcher_environment(entries);
     OMP_STORE_ENV_KEYS
         .iter()
-        .map(|key| {
-            (
-                (*key).to_string(),
-                values.get(*key).cloned().unwrap_or_default(),
-            )
+        .map(|key| match values.get(*key) {
+            Some(value) => crate::tmux::PaneEnvMutation::set((*key).to_string(), value.clone()),
+            None => crate::tmux::PaneEnvMutation::unset((*key).to_string()),
         })
         .collect()
 }
@@ -2273,6 +2272,45 @@ mod tests {
         )
         .unwrap();
         assert_eq!(layout.sessions, project.join("exec-store/sessions"));
+
+        let routing_project = tmp.path().join("routing-project");
+        std::fs::create_dir_all(&routing_project).unwrap();
+        let pi_only = vec![
+            format!("HOME={}", home.display()),
+            "PI_PROFILE=work".to_string(),
+        ];
+        let (pi_layout, absent_fingerprint) = resolve_omp_store_layout_with_environment(
+            &pi_only,
+            routing_project.to_str().unwrap(),
+            &OmpCliCaptureOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            pi_layout.sessions,
+            home.join(".omp/profiles/work/agent/sessions")
+        );
+        let mutations = omp_host_routing_environment(&pi_only);
+        assert!(mutations.contains(&crate::tmux::PaneEnvMutation::unset(
+            "OMP_PROFILE".to_string()
+        )));
+        assert!(mutations.contains(&crate::tmux::PaneEnvMutation::set(
+            "PI_PROFILE".to_string(),
+            "work".to_string()
+        )));
+
+        let mut explicit_default = pi_only;
+        explicit_default.push("OMP_PROFILE=".to_string());
+        let (default_layout, empty_fingerprint) = resolve_omp_store_layout_with_environment(
+            &explicit_default,
+            routing_project.to_str().unwrap(),
+            &OmpCliCaptureOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            default_layout.sessions,
+            routing_project.join("agent-store/sessions")
+        );
+        assert_ne!(absent_fingerprint, empty_fingerprint);
     }
 
     #[test]

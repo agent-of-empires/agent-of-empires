@@ -40,14 +40,14 @@ type LaunchCommandParts = (
     Option<String>,
     bool,
     Option<OmpCapturePlan>,
-    Vec<(String, String)>,
+    Vec<tmux::PaneEnvMutation>,
 );
 
 struct PreparedLaunch {
     command: Option<String>,
     is_existing: bool,
     omp_capture_plan: Option<OmpCapturePlan>,
-    launch_env: Vec<(String, String)>,
+    launch_env: Vec<tmux::PaneEnvMutation>,
     expected_prior_sid: Option<String>,
     expected_prior_intent: ResumeIntent,
     expected_prior_omp_generation: Option<String>,
@@ -2196,14 +2196,15 @@ impl Instance {
         )
     }
 
-    /// True when a fresh (unexpired) lifecycle reservation holds this row. Only
-    /// `reserve_lifecycle_generation` sets it, so unlike `status` it is never
-    /// contaminated by the poller or a REST pre-mark; an expired reservation
-    /// self-heals a session left mid-launch by a crash.
+    /// True when a fresh lifecycle reservation owns this row's current
+    /// generation. A timestamp alone is not ownership: any transition that
+    /// advances the generation immediately supersedes an older marker.
     fn has_fresh_lifecycle_reservation(&self, now: DateTime<Utc>) -> bool {
         matches!(
             &self.lifecycle_reservation,
-            Some(r) if (now - r.at) < Self::OP_CLAIM_TTL
+            Some(r)
+                if r.generation == self.lifecycle_generation
+                    && (now - r.at) < Self::OP_CLAIM_TTL
         )
     }
 
@@ -3547,13 +3548,18 @@ impl Instance {
         let session = self.container_terminal_tmux_session_indexed(index)?;
         let is_new = !session.exists();
         if is_new {
+            let pane_env = env_info
+                .env
+                .into_iter()
+                .map(|(key, value)| tmux::PaneEnvMutation::set(key, value))
+                .collect::<Vec<_>>();
             let session = tmux::Session::from_name(session.name());
             session.create_with_size_env(
                 &self.project_path,
                 Some(&session_cmd),
                 size,
                 &self.effective_profile(),
-                &env_info.env,
+                &pane_env,
             )?;
             self.apply_container_terminal_tmux_options(index);
         }
@@ -3841,7 +3847,7 @@ impl Instance {
         let _lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to reacquire instance launch lock")?;
-        self.ensure_reservation_current(&storage)?;
+        self.ensure_reservation_current_or_fail(&storage)?;
         let result = self
             .spawn_prepared_launch(size, &profile, prepared)
             .and_then(|outcome| {
@@ -3926,6 +3932,19 @@ impl Instance {
             "session {} changed while launch hooks were running",
             self.id
         )
+    }
+
+    fn ensure_reservation_current_or_fail(
+        &mut self,
+        storage: &super::storage::Storage,
+    ) -> Result<()> {
+        match self.ensure_reservation_current(storage) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.fail_reserved_launch(storage, &error, false);
+                Err(error)
+            }
+        }
     }
 
     fn fail_reserved_launch(
@@ -4048,7 +4067,7 @@ impl Instance {
                     );
                 }
             }
-            prepared.launch_env.push((
+            prepared.launch_env.push(tmux::PaneEnvMutation::set(
                 crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY.to_string(),
                 metadata.launch_id.clone(),
             ));
@@ -4244,19 +4263,33 @@ impl Instance {
                 raw_command
             };
             let wrapped = wrap_command_ignore_suspend(&launch_command);
-            (Some(wrapped), is_existing, omp_capture_plan, env_info.env)
+            let pane_env = env_info
+                .env
+                .into_iter()
+                .map(|(key, value)| tmux::PaneEnvMutation::set(key, value))
+                .collect();
+            (Some(wrapped), is_existing, omp_capture_plan, pane_env)
         } else {
             let result = self.build_host_command(agent)?;
             let mut env = super::environment::resolve_host_environment_pairs(
                 &self.profile_host_environment(),
-            );
+            )
+            .into_iter()
+            .map(|(key, value)| tmux::PaneEnvMutation::set(key, value))
+            .collect::<Vec<_>>();
             // The protected file is sourced in order, so freshly minted hook
             // values appended last override same-keyed static profile values.
-            env.extend(self.pending_host_env.iter().cloned());
+            env.extend(
+                self.pending_host_env
+                    .iter()
+                    .cloned()
+                    .map(|(key, value)| tmux::PaneEnvMutation::set(key, value)),
+            );
             if result.2.is_some() {
-                // Pin every routing input, including explicit empty values, so
-                // tmux's frozen server environment cannot select another OMP
-                // store. The in-pane fingerprint still detects login-file drift.
+                // Pin every routing input, including explicit empty values and
+                // true absence, so tmux's frozen server environment cannot
+                // select another OMP store. The in-pane fingerprint still
+                // detects login-file drift.
                 env.extend(omp_host_routing_environment(&self.omp_host_environment()));
             }
             (result.0, result.1, result.2, env)
@@ -5878,7 +5911,7 @@ impl Instance {
         let _lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to reacquire instance start lock")?;
-        self.ensure_reservation_current(&storage)?;
+        self.ensure_reservation_current_or_fail(&storage)?;
         let result = (|| {
             if restart {
                 self.kill_clean_locked()?;
@@ -8012,8 +8045,8 @@ mod tests {
         let mut cases = [
             // A bare Starting with no reservation is the REST pre-mark / poller
             // artifact; it must not self-trip the same operation (#3230).
-            ("premarked_only", Status::Starting, None, None, true),
-            // A fresh reservation is a genuinely live peer op: still rejected.
+            ("premarked_only", Status::Starting, None, None, 0, true),
+            // A fresh reservation at the row's generation is a live peer op.
             (
                 "reserved_peer",
                 Status::Starting,
@@ -8022,7 +8055,20 @@ mod tests {
                     generation: 1,
                     at: now,
                 }),
+                1,
                 false,
+            ),
+            // Generation advancement supersedes a still-fresh old marker.
+            (
+                "superseded_res",
+                Status::Idle,
+                None,
+                Some(LifecycleReservation {
+                    generation: 1,
+                    at: now,
+                }),
+                2,
+                true,
             ),
             // An expired reservation self-heals a crash mid-launch.
             (
@@ -8033,6 +8079,7 @@ mod tests {
                     generation: 1,
                     at: stale,
                 }),
+                1,
                 true,
             ),
             (
@@ -8043,6 +8090,7 @@ mod tests {
                     at: now,
                 }),
                 None,
+                0,
                 false,
             ),
             (
@@ -8053,6 +8101,7 @@ mod tests {
                     at: now,
                 }),
                 None,
+                0,
                 false,
             ),
             (
@@ -8063,20 +8112,24 @@ mod tests {
                     at: now,
                 }),
                 None,
+                0,
                 true,
             ),
-            ("creating", Status::Creating, None, None, true),
-            ("idle", Status::Idle, None, None, true),
-            ("stopped", Status::Stopped, None, None, true),
+            ("creating", Status::Creating, None, None, 0, true),
+            ("idle", Status::Idle, None, None, 0, true),
+            ("stopped", Status::Stopped, None, None, 0, true),
         ]
-        .map(|(title, status, claim, reservation, allowed)| {
-            let mut instance = Instance::new(title, "/tmp/test");
-            instance.source_profile = profile.to_string();
-            instance.status = status;
-            instance.op_claim = claim;
-            instance.lifecycle_reservation = reservation;
-            (instance, allowed)
-        });
+        .map(
+            |(title, status, claim, reservation, lifecycle_generation, allowed)| {
+                let mut instance = Instance::new(title, "/tmp/test");
+                instance.source_profile = profile.to_string();
+                instance.status = status;
+                instance.op_claim = claim;
+                instance.lifecycle_generation = lifecycle_generation;
+                instance.lifecycle_reservation = reservation;
+                (instance, allowed)
+            },
+        );
         storage
             .update(|instances, _groups| {
                 instances.extend(cases.iter().map(|(instance, _)| instance.clone()));
@@ -8114,6 +8167,7 @@ mod tests {
         let mut busy = Instance::new("busy-reserved", "/tmp/test");
         busy.source_profile = profile.to_string();
         busy.status = Status::Starting;
+        busy.lifecycle_generation = 1;
         busy.lifecycle_reservation = Some(LifecycleReservation {
             generation: 1,
             at: Utc::now(),
@@ -8181,7 +8235,12 @@ mod tests {
         // The launch then fails. The reservation must be released, not stranded
         // until its TTL: with the old status==Starting guard this early-returned
         // and left the marker, wedging every later start/restart/stop as busy.
-        inst.fail_reserved_launch(&storage, &anyhow::anyhow!("prepare failed"), false);
+        let error = inst
+            .ensure_reservation_current_or_fail(&storage)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("changed while launch hooks were running"));
 
         let leftover = storage
             .update(|instances, _groups| {
@@ -11121,10 +11180,16 @@ mod tests {
             // are not on every runner, and host_launcher_environment folds them
             // into the fingerprint, so forcing empties here would diverge from
             // the digest on any host that exports one of those keys.
-            for (key, value) in
-                omp_host_routing_environment(&[format!("HOME={}", live_home.display())])
+            for mutation in omp_host_routing_environment(&[format!("HOME={}", live_home.display())])
             {
-                command.env(key, value);
+                match mutation {
+                    tmux::PaneEnvMutation::Set { key, value } => {
+                        command.env(key, value);
+                    }
+                    tmux::PaneEnvMutation::Unset { key } => {
+                        command.env_remove(key);
+                    }
+                }
             }
             command.output().unwrap()
         };

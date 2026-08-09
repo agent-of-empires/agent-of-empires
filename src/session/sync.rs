@@ -58,6 +58,7 @@ struct Update {
     expected_prior: Option<String>,
     profile: String,
     guard: SessionIdGuard,
+    observation: SessionIdObservation,
 }
 
 struct Rollback {
@@ -67,9 +68,10 @@ struct Rollback {
     disk_omp_capture_generation: Option<String>,
 }
 
-/// Drain each instance's poller channel, persist new sids via CAS, reconcile
-/// in-memory state, and republish tmux env. Callers with auxiliary mirrors
-/// must re-sync touched ids from the slice.
+/// Lease each instance's newest poller observation, persist new sids via CAS,
+/// acknowledge terminal outcomes, reconcile in-memory state, and republish
+/// tmux env. Callers with auxiliary mirrors must re-sync touched ids from the
+/// slice.
 pub(crate) fn drain_and_persist_session_ids(
     instances: &mut [Instance],
     file_watch: &Arc<FileWatchService>,
@@ -94,11 +96,9 @@ pub(crate) fn drain_and_persist_session_ids(
         let Some(observation) = drain_poller(inst) else {
             continue;
         };
-        let SessionIdObservation {
-            sid: observed_sid,
-            guard,
-        } = observation;
+        let observed_sid = observation.sid.clone();
         let Some(sid) = validated_session_id(observed_sid) else {
+            acknowledge_poller_observation(inst, &observation);
             filtered_ids.insert(inst.id.clone());
             continue;
         };
@@ -107,7 +107,7 @@ pub(crate) fn drain_and_persist_session_ids(
         // bound to the exact old pane and must remain eligible for the
         // restart's post-join final flush.
         if matches!(inst.status, Status::Stopped)
-            && !matches!(&guard, SessionIdGuard::OmpGeneration(_))
+            && !matches!(&observation.guard, SessionIdGuard::OmpGeneration(_))
             && inst.agent_session_id.as_deref() != Some(sid.as_str())
         {
             tracing::debug!(
@@ -116,6 +116,7 @@ pub(crate) fn drain_and_persist_session_ids(
                 sid = %sid,
                 "Ignoring poller-reported sid for stopped session",
             );
+            acknowledge_poller_observation(inst, &observation);
             filtered_ids.insert(inst.id.clone());
             continue;
         }
@@ -132,6 +133,7 @@ pub(crate) fn drain_and_persist_session_ids(
                     pinned = %pinned,
                     "Ignoring poller-reported sid: contradicts explicit set-session-id pin",
                 );
+                acknowledge_poller_observation(inst, &observation);
                 filtered_ids.insert(inst.id.clone());
                 continue;
             }
@@ -147,6 +149,7 @@ pub(crate) fn drain_and_persist_session_ids(
                     owner = %owner,
                     "Ignoring poller-reported sid already owned by another instance",
                 );
+                acknowledge_poller_observation(inst, &observation);
                 filtered_ids.insert(inst.id.clone());
                 continue;
             }
@@ -158,18 +161,22 @@ pub(crate) fn drain_and_persist_session_ids(
                 sid = %sid,
                 "Ignoring poller-reported sid: in retroactive_capture_excludes",
             );
+            acknowledge_poller_observation(inst, &observation);
             filtered_ids.insert(inst.id.clone());
             continue;
         }
-        if inst.agent_session_id.as_deref() != Some(sid.as_str()) {
-            updates.push(Update {
-                id: inst.id.clone(),
-                sid,
-                expected_prior: inst.agent_session_id.clone(),
-                profile: inst.source_profile.clone(),
-                guard,
-            });
+        if inst.agent_session_id.as_deref() == Some(sid.as_str()) {
+            acknowledge_poller_observation(inst, &observation);
+            continue;
         }
+        updates.push(Update {
+            id: inst.id.clone(),
+            sid,
+            expected_prior: inst.agent_session_id.clone(),
+            profile: inst.source_profile.clone(),
+            guard: observation.guard.clone(),
+            observation,
+        });
     }
 
     // Reject, don't arbitrate: if two same-cwd peers both claim the same
@@ -189,6 +196,7 @@ pub(crate) fn drain_and_persist_session_ids(
                 sid = %upd.sid,
                 "Ignoring poller-reported sid claimed by multiple instances this tick",
             );
+            acknowledge_poller_observation_for(instances, &upd.id, &upd.observation);
             filtered_ids.insert(upd.id.clone());
             false
         } else {
@@ -231,11 +239,15 @@ pub(crate) fn drain_and_persist_session_ids(
         };
         match outcome {
             SidWrite::Applied => {
+                acknowledge_poller_observation_for(instances, &upd.id, &upd.observation);
                 to_apply.push((upd.id.clone(), upd.sid.clone()));
             }
             SidWrite::Skipped => {
                 request_poller_retry(instances, &upd.id);
                 if let Some(rb) = reload_skipped_from_disk(&upd.profile, &upd.id, file_watch) {
+                    if rb.disk_sid.as_deref() == Some(upd.sid.as_str()) {
+                        acknowledge_poller_observation_for(instances, &upd.id, &upd.observation);
+                    }
                     to_rollback.push(rb);
                 } else {
                     tracing::warn!(
@@ -368,14 +380,10 @@ pub(crate) fn capture_launched_session_id_blocking(
     }
 }
 
-/// Drain one poller's complete backlog and retain its newest observation.
-///
-/// Emptying the receiver under one mutex acquisition is important when a
-/// repair follows a CAS skip: an S2 already queued behind S1 must win now,
-/// before `RetryLast` can cause the producer to report S1 again.
+/// Lease one poller's newest observation from its sticky mailbox.
 fn drain_poller(inst: &Instance) -> Option<SessionIdObservation> {
     let arc = inst.session_id_poller.as_ref()?;
-    let guard = match arc.lock() {
+    let mut guard = match arc.lock() {
         Ok(g) => g,
         Err(poisoned) => {
             tracing::warn!(
@@ -386,11 +394,39 @@ fn drain_poller(inst: &Instance) -> Option<SessionIdObservation> {
             poisoned.into_inner()
         }
     };
-    let mut newest = None;
-    while let Some((_id, observation)) = guard.try_recv_observation() {
-        newest = Some(observation);
+    guard
+        .latest_observation()
+        .map(|(_instance_id, observation)| observation)
+}
+
+fn acknowledge_poller_observation(inst: &Instance, observation: &SessionIdObservation) {
+    let Some(poller) = inst.session_id_poller.as_ref() else {
+        return;
+    };
+    let expected = (inst.id.clone(), observation.clone());
+    match poller.lock() {
+        Ok(mut guard) => {
+            guard.acknowledge_observation(&expected);
+        }
+        Err(poisoned) => {
+            tracing::warn!(
+                target: "session.sync",
+                instance = %inst.id,
+                "session_id_poller mutex poisoned while acknowledging observation; recovering inner guard",
+            );
+            poisoned.into_inner().acknowledge_observation(&expected);
+        }
     }
-    newest
+}
+
+fn acknowledge_poller_observation_for(
+    instances: &[Instance],
+    id: &str,
+    observation: &SessionIdObservation,
+) {
+    if let Some(inst) = instances.iter().find(|inst| inst.id == id) {
+        acknowledge_poller_observation(inst, observation);
+    }
 }
 
 fn request_poller_retry(instances: &[Instance], id: &str) {
@@ -999,7 +1035,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn recurring_drain_persists_newest_and_empties_receiver() {
+    fn recurring_drain_persists_newest_and_acknowledges_mailbox() {
         let temp = tempdir().unwrap();
         let _guard = storage_home_guard(&temp);
 
@@ -1024,8 +1060,50 @@ mod tests {
         assert_eq!(outcome.applied, vec![instances[0].id.clone()]);
         assert_eq!(instances[0].agent_session_id.as_deref(), Some(newer));
         assert!(
-            poller.lock().unwrap().try_recv_observation().is_none(),
-            "one recurrent drain must empty S1 and S2"
+            poller.lock().unwrap().latest_observation().is_none(),
+            "an applied newest observation must acknowledge the sticky mailbox"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn leased_observation_survives_stop_flush_and_stale_ack() {
+        let temp = tempdir().unwrap();
+        let _guard = storage_home_guard(&temp);
+
+        let profile = "sync-sticky-stop-flush";
+        let mut inst = Instance::new("sticky-stop-flush", "/tmp/x");
+        inst.source_profile = profile.to_string();
+        seed_instance_on_disk(profile, &inst);
+
+        let sid = "019342ab-1234-7def-8901-cccccccccccc";
+        let newer = "019342ab-1234-7def-8901-dddddddddddd";
+        let poller = Arc::new(Mutex::new(SessionPoller::new(format!(
+            "test-tmux-{}",
+            inst.id
+        ))));
+        poller.lock().unwrap().inject_test_update(&inst.id, sid);
+        inst.session_id_poller = Some(poller.clone());
+
+        let stale_consumer = inst.clone();
+        let leased = drain_poller(&stale_consumer).unwrap();
+        assert_eq!(leased.sid, sid);
+
+        inst.stop_and_flush_poller();
+        let loaded = Storage::new_unwatched(profile).unwrap().load().unwrap();
+        assert_eq!(loaded[0].agent_session_id.as_deref(), Some(sid));
+
+        poller
+            .lock()
+            .unwrap()
+            .inject_test_update(&stale_consumer.id, newer);
+        let newer_observation = drain_poller(&stale_consumer).unwrap();
+        assert_eq!(newer_observation.sid, newer);
+        acknowledge_poller_observation(&stale_consumer, &leased);
+        assert_eq!(
+            drain_poller(&stale_consumer).unwrap(),
+            newer_observation,
+            "a late acknowledgement must not erase a newer observation"
         );
     }
 }

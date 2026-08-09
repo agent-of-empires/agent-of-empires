@@ -67,6 +67,18 @@ impl DeletionResult {
             teardown_started: false,
         }
     }
+
+    fn removed_with_error(session_id: String, message: impl Into<String>) -> Self {
+        Self {
+            session_id,
+            success: false,
+            messages: Vec::new(),
+            errors: vec![message.into()],
+            disposition: DeletionDisposition::Removed,
+            teardown_started: false,
+            retained_instance: None,
+        }
+    }
 }
 
 pub enum PurgeReservation {
@@ -83,6 +95,14 @@ pub struct PurgeTransaction {
     generation: u64,
     claim_at: DateTime<Utc>,
     active: bool,
+}
+
+/// A purge whose durable row has already been removed. Sidecar teardown may
+/// fail, but no caller may restore the now transcript-less session.
+#[must_use = "committed purge sidecars must be finished"]
+pub struct CommittedPurge {
+    profile: String,
+    request: DeletionRequest,
 }
 
 #[derive(Clone, Copy)]
@@ -270,6 +290,90 @@ impl PurgeTransaction {
         )
     }
 
+    /// Atomically validate this reservation and remove its durable row before
+    /// any irreversible external teardown. This is the server's structured
+    /// session path: once returned, the row must never be restored even if ACP
+    /// transcript or sidecar cleanup later fails.
+    pub fn begin_irreversible(
+        mut self,
+    ) -> std::result::Result<CommittedPurge, Box<DeletionResult>> {
+        let id = self.request.session_id.clone();
+        let _lifecycle_lock = match self.storage.acquire_instance_lifecycle_lock(&id) {
+            Ok(lock) => lock,
+            Err(error) => {
+                return Err(Box::new(DeletionResult::rejected(
+                    id,
+                    DeletionDisposition::Failed,
+                    format!("Failed to reacquire instance purge lock: {error}"),
+                    None,
+                )));
+            }
+        };
+        let generation = self.generation;
+        let claim_at = self.claim_at;
+        let was_trashed = self.was_trashed;
+        let mut commit = None;
+        if let Err(error) = self.storage.update(|instances, _groups| {
+            let Some(index) = instances.iter().position(|instance| instance.id == id) else {
+                commit = Some((CompletionGate::AlreadyGone, None));
+                return Ok(());
+            };
+            let restored = crate::session::claim::purge_restored_row_must_be_kept(
+                was_trashed,
+                instances[index].is_trashed(),
+            );
+            let owns = Self::claim_matches(&instances[index], claim_at);
+            if restored {
+                if owns {
+                    instances[index].op_claim = None;
+                }
+                commit = Some((CompletionGate::KeptRestored, Some(instances[index].clone())));
+            } else if instances[index].lifecycle_generation != generation || !owns {
+                if owns {
+                    instances[index].op_claim = None;
+                }
+                commit = Some((CompletionGate::Superseded, Some(instances[index].clone())));
+            } else {
+                instances.remove(index);
+                commit = Some((CompletionGate::Proceed, None));
+            }
+            Ok(())
+        }) {
+            return Err(Box::new(DeletionResult::rejected(
+                id,
+                DeletionDisposition::Failed,
+                format!("Failed to commit irreversible session purge: {error}"),
+                None,
+            )));
+        }
+
+        let Some((gate, retained)) = commit else {
+            return Err(Box::new(DeletionResult::rejected(
+                id,
+                DeletionDisposition::Failed,
+                "Irreversible purge commit produced no outcome",
+                None,
+            )));
+        };
+        self.active = false;
+        if !matches!(gate, CompletionGate::Proceed) {
+            return Err(Box::new(self.result_for_gate(gate, retained)));
+        }
+        Ok(CommittedPurge {
+            profile: self.storage.profile().to_string(),
+            request: DeletionRequest {
+                session_id: self.request.session_id.clone(),
+                instance: self.request.instance.clone(),
+                delete_worktree: self.request.delete_worktree,
+                delete_branch: self.request.delete_branch,
+                delete_sandbox: self.request.delete_sandbox,
+                force_delete: self.request.force_delete,
+                detach_hooks: self.request.detach_hooks,
+                keep_scratch: self.request.keep_scratch,
+            },
+        })
+    }
+
     /// Reacquire the lifecycle flock, verify the token, then keep the flock
     /// through teardown and the durable commit.
     fn complete_inner(
@@ -392,9 +496,37 @@ impl PurgeTransaction {
     pub fn complete(self) -> DeletionResult {
         self.complete_inner(|_| Ok(()), false)
     }
+}
 
-    pub fn complete_after_irreversible(self) -> DeletionResult {
-        self.complete_inner(|_| Ok(()), true)
+impl CommittedPurge {
+    /// Reacquire the per-instance lock and clean up resources from the owned
+    /// snapshot. The durable row is already gone, so failures are reported but
+    /// never roll the deletion back.
+    pub fn finish(self) -> DeletionResult {
+        let id = self.request.session_id.clone();
+        let storage = match Storage::open_unwatched(&self.profile) {
+            Ok(storage) => storage,
+            Err(error) => {
+                return DeletionResult::removed_with_error(
+                    id,
+                    format!(
+                        "Session was removed, but cleanup storage could not be opened: {error}"
+                    ),
+                );
+            }
+        };
+        let _lifecycle_lock = match storage.acquire_instance_lifecycle_lock(&id) {
+            Ok(lock) => lock,
+            Err(error) => {
+                return DeletionResult::removed_with_error(
+                    id,
+                    format!("Session was removed, but its cleanup lock failed: {error}"),
+                );
+            }
+        };
+        let mut result = perform_deletion_teardown_lifecycle_locked(&self.request);
+        result.disposition = DeletionDisposition::Removed;
+        result
     }
 }
 
@@ -1216,7 +1348,10 @@ mod tests {
             })
             .unwrap();
 
-        let result = transaction.complete();
+        let result = match transaction.begin_irreversible() {
+            Ok(_) => panic!("superseded purge crossed the irreversible boundary"),
+            Err(result) => *result,
+        };
         assert_eq!(result.disposition, DeletionDisposition::Busy);
         assert!(!result.teardown_started);
         let retained = storage.load().unwrap();
@@ -1244,9 +1379,16 @@ mod tests {
             PurgeReservation::Reserved(transaction) => transaction,
             PurgeReservation::Rejected(_) => panic!("retry reservation was refused"),
         };
-        let result = retry.complete();
+        let committed = match retry.begin_irreversible() {
+            Ok(committed) => committed,
+            Err(_) => panic!("current purge reservation was rejected"),
+        };
+        assert!(
+            storage.load().unwrap().is_empty(),
+            "durable row must be gone before irreversible cleanup starts"
+        );
+        let result = committed.finish();
         assert_eq!(result.disposition, DeletionDisposition::Removed);
-        assert!(storage.load().unwrap().is_empty());
     }
 
     #[test]

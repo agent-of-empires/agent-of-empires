@@ -202,6 +202,7 @@ pub struct SessionPoller {
     cmd_rx: Option<mpsc::Receiver<PollCommand>>,
     result_tx: mpsc::Sender<(String, SessionIdObservation)>,
     result_rx: Option<mpsc::Receiver<(String, SessionIdObservation)>>,
+    pending_observation: Option<(String, SessionIdObservation)>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -225,6 +226,7 @@ impl SessionPoller {
             cmd_rx: Some(cmd_rx),
             result_tx,
             result_rx: Some(result_rx),
+            pending_observation: None,
             handle: None,
         }
     }
@@ -382,6 +384,7 @@ impl SessionPoller {
                 let (result_tx, result_rx) = mpsc::channel();
                 self.result_tx = result_tx;
                 self.result_rx = Some(result_rx);
+                self.pending_observation = None;
                 false
             }
         }
@@ -391,7 +394,32 @@ impl SessionPoller {
         self.result_rx.as_ref()?.try_recv().ok()
     }
 
-    #[cfg(any(test, feature = "test-support"))]
+    /// Drain newly queued observations into a sticky one-slot mailbox and
+    /// lease the newest value without consuming it. The value remains
+    /// available to a concurrent stop/final flush until a terminal outcome
+    /// acknowledges it.
+    pub(crate) fn latest_observation(&mut self) -> Option<(String, SessionIdObservation)> {
+        while let Some(observation) = self.try_recv_observation() {
+            self.pending_observation = Some(observation);
+        }
+        self.pending_observation.clone()
+    }
+
+    /// Acknowledge only the observation that reached a terminal outcome. A
+    /// stale writer must not erase a newer correction queued in the meantime.
+    pub(crate) fn acknowledge_observation(
+        &mut self,
+        expected: &(String, SessionIdObservation),
+    ) -> bool {
+        if self.pending_observation.as_ref() == Some(expected) {
+            self.pending_observation = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(any(test, all(feature = "test-support", feature = "serve")))]
     pub(crate) fn inject_test_update(&self, instance_id: &str, session_id: &str) {
         self.result_tx
             .send((

@@ -3994,45 +3994,55 @@ async fn purge_session_artifacts(
         .await
         .map_err(|e| format!("Deletion hook task failed: {e}"))?;
 
-    // True once we have crossed the irreversible line (the structured-view
-    // transcript has been deleted). After that point a sidecar-cleanup
-    // failure must NOT leave the session row restorable, since the restore
-    // would resurrect a session whose transcript is already gone. See #2489.
     #[cfg(feature = "serve")]
     let transcript_purged = instance.is_structured();
     #[cfg(not(feature = "serve"))]
     let transcript_purged = false;
 
-    // Tear down the structured view worker FIRST so the ACP subprocess + its
-    // claude-agent-acp child don't leak past the session delete. Permanent
-    // removal releases the agent's persisted transcript too (#1710); the
-    // event store purge prevents a recreated same-id session from inheriting
-    // the deleted transcript.
-    #[cfg(feature = "serve")]
-    if transcript_purged {
-        match state.acp_supervisor.shutdown_and_delete(id).await {
-            Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
-            Err(e) => {
-                tracing::warn!(
-                    target: "acp.supervisor",
-                    session = %id,
-                    "shutdown during purge failed: {e}"
-                );
+    let deletion_result = if transcript_purged {
+        // Commit the row removal before deleting the ACP transcript. A lost
+        // restore/generation race therefore leaves both row and transcript
+        // intact; a successful commit makes later cleanup failures
+        // non-restorable by construction.
+        let committed = tokio::task::spawn_blocking(move || transaction.begin_irreversible())
+            .await
+            .map_err(|e| format!("Irreversible deletion commit task failed: {e}"))?;
+        match committed {
+            Err(result) => *result,
+            Ok(committed) => {
+                // Remove the local mirror before awaiting ACP so the reconciler
+                // cannot surface a durable row that no longer exists.
+                state.instances.write().await.retain(|row| row.id != id);
+
+                // The worker may still use the worktree, so ACP teardown stays
+                // ahead of sidecar cleanup. The durable row is already gone.
+                #[cfg(feature = "serve")]
+                {
+                    match state.acp_supervisor.shutdown_and_delete(id).await {
+                        Ok(())
+                        | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "acp.supervisor",
+                                session = %id,
+                                "shutdown during purge failed: {e}"
+                            );
+                        }
+                    }
+                    state.acp_supervisor.forget_session(id);
+                    state.acp_event_store.delete_session(id);
+                }
+
+                tokio::task::spawn_blocking(move || committed.finish())
+                    .await
+                    .map_err(|e| format!("Deletion cleanup task failed: {e}"))?
             }
         }
-        state.acp_supervisor.forget_session(id);
-        state.acp_event_store.delete_session(id);
-    }
-
-    let deletion_result = tokio::task::spawn_blocking(move || {
-        if transcript_purged {
-            transaction.complete_after_irreversible()
-        } else {
-            transaction.complete()
-        }
-    })
-    .await
-    .map_err(|e| format!("Deletion task failed: {e}"))?;
+    } else {
+        tokio::task::spawn_blocking(move || transaction.complete())
+            .await
+            .map_err(|e| format!("Deletion task failed: {e}"))?
+    };
 
     let mut messages = deletion_result.messages.clone();
     match deletion_result.disposition {
@@ -4068,7 +4078,7 @@ async fn purge_session_artifacts(
         tracing::warn!(
             target: "http.api.sessions",
             session = %id,
-            "purge sidecar cleanup failed after the transcript was deleted; removing the session row anyway: {errs}"
+            "purge sidecar cleanup failed after durable removal; session stays removed: {errs}"
         );
         messages.push(format!(
             "Cleanup incomplete (session removed anyway): {errs}"

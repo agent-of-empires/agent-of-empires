@@ -13,7 +13,7 @@ pub(crate) mod utils;
 #[cfg(unix)]
 pub(crate) mod vt;
 
-pub use session::{PaneCursor, Session, SIZE_OWNER_HEARTBEAT, SIZE_OWNER_TTL};
+pub use session::{PaneCursor, PaneEnvMutation, Session, SIZE_OWNER_HEARTBEAT, SIZE_OWNER_TTL};
 pub use status_bar::{get_session_info_for_current, get_status_for_current_session};
 pub use status_detection::detect_status_from_content;
 pub(crate) use status_detection::{

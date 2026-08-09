@@ -24,6 +24,28 @@ pub struct Session {
     name: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaneEnvMutation {
+    Set { key: String, value: String },
+    Unset { key: String },
+}
+
+impl PaneEnvMutation {
+    pub fn set(key: String, value: String) -> Self {
+        Self::Set { key, value }
+    }
+
+    pub fn unset(key: String) -> Self {
+        Self::Unset { key }
+    }
+
+    fn key(&self) -> &str {
+        match self {
+            Self::Set { key, .. } | Self::Unset { key } => key,
+        }
+    }
+}
+
 /// tmux user options holding the cross-process size-owner lock (see
 /// [`Session::claim_size_owner`]). User options ride on the session itself, so
 /// the web daemon and the native TUI read and write the same state.
@@ -350,14 +372,14 @@ impl Session {
         self.create_with_size_env(working_dir, command, size, profile, &[])
     }
 
-    /// Like [`Self::create_with_size`], but also installs `extra_env` in the
-    /// pane process through a protected, one-shot file.
+    /// Like [`Self::create_with_size`], but also applies `extra_env` mutations
+    /// in the pane process through a protected, one-shot file.
     ///
-    /// Extra environment values and the launch command never enter tmux client
-    /// argv, pane start-command metadata, or tmux's persistent session
-    /// environment. The short pane command runs the file as a POSIX script;
-    /// that script installs shell-escaped exports and unlinks itself before
-    /// executing the requested command.
+    /// Environment values and the launch command never enter tmux client argv,
+    /// pane start-command metadata, or tmux's persistent session environment.
+    /// The short pane command runs the file as a POSIX script; that script
+    /// applies shell-escaped exports and explicit unsets, then unlinks itself
+    /// before executing the requested command.
     /// The non-secret OMP launch ID remains a tmux `-e` value so capture can
     /// query it. Desktop/session values retain the existing tmux environment
     /// behavior used by later panes.
@@ -367,7 +389,7 @@ impl Session {
         command: Option<&str>,
         size: Option<(u16, u16)>,
         profile: &str,
-        extra_env: &[(String, String)],
+        extra_env: &[PaneEnvMutation],
     ) -> Result<()> {
         if self.exists() {
             return Ok(());
@@ -385,15 +407,19 @@ impl Session {
             .iter()
             .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect();
-        for (key, value) in extra_env {
+        for mutation in extra_env {
+            let key = mutation.key();
             if !crate::session::environment::is_valid_env_key(key) {
                 tracing::warn!(target: "session.create", "invalid pane environment key '{}'; skipping", key);
                 continue;
             }
-            if key == crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY {
-                tmux_env.push((key.as_str(), value.as_str()));
-            } else {
-                protected_env.push((key.clone(), value.clone()));
+            match mutation {
+                PaneEnvMutation::Set { key, value }
+                    if key == crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY =>
+                {
+                    tmux_env.push((key.as_str(), value.as_str()));
+                }
+                _ => protected_env.push(mutation.clone()),
             }
         }
 
@@ -1616,7 +1642,7 @@ struct EphemeralEnvFile {
 }
 
 impl EphemeralEnvFile {
-    fn create(env: &[(String, String)]) -> Result<Self> {
+    fn create(env: &[PaneEnvMutation]) -> Result<Self> {
         let mut file = tempfile::Builder::new()
             .prefix(PANE_ENV_FILE_PREFIX)
             .tempfile()?;
@@ -1626,12 +1652,18 @@ impl EphemeralEnvFile {
             file.as_file()
                 .set_permissions(std::fs::Permissions::from_mode(0o600))?;
         }
-        for (key, value) in env {
+        for mutation in env {
+            let key = mutation.key();
             if !crate::session::environment::is_valid_env_key(key) {
                 tracing::warn!(target: "session.create", "invalid protected environment key '{}'; skipping", key);
                 continue;
             }
-            writeln!(file, "export {}={}", key, script_shell_escape(value))?;
+            match mutation {
+                PaneEnvMutation::Set { key, value } => {
+                    writeln!(file, "export {}={}", key, script_shell_escape(value))?;
+                }
+                PaneEnvMutation::Unset { key } => writeln!(file, "unset {}", key)?,
+            }
         }
         file.flush()?;
         let (_handle, path) = file.keep().map_err(|error| error.error)?;
@@ -3437,9 +3469,9 @@ mod tests {
     fn test_protected_env_file_keeps_secret_out_of_pane_argv_and_rejects_invalid_keys() {
         let secret = "literal-secret-value";
         let file = EphemeralEnvFile::create(&[
-            ("GOOD_TOKEN".to_string(), "stale-profile-value".to_string()),
-            ("GOOD_TOKEN".to_string(), secret.to_string()),
-            ("X; touch /tmp/injected; #".to_string(), "bad".to_string()),
+            PaneEnvMutation::set("GOOD_TOKEN".to_string(), "stale-profile-value".to_string()),
+            PaneEnvMutation::set("GOOD_TOKEN".to_string(), secret.to_string()),
+            PaneEnvMutation::set("X; touch /tmp/injected; #".to_string(), "bad".to_string()),
         ])
         .unwrap();
         let path = file.path.as_ref().unwrap().clone();
@@ -3486,20 +3518,26 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let output = temp.path().join("multiline");
         let value = "line one\nline two\r\nquote ' intact";
-        let mut file =
-            EphemeralEnvFile::create(&[("MULTILINE_SECRET".to_string(), value.to_string())])
-                .unwrap();
+        let stale_output = temp.path().join("unset");
+        let mut file = EphemeralEnvFile::create(&[
+            PaneEnvMutation::set("MULTILINE_SECRET".to_string(), value.to_string()),
+            PaneEnvMutation::unset("AOE_TEST_STALE".to_string()),
+        ])
+        .unwrap();
         let command = format!(
-            "printf '%s' \"$MULTILINE_SECRET\" > {}",
-            script_shell_escape(&output.to_string_lossy())
+            "printf '%s' \"$MULTILINE_SECRET\" > {}; printf '%s' \"${{AOE_TEST_STALE+x}}\" > {}",
+            script_shell_escape(&output.to_string_lossy()),
+            script_shell_escape(&stale_output.to_string_lossy())
         );
         let wrapper = file.wrap_command(Some(&command)).unwrap();
         let status = std::process::Command::new("sh")
             .args(["-c", &wrapper])
+            .env("AOE_TEST_STALE", "inherited")
             .status()
             .unwrap();
         assert!(status.success());
         assert_eq!(std::fs::read(&output).unwrap(), value.as_bytes());
+        assert_eq!(std::fs::read_to_string(stale_output).unwrap(), "");
         assert!(file.wait_until_consumed(Duration::ZERO));
         file.disarm();
     }
@@ -3525,7 +3563,7 @@ mod tests {
                 Some(&command),
                 Some((80, 24)),
                 "default",
-                &[(
+                &[PaneEnvMutation::set(
                     "AOE_TEST_PROTECTED_VALUE".to_string(),
                     "secret value".to_string(),
                 )],
