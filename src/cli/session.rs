@@ -516,7 +516,7 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     if let crate::session::trash::RestoreOutcome::Failed { reason } =
         crate::session::trash::restore_worktree_location(&mut inst)
     {
-        release_restore_lease(&storage, &restore_id, restore_generation);
+        release_restore_reservation(&storage, &restore_id, restore_generation);
         anyhow::bail!("Cannot restore worktree: {reason}");
     }
     let restored_path = inst.project_path.clone();
@@ -545,7 +545,7 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     Ok(())
 }
 
-fn release_restore_lease(storage: &Storage, restore_id: &str, generation: u64) {
+fn release_restore_reservation(storage: &Storage, restore_id: &str, generation: u64) {
     let _ = storage.update(|instances, _groups| {
         if let Some(stored) = instances
             .iter_mut()

@@ -9065,7 +9065,7 @@ mod tests {
                     now + chrono::Duration::seconds(1),
                 ),
                 Err(LifecycleReservationError::Busy(LifecycleOperation::Purge)),
-                "{contender:?} must not replace a live peer lease",
+                "{contender:?} must not replace a live peer reservation",
             );
         }
         assert!(!instance

@@ -8314,7 +8314,7 @@ fn trash_reserves_durable_lifecycle_generation() {
     assert_eq!(row.lifecycle_generation, 1);
 }
 
-/// A plain session's no-relocation teardown releases its durable Trash lease
+/// A plain session's no-relocation teardown releases its durable Trash reservation
 /// before the worker publishes completion.
 #[test]
 #[serial]

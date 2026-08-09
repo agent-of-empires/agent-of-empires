@@ -2588,7 +2588,7 @@ pub async fn update_session_archive(
 }
 
 /// `POST /api/sessions/:id/trash`. The per-instance lifecycle flock is held
-/// from the durable Trash lease through teardown, relocation, and final commit.
+/// from the durable Trash reservation through teardown, relocation, and final commit.
 pub async fn trash_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -2711,7 +2711,7 @@ pub async fn trash_session(
                 );
                 anyhow::ensure!(
                     commit == crate::session::claim::RelocationCommit::Persisted,
-                    "trash relocation lease was superseded"
+                    "trash relocation reservation was superseded"
                 );
             } else if let Some(stored) = instances
                 .iter_mut()
@@ -2766,7 +2766,7 @@ pub async fn trash_session(
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
-/// `POST /api/sessions/:id/restore`. The lifecycle flock covers lease
+/// `POST /api/sessions/:id/restore`. The lifecycle flock covers reservation
 /// acquisition, worktree restoration, and durable untrash as one transition.
 pub async fn restore_session(
     State(state): State<Arc<AppState>>,

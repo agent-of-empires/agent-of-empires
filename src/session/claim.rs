@@ -6,8 +6,7 @@
 //! commit execute. Operation kind is never used as ownership identity.
 //!
 //! Vocabulary: `reservation` is the durable ownership primitive on `Instance`;
-//! `claim`/`decide_*` are the decision helpers this module layers on top. The
-//! term "lease" is not used.
+//! `claim`/`decide_*` are the decision helpers this module layers on top.
 
 use super::{Instance, LifecycleOperation, LifecycleReservationError};
 use chrono::{DateTime, Utc};

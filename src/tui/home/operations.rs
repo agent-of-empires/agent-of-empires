@@ -1940,7 +1940,7 @@ fn restore_from_trash_with_storage(
     }) {
         Ok(decision) => decision,
         Err(error) => {
-            tracing::warn!(target: "tui.home", id = %id, "restore lease failed: {error}");
+            tracing::warn!(target: "tui.home", id = %id, "restore reservation failed: {error}");
             return RestoreFromTrash::PersistFailed;
         }
     };

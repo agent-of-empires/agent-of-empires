@@ -231,7 +231,7 @@ pub fn relocate_worktree_to_trash(inst: &mut Instance) -> RelocateOutcome {
 /// `TrashPoller`, the server wraps it in `spawn_blocking`, and the CLI is a
 /// one-shot process.
 /// Stop the sandbox container and move a managed worktree into the trash.
-/// The caller must hold the session's lifecycle flock and own its Trash lease.
+/// The caller must hold the session's lifecycle flock and own its Trash reservation.
 pub fn prepare_trashed_worktree(inst: &mut Instance) -> RelocateOutcome {
     if let Err(error) =
         crate::session::worktree_edit::stop_sandbox_container(&inst.id, is_sandboxed(inst))
@@ -559,7 +559,7 @@ pub fn reconcile_trashed_location(inst: &mut Instance) -> bool {
 /// Reconcile one trashed worktree as a serialized lifecycle transition.
 ///
 /// The caller's snapshot is replaced with the durable row after commit. A
-/// fresh peer lease refuses the pass; an expired lease is superseded.
+/// fresh peer reservation refuses the pass; an expired reservation is superseded.
 pub fn reconcile_trashed_transition(inst: &mut Instance) -> anyhow::Result<bool> {
     let profile = inst.source_profile.clone();
     anyhow::ensure!(
@@ -596,7 +596,7 @@ pub fn reconcile_trashed_transition(inst: &mut Instance) -> anyhow::Result<bool>
             );
             anyhow::ensure!(
                 commit == crate::session::claim::RelocationCommit::Persisted,
-                "trash reconciliation lease was superseded"
+                "trash reconciliation reservation was superseded"
             );
         } else if let Some(stored) = instances.iter_mut().find(|candidate| candidate.id == id) {
             stored.release_lifecycle_reservation_if_owned(
