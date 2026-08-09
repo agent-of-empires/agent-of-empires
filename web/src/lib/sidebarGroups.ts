@@ -351,7 +351,7 @@ export function buildOrgGroups(
   const order: string[] = [];
 
   for (const repoGroup of repoGroups) {
-    const orgId = repoGroup.remoteOwner ?? NO_ORG_GROUP_ID;
+    const orgId = repoGroup.remoteOwnerKey ?? NO_ORG_GROUP_ID;
     const bucket = byOrg.get(orgId);
     if (bucket) {
       bucket.push(repoGroup);
@@ -362,7 +362,8 @@ export function buildOrgGroups(
   }
 
   const result: OrgNestedGroup[] = order.map((orgId) => {
-    const repos = byOrg.get(orgId)!.map((repoGroup) => {
+    const members = byOrg.get(orgId)!;
+    const repos = members.map((repoGroup) => {
       const repo = repoGroupToSidebarGroup(repoGroup);
       return {
         ...repo,
@@ -372,7 +373,10 @@ export function buildOrgGroups(
     });
     const workspaces = repos.flatMap((r) => r.workspaces);
     const hasActive = repos.some((r) => r.status === "active");
-    const displayName = orgId === NO_ORG_GROUP_ID ? "No organization" : orgId;
+    // Every member shares the same key, and therefore the same bare owner
+    // by construction; `orgId` itself is the host-scoped key, never the
+    // display text, so the display name is always read off a member.
+    const displayName = orgId === NO_ORG_GROUP_ID ? "No organization" : (members[0]?.remoteOwner ?? orgId);
     const org: SidebarGroup = {
       id: orgId,
       kind: "org",
@@ -380,7 +384,7 @@ export function buildOrgGroups(
       defaultDisplayName: displayName,
       alias: null,
       color: null,
-      remoteOwner: orgId === NO_ORG_GROUP_ID ? null : orgId,
+      remoteOwner: orgId === NO_ORG_GROUP_ID ? null : displayName,
       workspaces,
       status: hasActive ? "active" : "idle",
       collapsed: opts.isOrgCollapsed(orgId),
@@ -399,13 +403,6 @@ export function buildOrgGroups(
   });
 
   return result;
-}
-
-// Org-axis equivalent of `nestedSidebarGroupHasLiveWorkspace`: true while
-// any member repo still has a live row, so an all-sunk org block is not
-// rendered as an empty header.
-export function orgNestedGroupHasLiveWorkspace(group: OrgNestedGroup): boolean {
-  return group.repos.some(sidebarGroupHasLiveWorkspace);
 }
 
 // Org-axis equivalent of `nestedSidebarGroupShouldRender`: a pinned-but-

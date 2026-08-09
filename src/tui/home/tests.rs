@@ -10015,6 +10015,116 @@ fn build_flat_items_by_org_groups_by_resolved_owner() {
     );
 }
 
+/// Build a HomeView seeded with two sessions whose repos share the same
+/// owner login ("acme") but live on different hosts (GitHub, GitLab).
+/// Regression fixture for the Required #1 review fix: before it,
+/// `org_group_key` returned the bare owner, so these two repos merged into
+/// one org bucket and one bulk-archive scope despite having nothing to do
+/// with each other.
+fn create_test_env_same_owner_two_hosts() -> TestEnv {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+
+    let repo_gh = temp.path().join("repo-gh");
+    std::fs::create_dir_all(&repo_gh).unwrap();
+    git2::Repository::init(&repo_gh)
+        .unwrap()
+        .remote("origin", "git@github.com:acme/repo-gh.git")
+        .unwrap();
+
+    let repo_gl = temp.path().join("repo-gl");
+    std::fs::create_dir_all(&repo_gl).unwrap();
+    git2::Repository::init(&repo_gl)
+        .unwrap()
+        .remote("origin", "git@gitlab.com:acme/repo-gl.git")
+        .unwrap();
+
+    let inst_gh = Instance::new("gh-session", repo_gh.to_str().unwrap());
+    let inst_gl = Instance::new("gl-session", repo_gl.to_str().unwrap());
+
+    let instances = vec![inst_gh, inst_gl];
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    TestEnv {
+        view,
+        _guard,
+        _temp: temp,
+    }
+}
+
+/// Required-fix regression (#3284 review): two repos owned by the same
+/// login on different hosts (GitHub "acme" vs GitLab "acme") must render as
+/// two separate org headers, both displayed "acme", and a bulk operation
+/// scoped to one must never pull in the other's session.
+#[test]
+#[serial]
+fn build_flat_items_by_org_scopes_same_named_owners_by_host() {
+    use crate::session::config::GroupByMode;
+
+    let mut env = create_test_env_same_owner_two_hosts();
+    env.view.group_by = GroupByMode::Org;
+    env.view.flat_items = env.view.build_flat_items();
+
+    let group_paths: Vec<String> = env
+        .view
+        .flat_items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Group { path, name, .. } => {
+                assert_eq!(name, "acme", "both headers should display the bare owner");
+                Some(path.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        group_paths.len(),
+        2,
+        "same-named owners on different hosts must render as two separate headers, got {group_paths:?}"
+    );
+    assert_ne!(
+        group_paths[0], group_paths[1],
+        "the two org headers must have distinct identity keys"
+    );
+
+    // Selecting one host's group must not pull in the other host's session.
+    let gh_id = env
+        .view
+        .instances()
+        .find(|i| i.title == "gh-session")
+        .map(|i| i.id.clone())
+        .expect("gh-session instance must exist");
+    let gl_id = env
+        .view
+        .instances()
+        .find(|i| i.title == "gl-session")
+        .map(|i| i.id.clone())
+        .expect("gl-session instance must exist");
+    let gh_inst = env.view.get_instance(&gh_id).unwrap();
+    let gh_key = env.view.org_group_key(gh_inst);
+    env.view.selected_group = Some(gh_key);
+    let scoped_ids = env.view.active_sessions_in_selected_group();
+    assert_eq!(
+        scoped_ids,
+        vec![gh_id],
+        "archiving the GitHub org header must not include the GitLab session ({gl_id})"
+    );
+}
+
 /// Project grouping must survive Attention sort. Previously `build_flat_items`
 /// short-circuited on `SortOrder::Attention` before checking `GroupByMode`,
 /// flattening the list and dropping project headers. The headers are the

@@ -3322,11 +3322,14 @@ impl HomeView {
     }
 
     /// Pick a representative repo path for a selected group so "New Session"
-    /// from a project/org/group can prefill the working directory. In
-    /// project mode the group label is a derived repo basename, so match
-    /// members by `project_group_name`; in org mode it's a derived remote
-    /// owner, so match by `org_group_name`; in manual mode match by the
-    /// stored `group_path`, including nested subgroups. Returns `None` for
+    /// from a project/group can prefill the working directory. In project
+    /// mode the group label is a derived repo basename, so match members by
+    /// `project_group_name`; in manual mode match by the stored
+    /// `group_path`, including nested subgroups. In org mode there is no
+    /// single unambiguous repo to prefill (unlike Project, an org spans many
+    /// repos by design), so this always returns `None` there, mirroring the
+    /// web org header, which routes "New Session" through the generic
+    /// create flow instead of a specific repo path. Also returns `None` for
     /// an empty group (no member to borrow a path from), leaving the dialog
     /// on the default cwd.
     pub(super) fn group_repo_path(&self, group_path: &str) -> Option<String> {
@@ -3334,7 +3337,7 @@ impl HomeView {
             .values()
             .find(|inst| match self.group_by {
                 GroupByMode::Project => super::project_group_name(inst) == group_path,
-                GroupByMode::Org => self.org_group_name(inst) == group_path,
+                GroupByMode::Org => false,
                 GroupByMode::Manual => {
                     inst.group_path == group_path
                         || inst.group_path.starts_with(&format!("{group_path}/"))

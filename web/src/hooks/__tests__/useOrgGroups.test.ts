@@ -38,6 +38,7 @@ function session(): SessionResponse {
     profile: "default",
     cleanup_defaults: { delete_worktree: false, delete_branch: false, delete_sandbox: false },
     remote_owner: "acme",
+    remote_owner_key: "acme@example.com",
     notify_on_waiting: null,
     notify_on_idle: null,
     notify_on_error: null,
@@ -68,6 +69,7 @@ function repoGroup(over: Partial<RepoGroup> = {}): RepoGroup {
     alias: null,
     color: null,
     remoteOwner: "acme",
+    remoteOwnerKey: "acme@example.com",
     workspaces: [workspace()],
     status: "idle",
     collapsed: false,
@@ -77,11 +79,11 @@ function repoGroup(over: Partial<RepoGroup> = {}): RepoGroup {
 }
 
 function orgKey(): string {
-  return `${PREFIX}org:${encodeURIComponent("acme")}`;
+  return `${PREFIX}org:${encodeURIComponent("acme@example.com")}`;
 }
 
 function repoKey(): string {
-  return `${PREFIX}repo:${encodeURIComponent("acme")}::${encodeURIComponent("repo-1")}`;
+  return `${PREFIX}repo:${encodeURIComponent("acme@example.com")}::${encodeURIComponent("repo-1")}`;
 }
 
 beforeEach(() => localStorage.clear());
@@ -91,7 +93,7 @@ describe("useOrgGroups", () => {
   it("buckets repos under their org", () => {
     const { result } = renderHook(() => useOrgGroups([repoGroup()]));
     expect(result.current.groups).toHaveLength(1);
-    expect(result.current.groups[0]!.org.id).toBe("acme");
+    expect(result.current.groups[0]!.org.id).toBe("acme@example.com");
     expect(result.current.groups[0]!.repos.map((r) => r.id)).toEqual(["repo-1"]);
   });
 
@@ -105,11 +107,11 @@ describe("useOrgGroups", () => {
   it("toggles the org header and persists, then clears on toggle back", () => {
     const { result } = renderHook(() => useOrgGroups([repoGroup()]));
 
-    act(() => result.current.toggleOrgCollapsed("acme"));
+    act(() => result.current.toggleOrgCollapsed("acme@example.com"));
     expect(localStorage.getItem(orgKey())).toBe("1");
     expect(result.current.groups[0]!.org.collapsed).toBe(true);
 
-    act(() => result.current.toggleOrgCollapsed("acme"));
+    act(() => result.current.toggleOrgCollapsed("acme@example.com"));
     expect(localStorage.getItem(orgKey())).toBeNull();
     expect(result.current.groups[0]!.org.collapsed).toBe(false);
   });
@@ -117,14 +119,14 @@ describe("useOrgGroups", () => {
   it("toggles a repo within an org independently of the org header", () => {
     const { result } = renderHook(() => useOrgGroups([repoGroup(), repoGroup({ id: "repo-2", repoPath: "/repo-2" })]));
 
-    act(() => result.current.toggleRepoCollapsed("acme", "repo-1"));
+    act(() => result.current.toggleRepoCollapsed("acme@example.com", "repo-1"));
     expect(localStorage.getItem(repoKey())).toBe("1");
     const repos = result.current.groups[0]!.repos;
     expect(repos.find((r) => r.id === "repo-1")!.collapsed).toBe(true);
     expect(repos.find((r) => r.id === "repo-2")!.collapsed).toBe(false);
     expect(result.current.groups[0]!.org.collapsed).toBe(false);
 
-    act(() => result.current.toggleRepoCollapsed("acme", "repo-1"));
+    act(() => result.current.toggleRepoCollapsed("acme@example.com", "repo-1"));
     expect(localStorage.getItem(repoKey())).toBeNull();
     expect(result.current.groups[0]!.repos.find((r) => r.id === "repo-1")!.collapsed).toBe(false);
   });

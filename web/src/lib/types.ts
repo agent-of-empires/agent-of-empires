@@ -106,6 +106,12 @@ export interface SessionResponse {
   profile: string;
   cleanup_defaults: CleanupDefaults;
   remote_owner: string | null;
+  /** Host-scoped identity for `remote_owner` ("owner@host"): the org axis
+   *  buckets by this instead of the bare owner, so same-named owners on
+   *  different hosts (GitHub "acme" vs GitLab "acme") never merge into one
+   *  group. `remote_owner` stays the display label. `null` whenever
+   *  `remote_owner` is `null`. */
+  remote_owner_key: string | null;
   /** Per-session push-notification overrides. null means "inherit the
    *  server default" for that event type; boolean is an explicit toggle. */
   notify_on_waiting: boolean | null;
@@ -358,6 +364,10 @@ export interface RepoGroup {
   alias: string | null;
   color: RepoColor | null;
   remoteOwner: string | null;
+  /** Host-scoped identity for `remoteOwner` ("owner@host"); the org axis
+   *  buckets repos by this instead of the bare owner. See `SessionResponse
+   *  .remote_owner_key`. `null` whenever `remoteOwner` is `null`. */
+  remoteOwnerKey: string | null;
   workspaces: Workspace[];
   status: WorkspaceStatus;
   collapsed: boolean;

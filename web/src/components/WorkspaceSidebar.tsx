@@ -3385,6 +3385,20 @@ export function WorkspaceSidebar({
         .filter((og) => og.repos.length > 0)
     : orgGroups;
 
+  // Full (pre-filter) repo objects keyed by `${orgId}::${repoId}`, so
+  // "Archive all" on a filtered org repo can still act on every workspace,
+  // not just the filter-matching ones. Built once per render instead of a
+  // double `.find()` per rendered repo. Memoized: an unmemoized `new Map()`
+  // here broke the React Compiler's ability to preserve the manual
+  // `useMemo` below (`flatRenderedOrder`).
+  const fullOrgRepoById: Map<string, SidebarGroup> = useMemo(
+    () =>
+      isOrgAxis
+        ? new Map(orgGroups.flatMap((o) => o.repos.map((r): [string, SidebarGroup] => [`${o.org.id}::${r.id}`, r])))
+        : new Map(),
+    [isOrgAxis, orgGroups],
+  );
+
   // A filter query that matches only a saved project (no live session) still
   // populates the Projects section, so it must not trigger the "No matches"
   // empty state below it. The no-query empty state ("No sessions yet") is left
@@ -4088,8 +4102,7 @@ export function WorkspaceSidebar({
                       const liveWorkspaces = repo.workspaces.filter((v) => !workspaceIsSunk(v.workspace));
                       // Resolve the unfiltered repo so "Archive all"
                       // covers the whole repo, not just filter matches.
-                      const fullRepo =
-                        orgGroups.find((o) => o.org.id === org.id)?.repos.find((r) => r.id === repo.id) ?? repo;
+                      const fullRepo = fullOrgRepoById.get(`${org.id}::${repo.id}`) ?? repo;
                       return (
                         <div
                           key={`${org.id}::${repo.id}`}

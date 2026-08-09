@@ -294,7 +294,7 @@ test.describe("sidebar org axis (#3283)", () => {
     const orgBlocks = page.locator("[data-testid='sidebar-org-group']");
     await expect(orgBlocks).toHaveCount(2);
 
-    const acmeOrg = page.locator("[data-testid='sidebar-org-group'][data-org-id='acme']");
+    const acmeOrg = page.locator("[data-testid='sidebar-org-group'][data-org-id='acme@example.com']");
     await expect(acmeOrg.locator(HEADER).first()).toContainText("acme");
     await expect(acmeOrg.locator("[data-testid='sidebar-org-repo']")).toHaveCount(2);
 
@@ -304,7 +304,7 @@ test.describe("sidebar org axis (#3283)", () => {
 
     // The No-organization bucket renders after the named org, matching the
     // "pinned last" alphabetical order.
-    await expect(orgBlocks.nth(0)).toHaveAttribute("data-org-id", "acme");
+    await expect(orgBlocks.nth(0)).toHaveAttribute("data-org-id", "acme@example.com");
     await expect(orgBlocks.nth(1)).toHaveAttribute("data-org-id", "__no_org__");
 
     // Every session stays visible, now nested under org -> repo.
@@ -320,7 +320,7 @@ test.describe("sidebar org axis (#3283)", () => {
     await expect(axisToggle).toHaveAttribute("data-axis", "repo");
     await cycleAxisTo(axisToggle, "org");
 
-    const acmeOrg = page.locator("[data-testid='sidebar-org-group'][data-org-id='acme']");
+    const acmeOrg = page.locator("[data-testid='sidebar-org-group'][data-org-id='acme@example.com']");
     const alphaRepo = acmeOrg.locator("[data-testid='sidebar-org-repo'][data-repo-id='/tmp/repo-alpha']");
     const alphaExpand = alphaRepo.locator("button[aria-expanded]");
     await expect(alphaExpand).toHaveAttribute("aria-expanded", "true");

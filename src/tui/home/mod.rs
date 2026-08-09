@@ -493,13 +493,20 @@ pub struct HomeView {
     /// Collapsed state for org-mode groups (persists across rebuilds), same
     /// shape and lifecycle as `project_group_collapsed`.
     pub(super) org_group_collapsed: HashMap<String, bool>,
-    /// Memoizes `crate::git::get_remote_owner` per repo path so org-mode
-    /// grouping doesn't re-open a git repo on every `rebuild_flat_items`.
-    /// Mirrors the server's `AppState.remote_owner_cache`
+    /// Memoizes `crate::git::get_remote_owner_with_key` per repo path so
+    /// org-mode grouping doesn't re-open a git repo on every
+    /// `rebuild_flat_items`. Stores `(display owner, host-scoped identity
+    /// key)`: the key disambiguates same-named owners on different hosts
+    /// (GitHub "acme" vs GitLab "acme"), the owner alone is the header's
+    /// display text. Mirrors the server's `AppState.remote_owner_cache`
     /// (`src/server/api/sessions.rs`), but process-local to this TUI
-    /// instance. `RefCell` gives interior mutability so `org_group_name` can
+    /// instance. `RefCell` gives interior mutability so `org_group_key` can
     /// stay `&self`, matching every other `*_group_name` call site.
-    pub(super) remote_owner_cache: std::cell::RefCell<HashMap<String, Option<String>>>,
+    /// Cleared on every `reload_storage_only` so a `git remote
+    /// add`/`set-url` picked up on the next periodic reload, not stuck
+    /// under a stale cached owner (or lack thereof) for the rest of the
+    /// process.
+    pub(super) remote_owner_cache: std::cell::RefCell<HashMap<String, Option<(String, String)>>>,
     /// Merged project registry (global + active profile), refreshed on reload
     /// and after a pin/unpin. Project view injects the registered projects
     /// with no live sessions as empty "pinned" headers, and the renderer reads
@@ -2617,6 +2624,15 @@ impl HomeView {
         // Refresh the project registry so project view's empty pinned headers
         // and pin indicators reflect the current on-disk registry.
         self.refresh_registered_projects();
+
+        // Drop memoized remote-owner lookups so a `git remote add`/`set-url`
+        // run since the last reload is picked up on the next org-mode
+        // rebuild, instead of sticking with a stale cached owner (or a
+        // stale cached "no owner") for the rest of the process. Cheap: this
+        // only re-reads local `.git/config` state, no network access, and
+        // this reload path already runs on a multi-second cadence, not
+        // per-render.
+        self.remote_owner_cache.borrow_mut().clear();
 
         // Remember what the cursor was pointing at so we can follow it
         let prev_selected_session = self.selected_session.clone();
@@ -4788,7 +4804,7 @@ impl HomeView {
     fn known_org_group_paths(&self) -> std::collections::HashSet<String> {
         let mut paths = std::collections::HashSet::new();
         for inst in self.instances.values() {
-            let group = self.org_group_name(inst);
+            let group = self.org_group_key(inst);
             if group.is_empty() {
                 continue;
             }
@@ -5131,40 +5147,67 @@ impl HomeView {
         items
     }
 
-    /// Resolve `inst`'s org group name, memoized per repo path in
-    /// `remote_owner_cache` so grouping doesn't re-open a git repo on every
-    /// rebuild. Scratch sessions need no special case: they live under
-    /// `<app_dir>/scratch/<instance-id>/`, never a git checkout, so
-    /// `get_remote_owner` already returns `None` for them and they fall into
-    /// the "No organization" bucket for free, same as any other repo with no
-    /// hosted `origin` remote.
-    fn org_group_name(&self, inst: &Instance) -> String {
+    /// Resolve `inst`'s org display owner and host-scoped identity key
+    /// together, memoized per repo path in `remote_owner_cache` so grouping
+    /// doesn't re-open a git repo on every rebuild. Scratch sessions need no
+    /// special case: they live under `<app_dir>/scratch/<instance-id>/`,
+    /// never a git checkout, so `get_remote_owner_with_key` already returns
+    /// `None` for them and they fall into the "No organization" bucket for
+    /// free, same as any other repo with no hosted `origin` remote.
+    fn resolve_org(&self, inst: &Instance) -> (String, String) {
         let repo_path = inst.repo_path();
-        if let Some(owner) = self.remote_owner_cache.borrow().get(repo_path) {
-            return owner
-                .clone()
-                .unwrap_or_else(|| NO_ORG_GROUP_LABEL.to_string());
+        if let Some(cached) = self.remote_owner_cache.borrow().get(repo_path) {
+            return match cached {
+                Some((owner, key)) => (owner.clone(), key.clone()),
+                None => (
+                    NO_ORG_GROUP_LABEL.to_string(),
+                    NO_ORG_GROUP_LABEL.to_string(),
+                ),
+            };
         }
-        let owner = crate::git::get_remote_owner(std::path::Path::new(repo_path));
+        let resolved = crate::git::get_remote_owner_with_key(std::path::Path::new(repo_path));
         self.remote_owner_cache
             .borrow_mut()
-            .insert(repo_path.to_string(), owner.clone());
-        owner.unwrap_or_else(|| NO_ORG_GROUP_LABEL.to_string())
+            .insert(repo_path.to_string(), resolved.clone());
+        match resolved {
+            Some((owner, key)) => (owner, key),
+            None => (
+                NO_ORG_GROUP_LABEL.to_string(),
+                NO_ORG_GROUP_LABEL.to_string(),
+            ),
+        }
+    }
+
+    /// The org header's display text: the bare remote owner, or "No
+    /// organization". Never use this for `group_path`/collapse-state
+    /// matching; two owners of the same name on different hosts share this
+    /// label but not the same identity, see `org_group_key`.
+    fn org_group_name(&self, inst: &Instance) -> String {
+        self.resolve_org(inst).0
+    }
+
+    /// The org group's identity key ("owner@host", or "No organization"),
+    /// used for `group_path`, collapse-state matching, and group-membership
+    /// filters. Host-scoped so same-named owners on different hosts (GitHub
+    /// "acme" vs GitLab "acme") never merge into one bucket or one
+    /// bulk-archive scope.
+    fn org_group_key(&self, inst: &Instance) -> String {
+        self.resolve_org(inst).1
     }
 
     /// Org-mode counterpart of `build_flat_items_by_project`: groups sessions
     /// by their repo's resolved remote owner instead of by repo basename.
     /// Unlike project mode, there is no org registry to surface empty
     /// "pinned" headers for (#3283 explicitly scopes org grouping to live
-    /// sessions only), so the tree is seeded with `&[]` rather than
-    /// `unpopulated_projects`.
+    /// sessions only), so the tree is seeded with only the display-named
+    /// groups derived below rather than `unpopulated_projects`.
     fn build_flat_items_by_org(&self) -> Vec<Item> {
         let base_instances: Vec<Instance> = self.cloned_instances_in_active_view();
 
         let grouped: Vec<Instance> = base_instances
             .into_iter()
             .map(|mut inst| {
-                inst.group_path = self.org_group_name(&inst);
+                inst.group_path = self.org_group_key(&inst);
                 inst
             })
             .collect();
@@ -5179,7 +5222,20 @@ impl HomeView {
             .cloned()
             .collect();
 
-        let mut tree = GroupTree::new_with_groups(&tree_seed, &[]);
+        // `group_path` is now the host-scoped identity key ("owner@host"),
+        // not the display text, so pre-seed a `Group` per distinct key
+        // carrying the bare-owner display name; `GroupTree` renders these
+        // verbatim instead of deriving a name by splitting the key on '/'
+        // (which the key never contains, so it would otherwise stay a flat
+        // group named after the whole key).
+        let mut seen_keys = std::collections::HashSet::new();
+        let org_labels: Vec<crate::session::Group> = tree_seed
+            .iter()
+            .filter(|i| !i.group_path.is_empty() && seen_keys.insert(i.group_path.clone()))
+            .map(|i| crate::session::Group::new(&self.org_group_name(i), &i.group_path))
+            .collect();
+
+        let mut tree = GroupTree::new_with_groups(&tree_seed, &org_labels);
         for (path, &collapsed) in &self.org_group_collapsed {
             if collapsed {
                 tree.set_collapsed(path, true);
@@ -7211,7 +7267,7 @@ impl HomeView {
         };
         let group_path = match self.group_by {
             GroupByMode::Project => Some(project_group_name(inst)),
-            GroupByMode::Org => Some(self.org_group_name(inst)),
+            GroupByMode::Org => Some(self.org_group_key(inst)),
             GroupByMode::Manual => {
                 let p = inst.group_path.clone();
                 if p.is_empty() {
