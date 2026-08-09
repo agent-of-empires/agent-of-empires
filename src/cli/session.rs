@@ -1412,11 +1412,15 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let mut wake_succeeded = false;
     if !wake_msg.is_empty() && !matches!(outcome, StartOutcome::ResumeFailed { .. }) {
         // Restart re-execs the agent at a blank prompt; nudge it back into
-        // its prior task. Poll capture-pane for steady-state output instead
-        // of a blind sleep, so the keys land as soon as the agent is at a
-        // prompt and don't get stranded mid-banner on slow machines.
+        // its prior task. Wait for a real readiness signal when one is
+        // known for this agent, falling back to steady-state pane output
+        // otherwise, so the keys land as soon as the agent is at a prompt
+        // and don't get stranded mid-banner on slow machines.
         let tmux_session = crate::tmux::Session::new(&session_id, &title)?;
-        tmux_session.wait_until_content_settles(std::time::Duration::from_secs(5));
+        tmux_session.wait_until_ready(
+            std::time::Duration::from_secs(5),
+            crate::agents::ready_marker(&tool),
+        );
 
         if tmux_session.exists() {
             let delay = crate::agents::send_keys_enter_delay(&tool);

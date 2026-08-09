@@ -1177,18 +1177,19 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 }
 
                 let tmux_session = crate::tmux::Session::new(&instance.id, &instance.title)?;
-                if std::io::stdout().is_terminal() {
+                if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
                     tmux_session.attach()?;
                 } else {
                     // No controlling terminal (LaunchAgent, cron, or any
                     // other headless caller): `tmux attach-session` needs a
-                    // TTY and would fail even though the session above
-                    // started fine. Skip the attach instead of letting that
-                    // failure roll a successful launch back to an error.
+                    // TTY on both ends and would fail even though the
+                    // session above started fine. Skip the attach instead
+                    // of letting that failure roll a successful launch back
+                    // to an error.
                     println!(
                         "(no controlling terminal; session started without attaching. \
                          Use `aoe session attach {}` to view it.)",
-                        final_title
+                        shell_words::quote(&final_title)
                     );
                 }
 
@@ -1228,7 +1229,10 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     } else {
         println!();
         println!("Next steps:");
-        println!("  aoe session start {}   # Start the session", final_title);
+        println!(
+            "  aoe session start {}   # Start the session",
+            shell_words::quote(&final_title)
+        );
         println!("  aoe                         # Open TUI and press Enter to attach");
     }
 

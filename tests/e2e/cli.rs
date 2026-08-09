@@ -1830,8 +1830,8 @@ fn test_cli_stop_trap_redirects() {
 }
 
 /// Fake agent that prints a substantial startup banner, sleeps to simulate a
-/// slow-booting TUI, then reads exactly one line and echoes it back in a
-/// greppable form.
+/// slow-booting TUI, then prints opencode's real input-ready placeholder
+/// text and reads exactly one line, echoing it back in a greppable form.
 fn install_slow_boot_agent(h: &TuiTestHarness) -> std::path::PathBuf {
     let dir = h.home_path().join("fake-bin");
     std::fs::create_dir_all(&dir).expect("create fake-bin dir");
@@ -1841,7 +1841,7 @@ echo '=== Fake Agent booting ==='\n\
 echo 'Loading modules...'\n\
 sleep 1\n\
 echo '==========================='\n\
-echo '> Ready for input'\n\
+echo 'Ask anything...'\n\
 read -r line\n\
 echo \"GOT:[$line]\"\n\
 sleep 60\n";
@@ -1858,10 +1858,17 @@ sleep 60\n";
 /// `aoe send` right after `aoe session start` -- the sequence a headless
 /// dispatcher with no controlling terminal must use, since it cannot rely on
 /// `aoe add --launch`'s own attach -- must not race the agent's own boot: it
-/// waits for the pane to settle (`Session::wait_until_content_settles`)
-/// before typing, instead of typing into a still-booting pane whenever
-/// `ensure_pane_ready` reports `AlreadyAlive` (a pane that already exists
-/// gets no wait at all otherwise).
+/// waits for a real per-agent readiness marker (`Session::wait_until_ready`,
+/// `AgentDef::ready_marker`) before typing, instead of typing into a
+/// still-booting pane whenever `ensure_pane_ready` reports `AlreadyAlive` (a
+/// pane that already exists gets no wait at all otherwise). `--tool
+/// opencode` exercises the real registered marker ("ask anything") rather
+/// than the generic content-settle fallback. This test proves end-to-end
+/// delivery still works; the deterministic proof that the wait actually
+/// blocks until the marker appears (not just until the pane looks quiet)
+/// lives in `wait_until_ready_blocks_until_the_marker_appears` in
+/// `src/tmux/session.rs`, since canonical tty input buffering alone would
+/// let a message typed before boot survive to `read -r` here regardless.
 #[test]
 #[parallel]
 fn test_cli_send_waits_for_slow_boot_before_typing() {
@@ -1877,7 +1884,7 @@ fn test_cli_send_waits_for_slow_boot_before_typing() {
         "-t",
         "SlowBootSend",
         "--tool",
-        "claude",
+        "opencode",
         "--cmd-override",
         fake_agent.to_str().unwrap(),
     ]);

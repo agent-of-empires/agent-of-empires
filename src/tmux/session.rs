@@ -615,17 +615,29 @@ impl Session {
         }
     }
 
-    /// Poll the pane until captured content stops changing across two
-    /// consecutive samples (the agent has finished printing its startup
-    /// banner and is sitting idle) or `max_wait` elapses. Failsafe: always
-    /// returns by `max_wait`, so a caller's next action (e.g. `send-keys`)
-    /// still runs even if the pane's content never settles, such as an agent
-    /// that is genuinely still streaming output.
+    /// Wait for the pane to become ready for input, or `max_wait` to elapse.
+    /// Failsafe: always returns by `max_wait`, so a caller's next action
+    /// (e.g. `send-keys`) still runs even if the pane never becomes ready,
+    /// such as an agent that is genuinely still streaming output.
+    ///
+    /// When `ready_marker` is `Some` (see `AgentDef::ready_marker`), polls
+    /// for that substring actually appearing in the captured pane content
+    /// (matched case-insensitively) -- a real, agent-specific readiness
+    /// signal.
+    ///
+    /// When `ready_marker` is `None` (no such signal is known for this
+    /// agent yet), falls back to a generic heuristic: content stops
+    /// changing across two consecutive samples. This is weaker -- a short,
+    /// static "still loading" screen can satisfy it before the agent is
+    /// actually listening -- but it is strictly better than sending
+    /// immediately, and is the same heuristic `aoe session restart`'s
+    /// wake-message send already relied on before per-agent markers
+    /// existed.
     ///
     /// Shared by `aoe session restart`'s post-restart wake message and `aoe
     /// send`'s pre-send wait: both need to avoid typing into a pane whose
     /// agent has not finished rendering yet.
-    pub fn wait_until_content_settles(&self, max_wait: std::time::Duration) {
+    pub fn wait_until_ready(&self, max_wait: std::time::Duration, ready_marker: Option<&str>) {
         let poll_interval = std::time::Duration::from_millis(200);
         let deadline = std::time::Instant::now() + max_wait;
         let mut last: Option<String> = None;
@@ -634,6 +646,12 @@ impl Session {
             let Ok(now) = self.capture_pane(5) else {
                 continue;
             };
+            if let Some(marker) = ready_marker {
+                if now.to_lowercase().contains(marker) {
+                    return;
+                }
+                continue;
+            }
             if now.trim().len() > 20 {
                 if last.as_deref() == Some(now.as_str()) {
                     return;
@@ -1751,6 +1769,55 @@ mod tests {
                 "input {input:?}"
             );
         }
+    }
+
+    /// Direct, timing-based proof that `wait_until_ready` with a known
+    /// marker actually blocks until that marker appears, rather than
+    /// returning early on a merely-static pane -- the gap in the generic
+    /// content-settle fallback (a short "still loading" screen can look
+    /// "settled" long before the agent is really listening).
+    #[test]
+    fn wait_until_ready_blocks_until_the_marker_appears() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let guard = TmuxTestSession::new("aoe_test_ready_marker");
+        let name = guard.name().to_string();
+        // A short, static "booting" line appears immediately and would
+        // satisfy the generic settle heuristic well under 700ms; the real
+        // marker text only appears after the sleep.
+        let status = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &name,
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sh",
+                "-c",
+                "echo booting; sleep 0.7; echo 'ask anything...'; sleep 30",
+            ])
+            .status()
+            .expect("tmux new-session");
+        assert!(status.success());
+
+        let session = Session::from_name(&name);
+        let start = std::time::Instant::now();
+        session.wait_until_ready(std::time::Duration::from_secs(3), Some("ask anything"));
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= std::time::Duration::from_millis(600),
+            "returned before the marker could plausibly have appeared: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "should have returned promptly once the marker appeared, not idled toward the bound: {elapsed:?}"
+        );
     }
 
     #[test]
