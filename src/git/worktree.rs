@@ -1154,7 +1154,7 @@ impl GitWorktree {
             // locked admin entry is ours to reap; a live checkout must remain
             // untouched.
             if let Some(path) = self.worktree_path_for_branch(branch)? {
-                if !used_by_worktree_retried && !path.exists() {
+                if !used_by_worktree_retried && Self::checkout_confirmed_absent(path.try_exists()) {
                     used_by_worktree_retried = true;
                     tracing::warn!(target: "git.worktree",
                         branch,
@@ -1237,6 +1237,15 @@ impl GitWorktree {
     fn reap_worktree_entry(&self, path: &Path) {
         self.unlock_worktree(path);
         let _ = self.prune_worktrees();
+    }
+
+    /// Whether a lingering worktree admin entry may be reaped: only when its
+    /// checkout is confirmed absent. `Path::try_exists` distinguishes a real
+    /// absence (`Ok(false)`) from a `stat` failure (`Err`, e.g. EACCES / I/O),
+    /// which must NOT reap a possibly-live checkout and delete its branch,
+    /// mirroring the fail-closed rule on `branch_exists` (#2653).
+    fn checkout_confirmed_absent(probe: std::io::Result<bool>) -> bool {
+        matches!(probe, Ok(false))
     }
 
     /// Whether a local branch `refs/heads/<branch>` exists in this repo.
@@ -4091,6 +4100,27 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&listed.stdout).contains("locked"),
             "the live worktree must remain locked"
+        );
+    }
+
+    #[test]
+    fn checkout_confirmed_absent_only_reaps_on_confirmed_absence() {
+        use std::io::{Error, ErrorKind};
+        assert!(
+            GitWorktree::checkout_confirmed_absent(Ok(false)),
+            "confirmed-absent checkout may be reaped"
+        );
+        assert!(
+            !GitWorktree::checkout_confirmed_absent(Ok(true)),
+            "present checkout must be kept"
+        );
+        assert!(
+            !GitWorktree::checkout_confirmed_absent(Err(Error::from(ErrorKind::PermissionDenied))),
+            "stat failure must fail closed, not reap a possibly-live checkout"
+        );
+        assert!(
+            !GitWorktree::checkout_confirmed_absent(Err(Error::from(ErrorKind::Other))),
+            "any stat error must fail closed"
         );
     }
 }
