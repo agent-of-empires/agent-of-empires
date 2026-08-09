@@ -688,18 +688,22 @@ impl HomeView {
     }
 
     /// Force-remove a session from storage. Worktree and branch cleanup are
-    /// skipped (the original deletion already attempted them), but the sandbox
-    /// container IS torn down best-effort so a stuck delete cannot orphan a
-    /// live container. Both run off-thread so a hung tmux or docker call cannot
-    /// block the storage update on the TUI input thread. Used for sessions
-    /// stuck in the Deleting state where the background deletion thread never
-    /// returned a result.
+    /// skipped because the original deletion already attempted them. Once the
+    /// row is durably absent, tmux and sandbox teardown run off-thread so a
+    /// hung tmux or docker call cannot block the TUI input thread. Used for
+    /// sessions stuck in the Deleting state where the background deletion
+    /// thread never returned a result.
     pub(super) fn force_remove_session(&mut self, session_id: &str) -> anyhow::Result<()> {
-        if let Some(inst) = self.instances.get(session_id) {
-            let inst = inst.clone();
+        let instance = self.instances.get(session_id).cloned();
+        self.remove_instance(session_id);
+        self.rebuild_group_trees();
+        self.save()?;
+        self.reload()?;
+
+        if let Some(inst) = instance {
             std::thread::spawn(move || {
                 if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    inst.kill_all_tmux_sessions()
+                    inst.kill_all_tmux_sessions_after_forced_removal()
                 })) {
                     tracing::error!(
                         target: "session.delete",
@@ -721,10 +725,6 @@ impl HomeView {
                 }
             });
         }
-        self.remove_instance(session_id);
-        self.rebuild_group_trees();
-        self.save()?;
-        self.reload()?;
         Ok(())
     }
 

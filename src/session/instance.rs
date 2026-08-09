@@ -6209,13 +6209,26 @@ impl Instance {
     /// teardown and the durable row removal, so it must use this helper rather
     /// than reacquiring the non-reentrant lock via [`Self::kill_all_tmux_sessions`].
     pub(crate) fn kill_all_tmux_sessions_locked(&self) {
+        self.kill_all_tmux_sessions_uncoordinated();
+    }
+
+    /// Break-glass teardown after force-removal has durably deleted the row.
+    ///
+    /// A lifecycle reservation cannot be acquired once the row is absent.
+    /// Force-removal is limited to an already-Deleting row, so no launch can
+    /// race this idempotent cleanup.
+    pub(crate) fn kill_all_tmux_sessions_after_forced_removal(&self) {
+        self.kill_all_tmux_sessions_uncoordinated();
+    }
+
+    fn kill_all_tmux_sessions_uncoordinated(&self) {
         if let Err(e) = self.kill_locked() {
             tracing::debug!(
                 target: "session.tmux_cleanup",
                 session_id = %self.id,
                 kind = "agent",
                 error = %e,
-                "kill_all_tmux_sessions_locked: kill failed"
+                "kill_all_tmux_sessions_uncoordinated: kill failed"
             );
         }
         self.kill_ancillary_tmux_sessions_locked();
