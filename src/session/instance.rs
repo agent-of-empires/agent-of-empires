@@ -566,7 +566,13 @@ impl LifecycleOperation {
     pub(crate) fn busy_reason(self) -> String {
         format!("busy with lifecycle operation {self:?}")
     }
+
+    pub(crate) fn already_in_progress_reason(self) -> String {
+        format!("lifecycle operation {self:?} is already in progress")
+    }
 }
+
+pub(crate) const NEWER_GENERATION_BUSY_REASON: &str = "busy with a newer lifecycle generation";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleReservationError {
@@ -577,12 +583,7 @@ pub enum LifecycleReservationError {
 impl std::fmt::Display for LifecycleReservationError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Busy(operation) => {
-                write!(
-                    f,
-                    "lifecycle operation {operation:?} is already in progress"
-                )
-            }
+            Self::Busy(operation) => f.write_str(&operation.already_in_progress_reason()),
             Self::GenerationOverflow => f.write_str("lifecycle generation overflow"),
         }
     }

@@ -2005,7 +2005,7 @@ fn restore_from_trash_with_storage(
             pre_trash_project_path: restored_pre,
         },
         Ok(crate::session::claim::RestoreCommit::Superseded) => {
-            RestoreFromTrash::Busy("busy with a newer lifecycle generation".to_string())
+            RestoreFromTrash::Busy(crate::session::NEWER_GENERATION_BUSY_REASON.to_string())
         }
         Ok(crate::session::claim::RestoreCommit::AlreadyGone) => RestoreFromTrash::AlreadyGone,
         Err(error) => {

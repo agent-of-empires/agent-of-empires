@@ -78,7 +78,7 @@ pub use instance::{
 };
 pub(crate) use instance::{
     persist_omp_session_to_storage, persist_session_to_storage, PassiveStatusPatch, ResumeIntent,
-    SidWrite,
+    SidWrite, NEWER_GENERATION_BUSY_REASON,
 };
 
 use std::sync::atomic::{AtomicBool, Ordering};

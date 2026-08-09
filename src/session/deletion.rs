@@ -141,7 +141,7 @@ impl PurgeTransaction {
                     let retained = instances.iter().find(|instance| instance.id == id).cloned();
                     rejected = Some((
                         DeletionDisposition::Busy,
-                        format!("Session lifecycle operation {holder:?} is already in progress"),
+                        format!("Session {}", holder.already_in_progress_reason()),
                         retained,
                     ));
                     return Ok(());

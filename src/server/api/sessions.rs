@@ -2871,7 +2871,7 @@ pub async fn restore_session(
                 }
                 crate::session::claim::RestoreCommit::Superseded => {
                     Err(RestoreTransitionError::Busy(
-                        "busy with a newer lifecycle generation".to_string(),
+                        crate::session::NEWER_GENERATION_BUSY_REASON.to_string(),
                     ))
                 }
                 crate::session::claim::RestoreCommit::AlreadyGone => {
