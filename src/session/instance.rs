@@ -40,14 +40,19 @@ type LaunchCommandParts = (
     Option<String>,
     bool,
     Option<OmpCapturePlan>,
-    Vec<tmux::PaneEnvMutation>,
+    LaunchEnvironment,
 );
+
+struct LaunchEnvironment {
+    pane: Vec<tmux::PaneEnvMutation>,
+    container: Vec<(String, String)>,
+}
 
 struct PreparedLaunch {
     command: Option<String>,
     is_existing: bool,
     omp_capture_plan: Option<OmpCapturePlan>,
-    launch_env: Vec<tmux::PaneEnvMutation>,
+    launch_env: LaunchEnvironment,
     expected_prior_sid: Option<String>,
     expected_prior_intent: ResumeIntent,
     expected_prior_omp_generation: Option<String>,
@@ -1775,6 +1780,7 @@ impl Instance {
         disk.retroactive_capture_excludes = std::mem::take(&mut self.retroactive_capture_excludes);
         disk.pane_dead_observed = self.pane_dead_observed;
         disk.force_fresh_next_launch = self.force_fresh_next_launch;
+        disk.pending_host_env = std::mem::take(&mut self.pending_host_env);
         disk.source_profile = std::mem::take(&mut self.source_profile);
         disk.ever_confirmed_present = self.ever_confirmed_present;
         disk.unknown_since = self.unknown_since;
@@ -3554,25 +3560,20 @@ impl Instance {
             CONTAINER_TERMINAL_AUTODETECT_CMD,
         );
 
-        // Docker receives only `-e KEY`; values arrive through the protected
-        // one-shot pane environment channel.
-        let session_cmd = cmd;
-
+        // The pane wrapper opens the target values on a protected descriptor.
+        // No repo-configured key is installed in the host shell or runtime
+        // process environment.
         let session = self.container_terminal_tmux_session_indexed(index)?;
         let is_new = !session.exists();
         if is_new {
-            let pane_env = env_info
-                .env
-                .into_iter()
-                .map(|(key, value)| tmux::PaneEnvMutation::set(key, value))
-                .collect::<Vec<_>>();
             let session = tmux::Session::from_name(session.name());
-            session.create_with_size_env(
+            session.create_with_size_env_and_container_env(
                 &self.project_path,
-                Some(&session_cmd),
+                Some(&cmd),
                 size,
                 &self.effective_profile(),
-                &pane_env,
+                &[],
+                &env_info.env,
             )?;
             self.apply_container_terminal_tmux_options(index);
         }
@@ -3797,29 +3798,42 @@ impl Instance {
         let storage = super::storage::Storage::new(&profile, self.resolve_file_watch())
             .context("failed to open lifecycle lock storage")?;
 
-        let _lifecycle_lock = storage
+        let lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to acquire instance launch lock")?;
         self.reconcile_from_disk();
         if self.is_structured() || self.tmux_session()?.exists() {
             return Ok(LaunchSidOutcome::Skipped);
         }
-        self.apply_fresh_launch_intent();
         self.acquire_lifecycle_reservation(
             &storage,
             LifecycleOperation::Launch,
             Some(Status::Starting),
         )?;
 
-        let prepared = match self.prepare_launch(skip_on_launch, &profile) {
+        // The durable reservation excludes peer launches while user hooks run.
+        // The flock itself must be absent because a hook may invoke aoe for
+        // this same session.
+        drop(lifecycle_lock);
+        let hook_result = self.run_pre_launch_hooks(skip_on_launch, &profile);
+        let _lifecycle_lock = storage
+            .acquire_instance_lifecycle_lock(&self.id)
+            .context("failed to reacquire instance launch lock after hooks")?;
+        self.reconcile_from_disk();
+        if let Err(error) = hook_result {
+            self.fail_reserved_launch(&storage, &error, false);
+            return Err(error);
+        }
+        self.ensure_reservation_current_or_fail(&storage)?;
+        self.apply_fresh_launch_intent();
+
+        let prepared = match self.prepare_launch_command() {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.fail_reserved_launch(&storage, &error, false);
                 return Err(error);
             }
         };
-
-        self.ensure_reservation_current_or_fail(&storage)?;
         let result = self
             .spawn_prepared_launch(size, &profile, prepared)
             .and_then(|outcome| {
@@ -3904,13 +3918,15 @@ impl Instance {
         self.reconcile_sidecar_into_disk();
     }
 
-    fn prepare_launch(&mut self, skip_on_launch: bool, profile: &str) -> Result<PreparedLaunch> {
+    fn run_pre_launch_hooks(&mut self, skip_on_launch: bool, profile: &str) -> Result<()> {
+        self.mint_host_session_env()?;
+        self.run_launch_hooks(skip_on_launch, profile)
+    }
+
+    fn prepare_launch_command(&mut self) -> Result<PreparedLaunch> {
         let expected_prior_sid = self.agent_session_id.clone();
         let expected_prior_intent = self.resume_intent.clone();
         let expected_prior_omp_generation = self.omp_capture_generation.clone();
-
-        self.mint_host_session_env()?;
-        self.run_launch_hooks(skip_on_launch, profile)?;
         let (command, is_existing, omp_capture_plan, launch_env) = self.build_launch_command()?;
         Ok(PreparedLaunch {
             command,
@@ -3998,17 +4014,18 @@ impl Instance {
                     );
                 }
             }
-            prepared.launch_env.push(tmux::PaneEnvMutation::set(
+            prepared.launch_env.pane.push(tmux::PaneEnvMutation::set(
                 crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY.to_string(),
                 metadata.launch_id.clone(),
             ));
         }
-        session.create_with_size_env(
+        session.create_with_size_env_and_container_env(
             &self.project_path,
             prepared.command.as_deref(),
             size,
             profile,
-            &prepared.launch_env,
+            &prepared.launch_env.pane,
+            &prepared.launch_env.container,
         )?;
         if let Some(metadata) = omp_capture_metadata.as_ref() {
             let pane_generation = crate::tmux::env::get_env_uncached(
@@ -4194,12 +4211,15 @@ impl Instance {
                 raw_command
             };
             let wrapped = wrap_command_ignore_suspend(&launch_command);
-            let pane_env = env_info
-                .env
-                .into_iter()
-                .map(|(key, value)| tmux::PaneEnvMutation::set(key, value))
-                .collect();
-            (Some(wrapped), is_existing, omp_capture_plan, pane_env)
+            (
+                Some(wrapped),
+                is_existing,
+                omp_capture_plan,
+                LaunchEnvironment {
+                    pane: Vec::new(),
+                    container: env_info.env,
+                },
+            )
         } else {
             let result = self.build_host_command(agent)?;
             let mut env = super::environment::resolve_host_environment_pairs(
@@ -4223,7 +4243,15 @@ impl Instance {
                 // detects login-file drift.
                 env.extend(omp_host_routing_environment(&self.omp_host_environment()));
             }
-            (result.0, result.1, result.2, env)
+            (
+                result.0,
+                result.1,
+                result.2,
+                LaunchEnvironment {
+                    pane: env,
+                    container: Vec::new(),
+                },
+            )
         };
 
         Ok((cmd, is_existing, omp_capture_plan, launch_env))
@@ -5838,7 +5866,7 @@ impl Instance {
         let storage = super::storage::Storage::new(&profile, self.resolve_file_watch())
             .context("failed to open lifecycle lock storage")?;
 
-        let _lifecycle_lock = storage
+        let lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to acquire instance start lock")?;
         self.reconcile_from_disk();
@@ -5862,18 +5890,30 @@ impl Instance {
             self.stop_and_flush_poller_lifecycle_locked();
             self.capture_omp_before_restart(&profile);
         }
+
+        // Keep the generation reservation durable, but allow hooks to invoke
+        // aoe against this session without waiting on our flock.
+        drop(lifecycle_lock);
+        let hook_result = self.run_pre_launch_hooks(skip_on_launch, &profile);
+        let _lifecycle_lock = storage
+            .acquire_instance_lifecycle_lock(&self.id)
+            .context("failed to reacquire instance start lock after hooks")?;
+        self.reconcile_from_disk();
+        if let Err(error) = hook_result {
+            self.fail_reserved_launch(&storage, &error, false);
+            return Err(error);
+        }
+        self.ensure_reservation_current_or_fail(&storage)?;
         let skipped_failed_resume_sid = self.apply_resume_policy(resume_policy);
         self.apply_fresh_launch_intent();
 
-        let prepared = match self.prepare_launch(skip_on_launch, &profile) {
+        let prepared = match self.prepare_launch_command() {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.fail_reserved_launch(&storage, &error, false);
                 return Err(error);
             }
         };
-
-        self.ensure_reservation_current_or_fail(&storage)?;
         let result = (|| {
             if restart {
                 self.kill_clean_locked()?;
@@ -8069,6 +8109,99 @@ mod tests {
         assert_eq!(reloaded.lifecycle_generation, generation);
         assert_eq!(reloaded.lifecycle_reservation, None);
         assert_eq!(reloaded.status, Status::Error);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn launch_hooks_run_without_the_instance_lifecycle_flock() {
+        if !crate::tmux::tmux_command()
+            .arg("-V")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+
+        for restart in [false, true] {
+            let label = if restart { "restart" } else { "start" };
+            let profile = format!("lifecycle-hook-{label}");
+            let ready = temp.path().join(format!("{label}-ready"));
+            let release = temp.path().join(format!("{label}-release"));
+            let hook = format!(
+                ": > {}; while [ ! -e {} ]; do sleep 0.01; done",
+                super::shell_escape(&ready.to_string_lossy()),
+                super::shell_escape(&release.to_string_lossy()),
+            );
+            crate::session::config::update_config(|global| {
+                global.hooks.on_launch = vec![hook];
+            })
+            .unwrap();
+
+            let storage = crate::session::storage::Storage::new_unwatched(&profile).unwrap();
+            let title = format!("lifecycle hook {label}");
+            let mut instance = Instance::new(&title, temp.path().to_str().unwrap());
+            instance.source_profile = profile.clone();
+            instance.command = "sleep 30".to_string();
+            storage
+                .update(|instances, _groups| {
+                    instances.push(instance.clone());
+                    Ok(())
+                })
+                .unwrap();
+            if restart {
+                instance
+                    .tmux_session()
+                    .unwrap()
+                    .create(temp.path().to_str().unwrap(), Some("sleep 30"), &profile)
+                    .unwrap();
+            }
+
+            let (launch_tx, launch_rx) = std::sync::mpsc::channel();
+            let launch = std::thread::spawn(move || {
+                let result = if restart {
+                    instance.restart_with_size_opts(None, false).map(|_| ())
+                } else {
+                    instance.start_with_size_opts(None, false).map(|_| ())
+                };
+                launch_tx.send((result, instance)).unwrap();
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while !ready.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(ready.exists(), "{label} hook did not start");
+
+            let lock_storage = crate::session::storage::Storage::new_unwatched(&profile).unwrap();
+            let id = storage.load().unwrap()[0].id.clone();
+            let release_for_lock = release.clone();
+            let (lock_tx, lock_rx) = std::sync::mpsc::channel();
+            let lock = std::thread::spawn(move || {
+                let guard = lock_storage.acquire_instance_lifecycle_lock(&id).unwrap();
+                drop(guard);
+                std::fs::write(release_for_lock, b"release").unwrap();
+                lock_tx.send(()).unwrap();
+            });
+            let acquired = lock_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .is_ok();
+            if !acquired {
+                std::fs::write(&release, b"release").unwrap();
+            }
+
+            let (result, instance) = launch_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            launch.join().unwrap();
+            lock.join().unwrap();
+            let _ = instance.tmux_session().unwrap().kill();
+            assert!(
+                acquired,
+                "{label} hook ran while the lifecycle flock was held"
+            );
+            result.unwrap();
+        }
     }
 
     #[test]

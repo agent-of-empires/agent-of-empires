@@ -693,24 +693,24 @@ pub(crate) fn resolved_sandbox_environment(
         .collect()
 }
 
-/// Result of building docker exec environment arguments.
+/// Environment transport for a sandboxed `docker exec` pane.
 ///
-/// Every value is delivered to the pane through the protected ephemeral
-/// environment channel. Docker receives only `-e KEY`, preserving inheritance
-/// without publishing even configured literal values in argv or pane metadata.
+/// Target values are written to a protected env-file opened by the pane
+/// wrapper. They must never become environment variables of the host shell or
+/// container runtime process: repo configuration can set host-active keys such
+/// as `PATH`, `HOME`, or `DOCKER_HOST`.
 pub(crate) struct DockerExecEnv {
-    /// Docker `-e KEY` flags for the exec command line.
+    /// Runtime arguments naming the inherited env-file descriptor.
     pub docker_args: String,
-    /// Concrete values to write to the protected one-shot environment channel.
+    /// Concrete target-container values for the protected env-file.
     pub env: Vec<(String, String)>,
 }
 
-/// Build docker exec environment flags and protected-channel values from config
-/// and optional per-session extra entries.
-///
-/// The `docker run` path protects inherited host values separately via
-/// `Command::env()`. The tmux exec path passes only `-e KEY` to docker and
-/// installs every value through [`crate::tmux::Session::create_with_size_env`].
+pub(crate) const CONTAINER_EXEC_ENV_FD: u8 = 9;
+pub(crate) const CONTAINER_EXEC_ENV_PATH: &str = "/dev/fd/9";
+
+/// Build docker exec environment transport from config and optional
+/// per-session extra entries.
 pub(crate) fn build_docker_env_args(
     profile: &str,
     sandbox: &SandboxInfo,
@@ -735,18 +735,17 @@ pub(crate) fn build_docker_env_args(
         tracing::debug!(target: "session.create", "  env: {}=<set>", entry.key());
     }
 
-    let mut docker_flag_parts: Vec<String> = Vec::new();
-    let mut env = Vec::with_capacity(env_entries.len());
+    let env = env_entries
+        .iter()
+        .map(|entry| (entry.key().to_string(), entry.value().to_string()))
+        .collect::<Vec<_>>();
+    let docker_args = if env.is_empty() {
+        String::new()
+    } else {
+        format!("--env-file {CONTAINER_EXEC_ENV_PATH}")
+    };
 
-    for entry in &env_entries {
-        docker_flag_parts.push(format!("-e {}", entry.key()));
-        env.push((entry.key().to_string(), entry.value().to_string()));
-    }
-
-    DockerExecEnv {
-        docker_args: docker_flag_parts.join(" "),
-        env,
-    }
+    DockerExecEnv { docker_args, env }
 }
 
 #[cfg(test)]
@@ -987,7 +986,7 @@ environment = ["GH_TOKEN=write_token"]
         let project_path = temp_home.path().join("nonexistent_project");
 
         let result_personal = build_docker_env_args("personal", &sandbox, &project_path);
-        assert!(result_personal.docker_args.contains("-e GH_TOKEN"));
+        assert_eq!(result_personal.docker_args, "--env-file /dev/fd/9");
         assert!(
             !result_personal.docker_args.contains("write_token"),
             "configured values must stay out of docker argv: {}",
@@ -1003,7 +1002,7 @@ environment = ["GH_TOKEN=write_token"]
         );
 
         let result_default = build_docker_env_args("default", &sandbox, &project_path);
-        assert!(result_default.docker_args.contains("-e GH_TOKEN"));
+        assert_eq!(result_default.docker_args, "--env-file /dev/fd/9");
         assert!(!result_default.docker_args.contains("read_only_token"));
         assert!(result_default
             .env
@@ -1012,7 +1011,7 @@ environment = ["GH_TOKEN=write_token"]
         // Empty profile must fall back to the user's globally configured default,
         // preserving prior behavior for callers without a profile in hand.
         let result_empty = build_docker_env_args("", &sandbox, &project_path);
-        assert!(result_empty.docker_args.contains("-e GH_TOKEN"));
+        assert_eq!(result_empty.docker_args, "--env-file /dev/fd/9");
         assert!(!result_empty.docker_args.contains("read_only_token"));
         assert!(result_empty
             .env
@@ -1743,7 +1742,7 @@ environment = ["GH_TOKEN=write_token"]
             container_workdir: None,
         };
         let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
-        assert!(result.docker_args.contains("-e AOE_TEST_TOKEN"));
+        assert_eq!(result.docker_args, "--env-file /dev/fd/9");
         assert!(!result.docker_args.contains("secret123"));
         assert!(result
             .env
@@ -1766,7 +1765,7 @@ environment = ["GH_TOKEN=write_token"]
             container_workdir: None,
         };
         let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
-        assert!(result.docker_args.contains("-e MY_MAPPED"));
+        assert_eq!(result.docker_args, "--env-file /dev/fd/9");
         assert!(!result.docker_args.contains("secret456"));
         assert!(result
             .env
@@ -1789,7 +1788,7 @@ environment = ["GH_TOKEN=write_token"]
             container_workdir: None,
         };
         let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
-        assert!(result.docker_args.contains("-e AOE_TEST_BARE"));
+        assert_eq!(result.docker_args, "--env-file /dev/fd/9");
         assert!(!result.docker_args.contains("barevalue"));
         assert!(result
             .env
@@ -1810,7 +1809,7 @@ environment = ["GH_TOKEN=write_token"]
             container_workdir: None,
         };
         let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
-        assert!(result.docker_args.contains("-e MY_LITERAL"));
+        assert_eq!(result.docker_args, "--env-file /dev/fd/9");
         assert!(!result.docker_args.contains("literal-secret"));
         assert!(result
             .env
@@ -1835,8 +1834,7 @@ environment = ["GH_TOKEN=write_token"]
             container_workdir: None,
         };
         let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
-        assert!(result.docker_args.contains("-e AOE_TEST_SECRET"));
-        assert!(result.docker_args.contains("-e MY_LITERAL"));
+        assert_eq!(result.docker_args, "--env-file /dev/fd/9");
         assert!(!result.docker_args.contains("mysecret"));
         assert!(!result.docker_args.contains("literal-secret"));
         assert!(result

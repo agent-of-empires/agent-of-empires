@@ -391,6 +391,40 @@ impl Session {
         profile: &str,
         extra_env: &[PaneEnvMutation],
     ) -> Result<()> {
+        self.create_with_size_env_inner(working_dir, command, size, profile, extra_env, &[])
+    }
+
+    /// Create a pane whose container runtime reads target environment values
+    /// from an inherited env-file descriptor. The target keys never enter the
+    /// host pane environment.
+    pub(crate) fn create_with_size_env_and_container_env(
+        &self,
+        working_dir: &str,
+        command: Option<&str>,
+        size: Option<(u16, u16)>,
+        profile: &str,
+        extra_env: &[PaneEnvMutation],
+        container_env: &[(String, String)],
+    ) -> Result<()> {
+        self.create_with_size_env_inner(
+            working_dir,
+            command,
+            size,
+            profile,
+            extra_env,
+            container_env,
+        )
+    }
+
+    fn create_with_size_env_inner(
+        &self,
+        working_dir: &str,
+        command: Option<&str>,
+        size: Option<(u16, u16)>,
+        profile: &str,
+        extra_env: &[PaneEnvMutation],
+        container_env: &[(String, String)],
+    ) -> Result<()> {
         if self.exists() {
             return Ok(());
         }
@@ -423,7 +457,7 @@ impl Session {
             }
         }
 
-        let mut env_file = EphemeralEnvFile::create(&protected_env)?;
+        let mut env_file = EphemeralEnvFile::create(&protected_env, container_env)?;
         let wrapped_command = env_file.wrap_command(command)?;
         let mut args = build_create_args(
             &self.name,
@@ -1639,10 +1673,43 @@ fn raw_byte_batches(bytes: &[u8]) -> Vec<Vec<String>> {
 /// A successful tmux create alone does not transfer cleanup ownership.
 struct EphemeralEnvFile {
     path: Option<std::path::PathBuf>,
+    container_env_path: Option<std::path::PathBuf>,
 }
 
 impl EphemeralEnvFile {
-    fn create(env: &[PaneEnvMutation]) -> Result<Self> {
+    fn create(env: &[PaneEnvMutation], container_env: &[(String, String)]) -> Result<Self> {
+        let mut channel = Self {
+            path: None,
+            container_env_path: None,
+        };
+        if !container_env.is_empty() {
+            let mut file = tempfile::Builder::new()
+                .prefix(PANE_ENV_FILE_PREFIX)
+                .tempfile()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.as_file()
+                    .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            for (key, value) in container_env {
+                anyhow::ensure!(
+                    crate::session::environment::is_valid_env_key(key),
+                    "invalid container environment key {key:?}"
+                );
+                anyhow::ensure!(
+                    !value
+                        .bytes()
+                        .any(|byte| matches!(byte, b'\0' | b'\n' | b'\r')),
+                    "container environment value for {key} cannot be represented in an env-file"
+                );
+                writeln!(file, "{key}={value}")?;
+            }
+            file.flush()?;
+            let (_handle, path) = file.keep().map_err(|error| error.error)?;
+            channel.container_env_path = Some(path);
+        }
+
         let mut file = tempfile::Builder::new()
             .prefix(PANE_ENV_FILE_PREFIX)
             .tempfile()?;
@@ -1667,7 +1734,8 @@ impl EphemeralEnvFile {
         }
         file.flush()?;
         let (_handle, path) = file.keep().map_err(|error| error.error)?;
-        Ok(Self { path: Some(path) })
+        channel.path = Some(path);
+        Ok(channel)
     }
 
     fn wrap_command(&self, command: Option<&str>) -> Result<String> {
@@ -1682,6 +1750,19 @@ impl EphemeralEnvFile {
         });
         let shell = crate::session::environment::user_posix_shell();
         let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
+        if let Some(container_env_path) = self.container_env_path.as_deref() {
+            writeln!(
+                file,
+                "exec {}<{} || exit 1",
+                crate::session::environment::CONTAINER_EXEC_ENV_FD,
+                script_shell_escape(&container_env_path.to_string_lossy())
+            )?;
+            writeln!(
+                file,
+                "rm -f -- {}",
+                script_shell_escape(&container_env_path.to_string_lossy())
+            )?;
+        }
         writeln!(
             file,
             "rm -f -- {}",
@@ -1718,12 +1799,16 @@ impl EphemeralEnvFile {
 
     fn disarm(&mut self) {
         self.path = None;
+        self.container_env_path = None;
     }
 }
 
 impl Drop for EphemeralEnvFile {
     fn drop(&mut self) {
         if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Some(path) = self.container_env_path.take() {
             let _ = std::fs::remove_file(path);
         }
     }
@@ -3468,11 +3553,14 @@ mod tests {
     #[test]
     fn test_protected_env_file_keeps_secret_out_of_pane_argv_and_rejects_invalid_keys() {
         let secret = "literal-secret-value";
-        let file = EphemeralEnvFile::create(&[
-            PaneEnvMutation::set("GOOD_TOKEN".to_string(), "stale-profile-value".to_string()),
-            PaneEnvMutation::set("GOOD_TOKEN".to_string(), secret.to_string()),
-            PaneEnvMutation::set("X; touch /tmp/injected; #".to_string(), "bad".to_string()),
-        ])
+        let file = EphemeralEnvFile::create(
+            &[
+                PaneEnvMutation::set("GOOD_TOKEN".to_string(), "stale-profile-value".to_string()),
+                PaneEnvMutation::set("GOOD_TOKEN".to_string(), secret.to_string()),
+                PaneEnvMutation::set("X; touch /tmp/injected; #".to_string(), "bad".to_string()),
+            ],
+            &[],
+        )
         .unwrap();
         let path = file.path.as_ref().unwrap().clone();
         let wrapper = file.wrap_command(Some("omp --help")).unwrap();
@@ -3519,10 +3607,13 @@ mod tests {
         let output = temp.path().join("multiline");
         let value = "line one\nline two\r\nquote ' intact";
         let stale_output = temp.path().join("unset");
-        let mut file = EphemeralEnvFile::create(&[
-            PaneEnvMutation::set("MULTILINE_SECRET".to_string(), value.to_string()),
-            PaneEnvMutation::unset("AOE_TEST_STALE".to_string()),
-        ])
+        let mut file = EphemeralEnvFile::create(
+            &[
+                PaneEnvMutation::set("MULTILINE_SECRET".to_string(), value.to_string()),
+                PaneEnvMutation::unset("AOE_TEST_STALE".to_string()),
+            ],
+            &[],
+        )
         .unwrap();
         let command = format!(
             "printf '%s' \"$MULTILINE_SECRET\" > {}; printf '%s' \"${{AOE_TEST_STALE+x}}\" > {}",
@@ -3540,6 +3631,76 @@ mod tests {
         assert_eq!(std::fs::read_to_string(stale_output).unwrap(), "");
         assert!(file.wait_until_consumed(Duration::ZERO));
         file.disarm();
+    }
+
+    #[test]
+    fn test_container_env_file_does_not_mutate_host_process_environment() {
+        let temp = tempfile::tempdir().unwrap();
+        let host_output = temp.path().join("host-env");
+        let payload_output = temp.path().join("container-env");
+        let target_env = vec![
+            ("PATH".to_string(), "/repo-controlled/bin".to_string()),
+            (
+                "DOCKER_HOST".to_string(),
+                "tcp://repo-controlled.example".to_string(),
+            ),
+            ("TOKEN".to_string(), "secret-value".to_string()),
+        ];
+        let mut file = EphemeralEnvFile::create(&[], &target_env).unwrap();
+        let script_path = file.path.as_ref().unwrap().clone();
+        let payload_path = file.container_env_path.as_ref().unwrap().clone();
+        let command = format!(
+            "printf '%s\\n%s' \"$PATH\" \"${{DOCKER_HOST-unset}}\" > {}; \
+             /bin/cat {} > {}",
+            script_shell_escape(&host_output.to_string_lossy()),
+            crate::session::environment::CONTAINER_EXEC_ENV_PATH,
+            script_shell_escape(&payload_output.to_string_lossy()),
+        );
+        let wrapper = file.wrap_command(Some(&command)).unwrap();
+        let script = std::fs::read_to_string(&script_path).unwrap();
+
+        assert!(!script.contains("/repo-controlled/bin"));
+        assert!(!script.contains("tcp://repo-controlled.example"));
+        assert!(!wrapper.contains("secret-value"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&payload_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", &wrapper])
+            .env("PATH", "/usr/bin:/bin")
+            .env_remove("DOCKER_HOST")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::read_to_string(host_output).unwrap(),
+            "/usr/bin:/bin\nunset"
+        );
+        assert_eq!(
+            std::fs::read_to_string(payload_output).unwrap(),
+            "PATH=/repo-controlled/bin\n\
+             DOCKER_HOST=tcp://repo-controlled.example\n\
+             TOKEN=secret-value\n"
+        );
+        assert!(file.wait_until_consumed(Duration::ZERO));
+        assert!(!payload_path.exists());
+        file.disarm();
+
+        assert!(EphemeralEnvFile::create(
+            &[],
+            &[("MULTILINE".to_string(), "line one\nline two".to_string())],
+        )
+        .is_err());
     }
 
     #[test]

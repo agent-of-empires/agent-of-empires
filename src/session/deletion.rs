@@ -75,8 +75,9 @@ pub enum PurgeReservation {
     Rejected(DeletionResult),
 }
 
-/// Owned purge transition. Its lifecycle flock is acquired before the durable
-/// reservation and retained through hooks, teardown, and final commit.
+/// Owned purge transition. The durable reservation spans hooks, teardown, and
+/// final commit. The lifecycle flock is deliberately released around hooks and
+/// reacquired before any irreversible work.
 pub struct PurgeTransaction {
     storage: Storage,
     request: DeletionRequest,
@@ -186,9 +187,21 @@ impl PurgeTransaction {
     }
 
     /// Run best-effort hooks without a lifecycle or storage flock held.
-    pub fn run_hooks(self) -> Self {
+    pub fn run_hooks(mut self) -> Self {
+        self.lifecycle_lock = None;
         run_on_destroy_hooks(&self.request.instance, self.request.detach_hooks);
         self
+    }
+
+    fn ensure_lifecycle_lock(&mut self) -> Result<()> {
+        if self.lifecycle_lock.is_none() {
+            self.lifecycle_lock = Some(
+                self.storage
+                    .acquire_instance_lifecycle_lock(&self.request.session_id)
+                    .context("failed to reacquire instance purge lock after hooks")?,
+            );
+        }
+        Ok(())
     }
 
     fn release_reservation(&mut self) -> Result<Option<Instance>> {
@@ -277,6 +290,14 @@ impl PurgeTransaction {
     pub fn begin_irreversible(
         mut self,
     ) -> std::result::Result<CommittedPurge, Box<DeletionResult>> {
+        if let Err(error) = self.ensure_lifecycle_lock() {
+            return Err(Box::new(DeletionResult::rejected(
+                self.request.session_id.clone(),
+                DeletionDisposition::Failed,
+                format!("Failed to resume reserved session purge: {error}"),
+                None,
+            )));
+        }
         let id = self.request.session_id.clone();
         let generation = self.generation;
         let was_trashed = self.was_trashed;
@@ -342,13 +363,21 @@ impl PurgeTransaction {
         })
     }
 
-    /// Verify the token, then keep the already-held lifecycle flock through
+    /// Reacquire and verify the token, then keep the lifecycle flock through
     /// teardown and the durable commit.
     fn complete_inner(
         mut self,
         after_teardown: impl FnOnce(&Instance) -> std::result::Result<(), String>,
         commit_on_teardown_failure: bool,
     ) -> DeletionResult {
+        if let Err(error) = self.ensure_lifecycle_lock() {
+            return DeletionResult::rejected(
+                self.request.session_id.clone(),
+                DeletionDisposition::Failed,
+                format!("Failed to resume reserved session purge: {error}"),
+                None,
+            );
+        }
         let id = self.request.session_id.clone();
         let (gate, retained) = match self.gate() {
             Ok(outcome) => outcome,
@@ -473,6 +502,9 @@ impl Drop for PurgeTransaction {
             .name("aoe-purge-reservation-release".to_string())
             .spawn(move || {
                 let Ok(storage) = Storage::open_unwatched(&profile) else {
+                    return;
+                };
+                let Ok(_lifecycle_lock) = storage.acquire_instance_lifecycle_lock(&id) else {
                     return;
                 };
                 let _ = storage.update(|instances, _groups| {
@@ -1321,6 +1353,88 @@ mod tests {
         );
         let result = committed.finish();
         assert_eq!(result.disposition, DeletionDisposition::Removed);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn on_destroy_hooks_run_without_the_instance_lifecycle_flock() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let profile = "purge-unlocked-hooks";
+        let ready = temp.path().join("ready");
+        let release = temp.path().join("release");
+        let hook = format!(
+            ": > {}; while [ ! -e {} ]; do sleep 0.01; done",
+            crate::session::environment::shell_escape(&ready.to_string_lossy()),
+            crate::session::environment::shell_escape(&release.to_string_lossy()),
+        );
+        crate::session::config::update_config(|global| {
+            global.hooks.on_destroy = vec![hook];
+        })
+        .unwrap();
+
+        let storage = Storage::new_unwatched(profile).unwrap();
+        let mut instance = Instance::new("purge unlocked hooks", temp.path().to_str().unwrap());
+        instance.source_profile = profile.to_string();
+        let id = instance.id.clone();
+        storage
+            .update(|instances, _groups| {
+                instances.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        let request = DeletionRequest {
+            session_id: id.clone(),
+            instance,
+            delete_worktree: false,
+            delete_branch: false,
+            delete_sandbox: false,
+            force_delete: false,
+            detach_hooks: true,
+            keep_scratch: false,
+        };
+        let transaction =
+            match PurgeTransaction::reserve(Storage::open_unwatched(profile).unwrap(), request)
+                .unwrap()
+            {
+                PurgeReservation::Reserved(transaction) => transaction,
+                PurgeReservation::Rejected(_) => panic!("purge reservation was refused"),
+            };
+
+        let (purge_tx, purge_rx) = std::sync::mpsc::channel();
+        let purge = std::thread::spawn(move || {
+            purge_tx.send(transaction.run_hooks().complete()).unwrap();
+        });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        while !ready.exists() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(ready.exists(), "on_destroy hook did not start");
+
+        let lock_storage = Storage::open_unwatched(profile).unwrap();
+        let release_for_lock = release.clone();
+        let (lock_tx, lock_rx) = std::sync::mpsc::channel();
+        let lock = std::thread::spawn(move || {
+            let guard = lock_storage.acquire_instance_lifecycle_lock(&id).unwrap();
+            drop(guard);
+            std::fs::write(release_for_lock, b"release").unwrap();
+            lock_tx.send(()).unwrap();
+        });
+        let acquired = lock_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .is_ok();
+        if !acquired {
+            std::fs::write(&release, b"release").unwrap();
+        }
+
+        let result = purge_rx
+            .recv_timeout(std::time::Duration::from_secs(10))
+            .unwrap();
+        purge.join().unwrap();
+        lock.join().unwrap();
+        assert!(acquired, "on_destroy hook held the lifecycle flock");
+        assert_eq!(result.disposition, DeletionDisposition::Removed);
+        assert!(storage.load().unwrap().is_empty());
     }
 
     #[test]
