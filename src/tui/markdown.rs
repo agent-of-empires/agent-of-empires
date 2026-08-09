@@ -4,6 +4,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthChar;
 
+const TAB_STOP_WIDTH: usize = 4;
+
 /// Parse Markdown into styled ratatui lines.
 pub(crate) fn render(text: &str) -> Vec<Line<'static>> {
     MarkdownBuilder::render(text)
@@ -43,7 +45,6 @@ struct MarkdownBuilder {
     /// Open-table state: cells of the in-progress row; rows are flushed
     /// pipe-separated (the TUI has no column layout pass).
     table_row: Option<Vec<String>>,
-    in_table_head: bool,
 }
 
 impl MarkdownBuilder {
@@ -139,12 +140,10 @@ impl MarkdownBuilder {
                 self.table_row = None;
             }
             Event::Start(Tag::TableHead) => {
-                self.in_table_head = true;
                 self.table_row = Some(Vec::new());
             }
             Event::End(TagEnd::TableHead) => {
                 self.flush_table_row(Modifier::BOLD);
-                self.in_table_head = false;
             }
             Event::Start(Tag::TableRow) => {
                 self.table_row = Some(Vec::new());
@@ -255,15 +254,23 @@ impl MarkdownBuilder {
 /// Word-wrap one styled line while preserving span styles.
 fn wrap_line_into(line: Line<'static>, width: u16, out: &mut Vec<Line<'static>>) {
     let width = width.max(1) as usize;
-    if line.width() <= width {
-        out.push(line);
-        return;
+    let line_style = line.style;
+    let mut chars: Vec<(char, Style)> = Vec::new();
+    let mut expanded_width = 0usize;
+    let mut expanded_tabs = false;
+    for span in &line.spans {
+        for ch in span.content.chars() {
+            if ch == '\t' {
+                expanded_tabs = true;
+                let spaces = TAB_STOP_WIDTH - (expanded_width % TAB_STOP_WIDTH);
+                chars.extend(std::iter::repeat_n((' ', span.style), spaces));
+                expanded_width += spaces;
+            } else {
+                expanded_width += ch.width().unwrap_or(0);
+                chars.push((ch, span.style));
+            }
+        }
     }
-    let chars: Vec<(char, Style)> = line
-        .spans
-        .iter()
-        .flat_map(|span| span.content.chars().map(move |ch| (ch, span.style)))
-        .collect();
     let mut row: Vec<(char, Style)> = Vec::new();
     let mut row_width = 0usize;
     let mut last_space: Option<usize> = None;
@@ -275,15 +282,25 @@ fn wrap_line_into(line: Line<'static>, width: u16, out: &mut Vec<Line<'static>>)
                 _ => spans.push(Span::styled(ch.to_string(), style)),
             }
         }
-        out.push(Line::from(spans));
+        out.push(Line::from(spans).style(line_style));
     };
+    if expanded_width <= width {
+        if expanded_tabs {
+            flush(&mut chars, out);
+        } else {
+            out.push(line);
+        }
+        return;
+    }
     for (ch, style) in chars {
         let char_width = ch.width().unwrap_or(0);
         if row_width + char_width > width && !row.is_empty() {
             if let Some(cut) = last_space {
                 let tail: Vec<(char, Style)> = row.split_off(cut + 1);
                 row.truncate(cut);
-                flush(&mut row, out);
+                if !row.is_empty() {
+                    flush(&mut row, out);
+                }
                 row = tail;
                 row_width = row.iter().map(|(ch, _)| ch.width().unwrap_or(0)).sum();
             } else {
@@ -299,4 +316,82 @@ fn wrap_line_into(line: Line<'static>, width: u16, out: &mut Vec<Line<'static>>)
         row_width += char_width;
     }
     flush(&mut row, out);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wrap_line_handles_width_whitespace_and_styles() {
+        struct Case {
+            name: &'static str,
+            input: Line<'static>,
+            width: u16,
+            expected: Vec<Line<'static>>,
+        }
+
+        let bold = Style::default().add_modifier(Modifier::BOLD);
+        let italic = Style::default().add_modifier(Modifier::ITALIC);
+        let styled = |text: &'static str, style| Line::from(Span::styled(text, style));
+        let cases = vec![
+            Case {
+                name: "short line",
+                input: styled("short", bold),
+                width: 8,
+                expected: vec![styled("short", bold)],
+            },
+            Case {
+                name: "exact width",
+                input: styled("exact", italic),
+                width: 5,
+                expected: vec![styled("exact", italic)],
+            },
+            Case {
+                name: "word longer than width",
+                input: styled("abcdefgh", bold),
+                width: 3,
+                expected: vec![styled("abc", bold), styled("def", bold), styled("gh", bold)],
+            },
+            Case {
+                name: "consecutive spaces",
+                input: styled("ab  cd", italic),
+                width: 4,
+                expected: vec![styled("ab ", italic), styled("cd", italic)],
+            },
+            Case {
+                name: "wide characters",
+                input: styled("你好世界", bold),
+                width: 4,
+                expected: vec![styled("你好", bold), styled("世界", bold)],
+            },
+            Case {
+                name: "tab expansion",
+                input: styled("foo\tbar", italic),
+                width: 5,
+                expected: vec![styled("foo", italic), styled("bar", italic)],
+            },
+            Case {
+                name: "leading space does not emit an empty line",
+                input: styled(" abcdef", bold),
+                width: 3,
+                expected: vec![styled("abc", bold), styled("def", bold)],
+            },
+            Case {
+                name: "styles survive a whitespace break",
+                input: Line::from(vec![
+                    Span::styled("hello ", bold),
+                    Span::styled("world", italic),
+                ]),
+                width: 5,
+                expected: vec![styled("hello", bold), styled("world", italic)],
+            },
+        ];
+
+        for case in cases {
+            let mut actual = Vec::new();
+            wrap_line_into(case.input, case.width, &mut actual);
+            assert_eq!(actual, case.expected, "{}", case.name);
+        }
+    }
 }
