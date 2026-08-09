@@ -1688,7 +1688,7 @@ impl HomeView {
             RestoreFromTrash::Busy => {
                 self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
                     "Restore Failed",
-                    "Another lifecycle operation is in progress; the session was not restored.",
+                    "Session is busy with another lifecycle operation, so it was not restored.",
                 ));
             }
             RestoreFromTrash::WorktreeFailed { reason } => {

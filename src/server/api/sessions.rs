@@ -2889,7 +2889,7 @@ pub async fn restore_session(
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
                     "error": "lifecycle_busy",
-                    "message": format!("Session lifecycle is owned by {holder}")
+                    "message": format!("Session is busy with another lifecycle operation ({holder}), so it was not restored")
                 })),
             )
                 .into_response();
@@ -3853,7 +3853,9 @@ async fn purge_session_artifacts(
                     Err("Session is being restored, so it was not purged".to_string())
                 }
                 crate::session::deletion::DeletionDisposition::Busy => {
-                    Err("Session is already being purged by another process".to_string())
+                    Err(result.errors.first().cloned().unwrap_or_else(|| {
+                        "Session is busy with another lifecycle operation".to_string()
+                    }))
                 }
                 crate::session::deletion::DeletionDisposition::Failed
                 | crate::session::deletion::DeletionDisposition::Removed => {
