@@ -562,6 +562,12 @@ pub enum LifecycleOperation {
     Trash,
 }
 
+impl LifecycleOperation {
+    pub(crate) fn busy_reason(self) -> String {
+        format!("busy with lifecycle operation {self:?}")
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LifecycleReservationError {
     Busy(LifecycleOperation),
@@ -2017,7 +2023,7 @@ impl Instance {
         }
         // Lifecycle ownership is intentionally never spliced from a TUI
         // snapshot. Only transition code holding the per-instance flock may
-        // mutate the durable lease and generation.
+        // mutate the durable reservation and generation.
         self.last_accessed_at = self.last_accessed_at.max(post.last_accessed_at);
 
         let archived_changed = pre.archived_at != post.archived_at;
@@ -3692,10 +3698,9 @@ impl Instance {
             let generation = stored
                 .try_acquire_lifecycle_reservation(operation, Self::LIFECYCLE_RESERVATION_TTL, now)
                 .map_err(|error| match error {
-                    LifecycleReservationError::Busy(holder) => anyhow::anyhow!(
-                        "session {} is busy with lifecycle operation {holder:?}",
-                        self.id
-                    ),
+                    LifecycleReservationError::Busy(holder) => {
+                        anyhow::anyhow!("session {} is {}", self.id, holder.busy_reason())
+                    }
                     LifecycleReservationError::GenerationOverflow => {
                         anyhow::anyhow!("session {} lifecycle generation overflow", self.id)
                     }
@@ -3865,10 +3870,6 @@ impl Instance {
         self.lifecycle_reservation_is_current(storage, LifecycleOperation::Launch)
     }
 
-    fn reservation_generation_is_ours(&self, storage: &super::storage::Storage) -> Result<bool> {
-        self.lifecycle_reservation_is_current(storage, LifecycleOperation::Launch)
-    }
-
     fn ensure_reservation_current(&self, storage: &super::storage::Storage) -> Result<()> {
         if self.reservation_is_current(storage)? {
             return Ok(());
@@ -3898,10 +3899,7 @@ impl Instance {
         error: &anyhow::Error,
         cleanup_pane: bool,
     ) {
-        if !self
-            .reservation_generation_is_ours(storage)
-            .unwrap_or(false)
-        {
+        if !self.reservation_is_current(storage).unwrap_or(false) {
             return;
         }
         if cleanup_pane {
@@ -4682,7 +4680,11 @@ impl Instance {
         if self.tool != "omp" {
             return true;
         }
-        let tombstone = Uuid::new_v4().to_string();
+        // No capture plan: persist a distinct sentinel so any observation still
+        // carrying the prior generation fails the CAS. The `tombstone-` prefix
+        // marks it as never-captured in storage/logs (compared for equality,
+        // never parsed).
+        let tombstone = format!("tombstone-{}", Uuid::new_v4());
         self.persist_omp_capture_generation(profile, &tombstone, expected_prior)
     }
 

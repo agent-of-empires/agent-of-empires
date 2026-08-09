@@ -1685,10 +1685,10 @@ impl HomeView {
                 self.drop_peer_deleted_rows(std::slice::from_ref(&id));
                 self.rebuild_flat_items();
             }
-            RestoreFromTrash::Busy => {
+            RestoreFromTrash::Busy(reason) => {
                 self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
                     "Restore Failed",
-                    "Session is busy with another lifecycle operation, so it was not restored.",
+                    &format!("Session is {reason}, so it was not restored."),
                 ));
             }
             RestoreFromTrash::WorktreeFailed { reason } => {
@@ -1905,7 +1905,7 @@ enum RestoreFromTrash {
         pre_trash_project_path: Option<String>,
     },
     AlreadyGone,
-    Busy,
+    Busy(String),
     WorktreeFailed {
         reason: String,
     },
@@ -1949,8 +1949,8 @@ fn restore_from_trash_with_storage(
         crate::session::claim::RestoreClaimDecision::AlreadyGone => {
             return RestoreFromTrash::AlreadyGone;
         }
-        crate::session::claim::RestoreClaimDecision::Busy(_) => {
-            return RestoreFromTrash::Busy;
+        crate::session::claim::RestoreClaimDecision::Busy(holder) => {
+            return RestoreFromTrash::Busy(holder.busy_reason());
         }
     };
 
@@ -2004,7 +2004,9 @@ fn restore_from_trash_with_storage(
             project_path: restored_path,
             pre_trash_project_path: restored_pre,
         },
-        Ok(crate::session::claim::RestoreCommit::Superseded) => RestoreFromTrash::Busy,
+        Ok(crate::session::claim::RestoreCommit::Superseded) => {
+            RestoreFromTrash::Busy("busy with a newer lifecycle generation".to_string())
+        }
         Ok(crate::session::claim::RestoreCommit::AlreadyGone) => RestoreFromTrash::AlreadyGone,
         Err(error) => {
             tracing::warn!(target: "tui.home", id = %id, "restore commit failed: {error}");

@@ -2822,7 +2822,7 @@ pub async fn restore_session(
                     return Err(RestoreTransitionError::NotFound);
                 }
                 crate::session::claim::RestoreClaimDecision::Busy(holder) => {
-                    return Err(RestoreTransitionError::Busy(format!("{holder:?}")));
+                    return Err(RestoreTransitionError::Busy(holder.busy_reason()));
                 }
             };
             let Some(mut instance) = storage
@@ -2869,9 +2869,11 @@ pub async fn restore_session(
                     instance.lifecycle_reservation = None;
                     Ok(instance)
                 }
-                crate::session::claim::RestoreCommit::Superseded => Err(
-                    RestoreTransitionError::Busy("a newer lifecycle generation".to_string()),
-                ),
+                crate::session::claim::RestoreCommit::Superseded => {
+                    Err(RestoreTransitionError::Busy(
+                        "busy with a newer lifecycle generation".to_string(),
+                    ))
+                }
                 crate::session::claim::RestoreCommit::AlreadyGone => {
                     Err(RestoreTransitionError::NotFound)
                 }
@@ -2889,7 +2891,7 @@ pub async fn restore_session(
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
                     "error": "lifecycle_busy",
-                    "message": format!("Session is busy with another lifecycle operation ({holder}), so it was not restored")
+                    "message": format!("Session is {holder}, so it was not restored")
                 })),
             )
                 .into_response();
@@ -3854,7 +3856,8 @@ async fn purge_session_artifacts(
                 }
                 crate::session::deletion::DeletionDisposition::Busy => {
                     Err(result.errors.first().cloned().unwrap_or_else(|| {
-                        "Session is busy with another lifecycle operation".to_string()
+                        "Session is busy with another lifecycle operation, so it was not purged"
+                            .to_string()
                     }))
                 }
                 crate::session::deletion::DeletionDisposition::Failed

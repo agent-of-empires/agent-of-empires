@@ -190,10 +190,10 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
             }
             crate::session::trash::RelocateOutcome::Failed { reason } => {
                 eprintln!("  Note: left worktree in place ({reason}).");
-                release_trash_lease_best_effort(&storage, &removed_id, trash_generation);
+                release_trash_reservation_best_effort(&storage, &removed_id, trash_generation);
             }
             crate::session::trash::RelocateOutcome::Skipped => {
-                release_trash_lease_best_effort(&storage, &removed_id, trash_generation);
+                release_trash_reservation_best_effort(&storage, &removed_id, trash_generation);
             }
         }
 
@@ -329,10 +329,10 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     Ok(())
 }
 
-/// Release the teardown's lease on a no-relocation terminal path.
-fn release_trash_lease_best_effort(storage: &Storage, removed_id: &str, generation: u64) {
+/// Release the teardown's trash reservation on a no-relocation terminal path.
+fn release_trash_reservation_best_effort(storage: &Storage, removed_id: &str, generation: u64) {
     let _ = storage.update(|all_instances, _groups| {
-        crate::session::claim::release_trash_lease(all_instances, removed_id, generation);
+        crate::session::claim::release_trash_reservation(all_instances, removed_id, generation);
         Ok(())
     });
 }

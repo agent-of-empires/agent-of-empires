@@ -685,6 +685,82 @@ fn perform_deletion_core(
         &[]
     };
 
+    let preserved_worktree_paths =
+        stage_collect_preserved_worktrees(request, repos, &mut errors, &mut messages);
+    // Any preserved worktree, dirty or default-branch, blocks the in-container
+    // preclean (a recursive `find . -delete` that would reach through and
+    // destroy the contents we just decided to keep) and the host workspace-dir
+    // removal alike: with a worktree preserved under it the directory is not
+    // ours to remove, so we skip it rather than surface a spurious failure.
+    let any_preserved = !preserved_worktree_paths.is_empty();
+
+    if request.delete_worktree && is_sandboxed && !any_preserved {
+        tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "sandbox_worktree_preclean", "perform_deletion: stage");
+        // Best-effort. The container's workdir is the session's main
+        // worktree (or, for workspace sessions, the workspace root that
+        // contains every per-repo worktree). `find . -delete` from
+        // there recursively wipes everything we care about under the
+        // bind mount. If this fails, the host-side removal below will
+        // surface a permission error and exit cleanly. We do NOT walk
+        // workspace_info.repos here: their container mount paths are
+        // computed relative to the common ancestor of all repos
+        // (see compute_workspace_volume_paths) and don't necessarily
+        // match `/workspace/{repo.name}`, and the workspace-root walk
+        // already covers their contents.
+        let _ = crate::git::cleanup::cleanup_sandbox_worktree(&request.instance);
+    }
+
+    // Stage 3: container removal. Releases the bind mount on the
+    // worktree so the host can finish cleanup without racing in-
+    // container processes.
+    if request.delete_sandbox && is_sandboxed {
+        tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "container_remove", "perform_deletion: stage");
+        deletion_messages_for(teardown(&request.instance.id), &mut messages, &mut errors);
+    }
+
+    stage_remove_worktrees_and_branches(
+        request,
+        repos,
+        &preserved_worktree_paths,
+        any_preserved,
+        &mut errors,
+        &mut messages,
+    );
+
+    stage_cleanup_scratch(request, &mut errors, &mut messages);
+
+    // Stage 6: hook status cleanup
+    tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "hook_status_cleanup", "perform_deletion: stage");
+    crate::hooks::cleanup_hook_status_dir(&request.instance.id);
+
+    if !errors.is_empty() {
+        tracing::debug!(target: "session.delete",
+            session_id = %request.session_id,
+            error_count = errors.len(),
+            errors = ?errors,
+            "perform_deletion: completed with errors"
+        );
+    } else {
+        tracing::debug!(target: "session.delete", session_id = %request.session_id, "perform_deletion: completed successfully");
+    }
+
+    DeletionResult {
+        session_id: request.session_id.clone(),
+        success: errors.is_empty(),
+        teardown_started: true,
+        messages,
+        errors,
+        disposition: DeletionDisposition::Failed,
+        retained_instance: None,
+    }
+}
+
+fn stage_collect_preserved_worktrees(
+    request: &DeletionRequest,
+    repos: &[super::WorkspaceRepo],
+    errors: &mut Vec<String>,
+    messages: &mut Vec<String>,
+) -> std::collections::HashSet<PathBuf> {
     let mut preserved_worktree_paths: std::collections::HashSet<PathBuf> =
         std::collections::HashSet::new();
 
@@ -771,37 +847,18 @@ fn perform_deletion_core(
             }
         }
     }
-    // Any preserved worktree, dirty or default-branch, blocks the in-container
-    // preclean (a recursive `find . -delete` that would reach through and
-    // destroy the contents we just decided to keep) and the host workspace-dir
-    // removal alike: with a worktree preserved under it the directory is not
-    // ours to remove, so we skip it rather than surface a spurious failure.
-    let any_preserved = !preserved_worktree_paths.is_empty();
 
-    if request.delete_worktree && is_sandboxed && !any_preserved {
-        tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "sandbox_worktree_preclean", "perform_deletion: stage");
-        // Best-effort. The container's workdir is the session's main
-        // worktree (or, for workspace sessions, the workspace root that
-        // contains every per-repo worktree). `find . -delete` from
-        // there recursively wipes everything we care about under the
-        // bind mount. If this fails, the host-side removal below will
-        // surface a permission error and exit cleanly. We do NOT walk
-        // workspace_info.repos here: their container mount paths are
-        // computed relative to the common ancestor of all repos
-        // (see compute_workspace_volume_paths) and don't necessarily
-        // match `/workspace/{repo.name}`, and the workspace-root walk
-        // already covers their contents.
-        let _ = crate::git::cleanup::cleanup_sandbox_worktree(&request.instance);
-    }
+    preserved_worktree_paths
+}
 
-    // Stage 3: container removal. Releases the bind mount on the
-    // worktree so the host can finish cleanup without racing in-
-    // container processes.
-    if request.delete_sandbox && is_sandboxed {
-        tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "container_remove", "perform_deletion: stage");
-        deletion_messages_for(teardown(&request.instance.id), &mut messages, &mut errors);
-    }
-
+fn stage_remove_worktrees_and_branches(
+    request: &DeletionRequest,
+    repos: &[super::WorkspaceRepo],
+    preserved_worktree_paths: &std::collections::HashSet<PathBuf>,
+    any_preserved: bool,
+    errors: &mut Vec<String>,
+    messages: &mut Vec<String>,
+) {
     // Stage 4: worktree cleanup. Container is gone, agent is gone, no
     // bind mount holds the directory open, and (for sandboxed sessions)
     // the preclean above wiped any root-owned files. Must happen
@@ -1041,7 +1098,13 @@ fn perform_deletion_core(
             }
         }
     }
+}
 
+fn stage_cleanup_scratch(
+    request: &DeletionRequest,
+    errors: &mut Vec<String>,
+    messages: &mut Vec<String>,
+) {
     // Scratch directory cleanup. Runs unconditionally for scratch sessions
     // regardless of `request.delete_worktree`, since the scratch directory
     // is the entire reason the session has any on-disk state. Skipped when
@@ -1119,31 +1182,6 @@ fn perform_deletion_core(
                 path.display()
             ));
         }
-    }
-
-    // Stage 6: hook status cleanup
-    tracing::debug!(target: "session.delete", session_id = %request.session_id, stage = "hook_status_cleanup", "perform_deletion: stage");
-    crate::hooks::cleanup_hook_status_dir(&request.instance.id);
-
-    if !errors.is_empty() {
-        tracing::debug!(target: "session.delete",
-            session_id = %request.session_id,
-            error_count = errors.len(),
-            errors = ?errors,
-            "perform_deletion: completed with errors"
-        );
-    } else {
-        tracing::debug!(target: "session.delete", session_id = %request.session_id, "perform_deletion: completed successfully");
-    }
-
-    DeletionResult {
-        session_id: request.session_id.clone(),
-        success: errors.is_empty(),
-        teardown_started: true,
-        messages,
-        errors,
-        disposition: DeletionDisposition::Failed,
-        retained_instance: None,
     }
 }
 

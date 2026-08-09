@@ -4,6 +4,10 @@
 //! unlocked, but the caller must then hold the per-instance lifecycle flock
 //! while an exact generation check, irreversible side effects, and the durable
 //! commit execute. Operation kind is never used as ownership identity.
+//!
+//! Vocabulary: `reservation` is the durable ownership primitive on `Instance`;
+//! `claim`/`decide_*` are the decision helpers this module layers on top. The
+//! term "lease" is not used.
 
 use super::{Instance, LifecycleOperation, LifecycleReservationError};
 use chrono::{DateTime, Utc};
@@ -119,7 +123,7 @@ pub(crate) fn finalize_restore_commit(
     RestoreCommit::Committed
 }
 
-pub(crate) fn release_trash_lease(all: &mut [Instance], id: &str, generation: u64) {
+pub(crate) fn release_trash_reservation(all: &mut [Instance], id: &str, generation: u64) {
     if let Some(row) = all.iter_mut().find(|instance| instance.id == id) {
         row.release_lifecycle_reservation_if_owned(LifecycleOperation::Trash, generation);
     }
@@ -172,7 +176,7 @@ mod tests {
     }
 
     #[test]
-    fn decisions_grant_or_reject_one_unified_lease() {
+    fn decisions_grant_or_reject_one_unified_reservation() {
         let now = Utc::now();
         let mut restored = trashed("restored");
         restored.untrash();

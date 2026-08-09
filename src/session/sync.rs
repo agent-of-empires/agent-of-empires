@@ -740,6 +740,7 @@ mod tests {
         let disk = Storage::new_unwatched(profile).unwrap().load().unwrap();
         assert_eq!(disk[0].agent_session_id, None);
     }
+
     #[test]
     #[serial]
     fn disk_generation_accepts_typed_observation_when_memory_is_stale() {

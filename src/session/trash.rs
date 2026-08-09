@@ -326,7 +326,7 @@ pub fn perform_trash(request: &TrashRequest) -> TrashResult {
                 relocation,
             );
         } else {
-            crate::session::claim::release_trash_lease(
+            crate::session::claim::release_trash_reservation(
                 instances,
                 &request.session_id,
                 request.generation,
