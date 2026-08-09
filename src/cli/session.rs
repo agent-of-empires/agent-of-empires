@@ -5,7 +5,9 @@ use clap::{Args, Subcommand};
 use serde::Serialize;
 use std::collections::HashSet;
 
-use crate::session::{ClaimOp, GroupTree, Instance, ResumeIntent, StartOutcome, Storage};
+use crate::session::{
+    GroupTree, Instance, LifecycleOperation, ResumeIntent, StartOutcome, Storage,
+};
 
 #[derive(Subcommand)]
 pub enum SessionCommands {
@@ -488,27 +490,23 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         .clone();
     let restore_id = inst.id.clone();
 
-    // Symmetric claim (#2541): win the Restore claim under the flock BEFORE the
-    // unlocked worktree move, so a concurrent purge from another process cannot
-    // tear the worktree down while this restore relocates it. A fresh Purge
-    // claim wins here and the restore bails.
-    let claim = storage.update(|instances, _groups| {
-        Ok(crate::session::claim::decide_restore_claim(
-            instances,
-            &restore_id,
-            chrono::Utc::now(),
-        ))
+    let _lifecycle_lock = storage
+        .acquire_instance_lifecycle_lock(&restore_id)
+        .context("failed to acquire instance restore lock")?;
+    let decision = storage.update(|instances, _groups| {
+        crate::session::claim::decide_restore_claim(instances, &restore_id, chrono::Utc::now())
+            .map_err(anyhow::Error::new)
     })?;
-    match claim {
+    let restore_generation = match decision {
         crate::session::claim::RestoreClaimDecision::AlreadyGone => {
             anyhow::bail!("No trashed session matching '{}'", args.identifier)
         }
-        crate::session::claim::RestoreClaimDecision::PurgeInProgress => anyhow::bail!(
-            "Session {} is being purged by another process, so it was not restored",
+        crate::session::claim::RestoreClaimDecision::Busy(holder) => anyhow::bail!(
+            "Session {} is busy with lifecycle operation {holder:?}, so it was not restored",
             inst.title
         ),
-        crate::session::claim::RestoreClaimDecision::Claimed => {}
-    }
+        crate::session::claim::RestoreClaimDecision::Claimed(generation) => generation,
+    };
 
     // Move the worktree back to its pre-trash location before flipping the
     // marker. Strict: if the original path is occupied or git refuses, leave
@@ -517,7 +515,7 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     if let crate::session::trash::RestoreOutcome::Failed { reason } =
         crate::session::trash::restore_worktree_location(&mut inst)
     {
-        release_restore_claim(&storage, &restore_id);
+        release_restore_lease(&storage, &restore_id, restore_generation);
         anyhow::bail!("Cannot restore worktree: {reason}");
     }
     let restored_path = inst.project_path.clone();
@@ -527,14 +525,15 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         Ok(crate::session::claim::finalize_restore_commit(
             instances,
             &restore_id,
+            restore_generation,
             &restored_path,
             &restored_pre,
         ))
     })?;
     match commit {
         crate::session::claim::RestoreCommit::Committed => {}
-        crate::session::claim::RestoreCommit::PurgeStoleClaim => anyhow::bail!(
-            "Session {} was claimed by a purge mid-restore, so it was not restored",
+        crate::session::claim::RestoreCommit::Superseded => anyhow::bail!(
+            "Session {} lost its lifecycle reservation during restore",
             inst.title
         ),
         crate::session::claim::RestoreCommit::AlreadyGone => {
@@ -545,12 +544,13 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     Ok(())
 }
 
-/// Release a Restore claim after a failed worktree move, ownership-guarded so a
-/// peer's fresh Purge claim (stale-override) is never cleared. See #2541.
-fn release_restore_claim(storage: &Storage, restore_id: &str) {
+fn release_restore_lease(storage: &Storage, restore_id: &str, generation: u64) {
     let _ = storage.update(|instances, _groups| {
-        if let Some(stored) = instances.iter_mut().find(|i| i.id == restore_id) {
-            stored.clear_op_claim_if_owned(ClaimOp::Restore);
+        if let Some(stored) = instances
+            .iter_mut()
+            .find(|instance| instance.id == restore_id)
+        {
+            stored.release_lifecycle_reservation_if_owned(LifecycleOperation::Restore, generation);
         }
         Ok(())
     });

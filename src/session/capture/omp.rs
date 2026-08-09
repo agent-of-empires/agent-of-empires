@@ -2922,6 +2922,13 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn container_script_bounds_inputs_and_reads_only_the_marker_terminal() {
+        assert!(
+            CONTAINER_BREADCRUMB_SCRIPT.contains(&format!(
+                "head -n {} | grep",
+                super::super::PI_HEADER_SCAN_LINES
+            )),
+            "container header scan depth must match the host scan depth"
+        );
         let tmp = tempfile::tempdir().unwrap();
         let meta = metadata(tmp.path(), 100_000);
         let id = "019fc9a0-f688-7000-ae45-d9e51e5e1b8a";

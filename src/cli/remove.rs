@@ -4,7 +4,7 @@ use anyhow::Result;
 use chrono::Utc;
 use clap::Args;
 
-use crate::session::{ClaimOp, Instance, Storage};
+use crate::session::{Instance, LifecycleOperation, Storage};
 
 #[derive(Args)]
 pub struct RemoveArgs {
@@ -93,39 +93,29 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         let _lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&removed_id)
             .map_err(|error| anyhow::anyhow!("failed to acquire instance trash lock: {error}"))?;
-        if let Err(e) = inst.kill_locked() {
-            eprintln!("Warning: failed to kill agent tmux session: {}", e);
+        let trash_generation = storage.update(|all_instances, _groups| {
+            let stored = all_instances
+                .iter_mut()
+                .find(|instance| instance.id == removed_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Session {removed_title} was removed by another process before it could be trashed"
+                    )
+                })?;
+            let generation = stored
+                .try_acquire_lifecycle_reservation(
+                    LifecycleOperation::Trash,
+                    Instance::LIFECYCLE_RESERVATION_TTL,
+                    Utc::now(),
+                )
+                .map_err(|error| anyhow::anyhow!("Session {removed_title}: {error}"))?;
+            stored.trash();
+            Ok(generation)
+        })?;
+        if let Err(error) = inst.kill_locked() {
+            eprintln!("Warning: failed to kill agent tmux session: {error}");
         }
         inst.kill_ancillary_tmux_sessions_locked();
-
-        let landed = storage.update(|all_instances, _groups| {
-            if let Some(stored) = all_instances.iter_mut().find(|i| i.id == removed_id) {
-                stored.trash();
-                stored.lifecycle_generation = stored.lifecycle_generation.saturating_add(1);
-                // Mark the teardown in flight (ClaimOp::Trash) so peers
-                // observe it as durable state. Best-effort: a refused claim
-                // still tears down, gated by the pre-move re-check and the
-                // locked relocation commit.
-                if let Err(holder) =
-                    stored.try_claim(ClaimOp::Trash, Instance::OP_CLAIM_TTL, Utc::now())
-                {
-                    tracing::info!(
-                        target: "cli.session",
-                        session = %stored.id,
-                        "trash teardown runs unclaimed; a fresh {holder:?} claim holds the row"
-                    );
-                }
-                Ok(true)
-            } else {
-                Ok(false)
-            }
-        })?;
-        if !landed {
-            anyhow::bail!(
-                "Session {} was removed by another process before it could be trashed",
-                removed_title
-            );
-        }
 
         // The session is durably trashed; stop its sandbox container (so it
         // doesn't keep running for the whole retention window) and move its
@@ -163,8 +153,8 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
                     decided = Some(crate::session::claim::commit_trash_relocation(
                         all_instances,
                         &removed_id,
+                        trash_generation,
                         &reloc,
-                        chrono::Utc::now(),
                     ));
                     Ok(())
                 });
@@ -200,10 +190,10 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
             }
             crate::session::trash::RelocateOutcome::Failed { reason } => {
                 eprintln!("  Note: left worktree in place ({reason}).");
-                release_trash_claim_best_effort(&storage, &removed_id);
+                release_trash_lease_best_effort(&storage, &removed_id, trash_generation);
             }
             crate::session::trash::RelocateOutcome::Skipped => {
-                release_trash_claim_best_effort(&storage, &removed_id);
+                release_trash_lease_best_effort(&storage, &removed_id, trash_generation);
             }
         }
 
@@ -339,12 +329,10 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     Ok(())
 }
 
-/// Release the teardown's in-flight Trash claim on a no-relocation terminal
-/// path (the relocation paths release inside `commit_trash_relocation`).
-/// Ownership-guarded; best-effort, a stranded claim self-heals via the TTL.
-fn release_trash_claim_best_effort(storage: &Storage, removed_id: &str) {
+/// Release the teardown's lease on a no-relocation terminal path.
+fn release_trash_lease_best_effort(storage: &Storage, removed_id: &str, generation: u64) {
     let _ = storage.update(|all_instances, _groups| {
-        crate::session::claim::release_trash_claim(all_instances, removed_id);
+        crate::session::claim::release_trash_lease(all_instances, removed_id, generation);
         Ok(())
     });
 }
@@ -435,10 +423,13 @@ mod tests {
         let live = Instance::new("s", "/tmp/x");
         let id = live.id.clone();
         let mut all = vec![live];
+        assert!(matches!(
+            crate::session::claim::decide_purge_claim(&mut all, &id, false, Utc::now()).unwrap(),
+            crate::session::claim::PurgeClaimDecision::Claimed(1)
+        ));
         assert_eq!(
-            crate::session::claim::decide_purge_claim(&mut all, &id, false, Utc::now()),
-            crate::session::claim::PurgeClaimDecision::Claimed
+            all[0].lifecycle_reservation.as_ref().map(|c| c.op),
+            Some(LifecycleOperation::Purge)
         );
-        assert_eq!(all[0].op_claim.as_ref().map(|c| c.op), Some(ClaimOp::Purge));
     }
 }

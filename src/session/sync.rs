@@ -68,13 +68,28 @@ struct Rollback {
     disk_omp_capture_generation: Option<String>,
 }
 
-/// Lease each instance's newest poller observation, persist new sids via CAS,
-/// acknowledge terminal outcomes, reconcile in-memory state, and republish
-/// tmux env. Callers with auxiliary mirrors must re-sync touched ids from the
-/// slice.
+/// Drain and persist captures, acquiring each session's lifecycle flock around
+/// its final compare-and-set.
 pub(crate) fn drain_and_persist_session_ids(
     instances: &mut [Instance],
     file_watch: &Arc<FileWatchService>,
+) -> SessionIdSyncOutcome {
+    drain_and_persist_session_ids_inner(instances, file_watch, false)
+}
+
+/// Variant for a one-session caller that already holds its lifecycle flock.
+pub(crate) fn drain_and_persist_session_ids_lifecycle_locked(
+    instances: &mut [Instance],
+    file_watch: &Arc<FileWatchService>,
+) -> SessionIdSyncOutcome {
+    debug_assert_eq!(instances.len(), 1);
+    drain_and_persist_session_ids_inner(instances, file_watch, true)
+}
+
+fn drain_and_persist_session_ids_inner(
+    instances: &mut [Instance],
+    file_watch: &Arc<FileWatchService>,
+    lifecycle_already_locked: bool,
 ) -> SessionIdSyncOutcome {
     let mut updates: Vec<Update> = Vec::with_capacity(instances.len());
     let mut filtered_ids: HashSet<String> = HashSet::with_capacity(instances.len());
@@ -185,19 +200,19 @@ pub(crate) fn drain_and_persist_session_ids(
     // silent misassignment. Drop every claimant and defer; the next tick sees
     // the real owner's anchor advance and the collision guard resolves it (#2708).
     let mut sid_claim_counts: HashMap<String, usize> = HashMap::with_capacity(updates.len());
-    for upd in &updates {
-        *sid_claim_counts.entry(upd.sid.clone()).or_insert(0) += 1;
+    for update in &updates {
+        *sid_claim_counts.entry(update.sid.clone()).or_insert(0) += 1;
     }
-    updates.retain(|upd| {
-        if sid_claim_counts.get(&upd.sid).copied().unwrap_or(0) > 1 {
+    updates.retain(|update| {
+        if sid_claim_counts.get(&update.sid).copied().unwrap_or(0) > 1 {
             tracing::warn!(
                 target: "session.sync",
-                instance = %upd.id,
-                sid = %upd.sid,
+                instance = %update.id,
+                sid = %update.sid,
                 "Ignoring poller-reported sid claimed by multiple instances this tick",
             );
-            acknowledge_poller_observation_for(instances, &upd.id, &upd.observation);
-            filtered_ids.insert(upd.id.clone());
+            acknowledge_poller_observation_for(instances, &update.id, &update.observation);
+            filtered_ids.insert(update.id.clone());
             false
         } else {
             true
@@ -211,56 +226,135 @@ pub(crate) fn drain_and_persist_session_ids(
     let mut to_apply: Vec<(String, String)> = Vec::with_capacity(updates.len());
     let mut to_rollback: Vec<Rollback> = Vec::with_capacity(updates.len());
 
-    for upd in &updates {
-        let outcome = match &upd.guard {
-            SessionIdGuard::Unguarded => persist_session_to_storage(
-                &upd.profile,
-                &upd.id,
-                &upd.sid,
-                upd.expected_prior.as_deref(),
-                file_watch,
-            ),
-            SessionIdGuard::OmpLegacy => persist_omp_session_to_storage(
-                &upd.profile,
-                &upd.id,
-                &upd.sid,
-                upd.expected_prior.as_deref(),
-                None,
-                file_watch,
-            ),
-            SessionIdGuard::OmpGeneration(generation) => persist_omp_session_to_storage(
-                &upd.profile,
-                &upd.id,
-                &upd.sid,
-                upd.expected_prior.as_deref(),
-                Some(generation),
-                file_watch,
-            ),
+    let mut capture_generations: Vec<(String, u64)> = Vec::with_capacity(updates.len());
+    for update in &updates {
+        let ownership: anyhow::Result<_> = if lifecycle_already_locked {
+            Ok(None)
+        } else {
+            (|| {
+                let storage = Storage::new(&update.profile, file_watch.clone())?;
+                let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&update.id)?;
+                let generation = storage.update(|instances, _groups| {
+                    let Some(instance) = instances
+                        .iter_mut()
+                        .find(|instance| instance.id == update.id)
+                    else {
+                        anyhow::bail!("session disappeared before capture");
+                    };
+                    instance
+                        .try_acquire_lifecycle_reservation(
+                            crate::session::LifecycleOperation::Capture,
+                            Instance::LIFECYCLE_RESERVATION_TTL,
+                            chrono::Utc::now(),
+                        )
+                        .map_err(|error| anyhow::anyhow!("capture blocked: {error}"))
+                })?;
+                Ok(Some((storage, lifecycle_lock, generation)))
+            })()
         };
+        let mut outcome = match &ownership {
+            Err(error) => {
+                tracing::warn!(
+                    target: "session.sync",
+                    instance = %update.id,
+                    "capture ownership failed: {error}",
+                );
+                SidWrite::Failed
+            }
+            Ok(_) => match &update.guard {
+                SessionIdGuard::Unguarded => persist_session_to_storage(
+                    &update.profile,
+                    &update.id,
+                    &update.sid,
+                    update.expected_prior.as_deref(),
+                    file_watch,
+                ),
+                SessionIdGuard::OmpLegacy => persist_omp_session_to_storage(
+                    &update.profile,
+                    &update.id,
+                    &update.sid,
+                    update.expected_prior.as_deref(),
+                    None,
+                    file_watch,
+                ),
+                SessionIdGuard::OmpGeneration(generation) => persist_omp_session_to_storage(
+                    &update.profile,
+                    &update.id,
+                    &update.sid,
+                    update.expected_prior.as_deref(),
+                    Some(generation),
+                    file_watch,
+                ),
+            },
+        };
+        if let Ok(Some((storage, _lifecycle_lock, generation))) = ownership {
+            let released = storage.update(|instances, _groups| {
+                let Some(instance) = instances
+                    .iter_mut()
+                    .find(|instance| instance.id == update.id)
+                else {
+                    return Ok(false);
+                };
+                Ok(instance.release_lifecycle_reservation_if_owned(
+                    crate::session::LifecycleOperation::Capture,
+                    generation,
+                ))
+            });
+            match released {
+                Ok(true) => capture_generations.push((update.id.clone(), generation)),
+                Ok(false) => {
+                    tracing::warn!(
+                        target: "session.sync",
+                        instance = %update.id,
+                        "capture lost its lifecycle reservation before release",
+                    );
+                    outcome = SidWrite::Failed;
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        target: "session.sync",
+                        instance = %update.id,
+                        "capture reservation release failed: {error}",
+                    );
+                    outcome = SidWrite::Failed;
+                }
+            }
+        }
         match outcome {
             SidWrite::Applied => {
-                acknowledge_poller_observation_for(instances, &upd.id, &upd.observation);
-                to_apply.push((upd.id.clone(), upd.sid.clone()));
+                acknowledge_poller_observation_for(instances, &update.id, &update.observation);
+                to_apply.push((update.id.clone(), update.sid.clone()));
             }
             SidWrite::Skipped => {
-                request_poller_retry(instances, &upd.id);
-                if let Some(rb) = reload_skipped_from_disk(&upd.profile, &upd.id, file_watch) {
-                    if rb.disk_sid.as_deref() == Some(upd.sid.as_str()) {
-                        acknowledge_poller_observation_for(instances, &upd.id, &upd.observation);
+                request_poller_retry(instances, &update.id);
+                if let Some(rb) = reload_skipped_from_disk(&update.profile, &update.id, file_watch)
+                {
+                    if rb.disk_sid.as_deref() == Some(update.sid.as_str()) {
+                        acknowledge_poller_observation_for(
+                            instances,
+                            &update.id,
+                            &update.observation,
+                        );
                     }
                     to_rollback.push(rb);
                 } else {
                     tracing::warn!(
                         target: "session.sync",
-                        instance = %upd.id,
+                        instance = %update.id,
                         "Skipped reload failed; deferring env reconcile",
                     );
                 }
             }
             SidWrite::Failed => {
-                request_poller_retry(instances, &upd.id);
-                filtered_ids.insert(upd.id.clone());
+                request_poller_retry(instances, &update.id);
+                filtered_ids.insert(update.id.clone());
             }
+        }
+    }
+    for (id, generation) in &capture_generations {
+        if let Some(inst) = instances.iter_mut().find(|instance| instance.id == *id) {
+            inst.lifecycle_generation = *generation;
+            inst.lifecycle_reservation = None;
         }
     }
 
@@ -792,6 +886,43 @@ mod tests {
         assert_eq!(outcome.filtered, vec![instances[0].id.clone()]);
         assert!(outcome.applied.is_empty());
         assert_eq!(instances[0].agent_session_id.as_deref(), Some(own));
+    }
+
+    #[test]
+    #[serial]
+    fn drain_defers_capture_while_trash_owns_lifecycle() {
+        let temp = tempdir().unwrap();
+        let _guard = storage_home_guard(&temp);
+        let profile = "sync-trash-owned";
+        let sid = "019342ab-1234-7def-8901-bbbbbbbbbbbb";
+        let mut instance = Instance::new("trash-owned-title", "/tmp/x");
+        instance.source_profile = profile.to_string();
+        instance.status = Status::Running;
+        instance.lifecycle_generation = 1;
+        instance.lifecycle_reservation = Some(crate::session::LifecycleReservation {
+            op: crate::session::LifecycleOperation::Trash,
+            generation: 1,
+            at: chrono::Utc::now(),
+        });
+        seed_instance_on_disk(profile, &instance);
+        attach_poller_with_update(&mut instance, sid);
+
+        let file_watch = FileWatchService::noop();
+        let mut instances = vec![instance];
+        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
+
+        assert_eq!(outcome.filtered, vec![instances[0].id.clone()]);
+        assert!(outcome.applied.is_empty());
+        let stored = Storage::new_unwatched(profile).unwrap().load().unwrap();
+        assert_eq!(stored[0].agent_session_id, None);
+        assert_eq!(
+            stored[0]
+                .lifecycle_reservation
+                .as_ref()
+                .map(|reservation| reservation.op),
+            Some(crate::session::LifecycleOperation::Trash)
+        );
+        assert_eq!(stored[0].lifecycle_generation, 1);
     }
 
     #[test]

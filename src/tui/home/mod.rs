@@ -2013,35 +2013,44 @@ impl HomeView {
             // the active dir (rows trashed before relocation existed) and fix a
             // pointer a crash left stale. Best-effort and only touches trashed
             // rows, which are typically few. See #2522.
-            for inst in &mut instances {
-                if crate::session::trash::reconcile_trashed_location(inst) {
-                    let new_path = inst.project_path.clone();
-                    let pre = inst.pre_trash_project_path.clone();
-                    let target_id = inst.id.clone();
-                    let _ = storage.update(|disk, _groups| {
-                        if let Some(d) = disk.iter_mut().find(|i| i.id == target_id) {
-                            d.project_path = new_path.clone();
-                            d.pre_trash_project_path = pre.clone();
-                        }
-                        Ok(())
-                    });
+            for instance in &mut instances {
+                if !instance.is_trashed() {
+                    continue;
+                }
+                if let Err(error) = crate::session::trash::reconcile_trashed_transition(instance) {
+                    tracing::warn!(
+                        target: "tui.home",
+                        session = %instance.id,
+                        "trash reconciliation skipped: {error}",
+                    );
                 }
             }
-            // Self-heal (#2541): clear op_claims left by a purge/restore that
-            // crashed mid-operation. `try_claim` already treats an expired claim
-            // as free, so this is belt-and-suspenders that stops a stranded
-            // claim from lingering on disk after a crash.
-            let ttl = crate::session::Instance::OP_CLAIM_TTL;
+            // Clear expired lifecycle reservations only while holding the same
+            // per-instance flock used by live transitions.
+            let ttl = crate::session::Instance::LIFECYCLE_RESERVATION_TTL;
             let now = chrono::Utc::now();
-            for inst in &mut instances {
-                if inst.clear_expired_op_claim(ttl, now) {
-                    let target_id = inst.id.clone();
-                    let _ = storage.update(|disk, _groups| {
-                        if let Some(d) = disk.iter_mut().find(|i| i.id == target_id) {
-                            d.clear_expired_op_claim(ttl, now);
-                        }
-                        Ok(())
-                    });
+            for instance in &mut instances {
+                if !instance.has_fresh_lifecycle_reservation(now)
+                    && instance.lifecycle_reservation.is_some()
+                {
+                    let Ok(_lifecycle_lock) = storage.acquire_instance_lifecycle_lock(&instance.id)
+                    else {
+                        continue;
+                    };
+                    let target_id = instance.id.clone();
+                    if storage
+                        .update(|disk, _groups| {
+                            if let Some(stored) =
+                                disk.iter_mut().find(|candidate| candidate.id == target_id)
+                            {
+                                stored.clear_expired_lifecycle_reservation(ttl, now);
+                            }
+                            Ok(())
+                        })
+                        .is_ok()
+                    {
+                        instance.clear_expired_lifecycle_reservation(ttl, now);
+                    }
                 }
             }
             let tree = GroupTree::new_with_groups(&instances, &groups);
@@ -3157,7 +3166,7 @@ impl HomeView {
                             current.trashed_at = retained.trashed_at;
                             current.project_path = retained.project_path;
                             current.pre_trash_project_path = retained.pre_trash_project_path;
-                            current.op_claim = retained.op_claim;
+                            current.lifecycle_reservation = retained.lifecycle_reservation;
                         }
                         let message = if result.teardown_started {
                             "This session was restored while its delete ran; the record was kept, but its worktree, branch, container, or transcript may already be gone. Inspect and repair it."
@@ -3172,7 +3181,7 @@ impl HomeView {
                             if let Some(retained) = result.retained_instance {
                                 current.status = retained.status;
                                 current.lifecycle_generation = retained.lifecycle_generation;
-                                current.op_claim = retained.op_claim;
+                                current.lifecycle_reservation = retained.lifecycle_reservation;
                             } else {
                                 current.status = Status::Error;
                             }
@@ -3293,153 +3302,51 @@ impl HomeView {
         }
     }
 
-    /// Apply the result of a background trash prepare: persist the relocated
-    /// worktree path onto the (already-trashed) row. Returns true if an
-    /// instance was updated so the caller can trigger a redraw.
+    /// Apply a background trash result. The worker already committed durable
+    /// state while holding the lifecycle flock; this drain only refreshes the
+    /// in-memory path after confirming the same durable row is still trashed.
     pub fn apply_trash_results(&mut self) -> bool {
         use std::sync::mpsc::TryRecvError;
 
         match self.trash_poller.try_recv_result() {
             Ok(result) => {
                 let mut changed = false;
-                // Only persist the relocation if the row is still trashed. The
-                // teardown ran off-thread, so a fast restore or purge could have
-                // landed in between; applying the holding-area path to a row the
-                // user just restored would repoint a live session's worktree
-                // into `.aoe-trash/`. A purged row is gone from the map and this
-                // skips too. The relocation is best-effort regardless: a later
-                // reconcile pass heals a still-trashed row whose move was
-                // dropped here.
-                if result.relocation.is_none() {
-                    // Skipped/Failed teardown: nothing moved, but the drain is
-                    // this teardown's terminal path, so release its in-flight
-                    // Trash claim (ownership-guarded; a claim a purge/restore
-                    // seized is untouched). The row stays trashed in place and
-                    // the next reconcile pass relocates it.
-                    if let Some(storage) = self
+                if let Some(relocation) = result.relocation {
+                    let durable = self
                         .instances
                         .get(&result.session_id)
-                        .map(|i| i.source_profile.clone())
+                        .map(|instance| instance.source_profile.clone())
                         .and_then(|profile| self.storages.get(&profile))
-                    {
-                        if let Err(e) = storage.update(|insts, _groups| {
-                            crate::session::claim::release_trash_claim(insts, &result.session_id);
-                            Ok(())
-                        }) {
-                            tracing::warn!(
-                                target: "tui.session",
-                                session = %result.session_id,
-                                "could not release the Trash claim: {e}"
-                            );
-                        }
-                    }
-                }
-                if let Some(reloc) = result.relocation {
-                    // Atomic durable check-and-commit under the storage flock.
-                    // The worker's pre-move re-check leaves a window before
-                    // this drain in which a restore or purge (local or from a
-                    // peer process) can supersede the teardown; deciding
-                    // against the in-memory map would re-open that window
-                    // cross-process, so the decision is re-taken on the
-                    // durable row instead, serialized with the restore/purge
-                    // commits. Superseded means such a peer won: the disk move
-                    // is undone (a same-filesystem rename, the same tick-loop
-                    // trade `restore_selected_from_trash` makes). A row absent
-                    // from the map was purged locally and is skipped; its
-                    // holding dir falls to the purge teardown.
-                    // The decision travels through this captured slot rather
-                    // than the closure's return value, so it survives an
-                    // update that decided Superseded and then failed its
-                    // final write; the undo below keys off the decision
-                    // alone, since the durable row was already restored in
-                    // that case and skipping the undo would strand its
-                    // worktree in the holding area.
-                    let mut decided: Option<(
-                        crate::session::claim::RelocationCommit,
-                        Option<crate::session::Instance>,
-                    )> = None;
-                    let update_result = self
-                        .instances
-                        .get(&result.session_id)
-                        .map(|i| i.source_profile.clone())
-                        .and_then(|profile| self.storages.get(&profile))
-                        .map(|storage| {
-                            storage.update(|insts, _groups| {
-                                let commit = crate::session::claim::commit_trash_relocation(
-                                    insts,
-                                    &result.session_id,
-                                    &reloc,
-                                    chrono::Utc::now(),
-                                );
-                                let row = insts.iter().find(|i| i.id == result.session_id).cloned();
-                                decided = Some((commit, row));
-                                Ok(())
-                            })
+                        .and_then(|storage| storage.load().ok())
+                        .and_then(|instances| {
+                            instances
+                                .into_iter()
+                                .find(|instance| instance.id == result.session_id)
                         });
-                    if let Some(Err(e)) = &update_result {
-                        // A Persisted decision whose write failed needs no
-                        // repair here: the durable row is still trashed at its
-                        // old path and the load-time reconcile repoints it to
-                        // the holding area.
-                        tracing::error!(
-                            target: "tui.home",
-                            session = %result.session_id,
-                            "failed to persist trash worktree relocation: {e}",
-                        );
-                    }
-                    use crate::session::claim::RelocationCommit;
-                    match decided {
-                        Some((RelocationCommit::Persisted, _))
-                            if matches!(update_result, Some(Ok(()))) =>
-                        {
-                            if let Some(inst) = self.instances.get_mut(&result.session_id) {
-                                inst.project_path = reloc.new_project_path.clone();
-                                inst.pre_trash_project_path = reloc.pre_trash_project_path.clone();
-                            }
+                    if let Some(durable) = durable.filter(|instance| {
+                        instance.is_trashed()
+                            && instance.project_path == relocation.new_project_path
+                    }) {
+                        if let Some(instance) = self.instances.get_mut(&result.session_id) {
+                            instance.project_path = durable.project_path;
+                            instance.pre_trash_project_path = durable.pre_trash_project_path;
+                            instance.lifecycle_generation = durable.lifecycle_generation;
+                            instance.lifecycle_reservation = durable.lifecycle_reservation;
                             changed = true;
                         }
-                        Some((RelocationCommit::Superseded, row)) => {
-                            let undo_with =
-                                row.or_else(|| self.instances.get(&result.session_id).cloned());
-                            if let Some(live) = undo_with {
-                                match crate::session::trash::undo_raced_relocation(&live, &reloc) {
-                                    crate::session::trash::RestoreOutcome::Failed { reason } => {
-                                        tracing::warn!(
-                                            target: "tui.session",
-                                            session = %result.session_id,
-                                            "could not move a superseded trash relocation back ({reason}); worktree remains at {}",
-                                            reloc.new_project_path,
-                                        );
-                                    }
-                                    outcome => {
-                                        tracing::info!(
-                                            target: "tui.session",
-                                            session = %result.session_id,
-                                            "trash relocation superseded by a restore/claim; undone ({outcome:?})",
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
                     }
                 }
                 if let Some(reason) = result.relocate_warning {
                     tracing::warn!(
                         target: "tui.session",
                         session = %result.session_id,
-                        "trash worktree relocation skipped: {reason}",
+                        "trash transition incomplete: {reason}",
                     );
                 }
                 changed
             }
             Err(TryRecvError::Empty) => false,
             Err(TryRecvError::Disconnected) => {
-                // The worker thread is gone (a panic in perform_trash dropped
-                // result_tx). The rows are already durably trashed, so no
-                // status surgery is needed; their worktrees just did not
-                // relocate. A later reconcile pass (`reconcile_trashed_location`
-                // at load) moves them, so this only logs which are deferred.
                 let stuck = self.trash_poller.take_pending();
                 if stuck.is_empty() {
                     return false;
@@ -3447,7 +3354,7 @@ impl HomeView {
                 tracing::error!(
                     target: "tui.home",
                     rows = stuck.len(),
-                    "trash poller worker gone; worktree relocation deferred to next reconcile",
+                    "trash poller worker gone; transitions recover after reservation expiry",
                 );
                 false
             }
@@ -6381,50 +6288,34 @@ impl HomeView {
         }
     }
 
-    /// Atomic per-action mutate: in-memory once, disk via
-    /// `Instance::merge_user_action_diff` under the flock. On disk persist
-    /// failure, in-memory is rolled back to `pre` so memory and disk stay
-    /// consistent.
+    /// Atomic per-action mutate: update memory once, then merge the user-owned
+    /// diff under the storage flock. Roll memory back if persistence fails.
     pub(super) fn apply_user_action<F>(&mut self, id: &str, mutate: F) -> anyhow::Result<()>
     where
         F: FnOnce(&mut Instance),
     {
-        self.apply_user_action_with(id, mutate, |_| {})
-    }
-
-    /// [`Self::apply_user_action`] with a same-flock post-mutation hook on the
-    /// DISK row, run inside the same `storage.update` closure after
-    /// `merge_user_action_diff`. For durable state the diff-merge deliberately
-    /// drops (`op_claim`, #2541) that must still land atomically with the
-    /// action: the trash path uses it so a peer can never read a trashed row
-    /// without its in-flight Trash claim. The hook mutates the disk row only;
-    /// in-memory rows never carry claims.
-    pub(super) fn apply_user_action_with<F, H>(
-        &mut self,
-        id: &str,
-        mutate: F,
-        post_disk: H,
-    ) -> anyhow::Result<()>
-    where
-        F: FnOnce(&mut Instance),
-        H: FnOnce(&mut Instance),
-    {
-        let Some(profile) = self.instances.get(id).map(|i| i.source_profile.clone()) else {
+        let Some(profile) = self
+            .instances
+            .get(id)
+            .map(|instance| instance.source_profile.clone())
+        else {
             return Ok(());
         };
-        let Some(in_mem) = self.instances.get_mut(id) else {
+        let Some(in_memory) = self.instances.get_mut(id) else {
             return Ok(());
         };
-        let pre = in_mem.clone();
-        mutate(in_mem);
-        let post = in_mem.clone();
+        let before = in_memory.clone();
+        mutate(in_memory);
+        let after = in_memory.clone();
 
         let id_owned = id.to_string();
-        let res = if let Some(storage) = self.storages.get(&profile) {
-            storage.update(|insts, _groups| {
-                if let Some(disk) = insts.iter_mut().find(|i| i.id == id_owned) {
-                    disk.merge_user_action_diff(&pre, &post);
-                    post_disk(disk);
+        let result = if let Some(storage) = self.storages.get(&profile) {
+            storage.update(|instances, _groups| {
+                if let Some(disk) = instances
+                    .iter_mut()
+                    .find(|instance| instance.id == id_owned)
+                {
+                    disk.merge_user_action_diff(&before, &after);
                     Ok(true)
                 } else {
                     Ok(false)
@@ -6439,23 +6330,23 @@ impl HomeView {
             );
             Ok(true)
         };
-        match res {
+        match result {
             Ok(true) => Ok(()),
             Ok(false) => {
                 let added = self
                     .pending_added
                     .get(&profile)
-                    .is_some_and(|s| s.contains(id));
+                    .is_some_and(|pending| pending.contains(id));
                 if !added {
                     self.drop_peer_deleted_rows(&[id.to_string()]);
                 }
                 Ok(())
             }
-            Err(e) => {
+            Err(error) => {
                 if let Some(slot) = self.instances.get_mut(id) {
-                    *slot = pre;
+                    *slot = before;
                 }
-                Err(e)
+                Err(error)
             }
         }
     }

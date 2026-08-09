@@ -29,7 +29,13 @@ where
         cwd = %cwd.display(),
         "running git"
     );
-    let output = Command::new("git").args(&argv).current_dir(cwd).output()?;
+    // Callers classify several Git failures. Keep diagnostics deterministic
+    // instead of depending on the launching shell's locale.
+    let output = Command::new("git")
+        .args(&argv)
+        .current_dir(cwd)
+        .env("LC_ALL", "C")
+        .output()?;
     let dur = start.elapsed().as_millis() as u64;
     if output.status.success() {
         tracing::debug!(

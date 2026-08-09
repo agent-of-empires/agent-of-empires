@@ -536,63 +536,52 @@ pub enum SessionBucket {
     Trashed,
 }
 
-/// Which irreversible operation currently owns a session's `op_claim`. The
-/// purge (permanent teardown), restore (worktree move-back), and trash
-/// (container stop + worktree relocation into the holding area) paths run
-/// their slow work on an unlocked snapshot; the claim is the durable,
-/// cross-process primitive that serializes them so none tears down (or moves)
-/// state another is authoritative over. See #2541.
+/// One durable ownership protocol for every session lifecycle transition.
 ///
-/// `Trash` is deliberately the weakest claim: it marks "teardown in flight"
-/// so peers can observe it, but it never blocks user intent. A purge or
-/// restore seizes a fresh `Trash` claim (see [`Instance::try_claim`]) and the
-/// teardown yields via its pre-move re-check and the locked relocation
-/// commit, so a `d` followed by an immediate restore stays instant.
+/// A transition first acquires the per-instance lifecycle flock, then records
+/// a fresh generation under `Storage::update`. The same flock stays held
+/// through hooks, external side effects, and the exact-generation commit.
+/// `status` is presentation state and never proves ownership.
 ///
-/// Compat: `ClaimOp` has no `#[serde(other)]` fallback, so an aoe binary
-/// that predates the `Trash` variant fails to deserialize the whole
-/// `Instance` row carrying `op:"trash"`; `Storage::load` then skips the row
-/// and quarantines it to `sessions.corrupt.jsonl`, making the session
-/// temporarily invisible to that binary for the life of the claim. The TTL
-/// ([`Instance::OP_CLAIM_TTL`], 10 minutes) bounds how long the claim stays
-/// FRESH, but the field itself only clears when a newer binary next rewrites
-/// that row (a release path or the load-time expired-claim sweep), so the
-/// invisibility ends at that rewrite, not on a timer. If the older binary
-/// *writes* storage
-/// while the row is invisible, its save drops the row from `sessions.json`
-/// entirely (it survives only in the quarantine sidecar). Same exposure
-/// class as the #2541 Purge/Restore variants against pre-#2541 binaries: a
-/// mixed-version fleet touching storage inside a claim's TTL window.
+/// A crashed owner loses both the flock and, after the TTL, its reservation.
+/// Recovery may then acquire a newer generation; exact-generation commits
+/// ensure a late result can never mutate or clear that replacement.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum ClaimOp {
+pub enum LifecycleOperation {
+    Launch,
+    Capture,
+    Stop,
     Purge,
     Restore,
     Trash,
 }
 
-/// A durable ownership marker for an in-flight purge, restore, or trash
-/// teardown. `at` serves double duty: ownership plus the base for the TTL
-/// self-heal (a claim older than the TTL is treated as absent, so a crash
-/// mid-operation cannot strand a row permanently). Written on disk under the
-/// storage flock via
-/// [`Instance::try_claim`], the only serialization point visible across the
-/// CLI, the serve daemon, and the TUI. See #2541.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct OpClaim {
-    pub op: ClaimOp,
-    pub at: DateTime<Utc>,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleReservationError {
+    Busy(LifecycleOperation),
+    GenerationOverflow,
 }
 
-/// Authoritative "a lifecycle op holds this session" signal, distinct from the
-/// multi-writer `status`. Neither the status poller nor a REST pre-mark ever
-/// writes it, so a `Status::Starting` those two produce cannot be mistaken for
-/// a live op. Set under the lifecycle flock by `reserve_lifecycle_generation`
-/// and cleared on commit or fail; `generation` lets a stale commit clear only
-/// its own reservation, and `at` bases a TTL self-heal so a crash mid-launch
-/// cannot strand a session unstartable (mirrors `OpClaim`).
+impl std::fmt::Display for LifecycleReservationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy(operation) => {
+                write!(
+                    f,
+                    "lifecycle operation {operation:?} is already in progress"
+                )
+            }
+            Self::GenerationOverflow => f.write_str("lifecycle generation overflow"),
+        }
+    }
+}
+
+impl std::error::Error for LifecycleReservationError {}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct LifecycleReservation {
+    pub op: LifecycleOperation,
     pub generation: u64,
     pub at: DateTime<Utc>,
 }
@@ -758,26 +747,13 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_trash_project_path: Option<String>,
 
-    /// Durable ownership of an in-flight purge, restore, or trash teardown,
-    /// acquired under the storage flock via [`Self::try_claim`] before each
-    /// path runs its slow unlocked phase (purge teardown, restore worktree
-    /// move, trash container stop + relocation). It closes the cross-process
-    /// purge/restore race (#2541): a purge refuses to tear down a row a fresh
-    /// restore claim holds, and a restore refuses to move a row a fresh purge
-    /// claim holds. A `Trash` claim is weaker: it marks the teardown as
-    /// observable in-flight state and is seized by either of the other two
-    /// (see [`ClaimOp`]). Deliberately NOT copied by
-    /// [`Self::merge_user_action_diff`]: keeping it out of the peer-diff set is
-    /// exactly what stops a concurrent user action from clobbering a live claim.
-    /// Additive: absent in older `sessions.json` rows, so no migration is
-    /// needed (mirrors `trashed_at`).
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub op_claim: Option<OpClaim>,
-
-    /// Busy-guard signal for concurrent start/restart/stop, keyed on by the
-    /// lifecycle guards instead of `status` (which the poller and REST
-    /// pre-marks also write, so it cannot prove an op is in flight). Additive:
-    /// `None` on legacy rows and at rest.
+    /// Durable ownership reservation for every in-flight lifecycle transition.
+    /// Acquired atomically with a new `lifecycle_generation`; only that
+    /// generation may perform the transition's irreversible phase, commit, or
+    /// release it. This is intentionally the only persisted busy signal:
+    /// `status` remains multi-writer presentation state, while the per-instance
+    /// flock is the short-lived mutex protecting the final side effects and
+    /// commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub lifecycle_reservation: Option<LifecycleReservation>,
 
@@ -1532,7 +1508,6 @@ impl Instance {
             pinned_at: None,
             trashed_at: None,
             pre_trash_project_path: None,
-            op_claim: None,
             lifecycle_reservation: None,
             plugin_meta: std::collections::BTreeMap::new(),
             created_by_plugin: None,
@@ -2034,13 +2009,9 @@ impl Instance {
         if pre.status != post.status {
             self.status = post.status;
         }
-        // `op_claim` is intentionally NOT spliced here. It is a cross-process
-        // ownership marker for an in-flight purge, restore, or trash
-        // teardown, not a user-action field; excluding it from the peer diff
-        // is what stops a concurrent user action from clobbering a live claim
-        // on disk. The trash path relies on this same drop: its claim is
-        // written by a same-flock post-mutation hook instead
-        // (`apply_user_action_with`). See #2541.
+        // Lifecycle ownership is intentionally never spliced from a TUI
+        // snapshot. Only transition code holding the per-instance flock may
+        // mutate the durable lease and generation.
         self.last_accessed_at = self.last_accessed_at.max(post.last_accessed_at);
 
         let archived_changed = pre.archived_at != post.archived_at;
@@ -2142,88 +2113,91 @@ impl Instance {
         self.trashed_at.is_some()
     }
 
-    /// TTL for an `OpClaim`. Longer than any realistic teardown or worktree
-    /// move so a live operation is never overridden mid-flight, short enough
-    /// that a crash mid-operation self-heals promptly (the next purge/restore
-    /// overrides the expired claim, and the load-time reconcile clears it). See
-    /// #2541.
-    pub const OP_CLAIM_TTL: chrono::Duration = chrono::Duration::minutes(10);
+    /// Longer than any bounded hook, teardown, or worktree move. A crashed
+    /// owner cannot retain the reservation forever; a late owner is still
+    /// harmless because every commit is generation-checked.
+    pub const LIFECYCLE_RESERVATION_TTL: chrono::Duration = chrono::Duration::minutes(10);
 
-    /// Atomically acquire or keep the op claim for `want`. Returns `Ok` when
-    /// the claim is free, already ours, expired (self-heal), or held by a
-    /// fresh `Trash` claim being seized by a purge or restore; returns
-    /// `Err(holder)` when another operation holds a still-fresh claim that
-    /// `want` may not seize.
+    /// Acquire exclusive durable ownership of the next lifecycle generation.
     ///
-    /// Seizure order: `Trash` is the weakest claim. A teardown marks state,
-    /// it does not gate user intent, so `Purge` and `Restore` take over a
-    /// fresh `Trash` claim and the teardown yields via its pre-move re-check
-    /// and the locked relocation commit. `Trash` itself never seizes a fresh
-    /// `Purge` or `Restore` claim, and `Purge`/`Restore` still exclude each
-    /// other as before.
-    ///
-    /// Must be called inside a `Storage::update` closure so the check-and-set
-    /// runs under the storage flock, the only cross-process serialization
-    /// point. The whole destructive/irreversible phase (purge teardown, restore
-    /// worktree move, trash relocation) must win this before running unlocked,
-    /// and clear the claim when it finishes. See #2541.
-    pub fn try_claim(
+    /// Even a reservation for the same operation belongs to a peer: operation
+    /// kind is not an identity. A caller that already owns a reservation must
+    /// retain its returned generation and use
+    /// [`Self::lifecycle_reservation_is_owned`] rather than reacquiring by kind.
+    pub fn try_acquire_lifecycle_reservation(
         &mut self,
-        want: ClaimOp,
+        operation: LifecycleOperation,
         ttl: chrono::Duration,
         now: DateTime<Utc>,
-    ) -> Result<(), ClaimOp> {
-        match &self.op_claim {
-            Some(c) if c.op != want && c.op != ClaimOp::Trash && (now - c.at) < ttl => Err(c.op),
-            _ => {
-                self.op_claim = Some(OpClaim { op: want, at: now });
-                Ok(())
-            }
+    ) -> Result<u64, LifecycleReservationError> {
+        if let Some(reservation) = self.lifecycle_reservation.as_ref().filter(|reservation| {
+            reservation.generation == self.lifecycle_generation && (now - reservation.at) < ttl
+        }) {
+            return Err(LifecycleReservationError::Busy(reservation.op));
         }
+
+        let generation = self
+            .lifecycle_generation
+            .checked_add(1)
+            .ok_or(LifecycleReservationError::GenerationOverflow)?;
+        self.lifecycle_generation = generation;
+        self.lifecycle_reservation = Some(LifecycleReservation {
+            op: operation,
+            generation,
+            at: now,
+        });
+        Ok(generation)
     }
 
-    /// True when a fresh (unexpired) Purge or Restore claim holds this row,
-    /// i.e. a peer seized the trash teardown's claim (or claimed the row
-    /// outright while the teardown ran unclaimed). The teardown's two
-    /// decision points share this predicate: the pre-move gate
-    /// (`teardown_may_relocate`) and the locked relocation commit
-    /// (`commit_trash_relocation`). `try_claim` keeps its own inline
-    /// predicate because it additionally excludes the op being acquired.
-    pub fn is_seized_by_fresh_peer_claim(&self, now: DateTime<Utc>) -> bool {
-        matches!(
-            &self.op_claim,
-            Some(c) if c.op != ClaimOp::Trash && (now - c.at) < Self::OP_CLAIM_TTL
-        )
+    pub fn lifecycle_reservation_is_owned(
+        &self,
+        operation: LifecycleOperation,
+        generation: u64,
+    ) -> bool {
+        self.lifecycle_generation == generation
+            && matches!(
+                &self.lifecycle_reservation,
+                Some(reservation)
+                    if reservation.op == operation && reservation.generation == generation
+            )
     }
 
-    /// True when a fresh lifecycle reservation owns this row's current
-    /// generation. A timestamp alone is not ownership: any transition that
-    /// advances the generation immediately supersedes an older marker.
-    fn has_fresh_lifecycle_reservation(&self, now: DateTime<Utc>) -> bool {
+    pub fn has_fresh_lifecycle_reservation(&self, now: DateTime<Utc>) -> bool {
         matches!(
             &self.lifecycle_reservation,
-            Some(r)
-                if r.generation == self.lifecycle_generation
-                    && (now - r.at) < Self::OP_CLAIM_TTL
+            Some(reservation)
+                if reservation.generation == self.lifecycle_generation
+                    && (now - reservation.at) < Self::LIFECYCLE_RESERVATION_TTL
         )
     }
 
-    /// Drop the op claim only when it is owned by `op`. Ownership-guarding the
-    /// clear is critical on the stale-override path: if a purge overran the TTL
-    /// and a peer restore overrode it with a fresh Restore claim, the purge's
-    /// final commit must not clear that live Restore claim. See #2541.
-    pub fn clear_op_claim_if_owned(&mut self, op: ClaimOp) {
-        if matches!(&self.op_claim, Some(c) if c.op == op) {
-            self.op_claim = None;
+    pub fn release_lifecycle_reservation_if_owned(
+        &mut self,
+        operation: LifecycleOperation,
+        generation: u64,
+    ) -> bool {
+        if self.lifecycle_reservation_is_owned(operation, generation) {
+            self.lifecycle_reservation = None;
+            true
+        } else {
+            false
         }
     }
 
-    /// Self-heal: drop an expired claim so a crash mid-operation cannot strand
-    /// a row as permanently un-purgeable/un-restorable. Returns whether it
-    /// cleared anything (so a caller can persist only when needed). See #2541.
-    pub fn clear_expired_op_claim(&mut self, ttl: chrono::Duration, now: DateTime<Utc>) -> bool {
-        if matches!(&self.op_claim, Some(c) if (now - c.at) >= ttl) {
-            self.op_claim = None;
+    /// Clear a crashed owner's expired reservation. The generation is
+    /// deliberately retained as the monotonic cache/result revision.
+    pub fn clear_expired_lifecycle_reservation(
+        &mut self,
+        ttl: chrono::Duration,
+        now: DateTime<Utc>,
+    ) -> bool {
+        if matches!(
+            &self.lifecycle_reservation,
+            Some(reservation)
+                if reservation.generation == self.lifecycle_generation
+                    && (now - reservation.at) >= ttl
+        ) {
+            self.lifecycle_reservation = None;
             true
         } else {
             false
@@ -3229,21 +3203,60 @@ impl Instance {
         if !self.tmux_alive_cached() {
             return;
         }
-        let Some(captured) = self.try_retroactive_capture() else {
+        let file_watch = self.resolve_file_watch();
+        let ownership: Result<_> = (|| {
+            let storage = super::storage::Storage::new(profile, file_watch.clone())?;
+            let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&self.id)?;
+            let generation = storage.update(|instances, _groups| {
+                let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id)
+                else {
+                    anyhow::bail!("session disappeared before capture");
+                };
+                if stored.agent_session_id.is_some()
+                    || !stored.resume_intent.is_default()
+                    || matches!(stored.status, Status::Deleting | Status::Creating)
+                    || stored.effective_bucket() != SessionBucket::Active
+                {
+                    anyhow::bail!("session is no longer eligible for capture");
+                }
+                stored
+                    .try_acquire_lifecycle_reservation(
+                        LifecycleOperation::Capture,
+                        Self::LIFECYCLE_RESERVATION_TTL,
+                        Utc::now(),
+                    )
+                    .map_err(|error| anyhow::anyhow!("capture blocked: {error}"))
+            })?;
+            Ok((storage, lifecycle_lock, generation))
+        })();
+        let Ok((storage, _lifecycle_lock, generation)) = ownership else {
             return;
         };
-        if self.resume_probe_failed_sid.as_deref() == Some(captured.as_str()) {
+        let captured = self.try_retroactive_capture();
+        let applied = captured.as_ref().is_some_and(|captured| {
+            self.resume_probe_failed_sid.as_deref() != Some(captured.as_str())
+                && persist_session_to_storage(profile, &self.id, captured, None, &file_watch)
+                    == SidWrite::Applied
+        });
+        let released = storage.update(|instances, _groups| {
+            let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
+                return Ok(false);
+            };
+            Ok(stored
+                .release_lifecycle_reservation_if_owned(LifecycleOperation::Capture, generation))
+        });
+        if !matches!(released, Ok(true)) {
+            tracing::warn!(
+                target: "session.sync",
+                instance = %self.id,
+                "self-heal capture lost its lifecycle reservation before release",
+            );
             return;
         }
-        if persist_session_to_storage(
-            profile,
-            &self.id,
-            &captured,
-            None,
-            &self.resolve_file_watch(),
-        ) == SidWrite::Applied
-        {
-            self.agent_session_id = Some(captured);
+        self.lifecycle_generation = generation;
+        self.lifecycle_reservation = None;
+        if applied {
+            self.agent_session_id = captured;
             self.resume_probe_failed_sid = None;
             tracing::info!(
                 target: "session.store",
@@ -3636,18 +3649,14 @@ impl Instance {
         storage: &super::storage::Storage,
         restart: bool,
     ) -> Result<()> {
-        let reserved_generation = self.lifecycle_generation;
-        let committed_generation = storage.update(|instances, _groups| {
+        let generation = self.lifecycle_generation;
+        let committed = storage.update(|instances, _groups| {
             let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
-                return Ok(None);
+                return Ok(false);
             };
-            if stored.lifecycle_generation != reserved_generation {
-                return Ok(None);
+            if !stored.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation) {
+                return Ok(false);
             }
-            let committed_generation = reserved_generation.checked_add(1).ok_or_else(|| {
-                anyhow::anyhow!("lifecycle generation overflow for session {}", self.id)
-            })?;
-            stored.lifecycle_generation = committed_generation;
             stored.status = self.status;
             stored.idle_entered_at = self.idle_entered_at;
             stored.last_accessed_at = self.last_accessed_at;
@@ -3655,123 +3664,90 @@ impl Instance {
             if restart && stored.agent_session_id == self.agent_session_id {
                 stored.resume_probe_failed_sid = self.resume_probe_failed_sid.clone();
             }
-            // Ownership-guarded clear: only drop the reservation this launch
-            // owns, so a stale commit cannot clear a peer's fresh reservation.
-            if matches!(&stored.lifecycle_reservation, Some(r) if r.generation == reserved_generation)
-            {
-                stored.lifecycle_reservation = None;
-            }
-            Ok(Some(committed_generation))
+            stored.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
+            Ok(true)
         })?;
-        let Some(committed_generation) = committed_generation else {
-            anyhow::bail!(
-                "session {} disappeared or changed generation before launch commit",
-                self.id
-            );
-        };
-        self.lifecycle_generation = committed_generation;
+        anyhow::ensure!(
+            committed,
+            "session {} disappeared or lost its lifecycle reservation before launch commit",
+            self.id
+        );
         self.lifecycle_reservation = None;
         Ok(())
     }
 
-    fn reserve_lifecycle_generation(
+    fn acquire_lifecycle_reservation(
         &mut self,
         storage: &super::storage::Storage,
+        operation: LifecycleOperation,
         status: Option<Status>,
-    ) -> Result<()> {
-        let mut reserved = None;
+    ) -> Result<u64> {
         let now = Utc::now();
+        let mut acquired = None;
         storage.update(|instances, _groups| {
             let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
                 return Ok(());
             };
-            // Gate on the reservation marker, not on `status`: a poller-observed
-            // or REST-pre-marked `Status::Starting` is not proof of a live op and
-            // must not self-trip this same operation.
-            if stored.has_fresh_lifecycle_reservation(now) {
-                anyhow::bail!(
-                    "session {} is busy with another lifecycle operation",
-                    self.id
-                );
-            }
-            if stored.is_seized_by_fresh_peer_claim(Utc::now()) {
-                let holder = stored
-                    .op_claim
-                    .as_ref()
-                    .expect("fresh peer claim predicate requires a claim")
-                    .op;
-                anyhow::bail!("session {} is busy with a fresh {holder:?} claim", self.id);
-            }
-            let next = stored.lifecycle_generation.checked_add(1).ok_or_else(|| {
-                anyhow::anyhow!("lifecycle generation overflow for session {}", self.id)
-            })?;
-            stored.lifecycle_generation = next;
-            stored.lifecycle_reservation = Some(LifecycleReservation {
-                generation: next,
-                at: now,
-            });
+            let generation = stored
+                .try_acquire_lifecycle_reservation(operation, Self::LIFECYCLE_RESERVATION_TTL, now)
+                .map_err(|error| match error {
+                    LifecycleReservationError::Busy(holder) => anyhow::anyhow!(
+                        "session {} is busy with lifecycle operation {holder:?}",
+                        self.id
+                    ),
+                    LifecycleReservationError::GenerationOverflow => {
+                        anyhow::anyhow!("session {} lifecycle generation overflow", self.id)
+                    }
+                })?;
             if let Some(status) = status {
                 stored.status = status;
                 if status != Status::Idle {
                     stored.idle_entered_at = None;
                 }
             }
-            reserved = Some(next);
+            acquired = Some((generation, stored.lifecycle_reservation.clone()));
             Ok(())
         })?;
-        let Some(generation) = reserved else {
+        let Some((generation, reservation)) = acquired else {
             anyhow::bail!("session {} no longer exists", self.id);
         };
         self.lifecycle_generation = generation;
-        self.lifecycle_reservation = Some(LifecycleReservation {
-            generation,
-            at: now,
-        });
+        self.lifecycle_reservation = reservation;
         if let Some(status) = status {
             self.status = status;
             if status != Status::Idle {
                 self.idle_entered_at = None;
             }
         }
-        Ok(())
+        Ok(generation)
     }
 
-    fn commit_reserved_lifecycle_status(
+    fn commit_lifecycle_status(
         &mut self,
         storage: &super::storage::Storage,
+        operation: LifecycleOperation,
         status: Status,
     ) -> Result<()> {
-        let reserved_generation = self.lifecycle_generation;
-        let committed_generation = storage.update(|instances, _groups| {
+        let generation = self.lifecycle_generation;
+        let committed = storage.update(|instances, _groups| {
             let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
-                return Ok(None);
+                return Ok(false);
             };
-            if stored.lifecycle_generation != reserved_generation {
-                return Ok(None);
+            if !stored.lifecycle_reservation_is_owned(operation, generation) {
+                return Ok(false);
             }
-            let committed_generation = reserved_generation.checked_add(1).ok_or_else(|| {
-                anyhow::anyhow!("lifecycle generation overflow for session {}", self.id)
-            })?;
-            stored.lifecycle_generation = committed_generation;
             stored.status = status;
             if status != Status::Idle {
                 stored.idle_entered_at = None;
             }
-            // Ownership-guarded clear: only drop the reservation this commit
-            // owns, so a stale commit cannot clear a peer's fresh reservation.
-            if matches!(&stored.lifecycle_reservation, Some(r) if r.generation == reserved_generation)
-            {
-                stored.lifecycle_reservation = None;
-            }
-            Ok(Some(committed_generation))
+            stored.release_lifecycle_reservation_if_owned(operation, generation);
+            Ok(true)
         })?;
-        let Some(committed_generation) = committed_generation else {
-            anyhow::bail!(
-                "session {} disappeared or changed generation before lifecycle commit",
-                self.id
-            );
-        };
-        self.lifecycle_generation = committed_generation;
+        anyhow::ensure!(
+            committed,
+            "session {} disappeared or lost its lifecycle reservation before commit",
+            self.id
+        );
         self.lifecycle_reservation = None;
         self.status = status;
         if status != Status::Idle {
@@ -3780,24 +3756,25 @@ impl Instance {
         Ok(())
     }
 
-    fn advance_lifecycle_generation(
-        &self,
+    fn release_lifecycle_reservation(
+        &mut self,
         storage: &super::storage::Storage,
-        status: Option<Status>,
-    ) -> Result<bool> {
-        storage.update(|instances, _groups| {
+        operation: LifecycleOperation,
+    ) -> Result<()> {
+        let generation = self.lifecycle_generation;
+        let released = storage.update(|instances, _groups| {
             let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
                 return Ok(false);
             };
-            let next = stored.lifecycle_generation.checked_add(1).ok_or_else(|| {
-                anyhow::anyhow!("lifecycle generation overflow for session {}", self.id)
-            })?;
-            stored.lifecycle_generation = next;
-            if let Some(status) = status {
-                stored.status = status;
-            }
-            Ok(true)
-        })
+            Ok(stored.release_lifecycle_reservation_if_owned(operation, generation))
+        })?;
+        anyhow::ensure!(
+            released,
+            "session {} disappeared or lost its lifecycle reservation before release",
+            self.id
+        );
+        self.lifecycle_reservation = None;
+        Ok(())
     }
 
     pub fn start_with_size(&mut self, size: Option<(u16, u16)>) -> Result<()> {
@@ -3820,33 +3797,28 @@ impl Instance {
         let storage = super::storage::Storage::new(&profile, self.resolve_file_watch())
             .context("failed to open lifecycle lock storage")?;
 
-        {
-            let _lifecycle_lock = storage
-                .acquire_instance_lifecycle_lock(&self.id)
-                .context("failed to acquire instance launch lock")?;
-            self.reconcile_from_disk();
-            if self.is_structured() || self.tmux_session()?.exists() {
-                return Ok(LaunchSidOutcome::Skipped);
-            }
-            self.ensure_lifecycle_operation_available(&storage)?;
-            self.apply_fresh_launch_intent();
-            self.reserve_lifecycle_generation(&storage, Some(Status::Starting))?;
+        let _lifecycle_lock = storage
+            .acquire_instance_lifecycle_lock(&self.id)
+            .context("failed to acquire instance launch lock")?;
+        self.reconcile_from_disk();
+        if self.is_structured() || self.tmux_session()?.exists() {
+            return Ok(LaunchSidOutcome::Skipped);
         }
+        self.apply_fresh_launch_intent();
+        self.acquire_lifecycle_reservation(
+            &storage,
+            LifecycleOperation::Launch,
+            Some(Status::Starting),
+        )?;
 
         let prepared = match self.prepare_launch(skip_on_launch, &profile) {
             Ok(prepared) => prepared,
             Err(error) => {
-                let _lifecycle_lock = storage
-                    .acquire_instance_lifecycle_lock(&self.id)
-                    .context("failed to reacquire instance launch lock")?;
                 self.fail_reserved_launch(&storage, &error, false);
                 return Err(error);
             }
         };
 
-        let _lifecycle_lock = storage
-            .acquire_instance_lifecycle_lock(&self.id)
-            .context("failed to reacquire instance launch lock")?;
         self.ensure_reservation_current_or_fail(&storage)?;
         let result = self
             .spawn_prepared_launch(size, &profile, prepared)
@@ -3861,67 +3833,26 @@ impl Instance {
         result
     }
 
-    fn ensure_lifecycle_operation_available(
+    fn lifecycle_reservation_is_current(
         &self,
         storage: &super::storage::Storage,
-    ) -> Result<()> {
-        storage.update(|instances, _groups| {
-            let stored = instances
-                .iter()
-                .find(|instance| instance.id == self.id)
-                .ok_or_else(|| anyhow::anyhow!("session {} no longer exists", self.id))?;
-            // See `reserve_lifecycle_generation`: a `Status::Starting` is not a
-            // concurrency signal; the reservation marker is.
-            if stored.has_fresh_lifecycle_reservation(Utc::now()) {
-                anyhow::bail!(
-                    "session {} is busy with another lifecycle operation",
-                    self.id
-                );
-            }
-            if stored.is_seized_by_fresh_peer_claim(Utc::now()) {
-                let holder = stored
-                    .op_claim
-                    .as_ref()
-                    .expect("fresh peer claim predicate requires a claim")
-                    .op;
-                anyhow::bail!("session {} is busy with a fresh {holder:?} claim", self.id);
-            }
-            Ok(())
-        })
-    }
-
-    /// Base ownership predicate (our generation, no fresh peer claim), with
-    /// `extra` layering the caller's additional clause onto the stored row.
-    fn reservation_ownership_holds(
-        &self,
-        storage: &super::storage::Storage,
-        extra: impl Fn(&Instance) -> bool,
+        operation: LifecycleOperation,
     ) -> Result<bool> {
+        let generation = self.lifecycle_generation;
         storage.update(|instances, _groups| {
             Ok(instances
                 .iter()
                 .find(|instance| instance.id == self.id)
-                .is_some_and(|stored| {
-                    stored.lifecycle_generation == self.lifecycle_generation
-                        && !stored.is_seized_by_fresh_peer_claim(Utc::now())
-                        && extra(stored)
-                }))
+                .is_some_and(|stored| stored.lifecycle_reservation_is_owned(operation, generation)))
         })
     }
 
     fn reservation_is_current(&self, storage: &super::storage::Storage) -> Result<bool> {
-        self.reservation_ownership_holds(storage, |stored| stored.status == Status::Starting)
+        self.lifecycle_reservation_is_current(storage, LifecycleOperation::Launch)
     }
 
-    /// Ownership check for releasing a failed reservation, keyed on generation
-    /// only. Distinct from `reservation_is_current`, which also requires
-    /// `Status::Starting` for the pre-spawn CAS: on the failure path the status
-    /// poller may have drifted the row off Starting at our own generation while
-    /// prepare_launch ran unlocked, and requiring Starting there would leave our
-    /// reservation stranded until its TTL. Generation match plus no fresh peer
-    /// claim still proves no peer took the launch over.
     fn reservation_generation_is_ours(&self, storage: &super::storage::Storage) -> Result<bool> {
-        self.reservation_ownership_holds(storage, |_| true)
+        self.lifecycle_reservation_is_current(storage, LifecycleOperation::Launch)
     }
 
     fn ensure_reservation_current(&self, storage: &super::storage::Storage) -> Result<()> {
@@ -3963,7 +3894,7 @@ impl Instance {
             let _ = self.kill_clean_locked();
         }
         self.last_error = Some(format!("{error:#}"));
-        let _ = self.commit_reserved_lifecycle_status(storage, Status::Error);
+        let _ = self.commit_lifecycle_status(storage, LifecycleOperation::Launch, Status::Error);
     }
 
     fn apply_fresh_launch_intent(&mut self) {
@@ -5636,16 +5567,39 @@ impl Instance {
             }
         }
     }
-    /// Join the old poller, then persist the newest observation it queued
-    /// before allowing restart to choose a resume target.
+    /// Join the old poller and persist its final capture as a lifecycle
+    /// transition.
     pub(crate) fn stop_and_flush_poller(&mut self) {
+        let profile = self.effective_profile();
+        let storage = match super::storage::Storage::new(&profile, self.resolve_file_watch()) {
+            Ok(storage) => storage,
+            Err(error) => {
+                tracing::warn!(target: "session.sync", session = %self.id, "capture storage failed: {error}");
+                self.stop_poller();
+                self.session_id_poller = None;
+                return;
+            }
+        };
+        let _lifecycle_lock = match storage.acquire_instance_lifecycle_lock(&self.id) {
+            Ok(lock) => lock,
+            Err(error) => {
+                tracing::warn!(target: "session.sync", session = %self.id, "capture lifecycle lock failed: {error}");
+                self.stop_poller();
+                self.session_id_poller = None;
+                return;
+            }
+        };
+        self.stop_and_flush_poller_lifecycle_locked();
+    }
+
+    fn stop_and_flush_poller_lifecycle_locked(&mut self) {
         // stop_poller() signals the thread but leaves the handle in place, so
         // this is_some() means "a poller existed and may have queued a final
         // observation": drain it before dropping the handle below.
         self.stop_poller();
         if self.session_id_poller.is_some() {
             let file_watch = self.resolve_file_watch();
-            let _ = crate::session::sync::drain_and_persist_session_ids(
+            let _ = crate::session::sync::drain_and_persist_session_ids_lifecycle_locked(
                 std::slice::from_mut(self),
                 &file_watch,
             );
@@ -5732,9 +5686,23 @@ impl Instance {
         let _lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to acquire instance kill lock")?;
-        self.kill_clean_locked()?;
-        self.advance_lifecycle_generation(&storage, None)?;
-        Ok(())
+        let mut lifecycle = self.clone();
+        lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)?;
+        match self.kill_clean_locked() {
+            Ok(()) => lifecycle.commit_lifecycle_status(
+                &storage,
+                LifecycleOperation::Stop,
+                Status::Stopped,
+            ),
+            Err(error) => {
+                let _ = lifecycle.commit_lifecycle_status(
+                    &storage,
+                    LifecycleOperation::Stop,
+                    Status::Error,
+                );
+                Err(error)
+            }
+        }
     }
 
     /// Restart the session, optionally skipping on_launch hooks (e.g. when they
@@ -5870,47 +5838,41 @@ impl Instance {
         let storage = super::storage::Storage::new(&profile, self.resolve_file_watch())
             .context("failed to open lifecycle lock storage")?;
 
-        let skipped_failed_resume_sid = {
-            let _lifecycle_lock = storage
-                .acquire_instance_lifecycle_lock(&self.id)
-                .context("failed to acquire instance start lock")?;
-            self.reconcile_from_disk();
-            if self.is_structured() {
-                return Ok(StartOutcome::Fresh);
-            }
-            if !restart && self.tmux_session()?.exists() {
-                return Ok(StartOutcome::Fresh);
-            }
-            self.ensure_lifecycle_operation_available(&storage)?;
-            if self.status == Status::Error {
-                self.status = Status::Idle;
-                self.last_error = None;
-                self.last_error_check = None;
-            }
-            self.reserve_lifecycle_generation(&storage, Some(Status::Starting))?;
-            if restart {
-                self.stop_and_flush_poller();
-                self.capture_omp_before_restart(&profile);
-            }
-            let skipped = self.apply_resume_policy(resume_policy);
-            self.apply_fresh_launch_intent();
-            skipped
-        };
+        let _lifecycle_lock = storage
+            .acquire_instance_lifecycle_lock(&self.id)
+            .context("failed to acquire instance start lock")?;
+        self.reconcile_from_disk();
+        if self.is_structured() {
+            return Ok(StartOutcome::Fresh);
+        }
+        if !restart && self.tmux_session()?.exists() {
+            return Ok(StartOutcome::Fresh);
+        }
+        if self.status == Status::Error {
+            self.status = Status::Idle;
+            self.last_error = None;
+            self.last_error_check = None;
+        }
+        self.acquire_lifecycle_reservation(
+            &storage,
+            LifecycleOperation::Launch,
+            Some(Status::Starting),
+        )?;
+        if restart {
+            self.stop_and_flush_poller_lifecycle_locked();
+            self.capture_omp_before_restart(&profile);
+        }
+        let skipped_failed_resume_sid = self.apply_resume_policy(resume_policy);
+        self.apply_fresh_launch_intent();
 
         let prepared = match self.prepare_launch(skip_on_launch, &profile) {
             Ok(prepared) => prepared,
             Err(error) => {
-                let _lifecycle_lock = storage
-                    .acquire_instance_lifecycle_lock(&self.id)
-                    .context("failed to reacquire instance start lock")?;
                 self.fail_reserved_launch(&storage, &error, false);
                 return Err(error);
             }
         };
 
-        let _lifecycle_lock = storage
-            .acquire_instance_lifecycle_lock(&self.id)
-            .context("failed to reacquire instance start lock")?;
         self.ensure_reservation_current_or_fail(&storage)?;
         let result = (|| {
             if restart {
@@ -6165,9 +6127,23 @@ impl Instance {
         let _lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to acquire instance kill lock")?;
-        self.advance_lifecycle_generation(&storage, None)?;
-        self.kill_locked()?;
-        Ok(())
+        let mut lifecycle = self.clone();
+        lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)?;
+        match self.kill_locked() {
+            Ok(()) => lifecycle.commit_lifecycle_status(
+                &storage,
+                LifecycleOperation::Stop,
+                Status::Stopped,
+            ),
+            Err(error) => {
+                let _ = lifecycle.commit_lifecycle_status(
+                    &storage,
+                    LifecycleOperation::Stop,
+                    Status::Error,
+                );
+                Err(error)
+            }
+        }
     }
 
     /// Kill every tmux session owned by this instance (agent, web
@@ -6201,7 +6177,10 @@ impl Instance {
                 return;
             }
         };
-        if let Err(error) = self.advance_lifecycle_generation(&storage, None) {
+        let mut lifecycle = self.clone();
+        if let Err(error) =
+            lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)
+        {
             tracing::warn!(
                 target: "session.tmux_cleanup",
                 session_id = %self.id,
@@ -6211,7 +6190,18 @@ impl Instance {
             return;
         }
         self.kill_all_tmux_sessions_locked();
+        if let Err(error) =
+            lifecycle.commit_lifecycle_status(&storage, LifecycleOperation::Stop, Status::Stopped)
+        {
+            tracing::warn!(
+                target: "session.tmux_cleanup",
+                session_id = %self.id,
+                %error,
+                "kill_all_tmux_sessions: lifecycle commit failed"
+            );
+        }
     }
+
     /// Kill every tmux session owned by this instance while the caller holds
     /// the selected profile's per-instance lifecycle lock.
     ///
@@ -6264,7 +6254,29 @@ impl Instance {
                 return;
             }
         };
+        let mut lifecycle = self.clone();
+        if let Err(error) =
+            lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)
+        {
+            tracing::warn!(
+                target: "session.tmux_cleanup",
+                session_id = %self.id,
+                %error,
+                "kill_ancillary_tmux_sessions: lifecycle reservation failed"
+            );
+            return;
+        }
         self.kill_ancillary_tmux_sessions_locked();
+        if let Err(error) =
+            lifecycle.release_lifecycle_reservation(&storage, LifecycleOperation::Stop)
+        {
+            tracing::warn!(
+                target: "session.tmux_cleanup",
+                session_id = %self.id,
+                %error,
+                "kill_ancillary_tmux_sessions: lifecycle release failed"
+            );
+        }
     }
 
     /// Stop the session and its sandbox container under the same lifecycle
@@ -6277,18 +6289,26 @@ impl Instance {
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to acquire instance stop lock")?;
         let mut lifecycle = self.clone();
-        lifecycle.reserve_lifecycle_generation(&storage, None)?;
+        lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)?;
         let teardown = self.kill_locked().and_then(|()| {
             crate::session::worktree_edit::stop_sandbox_container(&self.id, self.is_sandboxed())
         });
         match teardown {
             Ok(()) => {
-                lifecycle.commit_reserved_lifecycle_status(&storage, Status::Stopped)?;
+                lifecycle.commit_lifecycle_status(
+                    &storage,
+                    LifecycleOperation::Stop,
+                    Status::Stopped,
+                )?;
                 crate::hooks::cleanup_hook_status_dir(&self.id);
                 Ok(())
             }
             Err(error) => {
-                let _ = lifecycle.commit_reserved_lifecycle_status(&storage, Status::Error);
+                let _ = lifecycle.commit_lifecycle_status(
+                    &storage,
+                    LifecycleOperation::Stop,
+                    Status::Error,
+                );
                 Err(error)
             }
         }
@@ -7994,42 +8014,47 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn lifecycle_status_commit_advances_past_the_reserved_generation() {
+    fn lifecycle_status_commit_releases_the_acquired_generation() {
         let temp = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
-        let storage =
-            crate::session::storage::Storage::new_unwatched("lifecycle-reservation").unwrap();
-        let mut inst = Instance::new("session", "/tmp/test");
+        let storage = crate::session::storage::Storage::new_unwatched("lifecycle-lease").unwrap();
+        let mut instance = Instance::new("session", "/tmp/test");
 
-        let missing = inst
-            .reserve_lifecycle_generation(&storage, Some(Status::Starting))
+        let missing = instance
+            .acquire_lifecycle_reservation(
+                &storage,
+                LifecycleOperation::Launch,
+                Some(Status::Starting),
+            )
             .unwrap_err();
         assert!(missing.to_string().contains("no longer exists"));
 
         storage
             .update(|instances, _groups| {
-                instances.push(inst.clone());
+                instances.push(instance.clone());
                 Ok(())
             })
             .unwrap();
-        inst.reserve_lifecycle_generation(&storage, Some(Status::Starting))
+        instance
+            .acquire_lifecycle_reservation(
+                &storage,
+                LifecycleOperation::Launch,
+                Some(Status::Starting),
+            )
             .unwrap();
-        let reserved = inst.clone();
-        inst.commit_reserved_lifecycle_status(&storage, Status::Error)
+        let generation = instance.lifecycle_generation;
+        instance
+            .commit_lifecycle_status(&storage, LifecycleOperation::Launch, Status::Error)
             .unwrap();
 
-        let mut reloaded = storage
+        let reloaded = storage
             .load()
             .unwrap()
             .into_iter()
-            .find(|candidate| candidate.id == inst.id)
+            .find(|candidate| candidate.id == instance.id)
             .unwrap();
-        assert_eq!(inst.lifecycle_generation, reserved.lifecycle_generation + 1);
-        assert_eq!(reloaded.lifecycle_generation, inst.lifecycle_generation);
-        assert_eq!(reloaded.status, Status::Error);
-
-        reloaded.merge_runtime_from_reload(&reserved);
-        assert_eq!(reloaded.lifecycle_generation, inst.lifecycle_generation);
+        assert_eq!(reloaded.lifecycle_generation, generation);
+        assert_eq!(reloaded.lifecycle_reservation, None);
         assert_eq!(reloaded.status, Status::Error);
     }
 
@@ -8041,41 +8066,36 @@ mod tests {
         let profile = "lifecycle-busy-reservation";
         let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
         let now = Utc::now();
-        let stale = now - Instance::OP_CLAIM_TTL - chrono::Duration::seconds(1);
+        let stale = now - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1);
         let mut cases = [
-            // A bare Starting with no reservation is the REST pre-mark / poller
-            // artifact; it must not self-trip the same operation (#3230).
-            ("premarked_only", Status::Starting, None, None, 0, true),
-            // A fresh reservation at the row's generation is a live peer op.
+            ("unleased", Status::Starting, None, 0, true),
             (
-                "reserved_peer",
+                "leased_peer",
                 Status::Starting,
-                None,
                 Some(LifecycleReservation {
+                    op: LifecycleOperation::Launch,
                     generation: 1,
                     at: now,
                 }),
                 1,
                 false,
             ),
-            // Generation advancement supersedes a still-fresh old marker.
             (
-                "superseded_res",
+                "superseded",
                 Status::Idle,
-                None,
                 Some(LifecycleReservation {
+                    op: LifecycleOperation::Launch,
                     generation: 1,
                     at: now,
                 }),
                 2,
                 true,
             ),
-            // An expired reservation self-heals a crash mid-launch.
             (
-                "expired_res",
+                "expired",
                 Status::Idle,
-                None,
                 Some(LifecycleReservation {
+                    op: LifecycleOperation::Launch,
                     generation: 1,
                     at: stale,
                 }),
@@ -8085,48 +8105,58 @@ mod tests {
             (
                 "purge",
                 Status::Idle,
-                Some(OpClaim {
-                    op: ClaimOp::Purge,
+                Some(LifecycleReservation {
+                    op: LifecycleOperation::Purge,
+                    generation: 1,
                     at: now,
                 }),
-                None,
-                0,
+                1,
                 false,
             ),
             (
                 "restore",
                 Status::Stopped,
-                Some(OpClaim {
-                    op: ClaimOp::Restore,
+                Some(LifecycleReservation {
+                    op: LifecycleOperation::Restore,
+                    generation: 1,
                     at: now,
                 }),
-                None,
-                0,
+                1,
                 false,
             ),
             (
                 "trash",
                 Status::Idle,
-                Some(OpClaim {
-                    op: ClaimOp::Trash,
+                Some(LifecycleReservation {
+                    op: LifecycleOperation::Trash,
+                    generation: 1,
                     at: now,
                 }),
-                None,
-                0,
-                true,
+                1,
+                false,
             ),
-            ("creating", Status::Creating, None, None, 0, true),
-            ("idle", Status::Idle, None, None, 0, true),
-            ("stopped", Status::Stopped, None, None, 0, true),
+            (
+                "capture",
+                Status::Running,
+                Some(LifecycleReservation {
+                    op: LifecycleOperation::Capture,
+                    generation: 1,
+                    at: now,
+                }),
+                1,
+                false,
+            ),
+            ("creating", Status::Creating, None, 0, true),
+            ("idle", Status::Idle, None, 0, true),
+            ("stopped", Status::Stopped, None, 0, true),
         ]
         .map(
-            |(title, status, claim, reservation, lifecycle_generation, allowed)| {
+            |(title, status, lifecycle_reservation, lifecycle_generation, allowed)| {
                 let mut instance = Instance::new(title, "/tmp/test");
                 instance.source_profile = profile.to_string();
                 instance.status = status;
-                instance.op_claim = claim;
                 instance.lifecycle_generation = lifecycle_generation;
-                instance.lifecycle_reservation = reservation;
+                instance.lifecycle_reservation = lifecycle_reservation;
                 (instance, allowed)
             },
         );
@@ -8138,37 +8168,35 @@ mod tests {
             .unwrap();
 
         for (instance, allowed) in &mut cases {
-            let result = instance.reserve_lifecycle_generation(&storage, Some(Status::Starting));
+            let result = instance.acquire_lifecycle_reservation(
+                &storage,
+                LifecycleOperation::Launch,
+                Some(Status::Starting),
+            );
             assert_eq!(result.is_ok(), *allowed, "{}", instance.title);
         }
 
-        // premarked_only reserved successfully; a peer generation advance during
-        // the unlocked prepare_launch window must lose the pre-spawn CAS.
-        let reserved = &cases[0].0;
-        assert!(reserved.reservation_is_current(&storage).unwrap());
+        let leased = &cases[0].0;
+        assert!(leased.reservation_is_current(&storage).unwrap());
         storage
             .update(|instances, _groups| {
                 let peer = instances
                     .iter_mut()
-                    .find(|candidate| candidate.id == reserved.id)
+                    .find(|candidate| candidate.id == leased.id)
                     .unwrap();
                 peer.lifecycle_generation += 1;
                 peer.status = Status::Stopped;
                 Ok(())
             })
             .unwrap();
-        assert!(
-            !reserved.reservation_is_current(&storage).unwrap(),
-            "a peer generation advance during hooks must lose the pre-spawn CAS"
-        );
+        assert!(!leased.reservation_is_current(&storage).unwrap());
 
-        // A session holding a fresh reservation (a real live lifecycle op)
-        // rejects a recursive stop/start fast, without waiting on the outer hook.
-        let mut busy = Instance::new("busy-reserved", "/tmp/test");
+        let mut busy = Instance::new("busy-leased", "/tmp/test");
         busy.source_profile = profile.to_string();
         busy.status = Status::Starting;
         busy.lifecycle_generation = 1;
         busy.lifecycle_reservation = Some(LifecycleReservation {
+            op: LifecycleOperation::Launch,
             generation: 1,
             at: Utc::now(),
         });
@@ -8180,28 +8208,22 @@ mod tests {
             .unwrap();
 
         let began = std::time::Instant::now();
-        let error = busy.stop().unwrap_err();
-        assert!(error.to_string().contains("busy"));
-        assert!(
-            began.elapsed() < std::time::Duration::from_secs(1),
-            "recursive stop must fail without waiting for the outer hook"
-        );
+        assert!(busy.stop().unwrap_err().to_string().contains("busy"));
+        assert!(began.elapsed() < std::time::Duration::from_secs(1));
 
         let mut recursive_start = busy.clone();
         let began = std::time::Instant::now();
-        let error = recursive_start
+        assert!(recursive_start
             .start_with_size_opts(None, true)
-            .unwrap_err();
-        assert!(error.to_string().contains("busy"));
-        assert!(
-            began.elapsed() < std::time::Duration::from_secs(1),
-            "recursive start must fail without waiting for the outer hook"
-        );
+            .unwrap_err()
+            .to_string()
+            .contains("busy"));
+        assert!(began.elapsed() < std::time::Duration::from_secs(1));
     }
 
     #[test]
     #[serial_test::serial]
-    fn failed_launch_releases_reservation_even_when_status_drifted_off_starting() {
+    fn failed_launch_releases_reservation_after_status_drift() {
         let temp = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
         let profile = "lifecycle-fail-drift";
@@ -8216,12 +8238,16 @@ mod tests {
             })
             .unwrap();
 
-        inst.reserve_lifecycle_generation(&storage, Some(Status::Starting))
-            .unwrap();
+        inst.acquire_lifecycle_reservation(
+            &storage,
+            LifecycleOperation::Launch,
+            Some(Status::Starting),
+        )
+        .unwrap();
         let reserved_gen = inst.lifecycle_generation;
 
-        // The status poller drifts the row off Starting at OUR generation (a
-        // same-generation PassiveStatusPatch) while prepare_launch runs unlocked.
+        // A same-generation passive status patch changes presentation state
+        // without changing ownership while prepare_launch runs unlocked.
         storage
             .update(|instances, _groups| {
                 let stored = instances.iter_mut().find(|i| i.id == inst.id).unwrap();
@@ -8232,22 +8258,19 @@ mod tests {
             })
             .unwrap();
 
-        // The launch then fails. The reservation must be released, not stranded
-        // until its TTL: with the old status==Starting guard this early-returned
-        // and left the marker, wedging every later start/restart/stop as busy.
-        let error = inst
-            .ensure_reservation_current_or_fail(&storage)
-            .unwrap_err();
-        assert!(error
-            .to_string()
-            .contains("changed while launch hooks were running"));
+        // The launch guard still recognizes the exact-generation reservation.
+        // A later launch failure must release it rather than stranding the
+        // marker until its TTL.
+        inst.ensure_reservation_current_or_fail(&storage).unwrap();
+        let error = anyhow::anyhow!("launch failed after status drift");
+        inst.fail_reserved_launch(&storage, &error, false);
 
         let leftover = storage
             .update(|instances, _groups| {
                 Ok(instances
                     .iter()
-                    .find(|i| i.id == inst.id)
-                    .and_then(|s| s.lifecycle_reservation.clone()))
+                    .find(|instance| instance.id == inst.id)
+                    .and_then(|instance| instance.lifecycle_reservation.clone()))
             })
             .unwrap();
         assert!(
@@ -8258,7 +8281,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn lifecycle_launch_commit_advances_generation_and_rejects_stale_or_overflowed_tokens() {
+    fn lifecycle_launch_commit_keeps_reserved_generation_and_rejects_stale_or_overflowed_tokens() {
         let temp = tempfile::tempdir().unwrap();
         let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
         let storage =
@@ -8275,7 +8298,11 @@ mod tests {
             .unwrap();
 
         committed
-            .reserve_lifecycle_generation(&storage, Some(Status::Starting))
+            .acquire_lifecycle_reservation(
+                &storage,
+                LifecycleOperation::Launch,
+                Some(Status::Starting),
+            )
             .unwrap();
         let reserved_generation = committed.lifecycle_generation;
         committed.status = Status::Running;
@@ -8286,12 +8313,16 @@ mod tests {
             .into_iter()
             .find(|candidate| candidate.id == committed.id)
             .unwrap();
-        assert_eq!(committed.lifecycle_generation, reserved_generation + 1);
+        assert_eq!(committed.lifecycle_generation, reserved_generation);
         assert_eq!(disk.lifecycle_generation, committed.lifecycle_generation);
         assert_eq!(disk.status, Status::Running);
 
         stale
-            .reserve_lifecycle_generation(&storage, Some(Status::Starting))
+            .acquire_lifecycle_reservation(
+                &storage,
+                LifecycleOperation::Launch,
+                Some(Status::Starting),
+            )
             .unwrap();
         let stale_token = stale.lifecycle_generation;
         stale.status = Status::Running;
@@ -8307,7 +8338,7 @@ mod tests {
             })
             .unwrap();
         let error = stale.commit_lifecycle_launch(&storage, false).unwrap_err();
-        assert!(error.to_string().contains("changed generation"));
+        assert!(error.to_string().contains("lost its lifecycle reservation"));
         let disk = storage
             .load()
             .unwrap()
@@ -8318,24 +8349,12 @@ mod tests {
         assert_eq!(disk.lifecycle_generation, stale_token + 1);
         assert_eq!(disk.status, Status::Stopped);
 
-        overflow.status = Status::Running;
         assert!(overflow
-            .commit_lifecycle_launch(&storage, false)
-            .unwrap_err()
-            .to_string()
-            .contains("overflow"));
-        assert!(overflow
-            .commit_reserved_lifecycle_status(&storage, Status::Error)
-            .unwrap_err()
-            .to_string()
-            .contains("overflow"));
-        assert!(overflow
-            .reserve_lifecycle_generation(&storage, Some(Status::Starting))
-            .unwrap_err()
-            .to_string()
-            .contains("overflow"));
-        assert!(overflow
-            .advance_lifecycle_generation(&storage, Some(Status::Stopped))
+            .acquire_lifecycle_reservation(
+                &storage,
+                LifecycleOperation::Launch,
+                Some(Status::Starting),
+            )
             .unwrap_err()
             .to_string()
             .contains("overflow"));
@@ -8346,7 +8365,7 @@ mod tests {
             .find(|candidate| candidate.id == overflow.id)
             .unwrap();
         assert_eq!(overflow.lifecycle_generation, u64::MAX);
-        assert_eq!(overflow.status, Status::Running);
+        assert_eq!(overflow.status, Status::Idle);
         assert_eq!(disk.lifecycle_generation, u64::MAX);
         assert_eq!(disk.status, Status::Idle);
     }
@@ -8843,194 +8862,95 @@ mod tests {
         assert!(back.is_trashed());
     }
 
-    // Mirrors `test_trashed_at_serde_roundtrip_and_default`: a fresh row omits
-    // `op_claim` on the wire (skip_serializing_if), so a legacy sessions.json
-    // without the key deserializes to None and no migration is needed. A set
-    // claim round-trips. Runs in both the non-serve and serve builds. See #2541.
     #[test]
-    fn test_op_claim_serde_roundtrip_and_default() {
+    fn lifecycle_reservation_roundtrips_and_legacy_rows_default_to_none() {
         let fresh = Instance::new("s", "/tmp/x");
         let fresh_json = serde_json::to_string(&fresh).expect("serialize fresh");
-        assert!(
-            !fresh_json.contains("op_claim"),
-            "None op_claim must not be serialized"
-        );
+        assert!(!fresh_json.contains("lifecycle_reservation"));
         let parsed: Instance = serde_json::from_str(&fresh_json).expect("parse fresh");
-        assert_eq!(parsed.op_claim, None, "missing op_claim => None");
+        assert_eq!(parsed.lifecycle_reservation, None);
 
-        let mut inst = Instance::new("s", "/tmp/x");
+        let mut instance = Instance::new("s", "/tmp/x");
         let now = Utc::now();
-        inst.try_claim(ClaimOp::Purge, Instance::OP_CLAIM_TTL, now)
-            .expect("free row grants the claim");
-        let json = serde_json::to_string(&inst).expect("serialize");
+        let generation = instance
+            .try_acquire_lifecycle_reservation(
+                LifecycleOperation::Purge,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                now,
+            )
+            .expect("free row grants the lease");
+        let json = serde_json::to_string(&instance).expect("serialize");
         let back: Instance = serde_json::from_str(&json).expect("round-trip");
         assert_eq!(
-            back.op_claim,
-            Some(OpClaim {
-                op: ClaimOp::Purge,
-                at: now
+            back.lifecycle_reservation,
+            Some(LifecycleReservation {
+                op: LifecycleOperation::Purge,
+                generation,
+                at: now,
             })
         );
     }
 
-    // A fresh Purge claim makes a Restore claim attempt lose (symmetry). See #2541.
     #[test]
-    fn restore_refuses_claimed_row() {
-        let mut inst = Instance::new("s", "/tmp/x");
+    fn lifecycle_reservation_excludes_peers_and_uses_generation_as_identity() {
         let now = Utc::now();
-        inst.try_claim(ClaimOp::Purge, Instance::OP_CLAIM_TTL, now)
-            .expect("purge wins the free row");
-        assert_eq!(
-            inst.try_claim(ClaimOp::Restore, Instance::OP_CLAIM_TTL, now),
-            Err(ClaimOp::Purge),
-            "a fresh Purge claim must refuse a Restore"
-        );
-    }
+        let mut instance = Instance::new("s", "/tmp/x");
+        let generation = instance
+            .try_acquire_lifecycle_reservation(
+                LifecycleOperation::Purge,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                now,
+            )
+            .expect("first operation acquires");
 
-    // Symmetry the other direction: a fresh Restore claim refuses a Purge.
-    #[test]
-    fn purge_refuses_restore_claimed_row() {
-        let mut inst = Instance::new("s", "/tmp/x");
-        let now = Utc::now();
-        inst.try_claim(ClaimOp::Restore, Instance::OP_CLAIM_TTL, now)
-            .expect("restore wins the free row");
-        assert_eq!(
-            inst.try_claim(ClaimOp::Purge, Instance::OP_CLAIM_TTL, now),
-            Err(ClaimOp::Restore),
-        );
-    }
-
-    // Trash is the weakest claim: a fresh Trash claim is seized by both
-    // Purge and Restore (teardown state never blocks user intent), while
-    // Trash itself is refused by a fresh Purge or Restore claim.
-    #[test]
-    fn trash_claim_seizure_matrix() {
-        let now = Utc::now();
-        for seizer in [ClaimOp::Purge, ClaimOp::Restore] {
-            let mut inst = Instance::new("s", "/tmp/x");
-            inst.try_claim(ClaimOp::Trash, Instance::OP_CLAIM_TTL, now)
-                .expect("trash wins the free row");
-            inst.try_claim(seizer, Instance::OP_CLAIM_TTL, now)
-                .unwrap_or_else(|holder| {
-                    panic!("{seizer:?} must seize a fresh Trash claim, refused by {holder:?}")
-                });
-            assert_eq!(inst.op_claim.as_ref().map(|c| c.op), Some(seizer));
-        }
-        for holder in [ClaimOp::Purge, ClaimOp::Restore] {
-            let mut inst = Instance::new("s", "/tmp/x");
-            inst.try_claim(holder, Instance::OP_CLAIM_TTL, now)
-                .expect("holder wins the free row");
+        for contender in [
+            LifecycleOperation::Launch,
+            LifecycleOperation::Stop,
+            LifecycleOperation::Purge,
+            LifecycleOperation::Restore,
+            LifecycleOperation::Trash,
+        ] {
             assert_eq!(
-                inst.try_claim(ClaimOp::Trash, Instance::OP_CLAIM_TTL, now),
-                Err(holder),
-                "a fresh {holder:?} claim must refuse a Trash claim"
+                instance.try_acquire_lifecycle_reservation(
+                    contender,
+                    Instance::LIFECYCLE_RESERVATION_TTL,
+                    now + chrono::Duration::seconds(1),
+                ),
+                Err(LifecycleReservationError::Busy(LifecycleOperation::Purge)),
+                "{contender:?} must not replace a live peer lease",
             );
         }
+        assert!(!instance
+            .release_lifecycle_reservation_if_owned(LifecycleOperation::Purge, generation + 1,));
+        assert!(instance.lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation));
+        assert!(
+            instance.release_lifecycle_reservation_if_owned(LifecycleOperation::Purge, generation)
+        );
     }
 
-    // The Trash variant round-trips on the wire as "trash". Compat (see the
-    // ClaimOp doc): a binary predating the variant fails the whole-row
-    // deserialize, so Storage::load quarantines the row and the session is
-    // temporarily invisible to that binary until a newer binary next
-    // rewrites the row without the claim.
     #[test]
-    fn trash_claim_serde_roundtrip() {
-        let mut inst = Instance::new("s", "/tmp/x");
+    fn expired_lifecycle_reservation_is_recoverable_without_reusing_generation() {
+        let ttl = Instance::LIFECYCLE_RESERVATION_TTL;
         let now = Utc::now();
-        inst.try_claim(ClaimOp::Trash, Instance::OP_CLAIM_TTL, now)
-            .expect("free row grants the claim");
-        let json = serde_json::to_string(&inst).expect("serialize");
-        assert!(json.contains("\"trash\""), "lowercase wire form");
-        let back: Instance = serde_json::from_str(&json).expect("round-trip");
-        assert_eq!(
-            back.op_claim,
-            Some(OpClaim {
-                op: ClaimOp::Trash,
-                at: now
-            })
+        let mut instance = Instance::new("s", "/tmp/x");
+        let old_generation = instance
+            .try_acquire_lifecycle_reservation(
+                LifecycleOperation::Purge,
+                ttl,
+                now - ttl - chrono::Duration::seconds(1),
+            )
+            .expect("first operation acquires");
+        let new_generation = instance
+            .try_acquire_lifecycle_reservation(LifecycleOperation::Restore, ttl, now)
+            .expect("expired lease can be replaced");
+
+        assert!(new_generation > old_generation);
+        assert!(!instance
+            .release_lifecycle_reservation_if_owned(LifecycleOperation::Purge, old_generation,));
+        assert!(
+            instance.lifecycle_reservation_is_owned(LifecycleOperation::Restore, new_generation,)
         );
     }
-
-    // Two purges of the same row: the second `try_claim(Purge)` on an already
-    // Purge-claimed row reacquires (no refusal) and refreshes the timestamp.
-    // See #2541.
-    #[test]
-    fn concurrent_purge_reacquires_own_claim() {
-        let mut inst = Instance::new("s", "/tmp/x");
-        let first = Utc::now();
-        inst.try_claim(ClaimOp::Purge, Instance::OP_CLAIM_TTL, first)
-            .expect("first purge claims");
-        let second = first + chrono::Duration::seconds(5);
-        inst.try_claim(ClaimOp::Purge, Instance::OP_CLAIM_TTL, second)
-            .expect("second purge reacquires its own claim");
-        assert_eq!(
-            inst.op_claim.as_ref().map(|c| c.at),
-            Some(second),
-            "reacquisition refreshes the claim timestamp"
-        );
-    }
-
-    // Self-heal: a claim older than the TTL is treated as absent, so the other
-    // operation can override it. Eliminates the post-crash wedge. See #2541.
-    #[test]
-    fn stale_claim_is_overridable() {
-        let mut inst = Instance::new("s", "/tmp/x");
-        let ttl = Instance::OP_CLAIM_TTL;
-        let old = Utc::now() - ttl - chrono::Duration::seconds(1);
-        inst.op_claim = Some(OpClaim {
-            op: ClaimOp::Purge,
-            at: old,
-        });
-        let now = Utc::now();
-        assert_eq!(
-            inst.try_claim(ClaimOp::Restore, ttl, now),
-            Ok(()),
-            "an expired Purge claim must not block a Restore"
-        );
-        assert_eq!(inst.op_claim.map(|c| c.op), Some(ClaimOp::Restore));
-    }
-
-    // The ownership-guarded clear only drops a claim owned by the requested op,
-    // so a purge's final commit never clobbers a peer's fresh Restore claim on
-    // the stale-override path. See #2541.
-    #[test]
-    fn clear_op_claim_if_owned_only_clears_matching_op() {
-        let mut inst = Instance::new("s", "/tmp/x");
-        inst.op_claim = Some(OpClaim {
-            op: ClaimOp::Restore,
-            at: Utc::now(),
-        });
-        inst.clear_op_claim_if_owned(ClaimOp::Purge);
-        assert_eq!(
-            inst.op_claim.as_ref().map(|c| c.op),
-            Some(ClaimOp::Restore),
-            "clearing for Purge must leave a Restore claim intact"
-        );
-        inst.clear_op_claim_if_owned(ClaimOp::Restore);
-        assert_eq!(inst.op_claim, None, "clearing for the owner drops it");
-    }
-
-    #[test]
-    fn clear_expired_op_claim_only_clears_expired() {
-        let ttl = Instance::OP_CLAIM_TTL;
-        let now = Utc::now();
-        let mut fresh = Instance::new("s", "/tmp/x");
-        fresh.op_claim = Some(OpClaim {
-            op: ClaimOp::Purge,
-            at: now,
-        });
-        assert!(!fresh.clear_expired_op_claim(ttl, now));
-        assert!(fresh.op_claim.is_some(), "a fresh claim survives");
-
-        let mut stale = Instance::new("s", "/tmp/x");
-        stale.op_claim = Some(OpClaim {
-            op: ClaimOp::Purge,
-            at: now - ttl - chrono::Duration::seconds(1),
-        });
-        assert!(stale.clear_expired_op_claim(ttl, now));
-        assert_eq!(stale.op_claim, None, "an expired claim is cleared");
-    }
-
     // A non-fork session omits fork_pending on the wire (skip_serializing_if),
     // so legacy sessions.json without the key deserializes to None and no
     // migration is needed. A seeded fork id round-trips.
@@ -9908,8 +9828,19 @@ mod tests {
             eprintln!("tmux not available; skipping");
             return;
         }
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let profile = "retitled-session-teardown";
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
 
         let mut inst = Instance::new("Vikings", "/tmp/test");
+        inst.source_profile = profile.to_string();
+        storage
+            .update(|instances, _groups| {
+                instances.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
         let created_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
         let _ = crate::tmux::tmux_command()
             .args(["kill-session", "-t", &created_name])

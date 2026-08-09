@@ -791,8 +791,10 @@ mod tests {
         }
 
         let key = "XDG_AOE_TERM_ENV_TEST_3075";
-        let original = std::env::var(key).ok();
-        std::env::set_var(key, "host-sentinel");
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            (key, "host-sentinel"),
+            ("SHELL", "/bin/sh"),
+        ]);
 
         let guard = TmuxTestSession::new("aoe_test_term_host_fwd");
         let session = PairedTerminal {
@@ -807,11 +809,6 @@ mod tests {
             .ok()
             .and_then(|o| String::from_utf8(o.stdout).ok())
             .map(|s| s.trim().to_string());
-
-        match original {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
 
         created.expect("create host terminal");
         assert_eq!(
@@ -835,8 +832,7 @@ mod tests {
         }
 
         let key = "XDG_AOE_TERM_ENV_TEST_3075_CTR";
-        let original = std::env::var(key).ok();
-        std::env::set_var(key, "must-not-leak");
+        let _env = crate::session::test_support::EnvGuard::set(&[(key, "must-not-leak")]);
 
         let guard = TmuxTestSession::new("aoe_test_term_ctr_excl");
         let session = PairedTerminal {
@@ -854,11 +850,6 @@ mod tests {
             .ok()
             .and_then(|o| String::from_utf8(o.stdout).ok())
             .map(|s| s.trim().to_string());
-
-        match original {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
 
         created.expect("create container terminal");
         assert_eq!(
