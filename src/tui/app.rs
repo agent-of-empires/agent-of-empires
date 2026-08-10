@@ -3461,7 +3461,7 @@ impl App {
                 // bottom-anchored preview paint up a row for the frame's
                 // lifetime, and a warm send is too fast for the toast to
                 // inform anyone.
-                let warm = self.home.agent_pane_is_warm(&id);
+                let warm = self.home.send_entry_is_warm(&id);
                 if !warm {
                     self.home
                         .set_instance_status(&id, crate::session::Status::Starting);
