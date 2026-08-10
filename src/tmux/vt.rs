@@ -1811,6 +1811,10 @@ pub(crate) struct Osc52Channel {
     name: String,
     target: String,
     clipboard: Arc<Mutex<Option<String>>>,
+    /// Monotonically bumps after publishing a clipboard value. Consumers keep
+    /// their own cursor so one dashboard viewer cannot consume an event for
+    /// another, and a newly promoted size owner cannot replay an old copy.
+    clipboard_seq: Arc<AtomicU64>,
     alive: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
     reader: Mutex<Option<std::thread::JoinHandle<()>>>,
@@ -1891,11 +1895,15 @@ impl Osc52Channel {
         let alive = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
         let clipboard = Arc::new(Mutex::new(None));
+        let clipboard_seq = Arc::new(AtomicU64::new(0));
         let reader = {
             let alive = alive.clone();
             let stop = stop.clone();
             let clipboard = clipboard.clone();
-            std::thread::spawn(move || run_osc52_reader(listener, stop, alive, clipboard))
+            let clipboard_seq = clipboard_seq.clone();
+            std::thread::spawn(move || {
+                run_osc52_reader(listener, stop, alive, clipboard, clipboard_seq)
+            })
         };
         let pipe_cmd = format!(
             "{} __vt-pipe {}",
@@ -1933,6 +1941,7 @@ impl Osc52Channel {
             name: name.to_string(),
             target,
             clipboard,
+            clipboard_seq,
             alive,
             stop,
             reader: Mutex::new(Some(reader)),
@@ -1946,8 +1955,18 @@ impl Osc52Channel {
         self.alive.load(Ordering::Relaxed)
     }
 
-    pub(crate) fn take_clipboard(&self) -> Option<String> {
-        self.clipboard.lock().ok().and_then(|mut slot| slot.take())
+    /// Start a new consumer at the current event sequence. This intentionally
+    /// skips a value emitted before the consumer began observing, mirroring the
+    /// old per-WebSocket watch receiver's `borrow_and_update` baseline.
+    pub(crate) fn clipboard_sequence(&self) -> u64 {
+        self.clipboard_seq.load(Ordering::Acquire)
+    }
+
+    /// Return the latest clipboard write after `seen`, advancing only this
+    /// consumer's cursor. Unlike a destructive slot read, every WebSocket can
+    /// mark an event seen while only its size owner forwards it.
+    pub(crate) fn clipboard_after(&self, seen: &mut u64) -> Option<String> {
+        osc52_clipboard_after(&self.clipboard, &self.clipboard_seq, seen)
     }
 
     /// Keep the exclusive pipe owner lease alive while the terminal snapshot
@@ -1965,11 +1984,26 @@ impl Osc52Channel {
     }
 }
 
+fn osc52_clipboard_after(
+    clipboard: &Mutex<Option<String>>,
+    clipboard_seq: &AtomicU64,
+    seen: &mut u64,
+) -> Option<String> {
+    let seq = clipboard_seq.load(Ordering::Acquire);
+    if seq == *seen {
+        return None;
+    }
+    let text = clipboard.lock().ok().and_then(|slot| slot.clone())?;
+    *seen = seq;
+    Some(text)
+}
+
 fn run_osc52_reader(
     listener: UnixListener,
     stop: Arc<AtomicBool>,
     alive: Arc<AtomicBool>,
     clipboard: Arc<Mutex<Option<String>>>,
+    clipboard_seq: Arc<AtomicU64>,
 ) {
     let Ok((mut conn, _)) = listener.accept() else {
         return;
@@ -1985,6 +2019,7 @@ fn run_osc52_reader(
                 if let Some(text) = scanner.feed(&buf[..n]) {
                     if let Ok(mut slot) = clipboard.lock() {
                         *slot = Some(text);
+                        clipboard_seq.fetch_add(1, Ordering::Release);
                     }
                 }
             }
@@ -2904,22 +2939,55 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(false));
         let clipboard = Arc::new(Mutex::new(None));
+        let clipboard_seq = Arc::new(AtomicU64::new(0));
         let reader = {
             let stop = stop.clone();
             let alive = alive.clone();
             let clipboard = clipboard.clone();
-            std::thread::spawn(move || run_osc52_reader(listener, stop, alive, clipboard))
+            let clipboard_seq = clipboard_seq.clone();
+            std::thread::spawn(move || {
+                run_osc52_reader(listener, stop, alive, clipboard, clipboard_seq)
+            })
         };
         let mut conn = UnixStream::connect(&sock).expect("connect");
         conn.write_all(b"\x1b]52;c;aGVsbG8=\x07")
             .expect("write pane output");
 
         let deadline = Instant::now() + Duration::from_secs(5);
-        while clipboard.lock().unwrap().is_none() {
+        while clipboard_seq.load(Ordering::Acquire) == 0 {
             assert!(Instant::now() < deadline, "observer never received OSC 52");
             std::thread::sleep(Duration::from_millis(2));
         }
-        assert_eq!(clipboard.lock().unwrap().as_deref(), Some("hello"));
+        let mut existing_viewer = 0;
+        let mut newly_connected_viewer = clipboard_seq.load(Ordering::Acquire);
+        assert_eq!(
+            osc52_clipboard_after(&clipboard, &clipboard_seq, &mut existing_viewer).as_deref(),
+            Some("hello")
+        );
+        assert_eq!(
+            osc52_clipboard_after(&clipboard, &clipboard_seq, &mut newly_connected_viewer),
+            None,
+            "a new viewer must baseline rather than replay an old copy"
+        );
+        conn.write_all(b"\x1b]52;c;d29ybGQ=\x07")
+            .expect("write second pane output");
+        while clipboard_seq.load(Ordering::Acquire) < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "observer never received second OSC 52"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            osc52_clipboard_after(&clipboard, &clipboard_seq, &mut existing_viewer).as_deref(),
+            Some("world")
+        );
+        assert_eq!(
+            osc52_clipboard_after(&clipboard, &clipboard_seq, &mut newly_connected_viewer)
+                .as_deref(),
+            Some("world"),
+            "each viewer must observe the new copy independently"
+        );
         assert!(alive.load(Ordering::Relaxed), "observer never became live");
 
         stop.store(true, Ordering::Relaxed);

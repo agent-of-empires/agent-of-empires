@@ -1036,6 +1036,8 @@ impl LiveCaptureWorker {
             let mut osc52_source: Option<
                 std::sync::Arc<crate::tmux::vt::Osc52Channel>,
             > = None;
+            #[cfg(unix)]
+            let mut osc52_seen = 0;
             // When the last arm attempt for the current target ran, so a
             // failure (or a channel death: pane killed and the tmux session
             // recreated under the same name, e.g. a session restart) retries
@@ -1095,6 +1097,7 @@ impl LiveCaptureWorker {
                         vt_source = None;
                         last_vt_arm = None;
                         osc52_source = None;
+                        osc52_seen = 0;
                         last_osc52_arm = None;
                     }
                     pane_count = 1;
@@ -1120,6 +1123,7 @@ impl LiveCaptureWorker {
                 #[cfg(unix)]
                 if !clipboard_capture_enabled {
                     osc52_source = None;
+                    osc52_seen = 0;
                     last_osc52_arm = None;
                 }
                 if lines > 0 && !name.is_empty() {
@@ -1162,6 +1166,9 @@ impl LiveCaptureWorker {
                     {
                         last_osc52_arm = Some(std::time::Instant::now());
                         osc52_source = crate::tmux::vt::Osc52Channel::acquire(&name);
+                        if let Some(source) = osc52_source.as_ref() {
+                            osc52_seen = source.clipboard_sequence();
+                        }
                     }
                     #[cfg(unix)]
                     if osc52_source
@@ -1169,11 +1176,12 @@ impl LiveCaptureWorker {
                         .is_some_and(|source| !source.is_alive())
                     {
                         osc52_source = None;
+                        osc52_seen = 0;
                     }
                     #[cfg(unix)]
                     let mut clipboard_now = osc52_source.as_ref().and_then(|source| {
                         source.refresh_owner_heartbeat();
-                        source.take_clipboard()
+                        source.clipboard_after(&mut osc52_seen)
                     });
                     #[cfg(not(unix))]
                     let clipboard_now: Option<String> = None;

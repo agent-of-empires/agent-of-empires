@@ -507,6 +507,10 @@ async fn handle_live_ws(
     #[cfg(unix)]
     let capture_osc52 = osc52;
     let capture_task = tokio::spawn(async move {
+        #[cfg(unix)]
+        let mut osc52_seen = capture_osc52
+            .as_ref()
+            .map_or(0, |source| source.clipboard_sequence());
         let mut last_published: Option<(String, Option<crate::tmux::PaneCursor>)> = None;
         // Created on the first frame after the client advertises deflate;
         // lives for the connection so the dictionary spans frames.
@@ -701,10 +705,11 @@ async fn handle_live_ws(
                         }
                     }
                     #[cfg(unix)]
-                    if clipboard_forward && capture_settings.is_owner.load(Ordering::Relaxed) {
-                        if let Some(source) = capture_osc52.as_ref() {
-                            source.refresh_owner_heartbeat();
-                            if let Some(text) = source.take_clipboard() {
+                    if let Some(source) = capture_osc52.as_ref() {
+                        source.refresh_owner_heartbeat();
+                        let clipboard = source.clipboard_after(&mut osc52_seen);
+                        if clipboard_forward && capture_settings.is_owner.load(Ordering::Relaxed) {
+                            if let Some(text) = clipboard {
                                 if capture_tx
                                     .send(Message::Text(clipboard_json(&text).into()))
                                     .await
