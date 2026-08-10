@@ -827,27 +827,29 @@ pub(crate) fn compose_exclusion(
 }
 
 /// Extend [`compose_exclusion`] with the sids of stopped, archived, or
-/// pane-less Claude peers in the same `project_path`, read from
+/// pane-less same-tool peers in the same `project_path`, read from
 /// `sessions.json` via `Storage` for the caller's effective profile.
 ///
-/// Used only by the Claude branch of `Instance::try_retroactive_capture`
-/// when the per-instance sidecar is absent or stale: the mtime fallback
-/// over `~/.claude/projects/<encoded-cwd>/` otherwise picks a co-located
-/// stopped peer's jsonl, since [`build_exclusion_set`] only sees live
-/// tmux peers, and the resume binds to the peer's conversation (#2355).
+/// Used by the Claude branch and by host Codex sessions in
+/// `Instance::try_retroactive_capture`. Their mtime fallbacks otherwise pick a
+/// co-located stopped peer's transcript, since [`build_exclusion_set`] only
+/// sees live tmux peers, and the resume binds to the peer's conversation
+/// (#2355). Sandboxed Codex sessions have instance-private `CODEX_HOME`
+/// directories and do not share a transcript store (#3317).
 ///
-/// `claude_poll_fn` keeps the live-only exclusion via [`compose_exclusion`]:
-/// it runs on a hot polling path, and live peers already surface in the
-/// tmux env scan.
+/// The poll functions keep the live-only exclusion via [`compose_exclusion`]:
+/// they run on a hot polling path, and live peers already surface in the tmux
+/// env scan.
 ///
-/// Scope: `~/.claude/projects/` is keyed by `$HOME`, not by AoE profile,
-/// but this helper only inspects `sessions.json` for the caller's effective
-/// profile. A stopped peer in a different profile against the same host
-/// `$HOME` will not be excluded; the residual gap is narrower than #2355's
+/// Scope: the host transcript directories are keyed by `$HOME`, not by AoE
+/// profile, but this helper only inspects `sessions.json` for the caller's
+/// effective profile. A stopped peer in a different profile against the same
+/// host `$HOME` will not be excluded; the residual gap is narrower than #2355's
 /// trigger and is left for a follow-up.
 pub(crate) fn compose_exclusion_with_stopped_peers(
     current_instance_id: &str,
     current_project_path: &str,
+    tool: &str,
     profile: &str,
     retroactive_capture_excludes: &HashSet<String>,
 ) -> HashSet<String> {
@@ -868,7 +870,7 @@ pub(crate) fn compose_exclusion_with_stopped_peers(
         if inst.id == current_instance_id {
             continue;
         }
-        if inst.tool != "claude" {
+        if inst.tool != tool {
             continue;
         }
         if canonicalize_or_raw(&inst.project_path) != canonical_current {

@@ -2532,6 +2532,7 @@ impl Instance {
                 let exclusion = super::capture::compose_exclusion_with_stopped_peers(
                     &self.id,
                     &self.project_path,
+                    "claude",
                     &self.effective_profile(),
                     &self.retroactive_capture_excludes,
                 );
@@ -2610,8 +2611,11 @@ impl Instance {
                 }
             }
             "codex" => {
-                let exclusion = self.retroactive_capture_exclusion_set();
                 if self.is_sandboxed() {
+                    // Sandboxed Codex sessions have instance-private homes, so
+                    // their transcript stores cannot contain a sibling's
+                    // rollout (#3317). Keep this path on the live-only helper.
+                    let exclusion = self.retroactive_capture_exclusion_set();
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
                     try_capture_codex_session_id_in_container(
                         &container_name,
@@ -2620,6 +2624,16 @@ impl Instance {
                     )
                     .ok()
                 } else {
+                    // Host Codex sessions share `~/.codex/sessions/`. Include
+                    // stopped and pane-less same-directory peers so the mtime
+                    // scan cannot adopt a sibling's newer conversation.
+                    let exclusion = super::capture::compose_exclusion_with_stopped_peers(
+                        &self.id,
+                        &self.project_path,
+                        "codex",
+                        &self.effective_profile(),
+                        &self.retroactive_capture_excludes,
+                    );
                     capture_codex_session_id(&self.project_path, &exclusion).ok()
                 }
             }
@@ -11586,6 +11600,53 @@ mod tests {
                 assert_eq!(sid.as_deref(), Some(fresh));
                 assert!(is_existing);
                 assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
+            }
+
+            #[test]
+            #[serial]
+            fn codex_mtime_fallback_skips_stopped_host_peer_sid() {
+                let temp = tempdir().unwrap();
+                let _home = isolate_app_dir_at(temp.path());
+                let _codex = EnvGuard::set(&[("CODEX_HOME", temp.path())]);
+
+                let project_path = temp.path().join("codex-project");
+                fs::create_dir_all(&project_path).unwrap();
+                let project_path = project_path.to_string_lossy().to_string();
+
+                let sessions_dir = temp.path().join("sessions");
+                fs::create_dir_all(&sessions_dir).unwrap();
+                let mine = "11111111-1111-4111-8111-111111111111";
+                let peer = "22222222-2222-4222-8222-222222222222";
+                let now = SystemTime::now();
+                for (uuid, age) in [(mine, 120), (peer, 5)] {
+                    let body = format!(
+                        r#"{{"type":"session_meta","payload":{{"cwd":"{project_path}"}}}}"#
+                    );
+                    write_with_mtime(
+                        &sessions_dir.join(format!("rollout-2025-03-06T10-30-00-{uuid}.jsonl")),
+                        &body,
+                        now - Duration::from_secs(age),
+                    );
+                }
+
+                let profile = "verify-codex-stopped-host-peer";
+                let mut peer_inst = Instance::new("stopped-codex-peer-id", &project_path);
+                peer_inst.source_profile = profile.to_string();
+                peer_inst.tool = "codex".to_string();
+                peer_inst.agent_session_id = Some(peer.to_string());
+                peer_inst.status = Status::Stopped;
+                super::seed_disk_for_sidecar_test(profile, &peer_inst);
+
+                let mut inst = Instance::new("verify-codex-host-peer", &project_path);
+                inst.source_profile = profile.to_string();
+                inst.tool = "codex".to_string();
+                inst.agent_session_id = Some(mine.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(mine));
+                assert!(is_existing);
+                assert_eq!(inst.agent_session_id.as_deref(), Some(mine));
             }
 
             #[test]
