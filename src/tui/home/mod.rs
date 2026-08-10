@@ -54,6 +54,11 @@ use super::stop_poller::StopPoller;
 /// has a backing repo must test the repo path, not this string (#3133).
 const SCRATCH_GROUP_LABEL: &str = "scratch";
 
+/// Diagnostics-strip history depth. At the 1s sample cadence this is about two
+/// minutes of headroom samples, over-provisioned past the strip's width (it
+/// docks under the session-list column) so it never runs short.
+const METRICS_HISTORY_LEN: usize = 150;
+
 /// Extract a project group name from a session instance.
 /// Uses `worktree_info.main_repo_path` for worktree sessions (so all branches of the
 /// same repo group together), otherwise uses `project_path`. Returns the last path segment.
@@ -750,6 +755,16 @@ pub struct HomeView {
     // Performance: background status polling
     pub(super) status_poller: StatusPoller,
     pub(super) pending_status_refresh: bool,
+
+    // Memory diagnostics strip (toggled by F9 / `session.show_diagnostics_pane`).
+    // The poller samples memory + agent counts off the UI thread; `metrics`
+    // holds the latest sample and `metrics_history` the headroom ring buffer
+    // (per-mille of used_fraction, newest at the back) feeding the sparkline.
+    pub(super) show_diagnostics: bool,
+    pub(super) metrics_poller: super::metrics_poller::MetricsPoller,
+    pub(super) pending_metrics_refresh: bool,
+    pub(super) metrics: crate::process::metrics::MetricsSnapshot,
+    pub(super) metrics_history: std::collections::VecDeque<u64>,
 
     // Structured (ACP) rows: the tmux poller above bails on them, so their
     // status comes from the daemon instead. See `daemon_status_poller`.
@@ -2275,6 +2290,11 @@ impl HomeView {
             available_tools,
             status_poller: StatusPoller::new(),
             pending_status_refresh: false,
+            show_diagnostics: resolved.session.show_diagnostics_pane,
+            metrics_poller: super::metrics_poller::MetricsPoller::new(),
+            pending_metrics_refresh: false,
+            metrics: crate::process::metrics::MetricsSnapshot::default(),
+            metrics_history: std::collections::VecDeque::new(),
             #[cfg(feature = "serve")]
             daemon_status_poller: super::daemon_status_poller::DaemonStatusPoller::new(),
             #[cfg(feature = "serve")]
@@ -2879,6 +2899,71 @@ impl HomeView {
                 self.reset_status_refresh();
                 true
             }
+        }
+    }
+
+    /// Request a memory + agent-count sample in the background (non-blocking),
+    /// only while the diagnostics strip is visible. Call `apply_metrics_updates`
+    /// to pick up the result.
+    pub fn request_metrics_refresh(&mut self) {
+        if self.show_diagnostics && !self.pending_metrics_refresh {
+            self.metrics_poller
+                .request_refresh(self.pollable_instances());
+            self.pending_metrics_refresh = true;
+        }
+    }
+
+    /// Apply any pending metrics sample, pushing the new headroom point onto
+    /// the sparkline ring buffer. Returns true if a sample was applied (so the
+    /// caller can force a repaint to animate the graph).
+    pub fn apply_metrics_updates(&mut self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+
+        match self.metrics_poller.try_recv_updates() {
+            Ok(snapshot) => {
+                self.metrics = snapshot;
+                let per_mille = (snapshot.memory.used_fraction() * 1000.0).round() as u64;
+                self.metrics_history.push_back(per_mille);
+                // At most one over the cap: exactly one push per apply.
+                if self.metrics_history.len() > METRICS_HISTORY_LEN {
+                    self.metrics_history.pop_front();
+                }
+                self.pending_metrics_refresh = false;
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                // The sampler thread died (a panic in sample_memory /
+                // count_running_agents). Respawn so pending_metrics_refresh
+                // does not stay stuck and freeze the strip.
+                tracing::error!(
+                    target: "tui.home",
+                    "metrics poller worker gone; respawning a fresh poller",
+                );
+                self.metrics_poller = super::metrics_poller::MetricsPoller::new();
+                self.pending_metrics_refresh = false;
+                false
+            }
+        }
+    }
+
+    /// Toggle the diagnostics strip and persist the new state to
+    /// `session.show_diagnostics_pane` so it survives restarts. Clears the
+    /// history when hiding so a re-open starts fresh rather than showing a
+    /// stale gap.
+    pub fn toggle_diagnostics(&mut self) {
+        self.show_diagnostics = !self.show_diagnostics;
+        if !self.show_diagnostics {
+            self.metrics_history.clear();
+        }
+        let enabled = self.show_diagnostics;
+        if let Err(e) = update_config(|config| {
+            config.session.show_diagnostics_pane = enabled;
+        }) {
+            tracing::warn!(
+                target: "tui.home",
+                "failed to persist show_diagnostics_pane: {e}",
+            );
         }
     }
 
@@ -7373,6 +7458,12 @@ impl HomeView {
         self.strict_hotkeys = config.session.strict_hotkeys;
         self.confirm_before_quit = config.session.confirm_before_quit;
         self.row_tag_mode = config.session.row_tag;
+        // Keep the strip in sync when the Settings UI or a config-file edit
+        // flips the toggle, not just the F9 keybinding.
+        if !self.show_diagnostics && config.session.show_diagnostics_pane {
+            self.metrics_history.clear();
+        }
+        self.show_diagnostics = config.session.show_diagnostics_pane;
         self.agent_clipboard_forward =
             config.tmux.clipboard != crate::session::config::TmuxSettingMode::Disabled;
         self.vt_live_enabled = config.tmux.vt_live;

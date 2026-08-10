@@ -898,6 +898,13 @@ pub struct SessionConfig {
     #[setting(label = "YOLO Mode Default", widget = "toggle")]
     pub yolo_mode_default: bool,
 
+    /// Show the memory diagnostics strip at the bottom of the home view: a
+    /// live memory-pressure sparkline plus the running agent and process
+    /// counts. Off by default; also toggleable with a keybinding.
+    #[serde(default)]
+    #[setting(label = "Show diagnostics pane", widget = "toggle")]
+    pub show_diagnostics_pane: bool,
+
     /// Forward AoE's whole environment to host sessions instead of just the
     /// desktop vars (DISPLAY, XDG_*, DBUS). Lets vars like GOPATH reach an
     /// agent without naming each one in the Host Environment list. AoE's own
@@ -1554,6 +1561,7 @@ impl Default for SessionConfig {
         Self {
             default_tool: None,
             yolo_mode_default: false,
+            show_diagnostics_pane: false,
             inherit_host_environment: false,
             agent_extra_args: HashMap::new(),
             agent_command_override: HashMap::new(),

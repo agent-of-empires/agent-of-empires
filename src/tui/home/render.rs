@@ -104,6 +104,9 @@ impl PaneLayout {
 /// requested scroll.
 const CAPTURE_BUFFER: u16 = 20;
 
+/// Rows the diagnostics strip occupies: a 2-row sparkline plus its readout row.
+const DIAGNOSTICS_STRIP_HEIGHT: u16 = 3;
+
 /// Window captured while the user is off the live edge (reading scrollback):
 /// the full scrollback in one shot, rather than a window that tracks the offset
 /// and re-anchors to the advancing live edge on every capture. Matches tmux's
@@ -761,11 +764,11 @@ impl HomeView {
             .constraints(constraints)
             .split(area);
 
-        // Below STACKED_BREAKPOINT (80 cols), put the list above the preview
-        // instead of side-by-side. At 80 cols a side-by-side preview is only
-        // ~45 cols (with default list_width 35), too cramped for output;
-        // stacking gives the preview the full width.
-        let available_width = main_chunks[0].width;
+        // The diagnostics strip docks under the session-list column (see
+        // `diagnostics_dock`) so it stays narrow and the preview keeps its full
+        // height.
+        let content_area = main_chunks[0];
+        let available_width = content_area.width;
         self.main_area_width = available_width;
         // Collapsed sidebar: the list shrinks to a narrow click-to-expand
         // strip on the left and the preview takes the rest of the width
@@ -778,7 +781,7 @@ impl HomeView {
             let chunks = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Length(strip_width), Constraint::Min(0)])
-                .split(main_chunks[0]);
+                .split(content_area);
             // The full list isn't drawn, so its hit-test rects would
             // otherwise keep last frame's values and a click in the now-
             // preview area could resolve to an invisible list row (and
@@ -788,10 +791,13 @@ impl HomeView {
             self.list_area = Rect::default();
             self.list_inner_area = Rect::default();
             self.shelf_inner_area = Rect::default();
-            self.render_collapsed_strip(frame, chunks[0], theme);
+            // Preview keeps full height; the strip docks under the collapsed
+            // list column.
+            let strip_col = self.diagnostics_dock(frame, chunks[0], theme);
+            self.render_collapsed_strip(frame, strip_col, theme);
             self.render_preview(frame, chunks[1], theme, PaneLayout::Collapsed);
         } else if available_width < responsive::STACKED_BREAKPOINT {
-            let main_height = main_chunks[0].height;
+            let main_height = content_area.height;
             let list_height = responsive::stacked_list_height(main_height);
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
@@ -799,13 +805,17 @@ impl HomeView {
                     Constraint::Length(list_height),
                     Constraint::Min(responsive::STACKED_PREVIEW_MIN),
                 ])
-                .split(main_chunks[0]);
+                .split(content_area);
 
             // Stacked layout has no vertical divider; only the side-by-side
             // path exposes the resize-by-drag affordance.
             self.divider_col = None;
 
-            self.render_list(frame, chunks[0], theme, PaneLayout::Stacked);
+            // Stacked: the list is on top with the preview below, so there is no
+            // list column to dock under; the strip spans the list's width above
+            // the preview.
+            let list_rect = self.diagnostics_dock(frame, chunks[0], theme);
+            self.render_list(frame, list_rect, theme, PaneLayout::Stacked);
             self.render_preview(frame, chunks[1], theme, PaneLayout::Stacked);
         } else {
             // Side-by-side: cap list width so the preview pane keeps its
@@ -820,7 +830,7 @@ impl HomeView {
                     Constraint::Length(effective_list_width),
                     Constraint::Min(responsive::PREVIEW_MIN_WIDTH),
                 ])
-                .split(main_chunks[0]);
+                .split(content_area);
 
             // Layout chunks are contiguous, so chunks[1].x is the first
             // column of the preview block, i.e. the visible left border
@@ -828,7 +838,9 @@ impl HomeView {
             // list's y-range (matches preview's y-range in side-by-side).
             self.divider_col = Some(chunks[1].x);
 
-            self.render_list(frame, chunks[0], theme, PaneLayout::SideBySide);
+            // Strip docks under the list column; the preview keeps full height.
+            let list_rect = self.diagnostics_dock(frame, chunks[0], theme);
+            self.render_list(frame, list_rect, theme, PaneLayout::SideBySide);
             self.render_preview(frame, chunks[1], theme, PaneLayout::SideBySide);
         }
         self.render_status_bar(frame, main_chunks[1], theme);
@@ -917,6 +929,32 @@ impl HomeView {
             // gated rename/delete attempt).
             context_menu,
         );
+    }
+
+    /// Dock the diagnostics strip under the session-list column: carve
+    /// `DIAGNOSTICS_STRIP_HEIGHT` rows off the bottom of `column`, render the
+    /// strip there, and return the reduced rect for the list. Returns `column`
+    /// unchanged when the strip is hidden or the column is too short to spare
+    /// the rows, so the list is never starved below one row.
+    fn diagnostics_dock(&self, frame: &mut Frame, column: Rect, theme: &Theme) -> Rect {
+        if !self.show_diagnostics || column.height <= DIAGNOSTICS_STRIP_HEIGHT {
+            return column;
+        }
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(DIAGNOSTICS_STRIP_HEIGHT),
+            ])
+            .split(column);
+        crate::tui::components::diagnostics::render(
+            frame,
+            rows[1],
+            theme,
+            &self.metrics_history,
+            &self.metrics,
+        );
+        rows[0]
     }
 
     fn active_diff_area(&self, area: Rect) -> Rect {

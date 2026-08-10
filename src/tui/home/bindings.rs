@@ -63,6 +63,10 @@ pub enum ActionId {
     ToggleUnread,
     ToggleContainer,
     TogglePreviewInfo,
+    /// Toggle the memory diagnostics strip (a live memory-pressure sparkline
+    /// plus running agent/process counts). Persisted via
+    /// `session.show_diagnostics_pane` so it survives restarts.
+    ToggleDiagnostics,
     SortPicker,
     GroupBy,
     NextWaiting,
@@ -452,6 +456,22 @@ pub static BINDINGS: &[Binding] = &[
         palette: Some(PaletteMeta {
             title: "Show keyboard shortcuts",
             keywords: &["keys", "shortcuts"],
+            group: PaletteGroup::Settings,
+            serve_only: false,
+        }),
+    },
+    Binding {
+        id: ActionId::ToggleDiagnostics,
+        non_strict: &[f(9)],
+        strict: &[f(9)],
+        context: Context::Always,
+        help: Some(HelpMeta {
+            section: HelpSection::Other,
+            desc: "Toggle memory diagnostics",
+        }),
+        palette: Some(PaletteMeta {
+            title: "Toggle memory diagnostics pane",
+            keywords: &["memory", "ram", "diagnostics", "pressure", "procs"],
             group: PaletteGroup::Settings,
             serve_only: false,
         }),
@@ -1015,6 +1035,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::ToggleSnooze => "snooze",
         ActionId::ToggleUnread => "toggle-unread",
         ActionId::TogglePreviewInfo => "toggle-preview-info",
+        ActionId::ToggleDiagnostics => "toggle-diagnostics",
         ActionId::SortPicker => "pick-sort",
         ActionId::GroupBy => "pick-group-by",
         ActionId::Help => "help",
@@ -1376,6 +1397,29 @@ mod tests {
         }
         // Fork has a stable palette id.
         assert_eq!(palette_id(ActionId::Fork), "fork");
+    }
+
+    #[test]
+    fn diagnostics_toggle_is_wired_to_f9_and_palette() {
+        let c = ctx();
+        let f9 = KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE);
+        assert_eq!(
+            resolve(&f9, false, &c),
+            Some(ActionId::ToggleDiagnostics),
+            "F9 toggles the diagnostics strip"
+        );
+        assert_eq!(
+            palette_id(ActionId::ToggleDiagnostics),
+            "toggle-diagnostics"
+        );
+        // The `?` overlay and command palette auto-derive their rows from the
+        // binding, so both must carry metadata for the action to be reachable.
+        let b = BINDINGS
+            .iter()
+            .find(|b| b.id == ActionId::ToggleDiagnostics)
+            .expect("ToggleDiagnostics binding exists");
+        assert!(b.help.is_some(), "help overlay lists the toggle");
+        assert!(b.palette.is_some(), "command palette lists the toggle");
     }
 
     #[test]
