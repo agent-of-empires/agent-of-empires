@@ -1107,42 +1107,15 @@ fn compute_workspace_volume_paths(
     Ok((volumes, ws_container))
 }
 
-/// Re-sync sandbox directories from the host so containers pick up credential
-/// changes (e.g. re-auth) since they were created.
-pub(crate) fn refresh_agent_configs_for_instance(
-    profile: &str,
-    instance_id: &str,
-    tool: &str,
-    detect_as: Option<&str>,
-) {
+/// Re-sync shared sandbox directories from the host so containers pick up
+/// credential changes (e.g. re-auth) since they were created.
+pub(crate) fn refresh_shared_agent_configs() {
     let Some(home) = dirs::home_dir() else {
         return;
     };
 
-    let profile_config = super::profile_config::resolve_config_or_warn(profile);
-    let hooks_enabled = profile_config.session.agent_status_hooks;
-    let refresh_codex = match managed_codex_home(tool, detect_as, profile, instance_id) {
-        Ok(Some(_)) => true,
-        Ok(None) => false,
-        Err(e) => {
-            tracing::warn!(target: "session.profile",
-                "Failed to resolve managed Codex home for {}: {}", instance_id, e
-            );
-            false
-        }
-    };
-
     for mount in AGENT_CONFIG_MOUNTS {
         if mount.tool_name == "codex" {
-            if refresh_codex {
-                refresh_codex_sandbox_dir(
-                    mount,
-                    &home,
-                    instance_id,
-                    hooks_enabled,
-                    &profile_config,
-                );
-            }
             continue;
         }
 
@@ -1157,6 +1130,54 @@ pub(crate) fn refresh_agent_configs_for_instance(
             }
         }
     }
+}
+
+/// Re-sync an instance-private Codex sandbox with its own profile settings.
+pub(crate) fn refresh_codex_agent_config_for_instance(
+    profile: &str,
+    instance_id: &str,
+    tool: &str,
+    detect_as: Option<&str>,
+) {
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+
+    let is_codex = match managed_codex_home(tool, detect_as, profile, instance_id) {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!(target: "session.profile",
+                "Failed to resolve managed Codex home for {}: {}", instance_id, e
+            );
+            false
+        }
+    };
+    if !is_codex {
+        return;
+    }
+
+    let profile_config = super::profile_config::resolve_config_or_warn(profile);
+    let hooks_enabled = profile_config.session.agent_status_hooks;
+    for mount in AGENT_CONFIG_MOUNTS
+        .iter()
+        .filter(|mount| mount.tool_name == "codex")
+    {
+        refresh_codex_sandbox_dir(mount, &home, instance_id, hooks_enabled, &profile_config);
+    }
+}
+
+/// Re-sync shared agent config plus the current instance's private Codex
+/// config. Session-start paths use this; periodic refreshes call the two
+/// narrower helpers to avoid repeating shared work for every instance.
+pub(crate) fn refresh_agent_configs_for_instance(
+    profile: &str,
+    instance_id: &str,
+    tool: &str,
+    detect_as: Option<&str>,
+) {
+    refresh_shared_agent_configs();
+    refresh_codex_agent_config_for_instance(profile, instance_id, tool, detect_as);
 }
 
 /// Refresh one instance-private Codex sandbox with its own profile settings.

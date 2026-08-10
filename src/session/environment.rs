@@ -2191,11 +2191,15 @@ environment = ["GH_TOKEN=write_token"]
         let project_path = std::path::Path::new("/nonexistent");
         let managed_home = "/root/.codex/codex-upgrade-test";
         let cases = [
-            (None, managed_home),
-            (Some("CODEX_HOME=/root/custom-codex"), "/root/custom-codex"),
+            (None, managed_home, true),
+            (
+                Some("CODEX_HOME=/root/custom-codex"),
+                "/root/custom-codex",
+                false,
+            ),
         ];
 
-        for (extra_env, expected_home) in cases {
+        for (extra_env, expected_home, managed_expected) in cases {
             let sandbox = SandboxInfo {
                 enabled: true,
                 container_id: None,
@@ -2215,6 +2219,12 @@ environment = ["GH_TOKEN=write_token"]
             assert!(
                 result.docker_args.contains(expected_home),
                 "expected {expected_home} in {}",
+                result.docker_args
+            );
+            assert_eq!(
+                result.docker_args.contains(managed_home),
+                managed_expected,
+                "an explicit CODEX_HOME must suppress the managed home, got {}",
                 result.docker_args
             );
         }
