@@ -576,13 +576,20 @@ impl App {
                 self.home.live_send.is_some(),
                 self.home.has_non_live_send_overlay(),
             );
-        crossterm::execute!(
+        // QUEUE, never execute: `execute!` flushes, and flushing the batch
+        // opener on its own puts the ~10ms widget build INSIDE the
+        // synchronized-update bracket, so the terminal holds its display
+        // frozen for a third of every frame instead of batching the result of
+        // one. Queued, these ride out in `terminal.draw`'s own flush together
+        // with the cells and the trailing Show, which is the whole point of
+        // the bracket: one write, one atomic frame.
+        crossterm::queue!(
             terminal.backend_mut(),
             crossterm::terminal::BeginSynchronizedUpdate
         )?;
         let draw_result = (|| -> Result<()> {
             if !skip_hide {
-                crossterm::execute!(terminal.backend_mut(), crossterm::cursor::Hide)?;
+                crossterm::queue!(terminal.backend_mut(), crossterm::cursor::Hide)?;
             }
             terminal.draw(|f| self.render(f))?;
             Ok(())
@@ -3454,7 +3461,7 @@ impl App {
                 // bottom-anchored preview paint up a row for the frame's
                 // lifetime, and a warm send is too fast for the toast to
                 // inform anyone.
-                let warm = self.home.agent_pane_is_warm(&id);
+                let warm = self.home.send_entry_is_warm(&id);
                 if !warm {
                     self.home
                         .set_instance_status(&id, crate::session::Status::Starting);

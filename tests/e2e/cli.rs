@@ -41,6 +41,67 @@ fn test_cli_add_and_list() {
     );
 }
 
+/// #3224: repeating `aoe add` for the same title and path must report a
+/// conflict instead of exiting successfully while silently retaining the
+/// first session's command override.
+#[test]
+#[parallel]
+fn test_cli_add_duplicate_errors_and_preserves_original_command() {
+    let h = TuiTestHarness::new("cli_add_duplicate");
+    let project = h.project_path();
+    let project = project.to_str().unwrap();
+
+    let first = h.run_cli(&[
+        "add",
+        project,
+        "--title",
+        "Duplicate Session",
+        "--cmd-override",
+        "echo OLD",
+    ]);
+    assert!(
+        first.status.success(),
+        "initial aoe add failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    let duplicate = h.run_cli(&[
+        "add",
+        project,
+        "--title",
+        "Duplicate Session",
+        "--cmd-override",
+        "echo NEW",
+    ]);
+    assert!(
+        !duplicate.status.success(),
+        "duplicate aoe add must return a non-zero status"
+    );
+    assert_eq!(
+        duplicate.status.code(),
+        Some(1),
+        "duplicate aoe add should use the CLI's ordinary error exit status"
+    );
+    let stderr = String::from_utf8_lossy(&duplicate.stderr);
+    assert!(
+        stderr.contains("Session already exists with same title and path")
+            && stderr.contains("different --title"),
+        "duplicate error should identify the collision and offer remediation.\nstderr: {stderr}"
+    );
+
+    let sessions = read_sessions_json(&h);
+    let sessions = sessions.as_array().expect("sessions array");
+    assert_eq!(
+        sessions.len(),
+        1,
+        "duplicate add must not create a second row"
+    );
+    assert_eq!(
+        sessions[0]["command"], "echo OLD",
+        "duplicate add must preserve the original command override"
+    );
+}
+
 /// Regression test for #848: `aoe add` "Next steps" hint should reference
 /// the actual binary name (`aoe`), not the long project name.
 #[test]

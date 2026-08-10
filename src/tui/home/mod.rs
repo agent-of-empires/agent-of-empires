@@ -5439,18 +5439,17 @@ impl HomeView {
             &mut self.pending_send_target,
             live_send::LiveSendTarget::Agent,
         );
-        let size = crate::terminal::get_size();
         // Same pane-readiness cascades as live-send: agent runs the
         // full `ensure_pane_ready` (Docker, splash, resume); terminals
-        // just need their tmux session to exist with a live pane. Seed a
-        // cold/dead agent pane at the terminal size for the same reason
-        // live-send does (see `ensure_pane_ready_with_size`): otherwise it
-        // boots at tmux's 80x24 default and runs narrow until something
-        // resizes it.
+        // just need their tmux session to exist with a live pane. Every cold
+        // target starts at the visible preview size, avoiding an immediate
+        // full-terminal-to-preview resize and its SIGWINCH repaint.
+        let boot_size = self.live_send_boot_size();
         match &target {
             live_send::LiveSendTarget::Agent => {
                 let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
-                    inst.ensure_pane_ready_with_size(size).map_err(Into::into)
+                    inst.ensure_pane_ready_with_size(boot_size)
+                        .map_err(Into::into)
                 });
                 match outcome {
                     Ok(Some(EnsureReadyOutcome::ResumeFailed { sid })) => {
@@ -5471,7 +5470,7 @@ impl HomeView {
                 }
             }
             live_send::LiveSendTarget::Terminal => {
-                if let Err(e) = self.ensure_terminal_pane_ready(session_id, size) {
+                if let Err(e) = self.ensure_terminal_pane_ready(session_id, boot_size) {
                     self.info_dialog = Some(InfoDialog::new(
                         "Send Failed",
                         &format!("Cannot prepare terminal: {}", e),
@@ -5480,7 +5479,7 @@ impl HomeView {
                 }
             }
             live_send::LiveSendTarget::ContainerTerminal => {
-                if let Err(e) = self.ensure_container_terminal_pane_ready(session_id, size) {
+                if let Err(e) = self.ensure_container_terminal_pane_ready(session_id, boot_size) {
                     self.info_dialog = Some(InfoDialog::new(
                         "Send Failed",
                         &format!("Cannot prepare container terminal: {}", e),
@@ -5490,7 +5489,7 @@ impl HomeView {
             }
             live_send::LiveSendTarget::Tool(name) => {
                 let name = name.clone();
-                if let Err(e) = self.ensure_tool_pane_ready(session_id, &name, size) {
+                if let Err(e) = self.ensure_tool_pane_ready(session_id, &name, boot_size) {
                     self.info_dialog = Some(InfoDialog::new(
                         "Send Failed",
                         &format!("Cannot prepare tool '{}': {}", name, e),
@@ -5688,16 +5687,15 @@ impl HomeView {
         inst.tmux_session().is_ok_and(|s| s.exists())
     }
 
-    /// [`agent_pane_is_warm`](Self::agent_pane_is_warm) for the pane the
-    /// pending live-send target actually drives. Terminal / tool targets check
-    /// their own pane's existence and ignore the agent's status (a stopped
-    /// agent can have a live paired terminal); the Agent target defers to the
-    /// full agent predicate.
-    pub fn live_entry_is_warm(&self, session_id: &str) -> bool {
+    /// Whether the target pane is already live, so its entry can skip the
+    /// transient revive toast. Terminal and tool targets check their own pane's
+    /// existence and ignore the agent's status, because a stopped agent can
+    /// have a live paired terminal.
+    fn target_pane_is_warm(&self, session_id: &str, target: &live_send::LiveSendTarget) -> bool {
         let Some(inst) = self.get_instance(session_id) else {
             return false;
         };
-        let tmux_name = match &self.pending_live_send_target {
+        let tmux_name = match target {
             live_send::LiveSendTarget::Agent => return self.agent_pane_is_warm(session_id),
             live_send::LiveSendTarget::Terminal => {
                 crate::tmux::TerminalSession::resolve_name(&inst.id, &inst.title)
@@ -5714,7 +5712,15 @@ impl HomeView {
         crate::tmux::Session::from_name(&tmux_name).exists()
     }
 
-    /// Size to boot a cold/dead agent pane at on live-send entry: the visible
+    pub fn live_entry_is_warm(&self, session_id: &str) -> bool {
+        self.target_pane_is_warm(session_id, &self.pending_live_send_target)
+    }
+
+    pub fn send_entry_is_warm(&self, session_id: &str) -> bool {
+        self.target_pane_is_warm(session_id, &self.pending_send_target)
+    }
+
+    /// Size to boot a cold/dead pane at on live-send entry: the visible
     /// preview output rect when known, else the full terminal. `preview_pane_area`
     /// is the exact rect `finalize_live_send_resize` resizes to, so seeding the
     /// boot here makes the post-boot resize a no-op for cold starts (no reflow,
@@ -5757,24 +5763,23 @@ impl HomeView {
             &mut self.pending_live_send_target,
             live_send::LiveSendTarget::Agent,
         );
-        let size = crate::terminal::get_size();
         // Agent targets revive the agent pane via the full
         // ensure_pane_ready cascade (Docker, splash, resume). Terminal
         // targets are simpler: the paired terminal is a plain shell,
         // so we just ensure the tmux session exists and re-spawn it if
         // the pane has died (matches `attach_terminal`).
         //
-        // Boot the agent at the size it will be shown at, not tmux's 80x24
-        // default. A cold-started agent that boots narrow relies on
+        // Boot every target at the size it will be shown at, not tmux's 80x24
+        // default. A cold-started pane that boots narrow relies on
         // `finalize_live_send_resize`'s single post-boot SIGWINCH to grow into
         // the live area, a resize that races the agent's startup and, when
         // lost, leaves the pane pinned at ~50% width until live mode is
         // re-entered. See `Instance::ensure_pane_ready_with_size`.
-        let agent_boot_size = self.live_send_boot_size();
+        let boot_size = self.live_send_boot_size();
         match &target {
             live_send::LiveSendTarget::Agent => {
                 let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
-                    inst.ensure_pane_ready_with_size(agent_boot_size)
+                    inst.ensure_pane_ready_with_size(boot_size)
                         .map_err(Into::into)
                 });
                 match outcome {
@@ -5796,7 +5801,7 @@ impl HomeView {
                 }
             }
             live_send::LiveSendTarget::Terminal => {
-                if let Err(e) = self.ensure_terminal_pane_ready(session_id, size) {
+                if let Err(e) = self.ensure_terminal_pane_ready(session_id, boot_size) {
                     self.info_dialog = Some(InfoDialog::new(
                         "Live send failed",
                         &format!("Cannot prepare terminal: {}", e),
@@ -5805,7 +5810,7 @@ impl HomeView {
                 }
             }
             live_send::LiveSendTarget::ContainerTerminal => {
-                if let Err(e) = self.ensure_container_terminal_pane_ready(session_id, size) {
+                if let Err(e) = self.ensure_container_terminal_pane_ready(session_id, boot_size) {
                     self.info_dialog = Some(InfoDialog::new(
                         "Live send failed",
                         &format!("Cannot prepare container terminal: {}", e),
@@ -5815,7 +5820,7 @@ impl HomeView {
             }
             live_send::LiveSendTarget::Tool(name) => {
                 let name = name.clone();
-                if let Err(e) = self.ensure_tool_pane_ready(session_id, &name, size) {
+                if let Err(e) = self.ensure_tool_pane_ready(session_id, &name, boot_size) {
                     self.info_dialog = Some(InfoDialog::new(
                         "Live send failed",
                         &format!("Cannot prepare tool '{}': {}", name, e),
@@ -7178,7 +7183,10 @@ impl HomeView {
             config.tmux.clipboard != crate::session::config::TmuxSettingMode::Disabled;
         self.vt_live_enabled = config.tmux.vt_live;
         if let Some(worker) = self.preview_capture_worker.as_ref() {
-            worker.set_vt_enabled(self.vt_live_enabled);
+            worker.set_vt_enabled(
+                self.vt_live_enabled && !matches!(self.view_mode, ViewMode::Terminal),
+            );
+            worker.set_clipboard_capture_enabled(self.agent_clipboard_forward);
         }
         self.profile_default_attach_mode = config.session.default_attach_mode;
         self.idle_decay_window =

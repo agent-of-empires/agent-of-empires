@@ -1993,10 +1993,15 @@ impl HomeView {
         }
         if self.preview_capture_worker.is_none() {
             let worker = live_send::LiveCaptureWorker::spawn(self.preview_wake.clone());
-            // The worker spawns VT-enabled; hand it the real `[tmux] vt_live`
-            // value (cached on the view, refreshed with the config) before it
-            // can arm a channel.
-            worker.set_vt_enabled(self.vt_live_enabled);
+            // Shell terminals use capture-pane's authoritative cell snapshot.
+            // Their prompt repaint can transiently expose a PROMPT_EOL_MARK to
+            // a pipe-pane seed, producing a visible false frame before the
+            // grid reconciles. The capture path is slower but has no seed
+            // handoff, and live input still uses the existing send-keys path.
+            worker.set_vt_enabled(
+                self.vt_live_enabled && !matches!(self.view_mode, ViewMode::Terminal),
+            );
+            worker.set_clipboard_capture_enabled(self.agent_clipboard_forward);
             self.preview_capture_worker = Some(worker);
         }
         if self.preview_capture_target != desired {
@@ -2025,6 +2030,8 @@ impl HomeView {
         if let Some(worker) = self.preview_capture_worker.as_ref() {
             worker.set_live(live);
             worker.set_forward_empty(forward_empty);
+            worker.set_vt_enabled(self.vt_live_enabled && !forward_empty);
+            worker.set_clipboard_capture_enabled(self.agent_clipboard_forward);
         }
     }
 

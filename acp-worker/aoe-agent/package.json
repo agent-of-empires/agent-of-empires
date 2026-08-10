@@ -17,11 +17,11 @@
   },
   "dependencies": {
     "@agentclientprotocol/sdk": "^1.0.0",
-    "@ai-sdk/anthropic": "^4.0.1",
-    "@ai-sdk/google": "^4.0.2",
-    "@ai-sdk/openai": "^4.0.2",
-    "@ai-sdk/openai-compatible": "^3.0.1",
-    "ai": "^7.0.4",
+    "@ai-sdk/anthropic": "^4.0.27",
+    "@ai-sdk/google": "^4.0.31",
+    "@ai-sdk/openai": "^4.0.27",
+    "@ai-sdk/openai-compatible": "^3.0.20",
+    "ai": "^7.0.48",
     "zod": "^4.4.3"
   },
   "license": "MIT"

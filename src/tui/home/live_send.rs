@@ -783,12 +783,9 @@ pub(in crate::tui) struct LiveCaptureWorker {
     /// cursor query (a one-line `display-message` folded into the capture
     /// fork) runs every cycle, not just live ones.
     cursor: std::sync::Arc<std::sync::Mutex<Option<crate::tmux::PaneCursor>>>,
-    /// Newest OSC 52 clipboard write the displayed pane's agent has emitted
-    /// (VT path only; `capture-pane` returns rendered cells, so the fallback
-    /// path never sees the escape). Single-slot like `latest`; drained by the
-    /// render loop via `take_agent_clipboard`, which forwards it to the host
-    /// clipboard (#2420). Cleared on `set_target` so a copy from the old pane
-    /// can't land after a retarget.
+    /// Newest OSC 52 clipboard write the displayed pane has emitted. A VT grid
+    /// extracts it from the live byte stream; terminal capture uses a separate
+    /// raw observer so rendered snapshots never need to carry the escape.
     clipboard: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// Whether the worker may render through a VT channel (`[tmux] vt_live`).
     /// Pushed by the render reconcile at spawn and on config refresh
@@ -796,6 +793,10 @@ pub(in crate::tui) struct LiveCaptureWorker {
     /// down an armed channel (disabling its `pipe-pane`) and falls back to
     /// the capture path in place, no restart needed.
     vt_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the raw OSC 52 observer may run when terminal rendering uses
+    /// capture-pane. Mirrors the Clipboard Pass-through setting, so disabled
+    /// mode does not keep a second pipe-pane connection open.
+    clipboard_capture_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drop for LiveCaptureWorker {
@@ -990,6 +991,10 @@ impl LiveCaptureWorker {
         // `[tmux] vt_live` value right after spawn (and on every config
         // refresh), so the worker itself never touches the config file.
         let vt_enabled = Arc::new(AtomicBool::new(true));
+        // Start disabled until the render reconcile publishes the Clipboard
+        // Pass-through setting, avoiding an observer before configuration is
+        // available for a newly created worker.
+        let clipboard_capture_enabled = Arc::new(AtomicBool::new(false));
         let lines_cell = capture_lines.clone();
         let target_cell = target.clone();
         let slot = latest.clone();
@@ -1001,6 +1006,8 @@ impl LiveCaptureWorker {
         let clipboard_cell = clipboard.clone();
         #[cfg(unix)]
         let vt_enabled_cell = vt_enabled.clone();
+        #[cfg(unix)]
+        let clipboard_capture_enabled_cell = clipboard_capture_enabled.clone();
         std::thread::spawn(move || {
             let mut last_target = String::new();
             let mut last_captured: Option<String> = None;
@@ -1022,6 +1029,15 @@ impl LiveCaptureWorker {
             // worker also falls back to capture for that pane.
             #[cfg(unix)]
             let mut vt_source: Option<std::sync::Arc<crate::tmux::vt::VtChannel>> = None;
+            // Terminal snapshots do not include raw OSC 52 escapes. When VT is
+            // intentionally off for a terminal pane, this observer restores
+            // clipboard forwarding without constructing a grid or seed.
+            #[cfg(unix)]
+            let mut osc52_source: Option<
+                std::sync::Arc<crate::tmux::vt::Osc52Channel>,
+            > = None;
+            #[cfg(unix)]
+            let mut osc52_seen = 0;
             // When the last arm attempt for the current target ran, so a
             // failure (or a channel death: pane killed and the tmux session
             // recreated under the same name, e.g. a session restart) retries
@@ -1030,6 +1046,8 @@ impl LiveCaptureWorker {
             // panes. Reset on target change so a new pane arms immediately.
             #[cfg(unix)]
             let mut last_vt_arm: Option<std::time::Instant> = None;
+            #[cfg(unix)]
+            let mut last_osc52_arm: Option<std::time::Instant> = None;
             // Panes in the target window, refreshed on the lazy
             // `PANE_COUNT_PROBE_MS` cadence. The seed only covers the window
             // between arming and the first probe, which runs on the first cycle
@@ -1078,6 +1096,9 @@ impl LiveCaptureWorker {
                     {
                         vt_source = None;
                         last_vt_arm = None;
+                        osc52_source = None;
+                        osc52_seen = 0;
+                        last_osc52_arm = None;
                     }
                     pane_count = 1;
                     last_pane_probe = None;
@@ -1089,12 +1110,21 @@ impl LiveCaptureWorker {
                 // for the same target instead of waiting for a retarget.
                 #[cfg(unix)]
                 let vt_enabled = vt_enabled_cell.load(Ordering::Relaxed);
+                #[cfg(unix)]
+                let clipboard_capture_enabled =
+                    clipboard_capture_enabled_cell.load(Ordering::Relaxed);
                 // The throttle resets even when no channel is armed (a failed
                 // arm attempt), so re-enabling always arms on the next cycle.
                 #[cfg(unix)]
                 if !vt_enabled {
                     vt_source = None;
                     last_vt_arm = None;
+                }
+                #[cfg(unix)]
+                if !clipboard_capture_enabled {
+                    osc52_source = None;
+                    osc52_seen = 0;
+                    last_osc52_arm = None;
                 }
                 if lines > 0 && !name.is_empty() {
                     let forward_empty = forward_empty_cell.load(Ordering::Relaxed);
@@ -1119,11 +1149,40 @@ impl LiveCaptureWorker {
                     // still comes from the grid, and only the panes beside it
                     // are re-captured, on their own slower cadence.
                     let composite = pane_count > 1;
-                    // An OSC 52 clipboard write the displayed agent emitted
-                    // since the last cycle (VT path only). Published below
-                    // under the same retarget guard as the cursor.
+                    // An OSC 52 clipboard write the displayed pane emitted
+                    // since the last cycle. Published below under the same
+                    // retarget guard as the cursor.
                     #[cfg(unix)]
-                    let mut clipboard_now: Option<String> = None;
+                    let observe_osc52 = !vt_enabled && forward_empty && clipboard_capture_enabled;
+                    #[cfg(unix)]
+                    if !observe_osc52 {
+                        osc52_source = None;
+                        last_osc52_arm = None;
+                    }
+                    #[cfg(unix)]
+                    if observe_osc52
+                        && osc52_source.is_none()
+                        && last_osc52_arm.is_none_or(|t| t.elapsed() >= VT_REARM_INTERVAL)
+                    {
+                        last_osc52_arm = Some(std::time::Instant::now());
+                        osc52_source = crate::tmux::vt::Osc52Channel::acquire(&name);
+                        if let Some(source) = osc52_source.as_ref() {
+                            osc52_seen = source.clipboard_sequence();
+                        }
+                    }
+                    #[cfg(unix)]
+                    if osc52_source
+                        .as_ref()
+                        .is_some_and(|source| !source.is_alive())
+                    {
+                        osc52_source = None;
+                        osc52_seen = 0;
+                    }
+                    #[cfg(unix)]
+                    let mut clipboard_now = osc52_source.as_ref().and_then(|source| {
+                        source.refresh_owner_heartbeat();
+                        source.clipboard_after(&mut osc52_seen)
+                    });
                     #[cfg(not(unix))]
                     let clipboard_now: Option<String> = None;
                     // Acquire one frame + cursor. Default: sample the in-process
@@ -1342,6 +1401,7 @@ impl LiveCaptureWorker {
             cursor,
             clipboard,
             vt_enabled,
+            clipboard_capture_enabled,
         }
     }
 
@@ -1353,6 +1413,18 @@ impl LiveCaptureWorker {
     pub(in crate::tui) fn set_vt_enabled(&self, enabled: bool) {
         let prev = self
             .vt_enabled
+            .swap(enabled, std::sync::atomic::Ordering::Relaxed);
+        if prev != enabled {
+            self.nudge();
+        }
+    }
+
+    /// Enable raw OSC 52 observation for terminal previews that render via
+    /// capture-pane. This does not affect a VT grid, which already extracts
+    /// clipboard writes from its own pipe.
+    pub(in crate::tui) fn set_clipboard_capture_enabled(&self, enabled: bool) {
+        let prev = self
+            .clipboard_capture_enabled
             .swap(enabled, std::sync::atomic::Ordering::Relaxed);
         if prev != enabled {
             self.nudge();
