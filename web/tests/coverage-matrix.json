@@ -1728,6 +1728,24 @@
       "components": ["web/src/components/settings/DiffSettings.tsx", "web/src/components/SettingsView.tsx"]
     },
     {
+      "id": "settings.structured-view-font-size",
+      "kind": "mocked-playwright",
+      "risk": "low",
+      "specs": [
+        "src/components/settings/__tests__/StructuredViewDisplaySettings.test.tsx",
+        "src/components/acp/__tests__/StructuredViewRoot.test.tsx",
+        "src/components/acp/Markdown.test.tsx",
+        "tests/acp-conversation-font-size.spec.ts"
+      ],
+      "components": [
+        "web/src/components/settings/StructuredViewDisplaySettings.tsx",
+        "web/src/components/settings/FontSizeControl.tsx",
+        "web/src/components/TerminalSettings.tsx",
+        "web/src/lib/fontSizeRange.ts",
+        "web/src/components/SettingsView.tsx"
+      ]
+    },
+    {
       "id": "settings.panels-section",
       "kind": "vitest",
       "risk": "low",

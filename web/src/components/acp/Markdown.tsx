@@ -68,7 +68,7 @@ export function Markdown({ text, smooth = false, breaks = false }: Props) {
       preprocess={() => text}
       smooth={smooth}
       remarkPlugins={remarkPlugins}
-      className="acp-markdown text-sm leading-relaxed"
+      className="acp-markdown acp-markdown-body leading-relaxed"
       components={{
         SyntaxHighlighter: ShikiSyntaxHighlighter,
         CodeHeader,
@@ -251,18 +251,18 @@ function ShikiSyntaxHighlighter({ language, code }: SyntaxHighlighterProps) {
   if (html) {
     return (
       <div
-        className="overflow-x-auto px-3 py-2 text-xs [&_pre]:!bg-transparent [&_pre]:!m-0 [&_pre]:!p-0"
+        className="overflow-x-auto px-3 py-2 text-[0.86em] [&_pre]:!bg-transparent [&_pre]:!m-0 [&_pre]:!p-0"
         dangerouslySetInnerHTML={{ __html: html }}
       />
     );
   }
-  return <pre className="overflow-x-auto px-3 py-2 text-xs font-mono text-text-primary">{code}</pre>;
+  return <pre className="overflow-x-auto px-3 py-2 text-[0.86em] font-mono text-text-primary">{code}</pre>;
 }
 
 /** Header strip above each code block: language label + copy button. */
 function CodeHeader({ language, code }: CodeHeaderProps) {
   return (
-    <div className="flex items-center justify-between border-b border-surface-800 bg-surface-950 px-3 py-1 text-[11px] font-mono uppercase tracking-wider text-text-dim">
+    <div className="flex items-center justify-between border-b border-surface-800 bg-surface-950 px-3 py-1 text-[0.79em] font-mono uppercase tracking-wider text-text-dim">
       <span>{language ?? "text"}</span>
       <button
         type="button"

@@ -62,6 +62,7 @@ import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
 import { useIsWideViewport } from "../../hooks/useIsWideViewport";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import { ChromeCollapseHandle, CollapsibleRegion } from "../CollapsibleChrome";
+import { useWebSettings } from "../../hooks/useWebSettings";
 import { dispatchFocusTerminal } from "../../lib/terminalFocus";
 import { shouldFocusComposerOnThreadTap } from "./threadTapFocus";
 import type {
@@ -223,17 +224,40 @@ export function structuredViewRootStyle(keyboardHeight: number): React.CSSProper
   return keyboardHeight > 0 ? { paddingBottom: keyboardHeight } : undefined;
 }
 
+/** Publishes both conversation font-size preferences as scoped custom
+ *  properties on the structured-view root; `index.css` picks the active one via
+ *  a media query, so crossing the 768px breakpoint reflows without a reload and
+ *  without a JS width probe. Merged on top of the keyboard reservation rather
+ *  than replacing it. Both sizes arrive already clamped from `useWebSettings`,
+ *  which is the single normalization boundary for stored prefs. */
+function structuredViewFontStyle(
+  keyboardHeight: number,
+  mobileFontSize: number,
+  desktopFontSize: number,
+): React.CSSProperties {
+  return {
+    ...structuredViewRootStyle(keyboardHeight),
+    "--acp-conversation-font-size-mobile": `${mobileFontSize}px`,
+    "--acp-conversation-font-size-desktop": `${desktopFontSize}px`,
+  } as React.CSSProperties;
+}
+
 /** Fixed-height flex root for the structured view, owning the mobile-keyboard
  *  reservation (see {@link structuredViewRootStyle}). Exported and kept tiny so
  *  the hook-to-style wiring is testable without mounting the assistant-ui
  *  runtime, mirroring the #1282 rate-limit-recovery extraction. */
 export function StructuredViewRoot({ children }: { children: React.ReactNode }) {
   const { keyboardHeight } = useMobileKeyboard();
+  const { settings } = useWebSettings();
   return (
     <div
       data-testid="structured-view-root"
-      className="flex h-full flex-col bg-surface-900 text-text-primary"
-      style={structuredViewRootStyle(keyboardHeight)}
+      className="acp-conversation-scope flex h-full flex-col bg-surface-900 text-text-primary"
+      style={structuredViewFontStyle(
+        keyboardHeight,
+        settings.structuredMobileFontSize,
+        settings.structuredDesktopFontSize,
+      )}
     >
       {children}
     </div>

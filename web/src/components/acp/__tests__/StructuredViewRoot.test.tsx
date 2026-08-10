@@ -21,6 +21,7 @@ import { StructuredViewRoot } from "../StructuredView";
 
 afterEach(() => {
   cleanup();
+  window.localStorage.clear();
   mockKeyboard.current = { isMobile: false, keyboardOpen: false, keyboardHeight: 0 };
 });
 
@@ -42,5 +43,25 @@ describe("StructuredViewRoot (#2011)", () => {
       </StructuredViewRoot>,
     );
     expect(screen.getByTestId("structured-view-root").style.paddingBottom).toBe("");
+  });
+
+  it("publishes both conversation font-size custom properties without dropping the keyboard reservation", () => {
+    mockKeyboard.current = { isMobile: true, keyboardOpen: true, keyboardHeight: 300 };
+    window.localStorage.setItem(
+      "aoe-web-settings",
+      JSON.stringify({ structuredMobileFontSize: 11, structuredDesktopFontSize: 18 }),
+    );
+    render(
+      <StructuredViewRoot>
+        <div>child</div>
+      </StructuredViewRoot>,
+    );
+    const root = screen.getByTestId("structured-view-root");
+    expect(root.style.getPropertyValue("--acp-conversation-font-size-mobile")).toBe("11px");
+    expect(root.style.getPropertyValue("--acp-conversation-font-size-desktop")).toBe("18px");
+    // The breakpoint that picks between them lives in CSS, so the root must
+    // carry the scope class the media query keys off.
+    expect(root.classList.contains("acp-conversation-scope")).toBe(true);
+    expect(root.style.paddingBottom).toBe("300px");
   });
 });

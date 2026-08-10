@@ -28,6 +28,7 @@ import { PluginsSettings } from "./settings/PluginsSettings";
 import { TOUR_ANCHORS, tourAnchor } from "../lib/tourSteps";
 import { PluginSettingsSections } from "./settings/PluginSettingsSections";
 import { SettingsHeader } from "./settings/SettingsHeader";
+import { StructuredViewDisplaySettings } from "./settings/StructuredViewDisplaySettings";
 import { ProfilesSection } from "./profiles/ProfilesSection";
 import { SECTION_TO_TAB, type SettingsSearchHit } from "./settings/settingsSearchIndex";
 
@@ -815,12 +816,14 @@ export function SettingsView({
             {/* Tour anchor for the per-agent defaults step (#2631). Anchored on
                 this top-of-tab intro, not the defaults widget itself, so
                 react-joyride never has to scroll a far-down, async-growing
-                target into view (which made it loop and never advance). */}
+                target into view (which made it loop and never advance). Keep it
+                first in the tab for the same reason. */}
             <p className="text-xs text-text-dim" {...tourAnchor(TOUR_ANCHORS.settingsAgentDefaults)}>
               Defaults for structured-view (ACP) sessions: which agent starts, how many workers run at once, how much
               history is replayed on reconnect, and the per-agent model, mode, and thinking defaults below. These apply
               when a session renders in the structured view instead of a raw terminal.
             </p>
+            <StructuredViewDisplaySettings />
             <SchemaSection
               section="acp"
               schema={schema}

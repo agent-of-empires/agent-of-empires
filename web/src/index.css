@@ -228,6 +228,26 @@ body {
    raw <p>/<ul>/<ol>/<h*>/<blockquote>/<code> elements (no class
    names). Style them via descendant selectors so the prose looks
    right inside the structured-view conversation. */
+/* The structured-view root publishes both conversation font-size preferences as
+   custom properties; the breakpoint picks the active one in CSS so resizing the
+   window across 768px switches sizes without a reload. */
+.acp-conversation-scope {
+  --acp-conversation-font-size: var(--acp-conversation-font-size-mobile, 14px);
+}
+@media (min-width: 768px) {
+  .acp-conversation-scope {
+    --acp-conversation-font-size: var(--acp-conversation-font-size-desktop, 14px);
+  }
+}
+/* Only the conversation renderer (Markdown.tsx) opts in. The other
+   `.acp-markdown` consumers (tool-card bodies, the diff pane's file viewer)
+   keep their own explicit sizes, so the child typography below stays in `rem`
+   for them and is re-expressed in `em` under `.acp-markdown-body` only. */
+.acp-markdown-body {
+  /* Fallback matches the previous fixed `text-sm` for transcript markdown
+     rendered outside the structured-view root (e.g. the skills manager). */
+  font-size: var(--acp-conversation-font-size, 0.875rem);
+}
 .acp-markdown p {
   margin: 0.5rem 0;
 }
@@ -389,6 +409,28 @@ body {
 }
 .acp-markdown tbody tr:last-child td {
   border-bottom: none;
+}
+
+/* Child typography for the opted-in conversation renderer only, in `em` so the
+   whole hierarchy scales with the user's base size. These tie on specificity
+   with the `.acp-markdown <type>` rules above and win on source order, so they
+   must stay after them. Ratios reproduce the `rem` values at the 14px default;
+   the other `.acp-markdown` consumers set their own base (tool cards render at
+   11px) and keep the fixed `rem` sizes. */
+.acp-markdown-body h1 {
+  font-size: 1.43em; /* 20px at the 14px default */
+}
+.acp-markdown-body h2 {
+  font-size: 1.29em; /* 18px at the 14px default */
+}
+.acp-markdown-body h3 {
+  font-size: 1.14em; /* 16px at the 14px default */
+}
+.acp-markdown-body th {
+  font-size: 0.79em; /* 11px at the 14px default */
+}
+.acp-markdown-body td {
+  font-size: 0.86em; /* 12px at the 14px default */
 }
 
 /* Subtle scrollbar styling */

@@ -1,5 +1,6 @@
 import { useCallback, useSyncExternalStore } from "react";
 
+import { DEFAULT_CONVERSATION_FONT_SIZE, normalizeConversationFontSize } from "../lib/conversationFontSize";
 import { DEFAULT_PERSISTENT_TERMINALS, normalizePersistentTerminalLimit } from "../lib/persistentTerminals";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 
@@ -8,6 +9,12 @@ const STORAGE_KEY = "aoe-web-settings";
 export interface WebSettings {
   mobileFontSize: number;
   desktopFontSize: number;
+  /** Base font size (px) for the structured-view conversation transcript on
+   *  mobile. Independent of `mobileFontSize`, which sizes terminal cells. */
+  structuredMobileFontSize: number;
+  /** Base font size (px) for the structured-view conversation transcript on
+   *  desktop. Independent of `desktopFontSize`. */
+  structuredDesktopFontSize: number;
   terminalFontFamily: string;
   autoOpenKeyboard: boolean;
   persistentTerminals: boolean;
@@ -41,6 +48,8 @@ function getDefaults(): WebSettings {
   return {
     mobileFontSize: 8,
     desktopFontSize: 14,
+    structuredMobileFontSize: DEFAULT_CONVERSATION_FONT_SIZE,
+    structuredDesktopFontSize: DEFAULT_CONVERSATION_FONT_SIZE,
     terminalFontFamily: "",
     autoOpenKeyboard: true,
     persistentTerminals: false,
@@ -68,6 +77,10 @@ function normalizeSnapshot(settings: WebSettings): WebSettings {
     persistentTerminals:
       typeof settings.persistentTerminals === "boolean" ? settings.persistentTerminals : defaults.persistentTerminals,
     maxPersistentTerminals: normalizePersistentTerminalLimit(settings.maxPersistentTerminals),
+    // A malformed value here reaches CSS directly, so clamp it rather than let
+    // the transcript render at NaN/0px.
+    structuredMobileFontSize: normalizeConversationFontSize(settings.structuredMobileFontSize),
+    structuredDesktopFontSize: normalizeConversationFontSize(settings.structuredDesktopFontSize),
     // localStorage is user-editable: a corrupted stringy "false" must not read
     // truthy and silently auto-open panes the user disabled.
     sidebarCompact: normalizeBool(settings.sidebarCompact, defaults.sidebarCompact),
