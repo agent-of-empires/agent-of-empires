@@ -229,14 +229,18 @@ body {
    names). Style them via descendant selectors so the prose looks
    right inside the structured-view conversation. */
 /* The structured-view root publishes both conversation font-size preferences as
-   custom properties; the breakpoint picks the active one in CSS so resizing the
-   window across 768px switches sizes without a reload. */
+   custom properties; CSS picks the active one, so a resize or an orientation
+   change switches sizes without a reload. Desktop is the default and mobile is
+   the override, keyed on the same classifier `clientFormFactor()` uses: coarse
+   primary pointer AND a viewport below the 768px `md` breakpoint. A touch
+   laptop and a narrow desktop window both stay on the desktop size, matching
+   how the rest of the dashboard decides what "mobile" means. */
 .acp-conversation-scope {
-  --acp-conversation-font-size: var(--acp-conversation-font-size-mobile, 14px);
+  --acp-conversation-font-size: var(--acp-conversation-font-size-desktop, 0.875rem);
 }
-@media (min-width: 768px) {
+@media (pointer: coarse) and (max-width: 767.98px) {
   .acp-conversation-scope {
-    --acp-conversation-font-size: var(--acp-conversation-font-size-desktop, 14px);
+    --acp-conversation-font-size: var(--acp-conversation-font-size-mobile, 0.875rem);
   }
 }
 /* Only the conversation renderer (Markdown.tsx) opts in. The other
@@ -412,24 +416,24 @@ body {
 }
 
 /* Child typography for the opted-in conversation renderer only, in `em` so the
-   whole hierarchy scales with the user's base size. These tie on specificity
-   with the `.acp-markdown <type>` rules above and win on source order, so they
-   must stay after them. Ratios reproduce the `rem` values at the 14px default;
-   the other `.acp-markdown` consumers set their own base (tool cards render at
+   whole hierarchy scales with the user's base size. The doubled class outranks
+   the single-class `.acp-markdown <type>` rules above regardless of where they
+   sit in the file. Ratios reproduce the `rem` values at the 14px default; the
+   other `.acp-markdown` consumers set their own base (tool cards render at
    11px) and keep the fixed `rem` sizes. */
-.acp-markdown-body h1 {
+.acp-markdown.acp-markdown-body h1 {
   font-size: 1.43em; /* 20px at the 14px default */
 }
-.acp-markdown-body h2 {
+.acp-markdown.acp-markdown-body h2 {
   font-size: 1.29em; /* 18px at the 14px default */
 }
-.acp-markdown-body h3 {
+.acp-markdown.acp-markdown-body h3 {
   font-size: 1.14em; /* 16px at the 14px default */
 }
-.acp-markdown-body th {
+.acp-markdown.acp-markdown-body th {
   font-size: 0.79em; /* 11px at the 14px default */
 }
-.acp-markdown-body td {
+.acp-markdown.acp-markdown-body td {
   font-size: 0.86em; /* 12px at the 14px default */
 }
 

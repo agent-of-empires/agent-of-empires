@@ -33,14 +33,25 @@ TUI/`config.toml`-only.
 **Sessions > Structured view > Conversation display** sets the base font size
 of the structured-view conversation transcript, separately for mobile and
 desktop. Prose, headings, lists, tables, and fenced code all scale from that
-base, so shrinking it fits more of a transcript on a phone screen. The
-breakpoint is 768px; resizing the window across it switches between the two
-values live.
+base, so shrinking it fits more of a transcript on a phone screen.
+
+The mobile value applies when the device has a coarse primary pointer (touch)
+*and* the viewport is narrower than 768px, the same rule the rest of the
+dashboard uses to decide what counts as mobile. A touch laptop and a narrowed
+desktop window both keep the desktop value. The switch happens live, so
+resizing the window or rotating a phone reflows the transcript without a
+reload.
 
 Each axis runs from 6px to 28px in 1px steps and defaults to 14px, the same
 range as the terminal font sizes under **Web Dashboard > Terminal**, so the two
 sliders read alike. Drag the slider or pick the exact size from the px dropdown
 next to it; the two stay in sync.
+
+The number you pick is relative to your browser's own font-size setting rather
+than an absolute pixel size: the 14px default renders at 14px with the usual
+16px browser default, and at 17.5px if you have raised your browser's base font
+size to 20px. Every size scales by that same factor, so the setting stacks with
+browser-level zoom or accessibility preferences instead of overriding them.
 
 Both values are dashboard preferences rather than agent config: they live in
 the `aoe-web-settings` browser storage entry, which the dashboard mirrors to

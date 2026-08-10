@@ -20,3 +20,13 @@ export function normalizeConversationFontSize(value: unknown): number {
   if (!Number.isFinite(n)) return DEFAULT_CONVERSATION_FONT_SIZE;
   return Math.min(MAX_FONT_SIZE, Math.max(MIN_FONT_SIZE, Math.round(n)));
 }
+
+/** The setting is authored and stored as an integer px value because that is
+ *  what the slider and the px select speak, but it reaches CSS as `rem` against
+ *  the 16px default root size. Publishing absolute px would pin the transcript
+ *  to 14px for a reader who raised their browser's root font size; as `rem` the
+ *  default 14 still renders at 14px on a 16px root and at 17.5px on a 20px one,
+ *  and a user-picked size scales by the same factor. */
+export function conversationFontSizeRem(px: number): string {
+  return `${px / 16}rem`;
+}

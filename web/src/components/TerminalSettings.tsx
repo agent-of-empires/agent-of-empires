@@ -2,7 +2,6 @@ import { useMemo } from "react";
 
 import { useWebSettings } from "../hooks/useWebSettings";
 import { detectInstalledFonts } from "../lib/fontDetect";
-import { MAX_FONT_SIZE, MIN_FONT_SIZE } from "../lib/fontSizeRange";
 import {
   MAX_PERSISTENT_TERMINALS,
   MIN_PERSISTENT_TERMINALS,
@@ -26,8 +25,6 @@ export function TerminalSettings() {
           label="Mobile font size"
           testIdPrefix="terminal-mobile-font-size"
           value={settings.mobileFontSize}
-          min={MIN_FONT_SIZE}
-          max={MAX_FONT_SIZE}
           onChange={(value) => update({ mobileFontSize: value })}
           description="Font size for web terminal sessions on mobile devices, including tmux-backed sessions. Pinch the terminal with two fingers to zoom; the new size is saved here."
         />
@@ -36,8 +33,6 @@ export function TerminalSettings() {
           label="Desktop font size"
           testIdPrefix="terminal-desktop-font-size"
           value={settings.desktopFontSize}
-          min={MIN_FONT_SIZE}
-          max={MAX_FONT_SIZE}
           onChange={(value) => update({ desktopFontSize: value })}
           description="Font size for web terminal sessions on desktop, including tmux-backed sessions. Hold Ctrl and scroll over the terminal (or pinch on a trackpad) to zoom; the new size is saved here."
         />

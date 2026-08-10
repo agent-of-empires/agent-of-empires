@@ -1,50 +1,95 @@
 import { test, expect } from "./helpers/mockedTest";
+import { devices, type Page } from "@playwright/test";
 import { agentMessageChunk, mockAcpSession, openStructuredSession, stopped } from "./helpers/acpMock";
 
-// User story: the transcript font size is a browser-local preference with a
-// separate mobile and desktop value, and crossing 768px must switch between
-// them live.
+// User story: the transcript font size is a dashboard preference with a
+// separate mobile and desktop value, and the dashboard's own mobile classifier
+// (coarse primary pointer AND a viewport below 768px, the rule
+// `clientFormFactor()` uses) decides which one applies.
 //
-// Mocked Playwright rather than Vitest because the whole contract is a CSS
-// media query resolving a custom property into a computed font size: jsdom
-// evaluates neither, so a unit test could only re-assert the inline variables
-// (which StructuredViewRoot.test.tsx already covers). One test walks both
-// viewports and the proportional child scaling, per the "one test per
-// behavior" rule.
-test.describe("structured view conversation font size", () => {
-  test("resolves the stored mobile/desktop sizes across the 768px breakpoint and scales markdown with them", async ({
-    page,
-  }) => {
-    await page.addInitScript(() => {
+// Mocked Playwright rather than Vitest because the whole contract is a media
+// query resolving a custom property into a computed font size: jsdom evaluates
+// neither pointer capability nor `rem`, so a unit test could only re-assert the
+// inline variables (which StructuredViewRoot.test.tsx already covers).
+//
+// Split into two describes because pointer capability is fixed per browser
+// context: Playwright cannot flip `(pointer: coarse)` mid-page the way it can
+// resize a viewport. Each context still exercises a live viewport change, which
+// is the resize case users actually hit.
+
+const MOBILE_SIZE = 11;
+const DESKTOP_SIZE = 20;
+
+async function openTranscript(page: Page) {
+  await page.addInitScript(
+    ([mobile, desktop]) => {
       window.localStorage.setItem(
         "aoe-web-settings",
-        JSON.stringify({ structuredMobileFontSize: 11, structuredDesktopFontSize: 20 }),
+        JSON.stringify({ structuredMobileFontSize: mobile, structuredDesktopFontSize: desktop }),
       );
-    });
+    },
+    [MOBILE_SIZE, DESKTOP_SIZE],
+  );
 
-    const mock = await mockAcpSession(page, {
-      title: "story-font-size",
-      initialEvents: [agentMessageChunk("# heading\n\nplain paragraph text"), stopped()],
-    });
-    await page.setViewportSize({ width: 1200, height: 800 });
-    await openStructuredSession(page, mock);
+  const mock = await mockAcpSession(page, {
+    title: "story-font-size",
+    initialEvents: [agentMessageChunk("# heading\n\nplain paragraph text"), stopped()],
+  });
+  await openStructuredSession(page, mock);
 
-    const body = page.locator(".acp-markdown-body").first();
-    await expect(body).toBeVisible({ timeout: 10_000 });
-    const fontSizeOf = (locator = body) => locator.evaluate((el) => getComputedStyle(el).fontSize);
+  const body = page.locator(".acp-markdown-body").first();
+  await expect(body).toBeVisible({ timeout: 10_000 });
+  return body;
+}
 
-    expect(await fontSizeOf()).toBe("20px");
+const fontSizeOf = (locator: ReturnType<Page["locator"]>) => locator.evaluate((el) => getComputedStyle(el).fontSize);
+
+test.describe("structured view conversation font size (fine pointer)", () => {
+  test.use({ viewport: { width: 1200, height: 800 }, hasTouch: false });
+
+  test("uses the desktop size at any width and scales it with the browser root font size", async ({ page }) => {
+    const body = await openTranscript(page);
+    const heading = body.locator("h1").first();
+
+    expect(await fontSizeOf(body)).toBe("20px");
     // Headings are `em`, so the whole hierarchy follows the base rather than
     // only paragraphs changing (1.43em * 20px).
-    const heading = body.locator("h1").first();
     expect(await fontSizeOf(heading)).toBe("28.6px");
 
-    // Crossing the breakpoint swaps to the mobile value with no reload.
+    // A narrow desktop window is not mobile: without the pointer term this
+    // would wrongly drop to the mobile size.
     await page.setViewportSize({ width: 500, height: 800 });
-    await expect.poll(() => fontSizeOf()).toBe("11px");
+    await expect.poll(() => fontSizeOf(body)).toBe("20px");
+
+    // The size is published as `rem`, so raising the browser/root font size
+    // scales the transcript proportionally (20 setting = 1.25rem = 25px at a
+    // 20px root) instead of pinning it to the authored px.
+    await page.evaluate(() => {
+      document.documentElement.style.fontSize = "20px";
+    });
+    await expect.poll(() => fontSizeOf(body)).toBe("25px");
+  });
+});
+
+// iPhone 13 gives width 390 (< 768), pointer:coarse and hasTouch. Drop
+// `defaultBrowserType`: Playwright forbids it in a describe-level `test.use`
+// (it would force a new worker) and the project already pins chromium.
+const { defaultBrowserType: _iphoneBrowser, ...iPhone13 } = devices["iPhone 13"];
+
+test.describe("structured view conversation font size (coarse pointer)", () => {
+  test.use(iPhone13);
+
+  test("uses the mobile size when narrow and the desktop size once the viewport widens", async ({ page }) => {
+    const body = await openTranscript(page);
+    const heading = body.locator("h1").first();
+
+    expect(await fontSizeOf(body)).toBe("11px");
     expect(await fontSizeOf(heading)).toBe("15.73px");
 
-    await page.setViewportSize({ width: 1200, height: 800 });
-    await expect.poll(() => fontSizeOf()).toBe("20px");
+    // Still a coarse pointer, but a tablet-width viewport is classified
+    // desktop, and the swap happens live with no reload.
+    await page.setViewportSize({ width: 900, height: 800 });
+    await expect.poll(() => fontSizeOf(body)).toBe("20px");
+    expect(await fontSizeOf(heading)).toBe("28.6px");
   });
 });

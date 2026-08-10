@@ -63,6 +63,7 @@ import { useIsWideViewport } from "../../hooks/useIsWideViewport";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import { ChromeCollapseHandle, CollapsibleRegion } from "../CollapsibleChrome";
 import { useWebSettings } from "../../hooks/useWebSettings";
+import { conversationFontSizeRem } from "../../lib/conversationFontSize";
 import { dispatchFocusTerminal } from "../../lib/terminalFocus";
 import { shouldFocusComposerOnThreadTap } from "./threadTapFocus";
 import type {
@@ -226,10 +227,13 @@ export function structuredViewRootStyle(keyboardHeight: number): React.CSSProper
 
 /** Publishes both conversation font-size preferences as scoped custom
  *  properties on the structured-view root; `index.css` picks the active one via
- *  a media query, so crossing the 768px breakpoint reflows without a reload and
- *  without a JS width probe. Merged on top of the keyboard reservation rather
- *  than replacing it. Both sizes arrive already clamped from `useWebSettings`,
- *  which is the single normalization boundary for stored prefs. */
+ *  the same coarse-pointer + narrow-viewport rule the rest of the dashboard
+ *  classifies mobile with, so a resize or an orientation change reflows without
+ *  a reload and without a JS width probe. Merged on top of the keyboard
+ *  reservation rather than replacing it. The stored px values are published as
+ *  `rem` (see {@link conversationFontSizeRem}) so the transcript still tracks
+ *  the reader's root font size. Both sizes arrive already clamped from
+ *  `useWebSettings`, the single normalization boundary for stored prefs. */
 function structuredViewFontStyle(
   keyboardHeight: number,
   mobileFontSize: number,
@@ -237,8 +241,8 @@ function structuredViewFontStyle(
 ): React.CSSProperties {
   return {
     ...structuredViewRootStyle(keyboardHeight),
-    "--acp-conversation-font-size-mobile": `${mobileFontSize}px`,
-    "--acp-conversation-font-size-desktop": `${desktopFontSize}px`,
+    "--acp-conversation-font-size-mobile": conversationFontSizeRem(mobileFontSize),
+    "--acp-conversation-font-size-desktop": conversationFontSizeRem(desktopFontSize),
   } as React.CSSProperties;
 }
 

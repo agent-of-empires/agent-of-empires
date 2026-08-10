@@ -1,5 +1,4 @@
 import { useWebSettings } from "../../hooks/useWebSettings";
-import { MAX_FONT_SIZE, MIN_FONT_SIZE } from "../../lib/fontSizeRange";
 import { FontSizeControl } from "./FontSizeControl";
 
 /** Dashboard display preferences for the structured view. These are not agent
@@ -21,8 +20,6 @@ export function StructuredViewDisplaySettings() {
         label="Mobile font size"
         testIdPrefix="structured-mobile-font-size"
         value={settings.structuredMobileFontSize}
-        min={MIN_FONT_SIZE}
-        max={MAX_FONT_SIZE}
         onChange={(value) => update({ structuredMobileFontSize: value })}
         description="Font size for Structured View conversation content on mobile devices. Separate from the terminal font size, and shared with your other browsers like the rest of the dashboard preferences."
       />
@@ -31,8 +28,6 @@ export function StructuredViewDisplaySettings() {
         label="Desktop font size"
         testIdPrefix="structured-desktop-font-size"
         value={settings.structuredDesktopFontSize}
-        min={MIN_FONT_SIZE}
-        max={MAX_FONT_SIZE}
         onChange={(value) => update({ structuredDesktopFontSize: value })}
         description="Font size for Structured View conversation content on desktop devices. Separate from the terminal font size, and shared with your other browsers like the rest of the dashboard preferences."
       />
