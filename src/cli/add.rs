@@ -588,10 +588,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     // seed its directory leaf from it); run the path-dependent duplicate check
     // now that `path` points at the final worktree/workspace directory.
     if is_duplicate_session(&instances, &final_title, path.to_str().unwrap_or("")) {
-        println!(
-            "Session already exists with same title and path: {}",
-            final_title
-        );
         cleanup_partial_session(
             &path,
             worktree_info_opt.as_ref(),
@@ -600,7 +596,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             None,
             None,
         );
-        return Ok(());
+        return Err(duplicate_session_error(&final_title));
     }
 
     let mut instance = Instance::new(&final_title, path.to_str().unwrap_or(""));
@@ -1065,10 +1061,6 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     match persist_result {
         Ok(true) => {}
         Ok(false) => {
-            println!(
-                "Session already exists with same title and path: {}",
-                instance.title
-            );
             cleanup_partial_session(
                 &path,
                 instance.worktree_info.as_ref(),
@@ -1081,7 +1073,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 },
                 instance.sandbox_info.as_ref().map(|_| instance.id.as_str()),
             );
-            return Ok(());
+            return Err(duplicate_session_error(&instance.title));
         }
         Err(e) => {
             cleanup_partial_session(
@@ -1338,6 +1330,14 @@ pub fn is_duplicate_session(instances: &[Instance], title: &str, path: &str) -> 
         let existing_path = inst.project_path.trim_end_matches('/');
         existing_path == normalized_path && inst.title == title
     })
+}
+
+fn duplicate_session_error(title: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Session already exists with same title and path: {}\n\
+         Tip: use a different --title or remove the existing session first",
+        title
+    )
 }
 
 /// Sync mirror of `Supervisor::pick_agent_for_tool` so add-time
