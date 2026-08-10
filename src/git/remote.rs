@@ -296,6 +296,9 @@ fn split_host_and_path(url: &str) -> Option<(&str, &str)> {
             return None;
         }
         let host = userinfo.rsplit_once('@').map_or(userinfo, |(_, h)| h);
+        if host.is_empty() {
+            return None;
+        }
         return Some((host, path));
     }
 
@@ -306,6 +309,9 @@ fn split_host_and_path(url: &str) -> Option<(&str, &str)> {
     let slash_pos = without_scheme.find('/')?;
     let host_part = &without_scheme[..slash_pos];
     let host = host_part.rsplit_once('@').map_or(host_part, |(_, h)| h);
+    if host.is_empty() {
+        return None;
+    }
     Some((host, &without_scheme[slash_pos + 1..]))
 }
 
@@ -338,7 +344,10 @@ pub fn get_remote_owner(path: &Path) -> Option<String> {
 pub(crate) fn parse_owner_with_key_from_remote_url(url: &str) -> Option<(String, String)> {
     let owner = parse_owner_from_remote_url(url)?;
     let (host, _) = split_host_and_path(url)?;
-    let key = format!("{owner}@{host}");
+    // Hostnames are case-insensitive (DNS); without lowercasing, a remote
+    // typed as `GitHub.com/acme` and one typed as `github.com/acme` would
+    // land in two different buckets for the same real host.
+    let key = format!("{owner}@{}", host.to_ascii_lowercase());
     Some((owner, key))
 }
 
@@ -500,6 +509,12 @@ mod tests {
             "file:///srv/git/foo.git",
             "file://host/myorg/repo.git",
             "git@host:/foo/bar.git",
+            // Empty authority after stripping userinfo: no real host to
+            // scope an identity to, so these must not produce an owner
+            // either, not just a key.
+            "user@:owner/repo.git",
+            "https:///owner/repo.git",
+            "ssh://@/owner/repo.git",
         ] {
             assert_eq!(parse_owner_from_remote_url(url), None, "failed for {url}");
         }
@@ -521,6 +536,22 @@ mod tests {
         assert_eq!(
             parse_owner_with_key_from_remote_url("file:///srv/git/foo.git"),
             None
+        );
+    }
+
+    #[test]
+    fn test_parse_owner_with_key_normalizes_host_case() {
+        // Hostnames are case-insensitive (DNS): a remote typed with a
+        // differently-cased host must resolve to the same identity key as
+        // its canonical lowercase form, or the two would spuriously land
+        // in separate org buckets for what is really one host.
+        assert_eq!(
+            parse_owner_with_key_from_remote_url("git@GitHub.COM:acme/x.git"),
+            Some(("acme".to_string(), "acme@github.com".to_string())),
+        );
+        assert_eq!(
+            parse_owner_with_key_from_remote_url("https://GitHub.com/acme/x.git"),
+            parse_owner_with_key_from_remote_url("https://github.com/acme/x.git"),
         );
     }
 
