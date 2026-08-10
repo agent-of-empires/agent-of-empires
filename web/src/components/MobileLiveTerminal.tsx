@@ -910,20 +910,26 @@ export function MobileLiveTerminal({
     inputRef.current?.focus();
   }, [inputRef]);
 
-  // Map a viewport point to the app's 1-based pane cell for the forwarded
-  // wheel event (apps mostly ignore the exact cell, but send a sane one).
+  // Map a viewport point to the app's 1-based pane cell. The grid can be
+  // bottom-aligned and its trailing blank rows are trimmed, so its origin is
+  // the rendered content rather than the scroller's box.
   const pointerCell = useCallback(
     (clientX: number, clientY: number) => {
       const el = scrollerRef.current;
       if (!el || charW <= 0 || lineH <= 0) return { col: 1, row: 1 };
       const r = el.getBoundingClientRect();
+      const content = el.querySelector<HTMLElement>("[data-live-content]");
+      const gridTop = content?.getBoundingClientRect().top ?? r.top;
       const cols = renderCols > 0 ? renderCols : 1;
       const rows = Math.max(1, screenRows || rowsRef.current);
       const col = Math.min(cols, Math.max(1, Math.floor((clientX - r.left) / charW) + 1));
-      const row = Math.min(rows, Math.max(1, Math.floor((clientY - r.top) / lineH) + 1));
+      const visualRow = Math.floor((clientY - gridTop) / lineH) - effectiveSpacerLines;
+      const firstScreenLine = Math.max(0, lines.length - screenRows);
+      const screenTopVisual = visual.lineStartRow[firstScreenLine] ?? 0;
+      const row = Math.min(rows, Math.max(1, visualRow - screenTopVisual + 1));
       return { col, row };
     },
-    [charW, lineH, renderCols, screenRows],
+    [charW, lineH, renderCols, screenRows, effectiveSpacerLines, lines.length, visual],
   );
 
   // Translate an accumulated pixel delta (positive = toward newer/down)
