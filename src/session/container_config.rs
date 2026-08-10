@@ -15,7 +15,7 @@ use crate::session::config::VolumeIgnoresStrategy;
 use super::environment::collect_environment;
 use super::instance::SandboxInfo;
 
-/// Subdirectory name inside each agent's config dir for the shared sandbox config.
+/// Subdirectory name inside each agent's config dir for sandbox config.
 const SANDBOX_SUBDIR: &str = "sandbox";
 
 /// Content seeded into the Claude sandbox `.sandbox-gitconfig`. Scoped to github.com;
@@ -716,11 +716,52 @@ fn extract_keychain_credential(_service: &str, _dest: &Path) -> Result<bool> {
     Ok(false)
 }
 
-/// Sync a single agent's host config into its shared sandbox directory.
-/// Handles config file sync, keychain credential extraction, and home-level seed files.
-fn prepare_sandbox_dir(mount: &AgentConfigMount, home: &Path) -> Result<std::path::PathBuf> {
-    let host_dir = home.join(mount.host_rel);
+/// Return the sandbox config path for an agent. Codex keeps live SQLite state at
+/// the root of its home, so it gets a private directory for every AoE instance.
+fn sandbox_dir_for(
+    mount: &AgentConfigMount,
+    home: &Path,
+    instance_id: Option<&str>,
+) -> Result<PathBuf> {
     let sandbox_dir = home.join(mount.host_rel).join(SANDBOX_SUBDIR);
+    if mount.tool_name != "codex" {
+        return Ok(sandbox_dir);
+    }
+
+    let instance_id = instance_id.context("Codex sandbox config requires an instance ID")?;
+    crate::session::validate_instance_id(instance_id).map_err(|e| {
+        anyhow::anyhow!("refusing to use Codex sandbox config for unsafe AOE_INSTANCE_ID: {e}")
+    })?;
+    Ok(sandbox_dir.join(instance_id))
+}
+
+/// Seed a newly isolated Codex home from the legacy shared sandbox only for the
+/// credential that prior AoE versions migrated there. SQLite state is deliberately
+/// not copied: it is process-local and is the source of the single-instance lock.
+fn seed_legacy_codex_auth(sandbox_dir: &Path, home: &Path) {
+    let auth = sandbox_dir.join("auth.json");
+    let legacy_auth = home.join(".codex").join(SANDBOX_SUBDIR).join("auth.json");
+    if auth.exists() || !legacy_auth.is_file() {
+        return;
+    }
+
+    if let Err(e) = std::fs::copy(&legacy_auth, &auth) {
+        tracing::warn!(target: "session.profile",
+            "Failed to seed isolated Codex auth from {} to {}: {}",
+            legacy_auth.display(), auth.display(), e
+        );
+    }
+}
+
+/// Sync a single agent's host config into its sandbox directory.
+/// Handles config file sync, keychain credential extraction, and home-level seed files.
+fn prepare_sandbox_dir(
+    mount: &AgentConfigMount,
+    home: &Path,
+    instance_id: Option<&str>,
+) -> Result<PathBuf> {
+    let host_dir = home.join(mount.host_rel);
+    let sandbox_dir = sandbox_dir_for(mount, home, instance_id)?;
 
     // Remove stale files before syncing. This prevents leftovers from a previous
     // session (e.g. a SQLite database created by an older tool version) from
@@ -768,6 +809,10 @@ fn prepare_sandbox_dir(mount: &AgentConfigMount, home: &Path) -> Result<std::pat
             mount.copy_dirs,
             mount.preserve_files,
         )?;
+
+        if mount.tool_name == "codex" {
+            seed_legacy_codex_auth(&sandbox_dir, home);
+        }
 
         if let Some(state) = preserved_codex_state {
             let sandbox_config = sandbox_dir.join("config.toml");
@@ -1062,8 +1107,8 @@ fn compute_workspace_volume_paths(
     Ok((volumes, ws_container))
 }
 
-/// Re-sync shared sandbox directories from the host so the container picks up
-/// any credential changes (e.g. re-auth) since it was created.
+/// Re-sync sandbox directories from the host so containers pick up credential
+/// changes (e.g. re-auth) since they were created.
 pub(crate) fn refresh_agent_configs_for_profile(profile: &str) {
     let Some(home) = dirs::home_dir() else {
         return;
@@ -1073,14 +1118,13 @@ pub(crate) fn refresh_agent_configs_for_profile(profile: &str) {
     let hooks_enabled = profile_config.session.agent_status_hooks;
 
     for mount in AGENT_CONFIG_MOUNTS {
-        let refresh_codex_hooks = hooks_enabled && should_refresh_codex_hooks(mount, &home);
+        if mount.tool_name == "codex" {
+            refresh_codex_sandbox_dirs(mount, &home, hooks_enabled, &profile_config);
+            continue;
+        }
 
-        match prepare_sandbox_dir(mount, &home) {
-            Ok(sandbox_dir) => {
-                if refresh_codex_hooks {
-                    refresh_codex_sandbox_hooks(mount, &sandbox_dir, &profile_config);
-                }
-            }
+        match prepare_sandbox_dir(mount, &home, None) {
+            Ok(_) => {}
             Err(e) => {
                 tracing::warn!(target: "session.profile",
                     "Failed to refresh agent config for {}: {}",
@@ -1088,6 +1132,54 @@ pub(crate) fn refresh_agent_configs_for_profile(profile: &str) {
                     e
                 );
             }
+        }
+    }
+}
+
+/// Refresh every extant instance-private Codex sandbox. The old flat
+/// `.codex/sandbox` directory is intentionally ignored: it may contain the
+/// SQLite files held by a running legacy session and must never be mounted again.
+fn refresh_codex_sandbox_dirs(
+    mount: &AgentConfigMount,
+    home: &Path,
+    hooks_enabled: bool,
+    profile_config: &super::config::Config,
+) {
+    let root = home.join(mount.host_rel).join(SANDBOX_SUBDIR);
+    let entries = match std::fs::read_dir(&root) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+        Err(e) => {
+            tracing::warn!(target: "session.profile",
+                "Failed to read isolated Codex sandbox dirs at {}: {}", root.display(), e
+            );
+            return;
+        }
+    };
+
+    for entry in entries.flatten() {
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+        if !file_type.is_dir() {
+            continue;
+        }
+        let Some(instance_id) = entry.file_name().to_str().map(str::to_owned) else {
+            continue;
+        };
+        if crate::session::validate_instance_id(&instance_id).is_err() {
+            continue;
+        }
+
+        match prepare_sandbox_dir(mount, home, Some(&instance_id)) {
+            Ok(sandbox_dir) => {
+                if hooks_enabled && should_refresh_codex_hooks(mount, &sandbox_dir, home) {
+                    refresh_codex_sandbox_hooks(mount, &sandbox_dir, profile_config);
+                }
+            }
+            Err(e) => tracing::warn!(target: "session.profile",
+                "Failed to refresh isolated Codex config for {}: {}", instance_id, e
+            ),
         }
     }
 }
@@ -1102,16 +1194,13 @@ fn agent_format_is_codex_json(tool_name: &str) -> bool {
         .is_some_and(|c| c.format == crate::agents::HookFormat::CodexJson)
 }
 
-fn should_refresh_codex_hooks(mount: &AgentConfigMount, home: &Path) -> bool {
+fn should_refresh_codex_hooks(mount: &AgentConfigMount, sandbox_dir: &Path, home: &Path) -> bool {
     if !agent_format_is_codex_json(mount.tool_name) {
         return false;
     }
 
     let host_hooks = home.join(mount.host_rel).join("hooks.json");
-    let sandbox_hooks = home
-        .join(mount.host_rel)
-        .join(SANDBOX_SUBDIR)
-        .join("hooks.json");
+    let sandbox_hooks = sandbox_dir.join("hooks.json");
     host_hooks.exists() || sandbox_hooks.exists()
 }
 
@@ -1170,6 +1259,7 @@ pub(crate) fn ensure_yolo_trust_config_for_active_agent(
     tool: &str,
     detect_as: Option<&str>,
     profile: &str,
+    instance_id: &str,
     container_workspace_path: &str,
 ) {
     let Some(home) = dirs::home_dir() else {
@@ -1185,7 +1275,15 @@ pub(crate) fn ensure_yolo_trust_config_for_active_agent(
         .iter()
         .filter(|m| m.tool_name == config_tool)
     {
-        let sandbox_dir = home.join(mount.host_rel).join(SANDBOX_SUBDIR);
+        let sandbox_dir = match sandbox_dir_for(mount, &home, Some(instance_id)) {
+            Ok(dir) => dir,
+            Err(e) => {
+                tracing::warn!(target: "session.profile",
+                    "Failed to resolve sandbox YOLO trust config for {}: {}", mount.tool_name, e
+                );
+                continue;
+            }
+        };
         if let Err(e) = std::fs::create_dir_all(&sandbox_dir)
             .with_context(|| format!("creating sandbox config dir {}", sandbox_dir.display()))
             .and_then(|_| apply_yolo_trust_config(mount, &sandbox_dir, container_workspace_path))
@@ -1446,6 +1544,9 @@ pub(crate) fn build_container_config(
     profile: &str,
 ) -> Result<ContainerConfig> {
     let home = dirs::home_dir().ok_or_else(|| anyhow::anyhow!("Could not find home directory"))?;
+    crate::session::validate_instance_id(instance_id).map_err(|e| {
+        anyhow::anyhow!("refusing to build sandbox config for unsafe AOE_INSTANCE_ID: {e}")
+    })?;
 
     let project_path = Path::new(project_path_str);
     let resolved_profile = super::config::effective_profile(profile);
@@ -1506,6 +1607,12 @@ pub(crate) fn build_container_config(
     const CONTAINER_HOME: &str = "/root";
 
     let mut environment = collect_environment(&sandbox_config, sandbox_info);
+    if config_tool == "codex" && !environment.iter().any(|entry| entry.key() == "CODEX_HOME") {
+        environment.push(EnvEntry::Literal {
+            key: "CODEX_HOME".to_string(),
+            value: format!("{CONTAINER_HOME}/.codex/{instance_id}"),
+        });
+    }
 
     // Bind-mount the session's managed artifact dir and point the agent at it
     // via AOE_ARTIFACT_DIR, so screenshots/status files the agent writes land
@@ -1579,7 +1686,7 @@ pub(crate) fn build_container_config(
         }
     }
 
-    // Sync host agent config into a shared sandbox directory per agent and
+    // Sync host agent config into a sandbox directory per agent and
     // bind-mount it read-write. Only mount the config for the active tool.
     // Agent definitions are in AGENT_CONFIG_MOUNTS -- add new agents there, not here.
     for mount in AGENT_CONFIG_MOUNTS
@@ -1588,7 +1695,11 @@ pub(crate) fn build_container_config(
     {
         let container_path = agent_config_container_path(mount, CONTAINER_HOME, &environment);
 
-        let sandbox_dir = match prepare_sandbox_dir(mount, &home) {
+        let sandbox_dir = match prepare_sandbox_dir(
+            mount,
+            &home,
+            (mount.tool_name == "codex").then_some(instance_id),
+        ) {
             Ok(dir) => dir,
             Err(e) => {
                 tracing::warn!(target: "session.profile",
@@ -1721,7 +1832,19 @@ pub(crate) fn build_container_config(
                     // Find the matching agent config mount to locate the sandbox dir
                     for mount in AGENT_CONFIG_MOUNTS {
                         if std::path::Path::new(mount.host_rel) == config_dir_name {
-                            let sandbox_dir = home.join(mount.host_rel).join(SANDBOX_SUBDIR);
+                            let sandbox_dir = match sandbox_dir_for(
+                                mount,
+                                &home,
+                                (mount.tool_name == "codex").then_some(instance_id),
+                            ) {
+                                Ok(dir) => dir,
+                                Err(e) => {
+                                    tracing::warn!(target: "session.profile",
+                                        "Failed to resolve sandbox hook config for {}: {}", mount.tool_name, e
+                                    );
+                                    break;
+                                }
+                            };
                             let settings_file = sandbox_dir.join(config_file_name);
                             let result = match hook_cfg.format {
                                 crate::agents::HookFormat::CodexJson
@@ -1769,11 +1892,27 @@ pub(crate) fn build_container_config(
             // into the container.
             match agent.name {
                 "codex" => {
-                    let config_file = home.join(".codex").join(SANDBOX_SUBDIR).join("config.toml");
-                    if let Err(e) = crate::hooks::trust_codex_project(&config_file, &workspace_path)
+                    if let Some(mount) = AGENT_CONFIG_MOUNTS
+                        .iter()
+                        .find(|mount| mount.tool_name == "codex" && mount.host_rel == ".codex")
                     {
+                        match sandbox_dir_for(mount, &home, Some(instance_id)) {
+                            Ok(sandbox_dir) => {
+                                if let Err(e) = crate::hooks::trust_codex_project(
+                                    &sandbox_dir.join("config.toml"),
+                                    &workspace_path,
+                                ) {
+                                    tracing::warn!(target: "session.profile",
+                                        "Failed to mark project trusted in sandbox Codex config: {}", e);
+                                }
+                            }
+                            Err(e) => tracing::warn!(target: "session.profile",
+                                "Failed to resolve sandbox Codex config for YOLO trust: {}", e
+                            ),
+                        }
+                    } else {
                         tracing::warn!(target: "session.profile",
-                            "Failed to mark project trusted in sandbox Codex config: {}", e);
+                            "Codex config mount is unavailable for sandbox YOLO trust");
                     }
                 }
                 "gemini" => {
@@ -2431,7 +2570,7 @@ mod tests {
             .iter()
             .find(|m| m.tool_name == "hermes")
             .unwrap();
-        let sandbox = prepare_sandbox_dir(mount, dir.path()).unwrap();
+        let sandbox = prepare_sandbox_dir(mount, dir.path(), None).unwrap();
 
         assert!(sandbox.join("config.yaml").exists());
         assert!(sandbox.join(".env").exists());
@@ -2506,7 +2645,7 @@ mod tests {
             .iter()
             .find(|m| m.tool_name == "opencode" && m.host_rel == ".local/share/opencode")
             .expect("opencode data-dir mount");
-        let out = prepare_sandbox_dir(mount, dir.path()).unwrap();
+        let out = prepare_sandbox_dir(mount, dir.path(), None).unwrap();
         assert_eq!(out, sandbox);
 
         assert!(
@@ -3750,7 +3889,11 @@ volume_ignores = ["node_modules"]
         )
         .unwrap();
 
-        let codex_sandbox = temp_home.path().join(".codex").join(SANDBOX_SUBDIR);
+        let codex_sandbox = temp_home
+            .path()
+            .join(".codex")
+            .join(SANDBOX_SUBDIR)
+            .join(instance_id);
         assert!(codex_sandbox.join("hooks.json").exists());
         assert!(!codex_sandbox.join("config.toml").exists());
         assert!(!codex_sandbox.join("settings.json").exists());
@@ -3759,7 +3902,8 @@ volume_ignores = ["node_modules"]
         assert!(parsed["hooks"]["PreToolUse"].is_array());
         assert!(codex_hooks.contains("aoe-hooks"));
         assert!(config.volumes.iter().any(|v| {
-            v.host_path == codex_sandbox.to_string_lossy() && v.container_path == "/root/.codex"
+            v.host_path == codex_sandbox.to_string_lossy()
+                && v.container_path == format!("/root/.codex/{instance_id}")
         }));
 
         let hook_dir =
@@ -3782,6 +3926,80 @@ volume_ignores = ["node_modules"]
             "host (per-user) and container (fixed) paths MUST differ for the bind-mount remap"
         );
         crate::hooks::cleanup_hook_status_dir(instance_id);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_build_container_config_isolates_codex_home_per_instance() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+        let legacy_sandbox = temp_home.path().join(".codex").join(SANDBOX_SUBDIR);
+        fs::create_dir_all(&legacy_sandbox).unwrap();
+        fs::write(legacy_sandbox.join("auth.json"), "legacy-auth").unwrap();
+        fs::write(legacy_sandbox.join("state_5.sqlite"), "legacy-state").unwrap();
+        let sandbox_info = build_minimal_sandbox_info();
+        let instance_ids = ["codex-isolated-home-one", "codex-isolated-home-two"];
+        let configs: Vec<_> = instance_ids
+            .iter()
+            .map(|instance_id| {
+                build_container_config(
+                    project_dir.path().to_str().unwrap(),
+                    &sandbox_info,
+                    ContainerAgentSelection::new("codex", None),
+                    false,
+                    instance_id,
+                    None,
+                    "",
+                )
+                .unwrap()
+            })
+            .collect();
+
+        let homes: Vec<_> = instance_ids
+            .iter()
+            .map(|instance_id| {
+                temp_home
+                    .path()
+                    .join(".codex")
+                    .join(SANDBOX_SUBDIR)
+                    .join(instance_id)
+            })
+            .collect();
+        assert_ne!(homes[0], homes[1]);
+        for home in &homes {
+            assert_eq!(fs::read(home.join("auth.json")).unwrap(), b"legacy-auth");
+            assert!(
+                !home.join("state_5.sqlite").exists(),
+                "legacy SQLite state must not enter an isolated Codex home"
+            );
+        }
+        fs::write(homes[0].join("state_5.sqlite"), "first").unwrap();
+        fs::write(homes[1].join("state_5.sqlite"), "second").unwrap();
+        assert_eq!(fs::read(homes[0].join("state_5.sqlite")).unwrap(), b"first");
+        assert_eq!(
+            fs::read(homes[1].join("state_5.sqlite")).unwrap(),
+            b"second"
+        );
+
+        for ((config, home), instance_id) in configs.iter().zip(&homes).zip(instance_ids) {
+            assert!(config.volumes.iter().any(|volume| {
+                volume.host_path == home.to_string_lossy()
+                    && volume.container_path == format!("/root/.codex/{instance_id}")
+            }));
+            assert!(config.environment.iter().any(|entry| {
+                entry.key() == "CODEX_HOME"
+                    && entry.value() == format!("/root/.codex/{instance_id}")
+            }));
+        }
+        for instance_id in instance_ids {
+            crate::hooks::cleanup_hook_status_dir(instance_id);
+        }
     }
 
     // Issue #472: a YOLO-mode sandbox session must disable the agent's
@@ -3809,12 +4027,13 @@ volume_ignores = ["node_modules"]
             before_start_env: Vec::new(),
             container_workdir: None,
         };
+        let instance_id = "codex-yolo-trust-test";
         let config = build_container_config(
             project_dir.path().to_str().unwrap(),
             &sandbox_info,
             ContainerAgentSelection::new("codex", None),
             true,
-            "codex-yolo-trust-test",
+            instance_id,
             None,
             "",
         )
@@ -3824,6 +4043,7 @@ volume_ignores = ["node_modules"]
             .path()
             .join(".codex")
             .join(SANDBOX_SUBDIR)
+            .join(instance_id)
             .join("config.toml");
         assert!(
             codex_config.exists(),
@@ -3838,7 +4058,7 @@ volume_ignores = ["node_modules"]
             Some("trusted")
         );
 
-        crate::hooks::cleanup_hook_status_dir("codex-yolo-trust-test");
+        crate::hooks::cleanup_hook_status_dir(instance_id);
     }
 
     #[test]
@@ -3903,7 +4123,8 @@ volume_ignores = ["node_modules"]
         std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
 
         let codex_dir = temp_home.path().join(".codex");
-        let codex_sandbox = codex_dir.join(SANDBOX_SUBDIR);
+        let instance_id = "codex-yolo-refresh-test";
+        let codex_sandbox = codex_dir.join(SANDBOX_SUBDIR).join(instance_id);
         fs::create_dir_all(&codex_sandbox).unwrap();
         fs::write(codex_dir.join("config.toml"), r#"model = "host""#).unwrap();
         fs::write(
@@ -3921,7 +4142,13 @@ trust_level = "trusted"
         assert_eq!(refreshed["model"].as_str(), Some("host"));
         assert!(refreshed.get("projects").is_none());
 
-        ensure_yolo_trust_config_for_active_agent("codex", None, "", "/workspace/project");
+        ensure_yolo_trust_config_for_active_agent(
+            "codex",
+            None,
+            "",
+            instance_id,
+            "/workspace/project",
+        );
         let restored: toml::Value =
             toml::from_str(&fs::read_to_string(codex_sandbox.join("config.toml")).unwrap())
                 .unwrap();
@@ -3959,7 +4186,13 @@ trust_level = "trusted"
         assert_eq!(refreshed["theme"].as_str(), Some("host"));
         assert!(refreshed["security"]["folderTrust"]["enabled"].is_null());
 
-        ensure_yolo_trust_config_for_active_agent("gemini", None, "", "/workspace/project");
+        ensure_yolo_trust_config_for_active_agent(
+            "gemini",
+            None,
+            "",
+            "gemini-yolo-refresh-test",
+            "/workspace/project",
+        );
         let restored: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(gemini_sandbox.join("settings.json")).unwrap(),
         )
@@ -4278,7 +4511,11 @@ trust_level = "trusted"
         )
         .unwrap();
 
-        let codex_sandbox = temp_home.path().join(".codex").join(SANDBOX_SUBDIR);
+        let codex_sandbox = temp_home
+            .path()
+            .join(".codex")
+            .join(SANDBOX_SUBDIR)
+            .join(instance_id);
         assert!(!codex_sandbox.join("config.toml").exists());
 
         let hook_dir =
@@ -4342,10 +4579,15 @@ agent_detect_as = { "wrapped-codex" = "codex" }
         )
         .unwrap();
 
-        let codex_sandbox = temp_home.path().join(".codex").join(SANDBOX_SUBDIR);
+        let codex_sandbox = temp_home
+            .path()
+            .join(".codex")
+            .join(SANDBOX_SUBDIR)
+            .join(instance_id);
         assert!(codex_sandbox.join("hooks.json").exists());
         assert!(config.volumes.iter().any(|v| {
-            v.host_path == codex_sandbox.to_string_lossy() && v.container_path == "/root/.codex"
+            v.host_path == codex_sandbox.to_string_lossy()
+                && v.container_path == format!("/root/.codex/{instance_id}")
         }));
 
         let codex_hooks = fs::read_to_string(codex_sandbox.join("hooks.json")).unwrap();
@@ -4402,7 +4644,7 @@ agent_detect_as = { "wrapped-codex" = "codex" }
         )
         .unwrap();
 
-        let codex_sandbox = codex_dir.join(SANDBOX_SUBDIR);
+        let codex_sandbox = codex_dir.join(SANDBOX_SUBDIR).join(instance_id);
         let sandbox_config_path = codex_sandbox.join("config.toml");
         let mut sandbox_config = fs::read_to_string(&sandbox_config_path).unwrap();
         sandbox_config.push_str(
@@ -4489,7 +4731,10 @@ trusted_hash = "keep"
 
         refresh_agent_configs_for_profile("work");
 
-        let hooks_path = codex_dir.join(SANDBOX_SUBDIR).join("hooks.json");
+        let hooks_path = codex_dir
+            .join(SANDBOX_SUBDIR)
+            .join(instance_id)
+            .join("hooks.json");
         let hooks: serde_json::Value =
             serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
         let cmd = hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
@@ -4533,7 +4778,11 @@ trusted_hash = "keep"
         )
         .unwrap();
 
-        let codex_sandbox = temp_home.path().join(".codex").join(SANDBOX_SUBDIR);
+        let codex_sandbox = temp_home
+            .path()
+            .join(".codex")
+            .join(SANDBOX_SUBDIR)
+            .join(instance_id);
         assert!(codex_sandbox.join("hooks.json").exists());
         assert!(config.volumes.iter().any(|v| {
             v.host_path == codex_sandbox.to_string_lossy()
@@ -4589,7 +4838,11 @@ environment = ["CODEX_HOME=/root/profile-codex"]
         )
         .unwrap();
 
-        let codex_sandbox = temp_home.path().join(".codex").join(SANDBOX_SUBDIR);
+        let codex_sandbox = temp_home
+            .path()
+            .join(".codex")
+            .join(SANDBOX_SUBDIR)
+            .join(instance_id);
         assert!(codex_sandbox.join("hooks.json").exists());
         assert!(config.volumes.iter().any(|v| {
             v.host_path == codex_sandbox.to_string_lossy()
@@ -4981,7 +5234,7 @@ volume_ignores = ["target"]
             clean_files: &["opencode.db", "opencode.db-wal", "opencode.db-shm"],
         };
 
-        prepare_sandbox_dir(&mount, home.path()).unwrap();
+        prepare_sandbox_dir(&mount, home.path(), None).unwrap();
 
         assert!(!sandbox_dir.join("opencode.db").exists());
         assert!(!sandbox_dir.join("opencode.db-wal").exists());
@@ -5018,7 +5271,7 @@ volume_ignores = ["target"]
             clean_files: &[],
         };
 
-        prepare_sandbox_dir(&mount, home.path()).unwrap();
+        prepare_sandbox_dir(&mount, home.path(), None).unwrap();
 
         assert!(
             !sandbox_dir.join("opencode.db").exists(),
@@ -5050,7 +5303,7 @@ volume_ignores = ["target"]
         };
 
         // Should not panic or error when files don't exist
-        prepare_sandbox_dir(&mount, home.path()).unwrap();
+        prepare_sandbox_dir(&mount, home.path(), None).unwrap();
     }
 
     // --- GCP credential mount tests ---

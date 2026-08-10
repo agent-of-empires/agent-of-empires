@@ -4184,6 +4184,7 @@ impl Instance {
                     &self.tool,
                     Some(&self.detect_as),
                     &self.source_profile,
+                    &self.id,
                     &self.container_workdir(),
                 );
             }
@@ -4202,6 +4203,7 @@ impl Instance {
                     &self.tool,
                     Some(&self.detect_as),
                     &self.source_profile,
+                    &self.id,
                     &self.container_workdir(),
                 );
             }
