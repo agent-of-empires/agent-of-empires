@@ -3414,8 +3414,10 @@ impl Instance {
                 shell_escape(&self.id)
             );
             let env_part = format!("{} ", docker_args);
-            let wrapped =
-                wrap_command_ignore_suspend(&container.exec_command(Some(&env_part), &tool_cmd));
+            let wrapped = wrap_command_ignore_suspend(
+                &container.exec_command(Some(&env_part), &tool_cmd),
+                &self.project_path,
+            );
             (
                 Some(prepend_exports(&env_info.exports, wrapped)),
                 is_existing,
@@ -3728,10 +3730,10 @@ impl Instance {
                     let is_existing = self.apply_session_flags(&mut cmd, "host agent");
                     apply_agent_launch_env(&mut cmd, agent);
                     Ok((
-                        Some(wrap_command_ignore_suspend(&format!(
-                            "{}{}",
-                            env_prefix, cmd
-                        ))),
+                        Some(wrap_command_ignore_suspend(
+                            &format!("{}{}", env_prefix, cmd),
+                            &self.project_path,
+                        )),
                         is_existing,
                     ))
                 }
@@ -3750,10 +3752,10 @@ impl Instance {
             let is_existing = self.apply_session_flags(&mut cmd, "host custom");
             apply_agent_launch_env(&mut cmd, agent);
             Ok((
-                Some(wrap_command_ignore_suspend(&format!(
-                    "{}{}",
-                    env_prefix, cmd
-                ))),
+                Some(wrap_command_ignore_suspend(
+                    &format!("{}{}", env_prefix, cmd),
+                    &self.project_path,
+                )),
                 is_existing,
             ))
         }
@@ -5752,7 +5754,21 @@ const CONTAINER_TERMINAL_AUTODETECT_CMD: &str = r#"sh -c 'exec "$(command -v "$(
 /// pane process because fish does not exec the last command in `-c` mode. That
 /// causes `#{pane_current_command}` to report "fish", which triggers a false
 /// restart on reattach. See #757.
-fn wrap_command_ignore_suspend(cmd: &str) -> String {
+///
+/// `working_dir` is re-asserted with an explicit `cd` *inside* the wrapped
+/// script, after the login shell's profile/rc files have already run. `tmux
+/// new-session -c <working_dir>` (see `tmux::Session::create_with_size_env`)
+/// only sets the *shell's* initial cwd; the `-l` login flag below sources
+/// `~/.bash_profile`/`~/.bashrc` (needed for version-manager PATH setup, e.g.
+/// NVM), and anything in those files that changes directory — a user's own
+/// stray `cd`, or a legitimate nvm/pyenv/direnv hook — silently overrides
+/// tmux's `-c` before the real agent command ever runs, landing the pane
+/// wherever the profile left it (typically `$HOME`) instead of
+/// `project_path`. This was the actual mechanism behind #3265: `-c` was
+/// always correct, but the login shell's own rc files re-pointed cwd after
+/// tmux had already set it. Re-`cd`-ing here, right before the final `exec`,
+/// wins regardless of what the profile scripts did in between.
+fn wrap_command_ignore_suspend(cmd: &str, working_dir: &str) -> String {
     let user = super::environment::user_shell();
     let posix = super::environment::user_posix_shell();
     let escaped = cmd.replace('\'', "'\\''");
@@ -5761,9 +5777,10 @@ fn wrap_command_ignore_suspend(cmd: &str) -> String {
     // pwsh): bash's login scripts won't contain the user's PATH setup and -l
     // may reset the inherited PATH that already has the correct entries.
     let flag = if user == posix { "-lc" } else { "-c" };
+    let cd = super::environment::shell_escape(working_dir);
     format!(
-        "exec {} {} 'stty susp undef; exec env {}'",
-        posix, flag, escaped
+        "exec {} {} 'cd {} || exit 1; stty susp undef; exec env {}'",
+        posix, flag, cd, escaped
     )
 }
 
@@ -8383,7 +8400,7 @@ mod tests {
         // Single quotes from shell_escape are escaped by wrap_command_ignore_suspend
         // via the '\'' technique, which correctly round-trips through the shell.
         let cmd = format_env_var_prefix("OPENCODE_PERMISSION", r#"{"*":"allow"}"#, "opencode");
-        let wrapped = wrap_command_ignore_suspend(&cmd);
+        let wrapped = wrap_command_ignore_suspend(&cmd, "/tmp/proj");
         // The inner single quotes from shell_escape become '\'' in the outer wrapper
         assert!(
             wrapped.contains(r#"OPENCODE_PERMISSION='\''{"*":"allow"}'\'' opencode"#),
@@ -8403,7 +8420,7 @@ mod tests {
         // to tolerate the double-exec, which is why this regression hid
         // for several days after #757 merged. See PR #819.
         std::env::set_var("SHELL", "/bin/bash");
-        let wrapped = wrap_command_ignore_suspend("docker exec -it container claude");
+        let wrapped = wrap_command_ignore_suspend("docker exec -it container claude", "/tmp/proj");
         assert!(
             wrapped.starts_with("exec "),
             "test invariant: wrapped must start with `exec ` (else this test \
@@ -8424,7 +8441,7 @@ mod tests {
         );
 
         // Empty exports must pass through unchanged.
-        let wrapped2 = wrap_command_ignore_suspend("docker exec -it container claude");
+        let wrapped2 = wrap_command_ignore_suspend("docker exec -it container claude", "/tmp/proj");
         assert_eq!(prepend_exports(&[], wrapped2.clone()), wrapped2);
     }
 
@@ -8439,7 +8456,7 @@ mod tests {
         let original = std::env::var("SHELL").ok();
         for shell in &["/bin/bash", "/bin/zsh", "/usr/bin/fish", "/usr/bin/nu"] {
             std::env::set_var("SHELL", shell);
-            let wrapped = wrap_command_ignore_suspend("claude");
+            let wrapped = wrap_command_ignore_suspend("claude", "/tmp/proj");
             assert!(
                 wrapped.starts_with("exec "),
                 "SHELL={}: wrapped command must start with 'exec': {}",
@@ -8458,7 +8475,7 @@ mod tests {
     fn test_wrap_command_posix_shell_uses_login() {
         let original = std::env::var("SHELL").ok();
         std::env::set_var("SHELL", "/bin/zsh");
-        let wrapped = wrap_command_ignore_suspend("claude");
+        let wrapped = wrap_command_ignore_suspend("claude", "/tmp/proj");
         // POSIX shell: should use -lc for version-manager PATHs
         assert!(
             wrapped.contains("-lc"),
@@ -8476,7 +8493,7 @@ mod tests {
     fn test_wrap_command_fish_skips_login() {
         let original = std::env::var("SHELL").ok();
         std::env::set_var("SHELL", "/usr/bin/fish");
-        let wrapped = wrap_command_ignore_suspend("claude");
+        let wrapped = wrap_command_ignore_suspend("claude", "/tmp/proj");
         // Fish: should use -c (no -l) because bash's login scripts
         // won't have fish's PATH setup.
         assert!(
@@ -8500,10 +8517,51 @@ mod tests {
     fn test_wrap_command_nu_skips_login() {
         let original = std::env::var("SHELL").ok();
         std::env::set_var("SHELL", "/usr/bin/nu");
-        let wrapped = wrap_command_ignore_suspend("claude");
+        let wrapped = wrap_command_ignore_suspend("claude", "/tmp/proj");
         assert!(
             wrapped.starts_with("exec bash -c "),
             "nu shell should produce 'exec bash -c ...': {}",
+            wrapped,
+        );
+        match original {
+            Some(v) => std::env::set_var("SHELL", v),
+            None => std::env::remove_var("SHELL"),
+        }
+    }
+
+    /// #3265: a login shell's own profile/rc files can `cd` elsewhere
+    /// (a stray line in `~/.bashrc`, or a legitimate nvm/pyenv/direnv hook)
+    /// after tmux's `-c` has already set the pane's cwd, silently landing
+    /// the agent in the wrong directory. The wrapper must re-assert
+    /// `working_dir` inside the login shell's own script, after profile
+    /// sourcing, so it wins regardless of what those files did.
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn test_wrap_command_reasserts_working_dir_after_login_shell() {
+        let original = std::env::var("SHELL").ok();
+        std::env::set_var("SHELL", "/bin/bash");
+        let wrapped = wrap_command_ignore_suspend("claude", "/tmp/some project's dir");
+        assert!(
+            wrapped.contains("/tmp/some project"),
+            "wrapped command must carry the working_dir path: {}",
+            wrapped,
+        );
+        assert!(
+            wrapped.contains("|| exit 1; stty susp undef"),
+            "wrapped command must `cd` back to working_dir, with exit-on-failure, \
+             before disabling suspend and exec'ing the real command: {}",
+            wrapped,
+        );
+        // The cd must run *inside* the login shell's quoted script (after -lc),
+        // not before it -- otherwise it has no effect on where the login
+        // shell's own profile sourcing left the cwd.
+        let login_script_start = wrapped
+            .find("-lc '")
+            .map(|i| i + "-lc '".len())
+            .expect("wrapped command must use -lc for a POSIX $SHELL");
+        assert!(
+            wrapped[login_script_start..].starts_with("cd "),
+            "the cd must be the first statement inside the login shell's script: {}",
             wrapped,
         );
         match original {
@@ -12122,6 +12180,9 @@ mod tests {
                 return;
             }
             let temp = tempdir().unwrap();
+            let project_dir = temp.path().join("project");
+            std::fs::create_dir_all(&project_dir).unwrap();
+            let project_path = project_dir.to_str().unwrap();
             std::env::set_var("HOME", temp.path());
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
@@ -12129,7 +12190,7 @@ mod tests {
             let storage = crate::session::storage::Storage::new_unwatched("fb-test").unwrap();
 
             let stale_sid = "11111111-1111-1111-1111-111111111111".to_string();
-            let mut inst = Instance::new("fallback_dies_test", "/tmp/x");
+            let mut inst = Instance::new("fallback_dies_test", project_path);
             inst.tool = "claude".to_string();
             inst.source_profile = "fb-test".to_string();
             inst.command = "/bin/false".to_string();
@@ -12196,6 +12257,9 @@ mod tests {
                 return;
             }
             let temp = tempdir().unwrap();
+            let project_dir = temp.path().join("project");
+            std::fs::create_dir_all(&project_dir).unwrap();
+            let project_path = project_dir.to_str().unwrap();
             std::env::set_var("HOME", temp.path());
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
@@ -12203,7 +12267,7 @@ mod tests {
             let storage = crate::session::storage::Storage::new_unwatched("fb-test-live").unwrap();
 
             let stale_sid = "22222222-2222-2222-2222-222222222222".to_string();
-            let mut inst = Instance::new("fallback_lives_test", "/tmp/x");
+            let mut inst = Instance::new("fallback_lives_test", project_path);
             inst.tool = "claude".to_string();
             inst.source_profile = "fb-test-live".to_string();
             inst.command = format!(
@@ -12267,6 +12331,9 @@ mod tests {
                 return;
             }
             let temp = tempdir().unwrap();
+            let project_dir = temp.path().join("project");
+            std::fs::create_dir_all(&project_dir).unwrap();
+            let project_path = project_dir.to_str().unwrap();
             std::env::set_var("HOME", temp.path());
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
@@ -12279,7 +12346,7 @@ mod tests {
             let storage = crate::session::storage::Storage::new_unwatched("fb-toggle-off").unwrap();
 
             let stale_sid = "44444444-4444-4444-4444-444444444444".to_string();
-            let mut inst = Instance::new("fallback_toggle_off_test", "/tmp/x");
+            let mut inst = Instance::new("fallback_toggle_off_test", project_path);
             inst.tool = "claude".to_string();
             inst.source_profile = "fb-toggle-off".to_string();
             // Would die if (and only if) `--resume <stale_sid>` reached the
@@ -12336,6 +12403,9 @@ mod tests {
                 return;
             }
             let temp = tempdir().unwrap();
+            let project_dir = temp.path().join("project");
+            std::fs::create_dir_all(&project_dir).unwrap();
+            let project_path = project_dir.to_str().unwrap();
             std::env::set_var("HOME", temp.path());
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
@@ -12349,7 +12419,7 @@ mod tests {
                 crate::session::storage::Storage::new_unwatched("fb-allow-ignores").unwrap();
 
             let stale_sid = "55555555-5555-5555-5555-555555555555".to_string();
-            let mut inst = Instance::new("fallback_allow_ignores_toggle_test", "/tmp/x");
+            let mut inst = Instance::new("fallback_allow_ignores_toggle_test", project_path);
             inst.tool = "claude".to_string();
             inst.source_profile = "fb-allow-ignores".to_string();
             inst.command = "/bin/false".to_string();
@@ -12400,6 +12470,9 @@ mod tests {
                 return;
             }
             let temp = tempdir().unwrap();
+            let project_dir = temp.path().join("project");
+            std::fs::create_dir_all(&project_dir).unwrap();
+            let project_path = project_dir.to_str().unwrap();
             std::env::set_var("HOME", temp.path());
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
@@ -12407,7 +12480,7 @@ mod tests {
             let storage = crate::session::storage::Storage::new_unwatched("fb-loop-break").unwrap();
 
             let stale_sid = "66666666-6666-6666-6666-666666666666".to_string();
-            let mut inst = Instance::new("fallback_loop_break_test", "/tmp/x");
+            let mut inst = Instance::new("fallback_loop_break_test", project_path);
             inst.tool = "claude".to_string();
             inst.source_profile = "fb-loop-break".to_string();
             inst.command = "/bin/false".to_string();
@@ -12487,6 +12560,9 @@ mod tests {
                 return;
             }
             let temp = tempdir().unwrap();
+            let project_dir = temp.path().join("project");
+            std::fs::create_dir_all(&project_dir).unwrap();
+            let project_path = project_dir.to_str().unwrap();
             std::env::set_var("HOME", temp.path());
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
@@ -12494,7 +12570,7 @@ mod tests {
             let storage = crate::session::storage::Storage::new_unwatched("fb-test-grace").unwrap();
 
             let stale_sid = "33333333-3333-3333-3333-333333333333".to_string();
-            let mut inst = Instance::new("fallback_grace_test", "/tmp/x");
+            let mut inst = Instance::new("fallback_grace_test", project_path);
             inst.tool = "claude".to_string();
             inst.source_profile = "fb-test-grace".to_string();
             inst.command = format!(
