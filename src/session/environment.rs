@@ -875,10 +875,22 @@ pub(crate) struct DockerExecEnv {
 ///
 /// The `docker run` path (container creation) is protected separately via
 /// `Command::env()` in `run_create`, which keeps secrets out of argv entirely.
+#[cfg(test)]
 pub(crate) fn build_docker_env_args(
     profile: &str,
     sandbox: &SandboxInfo,
     project_path: &std::path::Path,
+) -> DockerExecEnv {
+    build_docker_env_args_with_managed_codex_home(profile, sandbox, project_path, None)
+}
+
+/// Build docker exec environment flags and add AoE's managed Codex home when
+/// the session does not explicitly configure `CODEX_HOME`.
+pub(crate) fn build_docker_env_args_with_managed_codex_home(
+    profile: &str,
+    sandbox: &SandboxInfo,
+    project_path: &std::path::Path,
+    managed_codex_home: Option<&str>,
 ) -> DockerExecEnv {
     let sandbox_config = resolved_sandbox_config(profile, project_path);
 
@@ -889,7 +901,15 @@ pub(crate) fn build_docker_env_args(
         sandbox.extra_env
     );
 
-    let env_entries = collect_environment(&sandbox_config, sandbox);
+    let mut env_entries = collect_environment(&sandbox_config, sandbox);
+    if let Some(codex_home) = managed_codex_home {
+        if !env_entries.iter().any(|entry| entry.key() == "CODEX_HOME") {
+            env_entries.push(EnvEntry::Literal {
+                key: "CODEX_HOME".to_string(),
+                value: codex_home.to_string(),
+            });
+        }
+    }
 
     tracing::debug!(target: "session.create",
         "build_docker_env_args: resolved {} env entries",
@@ -2164,6 +2184,40 @@ environment = ["GH_TOKEN=write_token"]
         assert!(result.docker_args.contains("MY_LITERAL='public_val'"));
         assert!(!result.exports.iter().any(|e| e.contains("MY_LITERAL")));
         std::env::remove_var("AOE_TEST_SECRET");
+    }
+
+    #[test]
+    fn test_managed_codex_home_is_passed_to_exec_unless_overridden() {
+        let project_path = std::path::Path::new("/nonexistent");
+        let managed_home = "/root/.codex/codex-upgrade-test";
+        let cases = [
+            (None, managed_home),
+            (Some("CODEX_HOME=/root/custom-codex"), "/root/custom-codex"),
+        ];
+
+        for (extra_env, expected_home) in cases {
+            let sandbox = SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "test".to_string(),
+                container_name: "test".to_string(),
+                extra_env: extra_env.map(|entry| vec![entry.to_string()]),
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: None,
+            };
+            let result = build_docker_env_args_with_managed_codex_home(
+                "",
+                &sandbox,
+                project_path,
+                Some(managed_home),
+            );
+            assert!(
+                result.docker_args.contains(expected_home),
+                "expected {expected_home} in {}",
+                result.docker_args
+            );
+        }
     }
 
     #[test]

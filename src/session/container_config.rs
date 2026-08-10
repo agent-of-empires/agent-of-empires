@@ -1109,17 +1109,40 @@ fn compute_workspace_volume_paths(
 
 /// Re-sync sandbox directories from the host so containers pick up credential
 /// changes (e.g. re-auth) since they were created.
-pub(crate) fn refresh_agent_configs_for_profile(profile: &str) {
+pub(crate) fn refresh_agent_configs_for_instance(
+    profile: &str,
+    instance_id: &str,
+    tool: &str,
+    detect_as: Option<&str>,
+) {
     let Some(home) = dirs::home_dir() else {
         return;
     };
 
     let profile_config = super::profile_config::resolve_config_or_warn(profile);
     let hooks_enabled = profile_config.session.agent_status_hooks;
+    let refresh_codex = match managed_codex_home(tool, detect_as, profile, instance_id) {
+        Ok(Some(_)) => true,
+        Ok(None) => false,
+        Err(e) => {
+            tracing::warn!(target: "session.profile",
+                "Failed to resolve managed Codex home for {}: {}", instance_id, e
+            );
+            false
+        }
+    };
 
     for mount in AGENT_CONFIG_MOUNTS {
         if mount.tool_name == "codex" {
-            refresh_codex_sandbox_dirs(mount, &home, hooks_enabled, &profile_config);
+            if refresh_codex {
+                refresh_codex_sandbox_dir(
+                    mount,
+                    &home,
+                    instance_id,
+                    hooks_enabled,
+                    &profile_config,
+                );
+            }
             continue;
         }
 
@@ -1136,51 +1159,26 @@ pub(crate) fn refresh_agent_configs_for_profile(profile: &str) {
     }
 }
 
-/// Refresh every extant instance-private Codex sandbox. The old flat
-/// `.codex/sandbox` directory is intentionally ignored: it may contain the
-/// SQLite files held by a running legacy session and must never be mounted again.
-fn refresh_codex_sandbox_dirs(
+/// Refresh one instance-private Codex sandbox with its own profile settings.
+/// The old flat `.codex/sandbox` directory is intentionally ignored: it may
+/// contain the SQLite files held by a running legacy session and must never be
+/// mounted again.
+fn refresh_codex_sandbox_dir(
     mount: &AgentConfigMount,
     home: &Path,
+    instance_id: &str,
     hooks_enabled: bool,
     profile_config: &super::config::Config,
 ) {
-    let root = home.join(mount.host_rel).join(SANDBOX_SUBDIR);
-    let entries = match std::fs::read_dir(&root) {
-        Ok(entries) => entries,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
-        Err(e) => {
-            tracing::warn!(target: "session.profile",
-                "Failed to read isolated Codex sandbox dirs at {}: {}", root.display(), e
-            );
-            return;
-        }
-    };
-
-    for entry in entries.flatten() {
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-        if !file_type.is_dir() {
-            continue;
-        }
-        let Some(instance_id) = entry.file_name().to_str().map(str::to_owned) else {
-            continue;
-        };
-        if crate::session::validate_instance_id(&instance_id).is_err() {
-            continue;
-        }
-
-        match prepare_sandbox_dir(mount, home, Some(&instance_id)) {
-            Ok(sandbox_dir) => {
-                if hooks_enabled && should_refresh_codex_hooks(mount, &sandbox_dir, home) {
-                    refresh_codex_sandbox_hooks(mount, &sandbox_dir, profile_config);
-                }
+    match prepare_sandbox_dir(mount, home, Some(instance_id)) {
+        Ok(sandbox_dir) => {
+            if hooks_enabled && should_refresh_codex_hooks(mount, &sandbox_dir, home) {
+                refresh_codex_sandbox_hooks(mount, &sandbox_dir, profile_config);
             }
-            Err(e) => tracing::warn!(target: "session.profile",
-                "Failed to refresh isolated Codex config for {}: {}", instance_id, e
-            ),
         }
+        Err(e) => tracing::warn!(target: "session.profile",
+            "Failed to refresh isolated Codex config for {}: {}", instance_id, e
+        ),
     }
 }
 
@@ -1315,6 +1313,25 @@ fn resolve_active_agent(
                 .get(tool)
                 .and_then(|detect_as| crate::agents::get_agent(detect_as))
         })
+}
+
+/// The managed Codex home for an instance, when its resolved agent uses Codex
+/// configuration. This is also passed to `docker exec`, so pre-isolation
+/// containers use their private child directory without being recreated.
+pub(crate) fn managed_codex_home(
+    tool: &str,
+    detect_as: Option<&str>,
+    profile: &str,
+    instance_id: &str,
+) -> Result<Option<String>> {
+    crate::session::validate_instance_id(instance_id).map_err(|e| {
+        anyhow::anyhow!("refusing to build Codex home for unsafe AOE_INSTANCE_ID: {e}")
+    })?;
+    let resolved_profile = super::config::effective_profile(profile);
+    let session_config = super::profile_config::resolve_config_or_warn(&resolved_profile).session;
+    let config_tool =
+        resolve_active_agent(tool, detect_as, &session_config).map_or(tool, |a| a.name);
+    Ok((config_tool == "codex").then(|| format!("/root/.codex/{instance_id}")))
 }
 
 fn agent_config_container_path(
@@ -1607,11 +1624,18 @@ pub(crate) fn build_container_config(
     const CONTAINER_HOME: &str = "/root";
 
     let mut environment = collect_environment(&sandbox_config, sandbox_info);
-    if config_tool == "codex" && !environment.iter().any(|entry| entry.key() == "CODEX_HOME") {
-        environment.push(EnvEntry::Literal {
-            key: "CODEX_HOME".to_string(),
-            value: format!("{CONTAINER_HOME}/.codex/{instance_id}"),
-        });
+    if !environment.iter().any(|entry| entry.key() == "CODEX_HOME") {
+        if let Some(codex_home) = managed_codex_home(
+            agent_selection.tool,
+            agent_selection.detect_as,
+            profile,
+            instance_id,
+        )? {
+            environment.push(EnvEntry::Literal {
+                key: "CODEX_HOME".to_string(),
+                value: codex_home,
+            });
+        }
     }
 
     // Bind-mount the session's managed artifact dir and point the agent at it
@@ -4135,7 +4159,12 @@ trust_level = "trusted"
         )
         .unwrap();
 
-        refresh_agent_configs_for_profile(&crate::session::config::effective_profile(""));
+        refresh_agent_configs_for_instance(
+            &crate::session::config::effective_profile(""),
+            instance_id,
+            "codex",
+            None,
+        );
         let refreshed: toml::Value =
             toml::from_str(&fs::read_to_string(codex_sandbox.join("config.toml")).unwrap())
                 .unwrap();
@@ -4178,7 +4207,12 @@ trust_level = "trusted"
         )
         .unwrap();
 
-        refresh_agent_configs_for_profile(&crate::session::config::effective_profile(""));
+        refresh_agent_configs_for_instance(
+            &crate::session::config::effective_profile(""),
+            "gemini-yolo-refresh-test",
+            "gemini",
+            None,
+        );
         let refreshed: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(gemini_sandbox.join("settings.json")).unwrap(),
         )
@@ -4658,7 +4692,12 @@ trusted_hash = "keep"
         fs::write(&sandbox_config_path, sandbox_config).unwrap();
         fs::write(codex_dir.join("config.toml"), r#"model = "updated""#).unwrap();
 
-        refresh_agent_configs_for_profile(&crate::session::config::effective_profile(""));
+        refresh_agent_configs_for_instance(
+            &crate::session::config::effective_profile(""),
+            instance_id,
+            "codex",
+            None,
+        );
 
         let config_text = fs::read_to_string(&sandbox_config_path).unwrap();
         let config: toml::Value = toml::from_str(&config_text).unwrap();
@@ -4691,8 +4730,8 @@ trusted_hash = "keep"
         fs::create_dir_all(&codex_dir).unwrap();
         fs::write(codex_dir.join("config.toml"), r#"model = "initial""#).unwrap();
 
-        let mut profile_config = super::super::profile_config::ProfileConfig::default();
-        profile_config.overrides.insert(
+        let mut work_config = super::super::profile_config::ProfileConfig::default();
+        work_config.overrides.insert(
             "agents".to_string(),
             serde_json::json!({
                 "codex": {
@@ -4702,7 +4741,19 @@ trusted_hash = "keep"
                 }
             }),
         );
-        super::super::profile_config::save_profile_config("work", &profile_config).unwrap();
+        super::super::profile_config::save_profile_config("work", &work_config).unwrap();
+        let mut personal_config = super::super::profile_config::ProfileConfig::default();
+        personal_config.overrides.insert(
+            "agents".to_string(),
+            serde_json::json!({
+                "codex": {
+                    "status_map": {
+                        "PreToolUse": "running"
+                    }
+                }
+            }),
+        );
+        super::super::profile_config::save_profile_config("personal", &personal_config).unwrap();
 
         let project_dir = TempDir::new().unwrap();
         git2::Repository::init(project_dir.path()).unwrap();
@@ -4717,31 +4768,44 @@ trusted_hash = "keep"
             before_start_env: Vec::new(),
             container_workdir: None,
         };
-        let instance_id = "codex-profile-status-map-refresh-test";
-        build_container_config(
-            project_dir.path().to_str().unwrap(),
-            &sandbox_info,
-            ContainerAgentSelection::new("codex", None),
-            false,
-            instance_id,
-            None,
-            "work",
-        )
-        .unwrap();
-
-        refresh_agent_configs_for_profile("work");
-
-        let hooks_path = codex_dir
-            .join(SANDBOX_SUBDIR)
-            .join(instance_id)
-            .join("hooks.json");
-        let hooks: serde_json::Value =
-            serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
-        let cmd = hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-            .as_str()
+        let instances = [
+            ("codex-work-status-map-refresh-test", "work", "waiting"),
+            (
+                "codex-personal-status-map-refresh-test",
+                "personal",
+                "running",
+            ),
+        ];
+        for (instance_id, profile, _) in instances {
+            build_container_config(
+                project_dir.path().to_str().unwrap(),
+                &sandbox_info,
+                ContainerAgentSelection::new("codex", None),
+                false,
+                instance_id,
+                None,
+                profile,
+            )
             .unwrap();
-        assert!(cmd.contains("printf waiting"), "got command: {cmd}");
-        crate::hooks::cleanup_hook_status_dir(instance_id);
+            refresh_agent_configs_for_instance(profile, instance_id, "codex", None);
+        }
+
+        for (instance_id, _, expected_status) in instances {
+            let hooks_path = codex_dir
+                .join(SANDBOX_SUBDIR)
+                .join(instance_id)
+                .join("hooks.json");
+            let hooks: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&hooks_path).unwrap()).unwrap();
+            let cmd = hooks["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+                .as_str()
+                .unwrap();
+            assert!(
+                cmd.contains(&format!("printf {expected_status}")),
+                "got command: {cmd}"
+            );
+            crate::hooks::cleanup_hook_status_dir(instance_id);
+        }
     }
 
     #[test]

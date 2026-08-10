@@ -13,7 +13,7 @@ use crate::containers::{self, DockerContainer};
 use crate::tmux;
 
 use super::container_config;
-use super::environment::{build_docker_env_args, shell_escape};
+use super::environment::{build_docker_env_args_with_managed_codex_home, shell_escape};
 use super::poller::SessionPoller;
 
 use crate::session::capture::{
@@ -3087,10 +3087,17 @@ impl Instance {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("sandbox_info missing for sandboxed session"))?;
 
-        let env_info = build_docker_env_args(
+        let managed_codex_home = container_config::managed_codex_home(
+            &self.tool,
+            Some(&self.detect_as),
+            &self.source_profile,
+            &self.id,
+        )?;
+        let env_info = build_docker_env_args_with_managed_codex_home(
             &self.source_profile,
             sandbox,
             std::path::Path::new(&self.project_path),
+            managed_codex_home.as_deref(),
         );
         let env_part = if env_info.docker_args.is_empty() {
             String::new()
@@ -3401,10 +3408,17 @@ impl Instance {
                 .sandbox_info
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("sandbox_info missing for sandboxed instance"))?;
-            let env_info = build_docker_env_args(
+            let managed_codex_home = container_config::managed_codex_home(
+                &self.tool,
+                Some(&self.detect_as),
+                &self.source_profile,
+                &self.id,
+            )?;
+            let env_info = build_docker_env_args_with_managed_codex_home(
                 &self.source_profile,
                 sandbox,
                 std::path::Path::new(&self.project_path),
+                managed_codex_home.as_deref(),
             );
             let profile = self.effective_profile();
             let docker_args = format!(
@@ -4177,7 +4191,12 @@ impl Instance {
             // Already up: not a come-up, so don't re-mint. Fill lazily only if a
             // fresh process attached to a running container with no values yet.
             self.ensure_before_start_env(false)?;
-            container_config::refresh_agent_configs_for_profile(&self.effective_profile());
+            container_config::refresh_agent_configs_for_instance(
+                &self.effective_profile(),
+                &self.id,
+                &self.tool,
+                Some(&self.detect_as),
+            );
             self.backfill_container_workdir(&container);
             if self.is_yolo_mode() {
                 container_config::ensure_yolo_trust_config_for_active_agent(
@@ -4195,7 +4214,12 @@ impl Instance {
             // Restart of a stopped container is a come-up: refresh so a
             // short-lived token is re-minted.
             self.ensure_before_start_env(true)?;
-            container_config::refresh_agent_configs_for_profile(&self.effective_profile());
+            container_config::refresh_agent_configs_for_instance(
+                &self.effective_profile(),
+                &self.id,
+                &self.tool,
+                Some(&self.detect_as),
+            );
             container.start()?;
             self.backfill_container_workdir(&container);
             if self.is_yolo_mode() {
