@@ -453,11 +453,12 @@ pub struct AppState {
     /// dashboard can tail their host-side log. In-memory; see
     /// `api::plugins::PluginJobRegistry`.
     pub plugin_jobs: Arc<crate::server::api::plugins::PluginJobRegistry>,
-    /// Epoch-millis timestamp of the most recent authenticated API request.
-    /// Updated by auth middleware on every successful auth. The push consumer
-    /// checks this to suppress notifications when someone is actively using
-    /// the web dashboard (on any device).
-    pub last_web_activity: std::sync::atomic::AtomicI64,
+    /// Per-browser foreground dashboard presence. Entries are keyed by a hash
+    /// of the device-binding secret and expire when the browser stops sending
+    /// its visibility heartbeat. Push suppression must not treat ordinary
+    /// polling or a backgrounded PWA as evidence that somebody is looking at
+    /// the dashboard.
+    pub web_presence: std::sync::Mutex<std::collections::HashMap<[u8; 32], i64>>,
     /// Packed sleep-inhibit reconciler snapshot for read-only status reporting:
     /// bit `SLEEP_INHIBIT_SNAPSHOT_ENABLED` is the
     /// `prevent_sleep_when_active` toggle as the reconciler last read it, bit
@@ -611,24 +612,25 @@ impl AppState {
             .clone()
     }
 
-    /// Record that an authenticated web client just made a request.
-    pub fn touch_web_activity(&self) {
-        self.last_web_activity.store(
-            crate::util::now_ms() as i64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+    /// Record whether one browser is currently foregrounded. Browser identity
+    /// is derived from its device-binding secret, never retained in plaintext.
+    pub fn set_web_presence(&self, client: [u8; 32], active: bool) {
+        let mut presence = self.web_presence.lock().expect("web_presence poisoned");
+        if active {
+            presence.insert(client, crate::util::now_ms() as i64);
+        } else {
+            presence.remove(&client);
+        }
     }
 
-    /// Returns true if an authenticated web request arrived within `threshold`.
+    /// Returns true if any dashboard recently reported itself visible and
+    /// focused. Stale entries are swept here, on the only read path.
     pub fn web_active_within(&self, threshold: std::time::Duration) -> bool {
-        let last = self
-            .last_web_activity
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if last == 0 {
-            return false;
-        }
-        let elapsed_ms = crate::util::now_ms() as i64 - last;
-        elapsed_ms >= 0 && (elapsed_ms as u64) < threshold.as_millis() as u64
+        let now = crate::util::now_ms() as i64;
+        let max_age = threshold.as_millis() as i64;
+        let mut presence = self.web_presence.lock().expect("web_presence poisoned");
+        presence.retain(|_, last| now.saturating_sub(*last) < max_age);
+        !presence.is_empty()
     }
 }
 
@@ -1218,7 +1220,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         push: push_state,
         push_enabled,
         web_config: config.web.clone(),
-        last_web_activity: std::sync::atomic::AtomicI64::new(0),
+        web_presence: std::sync::Mutex::new(std::collections::HashMap::new()),
         sleep_inhibit_snapshot: std::sync::atomic::AtomicU8::new(0),
         telemetry_usage_seen: crate::telemetry::usage_signals::UsageSeenCounters::new(),
         telemetry_web_clients: FormFactorCounters::default(),
@@ -1650,6 +1652,9 @@ fn build_router(state: Arc<AppState>) -> Router {
     use axum::routing::{delete, get, patch, post, put};
 
     let app = Router::new()
+        // Explicit browser visibility heartbeat. Ordinary API requests do not
+        // imply the dashboard is foregrounded, so they must not suppress push.
+        .route("/api/presence", post(api::post_dashboard_presence))
         // Sessions
         .route(
             "/api/sessions",
@@ -2421,6 +2426,8 @@ const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     ("POST", "/api/telemetry/consent"),
     ("POST", "/api/telemetry/seen"),
     ("POST", "/api/telemetry/structured-interaction"),
+    // Ephemeral foreground-presence heartbeat. Does not mutate user data.
+    ("POST", "/api/presence"),
     // Per-device UI preferences / client log.
     ("PATCH", "/api/app-state/web-ui-state"),
     ("POST", "/api/app-state/dismiss-update"),
@@ -3004,6 +3011,16 @@ fn apply_tick_status_decisions(
             continue;
         }
         inst.live_status_baseline = prev.get(&inst.id).copied();
+        // A trashed row remains in storage until its retention period ends,
+        // but it is no longer a live session. Do not turn its deliberately
+        // stopped pane into a synthetic Error, and do not emit a status event
+        // that the push consumer could notify about.
+        if inst.is_trashed() {
+            if let Some(live) = inst.live_status_baseline {
+                inst.status = live;
+            }
+            continue;
+        }
         if skip_tmux_decision_for_structured(inst) {
             continue;
         }
@@ -5509,7 +5526,7 @@ pub(crate) fn apply_status_intent(
 ) {
     let Some(intent) = intent else { return };
     // Genuine in-flight terminal states: never fight them.
-    if matches!(inst.status, Status::Deleting | Status::Creating) {
+    if inst.is_trashed() || matches!(inst.status, Status::Deleting | Status::Creating) {
         return;
     }
     let target = match intent {
@@ -5813,7 +5830,6 @@ async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
 pub mod test_support {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::atomic::AtomicI64;
 
     /// Build a minimal `Arc<AppState>` for helper-equivalence tests. Most
     /// fields are seeded with empty / default values; only `instances`,
@@ -5914,7 +5930,7 @@ pub mod test_support {
             push: None,
             push_enabled: false,
             web_config: crate::session::config::WebConfig::default(),
-            last_web_activity: AtomicI64::new(0),
+            web_presence: std::sync::Mutex::new(HashMap::new()),
             sleep_inhibit_snapshot: std::sync::atomic::AtomicU8::new(0),
             telemetry_usage_seen: crate::telemetry::usage_signals::UsageSeenCounters::new(),
             telemetry_web_clients: FormFactorCounters::default(),
@@ -8724,6 +8740,22 @@ mod tests {
         // The UserPromptSent that follows the respawn then drives Running.
         apply(&mut inst, StatusIntent::Set(Status::Running));
         assert_eq!(inst.status, Status::Running);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn trailing_acp_event_cannot_change_a_trashed_session_status() {
+        let mut inst = stopped_structured_instance();
+        inst.status = Status::Running;
+        inst.trash();
+
+        apply(&mut inst, StatusIntent::Set(Status::Error));
+
+        assert_eq!(
+            inst.status,
+            Status::Running,
+            "trash teardown must not become a user-facing error transition"
+        );
     }
 
     #[cfg(feature = "serve")]

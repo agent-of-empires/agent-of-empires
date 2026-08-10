@@ -208,6 +208,68 @@ test.describe("Mobile responsive", () => {
     await expect(page.getByRole("button", { name: NEW_SESSION_PANE_NAME })).toBeVisible();
   });
 
+  test("mobile home offers the five most recent sessions while desktop keeps them hidden", async ({ page }) => {
+    const sessions = [
+      ["old", "2026-01-02T00:00:00Z"],
+      ["new", "2026-01-07T00:00:00Z"],
+      ["middle", "2026-01-04T00:00:00Z"],
+      ["four", "2026-01-05T00:00:00Z"],
+      ["five", "2026-01-06T00:00:00Z"],
+      ["six", "2026-01-03T00:00:00Z"],
+      ["trash", "2026-01-08T00:00:00Z"],
+    ].map(([id, last_accessed_at]) => ({
+      id,
+      title: `Session ${id}`,
+      project_path: `/repo/${id}`,
+      artifact_dir: `/tmp/${id}`,
+      group_path: "",
+      tool: "claude",
+      status: "Idle",
+      dormant: false,
+      yolo_mode: false,
+      created_at: "2026-01-01T00:00:00Z",
+      last_accessed_at,
+      idle_entered_at: null,
+      last_error: null,
+      branch: null,
+      main_repo_path: `/repo/${id}`,
+      is_sandboxed: false,
+      scratch: false,
+      favorited: false,
+      has_managed_worktree: false,
+      has_terminal: true,
+      profile: "default",
+      cleanup_defaults: {},
+      remote_owner: null,
+      notify_on_waiting: null,
+      notify_on_idle: null,
+      notify_on_error: null,
+      trashed_at: id === "trash" ? "2026-01-08T00:00:00Z" : null,
+    }));
+    await page.route("**/api/sessions", (route) => route.fulfill({ json: { sessions, workspace_ordering: [] } }));
+
+    await page.setViewportSize({ width: 375, height: 812 });
+    await page.goto("/");
+    const recent = page.getByLabel("Recent sessions");
+    await expect(recent).toBeVisible();
+    await expect(recent.getByRole("button")).toHaveCount(5);
+    await expect(recent.getByRole("button").allTextContents()).resolves.toEqual([
+      expect.stringContaining("Session new"),
+      expect.stringContaining("Session five"),
+      expect.stringContaining("Session four"),
+      expect.stringContaining("Session middle"),
+      expect.stringContaining("Session six"),
+    ]);
+
+    await page.setViewportSize({ width: 1280, height: 720 });
+    await expect(recent).not.toBeAttached();
+
+    await page.setViewportSize({ width: 375, height: 812 });
+    await expect(recent).toBeVisible();
+    await recent.getByRole("button", { name: /Session new/ }).click();
+    await expect(page).toHaveURL(/\/session\/new$/);
+  });
+
   test("hamburger opens sidebar overlay on mobile", async ({ page }) => {
     await page.setViewportSize({ width: 375, height: 812 });
     await page.goto("/");

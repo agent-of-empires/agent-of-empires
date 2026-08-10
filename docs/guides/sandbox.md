@@ -123,6 +123,8 @@ Pass variables through containers by adding them to the `environment` list. Each
 - **`KEY`** (bare name) passes the host env var value into the container
 - **`KEY=VALUE`** sets an explicit value
 
+Keys must match `[A-Za-z_][A-Za-z0-9_]*` (an ASCII letter or `_` first, then ASCII alphanumerics or `_`). Any other key is dropped with a warning; Docker accepts laxer keys than this, so `FOO-BAR=x` or `foo.bar=x` is accepted by the runtime but silently rejected here.
+
 ```toml
 [sandbox]
 environment = [

@@ -23,6 +23,7 @@ import { AskUserQuestionCard } from "./AskUserQuestionCard";
 import { AcpFileRefContext } from "./AcpFileRefContext";
 import type { FileRef, FileRefSession } from "../../lib/fileRef";
 import { anchorIsStale, autoLoadDecision, scrollRestoreDelta } from "../../lib/historyScroll";
+import { repinOnResize } from "../../lib/repinOnResize";
 import { ToolDensityToggle, ToolDisplayModeProvider, useToolDensityPref } from "./ToolDisplayMode";
 import { AcpRuntime, SUBAGENT_TASK_NAME, TODO_GROUP_NAME, TOOL_GROUP_NAME, type AcpContext } from "./AcpRuntime";
 import { Composer } from "./Composer";
@@ -58,7 +59,9 @@ import { isClearAlias } from "../../lib/agentProfiles";
 import { AttentionChime } from "./AttentionChime";
 import { useRespawnSession, type RespawnState } from "../../hooks/useRespawnSession";
 import { useIsCoarsePointer } from "../../hooks/useIsCoarsePointer";
+import { useIsWideViewport } from "../../hooks/useIsWideViewport";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
+import { ChromeCollapseHandle, CollapsibleRegion } from "../CollapsibleChrome";
 import { dispatchFocusTerminal } from "../../lib/terminalFocus";
 import { shouldFocusComposerOnThreadTap } from "./threadTapFocus";
 import type {
@@ -404,6 +407,14 @@ function AcpChrome({
   // usually a selection. Interactive targets and live selections are skipped by
   // the guard.
   const isCoarse = useIsCoarsePointer();
+  // Phone-only reading mode: fold the composer away so the transcript gets its
+  // ~150px back. Width-gated (not pointer-gated) to stay aligned with the rest
+  // of the layout's `md:` split, same rationale as useIsWideViewport's doc.
+  // Local state, so it resets when the view remounts on a session switch; the
+  // top bar's twin handle lives in App and is independent of this one.
+  const isWideViewport = useIsWideViewport();
+  const composerCollapsible = !isWideViewport;
+  const [composerCollapsed, setComposerCollapsed] = useState(false);
   const onThreadTap = (e: React.MouseEvent) => {
     const sel = window.getSelection();
     if (shouldFocusComposerOnThreadTap({ isCoarse, target: e.target, hasSelection: !!sel && !sel.isCollapsed })) {
@@ -448,16 +459,15 @@ function AcpChrome({
     };
     sample();
     vp.addEventListener("scroll", sample, { passive: true });
-    let prevHeight = below.offsetHeight;
-    const ro = new ResizeObserver(() => {
-      const nextHeight = below.offsetHeight;
-      if (nextHeight === prevHeight) return;
-      prevHeight = nextHeight;
-      if (wasAtBottomRef.current) {
-        vp.scrollTop = vp.scrollHeight;
-      }
-    });
-    ro.observe(below);
+    // Re-pin on two elements: the chrome below the viewport (composer, queued
+    // strips) and the viewport itself, because chrome *outside* this view can
+    // resize it too (the App's header collapse).
+    const wasAtBottom = () => wasAtBottomRef.current;
+    const repin = () => {
+      vp.scrollTop = vp.scrollHeight;
+    };
+    const ro = repinOnResize({ target: below, readHeight: () => below.offsetHeight, wasAtBottom, repin });
+    const vpRo = repinOnResize({ target: vp, readHeight: () => vp.clientHeight, wasAtBottom, repin });
     // Freeze the read position when older rows grow the transcript at the
     // top: add the height delta to scrollTop so the row the user was
     // reading stays under the cursor instead of jumping. Skipped while
@@ -472,6 +482,7 @@ function AcpChrome({
     if (content) contentRo.observe(content);
     return () => {
       ro.disconnect();
+      vpRo.disconnect();
       contentRo.disconnect();
       vp.removeEventListener("scroll", sample);
     };
@@ -705,28 +716,45 @@ function AcpChrome({
                 onDismiss={dismissCompactionReminder}
               />
 
-              <Composer
-                sessionId={sessionId}
-                currentAgent={state.agent ?? acpAgent}
-                availableModes={state.availableModes}
-                currentModeId={state.currentModeId}
-                legacyMode={state.mode}
-                configOptions={state.configOptions}
-                pendingConfigOption={state.pendingConfigOption}
-                setConfigOption={setConfigOption}
-                sessionUsage={state.sessionUsage}
-                availableCommands={state.availableCommands}
-                connected={status === "open" && !state.workerStopped && !state.workerRestarting}
-                turnActive={state.turnActive}
-                queuedCount={state.queuedPrompts.length}
-                enqueuePrompt={sendPrompt}
-                promptCapabilities={state.promptCapabilities}
-                pendingAttachments={pendingAttachments}
-                setPendingAttachments={setPendingAttachments}
-                primerPrefill={primerPrefill}
-                queuedPrompts={state.queuedPrompts}
-                editQueuedPrompt={editQueuedPrompt}
-              />
+              {composerCollapsible && (
+                <ChromeCollapseHandle
+                  edge="bottom"
+                  collapsed={composerCollapsed}
+                  onToggle={() => setComposerCollapsed((v) => !v)}
+                  collapseLabel="Collapse message composer"
+                  expandLabel="Expand message composer"
+                  controlsId="conversation-composer"
+                  testId="composer-collapse-toggle"
+                />
+              )}
+
+              {/* Only the composer folds away; the strips above it carry
+                  actionable state (queued / rejected prompts, switch failures)
+                  that must not vanish behind a collapse the user forgot about. */}
+              <CollapsibleRegion id="conversation-composer" collapsed={composerCollapsible && composerCollapsed}>
+                <Composer
+                  sessionId={sessionId}
+                  currentAgent={state.agent ?? acpAgent}
+                  availableModes={state.availableModes}
+                  currentModeId={state.currentModeId}
+                  legacyMode={state.mode}
+                  configOptions={state.configOptions}
+                  pendingConfigOption={state.pendingConfigOption}
+                  setConfigOption={setConfigOption}
+                  sessionUsage={state.sessionUsage}
+                  availableCommands={state.availableCommands}
+                  connected={status === "open" && !state.workerStopped && !state.workerRestarting}
+                  turnActive={state.turnActive}
+                  queuedCount={state.queuedPrompts.length}
+                  enqueuePrompt={sendPrompt}
+                  promptCapabilities={state.promptCapabilities}
+                  pendingAttachments={pendingAttachments}
+                  setPendingAttachments={setPendingAttachments}
+                  primerPrefill={primerPrefill}
+                  queuedPrompts={state.queuedPrompts}
+                  editQueuedPrompt={editQueuedPrompt}
+                />
+              </CollapsibleRegion>
             </>
           )}
         </div>

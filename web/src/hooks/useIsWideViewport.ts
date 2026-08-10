@@ -20,7 +20,11 @@ export function useIsWideViewport(): boolean {
     const mql = window.matchMedia("(min-width: 768px)");
     const onChange = () => setIsWide(mql.matches);
     mql.addEventListener?.("change", onChange);
-    return () => mql.removeEventListener?.("change", onChange);
+    window.addEventListener("resize", onChange);
+    return () => {
+      mql.removeEventListener?.("change", onChange);
+      window.removeEventListener("resize", onChange);
+    };
   }, []);
   return isWide;
 }

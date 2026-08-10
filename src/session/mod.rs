@@ -698,28 +698,43 @@ pub fn collect_startup_config_warnings(profile: &str) -> Option<String> {
 // ── TUI presence ────────────────────────────────────────────────────────────
 //
 // Each running TUI process drops a `<pid>` file under `tui-presence/` and
-// refreshes its mtime on the heartbeat tick. This lets us (a) tell the push
-// consumer whether *any* TUI is watching, and (b) count how many TUIs are
-// alive so the footer can surface "another instance is watching" when two
-// `aoe` TUIs run at once (the launcher TUI isn't tmux-backed, so there's no
-// tmux client list to read). A presence file is considered live while its
-// mtime is fresh; stale ones (crash without cleanup) are swept on read.
+// refreshes its mtime on the heartbeat tick. This lets the footer surface
+// "another instance is watching" when two `aoe` TUIs run at once (the launcher
+// TUI isn't tmux-backed, so there's no tmux client list to read). A presence
+// file is considered live while its mtime is fresh; stale ones (crash without
+// cleanup) are swept on read.
+//
+// Push suppression deliberately uses a separate `tui-activity/` directory.
+// A live TUI can sit unattended while an agent needs attention, so process
+// liveness is not evidence that the user is looking at it. Activity files are
+// touched only for real keyboard, paste, and mouse input.
 
 const TUI_PRESENCE_DIR: &str = "tui-presence";
+const TUI_ACTIVITY_DIR: &str = "tui-activity";
 
-fn presence_dir() -> Option<std::path::PathBuf> {
-    get_app_dir().ok().map(|d| d.join(TUI_PRESENCE_DIR))
+fn tui_dir(name: &str) -> Option<std::path::PathBuf> {
+    get_app_dir().ok().map(|d| d.join(name))
 }
 
-fn own_presence_file() -> Option<std::path::PathBuf> {
-    presence_dir().map(|d| d.join(std::process::id().to_string()))
+fn own_tui_file(name: &str) -> Option<std::path::PathBuf> {
+    tui_dir(name).map(|d| d.join(std::process::id().to_string()))
 }
 
 /// Write (or touch) this process's presence file so the push consumer knows
 /// a TUI is running and other TUIs can count us. Called periodically from the
 /// TUI event loop.
 pub fn write_tui_heartbeat() {
-    if let Some(dir) = presence_dir() {
+    if let Some(dir) = tui_dir(TUI_PRESENCE_DIR) {
+        let _ = fs::create_dir_all(&dir);
+        let _ = fs::write(dir.join(std::process::id().to_string()), b"");
+    }
+}
+
+/// Record real user input in this TUI. Push notification suppression reads
+/// this separately from the process-liveness heartbeat, so an unattended TUI
+/// cannot permanently silence a phone's notifications.
+pub fn write_tui_activity() {
+    if let Some(dir) = tui_dir(TUI_ACTIVITY_DIR) {
         let _ = fs::create_dir_all(&dir);
         let _ = fs::write(dir.join(std::process::id().to_string()), b"");
     }
@@ -727,7 +742,10 @@ pub fn write_tui_heartbeat() {
 
 /// Remove this process's presence file on TUI exit.
 pub fn clear_tui_heartbeat() {
-    if let Some(file) = own_presence_file() {
+    if let Some(file) = own_tui_file(TUI_PRESENCE_DIR) {
+        let _ = fs::remove_file(file);
+    }
+    if let Some(file) = own_tui_file(TUI_ACTIVITY_DIR) {
         let _ = fs::remove_file(file);
     }
 }
@@ -736,7 +754,11 @@ pub fn clear_tui_heartbeat() {
 /// any stale entries left behind by crashed processes. Returns the number of
 /// live TUIs (including this process, if its file is fresh).
 pub fn count_active_tuis(threshold: Duration) -> usize {
-    let dir = match presence_dir() {
+    count_fresh_tui_files(TUI_PRESENCE_DIR, threshold)
+}
+
+fn count_fresh_tui_files(dir_name: &str, threshold: Duration) -> usize {
+    let dir = match tui_dir(dir_name) {
         Some(d) => d,
         None => return 0,
     };
@@ -761,11 +783,11 @@ pub fn count_active_tuis(threshold: Duration) -> usize {
     live
 }
 
-/// Returns true if any TUI presence file was modified within `threshold`.
-/// Used by the push consumer to suppress notifications when the user is
-/// actively watching a TUI.
+/// Returns true if any TUI received real input within `threshold`. Used by the
+/// push consumer to suppress notifications only while a user is interacting
+/// with a TUI, rather than merely while a TUI process is alive.
 pub fn is_tui_active(threshold: Duration) -> bool {
-    count_active_tuis(threshold) > 0
+    count_fresh_tui_files(TUI_ACTIVITY_DIR, threshold) > 0
 }
 
 #[cfg(test)]
@@ -899,6 +921,12 @@ mod tests {
         // Our own heartbeat counts as one live TUI.
         write_tui_heartbeat();
         assert_eq!(count_active_tuis(Duration::from_secs(30)), 1);
+        assert!(
+            !is_tui_active(Duration::from_secs(30)),
+            "a live but untouched TUI must not suppress phone notifications"
+        );
+
+        write_tui_activity();
         assert!(is_tui_active(Duration::from_secs(30)));
 
         // A second instance's presence file bumps the count to two.
@@ -908,6 +936,7 @@ mod tests {
         // A zero threshold makes every file stale; they're swept and the
         // directory is left empty.
         assert_eq!(count_active_tuis(Duration::ZERO), 0);
+        assert_eq!(count_fresh_tui_files(TUI_ACTIVITY_DIR, Duration::ZERO), 0);
         assert!(!is_tui_active(Duration::from_secs(30)));
         assert_eq!(fs::read_dir(&pdir).unwrap().count(), 0);
 

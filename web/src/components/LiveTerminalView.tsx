@@ -90,6 +90,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const [ctrlActive, setCtrlActive] = useState(false);
   const ctrlActiveRef = useRef(false);
+  const clearCtrl = useCallback(() => setCtrlActive(false), []);
   useEffect(() => {
     ctrlActiveRef.current = ctrlActive;
   }, [ctrlActive]);
@@ -236,7 +237,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
       <div
         aria-hidden="true"
         className={`pointer-events-none absolute inset-0 z-10 ring-inset transition-shadow ${
-          inputFocused ? "ring-2 ring-terminal-active" : "ring-1 ring-surface-700/40"
+          coarse ? "" : inputFocused ? "ring-2 ring-terminal-active" : "ring-1 ring-surface-700/40"
         }`}
       />
 
@@ -249,7 +250,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
         onRetry={live.manualReconnect}
       />
 
-      {live.state.connected && !live.state.isOwner && (
+      {live.state.connected && live.state.ownerKnown && !live.state.isOwner && (
         <div className="absolute left-0 right-0 top-3 flex justify-center z-20 px-3">
           <button
             type="button"
@@ -306,7 +307,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
           forwardWheel={live.forwardWheel}
           forwardButton={live.forwardButton}
           ctrlActiveRef={ctrlActiveRef}
-          clearCtrl={() => setCtrlActive(false)}
+          clearCtrl={clearCtrl}
           inputRef={inputRef}
           onInputFocusChange={setInputFocused}
           bottomAlign={surface === "agent"}

@@ -4,16 +4,50 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Json};
+use axum::{
+    extract::{Extension, State},
+    http::{HeaderMap, StatusCode},
+    response::IntoResponse,
+    Json,
+};
 use serde::{Deserialize, Serialize};
 
 use super::validate_profile_name;
 use super::AppState;
+use crate::server::auth::AuthenticatedTokenHash;
 use crate::server::auth::{handler_elevated, AuthenticatedSession, LoopbackTrusted};
 use crate::session::settings_schema::{
     clear_path, rewrite_plugin_sections, runtime_schema, strip_local_only, validate_patch,
     validate_patch_with, PatchRejection, Scope,
 };
+
+/// Foreground state reported by one browser dashboard. This is intentionally
+/// separate from normal API traffic: background polling must not suppress a
+/// phone's push notification.
+#[derive(Deserialize)]
+pub struct DashboardPresenceBody {
+    pub active: bool,
+}
+
+/// `POST /api/presence`. Record or clear this browser's foreground presence.
+/// The device-binding header is already attached to authenticated dashboard
+/// requests. Hashing it gives each browser an ephemeral server-side key without
+/// retaining the secret itself. Older clients without that header fall back to
+/// their authenticated token owner.
+pub async fn post_dashboard_presence(
+    State(state): State<Arc<AppState>>,
+    Extension(owner): Extension<AuthenticatedTokenHash>,
+    headers: HeaderMap,
+    Json(body): Json<DashboardPresenceBody>,
+) -> StatusCode {
+    let client = headers
+        .get("x-aoe-device-binding")
+        .and_then(|value| value.to_str().ok())
+        .map(crate::server::push::sha256_token)
+        .unwrap_or(owner.0);
+    state.set_web_presence(client, body.active);
+    StatusCode::NO_CONTENT
+}
 
 // --- Agents ---
 
