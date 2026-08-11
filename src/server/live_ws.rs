@@ -532,7 +532,8 @@ async fn handle_live_ws(
             {
                 let name = capture_tmux.clone();
                 outcome = match tokio::task::spawn_blocking(move || {
-                    crate::tmux::Session::from_name(&name).capture_pane_with_cursor(lines)
+                    crate::tmux::Session::from_name(&name)
+                        .capture_window_composited_with_cursor(lines)
                 })
                 .await
                 {
@@ -550,7 +551,8 @@ async fn handle_live_ws(
             {
                 let name = capture_tmux.clone();
                 outcome = match tokio::task::spawn_blocking(move || {
-                    crate::tmux::Session::from_name(&name).capture_pane_with_cursor(lines)
+                    crate::tmux::Session::from_name(&name)
+                        .capture_window_composited_with_cursor(lines)
                 })
                 .await
                 {
@@ -1044,6 +1046,9 @@ fn frame_json(content: &str, cursor: Option<&crate::tmux::PaneCursor>) -> String
         "altScreen": cursor.map(|c| c.alternate_on).unwrap_or(false),
         "mouse": cursor.map(|c| c.mouse_tracking).unwrap_or(false),
         "mouseSgr": cursor.map(|c| c.mouse_sgr).unwrap_or(false),
+        "pane0": cursor.and_then(|c| c.composite_pane0).map(|(cols, rows)| {
+            serde_json::json!({ "cols": cols, "rows": rows })
+        }),
     })
     .to_string()
 }
@@ -1146,7 +1151,7 @@ mod tests {
             mouse_sgr: false,
             mouse_all: false,
             position_reliable: true,
-            composite_pane0: None,
+            composite_pane0: Some((37, 46)),
         };
         let json = frame_json("hello\nworld", Some(&cursor));
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1159,6 +1164,8 @@ mod tests {
         assert_eq!(v["altScreen"], false);
         assert_eq!(v["mouse"], false);
         assert_eq!(v["mouseSgr"], false);
+        assert_eq!(v["pane0"]["cols"], 37);
+        assert_eq!(v["pane0"]["rows"], 46);
     }
 
     #[test]

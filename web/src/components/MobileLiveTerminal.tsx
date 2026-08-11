@@ -920,8 +920,8 @@ export function MobileLiveTerminal({
       const r = el.getBoundingClientRect();
       const content = el.querySelector<HTMLElement>("[data-live-content]");
       const gridTop = content?.getBoundingClientRect().top ?? r.top;
-      const cols = renderCols > 0 ? renderCols : 1;
-      const rows = Math.max(1, screenRows || rowsRef.current);
+      const cols = frame?.pane0?.cols ?? (renderCols > 0 ? renderCols : 1);
+      const rows = frame?.pane0?.rows ?? Math.max(1, screenRows || rowsRef.current);
       const col = Math.min(cols, Math.max(1, Math.floor((clientX - r.left) / charW) + 1));
       const visualRow = Math.floor((clientY - gridTop) / lineH) - effectiveSpacerLines;
       const firstScreenLine = Math.max(0, lines.length - screenRows);
@@ -929,7 +929,7 @@ export function MobileLiveTerminal({
       const row = Math.min(rows, Math.max(1, visualRow - screenTopVisual + 1));
       return { col, row };
     },
-    [charW, lineH, renderCols, screenRows, effectiveSpacerLines, lines.length, visual],
+    [charW, lineH, renderCols, screenRows, effectiveSpacerLines, lines.length, visual, frame?.pane0],
   );
 
   // Translate an accumulated pixel delta (positive = toward newer/down)

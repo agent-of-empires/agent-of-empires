@@ -38,6 +38,7 @@ function frame(over: Partial<LiveFrame>): LiveFrame {
     altScreen: false,
     mouse: false,
     mouseSgr: false,
+    pane0: null,
     ...over,
   };
 }
@@ -171,6 +172,14 @@ describe("MobileLiveTerminal wheel forwarding", () => {
     // press: base left=0, release=false; then release=true.
     expect(forwardButton.mock.calls[0].slice(0, 3)).toEqual([0, false, false]);
     expect(forwardButton.mock.calls[1][1]).toBe(true);
+  });
+
+  it("clamps split-window mouse input to pane 0", () => {
+    const { scroller, forwardButton } = renderTerm(
+      frame({ altScreen: true, mouse: true, mouseSgr: true, pane0: { cols: 1, rows: 1 } }),
+    );
+    fireEvent.pointerDown(scroller, { pointerType: "mouse", button: 0, clientX: 500, clientY: 500 });
+    expect(forwardButton.mock.calls[0]!.slice(4)).toEqual([1, 1]);
   });
 
   it("does NOT forward a click for a normal-screen agent", () => {

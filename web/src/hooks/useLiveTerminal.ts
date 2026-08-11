@@ -27,6 +27,11 @@ export interface LiveCursor {
   y: number;
 }
 
+export interface LivePaneExtent {
+  cols: number;
+  rows: number;
+}
+
 export interface LiveFrame {
   content: string;
   /** Pane height in rows; the content's last `rows` lines are the live
@@ -47,6 +52,8 @@ export interface LiveFrame {
   /** App is in SGR (1006) mouse encoding; picks the forwarded wire format
    *  (SGR vs legacy X10). */
   mouseSgr: boolean;
+  /** Pane 0's input extent when the frame composites a split window. */
+  pane0?: LivePaneExtent | null;
 }
 
 export interface LiveTerminalState {
@@ -257,6 +264,7 @@ export function useLiveTerminal(
           altScreen?: boolean;
           mouse?: boolean;
           mouseSgr?: boolean;
+          pane0?: LivePaneExtent | null;
         };
         try {
           msg = JSON.parse(text) as typeof msg;
@@ -292,6 +300,7 @@ export function useLiveTerminal(
           altScreen: msg.altScreen ?? false,
           mouse: msg.mouse ?? false,
           mouseSgr: msg.mouseSgr ?? false,
+          pane0: msg.pane0 ?? null,
         };
         // While reading, keep the capture window covering the FULL
         // history as the agent appends: the window was sized at entry,

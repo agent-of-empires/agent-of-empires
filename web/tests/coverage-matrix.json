@@ -139,6 +139,16 @@
       ]
     },
     {
+      "id": "terminal.live-split-composite",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/hooks/useLiveTerminal.forward.test.ts",
+        "src/components/__tests__/MobileLiveTerminal.forward.test.tsx"
+      ],
+      "components": ["web/src/hooks/useLiveTerminal.ts", "web/src/components/MobileLiveTerminal.tsx"]
+    },
+    {
       "id": "terminal.live-line-wrap-units",
       "kind": "vitest",
       "risk": "high",
