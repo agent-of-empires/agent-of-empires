@@ -4336,7 +4336,7 @@ impl Instance {
             } else {
                 raw_command
             };
-            let wrapped = wrap_command_ignore_suspend(&launch_command);
+            let wrapped = wrap_command_ignore_suspend(&launch_command, &self.project_path);
             (
                 Some(wrapped),
                 is_existing,
@@ -4647,7 +4647,7 @@ impl Instance {
                         raw_command
                     };
                     Ok((
-                        Some(wrap_command_ignore_suspend(&command)),
+                        Some(wrap_command_ignore_suspend(&command, &self.project_path)),
                         is_existing,
                         omp_capture_plan,
                     ))
@@ -4674,7 +4674,7 @@ impl Instance {
                 raw_command
             };
             Ok((
-                Some(wrap_command_ignore_suspend(&command)),
+                Some(wrap_command_ignore_suspend(&command, &self.project_path)),
                 is_existing,
                 omp_capture_plan,
             ))
@@ -7068,10 +7068,17 @@ fn shell_stdin_command(shell: &str, login: bool, script: &str, stem: &str) -> St
 /// Disable terminal suspension before replacing the pane process with the
 /// requested command. The user's POSIX login shell reads the launch script
 /// from a dedicated descriptor, keeping both large prompts and the pane TTY.
-fn wrap_command_ignore_suspend(cmd: &str) -> String {
+///
+/// `working_dir` is re-asserted with `cd` as the first statement in that
+/// script, after the login shell's profile/rc files have run. tmux's
+/// `new-session -c` only sets the shell's initial cwd, and a `-l` login
+/// shell's rc files (or an nvm/direnv hook) can `cd` away before the agent
+/// starts; re-cd-ing here wins regardless (#3265).
+fn wrap_command_ignore_suspend(cmd: &str, working_dir: &str) -> String {
     let user = super::environment::user_shell();
     let posix = super::environment::user_posix_shell();
-    let script = format!("stty susp undef\nexec env {cmd}");
+    let cd = super::environment::shell_escape(working_dir);
+    let script = format!("cd {cd} || exit 1\nstty susp undef\nexec env {cmd}");
     shell_stdin_command(&posix, user == posix, &script, "AOE_LAUNCH_BODY")
 }
 
@@ -10337,7 +10344,7 @@ mod tests {
     #[test]
     fn test_yolo_envvar_survives_suspend_wrapper() {
         let cmd = format_env_var_prefix("OPENCODE_PERMISSION", r#"{"*":"allow"}"#, "opencode");
-        let wrapped = wrap_command_ignore_suspend(&cmd);
+        let wrapped = wrap_command_ignore_suspend(&cmd, "/tmp/proj");
         assert!(
             wrapped.contains(r#"OPENCODE_PERMISSION='{"*":"allow"}' opencode"#),
             "wrapped command should preserve the env assignment: {wrapped}",
@@ -10350,7 +10357,7 @@ mod tests {
         let original = std::env::var("SHELL").ok();
         for shell in &["/bin/bash", "/bin/zsh", "/usr/bin/fish", "/usr/bin/nu"] {
             std::env::set_var("SHELL", shell);
-            let wrapped = wrap_command_ignore_suspend("claude");
+            let wrapped = wrap_command_ignore_suspend("claude", "/tmp/proj");
             assert!(
                 wrapped.contains("/dev/fd/3 3<<'AOE_LAUNCH_BODY'"),
                 "{shell}: {wrapped}"
@@ -10369,7 +10376,7 @@ mod tests {
     fn test_wrap_command_posix_shell_uses_login() {
         let original = std::env::var("SHELL").ok();
         std::env::set_var("SHELL", "/bin/zsh");
-        let wrapped = wrap_command_ignore_suspend("claude");
+        let wrapped = wrap_command_ignore_suspend("claude", "/tmp/proj");
         assert!(
             wrapped.starts_with("'/bin/zsh' -l /dev/fd/3 "),
             "POSIX shell should use a login descriptor script: {wrapped}",
@@ -10385,7 +10392,7 @@ mod tests {
     fn test_wrap_command_fish_skips_login() {
         let original = std::env::var("SHELL").ok();
         std::env::set_var("SHELL", "/usr/bin/fish");
-        let wrapped = wrap_command_ignore_suspend("claude");
+        let wrapped = wrap_command_ignore_suspend("claude", "/tmp/proj");
         // The bash fallback must not load bash login files because the user's
         // PATH setup belongs to fish.
         assert!(
@@ -10403,10 +10410,54 @@ mod tests {
     fn test_wrap_command_nu_skips_login() {
         let original = std::env::var("SHELL").ok();
         std::env::set_var("SHELL", "/usr/bin/nu");
-        let wrapped = wrap_command_ignore_suspend("claude");
+        let wrapped = wrap_command_ignore_suspend("claude", "/tmp/proj");
         assert!(
             wrapped.starts_with("'bash' /dev/fd/3 "),
             "nu should use a non-login bash descriptor script: {wrapped}",
+        );
+        match original {
+            Some(v) => std::env::set_var("SHELL", v),
+            None => std::env::remove_var("SHELL"),
+        }
+    }
+
+    /// #3265: a login shell's own profile/rc files can `cd` elsewhere
+    /// (a stray line in `~/.bashrc`, or a legitimate nvm/pyenv/direnv hook)
+    /// after tmux's `-c` has already set the pane's cwd, silently landing
+    /// the agent in the wrong directory. The wrapper must re-assert
+    /// `working_dir` inside the login shell's own script, after profile
+    /// sourcing, so it wins regardless of what those files did.
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn test_wrap_command_reasserts_working_dir_after_login_shell() {
+        let original = std::env::var("SHELL").ok();
+        std::env::set_var("SHELL", "/bin/bash");
+        let temp = tempfile::tempdir().unwrap();
+        let working_dir = temp.path().join("some project's dir");
+        std::fs::create_dir(&working_dir).unwrap();
+        let wrapped = wrap_command_ignore_suspend("pwd", working_dir.to_str().unwrap());
+        // The cd is the first statement inside the login shell's stdin script,
+        // after profile sourcing, before disabling suspend and exec'ing.
+        assert!(
+            wrapped.contains("3<<'AOE_LAUNCH_BODY'\ncd "),
+            "the cd must open the login shell's stdin script: {wrapped}",
+        );
+        assert!(
+            wrapped.contains("|| exit 1\nstty susp undef"),
+            "the cd must exit-on-failure before disabling suspend: {wrapped}",
+        );
+        let output = std::process::Command::new("bash")
+            .args(["-c", &wrapped])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "wrapped command failed: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            working_dir.to_string_lossy(),
         );
         match original {
             Some(v) => std::env::set_var("SHELL", v),
@@ -11550,7 +11601,7 @@ mod tests {
             shell_escape(&output.to_string_lossy())
         );
         let large_gate = gate_omp_launch(&large_command, &large_command, &omp_test_plan());
-        let large_outer = wrap_command_ignore_suspend(&large_gate);
+        let large_outer = wrap_command_ignore_suspend(&large_gate, temp.path().to_str().unwrap());
         assert!(!large_outer.lines().next().unwrap().contains("-c"));
         std::fs::write(&script, large_outer).unwrap();
         let status = std::process::Command::new("sh")
@@ -14487,6 +14538,9 @@ mod tests {
                 return;
             }
             let temp = tempdir().unwrap();
+            let project_dir = temp.path().join("project");
+            std::fs::create_dir_all(&project_dir).unwrap();
+            let project_path = project_dir.to_str().unwrap();
             std::env::set_var("HOME", temp.path());
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
@@ -14494,7 +14548,7 @@ mod tests {
             let storage = crate::session::storage::Storage::new_unwatched("fb-test").unwrap();
 
             let stale_sid = "11111111-1111-1111-1111-111111111111".to_string();
-            let mut inst = Instance::new("fallback_dies_test", "/tmp/x");
+            let mut inst = Instance::new("fallback_dies_test", project_path);
             inst.tool = "claude".to_string();
             inst.source_profile = "fb-test".to_string();
             inst.command = "/bin/false".to_string();
@@ -14561,6 +14615,9 @@ mod tests {
                 return;
             }
             let temp = tempdir().unwrap();
+            let project_dir = temp.path().join("project");
+            std::fs::create_dir_all(&project_dir).unwrap();
+            let project_path = project_dir.to_str().unwrap();
             std::env::set_var("HOME", temp.path());
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
@@ -14568,7 +14625,7 @@ mod tests {
             let storage = crate::session::storage::Storage::new_unwatched("fb-test-live").unwrap();
 
             let stale_sid = "22222222-2222-2222-2222-222222222222".to_string();
-            let mut inst = Instance::new("fallback_lives_test", "/tmp/x");
+            let mut inst = Instance::new("fallback_lives_test", project_path);
             inst.tool = "claude".to_string();
             inst.source_profile = "fb-test-live".to_string();
             inst.command = format!(
@@ -14632,6 +14689,9 @@ mod tests {
                 return;
             }
             let temp = tempdir().unwrap();
+            let project_dir = temp.path().join("project");
+            std::fs::create_dir_all(&project_dir).unwrap();
+            let project_path = project_dir.to_str().unwrap();
             std::env::set_var("HOME", temp.path());
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
@@ -14644,7 +14704,7 @@ mod tests {
             let storage = crate::session::storage::Storage::new_unwatched("fb-toggle-off").unwrap();
 
             let stale_sid = "44444444-4444-4444-4444-444444444444".to_string();
-            let mut inst = Instance::new("fallback_toggle_off_test", "/tmp/x");
+            let mut inst = Instance::new("fallback_toggle_off_test", project_path);
             inst.tool = "claude".to_string();
             inst.source_profile = "fb-toggle-off".to_string();
             // Would die if (and only if) `--resume <stale_sid>` reached the
@@ -14701,6 +14761,9 @@ mod tests {
                 return;
             }
             let temp = tempdir().unwrap();
+            let project_dir = temp.path().join("project");
+            std::fs::create_dir_all(&project_dir).unwrap();
+            let project_path = project_dir.to_str().unwrap();
             std::env::set_var("HOME", temp.path());
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
@@ -14714,7 +14777,7 @@ mod tests {
                 crate::session::storage::Storage::new_unwatched("fb-allow-ignores").unwrap();
 
             let stale_sid = "55555555-5555-5555-5555-555555555555".to_string();
-            let mut inst = Instance::new("fallback_allow_ignores_toggle_test", "/tmp/x");
+            let mut inst = Instance::new("fallback_allow_ignores_toggle_test", project_path);
             inst.tool = "claude".to_string();
             inst.source_profile = "fb-allow-ignores".to_string();
             inst.command = "/bin/false".to_string();
@@ -14765,6 +14828,9 @@ mod tests {
                 return;
             }
             let temp = tempdir().unwrap();
+            let project_dir = temp.path().join("project");
+            std::fs::create_dir_all(&project_dir).unwrap();
+            let project_path = project_dir.to_str().unwrap();
             std::env::set_var("HOME", temp.path());
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
@@ -14772,7 +14838,7 @@ mod tests {
             let storage = crate::session::storage::Storage::new_unwatched("fb-loop-break").unwrap();
 
             let stale_sid = "66666666-6666-6666-6666-666666666666".to_string();
-            let mut inst = Instance::new("fallback_loop_break_test", "/tmp/x");
+            let mut inst = Instance::new("fallback_loop_break_test", project_path);
             inst.tool = "claude".to_string();
             inst.source_profile = "fb-loop-break".to_string();
             inst.command = "/bin/false".to_string();
@@ -14852,6 +14918,9 @@ mod tests {
                 return;
             }
             let temp = tempdir().unwrap();
+            let project_dir = temp.path().join("project");
+            std::fs::create_dir_all(&project_dir).unwrap();
+            let project_path = project_dir.to_str().unwrap();
             std::env::set_var("HOME", temp.path());
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
@@ -14859,7 +14928,7 @@ mod tests {
             let storage = crate::session::storage::Storage::new_unwatched("fb-test-grace").unwrap();
 
             let stale_sid = "33333333-3333-3333-3333-333333333333".to_string();
-            let mut inst = Instance::new("fallback_grace_test", "/tmp/x");
+            let mut inst = Instance::new("fallback_grace_test", project_path);
             inst.tool = "claude".to_string();
             inst.source_profile = "fb-test-grace".to_string();
             inst.command = format!(

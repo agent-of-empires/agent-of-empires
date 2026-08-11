@@ -422,6 +422,42 @@ impl Session {
         if self.exists() {
             return Ok(());
         }
+
+        // tmux does not error when `-c <dir>` points at a missing directory;
+        // it silently falls back to the server's own `$HOME`, which for a
+        // long-running daemon/TUI process is wherever *it* was launched from,
+        // not this session's `project_path`. Callers (`Instance::start_with_size_opts`)
+        // already reload `project_path` from disk immediately before this call,
+        // so a missing directory here means the worktree/project itself is
+        // gone or not yet materialized, not a stale in-memory value. Fail
+        // loudly instead of silently spawning in the wrong place. See #3265.
+        let working_dir_path = std::path::Path::new(working_dir);
+        if !working_dir_path.is_dir() {
+            bail!(
+                "Cannot create tmux session '{}': working directory '{}' does not exist \
+                 or is not a directory (tmux would otherwise silently fall back to $HOME)",
+                self.name,
+                working_dir
+            );
+        }
+
+        // Diagnostic for #3265 ("fresh/restarted panes spawn with the wrong
+        // cwd"): log the exact `-c` value this spawn resolved to, plus its
+        // canonicalized form, so a future recurrence (if the guard above
+        // doesn't catch it, e.g. a permissions issue rather than a missing
+        // path) leaves direct evidence of what `working_dir` actually was at
+        // the moment of the `tmux new-session` call, instead of requiring a
+        // fresh repro under instrumentation.
+        tracing::debug!(target: "tmux.command",
+            session = %self.name,
+            working_dir,
+            working_dir_canonical = %working_dir_path
+                .canonicalize()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|e| format!("<canonicalize failed: {e}>")),
+            "resolved working directory for tmux new-session"
+        );
+
         let config = super::tmux_option_config(profile);
 
         // Forward the inherited host env (DISPLAY, XDG_*, DBUS, ... plus every
@@ -2653,6 +2689,41 @@ mod tests {
             shown.as_deref(),
             Some("XDG_AOE_ENV_TEST_3075=sentinel-value"),
             "a created agent session must carry the forwarded desktop/session env (#3075)"
+        );
+    }
+
+    /// #3265: tmux silently falls back to its server's `$HOME` when `-c`
+    /// points at a directory that doesn't exist, landing a fresh/restarted
+    /// pane in the daemon's launch directory instead of the session's
+    /// `project_path`. `create_with_size_env` must refuse to spawn rather
+    /// than let that happen invisibly.
+    #[test]
+    #[serial_test::serial]
+    fn test_create_with_size_env_rejects_missing_working_dir() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let guard = TmuxTestSession::new("aoe_test_missing_dir");
+        let session = super::Session::from_name(guard.name());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing_dir = tmp.path().join("does-not-exist");
+        let result = session.create_with_size(
+            missing_dir.to_str().unwrap(),
+            Some("sleep 5"),
+            None,
+            "default",
+        );
+
+        assert!(
+            result.is_err(),
+            "create_with_size_env must reject a missing working directory instead of \
+             silently falling back to tmux's own $HOME"
+        );
+        assert!(
+            !session.exists(),
+            "no tmux session should have been created"
         );
     }
 
