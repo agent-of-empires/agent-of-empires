@@ -910,20 +910,30 @@ export function MobileLiveTerminal({
     inputRef.current?.focus();
   }, [inputRef]);
 
-  // Map a viewport point to the app's 1-based pane cell for the forwarded
-  // wheel event (apps mostly ignore the exact cell, but send a sane one).
+  // Map a viewport point to the app's 1-based pane cell. The grid can be
+  // bottom-aligned and its trailing blank rows are trimmed, so its origin is
+  // the rendered content rather than the scroller's box.
   const pointerCell = useCallback(
     (clientX: number, clientY: number) => {
       const el = scrollerRef.current;
       if (!el || charW <= 0 || lineH <= 0) return { col: 1, row: 1 };
       const r = el.getBoundingClientRect();
-      const cols = renderCols > 0 ? renderCols : 1;
-      const rows = Math.max(1, screenRows || rowsRef.current);
+      const content = el.querySelector<HTMLElement>("[data-live-content]");
+      const gridTop = content?.getBoundingClientRect().top ?? r.top;
+      const cols = frame?.pane0?.cols ?? (renderCols > 0 ? renderCols : 1);
+      const rows = frame?.pane0?.rows ?? Math.max(1, screenRows || rowsRef.current);
       const col = Math.min(cols, Math.max(1, Math.floor((clientX - r.left) / charW) + 1));
-      const row = Math.min(rows, Math.max(1, Math.floor((clientY - r.top) / lineH) + 1));
+      const visualRow = Math.floor((clientY - gridTop) / lineH) - effectiveSpacerLines;
+      const firstScreenLine = Math.max(0, lines.length - screenRows);
+      const screenTopVisual = visual.lineStartRow[firstScreenLine] ?? 0;
+      const row = Math.min(rows, Math.max(1, visualRow - screenTopVisual + 1));
       return { col, row };
     },
-    [charW, lineH, renderCols, screenRows],
+    [charW, lineH, renderCols, screenRows, effectiveSpacerLines, lines.length, visual, frame?.pane0],
+  );
+  const inputPaneMiddleRow = useCallback(
+    () => Math.max(1, Math.round((frame?.pane0?.rows ?? rowsRef.current) / 2)),
+    [frame?.pane0?.rows],
   );
 
   // Translate an accumulated pixel delta (positive = toward newer/down)
@@ -942,11 +952,11 @@ export function MobileLiveTerminal({
       wheelAccumRef.current = remainder;
       if (notches === 0) return;
       const { col, row } = pointerCell(clientX, clientY);
-      const wheelRow = touchCell ? Math.max(1, Math.round(rowsRef.current / 2)) : row;
+      const wheelRow = touchCell ? inputPaneMiddleRow() : row;
       const up = notches < 0;
       for (let i = 0; i < Math.abs(notches); i++) forwardWheel(up, mouseSgrRef.current, col, wheelRow);
     },
-    [lineH, pointerCell, forwardWheel, mouseSgrRef],
+    [lineH, pointerCell, forwardWheel, mouseSgrRef, inputPaneMiddleRow],
   );
 
   const cancelTouchWheelQueue = useCallback(() => {
@@ -977,7 +987,7 @@ export function MobileLiveTerminal({
         state.raf = 0;
         if (!forwardModeRef.current || state.notches === 0) return;
         const { col } = pointerCell(state.x, state.y);
-        const row = Math.max(1, Math.round(rowsRef.current / 2));
+        const row = inputPaneMiddleRow();
         const up = state.notches < 0;
         forwardWheel(up, mouseSgrRef.current, col, row);
         state.notches += up ? 1 : -1;
@@ -989,7 +999,7 @@ export function MobileLiveTerminal({
       // swipe track remote redraws instead of arriving as a wheel storm.
       if (!queued.raf) flushOne();
     },
-    [lineH, pointerCell, forwardWheel, forwardModeRef, mouseSgrRef],
+    [lineH, pointerCell, forwardWheel, forwardModeRef, mouseSgrRef, inputPaneMiddleRow],
   );
   useEffect(() => cancelTouchWheelQueue, [cancelTouchWheelQueue]);
 

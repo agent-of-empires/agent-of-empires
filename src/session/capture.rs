@@ -826,30 +826,31 @@ pub(crate) fn compose_exclusion(
     set
 }
 
-/// Extend [`compose_exclusion`] with the sids of stopped, archived, or
-/// pane-less same-tool peers in the same `project_path`, read from
-/// `sessions.json` via `Storage` for the caller's effective profile.
+/// Extend [`compose_exclusion`] with conversations same-project peers parked
+/// for `current_tool` during an engine swap. When
+/// `include_inactive_same_tool` is true, also include the sids of stopped,
+/// archived, or pane-less peers using `current_tool`. Persisted peers are read
+/// from `sessions.json` via `Storage` for the caller's effective profile.
 ///
-/// Used by the Claude branch and by host Codex sessions in
-/// `Instance::try_retroactive_capture`. Their mtime fallbacks otherwise pick a
-/// co-located stopped peer's transcript, since [`build_exclusion_set`] only
-/// sees live tmux peers, and the resume binds to the peer's conversation
-/// (#2355). Sandboxed Codex sessions have instance-private `CODEX_HOME`
-/// directories and do not share a transcript store (#3317).
-///
-/// The poll functions keep the live-only exclusion via [`compose_exclusion`]:
-/// they run on a hot polling path, and live peers already surface in the tmux
-/// env scan.
+/// Used by `Instance::try_retroactive_capture` and snapshotted when its poller
+/// starts. Parked conversations are no longer published in the peer's tmux
+/// environment, so [`build_exclusion_set`] cannot see them. Without this set,
+/// another session can capture the parked conversation before its owner swaps
+/// back. Claude and host Codex additionally need stopped peer protection
+/// because their mtime fallbacks can select a transcript after the owning tmux
+/// pane disappears (#2355). Sandboxed Codex sessions have instance-private
+/// `CODEX_HOME` directories and do not share a transcript store (#3317).
 ///
 /// Scope: the host transcript directories are keyed by `$HOME`, not by AoE
 /// profile, but this helper only inspects `sessions.json` for the caller's
 /// effective profile. A stopped peer in a different profile against the same
 /// host `$HOME` will not be excluded; the residual gap is narrower than #2355's
 /// trigger and is left for a follow-up.
-pub(crate) fn compose_exclusion_with_stopped_peers(
+pub(crate) fn compose_exclusion_with_persisted_peers(
     current_instance_id: &str,
     current_project_path: &str,
-    tool: &str,
+    current_tool: &str,
+    include_inactive_same_tool: bool,
     profile: &str,
     retroactive_capture_excludes: &HashSet<String>,
 ) -> HashSet<String> {
@@ -870,10 +871,22 @@ pub(crate) fn compose_exclusion_with_stopped_peers(
         if inst.id == current_instance_id {
             continue;
         }
-        if inst.tool != tool {
+        if canonicalize_or_raw(&inst.project_path) != canonical_current {
             continue;
         }
-        if canonicalize_or_raw(&inst.project_path) != canonical_current {
+        // A peer that swapped away still owns the conversation it parked and
+        // intends to resume it on a swap back. It is excluded regardless of the
+        // peer's current tool or liveness: its pane is running another engine,
+        // so the live tmux ownership scan cannot discover this id.
+        if let Some(parked) = inst
+            .prior_tool_session_ids
+            .get(current_tool)
+            .and_then(|p| p.agent_session_id.as_deref())
+            .filter(|s| !s.is_empty())
+        {
+            set.insert(parked.to_string());
+        }
+        if !include_inactive_same_tool || inst.tool != current_tool {
             continue;
         }
         let should_exclude = matches!(inst.status, crate::session::Status::Stopped)

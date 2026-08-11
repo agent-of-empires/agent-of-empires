@@ -104,12 +104,14 @@ describe("useLiveTerminal forwardWheel", () => {
           altScreen: true,
           mouse: true,
           mouseSgr: false,
+          pane0: { cols: 40, rows: 24 },
         }),
       });
     });
     expect(result.current.state.frame?.altScreen).toBe(true);
     expect(result.current.state.frame?.mouse).toBe(true);
     expect(result.current.state.frame?.mouseSgr).toBe(false);
+    expect(result.current.state.frame?.pane0).toEqual({ cols: 40, rows: 24 });
   });
 
   it("delivers every clipboard event even when the copied text repeats", () => {

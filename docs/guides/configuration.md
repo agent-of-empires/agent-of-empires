@@ -141,6 +141,7 @@ Notification = "waiting"
 | `acp.allowed_agents` | `[]` | ACP registry keys a structured view session may run while `acp.restrict_agents` is on, e.g. `["claude", "codex"]`. These are registry keys, not binary names, and each alias counts separately (allowing `claude` does not allow `claude-code`). With the restriction on, an empty list denies every agent. Governs the structured view only; a terminal session runs in a pane where any binary can be launched, so it is not constrained here. A policy change applies to new sessions immediately and to an already-running worker when it next respawns or when the daemon restarts, at which point a worker on a now-disallowed agent is terminated rather than reattached. |
 | `acp.acp_defaults` | `{}` | Per-agent defaults for structured view startup (under the `[acp]` section, not `[session]`). `model` is forwarded when the worker starts; `effort` (thinking) and `mode` are applied through the agent's ACP config options (`thought_level`, `mode`) when advertised, and skipped with a warning otherwise. `effort_by_model` (a `{model = effort}` map) overrides `effort` for the resolved model. Editable per agent from the web dashboard (Structured view tab, Structured View Defaults). Example: `[acp.acp_defaults.opencode] model = "openai/gpt-5.5" effort = "high" mode = "plan"`. |
 | `agents.<name>.status_map` | `{}` | Trusted global/profile-only hook event to AoE status mappings. Valid statuses are `running`, `waiting`, `idle`, and `error`. Entries apply by event name to built-in hook defaults, so duplicate event names with different matchers all receive the same status; new event names are added to the installed hooks when the agent format supports event keys. Existing hook files update on the next hook install, usually a new or restarted session. Agent processes with installed status hooks receive `AOE_PROFILE`, so hook scripts can query the resolved map with `aoe -p "$AOE_PROFILE" profile show --status-map <agent> --json`. |
+| `agents.<name>.status_rules` | `[]` | Trusted global/profile-only declarative pane status rules (`[[agents.<name>.status_rules]]` array of tables). Each rule has `status` (`running`, `waiting`, `idle`, or `error`) and exactly one of `contains` (case-insensitive substring) or `regex` (Rust regex, matched as written; use `(?i)` for case-insensitive). Rules are evaluated in order against the ANSI-stripped pane snapshot; first match wins, no match reports `idle`. Rules take precedence over `agent_detect_as` and over a built-in detector of the same name. Invalid rules are skipped with a warning in the debug log. Takes effect on the next config resolve (TUI or daemon start). |
 
 For Codex, AoE preserves existing `[hooks.state]` trust data and writes `~/.codex/config.toml` through `config.toml.lock` plus an atomic replace. This keeps repeated or concurrent AoE launches from duplicating hook blocks or leaving partial TOML.
 
@@ -193,11 +194,30 @@ agent_detect_as = { "lenovo-claude" = "claude" }
 ```
 
 - **`custom_agents`**: Maps a display name to the shell command AoE runs in a tmux pane when that agent is selected. Names appear in the TUI picker alongside built-ins like `claude`, `opencode`, and `codex`, and work with `aoe add --tool <name>`.
-- **`agent_detect_as`** (optional): Reuses a built-in agent's status detection for the custom agent. Without it, custom agents default to `Idle`.
+- **`agent_detect_as`** (optional): Reuses a built-in agent's status detection for the custom agent. Without it (and without `status_rules`, below), custom agents default to `Idle`. Best for wrappers that run the *same* binary differently (SSH, scripts); for an agent whose output differs from every built-in, use `status_rules` instead.
 - **`agent_acp_cmd`** (optional): ACP launch command that lets the agent run in the structured view (see below).
 - **`default_tool`** (optional): Can point at a custom-agent name to default new sessions to it.
 
 Custom agents are always shown as available in the picker since their command may target a remote host or wrapper. All three maps are editable in config files or the TUI settings screen and support profile/repo overrides; profile/repo values fully replace the global map (redeclare any agents you want to keep). The Web wizard can select a configured custom agent but does not expose or edit the command strings.
+
+#### Status rules for custom agents
+
+`agent_detect_as` only works when the custom agent renders the same output as the built-in it aliases. For a harness that is *similar to but not the same binary as* any built-in, declare pane status rules instead; no change to the agent is needed:
+
+```toml
+[session.custom_agents]
+gjc = "gjc"
+
+[[agents.gjc.status_rules]]
+status = "waiting"
+contains = "(y/n)"
+
+[[agents.gjc.status_rules]]
+status = "running"
+regex = "esc to interrupt|thinking"
+```
+
+Rules are checked in order against the last screenful of ANSI-stripped pane text every status poll; the first match wins and no match reports `idle`. Put the more specific states (`waiting`, `error`) before the broad `running` matchers. When an agent has rules, they take precedence over its `agent_detect_as` alias and over a built-in detector of the same name.
 
 #### Running a custom agent in the structured view
 

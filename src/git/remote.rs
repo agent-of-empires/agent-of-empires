@@ -276,30 +276,53 @@ fn redact_url(url: &str) -> String {
     url.to_string()
 }
 
-/// Extract the owner (first path segment) from a git remote URL.
-///
-/// Handles common formats:
-/// - SSH shorthand: `git@github.com:owner/repo.git`
-/// - HTTPS: `https://github.com/owner/repo.git`
-/// - SSH URL: `ssh://git@github.com/owner/repo.git`
-pub(crate) fn parse_owner_from_remote_url(url: &str) -> Option<String> {
-    // SSH shorthand: git@host:owner/repo.git
-    // Detect by presence of '@' before ':' and no "://" scheme prefix.
+/// Split a git remote URL into its host and the path segment after it,
+/// rejecting any URL that is not a canonical hosted remote: a known scheme
+/// (`http`/`https`/`ssh`) or SSH shorthand (`user@host:path`). Local schemes
+/// (`file://`), bare/absolute filesystem paths, and relative paths all
+/// return `None` so they can never be mistaken for a hosted `owner/repo`.
+fn split_host_and_path(url: &str) -> Option<(&str, &str)> {
     if !url.contains("://") {
-        if let Some(colon_pos) = url.find(':') {
-            if url[..colon_pos].contains('@') {
-                let after = &url[colon_pos + 1..];
-                let owner = after.split('/').next()?;
-                return (!owner.is_empty()).then(|| owner.to_string());
-            }
+        // SSH shorthand: git@host:owner/repo.git
+        let colon_pos = url.find(':')?;
+        let userinfo = &url[..colon_pos];
+        if !userinfo.contains('@') {
+            return None;
         }
+        let path = &url[colon_pos + 1..];
+        // An absolute path (`git@host:/foo/bar.git`) is a filesystem path,
+        // not a hosted owner/repo slug; reject it.
+        if path.starts_with('/') {
+            return None;
+        }
+        let host = userinfo.rsplit_once('@').map_or(userinfo, |(_, h)| h);
+        if host.is_empty() {
+            return None;
+        }
+        return Some((host, path));
     }
 
-    // URL format: scheme://[user@]host/owner/repo.git
-    let without_scheme = url.split("://").nth(1).unwrap_or(url);
-    let after_host = &without_scheme[without_scheme.find('/')? + 1..];
-    let owner = after_host.split('/').next()?;
-    (!owner.is_empty()).then(|| owner.to_string())
+    let (scheme, without_scheme) = url.split_once("://")?;
+    if !matches!(scheme, "http" | "https" | "ssh") {
+        return None;
+    }
+    let slash_pos = without_scheme.find('/')?;
+    let host_part = &without_scheme[..slash_pos];
+    let host = host_part.rsplit_once('@').map_or(host_part, |(_, h)| h);
+    if host.is_empty() {
+        return None;
+    }
+    Some((host, &without_scheme[slash_pos + 1..]))
+}
+
+/// Extract the owner (first path segment) from a git remote URL. Delegates
+/// to [`parse_slug_from_remote_url`] so it inherits the same rejection of
+/// non-hosted remotes: an owner only exists when the URL is a canonical
+/// hosted `owner/repo`, never a coincidental first path component of a
+/// local filesystem path (`file://`, absolute, or relative).
+pub(crate) fn parse_owner_from_remote_url(url: &str) -> Option<String> {
+    parse_slug_from_remote_url(url)
+        .and_then(|s| s.split_once('/').map(|(owner, _)| owner.to_string()))
 }
 
 /// Look up the owner of a git repository by reading the `origin` remote URL.
@@ -312,6 +335,35 @@ pub fn get_remote_owner(path: &Path) -> Option<String> {
     parse_owner_from_remote_url(url)
 }
 
+/// Extract a host-scoped owner identity ("owner@host") from a git remote
+/// URL, alongside the bare owner for display. Two owners of the same name on
+/// different hosts (GitHub "acme" vs GitLab "acme") must never collide into
+/// one grouping bucket, but the display label should stay the bare owner;
+/// this returns both from a single parse. `None` under the same conditions
+/// as [`parse_owner_from_remote_url`].
+pub(crate) fn parse_owner_with_key_from_remote_url(url: &str) -> Option<(String, String)> {
+    let owner = parse_owner_from_remote_url(url)?;
+    let (host, _) = split_host_and_path(url)?;
+    // Hostnames are case-insensitive (DNS); without lowercasing, a remote
+    // typed as `GitHub.com/acme` and one typed as `github.com/acme` would
+    // land in two different buckets for the same real host.
+    let key = format!("{owner}@{}", host.to_ascii_lowercase());
+    Some((owner, key))
+}
+
+/// Look up a git repository's `origin` remote owner and a host-scoped
+/// identity key ("owner@host") in a single repo/remote lookup. Use the
+/// owner for display (matches [`get_remote_owner`]); use the key for
+/// grouping/dedup, so two owners of the same name on different hosts never
+/// merge into one bucket. Returns `None` under the same conditions as
+/// `get_remote_owner`.
+pub fn get_remote_owner_with_key(path: &Path) -> Option<(String, String)> {
+    let repo = open_repo_at(path).ok()?;
+    let remote = repo.find_remote("origin").ok()?;
+    let url = remote.url().ok()?;
+    parse_owner_with_key_from_remote_url(url)
+}
+
 /// Extract the `owner/repo` slug from a git remote URL, stripping any `.git`
 /// suffix and trailing slash. Handles the same formats as
 /// [`parse_owner_from_remote_url`]. Returns `None` unless the URL is a canonical
@@ -319,27 +371,7 @@ pub fn get_remote_owner(path: &Path) -> Option<String> {
 /// with exactly an `owner/repo` path. Local schemes like `file://` are rejected
 /// so they never produce a bogus slug.
 pub(crate) fn parse_slug_from_remote_url(url: &str) -> Option<String> {
-    // Reduce to the path after the host: `owner/repo(.git)`.
-    let path = if !url.contains("://") {
-        // SSH shorthand: git@host:owner/repo.git
-        let colon_pos = url.find(':')?;
-        if !url[..colon_pos].contains('@') {
-            return None;
-        }
-        let scp_path = &url[colon_pos + 1..];
-        // An absolute path (`git@host:/foo/bar.git`) is a filesystem path, not a
-        // hosted owner/repo slug; reject it.
-        if scp_path.starts_with('/') {
-            return None;
-        }
-        scp_path
-    } else {
-        let (scheme, without_scheme) = url.split_once("://")?;
-        if !matches!(scheme, "http" | "https" | "ssh") {
-            return None;
-        }
-        &without_scheme[without_scheme.find('/')? + 1..]
-    };
+    let (_, path) = split_host_and_path(url)?;
     let path = path.trim_end_matches('/');
     let path = path.strip_suffix(".git").unwrap_or(path);
     let mut segments = path.split('/').filter(|s| !s.is_empty());
@@ -465,6 +497,62 @@ mod tests {
     #[test]
     fn test_parse_owner_empty_url() {
         assert_eq!(parse_owner_from_remote_url(""), None);
+    }
+
+    #[test]
+    fn test_parse_owner_rejects_non_hosted_remotes() {
+        // Regression: `parse_owner_from_remote_url` used to take the first
+        // path segment unconditionally, so local-only repos got a real
+        // (bogus) org header instead of falling into "No organization".
+        // Every case here previously returned `Some(..)`.
+        for url in [
+            "file:///srv/git/foo.git",
+            "file://host/myorg/repo.git",
+            "git@host:/foo/bar.git",
+            // Empty authority after stripping userinfo: no real host to
+            // scope an identity to, so these must not produce an owner
+            // either, not just a key.
+            "user@:owner/repo.git",
+            "https:///owner/repo.git",
+            "ssh://@/owner/repo.git",
+        ] {
+            assert_eq!(parse_owner_from_remote_url(url), None, "failed for {url}");
+        }
+    }
+
+    #[test]
+    fn test_parse_owner_with_key_scopes_identity_by_host() {
+        // Same owner login on two different hosts must not collide: the key
+        // disambiguates by host, the owner is bare for display.
+        assert_eq!(
+            parse_owner_with_key_from_remote_url("git@github.com:acme/x.git"),
+            Some(("acme".to_string(), "acme@github.com".to_string())),
+        );
+        assert_eq!(
+            parse_owner_with_key_from_remote_url("https://gitlab.com/acme/y.git"),
+            Some(("acme".to_string(), "acme@gitlab.com".to_string())),
+        );
+        // Non-hosted remotes still resolve to no identity at all.
+        assert_eq!(
+            parse_owner_with_key_from_remote_url("file:///srv/git/foo.git"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_parse_owner_with_key_normalizes_host_case() {
+        // Hostnames are case-insensitive (DNS): a remote typed with a
+        // differently-cased host must resolve to the same identity key as
+        // its canonical lowercase form, or the two would spuriously land
+        // in separate org buckets for what is really one host.
+        assert_eq!(
+            parse_owner_with_key_from_remote_url("git@GitHub.COM:acme/x.git"),
+            Some(("acme".to_string(), "acme@github.com".to_string())),
+        );
+        assert_eq!(
+            parse_owner_with_key_from_remote_url("https://GitHub.com/acme/x.git"),
+            parse_owner_with_key_from_remote_url("https://github.com/acme/x.git"),
+        );
     }
 
     #[test]

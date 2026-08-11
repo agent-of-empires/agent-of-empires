@@ -5,6 +5,7 @@ pub(crate) mod env;
 mod session;
 pub mod status_bar;
 pub(crate) mod status_detection;
+pub(crate) mod status_rules;
 mod terminal_session;
 #[cfg(test)]
 pub(crate) mod test_helpers;
@@ -15,12 +16,12 @@ pub(crate) mod vt;
 
 pub use session::{PaneCursor, Session, SIZE_OWNER_HEARTBEAT, SIZE_OWNER_TTL};
 pub use status_bar::{get_session_info_for_current, get_status_for_current_session};
-pub use status_detection::detect_status_from_content;
 pub(crate) use status_detection::{
     claude_pane_is_ambiguous_typed_prompt, claude_pane_marker_fingerprint,
     reconcile_claude_hook_status, reconcile_claude_idle_hook_status, reconcile_codex_hook_status,
     reconcile_waiting_hook,
 };
+pub use status_detection::{detect_status_from_content, detect_status_from_content_in};
 pub use terminal_session::{kill_all_terminals_for_id, ContainerTerminalSession, TerminalSession};
 pub use tool_session::{kill_all_tool_sessions_for_id, ToolSession};
 pub use utils::tmux_prefix_display;

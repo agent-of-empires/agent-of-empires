@@ -12,6 +12,7 @@ mod deletion_poller;
 pub mod dialogs;
 pub mod diff;
 pub(crate) mod home;
+pub(crate) mod markdown;
 #[cfg(feature = "serve")]
 pub(crate) mod open_url;
 #[cfg(feature = "serve")]
