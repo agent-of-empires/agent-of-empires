@@ -5760,8 +5760,8 @@ const CONTAINER_TERMINAL_AUTODETECT_CMD: &str = r#"sh -c 'exec "$(command -v "$(
 /// new-session -c <working_dir>` (see `tmux::Session::create_with_size_env`)
 /// only sets the *shell's* initial cwd; the `-l` login flag below sources
 /// `~/.bash_profile`/`~/.bashrc` (needed for version-manager PATH setup, e.g.
-/// NVM), and anything in those files that changes directory — a user's own
-/// stray `cd`, or a legitimate nvm/pyenv/direnv hook — silently overrides
+/// NVM), and anything in those files that changes directory, such as a user's
+/// own stray `cd` or a legitimate nvm/pyenv/direnv hook, silently overrides
 /// tmux's `-c` before the real agent command ever runs, landing the pane
 /// wherever the profile left it (typically `$HOME`) instead of
 /// `project_path`. This was the actual mechanism behind #3265: `-c` was
@@ -5771,17 +5771,15 @@ const CONTAINER_TERMINAL_AUTODETECT_CMD: &str = r#"sh -c 'exec "$(command -v "$(
 fn wrap_command_ignore_suspend(cmd: &str, working_dir: &str) -> String {
     let user = super::environment::user_shell();
     let posix = super::environment::user_posix_shell();
-    let escaped = cmd.replace('\'', "'\\''");
     // Use login shell (-l) so version-manager PATHs (NVM, etc.) are available.
     // Skip -l when falling back to bash for a non-POSIX user shell (fish, nu,
     // pwsh): bash's login scripts won't contain the user's PATH setup and -l
     // may reset the inherited PATH that already has the correct entries.
     let flag = if user == posix { "-lc" } else { "-c" };
     let cd = super::environment::shell_escape(working_dir);
-    format!(
-        "exec {} {} 'cd {} || exit 1; stty susp undef; exec env {}'",
-        posix, flag, cd, escaped
-    )
+    let script = format!("cd {cd} || exit 1; stty susp undef; exec env {cmd}");
+    let escaped = script.replace('\'', "'\\''");
+    format!("exec {posix} {flag} '{escaped}'")
 }
 
 /// Prepend shell `export` statements to an already-wrapped sandbox command.
@@ -8540,12 +8538,10 @@ mod tests {
     fn test_wrap_command_reasserts_working_dir_after_login_shell() {
         let original = std::env::var("SHELL").ok();
         std::env::set_var("SHELL", "/bin/bash");
-        let wrapped = wrap_command_ignore_suspend("claude", "/tmp/some project's dir");
-        assert!(
-            wrapped.contains("/tmp/some project"),
-            "wrapped command must carry the working_dir path: {}",
-            wrapped,
-        );
+        let temp = tempfile::tempdir().unwrap();
+        let working_dir = temp.path().join("some project's dir");
+        std::fs::create_dir(&working_dir).unwrap();
+        let wrapped = wrap_command_ignore_suspend("pwd", working_dir.to_str().unwrap());
         assert!(
             wrapped.contains("|| exit 1; stty susp undef"),
             "wrapped command must `cd` back to working_dir, with exit-on-failure, \
@@ -8553,7 +8549,7 @@ mod tests {
             wrapped,
         );
         // The cd must run *inside* the login shell's quoted script (after -lc),
-        // not before it -- otherwise it has no effect on where the login
+        // not before it; otherwise it has no effect on where the login
         // shell's own profile sourcing left the cwd.
         let login_script_start = wrapped
             .find("-lc '")
@@ -8563,6 +8559,19 @@ mod tests {
             wrapped[login_script_start..].starts_with("cd "),
             "the cd must be the first statement inside the login shell's script: {}",
             wrapped,
+        );
+        let output = std::process::Command::new("bash")
+            .args(["-c", &wrapped])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "wrapped command failed: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            working_dir.to_string_lossy(),
         );
         match original {
             Some(v) => std::env::set_var("SHELL", v),

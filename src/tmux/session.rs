@@ -371,13 +371,13 @@ impl Session {
             return Ok(());
         }
 
-        // tmux does not error when `-c <dir>` points at a missing directory —
+        // tmux does not error when `-c <dir>` points at a missing directory;
         // it silently falls back to the server's own `$HOME`, which for a
         // long-running daemon/TUI process is wherever *it* was launched from,
         // not this session's `project_path`. Callers (`Instance::start_with_size_opts`)
         // already reload `project_path` from disk immediately before this call,
         // so a missing directory here means the worktree/project itself is
-        // gone or not yet materialized, not a stale in-memory value — fail
+        // gone or not yet materialized, not a stale in-memory value. Fail
         // loudly instead of silently spawning in the wrong place. See #3265.
         let working_dir_path = std::path::Path::new(working_dir);
         if !working_dir_path.is_dir() {
@@ -392,7 +392,7 @@ impl Session {
         // Diagnostic for #3265 ("fresh/restarted panes spawn with the wrong
         // cwd"): log the exact `-c` value this spawn resolved to, plus its
         // canonicalized form, so a future recurrence (if the guard above
-        // doesn't catch it — e.g. a permissions issue rather than a missing
+        // doesn't catch it, e.g. a permissions issue rather than a missing
         // path) leaves direct evidence of what `working_dir` actually was at
         // the moment of the `tmux new-session` call, instead of requiring a
         // fresh repro under instrumentation.
