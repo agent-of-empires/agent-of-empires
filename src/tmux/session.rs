@@ -2354,8 +2354,10 @@ mod tests {
 
         let guard = TmuxTestSession::new("aoe_test_missing_dir");
         let session = super::Session::from_name(guard.name());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing_dir = tmp.path().join("does-not-exist");
         let result = session.create_with_size(
-            "/nonexistent/definitely-not-here/aoe-3265",
+            missing_dir.to_str().unwrap(),
             Some("sleep 5"),
             None,
             "default",
