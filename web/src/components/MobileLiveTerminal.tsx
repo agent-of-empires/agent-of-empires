@@ -931,6 +931,10 @@ export function MobileLiveTerminal({
     },
     [charW, lineH, renderCols, screenRows, effectiveSpacerLines, lines.length, visual, frame?.pane0],
   );
+  const inputPaneMiddleRow = useCallback(
+    () => Math.max(1, Math.round((frame?.pane0?.rows ?? rowsRef.current) / 2)),
+    [frame?.pane0?.rows],
+  );
 
   // Translate an accumulated pixel delta (positive = toward newer/down)
   // into forwarded wheel notches, one per text row, carrying the leftover.
@@ -948,11 +952,11 @@ export function MobileLiveTerminal({
       wheelAccumRef.current = remainder;
       if (notches === 0) return;
       const { col, row } = pointerCell(clientX, clientY);
-      const wheelRow = touchCell ? Math.max(1, Math.round(rowsRef.current / 2)) : row;
+      const wheelRow = touchCell ? inputPaneMiddleRow() : row;
       const up = notches < 0;
       for (let i = 0; i < Math.abs(notches); i++) forwardWheel(up, mouseSgrRef.current, col, wheelRow);
     },
-    [lineH, pointerCell, forwardWheel, mouseSgrRef],
+    [lineH, pointerCell, forwardWheel, mouseSgrRef, inputPaneMiddleRow],
   );
 
   const cancelTouchWheelQueue = useCallback(() => {
@@ -983,7 +987,7 @@ export function MobileLiveTerminal({
         state.raf = 0;
         if (!forwardModeRef.current || state.notches === 0) return;
         const { col } = pointerCell(state.x, state.y);
-        const row = Math.max(1, Math.round(rowsRef.current / 2));
+        const row = inputPaneMiddleRow();
         const up = state.notches < 0;
         forwardWheel(up, mouseSgrRef.current, col, row);
         state.notches += up ? 1 : -1;
@@ -995,7 +999,7 @@ export function MobileLiveTerminal({
       // swipe track remote redraws instead of arriving as a wheel storm.
       if (!queued.raf) flushOne();
     },
-    [lineH, pointerCell, forwardWheel, forwardModeRef, mouseSgrRef],
+    [lineH, pointerCell, forwardWheel, forwardModeRef, mouseSgrRef, inputPaneMiddleRow],
   );
   useEffect(() => cancelTouchWheelQueue, [cancelTouchWheelQueue]);
 
