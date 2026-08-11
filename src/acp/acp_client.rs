@@ -422,7 +422,9 @@ pub struct SpawnConfig {
     pub spec: AgentSpec,
     pub cwd: PathBuf,
     pub additional_dirs: Vec<PathBuf>,
-    /// Provider env vars to forward (after applying the agent's allowlist).
+    /// Explicit per-session provider env vars to forward after applying the
+    /// protected-key denylist. These are independent of ambient host auth and
+    /// therefore work for built-in and custom adapters alike.
     pub provider_env: Vec<(String, String)>,
     /// Trusted global/profile `environment` entries ("Host Environment"),
     /// already resolved to concrete pairs, to apply to the agent process the
@@ -3787,40 +3789,13 @@ fn build_sandbox_docker_argv(
         container_workdir.to_string(),
     ];
     // `collect_environment` already dedupes by key, so the entry list is
-    // unique. We still track `seen_keys` so the provider-auth block below
-    // can skip keys we've already forwarded.
+    // unique. We still track `seen_keys` so the explicit per-spawn entries
+    // below cannot override sandbox configuration.
     let mut seen_keys: std::collections::HashSet<String> =
         env_entries.iter().map(|e| e.key().to_string()).collect();
     let (env_argv, inherit_pairs) = docker_env_args(&env_entries);
     docker_args.extend(env_argv);
     let mut inherit_env: Vec<(String, String)> = inherit_pairs;
-
-    // Provider auth keys: forward into the container only when set on
-    // the host AND not already in the sandbox env list. Value-typed
-    // only; host filesystem paths (e.g. `CLAUDE_CONFIG_DIR`) must not
-    // cross the namespace boundary because they reference paths that
-    // don't exist inside the container. The agent's config dir is
-    // already bind-mounted at the canonical container path via
-    // `AGENT_CONFIG_MOUNTS`.
-    const PROVIDER_AUTH_KEYS: &[&str] = &[
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "CLAUDE_CODE_OAUTH_TOKEN",
-        "OPENAI_API_KEY",
-        "GEMINI_API_KEY",
-        "OPENROUTER_API_KEY",
-    ];
-    for &key in PROVIDER_AUTH_KEYS {
-        if seen_keys.contains(key) {
-            continue;
-        }
-        if let Ok(value) = std::env::var(key) {
-            seen_keys.insert(key.to_string());
-            docker_args.push("-e".into());
-            docker_args.push(key.into());
-            inherit_env.push((key.into(), value));
-        }
-    }
 
     // Per-spawn provider_env entries (the request's auth payload).
     for (key, value) in &config.provider_env {
@@ -3850,11 +3825,35 @@ fn build_sandbox_docker_argv(
     })
 }
 
-/// Env vars forwarded from the operator environment to every spawned
-/// agent, on both the detached-runner path (`apply_env_filter`) and the
-/// in-proc stdio path (`spawn_subprocess`). Both spawn sites `env_clear()`
-/// first, so this is the whole inheritance surface; keeping it in one const
-/// is what stops the two paths drifting apart.
+/// Ambient host variables declared by each built-in ACP adapter. These are
+/// host-only: sandboxed agents require `sandbox.environment` or an explicit
+/// per-session `provider_env` entry instead. Unknown and custom adapters get
+/// no ambient provider credentials and can opt in through `env_allowlist`.
+fn agent_host_env_keys(agent_key: &str) -> &'static [&'static str] {
+    const CLAUDE: &[&str] = &[
+        "ANTHROPIC_API_KEY",
+        "ANTHROPIC_AUTH_TOKEN",
+        "CLAUDE_CODE_OAUTH_TOKEN",
+        "CLAUDE_CONFIG_DIR",
+    ];
+    const CODEX: &[&str] = &["OPENAI_API_KEY"];
+    const GEMINI: &[&str] = &["GEMINI_API_KEY"];
+    const OPENCODE: &[&str] = &["OPENROUTER_API_KEY"];
+
+    match agent_key {
+        "claude" | "claude-code" => CLAUDE,
+        "codex" => CODEX,
+        "gemini" => GEMINI,
+        "opencode" => OPENCODE,
+        _ => &[],
+    }
+}
+
+/// Infrastructure variables forwarded from the operator environment to every
+/// host-side agent, on both the detached-runner path (`apply_env_filter`) and
+/// the in-proc stdio path (`spawn_subprocess`). Both spawn sites `env_clear()`
+/// first, so this plus [`agent_host_env_keys`] is the ambient inheritance
+/// surface; keeping both lists shared stops the two paths drifting apart.
 const ALWAYS_FORWARD_ENV: &[&str] = &[
     "PATH",
     "HOME",
@@ -3880,29 +3879,23 @@ const ALWAYS_FORWARD_ENV: &[&str] = &[
     // lives in the environment). The value is a socket path, not a secret;
     // the security lives in the ssh-agent behind it. See #2691.
     "SSH_AUTH_SOCK",
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "CLAUDE_CONFIG_DIR",
-    "OPENAI_API_KEY",
-    "GEMINI_API_KEY",
-    "OPENROUTER_API_KEY",
 ];
 
 /// The inherited host environment layer for a structured-view agent, applied
-/// under [`ALWAYS_FORWARD_ENV`] on both spawn paths.
+/// under [`ALWAYS_FORWARD_ENV`] and [`agent_host_env_keys`] on both spawn
+/// paths.
 ///
 /// This is the fix for #3262. #3079 added desktop-env forwarding for the tmux
 /// paths only, so an agent in the structured view still got `env_clear()` plus
-/// the twelve names in `ALWAYS_FORWARD_ENV` and never saw `DISPLAY`: the very
+/// the fixed base allowlist and never saw `DISPLAY`: the very
 /// symptom #3075 reported, still live for anyone driving aoe from the browser.
 /// Routing both views through
 /// [`crate::session::environment::inherited_host_env`] is what keeps them from
 /// drifting again.
 ///
-/// Applied first, so `ALWAYS_FORWARD_ENV` (and its `PATH` prepend), the agent
-/// allowlist, `provider_env`, and the operator's `environment` list all still
-/// win on a shared key.
+/// Applied first, so the base and per-agent ambient lists (including the
+/// `PATH` prepend), the explicit agent allowlist, `provider_env`, and the
+/// operator's `environment` list all still win on a shared key.
 /// Returns pairs rather than taking a `Command` because the two spawn sites use
 /// different `Command` types (`std` on the runner path, `tokio` in-proc).
 fn inherited_host_env_pairs(config: &SpawnConfig) -> Vec<(String, String)> {
@@ -3915,14 +3908,19 @@ fn inherited_host_env_pairs(config: &SpawnConfig) -> Vec<(String, String)> {
     crate::session::environment::inherited_host_env(profile)
 }
 
-/// Apply the env_clear + allowlist + provider_env filtering used by both
-/// the detached-runner path and the in-proc stdio path. Pulled out so
-/// the two spawn sites share the same security posture.
+/// Apply the env_clear + scoped ambient env + explicit provider filtering used
+/// by the detached-runner path. The in-proc path consumes the same shared
+/// lists below so both spawn mechanisms keep the same security posture.
 fn apply_env_filter(cmd: &mut std::process::Command, config: &SpawnConfig) {
     for (key, value) in inherited_host_env_pairs(config) {
         cmd.env(key, value);
     }
-    for name in ALWAYS_FORWARD_ENV {
+    let agent_env = if config.sandbox_info.is_none() {
+        agent_host_env_keys(&config.agent_key)
+    } else {
+        &[]
+    };
+    for &name in ALWAYS_FORWARD_ENV.iter().chain(agent_env.iter()) {
         if let Ok(value) = std::env::var(name) {
             cmd.env(name, value);
         }
@@ -4361,11 +4359,11 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    // Env: clear, then forward the shared allowlist + provider-specific
-    // creds. AOE_TOKEN must NEVER reach the agent. Uses the same
-    // `ALWAYS_FORWARD_ENV` const as the runner path so the two spawn
-    // sites cannot drift; provider auth (`ANTHROPIC_API_KEY`, etc.) and
-    // `SSH_AUTH_SOCK` for git-over-SSH ride along in that list.
+    // Env: clear, then forward the shared infrastructure list plus the
+    // selected adapter's ambient credentials. AOE_TOKEN must NEVER reach the
+    // agent. Both lists are shared with the runner path so the two spawn sites
+    // cannot drift; custom adapters receive ambient credentials only through
+    // their explicit allowlist.
     cmd.env_clear();
     // Under the allowlist, so ALWAYS_FORWARD_ENV's PATH prepend still wins.
     // Same layer the runner path applies in `apply_env_filter`; see #3262.
@@ -4374,8 +4372,13 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
         cmd.env(&key, value);
         inherited_keys.push(key);
     }
+    let agent_env = if config.sandbox_info.is_none() {
+        agent_host_env_keys(&config.agent_key)
+    } else {
+        &[]
+    };
     let mut forwarded_keys: Vec<&str> = Vec::new();
-    for &name in ALWAYS_FORWARD_ENV {
+    for &name in ALWAYS_FORWARD_ENV.iter().chain(agent_env.iter()) {
         if let Ok(mut value) = std::env::var(name) {
             // Prepend the resolved bin dir to PATH so the adapter's own
             // `node`/`npx` lookups land in the same node install as the
@@ -15152,38 +15155,96 @@ done
         }
     }
 
-    /// Regression test for #3238. Structured-view agents start from an empty
-    /// environment, so provider credentials must be forwarded explicitly on
-    /// both the host and sandbox spawn paths. Sandbox values travel through
-    /// the parent environment rather than argv, where process listings could
-    /// expose them.
+    /// Regression test for #3238. Host structured-view agents receive only
+    /// the credentials declared for their built-in adapter. Custom adapters
+    /// must opt in, while sandboxed agents keep `sandbox.environment` as the
+    /// ambient-secret boundary and accept explicit per-session credentials.
     #[test]
     #[serial_test::serial]
-    fn provider_auth_env_reaches_host_and_sandboxed_structured_agents() {
+    fn provider_auth_env_is_scoped_to_agent_and_sandbox_authorization() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let _app_dir = crate::session::test_support::isolate_app_dir_at(tmp.path());
-        let provider_keys = [
+        let auth_env = [
+            ("ANTHROPIC_API_KEY", "anthropic-test-value"),
+            ("ANTHROPIC_AUTH_TOKEN", "anthropic-token-test-value"),
+            ("CLAUDE_CODE_OAUTH_TOKEN", "claude-oauth-test-value"),
+            ("CLAUDE_CONFIG_DIR", "/tmp/claude-config-test"),
             ("OPENAI_API_KEY", "openai-test-value"),
             ("GEMINI_API_KEY", "gemini-test-value"),
             ("OPENROUTER_API_KEY", "openrouter-test-value"),
+            ("AOE_TOKEN", "must-not-leak"),
         ];
-        let mut guarded_env = provider_keys.to_vec();
-        guarded_env.push(("AOE_TOKEN", "must-not-leak"));
-        let _env = crate::session::test_support::EnvGuard::set(&guarded_env);
-
-        let config = env_test_spawn_config(tmp.path().to_path_buf());
-        let mut host_cmd = std::process::Command::new("/bin/true");
-        host_cmd.env_clear();
-        apply_env_filter(&mut host_cmd, &config);
-        let host_env: std::collections::HashMap<String, String> = host_cmd
-            .get_envs()
-            .filter_map(|(key, value)| {
-                Some((
-                    key.to_string_lossy().into_owned(),
-                    value?.to_string_lossy().into_owned(),
-                ))
-            })
+        let _env = crate::session::test_support::EnvGuard::set(&auth_env);
+        let auth_keys: Vec<&str> = auth_env[..auth_env.len() - 1]
+            .iter()
+            .map(|(key, _)| *key)
             .collect();
+
+        let host_cases: &[(&str, &[&str])] = &[
+            (
+                "claude",
+                &[
+                    "ANTHROPIC_API_KEY",
+                    "ANTHROPIC_AUTH_TOKEN",
+                    "CLAUDE_CODE_OAUTH_TOKEN",
+                    "CLAUDE_CONFIG_DIR",
+                ],
+            ),
+            (
+                "claude-code",
+                &[
+                    "ANTHROPIC_API_KEY",
+                    "ANTHROPIC_AUTH_TOKEN",
+                    "CLAUDE_CODE_OAUTH_TOKEN",
+                    "CLAUDE_CONFIG_DIR",
+                ],
+            ),
+            ("codex", &["OPENAI_API_KEY"]),
+            ("gemini", &["GEMINI_API_KEY"]),
+            ("opencode", &["OPENROUTER_API_KEY"]),
+            ("custom-acp", &[]),
+        ];
+        for (agent_key, expected_keys) in host_cases {
+            let mut config = env_test_spawn_config(tmp.path().to_path_buf());
+            config.agent_key = (*agent_key).into();
+            let mut host_cmd = std::process::Command::new("/bin/true");
+            host_cmd.env_clear();
+            apply_env_filter(&mut host_cmd, &config);
+            let host_env: std::collections::HashMap<String, String> = host_cmd
+                .get_envs()
+                .filter_map(|(key, value)| {
+                    Some((
+                        key.to_string_lossy().into_owned(),
+                        value?.to_string_lossy().into_owned(),
+                    ))
+                })
+                .collect();
+
+            for key in &auth_keys {
+                assert_eq!(
+                    host_env.contains_key(*key),
+                    expected_keys.contains(key),
+                    "{agent_key} credential scope drifted for {key}: {host_env:#?}"
+                );
+            }
+            assert!(!host_env.contains_key("AOE_TOKEN"));
+        }
+
+        let mut custom_config = env_test_spawn_config(tmp.path().to_path_buf());
+        custom_config.agent_key = "custom-acp".into();
+        custom_config.spec.env_allowlist = Some(vec!["OPENAI_API_KEY".into()]);
+        let mut custom_cmd = std::process::Command::new("/bin/true");
+        custom_cmd.env_clear();
+        apply_env_filter(&mut custom_cmd, &custom_config);
+        assert_eq!(
+            custom_cmd
+                .get_envs()
+                .find(|(key, _)| *key == "OPENAI_API_KEY")
+                .and_then(|(_, value)| value)
+                .and_then(|value| value.to_str()),
+            Some("openai-test-value"),
+            "a custom adapter may explicitly allowlist a provider credential"
+        );
 
         let sandbox = SandboxInfo {
             enabled: true,
@@ -15195,49 +15256,106 @@ done
             before_start_env: Vec::new(),
             container_workdir: None,
         };
-        let sandbox_argv = build_sandbox_docker_argv(&config, &sandbox, "/workspace/proj")
-            .expect("docker argv built");
+        let mut sandbox_config = env_test_spawn_config(tmp.path().to_path_buf());
+        sandbox_config.agent_key = "codex".into();
+        sandbox_config.sandbox_info = Some(sandbox.clone());
 
-        for (key, expected) in provider_keys {
-            assert_eq!(
-                host_env.get(key).map(String::as_str),
-                Some(expected),
-                "{key} must reach a host structured-view agent"
-            );
+        let mut sandbox_runner = std::process::Command::new("/bin/true");
+        sandbox_runner.env_clear();
+        apply_env_filter(&mut sandbox_runner, &sandbox_config);
+        let sandbox_runner_env: std::collections::HashSet<String> = sandbox_runner
+            .get_envs()
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        for key in &auth_keys {
             assert!(
-                sandbox_argv
+                !sandbox_runner_env.contains(*key),
+                "sandbox runner must not consume ambient credential {key}"
+            );
+        }
+
+        let ambient_only = build_sandbox_docker_argv(&sandbox_config, &sandbox, "/workspace/proj")
+            .expect("ambient-only docker argv built");
+        for key in &auth_keys {
+            assert!(
+                !ambient_only
+                    .docker_args
+                    .iter()
+                    .any(|arg| arg == key || arg.starts_with(&format!("{key}="))),
+                "ambient {key} must not bypass sandbox.environment"
+            );
+            assert_eq!(
+                ambient_only
+                    .inherit_env
+                    .iter()
+                    .find(|(name, _)| name == key)
+                    .map(|(_, value)| value),
+                None,
+                "ambient {key} must not enter the sandbox parent environment"
+            );
+        }
+
+        let app_dir = crate::session::get_app_dir().expect("isolated app dir");
+        std::fs::create_dir_all(&app_dir).expect("create isolated app dir");
+        std::fs::write(
+            app_dir.join("config.toml"),
+            "[sandbox]\nenvironment = [\"OPENAI_API_KEY\"]\n",
+        )
+        .expect("write sandbox environment config");
+        sandbox_config.provider_env = vec![("GEMINI_API_KEY".into(), "per-session-gemini".into())];
+        let authorized = build_sandbox_docker_argv(&sandbox_config, &sandbox, "/workspace/proj")
+            .expect("authorized docker argv built");
+
+        for (key, expected) in [
+            ("OPENAI_API_KEY", "openai-test-value"),
+            ("GEMINI_API_KEY", "per-session-gemini"),
+        ] {
+            assert!(
+                authorized
                     .docker_args
                     .windows(2)
                     .any(|pair| pair[0] == "-e" && pair[1] == key),
-                "{key} must be inherited by a sandboxed structured-view agent"
+                "authorized sandbox credential {key} must use key-only docker argv"
             );
             assert_eq!(
-                sandbox_argv
+                authorized
                     .inherit_env
                     .iter()
                     .find(|(name, _)| name == key)
                     .map(|(_, value)| value.as_str()),
                 Some(expected),
-                "{key} must travel through the parent environment"
-            );
-            assert!(
-                !sandbox_argv
-                    .docker_args
-                    .iter()
-                    .any(|arg| arg.starts_with(&format!("{key}="))),
-                "{key} value must not appear in docker argv"
             );
         }
-
-        assert!(!host_env.contains_key("AOE_TOKEN"));
-        assert!(!sandbox_argv
+        for key in [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CONFIG_DIR",
+            "OPENROUTER_API_KEY",
+            "AOE_TOKEN",
+        ] {
+            assert!(
+                !authorized
+                    .docker_args
+                    .iter()
+                    .any(|arg| arg == key || arg.starts_with(&format!("{key}="))),
+                "unauthorized sandbox credential {key} must remain absent"
+            );
+            assert!(!authorized.inherit_env.iter().any(|(name, _)| name == key));
+        }
+        for (_, secret) in auth_env {
+            assert!(
+                !authorized
+                    .docker_args
+                    .iter()
+                    .any(|arg| arg.contains(secret)),
+                "secret value must not appear in docker argv"
+            );
+        }
+        assert!(!authorized
             .docker_args
             .iter()
-            .any(|arg| arg == "AOE_TOKEN" || arg.starts_with("AOE_TOKEN=")));
-        assert!(!sandbox_argv
-            .inherit_env
-            .iter()
-            .any(|(key, _)| key == "AOE_TOKEN"));
+            .any(|arg| arg.contains("per-session-gemini")));
     }
 
     /// Regression test for #3262. The structured view spawns its agent with

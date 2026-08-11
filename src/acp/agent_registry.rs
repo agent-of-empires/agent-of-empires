@@ -15,8 +15,10 @@ pub struct AgentSpec {
     /// `aoe acp agents`.
     pub description: String,
     /// Optional: which env vars from aoe to forward to this agent. If
-    /// `None`, only `PATH`, `HOME`, `LANG`, `TERM`, and provider auth env
-    /// (e.g. `ANTHROPIC_API_KEY`) are forwarded.
+    /// `None`, only the shared infrastructure variables and any ambient auth
+    /// declared for this built-in adapter are forwarded. Custom adapters have
+    /// no ambient auth declaration, so they opt in here or use an explicit
+    /// per-session credential.
     pub env_allowlist: Option<Vec<String>>,
 }
 

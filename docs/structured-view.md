@@ -34,7 +34,7 @@ The `npm install -g` commands above are optional: `aoe acp doctor --fix` install
 
 Tools not yet wired into the registry (aider, cursor, copilot, droid, hermes, kiro) always run in the terminal view. A **custom agent** can opt in by setting an ACP launch command via `agent_acp_cmd` (see [Configuration](guides/configuration.md#running-a-custom-agent-in-the-structured-view)).
 
-The structured view always forwards `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, and `CLAUDE_CONFIG_DIR` to the agent. For other agents, set their auth env in the environment that runs `aoe serve` (or the per-session `extra_env` field).
+For host sessions, each built-in adapter receives only its matching ambient credentials: Claude receives `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, and `CLAUDE_CONFIG_DIR`; Codex receives `OPENAI_API_KEY`; Gemini receives `GEMINI_API_KEY`; and OpenCode receives `OPENROUTER_API_KEY`. Custom adapters require an explicit `env_allowlist` or per-session credential. Sandboxed sessions do not inherit ambient credentials; list them under `sandbox.environment` or provide a per-session credential instead.
 
 ### Feature matrix
 
