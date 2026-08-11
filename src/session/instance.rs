@@ -568,9 +568,10 @@ pub enum SessionBucket {
 /// One durable ownership protocol for every session lifecycle transition.
 ///
 /// A transition first acquires the per-instance lifecycle flock, then records
-/// a fresh generation under `Storage::update`. The same flock stays held
-/// through hooks, external side effects, and the exact-generation commit.
-/// `status` is presentation state and never proves ownership.
+/// a fresh generation under `Storage::update`. The durable reservation stays
+/// held through hooks, external side effects, and the exact-generation commit;
+/// callers may release the flock while running reentrant hooks. `status` is
+/// presentation state and never proves ownership.
 ///
 /// A crashed owner loses both the flock and, after the TTL, its reservation.
 /// Recovery may then acquire a newer generation; exact-generation commits

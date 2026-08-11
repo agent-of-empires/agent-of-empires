@@ -691,6 +691,25 @@ fn write_project_omp_dotenv(project: &Path, store: &Path) {
     .expect("write project OMP dotenv");
 }
 
+fn install_path_preserving_test_shell(h: &mut TuiTestHarness, path_bin: &Path) {
+    let shell = h.home_path().join("omp-test-shell");
+    fs::write(
+        &shell,
+        format!(
+            "#!/bin/sh\n[ \"${{1-}}\" = -l ] && shift\nexport PATH={}:\"$PATH\"\nexec /bin/sh \"$@\"\n",
+            sh_quote(path_bin)
+        ),
+    )
+    .expect("write OMP test shell");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&shell, fs::Permissions::from_mode(0o755))
+            .expect("chmod OMP test shell");
+    }
+    h.set_env("SHELL", shell.to_str().expect("UTF-8 OMP test shell"));
+}
+
 fn launched_tmux_name(h: &TuiTestHarness, title: &str) -> String {
     let content = fs::read_to_string(sessions_path(h)).expect("read sessions.json");
     let sessions: Value = serde_json::from_str(&content).expect("parse sessions.json");
@@ -837,6 +856,7 @@ fn install_toggling_fake_omp(h: &mut TuiTestHarness, project: &Path, omp_store: 
     let control = h.home_path().join("omp-toggle-control");
     fs::create_dir_all(&control).expect("create fake OMP control directory");
     let bin = h.install_path_command("omp");
+    install_path_preserving_test_shell(h, &bin);
     let script = format!(
         "#!/bin/sh\n\
          control={control}\n\
@@ -906,6 +926,7 @@ fn install_reconstructing_fake_omp(
     old_project: &Path,
 ) {
     let bin = h.install_path_command("omp");
+    install_path_preserving_test_shell(h, &bin);
     let control = h.home_path().join("omp-control");
     fs::create_dir_all(&control).expect("create fake OMP control directory");
     let metadata_stale = write_stale_omp_session(metadata_store, old_project);

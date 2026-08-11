@@ -3788,6 +3788,8 @@ mod tests {
             .args(["-c", &wrapper])
             .env("PATH", "/usr/bin:/bin")
             .env_remove("DOCKER_HOST")
+            .env_remove("BASH_ENV")
+            .env_remove("ENV")
             .status()
             .unwrap();
         assert!(status.success());
