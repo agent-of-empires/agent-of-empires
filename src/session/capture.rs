@@ -615,25 +615,32 @@ fn capture_pi_family_session_id(
         return Ok(id.clone());
     }
 
-    // Third fallback: when all JSONL headers fail to parse, pick the most
-    // recently modified session directory and extract a UUID from its files.
-    let mut dirs_by_mtime: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+    // Third fallback: when JSONL headers fail to parse (no `id` field),
+    // extract a UUID from the filename. Only consider directories whose
+    // encoded name matches the target project path, so we never grab a
+    // session from the wrong project.
+    let mut project_dirs: Vec<PathBuf> = Vec::new();
     if let Ok(entries) = resilient_read_dir(&sessions_dir) {
         for entry in entries {
             let path = entry.path();
             if !path.is_dir() {
                 continue;
             }
-            let mtime = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            dirs_by_mtime.push((path, mtime));
+            if path.file_name().and_then(|n| n.to_str()) == Some(&encoded_name) {
+                project_dirs.push(path);
+            }
         }
     }
-    dirs_by_mtime.sort_by_key(|c| std::cmp::Reverse(c.1));
+    // Sort by mtime descending so we pick the newest project directory
+    // (handles the case where the directory itself was recently recreated).
+    project_dirs.sort_by_key(|d| {
+        d.metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+    });
+    project_dirs.reverse();
 
-    for (dir, _) in &dirs_by_mtime {
+    for dir in &project_dirs {
         if let Ok(entries) = resilient_read_dir(dir) {
             let mut file_candidates: Vec<(String, std::time::SystemTime)> = Vec::new();
             for entry in entries {
@@ -3494,6 +3501,9 @@ mod tests {
         }
     }
 
+    /// Third fallback: when JSONL headers fail to parse, extract a UUID from
+    /// the filename. Only consider directories whose encoded name matches the
+    /// target project path, so we never grab a session from the wrong project.
     #[test]
     #[serial]
     fn test_capture_pi_session_id_fallback_by_dir_mtime() {
@@ -3503,21 +3513,60 @@ mod tests {
         let uuid_old = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
         let uuid_new = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
 
-        let dir_old = sessions_dir.join("--old-dir--");
-        std::fs::create_dir_all(&dir_old).unwrap();
+        // Create a non-matching directory (different project) — should be ignored.
+        let dir_other = sessions_dir.join("--other-dir--");
+        std::fs::create_dir_all(&dir_other).unwrap();
         std::fs::write(
-            dir_old.join(format!("2024-12-01T10-00-00-000Z_{uuid_old}.jsonl")),
+            dir_other.join(format!("2024-12-03T14-00-00-000Z_{uuid_old}.jsonl")),
             "not valid json\n",
         )
         .unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(50));
 
-        let dir_new = sessions_dir.join("--new-dir--");
-        std::fs::create_dir_all(&dir_new).unwrap();
+        // Create the matching directory with the newer session.
+        let dir_match = sessions_dir.join("--nonexistent-path-for-test--");
+        std::fs::create_dir_all(&dir_match).unwrap();
         std::fs::write(
-            dir_new.join(format!("2024-12-03T14-00-00-000Z_{uuid_new}.jsonl")),
+            dir_match.join(format!("2024-12-01T10-00-00-000Z_{uuid_new}.jsonl")),
             "also not valid json\n",
+        )
+        .unwrap();
+
+        let old_val = std::env::var("PI_CODING_AGENT_DIR").ok();
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.path());
+
+        // Should find the session in the matching directory, not the other one.
+        let result = capture_pi_session_id("/nonexistent/path/for/test", &HashSet::new());
+        assert!(
+            result.is_ok(),
+            "Dir-mtime fallback should find session: {:?}",
+            result
+        );
+        assert_eq!(result.unwrap(), uuid_new);
+
+        match old_val {
+            Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+    }
+
+    /// Third fallback: when no matching project directory exists, should
+    /// return an error rather than picking from any directory.
+    #[test]
+    #[serial]
+    fn test_capture_pi_session_id_fallback_no_match_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+
+        let uuid = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+
+        // Only a non-matching directory exists.
+        let dir_other = sessions_dir.join("--other-dir--");
+        std::fs::create_dir_all(&dir_other).unwrap();
+        std::fs::write(
+            dir_other.join(format!("2024-12-03T14-00-00-000Z_{uuid}.jsonl")),
+            "not valid json\n",
         )
         .unwrap();
 
@@ -3526,11 +3575,10 @@ mod tests {
 
         let result = capture_pi_session_id("/nonexistent/path/for/test", &HashSet::new());
         assert!(
-            result.is_ok(),
-            "Dir-mtime fallback should find session: {:?}",
+            result.is_err(),
+            "Should error when no matching project directory exists: {:?}",
             result
         );
-        assert_eq!(result.unwrap(), uuid_new);
 
         match old_val {
             Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
