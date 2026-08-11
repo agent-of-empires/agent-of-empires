@@ -3806,6 +3806,9 @@ fn build_sandbox_docker_argv(
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_AUTH_TOKEN",
         "CLAUDE_CODE_OAUTH_TOKEN",
+        "OPENAI_API_KEY",
+        "GEMINI_API_KEY",
+        "OPENROUTER_API_KEY",
     ];
     for &key in PROVIDER_AUTH_KEYS {
         if seen_keys.contains(key) {
@@ -3881,6 +3884,9 @@ const ALWAYS_FORWARD_ENV: &[&str] = &[
     "ANTHROPIC_AUTH_TOKEN",
     "CLAUDE_CODE_OAUTH_TOKEN",
     "CLAUDE_CONFIG_DIR",
+    "OPENAI_API_KEY",
+    "GEMINI_API_KEY",
+    "OPENROUTER_API_KEY",
 ];
 
 /// The inherited host environment layer for a structured-view agent, applied
@@ -15144,6 +15150,94 @@ done
             source_profile: None,
             mcp_servers: Vec::new(),
         }
+    }
+
+    /// Regression test for #3238. Structured-view agents start from an empty
+    /// environment, so provider credentials must be forwarded explicitly on
+    /// both the host and sandbox spawn paths. Sandbox values travel through
+    /// the parent environment rather than argv, where process listings could
+    /// expose them.
+    #[test]
+    #[serial_test::serial]
+    fn provider_auth_env_reaches_host_and_sandboxed_structured_agents() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let provider_keys = [
+            ("OPENAI_API_KEY", "openai-test-value"),
+            ("GEMINI_API_KEY", "gemini-test-value"),
+            ("OPENROUTER_API_KEY", "openrouter-test-value"),
+        ];
+        let mut guarded_env = provider_keys.to_vec();
+        guarded_env.push(("AOE_TOKEN", "must-not-leak"));
+        let _env = crate::session::test_support::EnvGuard::set(&guarded_env);
+
+        let config = env_test_spawn_config(tmp.path().to_path_buf());
+        let mut host_cmd = std::process::Command::new("/bin/true");
+        host_cmd.env_clear();
+        apply_env_filter(&mut host_cmd, &config);
+        let host_env: std::collections::HashMap<String, String> = host_cmd
+            .get_envs()
+            .filter_map(|(key, value)| {
+                Some((
+                    key.to_string_lossy().into_owned(),
+                    value?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+
+        let sandbox = SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "alpine:latest".into(),
+            container_name: "aoe-sandbox-provider-auth".into(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
+        let sandbox_argv = build_sandbox_docker_argv(&config, &sandbox, "/workspace/proj")
+            .expect("docker argv built");
+
+        for (key, expected) in provider_keys {
+            assert_eq!(
+                host_env.get(key).map(String::as_str),
+                Some(expected),
+                "{key} must reach a host structured-view agent"
+            );
+            assert!(
+                sandbox_argv
+                    .docker_args
+                    .windows(2)
+                    .any(|pair| pair[0] == "-e" && pair[1] == key),
+                "{key} must be inherited by a sandboxed structured-view agent"
+            );
+            assert_eq!(
+                sandbox_argv
+                    .inherit_env
+                    .iter()
+                    .find(|(name, _)| name == key)
+                    .map(|(_, value)| value.as_str()),
+                Some(expected),
+                "{key} must travel through the parent environment"
+            );
+            assert!(
+                !sandbox_argv
+                    .docker_args
+                    .iter()
+                    .any(|arg| arg.starts_with(&format!("{key}="))),
+                "{key} value must not appear in docker argv"
+            );
+        }
+
+        assert!(!host_env.contains_key("AOE_TOKEN"));
+        assert!(!sandbox_argv
+            .docker_args
+            .iter()
+            .any(|arg| arg == "AOE_TOKEN" || arg.starts_with("AOE_TOKEN=")));
+        assert!(!sandbox_argv
+            .inherit_env
+            .iter()
+            .any(|(key, _)| key == "AOE_TOKEN"));
     }
 
     /// Regression test for #3262. The structured view spawns its agent with
