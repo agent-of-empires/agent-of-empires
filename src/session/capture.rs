@@ -3510,45 +3510,42 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let sessions_dir = tmp.path().join("sessions");
 
-        let uuid_old = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
-        let uuid_new = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let uuid_match = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let uuid_other = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
 
-        // Create a non-matching directory (different project) — should be ignored.
-        let dir_other = sessions_dir.join("--other-dir--");
-        std::fs::create_dir_all(&dir_other).unwrap();
+        // Create the matching directory first, with the older session.
+        let dir_match = sessions_dir.join("--nonexistent-path-for-test--");
+        std::fs::create_dir_all(&dir_match).unwrap();
         std::fs::write(
-            dir_other.join(format!("2024-12-03T14-00-00-000Z_{uuid_old}.jsonl")),
-            "not valid json\n",
+            dir_match.join(format!("2024-12-01T10-00-00-000Z_{uuid_match}.jsonl")),
+            "also not valid json\n",
         )
         .unwrap();
 
         std::thread::sleep(std::time::Duration::from_millis(50));
 
-        // Create the matching directory with the newer session.
-        let dir_match = sessions_dir.join("--nonexistent-path-for-test--");
-        std::fs::create_dir_all(&dir_match).unwrap();
+        // Create a non-matching directory (different project) with a *newer*
+        // session — must still be ignored, so this pins the scoping filter
+        // rather than the mtime sort alone.
+        let dir_other = sessions_dir.join("--other-dir--");
+        std::fs::create_dir_all(&dir_other).unwrap();
         std::fs::write(
-            dir_match.join(format!("2024-12-01T10-00-00-000Z_{uuid_new}.jsonl")),
-            "also not valid json\n",
+            dir_other.join(format!("2024-12-03T14-00-00-000Z_{uuid_other}.jsonl")),
+            "not valid json\n",
         )
         .unwrap();
 
-        let old_val = std::env::var("PI_CODING_AGENT_DIR").ok();
-        std::env::set_var("PI_CODING_AGENT_DIR", tmp.path());
+        let _env = EnvGuard::set(&[("PI_CODING_AGENT_DIR", tmp.path())]);
 
-        // Should find the session in the matching directory, not the other one.
+        // Should find the session in the matching directory, not the newer
+        // (but unrelated) one.
         let result = capture_pi_session_id("/nonexistent/path/for/test", &HashSet::new());
         assert!(
             result.is_ok(),
             "Dir-mtime fallback should find session: {:?}",
             result
         );
-        assert_eq!(result.unwrap(), uuid_new);
-
-        match old_val {
-            Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
-            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-        }
+        assert_eq!(result.unwrap(), uuid_match);
     }
 
     /// Third fallback: when no matching project directory exists, should
@@ -3570,8 +3567,7 @@ mod tests {
         )
         .unwrap();
 
-        let old_val = std::env::var("PI_CODING_AGENT_DIR").ok();
-        std::env::set_var("PI_CODING_AGENT_DIR", tmp.path());
+        let _env = EnvGuard::set(&[("PI_CODING_AGENT_DIR", tmp.path())]);
 
         let result = capture_pi_session_id("/nonexistent/path/for/test", &HashSet::new());
         assert!(
@@ -3579,11 +3575,6 @@ mod tests {
             "Should error when no matching project directory exists: {:?}",
             result
         );
-
-        match old_val {
-            Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
-            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-        }
     }
 
     #[test]
