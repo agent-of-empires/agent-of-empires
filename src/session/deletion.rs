@@ -187,9 +187,16 @@ impl PurgeTransaction {
     }
 
     /// Run best-effort hooks without a lifecycle or storage flock held.
-    pub fn run_hooks(mut self) -> Self {
+    pub fn run_hooks(self) -> Self {
+        self.run_hooks_with(run_on_destroy_hooks)
+    }
+
+    fn run_hooks_with<F>(mut self, run_hooks: F) -> Self
+    where
+        F: FnOnce(&Instance, bool),
+    {
         self.lifecycle_lock = None;
-        run_on_destroy_hooks(&self.request.instance, self.request.detach_hooks);
+        run_hooks(&self.request.instance, self.request.detach_hooks);
         self
     }
 
@@ -1401,15 +1408,6 @@ mod tests {
         let profile = "purge-unlocked-hooks";
         let ready = temp.path().join("ready");
         let release = temp.path().join("release");
-        let hook = format!(
-            ": > {}; while [ ! -e {} ]; do sleep 0.01; done",
-            crate::session::environment::shell_escape(&ready.to_string_lossy()),
-            crate::session::environment::shell_escape(&release.to_string_lossy()),
-        );
-        crate::session::config::update_config(|global| {
-            global.hooks.on_destroy = vec![hook];
-        })
-        .unwrap();
 
         let storage = Storage::new_unwatched(profile).unwrap();
         let mut instance = Instance::new("purge unlocked hooks", temp.path().to_str().unwrap());
@@ -1440,8 +1438,16 @@ mod tests {
             };
 
         let (purge_tx, purge_rx) = std::sync::mpsc::channel();
+        let ready_for_hook = ready.clone();
+        let release_for_hook = release.clone();
         let purge = std::thread::spawn(move || {
-            purge_tx.send(transaction.run_hooks().complete()).unwrap();
+            let after_hooks = transaction.run_hooks_with(|_, _| {
+                std::fs::write(&ready_for_hook, b"ready").unwrap();
+                while !release_for_hook.exists() {
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+            });
+            purge_tx.send(after_hooks.complete()).unwrap();
         });
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         while !ready.exists() && std::time::Instant::now() < deadline {
