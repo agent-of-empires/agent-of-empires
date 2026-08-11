@@ -12,7 +12,13 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use super::DialogResult;
-use crate::tui::styles::Theme;
+use crate::tui::styles::{has_min_contrast, Theme};
+
+/// WCAG contrast floor for the focused choice's foreground against the
+/// dialog's background. `2.5` is the tightest a builtin clears
+/// (catppuccin-latte, at 2.64); a custom theme with a duller `accent` falls
+/// back to `theme.text` instead of rendering an illegible focused default.
+const MIN_FOCUSED_CONTRAST_RATIO: f32 = 2.5;
 
 /// Style for the focused choice: `theme.accent` bold on the dialog's own
 /// background, the same fg-only treatment `components::buttons::render_yes_no`
@@ -22,7 +28,12 @@ use crate::tui::styles::Theme;
 /// on the row. Unfocused choices drop to `theme.dimmed` so focus is carried
 /// by the brightness gap, not by a background block.
 fn focused_choice_style(theme: &Theme) -> Style {
-    Style::default().fg(theme.accent).bold()
+    let fg = if has_min_contrast(theme.accent, theme.background, MIN_FOCUSED_CONTRAST_RATIO) {
+        theme.accent
+    } else {
+        theme.text
+    };
+    Style::default().fg(fg).bold()
 }
 
 /// Style for the choices that are not focused.
@@ -260,8 +271,6 @@ mod tests {
     /// lands between 1.10:1 and 1.71:1 and would fail here.
     #[test]
     fn focused_choice_fg_stays_legible_on_every_builtin_background() {
-        const MIN_FOCUSED_CONTRAST_RATIO: f32 = 2.5;
-
         for name in crate::tui::styles::builtin_theme_names() {
             let theme = crate::tui::styles::load_theme(name);
             let style = focused_choice_style(&theme);
@@ -286,6 +295,19 @@ mod tests {
                 "{name}: focused and unfocused choices must differ"
             );
         }
+    }
+
+    /// A custom theme's `accent` isn't validated for contrast on load; if
+    /// it's too close to the background, the focused choice falls back to
+    /// `theme.text` rather than rendering illegible.
+    #[test]
+    fn focused_choice_style_falls_back_to_text_for_low_contrast_accent() {
+        let mut theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        theme.accent = theme.background;
+
+        let style = focused_choice_style(&theme);
+
+        assert_eq!(style.fg, Some(theme.text));
     }
 
     #[test]
