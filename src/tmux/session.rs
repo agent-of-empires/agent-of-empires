@@ -640,13 +640,14 @@ impl Session {
     pub fn wait_until_ready(&self, max_wait: std::time::Duration, ready_marker: Option<&str>) {
         let poll_interval = std::time::Duration::from_millis(200);
         let deadline = std::time::Instant::now() + max_wait;
+        let ready_marker = ready_marker.map(str::to_lowercase);
         let mut last: Option<String> = None;
         while std::time::Instant::now() < deadline {
             std::thread::sleep(poll_interval);
             let Ok(now) = self.capture_pane(5) else {
                 continue;
             };
-            if let Some(marker) = ready_marker {
+            if let Some(marker) = ready_marker.as_deref() {
                 if now.to_lowercase().contains(marker) {
                     return;
                 }
@@ -1804,6 +1805,7 @@ mod tests {
             .status()
             .expect("tmux new-session");
         assert!(status.success());
+        refresh_session_cache();
 
         let session = Session::from_name(&name);
         let start = std::time::Instant::now();
