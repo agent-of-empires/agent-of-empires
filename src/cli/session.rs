@@ -1562,6 +1562,7 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
             bail!("Not in a tmux session. Specify a session ID or run inside tmux.");
         }
     };
+    inst.source_profile = storage.profile().to_string();
 
     // Resolving the profile config installs the declarative status-rule
     // registry for this profile; the status detection below never loads config
@@ -1640,11 +1641,8 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
         (String::new(), "stopped".to_string())
     } else {
         let raw = tmux_session.capture_pane(args.lines)?;
-        let detection_tool = if inst.detect_as.is_empty() {
-            &inst.tool
-        } else {
-            &inst.detect_as
-        };
+        let detection_tool =
+            crate::tmux::status_rules::detection_tool(profile, &inst.tool, &inst.detect_as);
         let status = if let Some(hook_status) = crate::hooks::read_hook_status(&inst.id) {
             if detection_tool == "codex" && hook_status == crate::session::Status::Running {
                 let status_raw;
