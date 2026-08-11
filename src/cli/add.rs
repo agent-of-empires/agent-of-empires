@@ -1189,7 +1189,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                     println!(
                         "(no controlling terminal; session started without attaching. \
                          Use `aoe session attach {}` to view it.)",
-                        shell_words::quote(&final_title)
+                        shell_words::quote(&instance.id)
                     );
                 }
 

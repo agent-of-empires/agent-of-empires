@@ -1874,7 +1874,10 @@ sleep 60\n";
 fn test_cli_send_waits_for_slow_boot_before_typing() {
     require_tmux!();
 
-    let h = TuiTestHarness::new("cli_send_settle_wait");
+    let mut h = TuiTestHarness::new("cli_send_settle_wait");
+    // Install an `opencode` shim so `is_agent_available` passes (the test
+    // uses `--tool opencode` which triggers the built-in tool check).
+    h.install_path_command("opencode");
     let fake_agent = install_slow_boot_agent(&h);
     let project = h.project_path();
 
