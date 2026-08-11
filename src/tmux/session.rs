@@ -242,15 +242,9 @@ fn parse_pane_segments(raw: &str, sentinel: &str) -> Vec<CapturedPane> {
     panes
 }
 
-/// Flag a cursor's POSITION as untrustworthy while keeping its always-valid
-/// mode flags, for the composite paths that fall through to a scrollback-bearing
-/// pane-0 capture.
-///
-/// [`Session::capture_pane_with_cursor`] earns the right to trust a position by
-/// probing twice around its capture and comparing; a single probe against
-/// content that includes scrollback has no such evidence, so the render skips
-/// painting rather than risk the row-drift bug while the wheel forward (which
-/// reads only the mode flags) keeps working.
+/// Keep mode flags from a lone cursor probe while preventing the renderer from
+/// trusting its row. This is the degraded path when tmux omits the post-capture
+/// sentinel but still returns the pane capture successfully.
 fn unreliable_position(cursor: Option<PaneCursor>) -> Option<PaneCursor> {
     cursor.map(|c| PaneCursor {
         position_reliable: false,
@@ -669,6 +663,9 @@ impl Session {
         const WINDOW_SENTINEL: &str = "@@aoe-win@@";
         /// Gates the cursor line, for the same reason.
         const CURSOR_SENTINEL: &str = "@@aoe-cur@@";
+        /// Gates the post-capture cursor probe. Comparing it with the first
+        /// probe proves that the pane row still indexes the captured bytes.
+        const AFTER_CURSOR_SENTINEL: &str = "@@aoe-after-cur@@";
 
         if !self.exists() {
             return Ok((String::new(), None));
@@ -701,6 +698,13 @@ impl Session {
                 "-e",
                 "-S",
                 &format!("-{}", lines),
+                ";",
+                "display-message",
+                "-p",
+                "-t",
+                &pane0,
+                "-F",
+                &format!("{AFTER_CURSOR_SENTINEL} {CURSOR_FMT}"),
             ])
             .output()?;
 
@@ -716,7 +720,7 @@ impl Session {
         let mut rest: &str = &raw;
         let mut dims: Option<(u16, u16, u16)> = None;
         let mut zoomed = false;
-        let mut cursor: Option<PaneCursor> = None;
+        let mut cursor_before: Option<PaneCursor> = None;
         while let Some((line, tail)) = rest.split_once('\n') {
             if let Some(fields) = line.strip_prefix(WINDOW_SENTINEL) {
                 let mut f = fields.split_whitespace();
@@ -733,19 +737,37 @@ impl Session {
                 // which keeps the composite path rather than disabling it.
                 zoomed = f.next().is_some_and(|z| z != "0");
             } else if let Some(fields) = line.strip_prefix(CURSOR_SENTINEL) {
-                cursor = PaneCursor::parse(fields.trim());
+                cursor_before = PaneCursor::parse(fields.trim());
             } else {
                 break;
             }
             rest = tail;
         }
-        let pane0_content = rest.to_string();
+        // The final sentinel follows the capture bytes. Keep the newline that
+        // terminated the pane capture, matching `capture_pane_with_cursor`,
+        // while removing only the post-capture probe.
+        let trimmed = rest.strip_suffix('\n').unwrap_or(rest);
+        let (pane0_content, cursor_after) = match trimmed.rsplit_once('\n') {
+            Some((content, line)) => match line.strip_prefix(AFTER_CURSOR_SENTINEL) {
+                Some(fields) => (format!("{content}\n"), PaneCursor::parse(fields.trim())),
+                None => (rest.to_string(), None),
+            },
+            None => match trimmed.strip_prefix(AFTER_CURSOR_SENTINEL) {
+                Some(fields) => (String::new(), PaneCursor::parse(fields.trim())),
+                None => (rest.to_string(), None),
+            },
+        };
+        let cursor = if cursor_after.is_some() {
+            merge_cursor_probes(cursor_before, cursor_after)
+        } else {
+            unreliable_position(cursor_before)
+        };
 
         let Some((count, window_width, window_height)) = dims else {
-            return Ok((pane0_content, unreliable_position(cursor)));
+            return Ok((pane0_content, cursor));
         };
         if count <= 1 || window_width == 0 || window_height == 0 {
-            return Ok((pane0_content, unreliable_position(cursor)));
+            return Ok((pane0_content, cursor));
         }
         // A zoomed pane (`C-b z`) keeps `window_panes` at its real count but
         // reports every pane at the window's full rectangle, so the panes
@@ -756,18 +778,26 @@ impl Session {
         // in hand, scrollback included, which is what the preview showed before
         // compositing existed.
         if zoomed {
-            return Ok((pane0_content, unreliable_position(cursor)));
+            return Ok((pane0_content, cursor));
         }
 
         // Any failure in the split path (fork error, unparseable layout) falls
         // back to the pane-0 bytes already in hand, so a composite that cannot
         // be built is never worse than the old single-pane preview.
         let Some(layout) = self.capture_window_layout(count) else {
-            return Ok((pane0_content, unreliable_position(cursor)));
+            return Ok((pane0_content, cursor));
         };
-        // The composite is the visible window with no scrollback, so the row a
-        // single probe reported cannot have drifted underneath it, and the
-        // position stands.
+        // Reuse the pane-0 bytes bracketed by the cursor probes above. The
+        // layout capture happens in a second tmux invocation, so using its
+        // pane-0 copy could otherwise pair the cursor with a later screen and
+        // paint it one row high or low while the agent scrolls.
+        let pane0_rows = layout.first_pane().map(|first| {
+            crate::tmux::vt::capture_rows_padded(
+                pane0_content.as_bytes(),
+                first.width,
+                first.height,
+            )
+        });
         let cursor = cursor.map(|mut c| {
             c.pane_height = layout.window_height;
             c.pane_width = layout.window_width;
@@ -778,7 +808,11 @@ impl Session {
             c.composite_pane0 = layout.first_pane().map(|p| (p.width, p.height));
             c
         });
-        Ok((layout.composite(), cursor))
+        let content = pane0_rows.as_deref().map_or_else(
+            || layout.composite(),
+            |rows| layout.composite_with_first_pane_rows(rows),
+        );
+        Ok((content, cursor))
     }
 
     /// Second fork of [`capture_window_composited`](Self::capture_window_composited):
@@ -2909,6 +2943,10 @@ mod tests {
         );
         let cursor = cursor.expect("a cursor for a live pane");
         assert_eq!(cursor.pane_width, 80, "cursor carries the pane geometry");
+        assert!(
+            cursor.position_reliable,
+            "an unchanged single-pane capture must keep its cursor"
+        );
 
         // Now split, and the cursor must be rebased onto the window so the
         // renderer's `pane_height` anchoring still lines up with the composite.
