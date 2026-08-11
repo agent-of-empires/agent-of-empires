@@ -1169,11 +1169,27 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 }
 
                 let tmux_session = crate::tmux::Session::new(&instance.id, &instance.title)?;
-                tmux_session.attach()?;
+                if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+                    tmux_session.attach()?;
+                } else {
+                    // No controlling terminal (LaunchAgent, cron, or any
+                    // other headless caller): `tmux attach-session` needs a
+                    // TTY on both ends and would fail even though the
+                    // session above started fine. Skip the attach instead
+                    // of letting that failure roll a successful launch back
+                    // to an error.
+                    println!(
+                        "(no controlling terminal; session started without attaching. \
+                         Use `aoe -p {} session attach {}` to view it.)",
+                        shell_words::quote(storage.profile()),
+                        shell_words::quote(&instance.id)
+                    );
+                }
 
-                // The poller ran throughout the attached session but the CLI
-                // never drained it, dropping the observed id on detach. Drain it
-                // now (short bound: it is almost always already queued).
+                // The poller ran throughout the attach (or the launch above,
+                // headless) but the CLI never drained it, dropping the
+                // observed id. Drain it now (short bound: it is almost
+                // always already queued).
                 let file_watch = crate::file_watch::FileWatchService::noop();
                 crate::session::sync::capture_launched_session_id_blocking(
                     &mut instance,
@@ -1206,7 +1222,10 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     } else {
         println!();
         println!("Next steps:");
-        println!("  aoe session start {}   # Start the session", final_title);
+        println!(
+            "  aoe session start {}   # Start the session",
+            shell_words::quote(&final_title)
+        );
         println!("  aoe                         # Open TUI and press Enter to attach");
     }
 

@@ -791,6 +791,53 @@ impl Session {
         }
     }
 
+    /// Wait for the pane to become ready for input, or `max_wait` to elapse.
+    /// Failsafe: always returns by `max_wait`, so a caller's next action
+    /// (e.g. `send-keys`) still runs even if the pane never becomes ready,
+    /// such as an agent that is genuinely still streaming output.
+    ///
+    /// When `ready_marker` is `Some` (see `AgentDef::ready_marker`), polls
+    /// for that substring actually appearing in the captured pane content
+    /// (matched case-insensitively) -- a real, agent-specific readiness
+    /// signal.
+    ///
+    /// When `ready_marker` is `None` (no such signal is known for this
+    /// agent yet), falls back to a generic heuristic: content stops
+    /// changing across two consecutive samples. This is weaker -- a short,
+    /// static "still loading" screen can satisfy it before the agent is
+    /// actually listening -- but it is strictly better than sending
+    /// immediately, and is the same heuristic `aoe session restart`'s
+    /// wake-message send already relied on before per-agent markers
+    /// existed.
+    ///
+    /// Shared by `aoe session restart`'s post-restart wake message and `aoe
+    /// send`'s pre-send wait: both need to avoid typing into a pane whose
+    /// agent has not finished rendering yet.
+    pub fn wait_until_ready(&self, max_wait: std::time::Duration, ready_marker: Option<&str>) {
+        let poll_interval = std::time::Duration::from_millis(200);
+        let deadline = std::time::Instant::now() + max_wait;
+        let ready_marker = ready_marker.map(str::to_lowercase);
+        let mut last: Option<String> = None;
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(poll_interval);
+            let Ok(now) = self.capture_pane(5) else {
+                continue;
+            };
+            if let Some(marker) = ready_marker.as_deref() {
+                if now.to_lowercase().contains(marker) {
+                    return;
+                }
+                continue;
+            }
+            if now.trim().len() > 20 {
+                if last.as_deref() == Some(now.as_str()) {
+                    return;
+                }
+                last = Some(now);
+            }
+        }
+    }
+
     /// Capture the whole first window, panes composited, for the passive
     /// preview.
     ///
@@ -1293,9 +1340,10 @@ impl Session {
         if use_paste_buffer {
             Self::send_via_paste_buffer(&target, text)?;
         } else {
+            let payload = pad_slash_command_for_autocomplete(text);
             // `--` ends option parsing so lines beginning with `-` (markdown
             // bullets, CLI flags in prompts) are not misread as tmux flags.
-            Self::tmux_send(&target, &["-l", "--", text])?;
+            Self::tmux_send(&target, &["-l", "--", &payload])?;
         }
 
         if enter_delay_ms > 0 {
@@ -1891,6 +1939,23 @@ fn script_shell_escape(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
 
+/// Whether `text` should get a trailing space appended before being typed
+/// via the literal (non-paste-buffer) keystroke path in
+/// [`Session::send_keys_with_delay`]. A message that opens with `/` triggers
+/// some agents' own slash-command autocomplete dropdown (e.g. opencode); the
+/// dropdown then consumes the terminating `Enter` sent after this payload as
+/// navigation instead of submit, leaving the command typed but never
+/// delivered. A trailing space closes the dropdown as it's typed, so the
+/// following `Enter` submits normally instead. Every other message keeps its
+/// exact bytes. Pure so the padding decision is unit-testable without tmux.
+fn pad_slash_command_for_autocomplete(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.trim_start().starts_with('/') {
+        std::borrow::Cow::Owned(format!("{text} "))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
 /// Build the argument list for tmux new-session command. Shared by the
 /// agent session and the paired/container terminal sessions (their
 /// invocations are identical; only the session-name prefix differs).
@@ -2056,6 +2121,75 @@ mod tests {
     #[test]
     fn raw_byte_batches_empty_payload_sends_nothing() {
         assert!(raw_byte_batches(&[]).is_empty());
+    }
+
+    #[test]
+    fn pads_slash_prefixed_messages_only() {
+        let cases = [
+            ("/audit", "/audit "),
+            ("/", "/ "),
+            ("  /audit", "  /audit "),
+            ("audit", "audit"),
+            ("please run /audit", "please run /audit"),
+            ("", ""),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                pad_slash_command_for_autocomplete(input),
+                expected,
+                "input {input:?}"
+            );
+        }
+    }
+
+    /// Direct, timing-based proof that `wait_until_ready` with a known
+    /// marker actually blocks until that marker appears, rather than
+    /// returning early on a merely-static pane -- the gap in the generic
+    /// content-settle fallback (a short "still loading" screen can look
+    /// "settled" long before the agent is really listening).
+    #[test]
+    fn wait_until_ready_blocks_until_the_marker_appears() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let guard = TmuxTestSession::new("aoe_test_ready_marker");
+        let name = guard.name().to_string();
+        // A short, static "booting" line appears immediately and would
+        // satisfy the generic settle heuristic well under 700ms; the real
+        // marker text only appears after the sleep.
+        let status = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &name,
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sh",
+                "-c",
+                "echo booting; sleep 0.7; echo 'ask anything...'; sleep 30",
+            ])
+            .status()
+            .expect("tmux new-session");
+        assert!(status.success());
+        refresh_session_cache();
+
+        let session = Session::from_name(&name);
+        let start = std::time::Instant::now();
+        session.wait_until_ready(std::time::Duration::from_secs(3), Some("ask anything"));
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= std::time::Duration::from_millis(600),
+            "returned before the marker could plausibly have appeared: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "should have returned promptly once the marker appeared, not idled toward the bound: {elapsed:?}"
+        );
     }
 
     #[test]
