@@ -63,9 +63,11 @@ import type { SidebarAxis } from "../lib/sidebarAxis";
 import {
   archivableWorkspaces,
   nestedSidebarGroupShouldRender,
+  orgNestedGroupShouldRender,
   sidebarGroupHasLiveWorkspace,
   sidebarGroupShouldRender,
   type NestedSidebarGroup,
+  type OrgNestedGroup,
   type SidebarGroup,
   type SidebarWorkspaceView,
 } from "../lib/sidebarGroups";
@@ -308,6 +310,9 @@ interface Props {
   // The nested `repo+group` axis model (#1720). Only consumed when
   // `axis === "repo+group"`; the flat `groups` list drives the other axes.
   nestedGroups: NestedSidebarGroup[];
+  // The org axis model (#3283). Only consumed when `axis === "org"`; the
+  // flat `groups` list drives the other axes.
+  orgGroups: OrgNestedGroup[];
   // Fully-trashed workspaces, computed by the parent from the authoritative
   // unsliced workspace list (`workspaces.filter(workspaceIsTrashed)`), NOT from
   // the per-`group_path` slice views in `groups`/`nestedGroups`. Trash
@@ -318,6 +323,8 @@ interface Props {
   // thread it.
   trashedWorkspaces?: Workspace[];
   onToggleSubgroup: (repoId: string, groupPath: string) => void;
+  onToggleOrg: (orgId: string) => void;
+  onToggleOrgRepo: (orgId: string, repoId: string) => void;
   onReorderWorkspaces: (newOrder: string[]) => void;
   onReorderGroups: (orderedGroupIds: string[]) => void;
   activeId: string | null;
@@ -3055,29 +3062,34 @@ function workspaceMatchesFilter(ws: Workspace, q: string): boolean {
   );
 }
 
-// The grouping toggle cycles through the three axes on each click. Order is
-// chosen so the first click off the default still lands on the flat group
-// axis (preserving the pre-#1720 repo -> group step), then adds nesting.
+// The grouping toggle cycles through the four axes on each click. Order is
+// chosen so the first click off the default lands on the org axis,
+// then the flat user-group axis (preserving the pre-#1720 repo -> group
+// step), then adds nesting. See #3283.
 const NEXT_AXIS: Record<SidebarAxis, SidebarAxis> = {
-  repo: "group",
+  repo: "org",
+  org: "group",
   group: "repo+group",
   "repo+group": "repo",
 };
 
 const AXIS_HEADING: Record<SidebarAxis, string> = {
   repo: "Sessions",
+  org: "Sessions",
   group: "Groups",
   "repo+group": "Sessions",
 };
 
 const AXIS_TOOLTIP: Record<SidebarAxis, string> = {
   repo: "Grouping: by repository",
+  org: "Grouping: by organization",
   group: "Grouping: by user group",
   "repo+group": "Grouping: by repository, then user group",
 };
 
 const AXIS_ARIA: Record<SidebarAxis, string> = {
   repo: "Group sessions by repository",
+  org: "Group sessions by organization",
   group: "Group sessions by user group",
   "repo+group": "Group sessions by repository, then user group",
 };
@@ -3085,8 +3097,11 @@ const AXIS_ARIA: Record<SidebarAxis, string> = {
 export function WorkspaceSidebar({
   groups,
   nestedGroups,
+  orgGroups,
   trashedWorkspaces = [],
   onToggleSubgroup,
+  onToggleOrg,
+  onToggleOrgRepo,
   onReorderWorkspaces,
   onReorderGroups,
   activeId,
@@ -3313,6 +3328,7 @@ export function WorkspaceSidebar({
   const q = activeFilterQuery.trim().toLowerCase();
 
   const isNested = axis === "repo+group";
+  const isOrgAxis = axis === "org";
 
   // A row survives the text query when there is none, or it matches the
   // workspace/group name; a plugin facet filter (#2401) is ANDed on top, so an
@@ -3350,13 +3366,48 @@ export function WorkspaceSidebar({
         .filter((ng) => ng.subgroups.length > 0)
     : nestedGroups;
 
+  // Filter the org model the same way the nested model is filtered: a repo
+  // survives if it, or its org header name, matches; empty repos and then
+  // empty orgs drop out. See #3283.
+  const filteredOrgGroups: OrgNestedGroup[] = hasFilter
+    ? orgGroups
+        .map((og) => ({
+          org: og.org,
+          repos: og.repos
+            .map((r) => ({
+              ...r,
+              workspaces: r.workspaces.filter(
+                (v) => textMatches(v, r.displayName, og.org.displayName) && workspaceMatchesFacets(v.workspace),
+              ),
+            }))
+            .filter((r) => r.workspaces.length > 0),
+        }))
+        .filter((og) => og.repos.length > 0)
+    : orgGroups;
+
+  // Full (pre-filter) repo objects keyed by `${orgId}::${repoId}`, so
+  // "Archive all" on a filtered org repo can still act on every workspace,
+  // not just the filter-matching ones. Built once per render instead of a
+  // double `.find()` per rendered repo. Memoized: an unmemoized `new Map()`
+  // here broke the React Compiler's ability to preserve the manual
+  // `useMemo` below (`flatRenderedOrder`).
+  const fullOrgRepoById: Map<string, SidebarGroup> = useMemo(
+    () =>
+      isOrgAxis
+        ? new Map(orgGroups.flatMap((o) => o.repos.map((r): [string, SidebarGroup] => [`${o.org.id}::${r.id}`, r])))
+        : new Map(),
+    [isOrgAxis, orgGroups],
+  );
+
   // A filter query that matches only a saved project (no live session) still
   // populates the Projects section, so it must not trigger the "No matches"
   // empty state below it. The no-query empty state ("No sessions yet") is left
   // alone: saved projects are not sessions.
   const savedProjectsMatchQuery =
     !!q && savedProjects.some((p) => p.displayName.toLowerCase().includes(q) || p.repoPath.toLowerCase().includes(q));
-  const hasResults = (isNested ? filteredNested.length > 0 : filteredGroups.length > 0) || savedProjectsMatchQuery;
+  const hasResults =
+    (isNested ? filteredNested.length > 0 : isOrgAxis ? filteredOrgGroups.length > 0 : filteredGroups.length > 0) ||
+    savedProjectsMatchQuery;
 
   // Sidebar multi-select. Selection is ephemeral sidebar UI state (not routed
   // or persisted); the anchor pivots Shift+click ranges. See #1724.
@@ -3828,7 +3879,7 @@ export function WorkspaceSidebar({
         )}
 
         <div className="flex-1 overflow-y-auto overflow-x-hidden border-t border-surface-700/60">
-          {!isNested && (
+          {!isNested && !isOrgAxis && (
             <DragSuppressContext.Provider value={dragSuppressRef}>
               <DndContext
                 sensors={sensors}
@@ -4023,6 +4074,83 @@ export function WorkspaceSidebar({
                 </div>
               );
             })}
+          {isOrgAxis &&
+            filteredOrgGroups.filter(orgNestedGroupShouldRender).map((og) => {
+              const org = og.org;
+              const orgExpanded = hasFilter ? true : !org.collapsed;
+              const orgHasActiveChild = og.repos.some((r) =>
+                r.workspaces.some((v) => v.workspace.id === displayedActiveId),
+              );
+              return (
+                <div key={org.id} data-testid="sidebar-org-group" data-org-id={org.id}>
+                  <SidebarGroupHeader
+                    group={{ ...org, collapsed: !orgExpanded }}
+                    hasActiveChild={!orgExpanded && orgHasActiveChild}
+                    onClick={() => !hasFilter && onToggleOrg(org.id)}
+                    onUpdateAppearance={onUpdateRepoAppearance}
+                    onArchiveAll={readOnly || offline ? undefined : () => onArchiveGroup(org)}
+                    onNewSession={onNew}
+                    offline={offline}
+                  />
+                  {orgExpanded &&
+                    og.repos.filter(sidebarGroupShouldRender).map((repo) => {
+                      const repoExpanded = hasFilter ? true : !repo.collapsed;
+                      const repoHasActiveChild = repo.workspaces.some((v) => v.workspace.id === displayedActiveId);
+                      // Sunk rows are pulled into the single global
+                      // footer below, exactly like the other axes, so
+                      // each repo renders only its live tier.
+                      const liveWorkspaces = repo.workspaces.filter((v) => !workspaceIsSunk(v.workspace));
+                      // Resolve the unfiltered repo so "Archive all"
+                      // covers the whole repo, not just filter matches.
+                      const fullRepo = fullOrgRepoById.get(`${org.id}::${repo.id}`) ?? repo;
+                      return (
+                        <div
+                          key={`${org.id}::${repo.id}`}
+                          className="pl-3"
+                          data-testid="sidebar-org-repo"
+                          data-repo-id={repo.id}
+                        >
+                          <SidebarGroupHeader
+                            group={{ ...fullRepo, collapsed: !repoExpanded }}
+                            hasActiveChild={!repoExpanded && repoHasActiveChild}
+                            onClick={() => !hasFilter && onToggleOrgRepo(org.id, repo.id)}
+                            onUpdateAppearance={onUpdateRepoAppearance}
+                            onArchiveAll={readOnly || offline ? undefined : () => onArchiveGroup(fullRepo)}
+                            onNewSession={() =>
+                              fullRepo.capabilities.create === "repo" && fullRepo.repoPath
+                                ? onCreateSession(fullRepo.repoPath)
+                                : onNew()
+                            }
+                            offline={offline}
+                          />
+                          {repoExpanded &&
+                            liveWorkspaces.map((v) => (
+                              <SessionRow
+                                key={`${org.id}::${repo.id}::${v.key}`}
+                                workspace={v.workspace}
+                                isActive={v.workspace.id === displayedActiveId}
+                                isSelected={!readOnly && selection.selectedIds.has(v.workspace.id)}
+                                onActivate={(e) => handleRowActivate(v.workspace.id, e)}
+                                onDelete={onDeleteSession}
+                                onStop={onStopSession}
+                                onStart={onStartSession}
+                                onSwitchView={onSwitchView}
+                                readOnly={readOnly}
+                                optimistic={triage.optimisticFor(v.workspace.id)}
+                                onPinToggle={triage.pinToggle}
+                                onArchiveToggle={triage.archiveToggle}
+                                onSnooze={triage.snooze}
+                                onUnreadToggle={triage.unreadToggle}
+                                bulkApi={rowBulkApi}
+                                indented
+                              />
+                            ))}
+                        </div>
+                      );
+                    })}
+                </div>
+              );
+            })}
           {(() => {
             // Single global "Snoozed & archived" section at the very
             // bottom of the sidebar. Aggregates sunk workspaces from
@@ -4030,19 +4158,25 @@ export function WorkspaceSidebar({
             // collapsible bucket rather than one footer per repo.
             // Rows are listed flat in the order they appear inside
             // their respective groups; each row's SessionRow already
-            // surfaces the title/branch/repo chips that anchor it to
-            // its project. The nested axis flattens across its
-            // repo -> subgroup tree to feed the same bucket. See #1581,
-            // #1720.
+            // surfaces the title/branch/repo chips that anchor it to its
+            // project. The nested axis flattens across its repo -> subgroup
+            // tree, and the org axis its org -> repo tree, to feed the
+            // same bucket. See #1581, #1720, #3283.
             const sunkWorkspaces = isNested
               ? filteredNested.flatMap((ng) =>
                   ng.subgroups.flatMap((sg) =>
                     sg.workspaces.filter((v) => workspaceIsSunk(v.workspace) && !workspaceIsTrashed(v.workspace)),
                   ),
                 )
-              : filteredGroups.flatMap((g) =>
-                  g.workspaces.filter((v) => workspaceIsSunk(v.workspace) && !workspaceIsTrashed(v.workspace)),
-                );
+              : isOrgAxis
+                ? filteredOrgGroups.flatMap((og) =>
+                    og.repos.flatMap((r) =>
+                      r.workspaces.filter((v) => workspaceIsSunk(v.workspace) && !workspaceIsTrashed(v.workspace)),
+                    ),
+                  )
+                : filteredGroups.flatMap((g) =>
+                    g.workspaces.filter((v) => workspaceIsSunk(v.workspace) && !workspaceIsTrashed(v.workspace)),
+                  );
             if (sunkWorkspaces.length === 0) return null;
             return (
               <div data-testid="sidebar-sunk-section">

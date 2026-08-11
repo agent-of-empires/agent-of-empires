@@ -1246,7 +1246,7 @@ impl HomeView {
     }
 
     /// Confirm before archiving every active session under the focused group.
-    /// Archiving a whole project at once is a bigger hammer than the single-row
+    /// Archiving a whole project or organization at once is a bigger hammer than the single-row
     /// `z`, so it routes through a prompt. Archiving is reversible, hence the
     /// calmer neutral tone rather than the destructive red. No-ops silently
     /// (no prompt) when the group has no active sessions left to archive.
@@ -1258,13 +1258,13 @@ impl HomeView {
         if count == 0 {
             return;
         }
-        // Project mode groups by repo, Manual mode by user-assigned path; name
-        // the scope accordingly and show the full path so nested groups that
-        // share a leaf segment aren't ambiguous.
-        let (title, scope) = if self.group_by == crate::session::config::GroupByMode::Project {
-            ("Archive project", "project")
-        } else {
-            ("Archive group", "group")
+        // Project/Org mode groups by repo/owner, Manual mode by
+        // user-assigned path; name the scope accordingly and show the full
+        // path so nested groups that share a leaf segment aren't ambiguous.
+        let (title, scope) = match self.group_by {
+            crate::session::config::GroupByMode::Project => ("Archive project", "project"),
+            crate::session::config::GroupByMode::Org => ("Archive org", "org"),
+            crate::session::config::GroupByMode::Manual => ("Archive group", "group"),
         };
         let noun = if count == 1 { "session" } else { "sessions" };
         self.confirm_dialog = Some(
@@ -3322,17 +3322,23 @@ impl HomeView {
     }
 
     /// Pick a representative repo path for a selected group so "New Session"
-    /// from a project/group can prefill the working directory. In project mode
-    /// the group label is a derived basename, so match members by
-    /// `project_group_name`; in manual mode match by the stored `group_path`,
-    /// including nested subgroups. Returns `None` for an empty group (no member
-    /// to borrow a path from), leaving the dialog on the default cwd.
+    /// from a project/group can prefill the working directory. In project
+    /// mode the group label is a derived repo basename, so match members by
+    /// `project_group_name`; in manual mode match by the stored
+    /// `group_path`, including nested subgroups. In org mode there is no
+    /// single unambiguous repo to prefill (unlike Project, an org spans many
+    /// repos by design), so this always returns `None` there, mirroring the
+    /// web org header, which routes "New Session" through the generic
+    /// create flow instead of a specific repo path. Also returns `None` for
+    /// an empty group (no member to borrow a path from), leaving the dialog
+    /// on the default cwd.
     pub(super) fn group_repo_path(&self, group_path: &str) -> Option<String> {
         self.instances
             .values()
             .find(|inst| match self.group_by {
                 GroupByMode::Project => super::project_group_name(inst) == group_path,
-                _ => {
+                GroupByMode::Org => false,
+                GroupByMode::Manual => {
                     inst.group_path == group_path
                         || inst.group_path.starts_with(&format!("{group_path}/"))
                 }
@@ -4367,6 +4373,26 @@ impl HomeView {
         }
     }
 
+    /// Info-dialog copy for rename/delete attempted on a header whose
+    /// grouping mode derives it automatically (Project/Org), so there is no
+    /// user-owned group to rename or delete. Returns `None` for `Manual`,
+    /// where group membership is user-managed and the caller should proceed
+    /// with its normal rename/delete flow instead.
+    fn automatic_group_hint(&self) -> Option<(String, String)> {
+        let mode_label = match self.group_by {
+            GroupByMode::Manual => return None,
+            GroupByMode::Project => "Project",
+            GroupByMode::Org => "Org",
+        };
+        let toggle = if self.strict_hotkeys { "Ctrl+G" } else { "'g'" };
+        Some((
+            format!("Cannot Modify {mode_label} Groups"),
+            format!(
+                "{mode_label} groups are automatic. Press {toggle} and pick Manual to manage groups."
+            ),
+        ))
+    }
+
     fn toggle_group_collapsed(&mut self, path: &str) {
         // The synthetic Archived section is not a member of any
         // GroupTree; its collapsed state lives on HomeView and persists
@@ -4390,6 +4416,14 @@ impl HomeView {
                 .insert(path.to_string(), !collapsed);
             self.rebuild_flat_items();
             self.save_project_group_collapsed();
+            return;
+        }
+        if self.group_by == GroupByMode::Org {
+            let collapsed = self.org_group_collapsed.get(path).copied().unwrap_or(false);
+            self.org_group_collapsed
+                .insert(path.to_string(), !collapsed);
+            self.rebuild_flat_items();
+            self.save_org_group_collapsed();
             return;
         }
         // Route to the correct profile's GroupTree
@@ -5246,7 +5280,7 @@ impl HomeView {
     }
 
     /// Open the rename dialog for whatever the sidebar has selected (a
-    /// session row, or a manual-mode group). Project-mode groups can't be
+    /// session row, or a manual-mode group). Project and organization-mode groups can't be
     /// renamed, so they raise an info dialog explaining how to switch
     /// modes. No-op when nothing is selected, or when the selected session
     /// is mid-create or mid-delete (renaming under those states would race
@@ -5299,13 +5333,8 @@ impl HomeView {
             }
             self.rename_dialog = Some(dialog);
         } else if let Some(group_path) = &self.selected_group {
-            if self.group_by == GroupByMode::Project {
-                let hint = if self.strict_hotkeys {
-                    "Project groups are automatic. Press Ctrl+G and pick Manual to manage groups."
-                } else {
-                    "Project groups are automatic. Press 'g' and pick Manual to manage groups."
-                };
-                self.info_dialog = Some(InfoDialog::new("Cannot Modify Project Groups", hint));
+            if let Some((title, hint)) = self.automatic_group_hint() {
+                self.info_dialog = Some(InfoDialog::new(&title, &hint));
                 return;
             }
             let group_path = group_path.clone();
@@ -5396,7 +5425,7 @@ impl HomeView {
     ///   - Terminal view rejects deletion with an info dialog,
     ///   - Creating sessions are inert,
     ///   - Stuck-Deleting sessions get a force-remove confirm,
-    ///   - Project-mode groups can't be deleted (info dialog).
+    ///   - Project and organization-mode groups can't be deleted (info dialog).
     ///
     /// Shared by the `'d'` / `'D'` key handlers and the right-click
     /// context menu.
@@ -5495,13 +5524,8 @@ impl HomeView {
                 ));
             }
         } else if let Some(group_path) = &self.selected_group {
-            if self.group_by == GroupByMode::Project {
-                let hint = if self.strict_hotkeys {
-                    "Project groups are automatic. Press Ctrl+G and pick Manual to manage groups."
-                } else {
-                    "Project groups are automatic. Press 'g' and pick Manual to manage groups."
-                };
-                self.info_dialog = Some(InfoDialog::new("Cannot Modify Project Groups", hint));
+            if let Some((title, hint)) = self.automatic_group_hint() {
+                self.info_dialog = Some(InfoDialog::new(&title, &hint));
                 return;
             }
             // Scope the count to the selected group's profile: two groups in

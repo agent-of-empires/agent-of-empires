@@ -1562,6 +1562,12 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
             bail!("Not in a tmux session. Specify a session ID or run inside tmux.");
         }
     };
+    inst.source_profile = storage.profile().to_string();
+
+    // Resolving the profile config installs the declarative status-rule
+    // registry for this profile; the status detection below never loads config
+    // itself, so a rules-having custom agent would otherwise report Idle.
+    crate::session::profile_config::resolve_config_or_warn(profile);
 
     // Refresh status from tmux so the output reflects current state
     // rather than the stale persisted value.
@@ -1624,17 +1630,19 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
         }
     };
 
+    // Resolving the profile config installs the declarative status-rule
+    // registry for this profile; the status detection below never loads config
+    // itself, so a rules-having custom agent would otherwise report Idle.
+    crate::session::profile_config::resolve_config_or_warn(profile);
+
     let tmux_session = crate::tmux::Session::new(&inst.id, &inst.title)?;
 
     let (content, status) = if !tmux_session.exists() {
         (String::new(), "stopped".to_string())
     } else {
         let raw = tmux_session.capture_pane(args.lines)?;
-        let detection_tool = if inst.detect_as.is_empty() {
-            &inst.tool
-        } else {
-            &inst.detect_as
-        };
+        let detection_tool =
+            crate::tmux::status_rules::detection_tool(profile, &inst.tool, &inst.detect_as);
         let status = if let Some(hook_status) = crate::hooks::read_hook_status(&inst.id) {
             if detection_tool == "codex" && hook_status == crate::session::Status::Running {
                 let status_raw;
@@ -1652,7 +1660,7 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
             }
         } else {
             tmux_session
-                .detect_status(detection_tool)
+                .detect_status(profile, detection_tool)
                 .unwrap_or_default()
         };
         let content = if args.strip_ansi {

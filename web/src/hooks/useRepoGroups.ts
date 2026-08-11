@@ -159,6 +159,7 @@ export function useRepoGroups(
       const hasActive = sorted.some((ws) => ws.status === "active");
       const collapsed = collapsedMap[repoPath] ?? loadCollapsed(repoPath);
       const remoteOwner = sorted[0]?.sessions[0]?.remote_owner ?? null;
+      const remoteOwnerKey = sorted[0]?.sessions[0]?.remote_owner_key ?? null;
       const appearance = appearanceMap[repoPath];
       const defaultDisplayName = repoPath.split("/").pop() ?? repoPath;
 
@@ -170,6 +171,7 @@ export function useRepoGroups(
         alias: appearance?.alias ?? null,
         color: appearance?.color ?? null,
         remoteOwner,
+        remoteOwnerKey,
         workspaces: sorted,
         status: hasActive ? "active" : "idle",
         collapsed,
@@ -193,6 +195,7 @@ export function useRepoGroups(
         alias: appearance?.alias ?? null,
         color: appearance?.color ?? null,
         remoteOwner: null,
+        remoteOwnerKey: null,
         workspaces: sorted,
         status: hasActive ? "active" : "idle",
         collapsed,
@@ -216,6 +219,7 @@ export function useRepoGroups(
         alias: appearance?.alias ?? null,
         color: appearance?.color ?? null,
         remoteOwner: null,
+        remoteOwnerKey: null,
         workspaces: sorted,
         status: hasActive ? "active" : "idle",
         collapsed,

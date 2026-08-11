@@ -1990,6 +1990,22 @@ impl HomeView {
                 .filter(|i| super::project_group_name(i) == group_path)
                 .map(|i| i.id.clone())
                 .collect(),
+            // Org headers are derived from each session's resolved remote
+            // owner key (host-scoped, not just the bare owner, so same-named
+            // owners on different hosts stay separate), same
+            // unification-across-profiles rationale as Project.
+            crate::session::config::GroupByMode::Org => self
+                .instances
+                .values()
+                .filter(|i| !i.is_archived() && !i.is_trashed())
+                .filter(|i| {
+                    self.active_profile
+                        .as_ref()
+                        .is_none_or(|p| &i.source_profile == p)
+                })
+                .filter(|i| self.org_group_key(i) == group_path)
+                .map(|i| i.id.clone())
+                .collect(),
             // Manual groups can nest, so a session belongs when its path
             // matches exactly or sits beneath the group. Scope to the group's
             // owning profile the same way `delete_selected_group` does.

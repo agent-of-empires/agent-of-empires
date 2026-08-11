@@ -5583,7 +5583,12 @@ impl Instance {
             self.has_command_override()
         );
 
-        let detection_tool = if self.detect_as.is_empty() {
+        // Two detection identities: hooks are installed for (and must be
+        // interpreted by) the `agent_detect_as` alias when one is set, so
+        // hook reconciliation keeps the alias identity. The pane fallback
+        // below instead prefers the session's own configured status rules
+        // over the alias.
+        let hook_tool: &str = if self.detect_as.is_empty() {
             &self.tool
         } else {
             &self.detect_as
@@ -5627,20 +5632,20 @@ impl Instance {
                 //    keeps parked sessions (the dominant steady state) from
                 //    paying a capture per poll; see
                 //    reconcile_claude_idle_hook_status.
-                let reconciles_running = (detection_tool == "codex" || detection_tool == "claude")
+                let reconciles_running = (hook_tool == "codex" || hook_tool == "claude")
                     && hook_status == Status::Running;
                 let reconciles_waiting = hook_status == Status::Waiting;
-                let reconciles_idle = detection_tool == "claude"
+                let reconciles_idle = hook_tool == "claude"
                     && hook_status == Status::Idle
                     && matches!(self.status, Status::Running | Status::Waiting);
                 self.status = if reconciles_running || reconciles_waiting || reconciles_idle {
                     match session.capture_pane(50) {
                         Ok(pane_content) => {
                             if reconciles_waiting {
-                                tmux::reconcile_waiting_hook(detection_tool, &pane_content)
+                                tmux::reconcile_waiting_hook(hook_tool, &pane_content)
                             } else if reconciles_idle {
                                 tmux::reconcile_claude_idle_hook_status(&pane_content)
-                            } else if detection_tool == "codex" {
+                            } else if hook_tool == "codex" {
                                 tmux::reconcile_codex_hook_status(hook_status, &pane_content)
                             } else {
                                 let running_age = crate::hooks::read_hook_status_age(&self.id);
@@ -5655,7 +5660,7 @@ impl Instance {
                             tracing::trace!(
                                 "status '{}': {} hook fallback pane capture failed: {}",
                                 self.title,
-                                detection_tool,
+                                hook_tool,
                                 e
                             );
                             hook_status
@@ -5669,8 +5674,13 @@ impl Instance {
             return;
         }
 
+        // Pane-fallback identity: the session's own configured status rules
+        // outrank the `agent_detect_as` alias; without rules the alias applies.
+        let pane_tool =
+            tmux::status_rules::detection_tool(&self.source_profile, &self.tool, &self.detect_as);
         let pane_content = session.capture_pane(50).unwrap_or_default();
-        let detected = tmux::detect_status_from_content(&pane_content, detection_tool);
+        let detected =
+            tmux::detect_status_from_content_in(&self.source_profile, &pane_content, pane_tool);
         tracing::trace!(target: "session.store",
             "status '{}': detected={:?}, cmd_override={}, custom_cmd={}",
             self.title,
@@ -5712,7 +5722,7 @@ impl Instance {
             && !shell_stale
             && !is_dead
             && self.status == Status::Running
-            && detection_tool == "claude"
+            && pane_tool == "claude"
             && tmux::claude_pane_is_ambiguous_typed_prompt(&pane_content)
         {
             tracing::debug!(target: "session.store",

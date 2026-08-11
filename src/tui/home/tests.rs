@@ -1610,6 +1610,13 @@ fn test_g_key_opens_group_picker() {
     env.view.handle_key(key(KeyCode::Esc), None);
     assert!(env.view.group_picker_dialog.is_none());
     assert_eq!(env.view.group_by, GroupByMode::Project);
+
+    // 'g' again, Down + Enter advances Project -> Org.
+    env.view.handle_key(key(KeyCode::Char('g')), None);
+    env.view.handle_key(key(KeyCode::Down), None);
+    env.view.handle_key(key(KeyCode::Enter), None);
+    assert!(env.view.group_picker_dialog.is_none());
+    assert_eq!(env.view.group_by, GroupByMode::Org);
 }
 
 #[test]
@@ -3910,6 +3917,107 @@ fn test_project_group_collapsed_prunes_stale_paths() {
     assert!(
         !saved.iter().any(|p| p == "/repos/deleted-ghost"),
         "a collapse entry for a nonexistent project must be pruned"
+    );
+}
+
+/// Org-mode counterpart of `test_project_group_collapsed_state_persists_to_config`:
+/// org folder collapse state has no group record either (headers are derived
+/// from each session's resolved remote owner), so it must round-trip through
+/// `app_state.org_group_collapsed` the same way.
+#[test]
+#[serial]
+fn test_org_group_collapsed_state_persists_to_config() {
+    use crate::session::config::GroupByMode;
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Org;
+    env.view.flat_items = env.view.build_flat_items();
+
+    // Find an org folder header and confirm it starts expanded.
+    let (group_idx, group_path) = env
+        .view
+        .flat_items
+        .iter()
+        .enumerate()
+        .find_map(|(idx, item)| match item {
+            Item::Group {
+                path, collapsed, ..
+            } => {
+                assert!(!collapsed, "org folder should start expanded");
+                Some((idx, path.clone()))
+            }
+            _ => None,
+        })
+        .expect("org mode should have a folder header");
+
+    // Collapse it via Enter, which routes through toggle_group_collapsed.
+    env.view.cursor = group_idx;
+    env.view.update_selected();
+    env.view.handle_key(key(KeyCode::Enter), None);
+
+    // The collapsed path must be persisted to the on-disk config.
+    let config = crate::session::config::load_config()
+        .unwrap()
+        .expect("config should exist after collapse");
+    assert!(
+        config.app_state.org_group_collapsed.contains(&group_path),
+        "collapsed org folder path should be persisted to app_state"
+    );
+
+    // A freshly constructed HomeView (simulating relaunch) must restore it.
+    let fresh = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    assert_eq!(
+        fresh.org_group_collapsed.get(&group_path).copied(),
+        Some(true),
+        "relaunched HomeView should restore the collapsed org folder"
+    );
+}
+
+/// Org-mode counterpart of `test_project_group_collapsed_prunes_stale_paths`.
+#[test]
+#[serial]
+fn test_org_group_collapsed_prunes_stale_paths() {
+    use crate::session::config::GroupByMode;
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Org;
+    env.view.flat_items = env.view.build_flat_items();
+
+    // A real folder the user collapsed this session.
+    let live_path = env
+        .view
+        .flat_items
+        .iter()
+        .find_map(|item| match item {
+            Item::Group { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .expect("org mode should have a folder header");
+
+    env.view.org_group_collapsed.insert(live_path.clone(), true);
+    // A stale entry for an org that isn't part of this session at all.
+    env.view
+        .org_group_collapsed
+        .insert("stale-org".to_string(), true);
+
+    env.view.save_org_group_collapsed();
+
+    let config = crate::session::config::load_config()
+        .unwrap()
+        .expect("config should exist after save");
+    let saved = &config.app_state.org_group_collapsed;
+    assert!(
+        saved.contains(&live_path),
+        "a live collapsed folder must be persisted"
+    );
+    assert!(
+        !saved.iter().any(|p| p == "stale-org"),
+        "a collapse entry for a nonexistent org must be pruned"
     );
 }
 
@@ -9894,6 +10002,208 @@ fn create_test_env_two_projects_mixed_attention() -> TestEnv {
         _guard,
         _temp: temp,
     }
+}
+
+/// Build a HomeView seeded with three sessions: two live in real git repos
+/// with distinct hosted `origin` remotes on different hosts entirely
+/// (GitHub, GitLab) to prove owner resolution isn't GitHub-specific, and one
+/// live in a real git repo with no `origin` remote at all. Helper for
+/// `build_flat_items_by_org` grouping tests, which (unlike project mode)
+/// need an actual `.git` directory since `get_remote_owner` reads the
+/// on-disk remote configuration rather than parsing the path string.
+fn create_test_env_two_orgs() -> TestEnv {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+
+    let repo_a = temp.path().join("repo-a");
+    std::fs::create_dir_all(&repo_a).unwrap();
+    git2::Repository::init(&repo_a)
+        .unwrap()
+        .remote("origin", "git@github.com:org-a/repo-a.git")
+        .unwrap();
+
+    let repo_b = temp.path().join("repo-b");
+    std::fs::create_dir_all(&repo_b).unwrap();
+    git2::Repository::init(&repo_b)
+        .unwrap()
+        .remote("origin", "git@gitlab.com:org-b/repo-b.git")
+        .unwrap();
+
+    let repo_no_remote = temp.path().join("repo-no-remote");
+    std::fs::create_dir_all(&repo_no_remote).unwrap();
+    git2::Repository::init(&repo_no_remote).unwrap();
+
+    let inst_a = Instance::new("a-session", repo_a.to_str().unwrap());
+    let inst_b = Instance::new("b-session", repo_b.to_str().unwrap());
+    let inst_no_remote = Instance::new("no-remote-session", repo_no_remote.to_str().unwrap());
+
+    let instances = vec![inst_a, inst_b, inst_no_remote];
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    TestEnv {
+        view,
+        _guard,
+        _temp: temp,
+    }
+}
+
+/// `build_flat_items_by_org` must group sessions by each repo's resolved
+/// remote owner (any hosted git remote, not just GitHub), and fall a
+/// session with no resolvable owner into the synthetic "No organization"
+/// bucket.
+#[test]
+#[serial]
+fn build_flat_items_by_org_groups_by_resolved_owner() {
+    use crate::session::config::GroupByMode;
+
+    let mut env = create_test_env_two_orgs();
+    env.view.group_by = GroupByMode::Org;
+    env.view.flat_items = env.view.build_flat_items();
+
+    let mut membership: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut current_group: Option<String> = None;
+    for item in &env.view.flat_items {
+        match item {
+            Item::Group { name, .. } => current_group = Some(name.clone()),
+            Item::Session { id, .. } => {
+                if let Some(inst) = env.view.instances().find(|i| &i.id == id) {
+                    membership.insert(inst.title.clone(), current_group.clone().unwrap());
+                }
+            }
+        }
+    }
+
+    assert_eq!(membership.get("a-session"), Some(&"org-a".to_string()));
+    assert_eq!(membership.get("b-session"), Some(&"org-b".to_string()));
+    assert_eq!(
+        membership.get("no-remote-session"),
+        Some(&"No organization".to_string())
+    );
+}
+
+/// Build a HomeView seeded with two sessions whose repos share the same
+/// owner login ("acme") but live on different hosts (GitHub, GitLab).
+/// Regression fixture for the Required #1 review fix: before it,
+/// `org_group_key` returned the bare owner, so these two repos merged into
+/// one org bucket and one bulk-archive scope despite having nothing to do
+/// with each other.
+fn create_test_env_same_owner_two_hosts() -> TestEnv {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+
+    let repo_gh = temp.path().join("repo-gh");
+    std::fs::create_dir_all(&repo_gh).unwrap();
+    git2::Repository::init(&repo_gh)
+        .unwrap()
+        .remote("origin", "git@github.com:acme/repo-gh.git")
+        .unwrap();
+
+    let repo_gl = temp.path().join("repo-gl");
+    std::fs::create_dir_all(&repo_gl).unwrap();
+    git2::Repository::init(&repo_gl)
+        .unwrap()
+        .remote("origin", "git@gitlab.com:acme/repo-gl.git")
+        .unwrap();
+
+    let inst_gh = Instance::new("gh-session", repo_gh.to_str().unwrap());
+    let inst_gl = Instance::new("gl-session", repo_gl.to_str().unwrap());
+
+    let instances = vec![inst_gh, inst_gl];
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    TestEnv {
+        view,
+        _guard,
+        _temp: temp,
+    }
+}
+
+/// Required-fix regression (#3284 review): two repos owned by the same
+/// login on different hosts (GitHub "acme" vs GitLab "acme") must render as
+/// two separate org headers, both displayed "acme", and a bulk operation
+/// scoped to one must never pull in the other's session.
+#[test]
+#[serial]
+fn build_flat_items_by_org_scopes_same_named_owners_by_host() {
+    use crate::session::config::GroupByMode;
+
+    let mut env = create_test_env_same_owner_two_hosts();
+    env.view.group_by = GroupByMode::Org;
+    env.view.flat_items = env.view.build_flat_items();
+
+    let group_paths: Vec<String> = env
+        .view
+        .flat_items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Group { path, name, .. } => {
+                assert_eq!(name, "acme", "both headers should display the bare owner");
+                Some(path.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        group_paths.len(),
+        2,
+        "same-named owners on different hosts must render as two separate headers, got {group_paths:?}"
+    );
+    assert_ne!(
+        group_paths[0], group_paths[1],
+        "the two org headers must have distinct identity keys"
+    );
+
+    // Selecting one host's group must not pull in the other host's session.
+    let gh_id = env
+        .view
+        .instances()
+        .find(|i| i.title == "gh-session")
+        .map(|i| i.id.clone())
+        .expect("gh-session instance must exist");
+    let gl_id = env
+        .view
+        .instances()
+        .find(|i| i.title == "gl-session")
+        .map(|i| i.id.clone())
+        .expect("gl-session instance must exist");
+    let gh_inst = env.view.get_instance(&gh_id).unwrap();
+    let gh_key = env.view.org_group_key(gh_inst);
+    env.view.selected_group = Some(gh_key);
+    let scoped_ids = env.view.active_sessions_in_selected_group();
+    assert_eq!(
+        scoped_ids,
+        vec![gh_id],
+        "archiving the GitHub org header must not include the GitLab session ({gl_id})"
+    );
 }
 
 /// Project grouping must survive Attention sort. Previously `build_flat_items`
