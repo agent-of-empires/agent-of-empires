@@ -16,6 +16,15 @@ export interface MockSessionInput {
   created_at?: string;
   /** User group (`aoe add -g`); empty means Ungrouped on the group axis. */
   group?: string;
+  /** Parsed remote owner of the repo's `origin` remote; null/omitted means
+   *  the repo has no resolvable owner and buckets into "No organization"
+   *  on the org axis (#3283). */
+  remote_owner?: string | null;
+  /** Host-scoped identity key ("owner@host") backing the org axis's
+   *  bucketing; defaults to `${remote_owner}@example.com` when omitted, so
+   *  most specs need only set `remote_owner`. Set explicitly to test
+   *  same-named owners on different hosts staying in separate buckets. */
+  remote_owner_key?: string | null;
 }
 
 type MockSession = MockSessionInput & { created_at: string };
@@ -52,6 +61,9 @@ function sessionResponse(s: MockSession) {
     has_terminal: true,
     profile: "default",
     workspace_repos: [],
+    remote_owner: s.remote_owner ?? null,
+    remote_owner_key:
+      s.remote_owner_key !== undefined ? s.remote_owner_key : s.remote_owner ? `${s.remote_owner}@example.com` : null,
   };
 }
 

@@ -403,9 +403,12 @@ pub struct AppState {
     /// timestamp so we re-resolve after config changes (see
     /// `CLEANUP_DEFAULTS_TTL`).
     pub cleanup_defaults_cache: RwLock<CleanupDefaultsCache>,
-    /// Cached remote owner per repo path. Remote owners don't change, so
-    /// entries live for the lifetime of the process.
-    pub remote_owner_cache: RwLock<std::collections::HashMap<String, Option<String>>>,
+    /// Cached (owner, host-scoped key) per repo path. Remote owners don't
+    /// change, so entries live for the lifetime of the process. The key
+    /// ("owner@host") lets the web org axis bucket by host-scoped identity
+    /// without merging same-named owners on different hosts; `remote_owner`
+    /// stays the plain owner for display.
+    pub remote_owner_cache: RwLock<std::collections::HashMap<String, Option<(String, String)>>>,
     /// Short-TTL cache of `compute_changed_files` keyed by `(repo_path,
     /// base_branch)`, shared by the file-list and per-file diff endpoints so a
     /// burst of file switches reuses one branch scan. See `ChangedFilesEntry`.

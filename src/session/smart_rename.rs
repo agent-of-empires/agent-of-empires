@@ -1124,7 +1124,7 @@ pub async fn run_terminal_rename(
     // have started another turn since. Only proceed while the pane still reads
     // idle; a later idle edge retries.
     if let Ok(content) = tmux.capture_pane(50) {
-        if crate::tmux::detect_status_from_content(&content, detect_tool)
+        if crate::tmux::detect_status_from_content_in(profile, &content, detect_tool)
             == crate::session::Status::Running
         {
             return Ok(());

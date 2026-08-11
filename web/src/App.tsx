@@ -25,6 +25,7 @@ import { useLastSessionRestore } from "./hooks/useLastSessionRestore";
 import { useRepoGroups } from "./hooks/useRepoGroups";
 import { useSessionGroups } from "./hooks/useSessionGroups";
 import { useNestedSidebarGroups } from "./hooks/useNestedSidebarGroups";
+import { useOrgGroups } from "./hooks/useOrgGroups";
 import { PluginUiProvider, usePluginUiEntries } from "./lib/pluginUiContext";
 import { buildSortValueMap, pluginSortSpecs } from "./lib/pluginUi";
 import type { PluginSortContext, SidebarSortMode } from "./lib/sidebarSort";
@@ -435,6 +436,15 @@ function AppContent({
     sidebarSortMode,
     pluginSort,
   );
+  // The org axis (#3283) partitions the same repo groups by remote owner;
+  // it needs no sort/plugin-sort input of its own since it reuses each
+  // repo's already-ordered workspace list verbatim, just like the nested
+  // axis's repo header.
+  const {
+    groups: orgGroups,
+    toggleOrgCollapsed,
+    toggleRepoCollapsed: toggleOrgRepoCollapsed,
+  } = useOrgGroups(repoGroups);
 
   // The sidebar render path consumes one honest model (SidebarGroup): the
   // repo axis maps in via an adapter, the user-group axis is already in
@@ -2210,8 +2220,11 @@ function AppContent({
             <WorkspaceSidebar
               groups={sidebarGroups}
               nestedGroups={nestedGroups}
+              orgGroups={orgGroups}
               trashedWorkspaces={trashedWorkspaces}
               onToggleSubgroup={toggleSubgroupCollapsed}
+              onToggleOrg={toggleOrgCollapsed}
+              onToggleOrgRepo={toggleOrgRepoCollapsed}
               onReorderWorkspaces={handleReorderWorkspaces}
               onReorderGroups={reorderRepoGroups}
               activeId={activeWorkspace?.id ?? null}

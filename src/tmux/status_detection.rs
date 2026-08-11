@@ -80,10 +80,30 @@ fn matches_input_prompt(non_empty_lines: &[&str], take_n: usize, tool_prompts: &
     false
 }
 
-pub fn detect_status_from_content(content: &str, tool: &str) -> Status {
+/// Rules-aware pane detection for `profile`'s session. Configured declarative
+/// rules outrank the built-in detector: they are the only detection path for a
+/// custom agent that is not the same binary as any built-in, and an explicit
+/// override when the user writes rules for a built-in name. Rules are looked up
+/// per `(profile, tool)`, so a session consults only its own profile's rules.
+pub fn detect_status_from_content_in(profile: &str, content: &str, tool: &str) -> Status {
     // Strip ANSI escape codes before passing to detectors. capture-pane is
     // called with -e (to preserve colors for the TUI preview), but color codes
     // interspersed in text like "esc interrupt" break plain substring matches.
+    let clean = strip_ansi(content);
+    if let Some(status) = super::status_rules::detect(profile, tool, &clean) {
+        return status;
+    }
+    crate::agents::get_agent(tool)
+        .map(|a| (a.detect_status)(&clean))
+        .unwrap_or(Status::Idle)
+}
+
+/// Rules-free pane detection: strip ANSI, then the built-in detector only, no
+/// status-rule registry consult. Used by callers that are keyed to the
+/// built-in / alias identity rather than to a session's profile (see
+/// `reconcile_waiting_hook`), so their behavior is independent of any
+/// configured `[[agents.<name>.status_rules]]`.
+pub fn detect_status_from_content(content: &str, tool: &str) -> Status {
     let clean = strip_ansi(content);
     crate::agents::get_agent(tool)
         .map(|a| (a.detect_status)(&clean))

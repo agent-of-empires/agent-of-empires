@@ -161,6 +161,14 @@ pub struct SessionResponse {
     pub profile: String,
     pub cleanup_defaults: CleanupDefaults,
     pub remote_owner: Option<String>,
+    /// Host-scoped identity for `remote_owner` ("owner@host"), so the web
+    /// sidebar's org axis can bucket by this instead of the bare owner: two
+    /// owners of the same name on different hosts (GitHub "acme" vs GitLab
+    /// "acme") must never merge into one group or one bulk-archive scope.
+    /// `remote_owner` stays the display label. Populated the same way and on
+    /// the same cadence as `remote_owner` (see the cache fill in
+    /// `list_sessions`); `None` whenever `remote_owner` is `None`.
+    pub remote_owner_key: Option<String>,
     /// Per-session push-notification overrides. None means the session
     /// inherits the server-wide default (`web.notify_on_*`) for that
     /// event type; Some(true)/Some(false) is an explicit toggle.
@@ -406,6 +414,7 @@ impl SessionResponse {
                 delete_to_trash: true,
             },
             remote_owner: None,
+            remote_owner_key: None,
             notify_on_waiting: inst.notify_on_waiting,
             notify_on_idle: inst.notify_on_idle,
             notify_on_error: inst.notify_on_error,
@@ -825,8 +834,9 @@ pub async fn list_sessions(
                 .main_repo_path
                 .as_deref()
                 .unwrap_or(&session.project_path);
-            if let Some(owner) = cache.get(repo_path) {
-                session.remote_owner = owner.clone();
+            if let Some(resolved) = cache.get(repo_path) {
+                session.remote_owner = resolved.as_ref().map(|(owner, _)| owner.clone());
+                session.remote_owner_key = resolved.as_ref().map(|(_, key)| key.clone());
             }
         }
     }
@@ -848,8 +858,8 @@ pub async fn list_sessions(
         let mut cache = state.remote_owner_cache.write().await;
         for path in &uncached {
             if !cache.contains_key(path.as_str()) {
-                let owner = crate::git::get_remote_owner(std::path::Path::new(path));
-                cache.insert(path.clone(), owner);
+                let resolved = crate::git::get_remote_owner_with_key(std::path::Path::new(path));
+                cache.insert(path.clone(), resolved);
             }
         }
         for session in &mut sessions {
@@ -858,8 +868,9 @@ pub async fn list_sessions(
                 .as_deref()
                 .unwrap_or(&session.project_path);
             if session.remote_owner.is_none() {
-                if let Some(owner) = cache.get(repo_path) {
-                    session.remote_owner = owner.clone();
+                if let Some(resolved) = cache.get(repo_path) {
+                    session.remote_owner = resolved.as_ref().map(|(owner, _)| owner.clone());
+                    session.remote_owner_key = resolved.as_ref().map(|(_, key)| key.clone());
                 }
             }
         }
@@ -10259,6 +10270,7 @@ mod workspace_ordering_tests {
             },
             trashed_at: None,
             remote_owner: None,
+            remote_owner_key: None,
             notify_on_waiting: None,
             notify_on_idle: None,
             notify_on_error: None,

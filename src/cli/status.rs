@@ -45,6 +45,9 @@ struct StatusJson {
 pub async fn run(profile: &str, args: StatusArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
     let (mut instances, _) = storage.load_with_groups()?;
+    for inst in &mut instances {
+        inst.source_profile = storage.profile().to_string();
+    }
 
     if instances.is_empty() {
         if args.json {
@@ -58,6 +61,11 @@ pub async fn run(profile: &str, args: StatusArgs) -> Result<()> {
         }
         return Ok(());
     }
+
+    // Resolving the profile config installs the declarative status-rule
+    // registry (`[[agents.<name>.status_rules]]`); the per-instance poll
+    // below never loads config itself.
+    crate::session::profile_config::resolve_config_or_warn(profile);
 
     // Refresh tmux session cache
     crate::tmux::refresh_session_cache();
