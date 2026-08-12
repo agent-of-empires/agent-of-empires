@@ -5,9 +5,11 @@
 //! program path. This module is the single place that branching lives: a
 //! `Command` runtime resolves its `argv[0]` on `PATH` or inside the plugin
 //! directory; a `ReleaseBinary` runtime points at the per-platform binary
-//! installation already placed in the plugin directory. Adding a new runtime
-//! kind later is a new match arm in [`resolve_launch`], not a rewrite of the
-//! supervisor or the transport: they only ever see a [`ResolvedLaunch`].
+//! installation already placed in the plugin directory; a `SelfExec` runtime
+//! (built-ins only) runs the host binary itself with a hidden subcommand, so
+//! it needs no plugin directory. Adding a new runtime kind later is a new
+//! match arm in [`resolve_launch`], not a rewrite of the supervisor or the
+//! transport: they only ever see a [`ResolvedLaunch`].
 //!
 //! Resolution is language-agnostic. The Python reference plugin declares a
 //! console-script entrypoint (`aoe-github-worker`) or an interpreter
@@ -21,7 +23,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use aoe_plugin_api::RuntimeSpec;
+use aoe_plugin_api::{RuntimeSpec, TrustLevel};
 
 use crate::plugin::registry::LoadedPlugin;
 
@@ -52,6 +54,12 @@ pub enum LaunchError {
 
     #[error("plugin {plugin_id} declares a runtime but has no installed directory")]
     NoPluginDir { plugin_id: String },
+
+    #[error("plugin {plugin_id}: could not resolve the host executable for a self-exec worker: {reason}")]
+    CurrentExe { plugin_id: String, reason: String },
+
+    #[error("plugin {plugin_id}: self-exec runtime is only allowed for builtin plugins")]
+    SelfExecNotBuiltin { plugin_id: String },
 
     #[error(
         "plugin {plugin_id}: worker program {program:?} was not found on PATH. \
@@ -101,6 +109,9 @@ pub trait LaunchResolver {
     /// Whether `path` is a regular file with an executable bit (Unix) or
     /// simply a file (non-Unix).
     fn is_executable(&self, path: &Path) -> bool;
+    /// The running host executable, for a `SelfExec` worker. Behind the trait
+    /// so a test can resolve it without depending on the real binary path.
+    fn current_exe(&self) -> std::io::Result<PathBuf>;
 }
 
 /// The production [`LaunchResolver`]: real `PATH` and filesystem.
@@ -113,6 +124,10 @@ impl LaunchResolver for OsLaunchResolver {
 
     fn exists(&self, path: &Path) -> bool {
         path.exists()
+    }
+
+    fn current_exe(&self) -> std::io::Result<PathBuf> {
+        std::env::current_exe()
     }
 
     fn is_executable(&self, path: &Path) -> bool {
@@ -133,10 +148,10 @@ impl LaunchResolver for OsLaunchResolver {
 /// Resolve a plugin's runtime into a launchable command.
 ///
 /// The single dispatch site. A new `RuntimeSpec` variant becomes a new match
-/// arm here; nothing downstream changes. Builtins do not declare a runtime in
-/// this release, so a builtin (or any plugin with `runtime = None`) returns
-/// [`LaunchError::NoRuntime`]: it has no worker. The `aoe __plugin-worker`
-/// self-exec path for builtin workers arrives with the first builtin worker.
+/// arm here; nothing downstream changes. A plugin with `runtime = None` returns
+/// [`LaunchError::NoRuntime`]: it has no worker. `SelfExec` runs the host binary
+/// itself and so is the one variant that needs no installed directory; it is
+/// reserved for builtins, which ship their worker inside `aoe`.
 pub fn resolve_launch(
     plugin: &LoadedPlugin,
     resolver: &dyn LaunchResolver,
@@ -149,6 +164,30 @@ pub fn resolve_launch(
         .ok_or_else(|| LaunchError::NoRuntime {
             plugin_id: plugin_id.clone(),
         })?;
+
+    let mut env = BTreeMap::new();
+    env.insert("AOE_PLUGIN_ID".to_string(), plugin_id.clone());
+
+    // SelfExec needs no plugin directory (it runs `aoe` itself), so it resolves
+    // before the dir requirement the on-disk variants share.
+    if let RuntimeSpec::SelfExec { subcommand } = runtime {
+        if plugin.trust != TrustLevel::Builtin {
+            return Err(LaunchError::SelfExecNotBuiltin { plugin_id });
+        }
+        let program = resolver
+            .current_exe()
+            .map_err(|e| LaunchError::CurrentExe {
+                plugin_id: plugin_id.clone(),
+                reason: e.to_string(),
+            })?;
+        return Ok(ResolvedLaunch {
+            program,
+            args: vec![subcommand.clone()],
+            cwd: std::env::temp_dir(),
+            env,
+        });
+    }
+
     let dir = plugin
         .dir
         .as_ref()
@@ -172,10 +211,8 @@ pub fn resolve_launch(
             })?;
             (path, Vec::new())
         }
+        RuntimeSpec::SelfExec { .. } => unreachable!("SelfExec resolved above"),
     };
-
-    let mut env = BTreeMap::new();
-    env.insert("AOE_PLUGIN_ID".to_string(), plugin_id);
 
     Ok(ResolvedLaunch {
         program,
@@ -317,6 +354,9 @@ mod tests {
         fn is_executable(&self, path: &Path) -> bool {
             self.executable.contains(path)
         }
+        fn current_exe(&self) -> std::io::Result<PathBuf> {
+            Ok(PathBuf::from("/usr/bin/aoe"))
+        }
     }
 
     fn plugin(runtime: Option<&str>, dir: Option<&str>) -> LoadedPlugin {
@@ -349,6 +389,38 @@ capabilities = ["runtime.worker"]
         let p = plugin(None, Some("/plugins/acme.worker"));
         let err = resolve_launch(&p, &FakeResolver::new()).unwrap_err();
         assert!(matches!(err, LaunchError::NoRuntime { .. }));
+    }
+
+    #[test]
+    fn self_exec_builtin_runs_the_host_binary_with_the_subcommand() {
+        // A builtin worker has no plugin directory; SelfExec resolves the host
+        // exe and passes the hidden subcommand, independent of any dir.
+        let mut p = plugin(
+            Some("[runtime]\nkind = \"self-exec\"\nsubcommand = \"__plugin-diagnostics\""),
+            None,
+        );
+        p.trust = TrustLevel::Builtin;
+        let launch = resolve_launch(&p, &FakeResolver::new()).unwrap();
+        assert_eq!(launch.program, PathBuf::from("/usr/bin/aoe"));
+        assert_eq!(launch.args, vec!["__plugin-diagnostics".to_string()]);
+        assert_eq!(
+            launch.env.get("AOE_PLUGIN_ID").map(String::as_str),
+            Some("acme.worker")
+        );
+    }
+
+    #[test]
+    fn self_exec_is_rejected_for_a_non_builtin_plugin() {
+        // A community plugin cannot supply the host binary, so self-exec is
+        // refused even though the manifest parses.
+        let p = plugin(
+            Some("[runtime]\nkind = \"self-exec\"\nsubcommand = \"__plugin-diagnostics\""),
+            Some("/plugins/acme.worker"),
+        );
+        assert!(matches!(
+            resolve_launch(&p, &FakeResolver::new()).unwrap_err(),
+            LaunchError::SelfExecNotBuiltin { .. }
+        ));
     }
 
     #[test]

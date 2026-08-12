@@ -156,6 +156,13 @@ impl HostApiState {
         Storage::new_unwatched(&self.profile)
     }
 
+    /// The daemon's session-storage profile, injected into each worker's
+    /// environment so a worker that reads profile-scoped state sees the same
+    /// profile the host does.
+    pub fn profile(&self) -> &str {
+        &self.profile
+    }
+
     /// Bump and return the settings revision. Called by the settings write
     /// path so the next `config.get` reflects the change.
     pub fn bump_settings_revision(&self) -> u64 {

@@ -474,6 +474,7 @@ impl PluginHost {
         cmd.args(&prepared.args)
             .current_dir(&prepared.cwd)
             .env("AOE_PLUGIN_WORKER_ID", &worker_id)
+            .env("AGENT_OF_EMPIRES_PROFILE", self.api.profile())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::from(log))
