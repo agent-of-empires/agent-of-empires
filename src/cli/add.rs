@@ -570,13 +570,18 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
 
                 println!("Creating worktree at: {}", worktree_path.display());
                 // One repo, so a `--repo-base` can only name this one. Resolved
-                // rather than ignored, so a typo'd selector fails loudly.
-                let per_repo =
-                    builder::resolve_repo_base_selectors(&[path.clone()], &args.repo_bases)?;
+                // rather than ignored, so a typo'd selector fails loudly. Keyed
+                // by the repo root, not the launch path: launching from a
+                // subdirectory would otherwise only match that subdirectory's
+                // name, and the documented selector is the repo's own name.
+                let per_repo = builder::resolve_repo_base_selectors(
+                    std::slice::from_ref(&main_repo_path),
+                    &args.repo_bases,
+                )?;
                 // Single-repo sessions only have the launch repo, so fall back
                 // from the explicit session base to the global/profile default.
                 let base = if args.create_branch {
-                    per_repo.get(&path).cloned().or_else(|| {
+                    per_repo.get(&main_repo_path).cloned().or_else(|| {
                         builder::resolve_base_branch(
                             args.base_branch.as_deref(),
                             None,

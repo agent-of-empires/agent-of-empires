@@ -1946,6 +1946,23 @@ mod tests {
             assert!(err.contains(expected), "got: {err}");
         }
 
+        // A selector matches on the leaf of whatever path it is given, so
+        // callers must pass repo roots. Handing it a subdirectory would make
+        // the documented selector (the repo's own name) fail to match, which
+        // is exactly what `aoe add` got wrong when it keyed by the launch path
+        // rather than `find_main_repo`'s result.
+        let subdir = vec![PathBuf::from("/src/api/crates/core")];
+        assert!(
+            resolve_repo_base_selectors(&subdir, &[("api".to_string(), "develop".to_string())])
+                .is_err(),
+            "a repo name must not resolve against a subdirectory path"
+        );
+        assert!(resolve_repo_base_selectors(
+            &subdir,
+            &[("core".to_string(), "develop".to_string())]
+        )
+        .is_ok());
+
         // Two repos sharing a directory name are ambiguous by name. The
         // workspace builder rejects that pair later anyway, but the base
         // selector must not silently pick one.
