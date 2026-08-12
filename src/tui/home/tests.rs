@@ -18098,7 +18098,7 @@ mod apply_session_id_updates {
 
     use super::*;
     use crate::session::poller::SessionPoller;
-    use crate::session::ResumeIntent;
+    use crate::session::{ResumeIntent, View};
     use std::sync::{Arc, Mutex};
 
     const NEW_SID: &str = "019342ab-1111-7aaa-8bbb-cccdddeeefff";
@@ -18411,7 +18411,7 @@ mod apply_session_id_updates {
 
     #[test]
     #[serial]
-    fn apply_session_id_updates_repairs_stopped_poller_on_live_pane() {
+    fn repair_session_id_pollers_skips_structured_and_repairs_live_terminal() {
         if skip_if_no_tmux() {
             return;
         }
@@ -18419,23 +18419,46 @@ mod apply_session_id_updates {
         let _guard = setup_test_home(&temp);
 
         let profile = "apply-poller-repair";
-        let inst = fresh_instance(profile, "repair");
-        let mut view = build_view_with_inst(profile, &inst);
-        let stopped = Arc::new(Mutex::new(SessionPoller::new("stopped".to_string())));
-        view.instances.get_mut(&inst.id).unwrap().session_id_poller = Some(stopped.clone());
-        let _tmux = TmuxSession::create(&inst.id, &inst.title);
+        let terminal = fresh_instance(profile, "repair-terminal");
+        let mut structured = fresh_instance(profile, "repair-structured");
+        structured.view = View::Structured;
+        let mut view = build_view_with_inst(profile, &terminal);
+        view.instances
+            .insert(structured.id.clone(), structured.clone());
+        let terminal_stopped = Arc::new(Mutex::new(SessionPoller::new("stopped".to_string())));
+        let structured_stopped = Arc::new(Mutex::new(SessionPoller::new("stopped".to_string())));
+        view.instances
+            .get_mut(&terminal.id)
+            .unwrap()
+            .session_id_poller = Some(terminal_stopped.clone());
+        view.instances
+            .get_mut(&structured.id)
+            .unwrap()
+            .session_id_poller = Some(structured_stopped.clone());
+        let _tmux = TmuxSession::create(&terminal.id, &terminal.title);
 
-        assert!(!view.apply_session_id_updates());
+        view.repair_session_id_pollers();
         let repaired = view
             .instances
-            .get(&inst.id)
+            .get(&terminal.id)
             .and_then(|i| i.session_id_poller.clone())
             .expect("live pane should receive a replacement poller");
-        assert!(!Arc::ptr_eq(&repaired, &stopped));
+        assert!(!Arc::ptr_eq(&repaired, &terminal_stopped));
         assert!(repaired
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .is_running());
+        assert!(
+            Arc::ptr_eq(
+                &view
+                    .instances
+                    .get(&structured.id)
+                    .and_then(|i| i.session_id_poller.clone())
+                    .expect("structured poller should be untouched"),
+                &structured_stopped,
+            ),
+            "structured sessions must not probe tmux or start terminal pollers"
+        );
         repaired
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

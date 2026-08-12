@@ -3453,14 +3453,17 @@ impl HomeView {
             }
         }
 
-        // A concurrent restart can publish a newer OMP generation while the
-        // poller from this process exits in the pane-replacement gap. Repair
-        // stopped workers on the recurring tick, after draining their final
-        // observation.
-        for inst in self.instances.values_mut() {
-            inst.repair_session_id_poller_if_needed();
-        }
         changed
+    }
+
+    /// Recreate stopped terminal session-id pollers after a status-refresh
+    /// cadence has refreshed tmux state. This is deliberately separate from
+    /// [`Self::apply_session_id_updates`], which runs on every input/render
+    /// wake while live views are open.
+    pub fn repair_session_id_pollers(&mut self) {
+        for instance in self.instances.values_mut() {
+            instance.repair_session_id_poller_if_needed();
+        }
     }
 
     /// Drain the startup-recovery channel and apply each `RecoveryUpdate`

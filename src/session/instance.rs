@@ -5719,7 +5719,11 @@ impl Instance {
     /// OMP pollers reload pane metadata on every tick, so a replacement binds
     /// to the durable generation that won any concurrent restart race.
     pub(crate) fn repair_session_id_poller_if_needed(&mut self) -> bool {
-        if !self.supports_session_poller()
+        // Structured sessions have ACP workers rather than tmux panes. Their
+        // lifecycle is reconciled by the daemon, so probing tmux here can only
+        // fail and is especially costly from the native TUI's refresh loop.
+        if self.is_structured()
+            || !self.supports_session_poller()
             || self.session_id_poller_is_running()
             || !self.has_live_tmux_pane()
         {

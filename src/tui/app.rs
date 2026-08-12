@@ -1779,6 +1779,7 @@ impl App {
 
             if last_status_refresh.elapsed() >= STATUS_REFRESH_INTERVAL {
                 self.home.request_status_refresh();
+                self.home.repair_session_id_pollers();
                 last_status_refresh = std::time::Instant::now();
             }
 
