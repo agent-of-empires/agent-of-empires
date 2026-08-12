@@ -2955,12 +2955,12 @@ mod tests {
         );
         wait_for_pane_text(&session, "ALPHA");
 
-        let fill = "\u{1b}[44m    ";
+        let fill = format!("\u{1b}[44m{}", " ".repeat(40));
         let (with_cursor, _) = session
             .capture_pane_with_cursor(10)
             .expect("capture_pane_with_cursor");
         assert!(
-            with_cursor.contains(fill),
+            with_cursor.contains(fill.as_str()),
             "capture_pane_with_cursor dropped the styled fill:\n{with_cursor:?}"
         );
 
@@ -2968,14 +2968,14 @@ mod tests {
             .capture_window_composited(10)
             .expect("capture_window_composited");
         assert!(
-            composited.contains(fill),
+            composited.contains(fill.as_str()),
             "capture_window_composited dropped the styled fill:\n{composited:?}"
         );
 
         let layout = session.capture_window_layout(1).expect("layout");
         let rows = layout.panes[0].rows.join("\n");
         assert!(
-            rows.contains(fill),
+            rows.contains(fill.as_str()),
             "capture_window_layout dropped the styled fill:\n{rows:?}"
         );
     }
