@@ -193,15 +193,16 @@ pub(crate) fn tmux_command() -> Command {
     cmd
 }
 
-/// Like [`tmux_command`], but pins `LC_ALL=C` for read-only status queries
-/// whose non-zero stderr we classify with [`tmux_no_server_running`]. tmux's
+/// Like [`tmux_command`], but pins `LC_ALL=C` so tmux's connection-failure
+/// messages on stderr stay stable English for callers that match them. tmux's
 /// `client.c` prints `error connecting to <socket> (strerror(errno))` for a
 /// non-`ECONNREFUSED` connect failure, and glibc localizes `strerror` by
 /// `LC_MESSAGES`, so on a non-English host the `(No such file or directory)`
-/// ENOENT marker for an absent socket (#3337) would not match and the empty
-/// case would be misclassified as an error. NOT folded into [`tmux_command`]:
-/// the interactive attach/switch-client/capture-pane paths must keep the
-/// user's locale for UTF-8 and status-bar rendering.
+/// ENOENT marker for an absent socket (#3337) would not match. Used by the
+/// status-query callers (which classify via [`tmux_no_server_running`]) and by
+/// `kill_session_if_present`. NOT folded into [`tmux_command`]: the
+/// interactive attach/switch-client/capture-pane paths must keep the user's
+/// locale for UTF-8 and status-bar rendering.
 pub(crate) fn tmux_query_command() -> Command {
     let mut cmd = tmux_command();
     cmd.env("LC_ALL", "C");
@@ -272,18 +273,22 @@ const FIELD_SEP: char = '|';
 /// (`client.c`) emits `error connecting to <socket> (<strerror>)` for a
 /// non-`ECONNREFUSED` connect failure, so `(Permission denied)` (EACCES) and
 /// `(Socket operation on non-socket)` (ENOTSOCK) do NOT match. The ENOENT
-/// marker is matched anchored to the end of its own line, so a socket path
-/// that happens to contain the phrase cannot fake the empty case on a
-/// different errno. Callers MUST use [`tmux_query_command`] so the `strerror`
-/// text is stable English (see #3327/#3328).
+/// marker (and the `no server running` marker) is matched anchored per line,
+/// so a socket path that happens to contain either phrase cannot fake the
+/// empty case on a different errno. Callers MUST use [`tmux_query_command`] so
+/// the `strerror` text is stable English (see #3327/#3328).
 fn tmux_no_server_running(stderr: &[u8]) -> bool {
     let s = String::from_utf8_lossy(stderr);
-    s.contains("no server running")
-        || s.lines().any(|line| {
-            let line = line.trim();
-            line.starts_with("error connecting to ")
-                && line.ends_with("(No such file or directory)")
-        })
+    // tmux (`client.c`) prints both markers at the start of their own line
+    // (`no server running on <socket>` / `error connecting to <socket>
+    // (<strerror>)`), so anchor to the line rather than scanning the whole
+    // buffer, where an arbitrary socket path could otherwise spoof a match.
+    s.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("no server running")
+            || (line.starts_with("error connecting to ")
+                && line.ends_with("(No such file or directory)"))
+    })
 }
 
 pub fn refresh_session_cache() {
@@ -1562,10 +1567,13 @@ mod tests {
         assert!(!tmux_no_server_running(
             b"error connecting to /path.sock (Socket operation on non-socket)"
         ));
-        // A socket path containing the ENOENT phrase must not fake the empty
-        // case on a different errno (#3337 F4).
+        // A socket path containing either marker phrase must not fake the empty
+        // case on a different errno; both markers are anchored per line.
         assert!(!tmux_no_server_running(
             b"error connecting to /tmp/No such file or directory.sock (Permission denied)"
+        ));
+        assert!(!tmux_no_server_running(
+            b"error connecting to /tmp/no server running.sock (Permission denied)"
         ));
     }
 
