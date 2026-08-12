@@ -125,12 +125,17 @@ base("a queued follow-up drains while its chat is closed", async ({ page }, test
     // Still on settings; nothing navigated us back.
     await expect(page).toHaveURL(/\/settings/);
 
-    // Exactly once. A drain that re-fired would show the queued text in a
-    // second user prompt, and the scripted agent would answer twice.
+    // Exactly once, counted on the user's side of the transcript rather
+    // than the agent's. The fake agent falls back to a generic turn once
+    // its scripted turns run out (see `fakeAcpAgent.mjs`), so a duplicate
+    // send would NOT produce a second `TURN_TWO_TEXT` and counting agent
+    // chunks could never fail. Counting `UserPromptSent` frames can.
     const replay = await fetch(`${serve.baseUrl}/api/sessions/${session.id}/acp/replay?since=0`).then((r) => r.json());
-    const frames: unknown[] = Array.isArray(replay) ? replay : (replay?.frames ?? []);
-    const json = JSON.stringify(frames);
-    expect(json.split(TURN_TWO_TEXT).length - 1).toBe(1);
+    const frames: { event?: { UserPromptSent?: { text?: string } } }[] = Array.isArray(replay)
+      ? replay
+      : (replay?.frames ?? []);
+    const sends = frames.filter((f) => f.event?.UserPromptSent?.text === QUEUED_TEXT);
+    expect(sends).toHaveLength(1);
   } finally {
     try {
       if (serveHandle) await attachServeDiagnostics(testInfo, serveHandle);
