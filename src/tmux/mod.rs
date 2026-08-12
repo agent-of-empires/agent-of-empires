@@ -193,6 +193,22 @@ pub(crate) fn tmux_command() -> Command {
     cmd
 }
 
+/// Like [`tmux_command`], but pins `LC_ALL=C` so tmux's connection-failure
+/// messages on stderr stay stable English for callers that match them. tmux's
+/// `client.c` prints `error connecting to <socket> (strerror(errno))` for a
+/// non-`ECONNREFUSED` connect failure, and glibc localizes `strerror` by
+/// `LC_MESSAGES`, so on a non-English host the `(No such file or directory)`
+/// ENOENT marker for an absent socket (#3337) would not match. Used by the
+/// status-query callers (which classify via [`tmux_no_server_running`]) and by
+/// `kill_session_if_present`. NOT folded into [`tmux_command`]: the
+/// interactive attach/switch-client/capture-pane paths must keep the user's
+/// locale for UTF-8 and status-bar rendering.
+pub(crate) fn tmux_query_command() -> Command {
+    let mut cmd = tmux_command();
+    cmd.env("LC_ALL", "C");
+    cmd
+}
+
 // Debug builds use `aoe_dev_*` prefixes so `cargo run` and an installed
 // release `aoe` never mistake each other's sessions. Debug builds also run on
 // their own tmux socket (see `tmux_socket`), so the two builds no longer
@@ -246,17 +262,39 @@ struct SessionCache {
 const FIELD_SEP: char = '|';
 
 /// tmux exits non-zero with `no server running on <socket>` on stderr when
-/// there are simply zero sessions, the normal state for a structured-view
-/// user who never opens a terminal. That is the empty case, not an error:
-/// callers log it at trace and treat the result as empty, reserving warn for
-/// a genuinely unexpected non-zero exit.
+/// there is no server on the resolved socket (zero sessions, or the socket's
+/// server has died): the normal state for a structured-view user who never
+/// opens a terminal. It also exits non-zero with
+/// `error connecting to <socket> (No such file or directory)` when the socket
+/// file itself is absent (issue #3337), which is likewise the empty case, not
+/// an error. Both are treated as empty: callers log at trace and return an
+/// empty result, reserving warn for a genuinely unexpected non-zero exit.
+///
+/// A transient glitch on an existing socket stays on the error path: tmux
+/// (`client.c`) emits `error connecting to <socket> (<strerror>)` for a
+/// non-`ECONNREFUSED` connect failure, so `(Permission denied)` (EACCES) and
+/// `(Socket operation on non-socket)` (ENOTSOCK) do NOT match. The ENOENT
+/// marker (and the `no server running` marker) is matched anchored per line,
+/// so a socket path that happens to contain either phrase cannot fake the
+/// empty case on a different errno. Callers MUST use [`tmux_query_command`] so
+/// the `strerror` text is stable English (see #3327/#3328).
 fn tmux_no_server_running(stderr: &[u8]) -> bool {
-    String::from_utf8_lossy(stderr).contains("no server running")
+    let s = String::from_utf8_lossy(stderr);
+    // tmux (`client.c`) prints both markers at the start of their own line
+    // (`no server running on <socket>` / `error connecting to <socket>
+    // (<strerror>)`), so anchor to the line rather than scanning the whole
+    // buffer, where an arbitrary socket path could otherwise spoof a match.
+    s.lines().any(|line| {
+        let line = line.trim();
+        line.starts_with("no server running")
+            || (line.starts_with("error connecting to ")
+                && line.ends_with("(No such file or directory)"))
+    })
 }
 
 pub fn refresh_session_cache() {
     let start = Instant::now();
-    let output = tmux_command()
+    let output = tmux_query_command()
         .args(["list-sessions", "-F", "#{session_name}|#{session_activity}"])
         .output();
 
@@ -603,7 +641,7 @@ pub fn stop_all_sessions() -> anyhow::Result<usize> {
 /// successful empty map is authoritative and means there are no panes.
 pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
     let start = Instant::now();
-    let output = tmux_command()
+    let output = tmux_query_command()
         .args([
             "list-panes",
             "-a",
@@ -661,7 +699,7 @@ pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
 /// pass" rather than "nothing attached", so a transient tmux glitch cannot
 /// kill a pane the user is sitting in.
 pub fn attached_session_names() -> anyhow::Result<HashSet<String>> {
-    let output = tmux_command()
+    let output = tmux_query_command()
         .args(["list-sessions", "-F", "#{session_name}|#{session_attached}"])
         .output();
 
@@ -1517,6 +1555,15 @@ mod tests {
             b"no server running on /tmp/tmux-501/default\n"
         ));
         assert!(tmux_no_server_running(b"no server running on /path.sock"));
+        // The socket file itself is absent (issue #3337): also the empty case.
+        assert!(tmux_no_server_running(
+            b"error connecting to /path.sock (No such file or directory)"
+        ));
+        // The ENOENT marker is anchored to the line end, so it is still
+        // detected when the socket path itself contains the phrase (#3337 F4).
+        assert!(tmux_no_server_running(
+            b"error connecting to /tmp/No such file or directory.sock (No such file or directory)"
+        ));
     }
 
     #[test]
@@ -1525,6 +1572,24 @@ mod tests {
         assert!(!tmux_no_server_running(b"can't find session: aoe_foo"));
         assert!(!tmux_no_server_running(b"usage: list-sessions"));
         assert!(!tmux_no_server_running(b""));
+        // Transient strerrors reaching the error-connecting branch (tmux
+        // client.c, non-ECONNREFUSED) must stay on the error path (#3327/#3328).
+        // ECONNREFUSED is NOT here: tmux emits `no server running` for a dead
+        // server, which is the empty case above.
+        assert!(!tmux_no_server_running(
+            b"error connecting to /path.sock (Permission denied)"
+        ));
+        assert!(!tmux_no_server_running(
+            b"error connecting to /path.sock (Socket operation on non-socket)"
+        ));
+        // A socket path containing either marker phrase must not fake the empty
+        // case on a different errno; both markers are anchored per line.
+        assert!(!tmux_no_server_running(
+            b"error connecting to /tmp/No such file or directory.sock (Permission denied)"
+        ));
+        assert!(!tmux_no_server_running(
+            b"error connecting to /tmp/no server running.sock (Permission denied)"
+        ));
     }
 
     #[test]
