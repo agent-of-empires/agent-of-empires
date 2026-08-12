@@ -597,9 +597,9 @@ pub fn stop_all_sessions() -> anyhow::Result<usize> {
 /// Returns `Err` when the underlying `tmux list-panes` call fails to spawn or
 /// exits non-zero. Callers MUST distinguish this from `Ok(map)` where a missing
 /// key means the session is genuinely absent: `Err` means we don't know.
-/// Startup recovery treats `Err` as "skip this pass" to avoid killing a
-/// possibly-live pane on a transient tmux glitch; status pollers treat it as
-/// `unwrap_or_default()` because their semantics are unchanged by an empty map.
+/// Startup recovery and status pollers treat `Err` as "skip this pass" to
+/// avoid acting on a possibly-live pane during a transient tmux glitch. A
+/// successful empty map is authoritative and means there are no panes.
 pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
     let start = Instant::now();
     let output = tmux_command()
