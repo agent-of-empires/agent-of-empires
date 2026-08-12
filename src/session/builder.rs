@@ -43,6 +43,12 @@ pub struct InstanceParams {
     pub command_override: String,
     /// Additional repository paths for multi-repo workspace mode
     pub extra_repo_paths: Vec<String>,
+    /// Per-repo base branches as `(selector, base)` pairs, from
+    /// `aoe add --repo-base <selector>=<ref>` or the web wizard. The
+    /// selector is a repo directory name or one of the paths in `path` /
+    /// `extra_repo_paths`. Outranks `base_branch`, which stays the base for
+    /// every repo that no pair names. See #3329.
+    pub repo_base_branches: Vec<(String, String)>,
     /// Scratch session: ignore `path`, provision a fresh directory under
     /// `<app_dir>/scratch/<id>/`, and persist `instance.scratch = true` so
     /// the deletion path removes the directory. Mutually exclusive with
@@ -117,6 +123,60 @@ fn resolve_repo_base_branch(
     let key = crate::session::projects::canonical_key(&main_repo.to_string_lossy());
     let project = project_bases.get(&key).map(String::as_str);
     resolve_base_branch(session, project, global)
+}
+
+/// Match `(selector, base)` pairs to the repos a session is being built from.
+///
+/// A selector is either a repo's directory name (what every other surface
+/// calls it: the diff panel, `aoe list --json`, `set-base --repo`) or the
+/// literal path the caller passed. Returns a map keyed by the same `PathBuf`
+/// the spec builder uses, so a lookup there is exact.
+///
+/// An unmatched or ambiguous selector is an error rather than a silent
+/// no-op: a typo would otherwise fork the worktree from the wrong base and
+/// only show up as a confusing diff much later. See #3329.
+pub(crate) fn resolve_repo_base_selectors(
+    repos: &[PathBuf],
+    pairs: &[(String, String)],
+) -> Result<std::collections::HashMap<PathBuf, String>> {
+    let mut out = std::collections::HashMap::new();
+    for (selector, base) in pairs {
+        let sel = selector.trim();
+        let Some(base) = normalize_base(Some(base)) else {
+            bail!("No base branch given for repo '{}'", sel);
+        };
+        let matches: Vec<&PathBuf> = repos
+            .iter()
+            .filter(|p| {
+                p.as_os_str() == sel
+                    || p.file_name()
+                        .is_some_and(|n| n == std::ffi::OsStr::new(sel))
+            })
+            .collect();
+        match matches.as_slice() {
+            [one] => {
+                if out.insert((*one).clone(), base).is_some() {
+                    bail!("Repo '{}' was given a base branch twice", sel);
+                }
+            }
+            [] => {
+                let known: Vec<String> = repos
+                    .iter()
+                    .filter_map(|p| p.file_name().map(|n| n.to_string_lossy().to_string()))
+                    .collect();
+                bail!(
+                    "No repo named '{}' in this session. Available: {}",
+                    sel,
+                    known.join(", ")
+                );
+            }
+            _ => bail!(
+                "Repo name '{}' is ambiguous; pass the full path instead",
+                sel
+            ),
+        }
+    }
+    Ok(out)
 }
 
 /// Map of canonical repo path to configured default base branch for every
@@ -499,17 +559,25 @@ pub fn build_instance(
             let global_default = config.worktree.default_base_branch.as_deref();
             let project_bases = project_base_branches(profile);
 
-            // Every repo, including the launch repo, forks from its own
-            // registered per-project default when no explicit session base is
-            // given. Keyed by repo root so a launch path inside a subdirectory
-            // still matches a root-registered project.
+            // An explicit per-repo base outranks every shared layer, which is
+            // the point: one repo forks from develop while the others fork from
+            // their own epic branches. See #3329.
+            let mut all_paths = vec![primary_path.clone()];
+            all_paths.extend(params.extra_repo_paths.iter().map(PathBuf::from));
+            let per_repo = resolve_repo_base_selectors(&all_paths, &params.repo_base_branches)?;
+            let base_for = |path: &PathBuf| {
+                per_repo.get(path).cloned().or_else(|| {
+                    // Every repo, including the launch repo, otherwise forks
+                    // from its own registered per-project default when no
+                    // explicit session base is given. Keyed by repo root so a
+                    // launch path inside a subdirectory still matches a
+                    // root-registered project.
+                    resolve_repo_base_branch(path, session_base, &project_bases, global_default)
+                })
+            };
+
             let primary = WorkspaceRepoSpec {
-                base_branch: resolve_repo_base_branch(
-                    &primary_path,
-                    session_base,
-                    &project_bases,
-                    global_default,
-                ),
+                base_branch: base_for(&primary_path),
                 path: primary_path,
             };
             let extra_repos: Vec<WorkspaceRepoSpec> = params
@@ -518,12 +586,7 @@ pub fn build_instance(
                 .map(|p| {
                     let path = PathBuf::from(p);
                     WorkspaceRepoSpec {
-                        base_branch: resolve_repo_base_branch(
-                            &path,
-                            session_base,
-                            &project_bases,
-                            global_default,
-                        ),
+                        base_branch: base_for(&path),
                         path,
                     }
                 })
@@ -615,16 +678,26 @@ pub fn build_instance(
                     return Err(GitError::WorktreeAlreadyExists(worktree_path.clone()).into());
                 }
 
-                // The launch repo forks from its registered per-project default
-                // when no explicit session base is given (then global/profile,
-                // then auto-detect). Keyed by repo root via the shared helper.
+                // One repo, so a per-repo base can only name this one. Resolved
+                // anyway rather than ignored, so a typo'd selector fails loudly
+                // instead of quietly forking from the wrong base.
+                let per_repo = resolve_repo_base_selectors(
+                    &[main_repo_path.clone()],
+                    &params.repo_base_branches,
+                )?;
+                // The launch repo otherwise forks from its registered
+                // per-project default when no explicit session base is given
+                // (then global/profile, then auto-detect). Keyed by repo root
+                // via the shared helper.
                 let project_bases = project_base_branches(profile);
-                let base = resolve_repo_base_branch(
-                    &main_repo_path,
-                    params.base_branch.as_deref(),
-                    &project_bases,
-                    config.worktree.default_base_branch.as_deref(),
-                );
+                let base = per_repo.get(&main_repo_path).cloned().or_else(|| {
+                    resolve_repo_base_branch(
+                        &main_repo_path,
+                        params.base_branch.as_deref(),
+                        &project_bases,
+                        config.worktree.default_base_branch.as_deref(),
+                    )
+                });
 
                 let w = git_wt.create_worktree(branch, &worktree_path, true, base.as_deref())?;
                 warnings.extend(w);
@@ -1767,6 +1840,120 @@ mod tests {
             extra_release_tip,
             "extra repo worktree should branch from its configured `release` base"
         );
+        // The base the branch was forked from is recorded per repo, which is
+        // what lets the diff view default to the right ref for each one (#3329).
+        assert_eq!(extra_repo.base_branch.as_deref(), Some("release"));
+        assert_eq!(
+            result
+                .workspace_info
+                .repos
+                .iter()
+                .find(|r| r.name == "primary")
+                .unwrap()
+                .base_branch,
+            None,
+            "a repo with no configured base records none, so the diff falls through to detection"
+        );
+    }
+
+    /// A repo whose branch aoe did not create has no base of its own: the base
+    /// argument is ignored when checking out an existing branch, so recording
+    /// it would make "reset to default" compare against a ref that was never
+    /// this checkout's base. See #3329.
+    #[test]
+    fn create_workspace_records_no_base_when_attaching_an_existing_branch() {
+        let (parent_primary, _) = init_repo_with_branch("primary", "feature-x");
+        let primary = parent_primary.path().join("primary");
+        let workspaces_root = tempfile::TempDir::new().unwrap();
+        let template = workspaces_root
+            .path()
+            .join("{branch}")
+            .to_string_lossy()
+            .into_owned();
+
+        let result = create_workspace(
+            &WorkspaceRepoSpec {
+                path: primary,
+                base_branch: Some("main".to_string()),
+            },
+            &[],
+            "feature-x",
+            false,
+            &template,
+            true,
+        )
+        .expect("workspace creation should succeed");
+
+        assert_eq!(result.workspace_info.repos[0].base_branch, None);
+    }
+
+    #[test]
+    fn resolve_repo_base_selectors_matches_name_or_path() {
+        let repos = vec![
+            PathBuf::from("/src/app"),
+            PathBuf::from("/src/api"),
+            PathBuf::from("/elsewhere/web"),
+        ];
+
+        // Directory name and full path both resolve, and whitespace is trimmed.
+        let out = resolve_repo_base_selectors(
+            &repos,
+            &[
+                ("api".to_string(), "epic/checkout".to_string()),
+                ("/elsewhere/web".to_string(), " develop ".to_string()),
+            ],
+        )
+        .expect("both selectors resolve");
+        assert_eq!(
+            out.get(&PathBuf::from("/src/api")).map(String::as_str),
+            Some("epic/checkout")
+        );
+        assert_eq!(
+            out.get(&PathBuf::from("/elsewhere/web"))
+                .map(String::as_str),
+            Some("develop")
+        );
+        assert!(out.get(&PathBuf::from("/src/app")).is_none());
+
+        // No pairs is the common case and must stay cheap and quiet.
+        assert!(resolve_repo_base_selectors(&repos, &[]).unwrap().is_empty());
+
+        let cases = [
+            // A typo would otherwise fork from the wrong base and only show up
+            // much later as a confusing diff.
+            (
+                vec![("nope".to_string(), "develop".to_string())],
+                "No repo named",
+            ),
+            // Empty base.
+            (
+                vec![("api".to_string(), "  ".to_string())],
+                "No base branch",
+            ),
+            // Same repo twice.
+            (
+                vec![
+                    ("api".to_string(), "develop".to_string()),
+                    ("/src/api".to_string(), "main".to_string()),
+                ],
+                "twice",
+            ),
+        ];
+        for (pairs, expected) in cases {
+            let err = resolve_repo_base_selectors(&repos, &pairs)
+                .expect_err("should reject")
+                .to_string();
+            assert!(err.contains(expected), "got: {err}");
+        }
+
+        // Two repos sharing a directory name are ambiguous by name. The
+        // workspace builder rejects that pair later anyway, but the base
+        // selector must not silently pick one.
+        let dupes = vec![PathBuf::from("/a/api"), PathBuf::from("/b/api")];
+        let err = resolve_repo_base_selectors(&dupes, &[("api".to_string(), "x".to_string())])
+            .expect_err("ambiguous name")
+            .to_string();
+        assert!(err.contains("ambiguous"), "got: {err}");
     }
 
     fn isolated_app_dir(temp_home: &std::path::Path) -> std::path::PathBuf {
@@ -1799,6 +1986,7 @@ mod tests {
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: Vec::new(),
+            repo_base_branches: Vec::new(),
             scratch: false,
             fork_seed: None,
         }
@@ -1978,6 +2166,7 @@ mod tests {
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: vec![],
+            repo_base_branches: Vec::new(),
             scratch: false,
             fork_seed: Some(ForkSeed::Terminal {
                 parent_agent_session_id: "parent-uuid".into(),
@@ -2020,6 +2209,7 @@ mod tests {
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: vec![],
+            repo_base_branches: Vec::new(),
             scratch: false,
             fork_seed: Some(ForkSeed::Structured {
                 parent_acp_session_id: "parent-acp-id".into(),

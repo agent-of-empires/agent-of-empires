@@ -930,6 +930,7 @@ mod tests {
             extra_args: String::new(),
             command_override: String::new(),
             extra_repo_paths: Vec::new(),
+            repo_base_branches: Vec::new(),
             scratch: false,
             trust_hooks: None,
             custom_instruction: None,

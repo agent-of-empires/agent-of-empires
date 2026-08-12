@@ -442,6 +442,9 @@ async fn admit_and_create(
         extra_args: String::new(),
         command_override: String::new(),
         extra_repo_paths,
+        // A plugin cannot request a worktree, so there is no branch to fork and
+        // no per-repo base to honor.
+        repo_base_branches: Vec::new(),
         scratch,
         // The service forces this to Some(false) for plugin callers; set
         // explicitly anyway so the intent is local.

@@ -33,6 +33,8 @@ pub(crate) struct StructuredSessionSpec {
     pub extra_args: String,
     pub command_override: String,
     pub extra_repo_paths: Vec<String>,
+    /// Per-repo creation bases as `(selector, base)` pairs. See #3329.
+    pub repo_base_branches: Vec<(String, String)>,
     pub scratch: bool,
     pub trust_hooks: Option<bool>,
     pub custom_instruction: Option<String>,
@@ -134,6 +136,7 @@ pub(crate) async fn spawn_structured_session(
             extra_args,
             command_override,
             extra_repo_paths,
+            repo_base_branches,
             scratch,
             trust_hooks,
             custom_instruction,
@@ -217,6 +220,13 @@ pub(crate) async fn spawn_structured_session(
             extra_args,
             command_override,
             extra_repo_paths,
+            repo_base_branches: if create_new_branch {
+                repo_base_branches
+            } else {
+                // The base only matters when aoe creates the branch, the same
+                // gate `base_branch` above uses.
+                Vec::new()
+            },
             scratch,
             #[cfg(feature = "serve")]
             fork_seed,

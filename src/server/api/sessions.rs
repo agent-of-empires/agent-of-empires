@@ -4759,6 +4759,13 @@ pub async fn delete_workspace(
 
 // --- Create session ---
 
+/// One repo's creation base in a create-session request. See #3329.
+#[derive(Deserialize)]
+pub struct RepoBaseInput {
+    pub repo: String,
+    pub base_branch: String,
+}
+
 #[derive(Deserialize)]
 pub struct CreateSessionBody {
     pub title: Option<String>,
@@ -4791,6 +4798,12 @@ pub struct CreateSessionBody {
     pub extra_env: Vec<String>,
     #[serde(default)]
     pub extra_repo_paths: Vec<String>,
+    /// Base branch for individual repos, as `{ repo, base_branch }` entries.
+    /// `repo` is a repo directory name or one of the paths in `path` /
+    /// `extra_repo_paths`. Outranks `base_branch`, which stays the base for
+    /// every repo no entry names. See #3329.
+    #[serde(default)]
+    pub repo_bases: Vec<RepoBaseInput>,
     #[serde(default)]
     pub command_override: String,
     #[serde(default)]
@@ -5785,6 +5798,11 @@ pub async fn create_session(
         extra_args: body.extra_args,
         command_override: body.command_override,
         extra_repo_paths: body.extra_repo_paths,
+        repo_base_branches: body
+            .repo_bases
+            .into_iter()
+            .map(|r| (r.repo, r.base_branch))
+            .collect(),
         scratch: body.scratch,
         trust_hooks: body.trust_hooks,
         custom_instruction: body.custom_instruction,

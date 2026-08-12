@@ -10,6 +10,18 @@ use crate::session::builder;
 use crate::session::repo_config;
 use crate::session::{civilizations, GroupTree, Instance, SandboxInfo, Storage};
 
+/// Parse one `--repo-base <repo>=<branch>` pair. Split on the first `=` so a
+/// branch containing one still parses.
+fn parse_repo_base(raw: &str) -> Result<(String, String), String> {
+    let (repo, branch) = raw
+        .split_once('=')
+        .ok_or_else(|| format!("expected <repo>=<branch>, got '{raw}'"))?;
+    if repo.trim().is_empty() || branch.trim().is_empty() {
+        return Err(format!("expected <repo>=<branch>, got '{raw}'"));
+    }
+    Ok((repo.trim().to_string(), branch.trim().to_string()))
+}
+
 #[derive(Args)]
 pub struct AddArgs {
     /// Project directory (defaults to current directory). Omit when
@@ -67,6 +79,14 @@ pub struct AddArgs {
     /// branch, or branching off a teammate's branch.
     #[arg(long = "base-branch")]
     base_branch: Option<String>,
+
+    /// Base branch for one repo of a multi-repo workspace, as
+    /// `<repo>=<branch>` (repeatable). `<repo>` is the repo's directory name
+    /// or the path you passed to `--repo`. Outranks `--base-branch`, which
+    /// stays the base for every repo this does not name. Example:
+    /// `--base-branch develop --repo-base api=epic/checkout`.
+    #[arg(long = "repo-base", value_parser = parse_repo_base)]
+    repo_bases: Vec<(String, String)>,
 
     /// Additional repositories for multi-repo workspace (use with --worktree)
     #[arg(long = "repo", short = 'r')]
@@ -140,6 +160,7 @@ pub struct AddArgs {
             "worktree_branch",
             "create_branch",
             "base_branch",
+            "repo_bases",
             "extra_repos",
             "projects",
             "no_submodules",
@@ -192,6 +213,10 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         && explicit_worktree_branch(&args).is_none()
     {
         bail!("--repo/--project requires --worktree to specify a branch\nTip: aoe add /path --project repoB -w branch-name");
+    }
+
+    if !args.repo_bases.is_empty() && explicit_worktree_branch(&args).is_none() {
+        bail!("--repo-base requires --worktree to specify a branch\nTip: aoe add /path --project repoB -w branch-name --repo-base repoB=develop");
     }
 
     let resolved_project_paths: Vec<PathBuf> = if args.projects.is_empty() {
@@ -421,16 +446,26 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 builder::resolve_base_branch(session_base, project, global_default)
             };
 
+            // An explicit `--repo-base` for a repo outranks every shared layer,
+            // so one repo can fork from develop while others fork from their
+            // own epic branches. See #3329.
+            let mut all_paths = vec![path.clone()];
+            all_paths.extend(all_extra_repos.iter().cloned());
+            let per_repo = builder::resolve_repo_base_selectors(&all_paths, &args.repo_bases)?;
+
             // The launch repo never consults the per-project layer: explicit
             // session base, then the global/profile default.
             let primary = builder::WorkspaceRepoSpec {
-                base_branch: builder::resolve_base_branch(session_base, None, global_default),
+                base_branch: per_repo
+                    .get(&path)
+                    .cloned()
+                    .or_else(|| builder::resolve_base_branch(session_base, None, global_default)),
                 path: path.clone(),
             };
             let extra_repos: Vec<builder::WorkspaceRepoSpec> = all_extra_repos
                 .iter()
                 .map(|p| builder::WorkspaceRepoSpec {
-                    base_branch: resolve_extra(p),
+                    base_branch: per_repo.get(p).cloned().or_else(|| resolve_extra(p)),
                     path: p.clone(),
                 })
                 .collect();
@@ -534,14 +569,20 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                 }
 
                 println!("Creating worktree at: {}", worktree_path.display());
+                // One repo, so a `--repo-base` can only name this one. Resolved
+                // rather than ignored, so a typo'd selector fails loudly.
+                let per_repo =
+                    builder::resolve_repo_base_selectors(&[path.clone()], &args.repo_bases)?;
                 // Single-repo sessions only have the launch repo, so fall back
                 // from the explicit session base to the global/profile default.
                 let base = if args.create_branch {
-                    builder::resolve_base_branch(
-                        args.base_branch.as_deref(),
-                        None,
-                        config.worktree.default_base_branch.as_deref(),
-                    )
+                    per_repo.get(&path).cloned().or_else(|| {
+                        builder::resolve_base_branch(
+                            args.base_branch.as_deref(),
+                            None,
+                            config.worktree.default_base_branch.as_deref(),
+                        )
+                    })
                 } else {
                     None
                 };
@@ -1600,8 +1641,28 @@ fn resolve_sandbox_image(
 
 #[cfg(test)]
 mod tests {
-    use super::{override_launch_binary, resolve_sandbox_image};
+    use super::{override_launch_binary, parse_repo_base, resolve_sandbox_image};
     use crate::session::config::SessionConfig;
+
+    #[test]
+    fn parse_repo_base_splits_on_the_first_equals() {
+        let ok = [
+            ("api=develop", ("api", "develop")),
+            // A path selector, and a branch containing '=' (rare but legal).
+            ("/src/api=epic/a=b", ("/src/api", "epic/a=b")),
+            (" api = develop ", ("api", "develop")),
+        ];
+        for (raw, (repo, branch)) in ok {
+            assert_eq!(
+                parse_repo_base(raw).unwrap(),
+                (repo.to_string(), branch.to_string()),
+                "{raw:?}"
+            );
+        }
+        for raw in ["api", "=develop", "api=", "  =  "] {
+            assert!(parse_repo_base(raw).is_err(), "{raw:?} should be rejected");
+        }
+    }
 
     const HARDCODED: &str = "ghcr.io/agent-of-empires/aoe-sandbox:latest";
 
