@@ -101,7 +101,7 @@ const PAGES = [
     dest: "guides/web/diff.md",
     title: "Web Diff View",
     description:
-      "Review a session's changes from the browser: the flat / tree changed-files list, per-session base override, and inline review comments.",
+      "Review a session's changes from the browser: the flat / tree changed-files list, per-repo base override, and inline review comments.",
   },
   {
     source: "docs/guides/web/settings.md",
