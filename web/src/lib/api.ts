@@ -746,6 +746,7 @@ export type PluginUiSlot =
   | "detail-badge"
   | "settings-page"
   | "tool-card-badge"
+  | "home-pane"
   | "notification";
 
 /** One piece of UI state a worker pushed. `payload` shape is determined by
