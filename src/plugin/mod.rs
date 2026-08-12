@@ -44,6 +44,13 @@ pub mod ui_state;
 // so it is not gated.
 pub mod launch;
 
+// The built-in attention/triage worker (`aoe __plugin-attention`). Not gated:
+// it talks to the host over stdio with no host dependency, like the other
+// `aoe __*` worker entrypoints. Only its registration as a plugin (in
+// `registry`) is serve-gated, since the host that spawns it runs under
+// `aoe serve`.
+pub mod attention;
+
 use std::path::PathBuf;
 use std::sync::{Arc, RwLock};
 

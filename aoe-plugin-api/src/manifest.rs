@@ -837,7 +837,7 @@ pub enum RuntimeSpec {
     /// cannot supply the host binary.
     SelfExec {
         /// The hidden `aoe` subcommand that runs the worker loop, e.g.
-        /// `__plugin-diagnostics`.
+        /// `__plugin-attention`.
         subcommand: String,
     },
     /// A worker binary downloaded from the source repo's GitHub release assets.

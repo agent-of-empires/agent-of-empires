@@ -1234,7 +1234,7 @@ mod tests {
     fn home_pane_renders_a_global_sparkline_entry() {
         // A global HomePane (no session_id) carrying a sparkline block renders
         // heading + glyph row + caption through home_pane_lines, covering the
-        // whole payload -> render path for the diagnostics plugin.
+        // whole payload -> render path for a home-pane plugin.
         let snap = pane_snapshot(json!([
             {"plugin_id": "diag", "slot": "home-pane", "id": "mem",
              "payload": {"title": "memory", "blocks": [

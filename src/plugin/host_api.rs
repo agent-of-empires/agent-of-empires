@@ -736,7 +736,7 @@ fn sessions_list(state: &HostApiState, params: &Value) -> Result<Value, Dispatch
                 "title": i.title,
                 "project_path": i.project_path,
                 "tool": i.tool,
-                "status": format!("{:?}", i.status),
+                "status": i.status.wire_str(),
                 "archived": i.is_archived(),
                 "snoozed": i.is_snoozed(),
             })

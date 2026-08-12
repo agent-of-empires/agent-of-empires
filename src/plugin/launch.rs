@@ -396,13 +396,13 @@ capabilities = ["runtime.worker"]
         // A builtin worker has no plugin directory; SelfExec resolves the host
         // exe and passes the hidden subcommand, independent of any dir.
         let mut p = plugin(
-            Some("[runtime]\nkind = \"self-exec\"\nsubcommand = \"__plugin-diagnostics\""),
+            Some("[runtime]\nkind = \"self-exec\"\nsubcommand = \"__plugin-attention\""),
             None,
         );
         p.trust = TrustLevel::Builtin;
         let launch = resolve_launch(&p, &FakeResolver::new()).unwrap();
         assert_eq!(launch.program, PathBuf::from("/usr/bin/aoe"));
-        assert_eq!(launch.args, vec!["__plugin-diagnostics".to_string()]);
+        assert_eq!(launch.args, vec!["__plugin-attention".to_string()]);
         assert_eq!(
             launch.env.get("AOE_PLUGIN_ID").map(String::as_str),
             Some("acme.worker")
@@ -414,7 +414,7 @@ capabilities = ["runtime.worker"]
         // A community plugin cannot supply the host binary, so self-exec is
         // refused even though the manifest parses.
         let p = plugin(
-            Some("[runtime]\nkind = \"self-exec\"\nsubcommand = \"__plugin-diagnostics\""),
+            Some("[runtime]\nkind = \"self-exec\"\nsubcommand = \"__plugin-attention\""),
             Some("/plugins/acme.worker"),
         );
         assert!(matches!(

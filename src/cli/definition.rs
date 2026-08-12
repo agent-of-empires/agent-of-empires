@@ -229,6 +229,12 @@ pub enum Commands {
     #[command(name = "__acp-runner", hide = true)]
     AcpRunner(Box<crate::process::runner::AcpRunnerArgs>),
 
+    /// Internal: the built-in attention/triage worker, spawned by the plugin
+    /// host as a self-exec worker. Polls the session list and pushes the triage
+    /// board + waiting count over the plugin protocol. Hidden from help.
+    #[command(name = "__plugin-attention", hide = true)]
+    PluginAttention,
+
     /// Internal: extract Claude's `session_id` from a hook stdin payload
     /// and write it to the sidecar file. Spawned by the host-side
     /// `SessionStart`/`UserPromptSubmit` hook. Hidden from help.
@@ -341,6 +347,7 @@ pub fn command_name(command: &Commands) -> Option<&'static str> {
         // Internal, machine-spawned commands: never a user action, never counted.
         #[cfg(feature = "serve")]
         Commands::AcpRunner(_) => return None,
+        Commands::PluginAttention => return None,
         Commands::ExtractSessionId(_) => return None,
         Commands::Uninstall(_) => "uninstall",
         Commands::Update(_) => "update",

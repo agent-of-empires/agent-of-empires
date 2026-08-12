@@ -375,6 +375,7 @@ async fn run(
         }
         Some(Commands::Init(args)) => return cli::init::run(args).await,
         Some(Commands::ExtractSessionId(args)) => return cli::extract_session_id::run(args).await,
+        Some(Commands::PluginAttention) => return agent_of_empires::plugin::attention::run(),
         Some(Commands::Tmux { command }) => {
             use cli::tmux::TmuxCommands;
             return match command {

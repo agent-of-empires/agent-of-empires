@@ -550,7 +550,7 @@ resolution policy is unit-tested with no real filesystem.
 A builtin whose worker ships inside the host binary declares a `self-exec`
 runtime: `resolve_launch` runs the current executable with the hidden
 subcommand and needs no plugin directory. The first such worker is
-`aoe.diagnostics` (`aoe __plugin-diagnostics`); `self-exec` is rejected for
+`aoe.attention` (`aoe __plugin-attention`); `self-exec` is rejected for
 non-builtin plugins, which cannot supply the host binary. A builtin with no
 `[runtime]` at all (like `aoe.web`) has no worker.
 
