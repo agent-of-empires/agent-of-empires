@@ -682,7 +682,7 @@ pub fn build_instance(
                 // anyway rather than ignored, so a typo'd selector fails loudly
                 // instead of quietly forking from the wrong base.
                 let per_repo = resolve_repo_base_selectors(
-                    &[main_repo_path.clone()],
+                    std::slice::from_ref(&main_repo_path),
                     &params.repo_base_branches,
                 )?;
                 // The launch repo otherwise forks from its registered
@@ -1913,7 +1913,7 @@ mod tests {
                 .map(String::as_str),
             Some("develop")
         );
-        assert!(out.get(&PathBuf::from("/src/app")).is_none());
+        assert!(!out.contains_key(&PathBuf::from("/src/app")));
 
         // No pairs is the common case and must stay cheap and quiet.
         assert!(resolve_repo_base_selectors(&repos, &[]).unwrap().is_empty());
