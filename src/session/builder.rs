@@ -341,6 +341,14 @@ pub fn create_workspace(
                     // and worktree ownership coincide for a repo present at
                     // creation. Only `attach_project` can set this.
                     branch_preexisting: false,
+                    // The ref this repo's branch was forked from, so the diff
+                    // view can default to it per repo (#3329). Recorded only
+                    // when the branch was created here; `create_worktree`
+                    // ignores the base when checking out an existing branch.
+                    base_branch: create_new_branch
+                        .then(|| plan.base_branch.clone())
+                        .flatten(),
+                    base_branch_override: None,
                 });
             }
             Err(msg) => errors.push(msg),

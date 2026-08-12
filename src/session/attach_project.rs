@@ -351,6 +351,11 @@ fn plan_conversion(
                 // conservative choice, and closing it needs an authorship field
                 // on `WorktreeInfo`.
                 branch_preexisting: false,
+                // Carry the existing worktree's recorded base across the
+                // conversion; the session stops consulting `worktree_info`
+                // for its diff base once it becomes a workspace member.
+                base_branch: wt.base_branch.clone(),
+                base_branch_override: None,
             },
             from: current,
         });
@@ -399,6 +404,8 @@ fn plan_conversion(
             main_repo_path: main_repo.to_string_lossy().to_string(),
             managed_by_aoe: true,
             branch_preexisting: !plan.create,
+            base_branch: plan.create.then(|| plan.base.clone()).flatten(),
+            base_branch_override: None,
         },
         create_branch: plan.create,
         base: plan.base,
@@ -674,6 +681,10 @@ pub fn execute(instance: &super::Instance, plan: AttachPlan) -> Result<PreparedA
         // True when the branch was already there and the caller opted into
         // reusing it, so deleting the session leaves the user's branch alone.
         branch_preexisting: !plan.create,
+        // Recorded only when aoe forked the branch from this base; an
+        // attach-existing-branch repo has no base of its own.
+        base_branch: plan.create.then(|| plan.base.clone()).flatten(),
+        base_branch_override: None,
     };
 
     // The repo list the session ends up with: whatever it already had, then the

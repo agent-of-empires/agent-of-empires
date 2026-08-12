@@ -387,6 +387,24 @@ pub struct WorkspaceRepo {
     /// correct for every record written before the field existed.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub branch_preexisting: bool,
+    /// Branch this repo's worktree branch was forked from, recorded at
+    /// creation. The per-repo counterpart of [`WorktreeInfo::base_branch`],
+    /// and the reason a workspace member's diff can default to the right
+    /// ref: workspace sessions leave `worktree_info` unset, so before this
+    /// field existed there was nothing per-repo to fall back to (#3329).
+    ///
+    /// Only set when aoe actually created the branch from that base. A repo
+    /// attached to a pre-existing branch records None, so "reset to default"
+    /// never compares against a ref that was not the checkout's base.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch: Option<String>,
+    /// Explicit diff-base override for this repo alone, set by the web
+    /// diff picker or `aoe session set-base --repo <name>`. Wins over
+    /// `base_branch`. `Instance::base_branch_override` does NOT apply to a
+    /// workspace member; that field covers a single-repo session's own
+    /// checkout. See #3329.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_branch_override: Option<String>,
 }
 
 fn default_true() -> bool {
