@@ -2370,7 +2370,13 @@ export function QueuedPromptsStrip({ queued, onRemove, onEdit, onClear, pendingR
     <div className="border-t border-surface-800 bg-surface-900/60 px-4 py-2">
       <div className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl">
         <div className="flex items-center justify-between pb-1.5 text-[11px] uppercase tracking-wider text-text-dim">
-          <span className="inline-flex items-center gap-1">
+          {/* The queue is browser-local, which is not something a user can
+              work out from the strip. Say so here rather than let them
+              assume the daemon is holding the message. See #3331. */}
+          <span
+            className="inline-flex items-center gap-1"
+            title="Queued in this browser. Sends when the agent is free, even from another chat, as long as a dashboard tab stays open. Three closed chats deliver in the background at a time; the rest wait for a slot or for you to open them. Your other devices do not see it."
+          >
             <Clock className="h-3 w-3" />
             {pendingResume ? `Pending until session resumes (${queued.length})` : `Queued (${queued.length})`}
           </span>

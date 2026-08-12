@@ -85,6 +85,35 @@ function parseQueuedCount(raw: string | null): number | null {
   }
 }
 
+// Parse the newest `queuedAt` (epoch ms) out of a raw persisted entry,
+// honoring the TTL. Returns null when the entry is missing, expired,
+// corrupt, has no queued rows, or carries no parseable timestamp.
+function parseNewestQueuedAt(raw: string | null): number | null {
+  if (raw === null) return null;
+  try {
+    const parsed = JSON.parse(raw) as PersistedEntry | null;
+    if (
+      !parsed ||
+      typeof parsed.savedAt !== "number" ||
+      Number.isNaN(parsed.savedAt) ||
+      Date.now() - parsed.savedAt > STATE_TTL_MS
+    ) {
+      return null;
+    }
+    const q = (parsed.state as Partial<AcpState> | undefined)?.queuedPrompts;
+    if (!Array.isArray(q)) return null;
+    let newest: number | null = null;
+    for (const row of q) {
+      const at = Date.parse(row?.queuedAt ?? "");
+      if (Number.isNaN(at)) continue;
+      if (newest === null || at > newest) newest = at;
+    }
+    return newest;
+  } catch {
+    return null;
+  }
+}
+
 // Parse the rate-limit info out of a raw persisted entry, honoring the
 // TTL. Returns null when the entry is missing, expired, corrupt, or has
 // no (or malformed) rate-limit, so callers treat the session as not
@@ -163,6 +192,20 @@ export function getQueuedCount(sessionId: string): number {
   }
   queueCounts.set(sessionId, count);
   return count;
+}
+
+// Read the epoch-ms timestamp of the newest queued prompt persisted for
+// a session, or null when there is none. Used by the background drain
+// arming check to tell a queue this browser just parked from one
+// restored out of storage days later. Uncached: the arming check
+// memoises its own verdict and only asks once per session per page load.
+export function getNewestQueuedAt(sessionId: string): number | null {
+  if (typeof window === "undefined") return null;
+  try {
+    return parseNewestQueuedAt(window.localStorage.getItem(storageKey(sessionId)));
+  } catch {
+    return null;
+  }
 }
 
 // Side-effect-free read of a session's last-known rate-limit info (null

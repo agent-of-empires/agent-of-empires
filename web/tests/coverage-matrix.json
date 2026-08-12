@@ -2173,6 +2173,24 @@
       "components": ["web/src/lib/acpDrafts.ts"]
     },
     {
+      "id": "acp.queue-drain-ownership",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/lib/acpDrainCoordinator.test.ts",
+        "src/hooks/useAcpSession.queue.test.ts",
+        "src/components/acp/AcpQueueDrainer.test.tsx"
+      ],
+      "components": [
+        "web/src/lib/acpDrainCoordinator.ts",
+        "web/src/hooks/useAcpSession.ts",
+        "web/src/hooks/useAcpQueueCount.ts",
+        "web/src/components/acp/AcpQueueDrainer.tsx",
+        "web/src/lib/acpStateStorage.ts",
+        "web/src/App.tsx"
+      ]
+    },
+    {
       "id": "acp.queue-drain-clear-split",
       "kind": "vitest",
       "risk": "high",
@@ -2996,6 +3014,13 @@
         "web/src/components/acp/AcpRuntime.tsx",
         "web/src/lib/acpDrafts.ts"
       ]
+    },
+    {
+      "id": "acp.story.queue-drains-while-unmounted",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-stories/queue-drains-while-unmounted.spec.ts"],
+      "components": ["web/src/components/acp/AcpQueueDrainer.tsx", "web/src/App.tsx"]
     },
     {
       "id": "acp.story.queue-edit-message",

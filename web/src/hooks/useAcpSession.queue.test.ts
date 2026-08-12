@@ -14,10 +14,11 @@ import { act, renderHook } from "@testing-library/react";
 import { createElement, type ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { __resetDrainCoordinator, isDraining } from "../lib/acpDrainCoordinator";
 import { emptyAcpState, type QueuedPrompt } from "../lib/acpTypes";
 import { AgentProfileProvider } from "../lib/agentProfileContext";
 import { reportAcpInteraction } from "../lib/api";
-import { acpHookReducer, combineQueuedPrompts, useAcpSession } from "./useAcpSession";
+import { acpHookReducer, clearAcpCache, combineQueuedPrompts, useAcpSession } from "./useAcpSession";
 
 // Spy on the telemetry ping while keeping the rest of the api module real
 // (the hook also calls setSessionArchive / setSessionSnooze through it).
@@ -1676,5 +1677,116 @@ describe("useAcpSession drain split at clear-command boundary (#1356)", () => {
     expect(promptPostCount).toBe(1);
     expect(bodyTexts()).toEqual(["a\n\n/clear\n\nb"]);
     expect(hookResult.current.state.queuedPrompts).toEqual([]);
+  });
+});
+
+// #3331: a session can now drain while its chat is unmounted, so a drain
+// started by the headless background drainer can resolve after the user
+// has navigated into that chat and a second hook instance owns the
+// session. Ownership therefore lives in the module-level drain
+// coordinator, not in a per-instance ref, and the retirement is written
+// through the shared cache instead of a bare dispatch.
+describe("useAcpSession drain handoff across instances (#3331)", () => {
+  let promptPostCount: number;
+  let releasePrompt: (() => void) | null;
+
+  beforeEach(() => {
+    sockets.length = 0;
+    promptPostCount = 0;
+    releasePrompt = null;
+    clearAcpCache();
+    __resetDrainCoordinator();
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL) => {
+        const url = typeof input === "string" ? input : input.toString();
+        if (url.includes("/acp/replay")) {
+          return new Response(JSON.stringify({ frames: [], lost: false, highest_seq: 0 }), { status: 200 });
+        }
+        if (url.includes("/acp/prompt")) {
+          promptPostCount += 1;
+          // Hold the POST open so the test can swap hook instances while
+          // it is in flight, which is exactly the navigation race.
+          await new Promise<void>((resolve) => {
+            releasePrompt = resolve;
+          });
+          return new Response("{}", { status: 200 });
+        }
+        return new Response("{}", { status: 200 });
+      }),
+    );
+    originalWebSocket = global.WebSocket;
+    global.WebSocket = FakeWebSocket as unknown as typeof WebSocket;
+  });
+
+  afterEach(() => {
+    global.WebSocket = originalWebSocket;
+    vi.unstubAllGlobals();
+    clearAcpCache();
+    __resetDrainCoordinator();
+  });
+
+  it("does not re-send a batch when a second instance mounts mid-drain", async () => {
+    const sessionId = "sess-handoff";
+    const first = renderHook(() => useAcpSession(sessionId));
+    await flushAsync();
+    const ws = sockets[0]!;
+
+    // Park a prompt while the socket is still CONNECTING, then open the
+    // socket so the drain fires and hangs on the gated POST.
+    act(() => {
+      void first.result.current.sendPrompt("parked follow-up");
+    });
+    await flushAsync();
+    expect(promptPostCount).toBe(0);
+
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+    });
+    await flushAsync();
+    expect(promptPostCount).toBe(1);
+    expect(releasePrompt).not.toBeNull();
+
+    // The user navigates into this chat: the background owner goes away
+    // and a fresh instance mounts, hydrating the still-queued row out of
+    // the shared cache. It must not fire a second POST.
+    first.unmount();
+    const second = renderHook(() => useAcpSession(sessionId));
+    await flushAsync();
+    const secondWs = sockets[sockets.length - 1]!;
+    act(() => {
+      secondWs.readyState = FakeWebSocket.OPEN;
+      secondWs.onopen?.({} as Event);
+    });
+    await flushAsync();
+    expect(second.result.current.state.queuedPrompts).toHaveLength(1);
+    expect(promptPostCount).toBe(1);
+
+    // The original POST lands. Its retirement reaches the instance that is
+    // actually mounted now, so the delivered row leaves the queue exactly
+    // once and the lock frees.
+    act(() => {
+      releasePrompt?.();
+    });
+    await flushAsync();
+    expect(promptPostCount).toBe(1);
+    expect(second.result.current.state.queuedPrompts).toEqual([]);
+    expect(isDraining(sessionId)).toBe(false);
+
+    // The turn the delivered prompt started now ends. Nothing is left to
+    // drain, so no second POST: a retirement that reached only the dead
+    // instance would resurrect the row here and fire it again.
+    act(() => {
+      secondWs.onmessage?.({
+        data: JSON.stringify({
+          session_id: sessionId,
+          seq: 1,
+          event: { Stopped: { reason: "prompt_complete" } },
+        }),
+      } as MessageEvent);
+    });
+    await flushAsync();
+    expect(promptPostCount).toBe(1);
   });
 });
