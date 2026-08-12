@@ -1885,7 +1885,10 @@ export function useAcpSession(
     const combinedAttachments = snapshot.flatMap((q) => q.attachments ?? []);
     const sentIds = snapshot.map((q) => q.id);
     void withDrainLock(drainSessionId, async () => {
-      const result = await dispatchPromptNow(combined, combinedAttachments.length > 0 ? combinedAttachments : undefined);
+      const result = await dispatchPromptNow(
+        combined,
+        combinedAttachments.length > 0 ? combinedAttachments : undefined,
+      );
       // Retire on success and on non-retryable rejection; only a
       // transient failure keeps the batch queued for the next retry.
       // Routed through the coordinator rather than a bare dispatch so the
