@@ -58,7 +58,7 @@ aoe add /path/to/backend \
 
 Worktree creation across the repos in a workspace runs concurrently, so wall-clock time is roughly that of the slowest single repo rather than the sum (network-bound `git fetch` and `git submodule update` dominate). If any repo's post-checkout hook fails after `git worktree add` has already checked out the branch, the workspace is still created and the hook output is surfaced as a warning. See [Post-Checkout Hooks](worktrees.md#post-checkout-hooks) for details.
 
-### 3. The agent sees one workspace
+### 4. The agent sees one workspace
 
 The session starts in the workspace root with all the worktrees as siblings:
 
@@ -71,7 +71,7 @@ The session starts in the workspace root with all the worktrees as siblings:
 
 The agent navigates between them like any normal multi-repo working tree. Use `cd` and standard git commands; AoE does not impose any cross-repo orchestration.
 
-### 4. Add a repo to a session that already exists
+### 5. Add a repo to a session that already exists
 
 When you get twenty minutes into a task and realize you also need another repo,
 attach it instead of recreating the session:
