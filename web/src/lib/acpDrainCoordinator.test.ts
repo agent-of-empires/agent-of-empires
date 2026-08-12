@@ -9,6 +9,7 @@ import {
   emitQueueRetired,
   isArmedForBackgroundDrain,
   isDraining,
+  onAnyQueueRetired,
   onQueueRetired,
   withDrainLock,
 } from "./acpDrainCoordinator";
@@ -138,6 +139,56 @@ describe("queue retirement broadcast", () => {
     off();
     emitQueueRetired("s1", ["q3"]);
     expect(seen).toEqual([["q1", "q2"], ["q1", "q2"], ["q3"]]);
+  });
+});
+
+describe("cross-tab queue retirement", () => {
+  const CHANNEL = "aoe:acp-queue-retired";
+
+  /** Let a BroadcastChannel message land; delivery is a queued task. */
+  async function settle(): Promise<void> {
+    await new Promise((r) => setTimeout(r, 0));
+  }
+
+  it("publishes local retirements to other tabs", async () => {
+    const other = new BroadcastChannel(CHANNEL);
+    const received: unknown[] = [];
+    other.onmessage = (ev) => received.push(ev.data);
+    try {
+      emitQueueRetired("s1", ["q1"]);
+      await settle();
+      expect(received).toEqual([{ sessionId: "s1", ids: ["q1"] }]);
+    } finally {
+      other.close();
+    }
+  });
+
+  it("applies a retirement announced by another tab", async () => {
+    // The drain lock stops two tabs sending at once, but the loser still
+    // holds the delivered rows in its own reducer and cache, so it would
+    // re-send them once the lock frees. The announcement is what drops
+    // them there.
+    const anySeen: [string, string[]][] = [];
+    const sessionSeen: string[][] = [];
+    onAnyQueueRetired((sessionId, ids) => anySeen.push([sessionId, ids]));
+    onQueueRetired("s1", (ids) => sessionSeen.push(ids));
+
+    const other = new BroadcastChannel(CHANNEL);
+    try {
+      other.postMessage({ sessionId: "s1", ids: ["q1", "q2"] });
+      await settle();
+      expect(anySeen).toEqual([["s1", ["q1", "q2"]]]);
+      expect(sessionSeen).toEqual([["q1", "q2"]]);
+
+      // Malformed or empty announcements are ignored rather than fanned
+      // out; an empty retirement would re-run every drain effect.
+      other.postMessage({ sessionId: "s1", ids: [] });
+      other.postMessage({ nonsense: true });
+      await settle();
+      expect(sessionSeen).toHaveLength(1);
+    } finally {
+      other.close();
+    }
   });
 });
 

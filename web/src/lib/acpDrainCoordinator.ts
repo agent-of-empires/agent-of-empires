@@ -16,8 +16,11 @@
 //     Locks API closes the cross-tab one. A tab that dies mid-drain drops
 //     its Web Lock automatically, which a localStorage lease cannot do.
 //   - `onQueueRetired` / `emitQueueRetired` propagate a completed send to
-//     every live hook for that session, so the instance that started the
-//     POST does not have to be the one still mounted when it resolves.
+//     every live hook for that session, and over a BroadcastChannel to
+//     every other tab. The lock alone is not enough there: it stops two
+//     tabs draining at the same moment, but the loser still holds the
+//     delivered rows in its own reducer and cache, so it would re-persist
+//     and re-POST them the moment the lock frees.
 //   - `armForBackgroundDrain` gates background draining to queues this
 //     page parked, or restored ones young enough to still be wanted.
 //
@@ -50,6 +53,44 @@ const heldLocally = new Set<string>();
 
 type RetiredListener = (ids: string[]) => void;
 const retiredListeners = new Map<string, Set<RetiredListener>>();
+
+/** Listeners that want every session's retirements, not one session's.
+ *  `useAcpSession` registers one of these to apply the retirement to the
+ *  shared state cache, which has to happen whether or not a hook for that
+ *  session is currently mounted in this tab. */
+type AnyRetiredListener = (sessionId: string, ids: string[]) => void;
+const anyRetiredListeners = new Set<AnyRetiredListener>();
+
+const RETIRE_CHANNEL_NAME = "aoe:acp-queue-retired";
+type RetiredMessage = { sessionId: string; ids: string[] };
+
+let retireChannel: BroadcastChannel | null | undefined;
+
+/** Lazily open the cross-tab channel. `undefined` means "not tried yet",
+ *  `null` means "unavailable here" so we stop retrying. */
+function getRetireChannel(): BroadcastChannel | null {
+  if (retireChannel !== undefined) return retireChannel;
+  if (typeof BroadcastChannel === "undefined") {
+    retireChannel = null;
+    return null;
+  }
+  const channel = new BroadcastChannel(RETIRE_CHANNEL_NAME);
+  channel.onmessage = (ev: MessageEvent<RetiredMessage>) => {
+    const { sessionId, ids } = ev.data ?? {};
+    if (typeof sessionId !== "string" || !Array.isArray(ids) || ids.length === 0) return;
+    // Apply locally only. Re-broadcasting would ping-pong between tabs.
+    fanOutRetired(sessionId, ids);
+  };
+  retireChannel = channel;
+  return channel;
+}
+
+function fanOutRetired(sessionId: string, ids: string[]): void {
+  for (const cb of anyRetiredListeners) cb(sessionId, ids);
+  const set = retiredListeners.get(sessionId);
+  if (!set) return;
+  for (const cb of set) cb(ids);
+}
 
 /** Mark a session's queue eligible for background draining. Called on
  *  every enqueue: a prompt the user parked in this page's lifetime is
@@ -110,6 +151,7 @@ export async function withDrainLock(sessionId: string, fn: () => Promise<void>):
  *  instance that owned the POST need not be the one still mounted when it
  *  resolves. */
 export function onQueueRetired(sessionId: string, cb: RetiredListener): () => void {
+  getRetireChannel();
   let set = retiredListeners.get(sessionId);
   if (!set) {
     set = new Set();
@@ -124,14 +166,33 @@ export function onQueueRetired(sessionId: string, cb: RetiredListener): () => vo
   };
 }
 
-/** Announce that `ids` left the queue for good. Only ever called with a
- *  non-empty list: an empty broadcast would re-run every drain effect and
- *  turn a retryable failure into a hot retry loop. */
+/** Subscribe to retirements for every session. Returns an unsubscribe.
+ *  Used for tab-wide bookkeeping (the shared state cache) that must happen
+ *  even when no hook for that session is mounted here. */
+export function onAnyQueueRetired(cb: AnyRetiredListener): () => void {
+  // Open the channel on subscribe, not on first emit. The tab that loses
+  // the drain lock never emits anything, and it is precisely the tab that
+  // has to hear about the winner's retirement.
+  getRetireChannel();
+  anyRetiredListeners.add(cb);
+  return () => {
+    anyRetiredListeners.delete(cb);
+  };
+}
+
+/** Announce that `ids` left the queue for good, in this tab and every
+ *  other one. Only ever called with a non-empty list: an empty broadcast
+ *  would re-run every drain effect and turn a retryable failure into a hot
+ *  retry loop. */
 export function emitQueueRetired(sessionId: string, ids: string[]): void {
   if (ids.length === 0) return;
-  const set = retiredListeners.get(sessionId);
-  if (!set) return;
-  for (const cb of set) cb(ids);
+  fanOutRetired(sessionId, ids);
+  try {
+    getRetireChannel()?.postMessage({ sessionId, ids } satisfies RetiredMessage);
+  } catch {
+    // A closed or unavailable channel must not break the local drain; the
+    // other tab falls back to the pre-existing duplicate hazard.
+  }
 }
 
 /** Drop all coordinator state. Test-only; mirrors `clearAcpCache`. */
@@ -140,4 +201,7 @@ export function __resetDrainCoordinator(): void {
   restoredVerdict.clear();
   heldLocally.clear();
   retiredListeners.clear();
+  anyRetiredListeners.clear();
+  retireChannel?.close();
+  retireChannel = undefined;
 }

@@ -31,6 +31,7 @@ import {
   armForBackgroundDrain,
   emitQueueRetired,
   isDraining,
+  onAnyQueueRetired,
   onQueueRetired,
   withDrainLock,
 } from "../lib/acpDrainCoordinator";
@@ -336,27 +337,31 @@ function cacheSet(sessionId: string, value: AcpState): void {
   notifyStateListeners(sessionId);
 }
 
-/** Retire delivered queued prompts from the shared cache and tell every
- *  live hook for the session to drop them too.
+/** Drop delivered rows out of the shared cache (and therefore out of
+ *  localStorage).
  *
- *  The cache write is what makes this safe across an unmount: a drain
- *  started by the headless background drainer can resolve after the user
- *  has navigated into that chat, by which point the drainer's `dispatch`
- *  goes nowhere. Without this, the freshly mounted hook would hydrate the
- *  already-sent rows straight back out of the cache and POST them a
- *  second time. See #3331. */
-function retireQueuedPrompts(sessionId: string, ids: string[]): void {
-  if (ids.length === 0) return;
+ *  Registered once per module load for EVERY session's retirements, local
+ *  or arriving from another tab, because it has to run whether or not a
+ *  hook for that session is mounted here:
+ *
+ *   - Across an unmount: a drain started by the headless background
+ *     drainer can resolve after the user has navigated into that chat, by
+ *     which point the drainer's `dispatch` goes nowhere. Without the cache
+ *     write the freshly mounted hook hydrates the already-sent rows and
+ *     POSTs them again.
+ *   - Across tabs: the drain lock stops two tabs sending at the same
+ *     moment, but the losing tab still holds the delivered rows, so it
+ *     would re-persist and re-send them once the lock frees.
+ *
+ *  See #3331. */
+onAnyQueueRetired((sessionId, ids) => {
   const cached = stateCache.get(sessionId);
-  if (cached) {
-    const drop = new Set(ids);
-    const remaining = cached.queuedPrompts.filter((q) => !drop.has(q.id));
-    if (remaining.length !== cached.queuedPrompts.length) {
-      cacheSet(sessionId, { ...cached, queuedPrompts: remaining });
-    }
-  }
-  emitQueueRetired(sessionId, ids);
-}
+  if (!cached) return;
+  const drop = new Set(ids);
+  const remaining = cached.queuedPrompts.filter((q) => !drop.has(q.id));
+  if (remaining.length === cached.queuedPrompts.length) return;
+  cacheSet(sessionId, { ...cached, queuedPrompts: remaining });
+});
 
 // Lightweight per-session subscription over `stateCache` so a component
 // that is NOT a child of <StructuredView> (the Background agents panel
@@ -1893,13 +1898,22 @@ export function useAcpSession(
       // transient failure keeps the batch queued for the next retry.
       // Routed through the coordinator rather than a bare dispatch so the
       // retirement lands in the shared cache and reaches every live hook
-      // for this session, including when this instance unmounted while
+      // and every other tab, including when this instance unmounted while
       // the POST was in flight. A transient failure deliberately stays
       // silent: broadcasting it would re-run this effect immediately and
       // turn the retry into a hot loop. See #3331.
       if (result !== "retryable_failure") {
-        retireQueuedPrompts(drainSessionId, sentIds);
+        emitQueueRetired(drainSessionId, sentIds);
       }
+    }).catch((e: unknown) => {
+      // `dispatchPromptNow` handles its own failures, so reaching here
+      // means the lock itself failed (`navigator.locks` rejecting the
+      // request). Surface it rather than leaving an unhandled rejection.
+      // The queue is untouched, so the next state change retries.
+      dispatch({
+        kind: "error",
+        message: `Could not send queued messages: ${describeError(e)}`,
+      });
     });
   }, [
     status,

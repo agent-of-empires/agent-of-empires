@@ -261,8 +261,9 @@ follow from the queue being browser-local:
 - It drains only while a dashboard tab is open, and only three sessions
   are serviced at once. The rest keep their queue and their **N queued**
   badge until a slot frees or you open them.
-- With several tabs open, exactly one of them sends. The others see the
-  queue empty out.
+- With several tabs open, exactly one of them sends. The winner announces
+  the delivery to the others, so they drop the sent entries instead of
+  re-sending them.
 - Your other devices neither see nor drain the queue.
 
 After a reload, a restored queue resumes draining in the background only
