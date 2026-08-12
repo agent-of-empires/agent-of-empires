@@ -2375,7 +2375,7 @@ export function QueuedPromptsStrip({ queued, onRemove, onEdit, onClear, pendingR
               assume the daemon is holding the message. See #3331. */}
           <span
             className="inline-flex items-center gap-1"
-            title="Queued in this browser. Sends when the agent is free, even from another chat, as long as a dashboard tab stays open. Your other devices do not see it."
+            title="Queued in this browser. Sends when the agent is free, even from another chat, as long as a dashboard tab stays open. Three closed chats deliver in the background at a time; the rest wait for a slot or for you to open them. Your other devices do not see it."
           >
             <Clock className="h-3 w-3" />
             {pendingResume ? `Pending until session resumes (${queued.length})` : `Queued (${queued.length})`}
