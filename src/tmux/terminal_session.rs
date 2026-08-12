@@ -170,16 +170,19 @@ impl PairedTerminal {
         // including release ones (#2608). Container terminals are excluded;
         // their HOME/shell belong to the container, not the host.
         // `user_shell` yields a bare `bash` when `$SHELL` is unset (a daemon
-        // launched from launchd/systemd) and tmux's `default-shell` rejects a
-        // bare name ("not a suitable shell: bash"), so resolve it to an absolute
-        // path. Pinning SHELL to the resolved path also keeps #2608 consistent.
-        let host_shell = matches!(self.kind, TerminalKind::Host)
-            .then(user_shell)
-            .map(|shell| absolute_shell(&shell).unwrap_or(shell));
+        // launched from launchd/systemd), and tmux's `default-shell` rejects
+        // anything that is not an absolute path to an existing executable
+        // ("not a suitable shell: bash"). Resolve it once: `default_shell` is
+        // `Some` only when `which` finds an executable, and pins `default-shell`
+        // only then so tmux never fails `new-session` on an unusable shell. The
+        // pane's SHELL env and login command prefer that resolved path but fall
+        // back to the raw name so a pane still launches when it cannot resolve.
+        let host_shell = matches!(self.kind, TerminalKind::Host).then(user_shell);
+        let default_shell = host_shell.as_deref().and_then(absolute_shell);
+        let shell_for_pane = default_shell.as_deref().or(host_shell.as_deref());
         let home = std::env::var("HOME").unwrap_or_default();
         let path = std::env::var("PATH").unwrap_or_default();
-        let (pinned_pairs, effective_cmd) =
-            host_pane_inputs(host_shell.as_deref(), command, &home, &path);
+        let (pinned_pairs, effective_cmd) = host_pane_inputs(shell_for_pane, command, &home, &path);
         // Host terminals also forward the inherited host env (DISPLAY, XDG_*,
         // DBUS, ... plus every other var under `session.inherit_host_environment`)
         // so a browser opened from the pane reaches the user's desktop;
@@ -210,12 +213,9 @@ impl PairedTerminal {
         append_remain_on_exit_args(&mut args, &self.name);
         append_pane_base_index_args(&mut args, &self.name);
         append_window_size_args(&mut args, &self.name);
-        // Only pin `default-shell` when the shell resolved to an absolute path;
-        // tmux rejects a bare name and would fail the whole `new-session`.
-        if let Some(shell) = host_shell
-            .as_deref()
-            .filter(|s| std::path::Path::new(s).is_absolute())
-        {
+        // `default_shell` is `Some` only when `which` resolved an existing
+        // executable, so pinning it can never fail `new-session`.
+        if let Some(shell) = default_shell.as_deref() {
             append_default_shell_args(&mut args, &self.name, shell);
         }
         append_tmux_setting_args(&mut args, &self.name, &config);

@@ -314,8 +314,7 @@ pub fn tmux_prefix_display() -> &'static str {
 /// `Err`. Caller is responsible for `refresh_session_cache` after a
 /// successful kill.
 pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
-    let output = crate::tmux::tmux_command()
-        .env("LC_ALL", "C")
+    let output = crate::tmux::tmux_query_command()
         .args(["kill-session", "-t", name])
         .output()?;
     if !output.status.success() {
