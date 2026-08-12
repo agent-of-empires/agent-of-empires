@@ -2176,7 +2176,11 @@
       "id": "acp.queue-drain-ownership",
       "kind": "vitest",
       "risk": "high",
-      "specs": ["src/lib/acpDrainCoordinator.test.ts", "src/hooks/useAcpSession.queue.test.ts"],
+      "specs": [
+        "src/lib/acpDrainCoordinator.test.ts",
+        "src/hooks/useAcpSession.queue.test.ts",
+        "src/components/acp/AcpQueueDrainer.test.tsx"
+      ],
       "components": [
         "web/src/lib/acpDrainCoordinator.ts",
         "web/src/hooks/useAcpSession.ts",
