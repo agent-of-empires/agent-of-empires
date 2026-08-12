@@ -395,9 +395,10 @@ pub struct AppState {
     /// Bumped once per committed session removal, after the row is gone from
     /// both `sessions.json` and `instances`. A reloader reads it before its
     /// disk read and hands the value back to
-    /// [`reload_state_instances_from_disk`], which drops the reload when the
+    /// `reload_state_instances_from_disk`, which drops the reload when the
     /// value moved: the disk snapshot it is carrying predates a delete, so
-    /// folding it in would resurrect the removed row. See invariant 8.
+    /// folding it in would resurrect the removed row. See invariant 8 on that
+    /// function.
     pub delete_epoch: std::sync::atomic::AtomicU64,
     /// Ids whose startup-recovery cascade is scheduled but not yet complete.
     /// Phase A seeds it; each Phase B worker drains its id on completion. The
