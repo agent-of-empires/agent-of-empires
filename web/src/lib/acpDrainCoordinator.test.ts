@@ -145,10 +145,10 @@ describe("queue retirement broadcast", () => {
 describe("cross-tab queue retirement", () => {
   const CHANNEL = "aoe:acp-queue-retired";
 
-  /** Let a BroadcastChannel message land; delivery is a queued task. */
-  async function settle(): Promise<void> {
-    await new Promise((r) => setTimeout(r, 0));
-  }
+  // BroadcastChannel delivery is a queued task with no bound on when it
+  // runs, so every assertion below is polled with `vi.waitFor` rather than
+  // read after a fixed tick. A `setTimeout(0)` barrier passes locally and
+  // fails on a loaded CI runner.
 
   it("publishes local retirements to other tabs", async () => {
     const other = new BroadcastChannel(CHANNEL);
@@ -156,8 +156,9 @@ describe("cross-tab queue retirement", () => {
     other.onmessage = (ev) => received.push(ev.data);
     try {
       emitQueueRetired("s1", ["q1"]);
-      await settle();
-      expect(received).toEqual([{ sessionId: "s1", ids: ["q1"] }]);
+      await vi.waitFor(() => {
+        expect(received).toEqual([{ sessionId: "s1", ids: ["q1"] }]);
+      });
     } finally {
       other.close();
     }
@@ -176,16 +177,22 @@ describe("cross-tab queue retirement", () => {
     const other = new BroadcastChannel(CHANNEL);
     try {
       other.postMessage({ sessionId: "s1", ids: ["q1", "q2"] });
-      await settle();
+      await vi.waitFor(() => {
+        expect(sessionSeen).toEqual([["q1", "q2"]]);
+      });
       expect(anySeen).toEqual([["s1", ["q1", "q2"]]]);
-      expect(sessionSeen).toEqual([["q1", "q2"]]);
 
-      // Malformed or empty announcements are ignored rather than fanned
-      // out; an empty retirement would re-run every drain effect.
+      // Malformed and empty announcements are dropped rather than fanned
+      // out; an empty retirement would re-run every drain effect. Asserted
+      // against a following good message rather than a timeout: a channel
+      // preserves order, so q3 arriving without the two bad ones adding
+      // entries proves they were ignored.
       other.postMessage({ sessionId: "s1", ids: [] });
       other.postMessage({ nonsense: true });
-      await settle();
-      expect(sessionSeen).toHaveLength(1);
+      other.postMessage({ sessionId: "s1", ids: ["q3"] });
+      await vi.waitFor(() => {
+        expect(sessionSeen).toEqual([["q1", "q2"], ["q3"]]);
+      });
     } finally {
       other.close();
     }
