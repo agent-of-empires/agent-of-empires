@@ -68,6 +68,19 @@ fn host_pane_inputs(
     (pairs, cmd)
 }
 
+/// Resolve a shell name or path to an absolute path via a PATH lookup.
+///
+/// tmux's `default-shell` rejects a bare name ("not a suitable shell: bash"),
+/// and [`user_shell`] falls back to a bare `bash` when `$SHELL` is unset (e.g.
+/// an `aoe serve` daemon started from launchd/systemd). `which` returns an
+/// already absolute, existing path unchanged, and `None` when the shell is not
+/// found so the caller can skip `default-shell` rather than fail creation.
+fn absolute_shell(shell: &str) -> Option<String> {
+    which::which(shell)
+        .ok()
+        .map(|p| p.to_string_lossy().into_owned())
+}
+
 /// Shared implementation of the paired-terminal lifecycle. Not exposed; the
 /// public [`TerminalSession`] and [`ContainerTerminalSession`] wrap one of
 /// these with a fixed [`TerminalKind`].
@@ -156,7 +169,13 @@ impl PairedTerminal {
         // server and poison `default-shell` + base env for every session,
         // including release ones (#2608). Container terminals are excluded;
         // their HOME/shell belong to the container, not the host.
-        let host_shell = matches!(self.kind, TerminalKind::Host).then(user_shell);
+        // `user_shell` yields a bare `bash` when `$SHELL` is unset (a daemon
+        // launched from launchd/systemd) and tmux's `default-shell` rejects a
+        // bare name ("not a suitable shell: bash"), so resolve it to an absolute
+        // path. Pinning SHELL to the resolved path also keeps #2608 consistent.
+        let host_shell = matches!(self.kind, TerminalKind::Host)
+            .then(user_shell)
+            .map(|shell| absolute_shell(&shell).unwrap_or(shell));
         let home = std::env::var("HOME").unwrap_or_default();
         let path = std::env::var("PATH").unwrap_or_default();
         let (pinned_pairs, effective_cmd) =
@@ -191,7 +210,12 @@ impl PairedTerminal {
         append_remain_on_exit_args(&mut args, &self.name);
         append_pane_base_index_args(&mut args, &self.name);
         append_window_size_args(&mut args, &self.name);
-        if let Some(shell) = &host_shell {
+        // Only pin `default-shell` when the shell resolved to an absolute path;
+        // tmux rejects a bare name and would fail the whole `new-session`.
+        if let Some(shell) = host_shell
+            .as_deref()
+            .filter(|s| std::path::Path::new(s).is_absolute())
+        {
             append_default_shell_args(&mut args, &self.name, shell);
         }
         append_tmux_setting_args(&mut args, &self.name, &config);
@@ -658,6 +682,16 @@ mod tests {
     fn test_host_pane_inputs_drops_empty_home_path() {
         let (env, _) = host_pane_inputs(Some("/bin/bash"), None, "", "");
         assert_eq!(env, vec![("SHELL".to_string(), "/bin/bash".to_string())]);
+    }
+
+    #[test]
+    fn absolute_shell_resolves_bare_name_and_rejects_missing() {
+        // tmux's `default-shell` needs an absolute path: a bare name resolves
+        // via PATH, and an unknown shell yields None so create_with_size skips
+        // the option instead of failing `new-session`.
+        let resolved = absolute_shell("sh").expect("sh must resolve on a unix host");
+        assert!(std::path::Path::new(&resolved).is_absolute(), "{resolved}");
+        assert_eq!(absolute_shell("aoe-not-a-real-shell-xyzzy"), None);
     }
 
     #[test]

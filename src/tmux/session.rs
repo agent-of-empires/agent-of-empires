@@ -1857,7 +1857,10 @@ mod tests {
         let name = guard.name().to_string();
         // A short, static "booting" line appears immediately and would
         // satisfy the generic settle heuristic well under 700ms; the real
-        // marker text only appears after the sleep.
+        // marker text only appears after the sleep. The trailing `set-option
+        // pane-base-index 0` chain mirrors `append_pane_base_index_args` so the
+        // `^.0` capture target resolves on hosts with `pane-base-index 1` set
+        // globally (#488, #2231).
         let status = crate::tmux::tmux_command()
             .args([
                 "new-session",
@@ -1871,6 +1874,12 @@ mod tests {
                 "sh",
                 "-c",
                 "echo booting; sleep 0.7; echo 'ask anything...'; sleep 30",
+                ";",
+                "set-option",
+                "-t",
+                &name,
+                "pane-base-index",
+                "0",
             ])
             .status()
             .expect("tmux new-session");

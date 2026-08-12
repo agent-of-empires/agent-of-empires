@@ -246,11 +246,16 @@ const FIELD_SEP: char = '|';
 
 /// tmux exits non-zero with `no server running on <socket>` on stderr when
 /// there are simply zero sessions, the normal state for a structured-view
-/// user who never opens a terminal. That is the empty case, not an error:
-/// callers log it at trace and treat the result as empty, reserving warn for
-/// a genuinely unexpected non-zero exit.
+/// user who never opens a terminal. It also exits non-zero with
+/// `error connecting to <socket> (No such file or directory)` when the socket
+/// file itself is absent (issue #3337), which is likewise the empty case, not
+/// an error. Both are treated as empty: callers log at trace and return an
+/// empty result, reserving warn for a genuinely unexpected non-zero exit. A
+/// transient glitch on an existing socket stays on the error path.
 fn tmux_no_server_running(stderr: &[u8]) -> bool {
-    String::from_utf8_lossy(stderr).contains("no server running")
+    let s = String::from_utf8_lossy(stderr);
+    s.contains("no server running")
+        || (s.contains("error connecting to") && s.contains("No such file or directory"))
 }
 
 pub fn refresh_session_cache() {
@@ -1502,6 +1507,10 @@ mod tests {
             b"no server running on /tmp/tmux-501/default\n"
         ));
         assert!(tmux_no_server_running(b"no server running on /path.sock"));
+        // The socket file itself is absent (issue #3337): also the empty case.
+        assert!(tmux_no_server_running(
+            b"error connecting to /path.sock (No such file or directory)"
+        ));
     }
 
     #[test]
