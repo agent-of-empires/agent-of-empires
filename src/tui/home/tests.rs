@@ -18437,6 +18437,19 @@ mod apply_session_id_updates {
             .session_id_poller = Some(structured_stopped.clone());
         let _tmux = TmuxSession::create(&terminal.id, &terminal.title);
 
+        assert!(!view.apply_session_id_updates());
+        assert!(
+            Arc::ptr_eq(
+                &view
+                    .instances
+                    .get(&terminal.id)
+                    .and_then(|i| i.session_id_poller.clone())
+                    .expect("drain should retain the stopped poller"),
+                &terminal_stopped,
+            ),
+            "the hot drain path must not repair pollers"
+        );
+
         view.repair_session_id_pollers();
         let repaired = view
             .instances
