@@ -37,7 +37,7 @@ After saving and exiting, the diff view refreshes automatically to show your cha
 | Key | Action |
 |-----|--------|
 | `s` | Toggle split/unified layout |
-| `b` | Change base branch (persists per-session as `base_branch_override`) |
+| `b` | Change base branch (persisted as that repo's `base_branch_override`) |
 | `r` | Refresh the diff |
 | `y` | Copy the selected file's relative path to the clipboard |
 | `?` | Show help |
