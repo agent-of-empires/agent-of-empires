@@ -34,6 +34,10 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 - **tui:** Retain low-contrast fallback for permission selector focused choice in [#3269](https://github.com/agent-of-empires/agent-of-empires/pull/3269) by [@athal7](https://github.com/athal7) ([`2115427`](https://github.com/agent-of-empires/agent-of-empires/commit/21154272450b29efc755144730428dcda6ff6764))
 - **cli:** Harden tmux dispatch for headless add --launch and send in [#3293](https://github.com/agent-of-empires/agent-of-empires/pull/3293) by [@athal7](https://github.com/athal7) ([`62008cd`](https://github.com/agent-of-empires/agent-of-empires/commit/62008cdd2da7b90c6022404ad280d30cc95e611c))
 - **session:** Scope pi session-id fallback to the target project in [#3325](https://github.com/agent-of-empires/agent-of-empires/pull/3325) by [@athal7](https://github.com/athal7) ([`087fac2`](https://github.com/agent-of-empires/agent-of-empires/commit/087fac2ccfa5978ee443d59863b01534c369bb68))
+- Preserve statuses when tmux probe fails in [#3335](https://github.com/agent-of-empires/agent-of-empires/pull/3335) by [@njbrake](https://github.com/njbrake) ([`f2b81a6`](https://github.com/agent-of-empires/agent-of-empires/commit/f2b81a62b7991dce6b88a956b21a21128627d818))
+- **plugin:** Drop aoe-plugin topic results that carry no manifest in [#3330](https://github.com/agent-of-empires/agent-of-empires/pull/3330) by [@Seluj78](https://github.com/Seluj78) ([`174a2fc`](https://github.com/agent-of-empires/agent-of-empires/commit/174a2fcee27a61a346875166e0084395ff57a5b3))
+- **web:** Drain queued structured-view prompts while the chat is unmounted in [#3332](https://github.com/agent-of-empires/agent-of-empires/pull/3332) by [@Seluj78](https://github.com/Seluj78) ([`47119c7`](https://github.com/agent-of-empires/agent-of-empires/commit/47119c7dc463c1aa7b654db8d3324a80abec2666))
+- Classify absent tmux socket as no-server, not error in [#3341](https://github.com/agent-of-empires/agent-of-empires/pull/3341) by [@jerome-benoit](https://github.com/jerome-benoit) ([`afdcaf2`](https://github.com/agent-of-empires/agent-of-empires/commit/afdcaf2bfcfbc0559039e4674ad7895eaa8e5274))
 
 
 ### Features
@@ -3351,5 +3355,4 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 ### New Contributors
 
 - [@njbrake](https://github.com/njbrake) made their first contribution in [#](https://github.com/agent-of-empires/agent-of-empires/pull/)
-
 
