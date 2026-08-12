@@ -4081,6 +4081,13 @@ async fn purge_session_artifacts(
         let mut instances = state.instances.write().await;
         instances.retain(|i| i.id != id);
     }
+    // The row is now gone from both disk and memory. Bump last, so any
+    // reloader still carrying a `sessions.json` snapshot that predates either
+    // removal drops it instead of folding the deleted row back into
+    // `state.instances`. See invariant 8 on `reload_state_instances_from_disk`.
+    state
+        .delete_epoch
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     state.instance_locks.write().await.remove(id);
     if let Some(entry) = recent_entry {
         if let Err(e) = crate::session::record_recent_project(entry) {

@@ -392,6 +392,13 @@ pub struct AppState {
     /// transitions to `Status::Error` for up to 8 seconds while the agent
     /// is still settling. Periodically GC'd by a background task.
     pub recently_restarted: crate::session::recovery::RecentlyRestarted,
+    /// Bumped once per committed session removal, after the row is gone from
+    /// both `sessions.json` and `instances`. A reloader reads it before its
+    /// disk read and hands the value back to
+    /// [`reload_state_instances_from_disk`], which drops the reload when the
+    /// value moved: the disk snapshot it is carrying predates a delete, so
+    /// folding it in would resurrect the removed row. See invariant 8.
+    pub delete_epoch: std::sync::atomic::AtomicU64,
     /// Ids whose startup-recovery cascade is scheduled but not yet complete.
     /// Phase A seeds it; each Phase B worker drains its id on completion. The
     /// background refresher walks it to keep queued candidates' marks in
@@ -1201,6 +1208,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             crate::session::conversation_summary::MAX_CONCURRENT,
         ),
         recently_restarted: crate::session::recovery::new_recently_restarted(),
+        delete_epoch: std::sync::atomic::AtomicU64::new(0),
         recovery_pending: crate::session::recovery::new_recovery_pending(),
         cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
             // Seed with an already-stale timestamp so the first request
@@ -3143,6 +3151,16 @@ fn skip_tmux_decision_for_structured(inst: &mut Instance) -> bool {
 //    scrape can briefly carry the prior status; it self-corrects on
 //    the next 2s tick. Polling is canonical (invariant 6) so this is
 //    acceptable.
+// 8. Every caller must read `state.delete_epoch` BEFORE its disk read and
+//    pass that value as `read_epoch`. `fresh` is a snapshot of
+//    `sessions.json`, and `*current = merged` below replaces
+//    `state.instances` wholesale, so a delete that commits between the
+//    read and this call would otherwise be undone: the deleted row is
+//    still in `fresh` and comes straight back. The epoch check drops such
+//    a reload rather than resurrecting the row. Dropping ids missing from
+//    `prior_by_id` is NOT an alternative; that is also how a session
+//    created by another process (the CLI, a peer daemon) legitimately
+//    enters `state.instances`.
 
 /// Reload `state.instances` by merging caller-supplied `fresh` against the
 /// prior in-memory snapshot per id, then reapplying the acp overlay.
@@ -3179,7 +3197,23 @@ pub(crate) async fn reload_state_instances_from_disk(
     fresh: Vec<Instance>,
     #[cfg(feature = "serve")] live_worker_records: Vec<LiveStructuredWorkerRecord>,
     status_source: StatusSource,
+    read_epoch: u64,
 ) {
+    // Invariant 8: `fresh` predates a committed delete, so folding it in would
+    // put the removed row back. Drop the whole reload rather than filter it:
+    // the next poll tick re-reads disk 2s from now and converges, and a delete
+    // is rare enough that losing one tick of status updates costs nothing.
+    let current_epoch = state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst);
+    if current_epoch != read_epoch {
+        tracing::debug!(
+            target: "server.file_watch",
+            read_epoch,
+            current_epoch,
+            "dropping a disk reload whose snapshot predates a session delete"
+        );
+        return;
+    }
+
     // Snapshot suppression here so a worker that unmarks between the
     // caller's input build and the per-id decision cannot combine a
     // cleared mark with a stale row to re-emit the phantom Error
@@ -3716,6 +3750,9 @@ async fn disk_watcher_consumer(state: Arc<AppState>) {
             _ = state.disk_changed.notified() => {}
         }
         let started = std::time::Instant::now();
+        // Invariant 8: read before the disk read, so a delete committing
+        // during it invalidates this snapshot.
+        let read_epoch = state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst);
         let file_watch_for_load = state.file_watch.clone();
         let loaded = match tokio::task::spawn_blocking(move || {
             load_all_instances(&file_watch_for_load)
@@ -3748,6 +3785,7 @@ async fn disk_watcher_consumer(state: Arc<AppState>) {
             fresh,
             live_worker_records,
             StatusSource::DiskOnly,
+            read_epoch,
         )
         .await;
         tracing::trace!(
@@ -4367,6 +4405,11 @@ async fn status_poll_loop(state: Arc<AppState>) {
         // lands) misreads that mismatch as a brand new transition and
         // restamps idle_entered_at/last_accessed_at. See #2690.
         let prev_for_poll = prev.clone();
+        // Invariant 8: read before `load_all_instances()` below. The tmux
+        // scrape that follows it can block for seconds when the tmux server is
+        // unreachable, which is exactly when a concurrent delete has time to
+        // land and this tick's snapshot goes stale.
+        let read_epoch = state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst);
         let updated = tokio::task::spawn_blocking(move || {
             let mut instances = load_all_instances(&file_watch_for_poll).unwrap_or_default();
             seed_unknown_tracking(&mut instances, &prev_unknown_tracking);
@@ -4440,6 +4483,7 @@ async fn status_poll_loop(state: Arc<AppState>) {
                 instances,
                 live_worker_records,
                 StatusSource::TmuxApplied,
+                read_epoch,
             )
             .await;
 
@@ -5917,6 +5961,7 @@ pub mod test_support {
                 crate::session::conversation_summary::MAX_CONCURRENT,
             ),
             recently_restarted: crate::session::recovery::new_recently_restarted(),
+            delete_epoch: std::sync::atomic::AtomicU64::new(0),
             recovery_pending: crate::session::recovery::new_recovery_pending(),
             cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
                 refreshed_at: std::time::Instant::now(),
@@ -6022,11 +6067,13 @@ pub mod test_support {
         fresh: Vec<Instance>,
         live_worker_records: Vec<(crate::process::worker_registry::WorkerRecord, String)>,
     ) {
+        let read_epoch = state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst);
         super::reload_state_instances_from_disk(
             state,
             fresh,
             live_worker_records,
             super::StatusSource::DiskOnly,
+            read_epoch,
         )
         .await
     }
@@ -6036,11 +6083,13 @@ pub mod test_support {
         fresh: Vec<Instance>,
         live_worker_records: Vec<(crate::process::worker_registry::WorkerRecord, String)>,
     ) {
+        let read_epoch = state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst);
         super::reload_state_instances_from_disk(
             state,
             fresh,
             live_worker_records,
             super::StatusSource::TmuxApplied,
+            read_epoch,
         )
         .await
     }
@@ -8375,7 +8424,14 @@ mod tests {
             .await
             .expect("join")
             .expect("load");
-        reload_state_instances_from_disk(&state, fresh, Vec::new(), StatusSource::DiskOnly).await;
+        reload_state_instances_from_disk(
+            &state,
+            fresh,
+            Vec::new(),
+            StatusSource::DiskOnly,
+            state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst),
+        )
+        .await;
 
         let instances = state.instances.read().await;
         let titles: Vec<&str> = instances.iter().map(|i| i.title.as_str()).collect();
@@ -8388,6 +8444,85 @@ mod tests {
             titles.contains(&"p2-mid-init"),
             "writes DURING init's iteration (the gap window) must be reconciled by the bootstrap wake; titles: {:?}",
             titles
+        );
+    }
+
+    // A reloader reads `sessions.json`, then does slow work (the poll loop's
+    // tmux scrape, which blocks for seconds when the tmux server is
+    // unreachable) before folding the snapshot into `state.instances`. A
+    // delete committing inside that window used to come straight back, because
+    // the merge rebuilds `state.instances` wholesale from the stale snapshot.
+    // Observed as a live Playwright failure: DELETE returned 200, the sidebar
+    // row went away, and the very next `GET /api/sessions` listed the session
+    // again with its pre-delete status. See invariant 8.
+    #[tokio::test]
+    async fn a_reload_predating_a_delete_does_not_resurrect_the_removed_row() {
+        let doomed = Instance::new("doomed", "/tmp/doomed");
+        let survivor = Instance::new("survivor", "/tmp/survivor");
+        // What a reloader read from disk before the delete landed.
+        let stale_snapshot = vec![doomed.clone(), survivor.clone()];
+        let read_epoch = 0;
+
+        let state = test_support::build_test_app_state(vec![survivor.clone()]);
+        // The delete already committed: `doomed` is gone from memory, and the
+        // epoch moved to say so.
+        state
+            .delete_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        reload_state_instances_from_disk(
+            &state,
+            stale_snapshot,
+            Vec::new(),
+            StatusSource::DiskOnly,
+            read_epoch,
+        )
+        .await;
+
+        let titles: Vec<String> = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .map(|i| i.title.clone())
+            .collect();
+        assert!(
+            !titles.contains(&"doomed".to_string()),
+            "a deleted session must not come back from a pre-delete snapshot: {titles:?}"
+        );
+        assert_eq!(titles, vec!["survivor".to_string()]);
+    }
+
+    // The guard must not be implemented by dropping ids missing from the prior
+    // in-memory map: that is also how a session created by another process
+    // (the CLI, a peer daemon) legitimately arrives. Only a moved epoch means
+    // "this snapshot predates a delete".
+    #[tokio::test]
+    async fn a_reload_at_the_current_epoch_still_adopts_externally_created_rows() {
+        let known = Instance::new("known", "/tmp/known");
+        let created_elsewhere = Instance::new("created-elsewhere", "/tmp/elsewhere");
+        let state = test_support::build_test_app_state(vec![known.clone()]);
+        let read_epoch = state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst);
+
+        reload_state_instances_from_disk(
+            &state,
+            vec![known, created_elsewhere],
+            Vec::new(),
+            StatusSource::DiskOnly,
+            read_epoch,
+        )
+        .await;
+
+        let titles: Vec<String> = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .map(|i| i.title.clone())
+            .collect();
+        assert!(
+            titles.contains(&"created-elsewhere".to_string()),
+            "a row this daemon has never seen must still be adopted: {titles:?}"
         );
     }
 
@@ -8435,7 +8570,14 @@ mod tests {
             .await
             .expect("join")
             .expect("load");
-        reload_state_instances_from_disk(&state, fresh, Vec::new(), StatusSource::DiskOnly).await;
+        reload_state_instances_from_disk(
+            &state,
+            fresh,
+            Vec::new(),
+            StatusSource::DiskOnly,
+            state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst),
+        )
+        .await;
 
         let instances = state.instances.read().await;
         assert!(
