@@ -258,9 +258,10 @@ pub struct ContextPrimerResponse {
 /// `POST /api/sessions/{id}/acp/switch-agent` body.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SwitchAgentRequest {
-    /// Registry key of the target ACP agent (e.g. `"codex"`,
-    /// `"opencode"`). Must exist in the structured view agent registry; an
-    /// unknown name returns 400.
+    /// Registry key or configured custom ACP agent name (e.g.
+    /// `"codex"`, `"opencode"`, `"my-custom-bridge"`). Must be a built-in
+    /// registry agent or a custom agent with a valid `agent_acp_cmd`; an
+    /// unknown or unconfigured name returns 400.
     pub target: String,
     /// Optional model override forwarded to the new agent. None falls
     /// back to the instance's existing `agent_model`.
