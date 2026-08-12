@@ -806,7 +806,11 @@ pub const AGENTS: &[AgentDef] = &[
         // swallowed as newlines instead of triggering submit. 150ms > 120ms.
         send_keys_enter_delay_ms: 150,
         install_hint: "npm install -g @openai/codex",
-        permission_response: None,
+        permission_response: Some(PermissionResponse {
+            allow: &[KeyToken::Literal("y")],
+            allow_always: Some(&[KeyToken::Literal("a")]),
+            deny: &[KeyToken::Literal("d")],
+        }),
     },
     AgentDef {
         name: "gemini",
