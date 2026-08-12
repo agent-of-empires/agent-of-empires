@@ -2181,19 +2181,47 @@ pub async fn update_session_notifications(
 
 // --- Diff base override ---
 //
-// `PATCH /api/sessions/{id}/diff-base` sets / clears the per-session
-// override for the diff base ref. The web `vs <ref>` chip popover, the
+// `PATCH /api/sessions/{id}/diff-base` sets / clears the override for the
+// diff base ref, scoped to one repo. The web `vs <ref>` chip popover, the
 // TUI diff view's `b` keybind, and `aoe session set-base` all funnel
-// through this endpoint so the override is persisted alongside the
-// session record and survives restart. See #970.
+// through this endpoint (or its storage equivalent) so the override is
+// persisted alongside the session record and survives restart. A workspace
+// session must name the repo; a single-repo session omits it and the
+// override lands on the session's own checkout. See #970, #3329.
 
 #[derive(Deserialize)]
 pub struct UpdateDiffBaseBody {
     /// New override. `Some(non-empty)` sets the override; `Some("")` or
-    /// `None` clears it (the diff then falls back to the profile default
-    /// and then auto-detection).
+    /// `None` clears it (the diff then falls back to the recorded creation
+    /// base, the profile default, and then auto-detection).
     #[serde(default)]
     pub base_branch: Option<String>,
+    /// Workspace repo this override applies to. Omitted targets the
+    /// session's own checkout, which only exists on a single-repo session;
+    /// omitting it on a workspace is rejected rather than writing state
+    /// nothing reads. See #3329.
+    #[serde(default)]
+    pub repo: Option<String>,
+}
+
+/// Write a diff-base override onto the entry `repo` names, or onto the
+/// session's own checkout when it is `None`. Split out so the persist
+/// closure and the in-memory update cannot drift.
+fn apply_diff_base_override(
+    inst: &mut crate::session::Instance,
+    repo: Option<&str>,
+    value: Option<String>,
+) {
+    match repo {
+        Some(name) => {
+            if let Some(ws) = inst.workspace_info.as_mut() {
+                if let Some(r) = ws.repos.iter_mut().find(|r| r.name == name) {
+                    r.base_branch_override = value;
+                }
+            }
+        }
+        None => inst.base_branch_override = value,
+    }
 }
 
 pub async fn update_session_diff_base(
@@ -2223,6 +2251,39 @@ pub async fn update_session_diff_base(
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return super::session_not_found();
         };
+        // Reject a target that names no entry, so a stale client cannot
+        // silently write an override the diff never reads.
+        match body.repo.as_deref() {
+            Some(name) => {
+                if !inst.all_repos().iter().any(|r| r.name == name) {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": "bad_request",
+                            "message": "unknown workspace repo"
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+            None => {
+                if inst.workspace_info.is_some() {
+                    let names: Vec<&str> =
+                        inst.all_repos().iter().map(|r| r.name.as_str()).collect();
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": "bad_request",
+                            "message": format!(
+                                "this session is a multi-repo workspace; name the repo to set a diff base for ({})",
+                                names.join(", ")
+                            )
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
         inst.source_profile.clone()
     };
 
@@ -2236,13 +2297,14 @@ pub async fn update_session_diff_base(
     // Persist first; only mutate memory once disk is durable. See #1589.
     let persist_id = id.clone();
     let persist_override = new_override.clone();
+    let persist_repo = body.repo.clone();
     if persist_session_update(
         profile,
         "diff-base update",
         state.file_watch.clone(),
         move |instances| {
             if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                inst.base_branch_override = persist_override;
+                apply_diff_base_override(inst, persist_repo.as_deref(), persist_override);
             }
         },
     )
@@ -2261,7 +2323,7 @@ pub async fn update_session_diff_base(
         );
         return super::session_gone_after_persist();
     };
-    inst.base_branch_override = new_override;
+    apply_diff_base_override(inst, body.repo.as_deref(), new_override);
 
     let response =
         SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
@@ -8468,6 +8530,56 @@ mod tests {
         assert_eq!(repos[0].name, None);
         assert_eq!(repos[0].base_override.as_deref(), Some("upstream/main"));
         assert_eq!(repos[0].recorded_base.as_deref(), Some("develop"));
+    }
+
+    /// The PATCH write lands on exactly the named repo, and the unnamed
+    /// target still writes the session field. See #3329.
+    #[test]
+    fn apply_diff_base_override_writes_only_the_named_repo() {
+        let mut inst = make_test_instance();
+        inst.workspace_info = Some(crate::session::WorkspaceInfo {
+            branch: "feature/x".to_string(),
+            workspace_dir: "/ws".to_string(),
+            repos: ["api", "web"]
+                .iter()
+                .map(|n| crate::session::WorkspaceRepo {
+                    name: n.to_string(),
+                    source_path: format!("/src/{n}"),
+                    branch: "feature/x".to_string(),
+                    worktree_path: format!("/ws/{n}"),
+                    main_repo_path: format!("/src/{n}"),
+                    managed_by_aoe: true,
+                    branch_preexisting: false,
+                    base_branch: None,
+                    base_branch_override: None,
+                })
+                .collect(),
+            created_at: chrono::Utc::now(),
+            cleanup_on_delete: true,
+        });
+
+        apply_diff_base_override(&mut inst, Some("web"), Some("epic/checkout".to_string()));
+        let overrides: Vec<_> = inst
+            .all_repos()
+            .iter()
+            .map(|r| (r.name.as_str(), r.base_branch_override.as_deref()))
+            .collect();
+        assert_eq!(
+            overrides,
+            vec![("api", None), ("web", Some("epic/checkout"))]
+        );
+        assert_eq!(
+            inst.base_branch_override, None,
+            "a per-repo write must not touch the session field"
+        );
+
+        // Clearing one repo leaves its sibling alone.
+        apply_diff_base_override(&mut inst, Some("web"), None);
+        assert_eq!(inst.all_repos()[1].base_branch_override, None);
+
+        // The unnamed target is the session's own checkout.
+        apply_diff_base_override(&mut inst, None, Some("develop".to_string()));
+        assert_eq!(inst.base_branch_override.as_deref(), Some("develop"));
     }
 
     #[test]
