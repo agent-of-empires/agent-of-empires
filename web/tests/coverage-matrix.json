@@ -2836,8 +2836,23 @@
       "id": "story.diff-base-picker",
       "kind": "live-playwright",
       "risk": "medium",
-      "specs": ["tests/diff-base-override.spec.ts", "tests/live/diff-base-from-worktree.spec.ts"],
+      "specs": [
+        "tests/diff-base-override.spec.ts",
+        "tests/live/diff-base-from-worktree.spec.ts",
+        "src/components/diff/__tests__/DiffFileList.coverage.test.tsx"
+      ],
       "components": ["web/src/components/diff/DiffFileList.tsx"]
+    },
+    {
+      "id": "wizard.per-repo-base-branch",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/components/session-wizard/__tests__/ExtraReposPicker.perRepoBase.test.tsx"],
+      "components": [
+        "web/src/components/session-wizard/steps/ExtraReposPicker.tsx",
+        "web/src/components/session-wizard/steps/ProjectStep.tsx",
+        "web/src/components/session-wizard/SessionWizard.tsx"
+      ]
     },
     {
       "id": "story.diff-empty-state",

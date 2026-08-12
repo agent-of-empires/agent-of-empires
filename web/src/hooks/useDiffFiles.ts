@@ -19,7 +19,7 @@ interface UseDiffFilesResult {
 
 export function useDiffFiles(sessionId: string | null, enabled: boolean): UseDiffFilesResult {
   const [files, setFiles] = useState<RichDiffFile[]>([]);
-  const [perRepoBases, setPerRepoBases] = useState<RepoBase[]>([{ base_branch: "main" }]);
+  const [perRepoBases, setPerRepoBases] = useState<RepoBase[]>([{ base_branch: "main", repo_path: "" }]);
   const [warning, setWarning] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [revision, setRevision] = useState(0);

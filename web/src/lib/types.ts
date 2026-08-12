@@ -304,6 +304,12 @@ export interface RepoBase {
   /** Omitted for single-repo sessions. */
   repo_name?: string;
   base_branch: string;
+  /** Worktree path this repo's diff was computed in. The base picker queries
+   *  it for that repo's branch list. See #3329. */
+  repo_path: string;
+  /** Set when this repo carries an explicit override, which is what the
+   *  picker's reset affordance keys off. See #3329. */
+  base_override?: string;
 }
 
 /** Response from /api/sessions/{id}/diff/files */
@@ -520,6 +526,10 @@ export interface CreateSessionRequest {
   sandbox_image?: string;
   extra_env?: string[];
   extra_repo_paths?: string[];
+  /** Base branch for individual repos. `repo` is a repo directory name or one
+   *  of the paths in `path` / `extra_repo_paths`; outranks `base_branch`,
+   *  which stays the base for every repo no entry names. See #3329. */
+  repo_bases?: { repo: string; base_branch: string }[];
   command_override?: string;
   custom_instruction?: string;
   profile?: string;

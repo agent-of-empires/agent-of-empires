@@ -58,7 +58,7 @@ describe("useDiffFiles initial state", () => {
     const { result } = renderHook(() => useDiffFiles(null, false));
 
     expect(result.current.files).toEqual([]);
-    expect(result.current.perRepoBases).toEqual([{ base_branch: "main" }]);
+    expect(result.current.perRepoBases).toEqual([{ base_branch: "main", repo_path: "" }]);
     expect(result.current.warning).toBeNull();
     expect(result.current.loading).toBe(false);
     expect(result.current.revision).toBe(0);

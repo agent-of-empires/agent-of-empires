@@ -10,6 +10,10 @@ import { ClaudeSessionPicker } from "./ClaudeSessionPicker";
 interface WizardData {
   path: string;
   extraRepoPaths: string[];
+  /** Base branch per extra repo path; see #3329. */
+  repoBases: Record<string, string>;
+  useWorktree: boolean;
+  attachExisting: boolean;
   scratch: boolean;
   importAcpSessionId?: string;
   [key: string]: unknown;
@@ -593,6 +597,11 @@ export function ProjectStep({ data, onChange, initialTab, agents = [] }: Props) 
                 primaryPath={data.path}
                 selectedPaths={data.extraRepoPaths}
                 onChange={(paths) => onChange("extraRepoPaths", paths)}
+                repoBases={data.repoBases}
+                onRepoBasesChange={(bases) => onChange("repoBases", bases)}
+                // A base only applies to a branch aoe creates, the same gate
+                // the session-wide base branch field uses. See #3329.
+                basesEnabled={data.useWorktree && !data.attachExisting}
               />
             </div>
           )}

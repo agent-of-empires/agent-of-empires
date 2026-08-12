@@ -2267,15 +2267,21 @@ export async function setSessionNotifications(id: string, preset: "off" | "defau
   }
 }
 
-/** Set the per-session diff-base override. Pass `null` to clear the
- *  override and fall back to the profile default / auto-detection.
- *  See #970. */
-export async function setSessionDiffBase(id: string, baseBranch: string | null): Promise<SessionResponse | null> {
+/** Set the diff-base override for one repo. Pass `null` as the branch to
+ *  clear it and fall back to the repo's recorded creation base, then the
+ *  profile default, then auto-detection. `repo` names a workspace member;
+ *  omit it for a single-repo session's own checkout, which is the only entry
+ *  such a session has. See #970, #3329. */
+export async function setSessionDiffBase(
+  id: string,
+  baseBranch: string | null,
+  repo?: string | null,
+): Promise<SessionResponse | null> {
   try {
     const res = await fetch(`/api/sessions/${id}/diff-base`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ base_branch: baseBranch }),
+      body: JSON.stringify(repo ? { base_branch: baseBranch, repo } : { base_branch: baseBranch }),
     });
     if (!res.ok) return null;
     return (await res.json()) as SessionResponse;
