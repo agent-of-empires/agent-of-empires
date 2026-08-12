@@ -736,6 +736,11 @@ pub enum UiSlot {
     /// target-keyed list so one entry can badge every MCP server or skill the
     /// plugin knows about; the host renders the pill on the matching card.
     ToolCardBadge,
+    /// A host-wide docked pane on the home view (global), carrying the same
+    /// `blocks` vocabulary as `Pane` but not tied to any session; the host docks
+    /// it on the home view. The reusable slot for a machine-wide panel: `Pane`
+    /// is per-session and `Card` is text-only, so neither fits.
+    HomePane,
     /// A transient notification, pushed via `ui.notify` (gated by the
     /// `notifications` capability rather than a slot declaration).
     Notification,
@@ -772,6 +777,7 @@ impl UiSlot {
             UiSlot::DetailBadge => "detail-badge",
             UiSlot::SettingsPage => "settings-page",
             UiSlot::ToolCardBadge => "tool-card-badge",
+            UiSlot::HomePane => "home-pane",
             UiSlot::Notification => "notification",
         }
     }
@@ -823,6 +829,16 @@ pub enum RuntimeSpec {
         /// venvs embed absolute paths and are not relocatable.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         build: Vec<BuildStep>,
+    },
+    /// A worker that runs the host binary itself with a hidden subcommand, for
+    /// first-party builtins whose worker ships inside `aoe` (there is no plugin
+    /// directory to launch from). The host resolves the running executable and
+    /// invokes `aoe <subcommand>`. Rejected for non-builtin plugins, which
+    /// cannot supply the host binary.
+    SelfExec {
+        /// The hidden `aoe` subcommand that runs the worker loop, e.g.
+        /// `__plugin-diagnostics`.
+        subcommand: String,
     },
     /// A worker binary downloaded from the source repo's GitHub release assets.
     /// Installation resolves the asset for the host platform, downloads it, and
@@ -1041,6 +1057,12 @@ impl PluginManifest {
             check(
                 bin.as_ref().map(|b| !b.is_empty()).unwrap_or(true),
                 "runtime release-binary bin must not be empty".into(),
+            );
+        }
+        if let Some(RuntimeSpec::SelfExec { subcommand }) = &self.runtime {
+            check(
+                subcommand.starts_with("__"),
+                "runtime self-exec subcommand must be a hidden \"__\"-prefixed subcommand".into(),
             );
         }
 
@@ -1312,6 +1334,14 @@ impl PluginManifest {
                 "dynamic_multi_select settings fields require api_version >= 11".into(),
             );
         }
+        // `home-pane` is an api_version 13 slot; force the bump so an older host
+        // reports "upgrade aoe" rather than a confusing unknown-variant error.
+        if self.api_version < 13 {
+            check(
+                self.ui.iter().all(|u| u.slot != UiSlot::HomePane),
+                "home-pane UI slots require api_version >= 13".into(),
+            );
+        }
         for key in self.setting_defaults.keys() {
             check(
                 key.contains('.') && !key.starts_with('.') && !key.ends_with('.'),
@@ -1487,6 +1517,25 @@ mod tests {
              [[ui]]\nslot = \"{ui_slot}\"\nid = \"link\"\n\n\
              [[commands]]\nid = \"open\"\ntitle = \"Open\"\n[commands.action]\nkind = \"open-ui-link\"\nslot = \"{action_slot}\"\nid = \"link\"\n"
         )
+    }
+
+    fn home_pane_toml(api_version: u32) -> String {
+        format!(
+            "id = \"acme.diag\"\nname = \"Diag\"\nversion = \"1.0.0\"\napi_version = {api_version}\n\n\
+             [[ui]]\nslot = \"home-pane\"\nid = \"mem\"\n"
+        )
+    }
+
+    #[test]
+    fn home_pane_requires_api_version_13() {
+        let err = PluginManifest::from_toml_str(&home_pane_toml(12))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("home-pane") && err.contains("api_version"),
+            "{err}"
+        );
+        assert!(PluginManifest::from_toml_str(&home_pane_toml(13)).is_ok());
     }
 
     #[test]
