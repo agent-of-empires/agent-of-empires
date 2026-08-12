@@ -575,7 +575,8 @@ Set or clear the per-session diff base branch. The diff view compares the worktr
 
 ###### **Options:**
 
-* `--clear` — Clear the override and fall back to the profile default / auto-detected base
+* `--clear` — Clear the override and fall back to the recorded creation base, then the profile default, then the auto-detected base
+* `--repo <REPO>` — Workspace repo to set the base for, by directory name (as shown in the diff panel and `aoe list --json`). Required on a multi-repo workspace session, where each repo has its own base; omit it on a single-repo session
 
 
 

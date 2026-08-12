@@ -305,10 +305,16 @@ pub struct SetBaseArgs {
     /// remote-qualified like `upstream/main`). Required unless
     /// `--clear` is passed.
     pub branch: Option<String>,
-    /// Clear the override and fall back to the profile default /
-    /// auto-detected base.
+    /// Clear the override and fall back to the recorded creation base,
+    /// then the profile default, then the auto-detected base.
     #[arg(long, conflicts_with = "branch")]
     pub clear: bool,
+    /// Workspace repo to set the base for, by directory name (as shown in
+    /// the diff panel and `aoe list --json`). Required on a multi-repo
+    /// workspace session, where each repo has its own base; omit it on a
+    /// single-repo session.
+    #[arg(long)]
+    pub repo: Option<String>,
 }
 
 #[derive(Args)]
@@ -2180,6 +2186,11 @@ async fn set_base(profile: &str, args: SetBaseArgs) -> Result<()> {
     let id = inst.id.clone();
     let title = inst.title.clone();
 
+    // Each repo in a workspace has its own base, so the target has to be
+    // named. Validating and writing against the first repo, as this used to,
+    // set a ref the other repos may not even have. See #3329.
+    let target = resolve_base_target(inst, args.repo.as_deref())?;
+
     let new_value = if args.clear {
         None
     } else {
@@ -2187,38 +2198,91 @@ async fn set_base(profile: &str, args: SetBaseArgs) -> Result<()> {
         if trimmed.is_empty() {
             bail!("Branch name is empty. Pass --clear to remove the override.");
         }
-        let validate_path = inst
-            .workspace_info
-            .as_ref()
-            .and_then(|w| w.repos.first().map(|r| r.worktree_path.clone()))
-            .unwrap_or_else(|| inst.project_path.clone());
         if let Err(e) =
-            crate::git::diff::validate_ref(std::path::Path::new(&validate_path), &trimmed)
+            crate::git::diff::validate_ref(std::path::Path::new(&target.validate_path), &trimmed)
         {
             bail!(
                 "Branch '{}' does not resolve in {}: {}",
                 trimmed,
-                validate_path,
+                target.validate_path,
                 e
             );
         }
         Some(trimmed)
     };
 
+    let repo_name = target.repo_name.clone();
     storage.update(|instances, _groups| {
         let stored = instances
             .iter_mut()
             .find(|i| i.id == id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", args.identifier))?;
-        stored.base_branch_override = new_value.clone();
+        match repo_name.as_deref() {
+            Some(name) => {
+                if let Some(ws) = stored.workspace_info.as_mut() {
+                    if let Some(r) = ws.repos.iter_mut().find(|r| r.name == name) {
+                        r.base_branch_override = new_value.clone();
+                    }
+                }
+            }
+            None => stored.base_branch_override = new_value.clone(),
+        }
         Ok(())
     })?;
 
+    let label = match target.repo_name {
+        Some(ref name) => format!("{title}' / '{name}"),
+        None => title,
+    };
     match new_value {
-        Some(ref v) => println!("✓ Set diff base for '{}': {}", title, v),
-        None => println!("✓ Cleared diff base override for '{}'", title),
+        Some(ref v) => println!("✓ Set diff base for '{}': {}", label, v),
+        None => println!("✓ Cleared diff base override for '{}'", label),
     }
     Ok(())
+}
+
+/// Which entry a `set-base` invocation writes, and the checkout its ref is
+/// validated against.
+#[derive(Debug)]
+struct BaseTarget {
+    /// Workspace repo name, or None for the session's own checkout.
+    repo_name: Option<String>,
+    validate_path: String,
+}
+
+/// Resolve `--repo` against a session. A workspace session must name one of
+/// its repos; a single-repo session must not name any, since the only entry
+/// it has is its own checkout.
+fn resolve_base_target(inst: &crate::session::Instance, repo: Option<&str>) -> Result<BaseTarget> {
+    let names = || {
+        inst.all_repos()
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match repo {
+        Some(name) => match inst.all_repos().iter().find(|r| r.name == name) {
+            Some(r) => Ok(BaseTarget {
+                repo_name: Some(r.name.clone()),
+                validate_path: r.worktree_path.clone(),
+            }),
+            None if inst.all_repos().is_empty() => bail!(
+                "This session has no workspace repos, so --repo does not apply. Drop it to set \
+                 the session's own diff base."
+            ),
+            None => bail!("Unknown repo '{}'. This session has: {}", name, names()),
+        },
+        None if inst.workspace_info.is_some() => bail!(
+            "This session is a multi-repo workspace, and each repo has its own diff base.\nPass \
+             --repo <name> to pick one. Available: {}",
+            names()
+        ),
+        None => Ok(BaseTarget {
+            repo_name: None,
+            validate_path: inst.project_path.clone(),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -2345,6 +2409,80 @@ mod restart_args_tests {
         assert!(
             result.is_err(),
             "passing both branch and --clear should error"
+        );
+    }
+}
+
+#[cfg(test)]
+mod set_base_target_tests {
+    use super::resolve_base_target;
+    use crate::session::{Instance, WorkspaceInfo, WorkspaceRepo};
+
+    fn workspace_instance() -> Instance {
+        let mut inst = Instance::new("ws", "/ws");
+        inst.workspace_info = Some(WorkspaceInfo {
+            branch: "feature/x".to_string(),
+            workspace_dir: "/ws".to_string(),
+            repos: ["api", "web"]
+                .iter()
+                .map(|n| WorkspaceRepo {
+                    name: n.to_string(),
+                    source_path: format!("/src/{n}"),
+                    branch: "feature/x".to_string(),
+                    worktree_path: format!("/ws/{n}"),
+                    main_repo_path: format!("/src/{n}"),
+                    managed_by_aoe: true,
+                    branch_preexisting: false,
+                    base_branch: None,
+                    base_branch_override: None,
+                })
+                .collect(),
+            created_at: chrono::Utc::now(),
+            cleanup_on_delete: true,
+        });
+        inst
+    }
+
+    #[test]
+    fn resolves_named_repo_and_validates_against_its_own_worktree() {
+        let inst = workspace_instance();
+        let t = resolve_base_target(&inst, Some("web")).expect("named repo resolves");
+        assert_eq!(t.repo_name.as_deref(), Some("web"));
+        // The bug this replaces validated every ref against repos[0].
+        assert_eq!(t.validate_path, "/ws/web");
+    }
+
+    #[test]
+    fn rejects_unknown_repo_and_missing_repo_on_a_workspace() {
+        let inst = workspace_instance();
+        let err = resolve_base_target(&inst, Some("nope"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("api, web"),
+            "should list the repos, got: {err}"
+        );
+
+        let err = resolve_base_target(&inst, None).unwrap_err().to_string();
+        assert!(
+            err.contains("--repo") && err.contains("api, web"),
+            "should demand a repo and list them, got: {err}"
+        );
+    }
+
+    #[test]
+    fn single_repo_session_targets_its_own_checkout() {
+        let inst = Instance::new("solo", "/tmp/solo");
+        let t = resolve_base_target(&inst, None).expect("single repo resolves");
+        assert_eq!(t.repo_name, None);
+        assert_eq!(t.validate_path, "/tmp/solo");
+
+        let err = resolve_base_target(&inst, Some("api"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no workspace repos"),
+            "should explain --repo does not apply, got: {err}"
         );
     }
 }
