@@ -165,6 +165,47 @@ describe("useDiffFiles fingerprint dedupe", () => {
     expect(result.current.revision).toBe(2);
     expect(result.current.files[0].path).toBe("two.ts");
   });
+
+  // The refetch after a base-branch change often returns the same file list,
+  // and two empty diffs are identical. Keying the fingerprint on files alone
+  // dropped the new bases, so the picker kept showing the old base. See #3329.
+  it("applies changed per_repo_bases even when the file list is identical", async () => {
+    const files = [file({ path: "same.ts" })];
+    mockGetFiles.mockResolvedValueOnce(
+      resp({ files, per_repo_bases: [{ repo_name: "api", base_branch: "main", repo_path: "/ws/api" }] }),
+    );
+    const { result } = renderHook(() => useDiffFiles("s1", true));
+    await waitFor(() => expect(result.current.perRepoBases[0].base_branch).toBe("main"));
+
+    mockGetFiles.mockResolvedValueOnce(
+      resp({
+        files,
+        per_repo_bases: [
+          { repo_name: "api", base_branch: "epic/checkout", repo_path: "/ws/api", base_override: "epic/checkout" },
+        ],
+      }),
+    );
+    await act(async () => {
+      await result.current.refresh();
+    });
+
+    expect(result.current.perRepoBases[0].base_branch).toBe("epic/checkout");
+    expect(result.current.perRepoBases[0].base_override).toBe("epic/checkout");
+  });
+
+  it("applies a changed warning even when the file list is identical", async () => {
+    const files = [file({ path: "same.ts" })];
+    mockGetFiles.mockResolvedValueOnce(resp({ files, warning: null }));
+    const { result } = renderHook(() => useDiffFiles("s1", true));
+    await waitFor(() => expect(result.current.revision).toBe(1));
+
+    mockGetFiles.mockResolvedValueOnce(resp({ files, warning: "api: no merge base" }));
+    await act(async () => {
+      await result.current.refresh();
+    });
+
+    expect(result.current.warning).toBe("api: no merge base");
+  });
 });
 
 describe("useDiffFiles polling", () => {
