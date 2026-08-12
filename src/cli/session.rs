@@ -2218,12 +2218,22 @@ async fn set_base(profile: &str, args: SetBaseArgs) -> Result<()> {
             .find(|i| i.id == id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", args.identifier))?;
         match repo_name.as_deref() {
+            // The target was resolved from the copy loaded above, so a repo
+            // missing here means the session changed under us (the workspace
+            // was converted, the repo detached). Fail instead of dropping the
+            // write and printing success.
             Some(name) => {
-                if let Some(ws) = stored.workspace_info.as_mut() {
-                    if let Some(r) = ws.repos.iter_mut().find(|r| r.name == name) {
-                        r.base_branch_override = new_value.clone();
-                    }
-                }
+                let repo = stored
+                    .workspace_info
+                    .as_mut()
+                    .and_then(|ws| ws.repos.iter_mut().find(|r| r.name == name))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Repo '{}' is no longer part of this session; nothing was changed",
+                            name
+                        )
+                    })?;
+                repo.base_branch_override = new_value.clone();
             }
             None => stored.base_branch_override = new_value.clone(),
         }
