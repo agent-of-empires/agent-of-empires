@@ -4080,6 +4080,16 @@ async fn purge_session_artifacts(
     {
         let mut instances = state.instances.write().await;
         instances.retain(|i| i.id != id);
+        // The row is now gone from both disk and memory, so any reloader still
+        // carrying a `sessions.json` snapshot that predates either removal must
+        // drop it rather than fold the deleted row back in. Bump while still
+        // holding the `instances` write lock: a reloader checks the epoch under
+        // that same lock, so the removal and the bump land as one step and a
+        // reload cannot slip between them. See invariant 8 on
+        // `reload_state_instances_from_disk`.
+        state
+            .delete_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
     state.instance_locks.write().await.remove(id);
     if let Some(entry) = recent_entry {

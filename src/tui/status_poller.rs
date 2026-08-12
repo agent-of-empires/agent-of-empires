@@ -143,7 +143,17 @@ pub(super) fn poll_statuses_once(
 
     let pane_metadata = if any_pollable {
         crate::tmux::refresh_session_cache();
-        crate::tmux::batch_pane_metadata().unwrap_or_default()
+        match crate::tmux::batch_pane_metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                tracing::warn!(
+                    target: "session.status",
+                    %error,
+                    "skipping status refresh because tmux pane metadata is unavailable",
+                );
+                return Vec::new();
+            }
+        }
     } else {
         HashMap::new()
     };
