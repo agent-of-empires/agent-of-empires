@@ -9019,6 +9019,8 @@ mod tests {
                 main_repo_path: "/tmp/src/repo-a".to_string(),
                 managed_by_aoe: true,
                 branch_preexisting: false,
+                base_branch: None,
+                base_branch_override: None,
             }],
             created_at: Utc::now(),
             cleanup_on_delete: true,

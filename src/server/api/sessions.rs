@@ -6467,6 +6467,17 @@ pub struct RepoBase {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo_name: Option<String>,
     pub base_branch: String,
+    /// Worktree path this entry's diff was computed in. The web base
+    /// picker queries it for that repo's branch list, so a workspace
+    /// member's typeahead lists its own branches rather than the launch
+    /// repo's. See #3329.
+    pub repo_path: String,
+    /// This entry's explicit override, when one is set. Absent means
+    /// `base_branch` came from the recorded creation base, the profile
+    /// default, or auto-detection, so the client hides its reset
+    /// affordance. See #3329.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_override: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -6570,26 +6581,31 @@ fn validate_diff_path(
     }
 }
 
-/// One repo's worth of diff context: a name (for workspace members)
-/// and the filesystem path the diff helper walks. See #1047.
+/// One repo's worth of diff context: a name (for workspace members),
+/// the filesystem path the diff helper walks, and the two base-branch
+/// layers that vary per repo. See #1047, #3329.
 #[derive(Clone, Debug)]
 struct DiffRepo {
     /// Workspace member name, or None for single-repo sessions.
     name: Option<String>,
     path: String,
+    /// Explicit override for this entry's diff base, set via
+    /// `PATCH /api/sessions/{id}/diff-base`, the `aoe session set-base`
+    /// CLI, or the TUI diff view's `b` keybind. For a workspace member
+    /// that is `WorkspaceRepo::base_branch_override`; for a single-repo
+    /// session's own checkout it is `Instance::base_branch_override`.
+    /// See #970, #3329.
+    base_override: Option<String>,
+    /// The branch this entry's worktree was created from, recorded at
+    /// creation. `WorkspaceRepo::base_branch` for a workspace member,
+    /// `WorktreeInfo::base_branch` for a single-repo session. Slots
+    /// below the explicit override but above the profile default and
+    /// auto-detection. See #1951, #3329.
+    recorded_base: Option<String>,
 }
 
 struct DiffContext {
     repos: Vec<DiffRepo>,
-    /// Per-session override for the diff base (set via
-    /// `PATCH /api/sessions/{id}/diff-base`, the `aoe session set-base`
-    /// CLI, or the TUI diff view's `b` keybind). Wins over the
-    /// profile-level default and the auto-detected ref. See #970.
-    base_branch_override: Option<String>,
-    /// The branch the worktree was created from, recorded at creation
-    /// time. Slots below the explicit override but above the profile
-    /// default and auto-detection. See #1951.
-    base_from_worktree: Option<String>,
 }
 
 /// Expand a session into the list of repos whose diffs the sidebar
@@ -6606,6 +6622,14 @@ async fn resolve_diff_repos(
         .iter()
         .find(|i| i.id == id)
         .ok_or_else(super::session_not_found)?;
+    Ok(DiffContext {
+        repos: diff_repos_of(inst),
+    })
+}
+
+/// The repo entries for one session, split out of [`resolve_diff_repos`] so the
+/// per-repo base plumbing is testable without an `AppState`.
+fn diff_repos_of(inst: &crate::session::Instance) -> Vec<DiffRepo> {
     // A session with any repo record (a creation-time workspace, repos attached
     // later, or both) lists one entry per repo. A session with none falls back
     // to its project_path, which is the single-repo flow unchanged.
@@ -6615,43 +6639,47 @@ async fn resolve_diff_repos(
         .map(|r| DiffRepo {
             name: Some(r.name.clone()),
             path: r.worktree_path.clone(),
+            base_override: r.base_branch_override.clone(),
+            recorded_base: r.base_branch.clone(),
         })
         .collect();
     if inst.workspace_info.is_none() {
-        // An attached repo widens a single-repo session rather than replacing
-        // it, so the session's own checkout stays first in the list.
+        // A session with no repo records is single-repo: its own checkout is
+        // the only entry, and the session-level override is that entry's
+        // override. `attach_project` converts a session into a workspace, so
+        // a named entry and this unnamed one never coexist. See #3329.
         repos.insert(
             0,
             DiffRepo {
                 name: None,
                 path: inst.project_path.clone(),
+                base_override: inst.base_branch_override.clone(),
+                recorded_base: inst
+                    .worktree_info
+                    .as_ref()
+                    .and_then(|w| w.base_branch.clone()),
             },
         );
     }
-    Ok(DiffContext {
-        repos,
-        base_branch_override: inst.base_branch_override.clone(),
-        base_from_worktree: inst
-            .worktree_info
-            .as_ref()
-            .and_then(|w| w.base_branch.clone()),
-    })
+    repos
 }
 
-/// Resolve the diff base for one repo path. Override (per-session)
-/// wins over the worktree's recorded base, which wins over the
-/// profile's `DiffConfig.default_branch`, which wins over
-/// auto-detection (`get_default_base_ref`). See #970, #1951.
+/// Resolve the diff base for one repo. The repo's own override wins
+/// over the base its worktree was recorded as forked from, which wins
+/// over the profile's `DiffConfig.default_branch`, which wins over
+/// auto-detection (`get_default_base_ref`). Every layer above the
+/// config default is per repo, so each workspace member resolves
+/// independently. See #970, #1951, #3329.
 fn resolve_diff_base(
     override_value: Option<&str>,
-    worktree_base: Option<&str>,
+    recorded_base: Option<&str>,
     config_default: Option<&str>,
     repo_path: &std::path::Path,
 ) -> String {
     if let Some(v) = override_value.map(str::trim).filter(|v| !v.is_empty()) {
         return v.to_string();
     }
-    if let Some(v) = worktree_base.map(str::trim).filter(|v| !v.is_empty()) {
+    if let Some(v) = recorded_base.map(str::trim).filter(|v| !v.is_empty()) {
         return v.to_string();
     }
     if let Some(v) = config_default.map(str::trim).filter(|v| !v.is_empty()) {
@@ -6687,8 +6715,8 @@ pub async fn session_diff_files(
         for repo in &ctx.repos {
             let path = std::path::Path::new(&repo.path);
             let base_branch = resolve_diff_base(
-                ctx.base_branch_override.as_deref(),
-                ctx.base_from_worktree.as_deref(),
+                repo.base_override.as_deref(),
+                repo.recorded_base.as_deref(),
                 config_default.as_deref(),
                 path,
             );
@@ -6710,6 +6738,8 @@ pub async fn session_diff_files(
             per_repo_bases.push(RepoBase {
                 repo_name: repo.name.clone(),
                 base_branch: base_branch.clone(),
+                repo_path: repo.path.clone(),
+                base_override: repo.base_override.clone(),
             });
             if let Some(w) = warning {
                 match repo.name.as_deref() {
@@ -6806,8 +6836,8 @@ pub async fn session_diff_file(
         };
     let project_path = selected_repo.path;
     let selected_repo_name = selected_repo.name;
-    let base_branch_override = ctx.base_branch_override.clone();
-    let base_from_worktree = ctx.base_from_worktree.clone();
+    let base_override = selected_repo.base_override;
+    let recorded_base = selected_repo.recorded_base;
     let scan_state = state.clone();
 
     let result =
@@ -6822,8 +6852,8 @@ pub async fn session_diff_file(
                 .default_branch
                 .clone();
             let base_branch = resolve_diff_base(
-                base_branch_override.as_deref(),
-                base_from_worktree.as_deref(),
+                base_override.as_deref(),
+                recorded_base.as_deref(),
                 config_default.as_deref(),
                 repo_path,
             );
@@ -8147,6 +8177,8 @@ mod tests {
                 main_repo_path: "/tmp/src/repo-a".to_string(),
                 managed_by_aoe: true,
                 branch_preexisting: false,
+                base_branch: None,
+                base_branch_override: None,
             }],
             created_at: chrono::Utc::now(),
             cleanup_on_delete: true,
@@ -8359,6 +8391,83 @@ mod tests {
         // Auto-detect when nothing is set. The tmp dir is not a repo so
         // `get_default_base_ref` returns Err -> "main" fallback.
         assert_eq!(resolve_diff_base(None, None, None, tmp.path()), "main");
+    }
+
+    /// Each workspace member carries its own override and recorded base, and
+    /// the session-level `base_branch_override` does not leak into any of
+    /// them. That leak is what made a multi-repo diff compare every repo
+    /// against one ref. See #3329.
+    #[test]
+    fn diff_repos_of_scopes_bases_per_workspace_repo() {
+        fn repo(
+            name: &str,
+            base: Option<&str>,
+            over: Option<&str>,
+        ) -> crate::session::WorkspaceRepo {
+            crate::session::WorkspaceRepo {
+                name: name.to_string(),
+                source_path: format!("/src/{name}"),
+                branch: "feature/x".to_string(),
+                worktree_path: format!("/ws/{name}"),
+                main_repo_path: format!("/src/{name}"),
+                managed_by_aoe: true,
+                branch_preexisting: false,
+                base_branch: base.map(str::to_string),
+                base_branch_override: over.map(str::to_string),
+            }
+        }
+
+        let mut inst = make_test_instance();
+        inst.base_branch_override = Some("session-wide".to_string());
+        inst.workspace_info = Some(crate::session::WorkspaceInfo {
+            branch: "feature/x".to_string(),
+            workspace_dir: "/ws".to_string(),
+            repos: vec![
+                repo("api", Some("develop"), None),
+                repo("web", Some("develop"), Some("epic/checkout")),
+                repo("infra", None, None),
+            ],
+            created_at: chrono::Utc::now(),
+            cleanup_on_delete: true,
+        });
+
+        let repos = diff_repos_of(&inst);
+        let seen: Vec<_> = repos
+            .iter()
+            .map(|r| {
+                (
+                    r.name.as_deref(),
+                    r.base_override.as_deref(),
+                    r.recorded_base.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (Some("api"), None, Some("develop")),
+                (Some("web"), Some("epic/checkout"), Some("develop")),
+                (Some("infra"), None, None),
+            ],
+            "workspace members must not inherit the session-level override"
+        );
+
+        // A single-repo session is the other shape: one unnamed entry whose
+        // override IS the session-level field.
+        let mut single = make_test_instance();
+        single.base_branch_override = Some("upstream/main".to_string());
+        single.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "feature/x".to_string(),
+            main_repo_path: "/src/only".to_string(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: Some("develop".to_string()),
+        });
+        let repos = diff_repos_of(&single);
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].name, None);
+        assert_eq!(repos[0].base_override.as_deref(), Some("upstream/main"));
+        assert_eq!(repos[0].recorded_base.as_deref(), Some("develop"));
     }
 
     #[test]
