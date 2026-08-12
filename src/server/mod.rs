@@ -3006,7 +3006,7 @@ fn apply_tick_status_decisions(
     instances: &mut [Instance],
     prev: &std::collections::HashMap<String, crate::session::Status>,
     suppressed_ids: &std::collections::HashSet<String>,
-    pane_metadata: &std::collections::HashMap<String, crate::tmux::PaneMetadata>,
+    pane_metadata: Option<&std::collections::HashMap<String, crate::tmux::PaneMetadata>>,
 ) {
     for inst in instances.iter_mut() {
         if suppressed_ids.contains(&inst.id) {
@@ -3027,6 +3027,15 @@ fn apply_tick_status_decisions(
         if skip_tmux_decision_for_structured(inst) {
             continue;
         }
+        let Some(pane_metadata) = pane_metadata else {
+            // A failed batch probe says nothing about any individual pane.
+            // Keep the last live status instead of treating an empty metadata
+            // map as proof that every pane disappeared.
+            if let Some(live) = inst.live_status_baseline {
+                inst.status = live;
+            }
+            continue;
+        };
         let session_name = crate::tmux::resolve_agent_session_name_in(
             pane_metadata,
             &inst.id,
@@ -4371,12 +4380,19 @@ async fn status_poll_loop(state: Arc<AppState>) {
             let mut instances = load_all_instances(&file_watch_for_poll).unwrap_or_default();
             seed_unknown_tracking(&mut instances, &prev_unknown_tracking);
             crate::tmux::refresh_session_cache();
-            let pane_metadata = crate::tmux::batch_pane_metadata().unwrap_or_default();
+            let pane_metadata = crate::tmux::batch_pane_metadata();
+            if let Err(error) = &pane_metadata {
+                tracing::warn!(
+                    target: "server.status",
+                    %error,
+                    "holding tmux-backed statuses because pane metadata is unavailable",
+                );
+            }
             apply_tick_status_decisions(
                 &mut instances,
                 &prev_for_poll,
                 &suppressed_ids,
-                &pane_metadata,
+                pane_metadata.as_ref().ok(),
             );
             (instances, live_structured_worker_records())
         })
@@ -7217,7 +7233,7 @@ mod tests {
             &mut instances,
             &prev,
             &std::collections::HashSet::new(),
-            &std::collections::HashMap::new(),
+            Some(&std::collections::HashMap::new()),
         );
 
         assert_eq!(
@@ -7247,7 +7263,7 @@ mod tests {
             &mut instances,
             &prev,
             &std::collections::HashSet::new(),
-            &std::collections::HashMap::new(),
+            Some(&std::collections::HashMap::new()),
         );
 
         assert_eq!(instances[0].status, Status::Idle, "disk status stands");
@@ -7273,7 +7289,7 @@ mod tests {
             &mut instances,
             &prev,
             &std::collections::HashSet::from([id]),
-            &std::collections::HashMap::new(),
+            Some(&std::collections::HashMap::new()),
         );
 
         assert_eq!(instances[0].status, Status::Starting);
@@ -7282,6 +7298,30 @@ mod tests {
             vec![(0, Status::Error)],
             "a transition the tick does own must still be reported"
         );
+    }
+
+    #[test]
+    fn tick_holds_tmux_statuses_when_the_batch_probe_fails() {
+        for (disk, live) in [
+            (Status::Idle, Status::Running),
+            (Status::Unknown, Status::Error),
+        ] {
+            let mut inst = Instance::new("tmux-session", "/tmp/test");
+            inst.status = disk;
+            let id = inst.id.clone();
+            let prev = std::collections::HashMap::from([(id, live)]);
+            let mut instances = vec![inst];
+
+            apply_tick_status_decisions(
+                &mut instances,
+                &prev,
+                &std::collections::HashSet::new(),
+                None,
+            );
+
+            assert_eq!(instances[0].status, live, "disk status was {disk:?}");
+            assert_eq!(observed_transitions(&instances, &prev), vec![]);
+        }
     }
 
     #[test]
