@@ -252,6 +252,24 @@ the whole row is dropped on reload rather than draining a text-only
 prompt with the image missing. There is no server-side durability;
 clearing site data wipes the queue.
 
+**Draining while the chat is closed.** The drain does not need the
+session's chat to be the one on screen: the dashboard keeps a background
+subscription for each session with prompts waiting, so a follow-up you
+parked in one chat is delivered while you work in another. Three limits
+follow from the queue being browser-local:
+
+- It drains only while a dashboard tab is open, and only three sessions
+  are serviced at once. The rest keep their queue and their **N queued**
+  badge until a slot frees or you open them.
+- With several tabs open, exactly one of them sends. The others see the
+  queue empty out.
+- Your other devices neither see nor drain the queue.
+
+After a reload, a restored queue resumes draining in the background only
+when its newest entry is under an hour old. An older one waits until you
+open that chat, so a prompt parked days ago never fires at an agent you
+have since moved on from.
+
 **Editing a queued prompt.** Click any queued row to edit it inline, or,
 with the composer empty (caret at the start), press `↑` to pull the most
 recent queued prompt back into the composer; `↑` again walks toward older
