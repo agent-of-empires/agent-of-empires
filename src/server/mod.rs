@@ -3161,7 +3161,10 @@ fn skip_tmux_decision_for_structured(inst: &mut Instance) -> bool {
 //    a reload rather than resurrecting the row. Dropping ids missing from
 //    `prior_by_id` is NOT an alternative; that is also how a session
 //    created by another process (the CLI, a peer daemon) legitimately
-//    enters `state.instances`.
+//    enters `state.instances`. The comparison happens under the
+//    `state.instances` write lock, and the delete bumps under that same
+//    lock, so the two are ordered against each other; comparing before
+//    taking the lock reopens the race one lock acquisition later.
 
 /// Reload `state.instances` by merging caller-supplied `fresh` against the
 /// prior in-memory snapshot per id, then reapplying the acp overlay.
@@ -3200,10 +3203,30 @@ pub(crate) async fn reload_state_instances_from_disk(
     status_source: StatusSource,
     read_epoch: u64,
 ) {
+    // Snapshot suppression here so a worker that unmarks between the
+    // caller's input build and the per-id decision cannot combine a
+    // cleared mark with a stale row to re-emit the phantom Error
+    // transition the suppression exists to prevent. Idempotent on the
+    // poll path, where the caller already applied the same override
+    // inside `spawn_blocking`.
+    let suppressed_ids =
+        crate::session::recovery::snapshot_recently_restarted(&state.recently_restarted);
+
+    let mut current = state.instances.write().await;
+
     // Invariant 8: `fresh` predates a committed delete, so folding it in would
     // put the removed row back. Drop the whole reload rather than filter it:
     // the next poll tick re-reads disk 2s from now and converges, and a delete
     // is rare enough that losing one tick of status updates costs nothing.
+    //
+    // Read under the `instances` write lock, and before `drain_from` empties
+    // `current`, so this is atomic against the delete. Checking before taking
+    // the lock leaves a hole: a reload could pass the check, park on the lock,
+    // let a delete take the lock, remove the row and bump, then wake and write
+    // its stale snapshot over the removal. The delete bumps inside the same
+    // lock scope for the same reason. No memory ordering closes that gap; it
+    // is a check-then-act race, so the check has to happen under the lock that
+    // orders the two writers.
     let current_epoch = state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst);
     if current_epoch != read_epoch {
         tracing::debug!(
@@ -3215,16 +3238,6 @@ pub(crate) async fn reload_state_instances_from_disk(
         return;
     }
 
-    // Snapshot suppression here so a worker that unmarks between the
-    // caller's input build and the per-id decision cannot combine a
-    // cleared mark with a stale row to re-emit the phantom Error
-    // transition the suppression exists to prevent. Idempotent on the
-    // poll path, where the caller already applied the same override
-    // inside `spawn_blocking`.
-    let suppressed_ids =
-        crate::session::recovery::snapshot_recently_restarted(&state.recently_restarted);
-
-    let mut current = state.instances.write().await;
     let prior_by_id = PriorById::drain_from(&mut current);
 
     let mut merged: Vec<Instance> = Vec::with_capacity(fresh.len());
@@ -8420,6 +8433,9 @@ mod tests {
         .await
         .expect("bootstrap wake must fire after init returns");
 
+        // Invariant 8: capture the epoch BEFORE the disk read, the order every
+        // production caller uses.
+        let read_epoch = state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst);
         let file_watch = state.file_watch.clone();
         let fresh = tokio::task::spawn_blocking(move || load_all_instances(&file_watch))
             .await
@@ -8430,7 +8446,7 @@ mod tests {
             fresh,
             Vec::new(),
             StatusSource::DiskOnly,
-            state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst),
+            read_epoch,
         )
         .await;
 
@@ -8492,6 +8508,66 @@ mod tests {
             "a deleted session must not come back from a pre-delete snapshot: {titles:?}"
         );
         assert_eq!(titles, vec!["survivor".to_string()]);
+    }
+
+    // The epoch comparison has to be atomic against the delete, not merely
+    // ordered by `SeqCst`. Comparing before taking the `instances` write lock
+    // leaves a check-then-act race: a reload passes the check, parks on the
+    // lock, a delete takes the lock and removes the row, and the reload then
+    // wakes and writes its stale snapshot over the removal.
+    //
+    // This drives that exact interleaving. The test holds the write lock so
+    // the spawned reload is guaranteed to be parked on it, bumps the epoch
+    // while it waits (standing in for the delete), then releases. On a
+    // current-thread runtime the ordering is deterministic, not timing
+    // dependent.
+    #[tokio::test]
+    async fn a_reload_parked_on_the_instances_lock_still_sees_a_delete_that_won_the_race() {
+        let doomed = Instance::new("doomed", "/tmp/doomed");
+        let survivor = Instance::new("survivor", "/tmp/survivor");
+        let stale_snapshot = vec![doomed.clone(), survivor.clone()];
+
+        let state = test_support::build_test_app_state(vec![survivor.clone()]);
+        let read_epoch = state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst);
+
+        // Hold the lock the reload needs, so it cannot get past it.
+        let guard = state.instances.write().await;
+
+        let reload_state = Arc::clone(&state);
+        let reload = tokio::spawn(async move {
+            reload_state_instances_from_disk(
+                &reload_state,
+                stale_snapshot,
+                Vec::new(),
+                StatusSource::DiskOnly,
+                read_epoch,
+            )
+            .await;
+        });
+
+        // Let the spawned task run until it parks on the write lock.
+        tokio::task::yield_now().await;
+
+        // The delete commits while the reload is parked: row out, epoch up.
+        // Both happen before the lock is released, mirroring the real purge.
+        state
+            .delete_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        drop(guard);
+
+        reload.await.expect("reload task");
+
+        let titles: Vec<String> = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .map(|i| i.title.clone())
+            .collect();
+        assert!(
+            !titles.contains(&"doomed".to_string()),
+            "a reload that was already waiting on the lock when the delete landed must still drop: {titles:?}"
+        );
     }
 
     // The guard must not be implemented by dropping ids missing from the prior
@@ -8566,6 +8642,9 @@ mod tests {
         .await
         .expect("bootstrap wake must fire after init returns");
 
+        // Invariant 8: capture the epoch BEFORE the disk read, the order every
+        // production caller uses.
+        let read_epoch = state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst);
         let file_watch = state.file_watch.clone();
         let fresh = tokio::task::spawn_blocking(move || load_all_instances(&file_watch))
             .await
@@ -8576,7 +8655,7 @@ mod tests {
             fresh,
             Vec::new(),
             StatusSource::DiskOnly,
-            state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst),
+            read_epoch,
         )
         .await;
 
