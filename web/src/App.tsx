@@ -120,6 +120,13 @@ const StructuredView = lazy(() =>
     default: m.StructuredView,
   })),
 );
+// Lazy for the same reason: it pulls in `useAcpSession`, which belongs to
+// the structured-view chunk and has no business in a tmux-only cold start.
+const AcpBackgroundDrainers = lazy(() =>
+  import("./components/acp/AcpQueueDrainer").then((m) => ({
+    default: m.AcpBackgroundDrainers,
+  })),
+);
 import { type PaneDisplay } from "./components/Dock";
 import { DockGroups, type DockGroupView } from "./components/DockGroups";
 import { BottomDock } from "./components/BottomDock";
@@ -746,6 +753,9 @@ function AppContent({
     return workspaces.find((w) => w.sessions.some((s) => s.id === activeSessionId));
   }, [workspaces, activeSessionId]);
   const activeSession = activeWorkspace?.sessions.find((s) => s.id === activeSessionId);
+  // Flat session list, for the background queue drainers below. They need
+  // every structured session, not just the visible workspace's. See #3331.
+  const allSessions = useMemo(() => workspaces.flatMap((w) => w.sessions), [workspaces]);
   const allPaneIds: string[] = [
     // CityHall client mode hides the code-inspection panes (diff, files) and
     // the terminal (plus plugin panes below) so only the composer + structured
@@ -2163,6 +2173,13 @@ function AppContent({
 
   return (
     <AcpPrefsProvider value={acpPrefs}>
+      {/* Headless: holds a subscription for each structured session with
+          queued prompts waiting whose chat is not on screen, so a parked
+          follow-up is delivered without the user navigating back to it.
+          Renders no DOM. See #3331. */}
+      <Suspense fallback={null}>
+        <AcpBackgroundDrainers sessions={allSessions} activeSessionId={activeSessionId} />
+      </Suspense>
       <div className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
         {/* Wrapped unconditionally, not behind the `headerCollapsible`
             ternary: swapping the element type at this position would remount

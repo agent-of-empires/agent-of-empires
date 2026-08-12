@@ -605,7 +605,13 @@ fn collect_tmux_states(instances: &mut [Instance]) -> Vec<TmuxState> {
     }
 
     crate::tmux::refresh_session_cache();
-    let meta = crate::tmux::batch_pane_metadata().unwrap_or_default();
+    let meta = match crate::tmux::batch_pane_metadata() {
+        Ok(meta) => meta,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to collect tmux pane metadata");
+            return Vec::new();
+        }
+    };
 
     let mut states = Vec::new();
     let mut known: HashSet<String> = HashSet::new();
