@@ -1987,7 +1987,7 @@ impl HomeView {
                         .as_ref()
                         .is_none_or(|p| &i.source_profile == p)
                 })
-                .filter(|i| super::project_group_name(i) == group_path)
+                .filter(|i| super::project_group_key(i) == group_path)
                 .map(|i| i.id.clone())
                 .collect(),
             // Org headers are derived from each session's resolved remote

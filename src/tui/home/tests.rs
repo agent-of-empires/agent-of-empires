@@ -7196,16 +7196,16 @@ fn test_apply_creation_results_returns_session_id() {
 }
 
 #[test]
-fn test_project_group_name_uses_last_path_segment() {
-    use super::project_group_name;
+fn test_project_group_key_uses_last_path_segment() {
+    use super::project_group_key;
 
     let inst = Instance::new("test", "/home/user/my-project");
-    assert_eq!(project_group_name(&inst), "my-project");
+    assert_eq!(project_group_key(&inst), "my-project");
 }
 
 #[test]
-fn test_project_group_name_uses_main_repo_for_worktree() {
-    use super::project_group_name;
+fn test_project_group_key_uses_main_repo_for_worktree() {
+    use super::project_group_key;
     use crate::session::WorktreeInfo;
     use chrono::Utc;
 
@@ -7217,27 +7217,27 @@ fn test_project_group_name_uses_main_repo_for_worktree() {
         created_at: Utc::now(),
         base_branch: None,
     });
-    assert_eq!(project_group_name(&inst), "my-project");
+    assert_eq!(project_group_key(&inst), "my-project");
 }
 
 #[test]
-fn test_project_group_name_handles_trailing_slash() {
-    use super::project_group_name;
+fn test_project_group_key_handles_trailing_slash() {
+    use super::project_group_key;
 
     let inst = Instance::new("test", "/home/user/my-project/");
-    assert_eq!(project_group_name(&inst), "my-project");
+    assert_eq!(project_group_key(&inst), "my-project");
 }
 
 #[test]
-fn test_project_group_name_groups_scratch_under_scratch() {
-    use super::project_group_name;
+fn test_project_group_key_groups_scratch_under_scratch() {
+    use super::project_group_key;
 
     let mut inst = Instance::new(
         "test",
         "/home/user/.config/agent-of-empires/scratch/a4535853054b4096",
     );
     inst.scratch = true;
-    assert_eq!(project_group_name(&inst), "scratch");
+    assert_eq!(project_group_key(&inst), "scratch");
 }
 
 #[test]
@@ -10356,7 +10356,7 @@ fn project_attention_archive_selected_group_removes_empty_main_header() {
         env.view
             .instances
             .values()
-            .filter(|i| super::project_group_name(i) == "beta")
+            .filter(|i| super::project_group_key(i) == "beta")
             .all(|i| i.is_archived()),
         "all beta sessions must be archived"
     );
@@ -10676,7 +10676,7 @@ fn unpin_archived_only_project_leaves_main_flow() {
         .view
         .instances
         .values()
-        .filter(|i| super::project_group_name(i) == "beta")
+        .filter(|i| super::project_group_key(i) == "beta")
         .map(|i| i.id.clone())
         .collect();
     for id in &beta_ids {
@@ -10856,7 +10856,7 @@ fn pinned_project_survives_losing_last_session() {
     // entry keeps the header alive even with zero members.
     env.view
         .instances
-        .retain(|_, i| super::project_group_name(i) != "alpha");
+        .retain(|_, i| super::project_group_key(i) != "alpha");
     env.view.flat_items = env.view.build_flat_items();
 
     let alpha_header = env.view.flat_items.iter().find_map(|i| match i {

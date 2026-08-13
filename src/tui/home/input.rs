@@ -3324,7 +3324,7 @@ impl HomeView {
     /// Pick a representative repo path for a selected group so "New Session"
     /// from a project/group can prefill the working directory. In project
     /// mode the group label is a derived repo basename, so match members by
-    /// `project_group_name`; in manual mode match by the stored
+    /// `project_group_key`; in manual mode match by the stored
     /// `group_path`, including nested subgroups. In org mode there is no
     /// single unambiguous repo to prefill (unlike Project, an org spans many
     /// repos by design), so this always returns `None` there, mirroring the
@@ -3336,7 +3336,7 @@ impl HomeView {
         self.instances
             .values()
             .find(|inst| match self.group_by {
-                GroupByMode::Project => super::project_group_name(inst) == group_path,
+                GroupByMode::Project => super::project_group_key(inst) == group_path,
                 GroupByMode::Org => false,
                 GroupByMode::Manual => {
                     inst.group_path == group_path

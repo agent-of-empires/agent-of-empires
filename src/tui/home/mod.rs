@@ -57,7 +57,7 @@ const SCRATCH_GROUP_LABEL: &str = "scratch";
 /// Extract a project group name from a session instance.
 /// Uses `worktree_info.main_repo_path` for worktree sessions (so all branches of the
 /// same repo group together), otherwise uses `project_path`. Returns the last path segment.
-fn project_group_name(inst: &Instance) -> String {
+fn project_group_key(inst: &Instance) -> String {
     // Scratch sessions live under `<app_dir>/scratch/<instance-id>/`, so the last
     // path segment is the opaque instance id. Group them under a readable label.
     if inst.scratch {
@@ -4758,7 +4758,7 @@ impl HomeView {
     fn known_project_group_paths(&self) -> std::collections::HashSet<String> {
         let mut paths = std::collections::HashSet::new();
         for inst in self.instances.values() {
-            let group = project_group_name(inst);
+            let group = project_group_key(inst);
             if group.is_empty() {
                 continue;
             }
@@ -5089,7 +5089,7 @@ impl HomeView {
         let grouped: Vec<Instance> = base_instances
             .into_iter()
             .map(|mut inst| {
-                inst.group_path = project_group_name(&inst);
+                inst.group_path = project_group_key(&inst);
                 inst
             })
             .collect();
@@ -7098,7 +7098,7 @@ impl HomeView {
     pub(super) fn project_header_repo_path(&self, label: &str) -> Option<String> {
         self.instances
             .values()
-            .find(|i| !i.is_archived() && !i.scratch && project_group_name(i) == label)
+            .find(|i| !i.is_archived() && !i.scratch && project_group_key(i) == label)
             .map(|i| crate::session::projects::canonical_key(i.repo_path()))
     }
 
@@ -7271,7 +7271,7 @@ impl HomeView {
             return;
         };
         let group_path = match self.group_by {
-            GroupByMode::Project => Some(project_group_name(inst)),
+            GroupByMode::Project => Some(project_group_key(inst)),
             GroupByMode::Org => Some(self.org_group_key(inst)),
             GroupByMode::Manual => {
                 let p = inst.group_path.clone();
