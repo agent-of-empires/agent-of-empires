@@ -1826,65 +1826,66 @@ pub async fn acp_enable(
     // this user-initiated action; ancillary kinds delegate to the
     // shared helper so any future kind picked up by the audit lands
     // here automatically.
-    let inst_for_kill = instance.clone();
+    let inst_for_transition = instance.clone();
     let id_for_log = id.clone();
-    let kill_join = tokio::task::spawn_blocking(move || {
-        if let Err(e) = inst_for_kill.kill() {
-            tracing::warn!(target: "acp.switch", session = %inst_for_kill.id, "kill tmux failed: {e}");
+    let profile_for_transition = profile.clone();
+    let file_watch_for_transition = state.file_watch.clone();
+    let transition = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+        let storage =
+            crate::session::Storage::new(&profile_for_transition, file_watch_for_transition)?;
+        let _lifecycle_lock = storage
+            .acquire_instance_lifecycle_lock(&inst_for_transition.id)
+            .map_err(|error| {
+                anyhow::anyhow!("failed to acquire terminal-to-ACP lifecycle lock: {error}")
+            })?;
+        if let Err(e) = inst_for_transition.kill_locked() {
+            tracing::warn!(target: "acp.switch", session = %inst_for_transition.id, "kill tmux failed: {e}");
         }
-        inst_for_kill.kill_ancillary_tmux_sessions();
-    })
-    .await;
-    if let Err(join_err) = kill_join {
-        tracing::error!(target: "acp.switch", session = %id_for_log, "tmux teardown task panicked: {join_err}");
-    }
-    instance.view = crate::session::View::Structured;
-    instance.resume_intent = crate::session::ResumeIntent::Default;
-
-    // Persist before spawning so a crash mid-swap leaves us in the
-    // declared end state, not a half-broken intermediate.
-    //
-    // The on-disk and in-memory updates mutate ONLY the structured view-specific
-    // fields (`structured_view = true`, `resume_intent = Default`).
-    // Wholesale replacement with a pre-lock snapshot would clobber
-    // concurrent writes to other fields (status, last_accessed,
-    // agent_session_id) made by the status poll loop or other handlers
-    // between the snapshot and the lock acquisition.
-    //
-    // Clearing `resume_intent` here closes the dormant-intent gap: the
-    // CLI `set-session-id` writes `Use(sid)` to disk, then the user
-    // toggles structured view on; without this reset, a future `acp_disable`
-    // would reload the stale `Use(sid)` and the next non-structured view launch
-    // would honor a session id the user no longer expects. See #1745.
-    {
-        let mut instances = state.instances.write().await;
-        if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
+        inst_for_transition.kill_ancillary_tmux_sessions_locked();
+        storage.update(|all, _groups| {
+            let Some(slot) = all
+                .iter_mut()
+                .find(|candidate| candidate.id == inst_for_transition.id)
+            else {
+                anyhow::bail!("session disappeared during terminal-to-ACP transition");
+            };
             slot.view = crate::session::View::Structured;
             slot.resume_intent = crate::session::ResumeIntent::Default;
-        }
-    }
-    let id_for_save = id.clone();
-    let profile_for_save = profile.clone();
-    let file_watch_for_save = state.file_watch.clone();
-    let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let storage = crate::session::Storage::new(&profile_for_save, file_watch_for_save)?;
-        storage.update(|all, _groups| {
-            if let Some(slot) = all.iter_mut().find(|i| i.id == id_for_save) {
-                slot.view = crate::session::View::Structured;
-                slot.resume_intent = crate::session::ResumeIntent::Default;
-            }
-            Ok(())
-        })?;
-        Ok(())
+            slot.lifecycle_generation = slot.lifecycle_generation.saturating_add(1);
+            Ok(slot.lifecycle_generation)
+        })
     })
     .await;
-    match save_result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            tracing::error!(target: "acp.switch", "save after enable: {e}");
+    let lifecycle_generation = match transition {
+        Ok(Ok(generation)) => generation,
+        Ok(Err(error)) => {
+            tracing::error!(target: "acp.switch", session = %id_for_log, "terminal-to-ACP transition failed: {error:#}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to switch session to structured view",
+            )
+                .into_response();
         }
-        Err(join_err) => {
-            tracing::error!(target: "acp.switch", "save task panicked after enable: {join_err}");
+        Err(join_error) => {
+            tracing::error!(target: "acp.switch", session = %id_for_log, "terminal-to-ACP transition task panicked: {join_error}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to switch session to structured view",
+            )
+                .into_response();
+        }
+    };
+    instance.view = crate::session::View::Structured;
+    instance.resume_intent = crate::session::ResumeIntent::Default;
+    instance.lifecycle_generation = lifecycle_generation;
+    {
+        let mut instances = state.instances.write().await;
+        if let Some(slot) = instances.iter_mut().find(|candidate| candidate.id == id) {
+            if lifecycle_generation >= slot.lifecycle_generation {
+                slot.view = crate::session::View::Structured;
+                slot.resume_intent = crate::session::ResumeIntent::Default;
+                slot.lifecycle_generation = lifecycle_generation;
+            }
         }
     }
 

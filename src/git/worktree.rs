@@ -48,18 +48,6 @@ fn classify_worktree_add_failure(combined: &str, branch: &str) -> GitError {
     }
 }
 
-/// Extract the worktree path from a `git branch -d`/`-D` "used by worktree"
-/// error. Git formats it as `... used by worktree at '<path>'` (single-quoted,
-/// on one line). Returns `None` when the marker or its closing quote is absent,
-/// so an unrelated error is never misread as a path.
-fn parse_worktree_in_use(stderr: &str) -> Option<PathBuf> {
-    const MARKER: &str = "used by worktree at '";
-    let start = stderr.find(MARKER)? + MARKER.len();
-    let rest = &stderr[start..];
-    let end = rest.find('\'')?;
-    Some(PathBuf::from(&rest[..end]))
-}
-
 /// Remote name used as a fallback when no candidate remote can be picked
 /// from the local refs. Real selection happens in
 /// `detect_default_branch_info`, which walks every configured remote and
@@ -755,8 +743,7 @@ impl GitWorktree {
             };
             // Redact any credentialed remote URL before this text can reach
             // the debug log or the client (via the warnings channel below or
-            // the error message). Idempotent, so the second pass inside
-            // `classify_worktree_add_failure` is a no-op.
+            // the error message).
             let combined = sanitize_remote_credentials(&combined);
 
             // post-checkout hooks (e.g. pre-commit's hook-type=post-checkout
@@ -773,6 +760,10 @@ impl GitWorktree {
                 );
                 tracing::warn!(target: "git.worktree", "worktree create: {}", warning);
                 warnings.push(warning);
+            } else if self.worktree_path_for_branch(branch)?.is_some() {
+                // Determine ownership from locale-independent porcelain output;
+                // Git localizes the "already used by worktree" diagnostic.
+                return Err(GitError::BranchAlreadyCheckedOut(branch.to_string()));
             } else {
                 return Err(classify_worktree_add_failure(&combined, branch));
             }
@@ -1110,6 +1101,17 @@ impl GitWorktree {
             "delete_branch: invoking `git branch -d`"
         );
 
+        // Check the ref directly instead of parsing `git branch -d` stderr:
+        // Git localizes that diagnostic, so an absent branch otherwise stops
+        // being idempotent outside an English locale.
+        if !self.branch_exists(branch)? {
+            tracing::debug!(target: "git.worktree",
+                branch,
+                "delete_branch: branch already absent, treating as success"
+            );
+            return Ok(());
+        }
+
         // A trashed worktree is relocated with `git worktree move` and re-locked
         // (see WORKTREE_LOCK_REASON). If its checkout later goes missing but the
         // locked admin entry survives, `git worktree prune` skips it (prune
@@ -1136,66 +1138,86 @@ impl GitWorktree {
                 "delete_branch: `git branch -d` failed"
             );
 
-            // Branch already gone: treat as success. Git emits
-            // "error: branch '<name>' not found" in this case.
-            if stderr.contains("not found") {
+            // The ref existed at the pre-check but a peer may have deleted it
+            // before this command. Recheck the ref rather than parsing Git's
+            // localized "not found" diagnostic.
+            if !self.branch_exists(branch)? {
                 tracing::debug!(target: "git.worktree",
                     branch,
-                    "delete_branch: branch already absent, treating as success"
+                    "delete_branch: branch concurrently removed, treating as success"
                 );
                 return Ok(());
             }
 
-            // Branch still checked out by a lingering worktree entry whose
-            // checkout is gone (a relocated + locked trash worktree that prune
-            // skipped). Reap it and retry `-d` once. Git reports worktree usage
-            // before any merge-state check, so this can only surface here on the
-            // `-d`, never on the `-D` below. Gated on the checkout being absent:
-            // a worktree with a live checkout is legitimately using the branch
-            // and must NOT be force-removed behind the caller's back.
-            if !used_by_worktree_retried {
-                if let Some(path) = parse_worktree_in_use(&stderr) {
-                    if !path.exists() {
-                        used_by_worktree_retried = true;
-                        tracing::warn!(target: "git.worktree",
-                            branch,
-                            path = %path.display(),
-                            "delete_branch: branch held by a lingering worktree entry whose checkout is gone; reaping and retrying"
-                        );
-                        self.reap_worktree_entry(&path);
-                        continue;
-                    }
-                }
-            }
-
-            // If the branch has unmerged changes, try force delete.
-            if stderr.contains("not fully merged") {
-                let force_output =
-                    super::command::run_git(&self.repo_path, ["branch", "-D", branch])?;
-
-                if !force_output.status.success() {
-                    let force_stderr = String::from_utf8_lossy(&force_output.stderr);
-                    tracing::debug!(target: "git.worktree",
+            // Resolve worktree ownership from Git's stable porcelain output,
+            // not from localized stderr. A missing checkout with a retained,
+            // locked admin entry is ours to reap; a live checkout must remain
+            // untouched.
+            if let Some(path) = self.worktree_path_for_branch(branch)? {
+                if !used_by_worktree_retried && Self::checkout_confirmed_absent(path.try_exists()) {
+                    used_by_worktree_retried = true;
+                    tracing::warn!(target: "git.worktree",
                         branch,
-                        exit = ?force_output.status.code(),
-                        stderr = %force_stderr,
-                        "delete_branch: `git branch -D` (force) also failed"
+                        path = %path.display(),
+                        "delete_branch: branch held by a lingering worktree entry whose checkout is gone; reaping and retrying"
                     );
-                    return Err(GitError::WorktreeCommandFailed(format!(
-                        "git branch -D {}: {}",
-                        branch,
-                        force_stderr.trim()
-                    )));
+                    self.reap_worktree_entry(&path);
+                    continue;
                 }
-                return Ok(());
+                return Err(GitError::WorktreeCommandFailed(format!(
+                    "git branch -d {}: {}",
+                    branch,
+                    stderr.trim()
+                )));
             }
 
+            // The branch exists and no worktree owns it, so `-d` rejected an
+            // unmerged branch. Retry with the force-delete operation selected
+            // by AoE's branch cleanup contract. This avoids matching Git's
+            // localized "not fully merged" diagnostic.
+            let force_output = super::command::run_git(&self.repo_path, ["branch", "-D", branch])?;
+            if !force_output.status.success() {
+                let force_stderr = String::from_utf8_lossy(&force_output.stderr);
+                tracing::debug!(target: "git.worktree",
+                    branch,
+                    exit = ?force_output.status.code(),
+                    stderr = %force_stderr,
+                    "delete_branch: `git branch -D` (force) also failed"
+                );
+                return Err(GitError::WorktreeCommandFailed(format!(
+                    "git branch -D {}: {}",
+                    branch,
+                    force_stderr.trim()
+                )));
+            }
+            return Ok(());
+        }
+    }
+
+    /// Return the registered checkout path for the local branch, including a
+    /// stale locked entry whose checkout no longer exists.
+    fn worktree_path_for_branch(&self, branch: &str) -> Result<Option<PathBuf>> {
+        let output =
+            super::command::run_git(&self.repo_path, ["worktree", "list", "--porcelain", "-z"])?;
+        if !output.status.success() {
             return Err(GitError::WorktreeCommandFailed(format!(
-                "git branch -d {}: {}",
-                branch,
-                stderr.trim()
+                "git worktree list --porcelain: {}",
+                String::from_utf8_lossy(&output.stderr).trim()
             )));
         }
+
+        let wanted = format!("refs/heads/{branch}");
+        let mut path = None;
+        for field in output.stdout.split(|byte| *byte == 0) {
+            if let Some(raw_path) = field.strip_prefix(b"worktree ") {
+                path = Some(PathBuf::from(
+                    String::from_utf8_lossy(raw_path).into_owned(),
+                ));
+            } else if field.strip_prefix(b"branch ") == Some(wanted.as_bytes()) {
+                return Ok(path);
+            }
+        }
+        Ok(None)
     }
 
     /// Reap the single linked-worktree admin entry that `git branch -d` named
@@ -1215,6 +1237,15 @@ impl GitWorktree {
     fn reap_worktree_entry(&self, path: &Path) {
         self.unlock_worktree(path);
         let _ = self.prune_worktrees();
+    }
+
+    /// Whether a lingering worktree admin entry may be reaped: only when its
+    /// checkout is confirmed absent. `Path::try_exists` distinguishes a real
+    /// absence (`Ok(false)`) from a `stat` failure (`Err`, e.g. EACCES / I/O),
+    /// which must NOT reap a possibly-live checkout and delete its branch,
+    /// mirroring the fail-closed rule on `branch_exists` (#2653).
+    fn checkout_confirmed_absent(probe: std::io::Result<bool>) -> bool {
+        matches!(probe, Ok(false))
     }
 
     /// Whether a local branch `refs/heads/<branch>` exists in this repo.
@@ -1242,14 +1273,22 @@ impl GitWorktree {
         // all subprocess-driven for consistent stderr / exit-code
         // semantics. The subprocess is why `Err(_)` is a real possibility
         // here even though the repo is already open.
-        match super::command::run_git(
+        let output = super::command::run_git(
             &self.repo_path,
             ["show-ref", "--verify", "--quiet", &refname],
-        ) {
-            Ok(output) => Ok(output.status.success()),
-            Err(e) => Err(GitError::WorktreeCommandFailed(format!(
-                "git show-ref --verify {refname}: {e}"
-            ))),
+        )
+        .map_err(|e| {
+            GitError::WorktreeCommandFailed(format!("git show-ref --verify {refname}: {e}"))
+        })?;
+        match output.status.code() {
+            Some(0) => Ok(true),
+            Some(1) => Ok(false),
+            code => {
+                let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+                Err(GitError::WorktreeCommandFailed(format!(
+                    "git show-ref --verify {refname} exited {code:?}: {stderr}"
+                )))
+            }
         }
     }
 
@@ -3984,23 +4023,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn parse_worktree_in_use_extracts_quoted_path() {
-        let stderr = "error: cannot delete branch 'compact-2' used by worktree at \
-                      '/home/n/wt/compact-2/.aoe-trash/b147f0ac'";
-        assert_eq!(
-            parse_worktree_in_use(stderr),
-            Some(PathBuf::from("/home/n/wt/compact-2/.aoe-trash/b147f0ac"))
-        );
-    }
-
-    #[test]
-    fn parse_worktree_in_use_ignores_unrelated_errors() {
-        assert_eq!(parse_worktree_in_use("error: branch 'x' not found"), None);
-        // Marker present but no closing quote: must not panic or misparse.
-        assert_eq!(parse_worktree_in_use("used by worktree at 'oops"), None);
-    }
-
     /// Regression: a trashed worktree is relocated + re-locked, then its
     /// checkout goes missing while the locked admin entry survives. `git
     /// worktree prune` skips the locked entry, so the branch stays "used by
@@ -4078,6 +4100,27 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&listed.stdout).contains("locked"),
             "the live worktree must remain locked"
+        );
+    }
+
+    #[test]
+    fn checkout_confirmed_absent_only_reaps_on_confirmed_absence() {
+        use std::io::{Error, ErrorKind};
+        assert!(
+            GitWorktree::checkout_confirmed_absent(Ok(false)),
+            "confirmed-absent checkout may be reaped"
+        );
+        assert!(
+            !GitWorktree::checkout_confirmed_absent(Ok(true)),
+            "present checkout must be kept"
+        );
+        assert!(
+            !GitWorktree::checkout_confirmed_absent(Err(Error::from(ErrorKind::PermissionDenied))),
+            "stat failure must fail closed, not reap a possibly-live checkout"
+        );
+        assert!(
+            !GitWorktree::checkout_confirmed_absent(Err(Error::from(ErrorKind::Other))),
+            "any stat error must fail closed"
         );
     }
 }

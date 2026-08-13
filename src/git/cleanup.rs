@@ -1,6 +1,6 @@
 //! Shared worktree cleanup utilities used by both CLI and TUI deletion paths.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::containers::DockerContainer;
 use crate::session::Instance;
@@ -350,23 +350,26 @@ pub fn deinit_submodules_if_present(worktree_path: &Path) {
     }
 }
 
-/// Read `.git` (file form) in a worktree to recover the linked worktree's
-/// administrative name. Returns the basename of the gitdir path, e.g.
-/// `<main_repo>/.git/worktrees/feature-foo` → `feature-foo`. None when the
-/// `.git` file is missing or doesn't carry a `gitdir:` line.
+/// Read the `gitdir:` target from a linked worktree's `.git` file.
+fn read_linked_worktree_gitdir(worktree_path: &Path) -> Option<PathBuf> {
+    let contents = std::fs::read_to_string(worktree_path.join(".git")).ok()?;
+    let raw = contents
+        .lines()
+        .find_map(|line| line.strip_prefix("gitdir:").map(str::trim))?;
+    let path = PathBuf::from(raw);
+    Some(if path.is_absolute() {
+        path
+    } else {
+        worktree_path.join(path)
+    })
+}
+
+/// Recover the linked worktree's administrative name from its `.git` pointer.
 fn read_linked_worktree_name(worktree_path: &Path) -> Option<String> {
-    let dotgit = worktree_path.join(".git");
-    let contents = std::fs::read_to_string(&dotgit).ok()?;
-    for line in contents.lines() {
-        if let Some(rest) = line.strip_prefix("gitdir:") {
-            let gitdir = Path::new(rest.trim());
-            return gitdir
-                .file_name()
-                .and_then(|s| s.to_str())
-                .map(|s| s.to_string());
-        }
-    }
-    None
+    read_linked_worktree_gitdir(worktree_path)?
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
 }
 
 /// Manual cleanup fallback for the submodule-blocker error. Removes the
@@ -604,7 +607,9 @@ pub fn remove_managed_worktree(
                 // missing-`.git` branch above does. Checked before the
                 // permission/submodule fallbacks: those recover a live
                 // worktree, and this one is not one. See #3171.
-                if is_not_a_worktree_error(&err_str) {
+                if read_linked_worktree_gitdir(worktree_path).is_some_and(|path| !path.exists())
+                    || is_not_a_worktree_error(&err_str)
+                {
                     tracing::info!(target: "git.worktree",
                         path = %worktree_path.display(),
                         "git has no worktree entry for this path; removing the leftover directory by hand"

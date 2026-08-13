@@ -4,6 +4,8 @@ use crate::session::config::{resolve_tmux_setting, Config, TmuxSetting, TmuxSett
 use anyhow::{bail, Result};
 use std::sync::OnceLock;
 
+pub(crate) const PANE_ENV_FILE_PREFIX: &str = "aoe-pane-env-";
+
 pub fn strip_ansi(content: &str) -> String {
     let mut result = strip_osc_st(content);
 
@@ -269,6 +271,22 @@ pub(crate) fn pane_current_command(session_name: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+fn pane_start_command_is_protected(session_name: &str) -> bool {
+    let target = format!("{session_name}:^.0");
+    crate::tmux::tmux_command()
+        .args([
+            "display-message",
+            "-t",
+            &target,
+            "-p",
+            "#{pane_start_command}",
+        ])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .is_some_and(|command| command.contains(PANE_ENV_FILE_PREFIX))
+}
+
 // Shells that indicate the agent is not running (the pane was restored by
 // tmux-resurrect, the agent crashed back to a prompt, or the user exited).
 const KNOWN_SHELLS: &[&str] = &[
@@ -280,10 +298,31 @@ pub(crate) fn is_shell_command(cmd: &str) -> bool {
     KNOWN_SHELLS.contains(&normalized)
 }
 
+pub(crate) fn is_pane_running_shell_command(
+    current_command: &str,
+    pane_start_command_is_protected: bool,
+) -> bool {
+    is_shell_command(current_command) && !pane_start_command_is_protected
+}
+
 pub fn is_pane_running_shell(session_name: &str) -> bool {
-    pane_current_command(session_name)
-        .map(|cmd| is_shell_command(&cmd))
-        .unwrap_or(false)
+    let Some(current_command) = pane_current_command(session_name) else {
+        return false;
+    };
+    if !is_shell_command(&current_command) {
+        return false;
+    }
+
+    // Protected pane environment values are sourced by a short-lived script
+    // executed by the user's POSIX shell. While the launch command is alive,
+    // tmux therefore reports that shell rather than the agent as the pane's
+    // current command. The script itself is the pane command, so once the agent
+    // exits the pane becomes dead instead of returning to a prompt. Do not
+    // mistake this live wrapper for a resurrected or interactive shell.
+    is_pane_running_shell_command(
+        &current_command,
+        pane_start_command_is_protected(session_name),
+    )
 }
 
 /// Returns the tmux prefix key formatted for display (e.g. "Ctrl+a", "Ctrl+b").
@@ -314,12 +353,16 @@ pub fn tmux_prefix_display() -> &'static str {
 /// `Err`. Caller is responsible for `refresh_session_cache` after a
 /// successful kill.
 pub(crate) fn kill_session_if_present(name: &str) -> Result<()> {
-    let output = crate::tmux::tmux_command()
-        .env("LC_ALL", "C")
+    let output = crate::tmux::tmux_query_command()
         .args(["kill-session", "-t", name])
         .output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        // Deliberately broader than `tmux_no_server_running`: for a kill, ANY
+        // connect failure (`error connecting`, any errno) means there is no
+        // server and thus no session to remove, so it is success. The status
+        // pollers need the narrower ENOENT-only test to keep transient glitches
+        // on the error path; here a false "absent" cannot act on a live pane.
         let absent = stderr.contains("can't find session")
             || stderr.contains("no server running")
             || stderr.contains("error connecting");
@@ -525,6 +568,22 @@ mod tests {
             assert!(
                 !is_shell_command(cmd),
                 "{cmd} should not be recognized as a shell"
+            );
+        }
+    }
+
+    #[test]
+    fn test_is_pane_running_shell_command_accounts_for_protected_wrapper() {
+        let cases = [
+            ("sh", true, false),
+            ("sh", false, true),
+            ("claude", false, false),
+        ];
+        for (current_command, pane_start_command_is_protected, expected) in cases {
+            assert_eq!(
+                is_pane_running_shell_command(current_command, pane_start_command_is_protected),
+                expected,
+                "{current_command:?}, protected={pane_start_command_is_protected}"
             );
         }
     }

@@ -4,7 +4,7 @@ use anyhow::Result;
 use chrono::Utc;
 use clap::Args;
 
-use crate::session::{ClaimOp, Instance, Storage};
+use crate::session::{Instance, LifecycleOperation, Storage};
 
 #[derive(Args)]
 pub struct RemoveArgs {
@@ -66,15 +66,17 @@ fn should_delete_branch(
 pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
 
-    // Phase 1 (unlocked): identify the target and run the slow deletion
-    // side effects (worktree removal, branch deletion, container teardown,
-    // detach hooks). The flock would otherwise be held for the entire
-    // deletion sequence, blocking peer mutators on the same profile.
+    // Snapshot the target without holding either lock across user-facing
+    // config resolution. The purge path below takes its durable claim, then
+    // retains the per-instance lifecycle lock across every destructive stage.
     let (instances, _groups) = storage.load_with_groups()?;
 
-    let inst = super::resolve_session(&args.identifier, &instances)
+    let mut inst = super::resolve_session(&args.identifier, &instances)
         .map_err(|e| anyhow::anyhow!("{} in profile '{}'", e, storage.profile()))?
         .clone();
+    // Runtime-only source_profile is blank after deserialization; stamp the
+    // explicitly selected profile before hooks or teardown resolve config.
+    inst.source_profile = storage.profile().to_string();
     let removed_id = inst.id.clone();
     let removed_title = inst.title.clone();
 
@@ -88,38 +90,32 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
     // artifact so it can be restored. Mirrors the archive CLI's tmux
     // teardown. See #2489.
     if config.session.delete_to_trash && !args.purge {
-        if let Err(e) = inst.kill() {
-            eprintln!("Warning: failed to kill agent tmux session: {}", e);
-        }
-        inst.kill_ancillary_tmux_sessions();
-
-        let landed = storage.update(|all_instances, _groups| {
-            if let Some(stored) = all_instances.iter_mut().find(|i| i.id == removed_id) {
-                stored.trash();
-                // Mark the teardown in flight (ClaimOp::Trash) so peers
-                // observe it as durable state. Best-effort: a refused claim
-                // still tears down, gated by the pre-move re-check and the
-                // locked relocation commit.
-                if let Err(holder) =
-                    stored.try_claim(ClaimOp::Trash, Instance::OP_CLAIM_TTL, Utc::now())
-                {
-                    tracing::info!(
-                        target: "cli.session",
-                        session = %stored.id,
-                        "trash teardown runs unclaimed; a fresh {holder:?} claim holds the row"
-                    );
-                }
-                Ok(true)
-            } else {
-                Ok(false)
-            }
+        let _lifecycle_lock = storage
+            .acquire_instance_lifecycle_lock(&removed_id)
+            .map_err(|error| anyhow::anyhow!("failed to acquire instance trash lock: {error}"))?;
+        let trash_generation = storage.update(|all_instances, _groups| {
+            let stored = all_instances
+                .iter_mut()
+                .find(|instance| instance.id == removed_id)
+                .ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "Session {removed_title} was removed by another process before it could be trashed"
+                    )
+                })?;
+            let generation = stored
+                .try_acquire_lifecycle_reservation(
+                    LifecycleOperation::Trash,
+                    Instance::LIFECYCLE_RESERVATION_TTL,
+                    Utc::now(),
+                )
+                .map_err(|error| anyhow::anyhow!("Session {removed_title}: {error}"))?;
+            stored.trash();
+            Ok(generation)
         })?;
-        if !landed {
-            anyhow::bail!(
-                "Session {} was removed by another process before it could be trashed",
-                removed_title
-            );
+        if let Err(error) = inst.kill_locked() {
+            eprintln!("Warning: failed to kill agent tmux session: {error}");
         }
+        inst.kill_ancillary_tmux_sessions_locked();
 
         // The session is durably trashed; stop its sandbox container (so it
         // doesn't keep running for the whole retention window) and move its
@@ -157,8 +153,8 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
                     decided = Some(crate::session::claim::commit_trash_relocation(
                         all_instances,
                         &removed_id,
+                        trash_generation,
                         &reloc,
-                        chrono::Utc::now(),
                     ));
                     Ok(())
                 });
@@ -194,10 +190,10 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
             }
             crate::session::trash::RelocateOutcome::Failed { reason } => {
                 eprintln!("  Note: left worktree in place ({reason}).");
-                release_trash_claim_best_effort(&storage, &removed_id);
+                release_trash_reservation_best_effort(&storage, &removed_id, trash_generation);
             }
             crate::session::trash::RelocateOutcome::Skipped => {
-                release_trash_claim_best_effort(&storage, &removed_id);
+                release_trash_reservation_best_effort(&storage, &removed_id, trash_generation);
             }
         }
 
@@ -223,44 +219,10 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         && !args.keep_container
         && config.sandbox.auto_cleanup;
 
-    // Phase 1 (locked, quick): claim the purge before the unlocked teardown so
-    // a concurrent restore from another process (CLI / serve daemon / TUI)
-    // cannot bring the session back after its artifacts are already gone. The
-    // durable on-disk claim is the only cross-process serialization point; the
-    // server's in-memory instance lock is invisible here. See #2541.
-    let was_trashed = inst.is_trashed();
-    let claim = storage.update(|all_instances, _groups| {
-        Ok(crate::session::claim::decide_purge_claim(
-            all_instances,
-            &removed_id,
-            was_trashed,
-            Utc::now(),
-        ))
-    })?;
-    match claim {
-        crate::session::claim::PurgeClaimDecision::AlreadyGone => {
-            anyhow::bail!(
-                "Session {} was already removed by another process",
-                removed_title
-            );
-        }
-        crate::session::claim::PurgeClaimDecision::Restored => {
-            anyhow::bail!(
-                "Session {} was restored before its purge could start, so it was not purged",
-                removed_title
-            );
-        }
-        crate::session::claim::PurgeClaimDecision::RestoreInProgress => {
-            anyhow::bail!(
-                "Session {} is being restored by another process, so it was not purged",
-                removed_title
-            );
-        }
-        crate::session::claim::PurgeClaimDecision::Claimed => {}
-    }
-
-    let result =
-        crate::session::deletion::perform_deletion(&crate::session::deletion::DeletionRequest {
+    let storage_profile = storage.profile().to_string();
+    let reservation = crate::session::deletion::PurgeTransaction::reserve(
+        storage,
+        crate::session::deletion::DeletionRequest {
             session_id: inst.id.clone(),
             instance: inst.clone(),
             delete_worktree,
@@ -269,7 +231,27 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
             force_delete: args.force,
             detach_hooks: false,
             keep_scratch: args.keep_scratch,
-        });
+        },
+    )?;
+    let transaction = match reservation {
+        crate::session::deletion::PurgeReservation::Reserved(transaction) => transaction,
+        crate::session::deletion::PurgeReservation::Rejected(result) => {
+            let detail = result
+                .errors
+                .first()
+                .map(String::as_str)
+                .unwrap_or("Session purge was refused");
+            anyhow::bail!("{detail}: {removed_title}");
+        }
+    };
+    let result = transaction.run_hooks().complete_with(|instance| {
+        super::purge_acp_transcript(instance).map_err(|error| {
+            format!(
+                "Session teardown succeeded but its transcript could not be purged, so the session \
+                 record was kept (retry, or remove it once the event store is reachable): {error}"
+            )
+        })
+    });
 
     for msg in &result.messages {
         println!("  {}", msg);
@@ -278,29 +260,22 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         eprintln!("Warning: {}", err);
     }
 
-    // A failed teardown (worktree/branch/container cleanup) must keep the
-    // session row so the leftover artifacts can be retried, not abandoned by
-    // dropping the record below. Mirrors `empty-trash`, which only purges rows
-    // whose teardown succeeded. See #2489.
+    if result.disposition == crate::session::deletion::DeletionDisposition::KeptRestored {
+        eprintln!(
+            "Warning: session {} was restored while its purge was running; kept the \
+             restored record, but its worktree, branch, container, or transcript may \
+             already have been removed by the purge. Inspect and repair it.",
+            removed_title
+        );
+        return Ok(());
+    }
+    if result.disposition == crate::session::deletion::DeletionDisposition::AlreadyGone {
+        return Ok(());
+    }
     if !result.success {
-        release_purge_claim(&storage, &removed_id);
         anyhow::bail!(
             "Session teardown failed, so the session record was kept (retry, or fix the \
              underlying cause and remove it again)"
-        );
-    }
-
-    // Permanent purge of a structured-view session must also drop its durable
-    // transcript so it does not orphan in the event store; the CLI opens the
-    // store directly since it has no live worker. Only after a successful
-    // teardown so a failed purge stays restorable. If the transcript can't be
-    // dropped, keep the session row (skip the removal below) rather than
-    // orphan the transcript. See #2489.
-    if let Err(e) = super::purge_acp_transcript(&inst) {
-        release_purge_claim(&storage, &removed_id);
-        anyhow::bail!(
-            "Session teardown succeeded but its transcript could not be purged, so the session \
-             record was kept (retry, or remove it once the event store is reachable): {e}"
         );
     }
 
@@ -336,68 +311,28 @@ pub async fn run(profile: &str, args: RemoveArgs) -> Result<()> {
         }
     }
 
-    // Phase 2 (locked): drop the entry by id from the latest disk state.
-    // #2534: revalidate under the lock. The destructive teardown above ran on
-    // an unlocked snapshot; if this purge targeted a trashed session and a
-    // concurrent restore untrashed it in the meantime, the restore must win, so
-    // keep the row instead of deleting a session the user just brought back.
-    // A no-op when a peer already removed it; that is the correct semantics.
-    let outcome = storage.update(|all_instances, _groups| {
-        Ok(crate::session::claim::finalize_purge_removal(
-            all_instances,
-            &removed_id,
-            was_trashed,
-        ))
-    })?;
-
-    if matches!(outcome, crate::session::claim::PurgeCommit::KeptRestored) {
-        eprintln!(
-            "Warning: session {} was restored while its purge was running; kept the \
-             restored record, but its worktree, branch, container, or transcript may \
-             already have been removed by the purge. Inspect and repair it.",
-            removed_title
-        );
-        return Ok(());
-    }
-
-    // Keep the project in the new-session wizard's Recent tab after its last
-    // session is gone (#2141). Best-effort; a failure must not fail the remove.
-    if matches!(outcome, crate::session::claim::PurgeCommit::Removed) {
-        if let Some(entry) = crate::session::recent_project_entry_for(&inst) {
-            if let Err(e) = crate::session::record_recent_project(entry) {
-                tracing::warn!(target: "session.delete",
-                    "recording recent project after remove failed: {e}");
-            }
+    // The transaction durably removed the row before returning. Keep the
+    // project in the new-session wizard's Recent tab after its last session is
+    // gone (#2141). Best-effort; a failure must not fail the remove.
+    if let Some(entry) = crate::session::recent_project_entry_for(&inst) {
+        if let Err(e) = crate::session::record_recent_project(entry) {
+            tracing::warn!(target: "session.delete",
+                "recording recent project after remove failed: {e}");
         }
     }
 
     println!(
         "  Removed session: {} (from profile '{}')",
-        removed_title,
-        storage.profile()
+        removed_title, storage_profile
     );
 
     Ok(())
 }
 
-/// Release the teardown's in-flight Trash claim on a no-relocation terminal
-/// path (the relocation paths release inside `commit_trash_relocation`).
-/// Ownership-guarded; best-effort, a stranded claim self-heals via the TTL.
-fn release_trash_claim_best_effort(storage: &Storage, removed_id: &str) {
+/// Release the teardown's trash reservation on a no-relocation terminal path.
+fn release_trash_reservation_best_effort(storage: &Storage, removed_id: &str, generation: u64) {
     let _ = storage.update(|all_instances, _groups| {
-        crate::session::claim::release_trash_claim(all_instances, removed_id);
-        Ok(())
-    });
-}
-
-/// Release a purge claim on a kept row (teardown or transcript failed),
-/// ownership-guarded so a peer's fresh Restore claim is never cleared.
-/// Best-effort: a stranded claim self-heals via the TTL. See #2541.
-fn release_purge_claim(storage: &Storage, removed_id: &str) {
-    let _ = storage.update(|all_instances, _groups| {
-        if let Some(stored) = all_instances.iter_mut().find(|i| i.id == removed_id) {
-            stored.clear_op_claim_if_owned(ClaimOp::Purge);
-        }
+        crate::session::claim::release_trash_reservation(all_instances, removed_id, generation);
         Ok(())
     });
 }
@@ -488,10 +423,13 @@ mod tests {
         let live = Instance::new("s", "/tmp/x");
         let id = live.id.clone();
         let mut all = vec![live];
+        assert!(matches!(
+            crate::session::claim::decide_purge_claim(&mut all, &id, false, Utc::now()).unwrap(),
+            crate::session::claim::PurgeClaimDecision::Claimed(1)
+        ));
         assert_eq!(
-            crate::session::claim::decide_purge_claim(&mut all, &id, false, Utc::now()),
-            crate::session::claim::PurgeClaimDecision::Claimed
+            all[0].lifecycle_reservation.as_ref().map(|c| c.op),
+            Some(LifecycleOperation::Purge)
         );
-        assert_eq!(all[0].op_claim.as_ref().map(|c| c.op), Some(ClaimOp::Purge));
     }
 }

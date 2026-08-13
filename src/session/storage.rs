@@ -53,6 +53,10 @@
 //! (RAII drop order). The closure passed to `update` is
 //! `FnOnce(...) -> Result<R>` and cannot await, so `std::sync::Mutex` is
 //! safe across the body even on the tokio runtime.
+//! Session launch callers additionally hold a per-instance lifecycle flock.
+//! The only permitted order is lifecycle flock, then the short-lived storage
+//! mutex/flock taken by `update`; a caller that already holds a lifecycle lock
+//! must use the internal locked launch path rather than reacquiring it.
 //!
 //! Closures must remain CPU/memory only (no network, no user input, no tmux
 //! work). A closure that hangs holds both layers indefinitely and blocks
@@ -88,6 +92,9 @@ const STORAGE_LOCK_FILENAME: &str = ".storage.lock";
 /// Sidecar lock file name for the global workspace-ordering file. Lives in
 /// `<app_dir>` next to `workspace-ordering.json`.
 const WORKSPACE_LOCK_FILENAME: &str = ".workspace-ordering.lock";
+/// Sidecar lock prefix for one session's launch lifecycle. The validated
+/// instance id is appended verbatim, yielding one lock per (profile, instance).
+const INSTANCE_LIFECYCLE_LOCK_PREFIX: &str = ".instance-lifecycle-";
 
 /// Emit a tracing warn if the cross-process `flock` is held by a peer for
 /// longer than this. Surfaces a wedged peer in `aoe logs` instead of a
@@ -447,6 +454,29 @@ impl Storage {
     /// watcher.
     pub fn open_unwatched(profile: &str) -> Result<Self> {
         Self::open(profile, FileWatchService::noop())
+    }
+
+    /// Serialize launch/restart and explicit resume-target mutation for one
+    /// instance across every process using this profile.
+    ///
+    /// This lock is deliberately distinct from `.storage.lock`: lifecycle
+    /// callers hold it while invoking `Storage::update`, so reusing the storage
+    /// flock would deadlock. Every lifecycle caller acquires this lock first,
+    /// then takes short-lived storage flocks as needed.
+    pub(crate) fn acquire_instance_lifecycle_lock(
+        &self,
+        instance_id: &str,
+    ) -> Result<StorageFlock> {
+        super::validate_instance_id(instance_id)
+            .context("refusing lifecycle lock for invalid instance id")?;
+        let profile_dir = self
+            .sessions_path
+            .parent()
+            .ok_or_else(|| anyhow!("sessions path has no profile directory"))?;
+        acquire_storage_flock(
+            profile_dir,
+            &format!("{INSTANCE_LIFECYCLE_LOCK_PREFIX}{instance_id}.lock"),
+        )
     }
 
     pub fn profile(&self) -> &str {
@@ -1815,6 +1845,42 @@ mod tests {
                 "missing inst-{tid}"
             );
         }
+        Ok(())
+    }
+    #[test]
+    #[serial]
+    fn instance_lifecycle_lock_serializes_same_profile_and_instance() -> Result<()> {
+        let temp = tempdir()?;
+        let _guard = setup_test_home(temp.path());
+        let profile = "test-instance-lifecycle-lock";
+        let instance_id = Instance::new("locked", "/tmp/locked").id;
+        let storage = Storage::new_unwatched(profile)?;
+        let first = storage.acquire_instance_lifecycle_lock(&instance_id)?;
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let peer = Storage::new_unwatched(profile).unwrap();
+                let _second = peer.acquire_instance_lifecycle_lock(&instance_id).unwrap();
+                acquired_tx.send(()).unwrap();
+            });
+            assert!(
+                acquired_rx
+                    .recv_timeout(Duration::from_millis(150))
+                    .is_err(),
+                "peer acquired the same lifecycle lock before release"
+            );
+            drop(first);
+            acquired_rx
+                .recv_timeout(Duration::from_secs(2))
+                .expect("peer did not acquire lifecycle lock after release");
+        });
+        assert!(
+            storage
+                .acquire_instance_lifecycle_lock("../escape")
+                .is_err(),
+            "lock filename must reject an unsafe instance id"
+        );
         Ok(())
     }
 

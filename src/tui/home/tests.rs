@@ -8404,13 +8404,12 @@ fn trash_offloads_blocking_teardown_to_poller() {
     );
 }
 
-/// Trashing marks the teardown as in flight on the durable row: `d` sets the
-/// Trash claim under the storage flock so peer processes observe the teardown
-/// as state instead of inferring it. Driven directly against storage because
-/// `merge_user_action_diff` deliberately drops `op_claim` (#2541).
+/// Trashing reserves a durable lifecycle generation before queueing teardown.
+/// The worker may already have completed and released the lease by the time the
+/// test reloads, but the monotonic generation proves ownership was acquired.
 #[test]
 #[serial]
-fn trash_sets_durable_teardown_claim() {
+fn trash_reserves_durable_lifecycle_generation() {
     let mut env = create_test_env_with_sessions(2);
     let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
@@ -8418,19 +8417,13 @@ fn trash_sets_durable_teardown_claim() {
     env.view.trash_session_by_id(&id);
 
     let rows = env.view.storages.get("test").unwrap().load().unwrap();
-    let row = rows.iter().find(|i| i.id == id).unwrap();
+    let row = rows.iter().find(|instance| instance.id == id).unwrap();
     assert!(row.is_trashed());
-    assert_eq!(
-        row.op_claim.as_ref().map(|c| c.op),
-        Some(crate::session::ClaimOp::Trash),
-        "the durable row must carry the in-flight Trash claim"
-    );
+    assert_eq!(row.lifecycle_generation, 1);
 }
 
-/// The teardown's no-relocation terminal path releases the durable Trash
-/// claim: a plain (non-worktree) session's teardown ends in `Skipped`, and
-/// draining that result must clear the claim set at `d` time, leaving a
-/// trashed row with no in-flight marker.
+/// A plain session's no-relocation teardown releases its durable Trash reservation
+/// before the worker publishes completion.
 #[test]
 #[serial]
 fn trash_teardown_release_clears_durable_claim() {
@@ -8449,14 +8442,8 @@ fn trash_teardown_release_clears_durable_claim() {
             .find(|i| i.id == id)
             .unwrap()
     };
-    assert_eq!(
-        row(&env.view).op_claim.as_ref().map(|c| c.op),
-        Some(crate::session::ClaimOp::Trash),
-        "claim set at d time"
-    );
 
-    // Drain the worker's (Skipped) teardown result; the drain is the
-    // terminal path and must release the claim.
+    // Drain the worker's completed transition.
     let mut drained = false;
     for _ in 0..100 {
         env.view.apply_trash_results();
@@ -8470,7 +8457,7 @@ fn trash_teardown_release_clears_durable_claim() {
     let final_row = row(&env.view);
     assert!(final_row.is_trashed(), "row stays trashed");
     assert_eq!(
-        final_row.op_claim, None,
+        final_row.lifecycle_reservation, None,
         "Skipped teardown must release the Trash claim"
     );
 }
@@ -8504,7 +8491,7 @@ fn trash_then_immediate_restore_hands_off_cleanly() {
     let restored = row(&env.view);
     assert!(!restored.is_trashed(), "restore must win instantly");
     assert_eq!(
-        restored.op_claim, None,
+        restored.lifecycle_reservation, None,
         "restore seized the Trash claim and released it on commit"
     );
 
@@ -8521,7 +8508,10 @@ fn trash_then_immediate_restore_hands_off_cleanly() {
     assert!(drained, "teardown result never drained");
     let final_row = row(&env.view);
     assert!(!final_row.is_trashed(), "row stays restored");
-    assert_eq!(final_row.op_claim, None, "no claim resurrected");
+    assert_eq!(
+        final_row.lifecycle_reservation, None,
+        "no claim resurrected"
+    );
 }
 
 /// Right-clicking the synthetic Trash section header opens the bulk menu
@@ -8598,7 +8588,7 @@ fn right_click_archived_header_shows_restore_menu() {
 }
 
 /// "Empty Trash" routes through a destructive confirm carrying the count; the
-/// confirmed action marks every trashed row for deletion (claimed + Deleting).
+/// confirmed action queues every trashed row without taking a flock.
 #[test]
 #[serial]
 fn empty_trash_confirm_purges_every_trashed_row() {
@@ -8626,11 +8616,7 @@ fn empty_trash_confirm_purges_every_trashed_row() {
         assert_eq!(
             inst.status,
             Status::Deleting,
-            "each trashed row must be claimed and marked Deleting"
-        );
-        assert!(
-            env.view.purge_claimed.contains(id),
-            "each row's purge claim must be owned"
+            "each trashed row must be marked Deleting"
         );
     }
 }
@@ -16967,6 +16953,29 @@ mod save_field_merge {
         .unwrap();
         (temp, guard, view, id)
     }
+    #[test]
+    #[serial]
+    fn delete_action_does_not_wait_for_lifecycle_flock() {
+        use crate::tui::dialogs::DeleteOptions;
+
+        let (_temp, _guard, mut view, id) =
+            boot_view_with_one_session("session", "/tmp/delete-lock");
+        view.selected_session = Some(id.clone());
+        let storage = Storage::new_unwatched("test").unwrap();
+        let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&id).unwrap();
+
+        let started = std::time::Instant::now();
+        view.delete_selected(&DeleteOptions::default()).unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "the event-loop action must only enqueue deletion"
+        );
+        assert_eq!(
+            view.get_instance(&id).map(|instance| instance.status),
+            Some(crate::session::Status::Deleting)
+        );
+        drop(lifecycle_lock);
+    }
 
     #[test]
     #[serial]
@@ -18089,7 +18098,7 @@ mod apply_session_id_updates {
 
     use super::*;
     use crate::session::poller::SessionPoller;
-    use crate::session::ResumeIntent;
+    use crate::session::{ResumeIntent, View};
     use std::sync::{Arc, Mutex};
 
     const NEW_SID: &str = "019342ab-1111-7aaa-8bbb-cccdddeeefff";
@@ -18398,6 +18407,75 @@ mod apply_session_id_updates {
             captured_env(&expected_name).is_none(),
             "no tmux session means no publish target"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn repair_session_id_pollers_skips_structured_and_repairs_live_terminal() {
+        if skip_if_no_tmux() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let _guard = setup_test_home(&temp);
+
+        let profile = "apply-poller-repair";
+        let terminal = fresh_instance(profile, "repair-terminal");
+        let mut structured = fresh_instance(profile, "repair-structured");
+        structured.view = View::Structured;
+        let mut view = build_view_with_inst(profile, &terminal);
+        view.instances
+            .insert(structured.id.clone(), structured.clone());
+        let terminal_stopped = Arc::new(Mutex::new(SessionPoller::new("stopped".to_string())));
+        let structured_stopped = Arc::new(Mutex::new(SessionPoller::new("stopped".to_string())));
+        view.instances
+            .get_mut(&terminal.id)
+            .unwrap()
+            .session_id_poller = Some(terminal_stopped.clone());
+        view.instances
+            .get_mut(&structured.id)
+            .unwrap()
+            .session_id_poller = Some(structured_stopped.clone());
+        let _tmux = TmuxSession::create(&terminal.id, &terminal.title);
+
+        assert!(!view.apply_session_id_updates());
+        assert!(
+            Arc::ptr_eq(
+                &view
+                    .instances
+                    .get(&terminal.id)
+                    .and_then(|i| i.session_id_poller.clone())
+                    .expect("drain should retain the stopped poller"),
+                &terminal_stopped,
+            ),
+            "the hot drain path must not repair pollers"
+        );
+
+        view.repair_session_id_pollers();
+        let repaired = view
+            .instances
+            .get(&terminal.id)
+            .and_then(|i| i.session_id_poller.clone())
+            .expect("live pane should receive a replacement poller");
+        assert!(!Arc::ptr_eq(&repaired, &terminal_stopped));
+        assert!(repaired
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_running());
+        assert!(
+            Arc::ptr_eq(
+                &view
+                    .instances
+                    .get(&structured.id)
+                    .and_then(|i| i.session_id_poller.clone())
+                    .expect("structured poller should be untouched"),
+                &structured_stopped,
+            ),
+            "structured sessions must not probe tmux or start terminal pollers"
+        );
+        repaired
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .stop();
     }
 
     /// Discarding unsaved Settings changes via a mouse click on the

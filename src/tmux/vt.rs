@@ -626,7 +626,10 @@ fn capture_seed_snapshot(target: &str) -> Option<(Vec<u8>, PaneSeedState)> {
         };
         // The alternate screen has no scrollback, so only the normal buffer
         // pulls history (`-S`); the pane keeps that history across re-arms.
-        let mut args = vec!["capture-pane", "-t", target, "-p", "-e"];
+        // `-N` keeps trailing bg-styled fills (a modal backdrop painted as
+        // full-width styled spaces) so the seeded grid renders them the same
+        // way live chunks do (#3336).
+        let mut args = vec!["capture-pane", "-t", target, "-p", "-e", "-N"];
         if !pre.alt {
             args.extend_from_slice(&["-S", &seed_start]);
         }
