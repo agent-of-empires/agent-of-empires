@@ -3555,7 +3555,7 @@
       "risk": "medium",
       "specs": ["src/components/plugin/__tests__/PluginSlots.test.tsx"],
       "components": ["web/src/components/plugin/PluginSlots.tsx"],
-      "notes": "The api_version 12 pane block vocabulary: callout, bar and columns, plus the interactive row (clicking a row fires its `method` with the block's `params`, e.g. github.select_pr) and the pinned pane footer."
+      "notes": "The api_version 12 pane block vocabulary: callout, bar and columns, plus the interactive row (clicking a row fires its `method` with the block's `params`, e.g. github.select_pr) and the pinned pane footer. api_version 13 adds the sparkline block (per-sample band coloring) and the global home-pane slot (PluginHomePanes), covered by the sparkline and home-pane cases in PluginSlots.test.tsx."
     },
     {
       "id": "plugins.composer-actions",

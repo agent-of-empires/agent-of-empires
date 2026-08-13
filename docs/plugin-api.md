@@ -19,10 +19,10 @@ A manifest carries two independent version axes.
 
 | Key | Meaning |
 |---|---|
-| `api_version` | The manifest *schema* version. The current schema is `12`. The host rejects a manifest whose `api_version` is newer than it supports. Bump it as you adopt newer sections (see below). |
+| `api_version` | The manifest *schema* version. The current schema is `13`. The host rejects a manifest whose `api_version` is newer than it supports. Bump it as you adopt newer sections (see below). |
 | `aoe_version` | A semver requirement on the *host app* version, e.g. `">=1.11.0, <2.0.0"`. The host refuses to install, and skips loading, a plugin whose requirement excludes the running version. Optional; requires `api_version >= 4`. |
 
-Schema additions by `api_version`: `2` added contributions (commands, keybinds, settings, ui), `3` added the `pane` UI slot, `4` added `status` and `aoe_version`, `5` added `screenshots`, `6` added a command `action`, `7` added identity icons, `8` added the `composer-action` UI slot, `9` added session-driving worker RPCs (see [Session-driving RPCs](#session-driving-rpcs)), plugin-private storage, and the `dynamic_select` / `object_list` / `cron` settings widgets, `10` added the `tool-card-badge` UI slot, `11` added the `acp.capabilities.probe` RPC + capability, a `thinking` (thought-level) list on the capability response, the `dynamic_multi_select` object-list field widget, and an optional `project_path` (empty = scratch session), `extra_project_paths`, and a `sandbox` flag on `sessions.create`, plus a `multiline` attribute for `string` settings fields, `12` grew the pane block vocabulary (see [Pane payload](#pane-payload)): the `callout`, `bar` and `columns` kinds, clickable `row`s carrying `params`, header summaries and scrollable bodies on `section`, `disabled` / `variant` / `href` on `action`, and a pane-level `footer`.
+Schema additions by `api_version`: `2` added contributions (commands, keybinds, settings, ui), `3` added the `pane` UI slot, `4` added `status` and `aoe_version`, `5` added `screenshots`, `6` added a command `action`, `7` added identity icons, `8` added the `composer-action` UI slot, `9` added session-driving worker RPCs (see [Session-driving RPCs](#session-driving-rpcs)), plugin-private storage, and the `dynamic_select` / `object_list` / `cron` settings widgets, `10` added the `tool-card-badge` UI slot, `11` added the `acp.capabilities.probe` RPC + capability, a `thinking` (thought-level) list on the capability response, the `dynamic_multi_select` object-list field widget, and an optional `project_path` (empty = scratch session), `extra_project_paths`, and a `sandbox` flag on `sessions.create`, plus a `multiline` attribute for `string` settings fields, `12` grew the pane block vocabulary (see [Pane payload](#pane-payload)): the `callout`, `bar` and `columns` kinds, clickable `row`s carrying `params`, header summaries and scrollable bodies on `section`, `disabled` / `variant` / `href` on `action`, and a pane-level `footer`, `13` added the global `home-pane` UI slot (a host-wide docked pane carrying the same block vocabulary as `pane`) and the `sparkline` block kind (a history plot with optional per-sample `bands` coloring).
 
 ## Top-level fields
 
@@ -41,7 +41,7 @@ capabilities = ["runtime.worker"]
 | `id` | string | yes | Plugin id (see [Plugin id](#plugin-id)). Namespaces config, events, and action names. |
 | `name` | string | yes | Human-readable display name. |
 | `version` | string | yes | Semantic version of the plugin. |
-| `api_version` | integer | yes | Manifest schema version, `1` to `12`. |
+| `api_version` | integer | yes | Manifest schema version, `1` to `13`. |
 | `description` | string | no | Shown in plugin listings. Defaults to empty. |
 | `aoe_version` | string | no | Host-app semver requirement. Requires `api_version >= 4`. |
 | `capabilities` | array of string | no | Runtime grants the worker needs (see [Capabilities](#capabilities)). Static contributions need none. |
@@ -357,6 +357,7 @@ id = "my_pane"
 | `row-column` | per-session | A text column on the session row. |
 | `detail-badge` | per-session | A badge in the session detail view. |
 | `pane` | per-session | A dockable tool-window pane (requires `api_version >= 3`). See [Pane payload](#pane-payload). |
+| `home-pane` | global | A host-wide docked pane on the dashboard overview and the structured-view pane overlay, carrying the same block vocabulary as `pane` but session-less (requires `api_version >= 13`). Several plugins' home panes stack in snapshot order. |
 | `settings-page` | global | A full page under Settings, using the same block vocabulary as `pane` (requires `api_version >= 10`). |
 | `composer-action` | per-session | A button beside the ACP composer controls (requires `api_version >= 8`). |
 | `tool-card-badge` | per-session | A pill on a transcript MCP or skill tool-call card, matched by target (requires `api_version >= 10`). |
@@ -408,6 +409,7 @@ anything to attach to).
 | `section` | | `title`, `children`, `value`, `value_tone`, `badges`, `icon`, `tone`, `boxed`, `scroll`, `collapsible`, `collapsed` |
 | `callout` | one of `title` / `detail` | `icon`, `tone`, `color`, `actions` |
 | `bar` | `segments` | `caption` |
+| `sparkline` | `values` | `max`, `tone`, `bands`, `caption` (requires `api_version >= 13`) |
 | `columns` | `children` | |
 | `action` | `label`, plus one of `method` / `href` / `disabled` | `icon`, `tone`, `tooltip`, `variant` |
 | `comment` | one of `author` / `body` | `path`, `line`, `resolved`, `href` |
@@ -441,6 +443,14 @@ pane is telling the user; use a `section` for a list.
 **`bar`** is a proportional stacked bar over `segments`, each
 `{ value, tone?, color?, label? }`. Segments without a positive numeric `value` are
 dropped, and a bar left with nothing renders nothing. `caption` sits beneath it.
+
+**`sparkline`** plots `values` (an array of numbers, oldest first) as a compact
+history line. `max` fixes the top of the scale (default: the largest value), so a
+series plots against a stable ceiling instead of auto-scaling each refresh; a
+single `tone` colors the whole line. `bands` is a list of `{ at, tone }`
+thresholds that recolor each sample by the highest band its value reaches, for a
+green/amber/red pressure line. `caption` sits beneath. An empty `values` renders
+nothing.
 
 **`columns`** lays its `children` side by side in equal fractions. A single child
 spans the full width, so eliding one card collapses the row cleanly rather than

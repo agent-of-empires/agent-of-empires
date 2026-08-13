@@ -8177,6 +8177,53 @@ fn pollable_instances_recovers_after_inflight_clear() {
     assert_eq!(env.view.pollable_instances().len(), 1);
 }
 
+#[test]
+#[serial]
+fn system_health_survives_refresh_but_closes_on_selection_change() {
+    let mut env = create_test_env_with_sessions(2);
+    env.view.update_selected();
+    env.view.open_system_health();
+
+    env.view.update_selected();
+    assert!(env.view.system_health_open);
+
+    env.view.cursor = 1;
+    env.view.update_selected();
+    assert!(!env.view.system_health_open);
+}
+
+#[test]
+#[serial]
+fn system_health_tip_requires_three_six_agent_samples() {
+    let mut env = create_test_env_empty();
+    env.view.metrics.counts.agents = 6;
+
+    env.view.observe_system_health_tip_load();
+    env.view.observe_system_health_tip_load();
+    assert!(!env.view.system_health_tip_earned);
+    assert!(env.view.pending_tip_pop.is_none());
+
+    env.view.metrics.counts.agents = 5;
+    env.view.observe_system_health_tip_load();
+    assert_eq!(env.view.system_health_tip_high_samples, 0);
+
+    env.view.metrics.counts.agents = 6;
+    for _ in 0..3 {
+        env.view.observe_system_health_tip_load();
+    }
+    assert!(env.view.system_health_tip_earned);
+    assert_eq!(
+        env.view.pending_tip_pop.map(|tip| tip.id),
+        Some("system-health")
+    );
+
+    env.view.open_system_health();
+    assert!(env.view.pending_tip_pop.is_none());
+    let config = crate::session::Config::load().unwrap();
+    assert!(config.app_state.system_health_tip_earned);
+    assert!(config.app_state.used_system_health);
+}
+
 /// Footer discoverability hints track where each key actually does something.
 /// Archive/Snooze are Attention-only. Fav follows its keybind's own gate
 /// (`Context::FavoritesUsable`): usable in Attention, or in any sort order
@@ -8736,8 +8783,8 @@ fn shelf_renders_trash_with_glyph_and_divider_sort() {
         "shelf must show the Trash count"
     );
     assert!(
-        screen.contains("sort:"),
-        "the sort indicator rides the shelf divider"
+        !screen.contains("sort:"),
+        "the shelf divider must not duplicate the header's sort indicator"
     );
     assert!(
         env.view.shelf_inner_area.height > 0,

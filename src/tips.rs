@@ -27,6 +27,10 @@ pub struct TipSignals {
     /// Whether the user has already used `N` (new-from-selection). Once true,
     /// the tip teaching it is suppressed; they've discovered the feature.
     pub used_new_from_selection: bool,
+    /// Whether concurrent load has earned the System Health discovery tip.
+    pub system_health_tip_earned: bool,
+    /// Whether the user has already opened the detailed System Health view.
+    pub used_system_health: bool,
 }
 
 /// Number of `new_session_with_selection` opens before the "new from
@@ -34,6 +38,8 @@ pub struct TipSignals {
 /// their first session, but someone who keeps opening `n` with a row selected
 /// eventually learns about `N`.
 pub const NEW_FROM_SELECTION_TIP_THRESHOLD: u32 = 3;
+pub const SYSTEM_HEALTH_AGENT_THRESHOLD: usize = 6;
+pub const SYSTEM_HEALTH_SAMPLE_THRESHOLD: u8 = 3;
 
 /// Which surface a tip is meant for. A tip lists every surface it applies to in
 /// [`Tip::surfaces`], so keyboard-only hints (the `N` shortcut) stay out of the
@@ -99,6 +105,10 @@ fn earned_new_from_selection(signals: &TipSignals) -> bool {
         && signals.new_session_with_selection_count >= NEW_FROM_SELECTION_TIP_THRESHOLD
 }
 
+fn earned_system_health(signals: &TipSignals) -> bool {
+    signals.system_health_tip_earned && !signals.used_system_health
+}
+
 /// The full catalog, in display order.
 pub fn catalog() -> &'static [Tip] {
     CATALOG
@@ -116,6 +126,15 @@ static CATALOG: &[Tip] = &[
                all of them from the session you have selected.",
         trigger: TipTrigger::Earned(earned_new_from_selection),
         // Teaches a keyboard shortcut, so it only makes sense in the TUI.
+        surfaces: &[TipSurface::Tui],
+    },
+    Tip {
+        id: "system-health",
+        title: "See what your agents are costing",
+        body: "You have 6 or more agents running. Turn on the System Health strip in \
+               Settings, or open System Health from the command palette, to see CPU, \
+               memory, load, swap, and per-agent usage.",
+        trigger: TipTrigger::Earned(earned_system_health),
         surfaces: &[TipSurface::Tui],
     },
     Tip {
@@ -288,6 +307,7 @@ mod tests {
         TipSignals {
             new_session_with_selection_count: count,
             used_new_from_selection: false,
+            ..TipSignals::default()
         }
     }
 
@@ -320,6 +340,7 @@ mod tests {
         let used = TipSignals {
             new_session_with_selection_count: NEW_FROM_SELECTION_TIP_THRESHOLD + 5,
             used_new_from_selection: true,
+            ..TipSignals::default()
         };
         assert!(!tip.is_eligible(TipSurface::Tui, &used));
         // The earned tip drops out, but rotation TUI tips remain.
@@ -371,6 +392,24 @@ mod tests {
             ),
             base
         );
+    }
+
+    #[test]
+    fn system_health_tip_requires_earned_and_undiscovered() {
+        let tip = by_id("system-health").unwrap();
+        let cases = [
+            (false, false, false),
+            (true, false, true),
+            (true, true, false),
+        ];
+        for (earned, used, expected) in cases {
+            let signals = TipSignals {
+                system_health_tip_earned: earned,
+                used_system_health: used,
+                ..TipSignals::default()
+            };
+            assert_eq!(tip.is_eligible(TipSurface::Tui, &signals), expected);
+        }
     }
 
     #[test]

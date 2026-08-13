@@ -751,6 +751,21 @@ pub struct HomeView {
     pub(super) status_poller: StatusPoller,
     pub(super) pending_status_refresh: bool,
 
+    // Compact system-health strip controlled by `session.show_diagnostics_pane`.
+    // The poller samples host resources and agent counts off the UI thread;
+    // `metrics` holds the latest sample for the strip and detail view.
+    pub(super) show_diagnostics: bool,
+    pub(super) metrics_poller: super::metrics_poller::MetricsPoller,
+    pub(super) pending_metrics_refresh: bool,
+    pub(super) metrics: crate::process::metrics::MetricsSnapshot,
+    pub(super) system_health_open: bool,
+    pub(super) system_health_scroll: usize,
+    pub(super) diagnostics_area: Rect,
+    pub(super) diagnostics_hovered: bool,
+    pub(super) system_health_tip_high_samples: u8,
+    pub(super) system_health_tip_earned: bool,
+    pub(super) system_health_discovered: bool,
+
     // Structured (ACP) rows: the tmux poller above bails on them, so their
     // status comes from the daemon instead. See `daemon_status_poller`.
     #[cfg(feature = "serve")]
@@ -1173,6 +1188,8 @@ pub(super) fn tips_unseen_count(config: &crate::session::Config) -> usize {
         &crate::tips::TipSignals {
             new_session_with_selection_count: config.app_state.new_session_with_selection_count,
             used_new_from_selection: config.app_state.used_new_from_selection,
+            system_health_tip_earned: config.app_state.system_health_tip_earned,
+            used_system_health: config.app_state.used_system_health,
         },
     )
 }
@@ -2278,6 +2295,21 @@ impl HomeView {
             available_tools,
             status_poller: StatusPoller::new(),
             pending_status_refresh: false,
+            show_diagnostics: resolved.session.show_diagnostics_pane,
+            metrics_poller: super::metrics_poller::MetricsPoller::new(),
+            pending_metrics_refresh: false,
+            metrics: crate::process::metrics::MetricsSnapshot::default(),
+            system_health_open: false,
+            system_health_scroll: 0,
+            diagnostics_area: Rect::default(),
+            diagnostics_hovered: false,
+            system_health_tip_high_samples: 0,
+            system_health_tip_earned: user_config
+                .as_ref()
+                .is_some_and(|config| config.app_state.system_health_tip_earned),
+            system_health_discovered: user_config
+                .as_ref()
+                .is_some_and(|config| config.app_state.used_system_health),
             #[cfg(feature = "serve")]
             daemon_status_poller: super::daemon_status_poller::DaemonStatusPoller::new(),
             #[cfg(feature = "serve")]
@@ -2862,6 +2894,124 @@ impl HomeView {
                 self.reset_status_refresh();
                 true
             }
+        }
+    }
+
+    /// Request a system-health sample in the background while either health
+    /// surface is visible. Call `apply_metrics_updates` to pick up the result.
+    pub fn request_metrics_refresh(&mut self) {
+        let instances = self.pollable_instances();
+        let tip_candidate = !self.system_health_tip_earned
+            && !self.system_health_discovered
+            && instances.len() >= crate::tips::SYSTEM_HEALTH_AGENT_THRESHOLD;
+        if (self.show_diagnostics || self.system_health_open || tip_candidate)
+            && !self.pending_metrics_refresh
+        {
+            self.metrics_poller.request_refresh(instances);
+            self.pending_metrics_refresh = true;
+        }
+    }
+
+    /// Apply any pending metrics sample. Returns true if a sample was applied
+    /// so the caller can repaint the live readouts.
+    pub fn apply_metrics_updates(&mut self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+
+        match self.metrics_poller.try_recv_updates() {
+            Ok(snapshot) => {
+                self.metrics = snapshot;
+                self.observe_system_health_tip_load();
+                self.pending_metrics_refresh = false;
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                // The sampler thread died (a panic in sample_memory /
+                // count_running_agents). Respawn so pending_metrics_refresh
+                // does not stay stuck and freeze the strip.
+                tracing::error!(
+                    target: "tui.home",
+                    "metrics poller worker gone; respawning a fresh poller",
+                );
+                self.metrics_poller = super::metrics_poller::MetricsPoller::new();
+                self.pending_metrics_refresh = false;
+                false
+            }
+        }
+    }
+
+    /// Toggle the diagnostics strip and persist the new state to
+    /// `session.show_diagnostics_pane` so it survives restarts.
+    pub fn toggle_diagnostics(&mut self) {
+        self.show_diagnostics = !self.show_diagnostics;
+        let enabled = self.show_diagnostics;
+        if let Err(e) = update_config(|config| {
+            config.session.show_diagnostics_pane = enabled;
+        }) {
+            tracing::warn!(
+                target: "tui.home",
+                "failed to persist show_diagnostics_pane: {e}",
+            );
+        }
+    }
+
+    pub fn open_system_health(&mut self) {
+        self.system_health_discovered = true;
+        if self.pending_tip_pop.map(|tip| tip.id) == Some("system-health") {
+            self.pending_tip_pop = None;
+        }
+        let already_used = load_config()
+            .ok()
+            .flatten()
+            .is_some_and(|config| config.app_state.used_system_health);
+        if !already_used {
+            if let Err(error) = update_app_state(|state| state.used_system_health = true) {
+                tracing::warn!(target: "tui.home", "failed to persist System Health discovery: {error}");
+            } else if let Ok(config) = load_config().map(|config| config.unwrap_or_default()) {
+                self.tips_unseen = tips_unseen_count(&config);
+            }
+        }
+        self.system_health_open = true;
+        self.system_health_scroll = 0;
+        self.diff_view = None;
+        self.live_send = None;
+        self.request_metrics_refresh();
+    }
+
+    fn observe_system_health_tip_load(&mut self) {
+        if self.system_health_tip_earned || self.system_health_discovered {
+            return;
+        }
+        if self.metrics.counts.agents < crate::tips::SYSTEM_HEALTH_AGENT_THRESHOLD {
+            self.system_health_tip_high_samples = 0;
+            return;
+        }
+        self.system_health_tip_high_samples = self.system_health_tip_high_samples.saturating_add(1);
+        if self.system_health_tip_high_samples < crate::tips::SYSTEM_HEALTH_SAMPLE_THRESHOLD {
+            return;
+        }
+
+        self.system_health_tip_earned = true;
+        if let Err(error) = update_app_state(|state| state.system_health_tip_earned = true) {
+            tracing::warn!(target: "tui.home", "failed to persist System Health tip signal: {error}");
+            return;
+        }
+        let Ok(config) = load_config().map(|config| config.unwrap_or_default()) else {
+            return;
+        };
+        self.tips_unseen = tips_unseen_count(&config);
+        if config.session.show_tips
+            && !config.app_state.used_system_health
+            && !config
+                .app_state
+                .tips_seen
+                .iter()
+                .any(|id| id == "system-health")
+            && self.pending_tip_pop.is_none()
+        {
+            self.pending_tip_pop = crate::tips::catalog()
+                .iter()
+                .find(|tip| tip.id == "system-health");
         }
     }
 
@@ -7228,6 +7378,9 @@ impl HomeView {
         self.strict_hotkeys = config.session.strict_hotkeys;
         self.confirm_before_quit = config.session.confirm_before_quit;
         self.row_tag_mode = config.session.row_tag;
+        // Keep the strip in sync when the Settings UI or a config-file edit
+        // flips the toggle from any settings surface.
+        self.show_diagnostics = config.session.show_diagnostics_pane;
         self.agent_clipboard_forward =
             config.tmux.clipboard != crate::session::config::TmuxSettingMode::Disabled;
         self.vt_live_enabled = config.tmux.vt_live;

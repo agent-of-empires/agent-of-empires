@@ -852,6 +852,7 @@ impl App {
         let mut last_refresh_at: Option<std::time::Instant> = None;
         const REFRESH_COOLDOWN: Duration = Duration::from_millis(15);
         let mut last_status_refresh = std::time::Instant::now();
+        let mut last_metrics_sample = std::time::Instant::now();
         #[cfg(feature = "serve")]
         let mut last_daemon_status_refresh = std::time::Instant::now();
         let mut last_disk_refresh = std::time::Instant::now();
@@ -872,6 +873,10 @@ impl App {
         #[cfg(feature = "serve")]
         const DAEMON_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
         const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+        // Diagnostics-strip sampling. 1s keeps the sparkline responsive to a
+        // fast memory climb; request_metrics_refresh is a no-op unless the strip
+        // is visible, so this costs nothing when the pane is hidden.
+        const METRICS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
         // Fastest spinner (breathe) changes every 180ms; 120ms ensures smooth animation
         const SPINNER_REDRAW_INTERVAL: Duration = Duration::from_millis(120);
         const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
@@ -1111,6 +1116,8 @@ impl App {
                                                             // Sidebar collapse/expand toggle; must
                                                             // precede hit_list (button is on the
                                                             // list's top border).
+                                                        } else if self.home.handle_diagnostics_click(mouse.column, mouse.row) {
+                                                            // Compact system-health strip opened the read-only detail view.
                                                         } else if self.home.handle_tips_badge_click(mouse.column, mouse.row) {
                                                             // Footer tips badge opened the overlay;
                                                             // drop any stale preview highlight, like
@@ -1408,6 +1415,13 @@ impl App {
                                     // the collapsed strip toggled the sidebar.
                                     // Runs before hit_list because the button
                                     // lives on the list's top border.
+                                    let _ = self.home.clear_preview_selection();
+                                    self.draw(terminal)?;
+                                    None
+                                } else if self
+                                    .home
+                                    .handle_diagnostics_click(mouse.column, mouse.row)
+                                {
                                     let _ = self.home.clear_preview_selection();
                                     self.draw(terminal)?;
                                     None
@@ -1803,6 +1817,17 @@ impl App {
             if self.home.apply_status_updates() {
                 refresh_needed = true;
                 needs_full_refresh = true;
+            }
+
+            if last_metrics_sample.elapsed() >= METRICS_SAMPLE_INTERVAL {
+                self.home.request_metrics_refresh();
+                last_metrics_sample = std::time::Instant::now();
+            }
+
+            // A new sample only repaints the strip, so a diffed redraw is
+            // enough; no full clear.
+            if self.home.apply_metrics_updates() {
+                refresh_needed = true;
             }
 
             #[cfg(feature = "serve")]

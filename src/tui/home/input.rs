@@ -644,6 +644,19 @@ impl HomeView {
         }
     }
 
+    /// Open the read-only System Health view when the compact strip is clicked.
+    pub fn handle_diagnostics_click(&mut self, col: u16, row: u16) -> bool {
+        if self.has_non_live_send_overlay() {
+            return false;
+        }
+        if self.diagnostics_area.contains(Position::from((col, row))) {
+            self.open_system_health();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Click on the footer tips badge: open the tips overlay. Returns true when
     /// the click was on the badge (so the caller stops routing it). Gated on no
     /// overlay being open, the badge rect is captured behind any modal, so this
@@ -2906,6 +2919,8 @@ impl HomeView {
             }
             ActionId::ToggleContainer => self.toggle_container_for_selected(),
             ActionId::TogglePreviewInfo => self.toggle_preview_info(),
+            ActionId::ToggleDiagnostics => self.toggle_diagnostics(),
+            ActionId::OpenSystemHealth => self.open_system_health(),
             ActionId::SortPicker => self.show_sort_picker(),
             ActionId::GroupBy => self.show_group_picker(),
             ActionId::ToggleProjectPin => self.toggle_project_pin_at_cursor(),
@@ -4152,6 +4167,7 @@ impl HomeView {
     /// between the `Enter` keybind and double-click activation so the two
     /// paths can't drift.
     pub(super) fn activate_selected_session(&mut self) -> Option<Action> {
+        self.system_health_open = false;
         let id = self.selected_session.clone()?;
         if let Some(inst) = self.get_instance(&id) {
             if matches!(inst.status, Status::Deleting | Status::Creating) {
@@ -4301,6 +4317,7 @@ impl HomeView {
                 }
             }
             if self.selected_session != prev_session {
+                self.system_health_open = false;
                 self.preview_scroll_offset = 0;
                 // A finalized preview selection pins to the previous pane's
                 // cells; carried into a different session it would paint a
@@ -4669,6 +4686,10 @@ impl HomeView {
         // the wheel via `has_dialog()`.
         if let Some(view) = &mut self.settings_view {
             return view.handle_wheel_scroll(true);
+        }
+        if self.system_health_open && self.hit_preview(col, row) {
+            self.system_health_scroll = self.system_health_scroll.saturating_sub(3);
+            return true;
         }
         // A preview selection is anchored to absolute scrollback lines,
         // not screen cells, so scrolling no longer invalidates it: the
@@ -5123,6 +5144,8 @@ impl HomeView {
         let signals = crate::tips::TipSignals {
             new_session_with_selection_count: config.app_state.new_session_with_selection_count,
             used_new_from_selection: config.app_state.used_new_from_selection,
+            system_health_tip_earned: config.app_state.system_health_tip_earned,
+            used_system_health: config.app_state.used_system_health,
         };
         let eligible = crate::tips::eligible(crate::tips::TipSurface::Tui, &signals);
         self.tips_dialog = Some(TipsDialog::new(
@@ -5219,6 +5242,8 @@ impl HomeView {
         let signals = crate::tips::TipSignals {
             new_session_with_selection_count: config.app_state.new_session_with_selection_count,
             used_new_from_selection: config.app_state.used_new_from_selection,
+            system_health_tip_earned: config.app_state.system_health_tip_earned,
+            used_system_health: config.app_state.used_system_health,
         };
         self.pending_tip_pop = crate::tips::next_earned_pop(
             crate::tips::TipSurface::Tui,
@@ -5637,6 +5662,7 @@ impl HomeView {
                 None
             }
             Item::Session { id, .. } => {
+                self.system_health_open = false;
                 if self.cursor != abs_idx {
                     self.cursor = abs_idx;
                     self.update_selected();
@@ -5850,6 +5876,11 @@ impl HomeView {
             .map(|(_, key)| *key);
         let footer_changed = prev_footer_hover != self.footer_hover;
 
+        let diagnostics_hovered = !self.has_non_live_send_overlay()
+            && self.diagnostics_area.contains(Position::from((col, row)));
+        let diagnostics_changed = diagnostics_hovered != self.diagnostics_hovered;
+        self.diagnostics_hovered = diagnostics_hovered;
+
         // Hover is live over both the scrolling list and the pinned shelf, so
         // a shelf row (Trash / Archived) highlights under the pointer the same
         // way a list row does. `resolve_row_to_index` maps either region.
@@ -5870,7 +5901,11 @@ impl HomeView {
         let badge_changed = badge_hover != self.tips_badge_hovered;
         self.tips_badge_hovered = badge_hover;
 
-        overlay_changed || footer_changed || badge_changed || prev_idx != new_idx
+        overlay_changed
+            || footer_changed
+            || diagnostics_changed
+            || badge_changed
+            || prev_idx != new_idx
     }
 
     /// Route a mouse-wheel-down at (col, row); see handle_scroll_up.
@@ -5879,6 +5914,14 @@ impl HomeView {
         // Settings takeover owns the wheel; see handle_scroll_up.
         if let Some(view) = &mut self.settings_view {
             return view.handle_wheel_scroll(false);
+        }
+        if self.system_health_open && self.hit_preview(col, row) {
+            let visible_rows = crate::tui::components::diagnostics::agent_table_visible_rows(
+                self.preview_area.height,
+            );
+            let max = self.metrics.agents.len().saturating_sub(visible_rows);
+            self.system_health_scroll = self.system_health_scroll.saturating_add(3).min(max);
+            return true;
         }
         // Mirror handle_scroll_up: the selection is anchored to scrollback
         // lines, so it survives the scroll and is left in place.
