@@ -2922,11 +2922,15 @@ impl HomeView {
         match self.metrics_poller.try_recv_updates() {
             Ok(snapshot) => {
                 self.metrics = snapshot;
-                let per_mille = (snapshot.memory.used_fraction() * 1000.0).round() as u64;
-                self.metrics_history.push_back(per_mille);
-                // At most one over the cap: exactly one push per apply.
-                if self.metrics_history.len() > METRICS_HISTORY_LEN {
-                    self.metrics_history.pop_front();
+                // A sample requested while visible can arrive after the strip
+                // is hidden. Do not repopulate the history that hiding clears.
+                if self.show_diagnostics {
+                    let per_mille = (snapshot.memory.used_fraction() * 1000.0).round() as u64;
+                    self.metrics_history.push_back(per_mille);
+                    // At most one over the cap: exactly one push per apply.
+                    if self.metrics_history.len() > METRICS_HISTORY_LEN {
+                        self.metrics_history.pop_front();
+                    }
                 }
                 self.pending_metrics_refresh = false;
                 true

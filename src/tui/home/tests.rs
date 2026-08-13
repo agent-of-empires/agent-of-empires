@@ -8177,6 +8177,31 @@ fn pollable_instances_recovers_after_inflight_clear() {
     assert_eq!(env.view.pollable_instances().len(), 1);
 }
 
+#[test]
+#[serial]
+fn hidden_diagnostics_drops_an_inflight_sample_from_history() {
+    use crate::process::metrics::{MemorySample, MetricsSnapshot};
+
+    let mut env = create_test_env_empty();
+    let snapshot = MetricsSnapshot {
+        memory: MemorySample {
+            total_bytes: 100,
+            available_bytes: 25,
+            ..Default::default()
+        },
+        ..Default::default()
+    };
+    env.view.show_diagnostics = false;
+    env.view.metrics_poller =
+        super::super::metrics_poller::MetricsPoller::seeded_for_test(snapshot);
+    env.view.pending_metrics_refresh = true;
+
+    assert!(env.view.apply_metrics_updates());
+    assert_eq!(env.view.metrics, snapshot);
+    assert!(env.view.metrics_history.is_empty());
+    assert!(!env.view.pending_metrics_refresh);
+}
+
 /// Footer discoverability hints track where each key actually does something.
 /// Archive/Snooze are Attention-only. Fav follows its keybind's own gate
 /// (`Context::FavoritesUsable`): usable in Attention, or in any sort order
