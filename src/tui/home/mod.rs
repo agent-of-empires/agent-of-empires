@@ -48,31 +48,25 @@ use super::settings::SettingsView;
 use super::status_poller::{StatusPoller, StatusUpdate};
 use super::stop_poller::StopPoller;
 
-/// Header label the synthetic scratch bucket renders under in project view.
-/// Not an identity: a user's own repo whose basename happens to be `scratch`
-/// derives the same label from its path, so anything deciding whether a header
-/// has a backing repo must test the repo path, not this string (#3133).
-const SCRATCH_GROUP_LABEL: &str = "scratch";
-
-/// Extract a project group name from a session instance.
-/// Uses `worktree_info.main_repo_path` for worktree sessions (so all branches of the
-/// same repo group together), otherwise uses `project_path`. Returns the last path segment.
+/// The GroupTree identity key for a session in project mode. Worktree sessions
+/// key on `main_repo_path` (so all branches of a repo group together); other
+/// sessions key on the last segment of `project_path`. Scratch sessions key on
+/// the `SCRATCH_GROUP_PATH` sentinel, which no real repo basename can equal, so
+/// a user's own repo named `scratch` keeps a distinct identity (#3237); the
+/// bucket's display name is seeded separately in `build_flat_items_by_project`.
 fn project_group_key(inst: &Instance) -> String {
-    // Scratch sessions live under `<app_dir>/scratch/<instance-id>/`, so the last
-    // path segment is the opaque instance id. Group them under a readable label.
     if inst.scratch {
-        return SCRATCH_GROUP_LABEL.to_string();
+        return crate::session::SCRATCH_GROUP_PATH.to_string();
     }
 
     crate::session::projects::repo_label(inst.repo_path())
 }
 
 /// Header label the synthetic "no resolvable owner" bucket renders under in
-/// org view. Not an identity, same caveat as `SCRATCH_GROUP_LABEL`: a hosted
-/// remote whose owner happens to literally be named "No organization" would
-/// share this header, but that collision is vanishingly unlikely in practice
-/// (unlike `scratch`, a plausible real repo basename) so it is not guarded
-/// against the way `is_synthetic_scratch_header` guards the scratch label.
+/// org view. This is a display label; a hosted remote whose owner is literally
+/// "No organization" would share it, but that collision is vanishingly unlikely
+/// (unlike `scratch`, a plausible real repo basename), so org does not give it a
+/// sentinel identity the way project mode does for scratch (#3237).
 const NO_ORG_GROUP_LABEL: &str = "No organization";
 
 /// Kinds of in-progress mouse drags. Today only the list/preview divider
@@ -5119,7 +5113,7 @@ impl HomeView {
             .map(|i| i.group_path.clone())
             .filter(|p| !p.is_empty())
             .collect();
-        let empty_pinned: Vec<crate::session::Group> =
+        let mut seed_groups: Vec<crate::session::Group> =
             crate::session::projects::unpopulated_projects(
                 &populated_labels,
                 &self.registered_projects,
@@ -5127,7 +5121,18 @@ impl HomeView {
             .into_iter()
             .map(|p| crate::session::Group::new(&p.label, &p.label))
             .collect();
-        let mut tree = GroupTree::new_with_groups(&tree_seed, &empty_pinned);
+        // The synthetic scratch bucket keys on a sentinel path so a real repo
+        // named `scratch` keeps its own identity (#3237); seed its display name
+        // the way org seeds host-scoped keys, but only when a live scratch
+        // session populates it (an archived-only scratch group would otherwise
+        // render an undeletable empty header, per the phantom-header note above).
+        if populated_labels.contains(crate::session::SCRATCH_GROUP_PATH) {
+            seed_groups.push(crate::session::Group::new(
+                crate::session::SCRATCH_GROUP_NAME,
+                crate::session::SCRATCH_GROUP_PATH,
+            ));
+        }
+        let mut tree = GroupTree::new_with_groups(&tree_seed, &seed_groups);
         for (path, &collapsed) in &self.project_group_collapsed {
             if collapsed {
                 tree.set_collapsed(path, true);
@@ -7090,15 +7095,13 @@ impl HomeView {
     /// strings) render an unpinnable phantom header: pinned by label, judged
     /// by path.
     ///
-    /// Scratch sessions are excluded for the same reason: their `repo_path()` is
-    /// the throwaway `<app_dir>/scratch/<id>` directory, not a repo anyone can
-    /// register. They share the `scratch` header with a user repo of that
-    /// basename (#3133), so letting one lend the header its path would both hide
-    /// the real repo and offer an app-internal directory up for pinning.
+    /// A scratch session never matches here: its `project_group_key` is the
+    /// `SCRATCH_GROUP_PATH` sentinel, which no display label equals, so the
+    /// synthetic bucket has no backing repo path to lend (#3237).
     pub(super) fn project_header_repo_path(&self, label: &str) -> Option<String> {
         self.instances
             .values()
-            .find(|i| !i.is_archived() && !i.scratch && project_group_key(i) == label)
+            .find(|i| !i.is_archived() && project_group_key(i) == label)
             .map(|i| crate::session::projects::canonical_key(i.repo_path()))
     }
 
@@ -7124,38 +7127,17 @@ impl HomeView {
         }
     }
 
-    /// True when project header `label` is nothing but the synthetic scratch
-    /// bucket, so there is no repo behind it to register or pin. Judged by
-    /// backing identity rather than by the label: scratch sessions and a user's
-    /// own repo named `scratch` derive the same header label, and that header is
-    /// a real project (#3133). A PINNED registry entry carrying the label also
-    /// counts as backing, so an empty pinned `scratch` project stays reachable to
-    /// unpin. The pin flag is required because it is what `unpopulated_projects`
-    /// and `is_project_label_pinned`'s label branch key on: a saved-but-unpinned
-    /// entry never surfaces a header of its own, so counting it as backing would
-    /// open the gate on a header the toggle has no path to act on, and `p` would
-    /// silently do nothing instead of keeping its global meaning. With no
-    /// backing repo path, `is_project_label_pinned` IS that pinned-label
-    /// lookup, so it is reused here rather than restating the predicate.
-    fn is_synthetic_scratch_header(&self, label: &str) -> bool {
-        label == SCRATCH_GROUP_LABEL
-            && self.project_header_repo_path(label).is_none()
-            && !self.is_project_label_pinned(label)
-    }
-
     /// The project-view header label under the cursor when it is a real,
     /// pinnable project: project grouping is active, the cursor is on a group
-    /// header, and that header is neither the synthetic Archived section nor the
-    /// synthetic `scratch` bucket (scratch sessions have no backing repo to pin).
+    /// header, and that header is not a synthetic one (the Archived/Trash
+    /// shelves or the scratch bucket, none of which have a backing repo to pin).
     pub(super) fn project_group_at_cursor(&self) -> Option<String> {
         if self.group_by != GroupByMode::Project {
             return None;
         }
         match self.flat_items.get(self.cursor) {
             Some(Item::Group { path, name, .. })
-                if !crate::session::is_within_archived_section(path)
-                    && !crate::session::is_within_trash_section(path)
-                    && !self.is_synthetic_scratch_header(name) =>
+                if !crate::session::is_synthetic_project_header(path) =>
             {
                 Some(name.clone())
             }

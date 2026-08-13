@@ -1407,8 +1407,7 @@ impl HomeView {
                 // rather than stale. Project view only; the registry lookup is
                 // keyed by the header label.
                 let pinned = self.group_by == GroupByMode::Project
-                    && !crate::session::is_within_archived_section(path)
-                    && !crate::session::is_within_trash_section(path)
+                    && !crate::session::is_synthetic_project_header(path)
                     && self.is_project_label_pinned(name);
                 // The top-level shelf section headers get a leading type glyph
                 // so they read as system shelves, not user groups. Project

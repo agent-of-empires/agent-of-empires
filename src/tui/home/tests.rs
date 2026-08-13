@@ -7229,15 +7229,19 @@ fn test_project_group_key_handles_trailing_slash() {
 }
 
 #[test]
-fn test_project_group_key_groups_scratch_under_scratch() {
+fn test_project_group_key_scratch_uses_sentinel_not_label() {
     use super::project_group_key;
+    use crate::session::{project_group_display_name, SCRATCH_GROUP_PATH};
 
     let mut inst = Instance::new(
         "test",
         "/home/user/.config/agent-of-empires/scratch/a4535853054b4096",
     );
     inst.scratch = true;
-    assert_eq!(project_group_key(&inst), "scratch");
+    // Scratch keys on the sentinel identity, not the display label, so a real
+    // repo named `scratch` keeps a distinct identity (#3237).
+    assert_eq!(project_group_key(&inst), SCRATCH_GROUP_PATH);
+    assert_eq!(project_group_display_name(SCRATCH_GROUP_PATH), "scratch");
 }
 
 #[test]
@@ -10500,58 +10504,72 @@ fn p_key_opens_projects_dialog_off_project_header() {
 /// synthetic scratch bucket (sessions with no repo, living under
 /// `<app_dir>/scratch/<id>`) stays excluded. The gate used to reject the header
 /// by its display LABEL, which collapsed both cases together and left `p` on a
-/// real `~/scratch` repo falling through to the Projects dialog. See #3133.
+/// real `~/scratch` repo falling through to the Projects dialog. See #3133; #3237
+/// then gave the synthetic bucket its own sentinel identity, so the real repo
+/// and the bucket render as two separate headers, keyed here by path.
 #[test]
 #[serial]
 fn scratch_label_pin_gate_keys_on_backing_repo_not_label() {
     use crate::session::config::GroupByMode;
     use crate::session::projects::canonical_key;
+    use crate::session::SCRATCH_GROUP_PATH;
 
     // (case, has a real repo named `scratch`, has a synthetic scratch session,
     //  a pre-existing registry entry for `/repos/scratch` and its pin flag,
-    //  the pin gate opens on the header, the header is pinned after `p`)
+    //  the path of the header this case targets, the pin gate opens on it, and
+    //  whether it is pinned after `p`)
     let cases = [
         // The reporter's setup: a plain repo at `~/scratch`, no scratch sessions.
-        ("real repo only", true, false, None, true, true),
+        ("real repo only", true, false, None, "scratch", true, true),
         // Nothing but the synthetic bucket: no repo exists to register.
-        ("synthetic bucket only", false, true, None, false, false),
-        // Both derive the same label and so share one header today. The real
-        // repo backs it, so the header is pinnable and the pin must resolve to
-        // that repo rather than the app-internal scratch directory.
+        (
+            "synthetic bucket only",
+            false,
+            true,
+            None,
+            SCRATCH_GROUP_PATH,
+            false,
+            false,
+        ),
+        // The real repo and the synthetic bucket now render as two separate
+        // headers (#3237). This case targets the real repo header, which backs a
+        // pinnable project; the bucket's own header is covered by
+        // `synthetic_scratch_bucket_is_distinct_from_real_repo`.
         (
             "real repo plus scratch session",
             true,
             true,
             None,
+            "scratch",
             true,
             true,
         ),
         // A saved-but-unpinned repo named `scratch` surfaces no header of its
-        // own, so the synthetic bucket is the only thing rendering this one and
-        // the toggle has no path to act on. `p` must keep its global meaning
-        // rather than resolve to a pin that silently does nothing.
+        // own (only pinned empties do), so the synthetic bucket is the only
+        // `scratch` header and `p` must keep its global meaning.
         (
             "saved unpinned repo plus scratch session",
             false,
             true,
             Some(false),
+            SCRATCH_GROUP_PATH,
             false,
             false,
         ),
-        // A pinned registry entry backs the header even with no live session of
-        // its own, so `p` must reach the unpin path instead of being swallowed
-        // as the synthetic bucket.
+        // A pinned registry entry surfaces its own empty header even with no live
+        // session, so `p` must reach the unpin path on that header.
         (
             "pinned empty repo plus scratch session",
             false,
             true,
             Some(true),
+            "scratch",
             true,
             false,
         ),
     ];
 
-    for (case, has_repo, has_scratch, saved, gate_open, pinned_after) in cases {
+    for (case, has_repo, has_scratch, saved, target_path, gate_open, pinned_after) in cases {
         let temp = TempDir::new().unwrap();
         let _guard = setup_test_home(&temp);
         let storage = Storage::new_unwatched("test").unwrap();
@@ -10600,8 +10618,8 @@ fn scratch_label_pin_gate_keys_on_backing_repo_not_label() {
         let idx = view
             .flat_items
             .iter()
-            .position(|i| matches!(i, Item::Group { name, .. } if name == "scratch"))
-            .unwrap_or_else(|| panic!("{case}: scratch header must be present"));
+            .position(|i| matches!(i, Item::Group { path, .. } if path == target_path))
+            .unwrap_or_else(|| panic!("{case}: header at path {target_path} must be present"));
         view.cursor = idx;
         view.update_selected();
 
@@ -10646,6 +10664,177 @@ fn scratch_label_pin_gate_keys_on_backing_repo_not_label() {
             );
         }
     }
+}
+
+/// #3237: a real repo named `scratch` and the synthetic scratch bucket must
+/// render as two separate project headers with distinct identity paths, one
+/// session each (not a pooled count), and independent pin/scope state. Mirrors
+/// the org same-owner-two-hosts separation test above.
+#[test]
+#[serial]
+fn synthetic_scratch_bucket_is_distinct_from_real_repo() {
+    use crate::session::config::GroupByMode;
+    use crate::session::SCRATCH_GROUP_PATH;
+
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+
+    let real = Instance::new("work", "/repos/scratch");
+    let mut throwaway = Instance::new("throwaway", "/app-dir/scratch/abc123");
+    throwaway.scratch = true;
+    let scratch_id = throwaway.id.clone();
+    let instances = vec![real, throwaway];
+    storage
+        .update(|i, g| {
+            *i = instances.clone();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.group_by = GroupByMode::Project;
+    view.flat_items = view.build_flat_items();
+
+    // Two headers, both displayed "scratch", distinct identity paths, one
+    // session each rather than a pooled count of two.
+    let scratch_headers: Vec<(&str, usize)> = view
+        .flat_items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Group {
+                path,
+                name,
+                session_count,
+                ..
+            } if name == "scratch" => Some((path.as_str(), *session_count)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        scratch_headers.len(),
+        2,
+        "real repo and synthetic bucket must be two headers, got {scratch_headers:?}"
+    );
+    assert!(scratch_headers.contains(&("scratch", 1)));
+    assert!(scratch_headers.contains(&(SCRATCH_GROUP_PATH, 1)));
+
+    // The synthetic bucket is not a pinnable project; the real repo is.
+    let real_idx = view
+        .flat_items
+        .iter()
+        .position(|i| matches!(i, Item::Group { path, .. } if path == "scratch"))
+        .unwrap();
+    view.cursor = real_idx;
+    assert_eq!(view.project_group_at_cursor().as_deref(), Some("scratch"));
+    let bucket_idx = view
+        .flat_items
+        .iter()
+        .position(|i| matches!(i, Item::Group { path, .. } if path == SCRATCH_GROUP_PATH))
+        .unwrap();
+    view.cursor = bucket_idx;
+    assert_eq!(view.project_group_at_cursor(), None);
+
+    // Bulk-archive scope on the synthetic bucket touches only the scratch
+    // session, never the real repo's session.
+    view.selected_group = Some(SCRATCH_GROUP_PATH.to_string());
+    assert_eq!(view.active_sessions_in_selected_group(), vec![scratch_id]);
+}
+
+/// #3237: New Session from the synthetic scratch bucket must not prefill
+/// another scratch session's throwaway `<app_dir>/scratch/<id>` directory as
+/// the working cwd; the dialog should fall through to the default cwd instead
+/// of tying the new session's lifetime to an unrelated scratch dir. Mirrors
+/// the same invariant `project_header_repo_path` enforces for the pin action.
+#[test]
+#[serial]
+fn scratch_bucket_lends_no_repo_path_for_new_session_prefill() {
+    use crate::session::config::GroupByMode;
+    use crate::session::SCRATCH_GROUP_PATH;
+
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+
+    let mut throwaway = Instance::new("throwaway", "/app-dir/scratch/abc123");
+    throwaway.scratch = true;
+    let instances = vec![throwaway];
+    storage
+        .update(|i, g| {
+            *i = instances.clone();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    assert_eq!(view.group_by, GroupByMode::Project);
+    assert_eq!(view.group_repo_path(SCRATCH_GROUP_PATH), None);
+}
+
+/// #3237 pitfall guard: when the only scratch session is archived, the seed
+/// must not create a phantom empty `scratch` header in the main flow (an
+/// archived-only project header is undeletable in project mode). The bucket
+/// appears only nested under the Archived section.
+#[test]
+#[serial]
+fn scratch_bucket_absent_from_main_flow_when_only_scratch_is_archived() {
+    use crate::session::config::GroupByMode;
+    use crate::session::{is_within_archived_section, SCRATCH_GROUP_PATH};
+
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+
+    let mut throwaway = Instance::new("throwaway", "/app-dir/scratch/abc123");
+    throwaway.scratch = true;
+    throwaway.archive();
+    let instances = vec![throwaway];
+    storage
+        .update(|i, g| {
+            *i = instances.clone();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.group_by = GroupByMode::Project;
+    // Expand the Archived shelf so its per-project sub-headers are emitted.
+    view.archived_section_collapsed = false;
+    view.flat_items = view.build_flat_items();
+
+    assert!(
+        !view
+            .flat_items
+            .iter()
+            .any(|i| matches!(i, Item::Group { path, .. } if path == SCRATCH_GROUP_PATH)),
+        "an archived-only scratch session must not seed a phantom main-flow bucket"
+    );
+    assert!(
+        view.flat_items.iter().any(|i| matches!(
+            i,
+            Item::Group { path, name, .. }
+                if is_within_archived_section(path) && name == "scratch"
+        )),
+        "the archived scratch session should still render under the Archived section"
+    );
 }
 
 /// Pin a project, archive its only session, then unpin: the empty header must

@@ -23,6 +23,16 @@ pub const ARCHIVED_SECTION_NAME: &str = "Archived";
 pub const TRASH_SECTION_PATH: &str = "__aoe_trash_section__";
 pub const TRASH_SECTION_NAME: &str = "Trash";
 
+/// Synthetic group identity for the scratch bucket in project mode. Unlike the
+/// Archived/Trash shelves this IS a real in-flow GroupTree node built from live
+/// scratch sessions, so it is keyed on a sentinel PATH whose `__aoe_*_group__`
+/// shape no plausible real repo basename equals (same accepted tradeoff as
+/// `ARCHIVED_/TRASH_SECTION_PATH`), while its display name is seeded separately
+/// (the way org host-scoped keys are). That keeps a user's own repo named
+/// `scratch` on a distinct identity instead of merging into the bucket (#3237).
+pub const SCRATCH_GROUP_PATH: &str = "__aoe_scratch_group__";
+pub const SCRATCH_GROUP_NAME: &str = "scratch";
+
 #[inline]
 pub fn is_archived_section_path(path: &str) -> bool {
     path == ARCHIVED_SECTION_PATH
@@ -31,6 +41,12 @@ pub fn is_archived_section_path(path: &str) -> bool {
 #[inline]
 pub fn is_trash_section_path(path: &str) -> bool {
     path == TRASH_SECTION_PATH
+}
+
+/// Exact match for the synthetic scratch bucket's sentinel identity path.
+#[inline]
+fn is_scratch_group_path(path: &str) -> bool {
+    path == SCRATCH_GROUP_PATH
 }
 
 /// True for the Trash section sentinel or anything nested under it. Mirrors
@@ -58,6 +74,27 @@ pub fn is_within_archived_section(path: &str) -> bool {
 #[inline]
 pub fn archived_project_sub_path(project_name: &str) -> String {
     format!("{}/{}", ARCHIVED_SECTION_PATH, project_name)
+}
+
+/// True for any project-mode header that is synthetic rather than a real,
+/// pinnable repo: the Archived/Trash shelves (and anything nested under them)
+/// and the scratch bucket. Keyed on the path (identity), never the display
+/// label, so a real repo named `scratch` is not caught.
+#[inline]
+pub fn is_synthetic_project_header(path: &str) -> bool {
+    is_within_archived_section(path) || is_within_trash_section(path) || is_scratch_group_path(path)
+}
+
+/// Map a project-mode group identity key to its human display label, for the
+/// sites that render a raw `group_path` to the user. Only the scratch sentinel
+/// differs from its key; every real repo key already IS its label.
+#[inline]
+pub fn project_group_display_name(key: &str) -> &str {
+    if is_scratch_group_path(key) {
+        SCRATCH_GROUP_NAME
+    } else {
+        key
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1169,7 +1206,7 @@ pub fn append_archived_section_by_project(
         let sub_collapsed = project_collapsed.get(&sub_path).copied().unwrap_or(false);
         items.push(Item::Group {
             path: sub_path,
-            name: project_name,
+            name: project_group_display_name(&project_name).to_string(),
             depth: 1,
             collapsed: sub_collapsed,
             session_count: sessions.len(),

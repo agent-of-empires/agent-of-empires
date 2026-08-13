@@ -1270,7 +1270,10 @@ impl HomeView {
         self.confirm_dialog = Some(
             ConfirmDialog::new(
                 title,
-                &format!("Archive all {count} {noun} in {scope} \"{group_path}\"?"),
+                &format!(
+                    "Archive all {count} {noun} in {scope} \"{}\"?",
+                    crate::session::project_group_display_name(&group_path)
+                ),
                 "archive_group",
             )
             .neutral(),
@@ -2958,7 +2961,13 @@ impl HomeView {
                     Some(inst.group_path.clone())
                 }
             })
-            .or_else(|| self.selected_group.clone());
+            .or_else(|| {
+                // The scratch bucket's group_path is an internal sentinel; show
+                // its display label in the Group field, not the raw sentinel (#3237).
+                self.selected_group
+                    .as_deref()
+                    .map(|g| crate::session::project_group_display_name(g).to_string())
+            });
 
         if prefill_path.is_some() || prefill_group.is_some() {
             let existing_groups: Vec<String> =
@@ -3331,8 +3340,14 @@ impl HomeView {
     /// web org header, which routes "New Session" through the generic
     /// create flow instead of a specific repo path. Also returns `None` for
     /// an empty group (no member to borrow a path from), leaving the dialog
-    /// on the default cwd.
+    /// on the default cwd. The synthetic scratch bucket lends no path either:
+    /// a session under it would return its throwaway `<app_dir>/scratch/<id>`
+    /// as the prefill, and creating a new session rooted there ties its cwd
+    /// to another scratch session's lifetime (#3237).
     pub(super) fn group_repo_path(&self, group_path: &str) -> Option<String> {
+        if crate::session::is_synthetic_project_header(group_path) {
+            return None;
+        }
         self.instances
             .values()
             .find(|inst| match self.group_by {
@@ -3866,10 +3881,14 @@ impl HomeView {
                     {
                         continue;
                     }
-                    let label = if name == path {
+                    // The parenthetical disambiguates org keys (owner vs
+                    // owner@host); route it through the display mapper so a
+                    // synthetic bucket's sentinel path never leaks (#3237).
+                    let disambiguator = crate::session::project_group_display_name(path);
+                    let label = if name.as_str() == disambiguator {
                         format!("Jump to group: {}", name)
                     } else {
-                        format!("Jump to group: {} ({})", name, path)
+                        format!("Jump to group: {} ({})", name, disambiguator)
                     };
                     entries.push(PaletteCommand {
                         id: "jump-group",

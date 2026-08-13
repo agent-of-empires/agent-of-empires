@@ -65,9 +65,11 @@ pub(crate) use groups::is_live_favorite;
 pub use groups::{
     append_archived_section, append_archived_section_by_project, append_trash_section,
     archived_project_sub_path, flatten_sessions_by_attention, flatten_tree,
-    flatten_tree_all_profiles, is_archived_section_path, is_trash_section_path,
-    is_within_archived_section, is_within_trash_section, Group, GroupTree, Item,
-    ARCHIVED_SECTION_NAME, ARCHIVED_SECTION_PATH, TRASH_SECTION_NAME, TRASH_SECTION_PATH,
+    flatten_tree_all_profiles, is_archived_section_path, is_synthetic_project_header,
+    is_trash_section_path, is_within_archived_section, is_within_trash_section,
+    project_group_display_name, Group, GroupTree, Item, ARCHIVED_SECTION_NAME,
+    ARCHIVED_SECTION_PATH, SCRATCH_GROUP_NAME, SCRATCH_GROUP_PATH, TRASH_SECTION_NAME,
+    TRASH_SECTION_PATH,
 };
 #[cfg(feature = "serve")]
 pub(crate) use instance::ResumeAttemptPolicy;
