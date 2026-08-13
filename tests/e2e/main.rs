@@ -49,7 +49,6 @@ mod new_session;
 mod opencode_preassign_no_runtime_panic;
 mod opencode_sandbox_resume;
 mod permission_response_e2e;
-mod plugin_attention_worker_e2e;
 mod plugin_command_executor_e2e;
 mod plugins;
 mod profile_lazy_creation;

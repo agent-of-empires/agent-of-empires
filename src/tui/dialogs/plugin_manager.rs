@@ -821,9 +821,6 @@ impl PluginManagerDialog {
             aoe_plugin_api::RuntimeSpec::ReleaseBinary { asset, .. } => {
                 format!("release binary: {asset}")
             }
-            aoe_plugin_api::RuntimeSpec::SelfExec { subcommand } => {
-                format!("built-in worker (aoe {subcommand})")
-            }
         });
         let settings = m
             .settings

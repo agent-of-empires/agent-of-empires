@@ -148,6 +148,22 @@ describe("plugin slot renderers", () => {
     expect(lines[1].getAttribute("class")).toContain("text-status-error");
   });
 
+  it("sparkline block renders a band-colored point for one value", () => {
+    const entry: PluginUiEntry = {
+      plugin_id: "acme.diag",
+      slot: "pane",
+      id: "p",
+      session_id: "s1",
+      payload: {
+        blocks: [{ kind: "sparkline", values: [95], max: 100, bands: [{ at: 90, tone: "danger" }] }],
+      },
+    };
+    const { container } = render(<PluginPaneBody entry={entry} />);
+    const point = container.querySelector("circle");
+    expect(point).toBeTruthy();
+    expect(point?.getAttribute("class")).toContain("text-status-error");
+  });
+
   it("home-pane renders a global entry's blocks on the overview", () => {
     set([
       {

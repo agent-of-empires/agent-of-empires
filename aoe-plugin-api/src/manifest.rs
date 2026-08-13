@@ -830,16 +830,6 @@ pub enum RuntimeSpec {
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         build: Vec<BuildStep>,
     },
-    /// A worker that runs the host binary itself with a hidden subcommand, for
-    /// first-party builtins whose worker ships inside `aoe` (there is no plugin
-    /// directory to launch from). The host resolves the running executable and
-    /// invokes `aoe <subcommand>`. Rejected for non-builtin plugins, which
-    /// cannot supply the host binary.
-    SelfExec {
-        /// The hidden `aoe` subcommand that runs the worker loop, e.g.
-        /// `__plugin-attention`.
-        subcommand: String,
-    },
     /// A worker binary downloaded from the source repo's GitHub release assets.
     /// Installation resolves the asset for the host platform, downloads it, and
     /// places the binary in the plugin directory.
@@ -1057,12 +1047,6 @@ impl PluginManifest {
             check(
                 bin.as_ref().map(|b| !b.is_empty()).unwrap_or(true),
                 "runtime release-binary bin must not be empty".into(),
-            );
-        }
-        if let Some(RuntimeSpec::SelfExec { subcommand }) = &self.runtime {
-            check(
-                subcommand.starts_with("__"),
-                "runtime self-exec subcommand must be a hidden \"__\"-prefixed subcommand".into(),
             );
         }
 

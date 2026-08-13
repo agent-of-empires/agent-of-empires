@@ -218,12 +218,10 @@ registry's load errors) rather than bailing, so an aoe upgrade cannot brick
 startup. Builtins are exempt (they ship with aoe). An absent range means no
 constraint.
 
-The `runtime` section is one of three kinds: `command` (an argv launched from
-the plugin directory), `release-binary` (a compiled worker shipped as a GitHub
-release asset), or `self-exec` (built-ins only: run the host binary itself with
-a hidden subcommand, so no plugin directory is needed). Installation resolves
-and downloads a `release-binary` asset; the Tier 1 host (below) launches and
-supervises all kinds.
+The `runtime` section is one of two kinds: `command` (an argv launched from the
+plugin directory) or `release-binary` (a compiled worker shipped as a GitHub
+release asset). Installation resolves and downloads a `release-binary` asset;
+the Tier 1 host (below) launches and supervises both kinds.
 
 A `command` runtime may declare ordered `[[runtime.build]]` steps, run once at
 install and update inside the installed plugin directory before the plugin is
@@ -547,12 +545,10 @@ for a binary, the host `os-arch`), matching the project's error-with-hint style.
 Filesystem and `PATH` probing go through a `LaunchResolver` trait so the
 resolution policy is unit-tested with no real filesystem.
 
-A builtin whose worker ships inside the host binary declares a `self-exec`
-runtime: `resolve_launch` runs the current executable with the hidden
-subcommand and needs no plugin directory. The first such worker is
-`aoe.attention` (`aoe __plugin-attention`); `self-exec` is rejected for
-non-builtin plugins, which cannot supply the host binary. A builtin with no
-`[runtime]` at all (like `aoe.web`) has no worker.
+Builtins do not declare a `[runtime]` in this release, so `resolve_launch`
+returns `Err(LaunchError::NoRuntime)` for them. The `aoe __plugin-worker`
+self-exec path for a builtin worker, and the worker-side SDK, arrive with the
+first builtin worker that needs them; shipping them now would be unused code.
 
 ### Transport and supervision
 

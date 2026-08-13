@@ -874,19 +874,29 @@ function BlockSparkline({ block }: { block: Record<string, unknown> }) {
   return (
     <div className="flex flex-col gap-1" data-testid="plugin-pane-sparkline">
       <svg viewBox={`0 0 ${w} ${h}`} width={w} height={h} preserveAspectRatio="none" role="img">
-        {segments.map((seg, i) => (
-          <line
-            key={i}
-            x1={i * step}
-            y1={y(seg.from)}
-            x2={(i + 1) * step}
-            y2={y(seg.to)}
-            className={toneTextClass(bandTone(seg.to))}
-            stroke="currentColor"
-            strokeWidth={1.5}
-            vectorEffect="non-scaling-stroke"
+        {values.length === 1 ? (
+          <circle
+            cx={w / 2}
+            cy={y(values[0] ?? 0)}
+            r={1.5}
+            className={toneTextClass(bandTone(values[0] ?? 0))}
+            fill="currentColor"
           />
-        ))}
+        ) : (
+          segments.map((seg, i) => (
+            <line
+              key={i}
+              x1={i * step}
+              y1={y(seg.from)}
+              x2={(i + 1) * step}
+              y2={y(seg.to)}
+              className={toneTextClass(bandTone(seg.to))}
+              stroke="currentColor"
+              strokeWidth={1.5}
+              vectorEffect="non-scaling-stroke"
+            />
+          ))
+        )}
       </svg>
       {caption && <span className="text-[10px] text-text-dim">{caption}</span>}
     </div>
