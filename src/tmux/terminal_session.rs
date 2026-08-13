@@ -72,11 +72,23 @@ fn host_pane_inputs(
 ///
 /// tmux's `default-shell` rejects a bare name ("not a suitable shell: bash"),
 /// and [`user_shell`] falls back to a bare `bash` when `$SHELL` is unset (e.g.
-/// an `aoe serve` daemon started from launchd/systemd). `which` returns an
-/// already absolute, existing path unchanged, and `None` when the shell is not
-/// found so the caller can skip `default-shell` rather than fail creation.
+/// an `aoe serve` daemon started from launchd/systemd). Returns an already
+/// absolute, existing path unchanged, and `None` when the shell is not found
+/// so the caller can skip `default-shell` rather than fail creation.
 fn absolute_shell(shell: &str) -> Option<String> {
-    which::which(shell)
+    absolute_shell_in(shell, std::env::var_os("PATH").as_deref())
+}
+
+/// [`absolute_shell`] with an explicit PATH-style lookup list, split out so the
+/// unit test can resolve against a controlled directory instead of the
+/// process `$PATH`. `paths` is a `$PATH`-style joined string; when it is `None`
+/// no directories are searched, so a bare name will not resolve (an absolute
+/// path still does).
+fn absolute_shell_in(shell: &str, paths: Option<&std::ffi::OsStr>) -> Option<String> {
+    // `which_in` requires a cwd; it is only used to resolve a relative shell
+    // path, which bare names and absolute paths ignore.
+    let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    which::which_in(shell, paths, cwd)
         .ok()
         .map(|p| p.to_string_lossy().into_owned())
 }
@@ -686,12 +698,25 @@ mod tests {
 
     #[test]
     fn absolute_shell_resolves_bare_name_and_rejects_missing() {
-        // tmux's `default-shell` needs an absolute path: a bare name resolves
-        // via PATH, and an unknown shell yields None so create_with_size skips
+        // Hermetic: resolve against a controlled directory rather than the
+        // process `$PATH`, so the result does not depend on which shells the
+        // host happens to have installed. tmux's `default-shell` needs an
+        // absolute path; an unknown name yields None so create_with_size skips
         // the option instead of failing `new-session`.
-        let resolved = absolute_shell("sh").expect("sh must resolve on a unix host");
-        assert!(std::path::Path::new(&resolved).is_absolute(), "{resolved}");
-        assert_eq!(absolute_shell("aoe-not-a-real-shell-xyzzy"), None);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let bin = dir.path().join("aoe-test-shell");
+        std::fs::write(&bin, b"#!/bin/sh\n").expect("write shim");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        }
+        let paths = Some(dir.path().as_os_str());
+        // `which_in` returns the search dir joined with the name verbatim, so
+        // the resolved path equals the planted shim exactly.
+        let resolved = absolute_shell_in("aoe-test-shell", paths).expect("shim must resolve");
+        assert_eq!(std::path::Path::new(&resolved), bin);
+        assert_eq!(absolute_shell_in("aoe-not-a-real-shell-xyzzy", paths), None);
     }
 
     #[test]
@@ -825,8 +850,10 @@ mod tests {
         }
 
         let key = "XDG_AOE_TERM_ENV_TEST_3075";
-        let original = std::env::var(key).ok();
-        std::env::set_var(key, "host-sentinel");
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            (key, "host-sentinel"),
+            ("SHELL", "/bin/sh"),
+        ]);
 
         let guard = TmuxTestSession::new("aoe_test_term_host_fwd");
         let session = PairedTerminal {
@@ -841,11 +868,6 @@ mod tests {
             .ok()
             .and_then(|o| String::from_utf8(o.stdout).ok())
             .map(|s| s.trim().to_string());
-
-        match original {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
 
         created.expect("create host terminal");
         assert_eq!(
@@ -869,8 +891,7 @@ mod tests {
         }
 
         let key = "XDG_AOE_TERM_ENV_TEST_3075_CTR";
-        let original = std::env::var(key).ok();
-        std::env::set_var(key, "must-not-leak");
+        let _env = crate::session::test_support::EnvGuard::set(&[(key, "must-not-leak")]);
 
         let guard = TmuxTestSession::new("aoe_test_term_ctr_excl");
         let session = PairedTerminal {
@@ -888,11 +909,6 @@ mod tests {
             .ok()
             .and_then(|o| String::from_utf8(o.stdout).ok())
             .map(|s| s.trim().to_string());
-
-        match original {
-            Some(v) => std::env::set_var(key, v),
-            None => std::env::remove_var(key),
-        }
 
         created.expect("create container terminal");
         assert_eq!(

@@ -2726,7 +2726,9 @@ trusted_at = "2026-01-31T00:00:00Z"
     /// only verify the env vars are NOT forced here (stdin may or may not be
     /// a TTY depending on how tests are launched).
     #[test]
+    #[serial_test::serial]
     fn captured_hook_does_not_force_git_env() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["GIT_TERMINAL_PROMPT"]);
         let tmp = tempfile::tempdir().unwrap();
         let probe = "echo \"GIT_TERMINAL_PROMPT=${GIT_TERMINAL_PROMPT:-unset}\" > out.txt";
         execute_hooks(&[probe.to_string()], tmp.path(), &[]).unwrap();
@@ -2813,7 +2815,9 @@ trusted_at = "2026-01-31T00:00:00Z"
     }
 
     #[test]
+    #[serial_test::serial]
     fn best_effort_hook_attached_for_cli() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["GIT_TERMINAL_PROMPT"]);
         let tmp = tempfile::tempdir().unwrap();
         let probe = "echo \"GIT_TERMINAL_PROMPT=${GIT_TERMINAL_PROMPT:-unset}\" > out.txt";
         let errors = execute_hooks_best_effort(&[probe.to_string()], tmp.path(), false, &[]);

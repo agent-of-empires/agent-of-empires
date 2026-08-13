@@ -24,6 +24,7 @@ export const docsNav: NavSection[] = [
     title: "Guides",
     items: [
       { title: "Docker Sandbox", href: "/guides/sandbox/", description: "Run AI coding agents in isolated Docker containers." },
+      { title: "Claude Code Telemetry to Otari", href: "/guides/otari-telemetry/", description: "Export Claude Code usage from host and sandbox sessions to Otari." },
       { title: "Podman", href: "/guides/podman/", description: "Use Podman as a rootless alternative to Docker for sandboxing." },
       { title: "Apple Containers", href: "/guides/apple-containers/", description: "Sandbox agents with Apple's native container framework on macOS." },
       { title: "Live Mode", href: "/guides/live-mode/", description: "Watch a session stream live and type into it from the TUI." },
