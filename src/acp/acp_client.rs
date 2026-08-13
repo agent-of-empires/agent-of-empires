@@ -3923,7 +3923,11 @@ fn apply_env_filter(cmd: &mut std::process::Command, config: &SpawnConfig) {
     }
     if let Some(extra_allowlist) = &config.spec.env_allowlist {
         for name in extra_allowlist {
-            if name == "AOE_TOKEN" {
+            // Route through the same deny check `provider_env` uses so a
+            // malicious/edited allowlist can't smuggle `AOE_TOKEN`, an
+            // `AOE_*`-prefixed daemon carrier, `LD_*`/`DYLD_*` linker hooks,
+            // or infra keys under the guise of provider auth.
+            if provider_env_denyreason(name).is_some() {
                 continue;
             }
             if let Ok(value) = std::env::var(name) {
@@ -4394,8 +4398,12 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
     }
     if let Some(extra_allowlist) = &config.spec.env_allowlist {
         for name in extra_allowlist {
-            if name == "AOE_TOKEN" {
-                warn!(target: "acp", "ignoring AOE_TOKEN in agent env allowlist");
+            // Route through the same deny check `provider_env` uses so a
+            // malicious/edited allowlist can't smuggle `AOE_TOKEN`, an
+            // `AOE_*`-prefixed daemon carrier, `LD_*`/`DYLD_*` linker hooks,
+            // or infra keys under the guise of provider auth.
+            if let Some(reason) = provider_env_denyreason(name) {
+                warn!(target: "acp", "ignoring env allowlist entry '{name}' ({reason})");
                 continue;
             }
             if let Ok(value) = std::env::var(name) {
@@ -15193,6 +15201,56 @@ done
                 "{key} must reach a structured-view agent, got {applied:#?}"
             );
         }
+    }
+
+    /// #3238: `AgentSpec.env_allowlist` populated by `with_defaults` must
+    /// reach the agent via `apply_env_filter`. Uses the `aoe-agent` spec (the
+    /// one that would silently no-op if we keyed `env_allowlist_for` on
+    /// `spec.command` — placeholder-templated — instead of the binary token).
+    /// A negative case rides along: `GEMINI_API_KEY` is set but not in the
+    /// AI-SDK-based `aoe-agent`'s allowlist, so it must NOT be forwarded.
+    #[test]
+    #[serial_test::serial]
+    fn apply_env_filter_forwards_agent_env_allowlist() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("OPENAI_API_KEY", "sk-openai"),
+            ("GOOGLE_GENERATIVE_AI_API_KEY", "ai-google"),
+            ("GEMINI_API_KEY", "ai-gemini-cli-key"),
+        ]);
+
+        let mut config = env_test_spawn_config(tmp.path().to_path_buf());
+        let reg = crate::acp::agent_registry::AgentRegistry::with_defaults();
+        config.spec = reg.get("aoe-agent").expect("aoe-agent default").clone();
+
+        let mut cmd = std::process::Command::new("/bin/true");
+        cmd.env_clear();
+        apply_env_filter(&mut cmd, &config);
+
+        let applied: std::collections::HashMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        assert_eq!(
+            applied.get("OPENAI_API_KEY").map(String::as_str),
+            Some("sk-openai")
+        );
+        assert_eq!(
+            applied
+                .get("GOOGLE_GENERATIVE_AI_API_KEY")
+                .map(String::as_str),
+            Some("ai-google")
+        );
+        assert!(
+            !applied.contains_key("GEMINI_API_KEY"),
+            "aoe-agent (AI-SDK) must not receive the gemini-CLI-native key, got {applied:#?}"
+        );
     }
 
     /// A sandboxed agent's environment is `sandbox.environment` by contract:

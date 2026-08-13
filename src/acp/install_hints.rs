@@ -39,6 +39,55 @@ pub fn npm_package_for(binary: &str) -> Option<&'static str> {
     })
 }
 
+/// Extra operator env vars to forward to a given ACP binary, on top of
+/// `ALWAYS_FORWARD_ENV` in `acp_client.rs` (which already carries the
+/// Anthropic/Claude keys plus PATH/HOME/locale/SSH). Empty slice means
+/// nothing extra: Claude adapters use `ALWAYS_FORWARD_ENV` verbatim, and
+/// four adapters (`pi-acp`, `omp`, `kimi`, `vibe-acp`) are intentionally
+/// deferred because their env-var names could not be source-verified for
+/// #3238 and shipping a guess that never matches would silently no-op
+/// the fix. Follow-up: verify each adapter's real reads from its own
+/// package/binary and add its arm.
+///
+/// The key is the friendly binary token used at registration time (e.g.
+/// `"aoe-agent"`), NOT `AgentSpec.command`. `command` for `aoe-agent`
+/// carries a `${aoe_data_dir}/...` placeholder that is substituted at
+/// spawn time (`supervisor.rs`), so keying on it here would silently
+/// miss the bundled agent.
+pub fn env_allowlist_for(binary: &str) -> &'static [&'static str] {
+    match binary {
+        // Verified from source: acp-worker/aoe-agent/src/index.ts imports
+        // only @ai-sdk/{anthropic,openai,google}. Anthropic is already in
+        // ALWAYS_FORWARD_ENV. @ai-sdk/google reads GOOGLE_GENERATIVE_AI_API_KEY
+        // (NOT GEMINI_API_KEY, which is the gemini-CLI-native name).
+        "aoe-agent" => &["OPENAI_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY"],
+        // Verified from canonical provider env names: codex reads OpenAI SDK
+        // env (OPENAI_API_KEY/BASE_URL) and CODEX_HOME to reuse the operator's
+        // `codex login` auth.json.
+        "codex-acp" => &["OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_HOME"],
+        // Verified from canonical AI-SDK provider names: opencode is
+        // AI-SDK-based (Google reads GOOGLE_GENERATIVE_AI_API_KEY, distinct
+        // from gemini CLI-native GEMINI_API_KEY). OPENROUTER is a common
+        // opencode target. OPENCODE_API_KEY covers OpenCode Cloud auth.
+        "opencode" => &[
+            "OPENAI_API_KEY",
+            "GOOGLE_GENERATIVE_AI_API_KEY",
+            "OPENROUTER_API_KEY",
+            "OPENCODE_API_KEY",
+        ],
+        // Verified from canonical Google Gemini CLI env: uses the CLI-native
+        // names (distinct from AI-SDK's GOOGLE_GENERATIVE_AI_API_KEY), plus
+        // Vertex/ADC (GOOGLE_APPLICATION_CREDENTIALS, GOOGLE_CLOUD_PROJECT).
+        "gemini" => &[
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "GOOGLE_CLOUD_PROJECT",
+        ],
+        _ => &[],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

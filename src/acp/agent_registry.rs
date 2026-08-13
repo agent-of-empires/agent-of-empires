@@ -2,9 +2,18 @@
 //! `aoe-agent`, `gemini`) to a spawn command + args. Users add agents via
 //! the settings TUI; this module is the in-memory model.
 
-use super::install_hints::install_hint_for;
+use super::install_hints::{env_allowlist_for, install_hint_for};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
+
+/// Convert the static per-binary slice from `install_hints::env_allowlist_for`
+/// into the owned `Option<Vec<String>>` field on `AgentSpec`. Empty slice maps
+/// to `None` so Claude/deferred adapters serialize the same as before, and
+/// the JSON shape of a persisted default registry does not change.
+fn default_env_allowlist(binary: &str) -> Option<Vec<String>> {
+    let keys = env_allowlist_for(binary);
+    (!keys.is_empty()).then(|| keys.iter().map(|s| s.to_string()).collect())
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AgentSpec {
@@ -14,9 +23,14 @@ pub struct AgentSpec {
     /// Human-readable description shown in the settings TUI and
     /// `aoe acp agents`.
     pub description: String,
-    /// Optional: which env vars from aoe to forward to this agent. If
-    /// `None`, only `PATH`, `HOME`, `LANG`, `TERM`, and provider auth env
-    /// (e.g. `ANTHROPIC_API_KEY`) are forwarded.
+    /// Extra env vars forwarded to this agent on top of the base inheritance
+    /// set defined by `ALWAYS_FORWARD_ENV` in `acp_client.rs` (PATH/HOME/
+    /// locale/SSH plus the Claude/Anthropic auth keys). `None` means nothing
+    /// extra. Populated by `default_env_allowlist` for built-in adapters via
+    /// `install_hints::env_allowlist_for`; a custom `from_acp_cmd` spec
+    /// leaves it `None` and can be overridden by
+    /// `session.inherit_host_environment = true` if the user needs more keys
+    /// through.
     pub env_allowlist: Option<Vec<String>>,
 }
 
@@ -89,7 +103,7 @@ impl AgentRegistry {
                 description: format!(
                     "Anthropic Claude via the official ACP adapter ({claude_install})"
                 ),
-                env_allowlist: None,
+                env_allowlist: default_env_allowlist("claude-agent-acp"),
             },
         );
         // Legacy alias used by older session records before the
@@ -101,7 +115,7 @@ impl AgentRegistry {
                 command: "claude-agent-acp".into(),
                 args: vec![],
                 description: "Alias for `claude` (legacy name)".into(),
-                env_allowlist: None,
+                env_allowlist: default_env_allowlist("claude-agent-acp"),
             },
         );
         reg.agents.insert(
@@ -109,8 +123,8 @@ impl AgentRegistry {
             AgentSpec {
                 command: "opencode".into(),
                 args: vec!["acp".into()],
-                description: "OpenCode (SST) — native ACP via `opencode acp`".into(),
-                env_allowlist: None,
+                description: "OpenCode (SST), native ACP via `opencode acp`".into(),
+                env_allowlist: default_env_allowlist("opencode"),
             },
         );
         reg.agents.insert(
@@ -118,8 +132,8 @@ impl AgentRegistry {
             AgentSpec {
                 command: "gemini".into(),
                 args: vec!["--acp".into()],
-                description: "Google Gemini CLI — native ACP via `gemini --acp`".into(),
-                env_allowlist: None,
+                description: "Google Gemini CLI, native ACP via `gemini --acp`".into(),
+                env_allowlist: default_env_allowlist("gemini"),
             },
         );
         reg.agents.insert(
@@ -129,7 +143,7 @@ impl AgentRegistry {
                 args: vec![],
                 description:
                     "OpenAI Codex CLI via ACP adapter (npm i -g @agentclientprotocol/codex-acp@latest)".into(),
-                env_allowlist: None,
+                env_allowlist: default_env_allowlist("codex-acp"),
             },
         );
         reg.agents.insert(
@@ -137,8 +151,8 @@ impl AgentRegistry {
             AgentSpec {
                 command: "vibe-acp".into(),
                 args: vec![],
-                description: "Mistral Vibe — native ACP via the bundled `vibe-acp` binary".into(),
-                env_allowlist: None,
+                description: "Mistral Vibe, native ACP via the bundled `vibe-acp` binary".into(),
+                env_allowlist: default_env_allowlist("vibe-acp"),
             },
         );
         reg.agents.insert(
@@ -148,7 +162,7 @@ impl AgentRegistry {
                 args: vec![],
                 description: "Pi coding agent (`pi`) via the pi-acp adapter (npm i -g pi-acp)"
                     .into(),
-                env_allowlist: None,
+                env_allowlist: default_env_allowlist("pi-acp"),
             },
         );
         reg.agents.insert(
@@ -157,7 +171,7 @@ impl AgentRegistry {
                 command: "omp".into(),
                 args: vec!["acp".into()],
                 description: "Oh My Pi coding agent, native ACP via `omp acp`".into(),
-                env_allowlist: None,
+                env_allowlist: default_env_allowlist("omp"),
             },
         );
         reg.agents.insert(
@@ -165,8 +179,8 @@ impl AgentRegistry {
             AgentSpec {
                 command: "kimi".into(),
                 args: vec!["acp".into()],
-                description: "Kimi Code (Moonshot AI) — native ACP via `kimi acp`".into(),
-                env_allowlist: None,
+                description: "Kimi Code (Moonshot AI), native ACP via `kimi acp`".into(),
+                env_allowlist: default_env_allowlist("kimi"),
             },
         );
         reg.agents.insert(
@@ -174,8 +188,10 @@ impl AgentRegistry {
             AgentSpec {
                 command: "${aoe_data_dir}/acp-worker/dist/aoe-agent".into(),
                 args: vec![],
-                description: "aoe's bundled multi-provider agent (Vercel AI SDK 6)".into(),
-                env_allowlist: None,
+                description: "aoe's bundled multi-provider agent (Vercel AI SDK)".into(),
+                // Literal binary token, NOT `command` (which carries an
+                // unresolved `${aoe_data_dir}` placeholder here).
+                env_allowlist: default_env_allowlist("aoe-agent"),
             },
         );
         reg
@@ -237,6 +253,60 @@ mod tests {
     #[test]
     fn from_acp_cmd_rejects_unbalanced_quotes() {
         assert!(AgentSpec::from_acp_cmd("x", "ocp run \"unterminated").is_err());
+    }
+
+    /// #3238: verified adapters (`codex`, `opencode`, `gemini`, `aoe-agent`)
+    /// forward the operator's provider-auth env; adapters whose real env
+    /// vars couldn't be source-verified (pi, omp, kimi, vibe, and Claude
+    /// which is already covered by `ALWAYS_FORWARD_ENV`) stay `None`.
+    /// One row asserts a specific negative for `aoe-agent`: it must NOT
+    /// receive `GEMINI_API_KEY` (that's the CLI-native name; the bundled
+    /// AI-SDK agent reads `GOOGLE_GENERATIVE_AI_API_KEY` instead). The
+    /// negative row catches the "keyed on `spec.command` instead of the
+    /// binary token" bug, where `${aoe_data_dir}/...` would never match
+    /// and every `aoe-agent` provider key would drop.
+    #[test]
+    fn default_env_allowlists_match_verified_providers() {
+        let reg = AgentRegistry::with_defaults();
+        let al = |name: &str| reg.get(name).and_then(|s| s.env_allowlist.clone());
+
+        assert_eq!(
+            al("codex").as_deref(),
+            Some(
+                &["OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_HOME"][..]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()[..]
+            )
+        );
+        assert_eq!(
+            al("aoe-agent").as_deref(),
+            Some(
+                &["OPENAI_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY"][..]
+                    .iter()
+                    .map(|s| s.to_string())
+                    .collect::<Vec<_>>()[..]
+            )
+        );
+        // gemini CLI uses the CLI-native GEMINI_API_KEY; aoe-agent (AI-SDK)
+        // does not. Verify the two do not share the wrong Google key.
+        let gemini = al("gemini").unwrap_or_default();
+        assert!(gemini.iter().any(|k| k == "GEMINI_API_KEY"));
+        assert!(!gemini.iter().any(|k| k == "GOOGLE_GENERATIVE_AI_API_KEY"));
+        let aoe = al("aoe-agent").unwrap_or_default();
+        assert!(!aoe.iter().any(|k| k == "GEMINI_API_KEY"));
+
+        let opencode = al("opencode").unwrap_or_default();
+        assert!(opencode.iter().any(|k| k == "OPENROUTER_API_KEY"));
+
+        // Deferred + Claude: intentionally None until each adapter's env
+        // reads are verified from its own source.
+        for name in ["claude", "claude-code", "pi", "omp", "kimi", "vibe"] {
+            assert!(
+                al(name).is_none(),
+                "{name} must have None env_allowlist until source-verified"
+            );
+        }
     }
 
     #[test]
