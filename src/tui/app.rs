@@ -357,18 +357,19 @@ impl App {
         }
     }
 
-    /// Holding a key produces a stream of indistinguishable Press events on
-    /// terminals that do not report key-event types. That stream has the same
-    /// timing as Mosh's paste fallback, but it is navigation, not pasted text.
-    /// Keep it on the normal input path so held `j`/`k` continue scrolling the
-    /// session list instead of opening the message composer.
+    /// Holding a key produces a stream of Press events on terminals that do not
+    /// report key-event types, or an initial Press followed by Repeat events on
+    /// terminals that do. That stream has the same timing as Mosh's paste
+    /// fallback, but it is navigation, not pasted text. Keep it on the normal
+    /// input path so held `j`/`k` continue scrolling the session list instead of
+    /// opening the message composer.
     fn is_auto_repeat_burst(keys: &[KeyEvent]) -> bool {
         let Some(first) = keys.first() else {
             return false;
         };
-        keys.iter().skip(1).all(|key| {
-            key.code == first.code && key.modifiers == first.modifiers && key.kind == first.kind
-        })
+        keys.iter()
+            .skip(1)
+            .all(|key| key.code == first.code && key.modifiers == first.modifiers)
     }
 
     /// Peel a trailing Enter off a paste burst so plain-Enter Submit
@@ -4800,6 +4801,26 @@ mod tests {
                     key(KeyCode::Char('k'), KeyModifiers::NONE),
                     key(KeyCode::Char('k'), KeyModifiers::NONE),
                     key(KeyCode::Char('k'), KeyModifiers::NONE),
+                ],
+                true,
+            ),
+            (
+                vec![
+                    KeyEvent::new_with_kind(
+                        KeyCode::Char('j'),
+                        KeyModifiers::NONE,
+                        KeyEventKind::Press,
+                    ),
+                    KeyEvent::new_with_kind(
+                        KeyCode::Char('j'),
+                        KeyModifiers::NONE,
+                        KeyEventKind::Repeat,
+                    ),
+                    KeyEvent::new_with_kind(
+                        KeyCode::Char('j'),
+                        KeyModifiers::NONE,
+                        KeyEventKind::Repeat,
+                    ),
                 ],
                 true,
             ),
