@@ -398,8 +398,9 @@ impl SettingsView {
     /// section dividers (Appearance / Sessions / Hooks / Environment /
     /// Notifications / System) so the list isn't 14 unrelated tabs in
     /// arbitrary order. Status Hooks, Tmux, and Sound are dropped in Repo
-    /// scope because their sections are not repo-overridable
-    /// ([`REPO_OVERRIDABLE_SECTIONS`]), so a repo edit would strand at save.
+    /// scope because their sections are not repo-overridable (see
+    /// `REPO_OVERRIDABLE_SECTIONS` in `session::repo_config`), so a repo
+    /// edit would strand at save.
     fn categories_for_scope(scope: SettingsScope) -> Vec<CategoryRow> {
         let mut rows: Vec<CategoryRow> = Vec::new();
         let push_section = |rows: &mut Vec<CategoryRow>, label: &'static str| {
