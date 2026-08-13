@@ -25,6 +25,7 @@ import { useLastSessionRestore } from "./hooks/useLastSessionRestore";
 import { useRepoGroups } from "./hooks/useRepoGroups";
 import { useSessionGroups } from "./hooks/useSessionGroups";
 import { useNestedSidebarGroups } from "./hooks/useNestedSidebarGroups";
+import { useOrgGroups } from "./hooks/useOrgGroups";
 import { PluginUiProvider, usePluginUiEntries } from "./lib/pluginUiContext";
 import { buildSortValueMap, pluginSortSpecs } from "./lib/pluginUi";
 import type { PluginSortContext, SidebarSortMode } from "./lib/sidebarSort";
@@ -117,6 +118,13 @@ import { TerminalSessionStack } from "./components/TerminalSessionStack";
 const StructuredView = lazy(() =>
   import("./components/acp/StructuredView").then((m) => ({
     default: m.StructuredView,
+  })),
+);
+// Lazy for the same reason: it pulls in `useAcpSession`, which belongs to
+// the structured-view chunk and has no business in a tmux-only cold start.
+const AcpBackgroundDrainers = lazy(() =>
+  import("./components/acp/AcpQueueDrainer").then((m) => ({
+    default: m.AcpBackgroundDrainers,
   })),
 );
 import { type PaneDisplay } from "./components/Dock";
@@ -435,6 +443,15 @@ function AppContent({
     sidebarSortMode,
     pluginSort,
   );
+  // The org axis (#3283) partitions the same repo groups by remote owner;
+  // it needs no sort/plugin-sort input of its own since it reuses each
+  // repo's already-ordered workspace list verbatim, just like the nested
+  // axis's repo header.
+  const {
+    groups: orgGroups,
+    toggleOrgCollapsed,
+    toggleRepoCollapsed: toggleOrgRepoCollapsed,
+  } = useOrgGroups(repoGroups);
 
   // The sidebar render path consumes one honest model (SidebarGroup): the
   // repo axis maps in via an adapter, the user-group axis is already in
@@ -736,6 +753,9 @@ function AppContent({
     return workspaces.find((w) => w.sessions.some((s) => s.id === activeSessionId));
   }, [workspaces, activeSessionId]);
   const activeSession = activeWorkspace?.sessions.find((s) => s.id === activeSessionId);
+  // Flat session list, for the background queue drainers below. They need
+  // every structured session, not just the visible workspace's. See #3331.
+  const allSessions = useMemo(() => workspaces.flatMap((w) => w.sessions), [workspaces]);
   const allPaneIds: string[] = [
     // CityHall client mode hides the code-inspection panes (diff, files) and
     // the terminal (plus plugin panes below) so only the composer + structured
@@ -2153,6 +2173,13 @@ function AppContent({
 
   return (
     <AcpPrefsProvider value={acpPrefs}>
+      {/* Headless: holds a subscription for each structured session with
+          queued prompts waiting whose chat is not on screen, so a parked
+          follow-up is delivered without the user navigating back to it.
+          Renders no DOM. See #3331. */}
+      <Suspense fallback={null}>
+        <AcpBackgroundDrainers sessions={allSessions} activeSessionId={activeSessionId} />
+      </Suspense>
       <div className="h-dvh flex flex-col bg-surface-900 text-text-primary overflow-hidden safe-area-inset">
         {/* Wrapped unconditionally, not behind the `headerCollapsible`
             ternary: swapping the element type at this position would remount
@@ -2210,8 +2237,11 @@ function AppContent({
             <WorkspaceSidebar
               groups={sidebarGroups}
               nestedGroups={nestedGroups}
+              orgGroups={orgGroups}
               trashedWorkspaces={trashedWorkspaces}
               onToggleSubgroup={toggleSubgroupCollapsed}
+              onToggleOrg={toggleOrgCollapsed}
+              onToggleOrgRepo={toggleOrgRepoCollapsed}
               onReorderWorkspaces={handleReorderWorkspaces}
               onReorderGroups={reorderRepoGroups}
               activeId={activeWorkspace?.id ?? null}

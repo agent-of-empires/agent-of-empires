@@ -319,6 +319,16 @@ pub struct AgentDef {
     /// newlines within a paste rather than as "submit". A delay longer than the
     /// agent's burst window lets the suppression expire before Enter arrives.
     pub send_keys_enter_delay_ms: u64,
+    /// Pane-content substring (matched case-insensitively) that indicates
+    /// this agent's TUI has finished booting and is ready to accept input,
+    /// if known. `None` means no such per-agent signal is known yet;
+    /// callers fall back to a generic content-settle heuristic
+    /// (`tmux::Session::wait_until_content_settles`), which cannot tell a
+    /// genuinely idle prompt from a still-booting pane that merely hasn't
+    /// printed anything new in the last couple of samples. Used to avoid
+    /// typing into a pane before the agent is actually listening (see `aoe
+    /// send`'s pre-send wait).
+    pub ready_marker: Option<&'static str>,
     /// One-line install command shown when the agent is missing from PATH.
     pub install_hint: &'static str,
     /// Static keystroke sequences for answering this agent's own interactive
@@ -713,7 +723,15 @@ pub const AGENTS: &[AgentDef] = &[
         },
         fork_strategy: ForkStrategy::ClaudeFork,
         host_only: false,
-        send_keys_enter_delay_ms: 0,
+        // Claude Code has paste-burst suppression like Codex. Its input handler
+        // (usePasteHandler.ts) sets PASTE_COMPLETION_TIMEOUT_MS = 100 and, while a
+        // bracketed paste is still pending, appends any incoming Enter to the paste
+        // buffer instead of submitting it. When we send the message via
+        // send_via_paste_buffer and fire Enter immediately (0ms), that Enter lands
+        // inside the 100ms window and is swallowed, leaving an unsubmitted
+        // "[Pasted text]" placeholder. 150ms > 100ms lets the window expire first.
+        send_keys_enter_delay_ms: 150,
+        ready_marker: None,
         install_hint: "npm install -g @anthropic-ai/claude-code",
         permission_response: Some(PermissionResponse {
             allow: &[KeyToken::Literal("1")],
@@ -739,6 +757,11 @@ pub const AGENTS: &[AgentDef] = &[
         fork_strategy: ForkStrategy::Flag("--fork"),
         host_only: false,
         send_keys_enter_delay_ms: 0,
+        // Live-tested by an external headless-dispatch wrapper against
+        // real unattended runs: opencode's TUI shows this placeholder in
+        // its input box once it's finished booting and is ready to accept
+        // input, well before it necessarily prints anything else.
+        ready_marker: Some("ask anything"),
         install_hint: "curl -fsSL https://opencode.ai/install | bash",
         permission_response: Some(PermissionResponse {
             allow: &[KeyToken::Named("Enter")],
@@ -772,6 +795,7 @@ pub const AGENTS: &[AgentDef] = &[
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
+        ready_marker: None,
         install_hint: "pip install mistral-vibe",
         permission_response: None,
     },
@@ -805,8 +829,13 @@ pub const AGENTS: &[AgentDef] = &[
         // Enter keys arriving within that window after a character stream are
         // swallowed as newlines instead of triggering submit. 150ms > 120ms.
         send_keys_enter_delay_ms: 150,
+        ready_marker: None,
         install_hint: "npm install -g @openai/codex",
-        permission_response: None,
+        permission_response: Some(PermissionResponse {
+            allow: &[KeyToken::Literal("y")],
+            allow_always: Some(&[KeyToken::Literal("a")]),
+            deny: &[KeyToken::Literal("d")],
+        }),
     },
     AgentDef {
         name: "gemini",
@@ -860,6 +889,7 @@ pub const AGENTS: &[AgentDef] = &[
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
+        ready_marker: None,
         install_hint: "npm install -g @google/gemini-cli",
         permission_response: None,
     },
@@ -886,6 +916,7 @@ pub const AGENTS: &[AgentDef] = &[
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
+        ready_marker: None,
         install_hint: "see https://docs.cursor.com/cli",
         permission_response: None,
     },
@@ -913,6 +944,7 @@ pub const AGENTS: &[AgentDef] = &[
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
+        ready_marker: None,
         install_hint: "see https://docs.github.com/en/copilot/github-copilot-in-the-cli",
         permission_response: None,
     },
@@ -935,6 +967,7 @@ pub const AGENTS: &[AgentDef] = &[
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
+        ready_marker: None,
         install_hint: "npm install -g @earendil-works/pi-coding-agent",
         permission_response: None,
     },
@@ -956,6 +989,7 @@ pub const AGENTS: &[AgentDef] = &[
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
+        ready_marker: None,
         install_hint: "npm install -g droid",
         permission_response: None,
     },
@@ -989,6 +1023,7 @@ pub const AGENTS: &[AgentDef] = &[
         fork_strategy: ForkStrategy::Unsupported,
         host_only: true,
         send_keys_enter_delay_ms: 0,
+        ready_marker: None,
         install_hint: "brew install --cask mozilla-ai/tap/settl",
         permission_response: None,
     },
@@ -1028,6 +1063,7 @@ pub const AGENTS: &[AgentDef] = &[
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
+        ready_marker: None,
         install_hint:
             "curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash",
         permission_response: None,
@@ -1075,6 +1111,7 @@ pub const AGENTS: &[AgentDef] = &[
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
+        ready_marker: None,
         install_hint: "curl -fsSL https://cli.kiro.dev/install | bash",
         permission_response: None,
     },
@@ -1104,6 +1141,7 @@ pub const AGENTS: &[AgentDef] = &[
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
+        ready_marker: None,
         install_hint: "npm install -g @qwen-code/qwen-code",
         permission_response: None,
     },
@@ -1125,6 +1163,7 @@ pub const AGENTS: &[AgentDef] = &[
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
+        ready_marker: None,
         install_hint: "curl -fsSL https://antigravity.google/cli/install.sh | bash",
         permission_response: None,
     },
@@ -1164,6 +1203,7 @@ pub const AGENTS: &[AgentDef] = &[
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
+        ready_marker: None,
         install_hint: "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash",
         permission_response: None,
     },
@@ -1185,6 +1225,7 @@ pub const AGENTS: &[AgentDef] = &[
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
+        ready_marker: None,
         install_hint: "curl -fsSL https://omp.sh/install | sh",
         permission_response: Some(PermissionResponse {
             allow: &[KeyToken::Named("Enter")],
@@ -1513,6 +1554,12 @@ pub fn send_keys_enter_delay(tool: &str) -> u64 {
     get_agent(tool)
         .map(|a| a.send_keys_enter_delay_ms)
         .unwrap_or(0)
+}
+
+/// The known-ready pane-content marker for this agent, if any. See
+/// `AgentDef::ready_marker`.
+pub fn ready_marker(tool: &str) -> Option<&'static str> {
+    get_agent(tool).and_then(|a| a.ready_marker)
 }
 
 /// All canonical agent names in registry order.
@@ -2171,8 +2218,13 @@ mod tests {
     fn test_send_keys_enter_delay() {
         // Codex needs a delay to outlast its 120ms paste-burst suppression window
         assert!(send_keys_enter_delay("codex") >= 150);
-        // Other agents should not delay
-        assert_eq!(send_keys_enter_delay("claude"), 0);
+        // Claude Code also has paste-burst suppression: usePasteHandler.ts sets
+        // PASTE_COMPLETION_TIMEOUT_MS = 100 and, while a paste is pending, routes
+        // an incoming Enter into the paste buffer instead of submitting it (the
+        // `[Pasted text]` sits unsubmitted). The Enter must arrive after that
+        // 100ms window expires, so claude needs a delay > 100ms.
+        assert!(send_keys_enter_delay("claude") > 100);
+        // Other agents have no paste-burst suppression and should not delay
         assert_eq!(send_keys_enter_delay("opencode"), 0);
         assert_eq!(send_keys_enter_delay("hermes"), 0);
         assert_eq!(send_keys_enter_delay("kiro"), 0);

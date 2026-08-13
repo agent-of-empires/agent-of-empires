@@ -13,7 +13,7 @@
 //!    (Idle/Unknown) every 5 cycles, Cold (Error) every 60 cycles, Frozen
 //!    (Stopped/Deleting) never.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
@@ -143,7 +143,17 @@ pub(super) fn poll_statuses_once(
 
     let pane_metadata = if any_pollable {
         crate::tmux::refresh_session_cache();
-        crate::tmux::batch_pane_metadata().unwrap_or_default()
+        match crate::tmux::batch_pane_metadata() {
+            Ok(metadata) => metadata,
+            Err(error) => {
+                tracing::warn!(
+                    target: "session.status",
+                    %error,
+                    "skipping status refresh because tmux pane metadata is unavailable",
+                );
+                return Vec::new();
+            }
+        }
     } else {
         HashMap::new()
     };
@@ -165,13 +175,14 @@ pub(super) fn poll_statuses_once(
     if has_sandboxed && state.last_credential_refresh.elapsed() >= state.credential_refresh_interval
     {
         state.last_credential_refresh = Instant::now();
-        let profiles: BTreeSet<String> = instances
-            .iter()
-            .filter(|inst| inst.is_sandboxed())
-            .map(|inst| inst.effective_profile())
-            .collect();
-        for profile in profiles {
-            crate::session::container_config::refresh_agent_configs_for_profile(&profile);
+        crate::session::container_config::refresh_shared_agent_configs();
+        for instance in instances.iter().filter(|inst| inst.is_sandboxed()) {
+            crate::session::container_config::refresh_codex_agent_config_for_instance(
+                &instance.effective_profile(),
+                &instance.id,
+                &instance.tool,
+                Some(&instance.detect_as),
+            );
         }
     }
 

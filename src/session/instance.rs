@@ -1,8 +1,9 @@
 //! Session instance definition and operations
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
@@ -13,7 +14,9 @@ use crate::containers::{self, DockerContainer};
 use crate::tmux;
 
 use super::container_config;
-use super::environment::{build_docker_env_args, shell_escape};
+use super::environment::{
+    build_docker_env_args_with_managed_codex_home, resolved_sandbox_environment, shell_escape,
+};
 use super::poller::SessionPoller;
 
 use crate::session::capture::{
@@ -23,13 +26,43 @@ use crate::session::capture::{
     capture_vibe_session_id, claude_poll_fn, claude_poll_fn_sandboxed, codex_poll_fn,
     codex_poll_fn_sandboxed, copilot_poll_fn, gemini_poll_fn, gemini_poll_fn_sandboxed,
     generate_claude_session_id, hermes_poll_fn, hermes_poll_fn_sandboxed, is_valid_session_id,
-    kimi_poll_fn, omp_poll_fn, opencode_poll_fn, opencode_poll_fn_sandboxed, pi_poll_fn,
-    pi_poll_fn_sandboxed, try_capture_codex_session_id_in_container,
+    kimi_poll_fn, omp_host_routing_environment, omp_poll_fn, omp_poll_fn_sandboxed,
+    omp_sandbox_launch_marker, opencode_poll_fn, opencode_poll_fn_sandboxed, pi_poll_fn,
+    pi_poll_fn_sandboxed, reject_omp_secret_args, resolve_omp_store_layout,
+    resolve_omp_store_layout_in_container_with_environment,
+    resolve_omp_store_layout_with_environment, try_capture_codex_session_id_in_container,
     try_capture_gemini_session_id_in_container, try_capture_hermes_session_id_in_container,
-    try_capture_opencode_session_id, try_capture_opencode_session_id_in_container,
-    try_capture_pi_session_id_in_container, try_capture_vibe_session_id_in_container,
-    validated_session_id, vibe_poll_fn, vibe_poll_fn_sandboxed,
+    try_capture_omp_session_id_in_container, try_capture_opencode_session_id,
+    try_capture_opencode_session_id_in_container, try_capture_pi_session_id_in_container,
+    try_capture_vibe_session_id_in_container, validate_omp_capture_metadata, validated_session_id,
+    vibe_poll_fn, vibe_poll_fn_sandboxed, OmpCaptureMetadata, OmpCapturePlan, OmpCliCaptureOptions,
+    OmpStoreKind,
 };
+type LaunchCommandParts = (
+    Option<String>,
+    bool,
+    Option<OmpCapturePlan>,
+    LaunchEnvironment,
+);
+
+struct LaunchEnvironment {
+    pane: Vec<tmux::PaneEnvMutation>,
+    container: Vec<(String, String)>,
+}
+
+struct PreparedLaunch {
+    command: Option<String>,
+    is_existing: bool,
+    omp_capture_plan: Option<OmpCapturePlan>,
+    launch_env: LaunchEnvironment,
+    expected_prior_sid: Option<String>,
+    expected_prior_intent: ResumeIntent,
+    expected_prior_omp_generation: Option<String>,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalInfo {
@@ -464,6 +497,28 @@ where
     Ok(opt.filter(|s| !s.trim().is_empty()))
 }
 
+/// The session ids one agent left behind when an engine swap moved a row to a
+/// different `tool`, parked in `Instance::prior_tool_session_ids` under that
+/// agent's name so a swap back can resume where it left off. Both fields are
+/// per-agent namespaces, which is exactly why they cannot travel with the row.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct PriorToolSession {
+    /// The tmux-path conversation id, as `Instance::agent_session_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) agent_session_id: Option<String>,
+    /// The structured-view conversation id, as `Instance::acp_session_id`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) acp_session_id: Option<String>,
+}
+
+impl PriorToolSession {
+    /// Nothing worth parking: an agent that never got a conversation id (never
+    /// launched, or `/clear`ed) leaves no entry behind.
+    fn is_empty(&self) -> bool {
+        self.agent_session_id.is_none() && self.acp_session_id.is_none()
+    }
+}
+
 /// User intent gating `acquire_session_id`, persisted independently of the
 /// poller's observation in `agent_session_id`. CLI/REST/TUI write intent;
 /// the poller writes observation. Disjoint writers, no race.
@@ -510,51 +565,61 @@ pub enum SessionBucket {
     Trashed,
 }
 
-/// Which irreversible operation currently owns a session's `op_claim`. The
-/// purge (permanent teardown), restore (worktree move-back), and trash
-/// (container stop + worktree relocation into the holding area) paths run
-/// their slow work on an unlocked snapshot; the claim is the durable,
-/// cross-process primitive that serializes them so none tears down (or moves)
-/// state another is authoritative over. See #2541.
+/// One durable ownership protocol for every session lifecycle transition.
 ///
-/// `Trash` is deliberately the weakest claim: it marks "teardown in flight"
-/// so peers can observe it, but it never blocks user intent. A purge or
-/// restore seizes a fresh `Trash` claim (see [`Instance::try_claim`]) and the
-/// teardown yields via its pre-move re-check and the locked relocation
-/// commit, so a `d` followed by an immediate restore stays instant.
+/// A transition first acquires the per-instance lifecycle flock, then records
+/// a fresh generation under `Storage::update`. The durable reservation stays
+/// held through hooks, external side effects, and the exact-generation commit;
+/// callers may release the flock while running reentrant hooks. `status` is
+/// presentation state and never proves ownership.
 ///
-/// Compat: `ClaimOp` has no `#[serde(other)]` fallback, so an aoe binary
-/// that predates the `Trash` variant fails to deserialize the whole
-/// `Instance` row carrying `op:"trash"`; `Storage::load` then skips the row
-/// and quarantines it to `sessions.corrupt.jsonl`, making the session
-/// temporarily invisible to that binary for the life of the claim. The TTL
-/// ([`Instance::OP_CLAIM_TTL`], 10 minutes) bounds how long the claim stays
-/// FRESH, but the field itself only clears when a newer binary next rewrites
-/// that row (a release path or the load-time expired-claim sweep), so the
-/// invisibility ends at that rewrite, not on a timer. If the older binary
-/// *writes* storage
-/// while the row is invisible, its save drops the row from `sessions.json`
-/// entirely (it survives only in the quarantine sidecar). Same exposure
-/// class as the #2541 Purge/Restore variants against pre-#2541 binaries: a
-/// mixed-version fleet touching storage inside a claim's TTL window.
+/// A crashed owner loses both the flock and, after the TTL, its reservation.
+/// Recovery may then acquire a newer generation; exact-generation commits
+/// ensure a late result can never mutate or clear that replacement.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
-pub enum ClaimOp {
+pub enum LifecycleOperation {
+    Launch,
+    Capture,
+    Stop,
     Purge,
     Restore,
     Trash,
 }
 
-/// A durable ownership marker for an in-flight purge, restore, or trash
-/// teardown. `at` serves double duty: ownership plus the base for the TTL
-/// self-heal (a claim older than the TTL is treated as absent, so a crash
-/// mid-operation cannot strand a row permanently). Written on disk under the
-/// storage flock via
-/// [`Instance::try_claim`], the only serialization point visible across the
-/// CLI, the serve daemon, and the TUI. See #2541.
+impl LifecycleOperation {
+    pub(crate) fn busy_reason(self) -> String {
+        format!("busy with lifecycle operation {self:?}")
+    }
+
+    pub(crate) fn already_in_progress_reason(self) -> String {
+        format!("lifecycle operation {self:?} is already in progress")
+    }
+}
+
+pub(crate) const NEWER_GENERATION_BUSY_REASON: &str = "busy with a newer lifecycle generation";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LifecycleReservationError {
+    Busy(LifecycleOperation),
+    GenerationOverflow,
+}
+
+impl std::fmt::Display for LifecycleReservationError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Busy(operation) => f.write_str(&operation.already_in_progress_reason()),
+            Self::GenerationOverflow => f.write_str("lifecycle generation overflow"),
+        }
+    }
+}
+
+impl std::error::Error for LifecycleReservationError {}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct OpClaim {
-    pub op: ClaimOp,
+pub struct LifecycleReservation {
+    pub op: LifecycleOperation,
+    pub generation: u64,
     pub at: DateTime<Utc>,
 }
 
@@ -719,21 +784,15 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_trash_project_path: Option<String>,
 
-    /// Durable ownership of an in-flight purge, restore, or trash teardown,
-    /// acquired under the storage flock via [`Self::try_claim`] before each
-    /// path runs its slow unlocked phase (purge teardown, restore worktree
-    /// move, trash container stop + relocation). It closes the cross-process
-    /// purge/restore race (#2541): a purge refuses to tear down a row a fresh
-    /// restore claim holds, and a restore refuses to move a row a fresh purge
-    /// claim holds. A `Trash` claim is weaker: it marks the teardown as
-    /// observable in-flight state and is seized by either of the other two
-    /// (see [`ClaimOp`]). Deliberately NOT copied by
-    /// [`Self::merge_user_action_diff`]: keeping it out of the peer-diff set is
-    /// exactly what stops a concurrent user action from clobbering a live claim.
-    /// Additive: absent in older `sessions.json` rows, so no migration is
-    /// needed (mirrors `trashed_at`).
+    /// Durable ownership reservation for every in-flight lifecycle transition.
+    /// Acquired atomically with a new `lifecycle_generation`; only that
+    /// generation may perform the transition's irreversible phase, commit, or
+    /// release it. This is intentionally the only persisted busy signal:
+    /// `status` remains multi-writer presentation state, while the per-instance
+    /// flock is the short-lived mutex protecting the final side effects and
+    /// commit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub op_claim: Option<OpClaim>,
+    pub lifecycle_reservation: Option<LifecycleReservation>,
 
     /// Namespaced per-session plugin data, keyed by plugin id. Each plugin
     /// owns only its own slot (`plugin_meta["<id>"]`), an opaque JSON value it
@@ -829,6 +888,28 @@ pub struct Instance {
         deserialize_with = "deserialize_session_id"
     )]
     pub agent_session_id: Option<String>,
+    /// Active OMP launch generation. Poller observations must carry this
+    /// value through the storage CAS before they may update the durable sid.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) omp_capture_generation: Option<String>,
+    /// Monotone token for pane lifecycle commits. Async/CLI result merges may
+    /// update lifecycle-owned fields only when they are at least this recent.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub(crate) lifecycle_generation: u64,
+
+    /// Session ids this row used under a *previous* `tool`, keyed by that
+    /// tool's name, so an engine swap back (`claude` -> `pi` -> `claude`)
+    /// resumes the original conversation instead of starting a third one.
+    /// Written and read only by [`Self::swap_tool`], which parks the outgoing
+    /// agent's ids and consumes the incoming agent's entry, so the map holds at
+    /// most one entry per tool the row has ever run under.
+    ///
+    /// `resume_probe_failed_sid` is deliberately not parked with them: a
+    /// restored sid is worth one fresh probe (the conversation may well still
+    /// be there), and if it is gone the resume-fallback cascade already starts
+    /// a new session instead. Additive: absent in older rows, no migration.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub(crate) prior_tool_session_ids: HashMap<String, PriorToolSession>,
 
     /// Durable loop-breaker for ambiguous resume-probe failures. When this
     /// equals `agent_session_id`, startup recovery skips automatic resume so a
@@ -1006,20 +1087,16 @@ pub struct Instance {
     #[serde(skip)]
     pub unknown_since: Option<std::time::Instant>,
 
-    /// `KEY=VALUE` pairs minted by `host_hooks.before_session` for the launch
-    /// currently being assembled, for host (non-sandboxed) sessions only.
+    /// Runtime-only `KEY=VALUE` pairs minted by
+    /// `host_hooks.before_session` for the host launch currently being
+    /// assembled. They are appended after resolved static profile values in
+    /// the protected one-shot pane environment file, so minted values win
+    /// without entering tmux argv, pane metadata, or session environment.
     ///
-    /// Populated by [`Instance::mint_host_session_env`] at the top of the launch
-    /// path and consumed twice: [`Instance::build_host_command`] drops any
-    /// same-keyed static `environment` entry from the pane's shell-assignment
-    /// prefix (a prefix assignment would otherwise shadow the inherited value),
-    /// and the launch site passes it to `tmux new-session -e` so the value
-    /// reaches the pane without ever entering argv.
-    ///
-    /// `#[serde(skip)]` is intentional and load-bearing: these values are
-    /// secrets with a short lifetime, so persisting them to the session store
-    /// would both leak them to disk and let a stale value be replayed on a later
-    /// launch. Every host launch re-mints from scratch.
+    /// `#[serde(skip)]` is intentional and load-bearing: these values may be
+    /// secrets with a short lifetime, so persisting them would leak them and
+    /// replay stale values on a later launch. Every host launch re-mints them
+    /// from scratch.
     #[serde(skip)]
     pending_host_env: Vec<(String, String)>,
 
@@ -1255,6 +1332,45 @@ pub(crate) fn persist_session_to_storage(
     expected_prior: Option<&str>,
     file_watch: &std::sync::Arc<crate::file_watch::FileWatchService>,
 ) -> SidWrite {
+    persist_session_to_storage_guarded(
+        profile,
+        instance_id,
+        session_id,
+        expected_prior,
+        false,
+        None,
+        file_watch,
+    )
+}
+
+pub(crate) fn persist_omp_session_to_storage(
+    profile: &str,
+    instance_id: &str,
+    session_id: &str,
+    expected_prior: Option<&str>,
+    expected_generation: Option<&str>,
+    file_watch: &std::sync::Arc<crate::file_watch::FileWatchService>,
+) -> SidWrite {
+    persist_session_to_storage_guarded(
+        profile,
+        instance_id,
+        session_id,
+        expected_prior,
+        true,
+        expected_generation,
+        file_watch,
+    )
+}
+
+fn persist_session_to_storage_guarded(
+    profile: &str,
+    instance_id: &str,
+    session_id: &str,
+    expected_prior: Option<&str>,
+    guard_generation: bool,
+    expected_generation: Option<&str>,
+    file_watch: &std::sync::Arc<crate::file_watch::FileWatchService>,
+) -> SidWrite {
     if !is_valid_session_id(session_id) {
         tracing::warn!(target: "session.store",
             "Refusing to persist invalid session ID {:?} for {}",
@@ -1296,6 +1412,15 @@ pub(crate) fn persist_session_to_storage(
                     );
                     return Ok(SidWrite::Skipped);
                 }
+            }
+            if guard_generation && inst.omp_capture_generation.as_deref() != expected_generation {
+                tracing::warn!(target: "session.store",
+                    instance_id = %instance_id,
+                    expected_generation = ?expected_generation,
+                    disk_generation = ?inst.omp_capture_generation,
+                    "OMP generation CAS mismatch; skipping sid persist"
+                );
+                return Ok(SidWrite::Skipped);
             }
             if inst.agent_session_id.as_deref() != expected_prior {
                 tracing::warn!(target: "session.store",
@@ -1382,6 +1507,7 @@ fn tmux_env_session_name_for_instance_id(instance_id: &str) -> Option<String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PassiveStatusPatch {
     pub status: Status,
+    pub lifecycle_generation: u64,
     pub idle_entered_at: Option<DateTime<Utc>>,
     /// `None` when the source `Instance` was never touched by a user
     /// (`last_accessed_at` itself `None`); must stay `None` in that case
@@ -1399,6 +1525,7 @@ impl PassiveStatusPatch {
     pub(crate) fn from_instance(inst: &Instance) -> Self {
         Self {
             status: inst.status,
+            lifecycle_generation: inst.lifecycle_generation,
             idle_entered_at: inst.idle_entered_at,
             last_accessed_at: inst.last_accessed_at,
         }
@@ -1432,7 +1559,7 @@ impl Instance {
             pinned_at: None,
             trashed_at: None,
             pre_trash_project_path: None,
-            op_claim: None,
+            lifecycle_reservation: None,
             plugin_meta: std::collections::BTreeMap::new(),
             created_by_plugin: None,
             plugin_create_idempotency: None,
@@ -1440,12 +1567,15 @@ impl Instance {
             #[cfg(feature = "serve")]
             pending_initial_turn_attachments: Vec::new(),
             acp_mode_id: None,
+            prior_tool_session_ids: HashMap::new(),
             scratch: false,
             worktree_info: None,
             workspace_info: None,
             sandbox_info: None,
             terminal_info: None,
             agent_session_id: None,
+            omp_capture_generation: None,
+            lifecycle_generation: 0,
             resume_probe_failed_sid: None,
             resume_intent: ResumeIntent::Default,
             force_fresh_next_launch: false,
@@ -1590,10 +1720,19 @@ impl Instance {
         self.is_idle_dormant() && self.status != Status::Stopped
     }
 
-    /// Mutates: `status`, `sandbox_info`. Field set must match what
-    /// `start_with_size_opts` writes; missing fields re-introduce the
-    /// wholesale-replace clobber.
+    /// Mutates launch-owned state. A strictly newer lifecycle generation also
+    /// imports its status timestamps and error snapshot as one unit.
     pub fn merge_post_start(&mut self, src: &Self) {
+        if src.lifecycle_generation < self.lifecycle_generation {
+            return;
+        }
+        if src.lifecycle_generation > self.lifecycle_generation {
+            self.idle_entered_at = src.idle_entered_at;
+            self.last_accessed_at = src.last_accessed_at;
+            self.last_error = src.last_error.clone();
+            self.last_error_check = src.last_error_check;
+        }
+        self.lifecycle_generation = src.lifecycle_generation;
         self.status = src.status;
         self.sandbox_info = src.sandbox_info.clone();
     }
@@ -1602,26 +1741,41 @@ impl Instance {
     /// copied only when the sid still matches so peer poller writes that land
     /// between phase 2 and phase 3 of the restart remain authoritative.
     pub fn merge_post_restart(&mut self, src: &Self) {
+        if src.lifecycle_generation < self.lifecycle_generation {
+            return;
+        }
         self.merge_post_start(src);
         if self.agent_session_id == src.agent_session_id {
             self.resume_probe_failed_sid = src.resume_probe_failed_sid.clone();
         }
     }
 
-    /// Baseline-aware sibling for async restart workers. Copies worker-produced
-    /// identity only when the live row still matches the pre-restart snapshot;
-    /// peer writes that land while the worker is blocked remain authoritative.
     pub fn merge_post_restart_with_baseline(&mut self, before: &Self, src: &Self) {
+        if src.lifecycle_generation < self.lifecycle_generation {
+            return;
+        }
         self.merge_post_start(src);
+        let generation_can_merge = self.omp_capture_generation == before.omp_capture_generation
+            || self.omp_capture_generation == src.omp_capture_generation;
+        self.lifecycle_generation = src.lifecycle_generation;
         let sid_unchanged = self.agent_session_id == before.agent_session_id;
         let marker_unchanged = self.resume_probe_failed_sid == before.resume_probe_failed_sid;
 
-        if sid_unchanged {
-            self.agent_session_id = src.agent_session_id.clone();
+        if generation_can_merge {
+            self.omp_capture_generation = src.omp_capture_generation.clone();
+            self.session_id_poller = src.session_id_poller.clone();
+            if sid_unchanged {
+                self.agent_session_id = src.agent_session_id.clone();
+            }
+        } else if src.session_id_poller_is_running() {
+            // A concurrent launch already published a third generation. The
+            // restarted poller reloads tmux metadata on every tick, so keep
+            // that live worker and let it rebind to the newer generation
+            // without overwriting the newer durable identity.
             self.session_id_poller = src.session_id_poller.clone();
         }
-
-        if marker_unchanged && self.agent_session_id == src.agent_session_id {
+        if generation_can_merge && marker_unchanged && self.agent_session_id == src.agent_session_id
+        {
             self.resume_probe_failed_sid = src.resume_probe_failed_sid.clone();
         }
     }
@@ -1663,13 +1817,17 @@ impl Instance {
         // rewrites the runtime field it observes before reading
         // (`pane_dead_observed` is rewritten by the TUI's status poller
         // before its TUI-only consumers read).
-        disk.last_error_check = self.last_error_check;
+        let disk_has_newer_lifecycle = disk.lifecycle_generation > self.lifecycle_generation;
+        if !disk_has_newer_lifecycle {
+            disk.last_error_check = self.last_error_check;
+            disk.last_error = self.last_error.take();
+        }
         disk.last_start_time = self.last_start_time;
-        disk.last_error = self.last_error.take();
         disk.session_id_poller = self.session_id_poller.take();
         disk.retroactive_capture_excludes = std::mem::take(&mut self.retroactive_capture_excludes);
         disk.pane_dead_observed = self.pane_dead_observed;
         disk.force_fresh_next_launch = self.force_fresh_next_launch;
+        disk.pending_host_env = std::mem::take(&mut self.pending_host_env);
         disk.source_profile = std::mem::take(&mut self.source_profile);
         disk.ever_confirmed_present = self.ever_confirmed_present;
         disk.unknown_since = self.unknown_since;
@@ -1731,6 +1889,32 @@ impl Instance {
         }
     }
 
+    /// Carry runtime-only state across a storage reload without constructing a
+    /// lifecycle snapshot from two different generations.
+    ///
+    /// `status` and `idle_entered_at` ARE generation-governed: a strictly newer
+    /// disk snapshot (a peer's `commit_reserved_lifecycle_status`) must win over
+    /// the stale in-memory copy. `last_error`/`last_error_check` are NOT: no
+    /// lifecycle writer (`reserve_/commit_/advance_lifecycle_generation`)
+    /// produces an authoritative peer value for them. The only on-disk value is
+    /// the one `reconcile_from_disk` round-trips back from this same in-memory
+    /// poller state, so there is nothing to defer to and the in-memory value
+    /// always wins. Gating it on the generation would let an unrelated
+    /// generation bump (stop/unarchive, which pass `status: None`) discard a
+    /// freshly poller-derived `TMUX_SESSION_GONE_ERROR`, leaving the row stuck
+    /// at `Error`+`None`.
+    pub(crate) fn merge_runtime_from_reload(&mut self, previous: &Self) {
+        if self.lifecycle_generation <= previous.lifecycle_generation {
+            self.status = previous.status;
+            self.idle_entered_at = previous.idle_entered_at;
+        }
+        self.last_error = previous.last_error.clone();
+        self.last_error_check = previous.last_error_check;
+        self.last_start_time = previous.last_start_time;
+        self.session_id_poller = previous.session_id_poller.clone();
+        self.retroactive_capture_excludes = previous.retroactive_capture_excludes.clone();
+    }
+
     /// Splice TUI-mirrored, persisted fields from `src` onto `self`. Used by
     /// `HomeView::save` for fields the TUI is the canonical disk writer of
     /// (the daemon's `status_poll_loop` keeps these in memory only). The
@@ -1741,9 +1925,12 @@ impl Instance {
     /// are NOT here; they go through `apply_user_action` per-action so peer
     /// writers (CLI) cannot be clobbered by a stale TUI snapshot.
     pub fn merge_from_tui(&mut self, src: &Self) {
-        self.status = src.status;
-        self.last_accessed_at = self.last_accessed_at.max(src.last_accessed_at);
-        self.idle_entered_at = src.idle_entered_at;
+        if src.lifecycle_generation >= self.lifecycle_generation {
+            self.lifecycle_generation = src.lifecycle_generation;
+            self.status = src.status;
+            self.last_accessed_at = self.last_accessed_at.max(src.last_accessed_at);
+            self.idle_entered_at = src.idle_entered_at;
+        }
         // Launch-config fields are TUI-authoritative and only mutated after
         // creation by the restart dialog (engine / command / args swap). They
         // have no peer writer, so a plain copy is safe. Syncing them here is
@@ -1753,6 +1940,75 @@ impl Instance {
         self.tool = src.tool.clone();
         self.command = src.command.clone();
         self.extra_args = src.extra_args.clone();
+    }
+
+    /// Move this row to a different `tool` (the TUI restart dialog's engine
+    /// swap), parking the outgoing agent's session ids and picking up the
+    /// incoming agent's, if it has been here before.
+    ///
+    /// Session ids live in per-agent namespaces: a Claude UUID means nothing
+    /// to codex or gemini, but `is_valid_session_id` accepts any shape, so a
+    /// carried-over sid makes the next launch emit `--resume <foreign-sid>`
+    /// and the new engine starts by failing to resume. #3077 made the swap
+    /// reach disk, which is what exposed this. The rest of what this clears
+    /// mirrors the structured-view agent switch (`POST /api/acp/:id/switch`).
+    ///
+    /// A no-op when `new_tool` is the current tool, so a caller may apply it
+    /// to a disk row and an in-memory row independently without the second
+    /// call double-stashing.
+    ///
+    /// Callers must persist the result themselves: `merge_from_tui`
+    /// deliberately does not sync these fields (the capture pollers own
+    /// `agent_session_id` through CAS writes), so an in-memory-only swap is
+    /// reverted by `reconcile_from_disk` on the next launch.
+    pub(crate) fn swap_tool(&mut self, new_tool: &str) {
+        if new_tool == self.tool {
+            return;
+        }
+        // Park the outgoing agent's conversation under its own name so a swap
+        // back to it resumes there instead of starting a third conversation.
+        let outgoing = PriorToolSession {
+            agent_session_id: self.agent_session_id.take(),
+            acp_session_id: self.acp_session_id.take(),
+        };
+        if !outgoing.is_empty() {
+            self.prior_tool_session_ids
+                .insert(self.tool.clone(), outgoing);
+        }
+        self.tool = new_tool.to_string();
+        // Consumed, not copied: the row owns exactly one live conversation per
+        // agent, and leaving the entry behind would let a later swap restore an
+        // id this session has since replaced.
+        let restored = self
+            .prior_tool_session_ids
+            .remove(new_tool)
+            .unwrap_or_default();
+        self.agent_session_id = restored.agent_session_id;
+        self.acp_session_id = restored.acp_session_id;
+        self.resume_probe_failed_sid = None;
+        // A pin/clear/fork directive names an id in the old agent's namespace,
+        // so it cannot survive the swap either.
+        self.resume_intent = ResumeIntent::Default;
+        // Effort vocabularies are adapter-specific, so the old agent's pick is
+        // meaningless to the new one; it falls back to the new agent's default.
+        self.acp_effort = None;
+        // Same for the pinned model: `claude-opus-4-7` means nothing to codex,
+        // and it is re-injected on every spawn, so it has to go too.
+        self.agent_model = None;
+        // `acp_mode_id` deliberately stays. It is the session's approval
+        // posture, and clearing it does not fall back to "default": the spawn
+        // path's mode gate is `acp_mode_id.is_some() || yolo_mode`, whose
+        // `None` arm resolves the adapter's *bypass* mode id, so dropping an
+        // explicit restrictive mode from a `yolo_mode` row would silently
+        // escalate the new agent to auto-approve. An unrecognized mode id is a
+        // warn-and-continue no-op instead, which is the safe failure. The
+        // structured-view agent switch passes it through for the same reason.
+        self.import_pending = None;
+        self.fork_pending = None;
+        // The pinned structured-view agent belongs to the old tool; clearing it
+        // lets the spawn path pick the new tool's default agent instead of
+        // silently keeping the old backend alive across the swap.
+        self.agent_name = None;
     }
 
     /// Apply a passively-detected status transition to a disk row. Touches
@@ -1765,11 +2021,9 @@ impl Instance {
     /// poller-produced patch loses to a newer explicit user touch instead of
     /// racing it.
     ///
-    /// `status`/`idle_entered_at` always apply regardless: the poller is the
-    /// sole authority on detected agent status, and gating them on the
-    /// `last_accessed_at` comparison would let an unrelated peer touch
-    /// strand a real status transition on disk until the next one. See
-    /// #2690.
+    /// `status`/`idle_entered_at` apply independently of timestamp only while
+    /// the patch's lifecycle generation is current. This prevents an old pane
+    /// poll from repainting a newer Stop/Restart/Archive commit.
     ///
     /// The `>=` guard on `last_accessed_at` compares `chrono::Utc::now()`
     /// values, which delegate to `SystemTime::now()` (wall clock, not
@@ -1784,6 +2038,17 @@ impl Instance {
     /// Callers relying on the observable `last_accessed_at` change must
     /// re-read the field after `merge_passive_status_patch` returns.
     pub(crate) fn merge_passive_status_patch(&mut self, id: &str, patch: &PassiveStatusPatch) {
+        if patch.lifecycle_generation < self.lifecycle_generation {
+            tracing::debug!(
+                target: "session.store",
+                session_id = %id,
+                patch_generation = patch.lifecycle_generation,
+                disk_generation = self.lifecycle_generation,
+                "dropped passive status patch from an older lifecycle generation"
+            );
+            return;
+        }
+        self.lifecycle_generation = patch.lifecycle_generation;
         self.status = patch.status;
         self.idle_entered_at = patch.idle_entered_at;
         let Some(incoming) = patch.last_accessed_at else {
@@ -1866,13 +2131,9 @@ impl Instance {
         if pre.status != post.status {
             self.status = post.status;
         }
-        // `op_claim` is intentionally NOT spliced here. It is a cross-process
-        // ownership marker for an in-flight purge, restore, or trash
-        // teardown, not a user-action field; excluding it from the peer diff
-        // is what stops a concurrent user action from clobbering a live claim
-        // on disk. The trash path relies on this same drop: its claim is
-        // written by a same-flock post-mutation hook instead
-        // (`apply_user_action_with`). See #2541.
+        // Lifecycle ownership is intentionally never spliced from a TUI
+        // snapshot. Only transition code holding the per-instance flock may
+        // mutate the durable reservation and generation.
         self.last_accessed_at = self.last_accessed_at.max(post.last_accessed_at);
 
         let archived_changed = pre.archived_at != post.archived_at;
@@ -1974,76 +2235,91 @@ impl Instance {
         self.trashed_at.is_some()
     }
 
-    /// TTL for an `OpClaim`. Longer than any realistic teardown or worktree
-    /// move so a live operation is never overridden mid-flight, short enough
-    /// that a crash mid-operation self-heals promptly (the next purge/restore
-    /// overrides the expired claim, and the load-time reconcile clears it). See
-    /// #2541.
-    pub const OP_CLAIM_TTL: chrono::Duration = chrono::Duration::minutes(10);
+    /// Longer than any bounded hook, teardown, or worktree move. A crashed
+    /// owner cannot retain the reservation forever; a late owner is still
+    /// harmless because every commit is generation-checked.
+    pub const LIFECYCLE_RESERVATION_TTL: chrono::Duration = chrono::Duration::minutes(10);
 
-    /// Atomically acquire or keep the op claim for `want`. Returns `Ok` when
-    /// the claim is free, already ours, expired (self-heal), or held by a
-    /// fresh `Trash` claim being seized by a purge or restore; returns
-    /// `Err(holder)` when another operation holds a still-fresh claim that
-    /// `want` may not seize.
+    /// Acquire exclusive durable ownership of the next lifecycle generation.
     ///
-    /// Seizure order: `Trash` is the weakest claim. A teardown marks state,
-    /// it does not gate user intent, so `Purge` and `Restore` take over a
-    /// fresh `Trash` claim and the teardown yields via its pre-move re-check
-    /// and the locked relocation commit. `Trash` itself never seizes a fresh
-    /// `Purge` or `Restore` claim, and `Purge`/`Restore` still exclude each
-    /// other as before.
-    ///
-    /// Must be called inside a `Storage::update` closure so the check-and-set
-    /// runs under the storage flock, the only cross-process serialization
-    /// point. The whole destructive/irreversible phase (purge teardown, restore
-    /// worktree move, trash relocation) must win this before running unlocked,
-    /// and clear the claim when it finishes. See #2541.
-    pub fn try_claim(
+    /// Even a reservation for the same operation belongs to a peer: operation
+    /// kind is not an identity. A caller that already owns a reservation must
+    /// retain its returned generation and use
+    /// [`Self::lifecycle_reservation_is_owned`] rather than reacquiring by kind.
+    pub fn try_acquire_lifecycle_reservation(
         &mut self,
-        want: ClaimOp,
+        operation: LifecycleOperation,
         ttl: chrono::Duration,
         now: DateTime<Utc>,
-    ) -> Result<(), ClaimOp> {
-        match &self.op_claim {
-            Some(c) if c.op != want && c.op != ClaimOp::Trash && (now - c.at) < ttl => Err(c.op),
-            _ => {
-                self.op_claim = Some(OpClaim { op: want, at: now });
-                Ok(())
-            }
+    ) -> Result<u64, LifecycleReservationError> {
+        if let Some(reservation) = self.lifecycle_reservation.as_ref().filter(|reservation| {
+            reservation.generation == self.lifecycle_generation && (now - reservation.at) < ttl
+        }) {
+            return Err(LifecycleReservationError::Busy(reservation.op));
         }
+
+        let generation = self
+            .lifecycle_generation
+            .checked_add(1)
+            .ok_or(LifecycleReservationError::GenerationOverflow)?;
+        self.lifecycle_generation = generation;
+        self.lifecycle_reservation = Some(LifecycleReservation {
+            op: operation,
+            generation,
+            at: now,
+        });
+        Ok(generation)
     }
 
-    /// True when a fresh (unexpired) Purge or Restore claim holds this row,
-    /// i.e. a peer seized the trash teardown's claim (or claimed the row
-    /// outright while the teardown ran unclaimed). The teardown's two
-    /// decision points share this predicate: the pre-move gate
-    /// (`teardown_may_relocate`) and the locked relocation commit
-    /// (`commit_trash_relocation`). `try_claim` keeps its own inline
-    /// predicate because it additionally excludes the op being acquired.
-    pub fn is_seized_by_fresh_peer_claim(&self, now: DateTime<Utc>) -> bool {
+    pub fn lifecycle_reservation_is_owned(
+        &self,
+        operation: LifecycleOperation,
+        generation: u64,
+    ) -> bool {
+        self.lifecycle_generation == generation
+            && matches!(
+                &self.lifecycle_reservation,
+                Some(reservation)
+                    if reservation.op == operation && reservation.generation == generation
+            )
+    }
+
+    pub fn has_fresh_lifecycle_reservation(&self, now: DateTime<Utc>) -> bool {
         matches!(
-            &self.op_claim,
-            Some(c) if c.op != ClaimOp::Trash && (now - c.at) < Self::OP_CLAIM_TTL
+            &self.lifecycle_reservation,
+            Some(reservation)
+                if reservation.generation == self.lifecycle_generation
+                    && (now - reservation.at) < Self::LIFECYCLE_RESERVATION_TTL
         )
     }
 
-    /// Drop the op claim only when it is owned by `op`. Ownership-guarding the
-    /// clear is critical on the stale-override path: if a purge overran the TTL
-    /// and a peer restore overrode it with a fresh Restore claim, the purge's
-    /// final commit must not clear that live Restore claim. See #2541.
-    pub fn clear_op_claim_if_owned(&mut self, op: ClaimOp) {
-        if matches!(&self.op_claim, Some(c) if c.op == op) {
-            self.op_claim = None;
+    pub fn release_lifecycle_reservation_if_owned(
+        &mut self,
+        operation: LifecycleOperation,
+        generation: u64,
+    ) -> bool {
+        if self.lifecycle_reservation_is_owned(operation, generation) {
+            self.lifecycle_reservation = None;
+            true
+        } else {
+            false
         }
     }
 
-    /// Self-heal: drop an expired claim so a crash mid-operation cannot strand
-    /// a row as permanently un-purgeable/un-restorable. Returns whether it
-    /// cleared anything (so a caller can persist only when needed). See #2541.
-    pub fn clear_expired_op_claim(&mut self, ttl: chrono::Duration, now: DateTime<Utc>) -> bool {
-        if matches!(&self.op_claim, Some(c) if (now - c.at) >= ttl) {
-            self.op_claim = None;
+    /// Clear a crashed owner's expired reservation. The generation is
+    /// deliberately retained as the monotonic cache/result revision.
+    pub fn clear_expired_lifecycle_reservation(
+        &mut self,
+        ttl: chrono::Duration,
+        now: DateTime<Utc>,
+    ) -> bool {
+        if matches!(
+            &self.lifecycle_reservation,
+            Some(reservation)
+                if reservation.generation == self.lifecycle_generation
+                    && (now - reservation.at) >= ttl
+        ) {
+            self.lifecycle_reservation = None;
             true
         } else {
             false
@@ -2273,6 +2549,258 @@ impl Instance {
     fn profile_host_environment(&self) -> Vec<String> {
         let profile = self.effective_profile();
         super::profile_config::resolve_config_or_warn(&profile).environment
+    }
+
+    fn omp_host_environment(&self) -> Vec<String> {
+        let mut environment = super::environment::drop_shadowed_host_entries(
+            self.profile_host_environment(),
+            &self.pending_host_env,
+        );
+        environment.extend(self.pending_host_env.iter().map(|(key, value)| {
+            // These are already-concrete hook values. Escape a leading `$`
+            // back into the environment-list grammar so it remains literal.
+            if value.starts_with('$') {
+                format!("{key}=${value}")
+            } else {
+                format!("{key}={value}")
+            }
+        }));
+        environment
+    }
+
+    /// Capture is safe only for the built-in OMP command and a transparent,
+    /// parseable argv. Benign arguments remain supported; store-selecting
+    /// flags are interpreted by the capture resolver.
+    fn omp_capture_options(&self) -> Option<OmpCliCaptureOptions> {
+        if self.tool != "omp" || self.has_command_override() {
+            return None;
+        }
+        let args = super::config::quote_model_value_in_args(&self.extra_args);
+        OmpCliCaptureOptions::parse(&args).ok()
+    }
+
+    /// Resolve OMP's store, routing environment, and per-launch marker after
+    /// `on_launch`. Environment values remain transient; the marker and layout
+    /// survive in capture metadata.
+    fn resolve_omp_capture_plan(&self, options: &OmpCliCaptureOptions) -> Option<OmpCapturePlan> {
+        let resolved = if self.is_sandboxed() {
+            let sandbox = self.sandbox_info.as_ref()?;
+            let launch_environment = resolved_sandbox_environment(
+                &self.source_profile,
+                sandbox,
+                Path::new(&self.project_path),
+            );
+            resolve_omp_store_layout_in_container_with_environment(
+                &sandbox.container_name,
+                &self.container_workdir(),
+                &launch_environment,
+                options,
+            )
+        } else {
+            resolve_omp_store_layout_with_environment(
+                &self.omp_host_environment(),
+                &self.project_path,
+                options,
+            )
+        };
+        let (layout, routing_fingerprint) = match resolved {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                tracing::warn!(
+                    target: "session.store",
+                    instance = %self.id,
+                    "OMP capture disabled because launch routing could not be resolved: {error}"
+                );
+                return None;
+            }
+        };
+        let launch_marker = if self.is_sandboxed() {
+            omp_sandbox_launch_marker(&self.id)
+        } else {
+            match crate::hooks::ensure_instance_dir_path(&self.id) {
+                Ok(path) => path.join("omp_launch").to_string_lossy().into_owned(),
+                Err(error) => {
+                    tracing::warn!(
+                        target: "session.store",
+                        instance = %self.id,
+                        "OMP capture disabled because its launch marker directory is unavailable: {error}"
+                    );
+                    return None;
+                }
+            }
+        };
+        Some(OmpCapturePlan {
+            layout,
+            routing_fingerprint,
+            launch_id: Uuid::new_v4().to_string(),
+            launch_marker,
+            container_runtime: self.is_sandboxed().then(|| {
+                crate::session::config::Config::load()
+                    .map(|config| config.sandbox.container_runtime)
+                    .unwrap_or_default()
+            }),
+        })
+    }
+
+    /// Reconstruct metadata only for a legacy pane which predates launch
+    /// snapshots. New launches transport their already-resolved plan directly
+    /// into `finalize_launch` and never call this method.
+    fn resolve_legacy_omp_capture_metadata(
+        &self,
+        options: &OmpCliCaptureOptions,
+        launched_at_ms: u64,
+    ) -> Option<OmpCaptureMetadata> {
+        if launched_at_ms == 0 || self.is_sandboxed() {
+            return None;
+        }
+        let layout =
+            resolve_omp_store_layout(&self.omp_host_environment(), &self.project_path, options)
+                .ok()?;
+        Some(OmpCaptureMetadata {
+            layout,
+            launched_at_ms,
+            launch_id: format!("legacy-{}-{launched_at_ms}", self.id),
+            launch_marker: String::new(),
+            routing_fingerprint: String::new(),
+            container_runtime: None,
+        })
+    }
+
+    /// Load typed launch metadata without the generic env cache. A pane carrying
+    /// the regular bootstrap generation is modern; if its hidden metadata is
+    /// absent, capture stays disabled instead of being legacy-migrated.
+    fn omp_capture_metadata(
+        &self,
+        session_name: &str,
+        options: &OmpCliCaptureOptions,
+        launched_at_ms: Option<u64>,
+    ) -> Option<OmpCaptureMetadata> {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyLayout {
+            sessions: PathBuf,
+            terminal_sessions: PathBuf,
+            kind: OmpStoreKind,
+        }
+
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct LegacyMetadata {
+            layout: LegacyLayout,
+            launched_at_ms: u64,
+        }
+
+        let bootstrap_generation = || {
+            crate::tmux::env::get_env_uncached(
+                session_name,
+                crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY,
+            )
+        };
+        if let Some(encoded) = crate::tmux::env::get_hidden_env_uncached(
+            session_name,
+            crate::tmux::env::AOE_OMP_CAPTURE_META_KEY,
+        ) {
+            if let Ok(mut metadata) = serde_json::from_str::<OmpCaptureMetadata>(&encoded) {
+                if metadata.launch_id.trim().is_empty() {
+                    if bootstrap_generation().is_some() || self.omp_capture_generation.is_some() {
+                        return None;
+                    }
+                    metadata.launch_id = format!("legacy-{}-{}", self.id, metadata.launched_at_ms);
+                    let encoded = serde_json::to_string(&metadata).ok()?;
+                    crate::tmux::env::set_hidden_env(
+                        session_name,
+                        crate::tmux::env::AOE_OMP_CAPTURE_META_KEY,
+                        &encoded,
+                    )
+                    .ok()?;
+                }
+                if validate_omp_capture_metadata(&metadata).is_err() {
+                    return None;
+                }
+                let ready_generation = || {
+                    crate::tmux::env::get_hidden_env_uncached(
+                        session_name,
+                        crate::tmux::env::AOE_OMP_CAPTURE_READY_KEY,
+                    )
+                };
+                match bootstrap_generation() {
+                    Some(pane_generation)
+                        if pane_generation == metadata.launch_id
+                            && self.omp_capture_generation.as_deref()
+                                == Some(metadata.launch_id.as_str())
+                            && ready_generation().as_deref()
+                                == Some(metadata.launch_id.as_str()) => {}
+                    Some(_) => return None,
+                    None if !metadata.launch_marker.is_empty()
+                        || self.omp_capture_generation.is_some() =>
+                    {
+                        return None;
+                    }
+                    None => {}
+                }
+                return Some(metadata);
+            }
+
+            let legacy: LegacyMetadata = serde_json::from_str(&encoded).ok()?;
+            if legacy.launched_at_ms == 0
+                || !legacy.layout.sessions.is_absolute()
+                || !legacy.layout.terminal_sessions.is_absolute()
+                || bootstrap_generation().is_some()
+                || self.omp_capture_generation.is_some()
+            {
+                return None;
+            }
+            let managed_sessions = legacy.layout.terminal_sessions.parent()?.join("sessions");
+            let metadata = OmpCaptureMetadata {
+                layout: crate::session::capture::OmpStoreLayout {
+                    sessions: legacy.layout.sessions,
+                    managed_sessions,
+                    terminal_sessions: legacy.layout.terminal_sessions,
+                    kind: legacy.layout.kind,
+                },
+                launched_at_ms: legacy.launched_at_ms,
+                launch_id: format!("legacy-{}-{}", self.id, legacy.launched_at_ms),
+                launch_marker: String::new(),
+                routing_fingerprint: String::new(),
+                container_runtime: None,
+            };
+            let encoded = serde_json::to_string(&metadata).ok()?;
+            crate::tmux::env::set_hidden_env(
+                session_name,
+                crate::tmux::env::AOE_OMP_CAPTURE_META_KEY,
+                &encoded,
+            )
+            .ok()?;
+            return Some(metadata);
+        }
+
+        if bootstrap_generation().is_some() || self.omp_capture_generation.is_some() {
+            return None;
+        }
+        let legacy_watermark_ms = launched_at_ms.or_else(|| {
+            crate::tmux::Session::from_name(session_name)
+                .created_at_ms()
+                .ok()
+        })?;
+        let metadata = self.resolve_legacy_omp_capture_metadata(options, legacy_watermark_ms)?;
+        if bootstrap_generation().is_some()
+            || self.omp_capture_generation.is_some()
+            || crate::tmux::env::get_hidden_env_uncached(
+                session_name,
+                crate::tmux::env::AOE_OMP_CAPTURE_META_KEY,
+            )
+            .is_some()
+        {
+            return None;
+        }
+        let encoded = serde_json::to_string(&metadata).ok()?;
+        crate::tmux::env::set_hidden_env(
+            session_name,
+            crate::tmux::env::AOE_OMP_CAPTURE_META_KEY,
+            &encoded,
+        )
+        .ok()?;
+        Some(metadata)
     }
 
     pub fn is_sub_session(&self) -> bool {
@@ -2510,31 +3038,28 @@ impl Instance {
         !self.has_command_override() && self.profile_host_environment().is_empty()
     }
 
-    /// Full set of session IDs that retroactive capture must skip for THIS
-    /// instance: the live tmux-discovered set plus any sids the
-    /// resume-fallback cascade has explicitly cleared. Composed of
-    /// `build_exclusion_set` (live tmux scan) and
-    /// `self.retroactive_capture_excludes` (cascade memory) so the caller
-    /// gets the complete picture in one call.
+    /// Full set of session IDs capture must skip for this instance: live tmux
+    /// ownership, cascade-cleared ids, and conversations same-project peers
+    /// parked while running another tool.
     fn retroactive_capture_exclusion_set(&self) -> HashSet<String> {
-        super::capture::compose_exclusion(&self.id, &self.retroactive_capture_excludes)
+        super::capture::compose_exclusion_with_persisted_peers(
+            &self.id,
+            &self.project_path,
+            &self.tool,
+            self.tool == "claude" || (self.tool == "codex" && !self.is_sandboxed()),
+            &self.effective_profile(),
+            &self.retroactive_capture_excludes,
+        )
     }
 
     pub(crate) fn try_retroactive_capture(&self) -> Option<String> {
         let result: Option<String> = match self.tool.as_str() {
             "claude" => {
-                // Claude-only: extend the live-tmux exclusion with stopped,
-                // archived, or pane-less peer sids read from sessions.json so
+                // Claude additionally extends the common live and parked-id
+                // exclusion with stopped, archived, or pane-less peer sids so
                 // the mtime fallback skips peers whose jsonl outlived their
-                // tmux session (#2355). Other tool arms call
-                // `retroactive_capture_exclusion_set()` directly for the
-                // live-only set.
-                let exclusion = super::capture::compose_exclusion_with_stopped_peers(
-                    &self.id,
-                    &self.project_path,
-                    &self.effective_profile(),
-                    &self.retroactive_capture_excludes,
-                );
+                // tmux session (#2355).
+                let exclusion = self.retroactive_capture_exclusion_set();
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
                     capture_claude_session_id_in_container(
@@ -2592,26 +3117,33 @@ impl Instance {
                 }
             }
             "omp" => {
-                // Oh My Pi is a pi fork: same on-disk session format, but the
-                // host data dir defaults to `~/.omp/agent`. The container scan
-                // is identical (the omp container sets `PI_CODING_AGENT_DIR`),
-                // so sandboxed omp reuses the shared pi container capture.
+                let options = self.omp_capture_options()?;
                 let exclusion = self.retroactive_capture_exclusion_set();
+                let tmux_session_name = self
+                    .tmux_env_session_name()
+                    .or_else(|| self.tmux_session().ok().map(|s| s.name().to_string()))?;
+                let metadata = self.omp_capture_metadata(&tmux_session_name, &options, None)?;
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
-                    try_capture_pi_session_id_in_container(
+                    let marker = omp_sandbox_launch_marker(&self.id);
+                    try_capture_omp_session_id_in_container(
                         &container_name,
-                        &self.container_workdir(),
+                        &metadata,
                         &exclusion,
+                        Some(&marker),
                     )
                     .ok()
                 } else {
-                    capture_omp_session_id(&self.project_path, &exclusion).ok()
+                    capture_omp_session_id(&metadata, &exclusion, &tmux_session_name).ok()
                 }
             }
             "codex" => {
-                let exclusion = self.retroactive_capture_exclusion_set();
                 if self.is_sandboxed() {
+                    // Sandboxed Codex sessions have instance-private homes, so
+                    // their transcript stores cannot contain a sibling's
+                    // rollout (#3317). The common helper therefore omits
+                    // inactive same-tool peers on this path.
+                    let exclusion = self.retroactive_capture_exclusion_set();
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
                     try_capture_codex_session_id_in_container(
                         &container_name,
@@ -2620,6 +3152,10 @@ impl Instance {
                     )
                     .ok()
                 } else {
+                    // Host Codex sessions share `~/.codex/sessions/`. Include
+                    // stopped and pane-less same-directory peers so the mtime
+                    // scan cannot adopt a sibling's newer conversation.
+                    let exclusion = self.retroactive_capture_exclusion_set();
                     capture_codex_session_id(&self.project_path, &exclusion).ok()
                 }
             }
@@ -2794,21 +3330,60 @@ impl Instance {
         if !self.tmux_alive_cached() {
             return;
         }
-        let Some(captured) = self.try_retroactive_capture() else {
+        let file_watch = self.resolve_file_watch();
+        let ownership: Result<_> = (|| {
+            let storage = super::storage::Storage::new(profile, file_watch.clone())?;
+            let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&self.id)?;
+            let generation = storage.update(|instances, _groups| {
+                let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id)
+                else {
+                    anyhow::bail!("session disappeared before capture");
+                };
+                if stored.agent_session_id.is_some()
+                    || !stored.resume_intent.is_default()
+                    || matches!(stored.status, Status::Deleting | Status::Creating)
+                    || stored.effective_bucket() != SessionBucket::Active
+                {
+                    anyhow::bail!("session is no longer eligible for capture");
+                }
+                stored
+                    .try_acquire_lifecycle_reservation(
+                        LifecycleOperation::Capture,
+                        Self::LIFECYCLE_RESERVATION_TTL,
+                        Utc::now(),
+                    )
+                    .map_err(|error| anyhow::anyhow!("capture blocked: {error}"))
+            })?;
+            Ok((storage, lifecycle_lock, generation))
+        })();
+        let Ok((storage, _lifecycle_lock, generation)) = ownership else {
             return;
         };
-        if self.resume_probe_failed_sid.as_deref() == Some(captured.as_str()) {
+        let captured = self.try_retroactive_capture();
+        let applied = captured.as_ref().is_some_and(|captured| {
+            self.resume_probe_failed_sid.as_deref() != Some(captured.as_str())
+                && persist_session_to_storage(profile, &self.id, captured, None, &file_watch)
+                    == SidWrite::Applied
+        });
+        let released = storage.update(|instances, _groups| {
+            let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
+                return Ok(false);
+            };
+            Ok(stored
+                .release_lifecycle_reservation_if_owned(LifecycleOperation::Capture, generation))
+        });
+        if !matches!(released, Ok(true)) {
+            tracing::warn!(
+                target: "session.sync",
+                instance = %self.id,
+                "self-heal capture lost its lifecycle reservation before release",
+            );
             return;
         }
-        if persist_session_to_storage(
-            profile,
-            &self.id,
-            &captured,
-            None,
-            &self.resolve_file_watch(),
-        ) == SidWrite::Applied
-        {
-            self.agent_session_id = Some(captured);
+        self.lifecycle_generation = generation;
+        self.lifecycle_reservation = None;
+        if applied {
+            self.agent_session_id = captured;
             self.resume_probe_failed_sid = None;
             tracing::info!(
                 target: "session.store",
@@ -3087,10 +3662,17 @@ impl Instance {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("sandbox_info missing for sandboxed session"))?;
 
-        let env_info = build_docker_env_args(
+        let managed_codex_home = container_config::managed_codex_home(
+            &self.tool,
+            Some(&self.detect_as),
+            &self.source_profile,
+            &self.id,
+        )?;
+        let env_info = build_docker_env_args_with_managed_codex_home(
             &self.source_profile,
             sandbox,
             std::path::Path::new(&self.project_path),
+            managed_codex_home.as_deref(),
         );
         let env_part = if env_info.docker_args.is_empty() {
             String::new()
@@ -3106,24 +3688,20 @@ impl Instance {
             CONTAINER_TERMINAL_AUTODETECT_CMD,
         );
 
-        // If there are secret env vars, prepend shell exports and use `exec`
-        // so the outer shell (whose argv briefly contains the export values)
-        // is replaced immediately, keeping secrets out of long-lived process argv.
-        let session_cmd = if env_info.exports.is_empty() {
-            cmd
-        } else {
-            let exports = env_info.exports.join("; ");
-            format!("{}; exec {}", exports, cmd)
-        };
-
+        // The pane wrapper opens the target values on a protected descriptor.
+        // No repo-configured key is installed in the host shell or runtime
+        // process environment.
         let session = self.container_terminal_tmux_session_indexed(index)?;
         let is_new = !session.exists();
         if is_new {
-            session.create_with_size(
+            let session = tmux::Session::from_name(session.name());
+            session.create_with_size_env_and_container_env(
                 &self.project_path,
-                Some(&session_cmd),
+                Some(&cmd),
                 size,
                 &self.effective_profile(),
+                &[],
+                &env_info.env,
             )?;
             self.apply_container_terminal_tmux_options(index);
         }
@@ -3195,6 +3773,137 @@ impl Instance {
     pub fn start(&mut self) -> Result<()> {
         self.start_with_size(None)
     }
+    fn commit_lifecycle_launch(
+        &mut self,
+        storage: &super::storage::Storage,
+        restart: bool,
+    ) -> Result<()> {
+        let generation = self.lifecycle_generation;
+        let committed = storage.update(|instances, _groups| {
+            let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
+                return Ok(false);
+            };
+            if !stored.lifecycle_reservation_is_owned(LifecycleOperation::Launch, generation) {
+                return Ok(false);
+            }
+            stored.status = self.status;
+            stored.idle_entered_at = self.idle_entered_at;
+            stored.last_accessed_at = self.last_accessed_at;
+            stored.sandbox_info = self.sandbox_info.clone();
+            if restart && stored.agent_session_id == self.agent_session_id {
+                stored.resume_probe_failed_sid = self.resume_probe_failed_sid.clone();
+            }
+            stored.release_lifecycle_reservation_if_owned(LifecycleOperation::Launch, generation);
+            Ok(true)
+        })?;
+        anyhow::ensure!(
+            committed,
+            "session {} disappeared or lost its lifecycle reservation before launch commit",
+            self.id
+        );
+        self.lifecycle_reservation = None;
+        Ok(())
+    }
+
+    fn acquire_lifecycle_reservation(
+        &mut self,
+        storage: &super::storage::Storage,
+        operation: LifecycleOperation,
+        status: Option<Status>,
+    ) -> Result<u64> {
+        let now = Utc::now();
+        let mut acquired = None;
+        storage.update(|instances, _groups| {
+            let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
+                return Ok(());
+            };
+            let generation = stored
+                .try_acquire_lifecycle_reservation(operation, Self::LIFECYCLE_RESERVATION_TTL, now)
+                .map_err(|error| match error {
+                    LifecycleReservationError::Busy(holder) => {
+                        anyhow::anyhow!("session {} is {}", self.id, holder.busy_reason())
+                    }
+                    LifecycleReservationError::GenerationOverflow => {
+                        anyhow::anyhow!("session {} lifecycle generation overflow", self.id)
+                    }
+                })?;
+            if let Some(status) = status {
+                stored.status = status;
+                if status != Status::Idle {
+                    stored.idle_entered_at = None;
+                }
+            }
+            acquired = Some((generation, stored.lifecycle_reservation.clone()));
+            Ok(())
+        })?;
+        let Some((generation, reservation)) = acquired else {
+            anyhow::bail!("session {} no longer exists", self.id);
+        };
+        self.lifecycle_generation = generation;
+        self.lifecycle_reservation = reservation;
+        if let Some(status) = status {
+            self.status = status;
+            if status != Status::Idle {
+                self.idle_entered_at = None;
+            }
+        }
+        Ok(generation)
+    }
+
+    fn commit_lifecycle_status(
+        &mut self,
+        storage: &super::storage::Storage,
+        operation: LifecycleOperation,
+        status: Status,
+    ) -> Result<()> {
+        let generation = self.lifecycle_generation;
+        let committed = storage.update(|instances, _groups| {
+            let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
+                return Ok(false);
+            };
+            if !stored.lifecycle_reservation_is_owned(operation, generation) {
+                return Ok(false);
+            }
+            stored.status = status;
+            if status != Status::Idle {
+                stored.idle_entered_at = None;
+            }
+            stored.release_lifecycle_reservation_if_owned(operation, generation);
+            Ok(true)
+        })?;
+        anyhow::ensure!(
+            committed,
+            "session {} disappeared or lost its lifecycle reservation before commit",
+            self.id
+        );
+        self.lifecycle_reservation = None;
+        self.status = status;
+        if status != Status::Idle {
+            self.idle_entered_at = None;
+        }
+        Ok(())
+    }
+
+    fn release_lifecycle_reservation(
+        &mut self,
+        storage: &super::storage::Storage,
+        operation: LifecycleOperation,
+    ) -> Result<()> {
+        let generation = self.lifecycle_generation;
+        let released = storage.update(|instances, _groups| {
+            let Some(stored) = instances.iter_mut().find(|instance| instance.id == self.id) else {
+                return Ok(false);
+            };
+            Ok(stored.release_lifecycle_reservation_if_owned(operation, generation))
+        })?;
+        anyhow::ensure!(
+            released,
+            "session {} disappeared or lost its lifecycle reservation before release",
+            self.id
+        );
+        self.lifecycle_reservation = None;
+        Ok(())
+    }
 
     pub fn start_with_size(&mut self, size: Option<(u16, u16)>) -> Result<()> {
         self.start_with_size_opts(size, false).map(|_| ())
@@ -3207,62 +3916,163 @@ impl Instance {
         size: Option<(u16, u16)>,
         skip_on_launch: bool,
     ) -> Result<LaunchSidOutcome> {
-        // Validate before any shell-command construction in
-        // `build_launch_command` (covers `status_hook_env_prefix` and
-        // the sandbox docker_args interpolation). Runs before the
-        // structured view short-circuit so a tampered id surfaces as `Err` for
-        // structured view sessions too.
         crate::session::validate_instance_id(&self.id)
             .context("refusing to launch: AOE_INSTANCE_ID failed validation")?;
-
-        // Acp-mode sessions are not backed by tmux. The structured view
-        // worker supervisor spawns the ACP agent process directly;
-        // calling start() on a structured view session is a no-op (status
-        // updates flow through the ACP event channel, not tmux).
         if self.is_structured() {
             return Ok(LaunchSidOutcome::Skipped);
         }
+        let profile = self.effective_profile();
+        let storage = super::storage::Storage::new(&profile, self.resolve_file_watch())
+            .context("failed to open lifecycle lock storage")?;
 
-        let session = self.tmux_session()?;
-
-        if session.exists() {
+        let lifecycle_lock = storage
+            .acquire_instance_lifecycle_lock(&self.id)
+            .context("failed to acquire instance launch lock")?;
+        self.reconcile_from_disk();
+        if self.is_structured() || self.tmux_session()?.exists() {
             return Ok(LaunchSidOutcome::Skipped);
         }
+        self.acquire_lifecycle_reservation(
+            &storage,
+            LifecycleOperation::Launch,
+            Some(Status::Starting),
+        )?;
 
-        // Refresh peer-writable persisted fields (`agent_session_id`,
-        // `resume_intent`) from disk before the launch decision. Closes the
-        // status-poll lag window for both the read side
-        // (`acquire_session_id`) and the write side (`persist_session_id`'s
-        // CAS baseline). Covers resume-probe launches and explicit fresh
-        // launches since both call this function.
+        // The durable reservation excludes peer launches while user hooks run.
+        // The flock itself must be absent because a hook may invoke aoe for
+        // this same session.
+        drop(lifecycle_lock);
+        let hook_result = self.run_pre_launch_hooks(skip_on_launch, &profile);
+        let _lifecycle_lock = storage
+            .acquire_instance_lifecycle_lock(&self.id)
+            .context("failed to reacquire instance launch lock after hooks")?;
         self.reconcile_from_disk();
+        if let Err(error) = hook_result {
+            self.fail_reserved_launch(&storage, &error, false);
+            return Err(error);
+        }
+        self.ensure_reservation_current_or_fail(&storage)?;
+        self.apply_fresh_launch_intent();
 
-        // Consume the one-shot override, if `start_with_resume_fallback` set
-        // it, now that `reconcile_from_disk`'s `*self = disk` reload can no
-        // longer clobber it. Forces this launch through the same
-        // `ResumeIntent::Cleared` path a manual `aoe session set-session-id
-        // ""` would take: no `--resume` flag, fresh sid, one-shot
-        // auto-promote back to `Default` on disk after this launch persists.
-        // See #2609.
+        let prepared = match self.prepare_launch_command() {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.fail_reserved_launch(&storage, &error, false);
+                return Err(error);
+            }
+        };
+        let result = self
+            .spawn_prepared_launch(size, &profile, prepared)
+            .and_then(|outcome| {
+                self.commit_lifecycle_launch(&storage, false)?;
+                Ok(outcome)
+            });
+        if let Err(error) = result {
+            self.fail_reserved_launch(&storage, &error, true);
+            return Err(error);
+        }
+        result
+    }
+
+    fn lifecycle_reservation_is_current(
+        &self,
+        storage: &super::storage::Storage,
+        operation: LifecycleOperation,
+    ) -> Result<bool> {
+        let generation = self.lifecycle_generation;
+        storage.update(|instances, _groups| {
+            Ok(instances
+                .iter()
+                .find(|instance| instance.id == self.id)
+                .is_some_and(|stored| stored.lifecycle_reservation_is_owned(operation, generation)))
+        })
+    }
+
+    fn reservation_is_current(&self, storage: &super::storage::Storage) -> Result<bool> {
+        self.lifecycle_reservation_is_current(storage, LifecycleOperation::Launch)
+    }
+
+    fn ensure_reservation_current(&self, storage: &super::storage::Storage) -> Result<()> {
+        if self.reservation_is_current(storage)? {
+            return Ok(());
+        }
+        anyhow::bail!(
+            "session {} changed while launch hooks were running",
+            self.id
+        )
+    }
+
+    fn ensure_reservation_current_or_fail(
+        &mut self,
+        storage: &super::storage::Storage,
+    ) -> Result<()> {
+        match self.ensure_reservation_current(storage) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.fail_reserved_launch(storage, &error, false);
+                Err(error)
+            }
+        }
+    }
+
+    fn fail_reserved_launch(
+        &mut self,
+        storage: &super::storage::Storage,
+        error: &anyhow::Error,
+        cleanup_pane: bool,
+    ) {
+        if !self.reservation_is_current(storage).unwrap_or(false) {
+            return;
+        }
+        if cleanup_pane {
+            let _ = self.kill_clean_locked();
+        }
+        self.last_error = Some(format!("{error:#}"));
+        let _ = self.commit_lifecycle_status(storage, LifecycleOperation::Launch, Status::Error);
+    }
+
+    fn apply_fresh_launch_intent(&mut self) {
         if std::mem::take(&mut self.force_fresh_next_launch) {
             self.resume_intent = ResumeIntent::Cleared;
         }
-
         self.reconcile_sidecar_into_disk();
+    }
 
-        // CAS baseline for `persist_session_id`. `build_launch_command` ->
-        // `apply_session_flags` -> `acquire_session_id` may mutate
-        // `agent_session_id` (Claude UUID generation); capture before that.
+    fn run_pre_launch_hooks(&mut self, skip_on_launch: bool, profile: &str) -> Result<()> {
+        self.mint_host_session_env()?;
+        self.run_launch_hooks(skip_on_launch, profile)
+    }
+
+    fn prepare_launch_command(&mut self) -> Result<PreparedLaunch> {
         let expected_prior_sid = self.agent_session_id.clone();
         let expected_prior_intent = self.resume_intent.clone();
+        let expected_prior_omp_generation = self.omp_capture_generation.clone();
+        let (command, is_existing, omp_capture_plan, launch_env) = self.build_launch_command()?;
+        Ok(PreparedLaunch {
+            command,
+            is_existing,
+            omp_capture_plan,
+            launch_env,
+            expected_prior_sid,
+            expected_prior_intent,
+            expected_prior_omp_generation,
+        })
+    }
 
-        let profile = self.effective_profile();
-        // Mint `host_hooks.before_session` before the command is assembled:
-        // `build_host_command` needs the minted keys to know which static
-        // `environment` entries to leave out of the pane prefix.
-        self.mint_host_session_env()?;
-        let (cmd, is_existing) = self.build_launch_command(skip_on_launch, &profile)?;
-        let launch_sid = if is_existing {
+    fn spawn_prepared_launch(
+        &mut self,
+        size: Option<(u16, u16)>,
+        profile: &str,
+        mut prepared: PreparedLaunch,
+    ) -> Result<LaunchSidOutcome> {
+        let session = self.tmux_session()?;
+        if session.exists() {
+            anyhow::bail!(
+                "session {} gained a tmux pane before its reserved launch",
+                self.id
+            );
+        }
+        let launch_sid = if prepared.is_existing {
             Some(
                 self.agent_session_id
                     .clone()
@@ -3272,35 +4082,89 @@ impl Instance {
             None
         };
 
-        tracing::debug!(target: "session.store",
-            "container cmd: {}",
-            cmd.as_ref().map_or("none".to_string(), |v| {
-                super::environment::redact_env_values(v)
-            })
+        tracing::debug!(
+            target: "session.store",
+            sandboxed = self.is_sandboxed(),
+            has_command = prepared.command.is_some(),
+            "agent launch command prepared"
         );
 
         if self.tool == "claude" {
-            // Route through dir_guard so the session_id removal participates
-            // in the same `*at`-anchored, mode-checked, owner-checked
-            // discipline as every other hook I/O. Path-join + remove_file
-            // would have bypassed base verification on the first launch
-            // before any other hook code ran (#1844 follow-up).
             let _ = crate::hooks::unlink_session_id_via_guard(&self.id);
         }
 
-        session.create_with_size_env(
+        let mut omp_capture_metadata = if let Some(plan) = prepared.omp_capture_plan {
+            let launched_at_ms = SystemTime::now()
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .context("system clock predates UNIX_EPOCH during OMP launch")
+                .and_then(|elapsed| {
+                    u64::try_from(elapsed.as_millis())
+                        .context("OMP launch timestamp does not fit in u64")
+                })?;
+            Some(OmpCaptureMetadata {
+                layout: plan.layout,
+                launched_at_ms,
+                launch_id: plan.launch_id,
+                launch_marker: plan.launch_marker,
+                routing_fingerprint: plan.routing_fingerprint,
+                container_runtime: plan.container_runtime,
+            })
+        } else {
+            None
+        };
+        let omp_generation_published = self.publish_omp_launch_generation(
+            profile,
+            omp_capture_metadata.as_ref(),
+            prepared.expected_prior_omp_generation.as_deref(),
+        );
+        if let Some(metadata) = omp_capture_metadata.as_ref() {
+            // The launch preamble (`wrap_omp_launch`) rewrites OMP's breadcrumb
+            // and writes the capture marker only if the store's terminal-sessions
+            // directory already exists; it otherwise falls through to a raw
+            // launch and capture silently no-ops. A first-ever OMP launch (or a
+            // freshly routed store) has no such directory yet, so ensure it here
+            // for the host store. Sandboxed launches resolve a container-side
+            // path the host must not create.
+            if !self.is_sandboxed() {
+                if let Err(error) = std::fs::create_dir_all(&metadata.layout.terminal_sessions) {
+                    tracing::warn!(
+                        target: "session.store",
+                        instance = %self.id,
+                        "OMP capture may no-op: could not ensure terminal-sessions dir: {error}"
+                    );
+                }
+            }
+            prepared.launch_env.pane.push(tmux::PaneEnvMutation::set(
+                crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY.to_string(),
+                metadata.launch_id.clone(),
+            ));
+        }
+        session.create_with_size_env_and_container_env(
             &self.project_path,
-            cmd.as_deref(),
+            prepared.command.as_deref(),
             size,
-            &profile,
-            &self.pending_host_env,
+            profile,
+            &prepared.launch_env.pane,
+            &prepared.launch_env.container,
         )?;
+        if let Some(metadata) = omp_capture_metadata.as_ref() {
+            let pane_generation = crate::tmux::env::get_env_uncached(
+                session.name(),
+                crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY,
+            );
+            if !omp_generation_published
+                || pane_generation.as_deref() != Some(metadata.launch_id.as_str())
+            {
+                omp_capture_metadata = None;
+            }
+        }
 
         self.finalize_launch(
             session.name(),
-            &profile,
-            expected_prior_sid.as_deref(),
-            expected_prior_intent,
+            profile,
+            prepared.expected_prior_sid.as_deref(),
+            prepared.expected_prior_intent,
+            omp_capture_metadata,
         );
 
         Ok(match launch_sid {
@@ -3309,46 +4173,88 @@ impl Instance {
         })
     }
 
-    /// Build the launch command string the way `start_with_size_opts` would,
-    /// but without creating a tmux session. Returns `None` for structured view or
-    /// other modes where there is no command to launch.
-    ///
-    /// Side effects mirror the start path: agent status hooks are installed,
-    /// and (for sandboxed sessions) on_launch hooks run inside the container.
-    fn build_launch_command(
-        &mut self,
-        skip_on_launch: bool,
-        profile: &str,
-    ) -> Result<(Option<String>, bool)> {
-        let on_launch_hooks = self.resolve_on_launch_hooks(skip_on_launch, profile);
-
+    fn run_launch_hooks(&mut self, skip_on_launch: bool, profile: &str) -> Result<()> {
+        if self.tool == "omp" && !self.has_command_override() {
+            reject_omp_secret_args(&super::config::quote_model_value_in_args(&self.extra_args))?;
+        }
         let agent = crate::agents::get_agent(&self.tool)
             .or_else(|| crate::agents::get_agent(&self.detect_as));
         self.install_agent_status_hooks(agent);
         self.propagate_managed_skills();
 
-        let (cmd, is_existing) = if self.is_sandboxed() {
-            let container = self.get_container_for_instance()?;
-            if let Some(ref hook_cmds) = on_launch_hooks {
+        let on_launch_hooks = self.resolve_on_launch_hooks(skip_on_launch, profile);
+        if self.is_sandboxed() {
+            self.get_container_for_instance()?;
+            if let (Some(hook_cmds), Some(sandbox)) =
+                (on_launch_hooks.as_ref(), self.sandbox_info.as_ref())
+            {
                 let hook_env = super::repo_config::lifecycle_env_vars(self);
-                if let Some(ref sandbox) = self.sandbox_info {
-                    let workdir = self.container_workdir();
-                    if let Err(e) = super::repo_config::execute_hooks_in_container(
-                        hook_cmds,
-                        &sandbox.container_name,
-                        &workdir,
-                        &hook_env,
-                    ) {
-                        if e.chain().any(|c| {
-                            c.downcast_ref::<super::repo_config::HookTimeout>()
-                                .is_some()
-                        }) {
-                            return Err(e);
-                        }
-                        tracing::warn!(target: "session.store", "on_launch hook failed in container: {}", e);
+                let workdir = self.container_workdir();
+                if let Err(error) = super::repo_config::execute_hooks_in_container(
+                    hook_cmds,
+                    &sandbox.container_name,
+                    &workdir,
+                    &hook_env,
+                ) {
+                    if error.chain().any(|cause| {
+                        cause
+                            .downcast_ref::<super::repo_config::HookTimeout>()
+                            .is_some()
+                    }) {
+                        return Err(error);
                     }
+                    tracing::warn!(
+                        target: "session.store",
+                        "on_launch hook failed in container: {}",
+                        error
+                    );
                 }
             }
+        } else if let Some(hook_cmds) = on_launch_hooks.as_ref() {
+            let hook_env = super::repo_config::lifecycle_env_vars(self);
+            if let Err(error) = super::repo_config::execute_hooks(
+                hook_cmds,
+                Path::new(&self.project_path),
+                &hook_env,
+            ) {
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<super::repo_config::HookTimeout>()
+                        .is_some()
+                }) {
+                    return Err(error);
+                }
+                tracing::warn!(target: "session.store", "on_launch hook failed: {}", error);
+            }
+        }
+        Ok(())
+    }
+
+    /// Construct the command only after hook execution has completed. Keeping
+    /// this phase hook-free prevents a revalidation retry from replaying user
+    /// code while the lifecycle lock is held.
+    fn build_launch_command(&mut self) -> Result<LaunchCommandParts> {
+        if self.tool == "omp" && !self.has_command_override() {
+            reject_omp_secret_args(&super::config::quote_model_value_in_args(&self.extra_args))?;
+        }
+        let agent = crate::agents::get_agent(&self.tool)
+            .or_else(|| crate::agents::get_agent(&self.detect_as));
+
+        let (cmd, is_existing, omp_capture_plan, launch_env) = if self.is_sandboxed() {
+            let image = self
+                .sandbox_info
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("sandbox_info missing for sandboxed instance"))?
+                .image
+                .clone();
+            let container = DockerContainer::new(&self.id, &image);
+
+            // Snapshot only after container hooks have had their final chance
+            // to mutate OMP dotenv/config routing, but before any executable
+            // pane command exists.
+            let omp_capture_plan = self
+                .omp_capture_options()
+                .and_then(|options| self.resolve_omp_capture_plan(&options));
 
             let launch_cmd = self.get_launch_command();
             let base_cmd = if self.extra_args.is_empty() {
@@ -3401,30 +4307,81 @@ impl Instance {
                 .sandbox_info
                 .as_ref()
                 .ok_or_else(|| anyhow::anyhow!("sandbox_info missing for sandboxed instance"))?;
-            let env_info = build_docker_env_args(
+            let managed_codex_home = container_config::managed_codex_home(
+                &self.tool,
+                Some(&self.detect_as),
+                &self.source_profile,
+                &self.id,
+            )?;
+            let mut env_info = build_docker_env_args_with_managed_codex_home(
                 &self.source_profile,
                 sandbox,
                 std::path::Path::new(&self.project_path),
+                managed_codex_home.as_deref(),
             );
             let profile = self.effective_profile();
-            let docker_args = format!(
-                "{} -e AOE_PROFILE={} -e AOE_INSTANCE_ID={}",
-                env_info.docker_args,
+            if !env_info.docker_args.is_empty() {
+                env_info.docker_args.push(' ');
+            }
+            env_info.docker_args.push_str(&format!(
+                "-e AOE_PROFILE={} -e AOE_INSTANCE_ID={}",
                 shell_escape(&profile),
                 shell_escape(&self.id)
-            );
-            let env_part = format!("{} ", docker_args);
-            let wrapped =
-                wrap_command_ignore_suspend(&container.exec_command(Some(&env_part), &tool_cmd));
+            ));
+            let env_part = format!("{} ", env_info.docker_args);
+            let raw_command = container.exec_command(Some(&env_part), &tool_cmd);
+            let launch_command = if let Some(plan) = omp_capture_plan.as_ref() {
+                let marked_tool_cmd = wrap_omp_launch(&tool_cmd, plan);
+                let marked_command = container.exec_command(Some(&env_part), &marked_tool_cmd);
+                gate_omp_launch(&raw_command, &marked_command, plan)
+            } else {
+                raw_command
+            };
+            let wrapped = wrap_command_ignore_suspend(&launch_command, &self.project_path);
             (
-                Some(prepend_exports(&env_info.exports, wrapped)),
+                Some(wrapped),
                 is_existing,
+                omp_capture_plan,
+                LaunchEnvironment {
+                    pane: Vec::new(),
+                    container: env_info.env,
+                },
             )
         } else {
-            self.build_host_command(agent, &on_launch_hooks)?
+            let result = self.build_host_command(agent)?;
+            let mut env = super::environment::resolve_host_environment_pairs(
+                &self.profile_host_environment(),
+            )
+            .into_iter()
+            .map(|(key, value)| tmux::PaneEnvMutation::set(key, value))
+            .collect::<Vec<_>>();
+            // The protected file is sourced in order, so freshly minted hook
+            // values appended last override same-keyed static profile values.
+            env.extend(
+                self.pending_host_env
+                    .iter()
+                    .cloned()
+                    .map(|(key, value)| tmux::PaneEnvMutation::set(key, value)),
+            );
+            if result.2.is_some() {
+                // Pin every routing input, including explicit empty values and
+                // true absence, so tmux's frozen server environment cannot
+                // select another OMP store. The in-pane fingerprint still
+                // detects login-file drift.
+                env.extend(omp_host_routing_environment(&self.omp_host_environment()));
+            }
+            (
+                result.0,
+                result.1,
+                result.2,
+                LaunchEnvironment {
+                    pane: env,
+                    container: Vec::new(),
+                },
+            )
         };
 
-        Ok((cmd, is_existing))
+        Ok((cmd, is_existing, omp_capture_plan, launch_env))
     }
 
     /// Resolve on_launch hooks from the full config chain (global > profile > repo).
@@ -3646,65 +4603,21 @@ impl Instance {
         }
     }
 
-    /// Build the tmux command for a host (non-sandboxed) session.
-    ///
-    /// Runs on_launch hooks on the host, then constructs the command from either
-    /// the agent's default binary or a user-supplied custom command, applying
-    /// yolo mode, session flags, and the AOE_INSTANCE_ID env prefix.
-    ///
-    /// Returns `Err` only when an on_launch hook timed out under an active
-    /// `HookTimeoutScope` (recovery path). Generic hook failures continue to
-    /// be logged at `warn` and the cascade proceeds with whatever partial
-    /// setup the hook produced, matching the historical behavior for
-    /// non-recovery callers (`aoe add`, manual restart).
+    /// Build the tmux command for a host session after all launch hooks have
+    /// completed.
     fn build_host_command(
         &mut self,
         agent: Option<&'static crate::agents::AgentDef>,
-        on_launch_hooks: &Option<Vec<String>>,
-    ) -> Result<(Option<String>, bool)> {
-        if let Some(ref hook_cmds) = on_launch_hooks {
-            let hook_env = super::repo_config::lifecycle_env_vars(self);
-            if let Err(e) = super::repo_config::execute_hooks(
-                hook_cmds,
-                Path::new(&self.project_path),
-                &hook_env,
-            ) {
-                if e.chain().any(|c| {
-                    c.downcast_ref::<super::repo_config::HookTimeout>()
-                        .is_some()
-                }) {
-                    return Err(e);
-                }
-                tracing::warn!(target: "session.store", "on_launch hook failed: {}", e);
-            }
-        }
+    ) -> Result<(Option<String>, bool, Option<OmpCapturePlan>)> {
+        // Resolve after `on_launch`. The snapshot is checked inside the
+        // profile environment assignment scope executed by the login shell;
+        // startup-file routing drift therefore disables capture.
+        let omp_capture_plan = self
+            .omp_capture_options()
+            .and_then(|options| self.resolve_omp_capture_plan(&options));
 
         let profile = self.effective_profile();
-        let mut env_prefix = status_hook_env_prefix(&profile, &self.id, agent);
-
-        // Profile-scoped host environment entries (KEY=value, KEY=$VAR,
-        // KEY=$$literal, or bare KEY for passthrough). Sandboxed sessions
-        // intentionally skip this injection because the entries are
-        // host-side; sandbox users should configure `sandbox.environment`
-        // for the in-container env list.
-        //
-        // Entries whose key `host_hooks.before_session` minted are dropped: the
-        // minted value arrives through `tmux new-session -e` (kept out of argv),
-        // and a shell-assignment prefix binds tighter than the inherited
-        // environment, so leaving the static entry in would silently shadow the
-        // fresh value. Dropping it here makes minted-wins hold in the terminal
-        // view exactly as it does in the structured view.
-        let host_env = super::environment::drop_shadowed_host_entries(
-            self.profile_host_environment(),
-            &self.pending_host_env,
-        );
-        if !host_env.is_empty() {
-            env_prefix = format!(
-                "{}{}",
-                super::environment::host_environment_prefix(&host_env),
-                env_prefix
-            );
-        }
+        let env_prefix = status_hook_env_prefix(&profile, &self.id, agent);
 
         if self.command.is_empty() {
             match crate::agents::get_agent(&self.tool) {
@@ -3727,15 +4640,20 @@ impl Instance {
                     }
                     let is_existing = self.apply_session_flags(&mut cmd, "host agent");
                     apply_agent_launch_env(&mut cmd, agent);
+                    let raw_command = format!("{}{}", env_prefix, cmd);
+                    let command = if let Some(plan) = omp_capture_plan.as_ref() {
+                        let marked_command = wrap_omp_host_launch(&env_prefix, &cmd, plan);
+                        gate_omp_launch(&raw_command, &marked_command, plan)
+                    } else {
+                        raw_command
+                    };
                     Ok((
-                        Some(wrap_command_ignore_suspend(&format!(
-                            "{}{}",
-                            env_prefix, cmd
-                        ))),
+                        Some(wrap_command_ignore_suspend(&command, &self.project_path)),
                         is_existing,
+                        omp_capture_plan,
                     ))
                 }
-                None => Ok((None, false)),
+                None => Ok((None, false, omp_capture_plan)),
             }
         } else {
             let mut cmd = self.command.clone();
@@ -3749,12 +4667,17 @@ impl Instance {
             }
             let is_existing = self.apply_session_flags(&mut cmd, "host custom");
             apply_agent_launch_env(&mut cmd, agent);
+            let raw_command = format!("{}{}", env_prefix, cmd);
+            let command = if let Some(plan) = omp_capture_plan.as_ref() {
+                let marked_command = wrap_omp_host_launch(&env_prefix, &cmd, plan);
+                gate_omp_launch(&raw_command, &marked_command, plan)
+            } else {
+                raw_command
+            };
             Ok((
-                Some(wrap_command_ignore_suspend(&format!(
-                    "{}{}",
-                    env_prefix, cmd
-                ))),
+                Some(wrap_command_ignore_suspend(&command, &self.project_path)),
                 is_existing,
+                omp_capture_plan,
             ))
         }
     }
@@ -3766,7 +4689,29 @@ impl Instance {
         profile: &str,
         expected_prior_sid: Option<&str>,
         expected_prior_intent: ResumeIntent,
+        mut omp_capture_metadata: Option<OmpCaptureMetadata>,
     ) {
+        if let Some(metadata) = omp_capture_metadata.as_ref() {
+            let published = serde_json::to_string(metadata).ok().and_then(|encoded| {
+                crate::tmux::env::set_hidden_env(
+                    session_name,
+                    crate::tmux::env::AOE_OMP_CAPTURE_META_KEY,
+                    &encoded,
+                )
+                .and_then(|()| {
+                    crate::tmux::env::set_hidden_env(
+                        session_name,
+                        crate::tmux::env::AOE_OMP_CAPTURE_READY_KEY,
+                        &metadata.launch_id,
+                    )
+                })
+                .ok()
+            });
+            if published.is_none() {
+                omp_capture_metadata = None;
+            }
+        }
+
         let outcome = self.persist_session_id(profile, expected_prior_sid, expected_prior_intent);
 
         // Skip outcomes leave AOE_CAPTURED_SESSION_ID untouched: this path
@@ -3783,7 +4728,7 @@ impl Instance {
             crate::tmux::env::AOE_INSTANCE_ID_KEY,
             &self.id,
         )];
-        if let Some(ref sid) = captured_sid {
+        if let Some(sid) = &captured_sid {
             entries.push((
                 session_name,
                 crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
@@ -3807,7 +4752,7 @@ impl Instance {
             }
         }
 
-        self.maybe_start_poller();
+        self.maybe_start_poller_since(omp_capture_metadata);
 
         self.status = Status::Starting;
         self.last_start_time = Some(std::time::Instant::now());
@@ -3846,20 +4791,80 @@ impl Instance {
         }
     }
 
-    /// Atomic single-flock CAS+write of `agent_session_id` and (when
-    /// `expected_prior_intent == Cleared`) the auto-promote to `Default`.
-    /// A split would let a daemon crash freeze disk at `(new_sid, Cleared)`,
-    /// which the next launch's `acquire_session_id` short-circuits
-    /// on, orphaning the conversation just created with `new_sid`.
-    ///
-    /// On sid CAS skip: rollback both fields from disk.
-    /// On intent CAS skip with sid match: persist sid, leave intent as
-    /// peer wrote it, reload intent in memory.
-    ///
-    /// Returns `Published` if `self.agent_session_id` after return reflects
-    /// disk (Applied: committed under flock; Skipped: reloaded). Returns
-    /// `Skip` for invalid sid early-return, storage error, or `SidWrite::Failed`:
-    /// memory is unchanged and the caller must not touch the tmux env.
+    /// Publish the capture plan's generation, or mint a tombstone generation
+    /// for an OMP launch whose capture plan could not be resolved.
+    fn publish_omp_launch_generation(
+        &mut self,
+        profile: &str,
+        metadata: Option<&OmpCaptureMetadata>,
+        expected_prior: Option<&str>,
+    ) -> bool {
+        if let Some(metadata) = metadata {
+            return self.persist_omp_capture_generation(
+                profile,
+                &metadata.launch_id,
+                expected_prior,
+            );
+        }
+        if self.tool != "omp" {
+            return true;
+        }
+        // No capture plan: persist a distinct sentinel so any observation still
+        // carrying the prior generation fails the CAS. The `tombstone-` prefix
+        // marks it as never-captured in storage/logs (compared for equality,
+        // never parsed).
+        let tombstone = format!("tombstone-{}", Uuid::new_v4());
+        self.persist_omp_capture_generation(profile, &tombstone, expected_prior)
+    }
+
+    /// CAS-persist one OMP capture generation and reload the durable winner
+    /// when another writer has already advanced it.
+    fn persist_omp_capture_generation(
+        &mut self,
+        profile: &str,
+        generation: &str,
+        expected_prior: Option<&str>,
+    ) -> bool {
+        let storage = match super::storage::Storage::new(profile, self.resolve_file_watch()) {
+            Ok(storage) => storage,
+            Err(error) => {
+                tracing::warn!(
+                    target: "session.store",
+                    instance = %self.id,
+                    "Failed to open storage for OMP generation persist: {error}"
+                );
+                return false;
+            }
+        };
+        let outcome = storage.update(|instances, _groups| {
+            let Some(instance) = instances.iter_mut().find(|instance| instance.id == self.id)
+            else {
+                return Ok(SidWrite::Failed);
+            };
+            if instance.omp_capture_generation.as_deref() != expected_prior {
+                return Ok(SidWrite::Skipped);
+            }
+            instance.omp_capture_generation = Some(generation.to_string());
+            Ok(SidWrite::Applied)
+        });
+        if matches!(outcome, Ok(SidWrite::Applied)) {
+            self.omp_capture_generation = Some(generation.to_string());
+            return true;
+        }
+        if let Ok(instances) = storage.load() {
+            if let Some(instance) = instances.iter().find(|instance| instance.id == self.id) {
+                self.omp_capture_generation = instance.omp_capture_generation.clone();
+            }
+        }
+        tracing::warn!(
+            target: "session.store",
+            instance = %self.id,
+            generation,
+            "OMP generation CAS failed; launch continues with capture disabled"
+        );
+        false
+    }
+
     fn persist_session_id(
         &mut self,
         profile: &str,
@@ -4177,13 +5182,19 @@ impl Instance {
             // Already up: not a come-up, so don't re-mint. Fill lazily only if a
             // fresh process attached to a running container with no values yet.
             self.ensure_before_start_env(false)?;
-            container_config::refresh_agent_configs_for_profile(&self.effective_profile());
+            container_config::refresh_agent_configs_for_instance(
+                &self.effective_profile(),
+                &self.id,
+                &self.tool,
+                Some(&self.detect_as),
+            );
             self.backfill_container_workdir(&container);
             if self.is_yolo_mode() {
                 container_config::ensure_yolo_trust_config_for_active_agent(
                     &self.tool,
                     Some(&self.detect_as),
                     &self.source_profile,
+                    &self.id,
                     &self.container_workdir(),
                 );
             }
@@ -4194,7 +5205,12 @@ impl Instance {
             // Restart of a stopped container is a come-up: refresh so a
             // short-lived token is re-minted.
             self.ensure_before_start_env(true)?;
-            container_config::refresh_agent_configs_for_profile(&self.effective_profile());
+            container_config::refresh_agent_configs_for_instance(
+                &self.effective_profile(),
+                &self.id,
+                &self.tool,
+                Some(&self.detect_as),
+            );
             container.start()?;
             self.backfill_container_workdir(&container);
             if self.is_yolo_mode() {
@@ -4202,6 +5218,7 @@ impl Instance {
                     &self.tool,
                     Some(&self.detect_as),
                     &self.source_profile,
+                    &self.id,
                     &self.container_workdir(),
                 );
             }
@@ -4414,6 +5431,10 @@ impl Instance {
     }
 
     pub fn maybe_start_poller(&mut self) {
+        self.maybe_start_poller_since(None);
+    }
+
+    fn maybe_start_poller_since(&mut self, omp_metadata: Option<OmpCaptureMetadata>) {
         if !self.supports_session_poller() {
             return;
         }
@@ -4423,14 +5444,61 @@ impl Instance {
             .tmux_env_session_name()
             .or_else(|| self.tmux_session().ok().map(|s| s.name().to_string()))
             .unwrap_or_default();
+        let omp_metadata = if tool == "omp" {
+            let options = match self.omp_capture_options() {
+                Some(options) => options,
+                None => return,
+            };
+            match omp_metadata
+                .or_else(|| self.omp_capture_metadata(&tmux_session_name, &options, None))
+            {
+                Some(metadata) => Some(metadata),
+                None => return,
+            }
+        } else {
+            None
+        };
         let mut poller = SessionPoller::new(tmux_session_name.clone());
         let instance_id = self.id.clone();
         let initial_known = self.agent_session_id.clone();
-        // Snapshot per-instance excludes at poller-spawn time. Explicit sid
-        // invalidation inserts into `retroactive_capture_excludes` before any
-        // fresh poller starts, so the first immediate poll won't re-import the
-        // invalidated sid.
-        let extra_excludes = self.retroactive_capture_excludes.clone();
+        // Snapshot persisted peer ownership and per-instance excludes at
+        // poller-spawn time. This keeps storage reads off the hot polling path
+        // while preventing the poller from adopting a conversation another row
+        // parked during a tool swap.
+        let extra_excludes = self.retroactive_capture_exclusion_set();
+        if tool == "omp" {
+            let Some(metadata) = omp_metadata.as_ref() else {
+                return;
+            };
+            let poll_fn: crate::session::poller::SessionIdPollFn = if self.is_sandboxed() {
+                let container_name = match self.sandbox_info.as_ref() {
+                    Some(s) => s.container_name.clone(),
+                    None => return,
+                };
+                Box::new(omp_poll_fn_sandboxed(
+                    container_name,
+                    self.id.clone(),
+                    Some(metadata.launch_marker.clone()),
+                    extra_excludes,
+                ))
+            } else {
+                Box::new(omp_poll_fn(self.id.clone(), extra_excludes))
+            };
+            let cb_instance_id = self.id.clone();
+            let on_change: Box<dyn Fn(&str) + Send + 'static> = Box::new(move |new_id: &str| {
+                tracing::info!(target: "session.store", "Session ID observed for {}: {}", cb_instance_id, new_id);
+            });
+            let initial_known = initial_known.map(|sid| metadata.session_observation(sid));
+            if poller.start_observations(instance_id.clone(), poll_fn, on_change, initial_known) {
+                self.session_id_poller = Some(Arc::new(Mutex::new(poller)));
+            } else {
+                tracing::warn!(target: "session.store",
+                    "Failed to start session poller for instance {}, poller will not be stored",
+                    instance_id
+                );
+            }
+            return;
+        }
 
         let poll_fn: Box<dyn Fn() -> Option<String> + Send + 'static> = match tool {
             "claude" => {
@@ -4512,29 +5580,6 @@ impl Instance {
                     ))
                 } else {
                     Box::new(pi_poll_fn(
-                        self.project_path.clone(),
-                        self.id.clone(),
-                        extra_excludes.clone(),
-                    ))
-                }
-            }
-            "omp" => {
-                // Sandboxed omp reuses pi's container poll (the omp container
-                // sets `PI_CODING_AGENT_DIR`); host omp uses omp_poll_fn, which
-                // scans `~/.omp/agent`.
-                if self.is_sandboxed() {
-                    let container_name = match self.sandbox_info.as_ref() {
-                        Some(s) => s.container_name.clone(),
-                        None => return,
-                    };
-                    Box::new(pi_poll_fn_sandboxed(
-                        container_name,
-                        self.container_workdir(),
-                        self.id.clone(),
-                        extra_excludes.clone(),
-                    ))
-                } else {
-                    Box::new(omp_poll_fn(
                         self.project_path.clone(),
                         self.id.clone(),
                         extra_excludes.clone(),
@@ -4660,12 +5705,109 @@ impl Instance {
         }
     }
 
+    pub(crate) fn session_id_poller_is_running(&self) -> bool {
+        self.session_id_poller.as_ref().is_some_and(|poller| {
+            poller
+                .lock()
+                .map(|guard| guard.is_running())
+                .unwrap_or_else(|poisoned| poisoned.into_inner().is_running())
+        })
+    }
+
+    /// Replace a missing or finished poller once its tmux pane is live.
+    ///
+    /// OMP pollers reload pane metadata on every tick, so a replacement binds
+    /// to the durable generation that won any concurrent restart race.
+    pub(crate) fn repair_session_id_poller_if_needed(&mut self) -> bool {
+        // Structured sessions have ACP workers rather than tmux panes. Their
+        // lifecycle is reconciled by the daemon, so probing tmux here can only
+        // fail and is especially costly from the native TUI's refresh loop.
+        if self.is_structured()
+            || !self.supports_session_poller()
+            || self.session_id_poller_is_running()
+            || !self.has_live_tmux_pane()
+        {
+            return false;
+        }
+        self.session_id_poller = None;
+        self.maybe_start_poller();
+        self.session_id_poller_is_running()
+    }
+
     fn stop_poller(&self) {
         if let Some(ref poller_arc) = self.session_id_poller {
             match poller_arc.lock() {
                 Ok(mut poller) => poller.stop(),
                 Err(e) => e.into_inner().stop(),
             }
+        }
+    }
+    /// Join the old poller and persist its final capture as a lifecycle
+    /// transition.
+    pub(crate) fn stop_and_flush_poller(&mut self) {
+        let profile = self.effective_profile();
+        let storage = match super::storage::Storage::new(&profile, self.resolve_file_watch()) {
+            Ok(storage) => storage,
+            Err(error) => {
+                tracing::warn!(target: "session.sync", session = %self.id, "capture storage failed: {error}");
+                self.stop_poller();
+                self.session_id_poller = None;
+                return;
+            }
+        };
+        let _lifecycle_lock = match storage.acquire_instance_lifecycle_lock(&self.id) {
+            Ok(lock) => lock,
+            Err(error) => {
+                tracing::warn!(target: "session.sync", session = %self.id, "capture lifecycle lock failed: {error}");
+                self.stop_poller();
+                self.session_id_poller = None;
+                return;
+            }
+        };
+        self.stop_and_flush_poller_lifecycle_locked();
+    }
+
+    fn stop_and_flush_poller_lifecycle_locked(&mut self) {
+        // stop_poller() signals the thread but leaves the handle in place, so
+        // this is_some() means "a poller existed and may have queued a final
+        // observation": drain it before dropping the handle below.
+        self.stop_poller();
+        if self.session_id_poller.is_some() {
+            let file_watch = self.resolve_file_watch();
+            let _ = crate::session::sync::drain_and_persist_session_ids_lifecycle_locked(
+                std::slice::from_mut(self),
+                &file_watch,
+            );
+        }
+        self.session_id_poller = None;
+    }
+
+    /// Last-chance exact-pane OMP capture while the old pane still exists.
+    fn capture_omp_before_restart(&mut self, profile: &str) {
+        self.reconcile_from_disk();
+        if self.tool != "omp"
+            || self.agent_session_id.is_some()
+            || (self.is_sandboxed() && self.omp_capture_generation.is_none())
+        {
+            return;
+        }
+        let Some(captured) = self.try_retroactive_capture() else {
+            return;
+        };
+        match persist_omp_session_to_storage(
+            profile,
+            &self.id,
+            &captured,
+            None,
+            self.omp_capture_generation.as_deref(),
+            &self.resolve_file_watch(),
+        ) {
+            SidWrite::Applied => {
+                self.agent_session_id = Some(captured);
+                self.resume_probe_failed_sid = None;
+            }
+            SidWrite::Skipped => self.reconcile_from_disk(),
+            SidWrite::Failed => {}
         }
     }
 
@@ -4687,7 +5829,7 @@ impl Instance {
     /// down. Caller is responsible for the subsequent
     /// `start_with_size_opts` to recreate the session with the agent
     /// command.
-    pub(crate) fn kill_clean(&self) -> Result<()> {
+    fn kill_clean_locked(&self) -> Result<()> {
         let session = self.tmux_session()?;
         if !session.exists() {
             return Ok(());
@@ -4712,11 +5854,34 @@ impl Instance {
         Ok(())
     }
 
-    /// Restart the session, optionally skipping on_launch hooks (e.g. when
-    /// they already ran in the background creation poller). Honors
-    /// `SessionConfig::auto_resume_on_restart`; this is the explicit
-    /// user-initiated restart/reattach path (`e`, `Enter`, CLI `session
-    /// restart`, startup recovery). See #2609.
+    pub(crate) fn kill_clean(&self) -> Result<()> {
+        let profile = self.effective_profile();
+        let storage = super::storage::Storage::new(&profile, self.resolve_file_watch())
+            .context("failed to open lifecycle lock storage")?;
+        let _lifecycle_lock = storage
+            .acquire_instance_lifecycle_lock(&self.id)
+            .context("failed to acquire instance kill lock")?;
+        let mut lifecycle = self.clone();
+        lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)?;
+        match self.kill_clean_locked() {
+            Ok(()) => lifecycle.commit_lifecycle_status(
+                &storage,
+                LifecycleOperation::Stop,
+                Status::Stopped,
+            ),
+            Err(error) => {
+                let _ = lifecycle.commit_lifecycle_status(
+                    &storage,
+                    LifecycleOperation::Stop,
+                    Status::Error,
+                );
+                Err(error)
+            }
+        }
+    }
+
+    /// Restart the session, optionally skipping on_launch hooks (e.g. when they
+    /// already ran in the background creation poller).
     pub fn restart_with_size_opts(
         &mut self,
         size: Option<(u16, u16)>,
@@ -4729,20 +5894,13 @@ impl Instance {
         )
     }
 
-    /// Shared restart cascade behind `restart_with_size_opts`. Broken out so
-    /// `ensure_pane_ready_with_size`'s dead-pane respawn (Send Message / Live
-    /// Send) can pass `ResumeAttemptPolicy::Allow`, keeping those surfaces
-    /// unaffected by `auto_resume_on_restart`. See #2609.
-    fn restart_with_resume_policy(
+    pub(crate) fn restart_with_resume_policy(
         &mut self,
         size: Option<(u16, u16)>,
         skip_on_launch: bool,
         resume_policy: ResumeAttemptPolicy,
     ) -> Result<StartOutcome> {
-        self.stop_poller();
-        self.session_id_poller = None;
-        self.kill_clean()?;
-        self.start_with_resume_fallback(size, skip_on_launch, resume_policy)
+        self.orchestrate_resume_launch(size, skip_on_launch, resume_policy, true)
     }
 
     /// Settle-based pane probe used by the resume-fallback cascade.
@@ -4836,160 +5994,147 @@ impl Instance {
         skip_on_launch: bool,
         resume_policy: ResumeAttemptPolicy,
     ) -> Result<StartOutcome> {
-        // Clear `Status::Error` on entry so a successful relaunch from any
-        // restart surface (REST `ensure_session`, TUI Enter/restart, CLI
-        // `aoe session restart [id|--all]`, structured view-mode short-circuit)
-        // does not leave a stale error chip up. REST `ensure_session`
-        // re-asserts `status=Starting`, `last_error=None` pre-call as
-        // defense in depth.
-        //
-        // `last_error_check` is cleared alongside `last_error` to mirror
-        // how the field is otherwise managed: `update_status` writes both
-        // together when transitioning into Error (see the write sites
-        // gated on the 30s rate-limit). The clear is functionally inert
-        // today because the only reader is gated on `status == Error` and
-        // we just left Error, but the symmetry is intentional defense
-        // against a future read site that drops that gate.
+        self.orchestrate_resume_launch(size, skip_on_launch, resume_policy, false)
+    }
+
+    fn orchestrate_resume_launch(
+        &mut self,
+        size: Option<(u16, u16)>,
+        skip_on_launch: bool,
+        resume_policy: ResumeAttemptPolicy,
+        restart: bool,
+    ) -> Result<StartOutcome> {
+        crate::session::validate_instance_id(&self.id)
+            .context("refusing to start: AOE_INSTANCE_ID failed validation")?;
+        if self.is_structured() {
+            return Ok(StartOutcome::Fresh);
+        }
+        let profile = self.effective_profile();
+        let storage = super::storage::Storage::new(&profile, self.resolve_file_watch())
+            .context("failed to open lifecycle lock storage")?;
+
+        let lifecycle_lock = storage
+            .acquire_instance_lifecycle_lock(&self.id)
+            .context("failed to acquire instance start lock")?;
+        self.reconcile_from_disk();
+        if self.is_structured() {
+            return Ok(StartOutcome::Fresh);
+        }
+        if !restart && self.tmux_session()?.exists() {
+            return Ok(StartOutcome::Fresh);
+        }
         if self.status == Status::Error {
             self.status = Status::Idle;
             self.last_error = None;
             self.last_error_check = None;
         }
-
-        if self.is_structured() {
-            let _ = self.start_with_size_opts(size, skip_on_launch)?;
-            return Ok(StartOutcome::Fresh);
+        self.acquire_lifecycle_reservation(
+            &storage,
+            LifecycleOperation::Launch,
+            Some(Status::Starting),
+        )?;
+        if restart {
+            self.stop_and_flush_poller_lifecycle_locked();
+            self.capture_omp_before_restart(&profile);
         }
 
-        // Defense in depth: every current caller runs `kill_clean()` (or
-        // its equivalent) first, so this is normally false. It can still
-        // be true if `kill_clean` raced the macOS tmux session cache
-        // (see `Instance::kill_clean` doc): in that case
-        // `start_with_size_opts` no-ops, the probe would have nothing to
-        // detect, and reporting `Fresh` is the least-wrong outcome
-        // (returning `Resumed` would mean lying about a `--resume <sid>`
-        // that was never passed). The debug_assert surfaces the protocol
-        // violation in dev/test if a future caller forgets to tear down;
-        // the tracing::warn! mirrors it in release so the race is visible
-        // in `aoe logs` for diagnosis. The branch on `attempting_resume`
-        // separates the dangerous case (sid was passed but no probe ran,
-        // pane could be left frozen) from the benign one (no resume was
-        // attempted, the race is just kill_clean cache staleness).
-        let pane_was_preexisting = self.tmux_session().is_ok_and(|s| s.exists());
+        // Keep the generation reservation durable, but allow hooks to invoke
+        // aoe against this session without waiting on our flock.
+        drop(lifecycle_lock);
+        let hook_result = self.run_pre_launch_hooks(skip_on_launch, &profile);
+        let _lifecycle_lock = storage
+            .acquire_instance_lifecycle_lock(&self.id)
+            .context("failed to reacquire instance start lock after hooks")?;
+        self.reconcile_from_disk();
+        if let Err(error) = hook_result {
+            self.fail_reserved_launch(&storage, &error, false);
+            return Err(error);
+        }
+        self.ensure_reservation_current_or_fail(&storage)?;
+        let skipped_failed_resume_sid = self.apply_resume_policy(resume_policy);
+        self.apply_fresh_launch_intent();
 
-        // Decide BEFORE launching whether this call may pass `--resume`, since
-        // that flag is baked into the command by `acquire_session_id` inside
-        // `start_with_size_opts`, not by anything read afterward. Only
-        // intervenes on the ambient auto-resume path (`ResumeIntent::Default`):
-        // an explicit one-shot `Use`/`Fork`/`Cleared` intent (e.g. just set via
-        // `aoe session set-session-id`) is a deliberate user action and must
-        // not be silently overridden by the restart-time policy or
-        // loop-breaker. When it fires, `force_fresh_next_launch` routes the
-        // launch through the same `ResumeIntent::Cleared` path a manual
-        // `set-session-id ""` would take. See #2609.
-        let mut skipped_failed_resume_sid: Option<String> = None;
-        if self.resume_intent == ResumeIntent::Default {
-            if let Some(sid) = self.agent_session_id.clone() {
-                let resume_allowed_by_policy = match resume_policy {
-                    ResumeAttemptPolicy::Allow => true,
-                    ResumeAttemptPolicy::HonorAutoResumeSetting => {
-                        super::profile_config::resolve_config_or_warn(&self.effective_profile())
-                            .session
-                            .auto_resume_on_restart
-                    }
-                };
-                let resume_capable = should_attempt_resume(Some(&sid), &self.tool);
-                let probe_already_failed = self.resume_probe_failed_sid.as_deref() == Some(&sid);
-                if resume_capable && probe_already_failed {
-                    // Loop-breaker: a sid that already failed a probe is never
-                    // retried automatically, regardless of policy, mirroring
-                    // the check `is_recovery_candidate` already applies to
-                    // the passive startup sweep. Without it, `e`/`Enter`
-                    // retries the identical doomed sid forever.
-                    skipped_failed_resume_sid = Some(sid);
-                    self.force_fresh_next_launch = true;
-                } else if resume_capable && !resume_allowed_by_policy {
-                    self.force_fresh_next_launch = true;
-                }
+        let prepared = match self.prepare_launch_command() {
+            Ok(prepared) => prepared,
+            Err(error) => {
+                self.fail_reserved_launch(&storage, &error, false);
+                return Err(error);
             }
+        };
+        let result = (|| {
+            if restart {
+                self.kill_clean_locked()?;
+            }
+            let launch_outcome = self.spawn_prepared_launch(size, &profile, prepared)?;
+            let outcome =
+                self.finish_resume_launch(launch_outcome, skipped_failed_resume_sid, &profile)?;
+            self.commit_lifecycle_launch(&storage, restart)?;
+            Ok(outcome)
+        })();
+        if let Err(error) = result {
+            self.fail_reserved_launch(&storage, &error, true);
+            return Err(error);
         }
+        result
+    }
 
-        let outcome = self.start_with_size_opts(size, skip_on_launch)?;
+    fn apply_resume_policy(&mut self, resume_policy: ResumeAttemptPolicy) -> Option<String> {
+        if self.resume_intent != ResumeIntent::Default {
+            return None;
+        }
+        let sid = self.agent_session_id.clone()?;
+        let resume_allowed_by_policy = match resume_policy {
+            ResumeAttemptPolicy::Allow => true,
+            ResumeAttemptPolicy::HonorAutoResumeSetting => {
+                super::profile_config::resolve_config_or_warn(&self.effective_profile())
+                    .session
+                    .auto_resume_on_restart
+            }
+        };
+        if !should_attempt_resume(Some(&sid), &self.tool) {
+            return None;
+        }
+        if self.resume_probe_failed_sid.as_deref() == Some(&sid) {
+            self.force_fresh_next_launch = true;
+            return Some(sid);
+        }
+        if !resume_allowed_by_policy {
+            self.force_fresh_next_launch = true;
+        }
+        None
+    }
 
-        // Gated on `LaunchSidOutcome::Existing` so fresh launches (Cleared,
-        // no observed sid + Claude UUID generation) skip the probe and
-        // honestly report `Fresh`. Without this gate, every Claude launch
-        // would probe (~2s) and return `Resumed` because acquire always
-        // assigns a UUID, even when no `--resume` was passed. When the
-        // pre-launch decision above forced `Cleared`, `outcome` is already
-        // `LaunchSidOutcome::Fresh` here, so this naturally yields `None`.
-        let attempted_sid = match &outcome {
-            LaunchSidOutcome::Existing { sid } if should_attempt_resume(Some(sid), &self.tool) => {
-                Some(sid.clone())
+    fn finish_resume_launch(
+        &mut self,
+        launch_outcome: LaunchSidOutcome,
+        skipped_failed_resume_sid: Option<String>,
+        profile: &str,
+    ) -> Result<StartOutcome> {
+        let attempted_sid = match launch_outcome {
+            LaunchSidOutcome::Existing { sid } if should_attempt_resume(Some(&sid), &self.tool) => {
+                Some(sid)
             }
             _ => None,
         };
-        let attempting_resume = attempted_sid.is_some();
-
-        if pane_was_preexisting {
-            if attempting_resume {
-                tracing::warn!(
-                    target: "session.store",
-                    instance_id = %self.id,
-                    "start_with_resume_fallback: tmux session still exists on \
-                     entry with attempting_resume=true; cascade skipped, \
-                     returning Fresh. --resume <sid> was passed to \
-                     start_with_size_opts but no probe ran; if the agent \
-                     crashes inside the pane, it will be left frozen.",
-                );
-            } else {
-                tracing::warn!(
-                    target: "session.store",
-                    instance_id = %self.id,
-                    "start_with_resume_fallback: tmux session still exists on \
-                     entry (no resume attempted); cascade skipped, returning \
-                     Fresh. Likely a kill_clean race or caller protocol violation.",
-                );
-            }
-        }
-        debug_assert!(
-            !pane_was_preexisting,
-            "start_with_resume_fallback callers must kill_clean() first; \
-             tmux session for {} still exists on entry",
-            self.id
-        );
-
-        // Defensive `|| pane_was_preexisting`: covers the TOCTOU window
-        // where a peer killed the pane between the snapshot above and
-        // `start_with_size_opts`'s internal `session.exists()` check, in
-        // which case `outcome` could be `Existing` despite the snapshot.
-        if !attempting_resume || pane_was_preexisting {
+        let Some(stale_sid) = attempted_sid else {
             return Ok(match skipped_failed_resume_sid {
                 Some(sid) => StartOutcome::FreshAfterFailedResume { sid },
                 None => StartOutcome::Fresh,
             });
-        }
+        };
 
-        // Tier-1 settle probe. On Err (rare: only when `tmux_session()`
-        // fails), tear down the Tier-1 poller spawned by the
-        // start_with_size_opts above before propagating, so a transient
-        // tmux failure cannot leak a poller thread onto a presumed-broken
-        // pane.
         let probe = match self.probe_settle(RESUME_PROBE_MAX, RESUME_PROBE_POLL) {
-            Ok(p) => p,
-            Err(e) => {
+            Ok(probe) => probe,
+            Err(error) => {
                 self.stop_poller();
                 self.session_id_poller = None;
-                return Err(e);
+                return Err(error);
             }
         };
-        match probe {
-            ProbeResult::Alive => return Ok(StartOutcome::Resumed),
-            ProbeResult::Dead => {}
+        if probe == ProbeResult::Alive {
+            return Ok(StartOutcome::Resumed);
         }
 
-        let stale_sid = attempted_sid.expect("attempting_resume guarantees launch sid is Some");
-        let profile = self.effective_profile();
         tracing::warn!(
             target: "session.store",
             "start: resume with sid {} for session {} crashed pane within probe; \
@@ -4997,21 +6142,17 @@ impl Instance {
             stale_sid,
             self.id,
         );
-
         self.stop_poller();
         self.session_id_poller = None;
         self.resume_probe_failed_sid = Some(stale_sid.clone());
-        match self.mark_resume_probe_failed(&profile, &stale_sid) {
-            SidWrite::Applied | SidWrite::Skipped => {}
-            SidWrite::Failed => {
-                anyhow::bail!(
-                    "resume probe failed for sid {} for {}, but marker could not be persisted",
-                    stale_sid,
-                    self.id,
-                );
-            }
+        if self.mark_resume_probe_failed(profile, &stale_sid) == SidWrite::Failed {
+            anyhow::bail!(
+                "resume probe failed for sid {} for {}, but marker could not be persisted",
+                stale_sid,
+                self.id,
+            );
         }
-        self.kill_clean()
+        self.kill_clean_locked()
             .with_context(|| format!("kill_clean before resume fallback for {}", self.id))?;
         self.status = Status::Error;
         self.last_error = Some(format!(
@@ -5019,10 +6160,8 @@ impl Instance {
             stale_sid
         ));
         self.last_error_check = Some(std::time::Instant::now());
-
         Ok(StartOutcome::ResumeFailed { sid: stale_sid })
     }
-
     /// Smart-send precondition: bring this session's tmux pane to a state
     /// where `send_keys_with_delay` is safe.
     ///
@@ -5159,7 +6298,7 @@ impl Instance {
         }
     }
 
-    pub fn kill(&self) -> Result<()> {
+    pub(crate) fn kill_locked(&self) -> Result<()> {
         self.stop_poller();
         let session = self.tmux_session()?;
         if session.exists() {
@@ -5168,50 +6307,211 @@ impl Instance {
         Ok(())
     }
 
+    pub fn kill(&self) -> Result<()> {
+        let profile = self.effective_profile();
+        let storage = super::storage::Storage::new(&profile, self.resolve_file_watch())
+            .context("failed to open lifecycle lock storage")?;
+        let _lifecycle_lock = storage
+            .acquire_instance_lifecycle_lock(&self.id)
+            .context("failed to acquire instance kill lock")?;
+        let mut lifecycle = self.clone();
+        lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)?;
+        match self.kill_locked() {
+            Ok(()) => lifecycle.commit_lifecycle_status(
+                &storage,
+                LifecycleOperation::Stop,
+                Status::Stopped,
+            ),
+            Err(error) => {
+                let _ = lifecycle.commit_lifecycle_status(
+                    &storage,
+                    LifecycleOperation::Stop,
+                    Status::Error,
+                );
+                Err(error)
+            }
+        }
+    }
+
     /// Kill every tmux session owned by this instance (agent, web
     /// terminal, container terminal, tool sub-sessions). Best-effort
     /// and silent; agent/terminal/container terminal failures log at
     /// `debug!` target `session.tmux_cleanup`. Tool sub-sessions are
     /// silent by design via `kill_all_tool_sessions_for_id`.
     pub fn kill_all_tmux_sessions(&self) {
-        if let Err(e) = self.kill() {
+        let profile = self.effective_profile();
+        let storage = match super::storage::Storage::new(&profile, self.resolve_file_watch()) {
+            Ok(storage) => storage,
+            Err(error) => {
+                tracing::warn!(
+                    target: "session.tmux_cleanup",
+                    session_id = %self.id,
+                    %error,
+                    "kill_all_tmux_sessions: lifecycle storage failed"
+                );
+                return;
+            }
+        };
+        let _lifecycle_lock = match storage.acquire_instance_lifecycle_lock(&self.id) {
+            Ok(lock) => lock,
+            Err(error) => {
+                tracing::warn!(
+                    target: "session.tmux_cleanup",
+                    session_id = %self.id,
+                    %error,
+                    "kill_all_tmux_sessions: lifecycle lock failed"
+                );
+                return;
+            }
+        };
+        let mut lifecycle = self.clone();
+        if let Err(error) =
+            lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)
+        {
+            tracing::warn!(
+                target: "session.tmux_cleanup",
+                session_id = %self.id,
+                %error,
+                "kill_all_tmux_sessions: lifecycle reservation failed"
+            );
+            return;
+        }
+        self.kill_all_tmux_sessions_locked();
+        if let Err(error) =
+            lifecycle.commit_lifecycle_status(&storage, LifecycleOperation::Stop, Status::Stopped)
+        {
+            tracing::warn!(
+                target: "session.tmux_cleanup",
+                session_id = %self.id,
+                %error,
+                "kill_all_tmux_sessions: lifecycle commit failed"
+            );
+        }
+    }
+
+    /// Kill every tmux session owned by this instance while the caller holds
+    /// the selected profile's per-instance lifecycle lock.
+    ///
+    /// Destructive deletion keeps that guard across tmux/container/worktree
+    /// teardown and the durable row removal, so it must use this helper rather
+    /// than reacquiring the non-reentrant lock via [`Self::kill_all_tmux_sessions`].
+    pub(crate) fn kill_all_tmux_sessions_locked(&self) {
+        self.kill_all_tmux_sessions_uncoordinated();
+    }
+
+    /// Break-glass teardown after force-removal has durably deleted the row.
+    ///
+    /// A lifecycle reservation cannot be acquired once the row is absent.
+    /// Force-removal is limited to an already-Deleting row, so no launch can
+    /// race this idempotent cleanup.
+    pub(crate) fn kill_all_tmux_sessions_after_forced_removal(&self) {
+        self.kill_all_tmux_sessions_uncoordinated();
+    }
+
+    fn kill_all_tmux_sessions_uncoordinated(&self) {
+        if let Err(e) = self.kill_locked() {
             tracing::debug!(
                 target: "session.tmux_cleanup",
                 session_id = %self.id,
                 kind = "agent",
                 error = %e,
-                "kill_all_tmux_sessions: kill failed"
+                "kill_all_tmux_sessions_uncoordinated: kill failed"
             );
         }
-        self.kill_ancillary_tmux_sessions();
+        self.kill_ancillary_tmux_sessions_locked();
     }
 
-    /// Kill every tmux session owned by this instance EXCEPT the agent
-    /// session (web terminal, container terminal, tool sub-sessions).
-    /// Used by call sites that want to handle the agent kill failure
-    /// with caller-specific tracing while still letting all other
-    /// kinds be cleaned up consistently.
-    pub fn kill_ancillary_tmux_sessions(&self) {
-        // Reaps every paired terminal (host + container, index 0 and the
-        // additional web terminal tabs) in one tmux scan, so multi-terminal
-        // sessions (#2437) do not leak panes on teardown.
+    pub(crate) fn kill_ancillary_tmux_sessions_locked(&self) {
         crate::tmux::kill_all_terminals_for_id(&self.id);
         crate::tmux::kill_all_tool_sessions_for_id(&self.id);
     }
 
-    /// Stop the session: kill the tmux session and stop the Docker container
-    /// (if sandboxed) via
-    /// [`stop_sandbox_container`](crate::session::worktree_edit::stop_sandbox_container).
-    /// The container is stopped but not removed, so it can be restarted on
-    /// re-attach. The container-stop semantics (best-effort on a transient
-    /// `docker inspect` failure, propagating a genuine stop failure) live on
-    /// that shared helper, which the trash path reuses.
-    pub fn stop(&self) -> Result<()> {
-        self.kill()?;
-        crate::session::worktree_edit::stop_sandbox_container(&self.id, self.is_sandboxed())?;
-        crate::hooks::cleanup_hook_status_dir(&self.id);
+    /// Kill every tmux session owned by this instance EXCEPT the agent
+    /// session (web terminal, container terminal, tool sub-sessions).
+    pub fn kill_ancillary_tmux_sessions(&self) {
+        let profile = self.effective_profile();
+        let storage = match super::storage::Storage::new(&profile, self.resolve_file_watch()) {
+            Ok(storage) => storage,
+            Err(error) => {
+                tracing::warn!(
+                    target: "session.tmux_cleanup",
+                    session_id = %self.id,
+                    %error,
+                    "kill_ancillary_tmux_sessions: lifecycle storage failed"
+                );
+                return;
+            }
+        };
+        let _lifecycle_lock = match storage.acquire_instance_lifecycle_lock(&self.id) {
+            Ok(lock) => lock,
+            Err(error) => {
+                tracing::warn!(
+                    target: "session.tmux_cleanup",
+                    session_id = %self.id,
+                    %error,
+                    "kill_ancillary_tmux_sessions: lifecycle lock failed"
+                );
+                return;
+            }
+        };
+        let mut lifecycle = self.clone();
+        if let Err(error) =
+            lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)
+        {
+            tracing::warn!(
+                target: "session.tmux_cleanup",
+                session_id = %self.id,
+                %error,
+                "kill_ancillary_tmux_sessions: lifecycle reservation failed"
+            );
+            return;
+        }
+        self.kill_ancillary_tmux_sessions_locked();
+        if let Err(error) =
+            lifecycle.release_lifecycle_reservation(&storage, LifecycleOperation::Stop)
+        {
+            tracing::warn!(
+                target: "session.tmux_cleanup",
+                session_id = %self.id,
+                %error,
+                "kill_ancillary_tmux_sessions: lifecycle release failed"
+            );
+        }
+    }
 
-        Ok(())
+    /// Stop the session and its sandbox container under the same lifecycle
+    /// lock used by launch/restart.
+    pub fn stop(&self) -> Result<()> {
+        let profile = self.effective_profile();
+        let storage = super::storage::Storage::new(&profile, self.resolve_file_watch())
+            .context("failed to open lifecycle lock storage")?;
+        let _lifecycle_lock = storage
+            .acquire_instance_lifecycle_lock(&self.id)
+            .context("failed to acquire instance stop lock")?;
+        let mut lifecycle = self.clone();
+        lifecycle.acquire_lifecycle_reservation(&storage, LifecycleOperation::Stop, None)?;
+        let teardown = self.kill_locked().and_then(|()| {
+            crate::session::worktree_edit::stop_sandbox_container(&self.id, self.is_sandboxed())
+        });
+        match teardown {
+            Ok(()) => {
+                lifecycle.commit_lifecycle_status(
+                    &storage,
+                    LifecycleOperation::Stop,
+                    Status::Stopped,
+                )?;
+                crate::hooks::cleanup_hook_status_dir(&self.id);
+                Ok(())
+            }
+            Err(error) => {
+                let _ = lifecycle.commit_lifecycle_status(
+                    &storage,
+                    LifecycleOperation::Stop,
+                    Status::Error,
+                );
+                Err(error)
+            }
+        }
     }
 
     /// Update status using pre-fetched pane metadata to avoid per-instance
@@ -5339,7 +6639,7 @@ impl Instance {
             return;
         }
 
-        if self.status == Status::Error {
+        if self.status == Status::Error && self.last_error.is_some() {
             if let Some(last_check) = self.last_error_check {
                 if last_check.elapsed().as_secs() < 30 {
                     return;
@@ -5455,7 +6755,12 @@ impl Instance {
             self.has_command_override()
         );
 
-        let detection_tool = if self.detect_as.is_empty() {
+        // Two detection identities: hooks are installed for (and must be
+        // interpreted by) the `agent_detect_as` alias when one is set, so
+        // hook reconciliation keeps the alias identity. The pane fallback
+        // below instead prefers the session's own configured status rules
+        // over the alias.
+        let hook_tool: &str = if self.detect_as.is_empty() {
             &self.tool
         } else {
             &self.detect_as
@@ -5499,20 +6804,20 @@ impl Instance {
                 //    keeps parked sessions (the dominant steady state) from
                 //    paying a capture per poll; see
                 //    reconcile_claude_idle_hook_status.
-                let reconciles_running = (detection_tool == "codex" || detection_tool == "claude")
+                let reconciles_running = (hook_tool == "codex" || hook_tool == "claude")
                     && hook_status == Status::Running;
                 let reconciles_waiting = hook_status == Status::Waiting;
-                let reconciles_idle = detection_tool == "claude"
+                let reconciles_idle = hook_tool == "claude"
                     && hook_status == Status::Idle
                     && matches!(self.status, Status::Running | Status::Waiting);
                 self.status = if reconciles_running || reconciles_waiting || reconciles_idle {
                     match session.capture_pane(50) {
                         Ok(pane_content) => {
                             if reconciles_waiting {
-                                tmux::reconcile_waiting_hook(detection_tool, &pane_content)
+                                tmux::reconcile_waiting_hook(hook_tool, &pane_content)
                             } else if reconciles_idle {
                                 tmux::reconcile_claude_idle_hook_status(&pane_content)
-                            } else if detection_tool == "codex" {
+                            } else if hook_tool == "codex" {
                                 tmux::reconcile_codex_hook_status(hook_status, &pane_content)
                             } else {
                                 let running_age = crate::hooks::read_hook_status_age(&self.id);
@@ -5527,7 +6832,7 @@ impl Instance {
                             tracing::trace!(
                                 "status '{}': {} hook fallback pane capture failed: {}",
                                 self.title,
-                                detection_tool,
+                                hook_tool,
                                 e
                             );
                             hook_status
@@ -5541,8 +6846,13 @@ impl Instance {
             return;
         }
 
+        // Pane-fallback identity: the session's own configured status rules
+        // outrank the `agent_detect_as` alias; without rules the alias applies.
+        let pane_tool =
+            tmux::status_rules::detection_tool(&self.source_profile, &self.tool, &self.detect_as);
         let pane_content = session.capture_pane(50).unwrap_or_default();
-        let detected = tmux::detect_status_from_content(&pane_content, detection_tool);
+        let detected =
+            tmux::detect_status_from_content_in(&self.source_profile, &pane_content, pane_tool);
         tracing::trace!(target: "session.store",
             "status '{}': detected={:?}, cmd_override={}, custom_cmd={}",
             self.title,
@@ -5556,8 +6866,14 @@ impl Instance {
                 return false;
             }
             let shell_check = metadata
-                .and_then(|m| m.pane_current_command.as_deref())
-                .map(tmux::utils::is_shell_command)
+                .and_then(|m| {
+                    m.pane_current_command.as_deref().map(|current_command| {
+                        tmux::utils::is_pane_running_shell_command(
+                            current_command,
+                            m.pane_start_command_is_protected,
+                        )
+                    })
+                })
                 .unwrap_or_else(|| session.is_pane_running_shell());
             tracing::trace!(target: "session.store",
                 "status '{}': is_shell_stale check: expects_shell={}, shell_check={}",
@@ -5584,7 +6900,7 @@ impl Instance {
             && !shell_stale
             && !is_dead
             && self.status == Status::Running
-            && detection_tool == "claude"
+            && pane_tool == "claude"
             && tmux::claude_pane_is_ambiguous_typed_prompt(&pane_content)
         {
             tracing::debug!(target: "session.store",
@@ -5738,50 +7054,194 @@ fn apply_agent_launch_env(cmd: &mut String, agent: Option<&'static crate::agents
 /// so this reads the container's value, not the host's.
 const CONTAINER_TERMINAL_AUTODETECT_CMD: &str = r#"sh -c 'exec "$(command -v "$(getent passwd "$(id -u)" 2>/dev/null | cut -d: -f7)" 2>/dev/null || command -v "$SHELL" 2>/dev/null || command -v bash || command -v sh)" -l'"#;
 
-/// When running agents directly as tmux session commands (without a parent shell),
-/// pressing Ctrl-Z suspends the process with no way to recover via job control.
-/// This wrapper disables the suspend character at the terminal level before exec'ing
-/// the actual command.
-///
-/// Uses POSIX-standard `stty susp undef` which works on both Linux and macOS.
-/// Single quotes in `cmd` are escaped with the `'\''` technique to prevent
-/// breaking out of the outer single-quoted wrapper.
-///
-/// The leading `exec` ensures the tmux default shell (which may be fish, nu,
-/// etc.) replaces itself with the POSIX wrapper. Without it, fish stays as the
-/// pane process because fish does not exec the last command in `-c` mode. That
-/// causes `#{pane_current_command}` to report "fish", which triggers a false
-/// restart on reattach. See #757.
-fn wrap_command_ignore_suspend(cmd: &str) -> String {
-    let user = super::environment::user_shell();
-    let posix = super::environment::user_posix_shell();
-    let escaped = cmd.replace('\'', "'\\''");
-    // Use login shell (-l) so version-manager PATHs (NVM, etc.) are available.
-    // Skip -l when falling back to bash for a non-POSIX user shell (fish, nu,
-    // pwsh): bash's login scripts won't contain the user's PATH setup and -l
-    // may reset the inherited PATH that already has the correct entries.
-    let flag = if user == posix { "-lc" } else { "-c" };
+/// Run a script through a dedicated descriptor so its size is not constrained
+/// by the per-argument exec limit and the launched agent retains the pane TTY
+/// on standard input. The delimiter grows until it cannot close a here-document
+/// present in user-controlled command text.
+fn shell_stdin_command(shell: &str, login: bool, script: &str, stem: &str) -> String {
+    let mut delimiter = stem.to_string();
+    while script.lines().any(|line| line == delimiter) {
+        delimiter.push('_');
+    }
+    let flag = if login { "-l " } else { "" };
     format!(
-        "exec {} {} 'stty susp undef; exec env {}'",
-        posix, flag, escaped
+        "{} {flag}/dev/fd/3 3<<'{delimiter}'\n{script}\n{delimiter}",
+        shell_escape(shell)
     )
 }
 
-/// Prepend shell `export` statements to an already-wrapped sandbox command.
+/// Disable terminal suspension before replacing the pane process with the
+/// requested command. The user's POSIX login shell reads the launch script
+/// from a dedicated descriptor, keeping both large prompts and the pane TTY.
 ///
-/// `wrapped` MUST be the output of `wrap_command_ignore_suspend`, which
-/// guarantees a leading `exec`. This function therefore MUST NOT add another
-/// `exec` of its own: in bash, `exec exec <cmd>` searches PATH for a binary
-/// literally named `exec`, fails with exit 127, and kills the tmux pane on
-/// every sandboxed launch. zsh-on-macOS happens to tolerate the double-exec,
-/// which is why this regression hid for several days after #757 added the
-/// leading `exec` to `wrap_command_ignore_suspend`. See PR #819.
-fn prepend_exports(exports: &[String], wrapped: String) -> String {
-    if exports.is_empty() {
-        wrapped
-    } else {
-        format!("{}; {}", exports.join("; "), wrapped)
-    }
+/// `working_dir` is re-asserted with `cd` as the first statement in that
+/// script, after the login shell's profile/rc files have run. tmux's
+/// `new-session -c` only sets the shell's initial cwd, and a `-l` login
+/// shell's rc files (or an nvm/direnv hook) can `cd` away before the agent
+/// starts; re-cd-ing here wins regardless (#3265).
+fn wrap_command_ignore_suspend(cmd: &str, working_dir: &str) -> String {
+    let user = super::environment::user_shell();
+    let posix = super::environment::user_posix_shell();
+    let cd = super::environment::shell_escape(working_dir);
+    let script = format!("cd {cd} || exit 1\nstty susp undef\nexec env {cmd}");
+    shell_stdin_command(&posix, user == posix, &script, "AOE_LAUNCH_BODY")
+}
+
+/// Build a post-login routing fingerprint check without embedding any routing
+/// value in argv. The pane hashes its live environment through stdin; if no
+/// SHA-256 utility exists or startup files changed routing, capture is skipped
+/// and the original OMP command runs untouched.
+fn omp_routing_fingerprint_check(plan: &OmpCapturePlan) -> String {
+    let keys = crate::session::capture::OMP_STORE_ENV_KEYS.join(" ");
+    format!(
+        "route_payload() {{ \
+           for k in {keys}; do \
+             eval \"s=\\${{$k+x}};v=\\${{$k-}}\"; \
+             if [ \"$s\" ]; then printf '%s\\0001\\000%s\\000' \"$k\" \"$v\"; \
+             else printf '%s\\0000\\000\\000' \"$k\"; fi; \
+           done; \
+         }}; \
+          if command -v sha256sum >/dev/null 2>&1; then \
+           route_fingerprint=$(route_payload | command sha256sum) || launch_raw; \
+          elif command -v shasum >/dev/null 2>&1; then \
+           route_fingerprint=$(route_payload | command shasum -a 256) || launch_raw; \
+          else launch_raw; fi; \
+          route_fingerprint=${{route_fingerprint%% *}}; \
+          [ \"$route_fingerprint\" = {} ] || launch_raw; ",
+        shell_escape(&plan.routing_fingerprint)
+    )
+}
+
+/// Wait briefly for the parent to publish this launch generation's hidden
+/// capture metadata. A timeout runs the uninstrumented command, so capture
+/// fails closed without preventing the agent from starting.
+fn gate_omp_launch(raw_command: &str, marked_command: &str, plan: &OmpCapturePlan) -> String {
+    let expected = format!(
+        "{}={}",
+        crate::tmux::env::AOE_OMP_CAPTURE_READY_KEY,
+        plan.launch_id
+    );
+    let script = format!(
+        "expected={}; ready=; attempt=0; \
+         while [ \"$attempt\" -lt 100 ]; do \
+           ready=$(tmux show-environment -h -t \"$TMUX_PANE\" {} 2>/dev/null) || ready=; \
+           [ \"$ready\" = \"$expected\" ] && break; \
+           attempt=$((attempt + 1)); sleep 0.05; \
+         done\n\
+         if [ \"$ready\" = \"$expected\" ]; then\n\
+           exec env {marked_command}\n\
+         else\n\
+           exec env {raw_command}\n\
+         fi",
+        shell_escape(&expected),
+        crate::tmux::env::AOE_OMP_CAPTURE_READY_KEY,
+    );
+    shell_stdin_command("sh", false, &script, "AOE_OMP_CAPTURE_GATE")
+}
+
+/// Apply profile assignments to the marker wrapper itself, not only to its
+/// eventual OMP command. The routing fingerprint must observe the same
+/// effective environment that OMP inherits.
+fn wrap_omp_host_launch(env_prefix: &str, tool_cmd: &str, plan: &OmpCapturePlan) -> String {
+    format!("{env_prefix}{}", wrap_omp_launch(tool_cmd, plan))
+}
+
+/// Bind capture to the exact launch PTY. A valid pre-launch breadcrumb is
+/// rewritten to a lexically different but equivalent session path; the marker
+/// records that pending path so capture waits until OMP rewrites the breadcrumb.
+/// If no breadcrumb exists, install a fresh sentinel from a private directory
+/// by a no-clobber hardlink. Invalid breadcrumbs, collisions, symlinks, and
+/// write failures launch raw OMP without capture.
+fn wrap_omp_launch(tool_cmd: &str, plan: &OmpCapturePlan) -> String {
+    let breadcrumb_tmp_leaf = format!(".aoe-omp-breadcrumb-{}", plan.launch_id);
+    let pending_sentinel = plan
+        .layout
+        .managed_sessions
+        .join(format!(".aoe-pending-{}", plan.launch_id))
+        .join(format!("aoe-pending_{}.jsonl", plan.launch_id));
+    let fingerprint_check = omp_routing_fingerprint_check(plan);
+    let marked_launch = format!(
+        "tool_cmd={}; \
+         launch_raw() {{ exec sh -c \"$tool_cmd\"; }}; \
+         {}\
+         tty_path=$(tty) || launch_raw; \
+         terminal_id=${{tty_path#/dev/}}; \
+         [ \"$terminal_id\" != \"$tty_path\" ] && [ -n \"$terminal_id\" ] || launch_raw; \
+         terminal_id=$(printf '%s' \"$terminal_id\" | tr '/' '-') || launch_raw; \
+         terminal_dir={}; \
+         [ -d \"$terminal_dir\" ] && [ ! -L \"$terminal_dir\" ] || launch_raw; \
+         pending=; \
+         breadcrumb=\"$terminal_dir/$terminal_id\"; \
+         if [ -f \"$breadcrumb\" ] && [ ! -L \"$breadcrumb\" ]; then \
+           breadcrumb_bytes=$(head -c 16385 \"$breadcrumb\" 2>/dev/null | LC_ALL=C wc -c | tr -d '[:space:]'); \
+           case \"$breadcrumb_bytes\" in ''|*[!0-9]*) breadcrumb_bytes=16385 ;; esac; \
+           [ \"$breadcrumb_bytes\" -le 16384 ] || launch_raw; \
+           crumb_cwd=$(head -c 16385 \"$breadcrumb\" 2>/dev/null | sed -n '1p') || launch_raw; \
+           crumb_path=$(head -c 16385 \"$breadcrumb\" 2>/dev/null | sed -n '2p') || launch_raw; \
+           crumb_marker=$(head -c 16385 \"$breadcrumb\" 2>/dev/null | sed -n '3p') || launch_raw; \
+           crumb_lines=$(head -c 16385 \"$breadcrumb\" 2>/dev/null | sed -n '$=') || launch_raw; \
+           case \"$crumb_lines:$crumb_marker\" in '2:'|'3:fresh') ;; *) launch_raw ;; esac; \
+           [ -n \"$crumb_cwd\" ] && [ -n \"$crumb_path\" ] || launch_raw; \
+           case \"$crumb_path\" in \
+             /*) crumb_dir=${{crumb_path%/*}}; crumb_base=${{crumb_path##*/}}; \
+                 [ -n \"$crumb_dir\" ] || crumb_dir=/; \
+                 if [ \"$crumb_dir\" = / ]; then pending=\"/./$crumb_base\"; \
+                 else pending=\"$crumb_dir/./$crumb_base\"; fi ;; \
+             *) pending=\"./$crumb_path\" ;; \
+           esac; \
+           if [ \"$crumb_marker\" = fresh ]; then \
+             rewritten_bytes=$(printf '%s\\n%s\\nfresh\\n' \"$crumb_cwd\" \"$pending\" | LC_ALL=C wc -c | tr -d '[:space:]'); \
+           else \
+             rewritten_bytes=$(printf '%s\\n%s\\n' \"$crumb_cwd\" \"$pending\" | LC_ALL=C wc -c | tr -d '[:space:]'); \
+           fi; \
+           case \"$rewritten_bytes\" in ''|*[!0-9]*) rewritten_bytes=16385 ;; esac; \
+           [ \"$rewritten_bytes\" -le 16384 ] || launch_raw; \
+           breadcrumb_tmp_dir=\"$terminal_dir\"/{}.tmp.$$; \
+           (umask 077; mkdir \"$breadcrumb_tmp_dir\") || launch_raw; \
+           breadcrumb_tmp=\"$breadcrumb_tmp_dir/breadcrumb\"; \
+           if [ \"$crumb_marker\" = fresh ]; then \
+             (umask 077; set -C; printf '%s\\n%s\\nfresh\\n' \"$crumb_cwd\" \"$pending\" > \"$breadcrumb_tmp\") || launch_raw; \
+           else \
+             (umask 077; set -C; printf '%s\\n%s\\n' \"$crumb_cwd\" \"$pending\" > \"$breadcrumb_tmp\") || launch_raw; \
+           fi; \
+           mv -f -- \"$breadcrumb_tmp\" \"$breadcrumb\" || launch_raw; \
+           rmdir \"$breadcrumb_tmp_dir\" 2>/dev/null || :; \
+         elif [ ! -e \"$breadcrumb\" ] && [ ! -L \"$breadcrumb\" ]; then \
+           crumb_cwd=$(pwd -P) || launch_raw; \
+           [ -n \"$crumb_cwd\" ] || launch_raw; \
+           pending={}; \
+           rewritten_bytes=$(printf '%s\\n%s\\nfresh\\n' \"$crumb_cwd\" \"$pending\" | LC_ALL=C wc -c | tr -d '[:space:]'); \
+           case \"$rewritten_bytes\" in ''|*[!0-9]*) rewritten_bytes=16385 ;; esac; \
+           [ \"$rewritten_bytes\" -le 16384 ] || launch_raw; \
+           breadcrumb_tmp_dir=\"$terminal_dir\"/{}.tmp.$$; \
+           (umask 077; mkdir \"$breadcrumb_tmp_dir\") || launch_raw; \
+           breadcrumb_tmp=\"$breadcrumb_tmp_dir/breadcrumb\"; \
+           (umask 077; set -C; printf '%s\\n%s\\nfresh\\n' \"$crumb_cwd\" \"$pending\" > \"$breadcrumb_tmp\") || launch_raw; \
+           ln -n \"$breadcrumb_tmp\" \"$breadcrumb\" || launch_raw; \
+           rm -f -- \"$breadcrumb_tmp\" || launch_raw; \
+           rmdir \"$breadcrumb_tmp_dir\" 2>/dev/null || :; \
+         else \
+           launch_raw; \
+         fi; \
+         [ -n \"$pending\" ] || launch_raw; \
+         marker_tmp_dir={}.tmp.$$; \
+         (umask 077; mkdir \"$marker_tmp_dir\") || launch_raw; \
+         marker_tmp=\"$marker_tmp_dir/marker\"; \
+         (umask 077; set -C; printf '%s\\n%s\\n%s\\n%s\\n' \"$terminal_id\" {} \"$pending\" \"$route_fingerprint\" > \"$marker_tmp\") || launch_raw; \
+         mv -f -- \"$marker_tmp\" {} || launch_raw; \
+         rmdir \"$marker_tmp_dir\" 2>/dev/null || :; \
+         exec sh -c \"$tool_cmd\"",
+        shell_escape(tool_cmd),
+        fingerprint_check,
+        shell_escape(&plan.layout.terminal_sessions.to_string_lossy()),
+        shell_escape(&breadcrumb_tmp_leaf),
+        shell_escape(&pending_sentinel.to_string_lossy()),
+        shell_escape(&breadcrumb_tmp_leaf),
+        shell_escape(&plan.launch_marker),
+        shell_escape(&plan.launch_id),
+        shell_escape(&plan.launch_marker),
+    );
+    shell_stdin_command("sh", false, &marked_launch, "AOE_OMP_MARKED_LAUNCH")
 }
 
 fn resolve_detected_status(
@@ -6744,8 +8204,527 @@ mod tests {
         let mut disk2 = pre2.clone();
 
         disk2.merge_user_action_diff(&pre2, &post2);
-
         assert!(!disk2.is_trashed());
+    }
+    #[test]
+    fn test_merge_post_start_imports_newer_lifecycle_snapshot_as_a_unit() {
+        let stale_idle = Utc::now() - chrono::Duration::minutes(5);
+        let mut live = Instance::new("session", "/tmp/test");
+        live.lifecycle_generation = 7;
+        live.status = Status::Starting;
+        live.idle_entered_at = Some(stale_idle);
+        live.last_error = Some("stale pane observation".to_string());
+
+        let mut disk = live.clone();
+        disk.lifecycle_generation = 8;
+        disk.status = Status::Stopped;
+        disk.idle_entered_at = None;
+        disk.last_error = None;
+
+        live.merge_post_start(&disk);
+
+        assert_eq!(live.lifecycle_generation, 8);
+        assert_eq!(live.status, Status::Stopped);
+        assert_eq!(live.idle_entered_at, None);
+        assert_eq!(live.last_error, None);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn lifecycle_status_commit_releases_the_acquired_generation() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let storage = crate::session::storage::Storage::new_unwatched("lifecycle-lease").unwrap();
+        let mut instance = Instance::new("session", "/tmp/test");
+
+        let missing = instance
+            .acquire_lifecycle_reservation(
+                &storage,
+                LifecycleOperation::Launch,
+                Some(Status::Starting),
+            )
+            .unwrap_err();
+        assert!(missing.to_string().contains("no longer exists"));
+
+        storage
+            .update(|instances, _groups| {
+                instances.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        instance
+            .acquire_lifecycle_reservation(
+                &storage,
+                LifecycleOperation::Launch,
+                Some(Status::Starting),
+            )
+            .unwrap();
+        let generation = instance.lifecycle_generation;
+        instance
+            .commit_lifecycle_status(&storage, LifecycleOperation::Launch, Status::Error)
+            .unwrap();
+
+        let reloaded = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == instance.id)
+            .unwrap();
+        assert_eq!(reloaded.lifecycle_generation, generation);
+        assert_eq!(reloaded.lifecycle_reservation, None);
+        assert_eq!(reloaded.status, Status::Error);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn launch_hooks_run_without_the_instance_lifecycle_flock() {
+        if !crate::tmux::tmux_command()
+            .arg("-V")
+            .output()
+            .is_ok_and(|output| output.status.success())
+        {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+
+        for restart in [false, true] {
+            let label = if restart { "restart" } else { "start" };
+            let profile = format!("lifecycle-hook-{label}");
+            let ready = temp.path().join(format!("{label}-ready"));
+            let release = temp.path().join(format!("{label}-release"));
+            let hook = format!(
+                ": > {}; while [ ! -e {} ]; do sleep 0.01; done",
+                super::shell_escape(&ready.to_string_lossy()),
+                super::shell_escape(&release.to_string_lossy()),
+            );
+            crate::session::config::update_config(|global| {
+                global.hooks.on_launch = vec![hook];
+            })
+            .unwrap();
+
+            let storage = crate::session::storage::Storage::new_unwatched(&profile).unwrap();
+            let title = format!("lifecycle hook {label}");
+            let mut instance = Instance::new(&title, temp.path().to_str().unwrap());
+            instance.source_profile = profile.clone();
+            instance.command = "sleep 30".to_string();
+            storage
+                .update(|instances, _groups| {
+                    instances.push(instance.clone());
+                    Ok(())
+                })
+                .unwrap();
+            if restart {
+                instance
+                    .tmux_session()
+                    .unwrap()
+                    .create(temp.path().to_str().unwrap(), Some("sleep 30"), &profile)
+                    .unwrap();
+            }
+
+            let (launch_tx, launch_rx) = std::sync::mpsc::channel();
+            let launch = std::thread::spawn(move || {
+                let result = if restart {
+                    instance.restart_with_size_opts(None, false).map(|_| ())
+                } else {
+                    instance.start_with_size_opts(None, false).map(|_| ())
+                };
+                launch_tx.send((result, instance)).unwrap();
+            });
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+            while !ready.exists() && std::time::Instant::now() < deadline {
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            assert!(ready.exists(), "{label} hook did not start");
+
+            let lock_storage = crate::session::storage::Storage::new_unwatched(&profile).unwrap();
+            let id = storage.load().unwrap()[0].id.clone();
+            let release_for_lock = release.clone();
+            let (lock_tx, lock_rx) = std::sync::mpsc::channel();
+            let lock = std::thread::spawn(move || {
+                let guard = lock_storage.acquire_instance_lifecycle_lock(&id).unwrap();
+                drop(guard);
+                std::fs::write(release_for_lock, b"release").unwrap();
+                lock_tx.send(()).unwrap();
+            });
+            let acquired = lock_rx
+                .recv_timeout(std::time::Duration::from_secs(2))
+                .is_ok();
+            if !acquired {
+                std::fs::write(&release, b"release").unwrap();
+            }
+
+            let (result, instance) = launch_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            launch.join().unwrap();
+            lock.join().unwrap();
+            let _ = instance.tmux_session().unwrap().kill();
+            assert!(
+                acquired,
+                "{label} hook ran while the lifecycle flock was held"
+            );
+            result.unwrap();
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn lifecycle_reservation_rejects_busy_state_without_blocking_first_launch() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let profile = "lifecycle-busy-reservation";
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        let now = Utc::now();
+        let stale = now - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1);
+        let mut cases = [
+            ("unleased", Status::Starting, None, 0, true),
+            (
+                "leased_peer",
+                Status::Starting,
+                Some(LifecycleReservation {
+                    op: LifecycleOperation::Launch,
+                    generation: 1,
+                    at: now,
+                }),
+                1,
+                false,
+            ),
+            (
+                "superseded",
+                Status::Idle,
+                Some(LifecycleReservation {
+                    op: LifecycleOperation::Launch,
+                    generation: 1,
+                    at: now,
+                }),
+                2,
+                true,
+            ),
+            (
+                "expired",
+                Status::Idle,
+                Some(LifecycleReservation {
+                    op: LifecycleOperation::Launch,
+                    generation: 1,
+                    at: stale,
+                }),
+                1,
+                true,
+            ),
+            (
+                "purge",
+                Status::Idle,
+                Some(LifecycleReservation {
+                    op: LifecycleOperation::Purge,
+                    generation: 1,
+                    at: now,
+                }),
+                1,
+                false,
+            ),
+            (
+                "restore",
+                Status::Stopped,
+                Some(LifecycleReservation {
+                    op: LifecycleOperation::Restore,
+                    generation: 1,
+                    at: now,
+                }),
+                1,
+                false,
+            ),
+            (
+                "trash",
+                Status::Idle,
+                Some(LifecycleReservation {
+                    op: LifecycleOperation::Trash,
+                    generation: 1,
+                    at: now,
+                }),
+                1,
+                false,
+            ),
+            (
+                "capture",
+                Status::Running,
+                Some(LifecycleReservation {
+                    op: LifecycleOperation::Capture,
+                    generation: 1,
+                    at: now,
+                }),
+                1,
+                false,
+            ),
+            ("creating", Status::Creating, None, 0, true),
+            ("idle", Status::Idle, None, 0, true),
+            ("stopped", Status::Stopped, None, 0, true),
+        ]
+        .map(
+            |(title, status, lifecycle_reservation, lifecycle_generation, allowed)| {
+                let mut instance = Instance::new(title, "/tmp/test");
+                instance.source_profile = profile.to_string();
+                instance.status = status;
+                instance.lifecycle_generation = lifecycle_generation;
+                instance.lifecycle_reservation = lifecycle_reservation;
+                (instance, allowed)
+            },
+        );
+        storage
+            .update(|instances, _groups| {
+                instances.extend(cases.iter().map(|(instance, _)| instance.clone()));
+                Ok(())
+            })
+            .unwrap();
+
+        for (instance, allowed) in &mut cases {
+            let result = instance.acquire_lifecycle_reservation(
+                &storage,
+                LifecycleOperation::Launch,
+                Some(Status::Starting),
+            );
+            assert_eq!(result.is_ok(), *allowed, "{}", instance.title);
+        }
+
+        let leased = &cases[0].0;
+        assert!(leased.reservation_is_current(&storage).unwrap());
+        storage
+            .update(|instances, _groups| {
+                let peer = instances
+                    .iter_mut()
+                    .find(|candidate| candidate.id == leased.id)
+                    .unwrap();
+                peer.lifecycle_generation += 1;
+                peer.status = Status::Stopped;
+                Ok(())
+            })
+            .unwrap();
+        assert!(!leased.reservation_is_current(&storage).unwrap());
+
+        let mut busy = Instance::new("busy-leased", "/tmp/test");
+        busy.source_profile = profile.to_string();
+        busy.status = Status::Starting;
+        busy.lifecycle_generation = 1;
+        busy.lifecycle_reservation = Some(LifecycleReservation {
+            op: LifecycleOperation::Launch,
+            generation: 1,
+            at: Utc::now(),
+        });
+        storage
+            .update(|instances, _groups| {
+                instances.push(busy.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        let began = std::time::Instant::now();
+        assert!(busy.stop().unwrap_err().to_string().contains("busy"));
+        assert!(began.elapsed() < std::time::Duration::from_secs(1));
+
+        let mut recursive_start = busy.clone();
+        let began = std::time::Instant::now();
+        assert!(recursive_start
+            .start_with_size_opts(None, true)
+            .unwrap_err()
+            .to_string()
+            .contains("busy"));
+        assert!(began.elapsed() < std::time::Duration::from_secs(1));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn failed_launch_releases_reservation_after_status_drift() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let profile = "lifecycle-fail-drift";
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        let mut inst = Instance::new("drift", "/tmp/test");
+        inst.source_profile = profile.to_string();
+        inst.status = Status::Idle;
+        storage
+            .update(|instances, _groups| {
+                instances.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
+
+        inst.acquire_lifecycle_reservation(
+            &storage,
+            LifecycleOperation::Launch,
+            Some(Status::Starting),
+        )
+        .unwrap();
+        let reserved_gen = inst.lifecycle_generation;
+
+        // A same-generation passive status patch changes presentation state
+        // without changing ownership while prepare_launch runs unlocked.
+        storage
+            .update(|instances, _groups| {
+                let stored = instances.iter_mut().find(|i| i.id == inst.id).unwrap();
+                assert_eq!(stored.lifecycle_generation, reserved_gen);
+                assert!(stored.lifecycle_reservation.is_some());
+                stored.status = Status::Stopped;
+                Ok(())
+            })
+            .unwrap();
+
+        // The launch guard still recognizes the exact-generation reservation.
+        // A later launch failure must release it rather than stranding the
+        // marker until its TTL.
+        inst.ensure_reservation_current_or_fail(&storage).unwrap();
+        let error = anyhow::anyhow!("launch failed after status drift");
+        inst.fail_reserved_launch(&storage, &error, false);
+
+        let leftover = storage
+            .update(|instances, _groups| {
+                Ok(instances
+                    .iter()
+                    .find(|instance| instance.id == inst.id)
+                    .and_then(|instance| instance.lifecycle_reservation.clone()))
+            })
+            .unwrap();
+        assert!(
+            leftover.is_none(),
+            "a failed launch must clear its reservation even after a same-generation status drift"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn lifecycle_launch_commit_keeps_reserved_generation_and_rejects_stale_or_overflowed_tokens() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let storage =
+            crate::session::storage::Storage::new_unwatched("lifecycle-launch-commit").unwrap();
+        let mut committed = Instance::new("committed", "/tmp/test");
+        let mut stale = Instance::new("stale", "/tmp/test");
+        let mut overflow = Instance::new("overflow", "/tmp/test");
+        overflow.lifecycle_generation = u64::MAX;
+        storage
+            .update(|instances, _groups| {
+                instances.extend([committed.clone(), stale.clone(), overflow.clone()]);
+                Ok(())
+            })
+            .unwrap();
+
+        committed
+            .acquire_lifecycle_reservation(
+                &storage,
+                LifecycleOperation::Launch,
+                Some(Status::Starting),
+            )
+            .unwrap();
+        let reserved_generation = committed.lifecycle_generation;
+        committed.status = Status::Running;
+        committed.commit_lifecycle_launch(&storage, false).unwrap();
+        let disk = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == committed.id)
+            .unwrap();
+        assert_eq!(committed.lifecycle_generation, reserved_generation);
+        assert_eq!(disk.lifecycle_generation, committed.lifecycle_generation);
+        assert_eq!(disk.status, Status::Running);
+
+        stale
+            .acquire_lifecycle_reservation(
+                &storage,
+                LifecycleOperation::Launch,
+                Some(Status::Starting),
+            )
+            .unwrap();
+        let stale_token = stale.lifecycle_generation;
+        stale.status = Status::Running;
+        storage
+            .update(|instances, _groups| {
+                let peer = instances
+                    .iter_mut()
+                    .find(|candidate| candidate.id == stale.id)
+                    .unwrap();
+                peer.lifecycle_generation = stale_token + 1;
+                peer.status = Status::Stopped;
+                Ok(())
+            })
+            .unwrap();
+        let error = stale.commit_lifecycle_launch(&storage, false).unwrap_err();
+        assert!(error.to_string().contains("lost its lifecycle reservation"));
+        let disk = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == stale.id)
+            .unwrap();
+        assert_eq!(stale.lifecycle_generation, stale_token);
+        assert_eq!(disk.lifecycle_generation, stale_token + 1);
+        assert_eq!(disk.status, Status::Stopped);
+
+        assert!(overflow
+            .acquire_lifecycle_reservation(
+                &storage,
+                LifecycleOperation::Launch,
+                Some(Status::Starting),
+            )
+            .unwrap_err()
+            .to_string()
+            .contains("overflow"));
+        let disk = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|candidate| candidate.id == overflow.id)
+            .unwrap();
+        assert_eq!(overflow.lifecycle_generation, u64::MAX);
+        assert_eq!(overflow.status, Status::Idle);
+        assert_eq!(disk.lifecycle_generation, u64::MAX);
+        assert_eq!(disk.status, Status::Idle);
+    }
+
+    #[test]
+    fn runtime_reload_keeps_strictly_newer_disk_lifecycle_snapshot() {
+        let mut previous = Instance::new("session", "/tmp/test");
+        previous.lifecycle_generation = 3;
+        previous.status = Status::Starting;
+        previous.idle_entered_at = Some(Utc::now());
+        previous.last_error = Some("old observation".to_string());
+
+        let mut reloaded = previous.clone();
+        reloaded.lifecycle_generation = 4;
+        reloaded.status = Status::Stopped;
+        reloaded.idle_entered_at = None;
+        reloaded.last_error = None;
+        reloaded.merge_runtime_from_reload(&previous);
+
+        // Generation-governed fields: the strictly-newer disk snapshot wins.
+        assert_eq!(reloaded.lifecycle_generation, 4);
+        assert_eq!(reloaded.status, Status::Stopped);
+        assert_eq!(reloaded.idle_entered_at, None);
+        // last_error is runtime-only: the in-memory poller value survives even a
+        // newer generation, since no lifecycle writer persists last_error.
+        assert_eq!(reloaded.last_error.as_deref(), Some("old observation"));
+    }
+
+    #[test]
+    fn runtime_reload_preserves_poller_gone_error_across_generation_bump() {
+        // A stop/unarchive bumps the disk generation with status: None, so the
+        // reloaded row carries no last_error. The poller's freshly derived
+        // TMUX_SESSION_GONE_ERROR (in memory) must survive, or the row freezes
+        // at Error+None and the stopped preview never renders (#3230).
+        let mut previous = Instance::new("session", "/tmp/test");
+        previous.lifecycle_generation = 7;
+        previous.status = Status::Error;
+        previous.last_error = Some(TMUX_SESSION_GONE_ERROR.to_string());
+
+        let mut reloaded = previous.clone();
+        reloaded.lifecycle_generation = 8;
+        reloaded.status = Status::Error;
+        reloaded.last_error = None;
+        reloaded.merge_runtime_from_reload(&previous);
+
+        assert_eq!(
+            reloaded.last_error.as_deref(),
+            Some(TMUX_SESSION_GONE_ERROR)
+        );
     }
 
     #[test]
@@ -6814,6 +8793,19 @@ mod tests {
             Some("daemon-sid"),
             "peer-written sid must survive merge"
         );
+
+        stored.lifecycle_generation = 2;
+        stored.status = Status::Stopped;
+        working.lifecycle_generation = 1;
+        working.status = Status::Starting;
+        stored.merge_post_start(&working);
+        assert_eq!(stored.status, Status::Stopped);
+        stored.merge_from_tui(&working);
+        assert_eq!(
+            stored.status,
+            Status::Stopped,
+            "a stale async/TUI result must not overwrite a newer lifecycle commit"
+        );
     }
 
     #[test]
@@ -6836,6 +8828,49 @@ mod tests {
             "restart merge must not clobber peer sid write"
         );
         assert!(stored.is_snoozed(), "peer snooze must survive merge");
+
+        let mut before = Instance::new("omp-session", "/tmp/test");
+        before.agent_session_id = Some("old-sid".to_string());
+        before.omp_capture_generation = Some("generation-a".to_string());
+        let mut restarted = before.clone();
+        restarted.omp_capture_generation = Some("generation-b".to_string());
+        let mut poller = crate::session::poller::SessionPoller::new("omp-restarted".to_string());
+        assert!(poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,));
+        let restarted_poller = std::sync::Arc::new(std::sync::Mutex::new(poller));
+        restarted.session_id_poller = Some(restarted_poller.clone());
+        let mut live = before.clone();
+        live.merge_post_restart_with_baseline(&before, &restarted);
+        assert_eq!(live.omp_capture_generation.as_deref(), Some("generation-b"));
+        assert!(live.session_id_poller.is_some());
+
+        let mut generation_converged = before.clone();
+        generation_converged.agent_session_id = Some("peer-sid".to_string());
+        generation_converged.omp_capture_generation = Some("generation-b".to_string());
+        generation_converged.merge_post_restart_with_baseline(&before, &restarted);
+        assert_eq!(
+            generation_converged.agent_session_id.as_deref(),
+            Some("peer-sid")
+        );
+        assert!(generation_converged.session_id_poller.is_some());
+
+        let mut peer_relaunched = before.clone();
+        peer_relaunched.omp_capture_generation = Some("peer-generation".to_string());
+        peer_relaunched.merge_post_restart_with_baseline(&before, &restarted);
+        assert_eq!(
+            peer_relaunched.omp_capture_generation.as_deref(),
+            Some("peer-generation")
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            peer_relaunched
+                .session_id_poller
+                .as_ref()
+                .expect("running restart poller"),
+            &restarted_poller,
+        ));
+        restarted_poller
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .stop();
     }
 
     #[test]
@@ -7137,194 +9172,95 @@ mod tests {
         assert!(back.is_trashed());
     }
 
-    // Mirrors `test_trashed_at_serde_roundtrip_and_default`: a fresh row omits
-    // `op_claim` on the wire (skip_serializing_if), so a legacy sessions.json
-    // without the key deserializes to None and no migration is needed. A set
-    // claim round-trips. Runs in both the non-serve and serve builds. See #2541.
     #[test]
-    fn test_op_claim_serde_roundtrip_and_default() {
+    fn lifecycle_reservation_roundtrips_and_legacy_rows_default_to_none() {
         let fresh = Instance::new("s", "/tmp/x");
         let fresh_json = serde_json::to_string(&fresh).expect("serialize fresh");
-        assert!(
-            !fresh_json.contains("op_claim"),
-            "None op_claim must not be serialized"
-        );
+        assert!(!fresh_json.contains("lifecycle_reservation"));
         let parsed: Instance = serde_json::from_str(&fresh_json).expect("parse fresh");
-        assert_eq!(parsed.op_claim, None, "missing op_claim => None");
+        assert_eq!(parsed.lifecycle_reservation, None);
 
-        let mut inst = Instance::new("s", "/tmp/x");
+        let mut instance = Instance::new("s", "/tmp/x");
         let now = Utc::now();
-        inst.try_claim(ClaimOp::Purge, Instance::OP_CLAIM_TTL, now)
-            .expect("free row grants the claim");
-        let json = serde_json::to_string(&inst).expect("serialize");
+        let generation = instance
+            .try_acquire_lifecycle_reservation(
+                LifecycleOperation::Purge,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                now,
+            )
+            .expect("free row grants the lease");
+        let json = serde_json::to_string(&instance).expect("serialize");
         let back: Instance = serde_json::from_str(&json).expect("round-trip");
         assert_eq!(
-            back.op_claim,
-            Some(OpClaim {
-                op: ClaimOp::Purge,
-                at: now
+            back.lifecycle_reservation,
+            Some(LifecycleReservation {
+                op: LifecycleOperation::Purge,
+                generation,
+                at: now,
             })
         );
     }
 
-    // A fresh Purge claim makes a Restore claim attempt lose (symmetry). See #2541.
     #[test]
-    fn restore_refuses_claimed_row() {
-        let mut inst = Instance::new("s", "/tmp/x");
+    fn lifecycle_reservation_excludes_peers_and_uses_generation_as_identity() {
         let now = Utc::now();
-        inst.try_claim(ClaimOp::Purge, Instance::OP_CLAIM_TTL, now)
-            .expect("purge wins the free row");
-        assert_eq!(
-            inst.try_claim(ClaimOp::Restore, Instance::OP_CLAIM_TTL, now),
-            Err(ClaimOp::Purge),
-            "a fresh Purge claim must refuse a Restore"
-        );
-    }
+        let mut instance = Instance::new("s", "/tmp/x");
+        let generation = instance
+            .try_acquire_lifecycle_reservation(
+                LifecycleOperation::Purge,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                now,
+            )
+            .expect("first operation acquires");
 
-    // Symmetry the other direction: a fresh Restore claim refuses a Purge.
-    #[test]
-    fn purge_refuses_restore_claimed_row() {
-        let mut inst = Instance::new("s", "/tmp/x");
-        let now = Utc::now();
-        inst.try_claim(ClaimOp::Restore, Instance::OP_CLAIM_TTL, now)
-            .expect("restore wins the free row");
-        assert_eq!(
-            inst.try_claim(ClaimOp::Purge, Instance::OP_CLAIM_TTL, now),
-            Err(ClaimOp::Restore),
-        );
-    }
-
-    // Trash is the weakest claim: a fresh Trash claim is seized by both
-    // Purge and Restore (teardown state never blocks user intent), while
-    // Trash itself is refused by a fresh Purge or Restore claim.
-    #[test]
-    fn trash_claim_seizure_matrix() {
-        let now = Utc::now();
-        for seizer in [ClaimOp::Purge, ClaimOp::Restore] {
-            let mut inst = Instance::new("s", "/tmp/x");
-            inst.try_claim(ClaimOp::Trash, Instance::OP_CLAIM_TTL, now)
-                .expect("trash wins the free row");
-            inst.try_claim(seizer, Instance::OP_CLAIM_TTL, now)
-                .unwrap_or_else(|holder| {
-                    panic!("{seizer:?} must seize a fresh Trash claim, refused by {holder:?}")
-                });
-            assert_eq!(inst.op_claim.as_ref().map(|c| c.op), Some(seizer));
-        }
-        for holder in [ClaimOp::Purge, ClaimOp::Restore] {
-            let mut inst = Instance::new("s", "/tmp/x");
-            inst.try_claim(holder, Instance::OP_CLAIM_TTL, now)
-                .expect("holder wins the free row");
+        for contender in [
+            LifecycleOperation::Launch,
+            LifecycleOperation::Stop,
+            LifecycleOperation::Purge,
+            LifecycleOperation::Restore,
+            LifecycleOperation::Trash,
+        ] {
             assert_eq!(
-                inst.try_claim(ClaimOp::Trash, Instance::OP_CLAIM_TTL, now),
-                Err(holder),
-                "a fresh {holder:?} claim must refuse a Trash claim"
+                instance.try_acquire_lifecycle_reservation(
+                    contender,
+                    Instance::LIFECYCLE_RESERVATION_TTL,
+                    now + chrono::Duration::seconds(1),
+                ),
+                Err(LifecycleReservationError::Busy(LifecycleOperation::Purge)),
+                "{contender:?} must not replace a live peer reservation",
             );
         }
+        assert!(!instance
+            .release_lifecycle_reservation_if_owned(LifecycleOperation::Purge, generation + 1,));
+        assert!(instance.lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation));
+        assert!(
+            instance.release_lifecycle_reservation_if_owned(LifecycleOperation::Purge, generation)
+        );
     }
 
-    // The Trash variant round-trips on the wire as "trash". Compat (see the
-    // ClaimOp doc): a binary predating the variant fails the whole-row
-    // deserialize, so Storage::load quarantines the row and the session is
-    // temporarily invisible to that binary until a newer binary next
-    // rewrites the row without the claim.
     #[test]
-    fn trash_claim_serde_roundtrip() {
-        let mut inst = Instance::new("s", "/tmp/x");
+    fn expired_lifecycle_reservation_is_recoverable_without_reusing_generation() {
+        let ttl = Instance::LIFECYCLE_RESERVATION_TTL;
         let now = Utc::now();
-        inst.try_claim(ClaimOp::Trash, Instance::OP_CLAIM_TTL, now)
-            .expect("free row grants the claim");
-        let json = serde_json::to_string(&inst).expect("serialize");
-        assert!(json.contains("\"trash\""), "lowercase wire form");
-        let back: Instance = serde_json::from_str(&json).expect("round-trip");
-        assert_eq!(
-            back.op_claim,
-            Some(OpClaim {
-                op: ClaimOp::Trash,
-                at: now
-            })
+        let mut instance = Instance::new("s", "/tmp/x");
+        let old_generation = instance
+            .try_acquire_lifecycle_reservation(
+                LifecycleOperation::Purge,
+                ttl,
+                now - ttl - chrono::Duration::seconds(1),
+            )
+            .expect("first operation acquires");
+        let new_generation = instance
+            .try_acquire_lifecycle_reservation(LifecycleOperation::Restore, ttl, now)
+            .expect("expired lease can be replaced");
+
+        assert!(new_generation > old_generation);
+        assert!(!instance
+            .release_lifecycle_reservation_if_owned(LifecycleOperation::Purge, old_generation,));
+        assert!(
+            instance.lifecycle_reservation_is_owned(LifecycleOperation::Restore, new_generation,)
         );
     }
-
-    // Two purges of the same row: the second `try_claim(Purge)` on an already
-    // Purge-claimed row reacquires (no refusal) and refreshes the timestamp.
-    // See #2541.
-    #[test]
-    fn concurrent_purge_reacquires_own_claim() {
-        let mut inst = Instance::new("s", "/tmp/x");
-        let first = Utc::now();
-        inst.try_claim(ClaimOp::Purge, Instance::OP_CLAIM_TTL, first)
-            .expect("first purge claims");
-        let second = first + chrono::Duration::seconds(5);
-        inst.try_claim(ClaimOp::Purge, Instance::OP_CLAIM_TTL, second)
-            .expect("second purge reacquires its own claim");
-        assert_eq!(
-            inst.op_claim.as_ref().map(|c| c.at),
-            Some(second),
-            "reacquisition refreshes the claim timestamp"
-        );
-    }
-
-    // Self-heal: a claim older than the TTL is treated as absent, so the other
-    // operation can override it. Eliminates the post-crash wedge. See #2541.
-    #[test]
-    fn stale_claim_is_overridable() {
-        let mut inst = Instance::new("s", "/tmp/x");
-        let ttl = Instance::OP_CLAIM_TTL;
-        let old = Utc::now() - ttl - chrono::Duration::seconds(1);
-        inst.op_claim = Some(OpClaim {
-            op: ClaimOp::Purge,
-            at: old,
-        });
-        let now = Utc::now();
-        assert_eq!(
-            inst.try_claim(ClaimOp::Restore, ttl, now),
-            Ok(()),
-            "an expired Purge claim must not block a Restore"
-        );
-        assert_eq!(inst.op_claim.map(|c| c.op), Some(ClaimOp::Restore));
-    }
-
-    // The ownership-guarded clear only drops a claim owned by the requested op,
-    // so a purge's final commit never clobbers a peer's fresh Restore claim on
-    // the stale-override path. See #2541.
-    #[test]
-    fn clear_op_claim_if_owned_only_clears_matching_op() {
-        let mut inst = Instance::new("s", "/tmp/x");
-        inst.op_claim = Some(OpClaim {
-            op: ClaimOp::Restore,
-            at: Utc::now(),
-        });
-        inst.clear_op_claim_if_owned(ClaimOp::Purge);
-        assert_eq!(
-            inst.op_claim.as_ref().map(|c| c.op),
-            Some(ClaimOp::Restore),
-            "clearing for Purge must leave a Restore claim intact"
-        );
-        inst.clear_op_claim_if_owned(ClaimOp::Restore);
-        assert_eq!(inst.op_claim, None, "clearing for the owner drops it");
-    }
-
-    #[test]
-    fn clear_expired_op_claim_only_clears_expired() {
-        let ttl = Instance::OP_CLAIM_TTL;
-        let now = Utc::now();
-        let mut fresh = Instance::new("s", "/tmp/x");
-        fresh.op_claim = Some(OpClaim {
-            op: ClaimOp::Purge,
-            at: now,
-        });
-        assert!(!fresh.clear_expired_op_claim(ttl, now));
-        assert!(fresh.op_claim.is_some(), "a fresh claim survives");
-
-        let mut stale = Instance::new("s", "/tmp/x");
-        stale.op_claim = Some(OpClaim {
-            op: ClaimOp::Purge,
-            at: now - ttl - chrono::Duration::seconds(1),
-        });
-        assert!(stale.clear_expired_op_claim(ttl, now));
-        assert_eq!(stale.op_claim, None, "an expired claim is cleared");
-    }
-
     // A non-fork session omits fork_pending on the wire (skip_serializing_if),
     // so legacy sessions.json without the key deserializes to None and no
     // migration is needed. A seeded fork id round-trips.
@@ -7478,6 +9414,7 @@ mod tests {
 
         let now = Utc::now();
         let patch = PassiveStatusPatch {
+            lifecycle_generation: 0,
             status: Status::Idle,
             idle_entered_at: Some(now),
             last_accessed_at: Some(now),
@@ -7494,6 +9431,18 @@ mod tests {
         assert_eq!(disk.archived_at, before.archived_at);
         assert_eq!(disk.favorited_at, before.favorited_at);
         assert_eq!(disk.pinned_at, before.pinned_at);
+
+        disk.lifecycle_generation = 2;
+        disk.status = Status::Stopped;
+        let mut stale_lifecycle = patch.clone();
+        stale_lifecycle.lifecycle_generation = 1;
+        stale_lifecycle.status = Status::Running;
+        disk.merge_passive_status_patch(&disk.id.clone(), &stale_lifecycle);
+        assert_eq!(
+            disk.status,
+            Status::Stopped,
+            "a poll from an older pane generation must not repaint Stop"
+        );
     }
 
     #[test]
@@ -7507,6 +9456,7 @@ mod tests {
         disk.last_accessed_at = None;
 
         let patch = PassiveStatusPatch {
+            lifecycle_generation: 0,
             status: Status::Idle,
             idle_entered_at: Some(Utc::now()),
             last_accessed_at: None,
@@ -7534,6 +9484,7 @@ mod tests {
         disk.idle_entered_at = None;
 
         let stale_patch = PassiveStatusPatch {
+            lifecycle_generation: 0,
             status: Status::Idle,
             idle_entered_at: Some(peer_touch - chrono::Duration::minutes(5)),
             last_accessed_at: Some(peer_touch - chrono::Duration::minutes(5)),
@@ -7564,6 +9515,7 @@ mod tests {
         disk.last_accessed_at = Some(ts);
 
         let patch = PassiveStatusPatch {
+            lifecycle_generation: 0,
             status: Status::Idle,
             idle_entered_at: None,
             last_accessed_at: Some(ts),
@@ -7609,6 +9561,7 @@ mod tests {
         disk.last_accessed_at = Some(ts);
 
         let patch = PassiveStatusPatch {
+            lifecycle_generation: 0,
             status: Status::Idle,
             idle_entered_at: None,
             last_accessed_at: Some(ts),
@@ -7642,6 +9595,7 @@ mod tests {
         disk.last_accessed_at = Some(older);
 
         let patch = PassiveStatusPatch {
+            lifecycle_generation: 0,
             status: Status::Idle,
             idle_entered_at: None,
             last_accessed_at: Some(newer),
@@ -7663,6 +9617,7 @@ mod tests {
 
         let newer = Utc::now();
         let patch = PassiveStatusPatch {
+            lifecycle_generation: 0,
             status: Status::Idle,
             idle_entered_at: None,
             last_accessed_at: Some(newer),
@@ -7681,6 +9636,7 @@ mod tests {
 
         let ts = Utc::now();
         let patch = PassiveStatusPatch {
+            lifecycle_generation: 0,
             status: Status::Idle,
             idle_entered_at: None,
             last_accessed_at: Some(ts),
@@ -7695,6 +9651,7 @@ mod tests {
         let mut disk = Instance::new("session", "/tmp/test");
         let ts = Utc::now();
         let patch = PassiveStatusPatch {
+            lifecycle_generation: 0,
             status: Status::Idle,
             idle_entered_at: Some(ts),
             last_accessed_at: Some(ts),
@@ -7716,6 +9673,7 @@ mod tests {
         disk.merge_passive_status_patch(
             &disk.id.clone(),
             &PassiveStatusPatch {
+                lifecycle_generation: 0,
                 status: Status::Running,
                 idle_entered_at: None,
                 last_accessed_at: Some(t0),
@@ -7724,6 +9682,7 @@ mod tests {
         disk.merge_passive_status_patch(
             &disk.id.clone(),
             &PassiveStatusPatch {
+                lifecycle_generation: 0,
                 status: Status::Idle,
                 idle_entered_at: Some(t1),
                 last_accessed_at: Some(t1),
@@ -8179,8 +10138,19 @@ mod tests {
             eprintln!("tmux not available; skipping");
             return;
         }
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let profile = "retitled-session-teardown";
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
 
         let mut inst = Instance::new("Vikings", "/tmp/test");
+        inst.source_profile = profile.to_string();
+        storage
+            .update(|instances, _groups| {
+                instances.push(inst.clone());
+                Ok(())
+            })
+            .unwrap();
         let created_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
         let _ = crate::tmux::tmux_command()
             .args(["kill-session", "-t", &created_name])
@@ -8378,74 +10348,27 @@ mod tests {
 
     #[test]
     fn test_yolo_envvar_survives_suspend_wrapper() {
-        // The full chain: format_env_var_prefix -> wrap_command_ignore_suspend
-        // must preserve the JSON value through both quoting layers.
-        // Single quotes from shell_escape are escaped by wrap_command_ignore_suspend
-        // via the '\'' technique, which correctly round-trips through the shell.
         let cmd = format_env_var_prefix("OPENCODE_PERMISSION", r#"{"*":"allow"}"#, "opencode");
-        let wrapped = wrap_command_ignore_suspend(&cmd);
-        // The inner single quotes from shell_escape become '\'' in the outer wrapper
+        let wrapped = wrap_command_ignore_suspend(&cmd, "/tmp/proj");
         assert!(
-            wrapped.contains(r#"OPENCODE_PERMISSION='\''{"*":"allow"}'\'' opencode"#),
-            "wrapped command should contain the escaped env var assignment: {}",
-            wrapped,
+            wrapped.contains(r#"OPENCODE_PERMISSION='{"*":"allow"}' opencode"#),
+            "wrapped command should preserve the env assignment: {wrapped}",
         );
     }
 
     #[test]
     #[serial_test::serial(shell_env)]
-    fn test_prepend_exports_does_not_double_exec() {
-        // Regression: `wrap_command_ignore_suspend` always emits a string
-        // starting with `exec` (since #757). `prepend_exports` MUST NOT add
-        // another `exec`, because bash interprets `exec exec <cmd>` as
-        // "exec a binary literally named `exec`", fails with exit 127, and
-        // kills the pane on every sandboxed launch. zsh-on-macOS happens
-        // to tolerate the double-exec, which is why this regression hid
-        // for several days after #757 merged. See PR #819.
-        std::env::set_var("SHELL", "/bin/bash");
-        let wrapped = wrap_command_ignore_suspend("docker exec -it container claude");
-        assert!(
-            wrapped.starts_with("exec "),
-            "test invariant: wrapped must start with `exec ` (else this test \
-             is misaligned with wrap_command_ignore_suspend's contract): {}",
-            wrapped,
-        );
-
-        let exports = vec![
-            "export TERM='xterm-256color'".to_string(),
-            "export COLORTERM='truecolor'".to_string(),
-        ];
-        let session_cmd = prepend_exports(&exports, wrapped);
-
-        assert!(
-            !session_cmd.contains("exec exec"),
-            "session cmd must not contain `exec exec` -- bash exits 127 on it: {}",
-            session_cmd,
-        );
-
-        // Empty exports must pass through unchanged.
-        let wrapped2 = wrap_command_ignore_suspend("docker exec -it container claude");
-        assert_eq!(prepend_exports(&[], wrapped2.clone()), wrapped2);
-    }
-
-    #[test]
-    #[serial_test::serial(shell_env)]
-    fn test_wrap_command_starts_with_exec() {
-        // All wrapped commands must start with `exec` so that the tmux
-        // default shell (which may be fish/nu) replaces itself with the
-        // POSIX wrapper. Without this, fish stays as the pane process and
-        // #{pane_current_command} reports "fish", triggering false restarts
-        // on reattach. See #757.
+    fn test_wrap_command_uses_stdin_script() {
         let original = std::env::var("SHELL").ok();
         for shell in &["/bin/bash", "/bin/zsh", "/usr/bin/fish", "/usr/bin/nu"] {
             std::env::set_var("SHELL", shell);
-            let wrapped = wrap_command_ignore_suspend("claude");
+            let wrapped = wrap_command_ignore_suspend("claude", "/tmp/proj");
             assert!(
-                wrapped.starts_with("exec "),
-                "SHELL={}: wrapped command must start with 'exec': {}",
-                shell,
-                wrapped,
+                wrapped.contains("/dev/fd/3 3<<'AOE_LAUNCH_BODY'"),
+                "{shell}: {wrapped}"
             );
+            assert!(wrapped.contains("\nstty susp undef\nexec env claude\n"));
+            assert!(!wrapped.contains(" -c "));
         }
         match original {
             Some(v) => std::env::set_var("SHELL", v),
@@ -8458,12 +10381,10 @@ mod tests {
     fn test_wrap_command_posix_shell_uses_login() {
         let original = std::env::var("SHELL").ok();
         std::env::set_var("SHELL", "/bin/zsh");
-        let wrapped = wrap_command_ignore_suspend("claude");
-        // POSIX shell: should use -lc for version-manager PATHs
+        let wrapped = wrap_command_ignore_suspend("claude", "/tmp/proj");
         assert!(
-            wrapped.contains("-lc"),
-            "POSIX shell should use -lc: {}",
-            wrapped,
+            wrapped.starts_with("'/bin/zsh' -l /dev/fd/3 "),
+            "POSIX shell should use a login descriptor script: {wrapped}",
         );
         match original {
             Some(v) => std::env::set_var("SHELL", v),
@@ -8476,18 +10397,12 @@ mod tests {
     fn test_wrap_command_fish_skips_login() {
         let original = std::env::var("SHELL").ok();
         std::env::set_var("SHELL", "/usr/bin/fish");
-        let wrapped = wrap_command_ignore_suspend("claude");
-        // Fish: should use -c (no -l) because bash's login scripts
-        // won't have fish's PATH setup.
+        let wrapped = wrap_command_ignore_suspend("claude", "/tmp/proj");
+        // The bash fallback must not load bash login files because the user's
+        // PATH setup belongs to fish.
         assert!(
-            wrapped.starts_with("exec bash -c "),
-            "fish shell should produce 'exec bash -c ...': {}",
-            wrapped,
-        );
-        assert!(
-            !wrapped.contains("-lc"),
-            "fish shell should NOT use -lc: {}",
-            wrapped,
+            wrapped.starts_with("'bash' /dev/fd/3 "),
+            "fish should use a non-login bash descriptor script: {wrapped}",
         );
         match original {
             Some(v) => std::env::set_var("SHELL", v),
@@ -8500,11 +10415,54 @@ mod tests {
     fn test_wrap_command_nu_skips_login() {
         let original = std::env::var("SHELL").ok();
         std::env::set_var("SHELL", "/usr/bin/nu");
-        let wrapped = wrap_command_ignore_suspend("claude");
+        let wrapped = wrap_command_ignore_suspend("claude", "/tmp/proj");
         assert!(
-            wrapped.starts_with("exec bash -c "),
-            "nu shell should produce 'exec bash -c ...': {}",
-            wrapped,
+            wrapped.starts_with("'bash' /dev/fd/3 "),
+            "nu should use a non-login bash descriptor script: {wrapped}",
+        );
+        match original {
+            Some(v) => std::env::set_var("SHELL", v),
+            None => std::env::remove_var("SHELL"),
+        }
+    }
+
+    /// #3265: a login shell's own profile/rc files can `cd` elsewhere
+    /// (a stray line in `~/.bashrc`, or a legitimate nvm/pyenv/direnv hook)
+    /// after tmux's `-c` has already set the pane's cwd, silently landing
+    /// the agent in the wrong directory. The wrapper must re-assert
+    /// `working_dir` inside the login shell's own script, after profile
+    /// sourcing, so it wins regardless of what those files did.
+    #[test]
+    #[serial_test::serial(shell_env)]
+    fn test_wrap_command_reasserts_working_dir_after_login_shell() {
+        let original = std::env::var("SHELL").ok();
+        std::env::set_var("SHELL", "/bin/bash");
+        let temp = tempfile::tempdir().unwrap();
+        let working_dir = temp.path().join("some project's dir");
+        std::fs::create_dir(&working_dir).unwrap();
+        let wrapped = wrap_command_ignore_suspend("pwd", working_dir.to_str().unwrap());
+        // The cd is the first statement inside the login shell's stdin script,
+        // after profile sourcing, before disabling suspend and exec'ing.
+        assert!(
+            wrapped.contains("3<<'AOE_LAUNCH_BODY'\ncd "),
+            "the cd must open the login shell's stdin script: {wrapped}",
+        );
+        assert!(
+            wrapped.contains("|| exit 1\nstty susp undef"),
+            "the cd must exit-on-failure before disabling suspend: {wrapped}",
+        );
+        let output = std::process::Command::new("bash")
+            .args(["-c", &wrapped])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "wrapped command failed: {}",
+            String::from_utf8_lossy(&output.stderr),
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&output.stdout).trim(),
+            working_dir.to_string_lossy(),
         );
         match original {
             Some(v) => std::env::set_var("SHELL", v),
@@ -8968,20 +10926,65 @@ mod tests {
         assert_eq!(inst.agent_session_id, deserialized.agent_session_id);
     }
 
-    // Test: agent switch clears session ID
+    /// An engine swap parks the outgoing agent's conversation ids under its own
+    /// name and picks the incoming agent's back up, so claude -> pi -> claude
+    /// lands in the original Claude conversation instead of a third one. The
+    /// per-agent selectors go; the approval posture stays (clearing it resolves
+    /// the adapter's bypass mode on a `yolo_mode` row).
+    ///
+    /// Replaces a test that hand-assigned `agent_session_id = None` and then
+    /// asserted it was None, which could not fail.
     #[test]
-    fn test_agent_switch_clears_session_id() {
+    fn swap_tool_parks_and_restores_per_tool_session_ids() {
         let mut inst = Instance::new("Test", "/home/user/project");
         inst.tool = "claude".to_string();
         inst.agent_session_id = Some("claude-session-123".to_string());
+        inst.acp_session_id = Some("acp-claude-1".to_string());
+        inst.resume_probe_failed_sid = Some("claude-session-123".to_string());
+        inst.acp_effort = Some("high".to_string());
+        inst.agent_model = Some("claude-opus-4-7".to_string());
+        inst.agent_name = Some("claude-code".to_string());
+        inst.acp_mode_id = Some("plan".to_string());
 
-        // Simulate agent switch by clearing session ID
-        inst.agent_session_id = None;
-        inst.tool = "opencode".to_string();
+        inst.swap_tool("pi");
+        assert_eq!(inst.tool, "pi");
+        assert_eq!(
+            inst.agent_session_id, None,
+            "a Claude sid would make pi launch with --resume <foreign-sid>"
+        );
+        assert_eq!(inst.acp_session_id, None);
+        assert_eq!(inst.acp_effort, None);
+        assert_eq!(inst.agent_model, None);
+        assert_eq!(inst.agent_name, None);
+        assert_eq!(inst.resume_probe_failed_sid, None);
+        assert_eq!(inst.acp_mode_id.as_deref(), Some("plan"));
 
-        // Session ID should be None after switch
-        assert!(inst.agent_session_id.is_none());
-        assert_eq!(inst.tool, "opencode");
+        // pi runs and captures a sid of its own, then the user swaps back.
+        inst.agent_session_id = Some("pi-session-9".to_string());
+        inst.swap_tool("claude");
+        assert_eq!(
+            inst.agent_session_id.as_deref(),
+            Some("claude-session-123"),
+            "swapping back must resume the parked Claude conversation"
+        );
+        assert_eq!(inst.acp_session_id.as_deref(), Some("acp-claude-1"));
+        assert_eq!(
+            inst.prior_tool_session_ids["pi"]
+                .agent_session_id
+                .as_deref(),
+            Some("pi-session-9"),
+            "pi's conversation is the parked one now"
+        );
+        assert!(
+            !inst.prior_tool_session_ids.contains_key("claude"),
+            "a restored entry is consumed, so a later swap cannot resurrect it"
+        );
+
+        // Same-tool call is a no-op: the caller applies the swap to the disk row
+        // and the in-memory row independently, and the second must not re-park.
+        inst.swap_tool("claude");
+        assert_eq!(inst.agent_session_id.as_deref(), Some("claude-session-123"));
+        assert!(!inst.prior_tool_session_ids.contains_key("claude"));
     }
 
     #[test]
@@ -9332,7 +11335,7 @@ mod tests {
     fn test_has_custom_command_unknown_tool() {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "unknown_agent".to_string();
-        inst.command = "some-binary".to_string();
+        inst.command = "unknown_agent".to_string();
         assert!(inst.has_custom_command());
     }
 
@@ -9374,6 +11377,302 @@ mod tests {
     }
 
     #[test]
+    fn omp_capture_accepts_benign_args_and_rejects_opaque_launches() {
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.tool = "omp".to_string();
+        inst.extra_args =
+            "--model sonnet --profile first --profile=work --session-dir '/tmp/omp sessions'"
+                .to_string();
+
+        let options = inst
+            .omp_capture_options()
+            .expect("benign argv must capture");
+        assert_eq!(options.profile.as_deref(), Some("work"));
+        assert_eq!(
+            options.session_dir.as_deref(),
+            Some(std::path::Path::new("/tmp/omp sessions"))
+        );
+        inst.extra_args = "--model ${model:---profile=work}".to_string();
+        assert!(
+            inst.omp_capture_options().is_some(),
+            "model values are shell-quoted before both capture parsing and launch"
+        );
+        for arg in ["--continue", "-c", "--continue=false"] {
+            inst.extra_args = arg.to_string();
+            assert!(
+                inst.omp_capture_options().is_some(),
+                "{arg} remains a transparent OMP launch argument"
+            );
+        }
+        inst.extra_args = "--model sonnet[1m]".to_string();
+        assert!(
+            inst.omp_capture_options().is_some(),
+            "the launch path quotes model context suffixes before shell expansion"
+        );
+
+        inst.extra_args = "--no-session".to_string();
+        assert!(inst.omp_capture_options().is_none());
+        inst.extra_args = "'unterminated".to_string();
+        assert!(inst.omp_capture_options().is_none());
+        inst.extra_args.clear();
+        inst.command = "omp".to_string();
+        assert!(inst.omp_capture_options().is_some());
+        inst.command = "omp-wrapper".to_string();
+        assert!(inst.omp_capture_options().is_none());
+    }
+
+    #[test]
+    fn omp_launch_rejects_api_keys_in_extra_args() {
+        let mut instance = Instance::new("test", "/tmp/test");
+        instance.tool = "omp".to_string();
+        for extra_args in [
+            "--api-key secret",
+            "--api-key=secret",
+            "--api-key$EMPTY secret",
+        ] {
+            instance.extra_args = extra_args.to_string();
+            let error = instance
+                .build_launch_command()
+                .err()
+                .expect("inline OMP credentials must abort before launch");
+            if extra_args.contains('$') {
+                assert!(error.to_string().contains("opaque shell syntax"), "{error}");
+            } else {
+                assert!(
+                    error.to_string().contains("through the environment"),
+                    "{extra_args}: {error}"
+                );
+            }
+        }
+    }
+
+    fn omp_test_plan() -> OmpCapturePlan {
+        OmpCapturePlan {
+            layout: crate::session::capture::OmpStoreLayout {
+                sessions: PathBuf::from("/tmp/omp/sessions"),
+                managed_sessions: PathBuf::from("/tmp/omp/managed/sessions"),
+                terminal_sessions: PathBuf::from("/tmp/omp/terminal-sessions"),
+                kind: OmpStoreKind::Managed,
+            },
+            routing_fingerprint: "a".repeat(64),
+            launch_id: "launch-unit-123".to_string(),
+            launch_marker: "/tmp/aoe-omp.marker".to_string(),
+            container_runtime: None,
+        }
+    }
+
+    #[test]
+    fn omp_routing_fingerprint_check_never_embeds_values() {
+        let routing_values = ["/resolved omp/home", "default", "$resolved-secret-route"];
+        let plan = omp_test_plan();
+
+        let command = omp_routing_fingerprint_check(&plan);
+        for value in routing_values {
+            assert!(
+                !command.contains(value),
+                "resolved routing value leaked into command: {value}"
+            );
+        }
+        assert!(command.contains("${$k+x}"));
+        assert!(command.contains("${$k-}"));
+        assert!(command.contains("sha256sum"));
+        assert!(command.contains("shasum -a 256"));
+        assert!(command.contains(&plan.routing_fingerprint));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    #[serial_test::serial]
+    fn omp_routing_fingerprint_accepts_matching_live_env_and_rejects_drift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let (_, fingerprint) = resolve_omp_store_layout_with_environment(
+            &[format!("HOME={}", home.display())],
+            project.to_str().unwrap(),
+            &OmpCliCaptureOptions::default(),
+        )
+        .unwrap();
+        let mut plan = omp_test_plan();
+        plan.routing_fingerprint = fingerprint;
+        let check = omp_routing_fingerprint_check(&plan);
+        let script = format!("launch_raw() {{ printf raw; exit 0; }}; {check}printf captured");
+        let run = |live_home: &Path| {
+            let mut command = std::process::Command::new("sh");
+            command
+                .args(["-c", &script])
+                .env_clear()
+                .env("PATH", "/usr/bin:/bin");
+            // Pin the exact routing environment a host launch installs into the
+            // pane for this HOME, so the check reproduces the fingerprint's env
+            // instead of assuming the ambient OMP_STORE_ENV_KEYS are empty. They
+            // are not on every runner, and host_launcher_environment folds them
+            // into the fingerprint, so forcing empties here would diverge from
+            // the digest on any host that exports one of those keys.
+            for mutation in omp_host_routing_environment(&[format!("HOME={}", live_home.display())])
+            {
+                match mutation {
+                    tmux::PaneEnvMutation::Set { key, value } => {
+                        command.env(key, value);
+                    }
+                    tmux::PaneEnvMutation::Unset { key } => {
+                        command.env_remove(key);
+                    }
+                }
+            }
+            command.output().unwrap()
+        };
+
+        assert_eq!(run(&home).stdout, b"captured");
+        assert_eq!(run(&tmp.path().join("drifted")).stdout, b"raw");
+    }
+
+    #[test]
+    fn omp_launch_wrapper_hashes_live_routing_and_marker_is_noclobber() {
+        let routing_values = ["/sandbox home", "default", "/secret/$sandbox-route's"];
+        let plan = omp_test_plan();
+
+        let command = wrap_omp_launch("omp --profile work", &plan);
+        for value in routing_values {
+            assert!(
+                !command.contains(value),
+                "resolved routing value leaked into wrapper: {value}"
+            );
+        }
+        assert!(command.contains("route_payload"));
+        assert!(command.contains("route_fingerprint"));
+        assert!(command.contains("tty_path=$(tty) || launch_raw"));
+        assert!(command.contains("terminal_id=${tty_path#/dev/}"));
+        assert!(command.contains("tr"));
+        assert!(command.contains("launch-unit-123"));
+        assert!(command.contains("/tmp/aoe-omp.marker"));
+        assert!(command.contains("pending="));
+        assert!(command.contains("pending=\"./$crumb_path\""));
+        assert!(command.contains(".aoe-pending-launch-unit-123"));
+        assert!(command.contains("aoe-pending_launch-unit-123.jsonl"));
+        assert!(command.contains("mkdir \"$breadcrumb_tmp_dir\""));
+        assert!(command.contains("ln -n \"$breadcrumb_tmp\" \"$breadcrumb\" || launch_raw"));
+
+        assert!(command.contains("mkdir \"$marker_tmp_dir\""));
+        assert!(command.contains("(umask 077; set -C; printf"));
+        assert!(command.contains("> \"$marker_tmp\") || launch_raw"));
+        assert!(!command.contains(">| \"$marker_tmp\""));
+        assert!(!command.contains("/dev/pts/*"));
+        assert!(command.find("printf").unwrap() < command.rfind("exec sh -c").unwrap());
+    }
+    #[cfg(unix)]
+    #[test]
+    fn omp_capture_gate_executes_nested_stdin_scripts() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir(&bin).unwrap();
+        let tmux = bin.join("tmux");
+        let expected = format!(
+            "{}=launch-unit-123",
+            crate::tmux::env::AOE_OMP_CAPTURE_READY_KEY
+        );
+        std::fs::write(&tmux, format!("#!/bin/sh\nprintf '%s\\n' {expected:?}\n")).unwrap();
+        std::fs::set_permissions(&tmux, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let output = temp.path().join("result");
+        let raw = format!("printf raw > {}", shell_escape(&output.to_string_lossy()));
+        let marked = format!(
+            "printf marked > {}",
+            shell_escape(&output.to_string_lossy())
+        );
+        let gate = gate_omp_launch(&raw, &marked, &omp_test_plan());
+        let outer = shell_stdin_command("sh", false, &format!("exec env {gate}"), "AOE_TEST_OUTER");
+        let script = temp.path().join("launch.sh");
+        std::fs::write(&script, outer).unwrap();
+        let status = std::process::Command::new("sh")
+            .arg(&script)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("TMUX_PANE", "%1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(std::fs::read_to_string(&output).unwrap(), "marked");
+
+        // A valid 70 KiB prompt makes the capture gate body larger than
+        // Linux's per-argument exec limit because the raw and marked branches
+        // both contain it. The launch must still execute from the descriptor.
+        let payload = "x".repeat(70 * 1024);
+        let large_command = format!(
+            "printf '%s' {} > {}",
+            shell_escape(&payload),
+            shell_escape(&output.to_string_lossy())
+        );
+        let large_gate = gate_omp_launch(&large_command, &large_command, &omp_test_plan());
+        let large_outer = wrap_command_ignore_suspend(&large_gate, temp.path().to_str().unwrap());
+        assert!(!large_outer.lines().next().unwrap().contains("-c"));
+        std::fs::write(&script, large_outer).unwrap();
+        let status = std::process::Command::new("sh")
+            .arg(&script)
+            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("TMUX_PANE", "%1")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(
+            std::fs::metadata(output).unwrap().len(),
+            payload.len() as u64
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn omp_private_paths_reject_symlink_fifo_and_breadcrumb_races() {
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        let marker_link = dir.path().join("marker-link.tmp");
+        let marker_fifo = dir.path().join("marker-fifo.tmp");
+        std::fs::write(&victim, "unchanged").unwrap();
+        std::os::unix::fs::symlink(&victim, &marker_link).unwrap();
+        assert!(std::process::Command::new("mkfifo")
+            .arg(&marker_fifo)
+            .status()
+            .unwrap()
+            .success());
+
+        for collision in [&marker_link, &marker_fifo] {
+            let output = std::process::Command::new("sh")
+                .args(["-c", "(umask 077; mkdir \"$1\")", "sh"])
+                .arg(collision)
+                .output()
+                .unwrap();
+            assert!(
+                !output.status.success(),
+                "private-dir creation must reject an existing path"
+            );
+        }
+
+        let placeholder = dir.path().join("placeholder");
+        let raced_file = dir.path().join("breadcrumb-file");
+        let raced_link = dir.path().join("breadcrumb-link");
+        std::fs::write(&placeholder, "cwd\nsentinel\nfresh\n").unwrap();
+        std::fs::write(&raced_file, "winner").unwrap();
+        std::os::unix::fs::symlink(&victim, &raced_link).unwrap();
+        let raced_dir_link = dir.path().join("breadcrumb-dir-link");
+        std::os::unix::fs::symlink(dir.path(), &raced_dir_link).unwrap();
+        for collision in [&raced_file, &raced_link, &raced_dir_link] {
+            let output = std::process::Command::new("sh")
+                .args(["-c", "ln -n \"$1\" \"$2\"", "sh"])
+                .arg(&placeholder)
+                .arg(collision)
+                .output()
+                .unwrap();
+            assert!(
+                !output.status.success(),
+                "hardlink installation must not clobber a raced destination"
+            );
+        }
+        assert_eq!(std::fs::read_to_string(raced_file).unwrap(), "winner");
+        assert_eq!(std::fs::read_to_string(victim).unwrap(), "unchanged");
+    }
+    #[test]
     fn test_expects_shell() {
         let mut inst = Instance::new("test", "/tmp/test");
         assert!(!inst.expects_shell());
@@ -9403,8 +11702,8 @@ mod tests {
     fn test_build_host_command_basic() {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "codex".to_string();
-        let (cmd, _) = inst
-            .build_host_command(crate::agents::get_agent("codex"), &None)
+        let (cmd, _, _) = inst
+            .build_host_command(crate::agents::get_agent("codex"))
             .unwrap();
         assert!(cmd.is_some());
         assert!(cmd.as_ref().unwrap().contains("codex"));
@@ -9415,8 +11714,8 @@ mod tests {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "codex".to_string();
         inst.yolo_mode = true;
-        let (cmd, _) = inst
-            .build_host_command(crate::agents::get_agent("codex"), &None)
+        let (cmd, _, _) = inst
+            .build_host_command(crate::agents::get_agent("codex"))
             .unwrap();
         let cmd_str = cmd.unwrap();
         let agent = crate::agents::get_agent("codex").unwrap();
@@ -9432,8 +11731,8 @@ mod tests {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "claude".to_string();
         inst.agent_session_id = Some("ses_abc123def456".to_string());
-        let (cmd, _) = inst
-            .build_host_command(crate::agents::get_agent("claude"), &None)
+        let (cmd, _, _) = inst
+            .build_host_command(crate::agents::get_agent("claude"))
             .unwrap();
         let cmd_str = cmd.unwrap();
         assert!(cmd_str.contains("ses_abc123def456"));
@@ -9444,8 +11743,8 @@ mod tests {
     fn test_build_host_command_antigravity_forces_color() {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "antigravity".to_string();
-        let (cmd, _) = inst
-            .build_host_command(crate::agents::get_agent("antigravity"), &None)
+        let (cmd, _, _) = inst
+            .build_host_command(crate::agents::get_agent("antigravity"))
             .unwrap();
         let cmd_str = cmd.unwrap();
 
@@ -9461,8 +11760,8 @@ mod tests {
         // accepts chat-scoped flags. Bare `kiro-cli` rejects --trust-all-tools.
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "kiro".to_string();
-        let (cmd, _) = inst
-            .build_host_command(crate::agents::get_agent("kiro"), &None)
+        let (cmd, _, _) = inst
+            .build_host_command(crate::agents::get_agent("kiro"))
             .unwrap();
         assert!(cmd.unwrap().contains("kiro-cli chat"));
     }
@@ -9473,8 +11772,8 @@ mod tests {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "kiro".to_string();
         inst.yolo_mode = true;
-        let (cmd, _) = inst
-            .build_host_command(crate::agents::get_agent("kiro"), &None)
+        let (cmd, _, _) = inst
+            .build_host_command(crate::agents::get_agent("kiro"))
             .unwrap();
         let cmd_str = cmd.unwrap();
         let chat_pos = cmd_str
@@ -9496,8 +11795,8 @@ mod tests {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "kiro".to_string();
         inst.command = "kiro-cli chat --trust-all-tools".to_string();
-        let (cmd, _) = inst
-            .build_host_command(crate::agents::get_agent("kiro"), &None)
+        let (cmd, _, _) = inst
+            .build_host_command(crate::agents::get_agent("kiro"))
             .unwrap();
         let cmd_str = cmd.unwrap();
         // Exactly one "chat" token (no doubled `chat chat`).
@@ -9544,8 +11843,8 @@ mod tests {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "antigravity".to_string();
         inst.command = "agy --some-flag".to_string();
-        let (cmd, _) = inst
-            .build_host_command(crate::agents::get_agent("antigravity"), &None)
+        let (cmd, _, _) = inst
+            .build_host_command(crate::agents::get_agent("antigravity"))
             .unwrap();
         let cmd_str = cmd.unwrap();
 
@@ -9559,8 +11858,8 @@ mod tests {
     fn test_build_host_command_codex_forces_color() {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "codex".to_string();
-        let (cmd, _) = inst
-            .build_host_command(crate::agents::get_agent("codex"), &None)
+        let (cmd, _, _) = inst
+            .build_host_command(crate::agents::get_agent("codex"))
             .unwrap();
         let cmd_str = cmd.unwrap();
 
@@ -9574,8 +11873,8 @@ mod tests {
     fn test_build_host_command_color_env_is_limited_to_color_sensitive_agents() {
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "cursor".to_string();
-        let (cmd, _) = inst
-            .build_host_command(crate::agents::get_agent("cursor"), &None)
+        let (cmd, _, _) = inst
+            .build_host_command(crate::agents::get_agent("cursor"))
             .unwrap();
         let cmd_str = cmd.unwrap();
 
@@ -9981,7 +12280,7 @@ mod tests {
             let end = source.find("pub fn ensure_pane_ready").unwrap();
             let fallback_source = &source[start..end];
 
-            assert!(fallback_source.contains("let attempted_sid = match &outcome"));
+            assert!(fallback_source.contains("let attempted_sid = match launch_outcome"));
             assert!(fallback_source.contains("LaunchSidOutcome::Existing { sid }"));
             assert!(
                 !fallback_source.contains("should_attempt_resume(self.agent_session_id.as_deref()")
@@ -9997,18 +12296,16 @@ mod tests {
                 std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/session/instance.rs"),
             )
             .unwrap();
-            let start = source
-                .find("pub(crate) fn start_with_resume_fallback")
-                .unwrap();
+            let start = source.find("fn finish_resume_launch").unwrap();
             let end = source.find("pub fn ensure_pane_ready").unwrap();
             let fallback_source = &source[start..end];
             let local_marker = fallback_source
                 .find("self.resume_probe_failed_sid = Some(stale_sid.clone())")
                 .unwrap();
             let persisted_marker = fallback_source
-                .find("self.mark_resume_probe_failed(&profile, &stale_sid)")
+                .find("self.mark_resume_probe_failed(profile, &stale_sid)")
                 .unwrap();
-            let cleanup = fallback_source.find("self.kill_clean()").unwrap();
+            let cleanup = fallback_source.find("self.kill_clean_locked()").unwrap();
 
             assert!(local_marker < cleanup);
             assert!(persisted_marker < cleanup);
@@ -11203,7 +13500,7 @@ mod tests {
             // #2355: when a co-located stopped peer leaves a fresher jsonl in
             // the shared `~/.claude/projects/<encoded-cwd>/` dir, the mtime
             // fallback must skip the peer's sid. `build_exclusion_set` only
-            // sees live tmux peers; `compose_exclusion_with_stopped_peers`
+            // sees live tmux peers; `compose_exclusion_with_persisted_peers`
             // adds the stopped peer's sid from `sessions.json` so this
             // instance's own (older) jsonl wins.
             #[test]
@@ -11251,12 +13548,89 @@ mod tests {
                 assert_eq!(inst.agent_session_id.as_deref(), Some(mine));
             }
 
+            // Companion to the above for the engine swap: the peer is not a
+            // Claude session any more (it swapped to pi), so it no longer
+            // passes the `tool` filter in
+            // `compose_exclusion_with_persisted_peers`, and its Claude sid moved
+            // out of `agent_session_id` into `prior_tool_session_ids`. Unless
+            // parked ids are excluded too, the peer's Claude transcript is in no
+            // exclusion set at all and the mtime fallback hands it to this
+            // instance, which both steals the conversation the peer intends to
+            // resume on a swap back and leaks its context.
+            #[test]
+            #[serial]
+            fn mtime_fallback_skips_peer_sid_parked_by_a_tool_swap() {
+                let temp = tempdir().unwrap();
+                let _guard = claude_home_guard(&temp);
+
+                let project_path = "/tmp/aoe-test-parked-peer";
+                let claude_dir = temp
+                    .path()
+                    .join(".claude")
+                    .join("projects")
+                    .join(encode_claude_project_path(project_path));
+                fs::create_dir_all(&claude_dir).unwrap();
+
+                let mine = "55555555-5555-4555-8555-555555555555";
+                let parked = "66666666-6666-4666-8666-666666666666";
+                let now = SystemTime::now();
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{mine}.jsonl")),
+                    now - Duration::from_secs(120),
+                );
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{parked}.jsonl")),
+                    now - Duration::from_secs(5),
+                );
+
+                let profile = "verify-parked-peer";
+                let mut peer_inst = Instance::new("swapped-peer-id", project_path);
+                peer_inst.source_profile = profile.to_string();
+                peer_inst.tool = "claude".to_string();
+                peer_inst.agent_session_id = Some(parked.to_string());
+                // The peer is mid-life and running: only its Claude
+                // conversation is parked, not the row.
+                peer_inst.status = Status::Running;
+                peer_inst.swap_tool("pi");
+                peer_inst.agent_session_id = Some("pi-session-parked".to_string());
+                peer_inst.swap_tool("codex");
+                assert_eq!(peer_inst.tool, "codex");
+                super::seed_disk_for_sidecar_test(profile, &peer_inst);
+
+                let pi_exclusion = crate::session::capture::compose_exclusion_with_persisted_peers(
+                    "other-pi-instance",
+                    project_path,
+                    "pi",
+                    false,
+                    profile,
+                    &std::collections::HashSet::new(),
+                );
+                assert!(
+                    pi_exclusion.contains("pi-session-parked"),
+                    "parked ids must be protected for every resumable tool"
+                );
+
+                let mut inst = Instance::new("verify-parked", project_path);
+                inst.source_profile = profile.to_string();
+                inst.tool = "claude".to_string();
+                inst.agent_session_id = Some(mine.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, _is_existing) = inst.acquire_session_id();
+                assert_eq!(
+                    sid.as_deref(),
+                    Some(mine),
+                    "the parked peer's fresher transcript must not be adopted"
+                );
+                assert_eq!(inst.agent_session_id.as_deref(), Some(mine));
+            }
+
             // Companion to the above for #2858: the stopped peer's stored
             // `project_path` is an UNNORMALIZED spelling of the same
             // directory (`<parent>/decoy/../wt` vs `<parent>/wt`), as the
             // default `../{repo-name}-worktrees/{branch}` template used to
             // produce. A raw string comparison in
-            // `compose_exclusion_with_stopped_peers` drops the peer from the
+            // `compose_exclusion_with_persisted_peers` drops the peer from the
             // exclusion and re-opens the #2355 steal; the canonicalized
             // comparison must keep it.
             #[test]
@@ -11324,7 +13698,7 @@ mod tests {
 
             // Companion to the above: same setup but the peer is archived
             // instead of stopped, exercising the `is_archived()` branch of
-            // `compose_exclusion_with_stopped_peers`.
+            // `compose_exclusion_with_persisted_peers`.
             #[test]
             #[serial]
             fn mtime_fallback_skips_archived_peer_sid() {
@@ -11560,6 +13934,53 @@ mod tests {
                 assert_eq!(sid.as_deref(), Some(fresh));
                 assert!(is_existing);
                 assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
+            }
+
+            #[test]
+            #[serial]
+            fn codex_mtime_fallback_skips_stopped_host_peer_sid() {
+                let temp = tempdir().unwrap();
+                let _home = isolate_app_dir_at(temp.path());
+                let _codex = EnvGuard::set(&[("CODEX_HOME", temp.path())]);
+
+                let project_path = temp.path().join("codex-project");
+                fs::create_dir_all(&project_path).unwrap();
+                let project_path = project_path.to_string_lossy().to_string();
+
+                let sessions_dir = temp.path().join("sessions");
+                fs::create_dir_all(&sessions_dir).unwrap();
+                let mine = "11111111-1111-4111-8111-111111111111";
+                let peer = "22222222-2222-4222-8222-222222222222";
+                let now = SystemTime::now();
+                for (uuid, age) in [(mine, 120), (peer, 5)] {
+                    let body = format!(
+                        r#"{{"type":"session_meta","payload":{{"cwd":"{project_path}"}}}}"#
+                    );
+                    write_with_mtime(
+                        &sessions_dir.join(format!("rollout-2025-03-06T10-30-00-{uuid}.jsonl")),
+                        &body,
+                        now - Duration::from_secs(age),
+                    );
+                }
+
+                let profile = "verify-codex-stopped-host-peer";
+                let mut peer_inst = Instance::new("stopped-codex-peer-id", &project_path);
+                peer_inst.source_profile = profile.to_string();
+                peer_inst.tool = "codex".to_string();
+                peer_inst.agent_session_id = Some(peer.to_string());
+                peer_inst.status = Status::Stopped;
+                super::seed_disk_for_sidecar_test(profile, &peer_inst);
+
+                let mut inst = Instance::new("verify-codex-host-peer", &project_path);
+                inst.source_profile = profile.to_string();
+                inst.tool = "codex".to_string();
+                inst.agent_session_id = Some(mine.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(mine));
+                assert!(is_existing);
+                assert_eq!(inst.agent_session_id.as_deref(), Some(mine));
             }
 
             #[test]
@@ -12122,6 +14543,9 @@ mod tests {
                 return;
             }
             let temp = tempdir().unwrap();
+            let project_dir = temp.path().join("project");
+            std::fs::create_dir_all(&project_dir).unwrap();
+            let project_path = project_dir.to_str().unwrap();
             std::env::set_var("HOME", temp.path());
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
@@ -12129,7 +14553,7 @@ mod tests {
             let storage = crate::session::storage::Storage::new_unwatched("fb-test").unwrap();
 
             let stale_sid = "11111111-1111-1111-1111-111111111111".to_string();
-            let mut inst = Instance::new("fallback_dies_test", "/tmp/x");
+            let mut inst = Instance::new("fallback_dies_test", project_path);
             inst.tool = "claude".to_string();
             inst.source_profile = "fb-test".to_string();
             inst.command = "/bin/false".to_string();
@@ -12196,6 +14620,9 @@ mod tests {
                 return;
             }
             let temp = tempdir().unwrap();
+            let project_dir = temp.path().join("project");
+            std::fs::create_dir_all(&project_dir).unwrap();
+            let project_path = project_dir.to_str().unwrap();
             std::env::set_var("HOME", temp.path());
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
@@ -12203,7 +14630,7 @@ mod tests {
             let storage = crate::session::storage::Storage::new_unwatched("fb-test-live").unwrap();
 
             let stale_sid = "22222222-2222-2222-2222-222222222222".to_string();
-            let mut inst = Instance::new("fallback_lives_test", "/tmp/x");
+            let mut inst = Instance::new("fallback_lives_test", project_path);
             inst.tool = "claude".to_string();
             inst.source_profile = "fb-test-live".to_string();
             inst.command = format!(
@@ -12267,6 +14694,9 @@ mod tests {
                 return;
             }
             let temp = tempdir().unwrap();
+            let project_dir = temp.path().join("project");
+            std::fs::create_dir_all(&project_dir).unwrap();
+            let project_path = project_dir.to_str().unwrap();
             std::env::set_var("HOME", temp.path());
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
@@ -12279,7 +14709,7 @@ mod tests {
             let storage = crate::session::storage::Storage::new_unwatched("fb-toggle-off").unwrap();
 
             let stale_sid = "44444444-4444-4444-4444-444444444444".to_string();
-            let mut inst = Instance::new("fallback_toggle_off_test", "/tmp/x");
+            let mut inst = Instance::new("fallback_toggle_off_test", project_path);
             inst.tool = "claude".to_string();
             inst.source_profile = "fb-toggle-off".to_string();
             // Would die if (and only if) `--resume <stale_sid>` reached the
@@ -12336,6 +14766,9 @@ mod tests {
                 return;
             }
             let temp = tempdir().unwrap();
+            let project_dir = temp.path().join("project");
+            std::fs::create_dir_all(&project_dir).unwrap();
+            let project_path = project_dir.to_str().unwrap();
             std::env::set_var("HOME", temp.path());
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
@@ -12349,7 +14782,7 @@ mod tests {
                 crate::session::storage::Storage::new_unwatched("fb-allow-ignores").unwrap();
 
             let stale_sid = "55555555-5555-5555-5555-555555555555".to_string();
-            let mut inst = Instance::new("fallback_allow_ignores_toggle_test", "/tmp/x");
+            let mut inst = Instance::new("fallback_allow_ignores_toggle_test", project_path);
             inst.tool = "claude".to_string();
             inst.source_profile = "fb-allow-ignores".to_string();
             inst.command = "/bin/false".to_string();
@@ -12400,6 +14833,9 @@ mod tests {
                 return;
             }
             let temp = tempdir().unwrap();
+            let project_dir = temp.path().join("project");
+            std::fs::create_dir_all(&project_dir).unwrap();
+            let project_path = project_dir.to_str().unwrap();
             std::env::set_var("HOME", temp.path());
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
@@ -12407,7 +14843,7 @@ mod tests {
             let storage = crate::session::storage::Storage::new_unwatched("fb-loop-break").unwrap();
 
             let stale_sid = "66666666-6666-6666-6666-666666666666".to_string();
-            let mut inst = Instance::new("fallback_loop_break_test", "/tmp/x");
+            let mut inst = Instance::new("fallback_loop_break_test", project_path);
             inst.tool = "claude".to_string();
             inst.source_profile = "fb-loop-break".to_string();
             inst.command = "/bin/false".to_string();
@@ -12487,6 +14923,9 @@ mod tests {
                 return;
             }
             let temp = tempdir().unwrap();
+            let project_dir = temp.path().join("project");
+            std::fs::create_dir_all(&project_dir).unwrap();
+            let project_path = project_dir.to_str().unwrap();
             std::env::set_var("HOME", temp.path());
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
@@ -12494,7 +14933,7 @@ mod tests {
             let storage = crate::session::storage::Storage::new_unwatched("fb-test-grace").unwrap();
 
             let stale_sid = "33333333-3333-3333-3333-333333333333".to_string();
-            let mut inst = Instance::new("fallback_grace_test", "/tmp/x");
+            let mut inst = Instance::new("fallback_grace_test", project_path);
             inst.tool = "claude".to_string();
             inst.source_profile = "fb-test-grace".to_string();
             inst.command = format!(
@@ -12805,7 +15244,7 @@ mod tests {
     }
 
     mod publish_captured_sid {
-        use super::super::{Instance, ResumeIntent};
+        use super::super::{Instance, ResumeIntent, Status};
         use serial_test::serial;
         use std::collections::HashSet;
         use tempfile::{tempdir, TempDir};
@@ -12912,6 +15351,70 @@ mod tests {
                 })
                 .unwrap();
         }
+        #[test]
+        #[serial]
+        fn omp_launch_without_capture_plan_publishes_tombstone_generation() {
+            let temp = tempdir().unwrap();
+            let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+            let profile = "omp-plan-failure-tombstone";
+            let mut inst = make_inst(profile, "omp-plan-failure");
+            inst.tool = "omp".to_string();
+            let old_generation = "omp-old-generation";
+            let stale_sid = "019342ab-1234-7def-8901-abcdef012349";
+            inst.omp_capture_generation = Some(old_generation.to_string());
+            seed_disk_row(profile, &inst);
+
+            assert!(inst.publish_omp_launch_generation(profile, None, Some(old_generation)));
+            let disk = crate::session::storage::Storage::new_unwatched(profile)
+                .unwrap()
+                .load()
+                .unwrap();
+            assert!(disk[0].omp_capture_generation.is_some());
+            assert_eq!(disk[0].omp_capture_generation, inst.omp_capture_generation);
+            assert_ne!(
+                disk[0].omp_capture_generation.as_deref(),
+                Some(old_generation)
+            );
+            assert_eq!(
+                super::super::persist_omp_session_to_storage(
+                    profile,
+                    &inst.id,
+                    stale_sid,
+                    None,
+                    Some(old_generation),
+                    &crate::file_watch::FileWatchService::noop(),
+                ),
+                super::super::SidWrite::Skipped
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn stopped_poller_flush_persists_newest_omp_observation_without_tmux() {
+            let temp = tempdir().unwrap();
+            let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+            let profile = "omp-restart-final-flush";
+            let generation = "omp-restart-generation";
+            let sid = "019342ab-1234-7def-8901-abcdef012348";
+            let mut inst = make_inst(profile, "omp-restart-flush");
+            inst.tool = "omp".to_string();
+            inst.omp_capture_generation = Some(generation.to_string());
+            inst.status = Status::Stopped;
+            seed_disk_row(profile, &inst);
+
+            let poller = crate::session::poller::SessionPoller::new("unused-tmux".to_string());
+            poller.inject_test_omp_update(&inst.id, sid, generation);
+            inst.session_id_poller = Some(std::sync::Arc::new(std::sync::Mutex::new(poller)));
+            inst.stop_and_flush_poller();
+
+            assert!(inst.session_id_poller.is_none());
+            assert_eq!(inst.agent_session_id.as_deref(), Some(sid));
+            let disk = crate::session::storage::Storage::new_unwatched(profile)
+                .unwrap()
+                .load()
+                .unwrap();
+            assert_eq!(disk[0].agent_session_id.as_deref(), Some(sid));
+        }
 
         #[test]
         #[serial]
@@ -12961,7 +15464,7 @@ mod tests {
 
         #[test]
         #[serial]
-        fn finalize_publish_applied_writes_env() {
+        fn finalize_publish_applied_writes_omp_metadata() {
             if skip_if_no_tmux() {
                 return;
             }
@@ -12970,15 +15473,153 @@ mod tests {
 
             let profile = "publish-applied";
             let mut inst = make_inst(profile, "fpaw");
+            inst.tool = "omp".to_string();
+            inst.pending_host_env = vec![
+                ("OMP_PROFILE".to_string(), "work".to_string()),
+                ("PI_CONFIG_DIR".to_string(), "/custom".to_string()),
+            ];
             inst.agent_session_id = None;
+            let plan = inst
+                .resolve_omp_capture_plan(&inst.omp_capture_options().unwrap())
+                .expect("OMP launch plan");
+            let expected_layout = plan.layout.clone();
             seed_disk_row(profile, &inst);
 
             let tmux = TmuxSession::create(&inst.id, &inst.title);
+            // Simulate dotenv/config drift after snapshot. Finalize must
+            // publish the transported plan, not resolve these live values.
+            inst.pending_host_env = vec![(
+                "PI_CODING_AGENT_SESSION_DIR".to_string(),
+                "/must-not-be-reread".to_string(),
+            )];
 
             inst.agent_session_id = Some(VALID_SID.to_string());
-            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Default);
+            inst.finalize_launch(
+                tmux.name(),
+                profile,
+                None,
+                ResumeIntent::Default,
+                Some(crate::session::capture::OmpCaptureMetadata {
+                    layout: plan.layout,
+                    launched_at_ms: 1000,
+                    launch_id: plan.launch_id.clone(),
+                    launch_marker: plan.launch_marker.clone(),
+                    routing_fingerprint: plan.routing_fingerprint.clone(),
+                    container_runtime: plan.container_runtime,
+                }),
+            );
 
             assert_eq!(captured_env(tmux.name()).as_deref(), Some(VALID_SID));
+            let metadata: crate::session::capture::OmpCaptureMetadata = serde_json::from_str(
+                &crate::tmux::env::get_hidden_env(
+                    tmux.name(),
+                    crate::tmux::env::AOE_OMP_CAPTURE_META_KEY,
+                )
+                .expect("typed OMP capture metadata must survive poller reconstruction"),
+            )
+            .unwrap();
+            assert_eq!(metadata.launched_at_ms, 1000);
+            assert_eq!(metadata.layout, expected_layout);
+            assert!(metadata.layout.sessions.is_absolute());
+            assert!(metadata.layout.terminal_sessions.is_absolute());
+            assert!(metadata.layout.managed_sessions.is_absolute());
+            assert_eq!(metadata.launch_id, plan.launch_id);
+        }
+
+        #[test]
+        #[serial]
+        fn legacy_omp_pane_backfills_typed_metadata_from_tmux_creation() {
+            if skip_if_no_tmux() {
+                return;
+            }
+            let temp = tempdir().unwrap();
+            isolate_home(&temp);
+
+            let mut inst = make_inst("omp-legacy-metadata", "legacy-omp");
+            inst.tool = "omp".to_string();
+            inst.agent_session_id = Some(VALID_SID.to_string());
+            let tmux = TmuxSession::create(&inst.id, &inst.title);
+            assert!(crate::tmux::env::get_hidden_env(
+                tmux.name(),
+                crate::tmux::env::AOE_OMP_CAPTURE_META_KEY,
+            )
+            .is_none());
+
+            let expected_launch = crate::tmux::Session::from_name(tmux.name())
+                .created_at_ms()
+                .unwrap();
+            let options = inst.omp_capture_options().unwrap();
+            let metadata = inst
+                .omp_capture_metadata(tmux.name(), &options, None)
+                .expect("legacy pane should migrate");
+            assert_eq!(metadata.launched_at_ms, expected_launch);
+            assert_eq!(
+                metadata.launch_id,
+                format!("legacy-{}-{expected_launch}", inst.id)
+            );
+            assert!(metadata.layout.managed_sessions.is_absolute());
+
+            let persisted: crate::session::capture::OmpCaptureMetadata = serde_json::from_str(
+                &crate::tmux::env::get_hidden_env(
+                    tmux.name(),
+                    crate::tmux::env::AOE_OMP_CAPTURE_META_KEY,
+                )
+                .expect("migration must backfill metadata"),
+            )
+            .unwrap();
+            assert_eq!(
+                serde_json::to_value(persisted).unwrap(),
+                serde_json::to_value(metadata).unwrap()
+            );
+
+            inst.omp_capture_generation = Some("modern-generation".to_string());
+            assert!(
+                inst.omp_capture_metadata(tmux.name(), &options, None)
+                    .is_none(),
+                "markerless typed metadata is legacy only while no durable generation exists"
+            );
+        }
+
+        #[test]
+        #[serial]
+        fn modern_omp_pane_without_hidden_metadata_does_not_legacy_migrate() {
+            if skip_if_no_tmux() {
+                return;
+            }
+            let temp = tempdir().unwrap();
+            isolate_home(&temp);
+
+            let mut inst = make_inst("omp-modern-missing-metadata", "modern-omp");
+            inst.tool = "omp".to_string();
+            let generation = "modern-launch-generation";
+            inst.omp_capture_generation = Some(generation.to_string());
+            let tmux = TmuxSession::create(&inst.id, &inst.title);
+            let status = crate::tmux::tmux_command()
+                .args([
+                    "set-environment",
+                    "-t",
+                    tmux.name(),
+                    crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY,
+                    generation,
+                ])
+                .status()
+                .unwrap();
+            assert!(status.success());
+
+            let options = inst.omp_capture_options().unwrap();
+            assert!(
+                inst.omp_capture_metadata(tmux.name(), &options, None)
+                    .is_none(),
+                "a current pane missing its hidden launch snapshot must fail closed"
+            );
+            assert!(
+                crate::tmux::env::get_hidden_env_uncached(
+                    tmux.name(),
+                    crate::tmux::env::AOE_OMP_CAPTURE_META_KEY,
+                )
+                .is_none(),
+                "the legacy path must not synthesize metadata for a current pane"
+            );
         }
 
         #[test]
@@ -12999,7 +15640,7 @@ mod tests {
             let tmux = TmuxSession::create(&inst.id, &inst.title);
 
             inst.agent_session_id = Some(VALID_SID.to_string());
-            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Default);
+            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Default, None);
 
             assert_eq!(
                 captured_env(tmux.name()).as_deref(),
@@ -13025,7 +15666,13 @@ mod tests {
             let tmux = TmuxSession::create(&inst.id, &inst.title);
 
             inst.agent_session_id = Some(VALID_SID.to_string());
-            inst.finalize_launch(tmux.name(), profile, Some("stale"), ResumeIntent::Default);
+            inst.finalize_launch(
+                tmux.name(),
+                profile,
+                Some("stale"),
+                ResumeIntent::Default,
+                None,
+            );
 
             assert_eq!(inst.agent_session_id.as_deref(), Some(PEER_SID));
             assert_eq!(captured_env(tmux.name()).as_deref(), Some(PEER_SID));
@@ -13054,7 +15701,13 @@ mod tests {
             .unwrap();
 
             inst.agent_session_id = Some(VALID_SID.to_string());
-            inst.finalize_launch(tmux.name(), profile, Some("stale"), ResumeIntent::Default);
+            inst.finalize_launch(
+                tmux.name(),
+                profile,
+                Some("stale"),
+                ResumeIntent::Default,
+                None,
+            );
 
             assert!(inst.agent_session_id.is_none());
             assert!(captured_env(tmux.name()).is_none());
@@ -13082,7 +15735,7 @@ mod tests {
             .unwrap();
 
             inst.agent_session_id = Some(VALID_SID.to_string());
-            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Default);
+            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Default, None);
 
             assert_eq!(
                 captured_env(tmux.name()).as_deref(),
@@ -13118,7 +15771,7 @@ mod tests {
             .unwrap();
 
             inst.agent_session_id = Some("bad sid!".to_string());
-            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Default);
+            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Default, None);
 
             assert_eq!(
                 captured_env(tmux.name()).as_deref(),
@@ -13144,7 +15797,7 @@ mod tests {
             let tmux = TmuxSession::create(&inst.id, &inst.title);
 
             inst.agent_session_id = Some(VALID_SID.to_string());
-            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Cleared);
+            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Cleared, None);
 
             assert_eq!(inst.agent_session_id.as_deref(), Some(VALID_SID));
             assert_eq!(inst.resume_intent, ResumeIntent::Default);

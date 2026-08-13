@@ -38,6 +38,7 @@ function frame(over: Partial<LiveFrame>): LiveFrame {
     altScreen: false,
     mouse: false,
     mouseSgr: false,
+    pane0: null,
     ...over,
   };
 }
@@ -173,6 +174,14 @@ describe("MobileLiveTerminal wheel forwarding", () => {
     expect(forwardButton.mock.calls[1][1]).toBe(true);
   });
 
+  it("clamps split-window mouse input to pane 0", () => {
+    const { scroller, forwardButton } = renderTerm(
+      frame({ altScreen: true, mouse: true, mouseSgr: true, pane0: { cols: 1, rows: 1 } }),
+    );
+    fireEvent.pointerDown(scroller, { pointerType: "mouse", button: 0, clientX: 500, clientY: 500 });
+    expect(forwardButton.mock.calls[0]!.slice(4)).toEqual([1, 1]);
+  });
+
   it("does NOT forward a click for a normal-screen agent", () => {
     const { scroller, forwardButton } = renderTerm(frame({ altScreen: false, mouse: true, mouseSgr: true }));
     fireEvent.pointerDown(scroller, { pointerType: "mouse", button: 0, clientX: 10, clientY: 10 });
@@ -218,7 +227,7 @@ describe("MobileLiveTerminal wheel forwarding", () => {
     expect(forwardWheel).toHaveBeenCalledTimes(1);
   });
 
-  it("reports touch wheels at the pane's middle row; desktop wheels keep the pointer cell", () => {
+  it("reports touch wheels at the input pane's middle row; desktop wheels keep the pointer cell", () => {
     // Position-aware apps (Claude Code) hit-test the wheel's row and ignore
     // notches over their pinned input box, which shrank the usable touch area
     // to the transcript sliver above it. The touch path therefore clamps to
@@ -231,6 +240,15 @@ describe("MobileLiveTerminal wheel forwarding", () => {
     forwardWheel.mockClear();
     fireEvent.wheel(scroller, { deltaY: 120, clientX: 100, clientY: 266 });
     expect(forwardWheel.mock.calls[0]![3]).toBe(3);
+
+    // A top/bottom split retains the composite's full row count in `rows`,
+    // but touch input stays in pane 0 and must use that pane's smaller extent.
+    const split = renderTerm(
+      frame({ rows: 8, altScreen: true, mouse: true, mouseSgr: true, pane0: { cols: 80, rows: 2 } }),
+    );
+    fireEvent.touchStart(split.scroller, { touches: [{ clientX: 100, clientY: 300 } as Touch] });
+    fireEvent.touchMove(split.scroller, { touches: [{ clientX: 100, clientY: 266 } as Touch] });
+    expect(split.forwardWheel.mock.calls[0]![3]).toBe(1);
   });
 
   it("does not enter reading mode on scroll while forwarding", () => {

@@ -41,6 +41,67 @@ fn test_cli_add_and_list() {
     );
 }
 
+/// #3224: repeating `aoe add` for the same title and path must report a
+/// conflict instead of exiting successfully while silently retaining the
+/// first session's command override.
+#[test]
+#[parallel]
+fn test_cli_add_duplicate_errors_and_preserves_original_command() {
+    let h = TuiTestHarness::new("cli_add_duplicate");
+    let project = h.project_path();
+    let project = project.to_str().unwrap();
+
+    let first = h.run_cli(&[
+        "add",
+        project,
+        "--title",
+        "Duplicate Session",
+        "--cmd-override",
+        "echo OLD",
+    ]);
+    assert!(
+        first.status.success(),
+        "initial aoe add failed: {}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+
+    let duplicate = h.run_cli(&[
+        "add",
+        project,
+        "--title",
+        "Duplicate Session",
+        "--cmd-override",
+        "echo NEW",
+    ]);
+    assert!(
+        !duplicate.status.success(),
+        "duplicate aoe add must return a non-zero status"
+    );
+    assert_eq!(
+        duplicate.status.code(),
+        Some(1),
+        "duplicate aoe add should use the CLI's ordinary error exit status"
+    );
+    let stderr = String::from_utf8_lossy(&duplicate.stderr);
+    assert!(
+        stderr.contains("Session already exists with same title and path")
+            && stderr.contains("different --title"),
+        "duplicate error should identify the collision and offer remediation.\nstderr: {stderr}"
+    );
+
+    let sessions = read_sessions_json(&h);
+    let sessions = sessions.as_array().expect("sessions array");
+    assert_eq!(
+        sessions.len(),
+        1,
+        "duplicate add must not create a second row"
+    );
+    assert_eq!(
+        sessions[0]["command"], "echo OLD",
+        "duplicate add must preserve the original command override"
+    );
+}
+
 /// Regression test for #848: `aoe add` "Next steps" hint should reference
 /// the actual binary name (`aoe`), not the long project name.
 #[test]
@@ -1827,4 +1888,133 @@ fn test_cli_stop_trap_redirects() {
             "aoe {argv:?} should redirect to killall and session stop, got:\n{stderr}"
         );
     }
+}
+
+/// Fake agent that prints a substantial startup banner, sleeps to simulate a
+/// slow-booting TUI, then prints opencode's real input-ready placeholder
+/// text and reads exactly one line, echoing it back in a greppable form.
+fn install_slow_boot_agent(h: &TuiTestHarness) -> std::path::PathBuf {
+    let dir = h.home_path().join("fake-bin");
+    std::fs::create_dir_all(&dir).expect("create fake-bin dir");
+    let script_path = dir.join("fake-slow-agent");
+    let script = "#!/bin/sh\n\
+echo '=== Fake Agent booting ==='\n\
+echo 'Loading modules...'\n\
+sleep 1\n\
+echo '==========================='\n\
+echo 'Ask anything...'\n\
+read -r line\n\
+echo \"GOT:[$line]\"\n\
+sleep 60\n";
+    std::fs::write(&script_path, script).expect("write fake agent script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake agent script");
+    }
+    script_path
+}
+
+/// `aoe send` right after `aoe session start` -- the sequence a headless
+/// dispatcher with no controlling terminal must use, since it cannot rely on
+/// `aoe add --launch`'s own attach -- must not race the agent's own boot: it
+/// waits for a real per-agent readiness marker (`Session::wait_until_ready`,
+/// `AgentDef::ready_marker`) before typing, instead of typing into a
+/// still-booting pane whenever `ensure_pane_ready` reports `AlreadyAlive` (a
+/// pane that already exists gets no wait at all otherwise). `--tool
+/// opencode` exercises the real registered marker ("ask anything") rather
+/// than the generic content-settle fallback. This test proves end-to-end
+/// delivery still works; the deterministic proof that the wait actually
+/// blocks until the marker appears (not just until the pane looks quiet)
+/// lives in `wait_until_ready_blocks_until_the_marker_appears` in
+/// `src/tmux/session.rs`, since canonical tty input buffering alone would
+/// let a message typed before boot survive to `read -r` here regardless.
+#[test]
+#[parallel]
+fn test_cli_send_waits_for_slow_boot_before_typing() {
+    require_tmux!();
+
+    let mut h = TuiTestHarness::new("cli_send_settle_wait");
+    // Install an `opencode` shim so `is_agent_available` passes (the test
+    // uses `--tool opencode` which triggers the built-in tool check).
+    h.install_path_command("opencode");
+    let fake_agent = install_slow_boot_agent(&h);
+    let project = h.project_path();
+
+    let add_output = h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-t",
+        "SlowBootSend",
+        "--tool",
+        "opencode",
+        "--cmd-override",
+        fake_agent.to_str().unwrap(),
+    ]);
+    assert!(
+        add_output.status.success(),
+        "aoe add failed: {}",
+        String::from_utf8_lossy(&add_output.stderr)
+    );
+
+    let sessions = read_sessions_json(&h);
+    let session_id = sessions[0]["id"]
+        .as_str()
+        .expect("session should have id")
+        .to_string();
+
+    let start_output = h.run_cli(&["session", "start", &session_id]);
+    assert!(
+        start_output.status.success(),
+        "aoe session start failed: {}",
+        String::from_utf8_lossy(&start_output.stderr)
+    );
+
+    // Send immediately: `aoe session start` returns as soon as the tmux pane
+    // exists, well before the fake agent's 1s boot delay elapses, exactly
+    // mirroring a headless dispatcher that has no controlling terminal to
+    // attach with and so cannot use `aoe add --launch`'s readiness instead.
+    let send_output = h.run_cli(&["send", &session_id, "hello there"]);
+    assert!(
+        send_output.status.success(),
+        "aoe send failed: {}",
+        String::from_utf8_lossy(&send_output.stderr)
+    );
+
+    // Poll the pane for the echoed line: it only appears once the fake
+    // agent's `read -r line` has actually returned, proving the message was
+    // delivered end to end rather than lost during boot.
+    let sock = h.home_path().join("tmux.sock");
+    let truncated_id = &session_id[..8.min(session_id.len())];
+    let tmux_name = format!(
+        "{}SlowBootSend_{}",
+        agent_of_empires::tmux::SESSION_PREFIX,
+        truncated_id
+    );
+    let mut content = String::new();
+    for _ in 0..50 {
+        let out = Command::new("tmux")
+            .arg("-S")
+            .arg(&sock)
+            .args(["capture-pane", "-t", &format!("{tmux_name}:^.0"), "-p"])
+            .output();
+        if let Ok(out) = out {
+            content = String::from_utf8_lossy(&out.stdout).to_string();
+            if content.contains("GOT:[hello there]") {
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+    assert!(
+        content.contains("GOT:[hello there]"),
+        "expected the fake agent to echo the sent message; pane content:\n{content}"
+    );
+
+    let _ = Command::new("tmux")
+        .arg("-S")
+        .arg(&sock)
+        .args(["kill-session", "-t", &tmux_name])
+        .output();
 }

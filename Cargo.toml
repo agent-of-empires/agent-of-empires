@@ -3,7 +3,7 @@ members = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api"]
 
 [package]
 name = "agent-of-empires"
-version = "1.14.0"
+version = "1.14.1"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Agent of Empires Contributors"]
@@ -152,7 +152,7 @@ subtle = { version = "2", optional = true }
 # Always-on: used by the TUI for OSC 52 clipboard writes (preview
 # drag-select in live mode) and re-exported via the `serve` feature
 # for Web Push payload encoding.
-base64 = "0.22"
+base64 = "0.23"
 
 # Web Push (VAPID + payload encryption), optional behind "serve".
 p256 = { version = "0.13", features = ["pem", "pkcs8", "ecdsa", "ecdh"], optional = true }

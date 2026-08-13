@@ -259,6 +259,33 @@ export function PluginCards() {
   );
 }
 
+/** home-pane: host-wide docked panes on the overview, session-less. Each entry
+ *  renders its block body through the shared pane renderer, so a home pane and a
+ *  session pane look the same and share the block vocabulary. Entries stack in
+ *  snapshot order, so several plugins compose without colliding. */
+export function PluginHomePanes() {
+  const entries = globalEntries(usePluginUiEntries(), "home-pane");
+  if (entries.length === 0) return null;
+  return (
+    <div className="mt-4 flex w-full max-w-2xl flex-col gap-3" data-testid="plugin-home-panes">
+      {entries.map((e) => (
+        <div
+          key={`${e.plugin_id}:${e.id}`}
+          className="rounded-lg ring-1 ring-surface-700/60"
+          data-plugin-id={e.plugin_id}
+        >
+          {payloadStr(e, "title") && (
+            <div className="border-b border-surface-700/60 px-3 py-2 font-semibold text-sm">
+              {payloadStr(e, "title")}
+            </div>
+          )}
+          <PluginPaneBody entry={e} titleInChrome />
+        </div>
+      ))}
+    </div>
+  );
+}
+
 /** detail-badge: per-session badges in the session detail panel. */
 export function PluginDetailBadges({ sessionId }: { sessionId: string }) {
   const entries = sessionEntries(usePluginUiEntries(), "detail-badge", sessionId);
@@ -809,6 +836,73 @@ function calloutBorder(tone: PluginUiTone | undefined): string {
  *  segments, for a ratio a number pair alone does not convey (added vs removed
  *  lines, passing vs failing counts). Segments with a non-positive or absent
  *  `value` are dropped; a bar left with nothing renders nothing. */
+/** A history plot as an SVG polyline. Values scale against `max` (default: the
+ *  data's own max); `bands: [{at, tone}]` colors each segment by the highest
+ *  threshold its value reaches, so the line changes color as it climbs, with the
+ *  single `tone` as the fallback. An empty series renders nothing. Unknown fields
+ *  are ignored, matching the block vocabulary's forward-compatibility. */
+function BlockSparkline({ block }: { block: Record<string, unknown> }) {
+  const raw = block["values"];
+  const values = Array.isArray(raw) ? raw.filter((v): v is number => typeof v === "number" && Number.isFinite(v)) : [];
+  if (values.length === 0) return null;
+  const dataMax = values.reduce((m, v) => Math.max(m, v), 0);
+  const maxField = block["max"];
+  const max = typeof maxField === "number" && maxField > 0 ? maxField : Math.max(dataMax, Number.MIN_VALUE);
+  const bands = (objectList(block, "bands") ?? [])
+    .map((b) => ({ at: b["at"], tone: validTone(b.tone) }))
+    .filter(
+      (b): b is { at: number; tone: PluginUiTone } =>
+        typeof b.at === "number" && Number.isFinite(b.at) && b.tone !== undefined,
+    );
+  const baseTone = validTone(block.tone);
+  const bandTone = (v: number): PluginUiTone | undefined =>
+    bands
+      .filter((b) => v >= b.at)
+      .reduce<{ at: number; tone: PluginUiTone } | undefined>(
+        (hi, b) => (hi === undefined || b.at > hi.at ? b : hi),
+        undefined,
+      )?.tone ?? baseTone;
+
+  const w = 120;
+  const h = 24;
+  const step = values.length > 1 ? w / (values.length - 1) : w;
+  const y = (v: number) => h - Math.min(Math.max(v / max, 0), 1) * h;
+  // Adjacent (from, to) pairs, so both endpoints are typed numbers (avoids an
+  // unchecked index) and each segment is colored by its right-hand value's band.
+  const segments = values.slice(1).map((to, i) => ({ from: values[i] ?? to, to }));
+  const caption = str(block, "caption");
+  return (
+    <div className="flex flex-col gap-1" data-testid="plugin-pane-sparkline">
+      <svg viewBox={`0 0 ${w} ${h}`} width={w} height={h} preserveAspectRatio="none" role="img">
+        {values.length === 1 ? (
+          <circle
+            cx={w / 2}
+            cy={y(values[0] ?? 0)}
+            r={1.5}
+            className={toneTextClass(bandTone(values[0] ?? 0))}
+            fill="currentColor"
+          />
+        ) : (
+          segments.map((seg, i) => (
+            <line
+              key={i}
+              x1={i * step}
+              y1={y(seg.from)}
+              x2={(i + 1) * step}
+              y2={y(seg.to)}
+              className={toneTextClass(bandTone(seg.to))}
+              stroke="currentColor"
+              strokeWidth={1.5}
+              vectorEffect="non-scaling-stroke"
+            />
+          ))
+        )}
+      </svg>
+      {caption && <span className="text-[10px] text-text-dim">{caption}</span>}
+    </div>
+  );
+}
+
 function BlockBar({ block }: { block: Record<string, unknown> }) {
   const segments = (objectList(block, "segments") ?? [])
     .map((s) => ({
@@ -962,6 +1056,8 @@ function DetailBlock({
       return <BlockCallout block={block} pluginId={pluginId} sessionId={sessionId} />;
     case "bar":
       return <BlockBar block={block} />;
+    case "sparkline":
+      return <BlockSparkline block={block} />;
     case "columns":
       return <BlockColumns block={block} pluginId={pluginId} sessionId={sessionId} />;
     case "section":
@@ -1082,9 +1178,17 @@ function BlockSection({
  *  list (the flexible, forward-compatible form) or the simple `{ title, body }`
  *  form. The dock supplies the frame (title bar, move, close) and the
  *  `default_location`; this renders only the scrollable content. */
-export function PluginPaneBody({ entry }: { entry: PluginUiEntry }) {
+export function PluginPaneBody({
+  entry,
+  titleInChrome = false,
+}: {
+  entry: PluginUiEntry;
+  /** The caller's chrome already renders the payload title (the home-pane card
+   *  header), so the simple `{title, body}` form must not repeat it. */
+  titleInChrome?: boolean;
+}) {
   const blocks = objectList(entry.payload, "blocks");
-  const title = payloadStr(entry, "title");
+  const title = titleInChrome ? undefined : payloadStr(entry, "title");
   const body = payloadStr(entry, "body");
   const footer = isObject(entry.payload.footer) ? entry.payload.footer : undefined;
   // A background poll only flips this once it outlasts the indicator delay, so

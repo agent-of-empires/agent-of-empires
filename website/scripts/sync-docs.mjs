@@ -55,6 +55,13 @@ const PAGES = [
       "Run AI coding agents in isolated Docker containers with Agent of Empires.",
   },
   {
+    source: "docs/guides/otari-telemetry.md",
+    dest: "guides/otari-telemetry.md",
+    title: "Claude Code Telemetry to Otari",
+    description:
+      "Export Claude Code usage from host and AoE sandbox sessions to a self-hosted Otari gateway.",
+  },
+  {
     source: "docs/guides/tmux-status-bar.md",
     dest: "guides/tmux-status-bar.md",
     title: "tmux Status Bar",
@@ -424,6 +431,7 @@ const URL_MAP = {
   "docs/guides/repo-config.md": "/guides/repo-config/",
   "docs/guides/mcp-servers.md": "/guides/mcp-servers/",
   "docs/guides/sandbox.md": "/guides/sandbox/",
+  "docs/guides/otari-telemetry.md": "/guides/otari-telemetry/",
   "docs/guides/tmux-status-bar.md": "/guides/tmux-status-bar/",
   "docs/guides/web-dashboard.md": "/guides/web-dashboard/",
   "docs/guides/web/dashboard.md": "/guides/web/dashboard/",

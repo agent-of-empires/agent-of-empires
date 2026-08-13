@@ -6,24 +6,22 @@ use serial_test::parallel;
 
 use crate::harness::{require_tmux, TuiTestHarness};
 
-/// Write a fake "claude" script that prints a static permission-prompt
-/// block, then blocks reading exactly one byte from stdin via `dd` (not
-/// `read -r`, which would wait for a newline the app never sends; the
-/// real Claude Code CLI selects a numbered menu option on a bare digit
-/// with no Enter, and `send_key_tokens` deliberately sends no implicit
-/// trailing key). Once a byte arrives, it echoes it in a recognizable,
-/// greppable form and sleeps so the pane stays alive for the assertion.
+/// Write a fake agent script that prints a static permission-prompt block,
+/// then blocks reading exactly one byte from stdin via `dd` (not `read -r`,
+/// which would wait for a newline the app never sends). Once a byte arrives,
+/// it echoes it in a recognizable, greppable form and sleeps so the pane
+/// stays alive for the assertion.
 ///
-/// Returns the script's absolute path, for use with `--cmd-override`
-/// rather than relying on `$PATH`: the tmux pane that runs the agent
-/// launches it through a login shell (so version-manager PATHs like
-/// NVM load), and that shell's own rc files can reorder `$PATH` ahead of
-/// a `$PATH`-installed stub, letting a real `claude` on the host shadow
-/// it. An absolute `--cmd-override` path sidesteps PATH lookup entirely.
-fn install_fake_claude_prompt(h: &TuiTestHarness) -> std::path::PathBuf {
+/// Returns the script's absolute path, for use with `--cmd-override` rather
+/// than relying on `$PATH`: the tmux pane that runs the agent launches it
+/// through a login shell (so version-manager PATHs like NVM load), and that
+/// shell's own rc files can reorder `$PATH` ahead of a `$PATH`-installed stub,
+/// letting a real agent on the host shadow it. An absolute `--cmd-override`
+/// path sidesteps PATH lookup entirely.
+fn install_fake_prompt(h: &TuiTestHarness, tool: &str) -> std::path::PathBuf {
     let dir = h.home_path().join("fake-bin");
     std::fs::create_dir_all(&dir).expect("create fake-bin dir");
-    let claude = dir.join("fake-claude");
+    let prompt = dir.join(format!("fake-{tool}"));
     // The pane's tty starts in canonical line-buffered mode, so a bare
     // digit with no trailing Enter (exactly what `send_key_tokens` sends)
     // sits in the kernel tty driver's line buffer forever; `dd` would
@@ -40,14 +38,14 @@ char=$(dd bs=1 count=1 2>/dev/null)\n\
 stty icanon echo 2>/dev/null\n\
 echo \"GOT:[$char]\"\n\
 sleep 60\n";
-    std::fs::write(&claude, script).expect("write fake claude prompt script");
+    std::fs::write(&prompt, script).expect("write fake prompt script");
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&claude, std::fs::Permissions::from_mode(0o755))
-            .expect("chmod fake claude");
+        std::fs::set_permissions(&prompt, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake prompt script");
     }
-    claude
+    prompt
 }
 
 #[test]
@@ -56,16 +54,13 @@ fn test_respond_to_permission_allow_sends_bare_digit() {
     require_tmux!();
 
     let mut h = TuiTestHarness::new("perm_resp_allow");
-    let fake_claude = install_fake_claude_prompt(&h);
+    let fake_claude = install_fake_prompt(&h, "claude");
 
     let project = h.project_path();
     // `--launch` starts the tmux session (spawning the fake claude script)
-    // and then tries to attach the CLI process's own terminal to it; that
-    // attach fails here because `run_cli` has no tty, but the tmux session
-    // is already live by that point, which is all this test needs. Don't
-    // assert success; asserting on it would depend on that terminal-attach
-    // side effect, not on session creation/launch.
-    h.run_cli(&[
+    // and skips the interactive terminal-attach step, since `run_cli` has no
+    // controlling terminal; the exit status is asserted to cover that.
+    let output = h.run_cli(&[
         "add",
         project.to_str().unwrap(),
         "-t",
@@ -76,6 +71,11 @@ fn test_respond_to_permission_allow_sends_bare_digit() {
         fake_claude.to_str().unwrap(),
         "--launch",
     ]);
+    assert!(
+        output.status.success(),
+        "aoe add --launch should succeed without a controlling terminal: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     h.spawn_tui();
     h.wait_for(" aoe ");
@@ -104,11 +104,11 @@ fn test_respond_to_permission_deny_sends_bare_digit() {
     require_tmux!();
 
     let mut h = TuiTestHarness::new("perm_resp_deny");
-    let fake_claude = install_fake_claude_prompt(&h);
+    let fake_claude = install_fake_prompt(&h, "claude");
 
     let project = h.project_path();
-    // See the allow test above for why the add-launch output isn't asserted.
-    h.run_cli(&[
+    // See the allow test above: the exit status now IS asserted.
+    let output = h.run_cli(&[
         "add",
         project.to_str().unwrap(),
         "-t",
@@ -119,6 +119,11 @@ fn test_respond_to_permission_deny_sends_bare_digit() {
         fake_claude.to_str().unwrap(),
         "--launch",
     ]);
+    assert!(
+        output.status.success(),
+        "aoe add --launch should succeed without a controlling terminal: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     h.spawn_tui();
     h.wait_for(" aoe ");
@@ -130,4 +135,38 @@ fn test_respond_to_permission_deny_sends_bare_digit() {
     h.send_keys("d");
 
     h.wait_for("GOT:[3]");
+}
+
+#[test]
+#[parallel]
+fn test_respond_to_codex_permission_allow_always_sends_a() {
+    require_tmux!();
+
+    let mut h = TuiTestHarness::new("perm_resp_codex_allow_always");
+    h.install_path_command("codex");
+    let fake_codex = install_fake_prompt(&h, "codex");
+
+    let project = h.project_path();
+    h.run_cli(&[
+        "add",
+        project.to_str().unwrap(),
+        "-t",
+        "CodexPermResp",
+        "--tool",
+        "codex",
+        "--cmd-override",
+        fake_codex.to_str().unwrap(),
+        "--launch",
+    ]);
+
+    h.spawn_tui();
+    h.wait_for(" aoe ");
+    h.wait_for("CodexPermResp");
+    h.wait_for("Do you want to proceed?");
+
+    h.send_keys("a");
+    h.wait_for("Respond to Permission Prompt");
+    h.send_keys("A");
+
+    h.wait_for("GOT:[a]");
 }

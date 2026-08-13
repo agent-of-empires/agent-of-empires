@@ -17,7 +17,7 @@ pub(super) fn collect_pid_tree(pid: u32) -> Vec<u32> {
 }
 
 /// Scan `/proc` once and group every live PID by its parent.
-fn build_children_map() -> HashMap<u32, Vec<u32>> {
+pub(super) fn build_children_map() -> HashMap<u32, Vec<u32>> {
     let mut children_map: HashMap<u32, Vec<u32>> = HashMap::new();
     let proc_dir = Path::new("/proc");
     let Ok(entries) = fs::read_dir(proc_dir) else {
@@ -97,6 +97,139 @@ pub(super) fn processes_matching(
         }
     }
     found
+}
+
+/// Sample system memory from `/proc` and `/sys`: a handful of small pseudo-file
+/// reads, cheap enough for the background sampler. Any file that is missing or
+/// unparseable leaves its field at the default (0 for the always-present RAM
+/// figures, `None` for the optional ones) so a transient read never fabricates
+/// a reading.
+pub(super) fn sample_memory() -> super::metrics::MemorySample {
+    let meminfo = fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let total = parse_meminfo_field(&meminfo, "MemTotal").map(kib_to_bytes);
+    let avail = parse_meminfo_field(&meminfo, "MemAvailable").map(kib_to_bytes);
+
+    let psi_mem_some_avg10 =
+        parse_psi_some_avg10(&fs::read_to_string("/proc/pressure/memory").unwrap_or_default());
+    let psi_io_some_avg10 =
+        parse_psi_some_avg10(&fs::read_to_string("/proc/pressure/io").unwrap_or_default());
+
+    // Both figures must be known together: a 0 available against a real total
+    // reads as 100% used, a false Critical. Old kernels (and WSL1) omit
+    // MemAvailable, so require both and otherwise report "unknown" (0/0), which
+    // the renderer shows as counts-only.
+    let (total_bytes, available_bytes) = match (total, avail) {
+        (Some(t), Some(a)) => (t, a),
+        _ => (0, 0),
+    };
+
+    super::metrics::MemorySample {
+        total_bytes,
+        available_bytes,
+        psi_mem_some_avg10,
+        psi_io_some_avg10,
+        macos_pressure_level: None,
+    }
+}
+
+pub(super) fn sample_system() -> super::metrics::SystemReading {
+    let stat = fs::read_to_string("/proc/stat").unwrap_or_default();
+    let cpu = stat.lines().next().and_then(|line| {
+        let values: Vec<u64> = line
+            .split_whitespace()
+            .skip(1)
+            .filter_map(|value| value.parse().ok())
+            .collect();
+        (!values.is_empty()).then(|| {
+            (
+                values.iter().sum(),
+                values.get(3).copied().unwrap_or(0) + values.get(4).copied().unwrap_or(0),
+            )
+        })
+    });
+    let load = fs::read_to_string("/proc/loadavg").ok().and_then(|value| {
+        let values: Vec<f64> = value
+            .split_whitespace()
+            .take(3)
+            .filter_map(|part| part.parse().ok())
+            .collect();
+        (values.len() == 3).then(|| [values[0], values[1], values[2]])
+    });
+    let mem = fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let field = |name: &str| {
+        mem.lines()
+            .find(|line| line.starts_with(name))
+            .and_then(|line| line.split_whitespace().nth(1)?.parse::<u64>().ok())
+            .unwrap_or(0)
+            * 1024
+    };
+    let total = field("SwapTotal:");
+    let free = field("SwapFree:");
+    (cpu, None, load, (total, total.saturating_sub(free)))
+}
+
+pub(super) fn process_snapshot() -> Vec<super::metrics::ProcessRecord> {
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64;
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as u64;
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
+            let stat = fs::read_to_string(entry.path().join("stat")).ok()?;
+            let end = stat.rfind(')')?;
+            let fields: Vec<&str> = stat[end + 2..].split_whitespace().collect();
+            let ppid = fields.get(1)?.parse().ok()?;
+            let utime: u64 = fields.get(11)?.parse().ok()?;
+            let stime: u64 = fields.get(12)?.parse().ok()?;
+            let start_id = fields.get(19)?.parse().ok()?;
+            let rss_pages: i64 = fields.get(21)?.parse().ok()?;
+            Some(super::metrics::ProcessRecord {
+                pid,
+                ppid,
+                start_id,
+                rss_bytes: rss_pages.max(0) as u64 * page,
+                cpu_seconds: (utime + stime) as f64 / hz,
+            })
+        })
+        .collect()
+}
+
+fn kib_to_bytes(kib: u64) -> u64 {
+    kib.saturating_mul(1024)
+}
+
+/// Parse a `/proc/meminfo` line like `MemAvailable:   12345 kB` into its kB
+/// value. All meminfo size fields are in kB. Returns `None` if the key is
+/// absent or the value is not a number.
+fn parse_meminfo_field(meminfo: &str, key: &str) -> Option<u64> {
+    for line in meminfo.lines() {
+        let Some((name, rest)) = line.split_once(':') else {
+            continue;
+        };
+        if name.trim() != key {
+            continue;
+        }
+        // `rest` is like "   12345 kB"; the first whitespace token is the value.
+        return rest.split_whitespace().next()?.parse().ok();
+    }
+    None
+}
+
+/// Parse the `some avg10` stall percentage from a `/proc/pressure/*` file. The
+/// `some` line looks like `some avg10=0.00 avg60=0.00 avg300=0.00 total=12345`.
+/// `None` if absent (e.g. PSI not compiled into the kernel), never a false 0.0.
+fn parse_psi_some_avg10(psi: &str) -> Option<f32> {
+    for line in psi.lines() {
+        let mut fields = line.split_whitespace();
+        if fields.next() != Some("some") {
+            continue;
+        }
+        return fields.find_map(|kv| kv.strip_prefix("avg10=")?.parse().ok());
+    }
+    None
 }
 
 /// Per-boot identity from `/proc/sys/kernel/random/boot_id`: constant for the
@@ -265,5 +398,58 @@ mod tests {
         assert_eq!(parse_stat_field(stat, 3), Some(1233)); // ppid
         assert_eq!(parse_stat_field(stat, 4), Some(1234)); // pgrp
         assert_eq!(parse_stat_field(stat, 7), Some(1234)); // tpgid
+    }
+
+    const MEMINFO: &str = "\
+MemTotal:       32791036 kB
+MemFree:         1234567 kB
+MemAvailable:    9876543 kB
+Cached:          5678901 kB
+";
+
+    #[test]
+    fn test_parse_meminfo_field() {
+        let cases = [
+            ("MemTotal", Some(32791036)),
+            ("MemAvailable", Some(9876543)),
+            ("MemFree", Some(1234567)),
+            ("Nonexistent", None),
+            // Substring of a real key must not match (split on ':' + trim).
+            ("Mem", None),
+        ];
+        for (key, expected) in cases {
+            assert_eq!(parse_meminfo_field(MEMINFO, key), expected, "{key}");
+        }
+    }
+
+    #[test]
+    fn test_sample_used_derivation() {
+        // used = total - available, and used_fraction tracks it.
+        let total = parse_meminfo_field(MEMINFO, "MemTotal")
+            .map(kib_to_bytes)
+            .unwrap();
+        let avail = parse_meminfo_field(MEMINFO, "MemAvailable")
+            .map(kib_to_bytes)
+            .unwrap();
+        let sample = super::super::metrics::MemorySample {
+            total_bytes: total,
+            available_bytes: avail,
+            ..Default::default()
+        };
+        assert_eq!(sample.used_bytes(), total - avail);
+        assert!((sample.used_fraction() - (total - avail) as f64 / total as f64).abs() < 1e-9);
+    }
+
+    #[test]
+    fn test_parse_psi_some_avg10() {
+        let psi = "\
+some avg10=1.23 avg60=4.56 avg300=7.89 total=123456789
+full avg10=0.10 avg60=0.20 avg300=0.30 total=42
+";
+        assert_eq!(parse_psi_some_avg10(psi), Some(1.23));
+        // PSI not compiled in / empty file -> None (not a false 0.0).
+        assert_eq!(parse_psi_some_avg10(""), None);
+        // Only a `full` line, no `some` -> None.
+        assert_eq!(parse_psi_some_avg10("full avg10=5.0 total=9"), None);
     }
 }

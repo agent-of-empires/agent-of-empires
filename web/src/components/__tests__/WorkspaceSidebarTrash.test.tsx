@@ -70,7 +70,10 @@ function renderSidebar(over: Partial<React.ComponentProps<typeof WorkspaceSideba
   const props: React.ComponentProps<typeof WorkspaceSidebar> = {
     groups: buildSessionGroups([], { idleDecayWindowMs: 60_000, sortMode: "lastActivity", isCollapsed: () => false }),
     nestedGroups: [],
+    orgGroups: [],
     onToggleSubgroup: noop,
+    onToggleOrg: noop,
+    onToggleOrgRepo: noop,
     onReorderWorkspaces: noop,
     onReorderGroups: noop,
     activeId: null,

@@ -2,8 +2,9 @@
 //! native TUI (#2402). Mirrors the web selectors in `web/src/lib/pluginUi.ts`,
 //! narrowed to what a terminal can render: the structured view shows
 //! `StatusBar` (global) and `DetailBadge` (per-session) text, tone-colored,
-//! plus `Notification` toasts, and `Pane` blocks in a toggleable overlay
-//! (#2467); the remote-home picker shows `RowColumn` text per session row
+//! plus `Notification` toasts, and `Pane` (per session) and `HomePane` (global)
+//! blocks in a toggleable overlay (#2467); the remote-home picker shows
+//! `RowColumn` text per session row
 //! (#2948). Icons, tooltips, hrefs, and the
 //! `Card`/`RowBadge`/`SortKey`/`FilterFacet`/`SettingsPage`/
 //! `ToolCardBadge` slots have no TUI surface here and are ignored (a terminal
@@ -142,8 +143,19 @@ const DIVIDER_WIDTH: usize = 32;
 /// heard of. Entries are blank-line separated, and an entry that renders
 /// nothing contributes no separator (so a malformed payload leaves no gap).
 pub fn pane_lines(snapshot: &UiSnapshot, session_id: &str, theme: &Theme) -> Vec<Line<'static>> {
+    stack_pane_entries(session_entries(snapshot, UiSlot::Pane, session_id), theme)
+}
+
+/// Render a run of pane entries to lines, each entry's block body separated
+/// from the next by a blank line. An entry that renders nothing contributes no
+/// separator, so a malformed payload leaves no gap. Shared by the per-session
+/// `pane_lines` and the global `home_pane_lines`.
+fn stack_pane_entries<'a>(
+    entries: impl Iterator<Item = &'a UiEntry>,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
-    for entry in session_entries(snapshot, UiSlot::Pane, session_id) {
+    for entry in entries {
         let lines = pane_entry_lines(entry, theme);
         if lines.is_empty() {
             continue;
@@ -154,6 +166,16 @@ pub fn pane_lines(snapshot: &UiSnapshot, session_id: &str, theme: &Theme) -> Vec
         out.extend(lines);
     }
     out
+}
+
+/// Render global `HomePane` entries (session-less) with the same block
+/// vocabulary as a session `Pane`, the host-wide docked surface a plugin
+/// targets when its panel is not tied to a session. Entries stack in snapshot
+/// (insertion) order, so several plugins compose without colliding. `HomePane`
+/// reuses `PanePayload`, so a payload may carry `default_location`; it is a
+/// session-dock concept and is ignored here.
+pub fn home_pane_lines(snapshot: &UiSnapshot, theme: &Theme) -> Vec<Line<'static>> {
+    stack_pane_entries(global_entries(snapshot, UiSlot::HomePane), theme)
 }
 
 /// One pane entry: a heading naming the pane, then an ordered `blocks` list when
@@ -288,6 +310,7 @@ fn block_lines(block: &Value, indent: usize, theme: &Theme) -> Vec<Line<'static>
         Some("section") => section_lines(block, indent, theme),
         Some("callout") => callout_lines(block, indent, theme),
         Some("bar") => bar_lines(block, indent, theme),
+        Some("sparkline") => sparkline_lines(block, indent, theme),
         // The terminal has no side-by-side layout, so a `columns` block degrades
         // to its children stacked at the same indent, in order.
         Some("columns") => match block.get("children").and_then(Value::as_array) {
@@ -369,6 +392,94 @@ fn bar_lines(block: &Value, indent: usize, theme: &Theme) -> Vec<Line<'static>> 
         ));
     }
     out
+}
+
+/// The eight block-fill glyphs, index 0 (lowest) to 7 (full).
+const SPARK_GLYPHS: [char; 8] = ['▁', '▂', '▃', '▄', '▅', '▆', '▇', '█'];
+
+/// `sparkline`: a history plot as a run of block-eighths glyphs, one per value,
+/// scaled against `max`, with an optional caption below. A time series the
+/// other block kinds can't express (`bar` is a proportion, not a series). Wire
+/// shape: `{ kind: "sparkline", values: [f64], max?: f64, tone?, bands?, caption? }`.
+///
+/// Coloring: `bands: [{ at: f64, tone }]` colors each glyph by the highest `at`
+/// threshold its value meets, so a series can change color as it climbs
+/// (green/amber/red for a pressure metric). Without `bands`, the whole
+/// series takes the single `tone`. Provide `max` for a stable vertical scale;
+/// it defaults to the data's own max, which rescales as the window changes.
+/// Unknown fields are ignored (forward-compatible); an empty series renders
+/// nothing.
+fn sparkline_lines(block: &Value, indent: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let values: Vec<f64> = block
+        .get("values")
+        .and_then(Value::as_array)
+        .map(|vs| {
+            vs.iter()
+                .filter_map(Value::as_f64)
+                .filter(|v| v.is_finite())
+                .collect()
+        })
+        .unwrap_or_default();
+    if values.is_empty() {
+        return vec![];
+    }
+    let data_max = values.iter().cloned().fold(0.0_f64, f64::max);
+    let max = block
+        .get("max")
+        .and_then(Value::as_f64)
+        .filter(|m| *m > 0.0)
+        .unwrap_or(data_max)
+        .max(f64::MIN_POSITIVE);
+    let bands = parse_bands(block);
+    let base_tone = block_tone(block);
+
+    let mut spans = indent_span(indent);
+    spans.extend(values.iter().map(|&v| {
+        // frac is clamped to 0..=1, so idx lands in 0..=len-1 without a guard.
+        let frac = (v / max).clamp(0.0, 1.0);
+        let idx = (frac * (SPARK_GLYPHS.len() as f64 - 1.0)).round() as usize;
+        let tone = band_tone(&bands, v).or(base_tone);
+        Span::styled(SPARK_GLYPHS[idx].to_string(), tone_style(tone, theme))
+    }));
+
+    let mut out = vec![Line::from(spans)];
+    if let Some(caption) = block_str(block, "caption") {
+        out.push(indented_line(
+            indent,
+            caption.to_string(),
+            Style::default().fg(theme.dimmed),
+        ));
+    }
+    out
+}
+
+/// `(at, tone)` thresholds from a sparkline's `bands`, in declared order.
+/// Malformed or missing yields none, so coloring falls back to the single `tone`.
+fn parse_bands(block: &Value) -> Vec<(f64, Tone)> {
+    block
+        .get("bands")
+        .and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(|b| {
+                    let at = b
+                        .get("at")
+                        .and_then(Value::as_f64)
+                        .filter(|a| a.is_finite())?;
+                    Some((at, block_tone(b)?))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// The tone of the highest band `value` reaches, or `None` if it clears none.
+fn band_tone(bands: &[(f64, Tone)], value: f64) -> Option<Tone> {
+    bands
+        .iter()
+        .filter(|(at, _)| value >= *at)
+        .max_by(|a, b| a.0.total_cmp(&b.0))
+        .map(|(_, tone)| *tone)
 }
 
 /// Lay the segments out over [`BAR_WIDTH`] cells. Every positive segment gets at
@@ -1117,6 +1228,78 @@ mod tests {
         assert!(!t.iter().any(|l| l.contains("orphan")), "{t:?}");
         assert_eq!(t[1], "  unresolved");
         assert_eq!(t[2], "no author");
+    }
+
+    #[test]
+    fn home_pane_renders_a_global_sparkline_entry() {
+        // A global HomePane (no session_id) carrying a sparkline block renders
+        // heading + glyph row + caption through home_pane_lines, covering the
+        // whole payload -> render path for a home-pane plugin.
+        let snap = pane_snapshot(json!([
+            {"plugin_id": "diag", "slot": "home-pane", "id": "mem",
+             "payload": {"title": "memory", "blocks": [
+                 {"kind": "sparkline", "values": [0, 250, 500, 750, 1000], "max": 1000,
+                  "tone": "warn", "caption": "64% 22.7/32G"},
+                 {"kind": "row", "label": "agents", "value": "7"}
+             ]}}
+        ]));
+        let lines = home_pane_lines(&snap, &Theme::default());
+        let t = texts(&lines);
+        assert_eq!(t[0], "memory", "heading falls back to the pane title");
+        // Five values across 0..max, each frac rounded onto the 8-glyph ramp:
+        // 0, .25*7=1.75->2, .5*7=3.5->4, .75*7=5.25->5, full->7.
+        assert_eq!(t[1], "▁▃▅▆█");
+        assert_eq!(t[2], "64% 22.7/32G");
+        assert!(t.iter().any(|l| l.contains("agents") && l.contains("7")));
+    }
+
+    #[test]
+    fn sparkline_block_maps_values_onto_the_glyph_ramp() {
+        let theme = Theme::default();
+        // Empty / missing series renders nothing.
+        assert!(sparkline_lines(&json!({"kind": "sparkline", "values": []}), 0, &theme).is_empty());
+        assert!(sparkline_lines(&json!({"kind": "sparkline"}), 0, &theme).is_empty());
+        // Without an explicit max, the data's own max pins the top glyph
+        // (4/8=.5 -> .5*7=3.5 -> round 4 -> the 5th ramp glyph).
+        let lines = sparkline_lines(
+            &json!({"kind": "sparkline", "values": [0.0, 4.0, 8.0]}),
+            0,
+            &theme,
+        );
+        assert_eq!(texts(&lines), vec!["▁▅█"]);
+        // Values above max clamp to full rather than overflowing the ramp
+        // (50/100=.5 -> 4th index; 200 clamps to full).
+        let capped = sparkline_lines(
+            &json!({"kind": "sparkline", "values": [50, 200], "max": 100}),
+            0,
+            &theme,
+        );
+        assert_eq!(texts(&capped), vec!["▅█"]);
+    }
+
+    #[test]
+    fn sparkline_bands_color_each_glyph_by_the_threshold_it_reaches() {
+        let theme = Theme::default();
+        // Values climb across two thresholds; each glyph takes the highest band
+        // it reaches (10 -> none/base, 70 -> warn, 95 -> danger).
+        let lines = sparkline_lines(
+            &json!({"kind": "sparkline", "values": [10, 70, 95], "max": 100,
+                    "bands": [{"at": 70, "tone": "warn"}, {"at": 90, "tone": "danger"}]}),
+            0,
+            &theme,
+        );
+        let spans = &lines[0].spans;
+        assert_eq!(spans.len(), 3, "one span per sample for per-glyph coloring");
+        assert_eq!(
+            spans[0].style.fg,
+            tone_style(None, &theme).fg,
+            "below all bands: base tone"
+        );
+        assert_eq!(spans[1].style.fg, tone_style(Some(Tone::Warn), &theme).fg);
+        assert_eq!(spans[2].style.fg, tone_style(Some(Tone::Danger), &theme).fg);
+        // Bands are optional; malformed/missing falls back to the single tone.
+        assert!(parse_bands(&json!({"kind": "sparkline", "values": [1]})).is_empty());
+        assert!(band_tone(&[], 5.0).is_none());
     }
 
     #[test]

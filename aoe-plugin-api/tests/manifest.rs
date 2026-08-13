@@ -689,6 +689,7 @@ fn ui_slot_as_str_round_trips_the_wire_name() {
         ("composer-action", UiSlot::ComposerAction),
         ("settings-page", UiSlot::SettingsPage),
         ("tool-card-badge", UiSlot::ToolCardBadge),
+        ("home-pane", UiSlot::HomePane),
         ("notification", UiSlot::Notification),
     ] {
         assert_eq!(slot.as_str(), toml_slot);

@@ -4,14 +4,14 @@ use anyhow::{bail, Result};
 use std::io::Write;
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::{
     composite::{CapturedPane, PaneGeom, WindowLayout},
     probe_session_existence, refresh_session_cache,
     utils::{
         append_pane_base_index_args, append_remain_on_exit_args, append_tmux_setting_args,
-        append_window_size_args, is_pane_dead, is_pane_running_shell,
+        append_window_size_args, is_pane_dead, is_pane_running_shell, PANE_ENV_FILE_PREFIX,
     },
     SessionExistence, SESSION_PREFIX,
 };
@@ -22,6 +22,28 @@ use crate::util::now_ms;
 
 pub struct Session {
     name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PaneEnvMutation {
+    Set { key: String, value: String },
+    Unset { key: String },
+}
+
+impl PaneEnvMutation {
+    pub fn set(key: String, value: String) -> Self {
+        Self::Set { key, value }
+    }
+
+    pub fn unset(key: String) -> Self {
+        Self::Unset { key }
+    }
+
+    fn key(&self) -> &str {
+        match self {
+            Self::Set { key, .. } | Self::Unset { key } => key,
+        }
+    }
 }
 
 /// tmux user options holding the cross-process size-owner lock (see
@@ -242,15 +264,9 @@ fn parse_pane_segments(raw: &str, sentinel: &str) -> Vec<CapturedPane> {
     panes
 }
 
-/// Flag a cursor's POSITION as untrustworthy while keeping its always-valid
-/// mode flags, for the composite paths that fall through to a scrollback-bearing
-/// pane-0 capture.
-///
-/// [`Session::capture_pane_with_cursor`] earns the right to trust a position by
-/// probing twice around its capture and comparing; a single probe against
-/// content that includes scrollback has no such evidence, so the render skips
-/// painting rather than risk the row-drift bug while the wheel forward (which
-/// reads only the mode flags) keeps working.
+/// Keep mode flags from a lone cursor probe while preventing the renderer from
+/// trusting its row. This is the degraded path when tmux omits the post-capture
+/// sentinel but still returns the pane capture successfully.
 fn unreliable_position(cursor: Option<PaneCursor>) -> Option<PaneCursor> {
     cursor.map(|c| PaneCursor {
         position_reliable: false,
@@ -350,26 +366,98 @@ impl Session {
         self.create_with_size_env(working_dir, command, size, profile, &[])
     }
 
-    /// Like [`Self::create_with_size`], but also sets `extra_env` on the new
-    /// session via `new-session -e KEY=VALUE`.
+    /// Like [`Self::create_with_size`], but also applies `extra_env` mutations
+    /// in the pane process through a protected, one-shot file.
     ///
-    /// This is the channel for values that must not appear in the pane
-    /// command's argv: `host_hooks.before_session` mints secrets, and the
-    /// shell-assignment prefix used for the static `environment` list would
-    /// publish them to `ps` for the pane's whole lifetime. The `-e` flags ride
-    /// the short-lived `tmux` client invocation instead, and the tmux server
-    /// hands the value to the pane's process environment.
+    /// Environment values and the launch command never enter tmux client argv,
+    /// pane start-command metadata, or tmux's persistent session environment.
+    /// The short pane command runs the file as a POSIX script; that script
+    /// applies shell-escaped exports and explicit unsets, then unlinks itself
+    /// before executing the requested command.
+    /// The non-secret OMP launch ID remains a tmux `-e` value so capture can
+    /// query it. Desktop/session values retain the existing tmux environment
+    /// behavior used by later panes.
     pub fn create_with_size_env(
         &self,
         working_dir: &str,
         command: Option<&str>,
         size: Option<(u16, u16)>,
         profile: &str,
-        extra_env: &[(String, String)],
+        extra_env: &[PaneEnvMutation],
+    ) -> Result<()> {
+        self.create_with_size_env_inner(working_dir, command, size, profile, extra_env, &[])
+    }
+
+    /// Create a pane whose container runtime reads target environment values
+    /// from an inherited env-file descriptor. The target keys never enter the
+    /// host pane environment.
+    pub(crate) fn create_with_size_env_and_container_env(
+        &self,
+        working_dir: &str,
+        command: Option<&str>,
+        size: Option<(u16, u16)>,
+        profile: &str,
+        extra_env: &[PaneEnvMutation],
+        container_env: &[(String, String)],
+    ) -> Result<()> {
+        self.create_with_size_env_inner(
+            working_dir,
+            command,
+            size,
+            profile,
+            extra_env,
+            container_env,
+        )
+    }
+
+    fn create_with_size_env_inner(
+        &self,
+        working_dir: &str,
+        command: Option<&str>,
+        size: Option<(u16, u16)>,
+        profile: &str,
+        extra_env: &[PaneEnvMutation],
+        container_env: &[(String, String)],
     ) -> Result<()> {
         if self.exists() {
             return Ok(());
         }
+
+        // tmux does not error when `-c <dir>` points at a missing directory;
+        // it silently falls back to the server's own `$HOME`, which for a
+        // long-running daemon/TUI process is wherever *it* was launched from,
+        // not this session's `project_path`. Callers (`Instance::start_with_size_opts`)
+        // already reload `project_path` from disk immediately before this call,
+        // so a missing directory here means the worktree/project itself is
+        // gone or not yet materialized, not a stale in-memory value. Fail
+        // loudly instead of silently spawning in the wrong place. See #3265.
+        let working_dir_path = std::path::Path::new(working_dir);
+        if !working_dir_path.is_dir() {
+            bail!(
+                "Cannot create tmux session '{}': working directory '{}' does not exist \
+                 or is not a directory (tmux would otherwise silently fall back to $HOME)",
+                self.name,
+                working_dir
+            );
+        }
+
+        // Diagnostic for #3265 ("fresh/restarted panes spawn with the wrong
+        // cwd"): log the exact `-c` value this spawn resolved to, plus its
+        // canonicalized form, so a future recurrence (if the guard above
+        // doesn't catch it, e.g. a permissions issue rather than a missing
+        // path) leaves direct evidence of what `working_dir` actually was at
+        // the moment of the `tmux new-session` call, instead of requiring a
+        // fresh repro under instrumentation.
+        tracing::debug!(target: "tmux.command",
+            session = %self.name,
+            working_dir,
+            working_dir_canonical = %working_dir_path
+                .canonicalize()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|e| format!("<canonicalize failed: {e}>")),
+            "resolved working directory for tmux new-session"
+        );
+
         let config = super::tmux_option_config(profile);
 
         // Forward the inherited host env (DISPLAY, XDG_*, DBUS, ... plus every
@@ -378,14 +466,36 @@ impl Session {
         // desktop. tmux otherwise carries only its narrow `update-environment`
         // set plus the server's frozen base env (#3075, #3262).
         let inherited_env = crate::session::environment::inherited_host_env(profile);
-        let mut env_refs: Vec<(&str, &str)> = inherited_env
+        let mut protected_env = Vec::new();
+        let mut tmux_env: Vec<(&str, &str)> = inherited_env
             .iter()
-            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .map(|(key, value)| (key.as_str(), value.as_str()))
             .collect();
-        // Appended last so a minted value overrides a same-keyed desktop entry.
-        env_refs.extend(extra_env.iter().map(|(k, v)| (k.as_str(), v.as_str())));
+        for mutation in extra_env {
+            let key = mutation.key();
+            if !crate::session::environment::is_valid_env_key(key) {
+                tracing::warn!(target: "session.create", "invalid pane environment key '{}'; skipping", key);
+                continue;
+            }
+            match mutation {
+                PaneEnvMutation::Set { key, value }
+                    if key == crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY =>
+                {
+                    tmux_env.push((key.as_str(), value.as_str()));
+                }
+                _ => protected_env.push(mutation.clone()),
+            }
+        }
 
-        let mut args = build_create_args(&self.name, working_dir, &env_refs, command, size);
+        let mut env_file = EphemeralEnvFile::create(&protected_env, container_env)?;
+        let wrapped_command = env_file.wrap_command(command)?;
+        let mut args = build_create_args(
+            &self.name,
+            working_dir,
+            &tmux_env,
+            Some(&wrapped_command),
+            size,
+        );
         append_remain_on_exit_args(&mut args, &self.name);
         append_pane_base_index_args(&mut args, &self.name);
         append_window_size_args(&mut args, &self.name);
@@ -393,13 +503,15 @@ impl Session {
 
         let output = crate::tmux::tmux_command().args(&args).output()?;
 
-        // Note: With -d flag, tmux new-session returns 0 even if the shell command fails.
-        // Log args at debug level for troubleshooting.
-        tracing::debug!(target: "tmux.command",
-            "tmux new-session args: {:?}",
-            args.iter()
-                .map(|a| crate::session::environment::redact_env_values(a))
-                .collect::<Vec<_>>()
+        // With -d, tmux can accept a session even when the pane command will
+        // fail. Never log the full argv: the pane command can contain legacy
+        // user-configured credentials even though current launches reject or
+        // transport them out of band.
+        tracing::debug!(
+            target: "tmux.command",
+            session = %self.name,
+            arg_count = args.len(),
+            "tmux new-session completed"
         );
 
         if !output.status.success() {
@@ -407,6 +519,16 @@ impl Session {
             bail!("Failed to create tmux session: {}", stderr);
         }
 
+        // Unlinking the channel is the pane's acknowledgement that it sourced
+        // the protected values and command. Keep parent cleanup ownership until
+        // then: tmux's detached create can return success before the wrapper
+        // runs.
+        if !env_file.wait_until_consumed(Duration::from_secs(5)) {
+            super::refresh_session_cache();
+            let _ = self.kill();
+            bail!("Pane did not consume its protected launch script");
+        }
+        env_file.disarm();
         super::refresh_session_cache();
 
         Ok(())
@@ -588,6 +710,60 @@ impl Session {
         info.join(", ")
     }
 
+    /// Return a conservative Unix epoch millisecond watermark for the tmux
+    /// session creation time.
+    ///
+    /// `#{session_created}` has one-second precision, so migration rounds it
+    /// to the end of that second. A legacy breadcrumb from the same second is
+    /// deliberately not proof that OMP rewrote it after launch.
+    pub fn created_at_ms(&self) -> Result<u64> {
+        let output = crate::tmux::tmux_command()
+            .args([
+                "display-message",
+                "-t",
+                &self.name,
+                "-p",
+                "#{session_created}",
+            ])
+            .output()?;
+        if !output.status.success() {
+            bail!(
+                "Failed to read creation time for tmux session '{}'",
+                self.name
+            );
+        }
+        let raw = String::from_utf8_lossy(&output.stdout);
+        let seconds = raw.trim().parse::<u64>().map_err(|_| {
+            anyhow::anyhow!(
+                "tmux session '{}' reported an invalid creation time",
+                self.name
+            )
+        })?;
+        seconds
+            .checked_mul(1000)
+            .and_then(|millis| millis.checked_add(999))
+            .ok_or_else(|| anyhow::anyhow!("tmux session '{}' creation time overflowed", self.name))
+    }
+
+    /// Return the TTY device for the agent pane.
+    ///
+    /// OMP uses this device to key its terminal-session breadcrumb. Target the
+    /// first window's first pane for the same reason as [`Self::capture_pane`].
+    pub fn pane_tty(&self) -> Result<String> {
+        let target = format!("{}:^.0", self.name);
+        let output = crate::tmux::tmux_command()
+            .args(["display-message", "-t", &target, "-p", "#{pane_tty}"])
+            .output()?;
+        if !output.status.success() {
+            bail!("Failed to read pane TTY for tmux session '{}'", self.name);
+        }
+        let tty = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if tty.is_empty() {
+            bail!("tmux session '{}' reported an empty pane TTY", self.name);
+        }
+        Ok(tty)
+    }
+
     pub fn capture_pane(&self, lines: usize) -> Result<String> {
         if !self.exists() {
             return Ok(String::new());
@@ -612,6 +788,53 @@ impl Session {
             Ok(String::from_utf8_lossy(&output.stdout).to_string())
         } else {
             Ok(String::new())
+        }
+    }
+
+    /// Wait for the pane to become ready for input, or `max_wait` to elapse.
+    /// Failsafe: always returns by `max_wait`, so a caller's next action
+    /// (e.g. `send-keys`) still runs even if the pane never becomes ready,
+    /// such as an agent that is genuinely still streaming output.
+    ///
+    /// When `ready_marker` is `Some` (see `AgentDef::ready_marker`), polls
+    /// for that substring actually appearing in the captured pane content
+    /// (matched case-insensitively) -- a real, agent-specific readiness
+    /// signal.
+    ///
+    /// When `ready_marker` is `None` (no such signal is known for this
+    /// agent yet), falls back to a generic heuristic: content stops
+    /// changing across two consecutive samples. This is weaker -- a short,
+    /// static "still loading" screen can satisfy it before the agent is
+    /// actually listening -- but it is strictly better than sending
+    /// immediately, and is the same heuristic `aoe session restart`'s
+    /// wake-message send already relied on before per-agent markers
+    /// existed.
+    ///
+    /// Shared by `aoe session restart`'s post-restart wake message and `aoe
+    /// send`'s pre-send wait: both need to avoid typing into a pane whose
+    /// agent has not finished rendering yet.
+    pub fn wait_until_ready(&self, max_wait: std::time::Duration, ready_marker: Option<&str>) {
+        let poll_interval = std::time::Duration::from_millis(200);
+        let deadline = std::time::Instant::now() + max_wait;
+        let ready_marker = ready_marker.map(str::to_lowercase);
+        let mut last: Option<String> = None;
+        while std::time::Instant::now() < deadline {
+            std::thread::sleep(poll_interval);
+            let Ok(now) = self.capture_pane(5) else {
+                continue;
+            };
+            if let Some(marker) = ready_marker.as_deref() {
+                if now.to_lowercase().contains(marker) {
+                    return;
+                }
+                continue;
+            }
+            if now.trim().len() > 20 {
+                if last.as_deref() == Some(now.as_str()) {
+                    return;
+                }
+                last = Some(now);
+            }
         }
     }
 
@@ -669,6 +892,9 @@ impl Session {
         const WINDOW_SENTINEL: &str = "@@aoe-win@@";
         /// Gates the cursor line, for the same reason.
         const CURSOR_SENTINEL: &str = "@@aoe-cur@@";
+        /// Gates the post-capture cursor probe. Comparing it with the first
+        /// probe proves that the pane row still indexes the captured bytes.
+        const AFTER_CURSOR_SENTINEL: &str = "@@aoe-after-cur@@";
 
         if !self.exists() {
             return Ok((String::new(), None));
@@ -699,8 +925,18 @@ impl Session {
                 &pane0,
                 "-p",
                 "-e",
+                // Trailing bg fills stay, matching the VT path (#3336); see
+                // `capture_pane_with_cursor`.
+                "-N",
                 "-S",
                 &format!("-{}", lines),
+                ";",
+                "display-message",
+                "-p",
+                "-t",
+                &pane0,
+                "-F",
+                &format!("{AFTER_CURSOR_SENTINEL} {CURSOR_FMT}"),
             ])
             .output()?;
 
@@ -716,7 +952,7 @@ impl Session {
         let mut rest: &str = &raw;
         let mut dims: Option<(u16, u16, u16)> = None;
         let mut zoomed = false;
-        let mut cursor: Option<PaneCursor> = None;
+        let mut cursor_before: Option<PaneCursor> = None;
         while let Some((line, tail)) = rest.split_once('\n') {
             if let Some(fields) = line.strip_prefix(WINDOW_SENTINEL) {
                 let mut f = fields.split_whitespace();
@@ -733,19 +969,37 @@ impl Session {
                 // which keeps the composite path rather than disabling it.
                 zoomed = f.next().is_some_and(|z| z != "0");
             } else if let Some(fields) = line.strip_prefix(CURSOR_SENTINEL) {
-                cursor = PaneCursor::parse(fields.trim());
+                cursor_before = PaneCursor::parse(fields.trim());
             } else {
                 break;
             }
             rest = tail;
         }
-        let pane0_content = rest.to_string();
+        // The final sentinel follows the capture bytes. Keep the newline that
+        // terminated the pane capture, matching `capture_pane_with_cursor`,
+        // while removing only the post-capture probe.
+        let trimmed = rest.strip_suffix('\n').unwrap_or(rest);
+        let (pane0_content, cursor_after) = match trimmed.rsplit_once('\n') {
+            Some((content, line)) => match line.strip_prefix(AFTER_CURSOR_SENTINEL) {
+                Some(fields) => (format!("{content}\n"), PaneCursor::parse(fields.trim())),
+                None => (rest.to_string(), None),
+            },
+            None => match trimmed.strip_prefix(AFTER_CURSOR_SENTINEL) {
+                Some(fields) => (String::new(), PaneCursor::parse(fields.trim())),
+                None => (rest.to_string(), None),
+            },
+        };
+        let cursor = if cursor_after.is_some() {
+            merge_cursor_probes(cursor_before, cursor_after)
+        } else {
+            unreliable_position(cursor_before)
+        };
 
         let Some((count, window_width, window_height)) = dims else {
-            return Ok((pane0_content, unreliable_position(cursor)));
+            return Ok((pane0_content, cursor));
         };
         if count <= 1 || window_width == 0 || window_height == 0 {
-            return Ok((pane0_content, unreliable_position(cursor)));
+            return Ok((pane0_content, cursor));
         }
         // A zoomed pane (`C-b z`) keeps `window_panes` at its real count but
         // reports every pane at the window's full rectangle, so the panes
@@ -756,18 +1010,26 @@ impl Session {
         // in hand, scrollback included, which is what the preview showed before
         // compositing existed.
         if zoomed {
-            return Ok((pane0_content, unreliable_position(cursor)));
+            return Ok((pane0_content, cursor));
         }
 
         // Any failure in the split path (fork error, unparseable layout) falls
         // back to the pane-0 bytes already in hand, so a composite that cannot
         // be built is never worse than the old single-pane preview.
         let Some(layout) = self.capture_window_layout(count) else {
-            return Ok((pane0_content, unreliable_position(cursor)));
+            return Ok((pane0_content, cursor));
         };
-        // The composite is the visible window with no scrollback, so the row a
-        // single probe reported cannot have drifted underneath it, and the
-        // position stands.
+        // Reuse the pane-0 bytes bracketed by the cursor probes above. The
+        // layout capture happens in a second tmux invocation, so using its
+        // pane-0 copy could otherwise pair the cursor with a later screen and
+        // paint it one row high or low while the agent scrolls.
+        let pane0_rows = layout.first_pane().map(|first| {
+            crate::tmux::vt::capture_rows_padded(
+                pane0_content.as_bytes(),
+                first.width,
+                first.height,
+            )
+        });
         let cursor = cursor.map(|mut c| {
             c.pane_height = layout.window_height;
             c.pane_width = layout.window_width;
@@ -778,7 +1040,11 @@ impl Session {
             c.composite_pane0 = layout.first_pane().map(|p| (p.width, p.height));
             c
         });
-        Ok((layout.composite(), cursor))
+        let content = pane0_rows.as_deref().map_or_else(
+            || layout.composite(),
+            |rows| layout.composite_with_first_pane_rows(rows),
+        );
+        Ok((content, cursor))
     }
 
     /// Second fork of [`capture_window_composited`](Self::capture_window_composited):
@@ -827,6 +1093,9 @@ impl Session {
                 target,
                 "-p".to_string(),
                 "-e".to_string(),
+                // Trailing bg fills stay, matching the VT path (#3336); see
+                // `capture_pane_with_cursor`.
+                "-N".to_string(),
             ]);
         }
 
@@ -930,6 +1199,11 @@ impl Session {
                 &target,
                 "-p",
                 "-e",
+                // Preserve trailing spaces: a bg-styled fill running to the
+                // right edge is content the VT path keeps (`row_last_col`),
+                // and dropping it here makes the preview flicker whenever the
+                // two capture sources alternate (#3336).
+                "-N",
                 "-S",
                 &start,
                 ";",
@@ -948,8 +1222,8 @@ impl Session {
 
         let raw = String::from_utf8_lossy(&output.stdout);
         // First line: pre-capture cursor header. Last line: post-capture
-        // header. Everything between is the verbatim `capture-pane` output
-        // (same bytes the plain `capture_pane` path returns).
+        // header. Everything between is the verbatim cursor-aware preview
+        // capture output.
         let mut parts = raw.splitn(2, '\n');
         let cursor_line = parts.next().unwrap_or("");
         let rest = parts.next().unwrap_or("");
@@ -1010,10 +1284,10 @@ impl Session {
         process::get_foreground_pid(pane_pid).or(Some(pane_pid))
     }
 
-    pub fn detect_status(&self, tool: &str) -> Result<Status> {
+    pub fn detect_status(&self, profile: &str, tool: &str) -> Result<Status> {
         let content = self.capture_pane(50)?;
-        Ok(super::status_detection::detect_status_from_content(
-            &content, tool,
+        Ok(super::status_detection::detect_status_from_content_in(
+            profile, &content, tool,
         ))
     }
 
@@ -1077,9 +1351,10 @@ impl Session {
         if use_paste_buffer {
             Self::send_via_paste_buffer(&target, text)?;
         } else {
+            let payload = pad_slash_command_for_autocomplete(text);
             // `--` ends option parsing so lines beginning with `-` (markdown
             // bullets, CLI flags in prompts) are not misread as tmux flags.
-            Self::tmux_send(&target, &["-l", "--", text])?;
+            Self::tmux_send(&target, &["-l", "--", &payload])?;
         }
 
         if enter_delay_ms > 0 {
@@ -1521,6 +1796,177 @@ fn raw_byte_batches(bytes: &[u8]) -> Vec<Vec<String>> {
         .collect()
 }
 
+/// A one-shot, mode-0600 environment channel for a pane command.
+///
+/// The guard owns cleanup until the pane unlinks the file after sourcing it.
+/// A successful tmux create alone does not transfer cleanup ownership.
+struct EphemeralEnvFile {
+    path: Option<std::path::PathBuf>,
+    container_env_path: Option<std::path::PathBuf>,
+}
+
+impl EphemeralEnvFile {
+    fn create(env: &[PaneEnvMutation], container_env: &[(String, String)]) -> Result<Self> {
+        let mut channel = Self {
+            path: None,
+            container_env_path: None,
+        };
+        if !container_env.is_empty() {
+            let mut file = tempfile::Builder::new()
+                .prefix(PANE_ENV_FILE_PREFIX)
+                .tempfile()?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.as_file()
+                    .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+            }
+            for (key, value) in container_env {
+                anyhow::ensure!(
+                    crate::session::environment::is_valid_env_key(key),
+                    "invalid container environment key {key:?}"
+                );
+                anyhow::ensure!(
+                    !value
+                        .bytes()
+                        .any(|byte| matches!(byte, b'\0' | b'\n' | b'\r')),
+                    "container environment value for {key} cannot be represented in an env-file"
+                );
+                writeln!(file, "{key}={value}")?;
+            }
+            file.flush()?;
+            let (_handle, path) = file.keep().map_err(|error| error.error)?;
+            channel.container_env_path = Some(path);
+        }
+
+        let mut file = tempfile::Builder::new()
+            .prefix(PANE_ENV_FILE_PREFIX)
+            .tempfile()?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.as_file()
+                .set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        }
+        for mutation in env {
+            let key = mutation.key();
+            if !crate::session::environment::is_valid_env_key(key) {
+                tracing::warn!(target: "session.create", "invalid protected environment key '{}'; skipping", key);
+                continue;
+            }
+            match mutation {
+                PaneEnvMutation::Set { key, value } => {
+                    writeln!(file, "export {}={}", key, script_shell_escape(value))?;
+                }
+                PaneEnvMutation::Unset { key } => writeln!(file, "unset {}", key)?,
+            }
+        }
+        file.flush()?;
+        let (_handle, path) = file.keep().map_err(|error| error.error)?;
+        channel.path = Some(path);
+        Ok(channel)
+    }
+
+    fn wrap_command(&self, command: Option<&str>) -> Result<String> {
+        let path = self
+            .path
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("protected environment channel already consumed"))?;
+        let launch = command.map(str::to_owned).unwrap_or_else(|| {
+            crate::session::environment::login_shell_command(
+                &crate::session::environment::user_shell(),
+            )
+        });
+        let shell = crate::session::environment::user_posix_shell();
+        let mut file = std::fs::OpenOptions::new().append(true).open(path)?;
+        if let Some(container_env_path) = self.container_env_path.as_deref() {
+            writeln!(
+                file,
+                "exec {}<{} || exit 1",
+                crate::session::environment::CONTAINER_EXEC_ENV_FD,
+                script_shell_escape(&container_env_path.to_string_lossy())
+            )?;
+            writeln!(
+                file,
+                "rm -f -- {}",
+                script_shell_escape(&container_env_path.to_string_lossy())
+            )?;
+        }
+        writeln!(
+            file,
+            "rm -f -- {}",
+            script_shell_escape(&path.to_string_lossy())
+        )?;
+        writeln!(file, "{launch}")?;
+        file.flush()?;
+
+        // tmux hands its pane command to the user's configured shell. Keep that
+        // boundary to one short script invocation. The protected file contains
+        // both exports and the potentially large launch body, so neither
+        // secrets nor command contents enter tmux argv.
+        Ok(format!(
+            "exec {} {}",
+            crate::session::environment::shell_escape(&shell),
+            crate::session::environment::shell_escape(&path.to_string_lossy())
+        ))
+    }
+
+    fn wait_until_consumed(&self, timeout: Duration) -> bool {
+        let Some(path) = self.path.as_deref() else {
+            return true;
+        };
+        let deadline = Instant::now() + timeout;
+        loop {
+            match std::fs::symlink_metadata(path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
+                Err(_) => return false,
+                Ok(_) if Instant::now() >= deadline => return false,
+                Ok(_) => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+    }
+
+    fn disarm(&mut self) {
+        self.path = None;
+        self.container_env_path = None;
+    }
+}
+
+impl Drop for EphemeralEnvFile {
+    fn drop(&mut self) {
+        if let Some(path) = self.path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Some(path) = self.container_env_path.take() {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Quote one POSIX script word without changing its bytes. Unlike the
+/// single-line command formatter, literal CR and LF bytes are valid inside
+/// single quotes here and must survive environment transport.
+fn script_shell_escape(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Whether `text` should get a trailing space appended before being typed
+/// via the literal (non-paste-buffer) keystroke path in
+/// [`Session::send_keys_with_delay`]. A message that opens with `/` triggers
+/// some agents' own slash-command autocomplete dropdown (e.g. opencode); the
+/// dropdown then consumes the terminating `Enter` sent after this payload as
+/// navigation instead of submit, leaving the command typed but never
+/// delivered. A trailing space closes the dropdown as it's typed, so the
+/// following `Enter` submits normally instead. Every other message keeps its
+/// exact bytes. Pure so the padding decision is unit-testable without tmux.
+fn pad_slash_command_for_autocomplete(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.trim_start().starts_with('/') {
+        std::borrow::Cow::Owned(format!("{text} "))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
 /// Build the argument list for tmux new-session command. Shared by the
 /// agent session and the paired/container terminal sessions (their
 /// invocations are identical; only the session-name prefix differs).
@@ -1686,6 +2132,84 @@ mod tests {
     #[test]
     fn raw_byte_batches_empty_payload_sends_nothing() {
         assert!(raw_byte_batches(&[]).is_empty());
+    }
+
+    #[test]
+    fn pads_slash_prefixed_messages_only() {
+        let cases = [
+            ("/audit", "/audit "),
+            ("/", "/ "),
+            ("  /audit", "  /audit "),
+            ("audit", "audit"),
+            ("please run /audit", "please run /audit"),
+            ("", ""),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(
+                pad_slash_command_for_autocomplete(input),
+                expected,
+                "input {input:?}"
+            );
+        }
+    }
+
+    /// Direct, timing-based proof that `wait_until_ready` with a known
+    /// marker actually blocks until that marker appears, rather than
+    /// returning early on a merely-static pane -- the gap in the generic
+    /// content-settle fallback (a short "still loading" screen can look
+    /// "settled" long before the agent is really listening).
+    #[test]
+    fn wait_until_ready_blocks_until_the_marker_appears() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let guard = TmuxTestSession::new("aoe_test_ready_marker");
+        let name = guard.name().to_string();
+        // A short, static "booting" line appears immediately and would
+        // satisfy the generic settle heuristic well under 700ms; the real
+        // marker text only appears after the sleep. The trailing `set-option
+        // pane-base-index 0` chain mirrors `append_pane_base_index_args` so the
+        // `^.0` capture target resolves on hosts with `pane-base-index 1` set
+        // globally (#488, #2231).
+        let status = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &name,
+                "-x",
+                "80",
+                "-y",
+                "24",
+                "sh",
+                "-c",
+                "echo booting; sleep 0.7; echo 'ask anything...'; sleep 30",
+                ";",
+                "set-option",
+                "-t",
+                &name,
+                "pane-base-index",
+                "0",
+            ])
+            .status()
+            .expect("tmux new-session");
+        assert!(status.success());
+        refresh_session_cache();
+
+        let session = Session::from_name(&name);
+        let start = std::time::Instant::now();
+        session.wait_until_ready(std::time::Duration::from_secs(3), Some("ask anything"));
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= std::time::Duration::from_millis(600),
+            "returned before the marker could plausibly have appeared: {elapsed:?}"
+        );
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "should have returned promptly once the marker appeared, not idled toward the bound: {elapsed:?}"
+        );
     }
 
     #[test]
@@ -1857,6 +2381,25 @@ mod tests {
         assert!(merge_cursor_probes(None, Some(c)).is_none());
         assert!(merge_cursor_probes(Some(c), None).is_none());
         assert!(merge_cursor_probes(None, None).is_none());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn session_created_is_conservative_epoch_millisecond_watermark() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let guard = TmuxTestSession::new("aoe_test_session_created");
+        let output = crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", guard.name()])
+            .output()
+            .expect("tmux new-session");
+        assert!(output.status.success());
+
+        let created_at_ms = Session::from_name(guard.name()).created_at_ms().unwrap();
+        assert!(created_at_ms > 0);
+        assert_eq!(created_at_ms % 1000, 999);
     }
 
     #[test]
@@ -2303,6 +2846,41 @@ mod tests {
         );
     }
 
+    /// #3265: tmux silently falls back to its server's `$HOME` when `-c`
+    /// points at a directory that doesn't exist, landing a fresh/restarted
+    /// pane in the daemon's launch directory instead of the session's
+    /// `project_path`. `create_with_size_env` must refuse to spawn rather
+    /// than let that happen invisibly.
+    #[test]
+    #[serial_test::serial]
+    fn test_create_with_size_env_rejects_missing_working_dir() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let guard = TmuxTestSession::new("aoe_test_missing_dir");
+        let session = super::Session::from_name(guard.name());
+        let tmp = tempfile::TempDir::new().unwrap();
+        let missing_dir = tmp.path().join("does-not-exist");
+        let result = session.create_with_size(
+            missing_dir.to_str().unwrap(),
+            Some("sleep 5"),
+            None,
+            "default",
+        );
+
+        assert!(
+            result.is_err(),
+            "create_with_size_env must reject a missing working directory instead of \
+             silently falling back to tmux's own $HOME"
+        );
+        assert!(
+            !session.exists(),
+            "no tmux session should have been created"
+        );
+    }
+
     /// #3071: `is_attached` gates the TUI's passive preview resize, so it has
     /// to be right in both directions. The detached half is the cheap one; the
     /// attached half needs a real tmux client, which the sibling test below
@@ -2606,7 +3184,8 @@ mod tests {
         );
     }
 
-    /// An unsplit window must composite to exactly what `capture_pane`
+    /// An unsplit window must composite to exactly what the single-pane
+    /// preview capture (`capture_pane_with_cursor`, the other `-N` transport)
     /// returns, so the overwhelmingly common case is provably unchanged.
     #[test]
     #[serial_test::serial]
@@ -2620,7 +3199,10 @@ mod tests {
         let session = start_composite_session(guard.name(), 80, 24, "sh -c 'echo ALPHA; sleep 30'");
         wait_for_pane_text(&session, "ALPHA");
 
-        let plain = session.capture_pane(10).expect("capture_pane");
+        let plain = session
+            .capture_pane_with_cursor(10)
+            .expect("capture_pane_with_cursor")
+            .0;
         let composited = session
             .capture_window_composited(10)
             .expect("capture_window_composited");
@@ -2674,6 +3256,58 @@ mod tests {
         );
     }
 
+    /// A full-screen TUI (opencode's dimmed modal backdrop, its empty home
+    /// screen) paints its background as full-width runs of bg-styled spaces.
+    /// `capture-pane` trims trailing spaces by default, styled or not, while
+    /// the VT path keeps styled trailing blanks as content (`row_last_col`).
+    /// The preview alternates between the two sources, so a fill dropped by
+    /// one and kept by the other flickers at the idle-poll cadence (#3336).
+    /// Every preview-feeding capture must therefore preserve the fill.
+    #[test]
+    #[serial_test::serial]
+    fn preview_captures_preserve_trailing_bg_fill() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let guard = TmuxTestSession::new("aoe_test_bg_fill");
+        // Row 0: a 40-column run of bg-styled spaces, opencode's backdrop
+        // pattern. Row 1: text so the wait helper has a needle that survives
+        // the trim either way.
+        let session = start_composite_session(
+            guard.name(),
+            40,
+            8,
+            "sh -c 'printf \"\\033[44m%40s\\033[0m\\nALPHA\\n\" \"\"; sleep 30'",
+        );
+        wait_for_pane_text(&session, "ALPHA");
+
+        let fill = format!("\u{1b}[44m{}", " ".repeat(40));
+        let (with_cursor, _) = session
+            .capture_pane_with_cursor(10)
+            .expect("capture_pane_with_cursor");
+        assert!(
+            with_cursor.contains(fill.as_str()),
+            "capture_pane_with_cursor dropped the styled fill:\n{with_cursor:?}"
+        );
+
+        let composited = session
+            .capture_window_composited(10)
+            .expect("capture_window_composited");
+        assert!(
+            composited.contains(fill.as_str()),
+            "capture_window_composited dropped the styled fill:\n{composited:?}"
+        );
+
+        let layout = session.capture_window_layout(1).expect("layout");
+        let rows = layout.panes[0].rows.join("\n");
+        assert!(
+            rows.contains(fill.as_str()),
+            "capture_window_layout dropped the styled fill:\n{rows:?}"
+        );
+    }
+
     /// `C-b z` keeps `window_panes` at its real count while reporting every pane
     /// at the window's FULL rectangle, so the rectangles overlap and the
     /// compositor's tiling assumption breaks. Compositing that painted pane 0 at
@@ -2683,7 +3317,7 @@ mod tests {
     /// so, since nothing self-heals a zoom.
     ///
     /// Zoomed must therefore be treated as unsplit, byte-for-byte identical to
-    /// the plain capture.
+    /// the single-pane preview capture.
     #[test]
     #[serial_test::serial]
     fn a_zoomed_pane_falls_back_to_the_plain_capture() {
@@ -2741,7 +3375,10 @@ mod tests {
         );
         assert_eq!(
             zoomed,
-            session.capture_pane(10).expect("plain capture"),
+            session
+                .capture_pane_with_cursor(10)
+                .expect("capture_pane_with_cursor")
+                .0,
             "zoomed must be byte-identical to the pane-0 capture"
         );
 
@@ -2898,7 +3535,10 @@ mod tests {
         let (content, cursor) = session
             .capture_window_composited_with_cursor(20)
             .expect("composited capture");
-        let plain = session.capture_pane(20).expect("capture_pane");
+        let plain = session
+            .capture_pane_with_cursor(20)
+            .expect("capture_pane_with_cursor")
+            .0;
         assert_eq!(
             content, plain,
             "unsplit window must still pass pane bytes through untouched"
@@ -2909,6 +3549,10 @@ mod tests {
         );
         let cursor = cursor.expect("a cursor for a live pane");
         assert_eq!(cursor.pane_width, 80, "cursor carries the pane geometry");
+        assert!(
+            cursor.position_reliable,
+            "an unchanged single-pane capture must keep its cursor"
+        );
 
         // Now split, and the cursor must be rebased onto the window so the
         // renderer's `pane_height` anchoring still lines up with the composite.
@@ -3210,49 +3854,218 @@ mod tests {
     }
 
     #[test]
-    fn test_build_create_args_env_emits_e_flags_before_command() {
+    fn test_build_create_args_keeps_only_non_secret_launch_id_in_tmux_env() {
         let args = build_create_args(
             "s",
             "/tmp/work",
-            &[("HOME", "/Users/me"), ("SHELL", "/bin/zsh")],
-            Some("'/bin/zsh' -l"),
+            &[(
+                crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY,
+                "non-secret-generation",
+            )],
+            Some("omp"),
             None,
         );
-        // Each pair becomes an adjacent `-e KEY=VAL`.
-        let e_idx = args.iter().position(|a| a == "-e").unwrap();
-        assert_eq!(args[e_idx + 1], "HOME=/Users/me");
-        assert_eq!(args[e_idx + 3], "SHELL=/bin/zsh");
-        // Env flags precede the trailing command.
-        assert!(e_idx < args.iter().position(|a| a == "'/bin/zsh' -l").unwrap());
-        // `-c` still precedes the env flags.
-        assert!(args.iter().position(|a| a == "-c").unwrap() < e_idx);
+        let e_idx = args.iter().position(|arg| arg == "-e").unwrap();
+        assert_eq!(
+            args[e_idx + 1],
+            format!(
+                "{}=non-secret-generation",
+                crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY
+            )
+        );
     }
 
-    /// `create_with_size_env` appends the caller's `extra_env` after the
-    /// forwarded desktop env precisely so a `host_hooks.before_session` value
-    /// overrides a same-keyed desktop entry. Arg construction must preserve that
-    /// order rather than dedupe or reorder, or the intent is lost before tmux
-    /// ever sees it.
     #[test]
-    fn test_build_create_args_preserves_duplicate_key_order() {
-        let args = build_create_args(
-            "s",
-            "/tmp/work",
+    fn test_protected_env_file_keeps_secret_out_of_pane_argv_and_rejects_invalid_keys() {
+        let secret = "literal-secret-value";
+        let file = EphemeralEnvFile::create(
             &[
-                ("CLAUDE_CONFIG_DIR", "/desktop"),
-                ("CLAUDE_CONFIG_DIR", "/minted"),
+                PaneEnvMutation::set("GOOD_TOKEN".to_string(), "stale-profile-value".to_string()),
+                PaneEnvMutation::set("GOOD_TOKEN".to_string(), secret.to_string()),
+                PaneEnvMutation::set("X; touch /tmp/injected; #".to_string(), "bad".to_string()),
             ],
-            Some("claude"),
-            None,
+            &[],
+        )
+        .unwrap();
+        let path = file.path.as_ref().unwrap().clone();
+        let wrapper = file.wrap_command(Some("omp --help")).unwrap();
+        let args = build_create_args("s", "/tmp/work", &[], Some(&wrapper), None);
+        assert!(wrapper.starts_with(&format!(
+            "exec {} ",
+            crate::session::environment::shell_escape(
+                &crate::session::environment::user_posix_shell()
+            )
+        )));
+
+        assert!(!wrapper.contains(secret));
+        assert!(!wrapper.contains("stale-profile-value"));
+        assert!(!args.iter().any(|arg| arg.contains(secret)));
+        assert!(!wrapper.contains("touch /tmp/injected"));
+        assert!(wrapper.contains(&path.to_string_lossy().to_string()));
+        let contents = std::fs::read_to_string(&path).unwrap();
+
+        assert!(contents.find("rm -f").unwrap() < contents.find("omp --help").unwrap());
+        assert!(contents.contains("export GOOD_TOKEN='literal-secret-value'"));
+        let stale = contents
+            .find("export GOOD_TOKEN='stale-profile-value'")
+            .unwrap();
+        let minted = contents
+            .find("export GOOD_TOKEN='literal-secret-value'")
+            .unwrap();
+        assert!(stale < minted, "later minted export must win when sourced");
+        assert!(!contents.contains("touch /tmp/injected"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        drop(file);
+        assert!(!path.exists(), "failure guard must clean up the channel");
+    }
+
+    #[test]
+    fn test_protected_env_file_preserves_multiline_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("multiline");
+        let value = "line one\nline two\r\nquote ' intact";
+        let stale_output = temp.path().join("unset");
+        let mut file = EphemeralEnvFile::create(
+            &[
+                PaneEnvMutation::set("MULTILINE_SECRET".to_string(), value.to_string()),
+                PaneEnvMutation::unset("AOE_TEST_STALE".to_string()),
+            ],
+            &[],
+        )
+        .unwrap();
+        let command = format!(
+            "printf '%s' \"$MULTILINE_SECRET\" > {}; printf '%s' \"${{AOE_TEST_STALE+x}}\" > {}",
+            script_shell_escape(&output.to_string_lossy()),
+            script_shell_escape(&stale_output.to_string_lossy())
         );
-        let values: Vec<&String> = args
-            .iter()
-            .filter(|a| a.starts_with("CLAUDE_CONFIG_DIR="))
-            .collect();
+        let wrapper = file.wrap_command(Some(&command)).unwrap();
+        let status = std::process::Command::new("sh")
+            .args(["-c", &wrapper])
+            .env("AOE_TEST_STALE", "inherited")
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(std::fs::read(&output).unwrap(), value.as_bytes());
+        assert_eq!(std::fs::read_to_string(stale_output).unwrap(), "");
+        assert!(file.wait_until_consumed(Duration::ZERO));
+        file.disarm();
+    }
+
+    #[test]
+    fn test_container_env_file_does_not_mutate_host_process_environment() {
+        let temp = tempfile::tempdir().unwrap();
+        let host_output = temp.path().join("host-env");
+        let payload_output = temp.path().join("container-env");
+        let target_env = vec![
+            ("PATH".to_string(), "/repo-controlled/bin".to_string()),
+            (
+                "DOCKER_HOST".to_string(),
+                "tcp://repo-controlled.example".to_string(),
+            ),
+            ("TOKEN".to_string(), "secret-value".to_string()),
+        ];
+        let mut file = EphemeralEnvFile::create(&[], &target_env).unwrap();
+        let script_path = file.path.as_ref().unwrap().clone();
+        let payload_path = file.container_env_path.as_ref().unwrap().clone();
+        let command = format!(
+            "printf '%s\\n%s' \"$PATH\" \"${{DOCKER_HOST-unset}}\" > {}; \
+             /bin/cat {} > {}",
+            script_shell_escape(&host_output.to_string_lossy()),
+            crate::session::environment::CONTAINER_EXEC_ENV_PATH,
+            script_shell_escape(&payload_output.to_string_lossy()),
+        );
+        let wrapper = file.wrap_command(Some(&command)).unwrap();
+        let script = std::fs::read_to_string(&script_path).unwrap();
+
+        assert!(!script.contains("/repo-controlled/bin"));
+        assert!(!script.contains("tcp://repo-controlled.example"));
+        assert!(!wrapper.contains("secret-value"));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&payload_path)
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o600
+            );
+        }
+
+        let status = std::process::Command::new("/bin/sh")
+            .args(["-c", &wrapper])
+            .env("PATH", "/usr/bin:/bin")
+            .env_remove("DOCKER_HOST")
+            .env_remove("BASH_ENV")
+            .env_remove("ENV")
+            .status()
+            .unwrap();
+        assert!(status.success());
         assert_eq!(
-            values,
-            vec!["CLAUDE_CONFIG_DIR=/desktop", "CLAUDE_CONFIG_DIR=/minted"],
-            "both -e flags must survive, minted last"
+            std::fs::read_to_string(host_output).unwrap(),
+            "/usr/bin:/bin\nunset"
+        );
+        assert_eq!(
+            std::fs::read_to_string(payload_output).unwrap(),
+            "PATH=/repo-controlled/bin\n\
+             DOCKER_HOST=tcp://repo-controlled.example\n\
+             TOKEN=secret-value\n"
+        );
+        assert!(file.wait_until_consumed(Duration::ZERO));
+        assert!(!payload_path.exists());
+        file.disarm();
+
+        assert!(EphemeralEnvFile::create(
+            &[],
+            &[("MULTILINE".to_string(), "line one\nline two".to_string())],
+        )
+        .is_err());
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_protected_env_is_consumed_before_create_returns() {
+        if !tmux_available() {
+            return;
+        }
+        let guard = TmuxTestSession::new("aoe_test_protected_env");
+        let session = Session::from_name(guard.name());
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("value");
+        let command = format!(
+            "printf '%s' \"$AOE_TEST_PROTECTED_VALUE\" > {}; sleep 30",
+            crate::session::environment::shell_escape(&output.to_string_lossy())
+        );
+
+        session
+            .create_with_size_env(
+                "/tmp",
+                Some(&command),
+                Some((80, 24)),
+                "default",
+                &[PaneEnvMutation::set(
+                    "AOE_TEST_PROTECTED_VALUE".to_string(),
+                    "secret value".to_string(),
+                )],
+            )
+            .unwrap();
+
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !output.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(std::fs::read_to_string(output).unwrap(), "secret value");
+        assert!(
+            !session.is_pane_running_shell(),
+            "live protected-environment wrapper must not look like an exited agent"
         );
     }
 

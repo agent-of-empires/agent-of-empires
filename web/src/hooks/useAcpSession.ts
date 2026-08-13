@@ -27,6 +27,14 @@ import {
   type PromptAttachmentInput,
   type QueuedPrompt,
 } from "../lib/acpTypes";
+import {
+  armForBackgroundDrain,
+  emitQueueRetired,
+  isDraining,
+  onAnyQueueRetired,
+  onQueueRetired,
+  withDrainLock,
+} from "../lib/acpDrainCoordinator";
 import { useAcpPrefs } from "../lib/acpPrefs";
 import { isClearAlias } from "../lib/agentProfiles";
 import { useAgentProfile } from "../lib/agentProfileContext";
@@ -328,6 +336,32 @@ function cacheSet(sessionId: string, value: AcpState): void {
   persistState(sessionId, value);
   notifyStateListeners(sessionId);
 }
+
+/** Drop delivered rows out of the shared cache (and therefore out of
+ *  localStorage).
+ *
+ *  Registered once per module load for EVERY session's retirements, local
+ *  or arriving from another tab, because it has to run whether or not a
+ *  hook for that session is mounted here:
+ *
+ *   - Across an unmount: a drain started by the headless background
+ *     drainer can resolve after the user has navigated into that chat, by
+ *     which point the drainer's `dispatch` goes nowhere. Without the cache
+ *     write the freshly mounted hook hydrates the already-sent rows and
+ *     POSTs them again.
+ *   - Across tabs: the drain lock stops two tabs sending at the same
+ *     moment, but the losing tab still holds the delivered rows, so it
+ *     would re-persist and re-send them once the lock frees.
+ *
+ *  See #3331. */
+onAnyQueueRetired((sessionId, ids) => {
+  const cached = stateCache.get(sessionId);
+  if (!cached) return;
+  const drop = new Set(ids);
+  const remaining = cached.queuedPrompts.filter((q) => !drop.has(q.id));
+  if (remaining.length === cached.queuedPrompts.length) return;
+  cacheSet(sessionId, { ...cached, queuedPrompts: remaining });
+});
 
 // Lightweight per-session subscription over `stateCache` so a component
 // that is NOT a child of <StructuredView> (the Background agents panel
@@ -1744,6 +1778,9 @@ export function useAcpSession(
         // (and drops the whole row on reload) so the quota invariant
         // holds. See #1833 / #1000.
         dispatch({ kind: "enqueue_prompt", text, attachments });
+        // A prompt parked in this page's lifetime is unambiguously still
+        // wanted, so let it drain even once this chat is unmounted. See #3331.
+        armForBackgroundDrain(sessionId);
         // The agent was busy, so this prompt is genuinely queued. Report it for
         // opt-in telemetry (queue depth lives only in client state, so the
         // daemon cannot observe queueing on its own).
@@ -1758,6 +1795,7 @@ export function useAcpSession(
       // AcpSessionAssigned brings the worker online. See #1748 / #1833.
       if (result === "retryable_failure" && state.workerIdleStopped) {
         dispatch({ kind: "enqueue_prompt", text, attachments });
+        armForBackgroundDrain(sessionId);
         // Same parked-prompt telemetry as the busy-agent path above: the
         // idle-dormant wake POST failed retryably, so this prompt is queued
         // too and the daemon cannot observe it on its own.
@@ -1780,15 +1818,18 @@ export function useAcpSession(
   // Drain effect: when the agent transitions to idle and the queue is
   // non-empty, join every queued entry with `\n\n` and fire one
   // prompt; the agent's single response covers the batch.
-  // Guarded by `drainingRef` so a re-render between the dequeue
-  // dispatch and the next state tick doesn't fire the same head twice.
+  // Guarded by the drain coordinator's per-session lock, which is
+  // module-scoped rather than instance-scoped so a re-render, a second
+  // hook for the same session (the headless background drainer handing
+  // off to the real view), or a second tab cannot fire the same head
+  // twice. See #1031 / #3331.
   // Skipped while a worker-stopped / restarting banner is showing; a
   // fresh `AcpSessionAssigned` (which clears both flags) re-runs this
   // effect and drains then. See #1031.
-  const drainingRef = useRef(false);
   useEffect(() => {
-    if (drainingRef.current) return;
-    if (!sessionIdRef.current) return;
+    const drainSessionId = sessionIdRef.current;
+    if (!drainSessionId) return;
+    if (isDraining(drainSessionId)) return;
     if (state.turnActive) return;
     if (state.workerStopped || state.workerRestarting) return;
     // Worker still mid-resume from a daemon cold start (or it never
@@ -1813,7 +1854,6 @@ export function useAcpSession(
     // so this effect re-runs on transition. See #1144.
     if (statusRef.current !== "open") return;
     if (state.queuedPrompts.length === 0) return;
-    drainingRef.current = true;
     // Slice the leading sub-batch out of the queue and POST only that.
     // The boundary is each clear-command alias (`/clear`, `/new`); when
     // the head is a clear alias it fires alone, otherwise the run of
@@ -1849,17 +1889,32 @@ export function useAcpSession(
     // below, same as any other rejected combined send. See #1833.
     const combinedAttachments = snapshot.flatMap((q) => q.attachments ?? []);
     const sentIds = snapshot.map((q) => q.id);
-    void dispatchPromptNow(combined, combinedAttachments.length > 0 ? combinedAttachments : undefined)
-      .then((result) => {
-        // Retire on success and on non-retryable rejection; only a
-        // transient failure keeps the batch queued for the next retry.
-        if (result !== "retryable_failure") {
-          dispatch({ kind: "dequeue_prompts_by_id", ids: sentIds });
-        }
-      })
-      .finally(() => {
-        drainingRef.current = false;
+    void withDrainLock(drainSessionId, async () => {
+      const result = await dispatchPromptNow(
+        combined,
+        combinedAttachments.length > 0 ? combinedAttachments : undefined,
+      );
+      // Retire on success and on non-retryable rejection; only a
+      // transient failure keeps the batch queued for the next retry.
+      // Routed through the coordinator rather than a bare dispatch so the
+      // retirement lands in the shared cache and reaches every live hook
+      // and every other tab, including when this instance unmounted while
+      // the POST was in flight. A transient failure deliberately stays
+      // silent: broadcasting it would re-run this effect immediately and
+      // turn the retry into a hot loop. See #3331.
+      if (result !== "retryable_failure") {
+        emitQueueRetired(drainSessionId, sentIds);
+      }
+    }).catch((e: unknown) => {
+      // `dispatchPromptNow` handles its own failures, so reaching here
+      // means the lock itself failed (`navigator.locks` rejecting the
+      // request). Surface it rather than leaving an unhandled rejection.
+      // The queue is untouched, so the next state change retries.
+      dispatch({
+        kind: "error",
+        message: `Could not send queued messages: ${describeError(e)}`,
       });
+    });
   }, [
     status,
     workerState,
@@ -1870,6 +1925,19 @@ export function useAcpSession(
     state.queuedPrompts,
     dispatchPromptNow,
   ]);
+
+  // Converge on a drain owned by another hook instance for this same
+  // session. The background drainer and the visible chat overlap for one
+  // commit when the user navigates in, and the drainer's POST can resolve
+  // on either side of that swap; whoever is mounted drops the delivered
+  // rows. Idempotent, so receiving a retirement for rows already gone is
+  // a no-op. See #3331.
+  useEffect(() => {
+    if (!sessionId) return;
+    return onQueueRetired(sessionId, (ids) => {
+      dispatch({ kind: "dequeue_prompts_by_id", ids });
+    });
+  }, [sessionId]);
 
   const removeQueuedPrompt = useCallback((id: string) => {
     dispatch({ kind: "dequeue_prompt", id });

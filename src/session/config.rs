@@ -118,6 +118,37 @@ pub struct AgentRuntimeConfig {
     /// defaults by event name when status hooks are installed.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub status_map: BTreeMap<String, crate::agents::HookStatus>,
+
+    /// Declarative pane status rules (`[[agents.<name>.status_rules]]`).
+    /// Gives an agent with no built-in pane detector, typically a
+    /// `[session.custom_agents]` harness that is not the same binary as any
+    /// built-in, basic status detection without a code change. Ordered,
+    /// first match wins, no match reports `idle`. Rules take precedence over
+    /// `agent_detect_as` and over a built-in detector of the same name.
+    /// Compiled into `tmux::status_rules` on config resolve.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub status_rules: Vec<StatusRule>,
+}
+
+/// One declarative pane status rule. `status` is required; exactly one of
+/// `contains` (case-insensitive substring) or `regex` (Rust regex syntax)
+/// must be set. Both are matched against the ANSI-stripped pane snapshot.
+/// A rule with neither, both, or an invalid regex is skipped with a warning
+/// at compile time (`tmux::status_rules::install_from_config`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StatusRule {
+    /// Status to report when the rule matches: `running`, `waiting`,
+    /// `idle`, or `error`.
+    pub status: crate::agents::HookStatus,
+
+    /// Case-insensitive substring to look for in the pane text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contains: Option<String>,
+
+    /// Regex (Rust `regex` crate syntax) matched against the pane text as
+    /// written; prefix with `(?i)` for case-insensitive matching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regex: Option<String>,
 }
 
 /// Configuration for one plugin: whether it is enabled, its install source and
@@ -684,13 +715,15 @@ pub enum GroupByMode {
     #[default]
     Manual,
     Project,
+    Org,
 }
 
 impl GroupByMode {
     pub fn cycle(self) -> Self {
         match self {
             GroupByMode::Manual => GroupByMode::Project,
-            GroupByMode::Project => GroupByMode::Manual,
+            GroupByMode::Project => GroupByMode::Org,
+            GroupByMode::Org => GroupByMode::Manual,
         }
     }
 
@@ -698,6 +731,7 @@ impl GroupByMode {
         match self {
             GroupByMode::Manual => "Manual",
             GroupByMode::Project => "Project",
+            GroupByMode::Org => "Org",
         }
     }
 }
@@ -806,6 +840,13 @@ pub struct AppStateConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub project_group_collapsed: Vec<String>,
 
+    /// Paths of org-mode sidebar folders the user has collapsed. Same shape
+    /// and rationale as `project_group_collapsed`: org headers are derived
+    /// from each session's resolved remote owner rather than a persisted
+    /// group record, so their collapse state has nowhere else to live.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub org_group_collapsed: Vec<String>,
+
     /// Ids of tips the user has already seen/acknowledged. Drives the unseen
     /// badge count and stops earned tips from re-popping. Ids come from
     /// [`crate::tips`] and are stable, so this list stays meaningful across
@@ -825,6 +866,16 @@ pub struct AppStateConfig {
     /// the count above crosses the threshold.
     #[serde(default)]
     pub used_new_from_selection: bool,
+
+    /// Set after six live agents have been observed for three consecutive
+    /// health samples, making the System Health discovery tip eligible.
+    #[serde(default)]
+    pub system_health_tip_earned: bool,
+
+    /// Set once the detailed System Health view has been opened. Users who
+    /// found it themselves do not need its earned discovery tip.
+    #[serde(default)]
+    pub used_system_health: bool,
 
     /// Server-side mirror of the web dashboard's syncable UI state, keyed by
     /// the frontend's localStorage key (the value is the opaque string the
@@ -856,6 +907,13 @@ pub struct SessionConfig {
     #[serde(default)]
     #[setting(label = "YOLO Mode Default", widget = "toggle")]
     pub yolo_mode_default: bool,
+
+    /// Show the compact system-health strip below the session list. It reports
+    /// CPU, memory pressure, and running agent and process counts. Off by
+    /// default; also toggleable from the command palette.
+    #[serde(default)]
+    #[setting(label = "Show system health strip", widget = "toggle")]
+    pub show_diagnostics_pane: bool,
 
     /// Forward AoE's whole environment to host sessions instead of just the
     /// desktop vars (DISPLAY, XDG_*, DBUS). Lets vars like GOPATH reach an
@@ -1513,6 +1571,7 @@ impl Default for SessionConfig {
         Self {
             default_tool: None,
             yolo_mode_default: false,
+            show_diagnostics_pane: false,
             inherit_host_environment: false,
             agent_extra_args: HashMap::new(),
             agent_command_override: HashMap::new(),
@@ -2424,12 +2483,11 @@ pub struct TmuxConfig {
     )]
     pub socket_name: Option<String>,
 
-    /// Render live views from a persistent VT channel (`tmux pipe-pane` into
-    /// an in-process terminal grid) instead of polling `capture-pane` and
-    /// forking `send-keys` per keystroke. Needs tmux 3.4+; panes that cannot
-    /// arm a channel fall back to the capture path automatically. Disable
-    /// only to troubleshoot the VT transport; the fallback is slower and
-    /// loses agent clipboard forwarding in live-send.
+    /// Render native agent and tool previews from a persistent VT channel
+    /// (`tmux pipe-pane` into an in-process terminal grid) instead of polling
+    /// `capture-pane` and forking `send-keys` per keystroke. Terminal previews,
+    /// including the web terminal, always use tmux's rendered capture and keep
+    /// OSC 52 forwarding through a raw observer.
     #[serde(default = "default_true")]
     #[setting(label = "VT Live Transport", widget = "toggle", advanced, global_only)]
     pub vt_live: bool,
@@ -3972,16 +4030,22 @@ mod tests {
         assert!(app.tips_seen.is_empty());
         assert_eq!(app.new_session_with_selection_count, 0);
         assert!(!app.used_new_from_selection);
+        assert!(!app.system_health_tip_earned);
+        assert!(!app.used_system_health);
 
         let toml = r#"
             tips_seen = ["new-from-selection"]
             new_session_with_selection_count = 4
             used_new_from_selection = true
+            system_health_tip_earned = true
+            used_system_health = true
         "#;
         let app: AppStateConfig = toml::from_str(toml).unwrap();
         assert_eq!(app.tips_seen, vec!["new-from-selection"]);
         assert_eq!(app.new_session_with_selection_count, 4);
         assert!(app.used_new_from_selection);
+        assert!(app.system_health_tip_earned);
+        assert!(app.used_system_health);
 
         // Round-trips back out.
         let serialized = toml::to_string(&app).unwrap();
@@ -4281,6 +4345,45 @@ mod tests {
         let toml = r#"
             [agents.claude.status_map]
             Stop = "stopped"
+        "#;
+
+        let err = toml::from_str::<Config>(toml).unwrap_err();
+        assert!(err.to_string().contains("stopped"));
+    }
+
+    #[test]
+    fn agent_status_rules_roundtrip() {
+        let toml = r#"
+            [[agents.gjc.status_rules]]
+            status = "running"
+            contains = "esc to interrupt"
+
+            [[agents.gjc.status_rules]]
+            status = "waiting"
+            regex = "\\(y/n\\)"
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        let rules = &config.agents["gjc"].status_rules;
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].status, crate::agents::HookStatus::Running);
+        assert_eq!(rules[0].contains.as_deref(), Some("esc to interrupt"));
+        assert!(rules[0].regex.is_none());
+        assert_eq!(rules[1].status, crate::agents::HookStatus::Waiting);
+        assert_eq!(rules[1].regex.as_deref(), Some(r"\(y/n\)"));
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        assert!(serialized.contains("[[agents.gjc.status_rules]]"));
+        let reparsed: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.agents["gjc"].status_rules, *rules);
+    }
+
+    #[test]
+    fn agent_status_rules_reject_invalid_status() {
+        let toml = r#"
+            [[agents.gjc.status_rules]]
+            status = "stopped"
+            contains = "x"
         "#;
 
         let err = toml::from_str::<Config>(toml).unwrap_err();

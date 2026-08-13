@@ -15,6 +15,12 @@ import { MULTI_REPO_GROUP_ID, SCRATCH_GROUP_ID } from "../hooks/useRepoGroups";
 // empty after trimming), so it can double as a localStorage collapse key.
 export const UNGROUPED_GROUP_ID = "__ungrouped__";
 
+// Synthetic id for the bucket that collects repos with no resolvable
+// owner on their `origin` remote (scratch sessions, local-only
+// repos, non-hosted remotes). Distinct from any real owner login, so it
+// can double as a localStorage collapse key. See #3283.
+export const NO_ORG_GROUP_ID = "__no_org__";
+
 // Which affordances a sidebar group header may show. The repo axis groups
 // own appearance (alias/color), manual drag-reorder, and create-in-repo;
 // the user-group axis owns none of these in v1, so they are gated here
@@ -42,7 +48,7 @@ export interface SidebarWorkspaceView {
 // a user group.
 export interface SidebarGroup {
   id: string;
-  kind: "repo" | "sessionGroup";
+  kind: "repo" | "sessionGroup" | "org";
   displayName: string;
   defaultDisplayName: string;
   alias: string | null;
@@ -310,4 +316,100 @@ export function nestedSidebarGroupHasLiveWorkspace(group: NestedSidebarGroup): b
 // its header must still render. See #2047.
 export function nestedSidebarGroupShouldRender(group: NestedSidebarGroup): boolean {
   return group.repo.pinnedEmpty || group.subgroups.some(sidebarGroupShouldRender);
+}
+
+// The org axis (#3283). Every repo belongs to exactly one bucket, keyed by
+// its remote owner (the org/user login parsed from `origin`, on any
+// hosted git remote, not just GitHub), so unlike the nested `repo+group`
+// axis this is a partition of the repo list rather than a further split
+// of each repo's workspaces. Repos with no resolvable owner (scratch
+// sessions, local-only repos, non-hosted remotes) collect into the
+// `NO_ORG_GROUP_ID` bucket, displayed as "No organization".
+export interface OrgNestedGroup {
+  org: SidebarGroup;
+  repos: SidebarGroup[];
+}
+
+// Build the org axis from the already-built repo-axis groups. A repo's
+// position within its org bucket, and every other repo-axis property
+// (appearance, synthetic Multi-repo / Scratch buckets, and the workspace
+// order itself), are inherited verbatim from the repo axis; only manual
+// drag reorder is dropped (the org axis has no manual order, like the
+// group and nested axes) and collapse is re-keyed per (org, repo) pair,
+// since a repo's collapse state on this axis is independent of its
+// collapse state on the flat repo axis. The org header's own `workspaces`
+// is the union of its repos' workspaces, so its status dot and attention
+// badge reflect the whole org.
+export function buildOrgGroups(
+  repoGroups: RepoGroup[],
+  opts: {
+    isOrgCollapsed: (orgId: string) => boolean;
+    isRepoCollapsed: (orgId: string, repoId: string) => boolean;
+  },
+): OrgNestedGroup[] {
+  const byOrg = new Map<string, RepoGroup[]>();
+  const order: string[] = [];
+
+  for (const repoGroup of repoGroups) {
+    const orgId = repoGroup.remoteOwnerKey ?? NO_ORG_GROUP_ID;
+    const bucket = byOrg.get(orgId);
+    if (bucket) {
+      bucket.push(repoGroup);
+    } else {
+      byOrg.set(orgId, [repoGroup]);
+      order.push(orgId);
+    }
+  }
+
+  const result: OrgNestedGroup[] = order.map((orgId) => {
+    const members = byOrg.get(orgId)!;
+    const repos = members.map((repoGroup) => {
+      const repo = repoGroupToSidebarGroup(repoGroup);
+      return {
+        ...repo,
+        collapsed: opts.isRepoCollapsed(orgId, repo.id),
+        capabilities: { ...repo.capabilities, reorder: false },
+      };
+    });
+    const workspaces = repos.flatMap((r) => r.workspaces);
+    const hasActive = repos.some((r) => r.status === "active");
+    // Every member shares the same key, and therefore the same bare owner
+    // by construction; `orgId` itself is the host-scoped key, never the
+    // display text, so the display name is always read off a member.
+    const displayName = orgId === NO_ORG_GROUP_ID ? "No organization" : (members[0]?.remoteOwner ?? orgId);
+    const org: SidebarGroup = {
+      id: orgId,
+      kind: "org",
+      displayName,
+      defaultDisplayName: displayName,
+      alias: null,
+      color: null,
+      remoteOwner: orgId === NO_ORG_GROUP_ID ? null : displayName,
+      workspaces,
+      status: hasActive ? "active" : "idle",
+      collapsed: opts.isOrgCollapsed(orgId),
+      capabilities: { appearance: false, reorder: false, create: "generic" },
+      registeredProjects: [],
+      pinned: false,
+      pinnedEmpty: false,
+    };
+    return { org, repos };
+  });
+
+  result.sort((a, b) => {
+    if (a.org.id === NO_ORG_GROUP_ID) return 1;
+    if (b.org.id === NO_ORG_GROUP_ID) return -1;
+    return a.org.displayName.localeCompare(b.org.displayName);
+  });
+
+  return result;
+}
+
+// Org-axis equivalent of `nestedSidebarGroupShouldRender`: a pinned-but-
+// empty repo has no live workspace but must still render its own header
+// (mirrored by `sidebarGroupShouldRender` per repo), so this is a straight
+// OR across repos rather than a separate pinned check at the org level
+// (the org header itself is never pinned).
+export function orgNestedGroupShouldRender(group: OrgNestedGroup): boolean {
+  return group.repos.some(sidebarGroupShouldRender);
 }

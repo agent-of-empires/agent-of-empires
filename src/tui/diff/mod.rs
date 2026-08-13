@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use crate::file_watch::FileWatchService;
 use crate::git::diff::{
-    check_merge_base_status, compute_changed_files, compute_file_diff, get_default_base_ref,
-    list_branches, DiffFile, FileDiff,
+    check_merge_base_status, compute_changed_files, compute_file_contents, compute_file_diff,
+    get_default_base_ref, list_branches, DiffFile, FileContents, FileDiff, FileStatus,
 };
 use crate::session::config::{update_app_state, update_config};
 use crate::session::{load_profile_config, resolve_config_or_warn, save_profile_config, Config};
@@ -51,6 +51,12 @@ pub struct DiffView {
 
     /// Cached file diffs
     pub(crate) diff_cache: HashMap<PathBuf, FileDiff>,
+
+    /// Cached old/new file bodies used by rendered Markdown mode.
+    pub(crate) file_contents_cache: HashMap<PathBuf, FileContents>,
+
+    /// Show Markdown files as rendered prose instead of their raw diff.
+    pub(crate) markdown_rendered: bool,
 
     /// Scroll offset for the diff content
     pub(crate) scroll_offset: u16,
@@ -171,6 +177,8 @@ impl DiffView {
             files: Vec::new(),
             selected_file: 0,
             diff_cache: HashMap::new(),
+            file_contents_cache: HashMap::new(),
+            markdown_rendered: true,
             scroll_offset: 0,
             visible_lines: 20,
             total_lines: 0,
@@ -196,6 +204,7 @@ impl DiffView {
     pub fn refresh_files(&mut self) -> anyhow::Result<()> {
         self.files = compute_changed_files(&self.repo_path, &self.base_branch)?;
         self.diff_cache.clear();
+        self.file_contents_cache.clear();
         if self.selected_file >= self.files.len() {
             self.selected_file = self.files.len().saturating_sub(1);
         }
@@ -253,6 +262,73 @@ impl DiffView {
         }
 
         self.diff_cache.get(&path)
+    }
+
+    /// Get or compute the old/new bodies for the selected Markdown file.
+    pub fn get_current_file_contents(&mut self) -> Option<&FileContents> {
+        let file = self.files.get(self.selected_file)?;
+        if !Self::is_markdown_path(&file.path) {
+            return None;
+        }
+        let path = file.path.clone();
+
+        if !self.file_contents_cache.contains_key(&path) {
+            match compute_file_contents(&self.repo_path, &path, &self.base_branch) {
+                Ok(contents) => {
+                    self.file_contents_cache.insert(path.clone(), contents);
+                }
+                Err(e) => {
+                    self.error_message = Some(format!("Failed to read file contents: {e}"));
+                    return None;
+                }
+            }
+        }
+
+        self.file_contents_cache.get(&path)
+    }
+
+    pub(crate) fn selected_file_is_markdown(&self) -> bool {
+        self.selected_file()
+            .is_some_and(|file| Self::is_markdown_path(&file.path))
+    }
+
+    pub(crate) fn markdown_available(&self) -> bool {
+        let Some(file) = self.selected_file() else {
+            return false;
+        };
+        Self::is_markdown_path(&file.path)
+            && self
+                .file_contents_cache
+                .get(&file.path)
+                .is_some_and(|contents| !contents.is_binary)
+    }
+
+    pub(crate) fn current_markdown_source(&self) -> Option<&str> {
+        if !self.markdown_rendered || !self.markdown_available() {
+            return None;
+        }
+        let file = self.selected_file()?;
+        let contents = self.file_contents_cache.get(&file.path)?;
+        Some(if contents.status == FileStatus::Deleted {
+            contents.old_content.as_str()
+        } else {
+            contents.new_content.as_str()
+        })
+    }
+
+    pub(crate) fn toggle_markdown_rendering(&mut self) {
+        if self.markdown_available() {
+            self.markdown_rendered = !self.markdown_rendered;
+            self.scroll_offset = 0;
+        }
+    }
+
+    fn is_markdown_path(path: &std::path::Path) -> bool {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| {
+                extension.eq_ignore_ascii_case("md") || extension.eq_ignore_ascii_case("markdown")
+            })
     }
 
     /// Open the branch selection dialog
@@ -450,6 +526,8 @@ impl DiffView {
             files: Vec::new(),
             selected_file: 0,
             diff_cache: HashMap::new(),
+            file_contents_cache: HashMap::new(),
+            markdown_rendered: true,
             scroll_offset: 0,
             visible_lines: 20,
             total_lines: 0,

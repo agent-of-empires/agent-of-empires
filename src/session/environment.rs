@@ -7,108 +7,6 @@ use super::config::SandboxConfig;
 use super::instance::SandboxInfo;
 use crate::containers::container_interface::EnvEntry;
 
-/// Keys whose values are safe to show in logs (not secrets).
-const SAFE_ENV_KEYS: &[&str] = &[
-    "TERM",
-    "COLORTERM",
-    "FORCE_COLOR",
-    "NO_COLOR",
-    "GIT_CONFIG_GLOBAL",
-    "CLAUDE_CONFIG_DIR",
-    "AOE_INSTANCE_ID",
-];
-
-/// Redact secret values from a command string for safe logging.
-/// Replaces `-e KEY='value'` and `-e KEY=value` patterns with `-e KEY=<redacted>`,
-/// and `export KEY='value'` patterns with `export KEY=<redacted>`,
-/// except for known-safe keys (TERM, COLORTERM, GIT_CONFIG_GLOBAL, etc.).
-pub(crate) fn redact_env_values(cmd: &str) -> String {
-    let result = redact_docker_env_flags(cmd);
-    redact_export_statements(&result)
-}
-
-/// Redact `-e KEY=VALUE` patterns in a command string.
-fn redact_docker_env_flags(cmd: &str) -> String {
-    let mut result = String::with_capacity(cmd.len());
-    let mut remaining = cmd;
-
-    while let Some(pos) = remaining.find("-e ") {
-        result.push_str(&remaining[..pos]);
-        remaining = &remaining[pos + 3..]; // skip past "-e "
-
-        // Find the KEY before '='
-        let eq_pos = remaining.find('=');
-        // Find the boundary of this env arg: next " -e " or end of string
-        let next_env = remaining.find(" -e ").unwrap_or(remaining.len());
-
-        if let Some(eq_pos) = eq_pos {
-            // Only treat as KEY=VALUE if '=' comes before the next '-e' boundary
-            if eq_pos < next_env {
-                let key = &remaining[..eq_pos];
-                if key.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                    if SAFE_ENV_KEYS.contains(&key) {
-                        result.push_str("-e ");
-                        result.push_str(&remaining[..next_env]);
-                    } else {
-                        result.push_str("-e ");
-                        result.push_str(key);
-                        result.push_str("=<redacted>");
-                    }
-                    remaining = &remaining[next_env..];
-                    continue;
-                }
-            }
-        }
-
-        // No '=' found or not a valid key; pass through as-is (e.g., `-e KEY` inherit form)
-        result.push_str("-e ");
-        result.push_str(&remaining[..next_env]);
-        remaining = &remaining[next_env..];
-    }
-    result.push_str(remaining);
-    result
-}
-
-/// Redact `export KEY='value'` and `export KEY=value` patterns in a command string.
-fn redact_export_statements(cmd: &str) -> String {
-    let mut result = String::with_capacity(cmd.len());
-    let mut remaining = cmd;
-
-    while let Some(pos) = remaining.find("export ") {
-        result.push_str(&remaining[..pos]);
-        remaining = &remaining[pos + 7..]; // skip past "export "
-
-        // Find the boundary: next "; " or end of string
-        let boundary = remaining.find("; ").unwrap_or(remaining.len());
-
-        let eq_pos = remaining.find('=');
-        if let Some(eq_pos) = eq_pos {
-            if eq_pos < boundary {
-                let key = &remaining[..eq_pos];
-                if key.chars().all(|c| c.is_alphanumeric() || c == '_') {
-                    if SAFE_ENV_KEYS.contains(&key) {
-                        result.push_str("export ");
-                        result.push_str(&remaining[..boundary]);
-                    } else {
-                        result.push_str("export ");
-                        result.push_str(key);
-                        result.push_str("=<redacted>");
-                    }
-                    remaining = &remaining[boundary..];
-                    continue;
-                }
-            }
-        }
-
-        // No '=' or not a valid key; pass through
-        result.push_str("export ");
-        result.push_str(&remaining[..boundary]);
-        remaining = &remaining[boundary..];
-    }
-    result.push_str(remaining);
-    result
-}
-
 /// Terminal environment variables that are always passed through for proper UI/theming
 pub(crate) const DEFAULT_TERMINAL_ENV_VARS: &[&str] =
     &["TERM", "COLORTERM", "FORCE_COLOR", "NO_COLOR"];
@@ -306,70 +204,18 @@ pub(crate) fn user_posix_shell() -> String {
 ///
 /// Uses single-quote escaping: inside single quotes ALL characters are literal
 /// except `'` itself, which is escaped via the POSIX `'\''` technique. This is
-/// the most robust approach -- it prevents expansion of `$`, `` ` ``, `\`, `!`,
+/// the most robust approach; it prevents expansion of `$`, `` ` ``, `\`, `!`,
 /// and every other shell metacharacter in one shot.
 ///
-/// Newlines and carriage returns are replaced with literal `\n` / `\r` text to
-/// keep the command on a single line (required for tmux session commands).
+/// Newlines and carriage returns are replaced with the literal two-byte
+/// sequences `\n` / `\r` to keep the command on a single line (required for
+/// tmux session commands). This is a fail-closed sanitization of those two
+/// bytes, not a verbatim round-trip: a value carrying a real newline is
+/// altered rather than allowed to split the command.
 pub(crate) fn shell_escape(val: &str) -> String {
     let val = val.replace('\n', "\\n").replace('\r', "\\r");
     let escaped = val.replace('\'', "'\\''");
     format!("'{}'", escaped)
-}
-
-/// Build a shell-ready `KEY='value' KEY2='value2' ` prefix from a list of
-/// environment entries, suitable for prepending to a host command line.
-///
-/// Entry grammar (identical to `sandbox.environment`):
-/// - `KEY=value`: literal value, passed through verbatim.
-/// - `KEY=$VAR`: read VAR from the host env at spawn time (skipped with a
-///   warning if VAR is not set).
-/// - `KEY=$$literal`: escape; emits `KEY='$literal'`.
-/// - bare `KEY`: passthrough from the host env (skipped with a warning if
-///   the var is not set).
-///
-/// Values are passed through `shell_escape` so spaces, quotes, and shell
-/// metacharacters are preserved literally. Returns an empty string when
-/// the entry list is empty so callers can format unconditionally.
-///
-/// Keys are not escapable here (a shell assignment needs a bare name on the
-/// left), so an entry whose key is not a valid environment variable name is
-/// skipped with a warning rather than concatenated into the command line. The
-/// structured-view sibling [`resolve_host_environment_pairs`] applies the same
-/// rule, so both views drop the same entries.
-pub(crate) fn host_environment_prefix(entries: &[String]) -> String {
-    let mut out = String::new();
-    for entry in entries {
-        let key = entry.split_once('=').map(|(key, _)| key).unwrap_or(entry);
-        if !is_valid_env_key(key) {
-            tracing::warn!(target: "session.create", "invalid host environment key '{}'; skipping", key);
-            continue;
-        }
-        if let Some((key, value)) = entry.split_once('=') {
-            let resolved = if let Some(rest) = value.strip_prefix("$$") {
-                Some(format!("${}", rest))
-            } else if value.starts_with('$') {
-                match resolve_env_value(value) {
-                    Some(v) => Some(v),
-                    None => continue,
-                }
-            } else {
-                Some(value.to_string())
-            };
-            if let Some(v) = resolved {
-                out.push_str(&format!("{}={} ", key, shell_escape(&v)));
-            }
-        } else {
-            // Bare key: passthrough from host env.
-            match std::env::var(entry) {
-                Ok(v) => out.push_str(&format!("{}={} ", entry, shell_escape(&v))),
-                Err(_) => {
-                    tracing::warn!(target: "session.create", "host environment variable {} is not set; skipping", entry)
-                }
-            }
-        }
-    }
-    out
 }
 
 /// Resolve a session's sandbox environment entries to concrete `(KEY, VALUE)`
@@ -441,8 +287,7 @@ fn host_hook_entries(extra: &[String], trusted: &[String], repo_aware: &[String]
 ///
 /// Duplicate keys resolve FIRST-wins here. The agent-side sibling,
 /// `resolve_host_environment_pairs`, is deliberately LAST-wins to match the
-/// terminal-view shell-assignment prefix; keep the two distinct so a future
-/// edit does not copy one precedence rule onto the other.
+/// host pane's sourced export order; keep the two distinct.
 fn resolve_hook_env_pairs(entries: &[String]) -> Vec<(String, String)> {
     let mut seen = std::collections::HashSet::new();
     let mut pairs = Vec::new();
@@ -466,16 +311,9 @@ fn resolve_hook_env_pairs(entries: &[String]) -> Vec<(String, String)> {
     pairs
 }
 
-/// Drop every `environment` entry whose key was minted by
-/// `host_hooks.before_session`, so the minted value is the only source for that
-/// key on a host launch.
-///
-/// Exists because the two channels have different binding strength in the
-/// terminal view: the static list becomes a `KEY='v' ` shell-assignment prefix
-/// on the pane command, which overrides whatever the pane inherited, while a
-/// minted value arrives via `tmux new-session -e` (deliberately, so a secret
-/// stays out of argv). Without this filter the stale config entry would win and
-/// `before_session` would look like it silently did nothing.
+/// Drop every static `environment` entry whose key was minted by
+/// `host_hooks.before_session`, so OMP pre-launch routing resolves the same
+/// minted-wins environment that the pane later loads from its protected file.
 ///
 /// Entry keys are read with the same grammar the resolvers use: the part before
 /// the first `=`, or the whole entry for a bare passthrough key.
@@ -535,26 +373,21 @@ pub(crate) fn resolve_host_environment_value(
 }
 
 /// Resolve trusted global/profile `environment` entries for a host-side agent
-/// process. Uses the same grammar as [`host_environment_prefix`], but returns
-/// concrete pairs for `Command::env`. Later entries replace earlier entries,
-/// matching the shell assignment behavior used by terminal sessions.
+/// process. Returns concrete pairs for non-argv environment transport. Later
+/// entries replace earlier entries, matching historical assignment behavior.
 ///
 /// Repo configuration cannot contribute to `Config.environment`
 /// (`REPO_OVERRIDABLE_SECTIONS` in `repo_config` excludes it); callers must
 /// still keep these pairs out of sandboxed agents, whose environment is
 /// controlled by `sandbox.environment` instead.
-///
-/// Serve-gated to match its only consumer, the structured-view supervisor.
-#[cfg(feature = "serve")]
 pub(crate) fn resolve_host_environment_pairs(entries: &[String]) -> Vec<(String, String)> {
     let mut pairs: Vec<(String, String)> = Vec::new();
     for entry in entries {
         let (key, value) = match entry.split_once('=') {
             Some((key, value)) => (key.to_string(), resolve_env_value(value)),
             None => {
-                // Bare key: passthrough from host env. Warn when it is unset, so a bare key that
-                // silently does not forward leaves the same breadcrumb here as it does on the
-                // terminal path in `host_environment_prefix`.
+                // Bare key passthrough: unset values leave the same warning
+                // breadcrumb on every launch surface.
                 let resolved = std::env::var(entry);
                 if resolved.is_err() {
                     tracing::warn!(
@@ -634,9 +467,8 @@ where
         .collect()
 }
 
-/// Validate an env entry string and return a warning message when its key is
-/// not a valid environment variable name (the entry is dropped at collection
-/// time) or when it references a host variable that doesn't exist.
+/// Validate an env entry string and return a warning message if it references
+/// a host variable that doesn't exist.
 ///
 /// Entry formats:
 /// - `KEY` (bare): pass through from host
@@ -683,16 +515,12 @@ pub fn validate_env_entry(entry: &str) -> Option<String> {
     }
 }
 
-/// Collect all environment entries from defaults, global config, and per-session extras.
+/// Collect all environment entries from defaults, global config, and
+/// per-session extras.
 ///
-/// Each entry is either:
-/// - `KEY` (no `=`) -- pass through from host (inherited, not in argv)
-/// - `KEY=$VAR` -- read from host env (inherited, not in argv)
-/// - `KEY=literal` -- literal value (appears in argv, safe for non-secrets)
-///
-/// Returns `EnvEntry` values that distinguish inherited-from-host entries
-/// (which use Docker `-e KEY` to avoid leaking secrets in argv/ps) from
-/// literal entries (which use `-e KEY=VALUE`).
+/// `EnvEntry` retains whether a value was inherited or configured literally
+/// for container-creation semantics. The tmux/docker-exec path treats both as
+/// potentially secret and transports every concrete value out of argv.
 ///
 /// Deduplicates by key (first wins).
 pub(crate) fn collect_environment(
@@ -848,48 +676,76 @@ pub(crate) fn resolved_sandbox_config(
     super::repo_config::resolve_config_with_repo_or_warn(&resolved, project_path).sandbox
 }
 
-/// Result of building docker exec environment arguments.
+/// Resolve the complete environment inherited by an in-container agent.
 ///
-/// Separates secret (inherited from host) env vars from literal (non-secret) ones.
-/// Secret values are prepended to the tmux session command as `export` shell
-/// builtins, followed by `exec` to replace the outer shell process. This keeps
-/// secret values out of every long-lived process's argv/ps output. The docker
-/// exec command then uses `-e KEY` (key only, no value) to inherit the exported
-/// variable from the shell environment.
-pub(crate) struct DockerExecEnv {
-    /// Docker `-e` flags for the exec command line.
-    /// Inherit entries use `-e KEY` (key only); Literal entries use `-e KEY=VALUE`.
-    pub docker_args: String,
-    /// Shell export statements for Inherit (secret) entries.
-    /// Each entry is a complete `export KEY='escaped_value'` command ready
-    /// to be prepended to the tmux session command.
-    pub exports: Vec<String>,
+/// Capture resolution needs this transiently because Bun dotenv values may
+/// expand arbitrary launcher variables into one of OMP's routing keys. Callers
+/// must discard unrelated values after resolution.
+pub(crate) fn resolved_sandbox_environment(
+    profile: &str,
+    sandbox: &SandboxInfo,
+    project_path: &std::path::Path,
+) -> Vec<(String, String)> {
+    let sandbox_config = resolved_sandbox_config(profile, project_path);
+    collect_environment(&sandbox_config, sandbox)
+        .into_iter()
+        .map(|entry| (entry.key().to_string(), entry.value().to_string()))
+        .collect()
 }
 
-/// Build docker exec environment flags from config and optional per-session extra entries.
-/// Used for `docker exec` commands run inside tmux sessions.
+/// Environment transport for a sandboxed `docker exec` pane.
 ///
-/// Returns a [`DockerExecEnv`] that separates secret values (prepended as
-/// `export` statements to the tmux session command) from literal values
-/// (which are safe to include in the command line).
-///
-/// The `docker run` path (container creation) is protected separately via
-/// `Command::env()` in `run_create`, which keeps secrets out of argv entirely.
+/// Target values are written to a protected env-file opened by the pane
+/// wrapper. They must never become environment variables of the host shell or
+/// container runtime process: repo configuration can set host-active keys such
+/// as `PATH`, `HOME`, or `DOCKER_HOST`.
+pub(crate) struct DockerExecEnv {
+    /// Runtime arguments naming the inherited env-file descriptor.
+    pub docker_args: String,
+    /// Concrete target-container values for the protected env-file.
+    pub env: Vec<(String, String)>,
+}
+
+pub(crate) const CONTAINER_EXEC_ENV_FD: u8 = 9;
+pub(crate) const CONTAINER_EXEC_ENV_PATH: &str = "/dev/fd/9";
+
+/// Build docker exec environment transport from config and optional
+/// per-session extra entries.
+#[cfg(test)]
 pub(crate) fn build_docker_env_args(
     profile: &str,
     sandbox: &SandboxInfo,
     project_path: &std::path::Path,
 ) -> DockerExecEnv {
+    build_docker_env_args_with_managed_codex_home(profile, sandbox, project_path, None)
+}
+
+/// Build docker exec environment flags and add AoE's managed Codex home when
+/// the session does not explicitly configure `CODEX_HOME`.
+pub(crate) fn build_docker_env_args_with_managed_codex_home(
+    profile: &str,
+    sandbox: &SandboxInfo,
+    project_path: &std::path::Path,
+    managed_codex_home: Option<&str>,
+) -> DockerExecEnv {
     let sandbox_config = resolved_sandbox_config(profile, project_path);
 
     tracing::debug!(target: "session.create",
-        "build_docker_env_args: profile={:?}, config.sandbox.environment={:?}, extra_env={:?}",
+        "build_docker_env_args: profile={:?}, configured_entries={}, extra_entries={}",
         profile,
-        sandbox_config.environment,
-        sandbox.extra_env
+        sandbox_config.environment.len(),
+        sandbox.extra_env.as_ref().map_or(0, Vec::len)
     );
 
-    let env_entries = collect_environment(&sandbox_config, sandbox);
+    let mut env_entries = collect_environment(&sandbox_config, sandbox);
+    if let Some(codex_home) = managed_codex_home {
+        if !env_entries.iter().any(|entry| entry.key() == "CODEX_HOME") {
+            env_entries.push(EnvEntry::Literal {
+                key: "CODEX_HOME".to_string(),
+                value: codex_home.to_string(),
+            });
+        }
+    }
 
     tracing::debug!(target: "session.create",
         "build_docker_env_args: resolved {} env entries",
@@ -899,27 +755,17 @@ pub(crate) fn build_docker_env_args(
         tracing::debug!(target: "session.create", "  env: {}=<set>", entry.key());
     }
 
-    let mut docker_flag_parts: Vec<String> = Vec::new();
-    let mut exports: Vec<String> = Vec::new();
+    let env = env_entries
+        .iter()
+        .map(|entry| (entry.key().to_string(), entry.value().to_string()))
+        .collect::<Vec<_>>();
+    let docker_args = if env.is_empty() {
+        String::new()
+    } else {
+        format!("--env-file {CONTAINER_EXEC_ENV_PATH}")
+    };
 
-    for entry in &env_entries {
-        match entry {
-            EnvEntry::Inherit { key, value } => {
-                // Key only in docker args; value injected via shell export
-                docker_flag_parts.push(format!("-e {}", key));
-                exports.push(format!("export {}={}", key, shell_escape(value)));
-            }
-            EnvEntry::Literal { key, value } => {
-                // Non-secret literal values are safe in argv
-                docker_flag_parts.push(format!("-e {}={}", key, shell_escape(value)));
-            }
-        }
-    }
-
-    DockerExecEnv {
-        docker_args: docker_flag_parts.join(" "),
-        exports,
-    }
+    DockerExecEnv { docker_args, env }
 }
 
 #[cfg(test)]
@@ -1160,62 +1006,36 @@ environment = ["GH_TOKEN=write_token"]
         let project_path = temp_home.path().join("nonexistent_project");
 
         let result_personal = build_docker_env_args("personal", &sandbox, &project_path);
+        assert_eq!(result_personal.docker_args, "--env-file /dev/fd/9");
         assert!(
-            result_personal
-                .docker_args
-                .contains("GH_TOKEN='write_token'"),
-            "passing profile=\"personal\" should resolve personal profile's env, got: {}",
+            !result_personal.docker_args.contains("write_token"),
+            "configured values must stay out of docker argv: {}",
             result_personal.docker_args,
+        );
+        assert!(result_personal
+            .env
+            .contains(&("GH_TOKEN".to_string(), "write_token".to_string())));
+        assert!(
+            resolved_sandbox_environment("personal", &sandbox, &project_path)
+                .contains(&("GH_TOKEN".to_string(), "write_token".to_string())),
+            "capture metadata must see the exact exec-only sandbox value"
         );
 
         let result_default = build_docker_env_args("default", &sandbox, &project_path);
-        assert!(
-            result_default
-                .docker_args
-                .contains("GH_TOKEN='read_only_token'"),
-            "passing profile=\"default\" should resolve default profile's env, got: {}",
-            result_default.docker_args,
-        );
+        assert_eq!(result_default.docker_args, "--env-file /dev/fd/9");
+        assert!(!result_default.docker_args.contains("read_only_token"));
+        assert!(result_default
+            .env
+            .contains(&("GH_TOKEN".to_string(), "read_only_token".to_string())));
 
         // Empty profile must fall back to the user's globally configured default,
         // preserving prior behavior for callers without a profile in hand.
         let result_empty = build_docker_env_args("", &sandbox, &project_path);
-        assert!(
-            result_empty
-                .docker_args
-                .contains("GH_TOKEN='read_only_token'"),
-            "empty profile must fall back to global default, got: {}",
-            result_empty.docker_args,
-        );
-    }
-
-    #[test]
-    fn test_redact_env_values_docker_flags() {
-        let cmd = "docker exec -e GH_TOKEN='secret' -e TERM=xterm container claude";
-        let redacted = redact_env_values(cmd);
-        assert!(redacted.contains("GH_TOKEN=<redacted>"));
-        assert!(redacted.contains("TERM=xterm")); // safe key, not redacted
-        assert!(!redacted.contains("secret"));
-    }
-
-    #[test]
-    fn test_redact_env_values_export_statements() {
-        let cmd = "export GH_TOKEN='secret123'; export TERM='xterm'; exec docker exec -e GH_TOKEN container claude";
-        let redacted = redact_env_values(cmd);
-        assert!(redacted.contains("export GH_TOKEN=<redacted>"));
-        assert!(redacted.contains("export TERM='xterm'")); // safe key, not redacted
-        assert!(!redacted.contains("secret123"));
-    }
-
-    #[test]
-    fn test_redact_env_values_mixed_exports_and_flags() {
-        let cmd = "export API_KEY='sk-abc'; exec bash -lc 'exec env docker exec -e API_KEY -e FOO='bar' container claude'";
-        let redacted = redact_env_values(cmd);
-        assert!(redacted.contains("export API_KEY=<redacted>"));
-        assert!(!redacted.contains("sk-abc"));
-        // -e API_KEY (key only, no value) should pass through unchanged
-        assert!(redacted.contains("-e API_KEY"));
-        assert!(redacted.contains("FOO=<redacted>"));
+        assert_eq!(result_empty.docker_args, "--env-file /dev/fd/9");
+        assert!(!result_empty.docker_args.contains("read_only_token"));
+        assert!(result_empty
+            .env
+            .contains(&("GH_TOKEN".to_string(), "read_only_token".to_string())));
     }
 
     #[test]
@@ -1263,62 +1083,6 @@ environment = ["GH_TOKEN=write_token"]
     }
 
     #[test]
-    fn test_host_environment_prefix_literal_forms() {
-        // Cases that depend only on the entry string, not on host env. The
-        // `$VAR`-reading and bare-key forms need process env and live in the
-        // serial tests below.
-        let cases: &[(&[&str], &str)] = &[
-            (&["FOO=bar"], "FOO='bar' "),
-            (&[], ""),
-            // No path-aware magic: `~` is passed through verbatim, matching
-            // sandbox.environment behavior. Users who want home-relative paths
-            // should either use absolute paths or pass `$HOME` (bare key) and
-            // resolve in their agent invocation.
-            (&["DIR=~/sub"], "DIR='~/sub' "),
-            // `$$literal` emits a literal `$literal`.
-            (&["MARKER=$$KEEP"], "MARKER='$KEEP' "),
-            // Single-quote wrapping with `'\''` escape for the apostrophe.
-            (&["X=a b'c$d"], "X='a b'\\''c$d' "),
-            // A key is a bare shell name here and cannot be quoted, so an
-            // invalid one is dropped instead of concatenated into the command.
-            (&["FOO; touch /tmp/pwn; X=1", "GOOD=ok"], "GOOD='ok' "),
-        ];
-        for (entries, expected) in cases {
-            let owned: Vec<String> = entries.iter().map(|s| s.to_string()).collect();
-            assert_eq!(host_environment_prefix(&owned), *expected, "{entries:?}");
-        }
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_host_environment_prefix_dollar_var_reads_host_env() {
-        std::env::set_var("AOE_TEST_HOST_ENV_PREFIX", "from-host");
-        let prefix = host_environment_prefix(&["FORWARDED=$AOE_TEST_HOST_ENV_PREFIX".to_string()]);
-        std::env::remove_var("AOE_TEST_HOST_ENV_PREFIX");
-        assert_eq!(prefix, "FORWARDED='from-host' ");
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_host_environment_prefix_dollar_var_missing_is_skipped() {
-        std::env::remove_var("AOE_TEST_DEFINITELY_NOT_SET");
-        let prefix = host_environment_prefix(&[
-            "MISSING=$AOE_TEST_DEFINITELY_NOT_SET".to_string(),
-            "PRESENT=ok".to_string(),
-        ]);
-        assert_eq!(prefix, "PRESENT='ok' ");
-    }
-
-    #[test]
-    #[serial_test::serial]
-    fn test_host_environment_prefix_bare_key_passthrough() {
-        std::env::set_var("AOE_TEST_BARE_PASSTHROUGH", "v");
-        let prefix = host_environment_prefix(&["AOE_TEST_BARE_PASSTHROUGH".to_string()]);
-        std::env::remove_var("AOE_TEST_BARE_PASSTHROUGH");
-        assert_eq!(prefix, "AOE_TEST_BARE_PASSTHROUGH='v' ");
-    }
-
-    #[test]
     #[serial_test::serial]
     fn test_resolve_host_environment_value_uses_last_resolved_entry() {
         std::env::remove_var("AOE_TEST_MISSING_HOST_ENV_VALUE");
@@ -1349,10 +1113,8 @@ environment = ["GH_TOKEN=write_token"]
         std::env::remove_var("AOE_TEST_CODEX_HOME_REF");
     }
 
-    /// The pair resolver must speak the same entry grammar the terminal-view
-    /// prefix does, so a `Config.environment` list means the same thing to a
-    /// structured worker as it does to a tmux pane.
-    #[cfg(feature = "serve")]
+    /// The pair resolver must speak the same entry grammar as configured host
+    /// environment transport.
     #[test]
     #[serial_test::serial]
     fn test_resolve_host_environment_pairs_matches_prefix_grammar() {
@@ -1383,11 +1145,8 @@ environment = ["GH_TOKEN=write_token"]
         std::env::remove_var("AOE_TEST_HOST_PAIRS_BARE");
     }
 
-    /// Duplicate keys resolve LAST-wins, matching the shell assignment order
-    /// `host_environment_prefix` emits (and `resolve_host_environment_value`),
-    /// not the first-wins rule the container path uses. An entry whose host
-    /// reference is unset does not clobber an earlier resolved value.
-    #[cfg(feature = "serve")]
+    /// Duplicate keys resolve LAST-wins. An entry whose host reference is unset
+    /// does not clobber an earlier resolved value.
     #[test]
     #[serial_test::serial]
     fn test_resolve_host_environment_pairs_last_entry_wins() {
@@ -1466,50 +1225,6 @@ environment = ["GH_TOKEN=write_token"]
     /// Helper to find an entry by key and check its value
     fn find_entry<'a>(entries: &'a [EnvEntry], key: &str) -> Option<&'a EnvEntry> {
         entries.iter().find(|e| e.key() == key)
-    }
-
-    #[test]
-    fn test_collect_environment_rejects_invalid_config_extra_and_hook_keys() {
-        let config = SandboxConfig {
-            environment: vec![
-                "CFG; touch /tmp/cfg_injected; #=secret".to_string(),
-                "VALID_CONFIG=ok".to_string(),
-            ],
-            ..Default::default()
-        };
-        let base = SandboxInfo {
-            enabled: true,
-            container_id: None,
-            image: "test".to_string(),
-            container_name: "test".to_string(),
-            extra_env: None,
-            custom_instruction: None,
-            before_start_env: vec![
-                (
-                    "HOOK$(touch /tmp/hook_injected)".to_string(),
-                    "secret".to_string(),
-                ),
-                ("VALID_HOOK".to_string(), "minted".to_string()),
-            ],
-            container_workdir: None,
-        };
-        let configured = collect_environment(&config, &base);
-        assert!(find_entry(&configured, "VALID_CONFIG").is_some());
-        assert!(find_entry(&configured, "VALID_HOOK").is_some());
-        assert!(!configured
-            .iter()
-            .any(|entry| { entry.key().contains("touch") || entry.key().contains(';') }));
-
-        let mut extra = base;
-        extra.extra_env = Some(vec![
-            "EXTRA`touch /tmp/extra_injected`=secret".to_string(),
-            "VALID_EXTRA=ok".to_string(),
-        ]);
-        let resolved_extra = collect_environment(&config, &extra);
-        assert!(find_entry(&resolved_extra, "VALID_EXTRA").is_some());
-        assert!(!resolved_extra
-            .iter()
-            .any(|entry| { entry.key().contains("touch") || entry.key().contains('`') }));
     }
 
     #[test]
@@ -1660,6 +1375,50 @@ environment = ["GH_TOKEN=write_token"]
             matches!(entries[0], EnvEntry::Inherit { .. }),
             "before_start values must be Inherit (leak-safe), not Literal"
         );
+    }
+
+    #[test]
+    fn test_collect_environment_rejects_invalid_config_extra_and_hook_keys() {
+        let config = SandboxConfig {
+            environment: vec![
+                "CFG; touch /tmp/cfg_injected; #=secret".to_string(),
+                "VALID_CONFIG=ok".to_string(),
+            ],
+            ..Default::default()
+        };
+        let base = SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test".to_string(),
+            container_name: "test".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: vec![
+                (
+                    "HOOK$(touch /tmp/hook_injected)".to_string(),
+                    "secret".to_string(),
+                ),
+                ("VALID_HOOK".to_string(), "minted".to_string()),
+            ],
+            container_workdir: None,
+        };
+        let configured = collect_environment(&config, &base);
+        assert!(find_entry(&configured, "VALID_CONFIG").is_some());
+        assert!(find_entry(&configured, "VALID_HOOK").is_some());
+        assert!(!configured
+            .iter()
+            .any(|entry| { entry.key().contains("touch") || entry.key().contains(';') }));
+
+        let mut extra = base;
+        extra.extra_env = Some(vec![
+            "EXTRA`touch /tmp/extra_injected`=secret".to_string(),
+            "VALID_EXTRA=ok".to_string(),
+        ]);
+        let resolved_extra = collect_environment(&config, &extra);
+        assert!(find_entry(&resolved_extra, "VALID_EXTRA").is_some());
+        assert!(!resolved_extra
+            .iter()
+            .any(|entry| { entry.key().contains("touch") || entry.key().contains('`') }));
     }
 
     #[test]
@@ -1991,8 +1750,6 @@ environment = ["GH_TOKEN=write_token"]
     #[test]
     #[serial_test::serial]
     fn test_build_docker_env_args_inherit_uses_key_only_in_args() {
-        // Inherited (secret) env vars must NOT have values in docker_args.
-        // Values are in exports for injection via tmux send-keys.
         std::env::set_var("AOE_TEST_TOKEN", "secret123");
         let sandbox = SandboxInfo {
             enabled: true,
@@ -2005,26 +1762,11 @@ environment = ["GH_TOKEN=write_token"]
             container_workdir: None,
         };
         let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
-        // docker_args should have the key but NOT the secret value
-        assert!(
-            result.docker_args.contains("-e AOE_TEST_TOKEN"),
-            "Expected -e AOE_TEST_TOKEN in docker_args: {}",
-            result.docker_args
-        );
-        assert!(
-            !result.docker_args.contains("secret123"),
-            "Secret value must NOT appear in docker_args: {}",
-            result.docker_args
-        );
-        // exports should have the value for tmux send-keys injection
-        assert!(
-            result
-                .exports
-                .iter()
-                .any(|e| e.contains("AOE_TEST_TOKEN") && e.contains("secret123")),
-            "Expected export with secret value in exports: {:?}",
-            result.exports
-        );
+        assert_eq!(result.docker_args, "--env-file /dev/fd/9");
+        assert!(!result.docker_args.contains("secret123"));
+        assert!(result
+            .env
+            .contains(&("AOE_TEST_TOKEN".to_string(), "secret123".to_string())));
         std::env::remove_var("AOE_TEST_TOKEN");
     }
 
@@ -2043,32 +1785,17 @@ environment = ["GH_TOKEN=write_token"]
             container_workdir: None,
         };
         let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
-        assert!(
-            result.docker_args.contains("-e MY_MAPPED"),
-            "Expected -e MY_MAPPED in docker_args: {}",
-            result.docker_args
-        );
-        assert!(
-            !result.docker_args.contains("secret456"),
-            "Secret value must NOT appear in docker_args: {}",
-            result.docker_args
-        );
-        assert!(
-            result
-                .exports
-                .iter()
-                .any(|e| e.contains("MY_MAPPED") && e.contains("secret456")),
-            "Expected export with value in exports: {:?}",
-            result.exports
-        );
+        assert_eq!(result.docker_args, "--env-file /dev/fd/9");
+        assert!(!result.docker_args.contains("secret456"));
+        assert!(result
+            .env
+            .contains(&("MY_MAPPED".to_string(), "secret456".to_string())));
         std::env::remove_var("AOE_TEST_SOURCE");
     }
 
     #[test]
     #[serial_test::serial]
-    fn test_build_docker_env_args_bare_key_uses_export() {
-        // Bare keys (pass-through from host) are Inherit entries,
-        // so they must use exports, not inline values.
+    fn test_build_docker_env_args_bare_key_uses_protected_env() {
         std::env::set_var("AOE_TEST_BARE", "barevalue");
         let sandbox = SandboxInfo {
             enabled: true,
@@ -2081,63 +1808,37 @@ environment = ["GH_TOKEN=write_token"]
             container_workdir: None,
         };
         let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
-        assert!(
-            result.docker_args.contains("-e AOE_TEST_BARE"),
-            "Expected -e AOE_TEST_BARE in docker_args: {}",
-            result.docker_args
-        );
-        assert!(
-            !result.docker_args.contains("barevalue"),
-            "Secret value must NOT appear in docker_args: {}",
-            result.docker_args
-        );
-        assert!(
-            result
-                .exports
-                .iter()
-                .any(|e| e.contains("AOE_TEST_BARE") && e.contains("barevalue")),
-            "Expected export with value: {:?}",
-            result.exports
-        );
+        assert_eq!(result.docker_args, "--env-file /dev/fd/9");
+        assert!(!result.docker_args.contains("barevalue"));
+        assert!(result
+            .env
+            .contains(&("AOE_TEST_BARE".to_string(), "barevalue".to_string())));
         std::env::remove_var("AOE_TEST_BARE");
     }
 
     #[test]
-    fn test_build_docker_env_args_literal_stays_in_args() {
-        // Literal (non-secret) entries should have values in docker_args
-        // and should NOT produce exports.
+    fn test_build_docker_env_args_literal_uses_protected_env() {
         let sandbox = SandboxInfo {
             enabled: true,
             container_id: None,
             image: "test".to_string(),
             container_name: "test".to_string(),
-            extra_env: Some(vec!["MY_LITERAL=some_value".to_string()]),
+            extra_env: Some(vec!["MY_LITERAL=literal-secret".to_string()]),
             custom_instruction: None,
             before_start_env: Vec::new(),
             container_workdir: None,
         };
         let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
-        assert!(
-            result.docker_args.contains("MY_LITERAL="),
-            "Expected MY_LITERAL=value in docker_args: {}",
-            result.docker_args
-        );
-        assert!(
-            result.docker_args.contains("some_value"),
-            "Expected literal value in docker_args: {}",
-            result.docker_args
-        );
-        // No exports for literal entries
-        assert!(
-            !result.exports.iter().any(|e| e.contains("MY_LITERAL")),
-            "Literal entries must NOT produce exports: {:?}",
-            result.exports
-        );
+        assert_eq!(result.docker_args, "--env-file /dev/fd/9");
+        assert!(!result.docker_args.contains("literal-secret"));
+        assert!(result
+            .env
+            .contains(&("MY_LITERAL".to_string(), "literal-secret".to_string())));
     }
 
     #[test]
     #[serial_test::serial]
-    fn test_build_docker_env_args_mixed_inherit_and_literal() {
+    fn test_build_docker_env_args_mixed_values_never_inline() {
         std::env::set_var("AOE_TEST_SECRET", "mysecret");
         let sandbox = SandboxInfo {
             enabled: true,
@@ -2146,24 +1847,73 @@ environment = ["GH_TOKEN=write_token"]
             container_name: "test".to_string(),
             extra_env: Some(vec![
                 "AOE_TEST_SECRET=$AOE_TEST_SECRET".to_string(),
-                "MY_LITERAL=public_val".to_string(),
+                "MY_LITERAL=literal-secret".to_string(),
             ]),
             custom_instruction: None,
             before_start_env: Vec::new(),
             container_workdir: None,
         };
         let result = build_docker_env_args("", &sandbox, std::path::Path::new("/nonexistent"));
-        // Secret: key only in docker_args, value in exports
-        assert!(result.docker_args.contains("-e AOE_TEST_SECRET"));
+        assert_eq!(result.docker_args, "--env-file /dev/fd/9");
         assert!(!result.docker_args.contains("mysecret"));
+        assert!(!result.docker_args.contains("literal-secret"));
         assert!(result
-            .exports
-            .iter()
-            .any(|e| e.contains("AOE_TEST_SECRET") && e.contains("mysecret")));
-        // Literal: key=value in docker_args, no export
-        assert!(result.docker_args.contains("MY_LITERAL='public_val'"));
-        assert!(!result.exports.iter().any(|e| e.contains("MY_LITERAL")));
+            .env
+            .contains(&("AOE_TEST_SECRET".to_string(), "mysecret".to_string())));
+        assert!(result
+            .env
+            .contains(&("MY_LITERAL".to_string(), "literal-secret".to_string())));
         std::env::remove_var("AOE_TEST_SECRET");
+    }
+
+    #[test]
+    fn test_managed_codex_home_is_passed_to_exec_unless_overridden() {
+        let project_path = std::path::Path::new("/nonexistent");
+        let managed_home = "/root/.codex/codex-upgrade-test";
+        let cases = [
+            (None, managed_home, true),
+            (
+                Some("CODEX_HOME=/root/custom-codex"),
+                "/root/custom-codex",
+                false,
+            ),
+        ];
+
+        for (extra_env, expected_home, managed_expected) in cases {
+            let sandbox = SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "test".to_string(),
+                container_name: "test".to_string(),
+                extra_env: extra_env.map(|entry| vec![entry.to_string()]),
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: None,
+            };
+            let result = build_docker_env_args_with_managed_codex_home(
+                "",
+                &sandbox,
+                project_path,
+                Some(managed_home),
+            );
+            let codex_home = result
+                .env
+                .iter()
+                .find(|(key, _)| key == "CODEX_HOME")
+                .map(|(_, value)| value.as_str());
+            assert_eq!(
+                codex_home,
+                Some(expected_home),
+                "expected CODEX_HOME={expected_home} in the protected env-file entries, got {:?}",
+                result.env
+            );
+            assert_eq!(
+                codex_home == Some(managed_home),
+                managed_expected,
+                "an explicit CODEX_HOME must suppress the managed home, got {:?}",
+                result.env
+            );
+        }
     }
 
     #[test]

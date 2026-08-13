@@ -62,6 +62,25 @@ test("a left click on a full-screen SGR-mouse app forwards press + release", asy
   await expect.poll(() => anyMatch(handle, /\x1b\[<0;\d+;\d+m/)).toBe(true);
 });
 
+test("a click on a bottom-aligned row reports that row to the mouse app", async ({ page }) => {
+  const handle = await setup(page);
+  const lines = ["first", "second", "third", ...Array<string>(21).fill("")];
+  handle.pushLiveFrame({
+    content: `${lines.join("\n")}\n`,
+    rows: 24,
+    history: 120,
+    altScreen: true,
+    mouse: true,
+    mouseSgr: true,
+  });
+  const secondRow = page.getByText("second", { exact: true });
+  await expect(secondRow).toBeVisible();
+  const box = (await secondRow.boundingBox())!;
+
+  await pointer(page, "pointerdown", box.x + 10, box.y + box.height / 2);
+  await expect.poll(() => texts(handle).find((text) => /\x1b\[<0;\d+;\d+M/.test(text))).toMatch(/\x1b\[<0;\d+;2M/);
+});
+
 test("dragging forwards a motion report (button + 32) per new cell", async ({ page }) => {
   const handle = await setup(page);
   pushFrame(handle, { altScreen: true, mouse: true, mouseSgr: true });

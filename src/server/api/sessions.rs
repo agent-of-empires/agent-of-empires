@@ -13,7 +13,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::git::error::GitError;
 use crate::session::config::SessionConfig;
-use crate::session::{ClaimOp, EnsureReadyError, EnsureReadyOutcome, Instance, Status, Storage};
+use crate::session::{
+    EnsureReadyError, EnsureReadyOutcome, Instance, LifecycleOperation, Status, Storage,
+};
 
 use super::validate_display_label;
 use super::validate_no_shell_injection;
@@ -159,6 +161,14 @@ pub struct SessionResponse {
     pub profile: String,
     pub cleanup_defaults: CleanupDefaults,
     pub remote_owner: Option<String>,
+    /// Host-scoped identity for `remote_owner` ("owner@host"), so the web
+    /// sidebar's org axis can bucket by this instead of the bare owner: two
+    /// owners of the same name on different hosts (GitHub "acme" vs GitLab
+    /// "acme") must never merge into one group or one bulk-archive scope.
+    /// `remote_owner` stays the display label. Populated the same way and on
+    /// the same cadence as `remote_owner` (see the cache fill in
+    /// `list_sessions`); `None` whenever `remote_owner` is `None`.
+    pub remote_owner_key: Option<String>,
     /// Per-session push-notification overrides. None means the session
     /// inherits the server-wide default (`web.notify_on_*`) for that
     /// event type; Some(true)/Some(false) is an explicit toggle.
@@ -404,6 +414,7 @@ impl SessionResponse {
                 delete_to_trash: true,
             },
             remote_owner: None,
+            remote_owner_key: None,
             notify_on_waiting: inst.notify_on_waiting,
             notify_on_idle: inst.notify_on_idle,
             notify_on_error: inst.notify_on_error,
@@ -823,8 +834,9 @@ pub async fn list_sessions(
                 .main_repo_path
                 .as_deref()
                 .unwrap_or(&session.project_path);
-            if let Some(owner) = cache.get(repo_path) {
-                session.remote_owner = owner.clone();
+            if let Some(resolved) = cache.get(repo_path) {
+                session.remote_owner = resolved.as_ref().map(|(owner, _)| owner.clone());
+                session.remote_owner_key = resolved.as_ref().map(|(_, key)| key.clone());
             }
         }
     }
@@ -846,8 +858,8 @@ pub async fn list_sessions(
         let mut cache = state.remote_owner_cache.write().await;
         for path in &uncached {
             if !cache.contains_key(path.as_str()) {
-                let owner = crate::git::get_remote_owner(std::path::Path::new(path));
-                cache.insert(path.clone(), owner);
+                let resolved = crate::git::get_remote_owner_with_key(std::path::Path::new(path));
+                cache.insert(path.clone(), resolved);
             }
         }
         for session in &mut sessions {
@@ -856,8 +868,9 @@ pub async fn list_sessions(
                 .as_deref()
                 .unwrap_or(&session.project_path);
             if session.remote_owner.is_none() {
-                if let Some(owner) = cache.get(repo_path) {
-                    session.remote_owner = owner.clone();
+                if let Some(resolved) = cache.get(repo_path) {
+                    session.remote_owner = resolved.as_ref().map(|(owner, _)| owner.clone());
+                    session.remote_owner_key = resolved.as_ref().map(|(_, key)| key.clone());
                 }
             }
         }
@@ -2026,65 +2039,6 @@ fn persist_failed_response() -> axum::response::Response {
         .into_response()
 }
 
-/// Run `f` on the disk instances under the storage flock (off the async
-/// runtime) and return its result. The single serialization point shared by
-/// every server claim/commit; the claim/commit decision itself lives in the
-/// neutral `session::claim` helpers so the CLI, daemon, and TUI agree.
-///
-/// Claims are written to disk ONLY: the in-memory `state.instances.op_claim` is
-/// eventually-consistent (the disk watcher reloads it) and never authoritative,
-/// so no claim decision ever reads it. See #2541.
-async fn with_locked_storage<T, F>(state: &Arc<AppState>, profile: &str, f: F) -> Result<T, ()>
-where
-    T: Send + 'static,
-    F: FnOnce(&mut Vec<Instance>) -> T + Send + 'static,
-{
-    let profile = profile.to_string();
-    let file_watch = state.file_watch.clone();
-    match tokio::task::spawn_blocking(move || {
-        let storage = Storage::new(&profile, file_watch).map_err(|e| e.to_string())?;
-        storage
-            .update(|instances, _groups| Ok(f(instances)))
-            .map_err(|e| e.to_string())
-    })
-    .await
-    {
-        Ok(Ok(v)) => Ok(v),
-        Ok(Err(e)) => {
-            tracing::error!(target: "http.api.sessions", "locked storage op failed: {e}");
-            Err(())
-        }
-        Err(e) => {
-            tracing::error!(target: "http.api.sessions", "locked storage op join failed: {e}");
-            Err(())
-        }
-    }
-}
-
-/// Release the `op` claim for session `id` on disk and in memory,
-/// ownership-guarded so a peer's fresh claim (stale-override) is never cleared.
-/// Best-effort: a stranded claim self-heals via the TTL. See #2541.
-async fn release_op_claim(state: &Arc<AppState>, profile: &str, id: &str, op: ClaimOp) {
-    let _ = persist_session_update(
-        profile.to_string(),
-        "op-claim-release",
-        state.file_watch.clone(),
-        {
-            let id = id.to_string();
-            move |instances| {
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                    inst.clear_op_claim_if_owned(op);
-                }
-            }
-        },
-    )
-    .await;
-    let mut instances = state.instances.write().await;
-    if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-        inst.clear_op_claim_if_owned(op);
-    }
-}
-
 pub async fn update_session_notifications(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -2644,290 +2598,193 @@ pub async fn update_session_archive(
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
-/// Release the teardown's in-flight Trash claim on a no-relocation terminal
-/// path (the relocation paths release inside `commit_trash_relocation`).
-/// Ownership-guarded; best-effort, a stranded claim self-heals via the TTL.
-/// Mirrors the CLI's `release_trash_claim_best_effort` so the two surfaces
-/// stay symmetric.
-async fn release_trash_claim_best_effort(state: &Arc<AppState>, profile: String, id: &str) {
-    let release_id = id.to_string();
-    let _ = persist_session_update(
-        profile,
-        "trash-claim-release",
-        state.file_watch.clone(),
-        move |instances| {
-            crate::session::claim::release_trash_claim(instances, &release_id);
-        },
-    )
-    .await;
-}
-
-/// `POST /api/sessions/:id/trash`. Soft-delete a session into the trash
-/// bucket: persist `trashed_at`, then stop the live session the same way
-/// archive does (structured-view supervisor `shutdown`, which PRESERVES the
-/// transcript, plus optional tmux teardown). Durable artifacts (transcript,
-/// worktree, branch, container) are kept so `restore` is faithful; permanent
-/// teardown happens only on purge (`DELETE`). See #2489.
+/// `POST /api/sessions/:id/trash`. The per-instance lifecycle flock is held
+/// from the durable Trash reservation through teardown, relocation, and final commit.
 pub async fn trash_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     body: Option<Json<TrashSessionBody>>,
 ) -> impl IntoResponse {
-    // CityHall: only act on structured sessions this mode created; refuse a
-    // non-structured (or unknown) target so a locked-down client cannot
-    // respawn/destroy/edit an enumerated plain session. See #7.
-    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
-        return resp;
+    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
+        return response;
     }
     if state.read_only {
         return super::read_only_response();
     }
-    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let body = body.map(|Json(body)| body).unwrap_or_default();
 
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
-
-    let profile = {
+    let (profile, snapshot) = {
         let instances = state.instances.read().await;
-        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+        let Some(instance) = instances.iter().find(|instance| instance.id == id) else {
             return super::session_not_found();
         };
-        inst.source_profile.clone()
+        (instance.source_profile.clone(), instance.clone())
     };
 
-    let persist_id = id.clone();
-    if persist_session_update(
-        profile,
-        "trash",
-        state.file_watch.clone(),
-        move |instances| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                inst.trash();
-                // Mark the teardown in flight (ClaimOp::Trash) so peers
-                // observe it as durable state. Best-effort: a refused claim
-                // still tears down, gated by the pre-move re-check and the
-                // locked relocation commit.
-                if let Err(holder) = inst.try_claim(
-                    crate::session::ClaimOp::Trash,
-                    Instance::OP_CLAIM_TTL,
-                    chrono::Utc::now(),
-                ) {
-                    tracing::info!(
-                        target: "http.api.sessions",
-                        session = %inst.id,
-                        "trash teardown runs unclaimed; a fresh {holder:?} claim holds the row"
-                    );
-                }
-            }
+    let reserve_profile = profile.clone();
+    let reserve_id = id.clone();
+    let file_watch = state.file_watch.clone();
+    let (storage, lifecycle_lock, generation) = match tokio::task::spawn_blocking(
+        move || -> anyhow::Result<_> {
+            let storage = Storage::new(&reserve_profile, file_watch)?;
+            let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&reserve_id)?;
+            let generation = storage.update(|instances, _groups| {
+                let Some(instance) = instances
+                    .iter_mut()
+                    .find(|instance| instance.id == reserve_id)
+                else {
+                    anyhow::bail!("session disappeared before trash");
+                };
+                instance
+                    .try_acquire_lifecycle_reservation(
+                        LifecycleOperation::Trash,
+                        Instance::LIFECYCLE_RESERVATION_TTL,
+                        chrono::Utc::now(),
+                    )
+                    .map_err(anyhow::Error::new)?;
+                instance.trash();
+                Ok(instance.lifecycle_generation)
+            })?;
+            Ok((storage, lifecycle_lock, generation))
         },
     )
     .await
-    .is_err()
     {
-        return persist_failed_response();
-    }
-
-    // Disk durable; apply to memory and snapshot what teardown needs.
-    let (was_structured_view, inst_clone) = {
-        let mut instances = state.instances.write().await;
-        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-            tracing::warn!(
-                target: "http.api.sessions",
-                session = %id,
-                "trash: instance vanished after persist"
-            );
-            return super::session_gone_after_persist();
-        };
-        inst.trash();
-        let structured_view;
-        #[cfg(feature = "serve")]
-        {
-            structured_view = inst.is_structured();
+        Ok(Ok(reserved)) => reserved,
+        Ok(Err(error)) => {
+            tracing::warn!(target: "http.api.sessions", session = %id, "trash reservation failed: {error}");
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "lifecycle_busy",
+                    "message": error.to_string()
+                })),
+            )
+                .into_response();
         }
-        #[cfg(not(feature = "serve"))]
-        {
-            structured_view = false;
+        Err(error) => {
+            tracing::error!(target: "http.api.sessions", session = %id, "trash reservation join failed: {error}");
+            return persist_failed_response();
         }
-        (structured_view, inst.clone())
     };
 
-    // Stop the live session (mirror archive teardown). shutdown() preserves
-    // the transcript (#1710); purge is the only path that deletes it.
+    let was_structured_view = snapshot.is_structured();
+    {
+        let mut instances = state.instances.write().await;
+        let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) else {
+            return super::session_gone_after_persist();
+        };
+        instance.trash();
+        instance.lifecycle_generation = generation;
+    }
+
     if was_structured_view {
         #[cfg(feature = "serve")]
         match state.acp_supervisor.shutdown(&id).await {
             Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
-            Err(e) => tracing::warn!(
+            Err(error) => tracing::warn!(
                 target: "acp.supervisor",
                 session = %id,
-                "shutdown during trash failed: {e}"
+                "shutdown during trash failed: {error}"
             ),
-        }
-        if body.kill_pane {
-            let inst_for_kill = inst_clone.clone();
-            if let Err(e) =
-                tokio::task::spawn_blocking(move || inst_for_kill.kill_ancillary_tmux_sessions())
-                    .await
-            {
-                tracing::warn!(target: "http.api.sessions", "Trash: ancillary tmux kill join failed: {e}");
-            }
-        }
-    } else if body.kill_pane {
-        let inst_for_kill = inst_clone.clone();
-        if let Err(e) =
-            tokio::task::spawn_blocking(move || inst_for_kill.kill_all_tmux_sessions()).await
-        {
-            tracing::warn!(target: "http.api.sessions", "Trash: tmux kill join failed: {e}");
         }
     }
 
-    // The session is durably trashed; stop its sandbox container (so it doesn't
-    // keep running for the whole retention window) and relocate its managed
-    // worktree out of the active dir into the holding area, then persist the
-    // repointed project_path. Stopping the container is not enough on its own
-    // to release the worktree bind mount (a stopped container keeps pinning it,
-    // which is why the rename gate discards it); the stop is here so the
-    // sandbox isn't left running for the whole retention window. Both the
-    // container stop and the git move are blocking, so this runs on a blocking
-    // thread.
-    // Best-effort: a failure leaves the worktree in place and the daemon's
-    // reconcile pass can move it later. Never blocks the trash itself, which
-    // already landed above.
-    {
-        let profile = inst_clone.source_profile.clone();
-        match tokio::task::spawn_blocking(move || {
-            let mut inst = inst_clone;
-            let outcome = crate::session::trash::prepare_trashed_worktree(&mut inst);
-            (outcome, inst)
-        })
-        .await
-        {
-            Ok((crate::session::trash::RelocateOutcome::Relocated { .. }, moved)) => {
-                // Atomic durable check-and-commit: a peer restore or purge can
-                // land between the teardown's pre-move re-check and this
-                // persist, so the decision is re-taken on the durable row
-                // under the flock (`commit_trash_relocation`). Superseded
-                // means such a peer won: the paths are not recorded and the
-                // disk move is undone off-thread instead.
-                let reloc = crate::session::trash::TrashRelocation {
-                    new_project_path: moved.project_path.clone(),
-                    pre_trash_project_path: moved.pre_trash_project_path.clone(),
-                };
-                let decision: std::sync::Arc<
-                    std::sync::Mutex<Option<crate::session::claim::RelocationCommit>>,
-                > = std::sync::Arc::new(std::sync::Mutex::new(None));
-                let persist_id = id.clone();
-                let (decision_slot, closure_reloc) = (decision.clone(), reloc.clone());
-                let persisted = persist_session_update(
-                    profile,
-                    "trash-relocate",
-                    state.file_watch.clone(),
-                    move |instances| {
-                        let commit = crate::session::claim::commit_trash_relocation(
-                            instances,
-                            &persist_id,
-                            &closure_reloc,
-                            chrono::Utc::now(),
-                        );
-                        *decision_slot.lock().unwrap() = Some(commit);
-                    },
-                )
-                .await;
-                let commit = decision.lock().unwrap().take();
-                // The undo keys off the closure's decision alone, not the
-                // write outcome: the closure can decide Superseded (row
-                // already restored on disk) and the final write then fail,
-                // and skipping the undo in that case would leave a live
-                // restored row pointing at a worktree parked in the holding
-                // area. A Persisted decision whose write failed needs no
-                // undo: the durable row is still trashed at its old path,
-                // and the reconcile pass repoints it to the holding area.
-                match (persisted, commit) {
-                    (Ok(()), Some(crate::session::claim::RelocationCommit::Persisted)) => {
-                        let mut instances = state.instances.write().await;
-                        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                            inst.project_path = reloc.new_project_path.clone();
-                            inst.pre_trash_project_path = reloc.pre_trash_project_path.clone();
-                        }
-                    }
-                    (_, Some(crate::session::claim::RelocationCommit::Superseded)) => {
-                        let undo_id = id.clone();
-                        let outcome = tokio::task::spawn_blocking(move || {
-                            crate::session::trash::undo_raced_relocation(&moved, &reloc)
-                        })
-                        .await;
-                        match outcome {
-                            Ok(crate::session::trash::RestoreOutcome::Failed { reason }) => {
-                                tracing::warn!(
-                                    target: "http.api.sessions",
-                                    session = %undo_id,
-                                    "superseded trash relocation could not be moved back: {reason}"
-                                );
-                            }
-                            Ok(outcome) => {
-                                tracing::info!(
-                                    target: "http.api.sessions",
-                                    session = %undo_id,
-                                    "trash relocation superseded by a restore/claim; undone ({outcome:?})"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    target: "http.api.sessions",
-                                    session = %undo_id,
-                                    "superseded trash relocation undo join failed: {e}"
-                                );
-                            }
-                        }
-                    }
-                    _ => {}
-                }
+    let work_id = id.clone();
+    let kill_pane = body.kill_pane;
+    let transition = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let _lifecycle_lock = lifecycle_lock;
+        let mut instance = snapshot;
+        if kill_pane {
+            if was_structured_view {
+                instance.kill_ancillary_tmux_sessions_locked();
+            } else {
+                instance.kill_all_tmux_sessions_locked();
             }
-            Ok((crate::session::trash::RelocateOutcome::Failed { reason }, _)) => {
-                tracing::warn!(
-                    target: "http.api.sessions",
-                    session = %id,
-                    "trash worktree relocation skipped: {reason}"
+        }
+        let outcome = crate::session::trash::prepare_trashed_worktree(&mut instance);
+        let relocation = match &outcome {
+            crate::session::trash::RelocateOutcome::Relocated { .. } => {
+                Some(crate::session::trash::TrashRelocation {
+                    new_project_path: instance.project_path.clone(),
+                    pre_trash_project_path: instance.pre_trash_project_path.clone(),
+                })
+            }
+            crate::session::trash::RelocateOutcome::Skipped
+            | crate::session::trash::RelocateOutcome::Failed { .. } => None,
+        };
+        storage.update(|instances, _groups| {
+            if let Some(relocation) = &relocation {
+                let commit = crate::session::claim::commit_trash_relocation(
+                    instances, &work_id, generation, relocation,
                 );
-                release_trash_claim_best_effort(&state, profile, &id).await;
+                anyhow::ensure!(
+                    commit == crate::session::claim::RelocationCommit::Persisted,
+                    "trash relocation reservation was superseded"
+                );
+            } else if let Some(stored) = instances
+                .iter_mut()
+                .find(|candidate| candidate.id == work_id)
+            {
+                stored
+                    .release_lifecycle_reservation_if_owned(LifecycleOperation::Trash, generation);
             }
-            Ok((crate::session::trash::RelocateOutcome::Skipped, _)) => {
-                release_trash_claim_best_effort(&state, profile, &id).await;
-            }
-            Err(e) => tracing::warn!(
-                target: "http.api.sessions",
-                session = %id,
-                "trash worktree relocation join failed: {e}"
-            ),
+            Ok(())
+        })?;
+        let durable = storage
+            .load()?
+            .into_iter()
+            .find(|candidate| candidate.id == work_id);
+        Ok((outcome, durable))
+    })
+    .await;
+
+    let (outcome, durable) = match transition {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            tracing::warn!(target: "http.api.sessions", session = %id, "trash transition failed: {error}");
+            return persist_failed_response();
         }
+        Err(error) => {
+            tracing::warn!(target: "http.api.sessions", session = %id, "trash transition join failed: {error}");
+            return persist_failed_response();
+        }
+    };
+    if let crate::session::trash::RelocateOutcome::Failed { reason } = outcome {
+        tracing::warn!(
+            target: "http.api.sessions",
+            session = %id,
+            "trash worktree relocation skipped: {reason}",
+        );
     }
 
-    let instances = state.instances.read().await;
-    let response = match instances.iter().find(|i| i.id == id) {
-        Some(inst) => {
-            SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
-        }
-        None => {
-            return super::session_not_found();
-        }
+    let Some(durable) = durable else {
+        return super::session_not_found();
+    };
+    let response = {
+        let mut instances = state.instances.write().await;
+        let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) else {
+            return super::session_gone_after_persist();
+        };
+        instance.project_path = durable.project_path;
+        instance.pre_trash_project_path = durable.pre_trash_project_path;
+        instance.lifecycle_generation = durable.lifecycle_generation;
+        instance.lifecycle_reservation = durable.lifecycle_reservation;
+        SessionResponse::from_instance(instance, crate::claude_settings::read_tui_fullscreen())
     };
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
-/// `POST /api/sessions/:id/restore`. Move a session out of the trash bucket
-/// by clearing `trashed_at`. The session returns to its prior bucket (active,
-/// or archived if it was archived before trashing); the reconciler respawns a
-/// structured-view worker on the next tick since the row is no longer
-/// trashed. No teardown. See #2489.
+/// `POST /api/sessions/:id/restore`. The lifecycle flock covers reservation
+/// acquisition, worktree restoration, and durable untrash as one transition.
 pub async fn restore_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    // CityHall: only act on structured sessions this mode created; refuse a
-    // non-structured (or unknown) target so a locked-down client cannot
-    // respawn/destroy/edit an enumerated plain session. See #7.
-    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
-        return resp;
+    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
+        return response;
     }
     if state.read_only {
         return super::read_only_response();
@@ -2935,125 +2792,153 @@ pub async fn restore_session(
 
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
-
-    let (profile, snapshot) = {
+    let profile = {
         let instances = state.instances.read().await;
-        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+        let Some(instance) = instances.iter().find(|instance| instance.id == id) else {
             return super::session_not_found();
         };
-        (inst.source_profile.clone(), inst.clone())
+        instance.source_profile.clone()
     };
 
-    // Symmetric claim (#2541): win the Restore claim on disk BEFORE the unlocked
-    // worktree move. The in-memory `instance_lock` held above does not serialize
-    // a purge running in another process (CLI / another daemon); only the
-    // durable on-disk claim does. A fresh peer Purge claim wins and the restore
-    // is refused.
-    let claim_id = id.clone();
-    match with_locked_storage(&state, &profile, move |instances| {
-        crate::session::claim::decide_restore_claim(instances, &claim_id, chrono::Utc::now())
+    enum RestoreTransitionError {
+        NotFound,
+        Busy(String),
+        Worktree(String),
+        Persist(String),
+    }
+
+    let restore_profile = profile.clone();
+    let restore_id = id.clone();
+    let file_watch = state.file_watch.clone();
+    let restored = tokio::task::spawn_blocking(move || {
+        let run = || -> Result<Instance, RestoreTransitionError> {
+            let storage = Storage::new(&restore_profile, file_watch)
+                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
+            let _lifecycle_lock = storage
+                .acquire_instance_lifecycle_lock(&restore_id)
+                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
+            let decision = storage
+                .update(|instances, _groups| {
+                    crate::session::claim::decide_restore_claim(
+                        instances,
+                        &restore_id,
+                        chrono::Utc::now(),
+                    )
+                    .map_err(anyhow::Error::new)
+                })
+                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
+            let generation = match decision {
+                crate::session::claim::RestoreClaimDecision::Claimed(generation) => generation,
+                crate::session::claim::RestoreClaimDecision::AlreadyGone => {
+                    return Err(RestoreTransitionError::NotFound);
+                }
+                crate::session::claim::RestoreClaimDecision::Busy(holder) => {
+                    return Err(RestoreTransitionError::Busy(holder.busy_reason()));
+                }
+            };
+            let Some(mut instance) = storage
+                .load()
+                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?
+                .into_iter()
+                .find(|candidate| candidate.id == restore_id)
+            else {
+                return Err(RestoreTransitionError::NotFound);
+            };
+            if let crate::session::trash::RestoreOutcome::Failed { reason } =
+                crate::session::trash::restore_worktree_location(&mut instance)
+            {
+                let _ = storage.update(|instances, _groups| {
+                    if let Some(stored) = instances
+                        .iter_mut()
+                        .find(|candidate| candidate.id == restore_id)
+                    {
+                        stored.release_lifecycle_reservation_if_owned(
+                            LifecycleOperation::Restore,
+                            generation,
+                        );
+                    }
+                    Ok(())
+                });
+                return Err(RestoreTransitionError::Worktree(reason));
+            }
+            let restored_path = instance.project_path.clone();
+            let restored_pre = instance.pre_trash_project_path.clone();
+            let commit = storage
+                .update(|instances, _groups| {
+                    Ok(crate::session::claim::finalize_restore_commit(
+                        instances,
+                        &restore_id,
+                        generation,
+                        &restored_path,
+                        &restored_pre,
+                    ))
+                })
+                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
+            match commit {
+                crate::session::claim::RestoreCommit::Committed => {
+                    instance.untrash();
+                    instance.lifecycle_reservation = None;
+                    Ok(instance)
+                }
+                crate::session::claim::RestoreCommit::Superseded => {
+                    Err(RestoreTransitionError::Busy(
+                        crate::session::NEWER_GENERATION_BUSY_REASON.to_string(),
+                    ))
+                }
+                crate::session::claim::RestoreCommit::AlreadyGone => {
+                    Err(RestoreTransitionError::NotFound)
+                }
+            }
+        };
+        run()
     })
-    .await
-    {
-        Ok(crate::session::claim::RestoreClaimDecision::Claimed) => {}
-        Ok(crate::session::claim::RestoreClaimDecision::AlreadyGone) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
-        }
-        Ok(crate::session::claim::RestoreClaimDecision::PurgeInProgress) => {
+    .await;
+
+    let restored = match restored {
+        Ok(Ok(instance)) => instance,
+        Ok(Err(RestoreTransitionError::NotFound)) => return super::session_not_found(),
+        Ok(Err(RestoreTransitionError::Busy(holder))) => {
             return (
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
-                    "error": "purge_in_progress",
-                    "message": "Session is being purged; restore was refused"
+                    "error": "lifecycle_busy",
+                    "message": format!("Session is {holder}, so it was not restored")
                 })),
             )
                 .into_response();
         }
-        Err(()) => return persist_failed_response(),
-    }
-
-    // Move the worktree back to its pre-trash location before clearing the
-    // marker. Strict: if the original path is occupied or git refuses, keep
-    // the session trashed and surface a conflict, rather than restoring it to
-    // the holding-area path. The git move is blocking, so it runs off the
-    // async runtime.
-    let restored = match tokio::task::spawn_blocking(move || {
-        let mut inst = snapshot;
-        let outcome = crate::session::trash::restore_worktree_location(&mut inst);
-        (outcome, inst)
-    })
-    .await
-    {
-        Ok(pair) => pair,
-        Err(e) => {
-            tracing::warn!(target: "http.api.sessions", session = %id, "restore relocation join failed: {e}");
-            release_op_claim(&state, &profile, &id, ClaimOp::Restore).await;
+        Ok(Err(RestoreTransitionError::Worktree(reason))) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "worktree_restore_failed",
+                    "message": format!("Could not restore the worktree: {reason}")
+                })),
+            )
+                .into_response();
+        }
+        Ok(Err(RestoreTransitionError::Persist(error))) => {
+            tracing::warn!(target: "http.api.sessions", session = %id, "restore transition failed: {error}");
+            return persist_failed_response();
+        }
+        Err(error) => {
+            tracing::warn!(target: "http.api.sessions", session = %id, "restore transition join failed: {error}");
             return persist_failed_response();
         }
     };
-    if let crate::session::trash::RestoreOutcome::Failed { reason } = &restored.0 {
-        release_op_claim(&state, &profile, &id, ClaimOp::Restore).await;
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": "worktree_restore_failed",
-                "message": format!("Could not restore the worktree: {reason}")
-            })),
-        )
-            .into_response();
-    }
-    let restored_path = restored.1.project_path.clone();
-    let restored_pre = restored.1.pre_trash_project_path.clone();
 
-    // Final commit under the flock: untrash + release our claim, but only if we
-    // still own it. A stale-override purge (past the TTL) may have stolen it
-    // mid-move; in that case do not untrash and let the purge win (degrades to
-    // #2534, never worse than the status quo). See #2541.
-    let commit_id = id.clone();
-    let (rp, pre) = (restored_path.clone(), restored_pre.clone());
-    let commit = match with_locked_storage(&state, &profile, move |instances| {
-        crate::session::claim::finalize_restore_commit(instances, &commit_id, &rp, &pre)
-    })
-    .await
-    {
-        Ok(v) => v,
-        Err(()) => return persist_failed_response(),
+    let response = {
+        let mut instances = state.instances.write().await;
+        let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) else {
+            return super::session_gone_after_persist();
+        };
+        instance.project_path = restored.project_path;
+        instance.pre_trash_project_path = restored.pre_trash_project_path;
+        instance.lifecycle_generation = restored.lifecycle_generation;
+        instance.lifecycle_reservation = restored.lifecycle_reservation;
+        instance.untrash();
+        SessionResponse::from_instance(instance, crate::claude_settings::read_tui_fullscreen())
     };
-    match commit {
-        crate::session::claim::RestoreCommit::Committed => {}
-        crate::session::claim::RestoreCommit::PurgeStoleClaim => {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "purge_in_progress",
-                    "message": "Session was claimed by a purge mid-restore; restore was refused"
-                })),
-            )
-                .into_response();
-        }
-        crate::session::claim::RestoreCommit::AlreadyGone => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
-        }
-    }
-
-    let mut instances = state.instances.write().await;
-    let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-        return persist_failed_response();
-    };
-    inst.project_path = restored_path;
-    inst.pre_trash_project_path = restored_pre;
-    inst.untrash();
-    inst.clear_op_claim_if_owned(ClaimOp::Restore);
-    let response =
-        SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
@@ -3366,43 +3251,42 @@ pub async fn stop_session(
         return (StatusCode::OK, Json(serde_json::json!(response))).into_response();
     }
 
-    // Persist Stopped first. For structured sessions also mark the row
-    // idle-dormant so the acp reconciler does not respawn the worker we are
-    // about to shut down (mirrors the structured auto-stop reaper).
-    let persist_id = id.clone();
-    if persist_session_update(
-        profile,
-        "stop session",
-        state.file_watch.clone(),
-        move |instances| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                inst.status = Status::Stopped;
-                if is_structured {
+    // Structured sessions have no tmux/container teardown transaction, so
+    // persist their dormant stop before asking the supervisor to shut down.
+    // Plain sessions delegate the full reserve/teardown/commit sequence to
+    // `Instance::stop` below.
+    if is_structured {
+        let persist_id = id.clone();
+        if persist_session_update(
+            profile.clone(),
+            "stop session",
+            state.file_watch.clone(),
+            move |instances| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                    inst.status = Status::Stopped;
                     inst.mark_idle_dormant();
                 }
-            }
-        },
-    )
-    .await
-    .is_err()
-    {
-        return persist_failed_response();
+            },
+        )
+        .await
+        .is_err()
+        {
+            return persist_failed_response();
+        }
     }
 
-    // Disk is durable; apply to memory and snapshot the instance for the
-    // side effects below.
     let inst_clone = {
         let mut instances = state.instances.write().await;
         let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
             tracing::warn!(
                 target: "http.api.sessions",
                 session = %id,
-                "stop session: instance vanished after persist"
+                "stop session: instance vanished before teardown"
             );
             return super::session_gone_after_persist();
         };
-        inst.status = Status::Stopped;
         if is_structured {
+            inst.status = Status::Stopped;
             inst.mark_idle_dormant();
         }
         inst.clone()
@@ -3426,12 +3310,40 @@ pub async fn stop_session(
         // container. `Instance::stop` can block ~10s on `docker stop`, so run
         // it off the async runtime. Mirrors the TUI's StopPoller.
         let inst_for_stop = inst_clone.clone();
-        match tokio::task::spawn_blocking(move || inst_for_stop.stop()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!(
-                target: "http.api.sessions",
-                "Stop: session stop failed: {e}"
-            ),
+        let stop_profile = profile.clone();
+        let stop_id = id.clone();
+        match tokio::task::spawn_blocking(move || {
+            let stop_result = inst_for_stop.stop();
+            let disk_result = Storage::new_unwatched(&stop_profile)
+                .and_then(|storage| storage.load())
+                .map(|instances| {
+                    instances
+                        .into_iter()
+                        .find(|instance| instance.id == stop_id)
+                });
+            (stop_result, disk_result)
+        })
+        .await
+        {
+            Ok((stop_result, disk_result)) => {
+                if let Err(e) = stop_result {
+                    tracing::warn!(target: "http.api.sessions", "Stop: session stop failed: {e}");
+                }
+                match disk_result {
+                    Ok(Some(stopped)) => {
+                        let mut instances = state.instances.write().await;
+                        if let Some(live) = instances.iter_mut().find(|instance| instance.id == id)
+                        {
+                            live.merge_post_start(&stopped);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(
+                        target: "http.api.sessions",
+                        "Stop: failed to reload lifecycle generation: {e}"
+                    ),
+                }
+            }
             Err(e) => tracing::warn!(
                 target: "http.api.sessions",
                 "Stop: stop join failed: {e}"
@@ -3567,12 +3479,11 @@ pub async fn start_session(
     let restart_result = tokio::task::spawn_blocking(
         move || -> Result<(Instance, crate::session::StartOutcome), Box<(Instance, anyhow::Error)>> {
             let mut inst = instance;
-            if let Err(e) = inst.kill_clean() {
-                return Err(Box::new((inst, e)));
-            }
             // Explicit restart endpoint (web dashboard Restart button):
-            // honor auto_resume_on_restart, same as TUI `e`/`Enter`. See #2609.
-            match inst.start_with_resume_fallback(
+            // honor auto_resume_on_restart, same as TUI `e`/`Enter`. The
+            // instance-level cascade holds the lifecycle lock across final
+            // poller drain, exact-pane OMP capture, kill, and relaunch.
+            match inst.restart_with_resume_policy(
                 None,
                 false,
                 crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting,
@@ -3622,9 +3533,10 @@ pub async fn start_session(
             tracing::warn!(target: "http.api.sessions", "start_session restart failed for {id}: {msg}");
             let mut instances = state.instances.write().await;
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                apply_post_restart_sync(inst, &sync_base, &started);
-                inst.status = Status::Error;
-                inst.last_error = Some(msg.clone());
+                if apply_post_restart_sync(inst, &sync_base, &started) {
+                    inst.status = Status::Error;
+                    inst.last_error = Some(msg.clone());
+                }
             }
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -3898,11 +3810,10 @@ async fn mark_delete_error(state: &AppState, id: &str, message: String) {
 /// view), optional sidecar cleanup (worktree/branch/container/scratch per
 /// `body`), and removal from both `sessions.json` and the in-memory list.
 /// Shared by the `DELETE /api/sessions/{id}` handler and the retention
-/// auto-purge worker so the permanent-delete path can never diverge between
-/// the two. Returns the user-facing messages from `perform_deletion` on
-/// success, or a descriptive error string on failure (the caller decides how
-/// to surface it). The caller is expected to hold the per-instance lock.
-///
+/// auto-purge worker so the permanent-delete path cannot diverge between the
+/// two. Returns user-facing deletion messages on success, or a descriptive
+/// error string on failure. Blocking reservation, hook, and completion phases
+/// are dispatched internally; no caller-held lifecycle guard crosses an await.
 /// The `bool` in the success tuple is `true` when the session row was actually
 /// removed, and `false` when a concurrent restore won the race and the row was
 /// deliberately kept (see the `kept_restored` branch). Callers must not report
@@ -3916,89 +3827,133 @@ async fn purge_session_artifacts(
     recent_entry: Option<crate::session::RecentProjectEntry>,
 ) -> Result<(bool, Vec<String>), String> {
     let profile = instance.source_profile.clone();
-    let was_trashed = instance.is_trashed();
-
-    // Symmetric claim (#2541): win the Purge claim on disk before any
-    // irreversible teardown, so a restore from another process cannot bring the
-    // session back after its artifacts are gone. Refuse when a fresh Restore
-    // claim holds the row; a row already gone from disk proceeds (the teardown
-    // is idempotent and the final removal is a no-op).
-    let claim_id = id.to_string();
-    match with_locked_storage(state, &profile, move |instances| {
-        crate::session::claim::decide_purge_claim(
-            instances,
-            &claim_id,
-            was_trashed,
-            chrono::Utc::now(),
-        )
+    if profile.is_empty() {
+        return Err(
+            "Session has no source profile; refusing to acquire a default-profile purge lock"
+                .to_string(),
+        );
+    }
+    let delete_request = crate::session::deletion::DeletionRequest {
+        session_id: id.to_string(),
+        instance: instance.clone(),
+        delete_worktree: body.delete_worktree,
+        delete_branch: body.delete_branch,
+        delete_sandbox: body.delete_sandbox,
+        force_delete: body.force_delete,
+        detach_hooks: true,
+        keep_scratch: body.keep_scratch,
+    };
+    let file_watch = state.file_watch.clone();
+    let reserve_profile = profile.clone();
+    let reservation = tokio::task::spawn_blocking(move || {
+        let storage = Storage::new(&reserve_profile, file_watch)
+            .map_err(|e| format!("Storage init failed before session teardown: {e}"))?;
+        crate::session::deletion::PurgeTransaction::reserve(storage, delete_request)
+            .map_err(|e| format!("Failed to reserve session purge: {e}"))
     })
     .await
-    {
-        Ok(crate::session::claim::PurgeClaimDecision::Claimed)
-        | Ok(crate::session::claim::PurgeClaimDecision::AlreadyGone) => {}
-        Ok(crate::session::claim::PurgeClaimDecision::Restored)
-        | Ok(crate::session::claim::PurgeClaimDecision::RestoreInProgress) => {
-            return Err("Session is being restored, so it was not purged".to_string())
+    .map_err(|e| format!("Deletion reservation task failed: {e}"))??;
+    let transaction = match reservation {
+        crate::session::deletion::PurgeReservation::Reserved(transaction) => transaction,
+        crate::session::deletion::PurgeReservation::Rejected(result) => {
+            return match result.disposition {
+                crate::session::deletion::DeletionDisposition::AlreadyGone => {
+                    state.instances.write().await.retain(|row| row.id != id);
+                    state.instance_locks.write().await.remove(id);
+                    Ok((true, result.messages))
+                }
+                crate::session::deletion::DeletionDisposition::KeptRestored => {
+                    Err("Session is being restored, so it was not purged".to_string())
+                }
+                crate::session::deletion::DeletionDisposition::Busy => {
+                    Err(result.errors.first().cloned().unwrap_or_else(|| {
+                        "Session is busy with another lifecycle operation, so it was not purged"
+                            .to_string()
+                    }))
+                }
+                crate::session::deletion::DeletionDisposition::Failed
+                | crate::session::deletion::DeletionDisposition::Removed => {
+                    Err(result.errors.join("; "))
+                }
+            };
         }
-        Err(()) => {
-            return Err("Failed to acquire the purge claim under the storage lock".to_string())
-        }
-    }
+    };
+    let transaction = tokio::task::spawn_blocking(move || transaction.run_hooks())
+        .await
+        .map_err(|e| format!("Deletion hook task failed: {e}"))?;
 
-    // True once we have crossed the irreversible line (the structured-view
-    // transcript has been deleted). After that point a sidecar-cleanup
-    // failure must NOT leave the session row restorable, since the restore
-    // would resurrect a session whose transcript is already gone. See #2489.
     #[cfg(feature = "serve")]
     let transcript_purged = instance.is_structured();
     #[cfg(not(feature = "serve"))]
     let transcript_purged = false;
 
-    // Tear down the structured view worker FIRST so the ACP subprocess + its
-    // claude-agent-acp child don't leak past the session delete. Permanent
-    // removal releases the agent's persisted transcript too (#1710); the
-    // event store purge prevents a recreated same-id session from inheriting
-    // the deleted transcript.
-    #[cfg(feature = "serve")]
-    if transcript_purged {
-        match state.acp_supervisor.shutdown_and_delete(id).await {
-            Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
-            Err(e) => {
-                tracing::warn!(
-                    target: "acp.supervisor",
-                    session = %id,
-                    "shutdown during purge failed: {e}"
-                );
+    let deletion_result = if transcript_purged {
+        // Commit the row removal before deleting the ACP transcript. A lost
+        // restore/generation race therefore leaves both row and transcript
+        // intact; a successful commit makes later cleanup failures
+        // non-restorable by construction.
+        let committed = tokio::task::spawn_blocking(move || transaction.begin_irreversible())
+            .await
+            .map_err(|e| format!("Irreversible deletion commit task failed: {e}"))?;
+        match committed {
+            Err(result) => *result,
+            Ok(committed) => {
+                // Remove the local mirror before awaiting ACP so the reconciler
+                // cannot surface a durable row that no longer exists.
+                state.instances.write().await.retain(|row| row.id != id);
+
+                // The worker may still use the worktree, so ACP teardown stays
+                // ahead of sidecar cleanup. The durable row is already gone.
+                #[cfg(feature = "serve")]
+                {
+                    match state.acp_supervisor.shutdown_and_delete(id).await {
+                        Ok(())
+                        | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "acp.supervisor",
+                                session = %id,
+                                "shutdown during purge failed: {e}"
+                            );
+                        }
+                    }
+                    state.acp_supervisor.forget_session(id);
+                    state.acp_event_store.delete_session(id);
+                }
+
+                tokio::task::spawn_blocking(move || committed.finish())
+                    .await
+                    .map_err(|e| format!("Deletion cleanup task failed: {e}"))?
             }
         }
-        state.acp_supervisor.forget_session(id);
-        state.acp_event_store.delete_session(id);
-    }
-
-    let (delete_worktree, delete_branch, delete_sandbox, force_delete, keep_scratch) = (
-        body.delete_worktree,
-        body.delete_branch,
-        body.delete_sandbox,
-        body.force_delete,
-        body.keep_scratch,
-    );
-    let deletion_id = id.to_string();
-    let deletion_result = tokio::task::spawn_blocking(move || {
-        crate::session::deletion::perform_deletion(&crate::session::deletion::DeletionRequest {
-            session_id: deletion_id,
-            instance,
-            delete_worktree,
-            delete_branch,
-            delete_sandbox,
-            force_delete,
-            detach_hooks: true,
-            keep_scratch,
-        })
-    })
-    .await
-    .map_err(|e| format!("Deletion task failed: {e}"))?;
+    } else {
+        tokio::task::spawn_blocking(move || transaction.complete())
+            .await
+            .map_err(|e| format!("Deletion task failed: {e}"))?
+    };
 
     let mut messages = deletion_result.messages.clone();
+    match deletion_result.disposition {
+        crate::session::deletion::DeletionDisposition::KeptRestored
+        | crate::session::deletion::DeletionDisposition::Busy => {
+            tracing::warn!(
+                target: "http.api.sessions",
+                session = %id,
+                "session changed or was restored before purge completion; kept the durable row"
+            );
+            return Ok((false, messages));
+        }
+        crate::session::deletion::DeletionDisposition::Failed => {
+            let errs = if deletion_result.errors.is_empty() {
+                "Unknown error".to_string()
+            } else {
+                deletion_result.errors.join("; ")
+            };
+            return Err(errs);
+        }
+        crate::session::deletion::DeletionDisposition::Removed
+        | crate::session::deletion::DeletionDisposition::AlreadyGone => {}
+    }
     if !deletion_result.success {
         let errs = if deletion_result.errors.is_empty() {
             "Unknown error".to_string()
@@ -4006,69 +3961,31 @@ async fn purge_session_artifacts(
             deletion_result.errors.join("; ")
         };
         if !transcript_purged {
-            // Nothing irreversible happened (no transcript to lose), so keep
-            // the row intact and let the caller surface the error; the user
-            // can retry, e.g. with force on a dirty worktree.
-            release_op_claim(state, &profile, id, ClaimOp::Purge).await;
             return Err(errs);
         }
-        // The durable transcript is already gone; a kept row would only allow
-        // a broken restore. Commit the removal and surface the sidecar errors
-        // as warnings so the orphaned worktree/container can be cleaned up by
-        // hand. See #2489.
         tracing::warn!(
             target: "http.api.sessions",
             session = %id,
-            "purge sidecar cleanup failed after the transcript was deleted; removing the session row anyway: {errs}"
+            "purge sidecar cleanup failed after durable removal; session stays removed: {errs}"
         );
         messages.push(format!(
             "Cleanup incomplete (session removed anyway): {errs}"
         ));
     }
 
-    // Disk first: if persistence fails, in-memory state stays intact and the
-    // poll loop will not re-add a half-deleted row.
-    // #2534/#2541: revalidate under the flock. The teardown ran on an unlocked
-    // snapshot; if a restore from another process brought the session back
-    // (stale-override past the claim TTL), keep the row and release our purge
-    // claim (ownership-guarded) rather than deleting a session the user just
-    // restored. Degrades that rare residual to #2534 behavior, never worse.
-    // Deliberately hand-rolled rather than routed through `with_locked_storage`:
-    // this fn returns `Result<_, String>` and must propagate the storage error
-    // string up to the caller, whereas `with_locked_storage` logs and collapses
-    // to `Result<_, ()>`. See #2541.
-    let storage = Storage::new(&profile, state.file_watch.clone())
-        .map_err(|e| format!("Session was torn down but storage init failed: {e}"))?;
-    let id_for_save = id.to_string();
-    let kept_restored = tokio::task::spawn_blocking(move || {
-        storage.update(|instances, _groups| {
-            Ok(matches!(
-                crate::session::claim::finalize_purge_removal(instances, &id_for_save, was_trashed),
-                crate::session::claim::PurgeCommit::KeptRestored
-            ))
-        })
-    })
-    .await
-    .map_err(|e| format!("Persist task panicked: {e}"))?
-    .map_err(|e| {
-        format!("Session deletion completed on disk, but sessions.json could not be updated: {e}")
-    })?;
-
-    if kept_restored {
-        tracing::warn!(
-            target: "http.api.sessions",
-            session = %id,
-            "session was restored while its purge ran; kept the restored row, but its worktree, branch, container, or transcript may already be gone"
-        );
-        // Leave the in-memory row and its lock in place; the poll loop
-        // converges its trashed flag from the peer's on-disk untrash. The row
-        // was NOT removed, so report removed=false.
-        return Ok((false, messages));
-    }
-
     {
         let mut instances = state.instances.write().await;
         instances.retain(|i| i.id != id);
+        // The row is now gone from both disk and memory, so any reloader still
+        // carrying a `sessions.json` snapshot that predates either removal must
+        // drop it rather than fold the deleted row back in. Bump while still
+        // holding the `instances` write lock: a reloader checks the epoch under
+        // that same lock, so the removal and the bump land as one step and a
+        // reload cannot slip between them. See invariant 8 on
+        // `reload_state_instances_from_disk`.
+        state
+            .delete_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
     state.instance_locks.write().await.remove(id);
     if let Some(entry) = recent_entry {
@@ -4095,52 +4012,31 @@ pub(crate) async fn reconcile_trashed_worktrees(state: &Arc<AppState>) {
             .map(|i| (i.id.clone(), i.source_profile.clone()))
             .collect()
     };
-
-    // Self-heal (#2541): clear op_claims left by a purge/restore that crashed
-    // mid-operation. `try_claim` already treats an expired claim as free (that
-    // is the authoritative self-heal), so this startup sweep is
-    // belt-and-suspenders that tidies stale claims on disk. It only visits
-    // profiles that currently have a trashed candidate; a stray claim elsewhere
-    // is still healed by the next `try_claim`.
-    let profiles: std::collections::HashSet<String> =
-        candidates.iter().map(|(_, p)| p.clone()).collect();
-    let now = chrono::Utc::now();
-    let ttl = Instance::OP_CLAIM_TTL;
-    for profile in profiles {
-        let _ = persist_session_update(
-            profile,
-            "op-claim-self-heal",
-            state.file_watch.clone(),
-            move |instances| {
-                for inst in instances.iter_mut() {
-                    inst.clear_expired_op_claim(ttl, now);
-                }
-            },
-        )
-        .await;
-    }
-
-    for (id, profile) in candidates {
+    for (id, _profile) in candidates {
         let lock = state.instance_lock(&id).await;
         let _guard = lock.lock().await;
 
         let snapshot = {
             let instances = state.instances.read().await;
-            match instances.iter().find(|i| i.id == id) {
-                Some(i) if i.is_trashed() => i.clone(),
+            match instances.iter().find(|instance| instance.id == id) {
+                Some(instance) if instance.is_trashed() => instance.clone(),
                 _ => continue,
             }
         };
         let reconciled = match tokio::task::spawn_blocking(move || {
-            let mut inst = snapshot;
-            let changed = crate::session::trash::reconcile_trashed_location(&mut inst);
-            (changed, inst)
+            let mut instance = snapshot;
+            let changed = crate::session::trash::reconcile_trashed_transition(&mut instance)?;
+            anyhow::Ok((changed, instance))
         })
         .await
         {
-            Ok(pair) => pair,
-            Err(e) => {
-                tracing::warn!(target: "http.api.sessions", session = %id, "trash reconcile join failed: {e}");
+            Ok(Ok(pair)) => pair,
+            Ok(Err(error)) => {
+                tracing::warn!(target: "http.api.sessions", session = %id, "trash reconcile skipped: {error}");
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(target: "http.api.sessions", session = %id, "trash reconcile join failed: {error}");
                 continue;
             }
         };
@@ -4148,27 +4044,12 @@ pub(crate) async fn reconcile_trashed_worktrees(state: &Arc<AppState>) {
             continue;
         }
         let moved = reconciled.1;
-        let (np, pre) = (
-            moved.project_path.clone(),
-            moved.pre_trash_project_path.clone(),
-        );
-        let persist_id = id.clone();
-        let _ = persist_session_update(
-            profile,
-            "trash-reconcile",
-            state.file_watch.clone(),
-            move |instances| {
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                    inst.project_path = np.clone();
-                    inst.pre_trash_project_path = pre.clone();
-                }
-            },
-        )
-        .await;
         let mut instances = state.instances.write().await;
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            inst.project_path = moved.project_path;
-            inst.pre_trash_project_path = moved.pre_trash_project_path;
+        if let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) {
+            instance.project_path = moved.project_path;
+            instance.pre_trash_project_path = moved.pre_trash_project_path;
+            instance.lifecycle_generation = moved.lifecycle_generation;
+            instance.lifecycle_reservation = moved.lifecycle_reservation;
         }
     }
 }
@@ -5868,31 +5749,49 @@ fn public_create_session_error(e: &anyhow::Error) -> String {
 /// `agent_session_id = None` and generate (and persist) a new UUID,
 /// silently orphaning the previous Claude conversation.
 fn apply_post_restart_identity_sync(live: &mut Instance, before: &Instance, started: &Instance) {
+    if started.lifecycle_generation < live.lifecycle_generation {
+        return;
+    }
     // Treat the pre-restart snapshot as a CAS baseline for peer-writable
     // identity fields. If a poller/CLI/TUI peer changed the sid while the
     // restart clone was blocking, that newer sid and its marker stay
     // authoritative.
+    let generation_can_merge = live.omp_capture_generation == before.omp_capture_generation
+        || live.omp_capture_generation == started.omp_capture_generation;
     let sid_unchanged = live.agent_session_id == before.agent_session_id;
     let marker_unchanged = live.resume_probe_failed_sid == before.resume_probe_failed_sid;
-    if sid_unchanged {
-        live.agent_session_id = started.agent_session_id.clone();
+    if generation_can_merge {
+        live.omp_capture_generation = started.omp_capture_generation.clone();
+        live.session_id_poller = started.session_id_poller.clone();
+        if sid_unchanged {
+            live.agent_session_id = started.agent_session_id.clone();
+        }
+    } else if started.session_id_poller_is_running() {
+        // The worker follows the pane name and will rebind itself to the
+        // concurrently published generation on its next metadata refresh.
+        live.session_id_poller = started.session_id_poller.clone();
     }
-    if marker_unchanged && live.agent_session_id == started.agent_session_id {
+    if generation_can_merge && marker_unchanged && live.agent_session_id == started.agent_session_id
+    {
         live.resume_probe_failed_sid = started.resume_probe_failed_sid.clone();
     }
+    live.lifecycle_generation = started.lifecycle_generation;
 }
 
-fn apply_post_restart_sync(live: &mut Instance, before: &Instance, started: &Instance) {
-    live.status = started.status;
+fn apply_post_restart_sync(live: &mut Instance, before: &Instance, started: &Instance) -> bool {
+    if started.lifecycle_generation < live.lifecycle_generation {
+        return false;
+    }
+    live.merge_post_restart_with_baseline(before, started);
     live.last_error = if started.status == Status::Error {
         started.last_error.clone()
     } else {
         None
     };
     live.last_error_check = started.last_error_check;
-    apply_post_restart_identity_sync(live, before, started);
     live.last_start_time = started.last_start_time;
     live.retroactive_capture_excludes = started.retroactive_capture_excludes.clone();
+    true
 }
 
 /// Narrow sibling of [`apply_post_restart_sync`] that propagates only the
@@ -5907,6 +5806,9 @@ fn apply_post_restart_sync(live: &mut Instance, before: &Instance, started: &Ins
 /// post-cascade `finalize_launch`) would briefly mis-paint a broken pane
 /// as `Starting` until the 2s status poll loop reconciles.
 fn apply_cascade_state_sync(live: &mut Instance, before: &Instance, started: &Instance) {
+    if started.lifecycle_generation < live.lifecycle_generation {
+        return;
+    }
     apply_post_restart_identity_sync(live, before, started);
     live.retroactive_capture_excludes = started.retroactive_capture_excludes.clone();
 }
@@ -6046,25 +5948,13 @@ pub async fn ensure_session(
     let restart_result = tokio::task::spawn_blocking(
         move || -> Result<(Instance, crate::session::StartOutcome), Box<(Instance, anyhow::Error)>> {
             let mut inst = instance;
-            // Use kill_clean (vs bare tmux kill) so a remain-on-exit dead
-            // pane is respawned-then-killed; bare kill races against the
-            // session cache on macOS and can leave the corpse pane behind,
-            // which then trips the next start_with_resume_fallback's
-            // `pane_was_preexisting` short-circuit. See `Instance::kill_clean`.
-            if let Err(e) = inst.kill_clean() {
-                return Err(Box::new((inst, e)));
-            }
-            // Surface the moved Instance on the Err arm so the caller can
-            // sync resume-path mutations back to live state. Otherwise the
-            // live entry can retain stale marker/sid state until the next
-            // `status_poll_loop` reload window (~2s). See
-            // `apply_post_restart_sync`.
-            //
-            // `ensure_session` respawns on-demand before a WS attach/send,
+            // `ensure_session` respawns on demand before a WS attach/send,
             // the server-side analog of `ensure_pane_ready`: always `Allow`,
-            // ignoring `auto_resume_on_restart`, so attaching doesn't
-            // silently drop the agent's context. See #2609.
-            match inst.start_with_resume_fallback(
+            // ignoring `auto_resume_on_restart`, so attaching does not drop
+            // the agent's context. The instance-level cascade holds the
+            // lifecycle lock across final poller drain, exact-pane OMP
+            // capture, kill, and relaunch.
+            match inst.restart_with_resume_policy(
                 None,
                 false,
                 crate::session::ResumeAttemptPolicy::Allow,
@@ -6119,9 +6009,10 @@ pub async fn ensure_session(
             tracing::warn!(target: "http.api.sessions", "ensure_session restart failed for {id}: {msg}");
             let mut instances = state.instances.write().await;
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                apply_post_restart_sync(inst, &sync_base, &started);
-                inst.status = crate::session::Status::Error;
-                inst.last_error = Some(msg.clone());
+                if apply_post_restart_sync(inst, &sync_base, &started) {
+                    inst.status = crate::session::Status::Error;
+                    inst.last_error = Some(msg.clone());
+                }
             }
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -8617,6 +8508,11 @@ mod tests {
         let mut started = make_test_instance();
         started.status = Status::Starting;
         started.agent_session_id = Some("claude-uuid-restart".to_string());
+        started.omp_capture_generation = Some("omp-generation-restart".to_string());
+        let mut poller = crate::session::poller::SessionPoller::new("omp-restarted".to_string());
+        assert!(poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,));
+        let restarted_poller = std::sync::Arc::new(std::sync::Mutex::new(poller));
+        started.session_id_poller = Some(restarted_poller.clone());
         started.last_start_time = Some(std::time::Instant::now());
 
         apply_post_restart_sync(&mut live, &before, &started);
@@ -8627,7 +8523,41 @@ mod tests {
             live.agent_session_id.as_deref(),
             Some("claude-uuid-restart")
         );
+        assert_eq!(
+            live.omp_capture_generation.as_deref(),
+            Some("omp-generation-restart")
+        );
+        assert!(live.session_id_poller.is_some());
         assert_eq!(live.last_start_time, started.last_start_time);
+
+        let mut generation_converged = before.clone();
+        generation_converged.agent_session_id = Some("peer-sid".to_string());
+        generation_converged.omp_capture_generation = Some("omp-generation-restart".to_string());
+        apply_post_restart_identity_sync(&mut generation_converged, &before, &started);
+        assert_eq!(
+            generation_converged.agent_session_id.as_deref(),
+            Some("peer-sid")
+        );
+        assert!(generation_converged.session_id_poller.is_some());
+
+        let mut peer_relaunched = before.clone();
+        peer_relaunched.omp_capture_generation = Some("peer-generation".to_string());
+        apply_post_restart_identity_sync(&mut peer_relaunched, &before, &started);
+        assert_eq!(
+            peer_relaunched.omp_capture_generation.as_deref(),
+            Some("peer-generation")
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            peer_relaunched
+                .session_id_poller
+                .as_ref()
+                .expect("running restart poller"),
+            &restarted_poller,
+        ));
+        restarted_poller
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .stop();
     }
 
     #[test]
@@ -8724,6 +8654,34 @@ mod tests {
         assert_eq!(
             live.resume_probe_failed_sid.as_deref(),
             Some("peer-fresh-sid")
+        );
+    }
+
+    #[test]
+    fn restart_sync_rejects_an_older_lifecycle_generation() {
+        let mut before = make_test_instance();
+        before.lifecycle_generation = 4;
+
+        let mut started = before.clone();
+        started.status = Status::Error;
+        started.agent_session_id = Some("stale-restart-sid".to_string());
+        started.retroactive_capture_excludes = ["stale-exclusion".to_string()].into();
+
+        let mut live = before.clone();
+        live.lifecycle_generation = 5;
+        live.status = Status::Running;
+        live.agent_session_id = Some("newer-restart-sid".to_string());
+        live.retroactive_capture_excludes = ["newer-exclusion".to_string()].into();
+
+        assert!(!apply_post_restart_sync(&mut live, &before, &started));
+        apply_cascade_state_sync(&mut live, &before, &started);
+
+        assert_eq!(live.lifecycle_generation, 5);
+        assert_eq!(live.status, Status::Running);
+        assert_eq!(live.agent_session_id.as_deref(), Some("newer-restart-sid"));
+        assert_eq!(
+            live.retroactive_capture_excludes,
+            ["newer-exclusion".to_string()].into()
         );
     }
 
@@ -9961,9 +9919,10 @@ pub async fn send_message(
                     // must be copied back from the clone).
                     let mut instances = state.instances.write().await;
                     if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
-                        apply_post_restart_sync(i, &sync_base, &started);
-                        i.status = crate::session::Status::Error;
-                        i.last_error = Some(msg);
+                        if apply_post_restart_sync(i, &sync_base, &started) {
+                            i.status = crate::session::Status::Error;
+                            i.last_error = Some(msg);
+                        }
                     }
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -10321,6 +10280,7 @@ mod workspace_ordering_tests {
             },
             trashed_at: None,
             remote_owner: None,
+            remote_owner_key: None,
             notify_on_waiting: None,
             notify_on_idle: None,
             notify_on_error: None,

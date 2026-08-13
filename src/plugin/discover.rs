@@ -1,20 +1,27 @@
 //! GitHub plugin discovery over the `aoe-plugin` topic.
 //!
 //! Discovery is an explicit action (CLI `aoe plugin discover`, TUI `d`, the
-//! dashboard "Search GitHub" button), never a background task. It is repo-level,
-//! not manifest-level: it runs one GitHub search and badges each result by
-//! matching the repo slug against the featured index and the installed set. It
-//! deliberately does NOT clone or read each repo's `aoe-plugin.toml` (an N+1
-//! network blowup that would burn the unauthenticated search rate limit), so a
-//! result is "a GitHub repository tagged `aoe-plugin`", not "a verified plugin".
-//! Install remains the trust boundary: it fetches the manifest, prompts for
-//! capabilities, and enforces the featured pin (`install::install`).
+//! dashboard "Search GitHub" button), never a background task. It runs one
+//! GitHub search and badges each result by matching the repo slug against the
+//! featured index and the installed set. It deliberately does NOT clone, read,
+//! or parse each repo's `aoe-plugin.toml` (an N+1 that would burn the
+//! unauthenticated API rate limit). The one exception is a best-effort `HEAD`
+//! on the raw CDN for unvetted results: the `aoe-plugin` topic collides with
+//! Age of Empires game projects, so a repo that provably carries no manifest is
+//! dropped rather than offered for install. Existence is not validation, so a
+//! result is still "a GitHub repository tagged `aoe-plugin` that appears to
+//! carry a manifest", not "a verified plugin". Install remains the trust
+//! boundary: it fetches the manifest, prompts for capabilities, and enforces
+//! the featured pin (`install::install`).
 
+use std::collections::HashMap;
 use std::time::Duration;
 
 use anyhow::{bail, Result};
 use aoe_plugin_api::{lucide_icon_name_ok, screenshot_path_ok, MAX_SCREENSHOTS};
+use futures_util::{stream, StreamExt};
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
+use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
 use crate::github::{GitHubClient, GitHubClientConfig, GitHubRepo, DEFAULT_USER_AGENT};
@@ -45,6 +52,19 @@ use super::source::PluginSource;
 
 /// The GitHub topic plugins are published under.
 const PLUGIN_TOPIC: &str = "aoe-plugin";
+
+/// Per-probe timeout. Short on purpose: the manifest probe is a filter, not a
+/// dependency, so a slow CDN must not hold the search hostage.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// Wall-clock ceiling for the whole probe phase. Concurrency alone does not
+/// bound it: a full 30-result page at [`PROBE_CONCURRENCY`] is four serial
+/// batches, so uniform timeouts would cost four times [`PROBE_TIMEOUT`].
+/// Probes still in flight when this fires are simply inconclusive.
+const PROBE_PHASE_TIMEOUT: Duration = Duration::from_secs(6);
+
+/// How many manifest probes run at once.
+const PROBE_CONCURRENCY: usize = 8;
 
 /// How a discovered repository relates to what the host already knows.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -114,7 +134,131 @@ pub async fn discover(query: Option<&str>) -> Result<Vec<DiscoveryResult>> {
     // discovery and install would disagree about the same trust signal.
     let featured = FeaturedIndex::load()?;
     let installed = installed_slugs();
-    Ok(rank(badge_repos(repos, &featured, &installed)))
+    let badged = badge_repos(repos, &featured, &installed);
+    let probes = probe_unvetted(&badged).await;
+    Ok(rank(drop_missing(badged, &probes)))
+}
+
+/// The outcome of one `aoe-plugin.toml` existence probe. Tri-state on purpose:
+/// a bool would conflate "this repo has no manifest" with "we could not
+/// check", and only the former may drop a result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ManifestProbe {
+    Present,
+    Missing,
+    Unknown,
+}
+
+/// Map a probe response to an outcome; `None` is a transport error or timeout.
+/// Only a definitive 404 is `Missing`: a 403/429 (CDN throttling) or a 5xx says
+/// nothing about the repo, so everything else fails open.
+fn classify(status: Option<StatusCode>) -> ManifestProbe {
+    match status {
+        Some(s) if s.is_success() => ManifestProbe::Present,
+        Some(StatusCode::NOT_FOUND) => ManifestProbe::Missing,
+        _ => ManifestProbe::Unknown,
+    }
+}
+
+/// Split a `gh:owner/repo` slug. [`badge_repos`] already validated the shape.
+fn owner_repo(slug: &str) -> Option<(&str, &str)> {
+    slug.strip_prefix("gh:")?.split_once('/')
+}
+
+/// `HEAD` the repo's default-branch `aoe-plugin.toml` on the raw CDN. Not the
+/// contents API [`GitHubClient::get_repo_file`] uses: that draws on the 60/hr
+/// unauthenticated core budget, which one 30-result page would half exhaust,
+/// while the CDN is not on that budget. `HEAD` is enough because the question
+/// is existence, and it downloads no body.
+async fn probe_manifest(http: &reqwest::Client, owner: &str, repo: &str) -> ManifestProbe {
+    let url = raw_url(owner, repo, None, "aoe-plugin.toml");
+    classify(http.head(url).send().await.ok().map(|r| r.status()))
+}
+
+/// Probe every unvetted result concurrently, keyed by slug. Installed and
+/// featured sources are deliberately never probed: both install from a pinned
+/// ref, so a manifest missing from the default branch today does not make them
+/// uninstallable, and acting on that would be a false alarm on a working
+/// plugin. Curation drift belongs in featured-index maintenance, not here.
+async fn probe_unvetted(results: &[DiscoveryResult]) -> HashMap<String, ManifestProbe> {
+    let targets: Vec<(String, String, String)> = results
+        .iter()
+        .filter(|r| r.badge == DiscoveryBadge::Unvetted)
+        .filter_map(|r| {
+            owner_repo(&r.slug)
+                .map(|(owner, repo)| (r.slug.clone(), owner.to_string(), repo.to_string()))
+        })
+        .collect();
+    let attempted = targets.len();
+    if attempted == 0 {
+        return HashMap::new();
+    }
+    let http = match reqwest::Client::builder()
+        .user_agent(DEFAULT_USER_AGENT)
+        .timeout(PROBE_TIMEOUT)
+        .build()
+    {
+        Ok(http) => http,
+        // No client means no evidence, so every result stays.
+        Err(_) => return HashMap::new(),
+    };
+
+    let mut probes = stream::iter(targets.into_iter().map(|(slug, owner, repo)| {
+        let http = &http;
+        async move { (slug, probe_manifest(http, &owner, &repo).await) }
+    }))
+    .buffer_unordered(PROBE_CONCURRENCY);
+
+    // Drain under a phase deadline rather than wrapping the collect: a single
+    // timeout around the whole thing would throw away the probes that already
+    // came back, so one hung repo would unfilter the entire page.
+    let deadline = tokio::time::Instant::now() + PROBE_PHASE_TIMEOUT;
+    let mut out = HashMap::new();
+    while let Ok(Some((slug, probe))) = tokio::time::timeout_at(deadline, probes.next()).await {
+        out.insert(slug, probe);
+    }
+    log_probes(attempted, &out);
+    out
+}
+
+/// Report probe outcomes in aggregate. A page where nothing came back
+/// conclusive means the filter did not run at all (a network that reaches
+/// `api.github.com` but blocks `raw.githubusercontent.com` does this), which is
+/// worth saying out loud since the topic-collision results are then unfiltered.
+fn log_probes(attempted: usize, probes: &HashMap<String, ManifestProbe>) {
+    let count = |want: ManifestProbe| probes.values().filter(|p| **p == want).count();
+    let present = count(ManifestProbe::Present);
+    let missing = count(ManifestProbe::Missing);
+    // Probes that never completed before the deadline are inconclusive too.
+    let unknown = attempted - present - missing;
+    if present == 0 && missing == 0 {
+        tracing::warn!(
+            target: "plugin.discover",
+            unknown,
+            "every manifest probe was inconclusive; raw.githubusercontent.com may be unreachable, so topic-collision results are not filtered"
+        );
+    } else {
+        tracing::debug!(
+            target: "plugin.discover",
+            present,
+            missing,
+            unknown,
+            "manifest probes"
+        );
+    }
+}
+
+/// Drop the results a probe proved carry no manifest. A slug absent from
+/// `probes` (never probed, or still in flight when the phase deadline fired) is
+/// retained, so the filter always fails open.
+fn drop_missing(
+    results: Vec<DiscoveryResult>,
+    probes: &HashMap<String, ManifestProbe>,
+) -> Vec<DiscoveryResult> {
+    results
+        .into_iter()
+        .filter(|r| probes.get(&r.slug) != Some(&ManifestProbe::Missing))
+        .collect()
 }
 
 /// The normalized `gh:owner/repo` slugs of every installed external GitHub
@@ -506,6 +650,85 @@ mod tests {
         let repos = vec![repo("not-a-slug", 1), repo("a/b/c", 1)];
         let out = badge_repos(repos, &FeaturedIndex::default(), &[]);
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn classify_maps_only_404_to_missing() {
+        let cases = [
+            (Some(StatusCode::OK), ManifestProbe::Present),
+            (Some(StatusCode::NOT_FOUND), ManifestProbe::Missing),
+            // CDN throttling and server errors say nothing about the repo, so
+            // they must never drop a result.
+            (Some(StatusCode::FORBIDDEN), ManifestProbe::Unknown),
+            (Some(StatusCode::TOO_MANY_REQUESTS), ManifestProbe::Unknown),
+            (
+                Some(StatusCode::INTERNAL_SERVER_ERROR),
+                ManifestProbe::Unknown,
+            ),
+            // A transport error or a timeout.
+            (None, ManifestProbe::Unknown),
+        ];
+        for (status, expected) in cases {
+            assert_eq!(classify(status), expected, "{status:?}");
+        }
+    }
+
+    #[test]
+    fn drops_only_the_results_a_probe_proved_missing() {
+        let repos = vec![
+            repo("acme/missing", 1),
+            repo("acme/present", 1),
+            repo("acme/unknown", 1),
+            repo("acme/unprobed", 1),
+            repo("acme/installed", 1),
+            repo("acme/vetted", 1),
+        ];
+        let index = featured("gh:acme/vetted");
+        let installed = vec!["gh:acme/installed".to_string()];
+        let badged = badge_repos(repos, &index, &installed);
+        // Installed and featured slugs are never probed, so they are absent
+        // from the map even when their default branch lost its manifest;
+        // `unprobed` stands in for a probe that missed the phase deadline.
+        let probes = HashMap::from([
+            ("gh:acme/missing".to_string(), ManifestProbe::Missing),
+            ("gh:acme/present".to_string(), ManifestProbe::Present),
+            ("gh:acme/unknown".to_string(), ManifestProbe::Unknown),
+        ]);
+        let kept: Vec<String> = drop_missing(badged, &probes)
+            .into_iter()
+            .map(|r| r.slug)
+            .collect();
+        assert!(
+            !kept.contains(&"gh:acme/missing".to_string()),
+            "a confirmed-missing manifest must drop the result: {kept:?}"
+        );
+        assert_eq!(kept.len(), 5, "everything else fails open: {kept:?}");
+    }
+
+    #[test]
+    fn a_page_of_missing_manifests_yields_the_empty_state() {
+        let badged = badge_repos(
+            vec![repo("acme/a", 1), repo("acme/b", 1)],
+            &FeaturedIndex::default(),
+            &[],
+        );
+        let probes = HashMap::from([
+            ("gh:acme/a".to_string(), ManifestProbe::Missing),
+            ("gh:acme/b".to_string(), ManifestProbe::Missing),
+        ]);
+        assert!(drop_missing(badged, &probes).is_empty());
+    }
+
+    #[test]
+    fn the_manifest_probe_targets_the_raw_cdn_not_the_api() {
+        // The probe must not draw on the 60/hr unauthenticated core API budget,
+        // which is the whole reason discovery avoided per-repo manifest reads.
+        let url = raw_url("acme", "widget", None, "aoe-plugin.toml");
+        assert_eq!(
+            url,
+            "https://raw.githubusercontent.com/acme/widget/HEAD/aoe-plugin.toml"
+        );
+        assert!(!url.starts_with(&api_base()), "{url}");
     }
 
     #[test]

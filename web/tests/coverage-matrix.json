@@ -139,6 +139,16 @@
       ]
     },
     {
+      "id": "terminal.live-split-composite",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/hooks/useLiveTerminal.forward.test.ts",
+        "src/components/__tests__/MobileLiveTerminal.forward.test.tsx"
+      ],
+      "components": ["web/src/hooks/useLiveTerminal.ts", "web/src/components/MobileLiveTerminal.tsx"]
+    },
+    {
       "id": "terminal.live-line-wrap-units",
       "kind": "vitest",
       "risk": "high",
@@ -1408,6 +1418,31 @@
       ]
     },
     {
+      "id": "sidebar.org-axis-pure",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/lib/__tests__/sidebarGroups.test.ts"],
+      "components": ["web/src/lib/sidebarGroups.ts"]
+    },
+    {
+      "id": "sidebar.org-axis-hook",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/hooks/__tests__/useOrgGroups.test.ts"],
+      "components": ["web/src/hooks/useOrgGroups.ts"]
+    },
+    {
+      "id": "sidebar.org-axis-live",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/sidebar-grouping.spec.ts"],
+      "components": [
+        "web/src/components/WorkspaceSidebar.tsx",
+        "web/src/hooks/useOrgGroups.ts",
+        "web/src/lib/sidebarGroups.ts"
+      ]
+    },
+    {
       "id": "session.lifecycle",
       "kind": "live-playwright",
       "risk": "high",
@@ -2136,6 +2171,24 @@
       "risk": "medium",
       "specs": ["src/lib/acpDrafts.test.ts"],
       "components": ["web/src/lib/acpDrafts.ts"]
+    },
+    {
+      "id": "acp.queue-drain-ownership",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": [
+        "src/lib/acpDrainCoordinator.test.ts",
+        "src/hooks/useAcpSession.queue.test.ts",
+        "src/components/acp/AcpQueueDrainer.test.tsx"
+      ],
+      "components": [
+        "web/src/lib/acpDrainCoordinator.ts",
+        "web/src/hooks/useAcpSession.ts",
+        "web/src/hooks/useAcpQueueCount.ts",
+        "web/src/components/acp/AcpQueueDrainer.tsx",
+        "web/src/lib/acpStateStorage.ts",
+        "web/src/App.tsx"
+      ]
     },
     {
       "id": "acp.queue-drain-clear-split",
@@ -2963,6 +3016,13 @@
       ]
     },
     {
+      "id": "acp.story.queue-drains-while-unmounted",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": ["tests/live/acp-stories/queue-drains-while-unmounted.spec.ts"],
+      "components": ["web/src/components/acp/AcpQueueDrainer.tsx", "web/src/App.tsx"]
+    },
+    {
       "id": "acp.story.queue-edit-message",
       "kind": "live-playwright",
       "risk": "medium",
@@ -3495,7 +3555,7 @@
       "risk": "medium",
       "specs": ["src/components/plugin/__tests__/PluginSlots.test.tsx"],
       "components": ["web/src/components/plugin/PluginSlots.tsx"],
-      "notes": "The api_version 12 pane block vocabulary: callout, bar and columns, plus the interactive row (clicking a row fires its `method` with the block's `params`, e.g. github.select_pr) and the pinned pane footer."
+      "notes": "The api_version 12 pane block vocabulary: callout, bar and columns, plus the interactive row (clicking a row fires its `method` with the block's `params`, e.g. github.select_pr) and the pinned pane footer. api_version 13 adds the sparkline block (per-sample band coloring) and the global home-pane slot (PluginHomePanes), covered by the sparkline and home-pane cases in PluginSlots.test.tsx."
     },
     {
       "id": "plugins.composer-actions",

@@ -1,7 +1,9 @@
 //! Session operations for HomeView (create, delete, rename)
 
 use crate::session::builder::{self, InstanceParams};
-use crate::session::{list_profiles, ClaimOp, GroupTree, Instance, Item, Status, Storage};
+use crate::session::{
+    list_profiles, GroupTree, Instance, Item, LifecycleOperation, Status, Storage,
+};
 use crate::tui::deletion_poller::DeletionRequest;
 use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions, InfoDialog, NewSessionData};
 use crate::tui::restart_poller::RestartRequest;
@@ -422,9 +424,13 @@ impl HomeView {
                 .map(|i| i.tool.clone())
                 .unwrap_or_default();
             if target_tool != current_tool {
-                self.mutate_instance(&id, |inst| {
-                    inst.tool = target_tool.to_string();
-                });
+                // `swap_tool` (not a plain `tool` assignment) because the old
+                // engine's session id must not follow the row to the new
+                // engine: it parks the outgoing ids under the outgoing tool and
+                // restores the incoming tool's, if the row has been there
+                // before.
+                self.mutate_instance(&id, |inst| inst.swap_tool(target_tool));
+                self.persist_tool_swap(&id, target_tool);
             }
         }
 
@@ -492,26 +498,31 @@ impl HomeView {
                 self.rebuild_flat_items();
             }
         }
+        self.mutate_instance(&id, |inst| inst.touch_last_accessed());
+
+        // Persist user-selected profile/tool/command changes and the access
+        // timestamp while the durable row still carries its prior lifecycle
+        // state. The worker owns the Starting reservation; publishing that
+        // status here would make it reject its own request as concurrent.
+        self.save()?;
 
         // The start cascade shells out to docker (image pull, container
         // create/start) and runs the before_start host hook, any of which can
-        // block for seconds. Running it inline froze the TUI
-        // event loop, so mirror the recovery/stop paths: flip the row to
-        // Starting for immediate feedback, then run the cascade on the restart
-        // poller's worker thread. The post-cascade snapshot (and the wake-up)
-        // are handled via `apply_restart_results`.
+        // block for seconds. Running it inline froze the TUI event loop, so
+        // mirror the recovery/stop paths: show Starting locally for immediate
+        // feedback, then let the restart worker reserve and persist Starting.
+        // The post-cascade snapshot (and the wake-up) is handled via
+        // `apply_restart_results`.
         let size = crate::terminal::get_size();
 
-        // Status::Starting + a fresh last_start_time keeps the StatusPoller from
-        // flipping the row to Error before the worker finishes (the same grace
-        // startup recovery relies on); touch bumps the row on the user gesture.
+        // Status::Starting plus a fresh last_start_time keeps the StatusPoller
+        // from flipping the row to Error before the worker finishes. The
+        // access timestamp was persisted above on the user gesture.
         self.mutate_instance(&id, |inst| {
             inst.status = Status::Starting;
             inst.last_error = None;
             inst.last_start_time = Some(std::time::Instant::now());
-            inst.touch_last_accessed();
         });
-        self.save()?;
 
         let Some(instance) = self.get_instance(&id).cloned() else {
             return Ok(());
@@ -533,6 +544,52 @@ impl HomeView {
         Ok(())
     }
 
+    /// Land an engine swap's session bookkeeping on the disk row.
+    ///
+    /// `save()` syncs `tool`/`command`/`extra_args` through `merge_from_tui`
+    /// but deliberately leaves `agent_session_id` and friends to their CAS
+    /// writers, so the swap needs its own write: without it,
+    /// `reconcile_from_disk` restores the old engine's sid on the launch that
+    /// follows and the new engine spawns with `--resume <foreign-sid>`.
+    ///
+    /// `swap_tool` runs against the disk row rather than copying the in-memory
+    /// result over it, because the capture pollers may have written a fresher
+    /// sid to disk than this snapshot carries; parking whatever disk holds is
+    /// what makes the swap-back restore the real conversation.
+    ///
+    /// Best-effort. A failed write leaves the stale sid on disk (the restart
+    /// still runs, and its resume-probe fallback recovers by starting fresh),
+    /// so it is logged rather than surfaced as a restart failure.
+    fn persist_tool_swap(&self, id: &str, new_tool: &str) {
+        let Some(profile) = self.instances.get(id).map(|i| i.source_profile.clone()) else {
+            return;
+        };
+        let Some(storage) = self.storages.get(&profile) else {
+            tracing::warn!(
+                target: "tui.home",
+                profile = %profile,
+                id = %id,
+                "persist_tool_swap: no storage registered for profile; \
+                 the old engine's session id stays on disk"
+            );
+            return;
+        };
+        let id_owned = id.to_string();
+        let new_tool = new_tool.to_string();
+        if let Err(e) = storage.update(|instances, _groups| {
+            if let Some(disk) = instances.iter_mut().find(|i| i.id == id_owned) {
+                disk.swap_tool(&new_tool);
+            }
+            Ok(())
+        }) {
+            tracing::error!(
+                target: "tui.home",
+                id = %id,
+                "persist_tool_swap: failed to move the old engine's session state aside: {e}"
+            );
+        }
+    }
+
     pub(super) fn delete_selected(&mut self, options: &DeleteOptions) -> anyhow::Result<()> {
         if let Some(id) = &self.selected_session {
             let id = id.clone();
@@ -549,40 +606,6 @@ impl HomeView {
                     "This session is still restarting. Wait for it to finish before deleting.",
                 ));
                 return Ok(());
-            }
-
-            // #2541: a permanent delete of a trashed session is a purge that can
-            // race a restore from another process. Win the Purge claim under the
-            // flock before the unlocked teardown; refuse if a peer restore holds
-            // a fresh claim. A live-session delete has no restore to race, so it
-            // skips the claim.
-            let was_trashed = self.get_instance(&id).is_some_and(|i| i.is_trashed());
-            if was_trashed {
-                match self.claim_trashed_purge(&id, was_trashed) {
-                    Ok(crate::session::claim::PurgeClaimDecision::Claimed) => {
-                        self.purge_claimed.insert(id.clone());
-                    }
-                    Ok(crate::session::claim::PurgeClaimDecision::Restored)
-                    | Ok(crate::session::claim::PurgeClaimDecision::RestoreInProgress) => {
-                        self.info_dialog = Some(InfoDialog::new(
-                            "Restore in progress",
-                            "This session is being restored by another process; it was not deleted.",
-                        ));
-                        return Ok(());
-                    }
-                    Ok(crate::session::claim::PurgeClaimDecision::AlreadyGone) => {
-                        self.drop_peer_deleted_rows(std::slice::from_ref(&id));
-                        self.rebuild_flat_items();
-                        return Ok(());
-                    }
-                    Err(()) => {
-                        self.info_dialog = Some(InfoDialog::new(
-                            "Delete Failed",
-                            "Could not claim the delete under the storage lock. Try again.",
-                        ));
-                        return Ok(());
-                    }
-                }
             }
 
             self.set_instance_status(&id, Status::Deleting);
@@ -602,83 +625,6 @@ impl HomeView {
             }
         }
         Ok(())
-    }
-
-    /// Decide the Purge claim for a trashed session before its unlocked
-    /// teardown, under the storage flock (the cross-process serialization
-    /// point). Uses the shared `decide_purge_claim` so the TUI closes the same
-    /// window (peer restore un-trashed the row between snapshot and claim)
-    /// as the CLI and server. `Err(())` is a storage failure (surfaced as a
-    /// generic delete error), kept distinct from a claim decision. See #2541.
-    fn claim_trashed_purge(
-        &self,
-        id: &str,
-        was_trashed: bool,
-    ) -> Result<crate::session::claim::PurgeClaimDecision, ()> {
-        let Some(profile) = self.instances.get(id).map(|i| i.source_profile.clone()) else {
-            return Ok(crate::session::claim::PurgeClaimDecision::AlreadyGone);
-        };
-        let Some(storage) = self.storages.get(&profile) else {
-            tracing::warn!(
-                target: "tui.home",
-                profile = %profile,
-                id = %id,
-                "purge claim: no storage registered for profile"
-            );
-            return Err(());
-        };
-        storage
-            .update(|insts, _groups| {
-                Ok(crate::session::claim::decide_purge_claim(
-                    insts,
-                    id,
-                    was_trashed,
-                    chrono::Utc::now(),
-                ))
-            })
-            .map_err(|e| {
-                tracing::warn!(target: "tui.home", id = %id, "purge claim failed: {e}");
-            })
-    }
-
-    /// Finalize a claimed trashed-purge under the flock: apply the #2534 recheck
-    /// (keep the row if a peer restored it mid-purge) and release the owned
-    /// Purge claim, else drop the row. `Ok(true)` = kept (restored mid-purge),
-    /// `Ok(false)` = removed, `Err(())` = storage failure (the row is untouched
-    /// on disk, so the caller must not treat it as removed). See #2541.
-    pub(super) fn finalize_claimed_purge(&mut self, id: &str) -> Result<bool, ()> {
-        let Some(profile) = self.instances.get(id).map(|i| i.source_profile.clone()) else {
-            return Ok(false);
-        };
-        let Some(storage) = self.storages.get(&profile) else {
-            return Err(());
-        };
-        storage
-            .update(|insts, _groups| {
-                Ok(matches!(
-                    crate::session::claim::finalize_purge_removal(insts, id, true),
-                    crate::session::claim::PurgeCommit::KeptRestored
-                ))
-            })
-            .map_err(|e| {
-                tracing::warn!(target: "tui.home", id = %id, "purge finalize failed: {e}");
-            })
-    }
-
-    /// Release a trashed-purge claim on a kept row (teardown failed),
-    /// ownership-guarded so a peer's fresh Restore claim survives. See #2541.
-    pub(super) fn release_trashed_purge_claim(&self, id: &str) {
-        let Some(profile) = self.instances.get(id).map(|i| i.source_profile.clone()) else {
-            return;
-        };
-        if let Some(storage) = self.storages.get(&profile) {
-            let _ = storage.update(|insts, _groups| {
-                if let Some(stored) = insts.iter_mut().find(|i| i.id == id) {
-                    stored.clear_op_claim_if_owned(ClaimOp::Purge);
-                }
-                Ok(())
-            });
-        }
     }
 
     pub(super) fn delete_selected_group(&mut self) -> anyhow::Result<()> {
@@ -722,13 +668,14 @@ impl HomeView {
 
             // Scoped so the borrow of `group_path` / `owning_profile` ends
             // before the restart-in-flight bail-out moves them back into self.
-            let sessions_to_delete: Vec<String> = {
+            let mut sessions_to_delete: Vec<String> = {
                 let is_member = group_membership(&group_path, &prefix, owning_profile.as_deref());
                 self.instances()
                     .filter(|i| is_member(i))
                     .map(|i| i.id.clone())
                     .collect()
             };
+            sessions_to_delete.sort();
 
             // Refuse the whole group delete if any member is mid-restart (same
             // concurrent-docker race as delete_selected). Restore the selection
@@ -745,11 +692,12 @@ impl HomeView {
                 ));
                 return Ok(());
             }
-
-            self.bulk_apply_user_action(&sessions_to_delete, |inst| {
-                inst.status = Status::Deleting;
-                inst.group_path = String::new();
-            })?;
+            for session_id in &sessions_to_delete {
+                self.mutate_instance(session_id, |inst| {
+                    inst.status = Status::Deleting;
+                    inst.group_path = String::new();
+                });
+            }
 
             for session_id in &sessions_to_delete {
                 if let Some(inst) = self.get_instance(session_id) {
@@ -784,25 +732,28 @@ impl HomeView {
                     self.delete_group_in_profile(&profile, &group_path);
                 }
             }
-            self.save()?;
             self.rebuild_flat_items();
         }
         Ok(())
     }
 
     /// Force-remove a session from storage. Worktree and branch cleanup are
-    /// skipped (the original deletion already attempted them), but the sandbox
-    /// container IS torn down best-effort so a stuck delete cannot orphan a
-    /// live container. Both run off-thread so a hung tmux or docker call cannot
-    /// block the storage update on the TUI input thread. Used for sessions
-    /// stuck in the Deleting state where the background deletion thread never
-    /// returned a result.
+    /// skipped because the original deletion already attempted them. Once the
+    /// row is durably absent, tmux and sandbox teardown run off-thread so a
+    /// hung tmux or docker call cannot block the TUI input thread. Used for
+    /// sessions stuck in the Deleting state where the background deletion
+    /// thread never returned a result.
     pub(super) fn force_remove_session(&mut self, session_id: &str) -> anyhow::Result<()> {
-        if let Some(inst) = self.instances.get(session_id) {
-            let inst = inst.clone();
+        let instance = self.instances.get(session_id).cloned();
+        self.remove_instance(session_id);
+        self.rebuild_group_trees();
+        self.save()?;
+        self.reload()?;
+
+        if let Some(inst) = instance {
             std::thread::spawn(move || {
                 if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    inst.kill_all_tmux_sessions()
+                    inst.kill_all_tmux_sessions_after_forced_removal()
                 })) {
                     tracing::error!(
                         target: "session.delete",
@@ -824,10 +775,6 @@ impl HomeView {
                 }
             });
         }
-        self.remove_instance(session_id);
-        self.rebuild_group_trees();
-        self.save()?;
-        self.reload()?;
         Ok(())
     }
 
@@ -1675,47 +1622,61 @@ impl HomeView {
     /// `Instance::stop` runs on the `StopPoller`, #1496). A structured-view
     /// worker is reaped by the daemon reconciler once the row reads trashed.
     pub(super) fn trash_session_by_id(&mut self, id: &str) {
-        // The trash marker and the in-flight Trash claim land in ONE flock
-        // acquisition (the same-flock post_disk hook), mirroring the CLI and
-        // server sites, so a peer can never read a trashed row without its
-        // claim. The claim goes through the hook rather than the mutate
-        // because `merge_user_action_diff` deliberately drops `op_claim`
-        // (#2541). Best-effort: a refused claim (fresh peer purge/restore)
-        // still tears down, gated by the pre-move re-check and the locked
-        // relocation commit.
-        let outcome = self.apply_user_action_with(
-            id,
-            |inst| inst.trash(),
-            |disk| {
-                if let Err(holder) = disk.try_claim(
-                    crate::session::ClaimOp::Trash,
-                    crate::session::Instance::OP_CLAIM_TTL,
-                    chrono::Utc::now(),
-                ) {
-                    tracing::info!(
-                        target: "tui.session",
-                        session = %disk.id,
-                        "trash teardown runs unclaimed; a fresh {holder:?} claim holds the row"
-                    );
-                }
-            },
-        );
-        if let Err(e) = outcome {
-            tracing::warn!(target: "tui.session", session = %id, "trash failed: {e}");
+        let Some((profile, mut request_instance)) = self
+            .instances
+            .get(id)
+            .map(|instance| (instance.source_profile.clone(), instance.clone()))
+        else {
             return;
+        };
+        let Some(storage) = self.storages.get(&profile) else {
+            tracing::warn!(
+                target: "tui.session",
+                session = %id,
+                "trash failed: no storage registered for profile {profile}"
+            );
+            return;
+        };
+        let acquisition = (|| -> anyhow::Result<_> {
+            let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(id)?;
+            storage.update(|instances, _groups| {
+                let stored = instances
+                    .iter_mut()
+                    .find(|instance| instance.id == id)
+                    .ok_or_else(|| anyhow::anyhow!("session disappeared before trash"))?;
+                let generation = stored
+                    .try_acquire_lifecycle_reservation(
+                        LifecycleOperation::Trash,
+                        crate::session::Instance::LIFECYCLE_RESERVATION_TTL,
+                        chrono::Utc::now(),
+                    )
+                    .map_err(anyhow::Error::new)?;
+                stored.trash();
+                Ok((generation, stored.lifecycle_reservation.clone()))
+            })
+        })();
+        let (generation, reservation) = match acquisition {
+            Ok(acquired) => acquired,
+            Err(error) => {
+                tracing::warn!(target: "tui.session", session = %id, "trash failed: {error}");
+                return;
+            }
+        };
+
+        request_instance.trash();
+        request_instance.lifecycle_generation = generation;
+        request_instance.lifecycle_reservation = reservation.clone();
+        if let Some(instance) = self.instances.get_mut(id) {
+            instance.trash();
+            instance.lifecycle_generation = generation;
+            instance.lifecycle_reservation = reservation;
         }
-        // The row is durably trashed; hand the blocking teardown (tmux kill,
-        // container stop, worktree relocation) to the worker. The relocated
-        // path persists later via apply_trash_results. Best-effort: if the
-        // relocation cannot run, the worktree stays in place and a later
-        // reconcile pass moves it.
-        if let Some(inst) = self.instances.get(id) {
-            self.trash_poller
-                .request_trash(crate::session::trash::TrashRequest {
-                    session_id: id.to_string(),
-                    instance: inst.clone(),
-                });
-        }
+        self.trash_poller
+            .request_trash(crate::session::trash::TrashRequest {
+                session_id: id.to_string(),
+                instance: request_instance,
+                generation,
+            });
         self.rebuild_flat_items();
         self.cursor = self.cursor.min(self.flat_items.len().saturating_sub(1));
         self.update_selected();
@@ -1729,18 +1690,21 @@ impl HomeView {
         let Some(id) = self.selected_session.clone() else {
             return;
         };
-        let Some(profile) = self
-            .instances
-            .get(&id)
-            .filter(|i| i.is_trashed())
-            .map(|i| i.source_profile.clone())
+        let Some((profile, owned_trash_generation)) =
+            self.instances.get(&id).filter(|i| i.is_trashed()).map(|i| {
+                let generation = i
+                    .lifecycle_reservation
+                    .as_ref()
+                    .filter(|reservation| reservation.op == LifecycleOperation::Trash)
+                    .map(|reservation| reservation.generation);
+                (i.source_profile.clone(), generation)
+            })
         else {
             return;
         };
-        // Restore is NOT routed through `apply_user_action` here: that persists
-        // via `merge_user_action_diff`, which deliberately drops `op_claim`, so
-        // the symmetric claim would never reach disk. Drive storage directly,
-        // mirroring the CLI restore. See #2541.
+        // Restore bypasses the generic user-action diff because lifecycle
+        // ownership, worktree movement, and durable untrash must stay under the
+        // per-instance flock.
         let outcome = {
             let Some(storage) = self.storages.get(&profile) else {
                 tracing::warn!(
@@ -1751,7 +1715,7 @@ impl HomeView {
                 );
                 return;
             };
-            restore_from_trash_with_storage(storage, &id)
+            restore_from_trash_with_storage(storage, &id, owned_trash_generation)
         };
         match outcome {
             RestoreFromTrash::Restored {
@@ -1762,7 +1726,7 @@ impl HomeView {
                     inst.project_path = project_path;
                     inst.pre_trash_project_path = pre_trash_project_path;
                     inst.untrash();
-                    inst.clear_op_claim_if_owned(ClaimOp::Restore);
+                    inst.lifecycle_reservation = None;
                 }
                 self.rebuild_flat_items();
                 self.select_session_by_id(&id);
@@ -1771,10 +1735,10 @@ impl HomeView {
                 self.drop_peer_deleted_rows(std::slice::from_ref(&id));
                 self.rebuild_flat_items();
             }
-            RestoreFromTrash::PurgeInProgress => {
+            RestoreFromTrash::Busy(reason) => {
                 self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
                     "Restore Failed",
-                    "This session is being purged by another process; it was not restored.",
+                    &format!("Session is {reason}, so it was not restored."),
                 ));
             }
             RestoreFromTrash::WorktreeFailed { reason } => {
@@ -1843,20 +1807,20 @@ impl HomeView {
 
     /// Permanently purge every trashed session. The Trash section's "Empty
     /// Trash" bulk action, reached only after the confirm dialog. Each row runs
-    /// the same off-thread deletion path as a single permanent delete: win the
-    /// Purge claim under the flock, mark it Deleting, and hand the teardown to
-    /// the shared `deletion_poller`, whose completion handler finalizes each
-    /// row (the #2534 restore-race recheck and transcript purge included).
+    /// the same off-thread deletion path as a single permanent delete:
+    /// reservation, hooks, teardown, and durable completion all run inside
+    /// `deletion_poller`; the event loop only queues requests.
     /// Cleanup options are resolved per row from its repo config, mirroring the
     /// CLI `empty-trash`, with force removal so a dirty worktree can't keep a
     /// row pinned.
     pub(super) fn empty_trash_all(&mut self) {
-        let trashed: Vec<Instance> = self
+        let mut trashed: Vec<Instance> = self
             .instances
             .values()
             .filter(|i| i.is_trashed())
             .cloned()
             .collect();
+        trashed.sort_by(|left, right| left.id.cmp(&right.id));
         if trashed.is_empty() {
             return;
         }
@@ -1868,18 +1832,6 @@ impl HomeView {
             // applies to a single delete.
             if self.restart_in_flight.contains(&id) {
                 continue;
-            }
-            match self.claim_trashed_purge(&id, true) {
-                Ok(crate::session::claim::PurgeClaimDecision::Claimed) => {
-                    self.purge_claimed.insert(id.clone());
-                }
-                Ok(crate::session::claim::PurgeClaimDecision::Restored)
-                | Ok(crate::session::claim::PurgeClaimDecision::RestoreInProgress) => continue,
-                Ok(crate::session::claim::PurgeClaimDecision::AlreadyGone) => {
-                    self.drop_peer_deleted_rows(std::slice::from_ref(&id));
-                    continue;
-                }
-                Err(()) => continue,
             }
 
             self.set_instance_status(&id, Status::Deleting);
@@ -1905,9 +1857,7 @@ impl HomeView {
                 keep_scratch: false,
             });
         }
-        // Rows now show Deleting until the poller reports each one done and the
-        // completion handler drops them. Rebuild once so any AlreadyGone rows
-        // dropped above leave the list, then re-anchor the cursor.
+        // Rows show Deleting until the poller reports each transaction.
         self.rebuild_flat_items();
         if !self.flat_items.is_empty() && self.cursor >= self.flat_items.len() {
             self.cursor = self.flat_items.len() - 1;
@@ -1938,6 +1888,22 @@ impl HomeView {
                         .is_none_or(|p| &i.source_profile == p)
                 })
                 .filter(|i| super::project_group_name(i) == group_path)
+                .map(|i| i.id.clone())
+                .collect(),
+            // Org headers are derived from each session's resolved remote
+            // owner key (host-scoped, not just the bare owner, so same-named
+            // owners on different hosts stay separate), same
+            // unification-across-profiles rationale as Project.
+            crate::session::config::GroupByMode::Org => self
+                .instances
+                .values()
+                .filter(|i| !i.is_archived() && !i.is_trashed())
+                .filter(|i| {
+                    self.active_profile
+                        .as_ref()
+                        .is_none_or(|p| &i.source_profile == p)
+                })
+                .filter(|i| self.org_group_key(i) == group_path)
                 .map(|i| i.id.clone())
                 .collect(),
             // Manual groups can nest, so a session belongs when its path
@@ -2005,82 +1971,97 @@ enum RestoreFromTrash {
         pre_trash_project_path: Option<String>,
     },
     AlreadyGone,
-    PurgeInProgress,
+    Busy(String),
     WorktreeFailed {
         reason: String,
     },
     PersistFailed,
 }
 
-/// Restore a trashed session under the storage flock: win the Restore claim,
-/// move the worktree back off-lock, then commit untrash + release the claim,
-/// ownership-guarded. Driven directly against storage (not `apply_user_action`)
-/// because the TUI's `merge_user_action_diff` path deliberately drops
-/// `op_claim`; the claim/commit decisions are the shared `session::claim`
-/// helpers so all three surfaces agree. See #2541.
-fn restore_from_trash_with_storage(storage: &Storage, id: &str) -> RestoreFromTrash {
-    let claim = match storage.update(|insts, _groups| {
-        Ok(crate::session::claim::decide_restore_claim(
-            insts,
-            id,
-            chrono::Utc::now(),
-        ))
-    }) {
-        Ok(c) => c,
-        Err(e) => {
-            tracing::warn!(target: "tui.home", id = %id, "restore claim failed: {e}");
+/// Restore under one per-instance lifecycle flock. Acquisition, worktree move,
+/// and durable commit therefore form one serialized transition.
+fn restore_from_trash_with_storage(
+    storage: &Storage,
+    id: &str,
+    owned_trash_generation: Option<u64>,
+) -> RestoreFromTrash {
+    let _lifecycle_lock = match storage.acquire_instance_lifecycle_lock(id) {
+        Ok(lock) => lock,
+        Err(error) => {
+            tracing::warn!(target: "tui.home", id = %id, "restore lock failed: {error}");
             return RestoreFromTrash::PersistFailed;
         }
     };
-    match claim {
-        crate::session::claim::RestoreClaimDecision::Claimed => {}
+    let decision = match storage.update(|instances, _groups| {
+        let decision = match owned_trash_generation {
+            Some(generation) => crate::session::claim::decide_restore_claim_after_trash(
+                instances,
+                id,
+                generation,
+                chrono::Utc::now(),
+            ),
+            None => crate::session::claim::decide_restore_claim(instances, id, chrono::Utc::now()),
+        };
+        decision.map_err(anyhow::Error::new)
+    }) {
+        Ok(decision) => decision,
+        Err(error) => {
+            tracing::warn!(target: "tui.home", id = %id, "restore reservation failed: {error}");
+            return RestoreFromTrash::PersistFailed;
+        }
+    };
+    let generation = match decision {
+        crate::session::claim::RestoreClaimDecision::Claimed(generation) => generation,
         crate::session::claim::RestoreClaimDecision::AlreadyGone => {
-            return RestoreFromTrash::AlreadyGone
+            return RestoreFromTrash::AlreadyGone;
         }
-        crate::session::claim::RestoreClaimDecision::PurgeInProgress => {
-            return RestoreFromTrash::PurgeInProgress
+        crate::session::claim::RestoreClaimDecision::Busy(holder) => {
+            return RestoreFromTrash::Busy(holder.busy_reason());
         }
-    }
+    };
 
-    // Load the claimed row for the unlocked worktree move. Distinguish a
-    // storage error (transient: release our claim and bail as PersistFailed, so
-    // a live trashed row is not dropped from the view) from a genuinely absent
-    // row (a peer purged it: AlreadyGone). See #2541.
     let loaded = match storage.load() {
-        Ok(all) => all.into_iter().find(|i| i.id == id),
-        Err(e) => {
-            tracing::warn!(target: "tui.home", id = %id, "restore load failed: {e}");
-            let _ = storage.update(|insts, _groups| {
-                if let Some(stored) = insts.iter_mut().find(|i| i.id == id) {
-                    stored.clear_op_claim_if_owned(ClaimOp::Restore);
+        Ok(all) => all.into_iter().find(|instance| instance.id == id),
+        Err(error) => {
+            tracing::warn!(target: "tui.home", id = %id, "restore load failed: {error}");
+            let _ = storage.update(|instances, _groups| {
+                if let Some(stored) = instances.iter_mut().find(|instance| instance.id == id) {
+                    stored.release_lifecycle_reservation_if_owned(
+                        LifecycleOperation::Restore,
+                        generation,
+                    );
                 }
                 Ok(())
             });
             return RestoreFromTrash::PersistFailed;
         }
     };
-    let Some(mut inst) = loaded else {
+    let Some(mut instance) = loaded else {
         return RestoreFromTrash::AlreadyGone;
     };
 
     if let crate::session::trash::RestoreOutcome::Failed { reason } =
-        crate::session::trash::restore_worktree_location(&mut inst)
+        crate::session::trash::restore_worktree_location(&mut instance)
     {
-        let _ = storage.update(|insts, _groups| {
-            if let Some(stored) = insts.iter_mut().find(|i| i.id == id) {
-                stored.clear_op_claim_if_owned(ClaimOp::Restore);
+        let _ = storage.update(|instances, _groups| {
+            if let Some(stored) = instances.iter_mut().find(|candidate| candidate.id == id) {
+                stored.release_lifecycle_reservation_if_owned(
+                    LifecycleOperation::Restore,
+                    generation,
+                );
             }
             Ok(())
         });
         return RestoreFromTrash::WorktreeFailed { reason };
     }
-    let restored_path = inst.project_path.clone();
-    let restored_pre = inst.pre_trash_project_path.clone();
+    let restored_path = instance.project_path.clone();
+    let restored_pre = instance.pre_trash_project_path.clone();
 
-    match storage.update(|insts, _groups| {
+    match storage.update(|instances, _groups| {
         Ok(crate::session::claim::finalize_restore_commit(
-            insts,
+            instances,
             id,
+            generation,
             &restored_path,
             &restored_pre,
         ))
@@ -2089,12 +2070,12 @@ fn restore_from_trash_with_storage(storage: &Storage, id: &str) -> RestoreFromTr
             project_path: restored_path,
             pre_trash_project_path: restored_pre,
         },
-        Ok(crate::session::claim::RestoreCommit::PurgeStoleClaim) => {
-            RestoreFromTrash::PurgeInProgress
+        Ok(crate::session::claim::RestoreCommit::Superseded) => {
+            RestoreFromTrash::Busy(crate::session::NEWER_GENERATION_BUSY_REASON.to_string())
         }
         Ok(crate::session::claim::RestoreCommit::AlreadyGone) => RestoreFromTrash::AlreadyGone,
-        Err(e) => {
-            tracing::warn!(target: "tui.home", id = %id, "restore commit failed: {e}");
+        Err(error) => {
+            tracing::warn!(target: "tui.home", id = %id, "restore commit failed: {error}");
             RestoreFromTrash::PersistFailed
         }
     }
