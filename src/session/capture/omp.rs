@@ -3078,7 +3078,9 @@ mod tests {
             )
             .unwrap();
             let breadcrumb = write_breadcrumb(&meta, "pts-7", Path::new(cwd), &session, false);
-            set_mtime_ms(&breadcrumb, 100_001);
+            // BSD `test -nt` only compares timestamps at whole-second precision.
+            // Keep the fixture fresh on the macOS CI host as well as in Linux containers.
+            set_mtime_ms(&breadcrumb, 101_000);
             let marker = tmp.path().join("launch-marker");
             std::fs::write(&marker, launch_marker(&meta, "pts-7", "/pending")).unwrap();
             set_mtime_ms(&marker, 100_000);
@@ -3143,7 +3145,9 @@ mod tests {
         )
         .unwrap();
         let breadcrumb = write_breadcrumb(&meta, "pts-7", Path::new(cwd), &session, false);
-        set_mtime_ms(&breadcrumb, 100_001);
+        // The container script is exercised by the host shell in this test, whose
+        // BSD `test -nt` comparison needs a whole-second timestamp difference.
+        set_mtime_ms(&breadcrumb, 101_000);
         let marker = tmp.path().join("launch-marker");
         std::fs::write(&marker, launch_marker(&meta, "pts-7", "/pending")).unwrap();
         set_mtime_ms(&marker, 100_000);
