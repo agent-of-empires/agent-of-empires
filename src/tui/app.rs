@@ -357,6 +357,21 @@ impl App {
         }
     }
 
+    /// Holding a key produces a stream of Press events on terminals that do not
+    /// report key-event types, or an initial Press followed by Repeat events on
+    /// terminals that do. That stream has the same timing as Mosh's paste
+    /// fallback, but it is navigation, not pasted text. Keep it on the normal
+    /// input path so held `j`/`k` continue scrolling the session list instead of
+    /// opening the message composer.
+    fn is_auto_repeat_burst(keys: &[KeyEvent]) -> bool {
+        let Some(first) = keys.first() else {
+            return false;
+        };
+        keys.iter()
+            .skip(1)
+            .all(|key| key.code == first.code && key.modifiers == first.modifiers)
+    }
+
     /// Peel a trailing Enter off a paste burst so plain-Enter Submit
     /// semantics survive when the user types or dictates fast enough to
     /// pump everything through the burst path.
@@ -1001,7 +1016,9 @@ impl App {
                                         _ => break,
                                     }
                                 }
-                                if burst_keys.len() >= PASTE_BURST_MIN_LEN {
+                                if burst_keys.len() >= PASTE_BURST_MIN_LEN
+                                    && !Self::is_auto_repeat_burst(&burst_keys)
+                                {
                                     // Peel a trailing Enter so the dialog's
                                     // plain-Enter Submit branch still fires.
                                     // Embedded mid-burst Enters stay as '\n'
@@ -1793,6 +1810,7 @@ impl App {
 
             if last_status_refresh.elapsed() >= STATUS_REFRESH_INTERVAL {
                 self.home.request_status_refresh();
+                self.home.repair_session_id_pollers();
                 last_status_refresh = std::time::Instant::now();
             }
 
@@ -4790,6 +4808,61 @@ mod tests {
             KeyCode::Backspace,
             KeyModifiers::NONE
         )));
+    }
+
+    #[test]
+    fn auto_repeat_burst_rejects_held_navigation_but_not_pasted_text() {
+        let cases = [
+            (
+                vec![
+                    key(KeyCode::Char('j'), KeyModifiers::NONE),
+                    key(KeyCode::Char('j'), KeyModifiers::NONE),
+                    key(KeyCode::Char('j'), KeyModifiers::NONE),
+                ],
+                true,
+            ),
+            (
+                vec![
+                    key(KeyCode::Char('k'), KeyModifiers::NONE),
+                    key(KeyCode::Char('k'), KeyModifiers::NONE),
+                    key(KeyCode::Char('k'), KeyModifiers::NONE),
+                ],
+                true,
+            ),
+            (
+                vec![
+                    KeyEvent::new_with_kind(
+                        KeyCode::Char('j'),
+                        KeyModifiers::NONE,
+                        KeyEventKind::Press,
+                    ),
+                    KeyEvent::new_with_kind(
+                        KeyCode::Char('j'),
+                        KeyModifiers::NONE,
+                        KeyEventKind::Repeat,
+                    ),
+                    KeyEvent::new_with_kind(
+                        KeyCode::Char('j'),
+                        KeyModifiers::NONE,
+                        KeyEventKind::Repeat,
+                    ),
+                ],
+                true,
+            ),
+            (
+                vec![
+                    key(KeyCode::Char('p'), KeyModifiers::NONE),
+                    key(KeyCode::Char('a'), KeyModifiers::NONE),
+                    key(KeyCode::Char('s'), KeyModifiers::NONE),
+                    key(KeyCode::Char('t'), KeyModifiers::NONE),
+                    key(KeyCode::Char('e'), KeyModifiers::NONE),
+                ],
+                false,
+            ),
+        ];
+        for (keys, expected) in cases {
+            assert_eq!(App::is_auto_repeat_burst(&keys), expected, "{keys:?}");
+        }
     }
 
     #[test]

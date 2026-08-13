@@ -71,10 +71,22 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_stop_poller_channel_communication() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+        let profile = "stop-poller-channel";
+        let storage = crate::session::Storage::new_unwatched(profile).unwrap();
         let mut poller = StopPoller::new();
-        let instance = create_test_instance();
+        let mut instance = create_test_instance();
+        instance.source_profile = profile.to_string();
         let session_id = instance.id.clone();
+        storage
+            .update(|instances, _groups| {
+                instances.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
 
         poller.request_stop(StopRequest {
             session_id: session_id.clone(),

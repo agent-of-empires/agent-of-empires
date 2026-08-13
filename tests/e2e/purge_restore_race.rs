@@ -1,16 +1,7 @@
-//! Cross-process purge/restore claim e2e (#2541). Uses the real `aoe` binary as
-//! the two "processes": a session is trashed via the real trash flow, then an
-//! on-disk `op_claim` is injected into sessions.json to simulate a peer holding
-//! it mid-purge / mid-restore under the storage flock. Deterministic: the claim
-//! TTL is 10 minutes, so a `now()` claim is always fresh, and no timing/tmux
-//! coordination is needed for the claim contract.
-//!
-//! The mid-flight `Restored` / `PurgeStoleClaim` transitions (state changing
-//! between a command's resolve-read and its locked claim/commit) require genuine
-//! concurrency at the flock, which a single injected file cannot produce inside
-//! one process; those are covered by the unit tests in `session::claim`. Here we
-//! pin the deterministic cross-process contract: a fresh peer claim on disk
-//! refuses the opposing operation, and a clean trashed session purges.
+//! Cross-process lifecycle ownership e2e. A session is trashed through the
+//! real CLI, then a fresh unified lifecycle reservation is injected into
+//! `sessions.json` to simulate a peer transition. The opposing operation must
+//! refuse the row without disturbing the peer's reservation.
 
 use serial_test::parallel;
 
@@ -37,31 +28,35 @@ fn row_title<'a>(v: &'a serde_json::Value, title: &str) -> Option<&'a serde_json
     v.as_array()?.iter().find(|r| r["title"] == title)
 }
 
-/// Inject a FRESH on-disk claim (`op` = "purge" | "restore") onto the row titled
-/// `title`, simulating a peer holding it mid-operation under the flock. The `op`
-/// must be lowercase to match `#[serde(rename_all = "lowercase")]` on `ClaimOp`.
-fn inject_claim(h: &TuiTestHarness, title: &str, op: &str) {
-    let mut v = read_sessions_json(h);
-    let row = v
+/// Inject a fresh unified lifecycle reservation onto the named row.
+fn inject_reservation(h: &TuiTestHarness, title: &str, operation: &str) {
+    let mut value = read_sessions_json(h);
+    let row = value
         .as_array_mut()
         .unwrap()
         .iter_mut()
-        .find(|r| r["title"] == title)
-        .expect("row present for claim injection");
-    row["op_claim"] = serde_json::json!({ "op": op, "at": chrono::Utc::now().to_rfc3339() });
-    write_sessions(h, &v);
+        .find(|row| row["title"] == title)
+        .expect("row present for reservation injection");
+    let generation = row["lifecycle_generation"].as_u64().unwrap_or(0) + 1;
+    row["lifecycle_generation"] = serde_json::json!(generation);
+    row["lifecycle_reservation"] = serde_json::json!({
+        "op": operation,
+        "generation": generation,
+        "at": chrono::Utc::now().to_rfc3339(),
+    });
+    write_sessions(h, &value);
 }
 
-fn clear_claim(h: &TuiTestHarness, title: &str) {
-    let mut v = read_sessions_json(h);
-    let row = v
+fn clear_reservation(h: &TuiTestHarness, title: &str) {
+    let mut value = read_sessions_json(h);
+    let row = value
         .as_array_mut()
         .unwrap()
         .iter_mut()
-        .find(|r| r["title"] == title)
-        .expect("row present for claim clear");
-    row.as_object_mut().unwrap().remove("op_claim");
-    write_sessions(h, &v);
+        .find(|row| row["title"] == title)
+        .expect("row present for reservation clear");
+    row.as_object_mut().unwrap().remove("lifecycle_reservation");
+    write_sessions(h, &value);
 }
 
 /// Create a scratch session and move it to the trash via the real trash-first
@@ -91,15 +86,15 @@ fn create_trashed(h: &TuiTestHarness, title: &str) {
     );
 }
 
-/// (a) `session restore` is refused while a fresh on-disk Purge claim holds the
-/// row (a peer is mid-purge), and succeeds once that claim clears.
+/// Restore is refused while a fresh Purge reservation owns the row, then
+/// succeeds after that reservation clears.
 #[test]
 #[parallel]
-fn restore_refused_while_purge_claim_present_then_succeeds() {
+fn restore_refused_while_purge_reservation_present_then_succeeds() {
     let h = TuiTestHarness::new("purge_restore_race_restore");
     create_trashed(&h, "RaceRestore");
 
-    inject_claim(&h, "RaceRestore", "purge");
+    inject_reservation(&h, "RaceRestore", "purge");
 
     let refused = h.run_cli(&["session", "restore", "RaceRestore"]);
     assert!(
@@ -108,24 +103,24 @@ fn restore_refused_while_purge_claim_present_then_succeeds() {
     );
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(
-        stderr.contains("is being purged by another process, so it was not restored"),
+        stderr.contains("busy with lifecycle operation Purge"),
         "unexpected stderr:\n{stderr}"
     );
-    // Refusal leaves the row trashed and the peer's claim intact.
+    // Refusal leaves the row trashed and the peer's reservation intact.
     let after = read_sessions_json(&h);
     let row = row_title(&after, "RaceRestore").expect("row kept on refusal");
     assert!(row.get("trashed_at").is_some(), "row must stay trashed");
     assert_eq!(
-        row["op_claim"]["op"], "purge",
-        "peer's Purge claim must be untouched"
+        row["lifecycle_reservation"]["op"], "purge",
+        "peer's Purge reservation must be untouched"
     );
 
-    // Peer finished: claim cleared -> restore now lands.
-    clear_claim(&h, "RaceRestore");
+    // Peer finished: reservation cleared, so restore now lands.
+    clear_reservation(&h, "RaceRestore");
     let ok = h.run_cli(&["session", "restore", "RaceRestore"]);
     assert!(
         ok.status.success(),
-        "restore must succeed once the claim clears:\nstdout: {}\nstderr: {}",
+        "restore must succeed once the reservation clears:\nstdout: {}\nstderr: {}",
         String::from_utf8_lossy(&ok.stdout),
         String::from_utf8_lossy(&ok.stderr),
     );
@@ -137,20 +132,20 @@ fn restore_refused_while_purge_claim_present_then_succeeds() {
         "restored row must be untrashed"
     );
     assert!(
-        row.get("op_claim").is_none(),
-        "restore must clear its own claim"
+        row.get("lifecycle_reservation").is_none(),
+        "restore must clear its own reservation"
     );
 }
 
-/// (b) symmetry: `rm --purge` is refused and KEEPS the row while a fresh
-/// on-disk Restore claim holds it (a peer is mid-restore).
+/// Symmetry: purge is refused and keeps the row while a fresh Restore
+/// reservation owns it.
 #[test]
 #[parallel]
-fn purge_refused_while_restore_claim_present() {
+fn purge_refused_while_restore_reservation_present() {
     let h = TuiTestHarness::new("purge_restore_race_purge");
     create_trashed(&h, "RacePurge");
 
-    inject_claim(&h, "RacePurge", "restore");
+    inject_reservation(&h, "RacePurge", "restore");
 
     let refused = h.run_cli(&["rm", "--purge", "RacePurge"]);
     assert!(
@@ -159,7 +154,7 @@ fn purge_refused_while_restore_claim_present() {
     );
     let stderr = String::from_utf8_lossy(&refused.stderr);
     assert!(
-        stderr.contains("is being restored by another process, so it was not purged"),
+        stderr.contains("lifecycle operation Restore is already in progress"),
         "unexpected stderr:\n{stderr}"
     );
     // The row must survive with the peer's Restore claim intact.
@@ -170,12 +165,12 @@ fn purge_refused_while_restore_claim_present() {
         "kept row must still be trashed"
     );
     assert_eq!(
-        row["op_claim"]["op"], "restore",
-        "peer's Restore claim must be untouched"
+        row["lifecycle_reservation"]["op"], "restore",
+        "peer's Restore reservation must be untouched"
     );
 }
 
-/// (c) A trashed session with NO competing claim purges cleanly and is dropped.
+/// A trashed session with no competing reservation purges cleanly.
 #[test]
 #[parallel]
 fn purge_trashed_no_claim_removes_row() {
