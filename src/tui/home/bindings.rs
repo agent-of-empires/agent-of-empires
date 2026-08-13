@@ -67,6 +67,8 @@ pub enum ActionId {
     /// plus running agent/process counts). Persisted via
     /// `session.show_diagnostics_pane` so it survives restarts.
     ToggleDiagnostics,
+    /// Open the read-only host and running-agent resource view.
+    OpenSystemHealth,
     SortPicker,
     GroupBy,
     NextWaiting,
@@ -462,17 +464,27 @@ pub static BINDINGS: &[Binding] = &[
     },
     Binding {
         id: ActionId::ToggleDiagnostics,
-        non_strict: &[f(9)],
-        strict: &[f(9)],
+        non_strict: &[],
+        strict: &[],
         context: Context::Always,
-        help: Some(HelpMeta {
-            section: HelpSection::Other,
-            desc: "Toggle memory diagnostics",
-        }),
+        help: None,
         palette: Some(PaletteMeta {
-            title: "Toggle memory diagnostics pane",
-            keywords: &["memory", "ram", "diagnostics", "pressure", "procs"],
+            title: "Toggle system health strip",
+            keywords: &["system", "health", "memory", "cpu", "pressure"],
             group: PaletteGroup::Settings,
+            serve_only: false,
+        }),
+    },
+    Binding {
+        id: ActionId::OpenSystemHealth,
+        non_strict: &[],
+        strict: &[],
+        context: Context::Always,
+        help: None,
+        palette: Some(PaletteMeta {
+            title: "Open System Health",
+            keywords: &["system", "health", "memory", "cpu", "agents", "processes"],
+            group: PaletteGroup::Views,
             serve_only: false,
         }),
     },
@@ -1036,6 +1048,7 @@ pub fn palette_id(id: ActionId) -> &'static str {
         ActionId::ToggleUnread => "toggle-unread",
         ActionId::TogglePreviewInfo => "toggle-preview-info",
         ActionId::ToggleDiagnostics => "toggle-diagnostics",
+        ActionId::OpenSystemHealth => "open-system-health",
         ActionId::SortPicker => "pick-sort",
         ActionId::GroupBy => "pick-group-by",
         ActionId::Help => "help",
@@ -1400,26 +1413,21 @@ mod tests {
     }
 
     #[test]
-    fn diagnostics_toggle_is_wired_to_f9_and_palette() {
+    fn system_health_actions_are_palette_only() {
         let c = ctx();
         let f9 = KeyEvent::new(KeyCode::F(9), KeyModifiers::NONE);
-        assert_eq!(
-            resolve(&f9, false, &c),
-            Some(ActionId::ToggleDiagnostics),
-            "F9 toggles the diagnostics strip"
-        );
+        assert_ne!(resolve(&f9, false, &c), Some(ActionId::ToggleDiagnostics));
         assert_eq!(
             palette_id(ActionId::ToggleDiagnostics),
             "toggle-diagnostics"
         );
-        // The `?` overlay and command palette auto-derive their rows from the
-        // binding, so both must carry metadata for the action to be reachable.
-        let b = BINDINGS
-            .iter()
-            .find(|b| b.id == ActionId::ToggleDiagnostics)
-            .expect("ToggleDiagnostics binding exists");
-        assert!(b.help.is_some(), "help overlay lists the toggle");
-        assert!(b.palette.is_some(), "command palette lists the toggle");
+        assert_eq!(palette_id(ActionId::OpenSystemHealth), "open-system-health");
+        for action in [ActionId::ToggleDiagnostics, ActionId::OpenSystemHealth] {
+            let binding = BINDINGS.iter().find(|b| b.id == action).unwrap();
+            assert!(binding.non_strict.is_empty() && binding.strict.is_empty());
+            assert!(binding.help.is_none());
+            assert!(binding.palette.is_some());
+        }
     }
 
     #[test]

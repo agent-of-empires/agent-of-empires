@@ -644,6 +644,19 @@ impl HomeView {
         }
     }
 
+    /// Open the read-only System Health view when the compact strip is clicked.
+    pub fn handle_diagnostics_click(&mut self, col: u16, row: u16) -> bool {
+        if self.has_non_live_send_overlay() {
+            return false;
+        }
+        if self.diagnostics_area.contains(Position::from((col, row))) {
+            self.open_system_health();
+            true
+        } else {
+            false
+        }
+    }
+
     /// Click on the footer tips badge: open the tips overlay. Returns true when
     /// the click was on the badge (so the caller stops routing it). Gated on no
     /// overlay being open, the badge rect is captured behind any modal, so this
@@ -2907,6 +2920,7 @@ impl HomeView {
             ActionId::ToggleContainer => self.toggle_container_for_selected(),
             ActionId::TogglePreviewInfo => self.toggle_preview_info(),
             ActionId::ToggleDiagnostics => self.toggle_diagnostics(),
+            ActionId::OpenSystemHealth => self.open_system_health(),
             ActionId::SortPicker => self.show_sort_picker(),
             ActionId::GroupBy => self.show_group_picker(),
             ActionId::ToggleProjectPin => self.toggle_project_pin_at_cursor(),
@@ -4153,6 +4167,8 @@ impl HomeView {
     /// between the `Enter` keybind and double-click activation so the two
     /// paths can't drift.
     pub(super) fn activate_selected_session(&mut self) -> Option<Action> {
+        self.system_health_open = false;
+        self.cpu_history.clear();
         let id = self.selected_session.clone()?;
         if let Some(inst) = self.get_instance(&id) {
             if matches!(inst.status, Status::Deleting | Status::Creating) {
@@ -4275,6 +4291,8 @@ impl HomeView {
             let prev_session = self.selected_session.clone();
             match item {
                 Item::Session { id, .. } => {
+                    self.system_health_open = false;
+                    self.cpu_history.clear();
                     self.selected_session = Some(id.clone());
                     self.selected_group = None;
                     self.selected_group_profile = None;
@@ -4670,6 +4688,10 @@ impl HomeView {
         // the wheel via `has_dialog()`.
         if let Some(view) = &mut self.settings_view {
             return view.handle_wheel_scroll(true);
+        }
+        if self.system_health_open && self.hit_preview(col, row) {
+            self.system_health_scroll = self.system_health_scroll.saturating_sub(3);
+            return true;
         }
         // A preview selection is anchored to absolute scrollback lines,
         // not screen cells, so scrolling no longer invalidates it: the
@@ -5638,6 +5660,8 @@ impl HomeView {
                 None
             }
             Item::Session { id, .. } => {
+                self.system_health_open = false;
+                self.cpu_history.clear();
                 if self.cursor != abs_idx {
                     self.cursor = abs_idx;
                     self.update_selected();
@@ -5880,6 +5904,11 @@ impl HomeView {
         // Settings takeover owns the wheel; see handle_scroll_up.
         if let Some(view) = &mut self.settings_view {
             return view.handle_wheel_scroll(false);
+        }
+        if self.system_health_open && self.hit_preview(col, row) {
+            let max = self.metrics.agents.len().saturating_sub(1);
+            self.system_health_scroll = self.system_health_scroll.saturating_add(3).min(max);
+            return true;
         }
         // Mirror handle_scroll_up: the selection is anchored to scrollback
         // lines, so it survives the scroll and is left in place.

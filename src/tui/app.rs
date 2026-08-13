@@ -1099,6 +1099,8 @@ impl App {
                                                             // Sidebar collapse/expand toggle; must
                                                             // precede hit_list (button is on the
                                                             // list's top border).
+                                                        } else if self.home.handle_diagnostics_click(mouse.column, mouse.row) {
+                                                            // Compact system-health strip opened the read-only detail view.
                                                         } else if self.home.handle_tips_badge_click(mouse.column, mouse.row) {
                                                             // Footer tips badge opened the overlay;
                                                             // drop any stale preview highlight, like
@@ -1396,6 +1398,13 @@ impl App {
                                     // the collapsed strip toggled the sidebar.
                                     // Runs before hit_list because the button
                                     // lives on the list's top border.
+                                    let _ = self.home.clear_preview_selection();
+                                    self.draw(terminal)?;
+                                    None
+                                } else if self
+                                    .home
+                                    .handle_diagnostics_click(mouse.column, mouse.row)
+                                {
                                     let _ = self.home.clear_preview_selection();
                                     self.draw(terminal)?;
                                     None

@@ -756,7 +756,7 @@ pub struct HomeView {
     pub(super) status_poller: StatusPoller,
     pub(super) pending_status_refresh: bool,
 
-    // Memory diagnostics strip (toggled by F9 / `session.show_diagnostics_pane`).
+    // Compact system-health strip controlled by `session.show_diagnostics_pane`.
     // The poller samples memory + agent counts off the UI thread; `metrics`
     // holds the latest sample and `metrics_history` the headroom ring buffer
     // (per-mille of used_fraction, newest at the back) feeding the sparkline.
@@ -765,6 +765,10 @@ pub struct HomeView {
     pub(super) pending_metrics_refresh: bool,
     pub(super) metrics: crate::process::metrics::MetricsSnapshot,
     pub(super) metrics_history: std::collections::VecDeque<u64>,
+    pub(super) cpu_history: std::collections::VecDeque<u64>,
+    pub(super) system_health_open: bool,
+    pub(super) system_health_scroll: usize,
+    pub(super) diagnostics_area: Rect,
 
     // Structured (ACP) rows: the tmux poller above bails on them, so their
     // status comes from the daemon instead. See `daemon_status_poller`.
@@ -2295,6 +2299,10 @@ impl HomeView {
             pending_metrics_refresh: false,
             metrics: crate::process::metrics::MetricsSnapshot::default(),
             metrics_history: std::collections::VecDeque::new(),
+            cpu_history: std::collections::VecDeque::new(),
+            system_health_open: false,
+            system_health_scroll: 0,
+            diagnostics_area: Rect::default(),
             #[cfg(feature = "serve")]
             daemon_status_poller: super::daemon_status_poller::DaemonStatusPoller::new(),
             #[cfg(feature = "serve")]
@@ -2902,11 +2910,10 @@ impl HomeView {
         }
     }
 
-    /// Request a memory + agent-count sample in the background (non-blocking),
-    /// only while the diagnostics strip is visible. Call `apply_metrics_updates`
-    /// to pick up the result.
+    /// Request a system-health sample in the background while either health
+    /// surface is visible. Call `apply_metrics_updates` to pick up the result.
     pub fn request_metrics_refresh(&mut self) {
-        if self.show_diagnostics && !self.pending_metrics_refresh {
+        if (self.show_diagnostics || self.system_health_open) && !self.pending_metrics_refresh {
             self.metrics_poller
                 .request_refresh(self.pollable_instances());
             self.pending_metrics_refresh = true;
@@ -2921,15 +2928,27 @@ impl HomeView {
 
         match self.metrics_poller.try_recv_updates() {
             Ok(snapshot) => {
+                let memory_per_mille = (snapshot.memory.used_fraction() * 1000.0).round() as u64;
+                let cpu_per_mille = snapshot
+                    .system
+                    .cpu_fraction
+                    .map(|v| (v * 1000.0).round() as u64);
                 self.metrics = snapshot;
                 // A sample requested while visible can arrive after the strip
                 // is hidden. Do not repopulate the history that hiding clears.
-                if self.show_diagnostics {
-                    let per_mille = (snapshot.memory.used_fraction() * 1000.0).round() as u64;
-                    self.metrics_history.push_back(per_mille);
+                if self.show_diagnostics || self.system_health_open {
+                    self.metrics_history.push_back(memory_per_mille);
                     // At most one over the cap: exactly one push per apply.
                     if self.metrics_history.len() > METRICS_HISTORY_LEN {
                         self.metrics_history.pop_front();
+                    }
+                }
+                if self.system_health_open {
+                    if let Some(value) = cpu_per_mille {
+                        self.cpu_history.push_back(value);
+                    }
+                    if self.cpu_history.len() > METRICS_HISTORY_LEN {
+                        self.cpu_history.pop_front();
                     }
                 }
                 self.pending_metrics_refresh = false;
@@ -2969,6 +2988,14 @@ impl HomeView {
                 "failed to persist show_diagnostics_pane: {e}",
             );
         }
+    }
+
+    pub fn open_system_health(&mut self) {
+        self.system_health_open = true;
+        self.system_health_scroll = 0;
+        self.diff_view = None;
+        self.live_send = None;
+        self.request_metrics_refresh();
     }
 
     /// Request the daemon's view of every structured row's status
@@ -7463,7 +7490,7 @@ impl HomeView {
         self.confirm_before_quit = config.session.confirm_before_quit;
         self.row_tag_mode = config.session.row_tag;
         // Keep the strip in sync when the Settings UI or a config-file edit
-        // flips the toggle, not just the F9 keybinding.
+        // flips the toggle from any settings surface.
         if !self.show_diagnostics && config.session.show_diagnostics_pane {
             self.metrics_history.clear();
         }

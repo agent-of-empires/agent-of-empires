@@ -446,37 +446,6 @@ fn sleep_inhibit_child_held_alive(child: &mut Option<Child>, exit_reason: &str) 
     }
 }
 
-/// Count the distinct PIDs across every `roots` process tree, building the
-/// parent -> children map ONCE and descending it for each root: counting N
-/// trees costs one process table scan (a `/proc` walk on Linux, a `ps` fork on
-/// macOS), not N. Roots whose trees overlap are de-duplicated so a shared
-/// descendant is counted once. Returns 0 on unsupported platforms.
-pub(crate) fn count_pids_in_trees(roots: &[u32]) -> usize {
-    if roots.is_empty() {
-        return 0;
-    }
-    #[cfg(target_os = "linux")]
-    let children_map = linux::build_children_map();
-    #[cfg(target_os = "macos")]
-    let children_map = macos::build_children_map();
-
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
-    {
-        let mut all = Vec::new();
-        for &root in roots {
-            all.push(root);
-            collect_descendants_from_map(root, &children_map, &mut all);
-        }
-        all.sort_unstable();
-        all.dedup();
-        all.len()
-    }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        roots.len()
-    }
-}
-
 /// Kill a process and all its descendants
 /// Sends SIGTERM first, then SIGKILL to any survivors
 pub fn kill_process_tree(pid: u32) {

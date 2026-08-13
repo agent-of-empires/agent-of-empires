@@ -8193,7 +8193,7 @@ fn hidden_diagnostics_drops_an_inflight_sample_from_history() {
     };
     env.view.show_diagnostics = false;
     env.view.metrics_poller =
-        super::super::metrics_poller::MetricsPoller::seeded_for_test(snapshot);
+        super::super::metrics_poller::MetricsPoller::seeded_for_test(snapshot.clone());
     env.view.pending_metrics_refresh = true;
 
     assert!(env.view.apply_metrics_updates());
@@ -8775,8 +8775,8 @@ fn shelf_renders_trash_with_glyph_and_divider_sort() {
         "shelf must show the Trash count"
     );
     assert!(
-        screen.contains("sort:"),
-        "the sort indicator rides the shelf divider"
+        !screen.contains("sort:"),
+        "the shelf divider must not duplicate the header's sort indicator"
     );
     assert!(
         env.view.shelf_inner_area.height > 0,

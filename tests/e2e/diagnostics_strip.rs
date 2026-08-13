@@ -1,14 +1,11 @@
-use serial_test::parallel;
-use std::time::Duration;
-
 use crate::harness::{require_tmux, TuiTestHarness};
+use serial_test::parallel;
 
-/// F9 toggles the memory diagnostics strip on and off. The strip always shows
-/// the "N agents · N procs" counts (even before the first memory sample), so
-/// "procs" is a stable anchor for its presence.
+/// Both system-health surfaces are reachable independently from the command
+/// palette, without reserving a global function key.
 #[test]
 #[parallel]
-fn test_diagnostics_strip_toggles_with_f9() {
+fn test_system_health_palette_actions() {
     require_tmux!();
 
     let mut h = TuiTestHarness::new("diagnostics_toggle");
@@ -18,9 +15,14 @@ fn test_diagnostics_strip_toggles_with_f9() {
     // Off by default.
     h.assert_screen_not_contains("procs");
 
-    h.send_keys("F9");
+    h.send_keys("C-k");
+    h.type_text("toggle system health strip");
+    h.send_keys("Enter");
     h.wait_for("procs");
 
-    h.send_keys("F9");
-    h.wait_for_absent("procs", Duration::from_secs(5));
+    h.send_keys("C-k");
+    h.type_text("open system health");
+    h.send_keys("Enter");
+    h.wait_for("System Health");
+    h.wait_for("No running AoE agents");
 }

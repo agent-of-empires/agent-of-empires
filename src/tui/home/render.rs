@@ -104,8 +104,8 @@ impl PaneLayout {
 /// requested scroll.
 const CAPTURE_BUFFER: u16 = 20;
 
-/// Rows the diagnostics strip occupies: a 2-row sparkline plus its readout row.
-const DIAGNOSTICS_STRIP_HEIGHT: u16 = 3;
+/// Rows the compact system-health strip occupies.
+const DIAGNOSTICS_STRIP_HEIGHT: u16 = 1;
 
 /// Window captured while the user is off the live edge (reading scrollback):
 /// the full scrollback in one shot, rather than a window that tracks the offset
@@ -936,7 +936,8 @@ impl HomeView {
     /// strip there, and return the reduced rect for the list. Returns `column`
     /// unchanged when the strip is hidden or the column is too short to spare
     /// the rows, so the list is never starved below one row.
-    fn diagnostics_dock(&self, frame: &mut Frame, column: Rect, theme: &Theme) -> Rect {
+    fn diagnostics_dock(&mut self, frame: &mut Frame, column: Rect, theme: &Theme) -> Rect {
+        self.diagnostics_area = Rect::default();
         if !self.show_diagnostics || column.height <= DIAGNOSTICS_STRIP_HEIGHT {
             return column;
         }
@@ -947,13 +948,8 @@ impl HomeView {
                 Constraint::Length(DIAGNOSTICS_STRIP_HEIGHT),
             ])
             .split(column);
-        crate::tui::components::diagnostics::render(
-            frame,
-            rows[1],
-            theme,
-            &self.metrics_history,
-            &self.metrics,
-        );
+        crate::tui::components::diagnostics::render(frame, rows[1], theme, &self.metrics);
+        self.diagnostics_area = rows[1];
         rows[0]
     }
 
@@ -1228,16 +1224,12 @@ impl HomeView {
         }
         frame.render_widget(Paragraph::new(lines), list_region);
 
-        // --- Divider carrying the sort indicator (between list and shelf) ---
+        // --- Divider between the workspace list and pinned shelf ---
         if let Some(dy) = divider_y {
-            let label = format!(" sort: {} ", self.sort_order.label());
-            let dw = list_region.width as usize;
-            let label_w = label.chars().count().min(dw);
-            let fill = dw.saturating_sub(label_w);
-            let divider = Line::from(vec![
-                Span::styled("─".repeat(fill), Style::default().fg(theme.border)),
-                Span::styled(label, Style::default().fg(theme.dimmed)),
-            ]);
+            let divider = Line::from(Span::styled(
+                "─".repeat(list_region.width as usize),
+                Style::default().fg(theme.border),
+            ));
             frame.render_widget(
                 Paragraph::new(divider),
                 Rect {
@@ -2462,6 +2454,23 @@ impl HomeView {
     }
 
     fn render_preview(&mut self, frame: &mut Frame, area: Rect, theme: &Theme, layout: PaneLayout) {
+        if self.system_health_open {
+            self.preview_outer_area = area;
+            self.preview_area = area;
+            self.preview_pane_area = area;
+            self.preview_visible_rows = area.height as usize;
+            self.sync_preview_capture_worker(None);
+            crate::tui::components::diagnostics::render_system_health(
+                frame,
+                area,
+                theme,
+                &self.metrics_history,
+                &self.cpu_history,
+                &self.metrics,
+                self.system_health_scroll,
+            );
+            return;
+        }
         let compact = area.width < responsive::STACKED_BREAKPOINT;
         let (border_color, title_color) = match self.view_mode {
             ViewMode::Structured => (theme.border, theme.title),

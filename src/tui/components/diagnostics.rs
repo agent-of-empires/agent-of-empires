@@ -1,11 +1,4 @@
-//! "memory pressure" strip, docked under the session-list column.
-//!
-//! Two stacked rows: a memory-over-time area sparkline on top, then a readout
-//! row (percent plus used/total, and the agent/process counts). The sparkline
-//! plots memory headroom; its color and the percent share a green/amber/red
-//! band derived by [`pressure_band`] from headroom, PSI, and the macOS pressure
-//! level (worst wins). See [`crate::process::metrics`] for why headroom is the
-//! headline signal.
+//! Compact system-health strip and its read-only preview view.
 //!
 //! The readout row sheds gracefully as width shrinks: the used/total detail
 //! drops before the counts, and below that only the percent remains.
@@ -97,7 +90,7 @@ fn band_color(theme: &Theme, band: PressureBand) -> Color {
 /// Compact binary-unit byte string: `22.7G`, `9.9G`, `512M`, `1K`, `512B`.
 /// GiB keeps one decimal but drops a whole `.0`; smaller units round to a whole
 /// number. Integer math throughout so the rounding is exact.
-fn format_bytes(bytes: u64) -> String {
+pub(crate) fn format_bytes(bytes: u64) -> String {
     const KIB: u64 = 1 << 10;
     const MIB: u64 = 1 << 20;
     const GIB: u64 = 1 << 30;
@@ -119,51 +112,15 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-/// Render the memory-pressure strip into `area`.
-///
-/// `history` is the caller-owned ring buffer of headroom samples, newest at the
-/// back, each stored as per-mille of `used_fraction` (`0..=1000`). The sparkline
-/// plots against a fixed `1000` ceiling so the vertical scale is a stable
-/// `0..100%`. When the buffer holds more samples than the sparkline is wide, the
-/// newest `width` are shown (ratatui renders from the front, so the tail is
-/// sliced here to keep the recent window on screen).
-pub fn render(
-    frame: &mut Frame,
-    area: Rect,
-    theme: &Theme,
-    history: &VecDeque<u64>,
-    snapshot: &MetricsSnapshot,
-) {
+/// Render the single-row current-state strip into `area`.
+pub fn render(frame: &mut Frame, area: Rect, theme: &Theme, snapshot: &MetricsSnapshot) {
     if area.width == 0 || area.height == 0 {
         return;
     }
 
-    // Stack vertically: sparkline on top, the readout on the bottom row. The
-    // strip sits under the narrow list column, so a side-by-side split would
-    // leave too few columns for the counts.
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(1), Constraint::Length(1)])
-        .split(area);
-    let spark_area = chunks[0];
-    let text_area = chunks[1];
-
     let mem = &snapshot.memory;
     let band = pressure_band(mem);
     let color = band_color(theme, band);
-
-    // Show the newest `width` samples: ratatui's Sparkline renders the first N
-    // elements, so a buffer longer than the strip would otherwise drop the most
-    // recent readings.
-    let width = spark_area.width as usize;
-    let start = history.len().saturating_sub(width);
-    let recent: Vec<u64> = history.iter().skip(start).copied().collect();
-    let sparkline = Sparkline::default()
-        .data(recent)
-        .max(PER_MILLE_MAX)
-        .direction(RenderDirection::LeftToRight)
-        .style(Style::default().fg(color));
-    frame.render_widget(sparkline, spark_area);
 
     frame.render_widget(
         Paragraph::new(readout_line(
@@ -171,9 +128,9 @@ pub fn render(
             color,
             mem,
             snapshot,
-            text_area.width as usize,
+            area.width as usize,
         )),
-        text_area,
+        area,
     );
 }
 
@@ -188,8 +145,13 @@ fn readout_line<'a>(
     snapshot: &MetricsSnapshot,
     avail: usize,
 ) -> Line<'a> {
+    let cpu = snapshot
+        .system
+        .cpu_fraction
+        .map(|value| format!("CPU {}% · ", (value * 100.0).round() as u32))
+        .unwrap_or_default();
     let counts = format!(
-        "{} agents · {} procs",
+        "{cpu}{} agents · {} procs",
         snapshot.counts.agents, snapshot.counts.procs
     );
 
@@ -233,6 +195,203 @@ fn readout_line<'a>(
         vec![Span::raw(" "), pct_span]
     };
     Line::from(spans)
+}
+
+/// Read-only system-health detail rendered in the ordinary preview pane.
+pub fn render_system_health(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    memory_history: &VecDeque<u64>,
+    cpu_history: &VecDeque<u64>,
+    snapshot: &MetricsSnapshot,
+    scroll: usize,
+) {
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(theme.border))
+        .title(Span::styled(
+            " System Health ",
+            Style::default().fg(theme.title).bold(),
+        ))
+        .padding(Padding::horizontal(1));
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    let cpu = snapshot
+        .system
+        .cpu_fraction
+        .map(|v| format!("{:>3}%", (v * 100.0).round() as u32))
+        .unwrap_or_else(|| "  ?%".into());
+    let memory = if snapshot.memory.total_bytes > 0 {
+        format!(
+            "{:>3}%",
+            (snapshot.memory.used_fraction() * 100.0).round() as u32
+        )
+    } else {
+        "  ?%".into()
+    };
+    let load = snapshot
+        .system
+        .load_average
+        .map(|v| format!("{:.2} / {:.2} / {:.2}", v[0], v[1], v[2]))
+        .unwrap_or_else(|| "? / ? / ?".into());
+    let swap = if snapshot.system.swap_total_bytes > 0 {
+        format!(
+            "{} / {}",
+            format_bytes(snapshot.system.swap_used_bytes),
+            format_bytes(snapshot.system.swap_total_bytes)
+        )
+    } else {
+        "none".into()
+    };
+
+    let rows = Layout::vertical([
+        Constraint::Length(6),
+        Constraint::Length(1),
+        Constraint::Length(3),
+        Constraint::Length(1),
+        Constraint::Length(3),
+        Constraint::Min(0),
+    ])
+    .split(inner);
+    let band = pressure_band(&snapshot.memory);
+    let severity = match band {
+        PressureBand::Ok => "OK",
+        PressureBand::Warn => "WARN",
+        PressureBand::Critical => "CRITICAL",
+    };
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Status  ", Style::default().fg(theme.dimmed)),
+            Span::styled(
+                severity,
+                Style::default().fg(band_color(theme, band)).bold(),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("CPU     ", Style::default().fg(theme.dimmed)),
+            Span::styled(cpu, Style::default().fg(theme.text)),
+        ]),
+        Line::from(vec![
+            Span::styled("Memory  ", Style::default().fg(theme.dimmed)),
+            Span::styled(memory, Style::default().fg(theme.text)),
+            Span::raw(format!(
+                "   {} / {}",
+                format_bytes(snapshot.memory.used_bytes()),
+                format_bytes(snapshot.memory.total_bytes)
+            )),
+        ]),
+        Line::from(vec![
+            Span::styled("Load    ", Style::default().fg(theme.dimmed)),
+            Span::raw(load),
+        ]),
+        Line::from(vec![
+            Span::styled("Swap    ", Style::default().fg(theme.dimmed)),
+            Span::raw(swap),
+        ]),
+        Line::from(vec![
+            Span::styled("Agents  ", Style::default().fg(theme.dimmed)),
+            Span::raw(format!(
+                "{} running · {} processes",
+                snapshot.counts.agents, snapshot.counts.procs
+            )),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(lines), rows[0]);
+
+    render_timeline(
+        frame,
+        rows[1],
+        rows[2],
+        theme,
+        "Memory timeline",
+        memory_history,
+        band_color(theme, band),
+    );
+    render_timeline(
+        frame,
+        rows[3],
+        rows[4],
+        theme,
+        "CPU timeline",
+        cpu_history,
+        theme.running,
+    );
+
+    let table_area = rows[5];
+    if table_area.height == 0 {
+        return;
+    }
+    if snapshot.agents.is_empty() {
+        frame.render_widget(
+            Paragraph::new("No running AoE agents").style(Style::default().fg(theme.dimmed)),
+            table_area,
+        );
+        return;
+    }
+    let mut table_lines = vec![Line::from(vec![
+        Span::styled(
+            format!("{:<24}", "Agent"),
+            Style::default().fg(theme.hint).bold(),
+        ),
+        Span::styled(
+            format!("{:>7} {:>9} {:>6}", "CPU", "RSS", "Procs"),
+            Style::default().fg(theme.hint).bold(),
+        ),
+    ])];
+    let visible = table_area.height.saturating_sub(1) as usize;
+    for agent in snapshot.agents.iter().skip(scroll).take(visible) {
+        let name_width = table_area.width.saturating_sub(24).max(8) as usize;
+        let mut title = agent.title.clone();
+        title.truncate(name_width);
+        let cpu = agent
+            .cpu_fraction
+            .map(|v| format!("{:.1}%", v * 100.0))
+            .unwrap_or_else(|| "?".into());
+        table_lines.push(Line::from(vec![
+            Span::styled(
+                format!("{title:<name_width$}"),
+                Style::default().fg(theme.text),
+            ),
+            Span::raw(format!(
+                " {cpu:>6} {:>9} {:>6}",
+                format_bytes(agent.rss_bytes),
+                agent.procs
+            )),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(table_lines), table_area);
+}
+
+fn render_timeline(
+    frame: &mut Frame,
+    label_area: Rect,
+    graph_area: Rect,
+    theme: &Theme,
+    label: &str,
+    history: &VecDeque<u64>,
+    color: Color,
+) {
+    frame.render_widget(
+        Paragraph::new(label).style(Style::default().fg(theme.dimmed)),
+        label_area,
+    );
+    let width = graph_area.width as usize;
+    let start = history.len().saturating_sub(width);
+    let recent: Vec<u64> = history.iter().skip(start).copied().collect();
+    frame.render_widget(
+        Sparkline::default()
+            .data(recent)
+            .max(PER_MILLE_MAX)
+            .direction(RenderDirection::LeftToRight)
+            .style(Style::default().fg(color)),
+        graph_area,
+    );
 }
 
 #[cfg(test)]

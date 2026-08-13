@@ -898,11 +898,11 @@ pub struct SessionConfig {
     #[setting(label = "YOLO Mode Default", widget = "toggle")]
     pub yolo_mode_default: bool,
 
-    /// Show the memory diagnostics strip at the bottom of the home view: a
-    /// live memory-pressure sparkline plus the running agent and process
-    /// counts. Off by default; also toggleable with a keybinding.
+    /// Show the compact system-health strip below the session list. It reports
+    /// CPU, memory pressure, and running agent and process counts. Off by
+    /// default; also toggleable from the command palette.
     #[serde(default)]
-    #[setting(label = "Show diagnostics pane", widget = "toggle")]
+    #[setting(label = "Show system health strip", widget = "toggle")]
     pub show_diagnostics_pane: bool,
 
     /// Forward AoE's whole environment to host sessions instead of just the

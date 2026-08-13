@@ -5,7 +5,7 @@
 //! [`Worker`] on a named thread samples on request and the main loop drains the
 //! result each frame.
 
-use crate::process::metrics::{count_running_agents, sample_memory, MetricsSnapshot};
+use crate::process::metrics::{MetricsSampler, MetricsSnapshot};
 use crate::session::Instance;
 use crate::tui::worker::Worker;
 
@@ -17,12 +17,10 @@ pub struct MetricsPoller {
 
 impl MetricsPoller {
     pub fn new() -> Self {
+        let mut sampler = MetricsSampler::default();
         Self {
-            worker: Worker::spawn("aoe-metrics-poller", |instances: Vec<Instance>| {
-                MetricsSnapshot {
-                    memory: sample_memory(),
-                    counts: count_running_agents(&instances),
-                }
+            worker: Worker::spawn("aoe-metrics-poller", move |instances: Vec<Instance>| {
+                sampler.sample(&instances)
             }),
         }
     }
