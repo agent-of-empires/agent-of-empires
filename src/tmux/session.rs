@@ -1076,8 +1076,8 @@ impl Session {
 
         let raw = String::from_utf8_lossy(&output.stdout);
         // First line: pre-capture cursor header. Last line: post-capture
-        // header. Everything between is the verbatim `capture-pane` output
-        // (same bytes the plain `capture_pane` path returns).
+        // header. Everything between is the verbatim cursor-aware preview
+        // capture output.
         let mut parts = raw.splitn(2, '\n');
         let cursor_line = parts.next().unwrap_or("");
         let rest = parts.next().unwrap_or("");
