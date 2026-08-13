@@ -507,11 +507,23 @@ mod tests {
     /// made a profile `[tmux]` block inert no matter what a caller resolved.
     /// `Enabled` / `Disabled` are used rather than `Auto` so the assertions do
     /// not depend on whether the host has a `~/.tmux.conf`.
+    ///
+    /// Iterates [`TmuxSetting::ALL`], so a new managed option is covered by
+    /// this invariant without editing the loop. The setup above stays manual
+    /// per field: it has to name the `[tmux]` keys it flips. Without it a new
+    /// row would resolve as `Auto`, the profile assertion (== `ForceOff`)
+    /// would fail deterministically (Auto is never ForceOff), and the global
+    /// one (== `Apply`) would additionally depend on the host's tmux config.
     #[test]
+    #[serial_test::serial]
     fn test_tmux_decisions_follow_the_config_they_are_given() {
         use crate::session::config::{
             resolve_tmux_setting, TmuxSetting, TmuxSettingAction, TmuxSettingMode,
         };
+        // The resolver probes the user's tmux config on every call, even for
+        // explicit modes; isolate HOME so the probe stays off the real files.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(tmp.path());
         let mut global = Config::default();
         global.tmux.mouse = TmuxSettingMode::Enabled;
         global.tmux.status_bar = TmuxSettingMode::Enabled;
@@ -522,11 +534,7 @@ mod tests {
         }));
         let merged = merge_configs(global.clone(), &profile);
 
-        for setting in [
-            TmuxSetting::StatusBar,
-            TmuxSetting::Mouse,
-            TmuxSetting::Clipboard,
-        ] {
+        for setting in TmuxSetting::ALL {
             assert_eq!(
                 resolve_tmux_setting(setting, &global),
                 TmuxSettingAction::Apply,

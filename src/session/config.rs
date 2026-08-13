@@ -2487,8 +2487,13 @@ pub fn user_has_tmux_config() -> bool {
 /// A tmux option group aoe manages on its own sessions, one variant per
 /// `[tmux]` setting that writes to tmux.
 ///
-/// Adding a managed option is a variant plus a `TmuxSetting::row` arm, not a
-/// new `should_apply_*` helper plus an edit to each of the three create paths.
+/// Adding a managed option is a variant plus a `TmuxSetting::row` arm and an
+/// entry in `TmuxSetting::ALL`, not a new `should_apply_*` helper plus an
+/// edit to each of the three create paths. A setting whose application is
+/// post-creation (theme painting, unsets of stale session-scoped values)
+/// also needs a change in
+/// [`crate::tmux::status_bar::apply_all_tmux_options`], which does not
+/// iterate `ALL`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TmuxSetting {
     /// aoe's themed status bar, nine session options wide.
@@ -2533,48 +2538,158 @@ enum TmuxAutoDefer {
     WhenUserHasAnyConfig,
 }
 
-/// One row of the managed-settings table: where the mode is read from, and what
-/// makes `auto` defer. Returned by value; it is two words wide.
+/// One tmux `set-option` aoe writes on its own sessions, at creation.
+///
+/// The variant is the scope, so an illegal write (a server option carrying a
+/// target, say) does not compile. Scope flags are emitted explicitly (`-s`,
+/// `-w`, `-t`) rather than left to tmux's scope inference, so the write is
+/// unambiguous and resilient to future inference changes (same convention as
+/// `append_remain_on_exit_args`). `quiet` adds tmux's `-q` (ignore unknown
+/// options), which aoe needs for `allow-passthrough` on tmux < 3.3, where
+/// `allow-passthrough` does not exist and the set-option call would otherwise
+/// fail the whole `new-session` invocation; it is a per-write property, not a
+/// scope property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TmuxOptionWrite {
+    /// `set-option [-q] -t <target> <option> <value>` on the new session.
+    Session {
+        option: &'static str,
+        value: &'static str,
+        quiet: bool,
+    },
+    /// `set-option [-q] -s <option> <value>` on the shared server (no target).
+    Server {
+        option: &'static str,
+        value: &'static str,
+        quiet: bool,
+    },
+    /// `set-option [-q] -w -t <target> <option> <value>` on the new window.
+    Window {
+        option: &'static str,
+        value: &'static str,
+        quiet: bool,
+    },
+}
+
+/// One row of the managed-settings table: where the mode is read from, what
+/// makes `auto` defer, and the writes aoe emits at creation (`apply`) or to
+/// turn the setting off where "off" is expressible (`force_off`).
+///
+/// The enum variant is the row's identity; there is no `key` field because
+/// nothing consumes one (the issue sketch reserved it for docs and logs).
 struct TmuxManagedSetting {
     mode: fn(&TmuxConfig) -> TmuxSettingMode,
     defer: TmuxAutoDefer,
+    /// Writes emitted when the setting resolves to [`TmuxSettingAction::Apply`].
+    apply: &'static [TmuxOptionWrite],
+    /// Writes emitted when the setting resolves to
+    /// [`TmuxSettingAction::ForceOff`]; empty when "off" is not expressible.
+    force_off: &'static [TmuxOptionWrite],
 }
 
 impl TmuxSetting {
-    /// The single source of truth for how each managed setting resolves. Both
-    /// facts live in one arm so they cannot drift apart.
+    /// The settings aoe manages, in the order the create path applies them.
+    /// `StatusBar` is resolved but emits nothing at creation (its write lists
+    /// are empty), so the emitted order is `Mouse` then `Clipboard`, as the
+    /// create path has always used. Not exhaustive by construction: a variant
+    /// added without an `ALL` entry compiles and is silently skipped, so keep
+    /// the list in step with the enum (a tripwire test enforces it).
+    pub(crate) const ALL: [TmuxSetting; 3] = [Self::StatusBar, Self::Mouse, Self::Clipboard];
+
+    /// The single source of truth for how each managed setting resolves and
+    /// applies. Every fact of the row lives in one arm so they cannot drift
+    /// apart: the config field the mode is read from, the `auto` defer rule,
+    /// and the writes each action emits.
     fn row(self) -> TmuxManagedSetting {
         match self {
+            // Painted after creation by `status_bar::apply_all_tmux_options`,
+            // which computes the theme's values dynamically; both lists are
+            // empty so creation emits nothing for it.
             Self::StatusBar => TmuxManagedSetting {
                 mode: |tmux| tmux.status_bar,
                 defer: TmuxAutoDefer::WhenUserHasAnyConfig,
+                apply: &[],
+                force_off: &[],
             },
             Self::Mouse => TmuxManagedSetting {
                 mode: |tmux| tmux.mouse,
                 defer: TmuxAutoDefer::WhenUserSets(&["mouse"]),
+                apply: &[TmuxOptionWrite::Session {
+                    option: "mouse",
+                    value: "on",
+                    quiet: false,
+                }],
+                force_off: &[TmuxOptionWrite::Session {
+                    option: "mouse",
+                    value: "off",
+                    quiet: false,
+                }],
             },
             // Both options aoe writes count: a user who set either one has
             // taken over OSC 52 forwarding, and aoe applying only the other
-            // half would be a partial override of a deliberate choice.
+            // half would be a partial override of a deliberate choice. Both
+            // are written defensively: programs vary in which form they emit
+            // (raw OSC 52 vs the `\ePtmux;...\e\\`-wrapped form OpenCode
+            // uses), so one half alone would drop the other's passthrough.
+            // `force_off` stays empty: the options are server- and
+            // window-scoped, so unsetting them would reach past aoe's own
+            // sessions into the user's whole tmux server.
             Self::Clipboard => TmuxManagedSetting {
                 mode: |tmux| tmux.clipboard,
                 defer: TmuxAutoDefer::WhenUserSets(&["set-clipboard", "allow-passthrough"]),
+                apply: &[
+                    TmuxOptionWrite::Server {
+                        option: "set-clipboard",
+                        value: "on",
+                        quiet: true,
+                    },
+                    TmuxOptionWrite::Window {
+                        option: "allow-passthrough",
+                        value: "on",
+                        quiet: true,
+                    },
+                ],
+                force_off: &[],
             },
         }
+    }
+}
+
+/// The writes one action emits for one managed setting, straight from the
+/// table. `LeaveToUser` is creation-time skip: a fresh session has no
+/// session-scoped value aoe wrote, so declining to write one already leaves
+/// the user's own config in charge (#3207). (The post-creation path,
+/// `status_bar::apply_all_tmux_options`, actively unsets instead; that is a
+/// different concern and keeps its own code.)
+pub(crate) fn tmux_setting_writes(
+    setting: TmuxSetting,
+    action: TmuxSettingAction,
+) -> &'static [TmuxOptionWrite] {
+    let row = setting.row();
+    match action {
+        TmuxSettingAction::Apply => row.apply,
+        TmuxSettingAction::ForceOff => row.force_off,
+        TmuxSettingAction::LeaveToUser => &[],
     }
 }
 
 /// What aoe should do with one managed tmux setting.
 ///
 /// Resolution is uniform across settings; *application* is not, because tmux
-/// options differ in scope and not all of them can express every action. Each
-/// applier maps the three actions like this:
+/// options differ in scope and not all of them can express every action. The
+/// table's `apply` / `force_off` lists map the three actions like this:
 ///
 /// | setting | `Apply` | `ForceOff` | `LeaveToUser` |
 /// |---|---|---|---|
 /// | `Mouse` | `mouse on` | `mouse off` | unset the session's `mouse` |
 /// | `StatusBar` | paint aoe's themed bar | unset aoe's `status*` overrides | same as `ForceOff` |
 /// | `Clipboard` | set both options | write nothing | write nothing |
+///
+/// The `StatusBar` row and the `Mouse` `LeaveToUser` column describe the
+/// post-creation path (`status_bar::apply_all_tmux_options`), which paints the
+/// theme and clears stale session-scoped values on existing sessions; at
+/// creation only the `apply` / `force_off` lists are emitted, so `StatusBar`
+/// writes nothing and `Mouse` `LeaveToUser` writes nothing.
 ///
 /// `StatusBar` has no way to express "hide the bar": `disabled` means "stop
 /// painting aoe's", which reverts to whatever the user's own config says. The
@@ -3312,6 +3427,63 @@ mod tests {
                 "{mode:?} user_defers={user_defers}"
             );
         }
+    }
+
+    /// The options `auto` defers on must be exactly the options the row writes
+    /// on `Apply`: a write added without its defer entry would override a user
+    /// who took that option in hand, the #3207 failure mode for a new option.
+    /// Compared as sets, because the defer's order is unobservable: the
+    /// recognizer matches any order.
+    #[test]
+    fn test_tmux_setting_defer_matches_apply_options() {
+        for setting in TmuxSetting::ALL {
+            let row = setting.row();
+            let TmuxAutoDefer::WhenUserSets(defer_options) = row.defer else {
+                // StatusBar defers on config existence, not on any option.
+                continue;
+            };
+            let mut defer_names: Vec<&str> = defer_options.to_vec();
+            defer_names.sort_unstable();
+            let mut apply_names: Vec<&str> = row
+                .apply
+                .iter()
+                .map(|w| match *w {
+                    TmuxOptionWrite::Session { option, .. }
+                    | TmuxOptionWrite::Server { option, .. }
+                    | TmuxOptionWrite::Window { option, .. } => option,
+                })
+                .collect();
+            apply_names.sort_unstable();
+            assert_eq!(
+                apply_names, defer_names,
+                "{setting:?}: defer options and apply writes must name the same options"
+            );
+        }
+    }
+
+    /// The compiler tripwire for [`TmuxSetting::ALL`]: the exhaustive match
+    /// fails to compile when an enum variant is added, forcing a reviewer to
+    /// add a brace here; the equality then pins `ALL`'s content and emission
+    /// order against this literal. The unified applier iterates `ALL`, so a
+    /// setting missing from both the list and this literal would be silently
+    /// never applied; keeping the two in step is the point of the test.
+    #[test]
+    fn test_tmux_setting_all_is_exhaustive() {
+        let setting = TmuxSetting::StatusBar;
+        match setting {
+            TmuxSetting::StatusBar => {}
+            TmuxSetting::Mouse => {}
+            TmuxSetting::Clipboard => {}
+        }
+        assert_eq!(
+            TmuxSetting::ALL,
+            [
+                TmuxSetting::StatusBar,
+                TmuxSetting::Mouse,
+                TmuxSetting::Clipboard
+            ],
+            "ALL must list every variant exactly once, in emission order"
+        );
     }
 
     #[test]
