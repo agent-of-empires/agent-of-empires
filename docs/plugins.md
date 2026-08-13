@@ -4,9 +4,8 @@ Agent of Empires keeps its core small (sessions, tmux, worktrees) and grows a
 plugin system so optional capabilities can be enabled or disabled at runtime
 instead of bloating the core. The core ships first-party plugins bundled with
 the binary and can install external community plugins from GitHub or a local
-directory. Per-plugin settings and plugin-contributed UI land in follow-up
-releases; running plugin code is not wired up yet, so an installed external
-plugin records its grant and files but does not execute until a later release.
+directory. Plugins can contribute settings and UI, and workers run through the
+capability-gated plugin host.
 
 To build your own, start with [Writing Plugins](development/writing-plugins.md)
 and the [Plugin API Reference](plugin-api.md). The official starter scaffolds a
@@ -105,6 +104,3 @@ An external plugin cannot use the reserved `aoe.*` /
 
 Resolved versions live in `<app_dir>/plugins.lock` (the exact commit, manifest
 hash, and release asset per plugin), so an install is reproducible.
-
-Running plugin code, per-plugin settings, and plugin-contributed UI land in
-follow-up releases.

@@ -204,7 +204,16 @@ fn render_pane_panel(frame: &mut Frame, area: Rect, theme: &Theme, state: &Struc
     if inner.width == 0 || inner.height == 0 {
         return;
     }
-    let lines = plugin_ui::pane_lines(&state.plugin_ui, &state.session_id, theme);
+    let mut lines = plugin_ui::pane_lines(&state.plugin_ui, &state.session_id, theme);
+    // Host-wide HomePane entries (session-less) render in the same overlay,
+    // after this session's panes.
+    let home = plugin_ui::home_pane_lines(&state.plugin_ui, theme);
+    if !home.is_empty() {
+        if !lines.is_empty() {
+            lines.push(Line::default());
+        }
+        lines.extend(home);
+    }
     if lines.is_empty() {
         frame.render_widget(
             Paragraph::new(Line::from(Span::styled(

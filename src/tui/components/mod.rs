@@ -3,6 +3,7 @@
 pub(crate) mod buttons;
 pub(crate) mod checkbox;
 mod cycler;
+pub(crate) mod diagnostics;
 mod dir_picker;
 mod help;
 pub(crate) mod hover;

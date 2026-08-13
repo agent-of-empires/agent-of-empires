@@ -46,5 +46,6 @@ pub use manifest::{
 /// grew a `thinking` (thought-level) list; 12 when the pane block vocabulary
 /// gained the `callout`, `bar`, and `columns` kinds, clickable/badged `row`s,
 /// header-summary and scrollable `section`s, `disabled`/`variant` actions, and
-/// the pane-level `footer`.
-pub const API_VERSION: u32 = 12;
+/// the pane-level `footer`; 13 when the global `home-pane` slot and the
+/// `sparkline` block kind were added.
+pub const API_VERSION: u32 = 13;

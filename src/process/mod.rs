@@ -19,6 +19,9 @@ mod linux;
 #[cfg(target_os = "macos")]
 mod macos;
 
+/// System memory + agent-count sampling for the TUI diagnostics strip.
+pub(crate) mod metrics;
+
 /// Protocol-agnostic plumbing for supervised worker subprocesses, lifted
 /// out of `src/acp/` so the future plugin host can reuse it. Serve-gated
 /// because its only consumer today is the serve-gated `acp` module.

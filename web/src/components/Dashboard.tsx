@@ -5,7 +5,7 @@ import { useIdleDecayWindowMs } from "../lib/idleDecay";
 import { useIsWideViewport } from "../hooks/useIsWideViewport";
 import { AOE_BRAND_MARK_COLORS, AOE_BRAND_MARK_TEXT_SHADOW } from "../lib/brandMark";
 import { TOUR_ANCHORS, type TourAnchorId } from "../lib/tourSteps";
-import { PluginCards } from "./plugin/PluginSlots";
+import { PluginCards, PluginHomePanes } from "./plugin/PluginSlots";
 import { StatusGlyph } from "./StatusGlyph";
 
 interface Props {
@@ -240,6 +240,10 @@ export function Dashboard({
       {/* Plugin-contributed dashboard cards (#2366). Renders nothing (and adds
           no spacing) until a plugin pushes a card. */}
       <PluginCards />
+
+      {/* Host-wide plugin panes (the home-pane slot). Renders nothing until a
+          plugin pushes one. */}
+      <PluginHomePanes />
 
       {/* Keyboard hint (desktop only) */}
       {!readOnly && (
