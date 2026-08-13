@@ -824,7 +824,11 @@ pub const AGENTS: &[AgentDef] = &[
         send_keys_enter_delay_ms: 150,
         ready_marker: None,
         install_hint: "npm install -g @openai/codex",
-        permission_response: None,
+        permission_response: Some(PermissionResponse {
+            allow: &[KeyToken::Literal("y")],
+            allow_always: Some(&[KeyToken::Literal("a")]),
+            deny: &[KeyToken::Literal("d")],
+        }),
     },
     AgentDef {
         name: "gemini",
