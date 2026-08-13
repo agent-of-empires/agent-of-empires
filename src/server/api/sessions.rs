@@ -599,26 +599,12 @@ pub async fn get_recent_projects() -> Json<RecentProjectsResponse> {
 /// and trashed rows so a headless dispatcher polling the list doesn't have
 /// to know to filter `trashed_at`/`archived_at` client-side; `All` (or no
 /// `state` param) keeps the historical unfiltered behavior the web
-/// dashboard's client-side Trash view still relies on. See #3156.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SessionScope {
-    Live,
-    Trashed,
-    All,
-}
-
+/// Query params for `GET /api/sessions`. `state` shares its vocabulary with
+/// the CLI's `aoe list --state` via [`crate::session::SessionScope`] so a
+/// future third caller cannot drift.
 #[derive(Deserialize)]
 pub struct ListSessionsQuery {
-    pub state: Option<SessionScope>,
-}
-
-fn instance_matches_scope(inst: &Instance, scope: Option<SessionScope>) -> bool {
-    match scope {
-        None | Some(SessionScope::All) => true,
-        Some(SessionScope::Live) => !inst.is_archived() && !inst.is_trashed(),
-        Some(SessionScope::Trashed) => inst.is_trashed(),
-    }
+    pub state: Option<crate::session::SessionScope>,
 }
 
 pub async fn list_sessions(
@@ -642,7 +628,7 @@ pub async fn list_sessions(
         // it never appears in the list. The lifecycle routes apply the matching
         // structured-target gate. See #7.
         .filter(|inst| !state.cityhall_mode || inst.is_structured())
-        .filter(|inst| instance_matches_scope(inst, query.state))
+        .filter(|inst| crate::session::SessionScope::matches(query.state, inst))
         .collect();
     let mut sessions: Vec<SessionResponse> = scoped_instances
         .iter()
@@ -7603,7 +7589,7 @@ mod tests {
         let live_only = list_sessions(
             axum::extract::State(state.clone()),
             axum::extract::Query(ListSessionsQuery {
-                state: Some(SessionScope::Live),
+                state: Some(crate::session::SessionScope::Live),
             }),
         )
         .await;
@@ -7612,7 +7598,7 @@ mod tests {
         let trashed_only = list_sessions(
             axum::extract::State(state.clone()),
             axum::extract::Query(ListSessionsQuery {
-                state: Some(SessionScope::Trashed),
+                state: Some(crate::session::SessionScope::Trashed),
             }),
         )
         .await;
@@ -7621,7 +7607,7 @@ mod tests {
         let explicit_all = list_sessions(
             axum::extract::State(state),
             axum::extract::Query(ListSessionsQuery {
-                state: Some(SessionScope::All),
+                state: Some(crate::session::SessionScope::All),
             }),
         )
         .await;

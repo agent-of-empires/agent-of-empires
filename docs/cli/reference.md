@@ -242,6 +242,18 @@ List all sessions
 
 * `--json` — Output as JSON
 * `--all` — List sessions from all profiles
+* `--state <STATE>` — Filter by session state. Default is `all` (every persisted session, which is what `aoe list` has always shown). #3350 added the flag so a scripted consumer can pass `--state=live` to skip trashed and archived rows without a second `aoe session list-trash` shellout, mirroring the REST API's `state=live|trashed|all` from #3187. Rejects any other value at parse time
+
+  Default value: `all`
+
+  Possible values:
+  - `live`:
+    Only sessions that are neither archived nor trashed
+  - `trashed`:
+    Only sessions currently in the trash
+  - `all`:
+    Every persisted session in the profile (default)
+
 
 
 

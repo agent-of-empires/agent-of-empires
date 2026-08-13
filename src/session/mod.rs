@@ -33,6 +33,7 @@ pub mod projects;
 pub(crate) mod recovery;
 pub mod repo_config;
 pub mod restart;
+pub mod scope;
 pub mod scratch;
 pub(crate) mod serde_helpers;
 pub mod settings_schema;
@@ -131,6 +132,7 @@ pub use repo_config::{
     resolve_config_with_repo_or_warn, save_repo_config, trust_repo, HookTimeout, HooksConfig,
     RepoConfig, RepoTrust, TrustSurface,
 };
+pub use scope::SessionScope;
 pub(crate) use storage::{atomic_write, resolve_symlink_chain};
 pub use storage::{
     load_recent_projects, load_workspace_ordering, recent_project_entry_for, record_recent_project,

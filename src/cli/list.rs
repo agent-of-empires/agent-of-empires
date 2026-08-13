@@ -1,15 +1,43 @@
 //! `agent-of-empires list` command implementation
 
 use anyhow::Result;
-use clap::Args;
+use clap::{Args, ValueEnum};
 use serde::Serialize;
 
-use crate::session::{Instance, Storage};
+use crate::session::{Instance, SessionScope, Storage};
 
 const TABLE_COL_TITLE: usize = 20;
 const TABLE_COL_GROUP: usize = 15;
 const TABLE_COL_PATH: usize = 40;
 const TABLE_COL_ID_DISPLAY: usize = 12;
+const TABLE_COL_STATE: usize = 9;
+
+/// The `aoe list --state=` vocabulary. Mirrors the REST API's
+/// `SessionScope` (`GET /api/sessions?state=`) so the two vocabularies
+/// share one source of truth (#3350). Kept as a clap-facing enum here
+/// rather than deriving `ValueEnum` on the wire type: the API rejects
+/// unrecognized values via serde with a JSON 400, while clap wants its
+/// own `PossibleValue` list for `--help` and `--state=?` errors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[value(rename_all = "lowercase")]
+enum StateFilter {
+    /// Only sessions that are neither archived nor trashed.
+    Live,
+    /// Only sessions currently in the trash.
+    Trashed,
+    /// Every persisted session in the profile (default).
+    All,
+}
+
+impl From<StateFilter> for SessionScope {
+    fn from(v: StateFilter) -> Self {
+        match v {
+            StateFilter::Live => SessionScope::Live,
+            StateFilter::Trashed => SessionScope::Trashed,
+            StateFilter::All => SessionScope::All,
+        }
+    }
+}
 
 #[derive(Args)]
 pub struct ListArgs {
@@ -20,6 +48,31 @@ pub struct ListArgs {
     /// List sessions from all profiles
     #[arg(long)]
     all: bool,
+
+    /// Filter by session state. Default is `all` (every persisted session,
+    /// which is what `aoe list` has always shown). #3350 added the flag so a
+    /// scripted consumer can pass `--state=live` to skip trashed and
+    /// archived rows without a second `aoe session list-trash` shellout,
+    /// mirroring the REST API's `state=live|trashed|all` from #3187.
+    /// Rejects any other value at parse time.
+    #[arg(long, value_enum, default_value_t = StateFilter::All)]
+    state: StateFilter,
+}
+
+/// Simple string tag describing whether a session is live/archived/trashed,
+/// exposed alongside `trashed_at`/`archived_at` in `--json` so a consumer
+/// keying on state does not have to reason about the timestamps itself. The
+/// wire values match [`SessionScope`] (`live`/`trashed`), plus `archived`
+/// for the archive-but-not-trash case which the API happens to fold into
+/// `live` today.
+fn state_tag(inst: &Instance) -> &'static str {
+    if inst.is_trashed() {
+        "trashed"
+    } else if inst.is_archived() {
+        "archived"
+    } else {
+        "live"
+    }
 }
 
 #[derive(Serialize)]
@@ -32,7 +85,20 @@ struct SessionJson {
     #[serde(skip_serializing_if = "String::is_empty")]
     command: String,
     profile: String,
+    /// One of `live`, `archived`, `trashed`; the natural way to distinguish a
+    /// trashed row from a failed one that #3350 was filed for.
+    state: &'static str,
     created_at: chrono::DateTime<chrono::Utc>,
+    /// Set iff the session is currently in the trash. Together with
+    /// `archived_at`, lets a scripted consumer read the state without a
+    /// second `aoe session list-trash` shellout.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trashed_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Set iff the session is currently archived (trash's a strict superset
+    /// of archived on the store, but the two states are semantically distinct
+    /// and #3350's follow-up comment asked for archive to be readable too).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archived_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Empty for single-repo sessions; populated with one entry per repo
     /// (including the primary) for sessions created with `--repo`/`--project`.
     workspace_repos: Vec<WorkspaceRepoJson>,
@@ -74,7 +140,10 @@ fn session_json(inst: &Instance, profile: &str) -> SessionJson {
         tool: inst.tool.clone(),
         command: inst.command.clone(),
         profile: profile.to_string(),
+        state: state_tag(inst),
         created_at: inst.created_at,
+        trashed_at: inst.trashed_at,
+        archived_at: inst.archived_at,
         workspace_repos: workspace_repos_for(inst),
         worktree: worktree_for(inst),
     }
@@ -93,47 +162,104 @@ fn workspace_repos_for(inst: &Instance) -> Vec<WorkspaceRepoJson> {
         .collect()
 }
 
-fn print_table_header() {
-    println!(
-        "{:<width_title$} {:<width_group$} {:<width_path$} ID",
-        "TITLE",
-        "GROUP",
-        "PATH",
-        width_title = TABLE_COL_TITLE,
-        width_group = TABLE_COL_GROUP,
-        width_path = TABLE_COL_PATH
-    );
-    println!(
-        "{}",
-        "-".repeat(TABLE_COL_TITLE + TABLE_COL_GROUP + TABLE_COL_PATH + TABLE_COL_ID_DISPLAY + 5)
-    );
+fn print_table_header(show_state: bool) {
+    if show_state {
+        println!(
+            "{:<width_title$} {:<width_group$} {:<width_path$} {:<width_state$} ID",
+            "TITLE",
+            "GROUP",
+            "PATH",
+            "STATE",
+            width_title = TABLE_COL_TITLE,
+            width_group = TABLE_COL_GROUP,
+            width_path = TABLE_COL_PATH,
+            width_state = TABLE_COL_STATE,
+        );
+        println!(
+            "{}",
+            "-".repeat(
+                TABLE_COL_TITLE
+                    + TABLE_COL_GROUP
+                    + TABLE_COL_PATH
+                    + TABLE_COL_STATE
+                    + TABLE_COL_ID_DISPLAY
+                    + 6
+            )
+        );
+    } else {
+        println!(
+            "{:<width_title$} {:<width_group$} {:<width_path$} ID",
+            "TITLE",
+            "GROUP",
+            "PATH",
+            width_title = TABLE_COL_TITLE,
+            width_group = TABLE_COL_GROUP,
+            width_path = TABLE_COL_PATH
+        );
+        println!(
+            "{}",
+            "-".repeat(
+                TABLE_COL_TITLE + TABLE_COL_GROUP + TABLE_COL_PATH + TABLE_COL_ID_DISPLAY + 5
+            )
+        );
+    }
 }
 
-fn print_table_row(inst: &Instance) {
+fn print_table_row(inst: &Instance, show_state: bool) {
     let title = super::truncate(&inst.title, TABLE_COL_TITLE);
     let group = super::truncate(&inst.group_path, TABLE_COL_GROUP);
     let path = super::truncate(&inst.project_path, TABLE_COL_PATH);
     let id_display = super::truncate_id(&inst.id, TABLE_COL_ID_DISPLAY);
-    println!(
-        "{:<width_title$} {:<width_group$} {:<width_path$} {}",
-        title,
-        group,
-        path,
-        id_display,
-        width_title = TABLE_COL_TITLE,
-        width_group = TABLE_COL_GROUP,
-        width_path = TABLE_COL_PATH
-    );
+    if show_state {
+        println!(
+            "{:<width_title$} {:<width_group$} {:<width_path$} {:<width_state$} {}",
+            title,
+            group,
+            path,
+            state_tag(inst),
+            id_display,
+            width_title = TABLE_COL_TITLE,
+            width_group = TABLE_COL_GROUP,
+            width_path = TABLE_COL_PATH,
+            width_state = TABLE_COL_STATE,
+        );
+    } else {
+        println!(
+            "{:<width_title$} {:<width_group$} {:<width_path$} {}",
+            title,
+            group,
+            path,
+            id_display,
+            width_title = TABLE_COL_TITLE,
+            width_group = TABLE_COL_GROUP,
+            width_path = TABLE_COL_PATH
+        );
+    }
+}
+
+/// Whether the human table should render the `STATE` column. Off for
+/// `--state=live` (every row is `live` and the column carries no
+/// information) and off when filtering to only `trashed` (same). Only
+/// meaningful under `all`, where rows are mixed and a scripted consumer
+/// or human reader benefits from distinguishing a live row from a trashed
+/// or archived one.
+fn table_shows_state(scope: SessionScope) -> bool {
+    matches!(scope, SessionScope::All)
 }
 
 #[tracing::instrument(target = "cli.list", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, args: ListArgs) -> Result<()> {
+    let scope: SessionScope = args.state.into();
     if args.all {
-        return run_all_profiles(args.json).await;
+        return run_all_profiles(args.json, scope).await;
     }
 
     let storage = Storage::open_unwatched(profile)?;
-    let (instances, _) = storage.load_with_groups()?;
+    let (all_instances, _) = storage.load_with_groups()?;
+    let instances: Vec<Instance> = all_instances
+        .into_iter()
+        .filter(|inst| SessionScope::matches(Some(scope), inst))
+        .collect();
 
     if instances.is_empty() {
         println!("No sessions found in profile '{}'.", storage.profile());
@@ -149,10 +275,11 @@ pub async fn run(profile: &str, args: ListArgs) -> Result<()> {
         return Ok(());
     }
 
+    let show_state = table_shows_state(scope);
     println!("Profile: {}\n", storage.profile());
-    print_table_header();
+    print_table_header(show_state);
     for inst in &instances {
-        print_table_row(inst);
+        print_table_row(inst, show_state);
     }
     println!("\nTotal: {} sessions", instances.len());
 
@@ -161,7 +288,7 @@ pub async fn run(profile: &str, args: ListArgs) -> Result<()> {
     Ok(())
 }
 
-async fn run_all_profiles(json: bool) -> Result<()> {
+async fn run_all_profiles(json: bool, scope: SessionScope) -> Result<()> {
     let profiles = crate::session::list_profiles()?;
 
     if profiles.is_empty() {
@@ -175,6 +302,9 @@ async fn run_all_profiles(json: bool) -> Result<()> {
             if let Ok(storage) = Storage::open_unwatched(profile_name) {
                 if let Ok((instances, _)) = storage.load_with_groups() {
                     for inst in &instances {
+                        if !SessionScope::matches(Some(scope), inst) {
+                            continue;
+                        }
                         all_sessions.push(session_json(inst, profile_name));
                     }
                 }
@@ -184,18 +314,23 @@ async fn run_all_profiles(json: bool) -> Result<()> {
         return Ok(());
     }
 
+    let show_state = table_shows_state(scope);
     let mut total_sessions = 0;
     for profile_name in &profiles {
         if let Ok(storage) = Storage::open_unwatched(profile_name) {
-            if let Ok((instances, _)) = storage.load_with_groups() {
+            if let Ok((all_instances, _)) = storage.load_with_groups() {
+                let instances: Vec<&Instance> = all_instances
+                    .iter()
+                    .filter(|inst| SessionScope::matches(Some(scope), inst))
+                    .collect();
                 if instances.is_empty() {
                     continue;
                 }
 
                 println!("\n═══ Profile: {} ═══\n", profile_name);
-                print_table_header();
+                print_table_header(show_state);
                 for inst in &instances {
-                    print_table_row(inst);
+                    print_table_row(inst, show_state);
                 }
                 println!("({} sessions)", instances.len());
                 total_sessions += instances.len();
@@ -211,4 +346,89 @@ async fn run_all_profiles(json: bool) -> Result<()> {
     );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn state_tag_covers_the_three_states() {
+        let live = Instance::new("live", "/repo");
+        assert_eq!(state_tag(&live), "live");
+
+        let mut archived = Instance::new("archived", "/repo");
+        archived.archive();
+        assert_eq!(state_tag(&archived), "archived");
+
+        let mut trashed = Instance::new("trashed", "/repo");
+        trashed.trash();
+        assert_eq!(state_tag(&trashed), "trashed");
+    }
+
+    /// #3350: the whole point of the JSON change. A consumer keying on
+    /// state needs the `state` string AND the timestamp to distinguish
+    /// a trashed session from a genuinely failed one without a second
+    /// `aoe session list-trash` shellout.
+    #[test]
+    fn session_json_exposes_state_and_trashed_at_for_a_trashed_row() {
+        let mut inst = Instance::new("z", "/repo");
+        inst.trash();
+        let json = session_json(&inst, "p");
+        assert_eq!(json.state, "trashed");
+        assert!(json.trashed_at.is_some());
+        assert!(json.archived_at.is_none());
+    }
+
+    /// Companion for the follow-up comment on #3350: archived sessions
+    /// need the same treatment. The two states are semantically distinct
+    /// and both must be observable from a single `aoe list --json` call.
+    #[test]
+    fn session_json_exposes_state_and_archived_at_for_an_archived_row() {
+        let mut inst = Instance::new("z", "/repo");
+        inst.archive();
+        let json = session_json(&inst, "p");
+        assert_eq!(json.state, "archived");
+        assert!(json.archived_at.is_some());
+        assert!(json.trashed_at.is_none());
+    }
+
+    /// The default `state = "live"` and both timestamp fields being
+    /// `None` must not serialize any of the state-tracking keys as
+    /// `null`: consumers depending on `serde_if_none` semantics see no
+    /// difference from the pre-#3350 output. The `state` field is a
+    /// small addition and always serialized, so a v1.14.1 consumer that
+    /// parses JSON strictly will see one new key.
+    #[test]
+    fn session_json_omits_absent_timestamps_and_keeps_state_alive() {
+        let inst = Instance::new("z", "/repo");
+        let json = session_json(&inst, "p");
+        assert_eq!(json.state, "live");
+        let serialized = serde_json::to_string(&json).unwrap();
+        assert!(!serialized.contains("trashed_at"));
+        assert!(!serialized.contains("archived_at"));
+        assert!(serialized.contains("\"state\":\"live\""));
+    }
+
+    /// Backward-compat: `aoe list` (no `--state`) shows what it always
+    /// showed, i.e. every persisted session. Guards against a future
+    /// well-meaning refactor flipping the default to `live` and quietly
+    /// dropping trashed rows for anyone scripted against today's output.
+    #[test]
+    fn default_state_is_all_for_backward_compat() {
+        let default: SessionScope = StateFilter::All.into();
+        assert!(matches!(default, SessionScope::All));
+
+        let live_inst = Instance::new("l", "/r");
+        let mut trashed = Instance::new("t", "/r");
+        trashed.trash();
+        let mut archived = Instance::new("a", "/r");
+        archived.archive();
+        for inst in [&live_inst, &trashed, &archived] {
+            assert!(
+                SessionScope::matches(Some(default), inst),
+                "default state=all must list every session"
+            );
+        }
+    }
 }
