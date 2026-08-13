@@ -36,13 +36,6 @@ impl MetricsPoller {
     pub fn try_recv_updates(&self) -> Result<MetricsSnapshot, std::sync::mpsc::TryRecvError> {
         self.worker.try_recv()
     }
-
-    #[cfg(test)]
-    pub(crate) fn seeded_for_test(snapshot: MetricsSnapshot) -> Self {
-        Self {
-            worker: Worker::seeded_for_test("aoe-metrics-poller-test", snapshot),
-        }
-    }
 }
 
 impl Default for MetricsPoller {

@@ -54,11 +54,6 @@ use super::stop_poller::StopPoller;
 /// has a backing repo must test the repo path, not this string (#3133).
 const SCRATCH_GROUP_LABEL: &str = "scratch";
 
-/// Diagnostics-strip history depth. At the 1s sample cadence this is about two
-/// minutes of headroom samples, over-provisioned past the strip's width (it
-/// docks under the session-list column) so it never runs short.
-const METRICS_HISTORY_LEN: usize = 150;
-
 /// Extract a project group name from a session instance.
 /// Uses `worktree_info.main_repo_path` for worktree sessions (so all branches of the
 /// same repo group together), otherwise uses `project_path`. Returns the last path segment.
@@ -757,15 +752,12 @@ pub struct HomeView {
     pub(super) pending_status_refresh: bool,
 
     // Compact system-health strip controlled by `session.show_diagnostics_pane`.
-    // The poller samples memory + agent counts off the UI thread; `metrics`
-    // holds the latest sample and `metrics_history` the headroom ring buffer
-    // (per-mille of used_fraction, newest at the back) feeding the sparkline.
+    // The poller samples host resources and agent counts off the UI thread;
+    // `metrics` holds the latest sample for the strip and detail view.
     pub(super) show_diagnostics: bool,
     pub(super) metrics_poller: super::metrics_poller::MetricsPoller,
     pub(super) pending_metrics_refresh: bool,
     pub(super) metrics: crate::process::metrics::MetricsSnapshot,
-    pub(super) metrics_history: std::collections::VecDeque<u64>,
-    pub(super) cpu_history: std::collections::VecDeque<u64>,
     pub(super) system_health_open: bool,
     pub(super) system_health_scroll: usize,
     pub(super) diagnostics_area: Rect,
@@ -2307,8 +2299,6 @@ impl HomeView {
             metrics_poller: super::metrics_poller::MetricsPoller::new(),
             pending_metrics_refresh: false,
             metrics: crate::process::metrics::MetricsSnapshot::default(),
-            metrics_history: std::collections::VecDeque::new(),
-            cpu_history: std::collections::VecDeque::new(),
             system_health_open: false,
             system_health_scroll: 0,
             diagnostics_area: Rect::default(),
@@ -2922,38 +2912,15 @@ impl HomeView {
         }
     }
 
-    /// Apply any pending metrics sample, pushing the new headroom point onto
-    /// the sparkline ring buffer. Returns true if a sample was applied (so the
-    /// caller can force a repaint to animate the graph).
+    /// Apply any pending metrics sample. Returns true if a sample was applied
+    /// so the caller can repaint the live readouts.
     pub fn apply_metrics_updates(&mut self) -> bool {
         use std::sync::mpsc::TryRecvError;
 
         match self.metrics_poller.try_recv_updates() {
             Ok(snapshot) => {
-                let memory_per_mille = (snapshot.memory.used_fraction() * 1000.0).round() as u64;
-                let cpu_per_mille = snapshot
-                    .system
-                    .cpu_fraction
-                    .map(|v| (v * 1000.0).round() as u64);
                 self.metrics = snapshot;
                 self.observe_system_health_tip_load();
-                // A sample requested while visible can arrive after the strip
-                // is hidden. Do not repopulate the history that hiding clears.
-                if self.show_diagnostics || self.system_health_open {
-                    self.metrics_history.push_back(memory_per_mille);
-                    // At most one over the cap: exactly one push per apply.
-                    if self.metrics_history.len() > METRICS_HISTORY_LEN {
-                        self.metrics_history.pop_front();
-                    }
-                }
-                if self.system_health_open {
-                    if let Some(value) = cpu_per_mille {
-                        self.cpu_history.push_back(value);
-                    }
-                    if self.cpu_history.len() > METRICS_HISTORY_LEN {
-                        self.cpu_history.pop_front();
-                    }
-                }
                 self.pending_metrics_refresh = false;
                 true
             }
@@ -2974,14 +2941,9 @@ impl HomeView {
     }
 
     /// Toggle the diagnostics strip and persist the new state to
-    /// `session.show_diagnostics_pane` so it survives restarts. Clears the
-    /// history when hiding so a re-open starts fresh rather than showing a
-    /// stale gap.
+    /// `session.show_diagnostics_pane` so it survives restarts.
     pub fn toggle_diagnostics(&mut self) {
         self.show_diagnostics = !self.show_diagnostics;
-        if !self.show_diagnostics {
-            self.metrics_history.clear();
-        }
         let enabled = self.show_diagnostics;
         if let Err(e) = update_config(|config| {
             config.session.show_diagnostics_pane = enabled;
@@ -7418,9 +7380,6 @@ impl HomeView {
         self.row_tag_mode = config.session.row_tag;
         // Keep the strip in sync when the Settings UI or a config-file edit
         // flips the toggle from any settings surface.
-        if !self.show_diagnostics && config.session.show_diagnostics_pane {
-            self.metrics_history.clear();
-        }
         self.show_diagnostics = config.session.show_diagnostics_pane;
         self.agent_clipboard_forward =
             config.tmux.clipboard != crate::session::config::TmuxSettingMode::Disabled;

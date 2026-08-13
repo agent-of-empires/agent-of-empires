@@ -2470,8 +2470,6 @@ impl HomeView {
                 frame,
                 area,
                 theme,
-                &self.metrics_history,
-                &self.cpu_history,
                 &self.metrics,
                 self.system_health_scroll,
             );

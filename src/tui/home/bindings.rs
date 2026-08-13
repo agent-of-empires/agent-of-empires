@@ -63,8 +63,8 @@ pub enum ActionId {
     ToggleUnread,
     ToggleContainer,
     TogglePreviewInfo,
-    /// Toggle the memory diagnostics strip (a live memory-pressure sparkline
-    /// plus running agent/process counts). Persisted via
+    /// Toggle the system diagnostics strip (live CPU and memory pressure plus
+    /// running agent/process counts). Persisted via
     /// `session.show_diagnostics_pane` so it survives restarts.
     ToggleDiagnostics,
     /// Open the read-only host and running-agent resource view.

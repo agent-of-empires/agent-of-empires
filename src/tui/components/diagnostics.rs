@@ -3,8 +3,6 @@
 //! The readout row sheds gracefully as width shrinks: the used/total detail
 //! drops before the counts, and below that only the percent remains.
 
-use std::collections::VecDeque;
-
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 use unicode_width::UnicodeWidthStr;
@@ -21,10 +19,7 @@ const HEADROOM_WARN: f64 = 0.70;
 const PSI_CRITICAL: f32 = 20.0;
 /// PSI `some` avg10 percent at or above which a present PSI signal reads Warn.
 const PSI_WARN: f32 = 5.0;
-/// The full 0..=100% scale in per-mille, so the sparkline plots against a fixed
-/// ceiling instead of auto-scaling to whatever the recent peak happened to be.
-const PER_MILLE_MAX: u64 = 1000;
-const HEALTH_FIXED_ROWS: u16 = 14;
+const HEALTH_FIXED_ROWS: u16 = 6;
 const AGENT_TABLE_HEADER_ROWS: u16 = 1;
 
 pub(crate) fn agent_table_visible_rows(preview_height: u16) -> usize {
@@ -220,8 +215,6 @@ pub fn render_system_health(
     frame: &mut Frame,
     area: Rect,
     theme: &Theme,
-    memory_history: &VecDeque<u64>,
-    cpu_history: &VecDeque<u64>,
     snapshot: &MetricsSnapshot,
     scroll: usize,
 ) {
@@ -268,15 +261,7 @@ pub fn render_system_health(
         "none".into()
     };
 
-    let rows = Layout::vertical([
-        Constraint::Length(6),
-        Constraint::Length(1),
-        Constraint::Length(3),
-        Constraint::Length(1),
-        Constraint::Length(3),
-        Constraint::Min(0),
-    ])
-    .split(inner);
+    let rows = Layout::vertical([Constraint::Length(6), Constraint::Min(0)]).split(inner);
     let band = pressure_band(&snapshot.memory);
     let severity = match band {
         PressureBand::Ok => "OK",
@@ -322,26 +307,7 @@ pub fn render_system_health(
     ];
     frame.render_widget(Paragraph::new(lines), rows[0]);
 
-    render_timeline(
-        frame,
-        rows[1],
-        rows[2],
-        theme,
-        "Memory timeline",
-        memory_history,
-        band_color(theme, band),
-    );
-    render_timeline(
-        frame,
-        rows[3],
-        rows[4],
-        theme,
-        "CPU timeline",
-        cpu_history,
-        theme.running,
-    );
-
-    let table_area = rows[5];
+    let table_area = rows[1];
     if table_area.height == 0 {
         return;
     }
@@ -380,32 +346,6 @@ pub fn render_system_health(
         ]));
     }
     frame.render_widget(Paragraph::new(table_lines), table_area);
-}
-
-fn render_timeline(
-    frame: &mut Frame,
-    label_area: Rect,
-    graph_area: Rect,
-    theme: &Theme,
-    label: &str,
-    history: &VecDeque<u64>,
-    color: Color,
-) {
-    frame.render_widget(
-        Paragraph::new(label).style(Style::default().fg(theme.dimmed)),
-        label_area,
-    );
-    let width = graph_area.width as usize;
-    let start = history.len().saturating_sub(width);
-    let recent: Vec<u64> = history.iter().skip(start).copied().collect();
-    frame.render_widget(
-        Sparkline::default()
-            .data(recent)
-            .max(PER_MILLE_MAX)
-            .direction(RenderDirection::LeftToRight)
-            .style(Style::default().fg(color)),
-        graph_area,
-    );
 }
 
 #[cfg(test)]
@@ -493,7 +433,7 @@ mod tests {
 
     #[test]
     fn agent_table_visible_rows_handles_boundaries() {
-        let row_cases = [(17, 0), (18, 1), (24, 7)];
+        let row_cases = [(9, 0), (10, 1), (16, 7)];
         for (height, expected) in row_cases {
             assert_eq!(agent_table_visible_rows(height), expected);
         }

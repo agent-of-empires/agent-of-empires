@@ -8179,45 +8179,17 @@ fn pollable_instances_recovers_after_inflight_clear() {
 
 #[test]
 #[serial]
-fn hidden_diagnostics_drops_an_inflight_sample_from_history() {
-    use crate::process::metrics::{MemorySample, MetricsSnapshot};
-
-    let mut env = create_test_env_empty();
-    let snapshot = MetricsSnapshot {
-        memory: MemorySample {
-            total_bytes: 100,
-            available_bytes: 25,
-            ..Default::default()
-        },
-        ..Default::default()
-    };
-    env.view.show_diagnostics = false;
-    env.view.metrics_poller =
-        super::super::metrics_poller::MetricsPoller::seeded_for_test(snapshot.clone());
-    env.view.pending_metrics_refresh = true;
-
-    assert!(env.view.apply_metrics_updates());
-    assert_eq!(env.view.metrics, snapshot);
-    assert!(env.view.metrics_history.is_empty());
-    assert!(!env.view.pending_metrics_refresh);
-}
-
-#[test]
-#[serial]
 fn system_health_survives_refresh_but_closes_on_selection_change() {
     let mut env = create_test_env_with_sessions(2);
     env.view.update_selected();
     env.view.open_system_health();
-    env.view.cpu_history.push_back(500);
 
     env.view.update_selected();
     assert!(env.view.system_health_open);
-    assert_eq!(env.view.cpu_history.len(), 1);
 
     env.view.cursor = 1;
     env.view.update_selected();
     assert!(!env.view.system_health_open);
-    assert!(env.view.cpu_history.is_empty());
 }
 
 #[test]

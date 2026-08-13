@@ -4168,7 +4168,6 @@ impl HomeView {
     /// paths can't drift.
     pub(super) fn activate_selected_session(&mut self) -> Option<Action> {
         self.system_health_open = false;
-        self.cpu_history.clear();
         let id = self.selected_session.clone()?;
         if let Some(inst) = self.get_instance(&id) {
             if matches!(inst.status, Status::Deleting | Status::Creating) {
@@ -4319,7 +4318,6 @@ impl HomeView {
             }
             if self.selected_session != prev_session {
                 self.system_health_open = false;
-                self.cpu_history.clear();
                 self.preview_scroll_offset = 0;
                 // A finalized preview selection pins to the previous pane's
                 // cells; carried into a different session it would paint a
@@ -5665,7 +5663,6 @@ impl HomeView {
             }
             Item::Session { id, .. } => {
                 self.system_health_open = false;
-                self.cpu_history.clear();
                 if self.cursor != abs_idx {
                     self.cursor = abs_idx;
                     self.update_selected();
