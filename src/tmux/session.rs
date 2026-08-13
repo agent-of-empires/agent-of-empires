@@ -925,6 +925,9 @@ impl Session {
                 &pane0,
                 "-p",
                 "-e",
+                // Trailing bg fills stay, matching the VT path (#3336); see
+                // `capture_pane_with_cursor`.
+                "-N",
                 "-S",
                 &format!("-{}", lines),
                 ";",
@@ -1090,6 +1093,9 @@ impl Session {
                 target,
                 "-p".to_string(),
                 "-e".to_string(),
+                // Trailing bg fills stay, matching the VT path (#3336); see
+                // `capture_pane_with_cursor`.
+                "-N".to_string(),
             ]);
         }
 
@@ -1193,6 +1199,11 @@ impl Session {
                 &target,
                 "-p",
                 "-e",
+                // Preserve trailing spaces: a bg-styled fill running to the
+                // right edge is content the VT path keeps (`row_last_col`),
+                // and dropping it here makes the preview flicker whenever the
+                // two capture sources alternate (#3336).
+                "-N",
                 "-S",
                 &start,
                 ";",
@@ -1211,8 +1222,8 @@ impl Session {
 
         let raw = String::from_utf8_lossy(&output.stdout);
         // First line: pre-capture cursor header. Last line: post-capture
-        // header. Everything between is the verbatim `capture-pane` output
-        // (same bytes the plain `capture_pane` path returns).
+        // header. Everything between is the verbatim cursor-aware preview
+        // capture output.
         let mut parts = raw.splitn(2, '\n');
         let cursor_line = parts.next().unwrap_or("");
         let rest = parts.next().unwrap_or("");
@@ -3173,7 +3184,8 @@ mod tests {
         );
     }
 
-    /// An unsplit window must composite to exactly what `capture_pane`
+    /// An unsplit window must composite to exactly what the single-pane
+    /// preview capture (`capture_pane_with_cursor`, the other `-N` transport)
     /// returns, so the overwhelmingly common case is provably unchanged.
     #[test]
     #[serial_test::serial]
@@ -3187,7 +3199,10 @@ mod tests {
         let session = start_composite_session(guard.name(), 80, 24, "sh -c 'echo ALPHA; sleep 30'");
         wait_for_pane_text(&session, "ALPHA");
 
-        let plain = session.capture_pane(10).expect("capture_pane");
+        let plain = session
+            .capture_pane_with_cursor(10)
+            .expect("capture_pane_with_cursor")
+            .0;
         let composited = session
             .capture_window_composited(10)
             .expect("capture_window_composited");
@@ -3241,6 +3256,58 @@ mod tests {
         );
     }
 
+    /// A full-screen TUI (opencode's dimmed modal backdrop, its empty home
+    /// screen) paints its background as full-width runs of bg-styled spaces.
+    /// `capture-pane` trims trailing spaces by default, styled or not, while
+    /// the VT path keeps styled trailing blanks as content (`row_last_col`).
+    /// The preview alternates between the two sources, so a fill dropped by
+    /// one and kept by the other flickers at the idle-poll cadence (#3336).
+    /// Every preview-feeding capture must therefore preserve the fill.
+    #[test]
+    #[serial_test::serial]
+    fn preview_captures_preserve_trailing_bg_fill() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        let guard = TmuxTestSession::new("aoe_test_bg_fill");
+        // Row 0: a 40-column run of bg-styled spaces, opencode's backdrop
+        // pattern. Row 1: text so the wait helper has a needle that survives
+        // the trim either way.
+        let session = start_composite_session(
+            guard.name(),
+            40,
+            8,
+            "sh -c 'printf \"\\033[44m%40s\\033[0m\\nALPHA\\n\" \"\"; sleep 30'",
+        );
+        wait_for_pane_text(&session, "ALPHA");
+
+        let fill = format!("\u{1b}[44m{}", " ".repeat(40));
+        let (with_cursor, _) = session
+            .capture_pane_with_cursor(10)
+            .expect("capture_pane_with_cursor");
+        assert!(
+            with_cursor.contains(fill.as_str()),
+            "capture_pane_with_cursor dropped the styled fill:\n{with_cursor:?}"
+        );
+
+        let composited = session
+            .capture_window_composited(10)
+            .expect("capture_window_composited");
+        assert!(
+            composited.contains(fill.as_str()),
+            "capture_window_composited dropped the styled fill:\n{composited:?}"
+        );
+
+        let layout = session.capture_window_layout(1).expect("layout");
+        let rows = layout.panes[0].rows.join("\n");
+        assert!(
+            rows.contains(fill.as_str()),
+            "capture_window_layout dropped the styled fill:\n{rows:?}"
+        );
+    }
+
     /// `C-b z` keeps `window_panes` at its real count while reporting every pane
     /// at the window's FULL rectangle, so the rectangles overlap and the
     /// compositor's tiling assumption breaks. Compositing that painted pane 0 at
@@ -3250,7 +3317,7 @@ mod tests {
     /// so, since nothing self-heals a zoom.
     ///
     /// Zoomed must therefore be treated as unsplit, byte-for-byte identical to
-    /// the plain capture.
+    /// the single-pane preview capture.
     #[test]
     #[serial_test::serial]
     fn a_zoomed_pane_falls_back_to_the_plain_capture() {
@@ -3308,7 +3375,10 @@ mod tests {
         );
         assert_eq!(
             zoomed,
-            session.capture_pane(10).expect("plain capture"),
+            session
+                .capture_pane_with_cursor(10)
+                .expect("capture_pane_with_cursor")
+                .0,
             "zoomed must be byte-identical to the pane-0 capture"
         );
 
@@ -3465,7 +3535,10 @@ mod tests {
         let (content, cursor) = session
             .capture_window_composited_with_cursor(20)
             .expect("composited capture");
-        let plain = session.capture_pane(20).expect("capture_pane");
+        let plain = session
+            .capture_pane_with_cursor(20)
+            .expect("capture_pane_with_cursor")
+            .0;
         assert_eq!(
             content, plain,
             "unsplit window must still pass pane bytes through untouched"
