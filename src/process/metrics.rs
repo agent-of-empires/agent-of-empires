@@ -60,15 +60,15 @@ pub struct MetricsSnapshot {
 }
 
 #[derive(Debug, Clone)]
-struct ProcessRecord {
-    pid: u32,
-    ppid: u32,
-    start_id: u64,
-    rss_bytes: u64,
-    cpu_seconds: f64,
+pub(super) struct ProcessRecord {
+    pub(super) pid: u32,
+    pub(super) ppid: u32,
+    pub(super) start_id: u64,
+    pub(super) rss_bytes: u64,
+    pub(super) cpu_seconds: f64,
 }
 
-type SystemReading = (
+pub(super) type SystemReading = (
     Option<(u64, u64)>,
     Option<f64>,
     Option<[f64; 3]>,
@@ -292,170 +292,32 @@ pub(crate) fn sample_memory() -> MemorySample {
     }
 }
 
-#[cfg(target_os = "linux")]
 fn sample_system() -> SystemReading {
-    let stat = std::fs::read_to_string("/proc/stat").unwrap_or_default();
-    let cpu = stat.lines().next().and_then(|line| {
-        let values: Vec<u64> = line
-            .split_whitespace()
-            .skip(1)
-            .filter_map(|v| v.parse().ok())
-            .collect();
-        (!values.is_empty()).then(|| {
-            (
-                values.iter().sum(),
-                values.get(3).copied().unwrap_or(0) + values.get(4).copied().unwrap_or(0),
-            )
-        })
-    });
-    let load = std::fs::read_to_string("/proc/loadavg").ok().and_then(|s| {
-        let vals: Vec<f64> = s
-            .split_whitespace()
-            .take(3)
-            .filter_map(|v| v.parse().ok())
-            .collect();
-        (vals.len() == 3).then(|| [vals[0], vals[1], vals[2]])
-    });
-    let mem = std::fs::read_to_string("/proc/meminfo").unwrap_or_default();
-    let field = |name: &str| {
-        mem.lines()
-            .find(|l| l.starts_with(name))
-            .and_then(|l| l.split_whitespace().nth(1)?.parse::<u64>().ok())
-            .unwrap_or(0)
-            * 1024
-    };
-    let total = field("SwapTotal:");
-    let free = field("SwapFree:");
-    (cpu, None, load, (total, total.saturating_sub(free)))
-}
-
-#[cfg(target_os = "linux")]
-fn process_snapshot() -> Vec<ProcessRecord> {
-    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64;
-    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as u64;
-    let Ok(entries) = std::fs::read_dir("/proc") else {
-        return Vec::new();
-    };
-    entries
-        .filter_map(Result::ok)
-        .filter_map(|entry| {
-            let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
-            let stat = std::fs::read_to_string(entry.path().join("stat")).ok()?;
-            let end = stat.rfind(')')?;
-            let f: Vec<&str> = stat[end + 2..].split_whitespace().collect();
-            let ppid = f.get(1)?.parse().ok()?;
-            let utime: u64 = f.get(11)?.parse().ok()?;
-            let stime: u64 = f.get(12)?.parse().ok()?;
-            let start_id = f.get(19)?.parse().ok()?;
-            let rss_pages: i64 = f.get(21)?.parse().ok()?;
-            Some(ProcessRecord {
-                pid,
-                ppid,
-                start_id,
-                rss_bytes: rss_pages.max(0) as u64 * page,
-                cpu_seconds: (utime + stime) as f64 / hz,
-            })
-        })
-        .collect()
-}
-
-#[cfg(target_os = "macos")]
-fn sample_system() -> SystemReading {
-    let cpu = std::process::Command::new("ps")
-        .args(["-A", "-o", "%cpu="])
-        .output()
-        .ok()
-        .map(|output| {
-            let total_percent: f64 = String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .filter_map(|line| line.trim().parse::<f64>().ok())
-                .sum();
-            (total_percent / 100.0 / logical_cpus() as f64).clamp(0.0, 1.0)
-        });
-    let load = std::process::Command::new("sysctl")
-        .args(["-n", "vm.loadavg"])
-        .output()
-        .ok()
-        .and_then(|o| {
-            let s = String::from_utf8_lossy(&o.stdout).replace(['{', '}'], "");
-            let v: Vec<f64> = s
-                .split_whitespace()
-                .filter_map(|x| x.parse().ok())
-                .collect();
-            (v.len() >= 3).then(|| [v[0], v[1], v[2]])
-        });
-    let swap = std::process::Command::new("sysctl")
-        .args(["-n", "vm.swapusage"])
-        .output()
-        .ok()
-        .map(|output| parse_macos_swap(&String::from_utf8_lossy(&output.stdout)))
-        .unwrap_or((0, 0));
-    (None, cpu, load, swap)
-}
-
-#[cfg(target_os = "macos")]
-fn parse_macos_swap(value: &str) -> (u64, u64) {
-    let parse = |label: &str| {
-        let raw = value
-            .split_whitespace()
-            .skip_while(|part| *part != label)
-            .nth(2)?;
-        let (number, multiplier) = if let Some(number) = raw.strip_suffix('G') {
-            (number, 1u64 << 30)
-        } else if let Some(number) = raw.strip_suffix('M') {
-            (number, 1u64 << 20)
-        } else if let Some(number) = raw.strip_suffix('K') {
-            (number, 1u64 << 10)
-        } else {
-            (raw, 1)
-        };
-        Some((number.parse::<f64>().ok()? * multiplier as f64) as u64)
-    };
-    (parse("total").unwrap_or(0), parse("used").unwrap_or(0))
-}
-
-#[cfg(target_os = "macos")]
-fn process_snapshot() -> Vec<ProcessRecord> {
-    let Ok(out) = std::process::Command::new("ps")
-        .args(["-axo", "pid=,ppid=,rss=,time="])
-        .output()
-    else {
-        return Vec::new();
-    };
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .filter_map(|line| {
-            let f: Vec<&str> = line.split_whitespace().collect();
-            let pid = f.first()?.parse().ok()?;
-            let ppid = f.get(1)?.parse().ok()?;
-            let rss_bytes = f.get(2)?.parse::<u64>().ok()?.saturating_mul(1024);
-            let cpu_seconds = parse_ps_time(f.get(3)?)?;
-            Some(ProcessRecord {
-                pid,
-                ppid,
-                start_id: 0,
-                rss_bytes,
-                cpu_seconds,
-            })
-        })
-        .collect()
-}
-
-#[cfg(target_os = "macos")]
-fn parse_ps_time(value: &str) -> Option<f64> {
-    let parts: Vec<f64> = value.split(':').filter_map(|v| v.parse().ok()).collect();
-    match parts.as_slice() {
-        [m, s] => Some(m * 60.0 + s),
-        [h, m, s] => Some(h * 3600.0 + m * 60.0 + s),
-        _ => None,
+    #[cfg(target_os = "linux")]
+    {
+        super::linux::sample_system()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        super::macos::sample_system()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        (None, None, None, (0, 0))
     }
 }
 
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
-fn sample_system() -> SystemReading {
-    (None, None, None, (0, 0))
-}
-#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn process_snapshot() -> Vec<ProcessRecord> {
-    Vec::new()
+    #[cfg(target_os = "linux")]
+    {
+        super::linux::process_snapshot()
+    }
+    #[cfg(target_os = "macos")]
+    {
+        super::macos::process_snapshot()
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        Vec::new()
+    }
 }

@@ -8202,6 +8202,24 @@ fn hidden_diagnostics_drops_an_inflight_sample_from_history() {
     assert!(!env.view.pending_metrics_refresh);
 }
 
+#[test]
+#[serial]
+fn system_health_survives_refresh_but_closes_on_selection_change() {
+    let mut env = create_test_env_with_sessions(2);
+    env.view.update_selected();
+    env.view.open_system_health();
+    env.view.cpu_history.push_back(500);
+
+    env.view.update_selected();
+    assert!(env.view.system_health_open);
+    assert_eq!(env.view.cpu_history.len(), 1);
+
+    env.view.cursor = 1;
+    env.view.update_selected();
+    assert!(!env.view.system_health_open);
+    assert!(env.view.cpu_history.is_empty());
+}
+
 /// Footer discoverability hints track where each key actually does something.
 /// Archive/Snooze are Attention-only. Fav follows its keybind's own gate
 /// (`Context::FavoritesUsable`): usable in Attention, or in any sort order

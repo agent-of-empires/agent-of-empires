@@ -132,6 +132,71 @@ pub(super) fn sample_memory() -> super::metrics::MemorySample {
     }
 }
 
+pub(super) fn sample_system() -> super::metrics::SystemReading {
+    let stat = fs::read_to_string("/proc/stat").unwrap_or_default();
+    let cpu = stat.lines().next().and_then(|line| {
+        let values: Vec<u64> = line
+            .split_whitespace()
+            .skip(1)
+            .filter_map(|value| value.parse().ok())
+            .collect();
+        (!values.is_empty()).then(|| {
+            (
+                values.iter().sum(),
+                values.get(3).copied().unwrap_or(0) + values.get(4).copied().unwrap_or(0),
+            )
+        })
+    });
+    let load = fs::read_to_string("/proc/loadavg").ok().and_then(|value| {
+        let values: Vec<f64> = value
+            .split_whitespace()
+            .take(3)
+            .filter_map(|part| part.parse().ok())
+            .collect();
+        (values.len() == 3).then(|| [values[0], values[1], values[2]])
+    });
+    let mem = fs::read_to_string("/proc/meminfo").unwrap_or_default();
+    let field = |name: &str| {
+        mem.lines()
+            .find(|line| line.starts_with(name))
+            .and_then(|line| line.split_whitespace().nth(1)?.parse::<u64>().ok())
+            .unwrap_or(0)
+            * 1024
+    };
+    let total = field("SwapTotal:");
+    let free = field("SwapFree:");
+    (cpu, None, load, (total, total.saturating_sub(free)))
+}
+
+pub(super) fn process_snapshot() -> Vec<super::metrics::ProcessRecord> {
+    let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) }.max(1) as f64;
+    let page = unsafe { libc::sysconf(libc::_SC_PAGESIZE) }.max(1) as u64;
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|entry| {
+            let pid = entry.file_name().to_str()?.parse::<u32>().ok()?;
+            let stat = fs::read_to_string(entry.path().join("stat")).ok()?;
+            let end = stat.rfind(')')?;
+            let fields: Vec<&str> = stat[end + 2..].split_whitespace().collect();
+            let ppid = fields.get(1)?.parse().ok()?;
+            let utime: u64 = fields.get(11)?.parse().ok()?;
+            let stime: u64 = fields.get(12)?.parse().ok()?;
+            let start_id = fields.get(19)?.parse().ok()?;
+            let rss_pages: i64 = fields.get(21)?.parse().ok()?;
+            Some(super::metrics::ProcessRecord {
+                pid,
+                ppid,
+                start_id,
+                rss_bytes: rss_pages.max(0) as u64 * page,
+                cpu_seconds: (utime + stime) as f64 / hz,
+            })
+        })
+        .collect()
+}
+
 fn kib_to_bytes(kib: u64) -> u64 {
     kib.saturating_mul(1024)
 }

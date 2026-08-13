@@ -4291,8 +4291,6 @@ impl HomeView {
             let prev_session = self.selected_session.clone();
             match item {
                 Item::Session { id, .. } => {
-                    self.system_health_open = false;
-                    self.cpu_history.clear();
                     self.selected_session = Some(id.clone());
                     self.selected_group = None;
                     self.selected_group_profile = None;
@@ -4320,6 +4318,8 @@ impl HomeView {
                 }
             }
             if self.selected_session != prev_session {
+                self.system_health_open = false;
+                self.cpu_history.clear();
                 self.preview_scroll_offset = 0;
                 // A finalized preview selection pins to the previous pane's
                 // cells; carried into a different session it would paint a
@@ -5906,7 +5906,10 @@ impl HomeView {
             return view.handle_wheel_scroll(false);
         }
         if self.system_health_open && self.hit_preview(col, row) {
-            let max = self.metrics.agents.len().saturating_sub(1);
+            let visible_rows = crate::tui::components::diagnostics::agent_table_visible_rows(
+                self.preview_area.height,
+            );
+            let max = self.metrics.agents.len().saturating_sub(visible_rows);
             self.system_health_scroll = self.system_health_scroll.saturating_add(3).min(max);
             return true;
         }

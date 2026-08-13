@@ -10,6 +10,7 @@ use ratatui::widgets::*;
 use unicode_width::UnicodeWidthStr;
 
 use crate::process::metrics::{MemorySample, MetricsSnapshot};
+use crate::tui::components::truncate_to_width;
 use crate::tui::styles::Theme;
 
 /// Fraction used at or above which the strip reads Critical.
@@ -23,6 +24,15 @@ const PSI_WARN: f32 = 5.0;
 /// The full 0..=100% scale in per-mille, so the sparkline plots against a fixed
 /// ceiling instead of auto-scaling to whatever the recent peak happened to be.
 const PER_MILLE_MAX: u64 = 1000;
+const HEALTH_FIXED_ROWS: u16 = 14;
+const AGENT_TABLE_HEADER_ROWS: u16 = 1;
+
+pub(crate) fn agent_table_visible_rows(preview_height: u16) -> usize {
+    preview_height
+        .saturating_sub(2)
+        .saturating_sub(HEALTH_FIXED_ROWS)
+        .saturating_sub(AGENT_TABLE_HEADER_ROWS) as usize
+}
 
 /// Memory-pressure severity, worst-of across the available signals. Ordered
 /// ascending so the derived `Ord` lets callers fold inputs with `max`.
@@ -347,8 +357,7 @@ pub fn render_system_health(
     let visible = table_area.height.saturating_sub(1) as usize;
     for agent in snapshot.agents.iter().skip(scroll).take(visible) {
         let name_width = table_area.width.saturating_sub(24).max(8) as usize;
-        let mut title = agent.title.clone();
-        title.truncate(name_width);
+        let title = truncate_to_width(&agent.title, name_width);
         let cpu = agent
             .cpu_fraction
             .map(|v| format!("{:.1}%", v * 100.0))
@@ -475,6 +484,9 @@ mod tests {
     #[test]
     fn pressure_band_default_sample_is_ok() {
         assert_eq!(pressure_band(&MemorySample::default()), PressureBand::Ok);
+        assert_eq!(agent_table_visible_rows(17), 0);
+        assert_eq!(agent_table_visible_rows(18), 1);
+        assert_eq!(agent_table_visible_rows(24), 7);
     }
 
     #[test]

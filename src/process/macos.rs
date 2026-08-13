@@ -100,6 +100,89 @@ pub(super) fn sample_memory() -> super::metrics::MemorySample {
     }
 }
 
+pub(super) fn sample_system() -> super::metrics::SystemReading {
+    let cpu = Command::new("ps")
+        .args(["-A", "-o", "%cpu="])
+        .output()
+        .ok()
+        .map(|output| {
+            let total_percent: f64 = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .filter_map(|line| line.trim().parse::<f64>().ok())
+                .sum();
+            let cpus = std::thread::available_parallelism()
+                .map(usize::from)
+                .unwrap_or(1);
+            (total_percent / 100.0 / cpus as f64).clamp(0.0, 1.0)
+        });
+    let load = sysctl_string("vm.loadavg").and_then(|value| {
+        let values: Vec<f64> = value
+            .replace(['{', '}'], "")
+            .split_whitespace()
+            .filter_map(|part| part.parse().ok())
+            .collect();
+        (values.len() >= 3).then(|| [values[0], values[1], values[2]])
+    });
+    let swap = sysctl_string("vm.swapusage")
+        .map(|value| parse_swap(&value))
+        .unwrap_or((0, 0));
+    (None, cpu, load, swap)
+}
+
+pub(super) fn process_snapshot() -> Vec<super::metrics::ProcessRecord> {
+    let Ok(output) = Command::new("ps")
+        .args(["-axo", "pid=,ppid=,rss=,time="])
+        .output()
+    else {
+        return Vec::new();
+    };
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            Some(super::metrics::ProcessRecord {
+                pid: fields.first()?.parse().ok()?,
+                ppid: fields.get(1)?.parse().ok()?,
+                rss_bytes: fields.get(2)?.parse::<u64>().ok()?.saturating_mul(1024),
+                cpu_seconds: parse_ps_time(fields.get(3)?)?,
+                start_id: 0,
+            })
+        })
+        .collect()
+}
+
+fn parse_swap(value: &str) -> (u64, u64) {
+    let parse = |label: &str| {
+        let raw = value
+            .split_whitespace()
+            .skip_while(|part| *part != label)
+            .nth(2)?;
+        let (number, multiplier) = if let Some(number) = raw.strip_suffix('G') {
+            (number, 1u64 << 30)
+        } else if let Some(number) = raw.strip_suffix('M') {
+            (number, 1u64 << 20)
+        } else if let Some(number) = raw.strip_suffix('K') {
+            (number, 1u64 << 10)
+        } else {
+            (raw, 1)
+        };
+        Some((number.parse::<f64>().ok()? * multiplier as f64) as u64)
+    };
+    (parse("total").unwrap_or(0), parse("used").unwrap_or(0))
+}
+
+fn parse_ps_time(value: &str) -> Option<f64> {
+    let parts: Vec<f64> = value
+        .split(':')
+        .filter_map(|part| part.parse().ok())
+        .collect();
+    match parts.as_slice() {
+        [minutes, seconds] => Some(minutes * 60.0 + seconds),
+        [hours, minutes, seconds] => Some(hours * 3600.0 + minutes * 60.0 + seconds),
+        _ => None,
+    }
+}
+
 fn sysctl_string(key: &str) -> Option<String> {
     let out = Command::new("sysctl").args(["-n", key]).output().ok()?;
     if !out.status.success() {
