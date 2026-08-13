@@ -725,6 +725,25 @@ fn format_probe(probe: &ConfigProbe, scope_label: &str, path_display: &str) -> O
     }
 }
 
+/// Format only the unrecognized-keys half of a probe result. Returns `None`
+/// when the file is clean OR failed to parse: a parse failure would have
+/// been reported by `Config::load_or_warn`'s `tracing::warn!` (assuming a
+/// subscriber is running), and it does not carry ignored-key information.
+fn format_probe_ignored_keys_only(
+    probe: &ConfigProbe,
+    scope_label: &str,
+    path_display: &str,
+) -> Option<String> {
+    if probe.load_err.is_some() || probe.ignored_keys.is_empty() {
+        None
+    } else {
+        Some(format!(
+            "Unrecognized keys in {scope_label} ({path_display}) were ignored: {}",
+            probe.ignored_keys.join(", ")
+        ))
+    }
+}
+
 /// Probe the global config and the active profile's config at startup so the
 /// TUI can show a single user-visible warning when either fails to parse OR
 /// contains unrecognized keys. `tracing::warn!` calls inside the `_or_warn`
@@ -752,6 +771,47 @@ pub fn collect_startup_config_warnings(profile: &str) -> Option<String> {
         .unwrap_or_else(|_| format!("profiles/{effective}/config.toml"));
     let profile_scope = format!("profile config '{effective}'");
     if let Some(msg) = format_probe(
+        &probe_profile_config(&effective),
+        &profile_scope,
+        &profile_path_display,
+    ) {
+        messages.push(msg);
+    }
+
+    if messages.is_empty() {
+        None
+    } else {
+        Some(messages.join("\n\n"))
+    }
+}
+
+/// Like [`collect_startup_config_warnings`], but only the unrecognized-keys
+/// class. Used on paths where a tracing subscriber is already running
+/// (`should_init` true, e.g. TUI startup or `serve --daemon-child`): parse
+/// failures reach the operator through `tracing::warn!` from `_or_warn`
+/// helpers, but ignored keys are collected only by this probe, so they must
+/// still be surfaced on stderr even when tracing is up (#3228 CodeRabbit).
+pub fn collect_startup_ignored_key_warnings(profile: &str) -> Option<String> {
+    let mut messages: Vec<String> = Vec::new();
+
+    if let Some(msg) = format_probe_ignored_keys_only(
+        &probe_global_config(),
+        "global config",
+        &config_path_display(),
+    ) {
+        messages.push(msg);
+    }
+
+    let effective = if profile.is_empty() {
+        config::resolve_default_profile()
+    } else {
+        profile.to_string()
+    };
+    let profile_path_display = profile_config::get_profile_config_path(&effective)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| format!("profiles/{effective}/config.toml"));
+    let profile_scope = format!("profile config '{effective}'");
+    if let Some(msg) = format_probe_ignored_keys_only(
         &probe_profile_config(&effective),
         &profile_scope,
         &profile_path_display,
@@ -1057,6 +1117,45 @@ mod tests {
 
         let warning = collect_startup_config_warnings("default").expect("expected a warning");
         assert!(warning.contains("Failed to load profile config 'default'"));
+    }
+
+    /// #3228 CodeRabbit follow-up: the ignored-keys-only variant is the
+    /// path a subscribed run (TUI, foreground serve, or `AOE_LOG_LEVEL`
+    /// set) uses so ignored keys are still surfaced without duplicating
+    /// the parse-error line that `tracing::warn!` already reports. It
+    /// must report unrecognized keys but NOT parse failures.
+    #[test]
+    #[serial_test::serial]
+    fn test_collect_startup_ignored_key_warnings_reports_ignored_only() {
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        fs::write(
+            dir.join("config.toml"),
+            "[sandbox]\nenabled_by_default = true\nprivildged = true\n",
+        )
+        .unwrap();
+
+        let warning =
+            collect_startup_ignored_key_warnings("").expect("ignored key must be reported");
+        assert!(warning.contains("sandbox.privildged"));
+        assert!(!warning.contains("Failed to load"));
+    }
+
+    /// #3228 CodeRabbit follow-up: a parse failure alone is *not* reported
+    /// by the ignored-keys-only variant. `tracing::warn!` from
+    /// `Config::load_or_warn` covers that class when a subscriber is up.
+    #[test]
+    #[serial_test::serial]
+    fn test_collect_startup_ignored_key_warnings_silent_on_parse_failure() {
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        fs::write(
+            dir.join("config.toml"),
+            "[sandbox]\nenabled_by_default = \"not-a-bool\"\n",
+        )
+        .unwrap();
+
+        assert!(collect_startup_ignored_key_warnings("").is_none());
     }
 
     /// #3228: a nested typo inside a known section is silently dropped by

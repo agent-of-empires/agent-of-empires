@@ -424,19 +424,30 @@ async fn run(
         migrations::run_migrations()?;
     }
 
-    // Surface config parse errors and unrecognized keys on stderr for the
-    // one-shot CLI commands that reach this point (add/list/ps/status/session/
-    // remove/send/killall/group/serve-foreground). Skipped when a tracing
-    // subscriber is already running (`should_init`) so the `_or_warn` helpers'
-    // `tracing::warn!` handle it without a duplicate. Gated on
-    // `cli::command_name` so hidden machine-spawned subcommands (`__acp-runner`
-    // etc.) never eprintln into a detached worker's redirected stderr. The TUI
-    // path skips this: `collect_startup_config_warnings` already runs there and
-    // is rendered as a startup dialog by `App::show_startup_warning` (#3228).
-    if !should_init && cli.command.as_ref().and_then(cli::command_name).is_some() {
-        if let Some(warning) = agent_of_empires::session::collect_startup_config_warnings(&profile)
-        {
-            eprintln!("{warning}");
+    // Surface config diagnostics on stderr for user-visible CLI commands
+    // (`add`/`list`/`ps`/`status`/`session`/`remove`/`send`/`killall`/`group`/
+    // `serve` foreground). Two classes with different subscriber overlap:
+    //
+    // - Unrecognized keys: collected only by `serde_ignored` inside the
+    //   startup probe; no other surface reports them. Always emit when a user
+    //   is watching, even when a tracing subscriber is running (`should_init`
+    //   true), because the `_or_warn` helpers cover only parse failures.
+    // - Parse failures: reported by `Config::load_or_warn`'s `tracing::warn!`
+    //   when a subscriber is up. Emit here only when it isn't, so a foreground
+    //   run doesn't duplicate the tracing line.
+    //
+    // Gated on `cli::command_name` so hidden machine-spawned subcommands
+    // (`__acp-runner` etc.) never eprintln into a detached worker's redirected
+    // stderr. The TUI path skips this: `collect_startup_config_warnings`
+    // already runs there and is rendered by `App::show_startup_warning` (#3228).
+    if cli.command.as_ref().and_then(cli::command_name).is_some() {
+        let warning = if should_init {
+            agent_of_empires::session::collect_startup_ignored_key_warnings(&profile)
+        } else {
+            agent_of_empires::session::collect_startup_config_warnings(&profile)
+        };
+        if let Some(w) = warning {
+            eprintln!("{w}");
         }
     }
 
