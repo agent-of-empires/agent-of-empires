@@ -867,6 +867,16 @@ pub struct AppStateConfig {
     #[serde(default)]
     pub used_new_from_selection: bool,
 
+    /// Set after six live agents have been observed for three consecutive
+    /// health samples, making the System Health discovery tip eligible.
+    #[serde(default)]
+    pub system_health_tip_earned: bool,
+
+    /// Set once the detailed System Health view has been opened. Users who
+    /// found it themselves do not need its earned discovery tip.
+    #[serde(default)]
+    pub used_system_health: bool,
+
     /// Server-side mirror of the web dashboard's syncable UI state, keyed by
     /// the frontend's localStorage key (the value is the opaque string the
     /// browser stored). Single-tenant: there is one user, so these prefs
@@ -3848,16 +3858,22 @@ mod tests {
         assert!(app.tips_seen.is_empty());
         assert_eq!(app.new_session_with_selection_count, 0);
         assert!(!app.used_new_from_selection);
+        assert!(!app.system_health_tip_earned);
+        assert!(!app.used_system_health);
 
         let toml = r#"
             tips_seen = ["new-from-selection"]
             new_session_with_selection_count = 4
             used_new_from_selection = true
+            system_health_tip_earned = true
+            used_system_health = true
         "#;
         let app: AppStateConfig = toml::from_str(toml).unwrap();
         assert_eq!(app.tips_seen, vec!["new-from-selection"]);
         assert_eq!(app.new_session_with_selection_count, 4);
         assert!(app.used_new_from_selection);
+        assert!(app.system_health_tip_earned);
+        assert!(app.used_system_health);
 
         // Round-trips back out.
         let serialized = toml::to_string(&app).unwrap();

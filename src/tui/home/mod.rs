@@ -769,6 +769,10 @@ pub struct HomeView {
     pub(super) system_health_open: bool,
     pub(super) system_health_scroll: usize,
     pub(super) diagnostics_area: Rect,
+    pub(super) diagnostics_hovered: bool,
+    pub(super) system_health_tip_high_samples: u8,
+    pub(super) system_health_tip_earned: bool,
+    pub(super) system_health_discovered: bool,
 
     // Structured (ACP) rows: the tmux poller above bails on them, so their
     // status comes from the daemon instead. See `daemon_status_poller`.
@@ -1192,6 +1196,8 @@ pub(super) fn tips_unseen_count(config: &crate::session::Config) -> usize {
         &crate::tips::TipSignals {
             new_session_with_selection_count: config.app_state.new_session_with_selection_count,
             used_new_from_selection: config.app_state.used_new_from_selection,
+            system_health_tip_earned: config.app_state.system_health_tip_earned,
+            used_system_health: config.app_state.used_system_health,
         },
     )
 }
@@ -2306,6 +2312,14 @@ impl HomeView {
             system_health_open: false,
             system_health_scroll: 0,
             diagnostics_area: Rect::default(),
+            diagnostics_hovered: false,
+            system_health_tip_high_samples: 0,
+            system_health_tip_earned: user_config
+                .as_ref()
+                .is_some_and(|config| config.app_state.system_health_tip_earned),
+            system_health_discovered: user_config
+                .as_ref()
+                .is_some_and(|config| config.app_state.used_system_health),
             #[cfg(feature = "serve")]
             daemon_status_poller: super::daemon_status_poller::DaemonStatusPoller::new(),
             #[cfg(feature = "serve")]
@@ -2896,9 +2910,14 @@ impl HomeView {
     /// Request a system-health sample in the background while either health
     /// surface is visible. Call `apply_metrics_updates` to pick up the result.
     pub fn request_metrics_refresh(&mut self) {
-        if (self.show_diagnostics || self.system_health_open) && !self.pending_metrics_refresh {
-            self.metrics_poller
-                .request_refresh(self.pollable_instances());
+        let instances = self.pollable_instances();
+        let tip_candidate = !self.system_health_tip_earned
+            && !self.system_health_discovered
+            && instances.len() >= crate::tips::SYSTEM_HEALTH_AGENT_THRESHOLD;
+        if (self.show_diagnostics || self.system_health_open || tip_candidate)
+            && !self.pending_metrics_refresh
+        {
+            self.metrics_poller.request_refresh(instances);
             self.pending_metrics_refresh = true;
         }
     }
@@ -2917,6 +2936,7 @@ impl HomeView {
                     .cpu_fraction
                     .map(|v| (v * 1000.0).round() as u64);
                 self.metrics = snapshot;
+                self.observe_system_health_tip_load();
                 // A sample requested while visible can arrive after the strip
                 // is hidden. Do not repopulate the history that hiding clears.
                 if self.show_diagnostics || self.system_health_open {
@@ -2974,11 +2994,63 @@ impl HomeView {
     }
 
     pub fn open_system_health(&mut self) {
+        self.system_health_discovered = true;
+        if self.pending_tip_pop.map(|tip| tip.id) == Some("system-health") {
+            self.pending_tip_pop = None;
+        }
+        let already_used = load_config()
+            .ok()
+            .flatten()
+            .is_some_and(|config| config.app_state.used_system_health);
+        if !already_used {
+            if let Err(error) = update_app_state(|state| state.used_system_health = true) {
+                tracing::warn!(target: "tui.home", "failed to persist System Health discovery: {error}");
+            } else if let Ok(config) = load_config().map(|config| config.unwrap_or_default()) {
+                self.tips_unseen = tips_unseen_count(&config);
+            }
+        }
         self.system_health_open = true;
         self.system_health_scroll = 0;
         self.diff_view = None;
         self.live_send = None;
         self.request_metrics_refresh();
+    }
+
+    fn observe_system_health_tip_load(&mut self) {
+        if self.system_health_tip_earned || self.system_health_discovered {
+            return;
+        }
+        if self.metrics.counts.agents < crate::tips::SYSTEM_HEALTH_AGENT_THRESHOLD {
+            self.system_health_tip_high_samples = 0;
+            return;
+        }
+        self.system_health_tip_high_samples = self.system_health_tip_high_samples.saturating_add(1);
+        if self.system_health_tip_high_samples < crate::tips::SYSTEM_HEALTH_SAMPLE_THRESHOLD {
+            return;
+        }
+
+        self.system_health_tip_earned = true;
+        if let Err(error) = update_app_state(|state| state.system_health_tip_earned = true) {
+            tracing::warn!(target: "tui.home", "failed to persist System Health tip signal: {error}");
+            return;
+        }
+        let Ok(config) = load_config().map(|config| config.unwrap_or_default()) else {
+            return;
+        };
+        self.tips_unseen = tips_unseen_count(&config);
+        if config.session.show_tips
+            && !config.app_state.used_system_health
+            && !config
+                .app_state
+                .tips_seen
+                .iter()
+                .any(|id| id == "system-health")
+            && self.pending_tip_pop.is_none()
+        {
+            self.pending_tip_pop = crate::tips::catalog()
+                .iter()
+                .find(|tip| tip.id == "system-health");
+        }
     }
 
     /// Request the daemon's view of every structured row's status

@@ -129,7 +129,13 @@ pub(crate) fn format_bytes(bytes: u64) -> String {
 }
 
 /// Render the single-row current-state strip into `area`.
-pub fn render(frame: &mut Frame, area: Rect, theme: &Theme, snapshot: &MetricsSnapshot) {
+pub fn render(
+    frame: &mut Frame,
+    area: Rect,
+    theme: &Theme,
+    snapshot: &MetricsSnapshot,
+    hovered: bool,
+) {
     if area.width == 0 || area.height == 0 {
         return;
     }
@@ -138,6 +144,11 @@ pub fn render(frame: &mut Frame, area: Rect, theme: &Theme, snapshot: &MetricsSn
     let band = pressure_band(mem);
     let color = band_color(theme, band);
 
+    let style = if hovered {
+        Style::default().bg(theme.selection)
+    } else {
+        Style::default()
+    };
     frame.render_widget(
         Paragraph::new(readout_line(
             theme,
@@ -145,71 +156,62 @@ pub fn render(frame: &mut Frame, area: Rect, theme: &Theme, snapshot: &MetricsSn
             mem,
             snapshot,
             area.width as usize,
-        )),
+            hovered,
+        ))
+        .style(style),
         area,
     );
 }
 
-/// Build the readout line under the sparkline, dropping detail as `avail`
-/// (display cells) shrinks. A leading space insets it from the border. Before
-/// the first sample (`total_bytes == 0`) the memory figure is unknown, so only
-/// the counts show rather than a misleading `0%`.
+/// Build the compact CPU and memory readout, adding agent counts when width
+/// permits. A chevron makes the drill-down action visible without consuming a
+/// permanent keybinding.
 fn readout_line<'a>(
     theme: &Theme,
     color: Color,
     mem: &MemorySample,
     snapshot: &MetricsSnapshot,
     avail: usize,
+    hovered: bool,
 ) -> Line<'a> {
     let cpu = snapshot
         .system
         .cpu_fraction
-        .map(|value| format!("CPU {}% · ", (value * 100.0).round() as u32))
-        .unwrap_or_default();
+        .map(|value| format!("CPU {}%", (value * 100.0).round() as u32))
+        .unwrap_or_else(|| "CPU ?".to_string());
+    let memory = if mem.total_bytes > 0 {
+        format!("Mem {}%", (mem.used_fraction() * 100.0).round() as u32)
+    } else {
+        "Mem ?".to_string()
+    };
     let counts = format!(
-        "{cpu}{} agents · {} procs",
+        "{} agents · {} procs",
         snapshot.counts.agents, snapshot.counts.procs
     );
-
-    if mem.total_bytes == 0 {
-        return Line::from(vec![
-            Span::raw(" "),
+    let separator = " · ";
+    let detail_separator = "  │  ";
+    let affordance = "  ›";
+    let primary_width = 1 + cpu.width() + separator.width() + memory.width();
+    let full_width = primary_width + detail_separator.width() + counts.width() + affordance.width();
+    let affordance_color = if hovered { theme.title } else { theme.hint };
+    let mut spans = vec![
+        Span::raw(" "),
+        Span::styled(cpu, Style::default().fg(theme.text).bold()),
+        Span::styled(separator, Style::default().fg(theme.dimmed)),
+        Span::styled(memory, Style::default().fg(color).bold()),
+    ];
+    if full_width <= avail {
+        spans.extend([
+            Span::styled(detail_separator, Style::default().fg(theme.dimmed)),
             Span::styled(counts, Style::default().fg(theme.dimmed)),
         ]);
     }
-
-    let pct = format!("{}%", (mem.used_fraction() * 100.0).round() as u32);
-    let detail = format!(
-        "{}/{}",
-        format_bytes(mem.used_bytes()),
-        format_bytes(mem.total_bytes)
-    );
-    let gap = "  ";
-    let sep = "  │  ";
-
-    let pct_span = Span::styled(pct.clone(), Style::default().fg(color).bold());
-    let full_width = 1 + pct.width() + gap.width() + detail.width() + sep.width() + counts.width();
-    let counts_width = 1 + pct.width() + gap.width() + counts.width();
-
-    let spans = if full_width <= avail {
-        vec![
-            Span::raw(" "),
-            pct_span,
-            Span::raw(gap),
-            Span::styled(detail, Style::default().fg(theme.text)),
-            Span::styled(sep, Style::default().fg(theme.dimmed)),
-            Span::styled(counts, Style::default().fg(theme.dimmed)),
-        ]
-    } else if counts_width <= avail {
-        vec![
-            Span::raw(" "),
-            pct_span,
-            Span::raw(gap),
-            Span::styled(counts, Style::default().fg(theme.dimmed)),
-        ]
-    } else {
-        vec![Span::raw(" "), pct_span]
-    };
+    if primary_width + affordance.width() <= avail {
+        spans.push(Span::styled(
+            affordance,
+            Style::default().fg(affordance_color).bold(),
+        ));
+    }
     Line::from(spans)
 }
 

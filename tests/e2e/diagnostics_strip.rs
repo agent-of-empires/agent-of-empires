@@ -13,12 +13,13 @@ fn test_system_health_palette_actions() {
 
     h.wait_for(" aoe ");
     // Off by default.
-    h.assert_screen_not_contains("procs");
+    h.assert_screen_not_contains("CPU ");
 
     h.send_keys("C-k");
     h.type_text("toggle system health strip");
     h.send_keys("Enter");
-    h.wait_for("procs");
+    h.wait_for("CPU ");
+    h.wait_for("Mem ");
 
     h.send_keys("C-k");
     h.type_text("open system health");

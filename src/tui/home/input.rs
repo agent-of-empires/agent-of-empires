@@ -5146,6 +5146,8 @@ impl HomeView {
         let signals = crate::tips::TipSignals {
             new_session_with_selection_count: config.app_state.new_session_with_selection_count,
             used_new_from_selection: config.app_state.used_new_from_selection,
+            system_health_tip_earned: config.app_state.system_health_tip_earned,
+            used_system_health: config.app_state.used_system_health,
         };
         let eligible = crate::tips::eligible(crate::tips::TipSurface::Tui, &signals);
         self.tips_dialog = Some(TipsDialog::new(
@@ -5242,6 +5244,8 @@ impl HomeView {
         let signals = crate::tips::TipSignals {
             new_session_with_selection_count: config.app_state.new_session_with_selection_count,
             used_new_from_selection: config.app_state.used_new_from_selection,
+            system_health_tip_earned: config.app_state.system_health_tip_earned,
+            used_system_health: config.app_state.used_system_health,
         };
         self.pending_tip_pop = crate::tips::next_earned_pop(
             crate::tips::TipSurface::Tui,
@@ -5875,6 +5879,11 @@ impl HomeView {
             .map(|(_, key)| *key);
         let footer_changed = prev_footer_hover != self.footer_hover;
 
+        let diagnostics_hovered = !self.has_non_live_send_overlay()
+            && self.diagnostics_area.contains(Position::from((col, row)));
+        let diagnostics_changed = diagnostics_hovered != self.diagnostics_hovered;
+        self.diagnostics_hovered = diagnostics_hovered;
+
         // Hover is live over both the scrolling list and the pinned shelf, so
         // a shelf row (Trash / Archived) highlights under the pointer the same
         // way a list row does. `resolve_row_to_index` maps either region.
@@ -5895,7 +5904,11 @@ impl HomeView {
         let badge_changed = badge_hover != self.tips_badge_hovered;
         self.tips_badge_hovered = badge_hover;
 
-        overlay_changed || footer_changed || badge_changed || prev_idx != new_idx
+        overlay_changed
+            || footer_changed
+            || diagnostics_changed
+            || badge_changed
+            || prev_idx != new_idx
     }
 
     /// Route a mouse-wheel-down at (col, row); see handle_scroll_up.

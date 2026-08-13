@@ -948,7 +948,13 @@ impl HomeView {
                 Constraint::Length(DIAGNOSTICS_STRIP_HEIGHT),
             ])
             .split(column);
-        crate::tui::components::diagnostics::render(frame, rows[1], theme, &self.metrics);
+        crate::tui::components::diagnostics::render(
+            frame,
+            rows[1],
+            theme,
+            &self.metrics,
+            self.diagnostics_hovered,
+        );
         self.diagnostics_area = rows[1];
         rows[0]
     }
