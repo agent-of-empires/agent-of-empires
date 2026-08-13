@@ -131,24 +131,39 @@ pub(super) fn sample_system() -> super::metrics::SystemReading {
 
 pub(super) fn process_snapshot() -> Vec<super::metrics::ProcessRecord> {
     let Ok(output) = Command::new("ps")
-        .args(["-axo", "pid=,ppid=,rss=,time="])
+        .args(["-axo", "pid=,ppid=,rss=,time=,lstart="])
         .output()
     else {
         return Vec::new();
     };
     String::from_utf8_lossy(&output.stdout)
         .lines()
-        .filter_map(|line| {
-            let fields: Vec<&str> = line.split_whitespace().collect();
-            Some(super::metrics::ProcessRecord {
-                pid: fields.first()?.parse().ok()?,
-                ppid: fields.get(1)?.parse().ok()?,
-                rss_bytes: fields.get(2)?.parse::<u64>().ok()?.saturating_mul(1024),
-                cpu_seconds: parse_ps_time(fields.get(3)?)?,
-                start_id: 0,
-            })
-        })
+        .filter_map(parse_process_record)
         .collect()
+}
+
+fn parse_process_record(line: &str) -> Option<super::metrics::ProcessRecord> {
+    let fields: Vec<&str> = line.split_whitespace().collect();
+    let started_at = fields.get(4..)?;
+    if started_at.is_empty() {
+        return None;
+    }
+    Some(super::metrics::ProcessRecord {
+        pid: fields.first()?.parse().ok()?,
+        ppid: fields.get(1)?.parse().ok()?,
+        rss_bytes: fields.get(2)?.parse::<u64>().ok()?.saturating_mul(1024),
+        cpu_seconds: parse_ps_time(fields.get(3)?)?,
+        start_id: stable_process_start_id(started_at),
+    })
+}
+
+fn stable_process_start_id(fields: &[&str]) -> u64 {
+    fields
+        .iter()
+        .flat_map(|field| field.bytes().chain(std::iter::once(0)))
+        .fold(0xcbf29ce484222325, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100000001b3)
+        })
 }
 
 fn parse_swap(value: &str) -> (u64, u64) {
@@ -172,15 +187,22 @@ fn parse_swap(value: &str) -> (u64, u64) {
 }
 
 fn parse_ps_time(value: &str) -> Option<f64> {
-    let parts: Vec<f64> = value
+    let (days, clock) = if let Some((days, clock)) = value.split_once('-') {
+        (days.parse::<f64>().ok()?, clock)
+    } else {
+        (0.0, value)
+    };
+    let parts: Vec<f64> = clock
         .split(':')
-        .filter_map(|part| part.parse().ok())
-        .collect();
-    match parts.as_slice() {
-        [minutes, seconds] => Some(minutes * 60.0 + seconds),
-        [hours, minutes, seconds] => Some(hours * 3600.0 + minutes * 60.0 + seconds),
-        _ => None,
-    }
+        .map(str::parse)
+        .collect::<Result<_, _>>()
+        .ok()?;
+    let seconds = match parts.as_slice() {
+        [minutes, seconds] => minutes * 60.0 + seconds,
+        [hours, minutes, seconds] => hours * 3600.0 + minutes * 60.0 + seconds,
+        _ => return None,
+    };
+    Some(days * 86_400.0 + seconds)
 }
 
 fn sysctl_string(key: &str) -> Option<String> {
@@ -260,6 +282,29 @@ Pages wired down:                        300000.
             Some((123456 + 200000) * 16384)
         );
         assert_eq!(parse_vm_stat_pages(VM_STAT, "Pages nonexistent"), None);
+    }
+
+    #[test]
+    fn process_record_parses_stable_identity_and_cpu_time() {
+        let time_cases = [
+            ("03:04", Some(184.0)),
+            ("02:03:04", Some(7_384.0)),
+            ("1-02:03:04", Some(93_784.0)),
+            ("1-02:x:04", None),
+            ("1-02:03:bad", None),
+        ];
+        for (value, expected) in time_cases {
+            assert_eq!(parse_ps_time(value), expected, "CPU time {value}");
+        }
+
+        let line = "42 1 512 1-02:03:04 Thu Aug 13 12:34:56 2026";
+        let record = parse_process_record(line).unwrap();
+        assert_eq!(record.cpu_seconds, 93_784.0);
+        assert_ne!(record.start_id, 0);
+        assert_eq!(
+            record.start_id,
+            parse_process_record(line).unwrap().start_id
+        );
     }
 }
 

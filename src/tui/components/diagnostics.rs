@@ -34,6 +34,12 @@ pub(crate) fn agent_table_visible_rows(preview_height: u16) -> usize {
         .saturating_sub(AGENT_TABLE_HEADER_ROWS) as usize
 }
 
+fn format_agent_title(title: &str, width: usize) -> String {
+    let title = truncate_to_width(title, width);
+    let padding = width.saturating_sub(title.width());
+    format!("{title}{}", " ".repeat(padding))
+}
+
 /// Memory-pressure severity, worst-of across the available signals. Ordered
 /// ascending so the derived `Ord` lets callers fold inputs with `max`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -357,16 +363,13 @@ pub fn render_system_health(
     let visible = table_area.height.saturating_sub(1) as usize;
     for agent in snapshot.agents.iter().skip(scroll).take(visible) {
         let name_width = table_area.width.saturating_sub(24).max(8) as usize;
-        let title = truncate_to_width(&agent.title, name_width);
+        let title = format_agent_title(&agent.title, name_width);
         let cpu = agent
             .cpu_fraction
             .map(|v| format!("{:.1}%", v * 100.0))
             .unwrap_or_else(|| "?".into());
         table_lines.push(Line::from(vec![
-            Span::styled(
-                format!("{title:<name_width$}"),
-                Style::default().fg(theme.text),
-            ),
+            Span::styled(title, Style::default().fg(theme.text)),
             Span::raw(format!(
                 " {cpu:>6} {:>9} {:>6}",
                 format_bytes(agent.rss_bytes),
@@ -484,9 +487,22 @@ mod tests {
     #[test]
     fn pressure_band_default_sample_is_ok() {
         assert_eq!(pressure_band(&MemorySample::default()), PressureBand::Ok);
-        assert_eq!(agent_table_visible_rows(17), 0);
-        assert_eq!(agent_table_visible_rows(18), 1);
-        assert_eq!(agent_table_visible_rows(24), 7);
+    }
+
+    #[test]
+    fn agent_table_visible_rows_handles_boundaries() {
+        let row_cases = [(17, 0), (18, 1), (24, 7)];
+        for (height, expected) in row_cases {
+            assert_eq!(agent_table_visible_rows(height), expected);
+        }
+    }
+
+    #[test]
+    fn agent_table_title_padding_uses_display_width() {
+        for title in ["agent", "日本語", "aaaaaaaé"] {
+            let formatted = format_agent_title(title, 8);
+            assert_eq!(formatted.width(), 8, "title {title:?}");
+        }
     }
 
     #[test]
