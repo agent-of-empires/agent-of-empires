@@ -723,7 +723,14 @@ pub const AGENTS: &[AgentDef] = &[
         },
         fork_strategy: ForkStrategy::ClaudeFork,
         host_only: false,
-        send_keys_enter_delay_ms: 0,
+        // Claude Code has paste-burst suppression like Codex. Its input handler
+        // (usePasteHandler.ts) sets PASTE_COMPLETION_TIMEOUT_MS = 100 and, while a
+        // bracketed paste is still pending, appends any incoming Enter to the paste
+        // buffer instead of submitting it. When we send the message via
+        // send_via_paste_buffer and fire Enter immediately (0ms), that Enter lands
+        // inside the 100ms window and is swallowed, leaving an unsubmitted
+        // "[Pasted text]" placeholder. 150ms > 100ms lets the window expire first.
+        send_keys_enter_delay_ms: 150,
         ready_marker: None,
         install_hint: "npm install -g @anthropic-ai/claude-code",
         permission_response: Some(PermissionResponse {
@@ -824,7 +831,11 @@ pub const AGENTS: &[AgentDef] = &[
         send_keys_enter_delay_ms: 150,
         ready_marker: None,
         install_hint: "npm install -g @openai/codex",
-        permission_response: None,
+        permission_response: Some(PermissionResponse {
+            allow: &[KeyToken::Literal("y")],
+            allow_always: Some(&[KeyToken::Literal("a")]),
+            deny: &[KeyToken::Literal("d")],
+        }),
     },
     AgentDef {
         name: "gemini",
@@ -2207,8 +2218,13 @@ mod tests {
     fn test_send_keys_enter_delay() {
         // Codex needs a delay to outlast its 120ms paste-burst suppression window
         assert!(send_keys_enter_delay("codex") >= 150);
-        // Other agents should not delay
-        assert_eq!(send_keys_enter_delay("claude"), 0);
+        // Claude Code also has paste-burst suppression: usePasteHandler.ts sets
+        // PASTE_COMPLETION_TIMEOUT_MS = 100 and, while a paste is pending, routes
+        // an incoming Enter into the paste buffer instead of submitting it (the
+        // `[Pasted text]` sits unsubmitted). The Enter must arrive after that
+        // 100ms window expires, so claude needs a delay > 100ms.
+        assert!(send_keys_enter_delay("claude") > 100);
+        // Other agents have no paste-burst suppression and should not delay
         assert_eq!(send_keys_enter_delay("opencode"), 0);
         assert_eq!(send_keys_enter_delay("hermes"), 0);
         assert_eq!(send_keys_enter_delay("kiro"), 0);

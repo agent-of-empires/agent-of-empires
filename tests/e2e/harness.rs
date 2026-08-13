@@ -516,6 +516,41 @@ last_seen_version = "{}"
         bin
     }
 
+    /// Install a PATH stub that records the argv it was invoked with to
+    /// `<home>/<name>.argv`, then exits 0. Returns that record path. Unlike
+    /// `install_path_command`, this lets a test assert the command a launch
+    /// actually executed, which is the only observable point now that launches
+    /// run through an ephemeral env-file wrapper that keeps the command out of
+    /// tmux's `pane_start_command` argv.
+    pub fn install_recording_path_command(&mut self, name: &str) -> PathBuf {
+        let bin = self.home_dir.path().join("path-bin");
+        std::fs::create_dir_all(&bin).expect("create path-bin dir");
+        let record = self.home_dir.path().join(format!("{name}.argv"));
+        let path = bin.join(name);
+        // Embed the absolute record path directly: the stub runs inside the
+        // tmux pane, which does not inherit arbitrary harness env (tmux freezes
+        // the server env), so an env var would not reach it. Tempdir paths carry
+        // no shell metacharacters, so double-quoting is sufficient.
+        let record_str = record.to_string_lossy();
+        assert!(
+            !record_str.contains(['"', '$', '`', '\\']),
+            "record path has shell metacharacters: {record_str}"
+        );
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\nprintf '%s ' \"$0\" \"$@\" > \"{record_str}\"\nexit 0\n"),
+        )
+        .expect("write recording path command");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod path command");
+        }
+        self.extra_path_dirs.push(bin);
+        record
+    }
+
     /// Make `Drop` tear down structured view workers and the serve daemon.
     pub fn stop_daemon_on_drop(&mut self) {
         self.stop_daemon_on_drop = true;

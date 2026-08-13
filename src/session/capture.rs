@@ -1,12 +1,16 @@
 //! Session ID capture logic for all supported agent types.
 
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use uuid::Uuid;
+mod omp;
+
+pub(crate) use omp::*;
 
 /// Iterate directory entries, silently skipping unreadable ones.
 ///
@@ -457,17 +461,59 @@ pub(crate) fn encode_pi_project_path(cwd: &str) -> String {
     format!("--{encoded}--")
 }
 
+/// Number of leading lines and bytes scanned when locating a pi-family
+/// session header. The byte cap matters because `BufRead::lines` otherwise
+/// allocates without bound for one hostile or corrupt line.
+const PI_HEADER_SCAN_LINES: usize = 8;
+const PI_HEADER_SCAN_BYTES: usize = 64 * 1024;
+
 fn extract_pi_header_fields(path: &Path) -> Option<(Option<String>, Option<String>)> {
-    let file = std::fs::File::open(path).ok()?;
-    let reader = std::io::BufReader::new(file);
-    let first_line = std::io::BufRead::lines(reader).next()?.ok()?;
-    parse_pi_header_json(&first_line)
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    #[cfg(not(unix))]
+    if std::fs::symlink_metadata(path)
+        .ok()?
+        .file_type()
+        .is_symlink()
+    {
+        return None;
+    }
+    let file = options.open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut reader = std::io::BufReader::new(file);
+    let mut consumed = 0usize;
+    for _ in 0..PI_HEADER_SCAN_LINES {
+        let mut line = String::new();
+        let mut limited =
+            (&mut reader).take((PI_HEADER_SCAN_BYTES.saturating_sub(consumed) + 1) as u64);
+        let read = std::io::BufRead::read_line(&mut limited, &mut line).ok()?;
+        if read == 0 {
+            return None;
+        }
+        consumed = consumed.saturating_add(read);
+        if consumed > PI_HEADER_SCAN_BYTES {
+            return None;
+        }
+        if let Some(header) = parse_pi_header_json(&line) {
+            return Some(header);
+        }
+    }
+    None
 }
 
-/// Parse the first line of a Pi `.jsonl` session file (already in memory).
+/// Parse a single already-in-memory `.jsonl` line into a pi-family session
+/// header's `(id, cwd)`, returning `None` unless the record's `"type"` is
+/// `"session"`.
 ///
-/// Shared by the host scanner and the container scanner, which receives
-/// header lines via `docker exec` rather than direct filesystem reads.
+/// Non-session and malformed lines yield `None`, so bounded scanners can keep
+/// the first matching record.
 fn parse_pi_header_json(line: &str) -> Option<(Option<String>, Option<String>)> {
     let parsed: serde_json::Value = serde_json::from_str(line).ok()?;
     if parsed.get("type")?.as_str()? != "session" {
@@ -511,22 +557,11 @@ pub(crate) fn capture_pi_session_id(
     capture_pi_family_session_id(project_path, exclusion, ".pi/agent")
 }
 
-/// Capture an Oh My Pi (omp) session ID.
+/// Scan Pi's on-disk session store.
 ///
-/// OMP is a pi fork that shares pi's on-disk session format and the
-/// `PI_CODING_AGENT_DIR` override, but defaults its data dir to `~/.omp/agent`
-/// on the host rather than `~/.pi/agent`. Only the host default differs, so
-/// this delegates to the shared pi scan with the omp default subdir.
-pub(crate) fn capture_omp_session_id(
-    project_path: &str,
-    exclusion: &HashSet<String>,
-) -> Result<String> {
-    capture_pi_family_session_id(project_path, exclusion, ".omp/agent")
-}
-
-/// Shared pi-family session scan. `default_subdir` is the host home directory
-/// used when `PI_CODING_AGENT_DIR` is unset (`.pi/agent` for pi, `.omp/agent`
-/// for omp).
+/// This retains Pi's encoded-path fast path, cwd fallback, and historical
+/// newest-directory fallback. OMP deliberately does not use this heuristic:
+/// its dedicated capture module requires an exact terminal breadcrumb.
 fn capture_pi_family_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
@@ -574,6 +609,11 @@ fn capture_pi_family_session_id(
     // Fallback: scan all subdirectories and match via CWD header
     let canonical_project = canonicalize_or_raw(project_path);
     let mut fallback_candidates: Vec<(String, std::time::SystemTime)> = Vec::new();
+    // Whether any file recorded a cwd equal to the project, tracked before the
+    // exclusion filter. If a project session exists but every cwd match is
+    // excluded, we must not fall through to the project-agnostic newest-dir
+    // heuristic, which would resume a different project's session.
+    let mut saw_cwd_match = false;
 
     for subdir_entry in resilient_read_dir(&sessions_dir)? {
         let subdir_path = subdir_entry.path();
@@ -597,6 +637,7 @@ fn capture_pi_family_session_id(
             if canonical_cwd != canonical_project {
                 continue;
             }
+            saw_cwd_match = true;
             let session_id = match fields.0 {
                 Some(id) if !id.is_empty() && !exclusion.contains(&id) => id,
                 _ => continue,
@@ -613,6 +654,14 @@ fn capture_pi_family_session_id(
 
     if let Some((id, _)) = fallback_candidates.first() {
         return Ok(id.clone());
+    }
+
+    // A session for this project exists on disk but every cwd match was
+    // excluded (e.g. the just-crashed sid the resume cascade cleared). Return
+    // an error rather than the project-scoped newest-dir fallback below, which
+    // would otherwise resume a different project's session.
+    if saw_cwd_match {
+        anyhow::bail!("All Pi sessions matching project path are excluded");
     }
 
     // Third fallback: when JSONL headers fail to parse (no `id` field),
@@ -684,33 +733,27 @@ pub(crate) fn pi_poll_fn(
     }
 }
 
-/// Host polling closure for Oh My Pi (omp), mirroring [`pi_poll_fn`] against
-/// omp's `~/.omp/agent` default data dir. Sandboxed omp reuses
-/// [`pi_poll_fn_sandboxed`], since `PI_CODING_AGENT_DIR` is set in the omp
-/// container so the shared container scan already resolves the right dir.
-pub(crate) fn omp_poll_fn(
-    project_path: String,
-    instance_id: String,
-    extra_excludes: HashSet<String>,
-) -> impl Fn() -> Option<String> + Send + 'static {
-    move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
-        capture_omp_session_id(&project_path, &exclusion)
-            .map_err(
-                |e| tracing::debug!(target: "session.capture", "OMP poll capture failed: {}", e),
-            )
-            .ok()
-            .and_then(validated_session_id)
-    }
-}
-
 const PI_COMMAND_TIMEOUT_SECS: u64 = 5;
 
-/// Shell snippet executed via `docker exec` to enumerate Pi `.jsonl` session
-/// files inside the container. Each file is emitted as a `===PI:<unix-mtime>===`
-/// header followed by the first line of the file (the session header) and a
-/// `===END===` trailer; the host parses this stream rather than spawning one
-/// `docker exec head` per file.
+/// Shell snippet executed via `docker exec` to enumerate pi-family `.jsonl`
+/// session files inside the container. Each file is emitted as a
+/// `===PI:<unix-mtime>===` header followed by the file's `{"type":"session",...}`
+/// record and a `===END===` trailer; the host parses this stream rather than
+/// spawning one `docker exec head` per file.
+///
+/// `pi` writes that record on line 0, but `omp` (a pi fork) prefixes a
+/// `{"type":"title",...}` record, so the session record can be on line 1. The
+/// script scans the first 8 lines (mirroring `PI_HEADER_SCAN_LINES`) and emits
+/// only the session line, matched via `grep -m1 '^{"type":"session"'`. The
+/// anchor ties the match to a session record at the start of a line, so that
+/// `title` line 0 is skipped and a `"type":"session"` substring nested inside
+/// an earlier record is not picked in its place. Emitting one line per
+/// file keeps a conversation line (arbitrary text on later lines) from ever
+/// colliding with the `===PI:`/`===END===` delimiters.
+///
+/// `grep -m1` is a GNU and BusyBox extension rather than strict POSIX; both the
+/// Debian and Alpine container bases support it, so it is safe for the images
+/// pi-family agents run in.
 const PI_CONTAINER_LIST_SCRIPT: &str = r#"SESS_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/sessions"
 [ -d "$SESS_DIR" ] || exit 0
 for d in "$SESS_DIR"/*/; do
@@ -718,7 +761,7 @@ for d in "$SESS_DIR"/*/; do
     [ -f "$f" ] || continue
     ts=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)
     printf '===PI:%s===\n' "$ts"
-    head -n 1 "$f"
+    head -n 8 "$f" | grep -m1 '^{"type":"session"'
     printf '\n===END===\n'
   done
 done
@@ -1242,10 +1285,24 @@ const OPENCODE_COMMAND_TIMEOUT_SECS: u64 = 5;
 
 /// Spawn `cmd`, read stdout to EOF on a worker thread, and wait for the
 /// process to exit. Kills the child if `timeout` elapses first.
-fn run_with_timeout(
+fn run_with_timeout(cmd: std::process::Command, timeout: Duration, label: &str) -> Result<Vec<u8>> {
+    run_with_timeout_inner(cmd, timeout, label, None)
+}
+
+pub(super) fn run_with_timeout_limit(
+    cmd: std::process::Command,
+    timeout: Duration,
+    label: &str,
+    max_stdout_bytes: usize,
+) -> Result<Vec<u8>> {
+    run_with_timeout_inner(cmd, timeout, label, Some(max_stdout_bytes))
+}
+
+fn run_with_timeout_inner(
     mut cmd: std::process::Command,
     timeout: Duration,
     label: &str,
+    max_stdout_bytes: Option<usize>,
 ) -> Result<Vec<u8>> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = cmd
@@ -1253,18 +1310,27 @@ fn run_with_timeout(
         .with_context(|| format!("Failed to spawn '{}'", label))?;
 
     let stdout_pipe = child.stdout.take();
-    let stdout_handle = std::thread::spawn(move || {
-        stdout_pipe.map(|mut r| {
+    let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let buf = stdout_pipe.map(|mut reader| {
             let mut buf = Vec::new();
-            std::io::Read::read_to_end(&mut r, &mut buf).ok();
+            if let Some(limit) = max_stdout_bytes {
+                reader
+                    .take(limit.saturating_add(1) as u64)
+                    .read_to_end(&mut buf)
+                    .ok();
+            } else {
+                reader.read_to_end(&mut buf).ok();
+            }
             buf
-        })
+        });
+        let _ = stdout_tx.send(buf);
     });
 
     let deadline = std::time::Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
-            Ok(Some(s)) => break s,
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
@@ -1273,12 +1339,31 @@ fn run_with_timeout(
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return Err(anyhow::anyhow!("Failed to wait on {}: {}", label, e)),
+            Err(error) => {
+                return Err(anyhow::anyhow!("Failed to wait on {}: {}", label, error));
+            }
         }
     };
 
-    let stdout_bytes = stdout_handle.join().ok().flatten().unwrap_or_default();
-
+    // The child exited, but a grandchild that inherited the stdout write end
+    // (a backgrounded helper the command spawned) keeps `read_to_end` blocking
+    // even though the child is gone. Bound the drain by the remaining deadline
+    // so the timeout guarantee holds on the success path too, not just on the
+    // kill path; mirrors `process::run_with_timeout`. When the try_wait loop
+    // already burned the budget, `remaining` is zero and recv_timeout returns an
+    // empty buffer at once: intended fail-open, never a block. The reader thread
+    // is deliberately detached; it exits once the grandchild closes the fd, so
+    // the leak is bounded by the grandchild's lifetime. Joining it would
+    // reintroduce the unbounded block the timeout exists to prevent.
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let stdout_bytes = stdout_rx
+        .recv_timeout(remaining)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if max_stdout_bytes.is_some_and(|limit| stdout_bytes.len() > limit) {
+        anyhow::bail!("{} exceeded its stdout limit", label);
+    }
     if !status.success() {
         anyhow::bail!("{} command failed", label);
     }
@@ -2713,6 +2798,20 @@ mod tests {
     use crate::session::test_support::EnvGuard;
     use serial_test::serial;
 
+    /// Pin a modification time so mtime ordering in tests never depends on the
+    /// host filesystem's timestamp resolution. Opened read-only, which lets the
+    /// same call set the mtime of both files and directories on Unix.
+    fn set_mtime_secs(path: &Path, secs: u64) {
+        std::fs::File::options()
+            .read(true)
+            .open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+            ))
+            .unwrap();
+    }
+
     #[test]
     fn canonicalize_or_raw_normalizes_deleted_dirs_lexically() {
         // A stopped worktree session's directory is often deleted while its
@@ -3183,6 +3282,66 @@ mod tests {
         );
     }
 
+    /// Regression (#3078 family): omp writes a `{"type":"title"}` record on line
+    /// 0 and the `{"type":"session"}` header on line 1, so a line-0-only read
+    /// returned no id and no cwd. The bounded multi-line scan recovers both from
+    /// the title-first layout while leaving pi (session on line 0) unchanged.
+    #[test]
+    fn test_extract_pi_header_fields_title_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        let mut contents =
+            "{\"type\":\"title\",\"v\":1,\"title\":\"t\"}\n\
+             {\"type\":\"session\",\"version\":3,\"id\":\"019fc9a0-f688-7000-ae45-d9e51e5e1b8a\",\"cwd\":\"/Users/dev/proj\"}\n"
+                .to_string();
+        contents.push_str(&"x".repeat(PI_HEADER_SCAN_BYTES * 2));
+        std::fs::write(&path, contents).unwrap();
+        assert_eq!(
+            extract_pi_session_id_from_header(&path),
+            Some("019fc9a0-f688-7000-ae45-d9e51e5e1b8a".to_string())
+        );
+        assert_eq!(
+            extract_pi_cwd_from_header(&path),
+            Some("/Users/dev/proj".to_string())
+        );
+
+        let oversized_prefix = format!(
+            "{}\n{{\"type\":\"session\",\"id\":\"019fc9a0-f688-7000-ae45-d9e51e5e1b8a\",\"cwd\":\"/Users/dev/proj\"}}\n",
+            "x".repeat(PI_HEADER_SCAN_BYTES)
+        );
+        std::fs::write(&path, oversized_prefix).unwrap();
+        assert!(
+            extract_pi_session_id_from_header(&path).is_none(),
+            "a single oversized leading line must fail closed without scanning past the byte cap"
+        );
+    }
+
+    /// The header scan is bounded by `PI_HEADER_SCAN_LINES`: a `session` record
+    /// within the window is found, one past it is not (so a large `.jsonl` body
+    /// is never walked).
+    #[test]
+    fn test_extract_pi_header_fields_scan_bound() {
+        let session = r#"{"type":"session","id":"aaa","cwd":"/p"}"#;
+        let cases = [
+            (0usize, true),
+            (PI_HEADER_SCAN_LINES - 1, true),
+            (PI_HEADER_SCAN_LINES, false),
+        ];
+        for (index, expected_found) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("session.jsonl");
+            let mut contents = String::new();
+            for _ in 0..index {
+                contents.push_str("{\"type\":\"title\",\"v\":1}\n");
+            }
+            contents.push_str(session);
+            contents.push('\n');
+            std::fs::write(&path, &contents).unwrap();
+            let found = extract_pi_session_id_from_header(&path).is_some();
+            assert_eq!(found, expected_found, "session at line index {index}");
+        }
+    }
+
     /// Real e2e: run the same shell script we ship to `docker exec` against a
     /// Pi session dir on disk, and feed the stdout into the parser to confirm
     /// it picks up the live UUID. Set `AOE_PI_E2E_DIR=/path/to/.pi/agent` and
@@ -3285,92 +3444,11 @@ mod tests {
         }
     }
 
-    /// omp shares pi's on-disk format: with `PI_CODING_AGENT_DIR` set, the omp
-    /// capture reads the same sessions dir the pi capture would.
-    #[test]
-    #[serial]
-    fn test_capture_omp_session_id_basic() {
-        let tmp = tempfile::tempdir().unwrap();
-        let sessions_dir = tmp.path().join("sessions");
-        let project_encoded = encode_pi_project_path("/home/user/project");
-        let project_dir = sessions_dir.join(&project_encoded);
-        std::fs::create_dir_all(&project_dir).unwrap();
-
-        let uuid = "019342ab-1234-7def-8901-abcdef012345";
-        std::fs::write(
-            project_dir.join(format!("2024-12-03T14-00-00-000Z_{uuid}.jsonl")),
-            format!(r#"{{"type":"session","id":"{uuid}","cwd":"/home/user/project"}}"#),
-        )
-        .unwrap();
-
-        let old_val = std::env::var("PI_CODING_AGENT_DIR").ok();
-        std::env::set_var("PI_CODING_AGENT_DIR", tmp.path());
-
-        let result = capture_omp_session_id("/home/user/project", &HashSet::new());
-
-        match old_val {
-            Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
-            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-        }
-
-        assert_eq!(result.unwrap(), uuid);
-    }
-
-    /// Path-adjustment regression (#3065 follow-up): with `PI_CODING_AGENT_DIR`
-    /// unset, omp must default its host data dir to `~/.omp/agent`, NOT pi's
-    /// `~/.pi/agent`. A session written under `~/.omp/agent` is found by the omp
-    /// capture but not by the pi capture. Without the remap, omp resume would
-    /// silently scan the wrong (empty) dir and never resume.
-    #[test]
-    #[serial]
-    fn test_capture_omp_defaults_to_omp_agent_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let project_encoded = encode_pi_project_path("/home/user/project");
-        let omp_project_dir = tmp
-            .path()
-            .join(".omp/agent/sessions")
-            .join(&project_encoded);
-        std::fs::create_dir_all(&omp_project_dir).unwrap();
-
-        let uuid = "019342ab-1234-7def-8901-abcdef012345";
-        std::fs::write(
-            omp_project_dir.join(format!("2024-12-03T14-00-00-000Z_{uuid}.jsonl")),
-            format!(r#"{{"type":"session","id":"{uuid}","cwd":"/home/user/project"}}"#),
-        )
-        .unwrap();
-
-        let old_pi_dir = std::env::var("PI_CODING_AGENT_DIR").ok();
-        let old_home = std::env::var("HOME").ok();
-        std::env::remove_var("PI_CODING_AGENT_DIR");
-        std::env::set_var("HOME", tmp.path());
-
-        let omp_result = capture_omp_session_id("/home/user/project", &HashSet::new());
-        let pi_result = capture_pi_session_id("/home/user/project", &HashSet::new());
-
-        match old_pi_dir {
-            Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
-            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-        }
-        match old_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-
-        assert_eq!(
-            omp_result.unwrap(),
-            uuid,
-            "omp capture should default to ~/.omp/agent"
-        );
-        assert!(
-            pi_result.is_err(),
-            "pi capture must NOT find omp's session under ~/.omp/agent"
-        );
-    }
-
     #[test]
     #[serial]
     fn test_capture_pi_session_id_most_recent_wins() {
         let tmp = tempfile::tempdir().unwrap();
+
         let sessions_dir = tmp.path().join("sessions");
         let project_encoded = encode_pi_project_path("/home/user/project");
         let project_dir = sessions_dir.join(&project_encoded);
@@ -3379,17 +3457,20 @@ mod tests {
         let uuid_old = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
         let uuid_new = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
 
+        let old_path = project_dir.join(format!("2024-12-01T10-00-00-000Z_{uuid_old}.jsonl"));
+        let new_path = project_dir.join(format!("2024-12-03T14-00-00-000Z_{uuid_new}.jsonl"));
         std::fs::write(
-            project_dir.join(format!("2024-12-01T10-00-00-000Z_{uuid_old}.jsonl")),
+            &old_path,
             format!(r#"{{"type":"session","id":"{uuid_old}","cwd":"/home/user/project"}}"#),
         )
         .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(50));
         std::fs::write(
-            project_dir.join(format!("2024-12-03T14-00-00-000Z_{uuid_new}.jsonl")),
+            &new_path,
             format!(r#"{{"type":"session","id":"{uuid_new}","cwd":"/home/user/project"}}"#),
         )
         .unwrap();
+        set_mtime_secs(&old_path, 1_700_000_000);
+        set_mtime_secs(&new_path, 1_700_000_100);
 
         let old_val = std::env::var("PI_CODING_AGENT_DIR").ok();
         std::env::set_var("PI_CODING_AGENT_DIR", tmp.path());
@@ -3445,6 +3526,51 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_capture_pi_session_id_all_cwd_matches_excluded_errs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+
+        // Only session whose cwd matches the project, in a non-encoded dir so it
+        // is reached via the cwd-fallback scan; its id is excluded.
+        let target_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let target_dir = sessions_dir.join("--wrong-name--");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(
+            target_dir.join(format!("2024-12-01T10-00-00-000Z_{target_id}.jsonl")),
+            format!(r#"{{"type":"session","id":"{target_id}","cwd":"/home/user/project"}}"#),
+        )
+        .unwrap();
+
+        // A different project's session, newer: the newest-dir fallback would
+        // resume it if the cwd-match bail did not fire first.
+        let decoy_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let decoy_dir = sessions_dir.join("--decoy--");
+        std::fs::create_dir_all(&decoy_dir).unwrap();
+        std::fs::write(
+            decoy_dir.join(format!("2024-12-09T10-00-00-000Z_{decoy_id}.jsonl")),
+            format!(r#"{{"type":"session","id":"{decoy_id}","cwd":"/home/user/other"}}"#),
+        )
+        .unwrap();
+
+        let old_val = std::env::var("PI_CODING_AGENT_DIR").ok();
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.path());
+
+        let mut exclusion = HashSet::new();
+        exclusion.insert(target_id.to_string());
+        let result = capture_pi_session_id("/home/user/project", &exclusion);
+
+        match old_val {
+            Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+
+        let err =
+            result.expect_err("all cwd matches excluded must error, not cross-project resume");
+        assert!(err.to_string().contains("are excluded"), "{err:?}");
+    }
+
+    #[test]
+    #[serial]
     fn test_capture_pi_session_id_cwd_fallback_most_recent_wins() {
         let tmp = tempfile::tempdir().unwrap();
         let sessions_dir = tmp.path().join("sessions");
@@ -3454,21 +3580,23 @@ mod tests {
 
         let dir_a = sessions_dir.join("--wrong-name-a--");
         std::fs::create_dir_all(&dir_a).unwrap();
+        let path_a = dir_a.join(format!("2024-12-01T10-00-00-000Z_{uuid_old}.jsonl"));
         std::fs::write(
-            dir_a.join(format!("2024-12-01T10-00-00-000Z_{uuid_old}.jsonl")),
+            &path_a,
             format!(r#"{{"type":"session","id":"{uuid_old}","cwd":"/home/user/project"}}"#),
         )
         .unwrap();
 
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
         let dir_b = sessions_dir.join("--wrong-name-b--");
         std::fs::create_dir_all(&dir_b).unwrap();
+        let path_b = dir_b.join(format!("2024-12-03T14-00-00-000Z_{uuid_new}.jsonl"));
         std::fs::write(
-            dir_b.join(format!("2024-12-03T14-00-00-000Z_{uuid_new}.jsonl")),
+            &path_b,
             format!(r#"{{"type":"session","id":"{uuid_new}","cwd":"/home/user/project"}}"#),
         )
         .unwrap();
+        set_mtime_secs(&path_a, 1_700_000_000);
+        set_mtime_secs(&path_b, 1_700_000_100);
 
         let old_val = std::env::var("PI_CODING_AGENT_DIR").ok();
         std::env::set_var("PI_CODING_AGENT_DIR", tmp.path());
@@ -3537,8 +3665,6 @@ mod tests {
         )
         .unwrap();
 
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
         // Create a non-matching directory (different project) with a *newer*
         // session — must still be ignored, so this pins the scoping filter
         // rather than the mtime sort alone.
@@ -3549,6 +3675,8 @@ mod tests {
             "not valid json\n",
         )
         .unwrap();
+        set_mtime_secs(&dir_match, 1_700_000_000);
+        set_mtime_secs(&dir_other, 1_700_000_100);
 
         let _env = EnvGuard::set(&[("PI_CODING_AGENT_DIR", tmp.path())]);
 
@@ -5427,5 +5555,24 @@ mod tests {
             Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
             None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_with_timeout_inner_bounds_drain_when_grandchild_holds_pipe() {
+        // The immediate child (sh) exits fast but backgrounds a `sleep` that
+        // inherits the stdout pipe, so the write end never closes. The drain
+        // must still return by the deadline instead of blocking on read_to_end;
+        // `sleep 10` (>> the 4s assertion) makes an unbounded recv visibly fail.
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "sleep 10 & printf done"]);
+        let start = Instant::now();
+        let out = run_with_timeout_inner(cmd, Duration::from_millis(500), "grandchild-test", None)
+            .expect("the sh child exits quickly, so a buffer is produced");
+        assert!(
+            start.elapsed() < Duration::from_secs(4),
+            "drain must be bounded by the deadline even while the pipe stays open"
+        );
+        assert!(out.is_empty() || out == b"done");
     }
 }

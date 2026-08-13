@@ -71,15 +71,17 @@ pub use groups::{
     ARCHIVED_SECTION_PATH, SCRATCH_GROUP_NAME, SCRATCH_GROUP_PATH, TRASH_SECTION_NAME,
     TRASH_SECTION_PATH,
 };
-#[cfg(feature = "serve")]
 pub(crate) use instance::ResumeAttemptPolicy;
 pub use instance::{
-    is_valid_session_color, ClaimOp, EnsureReadyError, EnsureReadyOutcome, Instance,
-    LaunchSidOutcome, PluginCreateIdempotency, SandboxInfo, SessionBucket, StartOutcome, Status,
-    TerminalInfo, View, WorkspaceInfo, WorkspaceRepo, WorktreeInfo, SESSION_COLORS,
-    TMUX_SESSION_GONE_ERROR,
+    is_valid_session_color, EnsureReadyError, EnsureReadyOutcome, Instance, LaunchSidOutcome,
+    LifecycleOperation, LifecycleReservation, LifecycleReservationError, PluginCreateIdempotency,
+    SandboxInfo, SessionBucket, StartOutcome, Status, TerminalInfo, View, WorkspaceInfo,
+    WorkspaceRepo, WorktreeInfo, SESSION_COLORS, TMUX_SESSION_GONE_ERROR,
 };
-pub(crate) use instance::{persist_session_to_storage, PassiveStatusPatch, ResumeIntent, SidWrite};
+pub(crate) use instance::{
+    persist_omp_session_to_storage, persist_session_to_storage, PassiveStatusPatch, ResumeIntent,
+    SidWrite, NEWER_GENERATION_BUSY_REASON,
+};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
