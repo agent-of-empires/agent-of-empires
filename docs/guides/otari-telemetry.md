@@ -17,6 +17,8 @@ The examples use these placeholders:
 
 Claude Code appends `/v1/logs` to the root URL. The `api_request` events on the logs signal contain the usage Otari imports. Traces are not required. The optional metrics exporter adds content-free outcome counters such as commits and lines changed, but it does not import usage by itself.
 
+“Content-free” does not mean anonymous. Claude Code telemetry can carry `user.email`, `user.account_uuid`, `user.account_id`, `organization.id`, the installation-scoped `user.id`, and `session.id`. Restrict access to the Otari deployment accordingly. Prompt, response, and tool content are redacted by default; do not enable `OTEL_LOG_USER_PROMPTS`, `OTEL_LOG_ASSISTANT_RESPONSES`, `OTEL_LOG_TOOL_DETAILS`, `OTEL_LOG_TOOL_CONTENT`, or `OTEL_LOG_RAW_API_BODIES` unless you intend to export the corresponding sensitive content.
+
 ## Host Claude Code sessions
 
 Add an `env` block to `~/.claude/settings.json`, merging it with any settings already present:
@@ -48,7 +50,7 @@ export AOE_OTARI_OTEL_HEADERS='Authorization=Bearer gw-your-exempt-key'
 
 Use `~/.zshenv`, not `~/.zshrc`, when zsh launches AoE. `.zshrc` is only read by interactive shells and can be skipped by a non-interactive launch context. Open a new zsh after editing the file, or run `source ~/.zshenv`, before restarting AoE. If a service manager launches AoE, define the variable in that service's environment instead.
 
-Add the OTel settings to the `sandbox.environment` list for the profile that launches the session. On macOS and Windows, profile overrides normally live at `~/.agent-of-empires/profiles/<profile>/config.toml`. On Linux, they live under `$XDG_CONFIG_HOME/agent-of-empires/profiles/<profile>/config.toml`, with `~/.config` as the default XDG config home. See the [configuration reference](configuration.md#file-locations) if your app directory differs.
+Add the OTel settings to the `sandbox.environment` list for the profile that launches the session. On Linux, profiles live under `$XDG_CONFIG_HOME/agent-of-empires/profiles/<profile>/config.toml`, with `~/.config` as the default XDG config home. On Windows, use `~/.agent-of-empires/profiles/<profile>/config.toml`. On macOS, use the profile under the active app directory: AoE prefers `$XDG_CONFIG_HOME/agent-of-empires/` when that directory exists, but otherwise keeps using an existing `~/.agent-of-empires/` even if `XDG_CONFIG_HOME` is set. If neither directory exists, setting `XDG_CONFIG_HOME` selects the XDG path; otherwise AoE uses `~/.agent-of-empires/`. See the [configuration reference](configuration.md#file-locations).
 
 ```toml
 [sandbox]
@@ -68,7 +70,7 @@ To include optional outcome counters, add `"OTEL_METRICS_EXPORTER=otlp"` to the 
 
 ### Profile precedence
 
-AoE resolves global configuration first, then the active profile, then repository configuration. A profile's `sandbox.environment` list replaces the global list rather than extending it. If you use a named profile, edit that profile's `config.toml` and preserve its existing entries. Add the OTel entries separately to every profile that should export telemetry.
+AoE resolves global configuration first, then the active profile, then repository configuration. Arrays replace rather than extend the earlier layer: a profile's `sandbox.environment` replaces the global list, and a repository-level `.agent-of-empires/config.toml` list replaces the profile list. Preserve or add the OTel entries in every applicable profile and in each repository-level list that overrides it.
 
 ## Apply and verify
 
@@ -86,7 +88,8 @@ AoE resolves global configuration first, then the active profile, then repositor
 
    ```sh
    AOE_SANDBOX_NAME=aoe-sandbox-xxxxxxxx
-   docker exec "$AOE_SANDBOX_NAME" sh -c '
+   AOE_CONTAINER_CLI=docker  # use podman for Podman, or container for Apple Container
+   "$AOE_CONTAINER_CLI" exec "$AOE_SANDBOX_NAME" sh -c '
      for name in \
        CLAUDE_CODE_ENABLE_TELEMETRY \
        OTEL_LOGS_EXPORTER \
@@ -109,7 +112,7 @@ AoE resolves global configuration first, then the active profile, then repositor
 ## Troubleshooting
 
 - **The header is missing in the container:** confirm the variable is set in the exact shell or service environment that launched AoE, then restart AoE and create a new sandbox session.
-- **Other sandbox variables disappeared:** restore the prior entries in the active profile's `sandbox.environment` list. The profile list replaces the global list.
+- **Other sandbox variables disappeared:** restore the prior entries in the last `sandbox.environment` list AoE applies. Profile lists replace the global list, and repository-level lists replace profile lists.
 - **Otari returns 403:** confirm the key is active, belongs to the intended user, and is budget-exempt.
 - **Otari returns 404 for `/v1/logs`:** telemetry import requires a standalone Otari gateway, not a hybrid gateway.
 - **A manual `curl` or Python probe is blocked while Claude Code works:** a reverse proxy or WAF can classify clients differently. Check its rules and Otari logs before changing the OTel configuration.
