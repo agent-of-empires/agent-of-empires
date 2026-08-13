@@ -57,9 +57,13 @@ use super::project_mcp::ProjectMcpServer;
 /// [`HostHooksConfig`]), so honoring it from a repo would let a checked-out
 /// repository execute arbitrary host commands. Host hooks are profile/global
 /// only.
-const REPO_OVERRIDABLE_SECTIONS: &[&str] = &[
-    "hooks", "session", "sandbox", "worktree", "updates", "tmux", "sound",
-];
+///
+/// `tmux` and `sound` are deliberately absent (#3229): every consumer
+/// resolves them through profile/global-only paths (`resolve_config_or_warn`
+/// or `Config::load*`), never a repo-aware resolver, so a repo entry here
+/// could never take effect. Wire those resolvers before making either
+/// section repo-overridable.
+const REPO_OVERRIDABLE_SECTIONS: &[&str] = &["hooks", "session", "sandbox", "worktree", "updates"];
 
 /// What a repo may set inside one overridable section (#3154).
 enum SectionPolicy {
@@ -1622,13 +1626,6 @@ pub const INIT_TEMPLATE: &str = r#"# Agent of Empires - Repository Configuration
 
 # [updates]
 # update_check_mode = "off"
-
-# [tmux]
-# status_bar = "auto"
-# mouse = "auto"
-
-# [sound]
-# enabled = false
 "#;
 
 #[cfg(test)]
@@ -2040,13 +2037,69 @@ mod tests {
 
     #[test]
     fn test_repo_may_override_field() {
-        assert!(repo_may_override_field("session", "default_tool"));
-        assert!(repo_may_override_field("session", "agent_detect_as"));
-        assert!(repo_may_override_field("sandbox", "memory_limit"));
-        assert!(repo_may_override_field("worktree", "path_template"));
-        assert!(!repo_may_override_field("session", "custom_agents"));
-        assert!(!repo_may_override_field("sandbox", "default_image"));
-        assert!(!repo_may_override_field("acp", "auto_approve"));
+        // (section, field, expected) — the whitelist and denylist behavior
+        // across every scope the sanitizer / TUI query at runtime. tmux and
+        // sound rows guard #3229: their sections are not repo-overridable, so
+        // every field on them must answer false.
+        let cases = [
+            ("session", "default_tool", true),
+            ("session", "agent_detect_as", true),
+            ("sandbox", "memory_limit", true),
+            ("worktree", "path_template", true),
+            ("session", "custom_agents", false),
+            ("sandbox", "default_image", false),
+            ("acp", "auto_approve", false),
+            ("tmux", "status_bar", false),
+            ("tmux", "mouse", false),
+            ("tmux", "clipboard", false),
+            ("tmux", "socket_name", false),
+            ("tmux", "vt_live", false),
+            ("sound", "enabled", false),
+            ("sound", "on_start", false),
+        ];
+        for (section, field, expected) in cases {
+            assert_eq!(
+                repo_may_override_field(section, field),
+                expected,
+                "{section}.{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_merge_repo_config_strips_tmux_and_sound() {
+        // #3229: a repo config that sets `[tmux]` or `[sound]` merges to a
+        // no-op and the blocks are stripped from the allowed-override view
+        // used for save/edit.
+        // Every override must differ from the section's default value, or
+        // the "merge is a no-op" assertion below is a false-green (it would
+        // hold whether or not the sanitizer strips the block).
+        let repo: RepoConfig = toml::from_str(
+            r#"
+            [tmux]
+            status_bar = "enabled"
+            mouse = "enabled"
+            [sound]
+            enabled = true
+        "#,
+        )
+        .unwrap();
+        let base = Config::default();
+        let merged = merge_repo_config(base.clone(), &repo);
+        // Compare via serde_json since TmuxConfig/SoundConfig do not derive
+        // PartialEq; the JSON round-trip is the same shape the merge uses.
+        let merged_json = serde_json::to_value(&merged).unwrap();
+        let base_json = serde_json::to_value(&base).unwrap();
+        assert_eq!(
+            merged_json["tmux"], base_json["tmux"],
+            "repo-declared tmux must be dropped on merge"
+        );
+        assert_eq!(
+            merged_json["sound"], base_json["sound"],
+            "repo-declared sound must be dropped on merge"
+        );
+        assert!(repo.allowed_overrides().get("tmux").is_none());
+        assert!(repo.allowed_overrides().get("sound").is_none());
     }
 
     #[test]
