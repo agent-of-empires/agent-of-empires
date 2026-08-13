@@ -654,22 +654,90 @@ pub fn set_default_profile(name: &str) -> Result<()> {
     Ok(())
 }
 
+/// One file's probe result: either the parse errored out (per-key values fall
+/// back to defaults), or it loaded but some keys were unrecognized and
+/// silently dropped. The two are mutually exclusive per file: without
+/// `deny_unknown_fields`, an unknown key never fails the load.
+pub struct ConfigProbe {
+    pub load_err: Option<String>,
+    pub ignored_keys: Vec<String>,
+}
+
+/// Try to load a config file, and on success enumerate its unrecognized keys.
+/// The two arms of `ConfigProbe` are always populated the same way; this
+/// helper keeps the global and profile probes from drifting apart.
+fn probe<T, E: std::fmt::Display>(
+    load: impl FnOnce() -> Result<T, E>,
+    ignored: impl FnOnce(&T) -> Vec<String>,
+) -> ConfigProbe {
+    match load() {
+        Ok(cfg) => ConfigProbe {
+            load_err: None,
+            ignored_keys: ignored(&cfg),
+        },
+        Err(e) => ConfigProbe {
+            load_err: Some(e.to_string()),
+            ignored_keys: Vec::new(),
+        },
+    }
+}
+
+/// Probe the global `config.toml`: run the real `Config::load` and, if it
+/// succeeded, run `serde_ignored` to enumerate any unknown struct fields at
+/// any depth.
+pub fn probe_global_config() -> ConfigProbe {
+    probe(Config::load, |_| Config::config_ignored_keys())
+}
+
+/// Same shape as [`probe_global_config`] but for a profile's `config.toml`.
+pub fn probe_profile_config(profile: &str) -> ConfigProbe {
+    probe(
+        || profile_config::load_profile_config(profile),
+        profile_config::profile_config_ignored_keys,
+    )
+}
+
+/// Human-readable path of the global `config.toml`, with a stable fallback so
+/// the message reads sensibly when the app dir can't even be resolved.
+pub(crate) fn config_path_display() -> String {
+    config::config_path()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| "config.toml".to_string())
+}
+
+/// Format one probe result as a user-visible line, or `None` when the file is
+/// clean. `scope_label` is prefixed to both the parse-failure and the
+/// unrecognized-keys message (e.g. `"global config"`, `"profile config 'foo'"`).
+fn format_probe(probe: &ConfigProbe, scope_label: &str, path_display: &str) -> Option<String> {
+    if let Some(e) = probe.load_err.as_deref() {
+        Some(format!(
+            "Failed to load {scope_label} ({path_display}); using defaults.\n{e}"
+        ))
+    } else if !probe.ignored_keys.is_empty() {
+        Some(format!(
+            "Unrecognized keys in {scope_label} ({path_display}) were ignored: {}",
+            probe.ignored_keys.join(", ")
+        ))
+    } else {
+        None
+    }
+}
+
 /// Probe the global config and the active profile's config at startup so the
-/// TUI can show a single user-visible warning when either fails to parse.
-/// `tracing::warn!` calls inside the `_or_warn` helpers are silently dropped
-/// in default TUI mode (no subscriber), so this gives users a chance to see
-/// that their settings have been ignored without needing `AGENT_OF_EMPIRES_DEBUG=1`.
+/// TUI can show a single user-visible warning when either fails to parse OR
+/// contains unrecognized keys. `tracing::warn!` calls inside the `_or_warn`
+/// helpers are silently dropped in default TUI mode (no subscriber), so this
+/// gives users a chance to see that their settings have been ignored without
+/// needing `AGENT_OF_EMPIRES_DEBUG=1`.
 pub fn collect_startup_config_warnings(profile: &str) -> Option<String> {
     let mut messages: Vec<String> = Vec::new();
 
-    let global_path_display = config::config_path()
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| "config.toml".to_string());
-
-    if let Err(e) = Config::load() {
-        messages.push(format!(
-            "Failed to load global config ({global_path_display}); using defaults.\n{e}"
-        ));
+    if let Some(msg) = format_probe(
+        &probe_global_config(),
+        "global config",
+        &config_path_display(),
+    ) {
+        messages.push(msg);
     }
 
     let effective = if profile.is_empty() {
@@ -677,15 +745,16 @@ pub fn collect_startup_config_warnings(profile: &str) -> Option<String> {
     } else {
         profile.to_string()
     };
-
     let profile_path_display = profile_config::get_profile_config_path(&effective)
         .map(|p| p.display().to_string())
         .unwrap_or_else(|_| format!("profiles/{effective}/config.toml"));
-
-    if let Err(e) = profile_config::load_profile_config(&effective) {
-        messages.push(format!(
-            "Failed to load profile config '{effective}' ({profile_path_display}); using defaults.\n{e}"
-        ));
+    let profile_scope = format!("profile config '{effective}'");
+    if let Some(msg) = format_probe(
+        &probe_profile_config(&effective),
+        &profile_scope,
+        &profile_path_display,
+    ) {
+        messages.push(msg);
     }
 
     if messages.is_empty() {
@@ -986,6 +1055,111 @@ mod tests {
 
         let warning = collect_startup_config_warnings("default").expect("expected a warning");
         assert!(warning.contains("Failed to load profile config 'default'"));
+    }
+
+    /// #3228: a nested typo inside a known section is silently dropped by
+    /// serde today (no `deny_unknown_fields`). The startup probe surfaces it.
+    #[test]
+    #[serial_test::serial]
+    fn test_collect_startup_config_warnings_flags_nested_unknown_key() {
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        // The exact typo shape from #3218: an unknown key nested inside a
+        // known section. Must show up as `sandbox.privildged` in the warning.
+        fs::write(
+            dir.join("config.toml"),
+            "[sandbox]\nenabled_by_default = true\nprivildged = true\n",
+        )
+        .unwrap();
+
+        let warning = collect_startup_config_warnings("").expect("expected a warning");
+        assert!(
+            warning.contains("Unrecognized keys in global config"),
+            "warning should announce unrecognized keys, got: {warning}"
+        );
+        assert!(
+            warning.contains("sandbox.privildged"),
+            "warning should name the dotted path, got: {warning}"
+        );
+    }
+
+    /// #3228: user-defined map-key sections must never false-positive. These
+    /// are all documented in `docs/guides/configuration.md`.
+    #[test]
+    #[serial_test::serial]
+    fn test_collect_startup_config_warnings_allows_documented_map_sections() {
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        // `session.custom_agents` is a `HashMap<String,String>` (name -> shell
+        // command), so it must be an inline table, not a section. The other
+        // three are the real map-key-plus-struct shapes (`agents.<name>`,
+        // `tools.<name>`, `plugins.<id>`) that exercise the "user-defined
+        // section with typed contents" pattern.
+        fs::write(
+            dir.join("config.toml"),
+            "[session]\n\
+             custom_agents = { myagent = \"true\" }\n\
+             [agents.claude.status_map]\n\
+             SessionStart = \"running\"\n\
+             [tools.lazygit]\n\
+             command = \"lazygit\"\n\
+             [plugins.\"aoe.web\"]\n\
+             enabled = true\n",
+        )
+        .unwrap();
+
+        // These are all valid map-key entries, not struct fields, so
+        // serde_ignored produces zero paths and the probe is clean.
+        let warning = collect_startup_config_warnings("");
+        assert!(
+            warning.is_none(),
+            "documented map-key sections must not produce a warning, got: {warning:?}"
+        );
+    }
+
+    /// #3228: even inside a user-defined map entry, a struct-field typo does
+    /// flag. This guards against a future "just skip everything under
+    /// `agents.*`" regression that would swallow the intended catch.
+    #[test]
+    #[serial_test::serial]
+    fn test_collect_startup_config_warnings_flags_typo_inside_map_entry() {
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        // `agents.<name>.status_map` is a real field; the typo below is not.
+        fs::write(
+            dir.join("config.toml"),
+            "[agents.claude]\nstatus_maap = { foo = \"bar\" }\n",
+        )
+        .unwrap();
+
+        let warning = collect_startup_config_warnings("").expect("expected a warning");
+        assert!(
+            warning.contains("agents.claude.status_maap"),
+            "typo inside a map entry should still flag, got: {warning}"
+        );
+    }
+
+    /// #3228: unrecognized keys in a profile config are reported the same way.
+    /// The probe merges overrides onto a default `Config` to sidestep the
+    /// `#[serde(flatten)]` catch-all on `ProfileConfig` (which would otherwise
+    /// swallow every unknown key as valid JSON).
+    #[test]
+    #[serial_test::serial]
+    fn test_collect_startup_config_warnings_flags_unknown_key_in_profile() {
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        let profile_dir = dir.join("profiles").join("default");
+        fs::create_dir_all(&profile_dir).unwrap();
+        fs::write(
+            profile_dir.join("config.toml"),
+            "[sandbox]\nprivildged = true\n",
+        )
+        .unwrap();
+
+        let warning =
+            collect_startup_config_warnings("default").expect("expected a profile warning");
+        assert!(warning.contains("Unrecognized keys in profile config 'default'"));
+        assert!(warning.contains("sandbox.privildged"));
     }
 
     fn release_dir_in(root: impl AsRef<Path>) -> PathBuf {

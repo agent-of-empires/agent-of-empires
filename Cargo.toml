@@ -45,6 +45,7 @@ aoe-plugin-api = { path = "aoe-plugin-api" }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
+serde_ignored = "0.1"
 serde_json = "1.0"
 serde_yaml = "0.9"
 toml = "1.1"

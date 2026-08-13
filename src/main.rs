@@ -313,6 +313,7 @@ async fn main() -> Result<()> {
     if let Err(e) = run(
         cli,
         is_daemon_child,
+        should_init,
         debug_namespace_drift,
         debug_log_warning,
     )
@@ -335,6 +336,7 @@ async fn main() -> Result<()> {
 async fn run(
     cli: Cli,
     is_daemon_child: bool,
+    should_init: bool,
     debug_namespace_drift: Option<(std::path::PathBuf, std::path::PathBuf)>,
     debug_log_warning: Option<String>,
 ) -> Result<()> {
@@ -420,6 +422,22 @@ async fn run(
     // TUI mode handles migrations with a spinner; CLI runs them silently
     if cli.command.is_some() {
         migrations::run_migrations()?;
+    }
+
+    // Surface config parse errors and unrecognized keys on stderr for the
+    // one-shot CLI commands that reach this point (add/list/ps/status/session/
+    // remove/send/killall/group/serve-foreground). Skipped when a tracing
+    // subscriber is already running (`should_init`) so the `_or_warn` helpers'
+    // `tracing::warn!` handle it without a duplicate. Gated on
+    // `cli::command_name` so hidden machine-spawned subcommands (`__acp-runner`
+    // etc.) never eprintln into a detached worker's redirected stderr. The TUI
+    // path skips this: `collect_startup_config_warnings` already runs there and
+    // is rendered as a startup dialog by `App::show_startup_warning` (#3228).
+    if !should_init && cli.command.as_ref().and_then(cli::command_name).is_some() {
+        if let Some(warning) = agent_of_empires::session::collect_startup_config_warnings(&profile)
+        {
+            eprintln!("{warning}");
+        }
     }
 
     let result = match cli.command {

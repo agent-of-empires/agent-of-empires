@@ -64,15 +64,48 @@ pub fn load_profile_config(profile: &str) -> Result<ProfileConfig> {
     Ok(config)
 }
 
+/// Merge a sparse override object onto a full serialized `Config::default()`,
+/// yielding the resolved JSON that would land in memory if this profile were
+/// applied. Shared prelude for [`validate_overrides_typecheck`] (which
+/// re-deserializes it into `Config` to type-check) and
+/// [`profile_config_ignored_keys`] (which runs `serde_ignored` to enumerate
+/// unknown keys).
+fn merged_onto_default(overrides: &serde_json::Value) -> Result<serde_json::Value> {
+    let mut base = serde_json::to_value(Config::default())?;
+    crate::session::settings_schema::merge_json(&mut base, overrides);
+    Ok(base)
+}
+
 /// Confirm a sparse override object deserializes back into a [`Config`] when
 /// merged onto the defaults. Used at load time so a malformed override file is
 /// a graceful error rather than a merge-time panic.
 pub(super) fn validate_overrides_typecheck(overrides: &serde_json::Value) -> Result<()> {
-    let mut base = serde_json::to_value(Config::default())?;
-    crate::session::settings_schema::merge_json(&mut base, overrides);
+    let base = merged_onto_default(overrides)?;
     serde_json::from_value::<Config>(base)
         .map_err(|e| anyhow::anyhow!("invalid override value: {e}"))?;
     Ok(())
+}
+
+/// Dotted paths of keys in this profile that `Config` does not recognize
+/// (unknown struct fields at any depth), so a typo like `[sandbox] privildged
+/// = true` surfaces instead of being silently dropped. Runs `serde_ignored`
+/// against the profile's overrides merged onto a default `Config`; a raw
+/// `serde_ignored::deserialize::<ProfileConfig>` would report nothing, since
+/// `#[serde(flatten)] overrides` absorbs every unknown key as valid JSON.
+/// Map-keyed sections (`agents`, `tools`, `plugins`, `session.custom_agents`,
+/// `acp.acp_defaults`, ...) never flag because their keys are entries, not
+/// struct fields; nested struct-field typos inside them still do. Takes the
+/// already-loaded `ProfileConfig` so the caller does not read+parse the
+/// profile file a second time.
+pub(crate) fn profile_config_ignored_keys(cfg: &ProfileConfig) -> Vec<String> {
+    let Ok(base) = merged_onto_default(&cfg.overrides_value()) else {
+        return Vec::new();
+    };
+    let mut ignored = Vec::new();
+    let _ = serde_ignored::deserialize::<_, _, Config>(base, |path| {
+        ignored.push(path.to_string());
+    });
+    ignored
 }
 
 /// Save profile-specific config

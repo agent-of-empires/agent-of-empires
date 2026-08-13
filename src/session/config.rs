@@ -2820,7 +2820,12 @@ fn config_save_lock() -> &'static Mutex<()> {
 }
 
 impl Config {
-    pub fn load() -> Result<Self> {
+    /// Read and parse `config.toml` into a raw `toml::Table`, with the
+    /// stale `app_state` section stripped. Shared prelude for [`Config::load`]
+    /// and [`Config::config_ignored_keys`]; keeping the read + strip in one
+    /// place stops the ignored-key probe from ever flagging a section `load`
+    /// silently drops.
+    fn load_raw_table() -> Result<toml::Table> {
         let path = config_path()?;
         let mut table: toml::Table = if path.exists() {
             toml::from_str(&fs::read_to_string(&path)?)?
@@ -2831,9 +2836,35 @@ impl Config {
         // from before the split (or written by an out-of-date peer) so it
         // never shadows the authoritative source below.
         table.remove("app_state");
+        Ok(table)
+    }
+
+    pub fn load() -> Result<Self> {
+        let table = Self::load_raw_table()?;
         let mut config: Config = table.try_into()?;
         config.app_state = AppStateConfig::load()?;
         Ok(config)
+    }
+
+    /// Dotted paths of keys in the on-disk `config.toml` that `Config` does not
+    /// recognize (unknown struct fields at any depth), so a typo like
+    /// `[sandbox] privildged = true` surfaces instead of being silently
+    /// dropped. Only called on the Ok path: `Config::load` errored out already
+    /// carries the load-error text, and the two failure classes are per-file
+    /// mutually exclusive (no `deny_unknown_fields`, so an unknown key never
+    /// fails the load). Map-keyed sections (`agents`, `tools`, `plugins`,
+    /// `session.custom_agents`, `acp.acp_defaults`, ...) never flag because
+    /// their keys are entries, not struct fields; nested struct-field typos
+    /// inside them still do.
+    pub(crate) fn config_ignored_keys() -> Vec<String> {
+        let Ok(table) = Self::load_raw_table() else {
+            return Vec::new();
+        };
+        let mut ignored = Vec::new();
+        let _ = serde_ignored::deserialize::<_, _, Config>(toml::Value::Table(table), |path| {
+            ignored.push(path.to_string());
+        });
+        ignored
     }
 
     /// Like [`Config::load`], but logs a warning on failure and returns defaults
