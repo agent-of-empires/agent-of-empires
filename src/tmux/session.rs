@@ -2046,9 +2046,10 @@ mod tests {
     /// tmux runs a single-string pane command (`"sleep 30"`) through the
     /// user's shell, so `pane_current_command` reports that shell, which
     /// `is_shell_command` matches, until it execs into the real command.
-    /// A fixed sleep is a bet on that exec having happened and loses on a
-    /// cold tmux server, where server startup widens the window; wait for
-    /// the exec instead.
+    /// A fixed sleep is a bet on that exec having happened. The window it
+    /// has to cover is the shell's own startup, around 100ms on an idle
+    /// machine and several times that when the suite is competing for
+    /// cores, so the bet loses under load; wait for the exec instead.
     ///
     /// Keyed on the pane's own id rather than the `^.0` target so the wait
     /// never depends on the pane resolution the callers' assertions exist to
