@@ -34,44 +34,60 @@ struct Cache {
     fetched_at: Option<Instant>,
 }
 
-fn cache() -> &'static Mutex<Cache> {
+/// The cache guard, recovering from poisoning rather than propagating it. The
+/// data behind the lock is a plain map with no invariant a panicking writer
+/// could have half-broken, and treating a poisoned lock as fatal would strand
+/// every later sandbox row on "?" for the rest of the process.
+fn cache() -> std::sync::MutexGuard<'static, Cache> {
     static CACHE: OnceLock<Mutex<Cache>> = OnceLock::new();
-    CACHE.get_or_init(|| {
-        Mutex::new(Cache {
-            map: Arc::default(),
-            fetched_at: None,
+    CACHE
+        .get_or_init(|| {
+            Mutex::new(Cache {
+                map: Arc::default(),
+                fetched_at: None,
+            })
         })
-    })
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// Set while a refresh thread is in flight, so a caller polling every second
 /// never stacks up a second `docker stats` behind a slow one.
 static REFRESHING: AtomicBool = AtomicBool::new(false);
 
+/// Clears [`REFRESHING`] on drop, so a refresh that panics does not latch the
+/// flag and silently block every later refresh.
+struct RefreshGuard;
+
+impl Drop for RefreshGuard {
+    fn drop(&mut self) {
+        REFRESHING.store(false, Ordering::SeqCst);
+    }
+}
+
 /// The most recent sandbox container stats, starting a background refresh when
-/// the cached map has aged past [`STATS_TTL`].
+/// the cached map has aged past `STATS_TTL`.
 ///
 /// Never blocks. The first call after the pane opens returns an empty map and
 /// the row reads "?" until the refresh lands; that beats stalling the host
 /// CPU/memory sample behind a multi-second subprocess.
 pub fn cached_stats() -> Arc<StatsMap> {
-    let (map, stale) = match cache().lock() {
-        Ok(cache) => (
+    let (map, stale) = {
+        let cache = cache();
+        (
             cache.map.clone(),
             cache.fetched_at.is_none_or(|at| at.elapsed() >= STATS_TTL),
-        ),
-        Err(_) => return Arc::default(),
+        )
     };
     if stale && !REFRESHING.swap(true, Ordering::SeqCst) {
         let spawned = std::thread::Builder::new()
             .name("aoe-container-stats".to_string())
             .spawn(|| {
+                let _guard = RefreshGuard;
                 let fresh = super::batch_container_stats();
-                if let Ok(mut cache) = cache().lock() {
-                    cache.map = Arc::new(fresh);
-                    cache.fetched_at = Some(Instant::now());
-                }
-                REFRESHING.store(false, Ordering::SeqCst);
+                let mut cache = cache();
+                cache.map = Arc::new(fresh);
+                cache.fetched_at = Some(Instant::now());
             });
         if spawned.is_err() {
             REFRESHING.store(false, Ordering::SeqCst);

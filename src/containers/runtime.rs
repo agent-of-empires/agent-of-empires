@@ -418,6 +418,12 @@ impl ContainerRuntime {
     pub fn batch_stats(&self, prefix: &str) -> super::stats::StatsMap {
         match self.kind {
             RuntimeKind::Docker | RuntimeKind::Podman => {
+                // Stats everything and prefix-filters the rows, unlike
+                // `batch_running_states`, which narrows with `--filter name=`.
+                // The asymmetry is deliberate: `stats` has no `--filter`, and
+                // naming containers positionally fails the whole call with
+                // "No such container" if any one of them is gone, which is a
+                // normal state for a session whose sandbox has stopped.
                 let output = self
                     .base
                     .command()
