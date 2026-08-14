@@ -760,8 +760,13 @@ fn collect_startup_warnings(profile: &str, class: WarningClass) -> Option<String
     } else {
         profile.to_string()
     };
-    let profile_path_display = profile_config::get_profile_config_path(&effective)
-        .map(|p| p.display().to_string())
+    // Non-creating resolver: `get_profile_config_path` goes through the
+    // creating `get_profile_dir`, so naming an unknown profile (`aoe list -p
+    // ghost`) would birth `profiles/ghost/` here, before the command's own
+    // `resolve_existing_profile` gets to reject it. See
+    // `tests/e2e/profile_lazy_creation.rs`.
+    let profile_path_display = get_profile_dir_path(&effective)
+        .map(|p| p.join("config.toml").display().to_string())
         .unwrap_or_else(|_| format!("profiles/{effective}/config.toml"));
     let profile_scope = format!("profile config '{effective}'");
     if let Some(msg) = format_probe(
