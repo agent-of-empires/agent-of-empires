@@ -190,10 +190,13 @@ and later want to return to the original agent.
 
 - **Web dashboard:** right-click a structured view session in the sidebar and
   pick "Switch agent". It opens the same picker and switches on confirm. The
-  composer is pre-filled with a recap; review and send manually.
+  composer is pre-filled with a recap; review and send manually. The picker
+  lists built-in agents only.
 - **CLI:** `aoe acp switch-agent <session> <target>` (run `aoe acp agents` to
-  list valid target keys). Pass `--model <name>` to override the model the new
-  agent starts with.
+  list the built-in target keys). Pass `--model <name>` to override the model
+  the new agent starts with. A custom agent with an `agent_acp_cmd` entry is
+  also a valid target even though neither surface lists it, so switching to one
+  means naming it here.
 
 The transcript divider reads `Switched structured view agent from <from> to <to>
 (manual)`, distinct from the `(rate_limited)` divider the recovery flow emits.
