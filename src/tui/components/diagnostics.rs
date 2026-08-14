@@ -34,6 +34,19 @@ pub(crate) fn agent_table_visible_rows(preview_height: u16) -> usize {
         .saturating_sub(AGENT_TABLE_HEADER_ROWS) as usize
 }
 
+/// Gutter between the pane border and its contents, widening as the pane does.
+/// The agent table stretches its name column to whatever it is given, so at one
+/// column of padding a wide pane reads as pinned to its edges; a narrow one
+/// needs the width for the columns more than it needs the gutter. `width` is
+/// the outer pane width, borders included.
+fn health_padding(width: u16) -> u16 {
+    match width {
+        0..=47 => 1,
+        48..=79 => 2,
+        _ => 3,
+    }
+}
+
 fn agent_name_width(table_width: u16) -> usize {
     (table_width as usize)
         .saturating_sub(AGENT_METRICS_WIDTH)
@@ -282,7 +295,7 @@ pub fn render_system_health(
             " System Health ",
             Style::default().fg(theme.title).bold(),
         ))
-        .padding(Padding::horizontal(1));
+        .padding(Padding::horizontal(health_padding(area.width)));
     let inner = block.inner(area);
     frame.render_widget(block, area);
     if inner.width == 0 || inner.height == 0 {
@@ -537,6 +550,24 @@ mod tests {
                     .sum();
                 assert_eq!(header, cell, "table width {table_width}, {sandboxed}");
             }
+        }
+    }
+
+    #[test]
+    fn health_padding_never_starves_the_agent_table() {
+        // The gutter must not cost so much width that the metrics block and a
+        // minimum name cell stop fitting, which is what would make a wider
+        // pane render a worse table than a narrower one.
+        let mut previous = 0;
+        for width in 36u16..=200 {
+            let padding = health_padding(width);
+            assert!(padding >= previous, "padding shrank at width {width}");
+            previous = padding;
+            let inner = width - 2 - 2 * padding;
+            assert!(
+                inner as usize >= AGENT_METRICS_WIDTH + 8,
+                "width {width} leaves only {inner} columns for the table"
+            );
         }
     }
 
