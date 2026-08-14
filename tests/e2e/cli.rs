@@ -2067,5 +2067,10 @@ fn test_cli_list_state_filter_and_json_shape() {
     let trashed: serde_json::Value =
         serde_json::from_slice(&h.run_cli(&["list", "--json", "--state=trashed"]).stdout)
             .expect("list --json --state=trashed must emit JSON");
+    // Assert the row's state, not just its title: with a single-row fixture a
+    // title-only check would still pass if `--state=trashed` were ignored and
+    // the live row returned instead. The state field pins the filter contract.
     assert_eq!(trashed[0]["title"], "State Probe");
+    assert_eq!(trashed[0]["state"], "trashed");
+    assert!(trashed[0]["trashed_at"].is_string());
 }
