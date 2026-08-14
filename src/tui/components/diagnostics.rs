@@ -7,7 +7,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 use unicode_width::UnicodeWidthStr;
 
-use crate::process::metrics::{MemorySample, MetricsSnapshot};
+use crate::process::metrics::{AgentMetric, MemorySample, MetricsSnapshot};
 use crate::tui::components::truncate_to_width;
 use crate::tui::styles::Theme;
 
@@ -21,12 +21,68 @@ const PSI_CRITICAL: f32 = 20.0;
 const PSI_WARN: f32 = 5.0;
 const HEALTH_FIXED_ROWS: u16 = 6;
 const AGENT_TABLE_HEADER_ROWS: u16 = 1;
+/// Display width of the fixed metric block on the agent table, identical on the
+/// header (`{:>7} {:>9} {:>6}`) and on each row (` {cpu:>6} {:>9} {:>6}`). The
+/// name column takes whatever is left, so both lines must derive it the same
+/// way or the columns drift apart.
+const AGENT_METRICS_WIDTH: usize = 24;
 
 pub(crate) fn agent_table_visible_rows(preview_height: u16) -> usize {
     preview_height
         .saturating_sub(2)
         .saturating_sub(HEALTH_FIXED_ROWS)
         .saturating_sub(AGENT_TABLE_HEADER_ROWS) as usize
+}
+
+fn agent_name_width(table_width: u16) -> usize {
+    (table_width as usize)
+        .saturating_sub(AGENT_METRICS_WIDTH)
+        .max(8)
+}
+
+/// Marker on a sandboxed row, matching the session list's `[container]` badge.
+const CONTAINER_BADGE: &str = " [container]";
+
+/// The name cell: the agent title, plus the container marker when the row's
+/// figures come from a sandbox rather than a host process tree (its memory
+/// figure is the container's usage, not an RSS sum). The spans always total
+/// `width`, so the metric columns stay under their headers.
+fn agent_name_spans<'a>(agent: &AgentMetric, width: usize, theme: &Theme) -> Vec<Span<'a>> {
+    // Below this the badge would crowd out the name; the row keeps its
+    // numbers and just loses the marker.
+    let show_badge = agent.sandboxed && width >= CONTAINER_BADGE.width() + 8;
+    let title_width = if show_badge {
+        width - CONTAINER_BADGE.width()
+    } else {
+        width
+    };
+    let mut spans = vec![Span::styled(
+        format_agent_title(&agent.title, title_width),
+        Style::default().fg(theme.text),
+    )];
+    if show_badge {
+        spans.push(Span::styled(
+            CONTAINER_BADGE,
+            Style::default().fg(theme.sandbox),
+        ));
+    }
+    spans
+}
+
+/// The fixed-width CPU / Mem / Procs block of an agent row. A figure the
+/// sampler has no reading for prints "?" rather than a zero, which would read
+/// as a measured idle.
+fn agent_metrics_cell(agent: &AgentMetric) -> String {
+    let cpu = agent
+        .cpu_fraction
+        .map_or_else(|| "?".to_string(), |v| format!("{:.1}%", v * 100.0));
+    let mem = agent
+        .rss_bytes
+        .map_or_else(|| "?".to_string(), format_bytes);
+    let procs = agent
+        .procs
+        .map_or_else(|| "?".to_string(), |procs| procs.to_string());
+    format!(" {cpu:>6} {mem:>9} {procs:>6}")
 }
 
 fn format_agent_title(title: &str, width: usize) -> String {
@@ -318,32 +374,24 @@ pub fn render_system_health(
         );
         return;
     }
+    let name_width = agent_name_width(table_area.width);
     let mut table_lines = vec![Line::from(vec![
         Span::styled(
-            format!("{:<24}", "Agent"),
+            format!("{:<name_width$}", "Agent"),
             Style::default().fg(theme.hint).bold(),
         ),
         Span::styled(
-            format!("{:>7} {:>9} {:>6}", "CPU", "RSS", "Procs"),
+            // "Mem", not "RSS": a sandboxed row reports the container's memory
+            // usage, which is not a resident-set sum.
+            format!("{:>7} {:>9} {:>6}", "CPU", "Mem", "Procs"),
             Style::default().fg(theme.hint).bold(),
         ),
     ])];
     let visible = table_area.height.saturating_sub(1) as usize;
     for agent in snapshot.agents.iter().skip(scroll).take(visible) {
-        let name_width = table_area.width.saturating_sub(24).max(8) as usize;
-        let title = format_agent_title(&agent.title, name_width);
-        let cpu = agent
-            .cpu_fraction
-            .map(|v| format!("{:.1}%", v * 100.0))
-            .unwrap_or_else(|| "?".into());
-        table_lines.push(Line::from(vec![
-            Span::styled(title, Style::default().fg(theme.text)),
-            Span::raw(format!(
-                " {cpu:>6} {:>9} {:>6}",
-                format_bytes(agent.rss_bytes),
-                agent.procs
-            )),
-        ]));
+        let mut spans = agent_name_spans(agent, name_width, theme);
+        spans.push(Span::raw(agent_metrics_cell(agent)));
+        table_lines.push(Line::from(spans));
     }
     frame.render_widget(Paragraph::new(table_lines), table_area);
 }
@@ -445,6 +493,68 @@ mod tests {
             let formatted = format_agent_title(title, 8);
             assert_eq!(formatted.width(), 8, "title {title:?}");
         }
+    }
+
+    #[test]
+    fn agent_table_header_and_rows_share_column_offsets() {
+        // The metric block is fixed-width on both lines, so the name cell must
+        // be the same width on both or the CPU/RSS/Procs columns drift apart.
+        assert_eq!(
+            format!("{:>7} {:>9} {:>6}", "CPU", "RSS", "Procs").width(),
+            AGENT_METRICS_WIDTH
+        );
+        assert_eq!(
+            agent_metrics_cell(&AgentMetric {
+                cpu_fraction: Some(0.999),
+                rss_bytes: Some(22 * (1 << 30)),
+                procs: Some(12),
+                ..AgentMetric::default()
+            })
+            .width(),
+            AGENT_METRICS_WIDTH
+        );
+        // A sandbox with no runtime sample yet still fills its columns.
+        assert_eq!(
+            agent_metrics_cell(&AgentMetric {
+                sandboxed: true,
+                ..AgentMetric::default()
+            }),
+            format!("{:>7} {:>9} {:>6}", "?", "?", "?")
+        );
+        let theme = Theme::default();
+        for table_width in [20u16, 32, 48, 60, 120] {
+            let name_width = agent_name_width(table_width);
+            let header = format!("{:<name_width$}", "Agent").width();
+            for sandboxed in [false, true] {
+                let agent = AgentMetric {
+                    title: "some agent title".into(),
+                    sandboxed,
+                    ..AgentMetric::default()
+                };
+                let cell: usize = agent_name_spans(&agent, name_width, &theme)
+                    .iter()
+                    .map(|s| s.width())
+                    .sum();
+                assert_eq!(header, cell, "table width {table_width}, {sandboxed}");
+            }
+        }
+    }
+
+    #[test]
+    fn container_badge_is_dropped_when_the_name_cell_is_narrow() {
+        let theme = Theme::default();
+        let agent = AgentMetric {
+            title: "sandboxed agent".into(),
+            sandboxed: true,
+            ..AgentMetric::default()
+        };
+        let badged = |width| {
+            agent_name_spans(&agent, width, &theme)
+                .iter()
+                .any(|s| s.content.contains("[container]"))
+        };
+        assert!(!badged(CONTAINER_BADGE.width() + 7));
+        assert!(badged(CONTAINER_BADGE.width() + 8));
     }
 
     #[test]

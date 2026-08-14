@@ -36,13 +36,20 @@ pub struct SystemSample {
     pub swap_used_bytes: u64,
 }
 
+/// One agent's resource usage. Every figure is optional because a sandboxed
+/// agent's numbers come from the container runtime, which may not have a
+/// sample yet (or at all, on a runtime without a stats command); reporting
+/// unknown is the honest reading, a zero would not be.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AgentMetric {
     pub id: String,
     pub title: String,
     pub cpu_fraction: Option<f64>,
-    pub rss_bytes: u64,
-    pub procs: usize,
+    pub rss_bytes: Option<u64>,
+    pub procs: Option<usize>,
+    /// Measured inside a sandbox container rather than on the host process
+    /// tree. The memory figure is then the container's usage, not an RSS sum.
+    pub sandboxed: bool,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
@@ -104,7 +111,7 @@ impl MetricsSampler {
         let agents = aggregate_agents(instances, &processes, elapsed, &self.last_process_cpu);
         let counts = AgentCounts {
             agents: agents.len(),
-            procs: agents.iter().map(|a| a.procs).sum(),
+            procs: agents.iter().filter_map(|a| a.procs).sum(),
         };
 
         self.last_at = Some(now);
@@ -161,6 +168,13 @@ fn aggregate_agents(
         .filter(|i| eligible_instance(i))
         .cloned()
         .collect();
+    // Only pay for the runtime's stats pass when a sandbox is actually on
+    // screen; `cached_stats` returns the last completed map without blocking.
+    let container_stats = eligible
+        .iter()
+        .any(|i| i.is_sandboxed())
+        .then(crate::containers::stats::cached_stats)
+        .unwrap_or_default();
     let alive = crate::session::recovery::orphaned_agents_alive(&eligible);
     for (inst, is_alive) in eligible.iter().zip(alive) {
         if !is_alive {
@@ -184,28 +198,53 @@ fn aggregate_agents(
                 stack.extend(children);
             }
         }
-        let rss_bytes = pids
-            .iter()
-            .filter_map(|pid| by_pid.get(pid))
-            .map(|p| p.rss_bytes)
-            .sum();
-        let cpu_fraction = elapsed.filter(|v| *v > 0.0).map(|seconds| {
-            pids.iter()
+        // The pid tree is still walked for a sandboxed session, so its pane
+        // processes are claimed and cannot be double-counted onto a neighbour,
+        // but its figures come from the container instead: the pane holds a
+        // `docker exec` client, while the agent runs in the container, off
+        // this process tree entirely.
+        let sandbox_container = inst
+            .sandbox_info
+            .as_ref()
+            .filter(|s| s.enabled)
+            .map(|s| s.container_name.as_str());
+        let (cpu_fraction, rss_bytes, procs) = if let Some(name) = sandbox_container {
+            match container_stats.get(name) {
+                Some(stats) => (
+                    // `cpu_percent` is per-core (100 == one core); the table
+                    // reads as a share of the whole host, like the host rows.
+                    Some(stats.cpu_percent / 100.0 / logical_cpus() as f64),
+                    Some(stats.mem_used_bytes),
+                    Some(stats.pids),
+                ),
+                None => (None, None, None),
+            }
+        } else {
+            let rss_bytes = pids
+                .iter()
                 .filter_map(|pid| by_pid.get(pid))
-                .filter_map(|p| {
-                    let old = previous.get(&(p.pid, p.start_id))?;
-                    Some((p.cpu_seconds - old).max(0.0))
-                })
-                .sum::<f64>()
-                / seconds
-                / logical_cpus() as f64
-        });
+                .map(|p| p.rss_bytes)
+                .sum();
+            let cpu_fraction = elapsed.filter(|v| *v > 0.0).map(|seconds| {
+                pids.iter()
+                    .filter_map(|pid| by_pid.get(pid))
+                    .filter_map(|p| {
+                        let old = previous.get(&(p.pid, p.start_id))?;
+                        Some((p.cpu_seconds - old).max(0.0))
+                    })
+                    .sum::<f64>()
+                    / seconds
+                    / logical_cpus() as f64
+            });
+            (cpu_fraction, Some(rss_bytes), Some(pids.len()))
+        };
         rows.push(AgentMetric {
             id: inst.id.clone(),
             title: inst.title.clone(),
             cpu_fraction,
             rss_bytes,
-            procs: pids.len(),
+            procs,
+            sandboxed: sandbox_container.is_some(),
         });
     }
 
@@ -257,8 +296,9 @@ fn aggregate_agents(
             id: rec.session_id,
             title,
             cpu_fraction,
-            rss_bytes,
-            procs: pids.len(),
+            rss_bytes: Some(rss_bytes),
+            procs: Some(pids.len()),
+            sandboxed: false,
         });
     }
 
