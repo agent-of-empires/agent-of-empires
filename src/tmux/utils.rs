@@ -170,55 +170,35 @@ pub fn append_tmux_setting_args(args: &mut Vec<String>, target: &str, config: &C
 
 /// Append the writes of one managed setting to an in-flight tmux argument
 /// list. Pure over the writes, so the emitted tokens are table-testable.
-pub(crate) fn append_tmux_setting_writes(
-    args: &mut Vec<String>,
-    target: &str,
-    writes: &[TmuxOptionWrite],
-) {
+fn append_tmux_setting_writes(args: &mut Vec<String>, target: &str, writes: &[TmuxOptionWrite]) {
     for write in writes {
         args.push(";".to_string());
         args.push("set-option".to_string());
-        match *write {
+        // Only the scope flags differ per variant; the `-q` guard and the
+        // option/value pushes are shared.
+        let (scope_flags, option, value, quiet) = match *write {
             TmuxOptionWrite::Session {
                 option,
                 value,
                 quiet,
-            } => {
-                if quiet {
-                    args.push("-q".to_string());
-                }
-                args.push("-t".to_string());
-                args.push(target.to_string());
-                args.push(option.to_string());
-                args.push(value.to_string());
-            }
+            } => (&["-t", target][..], option, value, quiet),
             TmuxOptionWrite::Server {
                 option,
                 value,
                 quiet,
-            } => {
-                if quiet {
-                    args.push("-q".to_string());
-                }
-                args.push("-s".to_string());
-                args.push(option.to_string());
-                args.push(value.to_string());
-            }
+            } => (&["-s"][..], option, value, quiet),
             TmuxOptionWrite::Window {
                 option,
                 value,
                 quiet,
-            } => {
-                if quiet {
-                    args.push("-q".to_string());
-                }
-                args.push("-w".to_string());
-                args.push("-t".to_string());
-                args.push(target.to_string());
-                args.push(option.to_string());
-                args.push(value.to_string());
-            }
+            } => (&["-w", "-t", target][..], option, value, quiet),
+        };
+        if quiet {
+            args.push("-q".to_string());
         }
+        args.extend(scope_flags.iter().map(|flag| flag.to_string()));
+        args.push(option.to_string());
+        args.push(value.to_string());
     }
 }
 

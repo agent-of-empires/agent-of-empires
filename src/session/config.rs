@@ -2598,15 +2598,18 @@ enum TmuxAutoDefer {
 
 /// One tmux `set-option` aoe writes on its own sessions, at creation.
 ///
-/// The variant is the scope, so an illegal write (a server option carrying a
-/// target, say) does not compile. Scope flags are emitted explicitly (`-s`,
-/// `-w`, `-t`) rather than left to tmux's scope inference, so the write is
-/// unambiguous and resilient to future inference changes (same convention as
-/// `append_remain_on_exit_args`). `quiet` adds tmux's `-q` (ignore unknown
-/// options), which aoe needs for `allow-passthrough` on tmux < 3.3, where
-/// `allow-passthrough` does not exist and the set-option call would otherwise
-/// fail the whole `new-session` invocation; it is a per-write property, not a
-/// scope property.
+/// The variant is the scope the write addresses (session `-t <target>`,
+/// server `-s`, window `-w -t <target>`), so a write's scope flags follow
+/// from its variant alone; the target of session/window writes is a runtime
+/// parameter of the emitter, not a property of the write. Scope flags are
+/// emitted explicitly (`-s`, `-w`, `-t`) rather than left to tmux's scope
+/// inference, so the write is unambiguous and resilient to future inference
+/// changes (same convention as `append_remain_on_exit_args`). `quiet` adds
+/// tmux's `-q` (ignore unknown options), which aoe needs for
+/// `allow-passthrough` on tmux < 3.3, where `allow-passthrough` does not
+/// exist and the set-option call would otherwise fail the whole
+/// `new-session` invocation; it is a per-write property, not a scope
+/// property.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum TmuxOptionWrite {
     /// `set-option [-q] -t <target> <option> <value>` on the new session.
