@@ -3768,8 +3768,9 @@ mod tests {
         let _guard = crate::session::test_support::isolate_home(tmp.path());
 
         let sup = Supervisor::new(VecSink::new());
-        let app_dir = tmp.path().join(".config/agent-of-empires-dev");
-        let cfg_path = app_dir.join("config.toml");
+        // Resolve the dir via the same call the resolver uses so the namespace
+        // (release vs dev) always matches.
+        let cfg_path = crate::session::get_app_dir().unwrap().join("config.toml");
         std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
         std::fs::write(
             &cfg_path,
@@ -3800,8 +3801,9 @@ broken = ""
         let _guard = crate::session::test_support::isolate_home(tmp.path());
 
         let sup = Supervisor::new(VecSink::new());
-        let app_dir = tmp.path().join(".config/agent-of-empires-dev");
-        let profile_cfg_path = app_dir.join("profiles/cursor/config.toml");
+        let profile_cfg_path = crate::session::get_profile_dir_path("cursor")
+            .unwrap()
+            .join("config.toml");
         std::fs::create_dir_all(profile_cfg_path.parent().unwrap()).unwrap();
         std::fs::write(
             &profile_cfg_path,
@@ -3817,8 +3819,11 @@ cursor-acp-bridge = "agent acp"
                 .await,
             "custom agent visible in its profile"
         );
+        // A named profile, not `""`: an empty profile resolves through
+        // `resolve_default_profile`, which with no configured default returns
+        // the first profile that exists, i.e. `cursor` itself.
         assert!(
-            !sup.agent_is_valid_switch_target("cursor-acp-bridge", "", tmp.path())
+            !sup.agent_is_valid_switch_target("cursor-acp-bridge", "other", tmp.path())
                 .await,
             "custom agent not visible outside its profile"
         );
