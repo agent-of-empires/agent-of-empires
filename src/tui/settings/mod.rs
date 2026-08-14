@@ -397,8 +397,10 @@ impl SettingsView {
     /// Build the categories-panel layout. Categories are grouped under
     /// section dividers (Appearance / Sessions / Hooks / Environment /
     /// Notifications / System) so the list isn't 14 unrelated tabs in
-    /// arbitrary order. Status Hooks is dropped in Repo scope (the only
-    /// scope-conditional category today).
+    /// arbitrary order. Status Hooks, Tmux, and Sound are dropped in Repo
+    /// scope because their sections are not repo-overridable (see
+    /// `REPO_OVERRIDABLE_SECTIONS` in `session::repo_config`), so a repo
+    /// edit would strand at save.
     fn categories_for_scope(scope: SettingsScope) -> Vec<CategoryRow> {
         let mut rows: Vec<CategoryRow> = Vec::new();
         let push_section = |rows: &mut Vec<CategoryRow>, label: &'static str| {
@@ -427,10 +429,14 @@ impl SettingsView {
         push_section(&mut rows, "Environment");
         push_tab(&mut rows, SettingsCategory::Sandbox);
         push_tab(&mut rows, SettingsCategory::Worktree);
-        push_tab(&mut rows, SettingsCategory::Tmux);
+        if scope != SettingsScope::Repo {
+            push_tab(&mut rows, SettingsCategory::Tmux);
+        }
 
         push_section(&mut rows, "Notifications");
-        push_tab(&mut rows, SettingsCategory::Sound);
+        if scope != SettingsScope::Repo {
+            push_tab(&mut rows, SettingsCategory::Sound);
+        }
         push_tab(&mut rows, SettingsCategory::Web);
 
         push_section(&mut rows, "System");
@@ -1190,6 +1196,44 @@ mod plugin_enabled_changes_tests {
         let after = Some(json!({}));
         let changes = plugin_enabled_changes(Some(&before), &after);
         assert_eq!(changes, vec![("gone".to_string(), true)]);
+    }
+}
+
+#[cfg(test)]
+mod categories_for_scope_tests {
+    use super::{CategoryRow, SettingsCategory, SettingsScope, SettingsView};
+
+    fn has_tab(rows: &[CategoryRow], cat: SettingsCategory) -> bool {
+        rows.iter().any(|r| r.as_tab() == Some(cat))
+    }
+
+    /// StatusHooks, Tmux, and Sound are gated off Repo scope because their
+    /// sections are not repo-overridable (#3229); a Repo tab would render
+    /// edits that strand at save time. Global keeps every tab.
+    #[test]
+    fn repo_scope_drops_non_repo_overridable_categories() {
+        let repo = SettingsView::categories_for_scope(SettingsScope::Repo);
+        for cat in [
+            SettingsCategory::StatusHooks,
+            SettingsCategory::Tmux,
+            SettingsCategory::Sound,
+        ] {
+            assert!(!has_tab(&repo, cat), "{cat:?} must be absent under Repo");
+        }
+        // Sanity: a repo-overridable category IS visible.
+        assert!(has_tab(&repo, SettingsCategory::Sandbox));
+
+        let global = SettingsView::categories_for_scope(SettingsScope::Global);
+        for cat in [
+            SettingsCategory::StatusHooks,
+            SettingsCategory::Tmux,
+            SettingsCategory::Sound,
+        ] {
+            assert!(
+                has_tab(&global, cat),
+                "{cat:?} must be present under Global"
+            );
+        }
     }
 }
 

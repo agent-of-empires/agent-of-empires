@@ -1583,7 +1583,7 @@ Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 * `cancel` — Cancel the in-flight prompt for an agent session
 * `tail` — Stream the agent broadcast for a session to stdout as JSON lines (one frame per line). Press Ctrl-C to stop
 * `attach` — Open the TUI structured view directly for a known session id. Combine with `AOE_DAEMON_URL` (+ `AOE_DAEMON_TOKEN`) to attach across machines without going through the home session list
-* `switch-agent` — Switch an agent session to a different ACP agent, keeping the transcript. The new agent starts fresh; use `aoe acp agents` to list valid targets. Handy for returning to claude after a rate-limit handoff to codex
+* `switch-agent` — Switch an agent session to a different ACP agent, keeping the transcript. Valid targets are built-in registry agents and any custom agent configured in `[session.agent_acp_cmd]`. The new agent starts fresh; use `aoe acp agents` to list built-in targets. Handy for returning to claude after a rate-limit handoff to codex
 
 
 
@@ -1779,14 +1779,14 @@ Open the TUI structured view directly for a known session id. Combine with `AOE_
 
 ## `aoe acp switch-agent`
 
-Switch an agent session to a different ACP agent, keeping the transcript. The new agent starts fresh; use `aoe acp agents` to list valid targets. Handy for returning to claude after a rate-limit handoff to codex
+Switch an agent session to a different ACP agent, keeping the transcript. Valid targets are built-in registry agents and any custom agent configured in `[session.agent_acp_cmd]`. The new agent starts fresh; use `aoe acp agents` to list built-in targets. Handy for returning to claude after a rate-limit handoff to codex
 
 **Usage:** `aoe acp switch-agent [OPTIONS] <SESSION> <TARGET>`
 
 ###### **Arguments:**
 
 * `<SESSION>` — Acp session id
-* `<TARGET>` — Registry key of the target agent (e.g. `claude`, `codex`)
+* `<TARGET>` — Registry key or configured custom ACP agent name (e.g. `claude`, `codex`, `my-custom-bridge`)
 
 ###### **Options:**
 

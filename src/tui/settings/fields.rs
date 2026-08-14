@@ -1256,6 +1256,31 @@ mod tests {
         }
     }
 
+    /// #3229: no field under Repo scope for a category whose section is not
+    /// repo-overridable. Backs up the `categories_for_scope` tab-hide with a
+    /// builder-layer assertion so a direct call with Repo scope cannot yield
+    /// a field whose edit would strand at save time.
+    #[test]
+    fn repo_scope_yields_no_fields_for_tmux_or_sound() {
+        let base = Config::default();
+        let overrides = ProfileConfig::default();
+        for cat in [SettingsCategory::Tmux, SettingsCategory::Sound] {
+            let repo_rows = build_fields_for_category(cat, SettingsScope::Repo, &base, &overrides);
+            assert!(
+                repo_rows.is_empty(),
+                "{cat:?} must yield zero repo-scope fields, got {} rows",
+                repo_rows.len()
+            );
+            // Sanity: the category still has fields under Profile scope.
+            let profile_rows =
+                build_fields_for_category(cat, SettingsScope::Profile, &base, &overrides);
+            assert!(
+                !profile_rows.is_empty(),
+                "{cat:?} must still have profile-scope fields"
+            );
+        }
+    }
+
     #[test]
     fn acp_defaults_custom_widget_round_trips_json() {
         let current = json!({"opencode": {"model": "x", "effort": "high"}});

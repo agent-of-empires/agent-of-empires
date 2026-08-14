@@ -836,11 +836,12 @@ pub struct AcpAgentInfo {
     pub command: String,
 }
 
-/// `GET /api/acp/agents`: list the ACP registry entries the
+/// `GET /api/acp/agents`: list the built-in ACP registry entries the
 /// supervisor knows about. Distinct from `/api/agents` (which lists
 /// session-tool agents like claude/codex/cursor for the wizard);
 /// this returns the *structured view* ACP backend registry so the recovery
-/// modal can show what the user can hand off to. See #1282.
+/// modal can show what the user can hand off to. Custom `agent_acp_cmd`
+/// agents are intentionally not included here. See #1282.
 ///
 /// Filtered by the operator agent allowlist (#3241), so the switch-agent modal
 /// offers only what the policy permits instead of listing a target that
@@ -893,7 +894,12 @@ pub async fn get_option_catalog() -> impl IntoResponse {
 /// transcript; only the recorded `reason` differs.
 ///
 /// Sequence:
-///   1. Validate `target` exists in the structured view registry.
+///   1. Look up the instance, then validate `target` is a built-in
+///      registry agent or a configured custom ACP agent for the
+///      session's profile. Looking up the instance first is required
+///      because custom agents are profile-specific; it also means a
+///      non-existent session returns 404 before an unknown agent
+///      returns 400.
 ///   2. Snapshot `before_seq` = highest seq in the event store, so the
 ///      handoff `AgentSwitched` event lands at a known cursor and the
 ///      frontend's primer fetch (`fetchContextPrimer(before_seq)`)
@@ -929,7 +935,28 @@ pub async fn switch_acp_agent(
     if target.is_empty() {
         return (StatusCode::BAD_REQUEST, "target is required").into_response();
     }
-    if !state.acp_supervisor.registry_has_agent(&target).await {
+
+    // Look up the instance first: custom agents are profile-specific, so
+    // validation needs the session's source_profile and project_path. This
+    // also means a non-existent session returns 404 before an unknown agent
+    // returns 400, and a configured-but-disallowed custom agent returns 403
+    // instead of 400.
+    let instance = {
+        let instances = state.instances.read().await;
+        match instances.iter().find(|i| i.id == id).cloned() {
+            Some(inst) => inst,
+            None => return (StatusCode::NOT_FOUND, "session not found").into_response(),
+        }
+    };
+    if !state
+        .acp_supervisor
+        .agent_is_valid_switch_target(
+            &target,
+            &instance.source_profile,
+            std::path::Path::new(&instance.project_path),
+        )
+        .await
+    {
         return (
             StatusCode::BAD_REQUEST,
             format!("unknown structured view agent: {target}"),
@@ -939,7 +966,7 @@ pub async fn switch_acp_agent(
     // Refuse a disallowed target here, before the shutdown below tears the
     // current worker down. The spawn choke point would refuse it anyway, but by
     // then the session has lost the worker it was happily using and the user is
-    // left with nothing running. Same reason the registry check above is a
+    // left with nothing running. Same reason the validation check above is a
     // preflight. See #3241.
     if !super::agent_policy().await.allows(&target) {
         return (
@@ -948,14 +975,6 @@ pub async fn switch_acp_agent(
         )
             .into_response();
     }
-
-    let instance = {
-        let instances = state.instances.read().await;
-        match instances.iter().find(|i| i.id == id).cloned() {
-            Some(inst) => inst,
-            None => return (StatusCode::NOT_FOUND, "session not found").into_response(),
-        }
-    };
     let from_agent = state
         .acp_supervisor
         .pick_agent_for_tool(

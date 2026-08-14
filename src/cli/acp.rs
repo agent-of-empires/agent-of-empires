@@ -149,13 +149,16 @@ pub enum AcpCommands {
         session: String,
     },
     /// Switch an agent session to a different ACP agent, keeping the
-    /// transcript. The new agent starts fresh; use `aoe acp agents`
-    /// to list valid targets. Handy for returning to claude after a
-    /// rate-limit handoff to codex.
+    /// transcript. Valid targets are built-in registry agents and any
+    /// custom agent configured in `[session.agent_acp_cmd]`. The new
+    /// agent starts fresh; use `aoe acp agents` to list built-in
+    /// targets. Handy for returning to claude after a rate-limit handoff
+    /// to codex.
     SwitchAgent {
         /// Acp session id.
         session: String,
-        /// Registry key of the target agent (e.g. `claude`, `codex`).
+        /// Registry key or configured custom ACP agent name (e.g.
+        /// `claude`, `codex`, `my-custom-bridge`).
         target: String,
         /// Optional model override forwarded to the new agent.
         #[arg(long)]

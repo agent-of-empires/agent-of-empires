@@ -916,13 +916,31 @@ impl<S: BroadcastSink> Supervisor<S> {
         self.registry.lock().await.clone()
     }
 
-    /// True iff `name` is registered as an ACP agent. Used by the
-    /// `/acp/switch-agent` endpoint to validate the target before
-    /// tearing down the current worker; otherwise an unknown agent
-    /// would only surface at spawn time, leaving the session without a
-    /// worker.
+    /// True iff `name` is a built-in registry ACP agent. This does NOT
+    /// include custom `agent_acp_cmd` agents; switch-agent validation
+    /// should call [`Self::agent_is_valid_switch_target`] instead.
     pub async fn registry_has_agent(&self, name: &str) -> bool {
         self.registry.lock().await.get(name).is_some()
+    }
+
+    /// True iff `name` is a valid structured-view switch target for a
+    /// session with the given profile and project path. Built-in registry
+    /// entries are accepted; so are custom agents that declare a valid
+    /// `agent_acp_cmd` in the profile-resolved config. A malformed or
+    /// empty `agent_acp_cmd` entry is treated as invalid and returns
+    /// false, so the switch endpoint surfaces the same "unknown
+    /// structured view agent" 400 as a truly unknown name.
+    pub async fn agent_is_valid_switch_target(
+        &self,
+        name: &str,
+        profile: &str,
+        project_path: &std::path::Path,
+    ) -> bool {
+        if self.registry_has_agent(name).await {
+            return true;
+        }
+        self.custom_agent_has_acp_cmd(name, profile, project_path)
+            .await
     }
 
     /// Allocate the session's next seq and publish `event` on the sink in
@@ -3741,6 +3759,74 @@ mod tests {
                 ),
             }
         }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn agent_is_valid_switch_target_accepts_builtin_and_custom() {
+        let tmp = tempfile::TempDir::with_prefix_in("aoe-switch-target-", "/tmp").unwrap();
+        let _guard = crate::session::test_support::isolate_home(tmp.path());
+
+        let sup = Supervisor::new(VecSink::new());
+        // Resolve the dir via the same call the resolver uses so the namespace
+        // (release vs dev) always matches.
+        let cfg_path = crate::session::get_app_dir().unwrap().join("config.toml");
+        std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &cfg_path,
+            r#"
+[session.agent_acp_cmd]
+cursor-acp-bridge = "agent acp"
+broken = ""
+"#,
+        )
+        .unwrap();
+
+        let cases = [
+            ("claude", true),
+            ("cursor-acp-bridge", true),
+            ("unknown-agent", false),
+            ("broken", false),
+        ];
+        for (name, expected) in cases {
+            let got = sup.agent_is_valid_switch_target(name, "", tmp.path()).await;
+            assert_eq!(got, expected, "{name:?}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn agent_is_valid_switch_target_respects_profile() {
+        let tmp = tempfile::TempDir::with_prefix_in("aoe-switch-target-", "/tmp").unwrap();
+        let _guard = crate::session::test_support::isolate_home(tmp.path());
+
+        let sup = Supervisor::new(VecSink::new());
+        let profile_cfg_path = crate::session::get_profile_dir_path("cursor")
+            .unwrap()
+            .join("config.toml");
+        std::fs::create_dir_all(profile_cfg_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &profile_cfg_path,
+            r#"
+[session.agent_acp_cmd]
+cursor-acp-bridge = "agent acp"
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            sup.agent_is_valid_switch_target("cursor-acp-bridge", "cursor", tmp.path())
+                .await,
+            "custom agent visible in its profile"
+        );
+        // A named profile, not `""`: an empty profile resolves through
+        // `resolve_default_profile`, which with no configured default returns
+        // the first profile that exists, i.e. `cursor` itself.
+        assert!(
+            !sup.agent_is_valid_switch_target("cursor-acp-bridge", "other", tmp.path())
+                .await,
+            "custom agent not visible outside its profile"
+        );
     }
 
     /// #3241: the reattach half of the enforcement. Workers are detached rather
