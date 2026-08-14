@@ -2025,6 +2025,62 @@ mod tests {
             .unwrap_or(false)
     }
 
+    /// The tmux id (`%N`) of `session_name`'s only pane. Call right after
+    /// `new-session`, before any split or extra window, so `-t <session>`
+    /// resolves unambiguously.
+    fn only_pane_id(session_name: &str) -> String {
+        let out = crate::tmux::tmux_command()
+            .args(["display-message", "-t", session_name, "-p", "#{pane_id}"])
+            .output()
+            .expect("tmux display-message");
+        let id = String::from_utf8(out.stdout)
+            .expect("utf8")
+            .trim()
+            .to_string();
+        assert!(!id.is_empty(), "no pane id for session {session_name}");
+        id
+    }
+
+    /// Block until `pane_id` reports `expected` as its current command.
+    ///
+    /// tmux runs a single-string pane command (`"sleep 30"`) through the
+    /// user's shell, so `pane_current_command` reports that shell, which
+    /// `is_shell_command` matches, until it execs into the real command.
+    /// A fixed sleep is a bet on that exec having happened and loses on a
+    /// cold tmux server, where server startup widens the window; wait for
+    /// the exec instead.
+    ///
+    /// Keyed on the pane's own id rather than the `^.0` target so the wait
+    /// never depends on the pane resolution the callers' assertions exist to
+    /// exercise: a targeting regression still fails on the assertion with its
+    /// own message instead of timing out here.
+    fn wait_for_pane_command(pane_id: &str, expected: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let current = crate::tmux::tmux_command()
+                .args([
+                    "display-message",
+                    "-t",
+                    pane_id,
+                    "-p",
+                    "#{pane_current_command}",
+                ])
+                .output()
+                .ok()
+                .and_then(|o| String::from_utf8(o.stdout).ok())
+                .map(|s| s.trim().to_string())
+                .unwrap_or_default();
+            if current == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "pane {pane_id} still reports {current:?}, expected {expected:?}"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     /// Create a detached session for the composite tests, applying the guards
     /// the rest of this module treats as mandatory:
     ///
@@ -3144,6 +3200,7 @@ mod tests {
             .output()
             .expect("tmux new-session");
         assert!(output.status.success());
+        let agent_pane = only_pane_id(&session_name);
 
         // Force base-index 1 to simulate users who have set base-index 1 in
         // their tmux.conf. With base-index 1, window 0 does not exist, so any
@@ -3161,7 +3218,7 @@ mod tests {
             .expect("tmux new-window");
         assert!(output.status.success());
 
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        wait_for_pane_command(&agent_pane, "sleep");
 
         let session = Session {
             name: session_name.clone(),
@@ -3652,6 +3709,7 @@ mod tests {
             .output()
             .expect("tmux new-session");
         assert!(output.status.success());
+        let agent_pane = only_pane_id(&session_name);
 
         // Force base-index 1 to simulate users who have set base-index 1 in
         // their tmux.conf. With base-index 1, window 0 does not exist, so any
@@ -3669,7 +3727,7 @@ mod tests {
             .expect("tmux new-window");
         assert!(output.status.success());
 
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        wait_for_pane_command(&agent_pane, "sleep");
 
         // Should be false: first window runs 'sleep', not a shell.
         // Would incorrectly return true if the active second window (sh) were checked.
@@ -3718,6 +3776,7 @@ mod tests {
             .output()
             .expect("tmux new-session");
         assert!(output.status.success());
+        let agent_pane = only_pane_id(&session_name);
 
         // Split the window -- this creates a new pane running a shell
         let output = crate::tmux::tmux_command()
@@ -3733,7 +3792,7 @@ mod tests {
             .expect("tmux select-pane");
         assert!(output.status.success());
 
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        wait_for_pane_command(&agent_pane, "sleep");
 
         // The agent pane (pane 0) is still alive
         assert!(
@@ -3790,6 +3849,7 @@ mod tests {
             .output()
             .expect("tmux new-session");
         assert!(output.status.success());
+        let agent_pane = only_pane_id(&session_name);
 
         // Simulate a user with pane-base-index 1 globally by setting it on the
         // window -- but aoe has already pinned pane-base-index 0 on the session,
@@ -3805,7 +3865,7 @@ mod tests {
             .expect("tmux split-window");
         assert!(output.status.success());
 
-        std::thread::sleep(std::time::Duration::from_millis(200));
+        wait_for_pane_command(&agent_pane, "sleep");
 
         assert!(
             !is_pane_dead(&session_name),
