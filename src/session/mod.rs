@@ -707,14 +707,30 @@ pub(crate) fn config_path_display() -> String {
         .unwrap_or_else(|_| "config.toml".to_string())
 }
 
+/// Which classes of probe finding a caller wants surfaced.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WarningClass {
+    /// Parse failures and unrecognized keys.
+    All,
+    /// Unrecognized keys only. For paths where a tracing subscriber is already
+    /// running: a parse failure reaches the operator through that sink, but
+    /// ignored keys are collected nowhere else.
+    IgnoredKeysOnly,
+}
+
 /// Format one probe result as a user-visible line, or `None` when the file is
-/// clean. `scope_label` is prefixed to both the parse-failure and the
-/// unrecognized-keys message (e.g. `"global config"`, `"profile config 'foo'"`).
-fn format_probe(probe: &ConfigProbe, scope_label: &str, path_display: &str) -> Option<String> {
+/// clean (or failed to parse under [`WarningClass::IgnoredKeysOnly`], which
+/// carries no ignored-key information anyway). `scope_label` is prefixed to
+/// both messages (e.g. `"global config"`, `"profile config 'foo'"`).
+fn format_probe(
+    probe: &ConfigProbe,
+    scope_label: &str,
+    path_display: &str,
+    class: WarningClass,
+) -> Option<String> {
     if let Some(e) = probe.load_err.as_deref() {
-        Some(format!(
-            "Failed to load {scope_label} ({path_display}); using defaults.\n{e}"
-        ))
+        (class == WarningClass::All)
+            .then(|| format!("Failed to load {scope_label} ({path_display}); using defaults.\n{e}"))
     } else if !probe.ignored_keys.is_empty() {
         Some(format!(
             "Unrecognized keys in {scope_label} ({path_display}) were ignored: {}",
@@ -725,22 +741,42 @@ fn format_probe(probe: &ConfigProbe, scope_label: &str, path_display: &str) -> O
     }
 }
 
-/// Format only the unrecognized-keys half of a probe result. Returns `None`
-/// when the file is clean OR failed to parse: a parse failure would have
-/// been reported by `Config::load_or_warn`'s `tracing::warn!` (assuming a
-/// subscriber is running), and it does not carry ignored-key information.
-fn format_probe_ignored_keys_only(
-    probe: &ConfigProbe,
-    scope_label: &str,
-    path_display: &str,
-) -> Option<String> {
-    if probe.load_err.is_some() || probe.ignored_keys.is_empty() {
+/// Probe the global config and the active profile's config, formatting the
+/// requested classes into one blank-line-separated message.
+fn collect_startup_warnings(profile: &str, class: WarningClass) -> Option<String> {
+    let mut messages: Vec<String> = Vec::new();
+
+    if let Some(msg) = format_probe(
+        &probe_global_config(),
+        "global config",
+        &config_path_display(),
+        class,
+    ) {
+        messages.push(msg);
+    }
+
+    let effective = if profile.is_empty() {
+        config::resolve_default_profile()
+    } else {
+        profile.to_string()
+    };
+    let profile_path_display = profile_config::get_profile_config_path(&effective)
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| format!("profiles/{effective}/config.toml"));
+    let profile_scope = format!("profile config '{effective}'");
+    if let Some(msg) = format_probe(
+        &probe_profile_config(&effective),
+        &profile_scope,
+        &profile_path_display,
+        class,
+    ) {
+        messages.push(msg);
+    }
+
+    if messages.is_empty() {
         None
     } else {
-        Some(format!(
-            "Unrecognized keys in {scope_label} ({path_display}) were ignored: {}",
-            probe.ignored_keys.join(", ")
-        ))
+        Some(messages.join("\n\n"))
     }
 }
 
@@ -751,38 +787,7 @@ fn format_probe_ignored_keys_only(
 /// gives users a chance to see that their settings have been ignored without
 /// needing `AGENT_OF_EMPIRES_DEBUG=1`.
 pub fn collect_startup_config_warnings(profile: &str) -> Option<String> {
-    let mut messages: Vec<String> = Vec::new();
-
-    if let Some(msg) = format_probe(
-        &probe_global_config(),
-        "global config",
-        &config_path_display(),
-    ) {
-        messages.push(msg);
-    }
-
-    let effective = if profile.is_empty() {
-        config::resolve_default_profile()
-    } else {
-        profile.to_string()
-    };
-    let profile_path_display = profile_config::get_profile_config_path(&effective)
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| format!("profiles/{effective}/config.toml"));
-    let profile_scope = format!("profile config '{effective}'");
-    if let Some(msg) = format_probe(
-        &probe_profile_config(&effective),
-        &profile_scope,
-        &profile_path_display,
-    ) {
-        messages.push(msg);
-    }
-
-    if messages.is_empty() {
-        None
-    } else {
-        Some(messages.join("\n\n"))
-    }
+    collect_startup_warnings(profile, WarningClass::All)
 }
 
 /// Like [`collect_startup_config_warnings`], but only the unrecognized-keys
@@ -792,38 +797,7 @@ pub fn collect_startup_config_warnings(profile: &str) -> Option<String> {
 /// helpers, but ignored keys are collected only by this probe, so they must
 /// still be surfaced on stderr even when tracing is up (#3228 CodeRabbit).
 pub fn collect_startup_ignored_key_warnings(profile: &str) -> Option<String> {
-    let mut messages: Vec<String> = Vec::new();
-
-    if let Some(msg) = format_probe_ignored_keys_only(
-        &probe_global_config(),
-        "global config",
-        &config_path_display(),
-    ) {
-        messages.push(msg);
-    }
-
-    let effective = if profile.is_empty() {
-        config::resolve_default_profile()
-    } else {
-        profile.to_string()
-    };
-    let profile_path_display = profile_config::get_profile_config_path(&effective)
-        .map(|p| p.display().to_string())
-        .unwrap_or_else(|_| format!("profiles/{effective}/config.toml"));
-    let profile_scope = format!("profile config '{effective}'");
-    if let Some(msg) = format_probe_ignored_keys_only(
-        &probe_profile_config(&effective),
-        &profile_scope,
-        &profile_path_display,
-    ) {
-        messages.push(msg);
-    }
-
-    if messages.is_empty() {
-        None
-    } else {
-        Some(messages.join("\n\n"))
-    }
+    collect_startup_warnings(profile, WarningClass::IgnoredKeysOnly)
 }
 
 // ── TUI presence ────────────────────────────────────────────────────────────
@@ -1081,9 +1055,33 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_collect_startup_config_warnings_clean() {
-        let _temp = isolate_app_dir();
+        let temp = isolate_app_dir();
         // No config files written = defaults everywhere = no warning.
         assert!(collect_startup_config_warnings("").is_none());
+
+        // A config.toml written by our own serializer must probe clean too.
+        // The ignored-key probe deserializes the file (and, for profiles, a
+        // serialized `Config::default()` with the overrides merged onto it),
+        // so any Serialize/Deserialize asymmetry in the schema would warn
+        // every user on every startup rather than only on a real typo.
+        let dir = app_dir(&temp);
+        fs::write(
+            dir.join("config.toml"),
+            toml::to_string_pretty(&config::Config::default()).unwrap(),
+        )
+        .unwrap();
+        let profile_dir = dir.join("profiles").join("default");
+        fs::create_dir_all(&profile_dir).unwrap();
+        fs::write(
+            profile_dir.join("config.toml"),
+            "description = \"work\"\n[sandbox]\nenabled_by_default = true\n",
+        )
+        .unwrap();
+        let warning = collect_startup_config_warnings("default");
+        assert!(
+            warning.is_none(),
+            "round-tripped config must not warn, got: {warning:?}"
+        );
     }
 
     #[test]
