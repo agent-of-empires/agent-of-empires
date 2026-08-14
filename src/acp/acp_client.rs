@@ -3831,6 +3831,21 @@ fn build_sandbox_docker_argv(
         }
     }
 
+    // Per-adapter env allowlist (#3238). The same keys `apply_env_filter`
+    // forwards on the non-sandboxed paths must also cross the container
+    // boundary, or a sandboxed non-Claude session silently loses its
+    // provider auth (the #3238 symptom). docker only forwards a name handed
+    // to it via `-e`, so each allowlisted host value is set on the runner
+    // (`inherit_env`) and named with `-e KEY`. Claimed after `provider_env`
+    // so a request-scoped credential still wins a key both would set.
+    for (key, value) in allowlisted_env_pairs(config) {
+        if seen_keys.insert(key.clone()) {
+            docker_args.push("-e".into());
+            docker_args.push(key.clone());
+            inherit_env.push((key, value));
+        }
+    }
+
     // Model override (AOE_AGENT_MODEL): the supervisor folds the
     // requested model into provider_env above, so it's already covered.
 
@@ -3909,6 +3924,33 @@ fn inherited_host_env_pairs(config: &SpawnConfig) -> Vec<(String, String)> {
     crate::session::environment::inherited_host_env(profile)
 }
 
+/// Resolve the adapter's `env_allowlist` (#3238) against the operator's live
+/// environment, dropping any key the provider-env deny policy rejects
+/// (`AOE_TOKEN`, infra keys, `LD_*`/`DYLD_*` linker hooks). Shared by all
+/// three spawn paths (detached runner, in-proc stdio, and the docker-exec
+/// sandbox wrap) so the forwarded set and the deny posture cannot drift
+/// between them. Returns `(key, value)` for each allowlisted key present in
+/// the host env, warning on a rejected one. It deliberately does not cover
+/// the daemon->runner carrier `AOE_ACP_AGENT_ENV`; that is
+/// `host_environment_denyreason`'s job, and the runner clears the carrier
+/// before exec regardless.
+fn allowlisted_env_pairs(config: &SpawnConfig) -> Vec<(String, String)> {
+    let Some(allowlist) = config.spec.env_allowlist.as_ref() else {
+        return Vec::new();
+    };
+    let mut pairs = Vec::new();
+    for name in allowlist {
+        if let Some(reason) = provider_env_denyreason(name) {
+            warn!(target: "acp", key = %name, reason, "ignoring env allowlist entry");
+            continue;
+        }
+        if let Ok(value) = std::env::var(name) {
+            pairs.push((name.clone(), value));
+        }
+    }
+    pairs
+}
+
 /// Apply the env_clear + allowlist + provider_env filtering used by both
 /// the detached-runner path and the in-proc stdio path. Pulled out so
 /// the two spawn sites share the same security posture.
@@ -3921,21 +3963,8 @@ fn apply_env_filter(cmd: &mut std::process::Command, config: &SpawnConfig) {
             cmd.env(name, value);
         }
     }
-    if let Some(extra_allowlist) = &config.spec.env_allowlist {
-        for name in extra_allowlist {
-            // Route through the same deny check `provider_env` uses so a
-            // malicious/edited allowlist can't smuggle `AOE_TOKEN`,
-            // `LD_*`/`DYLD_*` linker hooks, or infra keys under the guise of
-            // provider auth. It does not cover the daemon->runner carrier
-            // `AOE_ACP_AGENT_ENV`; only `host_environment_denyreason` rejects
-            // that, and the runner clears it before exec anyway.
-            if provider_env_denyreason(name).is_some() {
-                continue;
-            }
-            if let Ok(value) = std::env::var(name) {
-                cmd.env(name, value);
-            }
-        }
+    for (key, value) in allowlisted_env_pairs(config) {
+        cmd.env(key, value);
     }
     for (key, value) in &config.provider_env {
         if provider_env_denyreason(key).is_some() {
@@ -4398,23 +4427,12 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
             forwarded_keys.push(name);
         }
     }
-    if let Some(extra_allowlist) = &config.spec.env_allowlist {
-        for name in extra_allowlist {
-            // Route through the same deny check `provider_env` uses so a
-            // malicious/edited allowlist can't smuggle `AOE_TOKEN`,
-            // `LD_*`/`DYLD_*` linker hooks, or infra keys under the guise of
-            // provider auth. It does not cover the daemon->runner carrier
-            // `AOE_ACP_AGENT_ENV`; only `host_environment_denyreason` rejects
-            // that, and the runner clears it before exec anyway.
-            if let Some(reason) = provider_env_denyreason(name) {
-                warn!(target: "acp", "ignoring env allowlist entry '{name}' ({reason})");
-                continue;
-            }
-            if let Ok(value) = std::env::var(name) {
-                cmd.env(name, value);
-                forwarded_keys.push(name.as_str());
-            }
-        }
+    // Same allowlist + deny posture as the detached-runner path, via the
+    // shared helper so the two spawn sites cannot drift (#3238).
+    let allowlisted = allowlisted_env_pairs(config);
+    for (key, value) in &allowlisted {
+        cmd.env(key, value);
+        forwarded_keys.push(key.as_str());
     }
     let mut provider_keys: Vec<&str> = Vec::new();
     for (key, value) in &config.provider_env {
@@ -11825,6 +11843,78 @@ mod tests {
         );
     }
 
+    /// #3238 regression guard: the per-adapter `env_allowlist` must cross the
+    /// container boundary for a sandboxed session. Before the fix,
+    /// `build_sandbox_docker_argv` forwarded only `PROVIDER_AUTH_KEYS` +
+    /// `provider_env`, so an operator's `OPENAI_API_KEY` never reached a
+    /// sandboxed `codex`/`aoe-agent` session and auth silently failed. The
+    /// value must ride `inherit_env` (not `-e KEY=VALUE`, which would leak the
+    /// secret into argv), and a denied key (`LD_PRELOAD`) must still be
+    /// dropped even when allowlisted.
+    #[test]
+    #[serial_test::serial]
+    fn build_sandbox_docker_argv_forwards_env_allowlist() {
+        let prev_key = std::env::var("OPENAI_API_KEY").ok();
+        let prev_hook = std::env::var("LD_PRELOAD").ok();
+        std::env::set_var("OPENAI_API_KEY", "sk-openai");
+        std::env::set_var("LD_PRELOAD", "/tmp/evil.so");
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox = SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "alpine:latest".into(),
+            container_name: "aoe-sandbox-allowlist".into(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
+        let mut config = env_test_spawn_config(tmp.path().to_path_buf());
+        config.spec.command = "codex-acp".into();
+        config.spec.env_allowlist = Some(vec!["OPENAI_API_KEY".into(), "LD_PRELOAD".into()]);
+        config.sandbox_info = Some(sandbox.clone());
+
+        let argv = build_sandbox_docker_argv(&config, &sandbox, "/workspace/proj")
+            .expect("docker argv built");
+        match prev_key {
+            Some(v) => std::env::set_var("OPENAI_API_KEY", v),
+            None => std::env::remove_var("OPENAI_API_KEY"),
+        }
+        match prev_hook {
+            Some(v) => std::env::set_var("LD_PRELOAD", v),
+            None => std::env::remove_var("LD_PRELOAD"),
+        }
+
+        assert!(
+            argv.docker_args
+                .windows(2)
+                .any(|w| w[0] == "-e" && w[1] == "OPENAI_API_KEY"),
+            "allowlisted OPENAI_API_KEY must be named with `-e KEY`, got {:?}",
+            argv.docker_args
+        );
+        assert_eq!(
+            argv.inherit_env
+                .iter()
+                .find(|(k, _)| k == "OPENAI_API_KEY")
+                .map(|(_, v)| v.as_str()),
+            Some("sk-openai"),
+            "the value must ride inherit_env so it stays out of argv"
+        );
+        assert!(
+            !argv
+                .docker_args
+                .iter()
+                .any(|a| a.starts_with("OPENAI_API_KEY=")),
+            "secret must not appear as `KEY=VALUE` in argv"
+        );
+        assert!(
+            !argv.docker_args.iter().any(|a| a == "LD_PRELOAD")
+                && !argv.inherit_env.iter().any(|(k, _)| k == "LD_PRELOAD"),
+            "a denied linker hook must not cross the boundary even when allowlisted, got {:?}",
+            argv.docker_args
+        );
+    }
+
     /// Write a scripted stdio ACP agent for the conversation-reset tests
     /// (#2979): answers `initialize`, mints `sid-1`, `sid-2`, ... on each
     /// `session/new` (each carrying a `thought_level` config option so the
@@ -15255,6 +15345,59 @@ done
         assert!(
             !applied.contains_key("GEMINI_API_KEY"),
             "aoe-agent (AI-SDK) must not receive the gemini-CLI-native key, got {applied:#?}"
+        );
+    }
+
+    /// #3238 security posture: `spec.env_allowlist` (which a custom-agent
+    /// definition or an edited config could populate) must not become a
+    /// smuggling channel. Every entry runs through `provider_env_denyreason`,
+    /// so `AOE_TOKEN` and `LD_*`/`DYLD_*` linker hooks are dropped even when
+    /// the operator's environment has them set, while a legitimate provider
+    /// key still forwards. The deny predicate the fix routes through had
+    /// positive coverage only.
+    #[test]
+    #[serial_test::serial]
+    fn apply_env_filter_drops_denied_allowlist_entries() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("OPENAI_API_KEY", "sk-openai"),
+            ("AOE_TOKEN", "daemon-secret"),
+            ("LD_PRELOAD", "/tmp/evil.so"),
+        ]);
+
+        let mut config = env_test_spawn_config(tmp.path().to_path_buf());
+        config.spec.env_allowlist = Some(vec![
+            "OPENAI_API_KEY".into(),
+            "AOE_TOKEN".into(),
+            "LD_PRELOAD".into(),
+        ]);
+
+        let mut cmd = std::process::Command::new("/bin/true");
+        cmd.env_clear();
+        apply_env_filter(&mut cmd, &config);
+
+        let applied: std::collections::HashMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        assert_eq!(
+            applied.get("OPENAI_API_KEY").map(String::as_str),
+            Some("sk-openai"),
+            "a legitimately allowlisted provider key must forward"
+        );
+        assert!(
+            !applied.contains_key("AOE_TOKEN"),
+            "the daemon auth token must never reach the agent, got {applied:#?}"
+        );
+        assert!(
+            !applied.contains_key("LD_PRELOAD"),
+            "a linker hook must be denied even when allowlisted, got {applied:#?}"
         );
     }
 
