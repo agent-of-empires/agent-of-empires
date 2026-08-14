@@ -2018,3 +2018,54 @@ fn test_cli_send_waits_for_slow_boot_before_typing() {
         .args(["kill-session", "-t", &tmux_name])
         .output();
 }
+
+/// #3350: the `aoe list --state` contract a scripted consumer relies on.
+/// A trashed session must report `state: "trashed"` with a `trashed_at`
+/// stamp, must be excluded by `--state=live`, and the resulting empty
+/// listing must still be `[]` on the `--json` path rather than the
+/// human "No sessions found" line, which a `jq` consumer cannot parse.
+#[test]
+#[parallel]
+fn test_cli_list_state_filter_and_json_shape() {
+    let h = TuiTestHarness::new("cli_list_state");
+    let project = h.project_path();
+
+    let add = h.run_cli(&["add", project.to_str().unwrap(), "-t", "State Probe"]);
+    assert!(
+        add.status.success(),
+        "aoe add failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    let live: serde_json::Value =
+        serde_json::from_slice(&h.run_cli(&["list", "--json", "--state=live"]).stdout)
+            .expect("list --json --state=live must emit JSON");
+    assert_eq!(live[0]["state"], "live");
+    assert!(live[0].get("trashed_at").is_none());
+
+    let rm = h.run_cli(&["rm", "State Probe"]);
+    assert!(
+        rm.status.success(),
+        "aoe rm failed: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+
+    let all: serde_json::Value = serde_json::from_slice(&h.run_cli(&["list", "--json"]).stdout)
+        .expect("list --json must emit JSON");
+    assert_eq!(all[0]["state"], "trashed");
+    assert!(all[0]["trashed_at"].is_string());
+
+    let out = h.run_cli(&["list", "--json", "--state=live"]);
+    let empty: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap_or_else(|e| {
+        panic!(
+            "list --json with no matching rows must emit `[]`, got {:?} ({e})",
+            String::from_utf8_lossy(&out.stdout)
+        )
+    });
+    assert_eq!(empty, serde_json::json!([]));
+
+    let trashed: serde_json::Value =
+        serde_json::from_slice(&h.run_cli(&["list", "--json", "--state=trashed"]).stdout)
+            .expect("list --json --state=trashed must emit JSON");
+    assert_eq!(trashed[0]["title"], "State Probe");
+}

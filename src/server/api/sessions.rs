@@ -595,10 +595,6 @@ pub async fn get_recent_projects() -> Json<RecentProjectsResponse> {
     Json(RecentProjectsResponse { projects })
 }
 
-/// Archival scope for `GET /api/sessions?state=`. `Live` excludes archived
-/// and trashed rows so a headless dispatcher polling the list doesn't have
-/// to know to filter `trashed_at`/`archived_at` client-side; `All` (or no
-/// `state` param) keeps the historical unfiltered behavior the web
 /// Query params for `GET /api/sessions`. `state` shares its vocabulary with
 /// the CLI's `aoe list --state` via [`crate::session::SessionScope`] so a
 /// future third caller cannot drift.

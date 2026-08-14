@@ -4,7 +4,7 @@ use anyhow::Result;
 use clap::{Args, ValueEnum};
 use serde::Serialize;
 
-use crate::session::{Instance, SessionScope, Storage};
+use crate::session::{Instance, SessionBucket, SessionScope, Storage};
 
 const TABLE_COL_TITLE: usize = 20;
 const TABLE_COL_GROUP: usize = 15;
@@ -49,29 +49,30 @@ pub struct ListArgs {
     #[arg(long)]
     all: bool,
 
-    /// Filter by session state. Default is `all` (every persisted session,
-    /// which is what `aoe list` has always shown). #3350 added the flag so a
-    /// scripted consumer can pass `--state=live` to skip trashed and
-    /// archived rows without a second `aoe session list-trash` shellout,
-    /// mirroring the REST API's `state=live|trashed|all` from #3187.
-    /// Rejects any other value at parse time.
+    /// Filter by session state. Defaults to `all`, every persisted session,
+    /// which is what `aoe list` has always shown. Pass `--state=live` to skip
+    /// trashed and archived rows; the vocabulary matches the REST API's
+    /// `GET /api/sessions?state=`.
     #[arg(long, value_enum, default_value_t = StateFilter::All)]
     state: StateFilter,
 }
 
 /// Simple string tag describing whether a session is live/archived/trashed,
 /// exposed alongside `trashed_at`/`archived_at` in `--json` so a consumer
-/// keying on state does not have to reason about the timestamps itself. The
-/// wire values match [`SessionScope`] (`live`/`trashed`), plus `archived`
-/// for the archive-but-not-trash case which the API happens to fold into
-/// `live` today.
+/// keying on state does not have to reason about the timestamps itself.
+/// `live` and `trashed` are the [`SessionScope`] filter vocabulary; `archived`
+/// is an output-only third value, since `--state=archived` is not a filter the
+/// API offers either (an archived row is excluded by `live` and by `trashed`,
+/// and only shows under `all`).
+///
+/// Derived from [`Instance::effective_bucket`] so the `Trashed > Archived >
+/// Active` precedence has exactly one definition: an archived row that is then
+/// trashed keeps its `archived_at` but reports `trashed`.
 fn state_tag(inst: &Instance) -> &'static str {
-    if inst.is_trashed() {
-        "trashed"
-    } else if inst.is_archived() {
-        "archived"
-    } else {
-        "live"
+    match inst.effective_bucket() {
+        SessionBucket::Trashed => "trashed",
+        SessionBucket::Archived => "archived",
+        SessionBucket::Active => "live",
     }
 }
 
@@ -94,9 +95,10 @@ struct SessionJson {
     /// second `aoe session list-trash` shellout.
     #[serde(skip_serializing_if = "Option::is_none")]
     trashed_at: Option<chrono::DateTime<chrono::Utc>>,
-    /// Set iff the session is currently archived (trash's a strict superset
-    /// of archived on the store, but the two states are semantically distinct
-    /// and #3350's follow-up comment asked for archive to be readable too).
+    /// Set iff the session is currently archived. Orthogonal to `trashed_at`
+    /// on the store: `trash()` deliberately leaves `archived_at` alone so a
+    /// restore is faithful, so both keys can be present at once and `state`
+    /// reports `trashed` in that case.
     #[serde(skip_serializing_if = "Option::is_none")]
     archived_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Empty for single-repo sessions; populated with one entry per repo
@@ -261,17 +263,22 @@ pub async fn run(profile: &str, args: ListArgs) -> Result<()> {
         .filter(|inst| SessionScope::matches(Some(scope), inst))
         .collect();
 
-    if instances.is_empty() {
-        println!("No sessions found in profile '{}'.", storage.profile());
-        return Ok(());
-    }
-
+    // `--json` is answered before the empty-listing message: an empty result is
+    // `[]`, never human prose on stdout, matching `aoe ps --json` and `aoe group
+    // list --json`. `--state=live` makes this reachable with sessions present
+    // (a profile whose rows are all trashed), which is precisely the scripted
+    // consumer #3350 is about.
     if args.json {
         let sessions: Vec<SessionJson> = instances
             .iter()
             .map(|inst| session_json(inst, storage.profile()))
             .collect();
         super::output::print_json(&sessions)?;
+        return Ok(());
+    }
+
+    if instances.is_empty() {
+        println!("No sessions found in profile '{}'.", storage.profile());
         return Ok(());
     }
 
