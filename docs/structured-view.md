@@ -43,7 +43,7 @@ The structured view always forwards `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`,
 | `gemini` | `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GOOGLE_GENAI_USE_VERTEXAI`, `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION` |
 | `aoe-agent` | `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `GOOGLE_GENERATIVE_AI_API_KEY` |
 
-`vibe`, `pi`, `omp`, and `kimi` forward nothing extra yet. Until their variables are verified, give them auth through the per-session `extra_env` field or `environment` in your config, or set `session.inherit_host_environment = true` to forward your whole `aoe serve` environment to non-sandboxed agents. In a sandboxed session the per-adapter provider keys above still cross the container boundary (forwarded as `docker exec -e` flags), but `inherit_host_environment` does not; give a sandboxed not-yet-verified adapter its auth through `sandbox.environment`.
+`vibe`, `pi`, `omp`, and `kimi` forward nothing extra yet. Until their variables are verified, give them auth through the per-session `extra_env` field or `environment` in your config, or set `session.inherit_host_environment = true` to forward your whole `aoe serve` environment to non-sandboxed agents. In a sandboxed session the per-adapter provider keys above still cross the container boundary (forwarded as `docker exec -e` flags), but `inherit_host_environment` does not; give a sandboxed not-yet-verified adapter its auth through `sandbox.environment`. Two entries are host-only and never cross: `CODEX_HOME` and `GOOGLE_APPLICATION_CREDENTIALS` name paths on your machine that do not exist inside the container, and the agent's config dir is already bind-mounted at its canonical container location.
 
 ### Feature matrix
 

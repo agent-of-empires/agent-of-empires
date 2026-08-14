@@ -3821,7 +3821,17 @@ fn build_sandbox_docker_argv(
     // provider auth (the #3238 symptom). docker only forwards a name handed
     // to it via `-e`, so each allowlisted host value is set on the runner
     // (`inherit_env`) and named with `-e KEY`.
+    //
+    // Value-typed entries only, for the same reason `PROVIDER_AUTH_KEYS` below
+    // omits `CLAUDE_CONFIG_DIR`: a host path names nothing inside the
+    // container, so forwarding it points the adapter at a directory that does
+    // not exist instead of the one `AGENT_CONFIG_MOUNTS` bind-mounts at the
+    // canonical container path. These keys stay host-only and keep flowing on
+    // the two non-sandboxed spawn paths, where they are the point.
     for (key, value) in allowlisted_env_pairs(config) {
+        if is_host_only_path_env(&key) {
+            continue;
+        }
         if seen_keys.insert(key.clone()) {
             docker_args.push("-e".into());
             docker_args.push(key.clone());
@@ -3928,6 +3938,22 @@ fn inherited_host_env_pairs(config: &SpawnConfig) -> Vec<(String, String)> {
     }
     let profile = config.source_profile.as_deref().unwrap_or_default();
     crate::session::environment::inherited_host_env(profile)
+}
+
+/// Allowlist entries whose value is a host filesystem path rather than a
+/// credential. They are legitimate on the two host spawn paths and must not
+/// cross into a container: the path names nothing there, so forwarding it
+/// points the adapter away from the config dir `AGENT_CONFIG_MOUNTS` mounts
+/// at the canonical container location. `CLAUDE_CONFIG_DIR` is the case that
+/// established the rule (it is deliberately absent from `PROVIDER_AUTH_KEYS`
+/// in `build_sandbox_docker_argv`); the other two arrived with the per-adapter
+/// allowlists in #3238. Adding a path-valued key to `env_allowlist_for`
+/// means adding it here too.
+fn is_host_only_path_env(key: &str) -> bool {
+    matches!(
+        key,
+        "CLAUDE_CONFIG_DIR" | "CODEX_HOME" | "GOOGLE_APPLICATION_CREDENTIALS"
+    )
 }
 
 /// Resolve the adapter's `env_allowlist` (#3238) against the operator's live
@@ -11774,20 +11800,34 @@ mod tests {
         );
     }
 
-    /// `CLAUDE_CONFIG_DIR` is a host filesystem path, not a value, so
-    /// it must NOT be auto-forwarded into the container even when set
-    /// on the host. The agent's config dir is bind-mounted at the
-    /// canonical container path by `AGENT_CONFIG_MOUNTS`.
+    /// A host filesystem path is not a credential, so it must NOT be
+    /// auto-forwarded into the container even when set on the host and even
+    /// when the adapter's `env_allowlist` names it (#3238). The path resolves
+    /// to nothing inside the container, so forwarding it points the adapter
+    /// away from the config dir `AGENT_CONFIG_MOUNTS` bind-mounts at the
+    /// canonical container location. `CLAUDE_CONFIG_DIR` established the rule;
+    /// `CODEX_HOME` and `GOOGLE_APPLICATION_CREDENTIALS` reach the same
+    /// function through the per-adapter allowlists.
     ///
     /// Tagged `#[serial]` because the test mutates the process-wide
     /// env; parallel readers of `std::env::var` would race.
     #[test]
     #[serial_test::serial]
-    fn build_sandbox_docker_argv_drops_host_only_claude_config_dir() {
-        // Set the env var to simulate the host having it; the function
-        // under test must still skip it.
-        let prev = std::env::var("CLAUDE_CONFIG_DIR").ok();
-        std::env::set_var("CLAUDE_CONFIG_DIR", "/Users/operator/.claude");
+    fn build_sandbox_docker_argv_drops_host_only_path_env() {
+        // Set the vars to simulate the host having them; the function under
+        // test must still skip every one. `OPENAI_API_KEY` rides along as the
+        // control: a value-typed allowlist entry alongside them must still
+        // cross, or the assertion below would pass on a function that forwards
+        // nothing at all.
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("CLAUDE_CONFIG_DIR", "/Users/operator/.claude"),
+            ("CODEX_HOME", "/Users/operator/.codex"),
+            (
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                "/Users/operator/gcp-key.json",
+            ),
+            ("OPENAI_API_KEY", "sk-test-value"),
+        ]);
         let tmp = tempfile::tempdir().unwrap();
         let sandbox = SandboxInfo {
             enabled: true,
@@ -11800,13 +11840,18 @@ mod tests {
             container_workdir: None,
         };
         let config = SpawnConfig {
-            agent_key: "claude".into(),
-            tool: "claude".into(),
+            agent_key: "codex".into(),
+            tool: "codex".into(),
             spec: AgentSpec {
-                command: "claude-agent-acp".into(),
+                command: "codex-acp".into(),
                 args: vec![],
                 description: "test".into(),
-                env_allowlist: None,
+                env_allowlist: Some(vec![
+                    "CLAUDE_CONFIG_DIR".into(),
+                    "CODEX_HOME".into(),
+                    "GOOGLE_APPLICATION_CREDENTIALS".into(),
+                    "OPENAI_API_KEY".into(),
+                ]),
             },
             cwd: tmp.path().to_path_buf(),
             additional_dirs: vec![],
@@ -11825,27 +11870,35 @@ mod tests {
         };
         let argv = build_sandbox_docker_argv(&config, &sandbox, "/workspace/proj")
             .expect("docker argv built");
-        match prev {
-            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
-            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+
+        for key in [
+            "CLAUDE_CONFIG_DIR",
+            "CODEX_HOME",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+        ] {
+            assert!(
+                !argv.docker_args.iter().any(|a| a == key),
+                "{key} is a host path and must not be forwarded as `-e KEY`"
+            );
+            assert!(
+                !argv
+                    .docker_args
+                    .iter()
+                    .any(|a| a.starts_with(&format!("{key}="))),
+                "{key} must not appear as a literal `KEY=VALUE` either"
+            );
+            assert!(
+                !argv.inherit_env.iter().any(|(k, _)| k == key),
+                "{key} must not land in inherit_env"
+            );
         }
-        assert!(
-            !argv.docker_args.iter().any(|a| a == "CLAUDE_CONFIG_DIR"),
-            "CLAUDE_CONFIG_DIR is a host path and must not be forwarded as `-e KEY`"
-        );
-        assert!(
-            !argv
-                .docker_args
+        assert_eq!(
+            argv.inherit_env
                 .iter()
-                .any(|a| a.starts_with("CLAUDE_CONFIG_DIR=")),
-            "CLAUDE_CONFIG_DIR must not appear as a literal `KEY=VALUE` either"
-        );
-        assert!(
-            !argv
-                .inherit_env
-                .iter()
-                .any(|(k, _)| k == "CLAUDE_CONFIG_DIR"),
-            "CLAUDE_CONFIG_DIR must not land in inherit_env"
+                .find(|(k, _)| k == "OPENAI_API_KEY")
+                .map(|(_, v)| v.as_str()),
+            Some("sk-test-value"),
+            "the value-typed allowlist entry must still cross the boundary"
         );
     }
 
