@@ -2,7 +2,7 @@
 //! `aoe-agent`, `gemini`) to a spawn command + args. Users add agents via
 //! the settings TUI; this module is the in-memory model.
 
-use super::install_hints::{env_allowlist_for, install_hint_for};
+use super::install_hints::{env_allowlist_for, install_hint_for, AOE_AGENT_BINARY};
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -189,9 +189,9 @@ impl AgentRegistry {
                 command: "${aoe_data_dir}/acp-worker/dist/aoe-agent".into(),
                 args: vec![],
                 description: "aoe's bundled multi-provider agent (Vercel AI SDK)".into(),
-                // Literal binary token, NOT `command` (which carries an
+                // Shared binary token, NOT `command` (which carries an
                 // unresolved `${aoe_data_dir}` placeholder here).
-                env_allowlist: default_env_allowlist("aoe-agent"),
+                env_allowlist: default_env_allowlist(AOE_AGENT_BINARY),
             },
         );
         reg
@@ -337,6 +337,25 @@ mod tests {
                 "{name} must have None env_allowlist until source-verified"
             );
         }
+
+        // Structural link between the registry and `env_allowlist_for`: exactly
+        // these adapters carry an allowlist. Adding an arm to `env_allowlist_for`
+        // (or a new default agent) without updating this set, or dropping an
+        // existing arm, fails here rather than silently changing what a spawn
+        // forwards.
+        let with_allowlist: std::collections::BTreeSet<&str> = reg
+            .list()
+            .into_iter()
+            .filter(|(_, spec)| spec.env_allowlist.is_some())
+            .map(|(name, _)| name.as_str())
+            .collect();
+        assert_eq!(
+            with_allowlist,
+            ["aoe-agent", "codex", "gemini", "opencode"]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>(),
+            "the set of adapters with an env_allowlist changed; update env_allowlist_for and this assertion together"
+        );
     }
 
     #[test]

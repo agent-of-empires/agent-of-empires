@@ -4,6 +4,13 @@
 //! the ACP handshake failure path so the user sees the correct command
 //! for whichever agent they tried to spawn.
 
+/// Friendly binary token for aoe's bundled multi-provider agent. Shared by the
+/// registry's spawn registration and [`env_allowlist_for`] so the two cannot
+/// drift onto different spellings (which would silently drop the agent's
+/// provider keys). Distinct from `AgentSpec.command`, whose value for this
+/// agent is the placeholder-templated `${aoe_data_dir}/...` path.
+pub const AOE_AGENT_BINARY: &str = "aoe-agent";
+
 /// Returns the install command for a known ACP binary, or `None` for
 /// unknown commands so callers can fall through to a generic message.
 pub fn install_hint_for(binary: &str) -> Option<&'static str> {
@@ -51,7 +58,7 @@ pub fn npm_package_for(binary: &str) -> Option<&'static str> {
 /// names came from; do not add one on convention alone.
 ///
 /// The key is the friendly binary token used at registration time (e.g.
-/// `"aoe-agent"`), NOT `AgentSpec.command`. `command` for `aoe-agent`
+/// [`AOE_AGENT_BINARY`]), NOT `AgentSpec.command`. `command` for `aoe-agent`
 /// carries a `${aoe_data_dir}/...` placeholder that is substituted at
 /// spawn time (`supervisor.rs`), so keying on it here would silently
 /// miss the bundled agent.
@@ -64,7 +71,7 @@ pub fn env_allowlist_for(binary: &str) -> &'static [&'static str] {
         // OPENAI_BASE_URL (src/openai-provider.ts); @ai-sdk/google 4.0.31 reads
         // GOOGLE_GENERATIVE_AI_API_KEY, NOT GEMINI_API_KEY (the gemini CLI's
         // own name).
-        "aoe-agent" => &[
+        AOE_AGENT_BINARY => &[
             "OPENAI_API_KEY",
             "OPENAI_BASE_URL",
             "GOOGLE_GENERATIVE_AI_API_KEY",
