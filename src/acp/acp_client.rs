@@ -3924,9 +3924,11 @@ fn apply_env_filter(cmd: &mut std::process::Command, config: &SpawnConfig) {
     if let Some(extra_allowlist) = &config.spec.env_allowlist {
         for name in extra_allowlist {
             // Route through the same deny check `provider_env` uses so a
-            // malicious/edited allowlist can't smuggle `AOE_TOKEN`, an
-            // `AOE_*`-prefixed daemon carrier, `LD_*`/`DYLD_*` linker hooks,
-            // or infra keys under the guise of provider auth.
+            // malicious/edited allowlist can't smuggle `AOE_TOKEN`,
+            // `LD_*`/`DYLD_*` linker hooks, or infra keys under the guise of
+            // provider auth. It does not cover the daemon->runner carrier
+            // `AOE_ACP_AGENT_ENV`; only `host_environment_denyreason` rejects
+            // that, and the runner clears it before exec anyway.
             if provider_env_denyreason(name).is_some() {
                 continue;
             }
@@ -4399,9 +4401,11 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
     if let Some(extra_allowlist) = &config.spec.env_allowlist {
         for name in extra_allowlist {
             // Route through the same deny check `provider_env` uses so a
-            // malicious/edited allowlist can't smuggle `AOE_TOKEN`, an
-            // `AOE_*`-prefixed daemon carrier, `LD_*`/`DYLD_*` linker hooks,
-            // or infra keys under the guise of provider auth.
+            // malicious/edited allowlist can't smuggle `AOE_TOKEN`,
+            // `LD_*`/`DYLD_*` linker hooks, or infra keys under the guise of
+            // provider auth. It does not cover the daemon->runner carrier
+            // `AOE_ACP_AGENT_ENV`; only `host_environment_denyreason` rejects
+            // that, and the runner clears it before exec anyway.
             if let Some(reason) = provider_env_denyreason(name) {
                 warn!(target: "acp", "ignoring env allowlist entry '{name}' ({reason})");
                 continue;
@@ -15206,7 +15210,8 @@ done
     /// #3238: `AgentSpec.env_allowlist` populated by `with_defaults` must
     /// reach the agent via `apply_env_filter`. Uses the `aoe-agent` spec (the
     /// one that would silently no-op if we keyed `env_allowlist_for` on
-    /// `spec.command` — placeholder-templated — instead of the binary token).
+    /// `spec.command`, which is placeholder-templated, instead of the binary
+    /// token).
     /// A negative case rides along: `GEMINI_API_KEY` is set but not in the
     /// AI-SDK-based `aoe-agent`'s allowlist, so it must NOT be forwarded.
     #[test]

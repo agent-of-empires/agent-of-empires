@@ -273,7 +273,12 @@ mod tests {
         assert_eq!(
             al("codex").as_deref(),
             Some(
-                &["OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_HOME"][..]
+                &[
+                    "CODEX_API_KEY",
+                    "OPENAI_API_KEY",
+                    "OPENAI_BASE_URL",
+                    "CODEX_HOME"
+                ][..]
                     .iter()
                     .map(|s| s.to_string())
                     .collect::<Vec<_>>()[..]
@@ -282,7 +287,11 @@ mod tests {
         assert_eq!(
             al("aoe-agent").as_deref(),
             Some(
-                &["OPENAI_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY"][..]
+                &[
+                    "OPENAI_API_KEY",
+                    "OPENAI_BASE_URL",
+                    "GOOGLE_GENERATIVE_AI_API_KEY"
+                ][..]
                     .iter()
                     .map(|s| s.to_string())
                     .collect::<Vec<_>>()[..]
@@ -293,11 +302,32 @@ mod tests {
         let gemini = al("gemini").unwrap_or_default();
         assert!(gemini.iter().any(|k| k == "GEMINI_API_KEY"));
         assert!(!gemini.iter().any(|k| k == "GOOGLE_GENERATIVE_AI_API_KEY"));
+        // Vertex is dead without the switch that selects it and the region
+        // that pairs with the project, so the credential alone is not enough.
+        for key in [
+            "GOOGLE_GENAI_USE_VERTEXAI",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+            "GOOGLE_CLOUD_PROJECT",
+            "GOOGLE_CLOUD_LOCATION",
+        ] {
+            assert!(gemini.iter().any(|k| k == key), "gemini missing {key}");
+        }
         let aoe = al("aoe-agent").unwrap_or_default();
         assert!(!aoe.iter().any(|k| k == "GEMINI_API_KEY"));
 
+        // opencode resolves providers through models.dev, whose `google` entry
+        // declares all three Google key names, so a user with any one of them
+        // exported must authenticate.
         let opencode = al("opencode").unwrap_or_default();
-        assert!(opencode.iter().any(|k| k == "OPENROUTER_API_KEY"));
+        for key in [
+            "OPENROUTER_API_KEY",
+            "OPENCODE_API_KEY",
+            "GOOGLE_GENERATIVE_AI_API_KEY",
+            "GOOGLE_API_KEY",
+            "GEMINI_API_KEY",
+        ] {
+            assert!(opencode.iter().any(|k| k == key), "opencode missing {key}");
+        }
 
         // Deferred + Claude: intentionally None until each adapter's env
         // reads are verified from its own source.

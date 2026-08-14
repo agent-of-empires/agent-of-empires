@@ -47,7 +47,8 @@ pub fn npm_package_for(binary: &str) -> Option<&'static str> {
 /// deferred because their env-var names could not be source-verified for
 /// #3238 and shipping a guess that never matches would silently no-op
 /// the fix. Follow-up: verify each adapter's real reads from its own
-/// package/binary and add its arm.
+/// package/binary and add its arm. Every arm below cites the artifact its
+/// names came from; do not add one on convention alone.
 ///
 /// The key is the friendly binary token used at registration time (e.g.
 /// `"aoe-agent"`), NOT `AgentSpec.command`. `command` for `aoe-agent`
@@ -56,33 +57,54 @@ pub fn npm_package_for(binary: &str) -> Option<&'static str> {
 /// miss the bundled agent.
 pub fn env_allowlist_for(binary: &str) -> &'static [&'static str] {
     match binary {
-        // Verified from source: acp-worker/aoe-agent/src/index.ts imports
-        // only @ai-sdk/{anthropic,openai,google}. Anthropic is already in
-        // ALWAYS_FORWARD_ENV. @ai-sdk/google reads GOOGLE_GENERATIVE_AI_API_KEY
-        // (NOT GEMINI_API_KEY, which is the gemini-CLI-native name).
-        "aoe-agent" => &["OPENAI_API_KEY", "GOOGLE_GENERATIVE_AI_API_KEY"],
-        // Verified from canonical provider env names: codex reads OpenAI SDK
-        // env (OPENAI_API_KEY/BASE_URL) and CODEX_HOME to reuse the operator's
-        // `codex login` auth.json.
-        "codex-acp" => &["OPENAI_API_KEY", "OPENAI_BASE_URL", "CODEX_HOME"],
-        // Verified from canonical AI-SDK provider names: opencode is
-        // AI-SDK-based (Google reads GOOGLE_GENERATIVE_AI_API_KEY, distinct
-        // from gemini CLI-native GEMINI_API_KEY). OPENROUTER is a common
-        // opencode target. OPENCODE_API_KEY covers OpenCode Cloud auth.
+        // Verified from source: acp-worker/aoe-agent/src/index.ts imports only
+        // @ai-sdk/{anthropic,openai,google}, and those providers read their key
+        // from the environment themselves. Anthropic is already in
+        // ALWAYS_FORWARD_ENV. @ai-sdk/openai 4.0.27 reads OPENAI_API_KEY and
+        // OPENAI_BASE_URL (src/openai-provider.ts); @ai-sdk/google 4.0.31 reads
+        // GOOGLE_GENERATIVE_AI_API_KEY, NOT GEMINI_API_KEY (the gemini CLI's
+        // own name).
+        "aoe-agent" => &[
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+            "GOOGLE_GENERATIVE_AI_API_KEY",
+        ],
+        // Verified from codex-acp 1.3.0 (dist, `readApiKeyFromEnv`): it takes
+        // CODEX_API_KEY first, then OPENAI_API_KEY. It then execs the codex
+        // CLI, which resolves its config dir from CODEX_HOME and its endpoint
+        // from OPENAI_BASE_URL, so both ride along for the operator's
+        // `codex login` auth.json and any proxy endpoint.
+        "codex-acp" => &[
+            "CODEX_API_KEY",
+            "OPENAI_API_KEY",
+            "OPENAI_BASE_URL",
+            "CODEX_HOME",
+        ],
+        // Verified from the models.dev provider registry opencode resolves
+        // against: its `google` entry accepts GOOGLE_API_KEY,
+        // GOOGLE_GENERATIVE_AI_API_KEY, and GEMINI_API_KEY alike, so all three
+        // are here. OPENROUTER_API_KEY and OPENCODE_API_KEY (OpenCode Zen) are
+        // the `openrouter` / `opencode` entries' declared env.
         "opencode" => &[
             "OPENAI_API_KEY",
             "GOOGLE_GENERATIVE_AI_API_KEY",
+            "GOOGLE_API_KEY",
+            "GEMINI_API_KEY",
             "OPENROUTER_API_KEY",
             "OPENCODE_API_KEY",
         ],
-        // Verified from canonical Google Gemini CLI env: uses the CLI-native
-        // names (distinct from AI-SDK's GOOGLE_GENERATIVE_AI_API_KEY), plus
-        // Vertex/ADC (GOOGLE_APPLICATION_CREDENTIALS, GOOGLE_CLOUD_PROJECT).
+        // Verified from @google/gemini-cli 0.55.1: CLI-native GEMINI_API_KEY /
+        // GOOGLE_API_KEY (distinct from AI-SDK's GOOGLE_GENERATIVE_AI_API_KEY),
+        // plus the Vertex set. GOOGLE_GENAI_USE_VERTEXAI is what selects Vertex
+        // at all, and GOOGLE_CLOUD_LOCATION pairs with GOOGLE_CLOUD_PROJECT, so
+        // forwarding the credential without them leaves that path dead.
         "gemini" => &[
             "GEMINI_API_KEY",
             "GOOGLE_API_KEY",
+            "GOOGLE_GENAI_USE_VERTEXAI",
             "GOOGLE_APPLICATION_CREDENTIALS",
             "GOOGLE_CLOUD_PROJECT",
+            "GOOGLE_CLOUD_LOCATION",
         ],
         _ => &[],
     }

@@ -34,7 +34,16 @@ The `npm install -g` commands above are optional: `aoe acp doctor --fix` install
 
 Tools not yet wired into the registry (aider, cursor, copilot, droid, hermes, kiro) always run in the terminal view. A **custom agent** can opt in by setting an ACP launch command via `agent_acp_cmd` (see [Configuration](guides/configuration.md#running-a-custom-agent-in-the-structured-view)).
 
-The structured view always forwards `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, and `CLAUDE_CONFIG_DIR` to the agent. For other agents, set their auth env in the environment that runs `aoe serve` (or the per-session `extra_env` field).
+The structured view always forwards `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, and `CLAUDE_CONFIG_DIR` to every agent. Four adapters additionally receive the provider variables they are known to read, from the environment that runs `aoe serve`:
+
+| Adapter | Also forwarded |
+|---|---|
+| `codex` | `CODEX_API_KEY`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `CODEX_HOME` |
+| `opencode` | `OPENAI_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY`, `GOOGLE_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `OPENCODE_API_KEY` |
+| `gemini` | `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GOOGLE_GENAI_USE_VERTEXAI`, `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION` |
+| `aoe-agent` | `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `GOOGLE_GENERATIVE_AI_API_KEY` |
+
+`vibe`, `pi`, `omp`, and `kimi` forward nothing extra yet; set their auth through the per-session `extra_env` field, or through `environment` in your config, until their variables are verified. Sandboxed sessions take `sandbox.environment` instead: the list above does not cross the container boundary.
 
 ### Feature matrix
 
