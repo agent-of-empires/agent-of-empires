@@ -33,7 +33,7 @@ async function openTranscript(page: Page) {
 
   const mock = await mockAcpSession(page, {
     title: "story-font-size",
-    initialEvents: [agentMessageChunk("# heading\n\nplain paragraph text"), stopped()],
+    initialEvents: [agentMessageChunk("# heading\n\nplain paragraph text\n\n```\nfenced code\n```"), stopped()],
   });
   await openStructuredSession(page, mock);
 
@@ -43,6 +43,14 @@ async function openTranscript(page: Page) {
 }
 
 const fontSizeOf = (locator: ReturnType<Page["locator"]>) => locator.evaluate((el) => getComputedStyle(el).fontSize);
+
+/** Computed line-height as a ratio of the element's own font size, so the
+ *  assertion holds at any base size. */
+const leadingRatioOf = (locator: ReturnType<Page["locator"]>) =>
+  locator.evaluate((el) => {
+    const cs = getComputedStyle(el);
+    return Number.parseFloat(cs.lineHeight) / Number.parseFloat(cs.fontSize);
+  });
 
 test.describe("structured view conversation font size (fine pointer)", () => {
   test.use({ viewport: { width: 1200, height: 800 }, hasTouch: false });
@@ -55,6 +63,14 @@ test.describe("structured view conversation font size (fine pointer)", () => {
     // Headings are `em`, so the whole hierarchy follows the base rather than
     // only paragraphs changing (1.43em * 20px).
     expect(await fontSizeOf(heading)).toBe("28.6px");
+
+    // Fenced code scales with the base (0.86em) but keeps the tight leading the
+    // old `text-xs` gave it: Tailwind's `--tw-leading` is `inherits: false`, so
+    // an em-sized block with no leading of its own would silently pick up the
+    // root's `leading-relaxed` (1.625) and render code much looser than before.
+    const codeBlock = body.locator("pre").first();
+    expect(await fontSizeOf(codeBlock)).toBe("17.2px");
+    expect(await leadingRatioOf(codeBlock)).toBeCloseTo(1.3333, 3);
 
     // A narrow desktop window is not mobile: without the pointer term this
     // would wrongly drop to the mobile size.
