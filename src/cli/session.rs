@@ -2240,13 +2240,16 @@ async fn set_base(profile: &str, args: SetBaseArgs) -> Result<()> {
         Ok(())
     })?;
 
+    // Quoted here rather than in the format strings below: leaving the quotes
+    // out there and relying on the label to supply its own middle pair reads as
+    // unbalanced at a glance, even though it composes correctly.
     let label = match target.repo_name {
-        Some(ref name) => format!("{title}' / '{name}"),
-        None => title,
+        Some(ref name) => format!("'{title}' / '{name}'"),
+        None => format!("'{title}'"),
     };
     match new_value {
-        Some(ref v) => println!("✓ Set diff base for '{}': {}", label, v),
-        None => println!("✓ Cleared diff base override for '{}'", label),
+        Some(ref v) => println!("✓ Set diff base for {}: {}", label, v),
+        None => println!("✓ Cleared diff base override for {}", label),
     }
     Ok(())
 }
