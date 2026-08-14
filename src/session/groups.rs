@@ -31,7 +31,12 @@ pub const TRASH_SECTION_NAME: &str = "Trash";
 /// (the way org host-scoped keys are). That keeps a user's own repo named
 /// `scratch` on a distinct identity instead of merging into the bucket (#3237).
 pub const SCRATCH_GROUP_PATH: &str = "__aoe_scratch_group__";
-pub const SCRATCH_GROUP_NAME: &str = "scratch";
+/// Capitalized so the bucket reads as a system group rather than a repo
+/// basename, matching the web sidebar's `Scratch` label. Only safe to differ
+/// from the basename because the identity above no longer rides on the label.
+/// Name sorts lowercase both here and in `sort_by_name`, so the header still
+/// lands at `s`.
+pub const SCRATCH_GROUP_NAME: &str = "Scratch";
 
 #[inline]
 pub fn is_archived_section_path(path: &str) -> bool {

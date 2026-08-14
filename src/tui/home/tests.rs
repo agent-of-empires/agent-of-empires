@@ -7241,7 +7241,7 @@ fn test_project_group_key_scratch_uses_sentinel_not_label() {
     // Scratch keys on the sentinel identity, not the display label, so a real
     // repo named `scratch` keeps a distinct identity (#3237).
     assert_eq!(project_group_key(&inst), SCRATCH_GROUP_PATH);
-    assert_eq!(project_group_display_name(SCRATCH_GROUP_PATH), "scratch");
+    assert_eq!(project_group_display_name(SCRATCH_GROUP_PATH), "Scratch");
 }
 
 #[test]
@@ -10707,7 +10707,7 @@ fn scratch_label_pin_gate_keys_on_backing_repo_not_label() {
 #[serial]
 fn synthetic_scratch_bucket_is_distinct_from_real_repo() {
     use crate::session::config::GroupByMode;
-    use crate::session::SCRATCH_GROUP_PATH;
+    use crate::session::{SCRATCH_GROUP_NAME, SCRATCH_GROUP_PATH};
 
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
@@ -10735,9 +10735,10 @@ fn synthetic_scratch_bucket_is_distinct_from_real_repo() {
     view.group_by = GroupByMode::Project;
     view.flat_items = view.build_flat_items();
 
-    // Two headers, both displayed "scratch", distinct identity paths, one
-    // session each rather than a pooled count of two.
-    let scratch_headers: Vec<(&str, usize)> = view
+    // Two headers on distinct identity paths, one session each rather than a
+    // pooled count of two. The repo header keeps its basename; the bucket
+    // renders the capitalized system label.
+    let scratch_headers: Vec<(&str, &str, usize)> = view
         .flat_items
         .iter()
         .filter_map(|i| match i {
@@ -10746,7 +10747,9 @@ fn synthetic_scratch_bucket_is_distinct_from_real_repo() {
                 name,
                 session_count,
                 ..
-            } if name == "scratch" => Some((path.as_str(), *session_count)),
+            } if name.eq_ignore_ascii_case("scratch") => {
+                Some((path.as_str(), name.as_str(), *session_count))
+            }
             _ => None,
         })
         .collect();
@@ -10755,8 +10758,8 @@ fn synthetic_scratch_bucket_is_distinct_from_real_repo() {
         2,
         "real repo and synthetic bucket must be two headers, got {scratch_headers:?}"
     );
-    assert!(scratch_headers.contains(&("scratch", 1)));
-    assert!(scratch_headers.contains(&(SCRATCH_GROUP_PATH, 1)));
+    assert!(scratch_headers.contains(&("scratch", "scratch", 1)));
+    assert!(scratch_headers.contains(&(SCRATCH_GROUP_PATH, SCRATCH_GROUP_NAME, 1)));
 
     // The synthetic bucket is not a pinnable project; the real repo is.
     let real_idx = view
@@ -10824,7 +10827,7 @@ fn scratch_bucket_lends_no_repo_path_for_new_session_prefill() {
 #[serial]
 fn scratch_bucket_absent_from_main_flow_when_only_scratch_is_archived() {
     use crate::session::config::GroupByMode;
-    use crate::session::{is_within_archived_section, SCRATCH_GROUP_PATH};
+    use crate::session::{is_within_archived_section, SCRATCH_GROUP_NAME, SCRATCH_GROUP_PATH};
 
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
@@ -10864,7 +10867,7 @@ fn scratch_bucket_absent_from_main_flow_when_only_scratch_is_archived() {
         view.flat_items.iter().any(|i| matches!(
             i,
             Item::Group { path, name, .. }
-                if is_within_archived_section(path) && name == "scratch"
+                if is_within_archived_section(path) && name == SCRATCH_GROUP_NAME
         )),
         "the archived scratch session should still render under the Archived section"
     );
