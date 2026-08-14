@@ -69,6 +69,9 @@ aoe list --json
 
 # List across all profiles
 aoe list --all
+
+# Skip trashed and archived rows (default is every persisted session)
+aoe list --json --state=live
 ```
 
 **JSON output shape** (`aoe list --json`):
@@ -82,13 +85,14 @@ aoe list --all
     "tool": "claude",
     "command": "claude",
     "profile": "default",
+    "state": "live",
     "created_at": "2025-01-01T00:00:00Z",
     "workspace_repos": []
   }
 ]
 ```
 
-`command` is omitted when empty; `worktree` appears only for worktree-backed sessions. `list --json` does not include live status; use `aoe status --json` or `aoe session capture --json` for that.
+`command` is omitted when empty; `worktree` appears only for worktree-backed sessions. `state` is `live`, `archived`, or `trashed`, with `trashed_at` / `archived_at` present only in those states; a trashed session stays in the listing and keeps its title, so check `state` before treating a row as a live session. `list --json` does not include live status; use `aoe status --json` or `aoe session capture --json` for that.
 
 ### Session lifecycle
 
