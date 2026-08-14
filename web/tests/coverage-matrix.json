@@ -1748,7 +1748,8 @@
         "src/components/diff/find/changedLines.test.ts",
         "src/components/diff/find/FindBar.test.tsx",
         "src/components/diff/comments/extractSnippetFromContents.test.ts",
-        "src/components/diff/comments/anchorToContents.test.ts"
+        "src/components/diff/comments/anchorToContents.test.ts",
+        "src/components/diff/pierre/__tests__/DiffWorkerPoolProvider.test.tsx"
       ],
       "components": [
         "web/src/components/diff/find/FindBar.tsx",
