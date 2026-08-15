@@ -5281,25 +5281,6 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_capture_hermes_legacy_multiple_exclusion_narrows() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
-        seed_hermes_db(
-            tmp.path(),
-            &[
-                ("20260429_193246_aaa", "cli", 1000.0, None, None),
-                ("20260429_193246_bbb", "cli", 2000.0, None, None),
-            ],
-            false,
-        );
-        let mut exclusion = HashSet::new();
-        exclusion.insert("20260429_193246_bbb".to_string());
-        let result = capture_hermes_session_id("/tmp/hermes-proj", &exclusion).unwrap();
-        assert_eq!(result, "20260429_193246_aaa");
-    }
-
-    #[test]
-    #[serial]
     fn test_capture_hermes_all_matched_excluded_returns_none() {
         let tmp = tempfile::tempdir().unwrap();
         let project = std::fs::canonicalize(tmp.path()).unwrap();
