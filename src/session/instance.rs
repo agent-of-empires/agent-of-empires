@@ -14103,17 +14103,20 @@ mod tests {
                 let db_path = temp.path().join("state.db");
                 let stale = "20260101_000000_stored";
                 let fresh = "20260101_000000_fresh";
+                let project = "/tmp/aoe-test-2304-hermes";
                 let conn = rusqlite::Connection::open(&db_path).unwrap();
                 conn.execute_batch(&format!(
-                    "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, started_at REAL, ended_at REAL);
-                     INSERT INTO sessions VALUES ('{stale}','cli',1000.0,NULL);
-                     INSERT INTO sessions VALUES ('{fresh}','cli',2000.0,NULL);",
+                    "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, started_at REAL, ended_at REAL, cwd TEXT, git_repo_root TEXT);
+                     INSERT INTO sessions (id, source, started_at, ended_at, cwd, git_repo_root) VALUES ('{stale}','cli',1000.0,NULL,'{project}',NULL);
+                     INSERT INTO sessions (id, source, started_at, ended_at, cwd, git_repo_root) VALUES ('{fresh}','cli',2000.0,NULL,'{project}',NULL);",
                 ))
                 .unwrap();
                 drop(conn);
 
-                // Hermes ignores the project path; it keys off the state.db rows.
-                let mut inst = Instance::new("verify-hermes-bascule", "/tmp/aoe-test-2304-hermes");
+                // Both rows carry this project's cwd, so the scoped capture
+                // sees them and supersedes the stale stored sid with the fresh
+                // conversation.
+                let mut inst = Instance::new("verify-hermes-bascule", project);
                 inst.tool = "hermes".to_string();
                 inst.agent_session_id = Some(stale.to_string());
                 inst.resume_intent = ResumeIntent::Default;
@@ -14122,6 +14125,42 @@ mod tests {
                 assert_eq!(sid.as_deref(), Some(fresh));
                 assert!(is_existing);
                 assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
+            }
+
+            #[test]
+            #[serial]
+            fn keeps_stored_hermes_sid_on_legacy_ambiguous_state() {
+                // A legacy (column-less) state.db with two active conversations
+                // is ambiguous: capture fails closed, so the stored sid is kept
+                // instead of being replaced by a guess. The stored sid is the
+                // OLDER row, which the pre-fix MRU code would have overridden
+                // with the fresh one; this test pins the fail-closed behavior.
+                let temp = tempdir().unwrap();
+                let _home = isolate_app_dir_at(temp.path());
+                let _hermes = EnvGuard::set(&[("HERMES_HOME", temp.path())]);
+
+                let db_path = temp.path().join("state.db");
+                let stored = "20260101_000000_stored";
+                let other = "20260101_000000_other";
+                let conn = rusqlite::Connection::open(&db_path).unwrap();
+                conn.execute_batch(&format!(
+                    "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, started_at REAL, ended_at REAL);
+                     INSERT INTO sessions VALUES ('{stored}','cli',1000.0,NULL);
+                     INSERT INTO sessions VALUES ('{other}','cli',2000.0,NULL);",
+                ))
+                .unwrap();
+                drop(conn);
+
+                let mut inst =
+                    Instance::new("verify-hermes-legacy-ambiguous", "/tmp/aoe-test-hermes-2");
+                inst.tool = "hermes".to_string();
+                inst.agent_session_id = Some(stored.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(stored));
+                assert!(is_existing);
+                assert_eq!(inst.agent_session_id.as_deref(), Some(stored));
             }
         }
 

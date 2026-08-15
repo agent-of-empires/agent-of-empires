@@ -2648,56 +2648,191 @@ pub(crate) fn kimi_poll_fn(
 
 const HERMES_COMMAND_TIMEOUT_SECS: u64 = 5;
 
-/// Python one-liner executed via `docker exec` to query active Hermes sessions.
+/// Python one-liner executed via `docker exec` to dump active Hermes sessions.
 /// Respects `$HERMES_HOME` env var, falling back to `~/.hermes/state.db`.
-/// Prints one session ID per line to stdout.
+///
+/// Prints a mode line (`SIGNAL` when the schema has at least one of the
+/// `cwd`/`git_repo_root` columns, else `LEGACY`) followed by one
+/// TAB-separated `id\tcwd\tgit_repo_root` tuple per active CLI session,
+/// newest first. The script deliberately performs no matching: the recorded
+/// cwd values may need host-side canonicalization, so selection happens in
+/// Rust (see `select_hermes_session`).
 const HERMES_CONTAINER_CAPTURE_SCRIPT: &str = "import sqlite3, os; \
 db=os.path.join(os.environ.get('HERMES_HOME', os.path.expanduser('~/.hermes')), 'state.db'); \
 conn=sqlite3.connect(db, timeout=1.0); \
-[print(r[0]) for r in conn.execute(\"SELECT id FROM sessions WHERE source='cli' AND ended_at IS NULL ORDER BY started_at DESC LIMIT 10\")]";
+cols={r[1] for r in conn.execute('PRAGMA table_info(sessions)')}; \
+has_cwd='cwd' in cols; \
+has_root='git_repo_root' in cols; \
+print('SIGNAL' if (has_cwd or has_root) else 'LEGACY'); \
+cwd_col='cwd' if has_cwd else 'NULL'; \
+root_col='git_repo_root' if has_root else 'NULL'; \
+[print('%s\\t%s\\t%s' % (r[0], r[1] or '', r[2] or '')) for r in conn.execute('SELECT id, ' + cwd_col + ', ' + root_col + \" FROM sessions WHERE source='cli' AND ended_at IS NULL ORDER BY started_at DESC, id DESC\")]";
 
-/// Parse newline-separated session IDs from sqlite3/python3 output and return
-/// the first ID not present in the exclusion set.
-fn select_hermes_session(output: &[u8], exclusion: &HashSet<String>) -> Result<String> {
+/// One active Hermes CLI session row with its recorded workspace signals.
+///
+/// `cwd`/`git_repo_root` are `None` when the column is missing from the
+/// schema, the value is NULL, or it is empty: such rows carry no usable
+/// project signal.
+struct HermesSessionRow {
+    id: String,
+    cwd: Option<String>,
+    git_repo_root: Option<String>,
+}
+
+/// Snapshot of the active Hermes CLI sessions read from `state.db`.
+///
+/// `rows` is ordered newest-first (by `started_at`, then `id`).
+/// `signal_columns_present` is true when the schema has at least one of the
+/// `cwd`/`git_repo_root` columns; selection differs between a signal-capable
+/// schema and a legacy one (see `select_hermes_session_id`).
+struct HermesSessionScan {
+    rows: Vec<HermesSessionRow>,
+    signal_columns_present: bool,
+}
+
+/// Normalize a Hermes workspace-signal value: NULL or empty means "no signal".
+fn normalize_hermes_signal(value: Option<String>) -> Option<String> {
+    value.filter(|v| !v.is_empty())
+}
+
+/// Parse `docker exec` output from [`HERMES_CONTAINER_CAPTURE_SCRIPT`] and
+/// pick the conversation for `container_cwd`.
+///
+/// The mode line is required: anything else means the script drifted from
+/// this parser's contract and the poll fails closed. Rows with fewer than
+/// three fields are skipped (a cwd containing a newline fragments into such
+/// rows; pathological, accepted). Fields are not trimmed, and an empty
+/// signal maps to `None`; selection then runs through
+/// [`select_hermes_session_id`].
+fn select_hermes_session(
+    output: &[u8],
+    container_cwd: &str,
+    exclusion: &HashSet<String>,
+) -> Result<String> {
     let text = String::from_utf8_lossy(output);
-    let id = text
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .find(|l| !exclusion.contains(*l));
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+    let mode = lines
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("No active Hermes session found"))?;
+    let signal_columns_present = match mode {
+        "SIGNAL" => true,
+        "LEGACY" => false,
+        _ => anyhow::bail!("Unexpected Hermes capture output: {mode:?}"),
+    };
 
-    match id {
-        Some(session_id) => Ok(session_id.to_string()),
-        None => anyhow::bail!("No active Hermes session found"),
+    let mut rows = Vec::new();
+    for line in lines {
+        let mut fields = line.splitn(3, '\t');
+        let id = fields.next().unwrap_or_default();
+        if id.is_empty() {
+            continue;
+        }
+        let (cwd, root) = match (fields.next(), fields.next()) {
+            (Some(cwd), Some(root)) => (
+                normalize_hermes_signal(Some(cwd.to_string())),
+                normalize_hermes_signal(Some(root.to_string())),
+            ),
+            _ => continue,
+        };
+        rows.push(HermesSessionRow {
+            id: id.to_string(),
+            cwd,
+            git_repo_root: root,
+        });
+    }
+
+    let scan = HermesSessionScan {
+        rows,
+        signal_columns_present,
+    };
+    select_hermes_session_id(&scan, container_cwd, exclusion)
+}
+
+/// Pick the Hermes conversation this AoE session should resume.
+///
+/// With a signal-capable schema (at least one of `cwd`/`git_repo_root`
+/// present), only rows whose canonicalized `cwd` or `git_repo_root` equals
+/// the canonicalized project path are eligible, and the most recent such row
+/// not in `exclusion` wins. Rows with no signal, or with a signal pointing
+/// at a different project, are never returned: resuming them would bind the
+/// wrong conversation, the #3373 bug class.
+///
+/// On a legacy schema (neither column present) no row carries a project
+/// signal. The sole unclaimed active conversation is returned (unambiguous);
+/// with more than one, capture fails closed so the agent starts fresh rather
+/// than silently guessing. This deliberately diverges from `hermes -c`,
+/// which falls back to the global most-recent conversation: for a
+/// project-scoped AoE session that fallback *is* the mis-attribution bug.
+fn select_hermes_session_id(
+    scan: &HermesSessionScan,
+    project_path: &str,
+    exclusion: &HashSet<String>,
+) -> Result<String> {
+    if scan.signal_columns_present {
+        let needle = canonicalize_or_raw(project_path);
+        for row in &scan.rows {
+            let matches = row
+                .cwd
+                .as_deref()
+                .map(|cwd| canonicalize_or_raw(cwd) == needle)
+                .unwrap_or(false)
+                || row
+                    .git_repo_root
+                    .as_deref()
+                    .map(|root| canonicalize_or_raw(root) == needle)
+                    .unwrap_or(false);
+            if matches && !exclusion.contains(&row.id) {
+                return Ok(row.id.clone());
+            }
+        }
+        anyhow::bail!("No active Hermes session found matching project path")
+    } else {
+        let unclaimed = scan
+            .rows
+            .iter()
+            .map(|row| row.id.as_str())
+            .filter(|id| !exclusion.contains(*id))
+            .collect::<Vec<_>>();
+        match unclaimed.len() {
+            0 => anyhow::bail!("No active Hermes session found"),
+            1 => Ok(unclaimed[0].to_string()),
+            _ => anyhow::bail!(
+                "Multiple active Hermes sessions without a project signal; starting fresh"
+            ),
+        }
     }
 }
 
 /// Capture session ID from Hermes's SQLite state database.
 ///
 /// Queries `~/.hermes/state.db` (or `$HERMES_HOME/state.db`) for active CLI
-/// sessions. Unlike other agents, Hermes does not record the working directory
-/// in its session table, so capture returns the most recent active CLI session
-/// regardless of project. Cross-instance isolation relies on the exclusion set.
+/// sessions. Hermes records the working directory and git repo root on each
+/// CLI session row, so capture scopes the active set to the canonicalized
+/// project path (exact `cwd` or `git_repo_root` match), mirroring how the
+/// other agents' captures validate cwd or project hash. On legacy databases
+/// without those columns capture degrades to the sole-row rule and returns
+/// `None` when more than one unclaimed active conversation exists, so the
+/// agent starts fresh instead of silently resuming the wrong conversation.
+/// Cross-instance isolation for same-project peers still relies on the
+/// exclusion set.
 pub(crate) fn capture_hermes_session_id(
-    _project_path: &str,
+    project_path: &str,
     exclusion: &HashSet<String>,
 ) -> Result<String> {
     let hermes_home = resolve_agent_home(Some("HERMES_HOME"), ".hermes")?;
     let db_path = hermes_home.join("state.db");
 
-    let ids = read_hermes_sessions_from_sqlite(&db_path)?;
-
-    ids.into_iter()
-        .find(|id| !exclusion.contains(id))
-        .ok_or_else(|| anyhow::anyhow!("No active Hermes session found"))
+    let scan = read_hermes_sessions_from_sqlite(&db_path)?;
+    select_hermes_session_id(&scan, project_path, exclusion)
 }
 
-/// Read active CLI session IDs from Hermes's SQLite state database.
+/// Read active CLI session rows from Hermes's SQLite state database.
 ///
-/// Returns session IDs ordered by most recent first. An `Err` means the DB
-/// is unreadable (missing, locked, schema mismatch); the poller will retry
-/// on the next tick.
-fn read_hermes_sessions_from_sqlite(db_path: &Path) -> Result<Vec<String>> {
+/// Returns the full active CLI set, newest first, with each row's `cwd` and
+/// `git_repo_root` when the schema has those columns (NULL literal
+/// otherwise). An `Err` means the DB is unreadable (missing, locked, schema
+/// mismatch); the poller will retry on the next tick.
+fn read_hermes_sessions_from_sqlite(db_path: &Path) -> Result<HermesSessionScan> {
     use rusqlite::{Connection, OpenFlags};
 
     if !db_path.exists() {
@@ -2712,24 +2847,64 @@ fn read_hermes_sessions_from_sqlite(db_path: &Path) -> Result<Vec<String>> {
     conn.busy_timeout(Duration::from_millis(100))
         .context("Failed to set Hermes DB busy timeout")?;
 
+    // Probe the schema per column: hermes adds cwd/git_repo_root in a later
+    // schema generation, and older databases lack them. The SELECT arms are
+    // built from a fixed whitelist so a partially-migrated schema (one column
+    // present) still carries its usable signal instead of failing prepare.
+    let (has_cwd, has_git_repo_root) = {
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(sessions)")
+            .context("Hermes sessions table missing")?;
+        let cols = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .context("Failed to read Hermes sessions table columns")?;
+        let mut has_cwd = false;
+        let mut has_git_repo_root = false;
+        for col in cols {
+            let col = col.context("Failed to read Hermes session column name")?;
+            has_cwd |= col == "cwd";
+            has_git_repo_root |= col == "git_repo_root";
+        }
+        (has_cwd, has_git_repo_root)
+    };
+
+    let cwd_expr = if has_cwd { "cwd" } else { "NULL" };
+    let root_expr = if has_git_repo_root {
+        "git_repo_root"
+    } else {
+        "NULL"
+    };
+    let sql = format!(
+        "SELECT id, {cwd_expr}, {root_expr} FROM sessions \
+         WHERE source='cli' AND ended_at IS NULL \
+         ORDER BY started_at DESC, id DESC"
+    );
     let mut stmt = conn
-        .prepare(
-            "SELECT id FROM sessions \
-             WHERE source='cli' AND ended_at IS NULL \
-             ORDER BY started_at DESC LIMIT 10",
-        )
+        .prepare(&sql)
         .context("Hermes sessions table schema mismatch")?;
 
     let rows = stmt
-        .query_map([], |row| row.get(0))
+        .query_map([], |row| {
+            let id: String = row.get(0)?;
+            let cwd: Option<String> = row.get(1)?;
+            let root: Option<String> = row.get(2)?;
+            Ok(HermesSessionRow {
+                id,
+                cwd: normalize_hermes_signal(cwd),
+                git_repo_root: normalize_hermes_signal(root),
+            })
+        })
         .context("Failed to query Hermes sessions table")?;
 
-    let mut ids: Vec<String> = Vec::new();
+    let mut out: Vec<HermesSessionRow> = Vec::new();
     for row in rows {
-        ids.push(row.context("Failed to read Hermes session row")?);
+        out.push(row.context("Failed to read Hermes session row")?);
     }
 
-    Ok(ids)
+    Ok(HermesSessionScan {
+        rows: out,
+        signal_columns_present: has_cwd || has_git_repo_root,
+    })
 }
 
 /// Capture a Hermes session ID from inside a Docker container.
@@ -2738,7 +2913,7 @@ fn read_hermes_sessions_from_sqlite(db_path: &Path) -> Result<Vec<String>> {
 /// `sqlite3` CLI binary, which may not be installed in minimal containers.
 pub(crate) fn try_capture_hermes_session_id_in_container(
     container_name: &str,
-    _container_cwd: &str,
+    container_cwd: &str,
     exclusion: &HashSet<String>,
 ) -> Result<String> {
     let mut cmd = std::process::Command::new("docker");
@@ -2756,7 +2931,7 @@ pub(crate) fn try_capture_hermes_session_id_in_container(
         "docker exec python3 (hermes session scan)",
     )?;
 
-    select_hermes_session(&stdout_bytes, exclusion)
+    select_hermes_session(&stdout_bytes, container_cwd, exclusion)
 }
 
 /// Polling closure for Hermes session tracking.
@@ -4698,42 +4873,609 @@ mod tests {
 
     // ─── Hermes tests ────────────────────────────────────────────────────────────
 
+    /// A seed row for [`seed_hermes_db`]: id, source, started_at, cwd,
+    /// git_repo_root.
+    type HermesSeedRow<'a> = (&'a str, &'a str, f64, Option<&'a str>, Option<&'a str>);
+
+    /// Seed a Hermes `state.db` under `home` (the dir `HERMES_HOME` points
+    /// at). `full_schema` selects the current schema (with
+    /// `cwd`/`git_repo_root` columns) or the legacy minimal schema.
+    fn seed_hermes_db(home: &Path, rows: &[HermesSeedRow], full_schema: bool) {
+        let db_path = home.join("state.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        if full_schema {
+            conn.execute_batch(
+                "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, started_at REAL, ended_at REAL, cwd TEXT, git_repo_root TEXT);",
+            )
+            .unwrap();
+            for (id, source, started_at, cwd, root) in rows {
+                conn.execute(
+                    "INSERT INTO sessions (id, source, started_at, ended_at, cwd, git_repo_root) \
+                     VALUES (?1, ?2, ?3, NULL, ?4, ?5)",
+                    rusqlite::params![id, source, started_at, cwd, root],
+                )
+                .unwrap();
+            }
+        } else {
+            conn.execute_batch(
+                "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, started_at REAL, ended_at REAL);",
+            )
+            .unwrap();
+            for (id, source, started_at, _, _) in rows {
+                conn.execute(
+                    "INSERT INTO sessions (id, source, started_at, ended_at) VALUES (?1, ?2, ?3, NULL)",
+                    rusqlite::params![id, source, started_at],
+                )
+                .unwrap();
+            }
+        }
+        drop(conn);
+    }
+
     #[test]
-    fn test_select_hermes_session_parsing() {
-        let output = b"20260429_193246_aaa\n20260429_193246_bbb\n";
-        let exclusion = HashSet::new();
-        let result = select_hermes_session(output, &exclusion).unwrap();
+    fn test_select_hermes_session_scoped_parsing() {
+        let output = b"SIGNAL\n\
+20260429_193246_aaa\t/tmp/hermes-a\t\n\
+20260429_193246_bbb\t/tmp/hermes-b\t\n";
+        let result = select_hermes_session(output, "/tmp/hermes-a", &HashSet::new()).unwrap();
         assert_eq!(result, "20260429_193246_aaa");
     }
 
     #[test]
-    fn test_select_hermes_session_with_exclusion() {
-        let output = b"20260429_193246_aaa\n20260429_193246_bbb\n";
+    fn test_select_hermes_session_scoped_with_exclusion() {
+        let output = b"SIGNAL\n\
+20260429_193246_aaa\t/tmp/hermes-a\t\n\
+20260429_193246_bbb\t/tmp/hermes-b\t\n";
         let mut exclusion = HashSet::new();
         exclusion.insert("20260429_193246_aaa".to_string());
-        let result = select_hermes_session(output, &exclusion).unwrap();
+        let result = select_hermes_session(output, "/tmp/hermes-b", &exclusion).unwrap();
+        assert_eq!(result, "20260429_193246_bbb");
+    }
+
+    #[test]
+    fn test_select_hermes_session_scoped_no_match() {
+        // In SIGNAL mode a row whose cwd points at another project is never
+        // returned, even when it is the only active conversation.
+        let output = b"SIGNAL\n20260429_193246_aaa\t/tmp/other-project\t\n";
+        let result = select_hermes_session(output, "/tmp/hermes-a", &HashSet::new());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_select_hermes_session_legacy_single_row() {
+        let output = b"LEGACY\n20260429_193246_aaa\t\t\n";
+        let result = select_hermes_session(output, "/tmp/anywhere", &HashSet::new()).unwrap();
+        assert_eq!(result, "20260429_193246_aaa");
+    }
+
+    #[test]
+    fn test_select_hermes_session_legacy_multiple_ambiguous() {
+        let output = b"LEGACY\n20260429_193246_aaa\t\t\n20260429_193246_bbb\t\t\n";
+        let result = select_hermes_session(output, "/tmp/anywhere", &HashSet::new());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_select_hermes_session_legacy_multiple_exclusion_narrows() {
+        let output = b"LEGACY\n20260429_193246_aaa\t\t\n20260429_193246_bbb\t\t\n";
+        let mut exclusion = HashSet::new();
+        exclusion.insert("20260429_193246_aaa".to_string());
+        let result = select_hermes_session(output, "/tmp/anywhere", &exclusion).unwrap();
         assert_eq!(result, "20260429_193246_bbb");
     }
 
     #[test]
     fn test_select_hermes_session_empty_output() {
-        let output = b"";
-        let exclusion = HashSet::new();
-        let result = select_hermes_session(output, &exclusion);
+        let result = select_hermes_session(b"", "/tmp/hermes-a", &HashSet::new());
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_select_hermes_session_whitespace_lines() {
-        let output = b"  \n\n20260429_193246_ccc\n  \n";
-        let exclusion = HashSet::new();
-        let result = select_hermes_session(output, &exclusion).unwrap();
+    fn test_select_hermes_session_whitespace_only_lines_skipped() {
+        // Whitespace-only lines before the mode line are tolerated; the first
+        // non-empty line must still be the mode line.
+        let output = b"  \n\nSIGNAL\n20260429_193246_ccc\t/tmp/hermes-c\t\n  \n";
+        let result = select_hermes_session(output, "/tmp/hermes-c", &HashSet::new()).unwrap();
         assert_eq!(result, "20260429_193246_ccc");
+    }
+
+    #[test]
+    fn test_select_hermes_session_garbage_mode_line() {
+        // Old id-only output (or a drifted script) must fail closed, not
+        // misparse into a bogus id.
+        let output = b"20260429_193246_aaa\n20260429_193246_bbb\n";
+        let result = select_hermes_session(output, "/tmp/hermes-a", &HashSet::new());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_select_hermes_session_malformed_rows_skipped() {
+        // A cwd containing a newline fragments the row into lines with fewer
+        // than three fields; those are skipped without panicking, and the
+        // healthy row still wins.
+        let output = b"SIGNAL\n\
+20260429_193246_good\t/tmp/hermes-a\t\n\
+20260429_193246_bad\t/tmp/hermes-b\nwith-newline\t\n";
+        let result = select_hermes_session(output, "/tmp/hermes-a", &HashSet::new()).unwrap();
+        assert_eq!(result, "20260429_193246_good");
+    }
+
+    #[test]
+    fn test_select_hermes_session_newline_in_root_accepted_truncated() {
+        // A newline in the trailing git_repo_root field yields a row with a
+        // truncated root (documented residual); the cwd arm still matches.
+        let output = b"SIGNAL\n\
+20260429_193246_root\t/tmp/hermes-a\t/tmp/root\npart2\t\n";
+        let result = select_hermes_session(output, "/tmp/hermes-a", &HashSet::new()).unwrap();
+        assert_eq!(result, "20260429_193246_root");
+    }
+
+    #[test]
+    fn test_select_hermes_session_tab_in_cwd_truncates() {
+        // A cwd containing a TAB truncates at the first TAB (documented
+        // residual). A needle equal to the pre-TAB prefix would match the
+        // truncated row; a different needle must not mis-attribute it.
+        let output = b"SIGNAL\n20260429_193246_aaa\t/tmp/hermes-a\trest\n";
+        let result = select_hermes_session(output, "/tmp/hermes-a/sub", &HashSet::new());
+        assert!(result.is_err());
+        // The documented residual: the truncated prefix does match.
+        let result = select_hermes_session(output, "/tmp/hermes-a", &HashSet::new()).unwrap();
+        assert_eq!(result, "20260429_193246_aaa");
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_hermes_matches_project_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(tmp.path()).unwrap();
+        let project_str = project.to_string_lossy().to_string();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+        seed_hermes_db(
+            tmp.path(),
+            &[(
+                "20260429_193246_aaa",
+                "cli",
+                1000.0,
+                Some(&project_str),
+                None,
+            )],
+            true,
+        );
+        let result = capture_hermes_session_id(&project_str, &HashSet::new()).unwrap();
+        assert_eq!(result, "20260429_193246_aaa");
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_hermes_matches_git_repo_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(tmp.path()).unwrap();
+        let project_str = project.to_string_lossy().to_string();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let sub_str = std::fs::canonicalize(&sub)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+        seed_hermes_db(
+            tmp.path(),
+            &[(
+                "20260429_193246_aaa",
+                "cli",
+                1000.0,
+                Some(&sub_str),
+                Some(&project_str),
+            )],
+            true,
+        );
+        let result = capture_hermes_session_id(&project_str, &HashSet::new()).unwrap();
+        assert_eq!(result, "20260429_193246_aaa");
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_hermes_subdir_project_matches_via_cwd() {
+        // A project that is a proper subdir of a git repo records
+        // git_repo_root != project; the cwd arm must still match (the empty
+        // git_repo_root gate of hermes' own clause would drop this).
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("pkg");
+        std::fs::create_dir_all(&project).unwrap();
+        let project_str = std::fs::canonicalize(&project)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let repo = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+        seed_hermes_db(
+            tmp.path(),
+            &[(
+                "20260429_193246_aaa",
+                "cli",
+                1000.0,
+                Some(&project_str),
+                Some(&repo_str),
+            )],
+            true,
+        );
+        let result = capture_hermes_session_id(&project_str, &HashSet::new()).unwrap();
+        assert_eq!(result, "20260429_193246_aaa");
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_hermes_symlinked_project_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let real_str = std::fs::canonicalize(&real)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let link_str = link.to_string_lossy().to_string();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+        seed_hermes_db(
+            tmp.path(),
+            &[("20260429_193246_aaa", "cli", 1000.0, Some(&real_str), None)],
+            true,
+        );
+        let result = capture_hermes_session_id(&link_str, &HashSet::new()).unwrap();
+        assert_eq!(result, "20260429_193246_aaa");
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_hermes_unnormalized_project_spelling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(tmp.path()).unwrap();
+        let project_str = project.to_string_lossy().to_string();
+        let spelled = project
+            .join("decoy")
+            .join("..")
+            .to_string_lossy()
+            .to_string();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+        seed_hermes_db(
+            tmp.path(),
+            &[(
+                "20260429_193246_aaa",
+                "cli",
+                1000.0,
+                Some(&project_str),
+                None,
+            )],
+            true,
+        );
+        let result = capture_hermes_session_id(&spelled, &HashSet::new()).unwrap();
+        assert_eq!(result, "20260429_193246_aaa");
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_hermes_ignores_newer_foreign_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(tmp.path()).unwrap();
+        let project_str = project.to_string_lossy().to_string();
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let other_str = std::fs::canonicalize(&other)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+        // The foreign row is newer; the matching row must still win.
+        seed_hermes_db(
+            tmp.path(),
+            &[
+                (
+                    "20260429_193246_aaa",
+                    "cli",
+                    1000.0,
+                    Some(&project_str),
+                    None,
+                ),
+                ("20260429_193246_bbb", "cli", 2000.0, Some(&other_str), None),
+            ],
+            true,
+        );
+        let result = capture_hermes_session_id(&project_str, &HashSet::new()).unwrap();
+        assert_eq!(result, "20260429_193246_aaa");
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_hermes_foreign_only_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(tmp.path()).unwrap();
+        let project_str = project.to_string_lossy().to_string();
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let other_str = std::fs::canonicalize(&other)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+        seed_hermes_db(
+            tmp.path(),
+            &[("20260429_193246_aaa", "cli", 1000.0, Some(&other_str), None)],
+            true,
+        );
+        // Never resume a conversation attributable to another project.
+        assert!(capture_hermes_session_id(&project_str, &HashSet::new()).is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_hermes_null_cwd_never_resumed() {
+        // Full-schema rows with NULL (or empty) cwd carry no project signal
+        // and are never returned: they are foreign by construction (aoe-launched
+        // rows always record cwd), and resuming one is the #3373 bug shape.
+        for cwd in [None, Some("")] {
+            let tmp = tempfile::tempdir().unwrap();
+            let project = std::fs::canonicalize(tmp.path()).unwrap();
+            let project_str = project.to_string_lossy().to_string();
+            let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+            seed_hermes_db(
+                tmp.path(),
+                &[("20260429_193246_aaa", "cli", 1000.0, cwd, None)],
+                true,
+            );
+            assert!(
+                capture_hermes_session_id(&project_str, &HashSet::new()).is_err(),
+                "NULL/empty cwd row must not be resumed (cwd={cwd:?})"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_hermes_multiple_null_cwd_ambiguous() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(tmp.path()).unwrap();
+        let project_str = project.to_string_lossy().to_string();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+        seed_hermes_db(
+            tmp.path(),
+            &[
+                ("20260429_193246_aaa", "cli", 1000.0, None, None),
+                ("20260429_193246_bbb", "cli", 2000.0, None, None),
+            ],
+            true,
+        );
+        assert!(capture_hermes_session_id(&project_str, &HashSet::new()).is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_hermes_legacy_single_row_returns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+        seed_hermes_db(
+            tmp.path(),
+            &[("20260429_193246_aaa", "cli", 1000.0, None, None)],
+            false,
+        );
+        let result = capture_hermes_session_id("/tmp/hermes-proj", &HashSet::new()).unwrap();
+        assert_eq!(result, "20260429_193246_aaa");
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_hermes_legacy_multiple_ambiguous() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+        seed_hermes_db(
+            tmp.path(),
+            &[
+                ("20260429_193246_aaa", "cli", 1000.0, None, None),
+                ("20260429_193246_bbb", "cli", 2000.0, None, None),
+            ],
+            false,
+        );
+        assert!(capture_hermes_session_id("/tmp/hermes-proj", &HashSet::new()).is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_hermes_legacy_multiple_exclusion_narrows() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+        seed_hermes_db(
+            tmp.path(),
+            &[
+                ("20260429_193246_aaa", "cli", 1000.0, None, None),
+                ("20260429_193246_bbb", "cli", 2000.0, None, None),
+            ],
+            false,
+        );
+        let mut exclusion = HashSet::new();
+        exclusion.insert("20260429_193246_bbb".to_string());
+        let result = capture_hermes_session_id("/tmp/hermes-proj", &exclusion).unwrap();
+        assert_eq!(result, "20260429_193246_aaa");
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_hermes_all_matched_excluded_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(tmp.path()).unwrap();
+        let project_str = project.to_string_lossy().to_string();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+        seed_hermes_db(
+            tmp.path(),
+            &[
+                (
+                    "20260429_193246_aaa",
+                    "cli",
+                    1000.0,
+                    Some(&project_str),
+                    None,
+                ),
+                (
+                    "20260429_193246_bbb",
+                    "cli",
+                    2000.0,
+                    Some(&project_str),
+                    None,
+                ),
+            ],
+            true,
+        );
+        // A same-project peer owns this project's conversations; never dip
+        // into no-signal or foreign rows.
+        let exclusion = HashSet::from([
+            "20260429_193246_aaa".to_string(),
+            "20260429_193246_bbb".to_string(),
+        ]);
+        assert!(capture_hermes_session_id(&project_str, &exclusion).is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_hermes_exclusion_picks_second_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(tmp.path()).unwrap();
+        let project_str = project.to_string_lossy().to_string();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+        seed_hermes_db(
+            tmp.path(),
+            &[
+                (
+                    "20260429_193246_aaa",
+                    "cli",
+                    1000.0,
+                    Some(&project_str),
+                    None,
+                ),
+                (
+                    "20260429_193246_bbb",
+                    "cli",
+                    2000.0,
+                    Some(&project_str),
+                    None,
+                ),
+            ],
+            true,
+        );
+        let mut exclusion = HashSet::new();
+        exclusion.insert("20260429_193246_bbb".to_string());
+        let result = capture_hermes_session_id(&project_str, &exclusion).unwrap();
+        assert_eq!(result, "20260429_193246_aaa");
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_hermes_cwd_only_and_root_only_schemas() {
+        // Partially-migrated schemas must not fail prepare and must use the
+        // single present column (F1 regression).
+        let tmp = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(tmp.path()).unwrap();
+        let project_str = project.to_string_lossy().to_string();
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let other_str = std::fs::canonicalize(&other)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+
+        // cwd-only schema.
+        let cwd_db = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(cwd_db.path().join("state.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, started_at REAL, ended_at REAL, cwd TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at, ended_at, cwd) VALUES (?1, 'cli', 1000.0, NULL, ?2)",
+            rusqlite::params!["20260429_193246_aaa", project_str],
+        )
+        .unwrap();
+        drop(conn);
+        let _cwd_guard = EnvGuard::set(&[("HERMES_HOME", cwd_db.path())]);
+        assert_eq!(
+            capture_hermes_session_id(&project_str, &HashSet::new()).unwrap(),
+            "20260429_193246_aaa"
+        );
+        drop(_cwd_guard);
+
+        // root-only schema.
+        let root_db = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(root_db.path().join("state.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, started_at REAL, ended_at REAL, git_repo_root TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at, ended_at, git_repo_root) VALUES (?1, 'cli', 1000.0, NULL, ?2)",
+            rusqlite::params!["20260429_193246_bbb", other_str],
+        )
+        .unwrap();
+        drop(conn);
+        let _root_guard = EnvGuard::set(&[("HERMES_HOME", root_db.path())]);
+        // The root-only row points at another project; it must not match.
+        assert!(capture_hermes_session_id(&project_str, &HashSet::new()).is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn test_hermes_poll_fn_matches_own_project() {
+        // Issue story 1 at the poller level: the closure resolves the
+        // project-scoped conversation.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(tmp.path()).unwrap();
+        let project_str = project.to_string_lossy().to_string();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+        seed_hermes_db(
+            tmp.path(),
+            &[(
+                "20260429_193246_aaa",
+                "cli",
+                1000.0,
+                Some(&project_str),
+                None,
+            )],
+            true,
+        );
+
+        let poll = hermes_poll_fn(project_str, "test-instance".to_string(), HashSet::new());
+        assert_eq!(poll(), Some("20260429_193246_aaa".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_hermes_poll_fn_legacy_multi_row_returns_none() {
+        // Issue story 2: with multiple active conversations and no project
+        // signal, the poller yields None so the agent starts fresh instead of
+        // silently resuming a wrong conversation.
+        let tmp = tempfile::tempdir().unwrap();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+        seed_hermes_db(
+            tmp.path(),
+            &[
+                ("20260429_193246_aaa", "cli", 1000.0, None, None),
+                ("20260429_193246_bbb", "cli", 2000.0, None, None),
+            ],
+            false,
+        );
+
+        let poll = hermes_poll_fn(
+            "/tmp/hermes-proj".to_string(),
+            "test-instance".to_string(),
+            HashSet::new(),
+        );
+        assert_eq!(poll(), None);
     }
 
     #[test]
     #[serial]
     fn test_capture_hermes_basic() {
+        // Legacy minimal schema: a single active conversation is unambiguous
+        // and is returned (sole-row rule).
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("state.db");
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -4789,6 +5531,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_capture_hermes_exclusion_set() {
+        // Legacy schema, two active rows, one claimed by a peer: the single
+        // unclaimed row is unambiguous and returned.
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("state.db");
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -4820,6 +5564,67 @@ mod tests {
     #[test]
     fn test_hermes_session_id_format_valid() {
         assert!(is_valid_session_id("20260429_193246_adcddd"));
+    }
+
+    #[test]
+    #[serial]
+    fn test_hermes_container_script_modes() {
+        // Run the literal HERMES_CONTAINER_CAPTURE_SCRIPT against a temp db
+        // with the host python3 (no docker needed), verifying the SIGNAL and
+        // LEGACY mode lines and the TAB row format. Skips when python3 is
+        // unavailable.
+        let ok = std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ok {
+            return;
+        }
+
+        // SIGNAL arm: full schema, two rows in different projects.
+        let signal_db = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(signal_db.path().join("state.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, started_at REAL, ended_at REAL, cwd TEXT, git_repo_root TEXT);
+             INSERT INTO sessions (id, source, started_at, ended_at, cwd, git_repo_root) VALUES ('20260429_193246_aaa','cli',1000.0,NULL,'/tmp/proj-a',NULL);
+             INSERT INTO sessions (id, source, started_at, ended_at, cwd, git_repo_root) VALUES ('20260429_193246_bbb','cli',2000.0,NULL,'/tmp/proj-b',NULL);",
+        )
+        .unwrap();
+        drop(conn);
+        let out = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(HERMES_CONTAINER_CAPTURE_SCRIPT)
+            .env("HERMES_HOME", signal_db.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let mut lines = stdout.lines();
+        assert_eq!(lines.next(), Some("SIGNAL"));
+        assert_eq!(lines.next(), Some("20260429_193246_bbb\t/tmp/proj-b\t"));
+        assert_eq!(lines.next(), Some("20260429_193246_aaa\t/tmp/proj-a\t"));
+        assert_eq!(lines.next(), None);
+
+        // LEGACY arm: minimal schema, no signal columns.
+        let legacy_db = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(legacy_db.path().join("state.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, started_at REAL, ended_at REAL);
+             INSERT INTO sessions VALUES ('20260429_193246_aaa','cli',1000.0,NULL);",
+        )
+        .unwrap();
+        drop(conn);
+        let out = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(HERMES_CONTAINER_CAPTURE_SCRIPT)
+            .env("HERMES_HOME", legacy_db.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let mut lines = stdout.lines();
+        assert_eq!(lines.next(), Some("LEGACY"));
+        assert_eq!(lines.next(), Some("20260429_193246_aaa\t\t"));
+        assert_eq!(lines.next(), None);
     }
 
     fn create_copilot_test_db(rows: &[(&str, &str, &str)]) -> tempfile::TempDir {
