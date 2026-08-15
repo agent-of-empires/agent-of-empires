@@ -2,6 +2,9 @@
 
 use crate::session::Status;
 
+use regex::Regex;
+use std::sync::OnceLock;
+
 use super::utils::strip_ansi;
 
 const SPINNER_CHARS: &[&str] = &[
@@ -1765,11 +1768,17 @@ pub fn detect_pi_status(raw_content: &str) -> Status {
 
 /// Oh My Pi status detection via its live footer.
 ///
-/// OMP keeps a bordered prompt visible both while running and while idle. The
-/// active loader is the distinguishing signal: `Working… ⟦esc⟧` with a spinner
-/// sits immediately above the prompt. Restrict spinner matching to the final
-/// three non-empty lines so a completed turn's loader in scrollback cannot pin
-/// the session on Running.
+/// OMP keeps a bordered prompt visible both while running and while idle.
+/// Status is decided by the lowest pane signal, where position 1 is the
+/// bottom non-empty line: the live loader (`Working… ⟦esc⟧`), the retry
+/// countdown (`Retrying (N/M) in Ns…`), the pinned error banner (matched by
+/// its dismissal footer), the terminal retry lines (`Error: Retry budget
+/// exhausted` / `Error: Retry failed after`), sub-agent retry labels
+/// (`retrying N/M …`), and the `╭── π`/`╰─` prompt box. Each signal has a
+/// freshness window; beyond it the signal is ignored, so a completed turn's
+/// loader or a dismissed banner in scrollback cannot pin the session.
+/// The heuristic cannot see structured turn events; the structured error/retry
+/// path (herdr-style extension) is tracked in #3380.
 pub fn detect_omp_status(raw_content: &str) -> Status {
     let clean = strip_ansi(raw_content);
     let non_empty_lines: Vec<&str> = clean
@@ -1777,36 +1786,112 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
         .filter(|line| !line.trim().is_empty())
         .collect();
 
-    let footer: Vec<&str> = non_empty_lines
-        .iter()
-        .rev()
-        .take(3)
-        .rev()
-        .copied()
-        .collect();
+    // Each signal registers the position of its lowest matching line (1 =
+    // bottom, within its freshness window); the lowest position wins, ties
+    // broken by registration order (spinner > countdown > anchor > terminal
+    // lines > approval > labels).
+    let mut winner: Option<(usize, OmpSignal)> = None;
+    let mut consider = |pos: usize, signal: OmpSignal| {
+        if winner.is_none_or(|(wpos, _)| pos < wpos) {
+            winner = Some((pos, signal));
+        }
+    };
+
+    // Spinner: live loader, footer (last 3 non-empty lines) only.
+    let footer = tail_lines(&non_empty_lines, 3);
     let footer_lower = footer.join("\n").to_lowercase();
     if has_any_spinner(&footer)
         && (footer_lower.contains("working") || footer_lower.contains("⟦esc⟧"))
     {
-        return Status::Running;
+        let pos = footer
+            .iter()
+            .rev()
+            .position(|line| has_any_spinner(&[*line]))
+            .map_or(1, |i| i + 1);
+        consider(pos, OmpSignal::Spinner);
     }
 
-    let approval_footer: String = non_empty_lines
-        .iter()
-        .rev()
-        .take(8)
-        .rev()
-        .copied()
-        .collect::<Vec<_>>()
-        .join("\n")
-        .to_lowercase();
+    // Retry countdown: fixed live region above the prompt (window 6). (a)
+    // single-line match; (b) if none, the window joined with single spaces so
+    // a character-wrap cut between tokens still matches.
+    let window6 = tail_lines(&non_empty_lines, 6);
+    let mut countdown_pos = None;
+    for (i, line) in window6.iter().enumerate() {
+        if countdown_a().is_match(&line.to_lowercase()) {
+            countdown_pos = Some(window6.len() - i);
+            break;
+        }
+    }
+    if countdown_pos.is_none() {
+        let mut joined = String::new();
+        let mut line_ends = Vec::with_capacity(window6.len());
+        for (i, line) in window6.iter().enumerate() {
+            if i > 0 {
+                joined.push(' ');
+            }
+            joined.push_str(&line.to_lowercase());
+            line_ends.push(joined.len());
+        }
+        if let Some(m) = countdown_b().find(&joined) {
+            for (i, end) in line_ends.iter().enumerate() {
+                if m.end() <= *end {
+                    countdown_pos = Some(window6.len() - i);
+                    break;
+                }
+            }
+        }
+    }
+    if let Some(pos) = countdown_pos {
+        consider(pos, OmpSignal::Countdown);
+    }
+
+    // Pinned error banner anchor and terminal retry lines: window 6.
+    if let Some(pos) = lowest_matching_line(&window6, |l| {
+        l.to_lowercase()
+            .contains("dismissed when you send your next message")
+    }) {
+        consider(pos, OmpSignal::Anchor);
+    }
+    if let Some(pos) = lowest_matching_line(&window6, |l| {
+        let l = l.to_lowercase();
+        l.contains("error: retry budget exhausted") || l.contains("error: retry failed after")
+    }) {
+        consider(pos, OmpSignal::TerminalLines);
+    }
+
+    // Approval prompt: window 8, all three substrings present.
+    let window8 = tail_lines(&non_empty_lines, 8);
+    let approval_footer = window8.join("\n").to_lowercase();
     if approval_footer.contains("allow tool:")
         && approval_footer.contains("approve")
         && approval_footer.contains("deny")
     {
-        return Status::Waiting;
+        if let Some(pos) = lowest_matching_line(&window8, |l| {
+            let l = l.to_lowercase();
+            l.contains("allow tool:") || l.contains("approve") || l.contains("deny")
+        }) {
+            consider(pos, OmpSignal::Approval);
+        }
     }
 
+    // Sub-agent retry labels and rule-repair progress: window 12.
+    let window12 = tail_lines(&non_empty_lines, 12);
+    if let Some(pos) = lowest_matching_line(&window12, |l| {
+        let l = l.to_lowercase();
+        label_re().is_match(&l) || attempt_re().is_match(&l)
+    }) {
+        consider(pos, OmpSignal::Labels);
+    }
+
+    if let Some((_, signal)) = winner {
+        return match signal {
+            OmpSignal::Spinner | OmpSignal::Countdown | OmpSignal::Labels => Status::Running,
+            OmpSignal::Anchor | OmpSignal::TerminalLines => Status::Error,
+            OmpSignal::Approval => Status::Waiting,
+        };
+    }
+
+    // Fallback: parked at the prompt.
     let has_header = footer
         .iter()
         .any(|line| line.trim_start().starts_with("╭── π"));
@@ -1818,6 +1903,56 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
     }
 
     Status::Idle
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OmpSignal {
+    Spinner,
+    Countdown,
+    Anchor,
+    TerminalLines,
+    Approval,
+    Labels,
+}
+
+/// Last `n` non-empty lines in pane order (top-down).
+fn tail_lines<'a>(lines: &[&'a str], n: usize) -> Vec<&'a str> {
+    lines.iter().rev().take(n).rev().copied().collect()
+}
+
+/// Position (1 = bottom) of the lowest line matching `matches`, within
+/// `lines` (assumed to be in pane order).
+fn lowest_matching_line(lines: &[&str], matches: impl Fn(&str) -> bool) -> Option<usize> {
+    lines
+        .iter()
+        .rev()
+        .position(|line| matches(line))
+        .map(|i| i + 1)
+}
+
+fn countdown_a() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"retrying \(\d+/\d+\) in \d+s…").unwrap())
+}
+
+fn countdown_b() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"retrying\s+\(\d+/\d+\)\s+in\s+\d+\s*s\s*…").unwrap())
+}
+
+fn label_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| {
+        Regex::new(
+            r"retrying \d+/\d+ (in (\d+(\.\d+)?ms|\d+(\.\d+)?s|\d+m(\d+(\.\d+)?s)?|\d+h(\d+m(\d+(\.\d+)?s)?)?|\d+d(\d+h(\d+m(\d+(\.\d+)?s)?)?)?)|now):",
+        )
+        .unwrap()
+    })
+}
+
+fn attempt_re() -> &'static Regex {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    RE.get_or_init(|| Regex::new(r"attempt \d+/\d+ ·").unwrap())
 }
 
 /// Factory Droid CLI status detection via tmux pane parsing.
@@ -4628,6 +4763,309 @@ You can monitor progress with aoe session logs.\n\
     #[test]
     fn test_detect_omp_status_idle_without_prompt() {
         assert_eq!(detect_omp_status("plain command output"), Status::Idle);
+    }
+
+    #[test]
+    fn test_detect_omp_status_error_retry_table() {
+        // #3377: omp's pane heuristic must stop reporting Idle for provider
+        // errors and retries. Error comes from omp's pinned banner (matched by
+        // its dismissal footer) or the terminal retry lines; retries read
+        // Running via the countdown and the sub-agent labels. Positions are
+        // 1-based from the bottom; the lowest signal wins.
+        let prompt_box = "╭── π  > GPT-5.6 Sol ─╮\n╰─                   ─╯";
+        let br = "─".repeat(24);
+        let banner = |msg: &str| {
+            format!(
+                "{br}\n ✖ {msg}\n Dismissed when you send your next message.\n{br}\n{prompt_box}"
+            )
+        };
+        let cases: &[(&str, String, Status)] = &[
+            // US1: rate limit / provider errors -> Error (banner anchor).
+            (
+                "banner 429",
+                banner("429 Too Many Requests (rate limited). Retry after 30s."),
+                Status::Error,
+            ),
+            (
+                "banner overloaded",
+                banner("Provider returned error: overloaded"),
+                Status::Error,
+            ),
+            ("banner rate limit", banner("Rate limit exceeded"), Status::Error),
+            (
+                "banner 503",
+                banner("503 Service Unavailable"),
+                Status::Error,
+            ),
+            ("banner 500", banner("500 Internal Server Error"), Status::Error),
+            (
+                "banner websocket",
+                banner("websocket closed before response completion"),
+                Status::Error,
+            ),
+            ("banner refused", banner("Connection refused"), Status::Error),
+            (
+                "banner fetch failed",
+                banner("fetch failed: socket hang up"),
+                Status::Error,
+            ),
+            ("banner timed out", banner("timed out after 30s"), Status::Error),
+            ("banner terminated", banner("terminated by upstream"), Status::Error),
+            ("banner retry delay", banner("retry delay exceeded"), Status::Error),
+            // Out-of-corpus errors still pin via the banner anchor alone.
+            (
+                "banner content filter",
+                banner("Output blocked by content filtering policy"),
+                Status::Error,
+            ),
+            ("banner unknown", banner("Unknown error"), Status::Error),
+            // Alternate glyph theme (default unicode theme uses U+2718).
+            (
+                "banner alt glyph",
+                format!(
+                    "{br}\n ✘ 429 Too Many Requests (rate limited). Retry after 30s.\n Dismissed when you send your next message.\n{br}\n{prompt_box}"
+                ),
+                Status::Error,
+            ),
+            // Terminal retry lines (live form, no banner on this path).
+            (
+                "terminal lines",
+                " Error: Retry budget exhausted after 10 retries: Unable to connect. Is the computer able to access the url?\n Error: Retry failed after 10 attempts: Unable to connect. Is the computer able to access the url?\n{prompt_box}"
+                    .to_string(),
+                Status::Error,
+            ),
+            // Banner with the retry-failed message (anchor is the signal).
+            (
+                "banner retry failed",
+                "✖ Retry failed after 3 attempts: 429 Too Many Requests (rate limited).\n Dismissed when you send your next message.\n{prompt_box}"
+                    .to_string(),
+                Status::Error,
+            ),
+            // Banner without the prompt box: the anchor alone suffices.
+            (
+                "banner no box",
+                format!(
+                    "{br}\n ✖ 429 Too Many Requests (rate limited). Retry after 30s.\n Dismissed when you send your next message.\n{br}"
+                ),
+                Status::Error,
+            ),
+            // Anchor at the window bound (pos 6) -> Error; past it (pos 7)
+            // the fallback prompt box wins.
+            (
+                "anchor pos 6 bound",
+                format!(
+                    " Dismissed when you send your next message.\n l1\n l2\n l3\n{prompt_box}"
+                ),
+                Status::Error,
+            ),
+            (
+                "anchor pos 7 out",
+                format!(
+                    " Dismissed when you send your next message.\n l1\n l2\n l3\n l4\n{prompt_box}"
+                ),
+                Status::Waiting,
+            ),
+            // US2: retry in progress -> Running.
+            (
+                "countdown",
+                format!("⠋ Retrying (2/3) in 30s… (esc to cancel)\n{prompt_box}"),
+                Status::Running,
+            ),
+            // No spinner frame and no esc glyph: isolates the countdown check.
+            (
+                "countdown no frame",
+                format!("Retrying (2/3) in 30s…\n{prompt_box}"),
+                Status::Running,
+            ),
+            // Countdown coexists with a pinned banner (preserved-turn retry).
+            (
+                "countdown with banner",
+                format!(
+                    "{br}\n ✖ 429 Too Many Requests (rate limited). Retry after 30s.\n Dismissed when you send your next message.\n{br}\n⠋ Retrying (2/3) in 30s… (esc to cancel)\n{prompt_box}"
+                ),
+                Status::Running,
+            ),
+            // Character wrap cutting between tokens is re-joined via (b).
+            (
+                "countdown wrapped",
+                format!("⠋ Retrying (2/3)\nin 30s… (esc to cancel)\n{prompt_box}"),
+                Status::Running,
+            ),
+            // Countdown at the window bound (pos 6).
+            (
+                "countdown pos 6 bound",
+                format!(
+                    "⠋ Retrying (2/3) in 30s… (esc to cancel)\n l1\n l2\n l3\n{prompt_box}"
+                ),
+                Status::Running,
+            ),
+            (
+                "label now",
+                format!(
+                    "└─ retrying 2/3 now: 429 Too Many Requests (rate limited). Retry after 30s.\n{prompt_box}"
+                ),
+                Status::Running,
+            ),
+            (
+                "label 5.0s",
+                format!(
+                    "retrying 2/3 in 5.0s: 429 Too Many Requests (rate limited).\n{prompt_box}"
+                ),
+                Status::Running,
+            ),
+            (
+                "label 1m5s",
+                format!(
+                    "retrying 2/3 in 1m5s: 429 Too Many Requests (rate limited).\n{prompt_box}"
+                ),
+                Status::Running,
+            ),
+            (
+                "rule repair attempt",
+                format!("Attempt 2/3 · generating…\n{prompt_box}"),
+                Status::Running,
+            ),
+            // US3: ordinary tool output never pins a healthy session.
+            (
+                "curl timed out",
+                format!(
+                    "curl: (28) Operation timed out after 30000 milliseconds\n{prompt_box}"
+                ),
+                Status::Waiting,
+            ),
+            (
+                "ssh refused",
+                format!(
+                    "ssh: connect to host 10.0.0.1 port 22: Connection refused\n{prompt_box}"
+                ),
+                Status::Waiting,
+            ),
+            (
+                "terminated by user",
+                format!("The agent was terminated by the user.\n{prompt_box}"),
+                Status::Waiting,
+            ),
+            (
+                "retry-after header",
+                format!("Retry-After: 30\n{prompt_box}"),
+                Status::Waiting,
+            ),
+            (
+                "attempt prose",
+                format!("I will attempt 2/3 of the cases\n{prompt_box}"),
+                Status::Waiting,
+            ),
+            (
+                "retrying prose",
+                format!(
+                    "The tool kept retrying 2/3 of the files before giving up.\n{prompt_box}"
+                ),
+                Status::Waiting,
+            ),
+            (
+                "retrying next batch",
+                format!("I will be retrying 2/3 in the next batch\n{prompt_box}"),
+                Status::Waiting,
+            ),
+            (
+                "stop retrying intervals",
+                format!("Stop retrying (2/3) in 5s intervals!\n{prompt_box}"),
+                Status::Waiting,
+            ),
+            (
+                "retry failed no prefix",
+                format!(
+                    "The tool reported retry failed after 3 attempts\n{prompt_box}"
+                ),
+                Status::Waiting,
+            ),
+            (
+                "retrying my tests",
+                format!("I keep retrying 2/3 in my tests: still failing\n{prompt_box}"),
+                Status::Waiting,
+            ),
+            (
+                "sub agent gave up",
+                format!(
+                    "auto-retry gave up after 3 attempts: 429 Too Many Requests (rate limited).\n{prompt_box}"
+                ),
+                Status::Waiting,
+            ),
+            // Accepted: prose indistinguishable from the real label render
+            // (family R3, bounded) reads Running by design.
+            (
+                "label prose accepted",
+                format!("I'm retrying 2/3 now: the API timed out.\n{prompt_box}"),
+                Status::Running,
+            ),
+            // Precedences: the lowest signal wins.
+            (
+                "stale approval over fresh banner",
+                format!(
+                    "Allow tool: bash\nApprove\nDeny\n ✖ 429 Too Many Requests (rate limited). Retry after 30s.\n Dismissed when you send your next message.\n{prompt_box}"
+                ),
+                Status::Error,
+            ),
+            (
+                "approval out of window",
+                format!(
+                    "Allow tool: bash\nApprove\nDeny\n l1\n l2\n ✖ 429 Too Many Requests (rate limited). Retry after 30s.\n Dismissed when you send your next message.\n{prompt_box}"
+                ),
+                Status::Error,
+            ),
+            (
+                "terminal lines below approval",
+                format!(
+                    " Error: Retry budget exhausted after 10 retries: …\nAllow tool: bash\nApprove\nDeny\n{prompt_box}"
+                ),
+                Status::Waiting,
+            ),
+            (
+                "approval in window over banner",
+                format!(
+                    "Allow tool: bash\nApprove\nDeny\n ✖ 429 Too Many Requests (rate limited). Retry after 30s.\n Dismissed when you send your next message.\n{br}\n{prompt_box}"
+                ),
+                Status::Error,
+            ),
+            (
+                "live countdown over approval",
+                format!(
+                    "Allow tool: bash\nApprove\nDeny\n⠋ Retrying (2/3) in 30s… (esc to cancel)\n{prompt_box}"
+                ),
+                Status::Running,
+            ),
+            (
+                "stale countdown under approval",
+                format!(
+                    "⠋ Retrying (2/3) in 30s… (esc to cancel)\nAllow tool: bash\nApprove\nDeny\n{prompt_box}"
+                ),
+                Status::Waiting,
+            ),
+            (
+                "anchor over label",
+                format!(
+                    "retrying 2/3 now: 429…\n ✖ 429 Too Many Requests (rate limited).\n Dismissed when you send your next message.\n{prompt_box}"
+                ),
+                Status::Error,
+            ),
+            (
+                "approval over label",
+                format!(
+                    "retrying 2/3 now: 429…\nAllow tool: bash\nApprove\nDeny\n{prompt_box}"
+                ),
+                Status::Waiting,
+            ),
+            (
+                "stale terminal lines out of window",
+                format!(
+                    " Error: Retry failed after 10 attempts: …\n OK\n Done.\n Next\n Final\n{prompt_box}"
+                ),
+                Status::Waiting,
+            ),
+        ];
+        for (name, pane, expected) in cases {
+            assert_eq!(detect_omp_status(pane), *expected, "case: {name}");
+        }
     }
 
     #[test]
