@@ -815,10 +815,21 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                         ),
                         // A custom agent inheriting a registry-backed base runs
                         // that base's adapter; check that binary is on PATH.
+                        // Resolve inheritance from the same keys the capability
+                        // check accepted (`capability_key` for an explicit
+                        // --agent wrapper, else the tool), so `--tool X --agent
+                        // <wrapper>` where only the wrapper inherits does not
+                        // fall through to `unreachable!`.
                         None => match crate::acp::inherited_acp_base(
-                            &instance.tool,
+                            capability_key,
                             &config.session.agent_detect_as,
                         )
+                        .or_else(|| {
+                            crate::acp::inherited_acp_base(
+                                &instance.tool,
+                                &config.session.agent_detect_as,
+                            )
+                        })
                         .and_then(|base| registry.get(&base).cloned())
                         {
                             Some(spec) => (spec, true),

@@ -125,12 +125,23 @@ export function MobileMainPane({
               />
             </Suspense>
           ) : (
-            <TerminalSessionStack
-              activeSessionId={activeSessionId!}
-              sessions={sessions.filter((session) => session.view !== "structured")}
-              persistent={webSettings.persistentTerminals}
-              maxPersistentTerminals={webSettings.maxPersistentTerminals}
-            />
+            // Reserve the bottom home-indicator inset on this wrapper (the App
+            // root no longer does; see index.css .safe-area-inset) so the last
+            // terminal row clears it. Kept off the pane root itself, which owns
+            // the keyboard-open lift and must stay inset-free when closed (#1432).
+            // Collapses to 0 with the keyboard open (iOS reports the inset as 0)
+            // and on desktop.
+            <div
+              className="flex-1 flex flex-col min-h-0 overflow-hidden"
+              style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
+            >
+              <TerminalSessionStack
+                activeSessionId={activeSessionId!}
+                sessions={sessions.filter((session) => session.view !== "structured")}
+                persistent={webSettings.persistentTerminals}
+                maxPersistentTerminals={webSettings.maxPersistentTerminals}
+              />
+            </div>
           )}
         </div>
 

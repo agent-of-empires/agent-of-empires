@@ -214,13 +214,11 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
     );
   }
 
-  // Bottom clearance: the App root no longer reserves the home-indicator inset
-  // (see `.safe-area-inset` in index.css), so the terminal owns it. Keyboard
-  // closed → `env(safe-area-inset-bottom)` keeps the last line / toolbar off
-  // the indicator. Keyboard open → iOS reports that inset as 0 and the layout
-  // viewport does not shrink on regular Safari, so the measured `keyboardHeight`
-  // does the lift; the `calc` reduces to it. Everywhere else both terms are 0.
-  const rootStyle = { paddingBottom: `calc(${keyboardHeight}px + env(safe-area-inset-bottom))` };
+  // Keyboard-open lift only. The pane root deliberately carries no inset while
+  // the keyboard is closed (#1432): home-indicator clearance is reserved by an
+  // ancestor (see the terminal wrapper in MobileMainPane), not here, so the
+  // mobile-keyboard specs can read a bare `${keyboardHeight}px` off this node.
+  const rootStyle = keyboardHeight > 0 ? { paddingBottom: keyboardHeight } : undefined;
 
   return (
     <div
