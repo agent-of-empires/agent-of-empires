@@ -134,6 +134,49 @@ test.describe("mobile jump-to-bottom", () => {
     await expect.poll(isPinned).toBe(true);
   });
 
+  test("reopening (reload) shows the bottom by default", async ({ page }) => {
+    const longText = Array.from({ length: 120 }, (_, i) => `line ${i}`).join("\n");
+    const mock = await mockAcpSession(page, {
+      title: "story-reopen-bottom",
+      initialEvents: [agentMessageChunk(longText), stopped()],
+    });
+    await openStructuredSession(page, mock);
+    await waitForComposerConnected(page);
+
+    const viewport = page.getByTestId("acp-viewport");
+    const isPinned = () => viewport.evaluate((el) => el.scrollTop + el.clientHeight >= el.scrollHeight - 16);
+    await expect.poll(isPinned).toBe(true);
+
+    // Reopen the PWA (hard reload of the deep-linked session, localStorage kept).
+    await page.reload();
+    await waitForComposerConnected(page);
+    await expect.poll(isPinned).toBe(true);
+    await expect(page.getByTestId("acp-jump-to-bottom")).toBeHidden();
+  });
+
+  test("reopening (reload) preserves a scrolled-up position", async ({ page }) => {
+    const longText = Array.from({ length: 200 }, (_, i) => `transcript history line number ${i}`).join("\n");
+    const mock = await mockAcpSession(page, {
+      title: "story-reopen-up",
+      initialEvents: [agentMessageChunk(longText), stopped()],
+    });
+    await openStructuredSession(page, mock);
+    await waitForComposerConnected(page);
+
+    const viewport = page.getByTestId("acp-viewport");
+    // Wait until the transcript actually overflows, so scrolling up is meaningful.
+    await expect.poll(() => viewport.evaluate((el) => el.scrollHeight > el.clientHeight + 40)).toBe(true);
+    // Scroll up with a real gesture so the stick intent releases (and is saved).
+    await userScroll(viewport, 0);
+    await expect(page.getByTestId("acp-jump-to-bottom")).toBeVisible();
+
+    // Reopen: because we were scrolled up when hidden, it must NOT jump to the
+    // bottom; the jump-to-bottom button is still shown.
+    await page.reload();
+    await waitForComposerConnected(page);
+    await expect(page.getByTestId("acp-jump-to-bottom")).toBeVisible();
+  });
+
   test("does not yank a scrolled-up reader to the bottom on new content", async ({ page }) => {
     const longText = Array.from({ length: 120 }, (_, i) => `history line ${i}`).join("\n");
     const mock = await mockAcpSession(page, {

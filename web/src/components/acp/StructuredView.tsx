@@ -34,6 +34,7 @@ import { AskUserQuestionCard } from "./AskUserQuestionCard";
 import { AcpFileRefContext } from "./AcpFileRefContext";
 import type { FileRef, FileRefSession } from "../../lib/fileRef";
 import { anchorIsStale, autoLoadDecision, isPinnedToBottom, scrollRestoreDelta } from "../../lib/historyScroll";
+import { loadScrollState, saveScrollState } from "../../lib/acpScrollState";
 import { repinOnResize } from "../../lib/repinOnResize";
 import { ToolDensityToggle, ToolDisplayModeProvider, useToolDensityPref } from "./ToolDisplayMode";
 import { AcpRuntime, SUBAGENT_TASK_NAME, TODO_GROUP_NAME, TOOL_GROUP_NAME, type AcpContext } from "./AcpRuntime";
@@ -403,6 +404,9 @@ function AcpChrome({
   // we at the bottom just before this transition" instead, which that interim
   // false-scroll cannot clobber (it only ever bumps the timestamp forward).
   const lastAtBottomAtRef = useRef(0);
+  // Guards the one-time PWA-reopen scroll restore so it runs on mount, not on
+  // every effect re-subscribe.
+  const didRestoreScrollRef = useRef(false);
   // Reactive mirror of `wasAtBottomRef` that drives the mobile
   // "jump to bottom" button's visibility. Updated only when the pinned
   // state actually flips, so a scroll gesture is not a per-frame re-render.
@@ -523,9 +527,14 @@ function AcpChrome({
     const sample = (force = false) => {
       if (force || !isCoarse || gestureActive) {
         const pinned = isPinnedToBottom(vp.scrollTop, vp.clientHeight, vp.scrollHeight);
+        const prevStuck = wasAtBottomRef.current;
         wasAtBottomRef.current = pinned;
         if (pinned) lastAtBottomAtRef.current = performance.now();
         setAtBottom((prev) => (prev === pinned ? prev : pinned));
+        // Persist the stick intent the moment it flips (user scrolled off / back
+        // to the bottom), so a PWA reopen restores it even if `pagehide` never
+        // fires. The offset save on hide/unmount refines the exact position.
+        if (pinned !== prevStuck) saveScrollState(sessionId, { stuck: pinned, top: vp.scrollTop });
         // Momentum after a flick keeps firing `scroll` with no fresh touchmove;
         // keep the gesture alive so those frames still count as the user's.
         if (gestureActive) scheduleGestureClear();
@@ -549,6 +558,54 @@ function AcpChrome({
     vp.addEventListener("scroll", onScroll, { passive: true });
     vp.addEventListener("wheel", markGesture, { passive: true });
     vp.addEventListener("touchmove", markGesture, { passive: true });
+    // The soft keyboard slides the visual viewport over ~300ms and fires
+    // `visualViewport` "resize" on every frame of that animation. Pinning to
+    // the bottom synchronously in that handler makes the transcript track the
+    // keyboard in lockstep, so the output and the input slide together instead
+    // of the output snapping into place a beat after the keyboard settles. Only
+    // when we are stuck to the bottom; a scrolled-up reader is left alone.
+    const vv = typeof window !== "undefined" ? window.visualViewport : null;
+    const onVvResize = () => {
+      if (wasAtBottomRef.current) vp.scrollTop = vp.scrollHeight;
+    };
+    vv?.addEventListener("resize", onVvResize);
+
+    // PWA reopen: `sample(true)` above ran against a cache-restored transcript
+    // sitting at scrollTop 0, which reads as "not at the bottom". Override that
+    // with the intent the reader had when the app was last hidden. Default (no
+    // record, or they were at the bottom) pins to the bottom; a scrolled-up
+    // reader gets their approximate position back. Runs once per mount.
+    if (!didRestoreScrollRef.current) {
+      didRestoreScrollRef.current = true;
+      const saved = loadScrollState(sessionId);
+      const stick = !saved || saved.stuck;
+      wasAtBottomRef.current = stick;
+      if (stick) lastAtBottomAtRef.current = performance.now();
+      setAtBottom(stick);
+      const applyStart = () => {
+        if (stick) {
+          vp.scrollTop = vp.scrollHeight;
+        } else if (saved) {
+          vp.scrollTop = Math.max(0, Math.min(saved.top, vp.scrollHeight - vp.clientHeight));
+        }
+      };
+      // After the cached transcript lays out; a second pass for the stick case
+      // catches content (markdown, tool cards, images) that renders a beat later.
+      requestAnimationFrame(() => requestAnimationFrame(applyStart));
+      if (stick) window.setTimeout(applyStart, 150);
+    }
+
+    // Persist the scroll intent when the app is hidden or torn down, so the next
+    // reopen can restore it. `pagehide` covers a reload / PWA close; the
+    // visibility hook covers backgrounding; the cleanup covers a session switch.
+    const saveScroll = () => {
+      saveScrollState(sessionId, { stuck: wasAtBottomRef.current, top: vp.scrollTop });
+    };
+    const onVisibility = () => {
+      if (document.visibilityState === "hidden") saveScroll();
+    };
+    window.addEventListener("pagehide", saveScroll);
+    document.addEventListener("visibilitychange", onVisibility);
     // Re-pin on two elements: the chrome below the viewport (composer, queued
     // strips) and the viewport itself, because chrome *outside* this view can
     // resize it too (the App's header collapse).
@@ -588,9 +645,13 @@ function AcpChrome({
       vp.removeEventListener("scroll", onScroll);
       vp.removeEventListener("wheel", markGesture);
       vp.removeEventListener("touchmove", markGesture);
+      vv?.removeEventListener("resize", onVvResize);
+      window.removeEventListener("pagehide", saveScroll);
+      document.removeEventListener("visibilitychange", onVisibility);
+      saveScroll();
       if (gestureClearTimer) window.clearTimeout(gestureClearTimer);
     };
-  }, [requestEarlierHistory, isCoarse]);
+  }, [requestEarlierHistory, isCoarse, sessionId]);
 
   // Hold the bottom pin across a chrome transition that resizes the viewport:
   // the soft keyboard opening/closing, and the composer ("hide text input")
