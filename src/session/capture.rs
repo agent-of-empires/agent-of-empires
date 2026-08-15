@@ -2668,7 +2668,7 @@ cwd_col='cwd' if has_cwd else 'NULL'; \
 root_col='git_repo_root' if has_root else 'NULL'; \
 [print('%s\\t%s\\t%s' % (r[0], r[1] or '', r[2] or '')) for r in conn.execute('SELECT id, ' + cwd_col + ', ' + root_col + \" FROM sessions WHERE source='cli' AND ended_at IS NULL ORDER BY started_at DESC, id DESC\")]";
 
-/// One active Hermes CLI session row with its recorded workspace signals.
+/// One active Hermes CLI session row with its recorded project signal.
 ///
 /// `cwd`/`git_repo_root` are `None` when the column is missing from the
 /// schema, the value is NULL, or it is empty: such rows carry no usable
@@ -2874,9 +2874,12 @@ fn read_hermes_sessions_from_sqlite(db_path: &Path) -> Result<HermesSessionScan>
     // built from a fixed whitelist so a partially-migrated schema (one column
     // present) still carries its usable signal instead of failing prepare.
     let (has_cwd, has_git_repo_root) = {
+        // PRAGMA table_info on a missing table returns zero rows (no error),
+        // so a prepare failure here is a genuinely unreadable store; a missing
+        // table surfaces at the SELECT prepare below.
         let mut stmt = conn
             .prepare("PRAGMA table_info(sessions)")
-            .context("Hermes sessions table missing")?;
+            .context("Failed to prepare Hermes sessions table probe")?;
         let cols = stmt
             .query_map([], |row| row.get::<_, String>(1))
             .context("Failed to read Hermes sessions table columns")?;
@@ -2903,7 +2906,7 @@ fn read_hermes_sessions_from_sqlite(db_path: &Path) -> Result<HermesSessionScan>
     );
     let mut stmt = conn
         .prepare(&sql)
-        .context("Hermes sessions table schema mismatch")?;
+        .context("Hermes sessions table missing or schema mismatch")?;
 
     let rows = stmt
         .query_map([], |row| {
@@ -5038,10 +5041,11 @@ mod tests {
     fn test_select_hermes_session_tab_in_cwd_truncates() {
         // A cwd containing a TAB truncates at the first TAB (documented
         // residual). The byte input mirrors what the script emits for a real
-        // cwd "/tmp/hermes-a<TAB>rest" with an empty root: id, then the
-        // truncated-looking cwd, then the remainder, then the empty root
-        // field. splitn(3) truncates cwd at the first TAB, so a needle equal
-        // to the pre-TAB prefix matches; a different needle must not.
+        // cwd "/tmp/hermes-a<TAB>rest" with an empty script-side root field:
+        // id, the pre-TAB cwd, the remainder, then the empty root field
+        // separator. splitn(3) puts the remainder into the parser-side root
+        // ("rest\t"), so a needle equal to the truncated cwd matches; a
+        // different needle must not.
         let output = b"SIGNAL\n20260429_193246_aaa\t/tmp/hermes-a\trest\t\n";
         let result = select_hermes_session(output, "/tmp/hermes-a/sub", &HashSet::new());
         assert!(result.is_err());
