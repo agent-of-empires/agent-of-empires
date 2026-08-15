@@ -7002,8 +7002,10 @@ fn summarize_error_from_pane(pane_content: &str) -> String {
     if anchor_is_lowest {
         let mut msg_lines: Vec<&str> = Vec::new();
         for line in tail.iter().skip(anchor_idx.unwrap() + 1) {
+            // Border line: the banner's DynamicBorder (U+2500 by default,
+            // `-` under omp's ascii theme).
             let trimmed = line.trim();
-            if trimmed.chars().all(|c| c == '─') {
+            if !trimmed.is_empty() && trimmed.chars().all(|c| c == '─' || c == '-') {
                 break;
             }
             msg_lines.push(line);

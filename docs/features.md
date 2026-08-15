@@ -101,7 +101,8 @@ Each session reports `Running`, `Waiting`, `Idle`, or `Error` based on tmux pane
 
 omp status is pane-heuristic only: it keys on the live loader (`Working… ⟦esc⟧`),
 the retry countdown (`Retrying (N/M) in Ns…`), sub-agent retry labels
-(`retrying N/M …`), omp's pinned error banner (matched by its dismissal footer
+(`retrying N/M …`, the rule-repair `Attempt N/M ·`), the approval prompt
+(`Allow tool: …`), omp's pinned error banner (matched by its anchor line
 "Dismissed when you send your next message."), the terminal retry lines
 (`Error: Retry budget exhausted` / `Error: Retry failed after`), and the
 `╭── π`/`╰─` prompt box; the lowest pane signal wins. It cannot see structured
@@ -110,11 +111,11 @@ lines. The banner anchor and the terminal retry lines are required for Error:
 provider-error words in ordinary tool output (timeout, terminated, connection
 refused) never pin a healthy session on Error, and a sub-agent retry failure
 (`auto-retry gave up …`) does not mark the session. The mode execution-frame
-loader (`Running… (esc to cancel)`) and the compaction loader
-(`Context overflow detected, compacting… (esc to cancel)`) are not matched by
-the spinner check. Degradations: if a future omp release rewords the banner
-footer or the terminal retry lines, errored sessions degrade to
-`Waiting`/`Idle` until the heuristic
+loader (`Running… (esc to cancel)`) and the compaction loaders
+(`Compacting context... (esc to cancel)` / `Auto-compacting context... (esc to
+cancel)`) are not matched by the spinner check. Degradations: if a future omp
+release rewords the banner footer or the terminal retry lines, errored
+sessions degrade to `Waiting`/`Idle` until the heuristic
 is updated; the `✖`/`✘` glyph and `⟦esc⟧` are theme-dependent; a countdown
 wrapped mid-token (very narrow panes) is not detected. The structured
 error/retry path (herdr-style extension) is tracked in #3380.

@@ -1774,7 +1774,8 @@ pub fn detect_pi_status(raw_content: &str) -> Status {
 /// countdown (`Retrying (N/M) in Ns…`), the pinned error banner (matched by
 /// its anchor line "Dismissed when you send your next message."), the
 /// terminal retry lines (`Error: Retry budget exhausted` / `Error: Retry
-/// failed after`), sub-agent retry labels (`retrying N/M …`), and the
+/// failed after`), sub-agent retry labels (`retrying N/M …`, the rule-repair
+/// `Attempt N/M ·`), the approval prompt (`Allow tool: …`), and the
 /// `╭── π`/`╰─` prompt box. Each signal has a freshness window; beyond it the
 /// signal is ignored, so a completed turn's loader or a dismissed banner in
 /// scrollback cannot pin the session. The heuristic cannot see structured
@@ -4934,9 +4935,37 @@ You can monitor progress with aoe session logs.\n\
                 Status::Running,
             ),
             (
+                "label 500ms",
+                format!(
+                    "retrying 2/3 in 500ms: 429 Too Many Requests (rate limited).\n{prompt_box}"
+                ),
+                Status::Running,
+            ),
+            (
+                "label 2h",
+                format!(
+                    "retrying 2/3 in 2h: 429 Too Many Requests (rate limited).\n{prompt_box}"
+                ),
+                Status::Running,
+            ),
+            (
                 "rule repair attempt",
                 format!("Attempt 2/3 · generating…\n{prompt_box}"),
                 Status::Running,
+            ),
+            // Wrap cut between the countdown number and its unit (R8).
+            (
+                "countdown cut 30|s",
+                format!("⠋ Retrying (2/3) in 30\ns… (esc to cancel)\n{prompt_box}"),
+                Status::Running,
+            ),
+            // Tie at equal position: terminal lines outrank labels.
+            (
+                "tie terminal over label",
+                format!(
+                    "retrying 1/3 now: Error: Retry failed after 2 attempts.\n{prompt_box}"
+                ),
+                Status::Error,
             ),
             // US3: ordinary tool output never pins a healthy session.
             (
