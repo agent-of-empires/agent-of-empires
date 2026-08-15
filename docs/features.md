@@ -110,9 +110,11 @@ lines. The banner anchor and the terminal retry lines are required for Error:
 provider-error words in ordinary tool output (timeout, terminated, connection
 refused) never pin a healthy session on Error, and a sub-agent retry failure
 (`auto-retry gave up …`) does not mark the session. The mode execution-frame
-loader (`Running… (esc to cancel)`) is not matched by the spinner check.
-Degradations: if a future omp release rewords the banner footer or the terminal
-retry lines, errored sessions degrade to `Waiting`/`Idle` until the heuristic
+loader (`Running… (esc to cancel)`) and the compaction loader
+(`Context overflow detected, compacting… (esc to cancel)`) are not matched by
+the spinner check. Degradations: if a future omp release rewords the banner
+footer or the terminal retry lines, errored sessions degrade to
+`Waiting`/`Idle` until the heuristic
 is updated; the `✖`/`✘` glyph and `⟦esc⟧` are theme-dependent; a countdown
 wrapped mid-token (very narrow panes) is not detected. The structured
 error/retry path (herdr-style extension) is tracked in #3380.

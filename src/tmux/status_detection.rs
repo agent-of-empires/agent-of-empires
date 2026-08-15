@@ -1766,19 +1766,20 @@ pub fn detect_pi_status(raw_content: &str) -> Status {
     Status::Idle
 }
 
-/// Oh My Pi status detection via its live footer.
+/// Oh My Pi status detection via its live pane output.
 ///
 /// OMP keeps a bordered prompt visible both while running and while idle.
 /// Status is decided by the lowest pane signal, where position 1 is the
 /// bottom non-empty line: the live loader (`Working… ⟦esc⟧`), the retry
 /// countdown (`Retrying (N/M) in Ns…`), the pinned error banner (matched by
-/// its dismissal footer), the terminal retry lines (`Error: Retry budget
-/// exhausted` / `Error: Retry failed after`), sub-agent retry labels
-/// (`retrying N/M …`), and the `╭── π`/`╰─` prompt box. Each signal has a
-/// freshness window; beyond it the signal is ignored, so a completed turn's
-/// loader or a dismissed banner in scrollback cannot pin the session.
-/// The heuristic cannot see structured turn events; the structured error/retry
-/// path (herdr-style extension) is tracked in #3380.
+/// its anchor line "Dismissed when you send your next message."), the
+/// terminal retry lines (`Error: Retry budget exhausted` / `Error: Retry
+/// failed after`), sub-agent retry labels (`retrying N/M …`), and the
+/// `╭── π`/`╰─` prompt box. Each signal has a freshness window; beyond it the
+/// signal is ignored, so a completed turn's loader or a dismissed banner in
+/// scrollback cannot pin the session. The heuristic cannot see structured
+/// turn events; the structured error/retry path (herdr-style extension) is
+/// tracked in #3380.
 pub fn detect_omp_status(raw_content: &str) -> Status {
     let clean = strip_ansi(raw_content);
     let non_empty_lines: Vec<&str> = clean
@@ -1946,8 +1947,12 @@ fn countdown_b() -> &'static Regex {
 fn label_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
+        // Exact grammar of omp's formatDuration (packages/utils/src/format.ts
+        // in the 17.3.4 source): Nms / X.Ys (toFixed(1)) / Nm / NmNs / Nh /
+        // NhNm / Nd / NdNh, never more than two units, never decimals below
+        // the seconds level.
         Regex::new(
-            r"retrying \d+/\d+ (in (\d+(\.\d+)?ms|\d+(\.\d+)?s|\d+m(\d+(\.\d+)?s)?|\d+h(\d+m(\d+(\.\d+)?s)?)?|\d+d(\d+h(\d+m(\d+(\.\d+)?s)?)?)?)|now):",
+            r"retrying \d+/\d+ (in (\d+ms|\d+\.\d+s|\d+m(\d+s)?|\d+h(\d+m)?|\d+d(\d+h)?)|now):",
         )
         .expect("static label regex")
     })
@@ -4830,7 +4835,10 @@ You can monitor progress with aoe session logs.\n\
                 ),
                 Status::Error,
             ),
-            // Terminal retry lines (live form, no banner on this path).
+            // Terminal retry lines (live form, no banner on this path). The
+            // budget-exhausted line is the attested terminal render; the
+            // failed-after line is defensive (omp 17.3.4 routes it through
+            // showPinnedError -> banner, covered by the anchor).
             (
                 "terminal lines",
                 format!(
