@@ -23,12 +23,12 @@ pub struct AgentSpec {
     /// Human-readable description shown in the settings TUI and
     /// `aoe acp agents`.
     pub description: String,
-    /// Extra env vars forwarded to this agent on top of the base inheritance
-    /// set defined by `ALWAYS_FORWARD_ENV` in `acp_client.rs` (PATH/HOME/
-    /// locale/SSH plus the Claude/Anthropic auth keys). `None` means nothing
-    /// extra. Populated by `default_env_allowlist` for built-in adapters via
-    /// `install_hints::env_allowlist_for`; a custom `from_acp_cmd` spec
-    /// leaves it `None` and can be overridden by
+    /// Provider env vars forwarded to this agent on top of the infrastructure
+    /// inheritance set defined by `ALWAYS_FORWARD_ENV` in `acp_client.rs`.
+    /// `None` means no ambient provider credentials. Populated by
+    /// `default_env_allowlist` for built-in adapters via
+    /// `install_hints::env_allowlist_for`; a custom `from_acp_cmd` spec leaves
+    /// it `None` and can be overridden by
     /// `session.inherit_host_environment = true` if the user needs more keys
     /// through.
     pub env_allowlist: Option<Vec<String>>,
@@ -255,10 +255,10 @@ mod tests {
         assert!(AgentSpec::from_acp_cmd("x", "ocp run \"unterminated").is_err());
     }
 
-    /// #3238: verified adapters (`codex`, `opencode`, `gemini`, `aoe-agent`)
+    /// #3238: verified adapters (`claude`, `codex`, `opencode`, `gemini`,
+    /// `aoe-agent`)
     /// forward the operator's provider-auth env; adapters whose real env
-    /// vars couldn't be source-verified (pi, omp, kimi, vibe, and Claude
-    /// which is already covered by `ALWAYS_FORWARD_ENV`) stay `None`.
+    /// vars couldn't be source-verified (pi, omp, kimi, vibe) stay `None`.
     /// One row asserts a specific negative for `aoe-agent`: it must NOT
     /// receive `GEMINI_API_KEY` (that's the CLI-native name; the bundled
     /// AI-SDK agent reads `GOOGLE_GENERATIVE_AI_API_KEY` instead). The
@@ -270,6 +270,17 @@ mod tests {
         let reg = AgentRegistry::with_defaults();
         let al = |name: &str| reg.get(name).and_then(|s| s.env_allowlist.clone());
 
+        let claude_keys = [
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CONFIG_DIR",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+        assert_eq!(al("claude").as_deref(), Some(claude_keys.as_slice()));
+        assert_eq!(al("claude-code").as_deref(), Some(claude_keys.as_slice()));
         assert_eq!(
             al("codex").as_deref(),
             Some(
@@ -288,6 +299,7 @@ mod tests {
             al("aoe-agent").as_deref(),
             Some(
                 &[
+                    "ANTHROPIC_API_KEY",
                     "OPENAI_API_KEY",
                     "OPENAI_BASE_URL",
                     "GOOGLE_GENERATIVE_AI_API_KEY"
@@ -329,9 +341,9 @@ mod tests {
             assert!(opencode.iter().any(|k| k == key), "opencode missing {key}");
         }
 
-        // Deferred + Claude: intentionally None until each adapter's env
-        // reads are verified from its own source.
-        for name in ["claude", "claude-code", "pi", "omp", "kimi", "vibe"] {
+        // Deferred adapters stay None until each adapter's env reads are
+        // verified from its own source.
+        for name in ["pi", "omp", "kimi", "vibe"] {
             assert!(
                 al(name).is_none(),
                 "{name} must have None env_allowlist until source-verified"
@@ -351,7 +363,14 @@ mod tests {
             .collect();
         assert_eq!(
             with_allowlist,
-            ["aoe-agent", "codex", "gemini", "opencode"]
+            [
+                "aoe-agent",
+                "claude",
+                "claude-code",
+                "codex",
+                "gemini",
+                "opencode",
+            ]
                 .into_iter()
                 .collect::<std::collections::BTreeSet<_>>(),
             "the set of adapters with an env_allowlist changed; update env_allowlist_for and this assertion together"

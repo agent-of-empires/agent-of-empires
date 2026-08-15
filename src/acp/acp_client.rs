@@ -3787,8 +3787,8 @@ fn build_sandbox_docker_argv(
         container_workdir.to_string(),
     ];
     // `collect_environment` already dedupes by key, so the entry list is
-    // unique. We still track `seen_keys` so the provider-auth block below
-    // can skip keys we've already forwarded.
+    // unique. We still track `seen_keys` so the explicit auth sources below
+    // cannot override sandbox configuration.
     let mut seen_keys: std::collections::HashSet<String> =
         env_entries.iter().map(|e| e.key().to_string()).collect();
     let (env_argv, inherit_pairs) = docker_env_args(&env_entries);
@@ -3799,9 +3799,8 @@ fn build_sandbox_docker_argv(
     // first-claim-wins. The order mirrors the non-sandboxed paths, where the
     // per-request `provider_env` is applied last and so wins a shared key over
     // the ambient host keys: request auth (`provider_env`) > per-adapter
-    // allowlist > ambient host Claude keys (`PROVIDER_AUTH_KEYS`). The sandbox
-    // env list (`collect_environment` above) is claimed before all of these,
-    // matching the operator-config precedence on the host paths.
+    // allowlist. The sandbox env list (`collect_environment` above) is claimed
+    // before both, matching the operator-config precedence on the host paths.
 
     // Per-spawn provider_env entries (the request's auth payload).
     for (key, value) in &config.provider_env {
@@ -3822,12 +3821,11 @@ fn build_sandbox_docker_argv(
     // to it via `-e`, so each allowlisted host value is set on the runner
     // (`inherit_env`) and named with `-e KEY`.
     //
-    // Value-typed entries only, for the same reason `PROVIDER_AUTH_KEYS` below
-    // omits `CLAUDE_CONFIG_DIR`: a host path names nothing inside the
-    // container, so forwarding it points the adapter at a directory that does
-    // not exist instead of the one `AGENT_CONFIG_MOUNTS` bind-mounts at the
-    // canonical container path. These keys stay host-only and keep flowing on
-    // the two non-sandboxed spawn paths, where they are the point.
+    // Value-typed entries only: a host path names nothing inside the container,
+    // so forwarding it points the adapter at a directory that does not exist
+    // instead of the one `AGENT_CONFIG_MOUNTS` bind-mounts at the canonical
+    // container path. These keys stay host-only and keep flowing on the two
+    // non-sandboxed spawn paths, where they are the point.
     for (key, value) in allowlisted_env_pairs(config) {
         if is_host_only_path_env(&key) {
             continue;
@@ -3836,29 +3834,6 @@ fn build_sandbox_docker_argv(
             docker_args.push("-e".into());
             docker_args.push(key.clone());
             inherit_env.push((key, value));
-        }
-    }
-
-    // Ambient host Claude auth keys: forward into the container only when set
-    // on the host AND not already claimed above. Value-typed only; host
-    // filesystem paths (e.g. `CLAUDE_CONFIG_DIR`) must not cross the namespace
-    // boundary because they reference paths that don't exist inside the
-    // container. The agent's config dir is already bind-mounted at the
-    // canonical container path via `AGENT_CONFIG_MOUNTS`.
-    const PROVIDER_AUTH_KEYS: &[&str] = &[
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "CLAUDE_CODE_OAUTH_TOKEN",
-    ];
-    for &key in PROVIDER_AUTH_KEYS {
-        if seen_keys.contains(key) {
-            continue;
-        }
-        if let Ok(value) = std::env::var(key) {
-            seen_keys.insert(key.to_string());
-            docker_args.push("-e".into());
-            docker_args.push(key.into());
-            inherit_env.push((key.into(), value));
         }
     }
 
@@ -3878,11 +3853,10 @@ fn build_sandbox_docker_argv(
     })
 }
 
-/// Env vars forwarded from the operator environment to every spawned
-/// agent, on both the detached-runner path (`apply_env_filter`) and the
-/// in-proc stdio path (`spawn_subprocess`). Both spawn sites `env_clear()`
-/// first, so this is the whole inheritance surface; keeping it in one const
-/// is what stops the two paths drifting apart.
+/// Infrastructure variables forwarded from the operator environment to every
+/// host-side agent, on both the detached-runner path (`apply_env_filter`) and
+/// the in-proc stdio path (`spawn_subprocess`). Provider credentials come only
+/// from the adapter's `env_allowlist` or explicit session configuration.
 const ALWAYS_FORWARD_ENV: &[&str] = &[
     "PATH",
     "HOME",
@@ -3908,10 +3882,6 @@ const ALWAYS_FORWARD_ENV: &[&str] = &[
     // lives in the environment). The value is a socket path, not a secret;
     // the security lives in the ssh-agent behind it. See #2691.
     "SSH_AUTH_SOCK",
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "CLAUDE_CONFIG_DIR",
 ];
 
 /// The inherited host environment layer for a structured-view agent, applied
@@ -3919,7 +3889,7 @@ const ALWAYS_FORWARD_ENV: &[&str] = &[
 ///
 /// This is the fix for #3262. #3079 added desktop-env forwarding for the tmux
 /// paths only, so an agent in the structured view still got `env_clear()` plus
-/// the twelve names in `ALWAYS_FORWARD_ENV` and never saw `DISPLAY`: the very
+/// the fixed base allowlist and never saw `DISPLAY`: the very
 /// symptom #3075 reported, still live for anyone driving aoe from the browser.
 /// Routing both views through
 /// [`crate::session::environment::inherited_host_env`] is what keeps them from
@@ -3945,10 +3915,9 @@ fn inherited_host_env_pairs(config: &SpawnConfig) -> Vec<(String, String)> {
 /// cross into a container: the path names nothing there, so forwarding it
 /// points the adapter away from the config dir `AGENT_CONFIG_MOUNTS` mounts
 /// at the canonical container location. `CLAUDE_CONFIG_DIR` is the case that
-/// established the rule (it is deliberately absent from `PROVIDER_AUTH_KEYS`
-/// in `build_sandbox_docker_argv`); the other two arrived with the per-adapter
-/// allowlists in #3238. Adding a path-valued key to `env_allowlist_for`
-/// means adding it here too.
+/// established the rule; the other two arrived with the per-adapter allowlists
+/// in #3238. Adding a path-valued key to `env_allowlist_for` means adding it
+/// here too.
 fn is_host_only_path_env(key: &str) -> bool {
     matches!(
         key,
@@ -4422,11 +4391,9 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    // Env: clear, then forward the shared allowlist + provider-specific
-    // creds. AOE_TOKEN must NEVER reach the agent. Uses the same
-    // `ALWAYS_FORWARD_ENV` const as the runner path so the two spawn
-    // sites cannot drift; provider auth (`ANTHROPIC_API_KEY`, etc.) and
-    // `SSH_AUTH_SOCK` for git-over-SSH ride along in that list.
+    // Env: clear, then forward shared infrastructure plus the selected
+    // adapter's provider allowlist. AOE_TOKEN must NEVER reach the agent. The
+    // shared helper keeps the runner and in-proc paths from drifting.
     cmd.env_clear();
     // Under the allowlist, so ALWAYS_FORWARD_ENV's PATH prepend still wins.
     // Same layer the runner path applies in `apply_env_filter`; see #3262.
@@ -11904,7 +11871,7 @@ mod tests {
 
     /// #3238 regression guard: the per-adapter `env_allowlist` must cross the
     /// container boundary for a sandboxed session. Before the fix,
-    /// `build_sandbox_docker_argv` forwarded only `PROVIDER_AUTH_KEYS` +
+    /// `build_sandbox_docker_argv` forwarded only a fixed Claude-key block plus
     /// `provider_env`, so an operator's `OPENAI_API_KEY` never reached a
     /// sandboxed `codex`/`aoe-agent` session and auth silently failed. The
     /// value must ride `inherit_env` (not `-e KEY=VALUE`, which would leak the
@@ -11913,10 +11880,11 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn build_sandbox_docker_argv_forwards_env_allowlist() {
-        let prev_key = std::env::var("OPENAI_API_KEY").ok();
-        let prev_hook = std::env::var("LD_PRELOAD").ok();
-        std::env::set_var("OPENAI_API_KEY", "sk-openai");
-        std::env::set_var("LD_PRELOAD", "/tmp/evil.so");
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("OPENAI_API_KEY", "sk-openai"),
+            ("ANTHROPIC_API_KEY", "sk-unrelated-anthropic"),
+            ("LD_PRELOAD", "/tmp/evil.so"),
+        ]);
         let tmp = tempfile::tempdir().unwrap();
         let sandbox = SandboxInfo {
             enabled: true,
@@ -11935,14 +11903,6 @@ mod tests {
 
         let argv = build_sandbox_docker_argv(&config, &sandbox, "/workspace/proj")
             .expect("docker argv built");
-        match prev_key {
-            Some(v) => std::env::set_var("OPENAI_API_KEY", v),
-            None => std::env::remove_var("OPENAI_API_KEY"),
-        }
-        match prev_hook {
-            Some(v) => std::env::set_var("LD_PRELOAD", v),
-            None => std::env::remove_var("LD_PRELOAD"),
-        }
 
         assert!(
             argv.docker_args
@@ -11972,19 +11932,29 @@ mod tests {
             "a denied linker hook must not cross the boundary even when allowlisted, got {:?}",
             argv.docker_args
         );
+        assert!(
+            !argv.docker_args.iter().any(|a| a == "ANTHROPIC_API_KEY")
+                && !argv
+                    .inherit_env
+                    .iter()
+                    .any(|(k, _)| k == "ANTHROPIC_API_KEY"),
+            "a credential outside this adapter's allowlist must not cross the boundary"
+        );
     }
 
     /// The per-session `provider_env` auth payload must win a shared key over
-    /// the ambient host `PROVIDER_AUTH_KEYS`, matching the non-sandboxed paths
-    /// (where `provider_env` is applied last). Before the ordering fix the
-    /// sandbox claimed the host key first, so a session that selected a
-    /// different Anthropic credential silently ran under the operator's ambient
-    /// one inside the container.
+    /// the adapter's ambient allowlist, matching the non-sandboxed paths (where
+    /// `provider_env` is applied last). Before the ordering fix the sandbox
+    /// claimed the host key first, so a session that selected a different
+    /// Anthropic credential silently ran under the operator's ambient one
+    /// inside the container.
     #[test]
     #[serial_test::serial]
     fn build_sandbox_docker_argv_provider_env_beats_ambient_host_key() {
-        let prev = std::env::var("ANTHROPIC_API_KEY").ok();
-        std::env::set_var("ANTHROPIC_API_KEY", "sk-host-ambient");
+        let _env = crate::session::test_support::EnvGuard::set(&[(
+            "ANTHROPIC_API_KEY",
+            "sk-host-ambient",
+        )]);
         let tmp = tempfile::tempdir().unwrap();
         let sandbox = SandboxInfo {
             enabled: true,
@@ -11997,15 +11967,13 @@ mod tests {
             container_workdir: None,
         };
         let mut config = env_test_spawn_config(tmp.path().to_path_buf());
+        let reg = crate::acp::agent_registry::AgentRegistry::with_defaults();
+        config.spec = reg.get("claude").expect("claude default").clone();
         config.provider_env = vec![("ANTHROPIC_API_KEY".into(), "sk-session-request".into())];
         config.sandbox_info = Some(sandbox.clone());
 
         let argv = build_sandbox_docker_argv(&config, &sandbox, "/workspace/proj")
             .expect("docker argv built");
-        match prev {
-            Some(v) => std::env::set_var("ANTHROPIC_API_KEY", v),
-            None => std::env::remove_var("ANTHROPIC_API_KEY"),
-        }
 
         let values: Vec<&str> = argv
             .inherit_env
@@ -15416,6 +15384,7 @@ done
         let tmp = tempfile::tempdir().expect("tempdir");
         let _app_dir = crate::session::test_support::isolate_app_dir_at(tmp.path());
         let _env = crate::session::test_support::EnvGuard::set(&[
+            ("ANTHROPIC_API_KEY", "sk-anthropic"),
             ("OPENAI_API_KEY", "sk-openai"),
             ("GOOGLE_GENERATIVE_AI_API_KEY", "ai-google"),
             ("GEMINI_API_KEY", "ai-gemini-cli-key"),
@@ -15439,6 +15408,10 @@ done
             })
             .collect();
         assert_eq!(
+            applied.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("sk-anthropic")
+        );
+        assert_eq!(
             applied.get("OPENAI_API_KEY").map(String::as_str),
             Some("sk-openai")
         );
@@ -15451,6 +15424,28 @@ done
         assert!(
             !applied.contains_key("GEMINI_API_KEY"),
             "aoe-agent (AI-SDK) must not receive the gemini-CLI-native key, got {applied:#?}"
+        );
+
+        config.spec = reg.get("codex").expect("codex default").clone();
+        let mut codex_cmd = std::process::Command::new("/bin/true");
+        codex_cmd.env_clear();
+        apply_env_filter(&mut codex_cmd, &config);
+        let codex_env: std::collections::HashMap<String, String> = codex_cmd
+            .get_envs()
+            .filter_map(|(key, value)| {
+                Some((
+                    key.to_string_lossy().into_owned(),
+                    value?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        assert_eq!(
+            codex_env.get("OPENAI_API_KEY").map(String::as_str),
+            Some("sk-openai")
+        );
+        assert!(
+            !codex_env.contains_key("ANTHROPIC_API_KEY"),
+            "Codex must not receive another adapter's ambient credential, got {codex_env:#?}"
         );
     }
 

@@ -34,16 +34,17 @@ The `npm install -g` commands above are optional: `aoe acp doctor --fix` install
 
 Tools not yet wired into the registry (aider, cursor, copilot, droid, hermes, kiro) always run in the terminal view. A **custom agent** can opt in by setting an ACP launch command via `agent_acp_cmd` (see [Configuration](guides/configuration.md#running-a-custom-agent-in-the-structured-view)).
 
-The structured view always forwards `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, and `CLAUDE_CONFIG_DIR` to every agent. Four adapters additionally receive the provider variables they are known to read, from the environment that runs `aoe serve`:
+Each built-in adapter receives only the provider variables it is known to read from the environment that runs `aoe serve`:
 
-| Adapter | Also forwarded |
+| Adapter | Forwarded |
 |---|---|
+| `claude` | `ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`, `CLAUDE_CODE_OAUTH_TOKEN`, `CLAUDE_CONFIG_DIR` |
 | `codex` | `CODEX_API_KEY`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `CODEX_HOME` |
 | `opencode` | `OPENAI_API_KEY`, `GOOGLE_GENERATIVE_AI_API_KEY`, `GOOGLE_API_KEY`, `GEMINI_API_KEY`, `OPENROUTER_API_KEY`, `OPENCODE_API_KEY` |
 | `gemini` | `GEMINI_API_KEY`, `GOOGLE_API_KEY`, `GOOGLE_GENAI_USE_VERTEXAI`, `GOOGLE_APPLICATION_CREDENTIALS`, `GOOGLE_CLOUD_PROJECT`, `GOOGLE_CLOUD_LOCATION` |
-| `aoe-agent` | `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `GOOGLE_GENERATIVE_AI_API_KEY` |
+| `aoe-agent` | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `GOOGLE_GENERATIVE_AI_API_KEY` |
 
-`vibe`, `pi`, `omp`, and `kimi` forward nothing extra yet. Until their variables are verified, give them auth through the per-session `extra_env` field or `environment` in your config, or set `session.inherit_host_environment = true` to forward your whole `aoe serve` environment to non-sandboxed agents. In a sandboxed session the per-adapter provider keys above still cross the container boundary (forwarded as `docker exec -e` flags), but `inherit_host_environment` does not; give a sandboxed not-yet-verified adapter its auth through `sandbox.environment`. Two entries are host-only and never cross: `CODEX_HOME` and `GOOGLE_APPLICATION_CREDENTIALS` name paths on your machine that do not exist inside the container, and the agent's config dir is already bind-mounted at its canonical container location.
+`vibe`, `pi`, `omp`, and `kimi` have no ambient provider allowlist yet. Custom adapters also receive no ambient provider credentials. Until their variables are verified, give them auth through the per-session `extra_env` field or `environment` in your config, or set `session.inherit_host_environment = true` to forward your whole `aoe serve` environment to non-sandboxed agents. In a sandboxed session the per-adapter provider keys above still cross the container boundary (forwarded as `docker exec -e` flags), but `inherit_host_environment` does not; give a sandboxed not-yet-verified adapter its auth through `sandbox.environment`. Three entries are host-only and never cross: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, and `GOOGLE_APPLICATION_CREDENTIALS` name paths on your machine that do not exist inside the container, and each agent's config dir is already bind-mounted at its canonical container location.
 
 ### Feature matrix
 

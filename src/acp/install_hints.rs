@@ -46,16 +46,14 @@ pub fn npm_package_for(binary: &str) -> Option<&'static str> {
     })
 }
 
-/// Extra operator env vars to forward to a given ACP binary, on top of
-/// `ALWAYS_FORWARD_ENV` in `acp_client.rs` (which already carries the
-/// Anthropic/Claude keys plus PATH/HOME/locale/SSH). Empty slice means
-/// nothing extra: Claude adapters use `ALWAYS_FORWARD_ENV` verbatim, and
-/// four adapters (`pi-acp`, `omp`, `kimi`, `vibe-acp`) are intentionally
-/// deferred because their env-var names could not be source-verified for
-/// #3238 and shipping a guess that never matches would silently no-op
-/// the fix. Follow-up: verify each adapter's real reads from its own
-/// package/binary and add its arm. Every arm below cites the artifact its
-/// names came from; do not add one on convention alone.
+/// Operator env vars to forward to a given ACP binary, on top of the
+/// infrastructure-only `ALWAYS_FORWARD_ENV` in `acp_client.rs`. Empty slice
+/// means no ambient provider credentials. Four adapters (`pi-acp`, `omp`,
+/// `kimi`, `vibe-acp`) are intentionally deferred because their env-var names
+/// could not be source-verified for #3238 and shipping a guess that never
+/// matches would silently no-op the fix. Follow-up: verify each adapter's real
+/// reads from its own package/binary and add its arm. Every arm below cites the
+/// artifact its names came from; do not add one on convention alone.
 ///
 /// The key is the friendly binary token used at registration time (e.g.
 /// [`AOE_AGENT_BINARY`]), NOT `AgentSpec.command`. `command` for `aoe-agent`
@@ -64,14 +62,24 @@ pub fn npm_package_for(binary: &str) -> Option<&'static str> {
 /// miss the bundled agent.
 pub fn env_allowlist_for(binary: &str) -> &'static [&'static str] {
     match binary {
+        // Existing Claude adapter contract, previously supplied through
+        // ALWAYS_FORWARD_ENV. Keep all four names on the Claude adapter while
+        // stopping unrelated and custom adapters from receiving them.
+        "claude-agent-acp" => &[
+            "ANTHROPIC_API_KEY",
+            "ANTHROPIC_AUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CONFIG_DIR",
+        ],
         // Verified from source: acp-worker/aoe-agent/src/index.ts imports only
         // @ai-sdk/{anthropic,openai,google}, and those providers read their key
-        // from the environment themselves. Anthropic is already in
-        // ALWAYS_FORWARD_ENV. @ai-sdk/openai 4.0.27 reads OPENAI_API_KEY and
+        // from the environment themselves. @ai-sdk/anthropic reads
+        // ANTHROPIC_API_KEY; @ai-sdk/openai 4.0.27 reads OPENAI_API_KEY and
         // OPENAI_BASE_URL (src/openai-provider.ts); @ai-sdk/google 4.0.31 reads
         // GOOGLE_GENERATIVE_AI_API_KEY, NOT GEMINI_API_KEY (the gemini CLI's
         // own name).
         AOE_AGENT_BINARY => &[
+            "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
             "OPENAI_BASE_URL",
             "GOOGLE_GENERATIVE_AI_API_KEY",
