@@ -1816,9 +1816,9 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
     // a character-wrap cut between tokens still matches.
     let window6 = tail_lines(&non_empty_lines, 6);
     let mut countdown_pos = None;
-    for (i, line) in window6.iter().enumerate() {
+    for (i, line) in window6.iter().rev().enumerate() {
         if countdown_a().is_match(&line.to_lowercase()) {
-            countdown_pos = Some(window6.len() - i);
+            countdown_pos = Some(i + 1);
             break;
         }
     }
@@ -1832,7 +1832,8 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
             joined.push_str(&line.to_lowercase());
             line_ends.push(joined.len());
         }
-        if let Some(m) = countdown_b().find(&joined) {
+        // The last (lowest) fragment wins, matching the lowest-signal rule.
+        if let Some(m) = countdown_b().find_iter(&joined).last() {
             for (i, end) in line_ends.iter().enumerate() {
                 if m.end() <= *end {
                     countdown_pos = Some(window6.len() - i);

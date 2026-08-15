@@ -7017,7 +7017,7 @@ fn summarize_error_from_pane(pane_content: &str) -> String {
             let mut reason = String::new();
             for line in msg_lines.iter().rev() {
                 let mut text = line.trim();
-                for glyph in ["✖", "✘", "✕"] {
+                for glyph in ["✖", "✘", "✕", "[!!]", "\u{f00d}"] {
                     if let Some(rest) = text.strip_prefix(glyph) {
                         text = rest.trim_start();
                         break;
