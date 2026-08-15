@@ -4958,6 +4958,13 @@ You can monitor progress with aoe session logs.\n\
                 Status::Running,
             ),
             (
+                "label 2h",
+                format!(
+                    "retrying 2/3 in 2h: 429 Too Many Requests (rate limited).\n{prompt_box}"
+                ),
+                Status::Running,
+            ),
+            (
                 "label 1h30m",
                 format!(
                     "retrying 2/3 in 1h30m: 429 Too Many Requests (rate limited).\n{prompt_box}"
