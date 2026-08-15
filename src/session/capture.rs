@@ -2690,7 +2690,7 @@ struct HermesSessionScan {
     signal_columns_present: bool,
 }
 
-/// Normalize a Hermes workspace-signal value: NULL or empty means "no signal".
+/// Normalize a Hermes project-signal value: NULL or empty means "no signal".
 fn normalize_hermes_signal(value: Option<String>) -> Option<String> {
     value.filter(|v| !v.is_empty())
 }
@@ -2705,14 +2705,15 @@ fn normalize_hermes_signal(value: Option<String>) -> Option<String> {
 /// signal maps to `None`; selection then runs through
 /// [`select_hermes_session_id`].
 ///
-/// Residuals, all pathological and benign (they degrade to a fresh start,
-/// never a wrong resume): a newline in the trailing `git_repo_root` field
-/// yields a row with a truncated root (its cwd arm still matches); a TAB in
-/// a cwd truncates it at the first TAB, so a needle equal to the truncated
-/// prefix matches a row whose real cwd differs; and row/needle paths are
-/// canonicalized against the host filesystem, so a container path that
-/// happens to exist on the host as a symlink can compare differently than
-/// the value Hermes recorded inside the container.
+/// Residuals, all pathological and mostly benign (they degrade to a fresh
+/// start): a newline in the trailing `git_repo_root` field yields a row with
+/// a truncated root (its cwd arm still matches); a TAB in a cwd truncates it
+/// at the first TAB, so a needle equal to the truncated prefix matches a row
+/// whose real cwd differs (a wrong-match corner, accepted for a literal TAB
+/// in a path); and row/needle paths are canonicalized against the host
+/// filesystem, so a container path that happens to exist on the host as a
+/// symlink can compare differently than the value Hermes recorded inside the
+/// container.
 fn select_hermes_session(
     output: &[u8],
     container_cwd: &str,
@@ -2774,9 +2775,16 @@ fn select_hermes_session(
 /// On a legacy schema (neither column present) no row carries a project
 /// signal. The sole unclaimed active conversation is returned (unambiguous);
 /// with more than one, capture fails closed so the agent starts fresh rather
-/// than silently guessing. This deliberately diverges from `hermes -c`,
-/// which falls back to the global most-recent conversation: for a
-/// project-scoped AoE session that fallback *is* the mis-attribution bug.
+/// than silently guessing.
+///
+/// Deliberate divergences from `hermes -c` (which is workspace-scoped via
+/// its git-root-or-cwd key and only then falls back to the global
+/// most-recent conversation; on a column-less schema it finds nothing at
+/// all): AoE requires exact canonicalized equality, considers only active
+/// rows (`ended_at IS NULL`, so a cleanly-exited conversation starts fresh
+/// by design), orders by `started_at` rather than Hermes' `last_active`
+/// recency, and never dips into a global-MRU fallback. That fallback is the
+/// mis-attribution bug shape for a project-scoped AoE session.
 fn select_hermes_session_id(
     scan: &HermesSessionScan,
     project_path: &str,
@@ -2785,31 +2793,31 @@ fn select_hermes_session_id(
     if scan.signal_columns_present {
         let needle = canonicalize_or_raw(project_path);
         for row in &scan.rows {
+            if exclusion.contains(&row.id) {
+                continue;
+            }
             let matches = row
                 .cwd
                 .as_deref()
-                .map(|cwd| canonicalize_or_raw(cwd) == needle)
-                .unwrap_or(false)
+                .is_some_and(|cwd| canonicalize_or_raw(cwd) == needle)
                 || row
                     .git_repo_root
                     .as_deref()
-                    .map(|root| canonicalize_or_raw(root) == needle)
-                    .unwrap_or(false);
-            if matches && !exclusion.contains(&row.id) {
+                    .is_some_and(|root| canonicalize_or_raw(root) == needle);
+            if matches {
                 return Ok(row.id.clone());
             }
         }
         anyhow::bail!("No active Hermes session found matching project path")
     } else {
-        let unclaimed = scan
+        let mut unclaimed = scan
             .rows
             .iter()
             .map(|row| row.id.as_str())
-            .filter(|id| !exclusion.contains(*id))
-            .collect::<Vec<_>>();
-        match unclaimed.len() {
-            0 => anyhow::bail!("No active Hermes session found"),
-            1 => Ok(unclaimed[0].to_string()),
+            .filter(|id| !exclusion.contains(*id));
+        match (unclaimed.next(), unclaimed.next()) {
+            (None, _) => anyhow::bail!("No active Hermes session found"),
+            (Some(id), None) => Ok(id.to_string()),
             _ => anyhow::bail!(
                 "Multiple active Hermes sessions without a project signal; starting fresh"
             ),
@@ -2820,15 +2828,15 @@ fn select_hermes_session_id(
 /// Capture session ID from Hermes's SQLite state database.
 ///
 /// Queries `~/.hermes/state.db` (or `$HERMES_HOME/state.db`) for active CLI
-/// sessions. Hermes records the working directory and git repo root on each
-/// CLI session row, so capture scopes the active set to the canonicalized
-/// project path (exact `cwd` or `git_repo_root` match), mirroring how the
-/// other agents' captures validate cwd or project hash. On legacy databases
-/// without those columns capture fails closed when more than one unclaimed
-/// active conversation exists (the poller then yields `None`), so the agent
-/// starts fresh instead of silently resuming the wrong conversation.
-/// Cross-instance isolation for same-project peers still relies on the
-/// exclusion set.
+/// sessions. Hermes records the working directory on each local CLI session
+/// row (`git_repo_root` only when a gateway or TUI frontend later enriches
+/// it), so capture scopes the active set to the canonicalized project path
+/// (exact `cwd` or `git_repo_root` match), mirroring how the other agents'
+/// captures validate cwd or project hash. On legacy databases without those
+/// columns capture fails closed when more than one unclaimed active
+/// conversation exists (the poller then yields `None`), so the agent starts
+/// fresh instead of silently resuming the wrong conversation. Cross-instance
+/// isolation for same-project peers still relies on the exclusion set.
 pub(crate) fn capture_hermes_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
@@ -5232,7 +5240,8 @@ mod tests {
     fn test_capture_hermes_null_cwd_never_resumed() {
         // Full-schema rows with NULL (or empty) cwd carry no project signal
         // and are never returned: they are foreign by construction (aoe-launched
-        // rows always record cwd), and resuming one is the #3373 bug shape.
+        // local rows always record cwd; a non-local TERMINAL_ENV backend makes
+        // hermes record None), and resuming one is the #3373 bug shape.
         for cwd in [None, Some("")] {
             let tmp = tempfile::tempdir().unwrap();
             let project = std::fs::canonicalize(tmp.path()).unwrap();
