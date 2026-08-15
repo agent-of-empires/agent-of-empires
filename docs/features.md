@@ -117,7 +117,12 @@ cancel)`) are not matched by the spinner check. Degradations: if a future omp
 release rewords the banner footer or the terminal retry lines, errored
 sessions degrade to `Waiting`/`Idle` until the heuristic
 is updated; the `✖`/`✘` glyph and `⟦esc⟧` are theme-dependent; a countdown
-wrapped mid-token (very narrow panes) is not detected. The structured
+wrapped mid-token (very narrow panes) is not detected. Tool output that
+verbatim contains an omp terminal retry phrase (`Error: Retry budget
+exhausted` / `Error: Retry failed after`, with the `Error:` prefix) or a
+rule-repair label (`attempt N/M ·`) within the detection window reads the
+corresponding status (Error/Running) until it scrolls out, the same accepted
+family as the `retrying N/M now:` prose case. The structured
 error/retry path (herdr-style extension) is tracked in #3380.
 
 ### Auto-stop idle sessions

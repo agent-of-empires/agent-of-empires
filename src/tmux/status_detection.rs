@@ -1949,11 +1949,12 @@ fn label_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
         // Exact grammar of omp's formatDuration (packages/utils/src/format.ts
-        // in the 17.3.4 source): Nms / X.Ys (toFixed(1)) / Nm / NmNs / Nh /
+        // in the 17.3.4 source): Nms (fractional: the retry jitter leaves
+        // fractional milliseconds) / X.Ys (toFixed(1)) / Nm / NmNs / Nh /
         // NhNm / Nd / NdNh, never more than two units, never decimals below
         // the seconds level.
         Regex::new(
-            r"retrying \d+/\d+ (in (\d+ms|\d+\.\d+s|\d+m(\d+s)?|\d+h(\d+m)?|\d+d(\d+h)?)|now):",
+            r"retrying \d+/\d+ (in (\d+(\.\d+)?ms|\d+\.\d+s|\d+m(\d+s)?|\d+h(\d+m)?|\d+d(\d+h)?)|now):",
         )
         .expect("static label regex")
     })
@@ -4941,10 +4942,39 @@ You can monitor progress with aoe session logs.\n\
                 ),
                 Status::Running,
             ),
+            // Fractional ms: the retry jitter leaves a fractional delayMs.
             (
-                "label 2h",
+                "label 876.5ms",
                 format!(
-                    "retrying 2/3 in 2h: 429 Too Many Requests (rate limited).\n{prompt_box}"
+                    "retrying 2/3 in 876.5ms: 429 Too Many Requests (rate limited).\n{prompt_box}"
+                ),
+                Status::Running,
+            ),
+            (
+                "label 2m",
+                format!(
+                    "retrying 2/3 in 2m: 429 Too Many Requests (rate limited).\n{prompt_box}"
+                ),
+                Status::Running,
+            ),
+            (
+                "label 1h30m",
+                format!(
+                    "retrying 2/3 in 1h30m: 429 Too Many Requests (rate limited).\n{prompt_box}"
+                ),
+                Status::Running,
+            ),
+            (
+                "label 1d",
+                format!(
+                    "retrying 2/3 in 1d: 429 Too Many Requests (rate limited).\n{prompt_box}"
+                ),
+                Status::Running,
+            ),
+            (
+                "label 1d5h",
+                format!(
+                    "retrying 2/3 in 1d5h: 429 Too Many Requests (rate limited).\n{prompt_box}"
                 ),
                 Status::Running,
             ),
@@ -4957,6 +4987,12 @@ You can monitor progress with aoe session logs.\n\
             (
                 "countdown cut 30|s",
                 format!("⠋ Retrying (2/3) in 30\ns… (esc to cancel)\n{prompt_box}"),
+                Status::Running,
+            ),
+            // Wrap cut between the unit and the ellipsis.
+            (
+                "countdown cut s|ellipsis",
+                format!("⠋ Retrying (2/3) in 30s\n… (esc to cancel)\n{prompt_box}"),
                 Status::Running,
             ),
             // Tie at equal position: terminal lines outrank labels.

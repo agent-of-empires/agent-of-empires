@@ -7019,6 +7019,9 @@ fn summarize_error_from_pane(pane_content: &str) -> String {
             let mut reason = String::new();
             for line in msg_lines.iter().rev() {
                 let mut text = line.trim();
+                // status.error glyphs across omp themes (✘ default, ✖
+                // poimandres override, [!!] ascii, U+F00D nerd); ✕ is the
+                // tool-result icon.error slot, included defensively.
                 for glyph in ["✖", "✘", "✕", "[!!]", "\u{f00d}"] {
                     if let Some(rest) = text.strip_prefix(glyph) {
                         text = rest.trim_start();
