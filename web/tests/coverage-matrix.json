@@ -595,6 +595,13 @@
       "components": ["web/public/sw.js"]
     },
     {
+      "id": "notifications.push-subscription",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/hooks/usePushSubscription.test.ts"],
+      "components": ["web/src/hooks/usePushSubscription.ts"]
+    },
+    {
       "id": "settings.security-readonly",
       "kind": "vitest",
       "risk": "low",
