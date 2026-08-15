@@ -2654,11 +2654,14 @@ const HERMES_COMMAND_TIMEOUT_SECS: u64 = 5;
 /// Prints a mode line (`SIGNAL` when the schema has at least one of the
 /// `cwd`/`git_repo_root` columns, else `LEGACY`) followed by one
 /// TAB-separated `id\tcwd\tgit_repo_root` tuple per active CLI session,
-/// newest first. The script deliberately performs no matching: the recorded
+/// newest first. A missing `state.db` exits without output (a read-only poll
+/// must never create the store it probes); the poll then fails closed. The
+/// script deliberately performs no matching: the recorded
 /// cwd values may need host-side canonicalization, so selection happens in
-/// Rust (see `select_hermes_session`).
-const HERMES_CONTAINER_CAPTURE_SCRIPT: &str = "import sqlite3, os; \
+/// Rust (see `select_hermes_session_in_container`).
+const HERMES_CONTAINER_CAPTURE_SCRIPT: &str = "import sqlite3, os, sys; \
 db=os.path.join(os.environ.get('HERMES_HOME', os.path.expanduser('~/.hermes')), 'state.db'); \
+sys.exit(0) if not os.path.exists(db) else None; \
 conn=sqlite3.connect(db, timeout=1.0); \
 cols={r[1] for r in conn.execute('PRAGMA table_info(sessions)')}; \
 has_cwd='cwd' in cols; \
@@ -2714,7 +2717,7 @@ fn normalize_hermes_signal(value: Option<String>) -> Option<String> {
 /// filesystem, so a container path that happens to exist on the host as a
 /// symlink can compare differently than the value Hermes recorded inside the
 /// container.
-fn select_hermes_session(
+fn select_hermes_session_in_container(
     output: &[u8],
     container_cwd: &str,
     exclusion: &HashSet<String>,
@@ -2956,7 +2959,7 @@ pub(crate) fn try_capture_hermes_session_id_in_container(
         "docker exec python3 (hermes session scan)",
     )?;
 
-    select_hermes_session(&stdout_bytes, container_cwd, exclusion)
+    select_hermes_session_in_container(&stdout_bytes, container_cwd, exclusion)
 }
 
 /// Polling closure for Hermes session tracking.
@@ -4942,7 +4945,8 @@ mod tests {
         let output = b"SIGNAL\n\
 20260429_193246_aaa\t/tmp/hermes-a\t\n\
 20260429_193246_bbb\t/tmp/hermes-b\t\n";
-        let result = select_hermes_session(output, "/tmp/hermes-a", &HashSet::new()).unwrap();
+        let result =
+            select_hermes_session_in_container(output, "/tmp/hermes-a", &HashSet::new()).unwrap();
         assert_eq!(result, "20260429_193246_aaa");
     }
 
@@ -4955,7 +4959,8 @@ mod tests {
 20260429_193246_bbb\t/tmp/hermes-a\t\n";
         let mut exclusion = HashSet::new();
         exclusion.insert("20260429_193246_aaa".to_string());
-        let result = select_hermes_session(output, "/tmp/hermes-a", &exclusion).unwrap();
+        let result =
+            select_hermes_session_in_container(output, "/tmp/hermes-a", &exclusion).unwrap();
         assert_eq!(result, "20260429_193246_bbb");
     }
 
@@ -4964,21 +4969,22 @@ mod tests {
         // In SIGNAL mode a row whose cwd points at another project is never
         // returned, even when it is the only active conversation.
         let output = b"SIGNAL\n20260429_193246_aaa\t/tmp/other-project\t\n";
-        let result = select_hermes_session(output, "/tmp/hermes-a", &HashSet::new());
+        let result = select_hermes_session_in_container(output, "/tmp/hermes-a", &HashSet::new());
         assert!(result.is_err());
     }
 
     #[test]
     fn test_select_hermes_session_legacy_single_row() {
         let output = b"LEGACY\n20260429_193246_aaa\t\t\n";
-        let result = select_hermes_session(output, "/tmp/anywhere", &HashSet::new()).unwrap();
+        let result =
+            select_hermes_session_in_container(output, "/tmp/anywhere", &HashSet::new()).unwrap();
         assert_eq!(result, "20260429_193246_aaa");
     }
 
     #[test]
     fn test_select_hermes_session_legacy_multiple_ambiguous() {
         let output = b"LEGACY\n20260429_193246_aaa\t\t\n20260429_193246_bbb\t\t\n";
-        let result = select_hermes_session(output, "/tmp/anywhere", &HashSet::new());
+        let result = select_hermes_session_in_container(output, "/tmp/anywhere", &HashSet::new());
         assert!(result.is_err());
     }
 
@@ -4987,13 +4993,14 @@ mod tests {
         let output = b"LEGACY\n20260429_193246_aaa\t\t\n20260429_193246_bbb\t\t\n";
         let mut exclusion = HashSet::new();
         exclusion.insert("20260429_193246_aaa".to_string());
-        let result = select_hermes_session(output, "/tmp/anywhere", &exclusion).unwrap();
+        let result =
+            select_hermes_session_in_container(output, "/tmp/anywhere", &exclusion).unwrap();
         assert_eq!(result, "20260429_193246_bbb");
     }
 
     #[test]
     fn test_select_hermes_session_empty_output() {
-        let result = select_hermes_session(b"", "/tmp/hermes-a", &HashSet::new());
+        let result = select_hermes_session_in_container(b"", "/tmp/hermes-a", &HashSet::new());
         assert!(result.is_err());
     }
 
@@ -5002,7 +5009,8 @@ mod tests {
         // Whitespace-only lines before the mode line are tolerated; the first
         // non-empty line must still be the mode line.
         let output = b"  \n\nSIGNAL\n20260429_193246_ccc\t/tmp/hermes-c\t\n  \n";
-        let result = select_hermes_session(output, "/tmp/hermes-c", &HashSet::new()).unwrap();
+        let result =
+            select_hermes_session_in_container(output, "/tmp/hermes-c", &HashSet::new()).unwrap();
         assert_eq!(result, "20260429_193246_ccc");
     }
 
@@ -5011,7 +5019,7 @@ mod tests {
         // Old id-only output (or a drifted script) must fail closed, not
         // misparse into a bogus id.
         let output = b"20260429_193246_aaa\n20260429_193246_bbb\n";
-        let result = select_hermes_session(output, "/tmp/hermes-a", &HashSet::new());
+        let result = select_hermes_session_in_container(output, "/tmp/hermes-a", &HashSet::new());
         assert!(result.is_err());
     }
 
@@ -5023,7 +5031,8 @@ mod tests {
         let output = b"SIGNAL\n\
 20260429_193246_good\t/tmp/hermes-a\t\n\
 20260429_193246_bad\t/tmp/hermes-b\nwith-newline\t\n";
-        let result = select_hermes_session(output, "/tmp/hermes-a", &HashSet::new()).unwrap();
+        let result =
+            select_hermes_session_in_container(output, "/tmp/hermes-a", &HashSet::new()).unwrap();
         assert_eq!(result, "20260429_193246_good");
     }
 
@@ -5033,7 +5042,8 @@ mod tests {
         // truncated root (documented residual); the cwd arm still matches.
         let output = b"SIGNAL\n\
 20260429_193246_root\t/tmp/hermes-a\t/tmp/root\npart2\t\n";
-        let result = select_hermes_session(output, "/tmp/hermes-a", &HashSet::new()).unwrap();
+        let result =
+            select_hermes_session_in_container(output, "/tmp/hermes-a", &HashSet::new()).unwrap();
         assert_eq!(result, "20260429_193246_root");
     }
 
@@ -5047,9 +5057,11 @@ mod tests {
         // ("rest\t"), so a needle equal to the truncated cwd matches; a
         // different needle must not.
         let output = b"SIGNAL\n20260429_193246_aaa\t/tmp/hermes-a\trest\t\n";
-        let result = select_hermes_session(output, "/tmp/hermes-a/sub", &HashSet::new());
+        let result =
+            select_hermes_session_in_container(output, "/tmp/hermes-a/sub", &HashSet::new());
         assert!(result.is_err());
-        let result = select_hermes_session(output, "/tmp/hermes-a", &HashSet::new()).unwrap();
+        let result =
+            select_hermes_session_in_container(output, "/tmp/hermes-a", &HashSet::new()).unwrap();
         assert_eq!(result, "20260429_193246_aaa");
     }
 
@@ -5583,12 +5595,12 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn test_hermes_container_script_modes() {
         // Run the literal HERMES_CONTAINER_CAPTURE_SCRIPT against a temp db
         // with the host python3 (no docker needed), verifying the SIGNAL and
-        // LEGACY mode lines and the TAB row format. Skips when python3 is
-        // unavailable.
+        // LEGACY mode lines and the TAB row format. No process-global state
+        // is touched (HERMES_HOME goes to the child only), so no #[serial].
+        // Skips when python3 is unavailable.
         let ok = std::process::Command::new("python3")
             .arg("--version")
             .output()
@@ -5597,6 +5609,21 @@ mod tests {
         if !ok {
             return;
         }
+
+        // Missing store: the read-only poll must not create state.db and must
+        // produce no output (the parser then fails closed).
+        let empty_home = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(HERMES_CONTAINER_CAPTURE_SCRIPT)
+            .env("HERMES_HOME", empty_home.path())
+            .output()
+            .unwrap();
+        assert!(out.stdout.is_empty());
+        assert!(
+            !empty_home.path().join("state.db").exists(),
+            "script must not create the store it probes"
+        );
 
         // SIGNAL arm: full schema, two rows in different projects.
         let signal_db = tempfile::tempdir().unwrap();

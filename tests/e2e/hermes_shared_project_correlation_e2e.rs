@@ -10,7 +10,8 @@
 //!
 //! Teeth: `aoe session start` is a blocking CLI launch that captures and
 //! persists the session id via `capture_launched_session_id_blocking`
-//! (src/cli/session.rs, an 8s bounded drain of the session's poller). With
+//! (defined in src/session/sync.rs, called from src/cli/session.rs; an 8s
+//! bounded drain of the session's poller). With
 //! the project scoping reverted, session A's start captures B (the global
 //! most-recent conversation) and publishes `AOE_CAPTURED_SESSION_ID`; session
 //! B's start then excludes B and captures A, a deterministic swap (or both
