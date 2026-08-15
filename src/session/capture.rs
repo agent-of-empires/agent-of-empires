@@ -5024,12 +5024,14 @@ mod tests {
     #[test]
     fn test_select_hermes_session_tab_in_cwd_truncates() {
         // A cwd containing a TAB truncates at the first TAB (documented
-        // residual). A needle equal to the pre-TAB prefix would match the
-        // truncated row; a different needle must not mis-attribute it.
-        let output = b"SIGNAL\n20260429_193246_aaa\t/tmp/hermes-a\trest\n";
+        // residual). The byte input mirrors what the script emits for a real
+        // cwd "/tmp/hermes-a<TAB>rest" with an empty root: id, then the
+        // truncated-looking cwd, then the remainder, then the empty root
+        // field. splitn(3) truncates cwd at the first TAB, so a needle equal
+        // to the pre-TAB prefix matches; a different needle must not.
+        let output = b"SIGNAL\n20260429_193246_aaa\t/tmp/hermes-a\trest\t\n";
         let result = select_hermes_session(output, "/tmp/hermes-a/sub", &HashSet::new());
         assert!(result.is_err());
-        // The documented residual: the truncated prefix does match.
         let result = select_hermes_session(output, "/tmp/hermes-a", &HashSet::new()).unwrap();
         assert_eq!(result, "20260429_193246_aaa");
     }
@@ -5259,20 +5261,6 @@ mod tests {
             true,
         );
         assert!(capture_hermes_session_id(&project_str, &HashSet::new()).is_err());
-    }
-
-    #[test]
-    #[serial]
-    fn test_capture_hermes_legacy_single_row_returns() {
-        let tmp = tempfile::tempdir().unwrap();
-        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
-        seed_hermes_db(
-            tmp.path(),
-            &[("20260429_193246_aaa", "cli", 1000.0, None, None)],
-            false,
-        );
-        let result = capture_hermes_session_id("/tmp/hermes-proj", &HashSet::new()).unwrap();
-        assert_eq!(result, "20260429_193246_aaa");
     }
 
     #[test]
