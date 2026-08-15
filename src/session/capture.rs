@@ -2704,6 +2704,15 @@ fn normalize_hermes_signal(value: Option<String>) -> Option<String> {
 /// rows; pathological, accepted). Fields are not trimmed, and an empty
 /// signal maps to `None`; selection then runs through
 /// [`select_hermes_session_id`].
+///
+/// Residuals, all pathological and benign (they degrade to a fresh start,
+/// never a wrong resume): a newline in the trailing `git_repo_root` field
+/// yields a row with a truncated root (its cwd arm still matches); a TAB in
+/// a cwd truncates it at the first TAB, so a needle equal to the truncated
+/// prefix matches a row whose real cwd differs; and row/needle paths are
+/// canonicalized against the host filesystem, so a container path that
+/// happens to exist on the host as a symlink can compare differently than
+/// the value Hermes recorded inside the container.
 fn select_hermes_session(
     output: &[u8],
     container_cwd: &str,
@@ -2810,9 +2819,9 @@ fn select_hermes_session_id(
 /// CLI session row, so capture scopes the active set to the canonicalized
 /// project path (exact `cwd` or `git_repo_root` match), mirroring how the
 /// other agents' captures validate cwd or project hash. On legacy databases
-/// without those columns capture degrades to the sole-row rule and returns
-/// `None` when more than one unclaimed active conversation exists, so the
-/// agent starts fresh instead of silently resuming the wrong conversation.
+/// without those columns capture fails closed when more than one unclaimed
+/// active conversation exists (the poller then yields `None`), so the agent
+/// starts fresh instead of silently resuming the wrong conversation.
 /// Cross-instance isolation for same-project peers still relies on the
 /// exclusion set.
 pub(crate) fn capture_hermes_session_id(
@@ -4923,12 +4932,14 @@ mod tests {
 
     #[test]
     fn test_select_hermes_session_scoped_with_exclusion() {
+        // Both rows carry the needle's cwd, so the exclusion filter is what
+        // separates them (mirrors the DB-level second-match test).
         let output = b"SIGNAL\n\
 20260429_193246_aaa\t/tmp/hermes-a\t\n\
-20260429_193246_bbb\t/tmp/hermes-b\t\n";
+20260429_193246_bbb\t/tmp/hermes-a\t\n";
         let mut exclusion = HashSet::new();
         exclusion.insert("20260429_193246_aaa".to_string());
-        let result = select_hermes_session(output, "/tmp/hermes-b", &exclusion).unwrap();
+        let result = select_hermes_session(output, "/tmp/hermes-a", &exclusion).unwrap();
         assert_eq!(result, "20260429_193246_bbb");
     }
 
@@ -5106,6 +5117,7 @@ mod tests {
 
     #[test]
     #[serial]
+    #[cfg(unix)]
     fn test_capture_hermes_symlinked_project_path() {
         let tmp = tempfile::tempdir().unwrap();
         let real = tmp.path().join("real");
@@ -5188,7 +5200,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_capture_hermes_foreign_only_returns_none() {
+    fn test_capture_hermes_foreign_only_fails_closed() {
         let tmp = tempfile::tempdir().unwrap();
         let project = std::fs::canonicalize(tmp.path()).unwrap();
         let project_str = project.to_string_lossy().to_string();
@@ -5403,7 +5415,7 @@ mod tests {
         );
         drop(_cwd_guard);
 
-        // root-only schema.
+        // root-only schema: a matching row resolves via the root arm.
         let root_db = tempfile::tempdir().unwrap();
         let conn = rusqlite::Connection::open(root_db.path().join("state.db")).unwrap();
         conn.execute_batch(
@@ -5412,12 +5424,29 @@ mod tests {
         .unwrap();
         conn.execute(
             "INSERT INTO sessions (id, source, started_at, ended_at, git_repo_root) VALUES (?1, 'cli', 1000.0, NULL, ?2)",
-            rusqlite::params!["20260429_193246_bbb", other_str],
+            rusqlite::params!["20260429_193246_bbb", project_str],
         )
         .unwrap();
         drop(conn);
         let _root_guard = EnvGuard::set(&[("HERMES_HOME", root_db.path())]);
-        // The root-only row points at another project; it must not match.
+        assert_eq!(
+            capture_hermes_session_id(&project_str, &HashSet::new()).unwrap(),
+            "20260429_193246_bbb"
+        );
+        // A root-only row pointing at another project must not match.
+        let other_db = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(other_db.path().join("state.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, started_at REAL, ended_at REAL, git_repo_root TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at, ended_at, git_repo_root) VALUES (?1, 'cli', 1000.0, NULL, ?2)",
+            rusqlite::params!["20260429_193246_ccc", other_str],
+        )
+        .unwrap();
+        drop(conn);
+        let _other_guard = EnvGuard::set(&[("HERMES_HOME", other_db.path())]);
         assert!(capture_hermes_session_id(&project_str, &HashSet::new()).is_err());
     }
 
