@@ -1933,12 +1933,14 @@ fn lowest_matching_line(lines: &[&str], matches: impl Fn(&str) -> bool) -> Optio
 
 fn countdown_a() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"retrying \(\d+/\d+\) in \d+s…").unwrap())
+    RE.get_or_init(|| Regex::new(r"retrying \(\d+/\d+\) in \d+s…").expect("static countdown regex"))
 }
 
 fn countdown_b() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"retrying\s+\(\d+/\d+\)\s+in\s+\d+\s*s\s*…").unwrap())
+    RE.get_or_init(|| {
+        Regex::new(r"retrying\s+\(\d+/\d+\)\s+in\s+\d+\s*s\s*…").expect("static countdown regex")
+    })
 }
 
 fn label_re() -> &'static Regex {
@@ -1947,13 +1949,13 @@ fn label_re() -> &'static Regex {
         Regex::new(
             r"retrying \d+/\d+ (in (\d+(\.\d+)?ms|\d+(\.\d+)?s|\d+m(\d+(\.\d+)?s)?|\d+h(\d+m(\d+(\.\d+)?s)?)?|\d+d(\d+h(\d+m(\d+(\.\d+)?s)?)?)?)|now):",
         )
-        .unwrap()
+        .expect("static label regex")
     })
 }
 
 fn attempt_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"attempt \d+/\d+ ·").unwrap())
+    RE.get_or_init(|| Regex::new(r"attempt \d+/\d+ ·").expect("static attempt regex"))
 }
 
 /// Factory Droid CLI status detection via tmux pane parsing.

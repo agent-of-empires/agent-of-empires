@@ -7482,6 +7482,22 @@ mod tests {
     }
 
     #[test]
+    fn summarize_falls_back_when_anchor_has_no_message_lines() {
+        // A banner whose dismissal footer is immediately under the top border
+        // has no collectable message lines: fall through to the word list.
+        let pane = "────\n\
+                     Dismissed when you send your next message.\n\
+                     ────\n\
+                     building failed: no such file\n\
+                     ╭── π  > GPT-5.6 Sol ─╮\n\
+                     ╰─                   ─╯";
+        assert_eq!(
+            summarize_error_from_pane(pane),
+            "building failed: no such file"
+        );
+    }
+
+    #[test]
     #[serial_test::serial]
     fn contended_capture_cwds_flags_only_live_colocated_idless_same_tool() {
         let cwd = std::env::current_dir().unwrap();
