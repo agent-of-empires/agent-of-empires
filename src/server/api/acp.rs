@@ -1886,6 +1886,16 @@ pub async fn acp_enable(
             };
             slot.view = crate::session::View::Structured;
             slot.resume_intent = crate::session::ResumeIntent::Default;
+            // Reset to Idle: killing tmux above removes the poller that would
+            // settle a terminal session's status, and structured rows are
+            // skipped by the tmux poller. Structured status is event-driven
+            // (`derive_acp_status`), where only a `Stopped` maps back to Idle
+            // and the worker's connect (`AcpSessionAssigned` -> HealError)
+            // clears only Error/Stopped. So a session that was Running/Waiting
+            // at conversion would otherwise stay stuck "working" with no live
+            // turn to stop. The freshly spawned worker has no turn; a real
+            // prompt drives Running -> Stopped -> Idle normally.
+            slot.status = crate::session::Status::Idle;
             slot.lifecycle_generation = slot.lifecycle_generation.saturating_add(1);
             Ok(slot.lifecycle_generation)
         })
@@ -1912,6 +1922,7 @@ pub async fn acp_enable(
     };
     instance.view = crate::session::View::Structured;
     instance.resume_intent = crate::session::ResumeIntent::Default;
+    instance.status = crate::session::Status::Idle;
     instance.lifecycle_generation = lifecycle_generation;
     {
         let mut instances = state.instances.write().await;
@@ -1919,6 +1930,7 @@ pub async fn acp_enable(
             if lifecycle_generation >= slot.lifecycle_generation {
                 slot.view = crate::session::View::Structured;
                 slot.resume_intent = crate::session::ResumeIntent::Default;
+                slot.status = crate::session::Status::Idle;
                 slot.lifecycle_generation = lifecycle_generation;
             }
         }

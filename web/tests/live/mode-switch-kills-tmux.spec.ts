@@ -113,6 +113,20 @@ test("enabling structured view reaps agent, terminal, and tool tmux sessions", a
 
     // The view genuinely converged (not just a teardown side effect).
     await waitForView(serve.baseUrl, sessionId, "structured");
+
+    // Regression: a converted session must not inherit a stale "working"
+    // status from its terminal life. Killing tmux above removes the poller
+    // that would settle it, and structured rows are event-driven (only a
+    // `Stopped` maps back to Idle; the worker's connect heals just
+    // Error/Stopped). acp_enable resets status to Idle so the freshly spawned
+    // worker, which has no live turn, is not stuck Running/Waiting with
+    // nothing to stop.
+    await expect
+      .poll(async () => (await listSessions(serve.baseUrl)).find((s) => s.id === sessionId)?.status, {
+        timeout: 10_000,
+        intervals: [100, 200, 400],
+      })
+      .toBe("Idle");
   } finally {
     // Best-effort: reap anything that survived a mid-test failure.
     if (agentName) tmuxKill(serve.tmuxSocket, agentName);
