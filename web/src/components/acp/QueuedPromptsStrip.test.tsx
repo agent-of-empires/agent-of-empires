@@ -15,10 +15,23 @@ function mk(id: string, text: string): QueuedPrompt {
   return { id, text, queuedAt: "2026-05-21T00:00:00.000Z" };
 }
 
-function renderWithProfile(toolKey: string, queued: QueuedPrompt[]) {
+function renderWithProfile(
+  toolKey: string,
+  queued: QueuedPrompt[],
+  opts: { onSendNow?: (prompt: QueuedPrompt) => void; canSendNow?: boolean; sendNowInterrupts?: boolean } = {},
+) {
   return render(
     <AgentProfileProvider toolKey={toolKey}>
-      <QueuedPromptsStrip queued={queued} onRemove={() => {}} onEdit={() => {}} onClear={() => {}} />
+      <QueuedPromptsStrip
+        queued={queued}
+        onRemove={() => {}}
+        onEdit={() => {}}
+        onClear={() => {}}
+        onSendNow={opts.onSendNow ?? (() => {})}
+        canSendNow={opts.canSendNow ?? true}
+        sendNowInterrupts={opts.sendNowInterrupts ?? false}
+        pendingResume={false}
+      />
     </AgentProfileProvider>,
   );
 }
@@ -76,6 +89,41 @@ describe("QueuedPromptsStrip clear-boundary divider (#1356)", () => {
   it("omits the Clear all button when the queue has exactly one entry", () => {
     const { queryByRole } = renderWithProfile("claude", [mk("a", "only")]);
     expect(queryByRole("button", { name: /clear all/i })).toBeNull();
+  });
+});
+
+describe("QueuedPromptsStrip send-now affordance", () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  it("force-sends the row's prompt when Send now is clicked", () => {
+    const sent: QueuedPrompt[] = [];
+    const row = mk("a", "ship it");
+    const { getAllByTestId } = renderWithProfile("claude", [row], {
+      onSendNow: (p) => sent.push(p),
+      canSendNow: true,
+    });
+    fireEvent.click(getAllByTestId("queued-send-now")[0]);
+    expect(sent).toEqual([row]);
+  });
+
+  it("disables Send now when the session is down (worker stopped / disconnected)", () => {
+    const { getAllByTestId } = renderWithProfile("claude", [mk("a", "wait")], {
+      canSendNow: false,
+    });
+    expect((getAllByTestId("queued-send-now")[0] as HTMLButtonElement).disabled).toBe(true);
+  });
+
+  it("labels Send now as an interrupt while a non-steerable turn is running", () => {
+    const idle = renderWithProfile("claude", [mk("a", "go")], { sendNowInterrupts: false });
+    expect(idle.getAllByTestId("queued-send-now")[0].getAttribute("aria-label")).toBe("Send this queued message now");
+    cleanup();
+    const busy = renderWithProfile("claude", [mk("a", "go")], { sendNowInterrupts: true });
+    const btn = busy.getAllByTestId("queued-send-now")[0];
+    expect(btn.getAttribute("aria-label")).toContain("Stop the current turn");
+    // Still pressable while the turn runs: that is the whole point of the interrupt.
+    expect((btn as HTMLButtonElement).disabled).toBe(false);
   });
 });
 

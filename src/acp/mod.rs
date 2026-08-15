@@ -47,6 +47,6 @@ pub mod terminal_handler;
 #[cfg(feature = "serve")]
 pub mod version_probe;
 
-pub use agent_registry::{AgentRegistry, AgentSpec};
+pub use agent_registry::{inherited_acp_base, AgentRegistry, AgentSpec};
 pub use approvals::{Approval, ApprovalDecision, Nonce};
 pub use state::{AcpState, Event};

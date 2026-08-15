@@ -214,11 +214,13 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
     );
   }
 
-  // iOS regular Safari is the one platform where the layout viewport
-  // does NOT shrink with the keyboard; inset the pane by the measured
-  // keyboard height there. Everywhere else this is 0 and dvh shrink
-  // does the work.
-  const rootStyle = keyboardHeight > 0 ? { paddingBottom: keyboardHeight } : undefined;
+  // Bottom clearance: the App root no longer reserves the home-indicator inset
+  // (see `.safe-area-inset` in index.css), so the terminal owns it. Keyboard
+  // closed → `env(safe-area-inset-bottom)` keeps the last line / toolbar off
+  // the indicator. Keyboard open → iOS reports that inset as 0 and the layout
+  // viewport does not shrink on regular Safari, so the measured `keyboardHeight`
+  // does the lift; the `calc` reduces to it. Everywhere else both terms are 0.
+  const rootStyle = { paddingBottom: `calc(${keyboardHeight}px + env(safe-area-inset-bottom))` };
 
   return (
     <div

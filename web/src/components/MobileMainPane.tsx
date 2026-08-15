@@ -141,7 +141,12 @@ export function MobileMainPane({
         )}
 
         {view === "diff" && (
-          <div className="absolute inset-0 z-10 flex flex-col min-h-0 overflow-hidden bg-surface-900">
+          // Reserve the bottom home-indicator inset here (the App root no longer
+          // does; see index.css .safe-area-inset) so the last diff row clears it.
+          <div
+            className="absolute inset-0 z-10 flex flex-col min-h-0 overflow-hidden bg-surface-900"
+            style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
+          >
             {selectedFilePath && activeSessionId ? (
               <DiffFileViewer
                 sessionId={activeSessionId}

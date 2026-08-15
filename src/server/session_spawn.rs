@@ -328,17 +328,27 @@ pub(crate) async fn spawn_structured_session(
                     .as_deref()
                     .filter(|s| !s.is_empty())
                     .unwrap_or(instance.tool.as_str());
-                let capable = acp_registry.get(resolved).is_some()
-                    || crate::session::repo_config::resolve_config_with_repo_or_warn(
+                let resolved_session =
+                    crate::session::repo_config::resolve_config_with_repo_or_warn(
                         &instance.source_profile,
                         std::path::Path::new(&instance.project_path),
                     )
-                    .session
-                    .agent_acp_cmd
-                    .get(&instance.tool)
-                    .is_some_and(|cmd| {
-                        crate::acp::AgentSpec::from_acp_cmd(&instance.tool, cmd).is_ok()
-                    });
+                    .session;
+                let capable = acp_registry.get(resolved).is_some()
+                    || resolved_session
+                        .agent_acp_cmd
+                        .get(&instance.tool)
+                        .is_some_and(|cmd| {
+                            crate::acp::AgentSpec::from_acp_cmd(&instance.tool, cmd).is_ok()
+                        })
+                    // A custom agent that inherits a registry-backed base
+                    // (e.g. a Claude wrapper) is structured-capable through the
+                    // base adapter; keep the requested Structured view.
+                    || crate::acp::inherited_acp_base(
+                        &instance.tool,
+                        &resolved_session.agent_detect_as,
+                    )
+                    .is_some();
                 if capable {
                     instance.view = crate::session::View::Structured;
                 } else {

@@ -61,7 +61,12 @@ export function Dashboard({
   );
 
   return (
-    <div className="flex-1 flex flex-col items-center justify-start overflow-y-auto bg-surface-950 px-4 py-6 md:justify-center md:py-0">
+    <div
+      className="flex-1 flex flex-col items-center justify-start overflow-y-auto bg-surface-950 px-4 py-6 md:justify-center md:py-0"
+      // Bottom home-indicator clearance: the App root no longer reserves it
+      // (see index.css .safe-area-inset). Collapses to the base gap off-device.
+      style={{ paddingBottom: "max(1.5rem, env(safe-area-inset-bottom))" }}
+    >
       {/* Logo + Title */}
       <svg viewBox="0 0 128 128" className="w-12 h-12 md:w-16 md:h-16 mb-3" aria-hidden="true">
         <defs>

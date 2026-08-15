@@ -77,7 +77,6 @@ function Harness({
         availableCommands={[] as never}
         connected={true}
         turnActive={true}
-        queuedCount={queue.length}
         enqueuePrompt={enqueuePrompt}
         promptCapabilities={null}
         pendingAttachments={[]}

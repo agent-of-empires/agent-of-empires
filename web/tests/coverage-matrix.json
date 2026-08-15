@@ -2015,11 +2015,11 @@
       ]
     },
     {
-      "id": "acp.thread-tap-focus",
+      "id": "acp.thread-tap-no-keyboard",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/acp-thread-tap-focus.spec.ts", "src/components/acp/threadTapFocus.test.ts"],
-      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/threadTapFocus.ts"]
+      "specs": ["tests/acp-thread-tap-focus.spec.ts"],
+      "components": ["web/src/components/acp/StructuredView.tsx"]
     },
     {
       "id": "acp.composer-queue-recall",
@@ -2359,6 +2359,27 @@
       "kind": "vitest",
       "risk": "medium",
       "specs": ["src/components/acp/QueuedPromptsStrip.test.tsx"],
+      "components": ["web/src/components/acp/StructuredView.tsx"]
+    },
+    {
+      "id": "acp.queue-send-now",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/acp/QueuedPromptsStrip.test.tsx",
+        "src/components/acp/Composer.toolbarButtons.test.tsx"
+      ],
+      "components": [
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/Composer.tsx",
+        "web/src/hooks/useAcpSession.ts"
+      ]
+    },
+    {
+      "id": "acp.mobile-jump-to-bottom",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/acp-mobile-jump-to-bottom.spec.ts"],
       "components": ["web/src/components/acp/StructuredView.tsx"]
     },
     {

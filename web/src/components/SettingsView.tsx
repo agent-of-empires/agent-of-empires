@@ -911,8 +911,9 @@ export function SettingsView({
           )}
         </nav>
 
-        {/* Content area */}
-        <div className="flex-1 overflow-y-auto">
+        {/* Content area. Owns its bottom home-indicator clearance now that the
+            App root no longer reserves it (see index.css .safe-area-inset). */}
+        <div className="flex-1 overflow-y-auto" style={{ paddingBottom: "env(safe-area-inset-bottom)" }}>
           {/* Skills renders its own two-pane layout and needs the full window
               width; every other tab keeps a generous but capped width so
               label-to-control gaps don't stretch across an ultrawide monitor. */}

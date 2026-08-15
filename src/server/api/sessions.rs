@@ -532,14 +532,17 @@ fn builtin_acp_registry() -> &'static crate::acp::AgentRegistry {
     REG.get_or_init(crate::acp::AgentRegistry::with_defaults)
 }
 
-/// True iff this custom agent declares a valid `agent_acp_cmd` in the
-/// given profile-resolved map. Built-in capability is handled separately
-/// in the constructor, so this only covers the custom case.
+/// True iff this custom agent can run in structured view: it declares a valid
+/// `agent_acp_cmd`, or it inherits a registry-backed base via
+/// `agent_detect_as`. Built-in capability is handled separately in the
+/// constructor, so this only covers the custom case.
 #[cfg(feature = "serve")]
-fn custom_agent_acp_capable(agent_acp_cmd: &HashMap<String, String>, tool: &str) -> bool {
-    agent_acp_cmd
+fn custom_agent_acp_capable(session: &crate::session::config::SessionConfig, tool: &str) -> bool {
+    session
+        .agent_acp_cmd
         .get(tool)
         .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(tool, cmd).is_ok())
+        || crate::acp::inherited_acp_base(tool, &session.agent_detect_as).is_some()
 }
 
 /// Resolve the [`SessionConfig`] for `(profile, project_path)` through the
@@ -695,7 +698,7 @@ pub async fn list_sessions(
                 &inst.source_profile,
                 &inst.project_path,
             );
-            resp.acp_capable = custom_agent_acp_capable(&cfg.agent_acp_cmd, &inst.tool);
+            resp.acp_capable = custom_agent_acp_capable(cfg, &inst.tool);
         }
     }
 
@@ -4827,11 +4830,16 @@ fn agent_is_acp_capable(
     // custom map by that same name. Looking up `tool` here would report
     // not-capable for an agent that spawns fine, skipping the up-front 403 in
     // favor of a late refusal at spawn.
-    crate::session::repo_config::resolve_config_with_repo_or_warn(profile, project_path)
-        .session
+    let session =
+        crate::session::repo_config::resolve_config_with_repo_or_warn(profile, project_path)
+            .session;
+    session
         .agent_acp_cmd
         .get(resolved)
         .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(resolved, cmd).is_ok())
+        // A custom agent inheriting a registry-backed base via `agent_detect_as`
+        // spawns fine through the base adapter, so report it capable up front.
+        || crate::acp::inherited_acp_base(resolved, &session.agent_detect_as).is_some()
 }
 
 fn validate_session_tool_identity(
@@ -5707,13 +5715,12 @@ pub async fn create_session(
                         .tie_workdir_to_name;
                 }
                 if !resp.acp_capable {
-                    let acp_cmd = crate::session::repo_config::resolve_config_with_repo_or_warn(
+                    let session = crate::session::repo_config::resolve_config_with_repo_or_warn(
                         &instance.source_profile,
                         std::path::Path::new(&instance.project_path),
                     )
-                    .session
-                    .agent_acp_cmd;
-                    resp.acp_capable = custom_agent_acp_capable(&acp_cmd, &instance.tool);
+                    .session;
+                    resp.acp_capable = custom_agent_acp_capable(&session, &instance.tool);
                 }
             }
 

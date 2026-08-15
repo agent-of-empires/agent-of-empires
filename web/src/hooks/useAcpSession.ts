@@ -1951,6 +1951,43 @@ export function useAcpSession(
     dispatch({ kind: "clear_queue" });
   }, []);
 
+  // Stable handle to `cancelPrompt` (defined below) so `sendQueuedNow` can
+  // interrupt a running turn without a forward reference. Assigned in the
+  // render body right after `cancelPrompt` is created.
+  const cancelPromptRef = useRef<() => Promise<void> | void>(() => {});
+
+  // Force-send a queued prompt now instead of waiting for the turn-end
+  // auto-drain. Two cases:
+  //   - Idle / steerable / dormant worker: send this row immediately (under the
+  //     per-session drain lock so it can't race or duplicate the auto-drain),
+  //     and retire it through the shared coordinator so the visible view and
+  //     any background drainer stay in sync.
+  //   - A live, non-steerable turn is blocking it: interrupt. Cancel the
+  //     current turn; the queued prompts then drain via the normal turn-end
+  //     path (which the drain effect fires when `turnActive` flips false). We
+  //     deliberately do NOT POST during the cancel: the daemon treats a prompt
+  //     arriving mid-cancel as a wedge and restarts the runner (see
+  //     `sendPrompt`). The clicked row rides that drain with the rest of the
+  //     queue. This is the destructive "interrupt and send" the user opted into.
+  const sendQueuedNow = useCallback(
+    async (prompt: QueuedPrompt) => {
+      const drainSessionId = sessionIdRef.current;
+      if (!drainSessionId) return;
+      const steerable = !!state.promptCapabilities?.steering && !state.cancelling && !state.compacting;
+      if (state.turnActive && !steerable) {
+        await cancelPromptRef.current();
+        return;
+      }
+      await withDrainLock(drainSessionId, async () => {
+        const result = await dispatchPromptNow(prompt.text, prompt.attachments);
+        if (result !== "retryable_failure") {
+          emitQueueRetired(drainSessionId, [prompt.id]);
+        }
+      });
+    },
+    [dispatchPromptNow, state.turnActive, state.promptCapabilities?.steering, state.cancelling, state.compacting],
+  );
+
   const dismissPrimer = useCallback(() => {
     dispatch({ kind: "dismiss_primer" });
   }, []);
@@ -2046,6 +2083,7 @@ export function useAcpSession(
       });
     }
   }, [sessionId]);
+  cancelPromptRef.current = cancelPrompt;
 
   // Escape hatch for the "spinner stuck" failure mode (#1100). POSTs to
   // the daemon and relies on the server-published Stopped event to drive
@@ -2096,6 +2134,25 @@ export function useAcpSession(
     setReconnecting(false);
     connectRef.current?.();
   }, []);
+
+  // Whether the per-row "Send now" affordance can do something useful: the
+  // socket is open, no worker-down banner is up, and the worker is either
+  // running (idle, steerable, or mid-turn, in which case Send now INTERRUPTS
+  // the turn) or dormant from idle-auto-stop (the send POST wakes it). A cold
+  // mid-resume worker or a disconnected socket disables it. Unlike the previous
+  // gate this stays enabled during an active turn, because that is exactly when
+  // the user wants to force a queued prompt through (see `sendQueuedNow`).
+  const canSendQueuedNow =
+    status === "open" &&
+    !state.workerStopped &&
+    !state.workerRestarting &&
+    (workerState === "running" || state.workerIdleStopped);
+
+  // True when pressing "Send now" would interrupt a running, non-steerable turn
+  // rather than send immediately, so the affordance can warn before it cancels
+  // the agent's in-flight work.
+  const sendNowInterruptsTurn =
+    state.turnActive && !(state.promptCapabilities?.steering && !state.cancelling && !state.compacting);
 
   return {
     state,
@@ -2150,6 +2207,9 @@ export function useAcpSession(
     removeQueuedPrompt,
     editQueuedPrompt,
     clearQueue,
+    sendQueuedNow,
+    canSendQueuedNow,
+    sendNowInterruptsTurn,
     dismissRejectedPrompt,
     dismissModeSwitchFailed,
     setConfigOption,

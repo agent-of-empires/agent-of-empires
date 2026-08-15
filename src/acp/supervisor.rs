@@ -837,6 +837,18 @@ impl<S: BroadcastSink> Supervisor<S> {
                 AgentSpec::from_acp_cmd(name, cmd).map_err(SupervisorError::InvalidAgentCommand)?;
             return Ok((spec, false));
         }
+        // A custom agent that inherits a registry-backed base via
+        // `agent_detect_as` resolves to the base agent's spec. The normal
+        // spawn path resolves to the base key up front (see
+        // `pick_agent_for_tool`), so this branch only fires when a caller
+        // passes the wrapper name directly (e.g. an explicit switch-agent
+        // target). `true` marks it registry-backed so the command-override
+        // overlay and the compatibility version gate still apply.
+        if let Some(base) = crate::acp::inherited_acp_base(name, &config.agent_detect_as) {
+            if let Some(spec) = self.registry.lock().await.get(&base).cloned() {
+                return Ok((spec, true));
+            }
+        }
         Err(SupervisorError::UnknownAgent(name.into()))
     }
 
@@ -847,7 +859,11 @@ impl<S: BroadcastSink> Supervisor<S> {
     ///      `opencode acp`, etc.)
     ///   3. custom agent declaring an ACP command via
     ///      `agent_acp_cmd` in the session's profile config
-    ///   4. legacy fallback: `claude` for the claude tool, otherwise
+    ///   4. custom agent inheriting a registry-backed base via
+    ///      `agent_detect_as` (e.g. a Claude wrapper); resolves to the *base*
+    ///      registry key so the base agent's adapter, version gate, env
+    ///      allowlist, and `AgentProfile` all apply
+    ///   5. legacy fallback: `claude` for the claude tool, otherwise
     ///      `aoe-agent` (our bundled multi-provider agent)
     ///
     /// `profile` is the session's source profile (`""` resolves the
@@ -882,12 +898,48 @@ impl<S: BroadcastSink> Supervisor<S> {
         {
             return tool.to_string();
         }
-        // Step 4: legacy fallbacks.
+        // Step 4: custom agent inheriting a registry-backed base. Resolve to
+        // the base key so the built-in adapter path serves it; the wrapper's
+        // identity stays on the session's `tool`.
+        if let Some(base) = self
+            .custom_agent_inherited_base(tool, profile, project_path)
+            .await
+        {
+            return base;
+        }
+        // Step 5: legacy fallbacks.
         if tool == "claude" {
             "claude".into()
         } else {
             "aoe-agent".into()
         }
+    }
+
+    /// The registry-backed base key `tool` inherits via `agent_detect_as` in
+    /// its profile + repo-resolved config, or `None`. See
+    /// [`crate::acp::inherited_acp_base`].
+    pub async fn custom_agent_inherited_base(
+        &self,
+        tool: &str,
+        profile: &str,
+        project_path: &std::path::Path,
+    ) -> Option<String> {
+        let tool = tool.to_string();
+        let profile = profile.to_string();
+        let project_path = project_path.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            crate::acp::inherited_acp_base(
+                &tool,
+                &crate::session::repo_config::resolve_config_with_repo_or_warn(
+                    &profile,
+                    &project_path,
+                )
+                .session
+                .agent_detect_as,
+            )
+        })
+        .await
+        .unwrap_or(None)
     }
 
     /// True iff `tool` is a custom agent that declares an
@@ -941,6 +993,10 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
         self.custom_agent_has_acp_cmd(name, profile, project_path)
             .await
+            || self
+                .custom_agent_inherited_base(name, profile, project_path)
+                .await
+                .is_some()
     }
 
     /// Allocate the session's next seq and publish `event` on the sink in
@@ -3716,6 +3772,10 @@ mod tests {
         let mut cfg = crate::session::config::SessionConfig::default();
         cfg.agent_acp_cmd
             .insert("oc-superpowers".into(), "ocp run sp acp".into());
+        // A custom agent that inherits a registry-backed base via
+        // `agent_detect_as` resolves to the base agent's registry spec.
+        cfg.agent_detect_as
+            .insert("lenovo-claude".into(), "claude".into());
 
         #[derive(Debug)]
         enum Want {
@@ -3725,11 +3785,13 @@ mod tests {
             Unknown,
         }
         let cases = [
-            // Unrestricted: both branches resolve as before.
+            // Unrestricted: all three branches resolve as before.
             (false, &[][..], "claude", Want::Registry),
             (false, &[][..], "oc-superpowers", Want::Custom),
+            // An inheriting wrapper resolves to the base's registry spec.
+            (false, &[][..], "lenovo-claude", Want::Registry),
             (false, &[][..], "no-such-agent", Want::Unknown),
-            // Restricted: only listed keys resolve, on either branch.
+            // Restricted: only listed keys resolve, on any branch.
             (true, &["claude"][..], "claude", Want::Registry),
             (true, &["claude"][..], "codex", Want::NotAllowed),
             (
@@ -3739,6 +3801,15 @@ mod tests {
                 Want::Custom,
             ),
             (true, &["claude"][..], "oc-superpowers", Want::NotAllowed),
+            // The allowlist is keyed on the name the caller passes: allowing the
+            // wrapper permits it, allowing only the base does not.
+            (
+                true,
+                &["lenovo-claude"][..],
+                "lenovo-claude",
+                Want::Registry,
+            ),
+            (true, &["claude"][..], "lenovo-claude", Want::NotAllowed),
             // Policy is checked before resolution, so an agent that is both
             // unlisted and unregistered reports the policy refusal. The
             // operator's list is the reason it will not run.
@@ -3789,6 +3860,10 @@ mod tests {
 [session.agent_acp_cmd]
 cursor-acp-bridge = "agent acp"
 broken = ""
+
+[session.agent_detect_as]
+lenovo-claude = "claude"
+my-cursor = "cursor"
 "#,
         )
         .unwrap();
@@ -3798,6 +3873,10 @@ broken = ""
             ("cursor-acp-bridge", true),
             ("unknown-agent", false),
             ("broken", false),
+            // Inherits a registry-backed base → valid structured target.
+            ("lenovo-claude", true),
+            // Inherits a terminal-only base (no ACP adapter) → not a target.
+            ("my-cursor", false),
         ];
         for (name, expected) in cases {
             let got = sup.agent_is_valid_switch_target(name, "", tmp.path()).await;

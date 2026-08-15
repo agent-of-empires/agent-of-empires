@@ -308,6 +308,7 @@ describe("useAcpSession drain race (#1144)", () => {
   let promptPostStatus: number;
   let promptPostBody: string;
   let promptPostBodies: string[];
+  let cancelPostCount: number;
   let replayResponse: { frames: unknown[]; lost: boolean; highest_seq: number };
 
   beforeEach(() => {
@@ -316,6 +317,7 @@ describe("useAcpSession drain race (#1144)", () => {
     promptPostStatus = 200;
     promptPostBody = "simulated failure";
     promptPostBodies = [];
+    cancelPostCount = 0;
     vi.mocked(reportAcpInteraction).mockClear();
     replayResponse = { frames: [], lost: false, highest_seq: 0 };
     vi.stubGlobal(
@@ -324,6 +326,10 @@ describe("useAcpSession drain race (#1144)", () => {
         const url = typeof input === "string" ? input : input.toString();
         if (url.includes("/acp/replay")) {
           return new Response(JSON.stringify(replayResponse), { status: 200 });
+        }
+        if (url.includes("/acp/cancel")) {
+          cancelPostCount += 1;
+          return new Response("{}", { status: 200 });
         }
         if (url.includes("/acp/prompt")) {
           promptPostCount += 1;
@@ -379,6 +385,42 @@ describe("useAcpSession drain race (#1144)", () => {
     expect(result.current.state.queuedPrompts).toHaveLength(1);
     expect(reportAcpInteraction).toHaveBeenCalledTimes(1);
     expect(reportAcpInteraction).toHaveBeenCalledWith("prompt_queued");
+  });
+
+  it("sendQueuedNow interrupts a running non-steerable turn (cancels, does not POST the prompt)", async () => {
+    const { result } = renderHook(() => useAcpSession("sess-interrupt"));
+    await flushAsync();
+    const ws = sockets[0]!;
+    act(() => {
+      ws.readyState = FakeWebSocket.OPEN;
+      ws.onopen?.({} as Event);
+    });
+    await flushAsync();
+    // Start a turn: a direct send flips turnActive true via the optimistic
+    // user-prompt row (no steering capability advertised → non-steerable).
+    await act(async () => {
+      await result.current.sendPrompt("start the turn");
+    });
+    await flushAsync();
+    expect(result.current.state.turnActive).toBe(true);
+    // A follow-up parks in the queue because the turn is in flight.
+    act(() => {
+      void result.current.sendPrompt("follow-up");
+    });
+    await flushAsync();
+    expect(result.current.state.queuedPrompts).toHaveLength(1);
+    const promptsBefore = promptPostCount;
+
+    // Force-send it: with a non-steerable active turn this INTERRUPTS (POSTs
+    // cancel) rather than POSTing the prompt mid-turn.
+    await act(async () => {
+      await result.current.sendQueuedNow(result.current.state.queuedPrompts[0]!);
+    });
+    await flushAsync();
+    expect(cancelPostCount).toBe(1);
+    expect(promptPostCount).toBe(promptsBefore);
+    // The row stays queued; the drain delivers it once the turn actually ends.
+    expect(result.current.state.queuedPrompts).toHaveLength(1);
   });
 
   it("does not report a prompt_queued interaction when a prompt POSTs directly (#1888)", async () => {

@@ -926,11 +926,13 @@ pub mod structured {
     use super::Instance;
 
     /// True when `tool` can back a structured-view session: it resolves in
-    /// the ACP agent registry, or the resolved config declares a parsable
-    /// `[session.agent_acp_cmd]` command for it. Mirrors the server create
-    /// path's capability re-validation; deliberately NOT the aoe-agent
-    /// fallback (`pick_acp_agent_name`), which would make every tool look
-    /// capable.
+    /// the ACP agent registry, the resolved config declares a parsable
+    /// `[session.agent_acp_cmd]` command for it, or it is a custom agent that
+    /// inherits a registry-backed base through `[session.agent_detect_as]`
+    /// (e.g. a Claude wrapper that only overrides profile/oauth locations).
+    /// Mirrors the server create path's capability re-validation; deliberately
+    /// NOT the aoe-agent fallback (`pick_acp_agent_name`), which would make
+    /// every tool look capable.
     pub fn tool_acp_capable(tool: &str, config: &crate::session::Config) -> bool {
         crate::acp::agent_registry::AgentRegistry::with_defaults()
             .get(tool)
@@ -940,6 +942,7 @@ pub mod structured {
                 .agent_acp_cmd
                 .get(tool)
                 .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(tool, cmd).is_ok())
+            || crate::acp::inherited_acp_base(tool, &config.session.agent_detect_as).is_some()
     }
 
     /// Pre-create validation for an explicit structured-view choice from the
@@ -973,7 +976,14 @@ pub mod structured {
             None => match config.session.agent_acp_cmd.get(tool) {
                 Some(cmd) => crate::acp::AgentSpec::from_acp_cmd(tool, cmd)
                     .map_err(|e| format!("invalid [session.agent_acp_cmd] for `{tool}`: {e}"))?,
-                None => unreachable!("tool_acp_capable implies a resolvable spec"),
+                // A custom agent that inherits a registry-backed base runs the
+                // base agent's adapter, so the on-PATH check targets that.
+                None => match crate::acp::inherited_acp_base(tool, &config.session.agent_detect_as)
+                    .and_then(|base| registry.get(&base).cloned())
+                {
+                    Some(spec) => spec,
+                    None => unreachable!("tool_acp_capable implies a resolvable spec"),
+                },
             },
         };
         if !crate::cli::acp::command_present(&spec.command) {

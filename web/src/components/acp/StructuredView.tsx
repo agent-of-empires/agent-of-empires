@@ -16,13 +16,24 @@
 
 import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { MessagePrimitive, ThreadPrimitive, useMessage } from "@assistant-ui/react";
-import { AlertTriangle, Check, ChevronDown, Clock, Info, ListChecks, Paperclip, RotateCcw, X } from "lucide-react";
+import {
+  AlertTriangle,
+  Check,
+  ChevronDown,
+  Clock,
+  Info,
+  ListChecks,
+  Paperclip,
+  RotateCcw,
+  SendHorizontal,
+  X,
+} from "lucide-react";
 
 import { ApprovalCard } from "./ApprovalCard";
 import { AskUserQuestionCard } from "./AskUserQuestionCard";
 import { AcpFileRefContext } from "./AcpFileRefContext";
 import type { FileRef, FileRefSession } from "../../lib/fileRef";
-import { anchorIsStale, autoLoadDecision, scrollRestoreDelta } from "../../lib/historyScroll";
+import { anchorIsStale, autoLoadDecision, isPinnedToBottom, scrollRestoreDelta } from "../../lib/historyScroll";
 import { repinOnResize } from "../../lib/repinOnResize";
 import { ToolDensityToggle, ToolDisplayModeProvider, useToolDensityPref } from "./ToolDisplayMode";
 import { AcpRuntime, SUBAGENT_TASK_NAME, TODO_GROUP_NAME, TOOL_GROUP_NAME, type AcpContext } from "./AcpRuntime";
@@ -64,8 +75,6 @@ import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
 import { ChromeCollapseHandle, CollapsibleRegion } from "../CollapsibleChrome";
 import { useWebSettings } from "../../hooks/useWebSettings";
 import { conversationFontSizeRem } from "../../lib/conversationFontSize";
-import { dispatchFocusTerminal } from "../../lib/terminalFocus";
-import { shouldFocusComposerOnThreadTap } from "./threadTapFocus";
 import type {
   Approval,
   ActivityRow,
@@ -301,6 +310,9 @@ function AcpChrome({
   removeQueuedPrompt,
   editQueuedPrompt,
   clearQueue,
+  sendQueuedNow,
+  canSendQueuedNow,
+  sendNowInterruptsTurn,
   dismissRejectedPrompt,
   dismissModeSwitchFailed,
   setConfigOption,
@@ -384,6 +396,31 @@ function AcpChrome({
   const belowViewportRef = useRef<HTMLDivElement | null>(null);
   const messagesContentRef = useRef<HTMLDivElement | null>(null);
   const wasAtBottomRef = useRef<boolean>(true);
+  // Timestamp (ms) of the last sample that saw us pinned to the bottom. Used by
+  // the keyboard-transition re-pin below: opening the soft keyboard resizes the
+  // viewport and iOS fires an interim scroll that flips `wasAtBottomRef` to
+  // false before the resize re-pin can read it, so we key the re-pin on "were
+  // we at the bottom just before this transition" instead, which that interim
+  // false-scroll cannot clobber (it only ever bumps the timestamp forward).
+  const lastAtBottomAtRef = useRef(0);
+  // Reactive mirror of `wasAtBottomRef` that drives the mobile
+  // "jump to bottom" button's visibility. Updated only when the pinned
+  // state actually flips, so a scroll gesture is not a per-frame re-render.
+  const [atBottom, setAtBottom] = useState(true);
+  // Soft-keyboard state, so we can hold the bottom pin across the keyboard
+  // open/close animation (see the effect below).
+  const { keyboardOpen } = useMobileKeyboard();
+  const scrollToBottom = useCallback(() => {
+    const vp = viewportRef.current;
+    if (!vp) return;
+    // Tapping the jump-to-bottom button is an explicit "stick again" intent. The
+    // smooth scroll fires no gesture, so the sampler won't pick it up; set the
+    // pinned state directly and re-pin.
+    wasAtBottomRef.current = true;
+    lastAtBottomAtRef.current = performance.now();
+    setAtBottom(true);
+    vp.scrollTo({ top: vp.scrollHeight, behavior: "smooth" });
+  }, []);
   // Stable mirrors so the [] scroll effect always sees the latest
   // load-earlier wiring without re-subscribing. Updated in an effect
   // (not during render) per react-hooks/refs. See #2236.
@@ -427,13 +464,6 @@ function AcpChrome({
     });
   }, []);
 
-  // Tap anywhere in the transcript focuses the composer and brings up the soft
-  // keyboard on touch, mirroring the live terminal's tap-to-focus (#2243). The
-  // bus dispatch runs the Composer's focus listener synchronously, so iOS still
-  // sees the focus inside the user-gesture call stack. Coarse-only: desktop
-  // already auto-focuses the composer, and a fine-pointer transcript click is
-  // usually a selection. Interactive targets and live selections are skipped by
-  // the guard.
   const isCoarse = useIsCoarsePointer();
   // Phone-only reading mode: fold the composer away so the transcript gets its
   // ~150px back. Width-gated (not pointer-gated) to stay aligned with the rest
@@ -443,12 +473,10 @@ function AcpChrome({
   const isWideViewport = useIsWideViewport();
   const composerCollapsible = !isWideViewport;
   const [composerCollapsed, setComposerCollapsed] = useState(false);
-  const onThreadTap = (e: React.MouseEvent) => {
-    const sel = window.getSelection();
-    if (shouldFocusComposerOnThreadTap({ isCoarse, target: e.target, hasSelection: !!sel && !sel.isCollapsed })) {
-      dispatchFocusTerminal("composer");
-    }
-  };
+  // No tap-to-focus on the transcript: on touch it popped the soft keyboard
+  // whenever you tapped anywhere in the output (including a multi-choice
+  // option's text). The keyboard should only open when you tap the composer
+  // input itself, so transcript taps do nothing. (#2243 reverted for SV.)
 
   // When an async older-history fetch settles without growing the
   // transcript (empty page, error), clear the anchor so it can't latch
@@ -469,8 +497,39 @@ function AcpChrome({
     // own stick-to-bottom uses a similar slop; sub-pixel rounding
     // and momentary content reflows otherwise drop us out of the
     // pinned state for one frame.
-    const sample = () => {
-      wasAtBottomRef.current = vp.scrollTop + vp.clientHeight >= vp.scrollHeight - 16;
+    // Stick-to-bottom intent (`wasAtBottomRef`) must change ONLY on a real user
+    // scroll gesture. On a coarse-pointer device the browser also fires "scroll"
+    // for programmatic scrolls and, critically, for the interim scroll it emits
+    // while the viewport resizes (soft keyboard opening, the composer growing as
+    // you type, chrome collapsing). Reading those as "the user scrolled up" is
+    // what made the composer creep over the transcript instead of the transcript
+    // staying pinned above it. So on coarse pointers we only re-sample the pinned
+    // intent while a touch/wheel gesture is active; the resize/content observers
+    // below re-pin whenever we are still stuck. Fine pointers keep the simpler
+    // always-sample behavior (scrollbar drag has no wheel event to gate on, and
+    // there is no soft keyboard to fire interim scrolls).
+    let gestureActive = false;
+    let gestureClearTimer = 0;
+    const scheduleGestureClear = () => {
+      if (gestureClearTimer) window.clearTimeout(gestureClearTimer);
+      gestureClearTimer = window.setTimeout(() => {
+        gestureActive = false;
+      }, 250);
+    };
+    const markGesture = () => {
+      gestureActive = true;
+      scheduleGestureClear();
+    };
+    const sample = (force = false) => {
+      if (force || !isCoarse || gestureActive) {
+        const pinned = isPinnedToBottom(vp.scrollTop, vp.clientHeight, vp.scrollHeight);
+        wasAtBottomRef.current = pinned;
+        if (pinned) lastAtBottomAtRef.current = performance.now();
+        setAtBottom((prev) => (prev === pinned ? prev : pinned));
+        // Momentum after a flick keeps firing `scroll` with no fresh touchmove;
+        // keep the gesture alive so those frames still count as the user's.
+        if (gestureActive) scheduleGestureClear();
+      }
       // Decision (overflow gate, arm, cooldown) lives in a pure helper so
       // it's unit-tested away from the DOM. See historyScroll.ts / #2236.
       const decision = autoLoadDecision({
@@ -485,8 +544,11 @@ function AcpChrome({
       autoLoadArmedRef.current = decision.armed;
       if (decision.fire) requestEarlierHistory();
     };
-    sample();
-    vp.addEventListener("scroll", sample, { passive: true });
+    const onScroll = () => sample();
+    sample(true);
+    vp.addEventListener("scroll", onScroll, { passive: true });
+    vp.addEventListener("wheel", markGesture, { passive: true });
+    vp.addEventListener("touchmove", markGesture, { passive: true });
     // Re-pin on two elements: the chrome below the viewport (composer, queued
     // strips) and the viewport itself, because chrome *outside* this view can
     // resize it too (the App's header collapse).
@@ -496,25 +558,79 @@ function AcpChrome({
     };
     const ro = repinOnResize({ target: below, readHeight: () => below.offsetHeight, wasAtBottom, repin });
     const vpRo = repinOnResize({ target: vp, readHeight: () => vp.clientHeight, wasAtBottom, repin });
-    // Freeze the read position when older rows grow the transcript at the
-    // top: add the height delta to scrollTop so the row the user was
-    // reading stays under the cursor instead of jumping. Skipped while
-    // pinned to the bottom so live appends keep their stick-to-bottom.
+    // Content-height changes split two ways:
+    //   - Older rows grew the transcript at the TOP (pending anchor set): add
+    //     the height delta to scrollTop so the row the user was reading stays
+    //     under the cursor instead of jumping.
+    //   - Otherwise it grew at the BOTTOM (a streaming turn, a new message):
+    //     keep the view pinned to the bottom if the user was already there, so
+    //     the latest output follows without them chasing it. If they scrolled
+    //     up, leave their position alone. This is our own stick-to-bottom;
+    //     assistant-ui's `autoScroll` is a belt-and-suspenders backstop that
+    //     was under-sticking during fast streams, which is why this exists.
     const contentRo = new ResizeObserver(() => {
       const anchor = pendingScrollAnchorRef.current;
-      if (anchor == null) return;
-      const delta = scrollRestoreDelta(anchor, vp.scrollHeight, wasAtBottomRef.current);
-      if (delta > 0) vp.scrollTop += delta;
-      pendingScrollAnchorRef.current = null;
+      if (anchor != null) {
+        const delta = scrollRestoreDelta(anchor, vp.scrollHeight, wasAtBottomRef.current);
+        if (delta > 0) vp.scrollTop += delta;
+        pendingScrollAnchorRef.current = null;
+        return;
+      }
+      if (wasAtBottomRef.current) {
+        vp.scrollTop = vp.scrollHeight;
+      }
     });
     if (content) contentRo.observe(content);
     return () => {
       ro.disconnect();
       vpRo.disconnect();
       contentRo.disconnect();
-      vp.removeEventListener("scroll", sample);
+      vp.removeEventListener("scroll", onScroll);
+      vp.removeEventListener("wheel", markGesture);
+      vp.removeEventListener("touchmove", markGesture);
+      if (gestureClearTimer) window.clearTimeout(gestureClearTimer);
     };
-  }, [requestEarlierHistory]);
+  }, [requestEarlierHistory, isCoarse]);
+
+  // Hold the bottom pin across a chrome transition that resizes the viewport:
+  // the soft keyboard opening/closing, and the composer ("hide text input")
+  // collapse toggling. Both resize the transcript viewport, and an interim
+  // scroll during that resize flips `wasAtBottomRef` to false before
+  // `repinOnResize` can act, so the transcript ends up scrolled up and the user
+  // has to re-scroll. If we were at the bottom just before the transition (per
+  // `lastAtBottomAtRef`, which the interim scroll can't clear), pin `scrollTop`
+  // to the bottom for the duration of the animation. Runs on open and close.
+  const chromeTransitionInitRef = useRef(true);
+  useEffect(() => {
+    // Skip the initial mount: only actual open/close transitions should pin.
+    // The first paint's scroll-to-bottom is handled by autoScroll + the content
+    // observer, and pinning here on mount would fight a user scrolling up right
+    // after the view appears.
+    if (chromeTransitionInitRef.current) {
+      chromeTransitionInitRef.current = false;
+      return;
+    }
+    const vp = viewportRef.current;
+    if (!vp) return;
+    // Were we at the bottom heading into this transition? `wasAtBottomRef` is
+    // the reliable signal: it is set true the last time we sampled at the bottom
+    // and stays true while the user sits there idle (no scroll events to flip
+    // it), so it does not go stale the way a timestamp does. The timestamp is
+    // only a fallback for when an interim resize-scroll already flipped the ref
+    // to false just before this effect ran (the keyboard path). This union is
+    // what fixed the intermittent "sometimes snaps, sometimes doesn't": the old
+    // timestamp-only guard missed the sit-idle-then-toggle case entirely.
+    const recentlyAtBottom = performance.now() - lastAtBottomAtRef.current < 1200;
+    if (!wasAtBottomRef.current && !recentlyAtBottom) return;
+    let raf = 0;
+    const start = performance.now();
+    const pin = () => {
+      vp.scrollTop = vp.scrollHeight;
+      if (performance.now() - start < 500) raf = requestAnimationFrame(pin);
+    };
+    raf = requestAnimationFrame(pin);
+    return () => cancelAnimationFrame(raf);
+  }, [keyboardOpen, composerCollapsed]);
   // Short-circuit: when the per-adapter compatibility check rejected
   // the adapter, replace the chat layout with a dedicated screen that
   // renders the exact remediation command. We never reach Running, so
@@ -606,88 +722,109 @@ function AcpChrome({
       {state.lastError && <InteractionErrorBanner message={state.lastError} onDismiss={dismissError} />}
 
       <ThreadPrimitive.Root className="flex flex-1 flex-col min-h-0">
-        <ThreadPrimitive.Viewport
-          autoScroll
-          ref={viewportRef}
-          data-testid="acp-viewport"
-          className="flex-1 overflow-x-hidden overflow-y-auto"
-          onClick={onThreadTap}
-        >
-          <div ref={messagesContentRef} className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl px-4 py-6">
-            <ThreadPrimitive.Empty>
-              <EmptyState onPick={sendPrompt} />
-            </ThreadPrimitive.Empty>
+        {/* Positioned wrapper so the mobile jump-to-bottom button can float at
+            the bottom of the scroll area, just above the composer. */}
+        <div className="relative flex min-h-0 flex-1 flex-col">
+          <ThreadPrimitive.Viewport
+            autoScroll
+            ref={viewportRef}
+            data-testid="acp-viewport"
+            className="flex-1 overflow-x-hidden overflow-y-auto"
+          >
+            <div ref={messagesContentRef} className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl px-4 py-6">
+              <ThreadPrimitive.Empty>
+                <EmptyState onPick={sendPrompt} />
+              </ThreadPrimitive.Empty>
 
-            {state.activity.length > 0 && (
-              <div className="mb-2 flex">
-                <ToolDensityToggle density={toolDensity} onToggle={onToggleToolDensity} />
-              </div>
-            )}
+              {state.activity.length > 0 && (
+                <div className="mb-2 flex">
+                  <ToolDensityToggle density={toolDensity} onToggle={onToggleToolDensity} />
+                </div>
+              )}
 
-            {clearedSummary && clearedSummary.hiddenCount > 0 && (
-              <ClearedTurnsBanner
-                hiddenCount={clearedSummary.hiddenCount}
-                expanded={showClearedTurns}
-                onToggle={onToggleClearedTurns}
+              {clearedSummary && clearedSummary.hiddenCount > 0 && (
+                <ClearedTurnsBanner
+                  hiddenCount={clearedSummary.hiddenCount}
+                  expanded={showClearedTurns}
+                  onToggle={onToggleClearedTurns}
+                />
+              )}
+
+              {canLoadEarlierHistory && (
+                <div className="mb-3 flex justify-center">
+                  <button
+                    type="button"
+                    onClick={requestEarlierHistory}
+                    disabled={loadingEarlierHistory}
+                    data-testid="acp-load-earlier"
+                    className="h-8 rounded-md border border-surface-700 bg-surface-800 px-3 text-xs text-text-secondary hover:bg-surface-700 hover:text-text-primary transition-colors cursor-pointer disabled:cursor-default disabled:opacity-60"
+                  >
+                    {loadingEarlierHistory ? "Loading…" : "Load earlier messages"}
+                  </button>
+                </div>
+              )}
+
+              <ThreadPrimitive.Messages
+                components={{
+                  UserMessage,
+                  AssistantMessage,
+                }}
               />
-            )}
 
-            {canLoadEarlierHistory && (
-              <div className="mb-3 flex justify-center">
-                <button
-                  type="button"
-                  onClick={requestEarlierHistory}
-                  disabled={loadingEarlierHistory}
-                  data-testid="acp-load-earlier"
-                  className="h-8 rounded-md border border-surface-700 bg-surface-800 px-3 text-xs text-text-secondary hover:bg-surface-700 hover:text-text-primary transition-colors cursor-pointer disabled:cursor-default disabled:opacity-60"
-                >
-                  {loadingEarlierHistory ? "Loading…" : "Load earlier messages"}
-                </button>
-              </div>
-            )}
-
-            <ThreadPrimitive.Messages
-              components={{
-                UserMessage,
-                AssistantMessage,
-              }}
-            />
-
-            <ThreadPrimitive.If running>
-              {/* The turn is "running" while an elicitation or approval card is
+              <ThreadPrimitive.If running>
+                {/* The turn is "running" while an elicitation or approval card is
                   on screen, but the agent is parked on the user's answer, not
                   stalled. Suppress the spinner (rattle verbs, "Waiting on
                   model…", and the Force end turn watchdog) so the actionable
                   card stands alone; it returns once the turn resumes. See
                   #2145. */}
-              {state.pendingElicitations.length === 0 && state.pendingApprovals.length === 0 ? (
-                <div className="mt-3 ml-1">
-                  <WorkingSpinner
-                    thinking={state.thinking}
-                    tool={state.inFlightTool?.name ?? null}
-                    cancelling={state.cancelling}
-                    cancelEscalatesAt={state.cancelEscalatesAt}
-                    compacting={state.compacting}
-                    lastActivityRef={lastActivityRef}
-                    onForceEndTurn={forceEndTurn}
-                  />
-                </div>
-              ) : null}
-            </ThreadPrimitive.If>
+                {state.pendingElicitations.length === 0 && state.pendingApprovals.length === 0 ? (
+                  <div className="mt-3 ml-1">
+                    <WorkingSpinner
+                      thinking={state.thinking}
+                      tool={state.inFlightTool?.name ?? null}
+                      cancelling={state.cancelling}
+                      cancelEscalatesAt={state.cancelEscalatesAt}
+                      compacting={state.compacting}
+                      lastActivityRef={lastActivityRef}
+                      onForceEndTurn={forceEndTurn}
+                    />
+                  </div>
+                ) : null}
+              </ThreadPrimitive.If>
 
-            {state.pendingApprovals.map((approval) => (
-              <PendingApproval key={approval.nonce} approval={approval} onResolve={resolveApproval} />
-            ))}
+              {state.pendingApprovals.map((approval) => (
+                <PendingApproval key={approval.nonce} approval={approval} onResolve={resolveApproval} />
+              ))}
 
-            {state.pendingElicitations.map((elicitation) => (
-              <AskUserQuestionCard
-                key={elicitation.nonce}
-                elicitation={elicitation}
-                onResolve={(resolution) => resolveElicitation(elicitation.nonce, resolution)}
-              />
-            ))}
-          </div>
-        </ThreadPrimitive.Viewport>
+              {state.pendingElicitations.map((elicitation) => (
+                <AskUserQuestionCard
+                  key={elicitation.nonce}
+                  elicitation={elicitation}
+                  onResolve={(resolution) => resolveElicitation(elicitation.nonce, resolution)}
+                />
+              ))}
+            </div>
+          </ThreadPrimitive.Viewport>
+          {/* Phone-only quick "jump to bottom" while scrolled up in a long
+              transcript. Desktop relies on the mouse wheel + autoScroll re-pin,
+              so it is gated to coarse pointers to avoid crowding that layout. */}
+          {isCoarse && !atBottom && (
+            <button
+              type="button"
+              onClick={scrollToBottom}
+              data-testid="acp-jump-to-bottom"
+              aria-label="Jump to latest"
+              title="Jump to latest"
+              // Centered, not bottom-right: the composer's collapse handle lives
+              // at the bottom-right corner (edge="top", right-3) and the two
+              // overlapped there.
+              className="absolute bottom-3 left-1/2 z-10 inline-flex h-9 w-9 -translate-x-1/2 items-center justify-center rounded-full border border-surface-700 bg-surface-800/95 text-text-secondary shadow-lg backdrop-blur transition-colors hover:text-text-primary active:scale-95"
+            >
+              <ChevronDown className="h-5 w-5" />
+            </button>
+          )}
+        </div>
 
         {/* The ref host stays mounted always: the transcript's pinned-bottom
             sampling and earlier-history resize anchoring (the useLayoutEffect
@@ -706,6 +843,9 @@ function AcpChrome({
                 onRemove={removeQueuedPrompt}
                 onEdit={editQueuedPrompt}
                 onClear={clearQueue}
+                onSendNow={sendQueuedNow}
+                canSendNow={canSendQueuedNow}
+                sendNowInterrupts={sendNowInterruptsTurn}
                 pendingResume={
                   status !== "open" || acpWorkerState !== "running" || state.workerStopped || state.workerRestarting
                 }
@@ -773,7 +913,6 @@ function AcpChrome({
                   availableCommands={state.availableCommands}
                   connected={status === "open" && !state.workerStopped && !state.workerRestarting}
                   turnActive={state.turnActive}
-                  queuedCount={state.queuedPrompts.length}
                   enqueuePrompt={sendPrompt}
                   promptCapabilities={state.promptCapabilities}
                   pendingAttachments={pendingAttachments}
@@ -2284,6 +2423,15 @@ interface QueuedPromptsStripProps {
   onRemove: (id: string) => void;
   onEdit: (id: string, text: string) => void;
   onClear: () => void;
+  /** Force-send a single queued prompt: send it now when the agent is free,
+   *  or interrupt (cancel) a running non-steerable turn so the queue drains. */
+  onSendNow: (prompt: QueuedPrompt) => void;
+  /** Whether "Send now" can act at all (socket up, worker alive). Gates the
+   *  per-row button. */
+  canSendNow: boolean;
+  /** Whether pressing "Send now" would interrupt a running turn rather than
+   *  send immediately. Drives the button's warning tooltip. */
+  sendNowInterrupts: boolean;
   /** True when the session is not in a state where the drain effect
    *  can fire (WS closed, worker stopped, worker restarting, or the
    *  worker is still cold-starting). Drives the heading copy so the
@@ -2375,7 +2523,16 @@ function RejectedPromptsStrip({
   );
 }
 
-export function QueuedPromptsStrip({ queued, onRemove, onEdit, onClear, pendingResume }: QueuedPromptsStripProps) {
+export function QueuedPromptsStrip({
+  queued,
+  onRemove,
+  onEdit,
+  onClear,
+  onSendNow,
+  canSendNow,
+  sendNowInterrupts,
+  pendingResume,
+}: QueuedPromptsStripProps) {
   // Strip-level collapse: when the queue exceeds `visibleDefault` rows,
   // only the first N render until the user expands. State resets when
   // the queue length drops back below the threshold (toggle disappears;
@@ -2442,7 +2599,14 @@ export function QueuedPromptsStrip({ queued, onRemove, onEdit, onClear, pendingR
                     <span className="h-px flex-1 bg-amber-500/20" />
                   </li>
                 )}
-                <QueuedPromptRow prompt={q} onRemove={() => onRemove(q.id)} onEdit={(text) => onEdit(q.id, text)} />
+                <QueuedPromptRow
+                  prompt={q}
+                  onRemove={() => onRemove(q.id)}
+                  onEdit={(text) => onEdit(q.id, text)}
+                  onSendNow={() => onSendNow(q)}
+                  canSendNow={canSendNow}
+                  sendNowInterrupts={sendNowInterrupts}
+                />
               </Fragment>
             );
           })}
@@ -2465,10 +2629,16 @@ function QueuedPromptRow({
   prompt,
   onRemove,
   onEdit,
+  onSendNow,
+  canSendNow,
+  sendNowInterrupts,
 }: {
   prompt: QueuedPrompt;
   onRemove: () => void;
   onEdit: (text: string) => void;
+  onSendNow: () => void;
+  canSendNow: boolean;
+  sendNowInterrupts: boolean;
 }) {
   // Editor state co-mounts with the textarea: when `editing` flips on
   // we re-key <QueuedPromptEditor> so it initialises `draft` from the
@@ -2562,6 +2732,27 @@ function QueuedPromptRow({
             </div>
           )}
         </div>
+      )}
+      {!editing && (
+        <button
+          type="button"
+          onClick={onSendNow}
+          disabled={!canSendNow}
+          title={
+            !canSendNow
+              ? "Waiting to resume; this sends automatically once the session is back"
+              : sendNowInterrupts
+                ? "Stop the current turn and send this message now"
+                : "Send this message now"
+          }
+          aria-label={
+            sendNowInterrupts ? "Stop the current turn and send this queued message" : "Send this queued message now"
+          }
+          data-testid="queued-send-now"
+          className="shrink-0 rounded p-1 text-sky-300 hover:bg-surface-800 hover:text-sky-200 disabled:cursor-not-allowed disabled:opacity-40 disabled:hover:bg-transparent disabled:hover:text-sky-300"
+        >
+          <SendHorizontal className="h-3.5 w-3.5" />
+        </button>
       )}
       <button
         type="button"

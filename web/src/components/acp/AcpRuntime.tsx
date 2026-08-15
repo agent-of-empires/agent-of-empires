@@ -104,6 +104,9 @@ export interface AcpContext {
   removeQueuedPrompt: (id: string) => void;
   editQueuedPrompt: (id: string, text: string) => void;
   clearQueue: () => void;
+  sendQueuedNow: ReturnType<typeof useAcpSession>["sendQueuedNow"];
+  canSendQueuedNow: boolean;
+  sendNowInterruptsTurn: boolean;
   dismissRejectedPrompt: (id: string) => void;
   dismissModeSwitchFailed: () => void;
   setConfigOption: (configId: string, value: string) => Promise<void>;
@@ -277,6 +280,9 @@ export function AcpRuntime({
         removeQueuedPrompt: acp.removeQueuedPrompt,
         editQueuedPrompt: acp.editQueuedPrompt,
         clearQueue: acp.clearQueue,
+        sendQueuedNow: acp.sendQueuedNow,
+        canSendQueuedNow: acp.canSendQueuedNow,
+        sendNowInterruptsTurn: acp.sendNowInterruptsTurn,
         dismissRejectedPrompt: acp.dismissRejectedPrompt,
         dismissModeSwitchFailed: acp.dismissModeSwitchFailed,
         setConfigOption: acp.setConfigOption,

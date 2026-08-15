@@ -6493,6 +6493,19 @@ async fn run_connection_task<W, R>(
         &cwd,
     );
 
+    // Async sub-agent transcripts live inside the container for a sandboxed
+    // session (their path is not on a mounted volume), so the tailer must
+    // read them via `<runtime> exec`, not host `tokio::fs`. Capture the
+    // container name once; a host session reads the file directly. See
+    // `background_agent::TranscriptSource`.
+    let bg_transcript_source = match resources.sandbox.as_ref() {
+        Some(sandbox) => crate::acp::background_agent::TranscriptSource::Container {
+            runtime: crate::containers::get_container_runtime().base.binary,
+            container: sandbox.container_name.clone(),
+        },
+        None => crate::acp::background_agent::TranscriptSource::Host,
+    };
+
     // After a successful `session/load`, claude-agent-acp re-emits the
     // full prior transcript as `session/update` notifications (each
     // historical assistant turn replayed as agent_message_chunk
@@ -6601,6 +6614,7 @@ async fn run_connection_task<W, R>(
     let between_prompt_tools_for_notif = between_prompt_tools.clone();
     let between_prompt_off_protocol_for_notif = between_prompt_off_protocol.clone();
     let between_prompt_bg_agents_for_notif = between_prompt_bg_agents.clone();
+    let bg_transcript_source_for_notif = bg_transcript_source.clone();
     let adopted_turn_active_for_notif = adopted_turn_active.clone();
     let prompt_in_flight_for_notif = prompt_in_flight.clone();
 
@@ -6631,6 +6645,7 @@ async fn run_connection_task<W, R>(
                 let lifecycle_signal_tx = lifecycle_signal_tx_for_notif.clone();
                 let current_prompt_epoch = current_prompt_epoch_for_notif.clone();
                 let agent_msg_dedup = agent_msg_dedup_for_notif.clone();
+                let bg_transcript_source = bg_transcript_source_for_notif.clone();
                 let last_lifecycle_at = last_lifecycle_at_for_notif.clone();
                 let between_prompt_active = between_prompt_active_for_notif.clone();
                 let terminal_claim = terminal_claim_for_notif.clone();
@@ -6894,6 +6909,7 @@ async fn run_connection_task<W, R>(
                                 crate::acp::background_agent::spawn_tailer(
                                     agent_id.clone(),
                                     output_file.clone(),
+                                    bg_transcript_source.clone(),
                                     event_tx.clone(),
                                     between_prompt_bg_agents.clone(),
                                 );
