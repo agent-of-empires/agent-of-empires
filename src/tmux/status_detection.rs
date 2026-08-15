@@ -4833,15 +4833,17 @@ You can monitor progress with aoe session logs.\n\
             // Terminal retry lines (live form, no banner on this path).
             (
                 "terminal lines",
-                " Error: Retry budget exhausted after 10 retries: Unable to connect. Is the computer able to access the url?\n Error: Retry failed after 10 attempts: Unable to connect. Is the computer able to access the url?\n{prompt_box}"
-                    .to_string(),
+                format!(
+                    " Error: Retry budget exhausted after 10 retries: Unable to connect. Is the computer able to access the url?\n Error: Retry failed after 10 attempts: Unable to connect. Is the computer able to access the url?\n{prompt_box}"
+                ),
                 Status::Error,
             ),
             // Banner with the retry-failed message (anchor is the signal).
             (
                 "banner retry failed",
-                "✖ Retry failed after 3 attempts: 429 Too Many Requests (rate limited).\n Dismissed when you send your next message.\n{prompt_box}"
-                    .to_string(),
+                format!(
+                    "✖ Retry failed after 3 attempts: 429 Too Many Requests (rate limited).\n Dismissed when you send your next message.\n{prompt_box}"
+                ),
                 Status::Error,
             ),
             // Banner without the prompt box: the anchor alone suffices.
