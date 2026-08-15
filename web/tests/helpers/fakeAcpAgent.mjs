@@ -6,7 +6,7 @@
 //
 //   initialize          -> return protocolVersion + agentCapabilities
 //   session/new         -> return a deterministic sessionId
-//   session/load        -> same shape; lets structured view's Resume mode work
+//   session/load        -> restore the requested id; Codex omits it from the response
 //   session/prompt      -> emit scripted session/update notifications,
 //                          then return a stop response. Script entries
 //                          with `sessionUpdate: "permission_request"`
@@ -506,7 +506,7 @@ function resolveAgentInfo() {
     return { name: "OpenCode", version: "1.16.0" };
   }
   if (process.env.FAKE_ACP_IMPERSONATE === "codex") {
-    return { name: "@agentclientprotocol/codex-acp", version: "1.1.4" };
+    return { name: "@agentclientprotocol/codex-acp", version: "1.1.9" };
   }
   if (STEERING_ENABLED) {
     return { ...INITIALIZE_RESULT.agentInfo, version: STEERING_MIN_VERSION };
@@ -658,41 +658,49 @@ async function handleRequest(msg) {
       // session/new and session/load *response*, not as a subsequent
       // notification. The structured view's acp_client reads the response
       // field and emits Event::ConfigOptionsUpdated. See #1403.
-      const result = { sessionId };
+      // LoadSessionResponse has no sessionId field. Keep Claude's historical
+      // extension for its existing fixtures, but model pinned codex-acp's
+      // standard response shape when this fake explicitly impersonates Codex.
+      const result = method === "session/load" && process.env.FAKE_ACP_IMPERSONATE === "codex" ? {} : { sessionId };
       const configOptions = buildSessionConfigOptions(sessionId);
       if (configOptions) result.configOptions = configOptions;
       const modes = buildSessionModes(sessionId);
       if (modes) result.modes = modes;
-      sendResult(id, result);
       // Test hook for the import flow (#2276): on session/load, replay a
       // deterministic transcript chunk the way claude-agent-acp re-emits
       // prior history during a load. Lets the import spec assert the
       // imported transcript renders (seed-not-suppressed), while a normal
-      // reattach would drop it. Only on load, deferred after the response.
+      // reattach would drop it.
       const loadReplay = process.env.FAKE_ACP_LOAD_REPLAY;
-      if (method === "session/load" && loadReplay) {
-        setImmediate(() => {
-          // Replay a prior USER turn first (claude-agent-acp emits
-          // user_message_chunk for historical user messages), then the
-          // assistant reply, so the import spec can assert both render.
-          const userReplay = process.env.FAKE_ACP_LOAD_REPLAY_USER;
-          if (userReplay) {
-            sendNotification("session/update", {
-              sessionId,
-              update: {
-                sessionUpdate: "user_message_chunk",
-                content: { type: "text", text: userReplay },
-              },
-            });
-          }
+      const replayLoadHistory = () => {
+        // Replay a prior USER turn first (claude-agent-acp emits
+        // user_message_chunk for historical user messages), then the
+        // assistant reply, so the import spec can assert both render.
+        const userReplay = process.env.FAKE_ACP_LOAD_REPLAY_USER;
+        if (userReplay) {
           sendNotification("session/update", {
             sessionId,
             update: {
-              sessionUpdate: "agent_message_chunk",
-              content: { type: "text", text: loadReplay },
+              sessionUpdate: "user_message_chunk",
+              content: { type: "text", text: userReplay },
             },
           });
+        }
+        sendNotification("session/update", {
+          sessionId,
+          update: {
+            sessionUpdate: "agent_message_chunk",
+            content: { type: "text", text: loadReplay },
+          },
         });
+      };
+      const replayBeforeResponse = process.env.FAKE_ACP_LOAD_REPLAY_BEFORE_RESPONSE === "1";
+      if (method === "session/load" && loadReplay && replayBeforeResponse) {
+        replayLoadHistory();
+      }
+      sendResult(id, result);
+      if (method === "session/load" && loadReplay && !replayBeforeResponse) {
+        setImmediate(replayLoadHistory);
       }
       return;
     }
@@ -895,6 +903,7 @@ async function main() {
       // calls.
       if (msg.method === "session/cancel") {
         const sid = msg.params?.sessionId;
+        fakeDebug(`session/cancel sessionId=${sid ?? ""}`);
         if (sid) cancelFlags.set(sid, true);
       } else {
         process.stderr.write(`[fakeAcpAgent] received notification: ${msg.method}\n`);

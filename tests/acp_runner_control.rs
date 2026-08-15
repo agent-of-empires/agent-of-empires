@@ -381,6 +381,145 @@ for line in sys.stdin:
     );
 }
 
+/// A standard `session/load` response has no `sessionId`: the requested id is
+/// already the identity being reopened. Codex also streams historical updates
+/// before answering the load. The runner must accept that response, retain the
+/// requested id for cancel, and replay the raw response from its handshake
+/// cache without issuing either a second load or a fallback session/new.
+#[test]
+fn runner_load_uses_requested_id_and_caches_response() {
+    if cfg!(not(unix)) {
+        return;
+    }
+    let scratch = Scratch::new("hsload");
+    let home = scratch.0.join("home");
+    let xdg = scratch.0.join("xdg");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&xdg).unwrap();
+
+    let agent_log = scratch.0.join("agent-methods.log");
+    let fake_agent =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("web/tests/helpers/fakeAcpAgent.mjs");
+
+    let session_id = "shsload1";
+    let workers = app_dir(&home, &xdg).join("acp-workers");
+    let socket = workers.join(format!("{session_id}.sock"));
+    let control = workers.join(format!("{session_id}.control.sock"));
+    let record = workers.join(format!("{session_id}.json"));
+
+    let bin = env!("CARGO_BIN_EXE_aoe");
+    let _child = KillOnDrop(
+        Command::new(bin)
+            .args([
+                "__acp-runner",
+                "--socket",
+                socket.to_str().unwrap(),
+                "--session-id",
+                session_id,
+                "--agent-name",
+                "fake-codex-acp",
+                "--cwd",
+                home.to_str().unwrap(),
+                "--",
+                "node",
+                fake_agent.to_str().unwrap(),
+            ])
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("FAKE_ACP_DEBUG_LOG", &agent_log)
+            .env("FAKE_ACP_IMPERSONATE", "codex")
+            .env("FAKE_ACP_LOAD_REPLAY", "old agent answer")
+            .env("FAKE_ACP_LOAD_REPLAY_USER", "old user prompt")
+            .env("FAKE_ACP_LOAD_REPLAY_BEFORE_RESPONSE", "1")
+            .env("AOE_ACP_WATCHDOG_POLL_MS", "150")
+            .spawn()
+            .expect("spawn acp runner"),
+    );
+
+    wait_for(&record, "registry record");
+    wait_for(&control, "control socket");
+
+    {
+        let mut ctl = UnixStream::connect(&control).expect("connect control socket");
+        ctl.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        assert_eq!(read_frame(&mut ctl)["kind"], "hello");
+        write_frame(
+            &mut ctl,
+            &serde_json::json!({"kind": "attach", "control_protocol_version": 2}),
+        );
+        write_frame(
+            &mut ctl,
+            &serde_json::json!({
+                "kind": "establish_session",
+                "method": "session/load",
+                "request": {"sessionId": "existing-session", "cwd": home.to_str().unwrap()}
+            }),
+        );
+
+        let ready = read_frame(&mut ctl);
+        assert_eq!(ready["kind"], "session_ready", "load must succeed: {ready}");
+        assert_eq!(ready["acp_session_id"], "existing-session");
+        assert!(ready["result"].get("sessionId").is_none());
+
+        write_frame(&mut ctl, &serde_json::json!({"kind": "cancel"}));
+    }
+
+    // Reattach and repeat the handshake inputs. Both responses must come from
+    // the runner cache, preserving the original raw load result and id.
+    {
+        let mut ctl = UnixStream::connect(&control).expect("reconnect control socket");
+        ctl.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        assert_eq!(read_frame(&mut ctl)["kind"], "hello");
+        write_frame(
+            &mut ctl,
+            &serde_json::json!({"kind": "attach", "control_protocol_version": 2}),
+        );
+        write_frame(
+            &mut ctl,
+            &serde_json::json!({
+                "kind": "establish_session",
+                "method": "session/load",
+                "request": {"sessionId": "existing-session", "cwd": home.to_str().unwrap()}
+            }),
+        );
+        let ready = read_frame(&mut ctl);
+        assert_eq!(ready["kind"], "session_ready");
+        assert_eq!(ready["acp_session_id"], "existing-session");
+        assert!(ready["result"].get("sessionId").is_none());
+    }
+
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let methods = loop {
+        let methods = std::fs::read_to_string(&agent_log).unwrap_or_default();
+        if methods.contains("session/cancel sessionId=existing-session")
+            || Instant::now() >= deadline
+        {
+            break methods;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(
+        methods
+            .lines()
+            .filter(|line| line.contains("handleRequest method=session/load"))
+            .count(),
+        1
+    );
+    assert_eq!(
+        methods
+            .lines()
+            .filter(|line| line.contains("handleRequest method=session/new"))
+            .count(),
+        0
+    );
+    assert!(
+        methods
+            .lines()
+            .any(|line| line.contains("session/cancel sessionId=existing-session")),
+        "cancel must address the loaded session: {methods:?}"
+    );
+}
+
 /// #2976 Phase B regression: when the agent answers `session/new` with a
 /// JSON-RPC error, the runner forwards the FULL error object (including
 /// `data`) in `HandshakeFailed`, so the daemon can reconstruct the crate
