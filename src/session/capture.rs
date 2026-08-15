@@ -2766,6 +2766,11 @@ fn select_hermes_session(
 /// at a different project, are never returned: resuming them would bind the
 /// wrong conversation, the #3373 bug class.
 ///
+/// A project path spelled through a now-deleted symlink falls back to its
+/// raw spelling in [`canonicalize_or_raw`] and never equals Hermes' recorded
+/// physical path, so such sessions start fresh (benign direction, pre-#2858
+/// corner shared with the other agents' captures).
+///
 /// On a legacy schema (neither column present) no row carries a project
 /// signal. The sole unclaimed active conversation is returned (unambiguous);
 /// with more than one, capture fails closed so the agent starts fresh rather
