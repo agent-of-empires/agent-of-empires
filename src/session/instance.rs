@@ -6971,6 +6971,9 @@ fn generate_id() -> String {
 /// message; otherwise fall back to a generic "stopped responding" string so
 /// the UI never renders an Error state without any explanation.
 fn summarize_error_from_pane(pane_content: &str) -> String {
+    const ANCHOR: &str = "dismissed when you send your next message";
+    const MAX_BANNER_LINES: usize = 3;
+
     let cleaned = crate::tmux::utils::strip_ansi(pane_content);
     let tail: Vec<&str> = cleaned
         .lines()
@@ -6979,6 +6982,57 @@ fn summarize_error_from_pane(pane_content: &str) -> String {
         .filter(|l| !l.is_empty())
         .take(12)
         .collect();
+
+    // omp pins an error banner whose dismissal footer is the anchor. When the
+    // anchor is the lowest of {anchor, terminal retry lines} (positions are
+    // 1-based from the bottom of the tail), the banner message is the reason:
+    // walk up from the anchor (excluded), collecting the consecutive message
+    // lines until the first border line (all `─`), at most MAX_BANNER_LINES.
+    let anchor_idx = tail.iter().position(|l| l.to_lowercase().contains(ANCHOR));
+    let terminal_idx = tail.iter().position(|l| {
+        let lower = l.to_lowercase();
+        lower.contains("error: retry budget exhausted")
+            || lower.contains("error: retry failed after")
+    });
+    let anchor_is_lowest = match (anchor_idx, terminal_idx) {
+        (Some(a), Some(t)) => a <= t,
+        (Some(_), None) => true,
+        _ => false,
+    };
+    if anchor_is_lowest {
+        let mut msg_lines: Vec<&str> = Vec::new();
+        for line in tail.iter().skip(anchor_idx.unwrap() + 1) {
+            let trimmed = line.trim();
+            if trimmed.chars().all(|c| c == '─') {
+                break;
+            }
+            msg_lines.push(line);
+            if msg_lines.len() == MAX_BANNER_LINES {
+                break;
+            }
+        }
+        if !msg_lines.is_empty() {
+            // Reorder to pane order (top first), trim per line, strip a
+            // leading error glyph (theme-dependent), join with one space.
+            let mut reason = String::new();
+            for line in msg_lines.iter().rev() {
+                let mut text = line.trim();
+                for glyph in ["✖", "✘", "✕"] {
+                    if let Some(rest) = text.strip_prefix(glyph) {
+                        text = rest.trim_start();
+                        break;
+                    }
+                }
+                if !reason.is_empty() {
+                    reason.push(' ');
+                }
+                reason.push_str(text);
+            }
+            return truncate_error_line(&reason);
+        }
+        // No collectable banner lines (exotic theme): fall through to the
+        // word list below.
+    }
 
     for line in &tail {
         let lower = line.to_lowercase();
@@ -7365,6 +7419,67 @@ mod tests {
     use super::*;
     use crate::session::test_support::EnvGuard;
     use tracing_test::traced_test;
+
+    #[test]
+    fn summarize_omp_banner_uses_message_above_anchor() {
+        // #3377: the omp error banner's dismissal footer anchors the reason
+        // extraction; the message line above it (glyph stripped) is returned.
+        let pane = "────\n\
+                     ✘ 401 Incorrect API key provided: sk-dummy.\n\
+                     Dismissed when you send your next message.\n\
+                     ────\n\
+                     ╭── π  > GPT-5.6 Sol ─╮\n\
+                     ╰─                   ─╯";
+        assert_eq!(
+            summarize_error_from_pane(pane),
+            "401 Incorrect API key provided: sk-dummy."
+        );
+    }
+
+    #[test]
+    fn summarize_omp_banner_joins_multiline_message() {
+        // A wrapped banner message (continuation lines indented) is joined
+        // with single spaces, borders and the anchor excluded.
+        let pane = "────\n\
+                     ✖ 429 Too Many Requests (rate limited). Retry after 30s.\n\
+                        This is a continuation with more detail.\n\
+                        And a third line.\n\
+                     Dismissed when you send your next message.\n\
+                     ────\n\
+                     ╭── π  > GPT-5.6 Sol ─╮\n\
+                     ╰─                   ─╯";
+        assert_eq!(
+            summarize_error_from_pane(pane),
+            "429 Too Many Requests (rate limited). Retry after 30s. This is a continuation with more detail. And a third line."
+        );
+    }
+
+    #[test]
+    fn summarize_prefers_terminal_lines_below_a_stale_banner() {
+        // When the terminal retry lines sit below the anchor, the word list
+        // picks them instead of the stale banner (lowest signal wins).
+        let pane = "────\n\
+                     ✖ 429 Too Many Requests (rate limited). Retry after 30s.\n\
+                     Dismissed when you send your next message.\n\
+                     ────\n\
+                     Error: Retry budget exhausted after 10 retries: Unable to connect. Is the computer able to access the url?\n\
+                     Error: Retry failed after 10 attempts: Unable to connect. Is the computer able to access the url?\n\
+                     ╭── π  > GPT-5.6 Sol ─╮\n\
+                     ╰─                   ─╯";
+        assert_eq!(
+            summarize_error_from_pane(pane),
+            "Error: Retry failed after 10 attempts: Unable to connect. Is the computer able to access the url?"
+        );
+    }
+
+    #[test]
+    fn summarize_without_banner_keeps_word_list_behavior() {
+        let pane = "building failed: no such file\n╭── π  > GPT-5.6 Sol ─╮\n╰─   ─╯";
+        assert_eq!(
+            summarize_error_from_pane(pane),
+            "building failed: no such file"
+        );
+    }
 
     #[test]
     #[serial_test::serial]
