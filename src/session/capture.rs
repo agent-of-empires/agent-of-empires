@@ -2782,12 +2782,14 @@ fn select_hermes_session_in_container(
 ///
 /// Deliberate divergences from `hermes -c` (which is workspace-scoped via
 /// its git-root-or-cwd key and only then falls back to the global
-/// most-recent conversation; on a column-less schema it finds nothing at
-/// all): AoE requires exact canonicalized equality, considers only active
-/// rows (`ended_at IS NULL`, so a cleanly-exited conversation starts fresh
-/// by design), orders by `started_at` rather than Hermes' `last_active`
-/// recency, and never dips into a global-MRU fallback. That fallback is the
-/// mis-attribution bug shape for a project-scoped AoE session.
+/// most-recent conversation; on a pre-cwd schema Hermes auto-migrates the
+/// missing columns on open, its workspace search then finds no
+/// signal-bearing rows, and it falls back to the global MRU): AoE requires
+/// exact canonicalized equality, considers only active rows (`ended_at IS
+/// NULL`, so a cleanly-exited conversation starts fresh by design), orders
+/// by `started_at` rather than Hermes' `last_active` recency, and never
+/// dips into a global-MRU fallback. That fallback is the mis-attribution
+/// bug shape for a project-scoped AoE session.
 fn select_hermes_session_id(
     scan: &HermesSessionScan,
     project_path: &str,
@@ -4941,7 +4943,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_hermes_session_scoped_parsing() {
+    fn test_select_hermes_session_in_container_scoped_parsing() {
         let output = b"SIGNAL\n\
 20260429_193246_aaa\t/tmp/hermes-a\t\n\
 20260429_193246_bbb\t/tmp/hermes-b\t\n";
@@ -4951,7 +4953,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_hermes_session_scoped_with_exclusion() {
+    fn test_select_hermes_session_in_container_scoped_with_exclusion() {
         // Both rows carry the needle's cwd, so the exclusion filter is what
         // separates them (mirrors the DB-level second-match test).
         let output = b"SIGNAL\n\
@@ -4965,7 +4967,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_hermes_session_scoped_no_match() {
+    fn test_select_hermes_session_in_container_scoped_no_match() {
         // In SIGNAL mode a row whose cwd points at another project is never
         // returned, even when it is the only active conversation.
         let output = b"SIGNAL\n20260429_193246_aaa\t/tmp/other-project\t\n";
@@ -4974,7 +4976,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_hermes_session_legacy_single_row() {
+    fn test_select_hermes_session_in_container_legacy_single_row() {
         let output = b"LEGACY\n20260429_193246_aaa\t\t\n";
         let result =
             select_hermes_session_in_container(output, "/tmp/anywhere", &HashSet::new()).unwrap();
@@ -4982,14 +4984,14 @@ mod tests {
     }
 
     #[test]
-    fn test_select_hermes_session_legacy_multiple_ambiguous() {
+    fn test_select_hermes_session_in_container_legacy_multiple_ambiguous() {
         let output = b"LEGACY\n20260429_193246_aaa\t\t\n20260429_193246_bbb\t\t\n";
         let result = select_hermes_session_in_container(output, "/tmp/anywhere", &HashSet::new());
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_select_hermes_session_legacy_multiple_exclusion_narrows() {
+    fn test_select_hermes_session_in_container_legacy_multiple_exclusion_narrows() {
         let output = b"LEGACY\n20260429_193246_aaa\t\t\n20260429_193246_bbb\t\t\n";
         let mut exclusion = HashSet::new();
         exclusion.insert("20260429_193246_aaa".to_string());
@@ -4999,13 +5001,13 @@ mod tests {
     }
 
     #[test]
-    fn test_select_hermes_session_empty_output() {
+    fn test_select_hermes_session_in_container_empty_output() {
         let result = select_hermes_session_in_container(b"", "/tmp/hermes-a", &HashSet::new());
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_select_hermes_session_whitespace_only_lines_skipped() {
+    fn test_select_hermes_session_in_container_whitespace_only_lines_skipped() {
         // Whitespace-only lines before the mode line are tolerated; the first
         // non-empty line must still be the mode line.
         let output = b"  \n\nSIGNAL\n20260429_193246_ccc\t/tmp/hermes-c\t\n  \n";
@@ -5015,7 +5017,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_hermes_session_garbage_mode_line() {
+    fn test_select_hermes_session_in_container_garbage_mode_line() {
         // Old id-only output (or a drifted script) must fail closed, not
         // misparse into a bogus id.
         let output = b"20260429_193246_aaa\n20260429_193246_bbb\n";
@@ -5024,7 +5026,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_hermes_session_malformed_rows_skipped() {
+    fn test_select_hermes_session_in_container_malformed_rows_skipped() {
         // A cwd containing a newline fragments the row into lines with fewer
         // than three fields; those are skipped without panicking, and the
         // healthy row still wins.
@@ -5037,7 +5039,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_hermes_session_newline_in_root_accepted_truncated() {
+    fn test_select_hermes_session_in_container_newline_in_root_accepted_truncated() {
         // A newline in the trailing git_repo_root field yields a row with a
         // truncated root (documented residual); the cwd arm still matches.
         let output = b"SIGNAL\n\
@@ -5048,7 +5050,7 @@ mod tests {
     }
 
     #[test]
-    fn test_select_hermes_session_tab_in_cwd_truncates() {
+    fn test_select_hermes_session_in_container_tab_in_cwd_truncates() {
         // A cwd containing a TAB truncates at the first TAB (documented
         // residual). The byte input mirrors what the script emits for a real
         // cwd "/tmp/hermes-a<TAB>rest" with an empty script-side root field:
