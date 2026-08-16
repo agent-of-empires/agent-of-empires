@@ -105,7 +105,6 @@ import { WorkspaceSidebar, SnoozeModal } from "./components/WorkspaceSidebar";
 import { DeleteSessionDialog } from "./components/DeleteSessionDialog";
 import { StopSessionDialog } from "./components/StopSessionDialog";
 import { SwitchViewDialog } from "./components/SwitchViewDialog";
-import { acpTranscriptCliResumable } from "./lib/acpKeepContext";
 import { TopBar } from "./components/TopBar";
 import { AppShellSkeleton, MainPaneSkeleton } from "./components/AppShellSkeleton";
 import { ContentSplit } from "./components/ContentSplit";
@@ -2348,10 +2347,7 @@ function AppContent({
           <SwitchViewDialog
             sessionTitle={switchViewSession.title}
             toStructured={switchViewTarget.toStructured}
-            keepsContext={acpTranscriptCliResumable(
-              switchViewSession.tool,
-              switchViewSession.acp_agent ?? switchViewSession.tool,
-            )}
+            keepsContext={switchViewSession.keeps_context ?? false}
             onConfirm={handleConfirmSwitchView}
             onCancel={() => setSwitchViewTarget(null)}
           />

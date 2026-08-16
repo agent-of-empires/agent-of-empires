@@ -1,16 +1,8 @@
-// Client mirror of the backend view-switch context-preservation gate
-// (`agents::acp_transcript_cli_resumable` in src/agents.rs) plus the
-// capability-aware confirm copy the TUI shows (src/tui/home/input.rs
-// `prompt_switch_view_for_selected`). The server has no "keeps_context" flag on
-// the session shape, so the dashboard computes it from `tool` + `acp_agent`.
-
-/** Whether switching this pairing preserves the conversation across a view
- *  swap. Only claude qualifies: claude-agent-acp and the terminal `claude` CLI
- *  share one CLI-resumable transcript. `acpAgent` is the active adapter
- *  (session `acp_agent`, which falls back to `tool` when unset). */
-export function acpTranscriptCliResumable(tool: string, acpAgent: string): boolean {
-  return tool === "claude" && (acpAgent === "claude" || acpAgent === "claude-code");
-}
+// Confirm-dialog copy for a terminal <-> structured view swap, matching the
+// TUI wording (src/tui/home/input.rs `prompt_switch_view_for_selected`). The
+// context-preservation gate that used to live here as a client mirror of
+// `agents::acp_transcript_cli_resumable` now rides on `SessionResponse`
+// (`keeps_context`), computed server-side, so both frontends share one gate.
 
 export interface SwitchViewCopy {
   title: string;

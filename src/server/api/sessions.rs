@@ -236,6 +236,15 @@ pub struct SessionResponse {
     #[cfg(feature = "serve")]
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub acp_can_fork: bool,
+    /// Whether switching this session between terminal and structured view
+    /// preserves the conversation (only claude pairings share one
+    /// CLI-resumable transcript). Server-owned via
+    /// `agents::acp_transcript_cli_resumable` so the dashboard and TUI stop
+    /// each recomputing it from `tool` + `acp_agent`. Omitted (read as false)
+    /// for non-preserving pairings. See docs/development/server-owned-sv-state.md.
+    #[cfg(feature = "serve")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keeps_context: bool,
     /// True when the session is a Claude Code session AND the user has
     /// enabled Claude's fullscreen renderer (`tui: "fullscreen"` in
     /// `~/.claude/settings.json`). The web client uses this to skip
@@ -469,6 +478,16 @@ impl SessionResponse {
             // cannot drift: forkable = ACP-capable AND a real fork strategy.
             #[cfg(feature = "serve")]
             acp_can_fork: agent_is_structured_fork_capable(&inst.tool, inst.agent_name.as_deref()),
+            // Same agent resolution as `acp_agent` above; computed once here so
+            // the web dashboard and native TUI stop mirroring the gate.
+            #[cfg(feature = "serve")]
+            keeps_context: crate::agents::acp_transcript_cli_resumable(
+                &inst.tool,
+                inst.agent_name
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(inst.tool.as_str()),
+            ),
             claude_fullscreen: claude_fullscreen && inst.tool == "claude",
             // A session converted by `attach_project` (#3103) has a real
             // `workspace_info`, so this lists both repos with no special case:
@@ -10539,6 +10558,8 @@ mod workspace_ordering_tests {
             acp_agent: None,
             #[cfg(feature = "serve")]
             acp_can_fork: false,
+            #[cfg(feature = "serve")]
+            keeps_context: false,
             claude_fullscreen: false,
             workspace_repos: Vec::new(),
             warnings: Vec::new(),
