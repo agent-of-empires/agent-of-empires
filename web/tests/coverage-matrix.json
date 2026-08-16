@@ -2383,11 +2383,7 @@
       "id": "acp.tool-stopped-sweep",
       "kind": "vitest",
       "risk": "high",
-      "specs": [
-        "src/lib/acpStopSweep.test.ts",
-        "src/components/acp/AcpRuntime.test.ts",
-        "src/components/acp/ToolCards.render.test.tsx"
-      ],
+      "specs": ["src/components/acp/AcpRuntime.test.ts", "src/components/acp/ToolCards.render.test.tsx"],
       "components": [
         "web/src/components/acp/AcpRuntime.tsx",
         "web/src/components/acp/StructuredView.tsx",
