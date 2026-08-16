@@ -305,6 +305,76 @@ impl HttpClient {
         Ok(())
     }
 
+    /// `GET /api/sessions/{id}/queue`: the server-owned prompt queue, ordered
+    /// by ascending `seq`. The daemon owns and drains this queue, so the native
+    /// view mirrors it rather than keeping its own (the web client does the
+    /// same). See `docs/development/server-side-prompt-queue.md`.
+    pub async fn queue_list(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<crate::acp::state::QueuedPromptEntry>, HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/queue",
+            self.endpoint.base_url, session_id
+        );
+        let res = self.auth(self.http.get(&url)).send().await?;
+        let res = check_status(res, session_id).await?;
+        Ok(res.json().await?)
+    }
+
+    /// `POST /api/sessions/{id}/queue`: append a text prompt to the server
+    /// queue. `id` is a client-minted stable id so an optimistic row reconciles
+    /// against the returned entry and a retry does not double-queue. Returns the
+    /// daemon's stored entry (with its assigned `seq`). Attachments are web-only
+    /// today, so the native view enqueues text.
+    pub async fn queue_enqueue(
+        &self,
+        session_id: &str,
+        id: &str,
+        text: &str,
+    ) -> Result<crate::acp::state::QueuedPromptEntry, HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/queue",
+            self.endpoint.base_url, session_id
+        );
+        let body = serde_json::json!({ "id": id, "text": text });
+        let res = self.auth(self.http.post(&url)).json(&body).send().await?;
+        let res = check_status(res, session_id).await?;
+        Ok(res.json().await?)
+    }
+
+    /// `PATCH /api/sessions/{id}/queue/{promptId}`: replace a queued prompt's
+    /// text in place, keeping its position. The prompt id is client-minted and
+    /// may be arbitrary, so it is percent-encoded to a single path segment.
+    pub async fn queue_edit(
+        &self,
+        session_id: &str,
+        prompt_id: &str,
+        text: &str,
+    ) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/queue/{}",
+            self.endpoint.base_url,
+            session_id,
+            utf8_percent_encode(prompt_id, PATH_SEGMENT)
+        );
+        let body = serde_json::json!({ "text": text });
+        let res = self.auth(self.http.patch(&url)).json(&body).send().await?;
+        check_status(res, session_id).await?;
+        Ok(())
+    }
+
+    /// `DELETE /api/sessions/{id}/queue`: drop every queued prompt.
+    pub async fn queue_clear(&self, session_id: &str) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/queue",
+            self.endpoint.base_url, session_id
+        );
+        let res = self.auth(self.http.delete(&url)).send().await?;
+        check_status(res, session_id).await?;
+        Ok(())
+    }
+
     /// `POST /api/sessions/{id}/smart-rename`: on-demand "Auto-name now" for a
     /// structured session. The daemon forces past the `smart_rename`-disabled
     /// gate and runs the one-shot detached; a 2xx means "started", not

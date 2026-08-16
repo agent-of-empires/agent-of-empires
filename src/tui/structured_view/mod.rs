@@ -39,6 +39,7 @@ use crate::acp::client::{
 };
 use crate::acp::elicitations::ElicitationResolution;
 use crate::acp::protocol::ApprovalDecisionWire;
+use crate::acp::state::QueuedPromptEntry;
 use crate::plugin::ui_state::{Tone, UiSnapshot};
 use crate::session::config::{resolve_theme_name, resolve_theme_palette_mode};
 use crate::tui::styles::Theme;
@@ -251,6 +252,11 @@ struct ViewSetup {
 pub(crate) struct ViewSideInfo {
     session: Result<crate::acp::session_paths::SessionViewInfo, String>,
     compaction_reminder: Option<u8>,
+    /// Initial daemon-owned prompt-queue snapshot, so the composer's queue
+    /// strip and ArrowUp recall reflect prompts queued from another client
+    /// (or before this attach) the moment the view opens. Empty on a fetch
+    /// error; the next turn-edge refresh recovers.
+    queued: Vec<QueuedPromptEntry>,
 }
 
 /// Hydrate the transcript via /replay, open the WebSocket, and spawn
@@ -293,10 +299,18 @@ async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSe
                     None
                 }
             };
+            let queued = match http.queue_list(&session_id).await {
+                Ok(entries) => entries,
+                Err(e) => {
+                    tracing::warn!(target: "acp.tui", "initial prompt-queue fetch failed; queue starts empty until the next refresh: {e}");
+                    Vec::new()
+                }
+            };
             let _ = session_info_tx
                 .send(ViewSideInfo {
                     session,
                     compaction_reminder,
+                    queued,
                 })
                 .await;
         });
@@ -500,6 +514,7 @@ fn apply_session_info(
 /// full-screen loop and the embedded preview.
 pub(crate) fn apply_side_info(state: &mut StructuredViewState, side: ViewSideInfo) {
     state.compaction_reminder_percent = side.compaction_reminder;
+    state.set_queue_snapshot(side.queued);
     match side.session {
         Ok(info) => apply_session_info(state, info),
         Err(e) => {
@@ -532,10 +547,11 @@ async fn apply_ws_message(
                 // served its purpose; release it.
                 state.in_flight = false;
             } else if was_active && !now_active {
-                // Turn ended: release the lock and drain the
-                // next queued batch, if any.
+                // Turn ended: release the lock and refresh the queue mirror.
+                // The daemon drains the next batch server-side at this edge, so
+                // pull the post-drain snapshot to keep the strip honest.
                 state.in_flight = false;
-                maybe_drain(state, toast_deadline).await;
+                refresh_queue(state).await;
             }
         }
         Ok(WsMessage::Lagged) => {
@@ -559,9 +575,9 @@ async fn apply_ws_message(
                     state.reconcile_slash_selection();
                     // Re-derived turn state from the rebuilt
                     // transcript; the lock no longer reflects
-                    // anything observable. Drain if idle.
+                    // anything observable. Resync the queue mirror too.
                     state.in_flight = false;
-                    maybe_drain(state, toast_deadline).await;
+                    refresh_queue(state).await;
                 }
                 Err(e) => {
                     set_toast(
@@ -603,11 +619,10 @@ async fn apply_ws_message(
                         "ws reconnected".into(),
                         ToastKind::Info,
                     );
-                    // Resumed frames will re-derive turn state
-                    // and drain on the next edge, but if the
-                    // turn already ended before reconnect there
-                    // is no edge to wait for: drain now.
-                    maybe_drain(state, toast_deadline).await;
+                    // Resync the queue mirror after the gap: the daemon may
+                    // have drained entries while the socket was down, and there
+                    // may be no future turn edge to refresh on.
+                    refresh_queue(state).await;
                 }
                 Err(e) => {
                     set_toast(
@@ -803,23 +818,21 @@ async fn handle_terminal_event(
             // edited text is never lost.
             if !text.is_empty() {
                 if let Some(r) = recall {
-                    if state.queue.replace(r.index, text.clone()) {
-                        set_toast(
-                            state,
-                            toast_deadline,
-                            format!("edited queued prompt ({} waiting)", state.queue.len()),
-                            ToastKind::Info,
-                        );
-                        return Ok(false);
+                    // Edit that queued entry in place on the daemon, by its
+                    // stable id, preserving its position. If the entry drained
+                    // between recall and now its id is gone from the mirror, so
+                    // fall through to the normal send / queue path.
+                    if let Some(id) = state.queue.id_at(r.index).map(str::to_string) {
+                        return Ok(edit_queued_prompt(state, toast_deadline, &id, &text).await);
                     }
                 }
             }
             if text.is_empty() {
-                // Empty Enter is a manual flush: if the agent is idle and
-                // prompts are stuck in the queue (e.g. a drain POST failed
-                // earlier), retry the drain. Otherwise just nudge the user.
+                // Empty Enter is a manual resync now that the daemon owns the
+                // drain: pull a fresh snapshot so a queue drained from another
+                // client (or server-side) is reflected. Nothing to send.
                 if !state.is_busy() && !state.queue.is_empty() {
-                    maybe_drain(state, toast_deadline).await;
+                    refresh_queue(state).await;
                 } else {
                     set_toast(
                         state,
@@ -831,16 +844,11 @@ async fn handle_terminal_event(
                 return Ok(false);
             }
             if state.should_queue_prompt() {
-                // A turn is running on an agent that cannot be steered
-                // (or the socket is down): park the prompt so it drains
-                // when the agent next goes idle.
-                state.queue.push(text);
-                set_toast(
-                    state,
-                    toast_deadline,
-                    format!("queued ({} waiting)", state.queue.len()),
-                    ToastKind::Info,
-                );
+                // A turn is running on an agent that cannot be steered (or the
+                // socket is down): park the prompt on the daemon-owned queue,
+                // which drains it server-side at the next turn edge even if this
+                // client closes first.
+                enqueue_prompt(state, toast_deadline, &text).await;
                 return Ok(false);
             }
             if send_prompt_now(state, toast_deadline, &text).await {
@@ -857,16 +865,7 @@ async fn handle_terminal_event(
             if state.queue.is_empty() {
                 return Ok(false);
             }
-            state.queue.clear();
-            // The browsed entry no longer exists; end the browse but keep
-            // whatever text is in the composer as a draft.
-            state.cancel_recall();
-            set_toast(
-                state,
-                toast_deadline,
-                "queue cleared".into(),
-                ToastKind::Info,
-            );
+            clear_queue(state, toast_deadline).await;
             Ok(false)
         }
         Intent::RecallQueued(delta) => {
@@ -1610,29 +1609,114 @@ async fn send_prompt_now(
     }
 }
 
-/// Drain the next queued batch if the agent is idle. The batch is removed
-/// from the queue only after its POST succeeds, so a failed send leaves
-/// the prompts in place to retry (via the next turn-end edge or an empty-
-/// composer flush) instead of silently dropping them.
-async fn maybe_drain(state: &mut StructuredViewState, toast_deadline: &mut Option<Instant>) {
-    if state.is_busy() || state.queue.is_empty() {
-        return;
+/// Enqueue a prompt on the daemon-owned queue and fold the stored entry into
+/// the local mirror. The daemon drains the queue server-side at the turn edge,
+/// so there is no client drain to schedule. On failure the composer text is
+/// restored so the prompt is never lost.
+async fn enqueue_prompt(
+    state: &mut StructuredViewState,
+    toast_deadline: &mut Option<Instant>,
+    text: &str,
+) {
+    let http = state.http.clone();
+    let session_id = state.session_id.clone();
+    let id = uuid::Uuid::new_v4().to_string();
+    match http.queue_enqueue(&session_id, &id, text).await {
+        Ok(entry) => {
+            state.queue.upsert(entry);
+            set_toast(
+                state,
+                toast_deadline,
+                format!("queued ({} waiting)", state.queue.len()),
+                ToastKind::Info,
+            );
+        }
+        Err(e) => {
+            state.set_composer_text(text);
+            set_toast(
+                state,
+                toast_deadline,
+                format!("queue failed: {e}"),
+                ToastKind::Error,
+            );
+        }
     }
-    let Some((text, count)) = state.queue.next_batch() else {
-        return;
-    };
-    if send_prompt_now(state, toast_deadline, &text).await {
-        state.queue.drop_front(count);
-        // Keep an in-progress ArrowUp/ArrowDown browse pointing at the
-        // right entry now that the front of the queue shifted.
-        state.reconcile_recall_after_drain(count);
-        let remaining = state.queue.len();
-        let msg = if remaining == 0 {
-            "queue drained".to_string()
-        } else {
-            format!("draining queue ({remaining} waiting)")
-        };
-        set_toast(state, toast_deadline, msg, ToastKind::Info);
+}
+
+/// Edit a queued prompt's text on the daemon in place (by its stable id), then
+/// mirror the change locally. Always returns `false` (the dispatcher's
+/// should-exit flag). On failure the edited text is restored to the composer so
+/// it is not lost.
+async fn edit_queued_prompt(
+    state: &mut StructuredViewState,
+    toast_deadline: &mut Option<Instant>,
+    id: &str,
+    text: &str,
+) -> bool {
+    let http = state.http.clone();
+    let session_id = state.session_id.clone();
+    match http.queue_edit(&session_id, id, text).await {
+        Ok(()) => {
+            state.queue.set_text(id, text);
+            set_toast(
+                state,
+                toast_deadline,
+                format!("edited queued prompt ({} waiting)", state.queue.len()),
+                ToastKind::Info,
+            );
+        }
+        Err(e) => {
+            state.set_composer_text(text);
+            set_toast(
+                state,
+                toast_deadline,
+                format!("edit failed: {e}"),
+                ToastKind::Error,
+            );
+        }
+    }
+    false
+}
+
+/// Clear the daemon-owned queue, then drop the local mirror and end any recall
+/// browse (keeping the composer text as a draft). Leaves the mirror intact on
+/// failure so the user can retry.
+async fn clear_queue(state: &mut StructuredViewState, toast_deadline: &mut Option<Instant>) {
+    let http = state.http.clone();
+    let session_id = state.session_id.clone();
+    match http.queue_clear(&session_id).await {
+        Ok(()) => {
+            state.queue.clear();
+            state.cancel_recall();
+            set_toast(
+                state,
+                toast_deadline,
+                "queue cleared".into(),
+                ToastKind::Info,
+            );
+        }
+        Err(e) => {
+            set_toast(
+                state,
+                toast_deadline,
+                format!("clear failed: {e}"),
+                ToastKind::Error,
+            );
+        }
+    }
+}
+
+/// Pull a fresh daemon queue snapshot into the mirror, preserving an active
+/// recall browse. Best-effort: a transient failure keeps the last snapshot
+/// rather than blanking the strip.
+async fn refresh_queue(state: &mut StructuredViewState) {
+    let http = state.http.clone();
+    let session_id = state.session_id.clone();
+    match http.queue_list(&session_id).await {
+        Ok(entries) => state.set_queue_snapshot(entries),
+        Err(e) => {
+            tracing::warn!(target: "acp.tui", "queue refresh failed; keeping last snapshot: {e}")
+        }
     }
 }
 

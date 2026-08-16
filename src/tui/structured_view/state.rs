@@ -10,12 +10,13 @@ use ratatui::layout::Rect;
 use ratatui_textarea::TextArea;
 
 use super::input::Focus;
-use super::queue::PromptQueue;
+use super::queue::QueueMirror;
 use super::reducer::AcpTranscript;
 use super::slash;
 use crate::acp::client::{DaemonEndpoint, HttpClient, PluginCommandView, WsHandle};
 use crate::acp::session_paths::SessionPathRoots;
 use crate::acp::state::AvailableCommand;
+use crate::acp::state::QueuedPromptEntry;
 use crate::plugin::ui_state::{Notification, UiSnapshot};
 use crate::tui::plugin_ui;
 
@@ -41,9 +42,11 @@ pub struct StructuredViewState {
     /// Toast banner that appears briefly above the composer, e.g.
     /// "prompt sent" or an HTTP error.
     pub toast: Option<ToastBanner>,
-    /// Prompts the user queued while a turn was in flight, awaiting the
-    /// next idle drain. Pure local state, like the web composer's queue.
-    pub queue: PromptQueue,
+    /// Mirror of the daemon-owned prompt queue (the daemon drains it
+    /// server-side at the turn edge; see [`QueueMirror`]). Refreshed from
+    /// `/queue` on connect and at each turn edge, with optimistic edits in
+    /// between.
+    pub queue: QueueMirror,
     /// Optimistic in-flight lock: set the instant a prompt POST is sent
     /// and cleared when the daemon echoes the turn start / end (or the
     /// POST fails). Without it, a second Enter pressed in the window
@@ -269,7 +272,7 @@ impl StructuredViewState {
             selected_approval: None,
             ws,
             toast: None,
-            queue: PromptQueue::default(),
+            queue: QueueMirror::default(),
             in_flight: false,
             slash_selected: 0,
             dismissed_slash_query: None,
@@ -412,7 +415,7 @@ impl StructuredViewState {
     /// Replace the composer contents with `text`, caret at the end.
     /// Mirrors [`take_composer_text`]'s fresh-textarea swap since
     /// ratatui-textarea has no public clear.
-    fn set_composer_text(&mut self, text: &str) {
+    pub(crate) fn set_composer_text(&mut self, text: &str) {
         self.composer = new_composer_textarea();
         self.composer.insert_str(text);
         self.slash_selected = 0;
@@ -440,7 +443,10 @@ impl StructuredViewState {
                 }
                 let stashed_draft = self.composer.lines().join("\n");
                 let index = len - 1;
-                self.set_composer_text(&self.queue.get(index).cloned().unwrap_or_default());
+                // Own the recalled text so the `&self.queue` borrow ends before
+                // the `&mut self` set_composer_text call.
+                let recalled = self.queue.text_at(index).unwrap_or_default().to_owned();
+                self.set_composer_text(&recalled);
                 self.recall = Some(RecallState {
                     index,
                     stashed_draft,
@@ -451,18 +457,16 @@ impl StructuredViewState {
                     // Older: stop at the oldest entry, no wrap.
                     if r.index > 0 {
                         r.index -= 1;
-                        self.set_composer_text(
-                            &self.queue.get(r.index).cloned().unwrap_or_default(),
-                        );
+                        let recalled = self.queue.text_at(r.index).unwrap_or_default().to_owned();
+                        self.set_composer_text(&recalled);
                     }
                     self.recall = Some(r);
                 } else {
                     // Newer: past the newest entry, restore the stashed draft.
                     if r.index + 1 < len {
                         r.index += 1;
-                        self.set_composer_text(
-                            &self.queue.get(r.index).cloned().unwrap_or_default(),
-                        );
+                        let recalled = self.queue.text_at(r.index).unwrap_or_default().to_owned();
+                        self.set_composer_text(&recalled);
                         self.recall = Some(r);
                     } else {
                         let draft = r.stashed_draft.clone();
@@ -474,16 +478,22 @@ impl StructuredViewState {
         }
     }
 
-    /// Reconcile an active browse after `dropped` entries drain off the
-    /// front of the queue. The browsed entry shifts down by `dropped`; if
-    /// it was among the drained ones (or the queue emptied) the browse is
-    /// cancelled, leaving the in-progress composer text as a normal draft.
-    pub fn reconcile_recall_after_drain(&mut self, dropped: usize) {
+    /// Replace the queue mirror with a fresh daemon snapshot, keeping an
+    /// active ArrowUp/ArrowDown browse pointed at the same entry across a
+    /// server-side drain. The browsed entry is tracked by its stable id (not
+    /// its index), so entries draining off the front reindex it correctly; if
+    /// that entry is gone from the snapshot the browse ends, leaving the
+    /// in-progress composer text as a normal draft.
+    pub fn set_queue_snapshot(&mut self, entries: Vec<QueuedPromptEntry>) {
+        let browsed_id = self
+            .recall
+            .as_ref()
+            .and_then(|r| self.queue.id_at(r.index).map(str::to_string));
+        self.queue.set_snapshot(entries);
         if let Some(r) = self.recall.as_mut() {
-            if r.index < dropped || self.queue.is_empty() {
-                self.recall = None;
-            } else {
-                r.index -= dropped;
+            match browsed_id.and_then(|id| self.queue.index_of(&id)) {
+                Some(idx) => r.index = idx,
+                None => self.recall = None,
             }
         }
     }
@@ -778,7 +788,7 @@ mod tests {
     }
 
     #[test]
-    fn reconcile_shifts_browse_index_when_front_drains() {
+    fn snapshot_refresh_shifts_browse_index_when_front_drains() {
         let mut state = test_state(None);
         state.queue.push("a".into());
         state.queue.push("b".into());
@@ -786,14 +796,16 @@ mod tests {
         state.recall_step(-1); // browsing "c" at index 2
         assert_eq!(state.recall.as_ref().unwrap().index, 2);
 
-        // Two entries drain off the front; the browsed entry shifts to 0.
-        state.queue.drop_front(2);
-        state.reconcile_recall_after_drain(2);
+        // Two entries drain server-side; refresh with just "c" remaining. The
+        // browse follows "c" by id to its new front position.
+        let c = state.queue.entries()[2].clone();
+        state.set_queue_snapshot(vec![c]);
         assert_eq!(state.recall.as_ref().unwrap().index, 0);
+        assert_eq!(composer_text(&state), "c");
     }
 
     #[test]
-    fn reconcile_cancels_browse_when_browsed_entry_drains() {
+    fn snapshot_refresh_cancels_browse_when_browsed_entry_drains() {
         let mut state = test_state(None);
         state.queue.push("a".into());
         state.queue.push("b".into());
@@ -803,9 +815,10 @@ mod tests {
         assert_eq!(state.recall.as_ref().unwrap().index, 0);
         let browsed = composer_text(&state);
 
-        state.queue.drop_front(1);
-        state.reconcile_recall_after_drain(1);
-        // The browsed entry is gone: browse cancelled, edited text retained.
+        // "a" drained; refresh with only "b". The browsed entry is gone, so the
+        // browse ends with the edited text retained as a draft.
+        let b = state.queue.entries()[1].clone();
+        state.set_queue_snapshot(vec![b]);
         assert!(state.recall.is_none());
         assert_eq!(composer_text(&state), browsed);
     }
@@ -848,8 +861,8 @@ mod tests {
         state.queue.push("hello".into());
         state.queue.push("world".into());
         assert_eq!(state.queue.len(), 2);
-        let items: Vec<&String> = state.queue.iter().collect();
-        assert_eq!(items, vec!["hello", "world"]);
+        assert_eq!(state.queue.text_at(0), Some("hello"));
+        assert_eq!(state.queue.text_at(1), Some("world"));
     }
 
     fn cmd(name: &str) -> AvailableCommand {
