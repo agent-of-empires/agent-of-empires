@@ -541,6 +541,15 @@ impl AcpState {
     /// bounded; the full diff history lives in the replay buffer.
     const MAX_RECENT_DIFFS: usize = 16;
 
+    /// A prompt getting through means the session is live, so any rate-limit
+    /// park is over. Clearing it only on `RateLimitAutoResumed` / a backend
+    /// switch left a session resumed by a plain prompt showing a stale
+    /// "Rate-limited; resets at ..." banner whose RESUME NOW button then 409'd
+    /// against the already-running worker. See #3028.
+    fn clear_rate_limit_park(&mut self) {
+        self.rate_limit = None;
+    }
+
     pub fn new(session_id: AcpSessionId, agent: AgentName, model: Option<String>) -> Self {
         Self {
             session_id,
@@ -1231,6 +1240,11 @@ impl AcpState {
                     }
                     _ => self.in_flight_tool = Some(tool_call),
                 }
+                // The reasoning block produced output, so the agent is no
+                // longer thinking. Adapters routinely skip `ThinkingEnded`
+                // when they transition straight into tool calls, which would
+                // otherwise leave the spinner stuck on "thinking". See #1213.
+                self.thinking = None;
             }
             Event::ToolCallCompleted { tool_call_id, .. } => {
                 if self
@@ -1280,6 +1294,19 @@ impl AcpState {
                 }
             }
             Event::ElicitationRequested { elicitation } => {
+                // The adapter pairs the elicitation with an `AskUserQuestion`
+                // tool call, and the card is the real UI: the transcript
+                // suppresses that tool row, so drop the in-flight pointer too
+                // rather than leave a spinner on the suppressed call.
+                if let Some(tool_call_id) = elicitation.tool_call_id.as_deref() {
+                    if self
+                        .in_flight_tool
+                        .as_ref()
+                        .is_some_and(|t| t.id == tool_call_id)
+                    {
+                        self.in_flight_tool = None;
+                    }
+                }
                 self.pending_elicitations.push(elicitation)
             }
             // Lenient on the nonce: a resolved/torn-down elicitation can be
@@ -1379,10 +1406,15 @@ impl AcpState {
             Event::Stopped { .. } => {
                 // The turn is over however it ended (completion, cancel, killed
                 // worker), so clear every in-turn phase. This is the
-                // self-healing clear for a dropped compaction marker (#3219).
+                // self-healing clear for a dropped compaction marker (#3219),
+                // and for an adapter that ends a turn without completing its
+                // tool call or emitting `ThinkingEnded`, either of which would
+                // otherwise leak a spinner into the next turn (#1213).
                 self.turn_active = false;
                 self.cancelling = false;
                 self.compacting = false;
+                self.in_flight_tool = None;
+                self.thinking = None;
             }
             Event::AgentStartupError { .. } => {
                 self.turn_active = false;
@@ -1401,6 +1433,7 @@ impl AcpState {
                 if !steered {
                     self.cancelling = false;
                 }
+                self.clear_rate_limit_park();
             }
             // Like UserPromptSent, the diff-comments prompt opens a turn.
             Event::UserDiffCommentsPrompt { .. } => {
@@ -1409,6 +1442,7 @@ impl AcpState {
                 if !steered {
                     self.cancelling = false;
                 }
+                self.clear_rate_limit_park();
             }
             // Surfaced to the web composer via replay and read by the
             // server prompt handler from the event store; no persistent
@@ -1433,19 +1467,19 @@ impl AcpState {
                 self.usage = None;
             }
             Event::SessionCleared => {
-                // /clear truly wipes the model's memory. Drop
-                // session-scoped capability caches and the usage
-                // snapshot so the UI doesn't keep showing stale data
-                // referencing a conversation the model has forgotten.
+                // /clear wipes the model's memory, so anything describing the
+                // forgotten conversation goes: the usage snapshot, the plan,
+                // and whatever it had pending.
                 self.usage = None;
-                self.available_commands = Vec::new();
                 self.current_plan = None;
                 self.mode = SessionMode::Default;
                 self.pending_approvals = Vec::new();
                 self.pending_elicitations = Vec::new();
-                // The mode list is an adapter capability and outlives /clear,
-                // but the selection is session-scoped, so only the id drops.
-                self.current_mode_id = None;
+                // What the ADAPTER advertises survives: slash commands and
+                // modes are process capabilities, not conversation state, and
+                // the agent never re-advertises them after a /clear. Dropping
+                // them leaves the pickers empty for the rest of the session.
+                // See #1128.
             }
             // Transient UI phase: the clients latch it to relabel the
             // spinner and park follow-up prompts. No durable server-side
@@ -2075,9 +2109,11 @@ mod tests {
         assert_eq!(s.current_mode_id.as_deref(), Some("plan"));
         assert_eq!(s.available_modes.len(), 2, "list survives a selection");
 
-        // /clear forgets the selection; the adapter still supports the modes.
+        // /clear forgets the conversation, not what the adapter advertises:
+        // the agent never re-announces its modes, so dropping them here would
+        // empty the picker for the rest of the session (#1128).
         s.apply_event(Event::SessionCleared).unwrap();
-        assert_eq!(s.current_mode_id, None);
+        assert_eq!(s.current_mode_id.as_deref(), Some("plan"));
         assert_eq!(s.available_modes.len(), 2);
 
         // A backend switch invalidates both: the new adapter advertises its own.
@@ -2272,17 +2308,131 @@ mod tests {
         assert!(s.config_option_switch_failed.is_none());
     }
 
+    /// Three phase clears the web reducer had and this one did not, each from
+    /// a bug the clients hit. They live here now that both clients render this
+    /// state instead of folding their own.
     #[test]
-    fn session_cleared_preserves_config_options() {
+    fn phase_clears_match_the_clients_they_replaced() {
+        let tool_call = |id: &str| ToolCall {
+            id: id.into(),
+            name: "Read".into(),
+            kind: "read".into(),
+            args_preview: "{}".into(),
+            started_at: Utc::now(),
+            parent_tool_call_id: None,
+            memory_recall: None,
+            diffs: Vec::new(),
+        };
+        let elicitation = |nonce: &str, tool_call_id: Option<&str>| Elicitation {
+            nonce: Nonce(nonce.into()),
+            message: "Which one?".into(),
+            title: None,
+            description: None,
+            tool_call_id: tool_call_id.map(str::to_string),
+            questions: Vec::new(),
+            requested_at: Utc::now(),
+            resolved: None,
+        };
+
+        // #1213: adapters skip `ThinkingEnded` when they go straight into a
+        // tool call, which left the spinner stuck on "thinking".
+        let mut s = fresh_state();
+        s.apply_event(Event::ThinkingStarted).unwrap();
+        assert!(s.thinking.is_some());
+        s.apply_event(Event::ToolCallStarted {
+            tool_call: tool_call("t-1"),
+        })
+        .unwrap();
+        assert!(s.thinking.is_none(), "a tool call ends the reasoning block");
+
+        // The AskUserQuestion tool call behind an elicitation is suppressed in
+        // the transcript, so its in-flight pointer must go too.
+        let mut s = fresh_state();
+        s.apply_event(Event::ToolCallStarted {
+            tool_call: tool_call("ask-1"),
+        })
+        .unwrap();
+        assert!(s.in_flight_tool.is_some());
+        s.apply_event(Event::ElicitationRequested {
+            elicitation: elicitation("n-1", Some("ask-1")),
+        })
+        .unwrap();
+        assert!(s.in_flight_tool.is_none());
+        // An elicitation scoped to some other call leaves it alone.
+        s.apply_event(Event::ToolCallStarted {
+            tool_call: tool_call("t-2"),
+        })
+        .unwrap();
+        s.apply_event(Event::ElicitationRequested {
+            elicitation: elicitation("n-2", Some("other")),
+        })
+        .unwrap();
+        assert_eq!(
+            s.in_flight_tool.as_ref().map(|t| t.id.as_str()),
+            Some("t-2")
+        );
+
+        // #3028: a session resumed by a plain prompt kept a stale rate-limit
+        // banner whose RESUME NOW button 409'd against the running worker.
+        let mut s = fresh_state();
+        s.apply_event(Event::RateLimit {
+            info: RateLimitInfo {
+                status: "resets in an hour".into(),
+                resets_at: None,
+                kind: "usage".into(),
+            },
+        })
+        .unwrap();
+        assert!(s.rate_limit.is_some());
+        s.apply_event(prompt("go")).unwrap();
+        assert!(s.rate_limit.is_none(), "a live prompt ends the park");
+    }
+
+    #[test]
+    fn session_cleared_preserves_adapter_capabilities() {
         let mut s = fresh_state();
         s.apply_event(Event::ConfigOptionsUpdated {
             options: sample_config_options(),
         })
         .unwrap();
+        s.apply_event(Event::AvailableCommandsUpdated {
+            commands: vec![AvailableCommand {
+                name: "review".into(),
+                description: "Review".into(),
+                accepts_input: false,
+            }],
+        })
+        .unwrap();
+        s.apply_event(Event::ModesAvailable {
+            current_mode_id: "plan".into(),
+            modes: vec![ModeInfo {
+                id: "plan".into(),
+                name: "Plan".into(),
+                description: None,
+            }],
+        })
+        .unwrap();
+        s.apply_event(Event::UsageUpdated {
+            usage: SessionUsage {
+                used: 5_000,
+                size: 200_000,
+                cost: None,
+            },
+        })
+        .unwrap();
+
         s.apply_event(Event::SessionCleared).unwrap();
-        // Adapter capabilities outlive /clear; the model has forgotten
-        // the conversation but still advertises the same selectors.
+
+        // Adapter capabilities outlive /clear: the model has forgotten the
+        // conversation but the process still advertises the same selectors,
+        // commands and modes, and it never re-announces them. See #1128.
         assert_eq!(s.config_options.len(), 2);
+        assert_eq!(s.available_commands.len(), 1);
+        assert_eq!(s.available_modes.len(), 1);
+        assert_eq!(s.current_mode_id.as_deref(), Some("plan"));
+        // What described the forgotten conversation does not survive.
+        assert!(s.usage.is_none());
+        assert!(s.current_plan.is_none());
     }
 
     #[test]

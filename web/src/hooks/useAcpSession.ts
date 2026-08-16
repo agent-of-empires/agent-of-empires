@@ -11,6 +11,7 @@ import { useCallback, useEffect, useReducer, useRef, useState, useSyncExternalSt
 import {
   appendElicitationAnswerRow,
   applyEvent,
+  applyReducedState,
   emptyAcpState,
   isTurnActive,
   mergePrependedActivity,
@@ -29,6 +30,7 @@ import {
   type ElicitationResolution,
   type PromptAttachmentInput,
   type QueuedPrompt,
+  type ReducedState,
   type TranscriptDelta,
   type TranscriptRow,
 } from "../lib/acpTypes";
@@ -62,6 +64,8 @@ type PromptSendResult = "ok" | "retryable_failure" | "non_retryable_failure";
 
 export type Action =
   | { kind: "frame"; frame: AcpFrame }
+  /** The daemon's folded control state, adopted verbatim (Tier 1.2). */
+  | { kind: "reduced_state"; state: ReducedState }
   | { kind: "frames"; frames: AcpFrame[]; rows?: ActivityRow[]; oldestSeq?: number }
   | { kind: "prepend"; rows: ActivityRow[]; oldestSeq: number }
   | { kind: "handshake"; frames: AcpFrame[] }
@@ -538,6 +542,9 @@ export function reducer(state: AcpState, action: Action): AcpState {
   if (action.kind === "frame") {
     return applyEvent(state, action.frame);
   }
+  if (action.kind === "reduced_state") {
+    return applyReducedState(state, action.state);
+  }
   if (action.kind === "frames") {
     // Reduce the raw frames for CONTROL state (turn/approvals/usage/modes),
     // then merge the server-folded rows into the transcript (activity). The
@@ -635,6 +642,7 @@ export function reducer(state: AcpState, action: Action): AcpState {
       ...state,
       lastError: removed ? null : state.lastError,
       pendingApprovals,
+      locallyResolved: [...state.locallyResolved, action.nonce],
     };
   }
   if (action.kind === "elicitation_resolved_locally") {
@@ -654,6 +662,7 @@ export function reducer(state: AcpState, action: Action): AcpState {
       ...state,
       lastError: removed ? null : state.lastError,
       pendingElicitations,
+      locallyResolved: [...state.locallyResolved, action.nonce],
       optimisticRows: appendElicitationAnswerRow(state.optimisticRows, action.nonce, answers),
     };
   }
@@ -1573,9 +1582,14 @@ export function useAcpSession(
               return;
             }
             if (kind === "reduced_state") {
-              // Server-owned control-state snapshot (Tier 1). Not consumed yet
-              // (Tier 1.2): the client still reduces raw frames for control.
-              // Ignore so it doesn't fall through to the raw-frame branch.
+              // Server-folded control state (Tier 1.2), sent on connect and
+              // after every event. Authoritative: the client no longer
+              // derives any of these fields.
+              const reduced = (data as { state?: ReducedState }).state;
+              if (reduced) {
+                lastActivityRef.current = Date.now();
+                dispatch({ kind: "reduced_state", state: reduced });
+              }
               return;
             }
             if (kind === "transcript_snapshot") {

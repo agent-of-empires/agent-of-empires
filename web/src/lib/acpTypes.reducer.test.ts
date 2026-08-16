@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   appendElicitationAnswerRow,
   applyEvent,
+  applyReducedState,
   emptyAcpState,
   mergeServerRows,
   patchServerRow,
@@ -11,16 +12,18 @@ import {
   type AcpFrame,
   type AcpState,
   type Elicitation,
+  type ReducedState,
   type ToolCall,
 } from "./acpTypes";
 
 // Targets the AcpEvent variants and helper branches the canonical
-// acpTypes.test.ts leaves cold: PlanUpdated, ThinkingEnded, the
-// approval pair, ModeChanged / ModesAvailable, PromptCapabilities,
-// PromptRejected, and the elicitation control path. The transcript
-// (activity) fold itself is server-owned now (Tier 4), so its behavior is
-// covered by the Rust `TranscriptModel` tests, not here; these assert only
-// the client-side CONTROL reducer.
+// acpTypes.test.ts leaves cold: PromptCapabilities, PromptRejected, and the
+// client-side halves of the elicitation path. Both projections are
+// server-owned now: the transcript rows since Tier 4 and the control state
+// since Tier 1.2, so the folds themselves are covered by the Rust
+// `TranscriptModel` / `AcpState` tests. What is asserted here is the client's
+// side of the boundary: how a `reduced_state` frame lands, and what the
+// client still derives for itself.
 
 function tc(id: string, over: Partial<ToolCall> = {}): ToolCall {
   return {
@@ -33,95 +36,97 @@ function tc(id: string, over: Partial<ToolCall> = {}): ToolCall {
   };
 }
 
-describe("applyEvent / seq gate + PlanUpdated", () => {
-  it("drops frames whose seq is not greater than lastSeq (returns the same ref)", () => {
-    const seeded: AcpState = { ...emptyAcpState(), lastSeq: 5 };
-    const out = applyEvent(seeded, {
-      session_id: "s-1",
-      seq: 5,
-      event: { PlanUpdated: { plan: { plan_id: "p", version: 1, steps: [] } } },
-    });
-    expect(out).toBe(seeded);
-  });
+function reducedState(over: Partial<ReducedState> = {}): ReducedState {
+  return {
+    agent: "claude",
+    model: null,
+    mode: "Default",
+    current_plan: null,
+    in_flight_tool: null,
+    pending_approvals: [],
+    pending_elicitations: [],
+    thinking: null,
+    rate_limit: null,
+    available_commands: [],
+    available_modes: [],
+    current_mode_id: null,
+    cancelling: false,
+    compacting: false,
+    ...over,
+  };
+}
 
-  it("stores the plan on PlanUpdated", () => {
-    const next = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: {
-        PlanUpdated: {
-          plan: {
-            plan_id: "plan-1",
-            version: 2,
-            steps: [{ id: "st-1", title: "Do it", status: "InProgress" }],
-          },
-        },
-      },
-    });
-    expect(next.plan?.plan_id).toBe("plan-1");
-    expect(next.plan?.steps).toHaveLength(1);
-  });
-});
-
-describe("applyEvent / ThinkingEnded", () => {
-  it("clears the thinking flag", () => {
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: "ThinkingStarted",
-    });
-    expect(state.thinking).toBe(true);
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: "ThinkingEnded",
-    });
-    expect(state.thinking).toBe(false);
-  });
-});
-
-describe("applyEvent / approval lifecycle", () => {
-  it("appends a pending approval on ApprovalRequested and removes it on ApprovalResolved", () => {
+describe("applyReducedState (Tier 1.2)", () => {
+  it("adopts the server's control state verbatim", () => {
     const approval = {
-      nonce: "ap-1",
-      tool_call: tc("tc-1"),
+      nonce: "n-1",
+      tool_call: tc("t-1"),
       destructive: true,
       requested_at: "2026-01-01T00:00:00Z",
     };
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: { ApprovalRequested: { approval } },
-    });
-    expect(state.pendingApprovals).toHaveLength(1);
-    expect(state.pendingApprovals[0].nonce).toBe("ap-1");
-
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: { ApprovalResolved: { nonce: "ap-1", decision: "Allow" } },
-    });
-    expect(state.pendingApprovals).toHaveLength(0);
+    const next = applyReducedState(
+      emptyAcpState(),
+      reducedState({
+        agent: "codex",
+        model: "gpt-5",
+        mode: "Plan",
+        current_plan: { plan_id: "p-1", version: 1, steps: [{ id: "s-1", title: "one", status: "Pending" }] },
+        in_flight_tool: tc("t-9"),
+        pending_approvals: [approval],
+        thinking: { started_at: "2026-01-01T00:00:00Z" },
+        rate_limit: { status: "limited", resets_at: null, kind: "usage" },
+        available_commands: [{ name: "review", description: "Review", accepts_input: true }],
+        available_modes: [{ id: "plan", name: "Plan" }],
+        current_mode_id: "plan",
+        cancelling: true,
+        compacting: true,
+      }),
+    );
+    expect(next.agent).toBe("codex");
+    expect(next.model).toBe("gpt-5");
+    expect(next.mode).toBe("Plan");
+    expect(next.plan?.steps).toHaveLength(1);
+    expect(next.inFlightTool?.id).toBe("t-9");
+    expect(next.pendingApprovals).toEqual([approval]);
+    // The wire carries a thinking signal object; the client renders a flag.
+    expect(next.thinking).toBe(true);
+    expect(next.rateLimit?.status).toBe("limited");
+    expect(next.availableCommands).toHaveLength(1);
+    expect(next.availableModes).toHaveLength(1);
+    expect(next.currentModeId).toBe("plan");
+    expect(next.cancelling).toBe(true);
+    expect(next.compacting).toBe(true);
   });
 
-  it("leaves unrelated approvals intact when a non-matching nonce resolves", () => {
+  it("leaves lastSeq alone so the raw-frame dedupe still governs replay", () => {
+    const seeded = { ...emptyAcpState(), lastSeq: 12 };
+    expect(applyReducedState(seeded, reducedState()).lastSeq).toBe(12);
+  });
+
+  // The card clears on the resolve POST rather than waiting for the
+  // broadcast (#1821); without the filter the next frame would paint it
+  // straight back, since the daemon has not folded the resolve yet.
+  it("keeps a locally-resolved card hidden until the server drops it", () => {
     const approval = {
-      nonce: "keep",
-      tool_call: tc("tc-1"),
+      nonce: "n-1",
+      tool_call: tc("t-1"),
       destructive: false,
       requested_at: "2026-01-01T00:00:00Z",
     };
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: { ApprovalRequested: { approval } },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: { ApprovalResolved: { nonce: "other", decision: "Deny" } },
-    });
-    expect(state.pendingApprovals.map((a) => a.nonce)).toEqual(["keep"]);
+    const pending = reducedState({ pending_approvals: [approval] });
+    let state = applyReducedState(emptyAcpState(), pending);
+    expect(state.pendingApprovals).toHaveLength(1);
+
+    state = { ...state, pendingApprovals: [], locallyResolved: ["n-1"] };
+    state = applyReducedState(state, pending);
+    expect(state.pendingApprovals).toEqual([]);
+
+    // Once the daemon stops listing it the nonce is forgotten, so a later
+    // request reusing it is not swallowed.
+    state = applyReducedState(state, reducedState());
+    expect(state.locallyResolved).toEqual([]);
+    state = applyReducedState(state, pending);
+    expect(state.pendingApprovals).toHaveLength(1);
   });
 });
 
@@ -193,72 +198,6 @@ describe("appendElicitationAnswerRow (#2209)", () => {
 
   it("is a no-op for empty answers", () => {
     expect(appendElicitationAnswerRow([], "n-1", [])).toEqual([]);
-  });
-});
-
-describe("applyEvent / elicitation answer (#2209)", () => {
-  const elicitation = {
-    nonce: "el-1",
-    message: "Pick",
-    questions: [],
-    requested_at: "2026-01-01T00:00:00Z",
-  };
-
-  it("clears the pending card on ElicitationResolved without touching the server-owned transcript", () => {
-    // The answered row is now a server transcript row (Tier 4), so applyEvent
-    // only drops the pending card; it must never mutate activity.
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: { ElicitationRequested: { elicitation } },
-    });
-    expect(state.pendingElicitations).toHaveLength(1);
-
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: {
-        ElicitationResolved: {
-          nonce: "el-1",
-          outcome: "Accepted",
-          answers: [{ question: "Proceed?", answer: "Yes" }],
-        },
-      },
-    });
-    expect(state.pendingElicitations).toHaveLength(0);
-    expect(state.activity).toHaveLength(0);
-  });
-});
-
-describe("applyEvent / mode events", () => {
-  it("ModeChanged updates the legacy mode enum", () => {
-    const next = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: { ModeChanged: { mode: "Plan" } },
-    });
-    expect(next.mode).toBe("Plan");
-  });
-
-  it("ModesAvailable populates the advertised modes and current id, normalising missing descriptions", () => {
-    const next = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: {
-        ModesAvailable: {
-          current_mode_id: "m2",
-          modes: [
-            { id: "m1", name: "Default", description: "the default" },
-            { id: "m2", name: "Plan" },
-          ],
-        },
-      },
-    });
-    expect(next.currentModeId).toBe("m2");
-    expect(next.availableModes).toEqual([
-      { id: "m1", name: "Default", description: "the default" },
-      { id: "m2", name: "Plan", description: null },
-    ]);
   });
 });
 
@@ -334,44 +273,6 @@ describe("applyEvent / PromptRejected (#1196)", () => {
     expect(state.rejectedPrompts).toHaveLength(5);
     expect(state.rejectedPrompts[0].text).toBe("p2");
     expect(state.rejectedPrompts[4].text).toBe("p6");
-  });
-});
-
-describe("applyEvent / suppressed elicitation completion clears inFlight", () => {
-  it("nulls inFlightTool when the suppressed AskUserQuestion call completes", () => {
-    const elicitation = {
-      nonce: "e-1",
-      message: "Pick",
-      tool_call_id: "tc-ask",
-      questions: [],
-      requested_at: "2026-01-01T00:00:00Z",
-      resolved: null,
-    };
-    // Tool starts first (in-flight pointer set), then the elicitation
-    // arrives and strips the row but keeps the in-flight pointer cleared,
-    // then a completion lands. Re-arm in-flight to a different tool to
-    // assert the completion only clears it when it matches.
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: { ToolCallStarted: { tool_call: tc("tc-ask", { name: "Asking" }) } },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: { ElicitationRequested: { elicitation } },
-    });
-    // ElicitationRequested already cleared inFlightTool; re-point it at the
-    // suppressed id so the completion arm exercises the matching clear.
-    state = { ...state, inFlightTool: tc("tc-ask", { name: "Asking" }) };
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 3,
-      event: { ToolCallCompleted: { tool_call_id: "tc-ask", is_error: false, content: "x" } },
-    });
-    expect(state.inFlightTool).toBeNull();
-    // No transcript card materialised for the suppressed id.
-    expect(state.activity.some((r) => r.toolCallId === "tc-ask")).toBe(false);
   });
 });
 

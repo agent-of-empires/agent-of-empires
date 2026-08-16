@@ -135,7 +135,21 @@ pub async fn connect(
     session_id: &str,
     since: u64,
 ) -> Result<WsHandle, WsError> {
-    let url = ws_url(endpoint, session_id, since);
+    connect_with(endpoint, session_id, since, true).await
+}
+
+/// [`connect`], with control over whether the server forwards the raw event
+/// frames. A consumer that renders only the folded projections (the native
+/// structured view since Tier 1.3) passes `forward_frames: false` so a long
+/// session's whole event history is not shipped on every open; the server
+/// still folds it to build the connect snapshots.
+pub async fn connect_with(
+    endpoint: &DaemonEndpoint,
+    session_id: &str,
+    since: u64,
+    forward_frames: bool,
+) -> Result<WsHandle, WsError> {
+    let url = ws_url(endpoint, session_id, since, forward_frames);
     debug!(
         target: "acp.client.ws",
         // Log the path without the token query param.
@@ -284,12 +298,15 @@ fn parse_text(raw: &str) -> Result<Option<WsMessage>, WsError> {
     Ok(Some(WsMessage::Frame(Arc::new(frame))))
 }
 
-fn ws_url(endpoint: &DaemonEndpoint, session_id: &str, since: u64) -> String {
+fn ws_url(endpoint: &DaemonEndpoint, session_id: &str, since: u64, forward_frames: bool) -> String {
     let base = endpoint.ws_base_url();
     let path = format!("/sessions/{session_id}/acp/ws");
     let mut params: Vec<String> = Vec::new();
     if since > 0 {
         params.push(format!("since={since}"));
+    }
+    if !forward_frames {
+        params.push("frames=0".to_string());
     }
     if let Some(token) = endpoint.resolved_token() {
         params.push(format!("token={token}"));
@@ -328,10 +345,15 @@ mod tests {
     #[test]
     fn ws_url_appends_since_and_token() {
         let e = endpoint("http://127.0.0.1:8080", Some("abc"));
-        let url = ws_url(&e, "s-1", 42);
+        let url = ws_url(&e, "s-1", 42, true);
         assert_eq!(
             url,
             "ws://127.0.0.1:8080/sessions/s-1/acp/ws?since=42&token=abc"
+        );
+        // A projections-only consumer asks the daemon to skip the raw frames.
+        assert_eq!(
+            ws_url(&e, "s-1", 42, false),
+            "ws://127.0.0.1:8080/sessions/s-1/acp/ws?since=42&frames=0&token=abc"
         );
     }
 
@@ -349,7 +371,7 @@ mod tests {
         .with_local_token_path(token_path);
 
         assert_eq!(
-            ws_url(&endpoint, "s-1", 0),
+            ws_url(&endpoint, "s-1", 0, true),
             format!("ws://127.0.0.1:8080/sessions/s-1/acp/ws?token={rotated}")
         );
     }
@@ -358,7 +380,7 @@ mod tests {
     fn ws_url_omits_since_when_zero() {
         let e = endpoint("http://127.0.0.1:8080", None);
         assert_eq!(
-            ws_url(&e, "s-1", 0),
+            ws_url(&e, "s-1", 0, true),
             "ws://127.0.0.1:8080/sessions/s-1/acp/ws"
         );
     }
@@ -366,7 +388,7 @@ mod tests {
     #[test]
     fn ws_url_uses_wss_for_https_endpoint() {
         let e = endpoint("https://remote.example.com", Some("t"));
-        assert!(ws_url(&e, "s-1", 0).starts_with("wss://"));
+        assert!(ws_url(&e, "s-1", 0, true).starts_with("wss://"));
     }
 
     /// How each `{"kind":...}` sentinel the daemon can send must classify.

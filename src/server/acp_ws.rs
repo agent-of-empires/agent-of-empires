@@ -71,6 +71,16 @@ fn heartbeat_frame() -> String {
 pub struct AcpWsQuery {
     #[serde(default)]
     pub since: Option<u64>,
+    /// Set `frames=0` to receive only the folded projections
+    /// (`reduced_state` + `transcript_snapshot` / `transcript_delta`) and
+    /// none of the raw event frames they are built from. The drain still
+    /// replays the full history server-side, since that is what builds the
+    /// projections; it just stops writing the frames to this socket. The
+    /// native TUI renders both projections and reads no raw frame, so this
+    /// saves it the entire event history on every open. Defaults to sending
+    /// them, which is what the web and `aoe acp tail` still need.
+    #[serde(default)]
+    pub frames: Option<u8>,
 }
 
 /// Public route handler for the structured view WebSocket.
@@ -87,21 +97,29 @@ pub async fn acp_ws(
     // One line per WS connect (not per message), so debug-level
     // doesn't risk spamming.
     let since = q.since.unwrap_or(0);
+    let forward_frames = q.frames.unwrap_or(1) != 0;
     debug!(
         target: "acp.ws",
         session = %id,
         since,
+        forward_frames,
         "agent ws route entered, beginning upgrade"
     );
     let session_for_handler = id.clone();
     ws.protocols(["aoe-auth"])
         .on_upgrade(move |socket| async move {
             debug!(target: "acp.ws", session = %session_for_handler, "agent ws upgrade complete");
-            handle(socket, session_for_handler, state, since).await
+            handle(socket, session_for_handler, state, since, forward_frames).await
         })
 }
 
-async fn handle(mut socket: WebSocket, session_id: String, state: Arc<AppState>, since: u64) {
+async fn handle(
+    mut socket: WebSocket,
+    session_id: String,
+    state: Arc<AppState>,
+    since: u64,
+    forward_frames: bool,
+) {
     // Clone the shutdown token so this handler exits promptly when the
     // daemon receives SIGINT/SIGTERM/SIGHUP, instead of holding axum's
     // graceful drain open until the browser tab decides to disconnect.
@@ -163,6 +181,7 @@ async fn handle(mut socket: WebSocket, session_id: String, state: Arc<AppState>,
         &state,
         &session_id,
         since,
+        forward_frames,
         &mut reduced,
         &mut transcript,
     )
@@ -251,15 +270,17 @@ async fn handle(mut socket: WebSocket, session_id: String, state: Arc<AppState>,
                         if frame.session_id != session_id {
                             continue;
                         }
-                        let payload = match serde_json::to_string(&frame) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                warn!(target: "acp.ws", "serialise frame: {e}");
-                                continue;
+                        if forward_frames {
+                            let payload = match serde_json::to_string(&frame) {
+                                Ok(s) => s,
+                                Err(e) => {
+                                    warn!(target: "acp.ws", "serialise frame: {e}");
+                                    continue;
+                                }
+                            };
+                            if socket.send(Message::Text(payload.into())).await.is_err() {
+                                break;
                             }
-                        };
-                        if socket.send(Message::Text(payload.into())).await.is_err() {
-                            break;
                         }
                         // Reduce this event into the connection's control state
                         // and push the updated snapshot. Reduction errors
@@ -318,8 +339,10 @@ async fn handle(mut socket: WebSocket, session_id: String, state: Arc<AppState>,
 }
 
 /// Read every stored event for `session_id` with `seq > since` out of
-/// the disk-backed event store and forward it to the socket as a
-/// `AcpBroadcastFrame`. Returns the number of frames sent. The
+/// the disk-backed event store, fold it into both projections, and (unless
+/// the client opted out with `frames=0`) forward it to the socket as an
+/// `AcpBroadcastFrame`. Returns the number of frames sent. The fold happens
+/// either way: it is what builds the connect snapshots. The
 /// event store survives `aoe serve` restart, so this drain works even
 /// after the daemon has restarted. The live broadcast channel is
 /// already subscribed by the caller before this runs, so any events
@@ -330,6 +353,7 @@ async fn drain_replay_into_socket(
     state: &AppState,
     session_id: &str,
     since: u64,
+    forward_frames: bool,
     reduced: &mut AcpState,
     transcript: &mut TranscriptModel,
 ) -> usize {
@@ -368,6 +392,9 @@ async fn drain_replay_into_socket(
         // because the transcript_snapshot below carries the built rows.
         let _ = transcript.apply_event(seq, &event);
         snapshot_seq = seq;
+        if !forward_frames {
+            continue;
+        }
         let frame = AcpBroadcastFrame {
             session_id: session_id.to_string(),
             seq,
@@ -700,6 +727,25 @@ where
 #[cfg(all(test, feature = "serve"))]
 mod tests {
     use super::*;
+
+    /// `frames` gates only the raw-frame forwarding, and its default has to
+    /// stay "send them": the web reducer and `aoe acp tail` both still read
+    /// raw frames, so a wrong default silently blanks them.
+    #[test]
+    fn ws_query_frames_flag_defaults_to_forwarding() {
+        let cases = [
+            ("", true),
+            ("since=7", true),
+            ("frames=1", true),
+            ("frames=0", false),
+            ("since=7&frames=0", false),
+        ];
+        for (query, expected) in cases {
+            let uri: axum::http::Uri = format!("/sessions/s-1/acp/ws?{query}").parse().unwrap();
+            let Query(q) = Query::<AcpWsQuery>::try_from_uri(&uri).expect("parse query");
+            assert_eq!(q.frames.unwrap_or(1) != 0, expected, "{query:?}");
+        }
+    }
 
     #[test]
     fn push_body_snippet_collapses_whitespace_and_caps_length() {

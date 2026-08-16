@@ -18,7 +18,6 @@ import {
   normaliseTurnCounters,
   type AcpFrame,
   type AcpState,
-  type ToolCall,
 } from "./acpTypes";
 
 function frame(seq: number, text: string): AcpFrame {
@@ -134,43 +133,6 @@ describe("applyEvent / UserDiffCommentsPrompt (#1123) (control state)", () => {
       resetSeq: 2,
       reason: "session/load failed: bad id",
     });
-  });
-});
-
-describe("applyEvent / AvailableCommandsUpdated", () => {
-  it("populates availableCommands and replaces the prior list", () => {
-    const f1: AcpFrame = {
-      session_id: "s-1",
-      seq: 1,
-      event: {
-        AvailableCommandsUpdated: {
-          commands: [{ name: "help", description: "Show help", accepts_input: false }],
-        },
-      },
-    };
-    const s1 = applyEvent(emptyAcpState(), f1);
-    expect(s1.availableCommands).toHaveLength(1);
-    expect(s1.availableCommands[0].name).toBe("help");
-
-    const f2: AcpFrame = {
-      session_id: "s-1",
-      seq: 2,
-      event: {
-        AvailableCommandsUpdated: {
-          commands: [
-            { name: "review", description: "Review PR", accepts_input: true },
-            {
-              name: "clear",
-              description: "Clear context",
-              accepts_input: false,
-            },
-          ],
-        },
-      },
-    };
-    const s2 = applyEvent(s1, f2);
-    expect(s2.availableCommands.map((c) => c.name)).toEqual(["review", "clear"]);
-    expect(s2.availableCommands[0].accepts_input).toBe(true);
   });
 });
 
@@ -678,132 +640,26 @@ describe("applyEvent / MonitorArmed lifecycle", () => {
   );
 });
 
-describe("applyEvent / CancelRequested lifecycle (#1727)", () => {
-  function startedTurn() {
-    // A turn must be active for cancelling to be meaningful.
-    return applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: { UserPromptSent: { text: "do a thing" } },
-    });
-  }
-
-  it("CancelRequested sets cancelling + the escalation deadline", () => {
-    const at = new Date(Date.now() + 10_000).toISOString();
-    const state = applyEvent(startedTurn(), {
-      session_id: "s-1",
-      seq: 2,
-      event: { CancelRequested: { escalates_at: at } },
-    });
-    expect(state.cancelling).toBe(true);
-    expect(state.cancelEscalatesAt).toBe(at);
-    // Turn is still active: CancelRequested is not a Stopped.
-    expect(state.turnActive).toBe(true);
-  });
-
-  it("any Stopped clears the cancelling state", () => {
-    const at = new Date(Date.now() + 10_000).toISOString();
-    let state = applyEvent(startedTurn(), {
-      session_id: "s-1",
-      seq: 2,
-      event: { CancelRequested: { escalates_at: at } },
-    });
-    expect(state.cancelling).toBe(true);
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 3,
-      event: { Stopped: { reason: "user_forced" } },
-    });
-    expect(state.cancelling).toBe(false);
-    expect(state.cancelEscalatesAt).toBeNull();
-    expect(state.turnActive).toBe(false);
-  });
-
-  it("a fresh user prompt clears a stale cancelling flag", () => {
-    const at = new Date(Date.now() + 10_000).toISOString();
-    let state = applyEvent(startedTurn(), {
-      session_id: "s-1",
-      seq: 2,
-      event: { CancelRequested: { escalates_at: at } },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 3,
-      event: { UserPromptSent: { text: "next turn" } },
-    });
-    expect(state.cancelling).toBe(false);
-    expect(state.cancelEscalatesAt).toBeNull();
-  });
-
-  it("replay reconstructs cancelling from the event stream", () => {
-    // REST replay applies the same ordered events; cancelling must
-    // survive a from-scratch rebuild, not depend on a local timer.
-    const at = new Date(Date.now() + 10_000).toISOString();
-    const frames = [
-      { session_id: "s-1", seq: 1, event: { UserPromptSent: { text: "go" } } },
-      {
-        session_id: "s-1",
-        seq: 2,
-        event: { CancelRequested: { escalates_at: at } },
-      },
-    ];
-    let state = emptyAcpState();
-    for (const f of frames) state = applyEvent(state, f);
-    expect(state.cancelling).toBe(true);
-    expect(state.cancelEscalatesAt).toBe(at);
-  });
-});
-
 describe("applyEvent / SessionCleared", () => {
-  // /clear wipes the model's memory. The reducer appends a divider row
-  // so the renderer can fold pre-clear turns behind a disclosure
-  // (#1101), and resets only the per-turn / in-flight fields the
-  // cleared context invalidates. Capability caches (slash commands,
-  // modes) are preserved because claude-agent-sdk caches them at
-  // Query init and does not rotate them on /clear (#1128).
-  it("resets per-turn state but preserves capability caches (#1128)", () => {
+  // /clear wipes the model's memory. Everything it invalidates (plan, mode,
+  // pending cards, usage) is server-owned since Tier 1.2, including the
+  // capability caches the agent never re-advertises (#1128). What stays here
+  // is the cost baseline: the agent keeps reporting session-lifetime
+  // cumulative cost, so the boundary snapshot is what makes the footer read
+  // "since the most recent clear" (#1354).
+  it("snapshots the cost baseline and leaves the rest to the server", () => {
     const seeded: AcpState = {
       ...emptyAcpState(),
-      availableCommands: [{ name: "foo", description: "", accepts_input: false }],
-      availableModes: [{ id: "m1", name: "Mode One" }],
-      currentModeId: "m1",
-      plan: {
-        plan_id: "p-1",
-        version: 1,
-        steps: [{ id: "s-1", title: "step", status: "Pending" }],
-      },
-      mode: "Plan",
-      pendingApprovals: [
-        {
-          nonce: "n-1",
-          tool_call: {
-            id: "tc-1",
-            name: "Bash",
-            kind: "execute",
-            args_preview: "ls",
-            started_at: new Date().toISOString(),
-          },
-          destructive: false,
-          requested_at: new Date().toISOString(),
-        },
-      ],
-      sessionUsage: { used: 10, size: 200_000 },
+      sessionUsage: { used: 10, size: 200_000, cost: { amount: 1.5, currency: "USD" } },
+      usageBaseline: { cost: 2 },
     };
     const next = applyEvent(seeded, {
       session_id: "s-1",
       seq: 7,
       event: "SessionCleared",
     });
-    // Per-turn / in-flight state cleared:
-    expect(next.plan).toBeNull();
-    expect(next.mode).toBe("Default");
-    expect(next.pendingApprovals).toEqual([]);
+    expect(next.usageBaseline).toEqual({ cost: 3.5 });
     expect(next.sessionUsage).toBeNull();
-    // Capability caches preserved (slash palette + mode picker keep
-    // working after /clear):
-    expect(next.availableCommands).toEqual(seeded.availableCommands);
-    expect(next.availableModes).toEqual(seeded.availableModes);
-    expect(next.currentModeId).toBe("m1");
   });
 });
 
@@ -838,56 +694,6 @@ describe("applyEvent / ConversationCompacted", () => {
       event: "ConversationCompacted",
     });
     expect(next.contextPrimerAvailable).toBeNull();
-  });
-});
-
-describe("applyEvent / ConversationCompactionStarted (#3219)", () => {
-  // The adapter goes silent for 90 to 170 seconds between the two
-  // markers, so the phase has to be latched from an event rather than
-  // inferred from the absence of frames. It clears on exactly two
-  // events; `Stopped` is the self-healing one.
-  const started = (seq: number): AcpFrame => ({
-    session_id: "s-1",
-    seq,
-    event: "ConversationCompactionStarted",
-  });
-
-  it("latches the phase without adding a transcript row", () => {
-    // The visible "Compacting..." chunk is already its own row; this
-    // event is state only.
-    const next = applyEvent(emptyAcpState(), started(4));
-    expect(next.compacting).toBe(true);
-    expect(next.activity).toHaveLength(0);
-  });
-
-  it.each([
-    { label: "the completion marker", event: "ConversationCompacted" as const, expected: false },
-    {
-      label: "a clean Stopped",
-      event: { Stopped: { reason: "prompt_complete" } } as const,
-      expected: false,
-    },
-    {
-      label: "a cancelled Stopped",
-      event: { Stopped: { reason: "cancelled" } } as const,
-      expected: false,
-    },
-    // The regression guard for the clear that must NOT exist:
-    // applyNewTurnResets runs on every server-confirmed UserPromptSent,
-    // including a follow-up confirmed inside the silent window. Clearing
-    // there would relabel the spinner and re-arm the Force-end-turn
-    // hatch while the compaction is still running.
-    {
-      label: "a mid-compaction UserPromptSent",
-      event: { UserPromptSent: { text: "also check the tests" } } as const,
-      expected: true,
-    },
-    { label: "ordinary streaming", event: "ThinkingStarted" as const, expected: true },
-  ])("$label leaves compacting=$expected", ({ event, expected }) => {
-    const latched = applyEvent(emptyAcpState(), started(1));
-    expect(latched.compacting).toBe(true);
-    const next = applyEvent(latched, { session_id: "s-1", seq: 2, event });
-    expect(next.compacting).toBe(expected);
   });
 });
 
@@ -1331,28 +1137,15 @@ describe("applyEvent / AgentSwitched", () => {
   // to another. Reducer must drop everything tied to the prior
   // backend so the UI doesn't show Claude's usage bar / mode pills /
   // in-flight tool while talking to Codex.
-  it("clears prior-backend transient state and records the handoff", () => {
+  it("records the handoff and resets the cost baseline", () => {
+    // What the new backend re-advertises (agent, rate limit, in-flight tool,
+    // pending cards, commands, modes, plan, mode) is dropped server-side
+    // since Tier 1.2. What stays is the client's own bookkeeping: the new
+    // backend reports its cumulative cost from zero (#1354).
     const seeded: AcpState = {
       ...emptyAcpState(),
-      agent: "claude",
-      rateLimit: {
-        status: "limited",
-        resets_at: "2099-01-01T00:00:00Z",
-        kind: "rate_limit",
-      },
-      inFlightTool: {
-        id: "t-1",
-        name: "Read",
-        kind: "read",
-        args_preview: "{}",
-        started_at: new Date().toISOString(),
-      },
-      thinking: true,
       sessionUsage: { used: 100, size: 200_000 },
-      availableCommands: [{ name: "/clear", description: "wipe context", accepts_input: false }],
-      availableModes: [{ id: "m1", name: "Default" }],
-      currentModeId: "m1",
-      mode: "Plan",
+      usageBaseline: { cost: 4 },
     };
     const next = applyEvent(seeded, {
       session_id: "s-1",
@@ -1361,15 +1154,8 @@ describe("applyEvent / AgentSwitched", () => {
         AgentSwitched: { from: "claude", to: "codex", reason: "rate_limited" },
       },
     });
-    expect(next.agent).toBe("codex");
-    expect(next.rateLimit).toBeNull();
-    expect(next.inFlightTool).toBeNull();
-    expect(next.thinking).toBe(false);
     expect(next.sessionUsage).toBeNull();
-    expect(next.availableCommands).toEqual([]);
-    expect(next.availableModes).toEqual([]);
-    expect(next.currentModeId).toBeNull();
-    expect(next.mode).toBe("Default");
+    expect(next.usageBaseline).toBeNull();
     expect(next.lastAgentSwitch).toMatchObject({
       from: "claude",
       to: "codex",
@@ -1759,8 +1545,9 @@ describe("applyEvent / ModeSwitchFailed", () => {
       seq: 2,
       event: { CurrentModeChanged: { current_mode_id: "acceptEdits" } },
     });
+    // The mode id itself is server-owned (Tier 1.2); the switch landing is
+    // what makes the notice stale.
     expect(state.modeSwitchFailed).toBeNull();
-    expect(state.currentModeId).toBe("acceptEdits");
   });
 });
 
@@ -2182,174 +1969,6 @@ describe("applyEvent / ConfigOptions (#1403)", () => {
   });
 });
 
-describe("applyEvent / thinking-state honesty (#1213)", () => {
-  // claude-agent-acp emits ThinkingStarted once per reasoning block but
-  // often skips ThinkingEnded when it transitions into tool calls or
-  // final text. Without these clears, `thinking` latches true through a
-  // whole turn and the WorkingSpinner shows "thinking" verbs while a
-  // Terminal command is actually running. See #1213.
-
-  function toolCall(id: string, name: string): ToolCall {
-    return {
-      id,
-      name,
-      kind: "execute",
-      args_preview: "{}",
-      started_at: "2026-01-01T00:00:00Z",
-    };
-  }
-
-  it("clears thinking when a tool call starts (no ThinkingEnded from adapter)", () => {
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: "ThinkingStarted",
-    });
-    expect(state.thinking).toBe(true);
-
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: { ToolCallStarted: { tool_call: toolCall("t1", "Terminal") } },
-    });
-    expect(state.thinking).toBe(false);
-    expect(state.inFlightTool?.name).toBe("Terminal");
-  });
-
-  it("clears thinking when assistant text starts streaming", () => {
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: "ThinkingStarted",
-    });
-    expect(state.thinking).toBe(true);
-
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: { AgentMessageChunk: { text: "Here is the answer" } },
-    });
-    expect(state.thinking).toBe(false);
-  });
-
-  it("clears thinking on Stopped so it does not leak across turns", () => {
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: "ThinkingStarted",
-    });
-    expect(state.thinking).toBe(true);
-
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: { Stopped: { reason: "prompt_complete" } },
-    });
-    expect(state.thinking).toBe(false);
-    expect(state.inFlightTool).toBeNull();
-  });
-
-  it("derives tool over thinking through an interleaved turn (full trace)", () => {
-    // Mirrors the affected session: ThinkingStarted, then a Terminal
-    // tool call with no intervening ThinkingEnded.
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: "ThinkingStarted",
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: { ToolCallStarted: { tool_call: toolCall("t1", "Terminal") } },
-    });
-    // The WorkingSpinner derives state as tool > thinking > working.
-    expect(state.thinking).toBe(false);
-    expect(state.inFlightTool).not.toBeNull();
-  });
-});
-
-describe("applyEvent / RateLimitAutoResumed (#1722)", () => {
-  it("clears the rate-limit banner so the composer unlocks", () => {
-    let state: AcpState = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: {
-        RateLimit: {
-          info: {
-            status: "usage limit reached",
-            resets_at: "2026-06-01T12:10:00Z",
-            kind: "rate_limit",
-          },
-        },
-      },
-    });
-    expect(state.rateLimit).not.toBeNull();
-
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: { RateLimitAutoResumed: { resets_at: "2026-06-01T12:10:00Z" } },
-    });
-    expect(state.rateLimit).toBeNull();
-  });
-});
-
-describe("applyEvent / elicitation (control state)", () => {
-  const elicitation = {
-    nonce: "e-1",
-    message: "Pick one",
-    tool_call_id: null,
-    questions: [],
-    requested_at: "2026-06-10T00:00:00Z",
-    resolved: null,
-  };
-
-  it("adds a pending elicitation on ElicitationRequested and drops it on resolve", () => {
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: { ElicitationRequested: { elicitation } },
-    });
-    expect(state.pendingElicitations).toHaveLength(1);
-    expect(state.pendingElicitations[0].nonce).toBe("e-1");
-
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: { ElicitationResolved: { nonce: "e-1", outcome: "Accepted" } },
-    });
-    expect(state.pendingElicitations).toHaveLength(0);
-  });
-
-  it("clears the in-flight tool pointer when the elicitation names the started tool", () => {
-    // The AskUserQuestion tool card suppression is server-owned (Tier 4); the
-    // client only drops the in-flight spinner pointer so it doesn't linger on
-    // the suppressed call.
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: {
-        ToolCallStarted: {
-          tool_call: {
-            id: "tc-ask",
-            name: "Asking for your input",
-            kind: "other",
-            args_preview: "{}",
-            started_at: "2026-06-10T00:00:00Z",
-          },
-        },
-      },
-    });
-    expect(state.inFlightTool?.id).toBe("tc-ask");
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: { ElicitationRequested: { elicitation: { ...elicitation, tool_call_id: "tc-ask" } } },
-    });
-    expect(state.inFlightTool).toBeNull();
-  });
-});
-
 describe("applyEvent / UsageUpdated context-window latch (upstream #596 bandaid)", () => {
   function usageFrame(seq: number, used: number, size: number): AcpFrame {
     return {
@@ -2409,48 +2028,5 @@ describe("applyEvent / UsageUpdated context-window latch (upstream #596 bandaid)
     expect(state.sessionUsage).toBeNull();
     state = applyEvent(state, usageFrame(4, 5_000, 200_000));
     expect(state.sessionUsage?.size).toBe(200_000);
-  });
-});
-
-describe("applyEvent / rate-limit banner clears on resume-to-life", () => {
-  const info = {
-    status: "rate_limited",
-    resets_at: "2026-07-23T15:40:00Z",
-    kind: "rate_limit",
-  };
-  const rateLimitFrame = (seq: number): AcpFrame => ({
-    session_id: "s-1",
-    seq,
-    event: { RateLimit: { info } },
-  });
-
-  it("clears rateLimit on the next UserPromptSent (resumed via a plain prompt)", () => {
-    // Reproduces #3028: a rate-limited turn parks the banner, the session
-    // resumes via a prompt (or a draining queued follow-up), yet the
-    // banner never went away because UserPromptSent didn't clear it.
-    let state = applyEvent(emptyAcpState(), rateLimitFrame(1));
-    expect(state.rateLimit).toEqual(info);
-    state = applyEvent(state, frame(2, "continue"));
-    expect(state.rateLimit).toBeNull();
-  });
-
-  it("clears rateLimit on a fresh AcpSessionAssigned (a new worker healed the park)", () => {
-    let state = applyEvent(emptyAcpState(), rateLimitFrame(1));
-    expect(state.rateLimit).toEqual(info);
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: { AcpSessionAssigned: { acp_session_id: "acp-1" } },
-    });
-    expect(state.rateLimit).toBeNull();
-  });
-
-  it("re-derives rateLimit === null on replay when a turn resumed after the park", () => {
-    // The "stuck 4h later" symptom is replay: reconnect reapplies the
-    // event log, so the post-park UserPromptSent must clear the banner
-    // every time the state is rebuilt, not just on the live dispatch.
-    const log: AcpFrame[] = [rateLimitFrame(1), frame(2, "continue")];
-    const replayed = log.reduce(applyEvent, emptyAcpState());
-    expect(replayed.rateLimit).toBeNull();
   });
 });

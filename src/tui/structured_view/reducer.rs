@@ -128,10 +128,20 @@ pub struct ToolCallRow {
 
 #[derive(Debug, Clone)]
 pub struct ToolCompletion {
-    pub ok: bool,
+    pub outcome: ToolOutcome,
     /// Empty string when the agent didn't ship a content body; the
     /// view layer falls back to a status word in that case.
     pub content: String,
+}
+
+/// How a tool call ended. `Stopped` is not a failure: it is the turn-end
+/// sweep closing a call the adapter left open (#1646), so it reads neutral,
+/// matching the web's third tool-card status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolOutcome {
+    Ok,
+    Error,
+    Stopped,
 }
 
 #[derive(Debug, Clone)]

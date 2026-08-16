@@ -2199,6 +2199,13 @@
       "components": ["web/src/lib/acpTypes.ts"]
     },
     {
+      "id": "acp.reduced-state-channel",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/lib/acpTypes.reducer.test.ts"],
+      "components": ["web/src/lib/acpTypes.ts", "web/src/hooks/useAcpSession.ts"]
+    },
+    {
       "id": "acp.drafts",
       "kind": "vitest",
       "risk": "medium",

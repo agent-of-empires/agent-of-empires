@@ -617,6 +617,35 @@ export interface AcpFrame {
   event: AcpEvent;
 }
 
+/** The daemon's folded control state, carried by the WS `reduced_state`
+ *  frame on connect and after every event. Mirrors the Rust `AcpState`
+ *  (`src/acp/state.rs`), which is the single reducer for everything here:
+ *  the fields below are adopted verbatim by {@link applyReducedState} rather
+ *  than re-derived from raw events. Only the fields this client reads are
+ *  declared; the frame carries more.
+ *
+ *  Everything still folded client-side in `applyEvent` is state the server
+ *  does not model: the worker-lifecycle latches (`Stopped` reasons), the
+ *  monitor / wakeup badges, the usage cost baseline, rejected prompts, and
+ *  the optimistic turn counters. See
+ *  `docs/development/server-owned-sv-state.md`. */
+export interface ReducedState {
+  agent: string;
+  model: string | null;
+  mode: SessionMode;
+  current_plan: Plan | null;
+  in_flight_tool: ToolCall | null;
+  pending_approvals: Approval[];
+  pending_elicitations: Elicitation[];
+  thinking: { started_at: string } | null;
+  rate_limit: RateLimitInfo | null;
+  available_commands: AvailableCommand[];
+  available_modes: Array<{ id: string; name: string; description?: string | null }>;
+  current_mode_id: string | null;
+  cancelling: boolean;
+  compacting: boolean;
+}
+
 export interface AcpState {
   agent: string | null;
   model: string | null;
@@ -630,6 +659,10 @@ export interface AcpState {
   pendingApprovals: Approval[];
   /** Pending AskUserQuestion elicitations awaiting a user answer. */
   pendingElicitations: Elicitation[];
+  /** Nonces of approvals / elicitations answered here, held until the
+   *  daemon's own pending list stops carrying them. See
+   *  {@link applyReducedState}. */
+  locallyResolved: string[];
   thinking: boolean;
   rateLimit: RateLimitInfo | null;
   /** Latest agent-reported context-window usage. Null until the agent
@@ -1183,6 +1216,7 @@ export function emptyAcpState(): AcpState {
     inFlightTool: null,
     pendingApprovals: [],
     pendingElicitations: [],
+    locallyResolved: [],
     thinking: false,
     rateLimit: null,
     sessionUsage: null,
@@ -1252,9 +1286,8 @@ function applyNewTurnResets(next: AcpState): void {
   next.startupError = null;
   next.lastError = null;
   next.turnActive = isTurnActive(next);
-  // A fresh turn supersedes any stale "Stopping..." state from a prior
-  // turn's cancel. See #1727.
-  next.cancelling = false;
+  // The cancel phase itself is server-owned (a fresh non-steered turn clears
+  // it there); only the escalation deadline is ours to drop. See #1727.
   next.cancelEscalatesAt = null;
   // A fresh prompt means the worker is alive again; clear the
   // user_stopped banner without waiting for AcpSessionAssigned.
@@ -1293,14 +1326,6 @@ function applyNewTurnResets(next: AcpState): void {
   // Any pending context-primer offer is consumed once the user submits
   // a new prompt; the recovery affordance is one-shot.
   next.contextPrimerAvailable = null;
-  // A fresh turn means the session is live again, so any rate-limit park
-  // is over. Clear the banner here (not only on the auto-resume
-  // `RateLimitAutoResumed` / `AgentSwitched` paths) so a session resumed
-  // by a plain prompt or a draining queued follow-up does not keep a
-  // stale "Rate-limited; resets at ..." banner, and so the dead
-  // `RESUME NOW` button it renders can no longer 409 against an
-  // already-running worker. See #3028.
-  next.rateLimit = null;
 }
 
 /** Pure reducer. Returns a new state; never mutates the input.
@@ -1315,129 +1340,27 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   const next = { ...state, lastSeq: frame.seq };
   const event = frame.event;
   if (typeof event === "string") {
-    if (event === "ThinkingStarted") {
-      next.thinking = true;
-    } else if (event === "ThinkingEnded") {
-      next.thinking = false;
-    } else if (event === "ConversationCompactionStarted") {
-      // The adapter is about to go silent for 90 to 170 seconds. This only
-      // latches the phase so the spinner stops reading the quiet as a wedge
-      // and the composer parks a follow-up. The visible "Compacting..." row
-      // is server-owned. See #3219.
-      next.compacting = true;
-    } else if (event === "ConversationCompacted") {
-      // Capture the agent's cumulative cost snapshot as the new baseline so
-      // the next UsageUpdate reports cost-since-compact instead of
-      // session-lifetime cumulative. The divider row is server-owned. See
-      // #1354 / #1109.
-      const compactPriorUsage = state.sessionUsage?.cost?.amount ?? 0;
-      const compactPriorBaseline = state.usageBaseline?.cost ?? 0;
-      const compactCumulative = compactPriorUsage + compactPriorBaseline;
-      next.usageBaseline = { cost: compactCumulative };
-      next.sessionUsage = null;
-      next.compacting = false;
-    } else if (event === "SessionCleared") {
-      // /clear wiped the model's memory. Drop the per-turn / in-flight state
-      // the cleared context invalidates. availableCommands / availableModes /
-      // currentModeId are deliberately preserved (see #1128). The divider row
-      // is server-owned.
-      next.plan = null;
-      next.mode = "Default";
-      next.pendingApprovals = [];
-      next.pendingElicitations = [];
-      // Capture the agent's cumulative cost snapshot as the new baseline so
-      // the next UsageUpdate reports cost-since-clear. See #1354.
-      const clearPriorUsage = state.sessionUsage?.cost?.amount ?? 0;
-      const clearPriorBaseline = state.usageBaseline?.cost ?? 0;
-      const clearCumulative = clearPriorUsage + clearPriorBaseline;
-      next.usageBaseline = { cost: clearCumulative };
+    // The phases themselves (thinking, compacting) and the state a context
+    // boundary invalidates (plan, mode, pending cards) are server-owned since
+    // Tier 1.2. What stays is the cost baseline, which the server does not
+    // model: the agent reports session-lifetime cumulative cost, so each
+    // boundary snapshots it to keep the footer reading "since the most recent
+    // boundary". See #1354 / #1109.
+    if (event === "ConversationCompacted" || event === "SessionCleared") {
+      const priorUsage = state.sessionUsage?.cost?.amount ?? 0;
+      const priorBaseline = state.usageBaseline?.cost ?? 0;
+      next.usageBaseline = { cost: priorUsage + priorBaseline };
       next.sessionUsage = null;
     }
-    return next;
-  }
-  if ("PlanUpdated" in event) {
-    next.plan = event.PlanUpdated.plan;
     return next;
   }
   if ("ToolCallStarted" in event) {
-    // Copy so the preserved `raw_name` (the immutable wire tool identity)
-    // stamped here can't leak back onto the shared event object. See #3070.
-    const tc = { ...event.ToolCallStarted.tool_call };
-    tc.raw_name = tc.raw_name ?? tc.name;
-    // Track the in-flight tool for the rattle spinner label. A duplicate
-    // start frame for the same id must not clobber richer data on the
-    // in-flight pointer with a sparser frame.
-    next.inFlightTool =
-      next.inFlightTool && next.inFlightTool.id === tc.id ? mergeToolStart(next.inFlightTool, tc) : tc;
     // A tool call after the monitor armed means the monitor fired and the
     // agent is acting on it; gate the badge clear on the next Stopped. See
-    // #2325.
+    // #2325. The in-flight pointer itself is server-owned (Tier 1.2).
     if (next.monitorArmed) {
       next.monitorWorkSeen = true;
     }
-    // The reasoning block produced output (a tool call), so the agent is no
-    // longer thinking. The adapter often skips ThinkingEnded when it
-    // transitions into tool calls, so clear it here. See #1213.
-    next.thinking = false;
-    return next;
-  }
-  if ("ToolCallCompleted" in event) {
-    const { tool_call_id } = event.ToolCallCompleted;
-    if (next.inFlightTool && next.inFlightTool.id === tool_call_id) {
-      next.inFlightTool = null;
-    }
-    return next;
-  }
-  if ("ToolCallUpdated" in event) {
-    const { tool_call_id, title, args_preview, started_at, diffs } = event.ToolCallUpdated;
-    const incomingDiffs = diffs && diffs.length > 0 ? diffs : null;
-    if (next.inFlightTool && next.inFlightTool.id === tool_call_id) {
-      next.inFlightTool = {
-        ...next.inFlightTool,
-        name: title ?? next.inFlightTool.name,
-        args_preview: args_preview ?? next.inFlightTool.args_preview,
-        started_at: started_at ?? next.inFlightTool.started_at,
-        diffs: incomingDiffs ?? next.inFlightTool.diffs,
-      };
-    }
-    return next;
-  }
-  if ("ApprovalRequested" in event) {
-    const a = event.ApprovalRequested.approval;
-    next.pendingApprovals = [...next.pendingApprovals, a];
-    return next;
-  }
-  if ("ApprovalResolved" in event) {
-    const { nonce } = event.ApprovalResolved;
-    next.pendingApprovals = next.pendingApprovals.filter((a) => a.nonce !== nonce);
-    return next;
-  }
-  if ("ElicitationRequested" in event) {
-    const e = event.ElicitationRequested.elicitation;
-    next.pendingElicitations = [...next.pendingElicitations, e];
-    // The adapter also emits an AskUserQuestion tool call for this
-    // elicitation; the elicitation card is the real UI. The server-owned
-    // transcript suppresses that tool card; here we only drop the in-flight
-    // spinner pointer so it does not linger on the suppressed call.
-    if (e.tool_call_id && next.inFlightTool && next.inFlightTool.id === e.tool_call_id) {
-      next.inFlightTool = null;
-    }
-    return next;
-  }
-  if ("ElicitationResolved" in event) {
-    const { nonce } = event.ElicitationResolved;
-    next.pendingElicitations = next.pendingElicitations.filter((e) => e.nonce !== nonce);
-    return next;
-  }
-  if ("RateLimit" in event) {
-    next.rateLimit = event.RateLimit.info;
-    return next;
-  }
-  if ("RateLimitAutoResumed" in event) {
-    // The reconciler crossed the reset deadline and is respawning the
-    // worker (opt-in acp.rate_limit_auto_resume). Clear the parked banner so
-    // the composer unlocks. See #1722.
-    next.rateLimit = null;
     return next;
   }
   if ("UsageUpdated" in event) {
@@ -1472,22 +1395,9 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     }
     return next;
   }
-  if ("ModeChanged" in event) {
-    next.mode = event.ModeChanged.mode;
-    return next;
-  }
-  if ("ModesAvailable" in event) {
-    next.availableModes = event.ModesAvailable.modes.map((m) => ({
-      id: m.id,
-      name: m.name,
-      description: m.description ?? null,
-    }));
-    next.currentModeId = event.ModesAvailable.current_mode_id;
-    return next;
-  }
   if ("CurrentModeChanged" in event) {
-    next.currentModeId = event.CurrentModeChanged.current_mode_id;
-    // Mode actually switched, so any prior failure notice is stale.
+    // The mode itself is server-owned (Tier 1.2); the switch actually
+    // landing is what makes a prior failure notice stale.
     next.modeSwitchFailed = null;
     return next;
   }
@@ -1497,10 +1407,6 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       reason: event.ModeSwitchFailed.reason,
       at: new Date().toISOString(),
     };
-    return next;
-  }
-  if ("AvailableCommandsUpdated" in event) {
-    next.availableCommands = event.AvailableCommandsUpdated.commands;
     return next;
   }
   if ("ConfigOptionsUpdated" in event) {
@@ -1537,27 +1443,11 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.pendingConfigOption = null;
     return next;
   }
-  if ("AgentMessageChunk" in event) {
-    // Visible assistant text means the agent is answering, not thinking. The
-    // streamed text itself is a server-owned transcript row. See #1213.
-    next.thinking = false;
-    return next;
-  }
   if ("Stopped" in event) {
-    // Final marker. Reset the in-flight tool in case the agent forgot to
-    // emit a completion, and advance the turn counters. The empty-output
-    // notice and the open-tool sweep are server-owned transcript concerns
-    // now; only the control derivation lives here. See #1170.
-    next.inFlightTool = null;
-    // Belt-and-suspenders against a missed ThinkingEnded leaking the
-    // thinking state into the next turn. See #1213.
-    next.thinking = false;
-    // The turn ended (cleanly, cancelled, force-stopped, or escalated):
-    // clear the "Stopping..." state regardless of reason. See #1727.
-    next.cancelling = false;
+    // Final marker. Every in-turn phase it used to clear (in-flight tool,
+    // thinking, cancelling, compacting) is server-owned since Tier 1.2; what
+    // remains is the client's own turn bookkeeping. See #1170.
     next.cancelEscalatesAt = null;
-    // Same for any compaction the turn was running. See #3219.
-    next.compacting = false;
     next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
     next.turnActive = isTurnActive(next);
     // Clear the "monitoring" badge once the monitor has fired and that turn
@@ -1608,7 +1498,6 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // failed the per-adapter compatibility check. The structured payload
     // powers the StartupErrorScreen.
     next.incompatibleAgent = event.IncompatibleAgent.detail;
-    next.inFlightTool = null;
     next.agentUnresponsive = false;
     next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
     next.turnActive = isTurnActive(next);
@@ -1616,7 +1505,6 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   }
   if ("AgentStartupError" in event) {
     next.startupError = event.AgentStartupError.message;
-    next.inFlightTool = null;
     // A failed respawn supersedes any in-progress unresponsive escalation.
     next.agentUnresponsive = false;
     // Same race-safe semantics as Stopped. See #1170.
@@ -1677,7 +1565,6 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.workerIdleStopped = false;
     next.agentUnresponsive = false;
     next.agentOrphaned = false;
-    next.rateLimit = null;
     // A prompt sent to an idle-dormant worker left pendingUserPromptSeq
     // bumped (turn pending) so the drain effect stays braked. The respawn
     // handshake is the worker-online signal: retire that phantom turn so the
@@ -1725,7 +1612,8 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // aoe sent session/cancel and armed the escalation watchdog; the turn is
     // still active. Surface "Stopping..." and the escalation deadline. See
     // #1727.
-    next.cancelling = true;
+    // The phase is server-owned; the escalation deadline is not modelled
+    // there, so the honest countdown still comes off the event.
     next.cancelEscalatesAt = event.CancelRequested.escalates_at;
     return next;
   }
@@ -1736,20 +1624,13 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // transcript divider row is server-owned. See #1282.
     const { from, to, reason } = event.AgentSwitched;
     const now = new Date().toISOString();
-    next.agent = to;
-    next.rateLimit = null;
-    next.inFlightTool = null;
-    next.thinking = false;
-    next.pendingApprovals = [];
-    next.pendingElicitations = [];
+    // Everything the new backend re-advertises (agent, rate limit, in-flight
+    // tool, pending cards, commands, modes, plan, mode) is dropped
+    // server-side; what stays here is the client's own cost bookkeeping and
+    // the banners the server does not model.
     next.sessionUsage = null;
     // The new backend reports its own cumulative cost from zero. See #1354.
     next.usageBaseline = null;
-    next.availableCommands = [];
-    next.availableModes = [];
-    next.currentModeId = null;
-    next.plan = null;
-    next.mode = "Default";
     next.startupError = null;
     next.lastAgentSwitch = { from, to, reason, at: now };
     // The switch path emits Stopped { user_stopped } just before this; clear
@@ -1854,6 +1735,45 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
  *  paging guarantees each page starts at a user-turn boundary. See #2236. */
 export function reduceFrames(frames: AcpFrame[]): AcpState {
   return frames.reduce(applyEvent, emptyAcpState());
+}
+
+/** Adopt the daemon's folded control state (Tier 1.2). Every field here is
+ *  the server's verbatim, so a client derivation for any of them would be a
+ *  second source of truth; the arms that used to build them are gone.
+ *
+ *  Deliberately does NOT touch `lastSeq`: raw frames still drive the rest of
+ *  the reducer, and their seq dedupe is what keeps replay idempotent.
+ *
+ *  The one piece of optimism kept is approvals and elicitations the user just
+ *  answered: the card clears on the resolve POST rather than waiting for the
+ *  broadcast (#1821), and without the filter the very next frame would paint
+ *  it straight back. A nonce is forgotten once the server stops listing it,
+ *  so a later request reusing it is not swallowed. */
+export function applyReducedState(state: AcpState, reduced: ReducedState): AcpState {
+  const stillPending = new Set<string>([
+    ...reduced.pending_approvals.map((a) => a.nonce),
+    ...reduced.pending_elicitations.map((e) => e.nonce),
+  ]);
+  const locallyResolved = state.locallyResolved.filter((nonce) => stillPending.has(nonce));
+  const resolved = new Set(locallyResolved);
+  return {
+    ...state,
+    agent: reduced.agent,
+    model: reduced.model,
+    mode: reduced.mode,
+    plan: reduced.current_plan,
+    inFlightTool: reduced.in_flight_tool,
+    pendingApprovals: reduced.pending_approvals.filter((a) => !resolved.has(a.nonce)),
+    pendingElicitations: reduced.pending_elicitations.filter((e) => !resolved.has(e.nonce)),
+    thinking: reduced.thinking != null,
+    rateLimit: reduced.rate_limit,
+    availableCommands: reduced.available_commands,
+    availableModes: reduced.available_modes,
+    currentModeId: reduced.current_mode_id,
+    cancelling: reduced.cancelling,
+    compacting: reduced.compacting,
+    locallyResolved,
+  };
 }
 
 /** Merge a duplicate `ToolCallStarted` into the existing row's payload

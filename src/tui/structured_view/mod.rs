@@ -33,7 +33,7 @@ use self::state::{
     ToastKind,
 };
 use crate::acp::client::{
-    require_daemon, ws_connect, DaemonEndpoint, HttpClient, HttpError, ManagerError,
+    require_daemon, ws_connect_with, DaemonEndpoint, HttpClient, HttpError, ManagerError,
     PluginCommandView, WsError, WsMessage, REPLAY_PAGE_SIZE,
 };
 use crate::acp::elicitations::ElicitationResolution;
@@ -265,7 +265,11 @@ pub(crate) struct ViewSideInfo {
 async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSetup> {
     let http = HttpClient::new(endpoint.clone()).context("build structured view HTTP client")?;
 
-    let ws_result = ws_connect(&endpoint, session_id, 0).await;
+    // `frames=0`: this view renders the server's folded projections and reads
+    // no raw frame, so the daemon skips forwarding the session's whole event
+    // history on every open. It still replays it internally to build the
+    // connect snapshots.
+    let ws_result = ws_connect_projections_only(&endpoint, session_id, 0).await;
 
     let (ws, ws_err) = match ws_result {
         Ok(handle) => (Some(handle), None),
@@ -1062,7 +1066,7 @@ async fn reconnect_with_backoff(
         if i > 0 {
             tokio::time::sleep(Duration::from_millis(delay)).await;
         }
-        match ws_connect(endpoint, session_id, since).await {
+        match ws_connect_projections_only(endpoint, session_id, since).await {
             Ok(handle) => return Ok(handle),
             Err(e) => {
                 tracing::debug!(
@@ -1690,6 +1694,16 @@ async fn clear_queue(state: &mut StructuredViewState, toast_deadline: &mut Optio
             );
         }
     }
+}
+
+/// Open the session WebSocket for a view that reads only the folded
+/// projections, so the daemon skips forwarding the raw event frames.
+async fn ws_connect_projections_only(
+    endpoint: &DaemonEndpoint,
+    session_id: &str,
+    since: u64,
+) -> Result<crate::acp::client::WsHandle, WsError> {
+    ws_connect_with(endpoint, session_id, since, false).await
 }
 
 /// Fetch the server-folded transcript rows via `?view=rows` and reconcile

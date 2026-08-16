@@ -21,7 +21,9 @@ use aoe_plugin_api::UiSlot;
 use ansi_to_tui::IntoText;
 
 use super::input::Focus;
-use super::reducer::{AcpTranscript, NoteKind, PendingApproval, ToolCallRow, ToolCompletion};
+use super::reducer::{
+    AcpTranscript, NoteKind, PendingApproval, ToolCallRow, ToolCompletion, ToolOutcome,
+};
 use super::state::{FileIndex, StructuredViewState, ViewLayout};
 use crate::acp::session_paths::{relative_display_path, SessionPathRoots};
 use crate::acp::state::{SessionUsage, ToolOutputBlock};
@@ -1470,7 +1472,11 @@ fn tool_completion_from_row(term: &TranscriptRow) -> ToolCompletion {
         summarize_output_blocks(&term.output)
     };
     ToolCompletion {
-        ok: term.kind == TranscriptRowKind::ToolComplete,
+        outcome: match term.kind {
+            TranscriptRowKind::ToolComplete => ToolOutcome::Ok,
+            TranscriptRowKind::ToolStopped => ToolOutcome::Stopped,
+            _ => ToolOutcome::Error,
+        },
         content,
     }
 }
@@ -1540,7 +1546,7 @@ fn render_tool_lines(
     if tool
         .completed
         .as_ref()
-        .is_some_and(|completion| completion.ok)
+        .is_some_and(|completion| completion.outcome == ToolOutcome::Ok)
     {
         return vec![compact_tool_line(tool, theme, path_roots)];
     }
@@ -1549,8 +1555,11 @@ fn render_tool_lines(
         "tool {} · {}",
         match tool.completed.as_ref() {
             None => "▶",
-            Some(c) if c.ok => "✓",
-            Some(_) => "✗",
+            Some(c) => match c.outcome {
+                ToolOutcome::Ok => "✓",
+                ToolOutcome::Stopped => "◼",
+                ToolOutcome::Error => "✗",
+            },
         },
         tool.name
     );
@@ -1797,6 +1806,17 @@ fn render_delete_body(
 /// Bounded preview of a tool's completion content, shared by the read
 /// and execute cards. Falls back to a status word before completion or
 /// when the agent shipped no body.
+/// What to show when a finished tool shipped no content body. A stopped call
+/// is the turn-end sweep closing an open call, not a failure, so it must not
+/// read as one.
+fn empty_output_note(completion: &ToolCompletion) -> &'static str {
+    match completion.outcome {
+        ToolOutcome::Ok => "  (no output)",
+        ToolOutcome::Stopped => "  (stopped when the turn ended)",
+        ToolOutcome::Error => "  (tool failed; press `o` for details)",
+    }
+}
+
 fn output_preview_lines(tool: &ToolCallRow) -> Vec<Line<'static>> {
     let Some(completion) = &tool.completed else {
         return vec![Line::from(Span::styled(
@@ -1805,12 +1825,7 @@ fn output_preview_lines(tool: &ToolCallRow) -> Vec<Line<'static>> {
         ))];
     };
     if completion.content.is_empty() {
-        let msg = if completion.ok {
-            "  (no output)"
-        } else {
-            "  (tool failed; press `o` for details)"
-        };
-        return vec![Line::from(msg.to_string())];
+        return vec![Line::from(empty_output_note(completion).to_string())];
     }
     let mut out = Vec::new();
     let styled = styled_output_lines(&completion.content);
@@ -1859,12 +1874,7 @@ fn render_generic_body(tool: &ToolCallRow) -> Vec<Line<'static>> {
     }
     if let Some(completion) = &tool.completed {
         if completion.content.is_empty() {
-            let msg = if completion.ok {
-                "  (no output)"
-            } else {
-                "  (tool failed; press `o` for details)"
-            };
-            lines.push(Line::from(msg.to_string()));
+            lines.push(Line::from(empty_output_note(completion).to_string()));
         } else {
             let (body, truncated) = match truncate_chars(&completion.content, 400) {
                 Some(head) => (head, true),
@@ -2332,7 +2342,11 @@ mod tests {
             args: args.into(),
             diffs: Vec::new(),
             completed: completion.map(|(ok, content)| ToolCompletion {
-                ok,
+                outcome: if ok {
+                    ToolOutcome::Ok
+                } else {
+                    ToolOutcome::Error
+                },
                 content: content.into(),
             }),
         }
