@@ -1994,6 +1994,16 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/acp/enable", post(api::acp_enable))
         .route("/api/sessions/{id}/acp/disable", post(api::acp_disable))
         .route(
+            "/api/sessions/{id}/queue",
+            post(api::queue_enqueue)
+                .get(api::queue_list)
+                .delete(api::queue_clear),
+        )
+        .route(
+            "/api/sessions/{id}/queue/{promptId}",
+            patch(api::queue_edit).delete(api::queue_remove),
+        )
+        .route(
             "/api/sessions/{id}/acp/approvals/{nonce}",
             post(api::resolve_approval),
         )
@@ -2501,6 +2511,12 @@ const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     ("POST", "/api/sessions/{id}/acp/force_end_turn"),
     ("POST", "/api/sessions/{id}/acp/approvals/{nonce}"),
     ("POST", "/api/sessions/{id}/acp/elicitations/{nonce}"),
+    // Server-owned prompt queue: deferred prompting into a session the caller
+    // already sees, so it is classified exactly like `acp/prompt` above.
+    ("POST", "/api/sessions/{id}/queue"),
+    ("DELETE", "/api/sessions/{id}/queue"),
+    ("PATCH", "/api/sessions/{id}/queue/{promptId}"),
+    ("DELETE", "/api/sessions/{id}/queue/{promptId}"),
     // Curated settings surfaces (the handlers field-filter / strip color-mode).
     ("PATCH", "/api/profiles/{name}/settings"),
     ("PATCH", "/api/theme"),
