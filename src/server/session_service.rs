@@ -75,6 +75,40 @@ enum IdempotentMatch {
     None,
 }
 
+/// Pick the leading drain batch from a session's queue and its combined text,
+/// matching the client's `useAcpSession` split exactly: a clear-command row at
+/// the head fires as its own turn; otherwise the leading run of non-clear rows
+/// combines with blank-line separators (empty-text rows skipped). An agent with
+/// no clear aliases combines the whole queue. Pure, so the boundary logic is
+/// unit-tested without a live worker.
+#[cfg(feature = "serve")]
+fn queue_drain_batch<'a>(
+    queue: &'a [crate::acp::state::QueuedPromptEntry],
+    profile: &crate::acp::agent_profiles::AgentProfile,
+) -> (&'a [crate::acp::state::QueuedPromptEntry], String) {
+    if queue.is_empty() {
+        return (&[], String::new());
+    }
+    let batch_end = if profile.clear_aliases.is_empty() {
+        queue.len()
+    } else if profile.is_clear_command(&queue[0].text) {
+        1
+    } else {
+        queue
+            .iter()
+            .position(|e| profile.is_clear_command(&e.text))
+            .unwrap_or(queue.len())
+    };
+    let sub = &queue[..batch_end];
+    let combined = sub
+        .iter()
+        .map(|e| e.text.as_str())
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (sub, combined)
+}
+
 pub struct SessionService {
     /// Live in-memory session list, shared with `AppState.instances`.
     pub instances: Arc<RwLock<Vec<Instance>>>,
@@ -873,6 +907,90 @@ impl SessionService {
             .unwrap_or_default()
     }
 
+    /// Drain the leading batch of a session's server-owned queue into the live
+    /// worker once the current turn has ended. Mirrors
+    /// `drain_pending_initial_turn`'s single-owner `pending_drains` claim +
+    /// per-instance-lock delivery, so a batch is never sent twice concurrently.
+    ///
+    /// Only drains an idle turn: `Status::Idle` means the prior turn emitted its
+    /// terminal `Stopped`, so this starts a fresh turn rather than racing a live
+    /// one. Callers (the reconciler tick) gate on `is_running`, so the worker is
+    /// live and `send_turn` will not spawn, making it safe to hold the instance
+    /// lock across delivery (the #3172 re-entrant-spawn deadlock cannot occur on
+    /// a live worker). The `/clear`-boundary split matches the client
+    /// (`useAcpSession`): a clear-command row fires as its own turn; a leading
+    /// run of non-clear rows combines into one with blank-line separators.
+    /// Attachments are a later increment; text-only rows drain here.
+    #[cfg(feature = "serve")]
+    pub(crate) async fn drain_queued_prompts_once(self: &Arc<Self>, id: &str) {
+        {
+            let mut drains = self
+                .pending_drains
+                .lock()
+                .expect("pending_drains mutex poisoned");
+            if !drains.insert(id.to_string()) {
+                return;
+            }
+        }
+        let _claim = PendingDrainGuard {
+            service: Arc::clone(self),
+            id: id.to_string(),
+        };
+        let inst_lock = self.instance_lock(id).await;
+        let _serialized = inst_lock.lock().await;
+
+        let (caller, agent_key, queue) = {
+            let instances = self.instances.read().await;
+            let Some(inst) = instances.iter().find(|i| i.id == id) else {
+                return;
+            };
+            if !inst.is_structured()
+                || inst.is_archived()
+                || inst.is_snoozed()
+                || inst.is_trashed()
+                || inst.status != crate::session::Status::Idle
+            {
+                return;
+            }
+            let mut queue = inst.queued_prompts.clone();
+            queue.sort_by_key(|e| e.seq);
+            if queue.is_empty() {
+                return;
+            }
+            let caller = match &inst.created_by_plugin {
+                Some(plugin_id) => SessionCaller::Plugin {
+                    plugin_id: plugin_id.clone(),
+                },
+                None => SessionCaller::User,
+            };
+            let agent_key = inst.agent_name.clone().unwrap_or_else(|| inst.tool.clone());
+            (caller, agent_key, queue)
+        };
+
+        // Leading batch up to a clear boundary (mirrors the client's split).
+        let profile = crate::acp::agent_profiles::resolve(&agent_key);
+        let (sub, combined) = queue_drain_batch(&queue, profile);
+        let sent_ids: std::collections::HashSet<String> =
+            sub.iter().map(|e| e.id.clone()).collect();
+        if combined.trim().is_empty() {
+            return;
+        }
+
+        // Deliver as a fresh turn on the live worker (attachments follow in a
+        // later increment). On failure leave the rows queued; the next tick
+        // retries once the worker settles.
+        if let Err(e) = self.send_turn(&caller, id, &combined, &[], false).await {
+            tracing::warn!(target: "acp.queue", session = %id, "queue drain delivery failed; will retry: {e}");
+            return;
+        }
+        // Retire only the delivered rows; prompts enqueued during the send
+        // survive into the next drain.
+        self.mutate_instance_persisted(id, move |inst| {
+            inst.queued_prompts.retain(|q| !sent_ids.contains(&q.id));
+        })
+        .await;
+    }
+
     /// Same lazy per-instance mutex registry as `AppState::instance_lock`;
     /// both operate on the shared map, so a lock taken through either handle
     /// excludes the other.
@@ -1435,5 +1553,57 @@ mod tests {
             )
             .await
             .is_none());
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn queue_drain_batch_splits_on_clear_boundary() {
+        use crate::acp::state::QueuedPromptEntry;
+        let entry = |id: &str, seq: u64, text: &str| QueuedPromptEntry {
+            id: id.into(),
+            seq,
+            text: text.into(),
+            attachments: vec![],
+            created_at: "t".into(),
+            origin_device: None,
+        };
+        // claude's profile clears with "/clear".
+        let claude = crate::acp::agent_profiles::resolve("claude");
+        assert!(
+            !claude.clear_aliases.is_empty(),
+            "test assumes claude has a clear alias"
+        );
+
+        // A leading run of non-clear rows combines up to (not including) the
+        // first clear command.
+        let q = vec![
+            entry("a", 0, "one"),
+            entry("b", 1, "two"),
+            entry("c", 2, "/clear"),
+            entry("d", 3, "three"),
+        ];
+        let (sub, combined) = queue_drain_batch(&q, claude);
+        assert_eq!(
+            sub.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert_eq!(combined, "one\n\ntwo");
+
+        // A clear command at the head fires as its own turn.
+        let q = vec![entry("c", 0, "/clear"), entry("a", 1, "one")];
+        let (sub, combined) = queue_drain_batch(&q, claude);
+        assert_eq!(sub.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["c"]);
+        assert_eq!(combined, "/clear");
+
+        // No clear anywhere: the whole queue combines and empty-text rows are
+        // skipped (so no stray blank-line separators).
+        let q = vec![
+            entry("a", 0, "one"),
+            entry("b", 1, ""),
+            entry("c", 2, "three"),
+        ];
+        let (sub, combined) = queue_drain_batch(&q, claude);
+        assert_eq!(sub.len(), 3);
+        assert_eq!(combined, "one\n\nthree");
     }
 }

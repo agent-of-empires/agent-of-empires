@@ -348,6 +348,10 @@ pub async fn reconcile_acp_workers(
     // between a plugin create and its first successful delivery.
     drain_pending_initial_turns(state).await;
 
+    // Drain each session's server-owned prompt queue when its turn has ended,
+    // with no client tab open. Same shape as the pending-turn drain above.
+    drain_queued_prompts(state).await;
+
     // Build the work list. Skip ids already in `attempted` (a
     // permanently-failing spawn shouldn't loop every tick) and ids the
     // supervisor already knows about (REST-triggered spawn or
@@ -1553,6 +1557,44 @@ async fn drain_pending_initial_turns(state: &Arc<AppState>) {
             crate::task_util::PanicPolicy::Log,
             async move {
                 service.drain_pending_initial_turn(&id).await;
+            },
+        );
+    }
+}
+
+/// Deliver each session's server-owned prompt queue once its turn has ended,
+/// so a follow-up queued behind a busy turn drains with no client tab open
+/// (see `docs/development/server-side-prompt-queue.md`). Candidates are idle
+/// (turn ended), structured, live sessions with a non-empty queue; the drain
+/// itself re-checks state under the per-instance lock and applies the
+/// `/clear`-boundary split. Gating on `is_running` here means the worker is
+/// live, so the drain can hold the instance lock across delivery safely.
+async fn drain_queued_prompts(state: &Arc<AppState>) {
+    let candidates: Vec<String> = {
+        let instances = state.instances.read().await;
+        instances
+            .iter()
+            .filter(|i| {
+                !i.queued_prompts.is_empty()
+                    && i.status == crate::session::Status::Idle
+                    && i.is_structured()
+                    && !i.is_archived()
+                    && !i.is_snoozed()
+                    && !i.is_trashed()
+            })
+            .map(|i| i.id.clone())
+            .collect()
+    };
+    for id in candidates {
+        if !state.acp_supervisor.is_running(&id).await {
+            continue;
+        }
+        let service = Arc::clone(&state.session_service);
+        crate::task_util::spawn_supervised(
+            "acp.queue_drain",
+            crate::task_util::PanicPolicy::Log,
+            async move {
+                service.drain_queued_prompts_once(&id).await;
             },
         );
     }
