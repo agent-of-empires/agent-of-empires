@@ -498,6 +498,28 @@ pub struct AcpState {
     #[serde(default)]
     pub background_agents: Vec<BackgroundAgentRecord>,
 
+    /// Whether a turn is in flight. Server-observed edges: opened by
+    /// `UserPromptSent` / `UserDiffCommentsPrompt` / `ThinkingStarted`, closed
+    /// by `Stopped` / startup error / runtime error / rejection. Ported from
+    /// the TUI's `AcpTranscript` so the daemon derives it once for every client
+    /// (see `docs/development/server-owned-sv-state.md`).
+    #[serde(default)]
+    pub turn_active: bool,
+    /// Whether the running turn is steerable (a mid-turn prompt is injected
+    /// rather than queued). Latest `PromptCapabilities.steering`.
+    #[serde(default)]
+    pub steering: bool,
+    /// A cancel has been requested for the running turn and its terminal
+    /// `Stopped` has not yet arrived. A fresh non-steered turn clears it.
+    #[serde(default)]
+    pub cancelling: bool,
+    /// A `/compact` is running (the adapter goes silent ~90-170s). Latched
+    /// between `ConversationCompactionStarted` and `ConversationCompacted` /
+    /// turn end, so a client parks a follow-up rather than steering it into a
+    /// turn that never answers.
+    #[serde(default)]
+    pub compacting: bool,
+
     pub last_seq: u64,
     pub updated_at: DateTime<Utc>,
 }
@@ -528,6 +550,10 @@ impl AcpState {
             config_options: Vec::new(),
             config_option_switch_failed: None,
             background_agents: Vec::new(),
+            turn_active: false,
+            steering: false,
+            cancelling: false,
+            compacting: false,
             last_seq: 0,
             updated_at: Utc::now(),
         }
@@ -1248,6 +1274,10 @@ impl AcpState {
                 self.thinking = Some(ThinkingSignal {
                     started_at: Utc::now(),
                 });
+                // Fires repeatedly within a running turn; opens the turn but
+                // deliberately does NOT clear `cancelling` (that would drop a
+                // pending stop the moment the agent emits its next thought).
+                self.turn_active = true;
             }
             Event::ThinkingEnded => self.thinking = None,
             Event::RateLimit { info } => self.rate_limit = Some(info),
@@ -1302,28 +1332,60 @@ impl AcpState {
             // clients see them in the replay buffer and know the session
             // made progress.
             Event::RawAgentUpdate { .. } => {}
-            Event::PromptRuntimeError { .. } => {}
+            Event::PromptRuntimeError { .. } => {
+                // The prompt failed: the turn is over. `cancelling` clears too
+                // (nothing left to cancel), mirroring the TUI reducer.
+                self.turn_active = false;
+                self.cancelling = false;
+            }
             Event::AgentMessageChunk { .. } => {}
-            // No in-memory mutation: the turn is still active (turnActive
-            // stays true until a real `Stopped`). The reducer/UI derive the
-            // "Stopping..." state from the broadcast/replayed event. Bumps
-            // seq so the WS replay surfaces it to live clients. See #1727.
-            Event::CancelRequested { .. } => {}
-            Event::Stopped { .. } => {}
-            Event::AgentStartupError { .. } => {}
+            // A cancel was requested; the turn is still active until its real
+            // `Stopped` arrives (the UI derives the "Stopping…" label from this
+            // flag). Bumps seq so the WS replay surfaces it to live clients.
+            Event::CancelRequested { .. } => {
+                self.cancelling = true;
+            }
+            Event::Stopped { .. } => {
+                // The turn is over however it ended (completion, cancel, killed
+                // worker), so clear every in-turn phase. This is the
+                // self-healing clear for a dropped compaction marker (#3219).
+                self.turn_active = false;
+                self.cancelling = false;
+                self.compacting = false;
+            }
+            Event::AgentStartupError { .. } => {
+                self.turn_active = false;
+                self.cancelling = false;
+            }
             Event::IncompatibleAgent { detail } => {
                 self.startup_error = Some(detail);
             }
-            Event::UserPromptSent { .. } => {}
-            // Like UserPromptSent, the diff-comments prompt doesn't mutate
-            // persistent AcpState; it bumps seq so the replay buffer
-            // and on-disk store capture the user's side of the turn.
-            Event::UserDiffCommentsPrompt { .. } => {}
+            Event::UserPromptSent { .. } => {
+                // Opens a turn. A steered continuation (a mid-turn prompt the
+                // daemon injected into a running steerable turn) is not a fresh
+                // turn, so it keeps any pending cancel; a genuine fresh turn
+                // clears it. Mirrors the TUI reducer's `is_steered_continuation`.
+                let steered = self.turn_active && self.steering;
+                self.turn_active = true;
+                if !steered {
+                    self.cancelling = false;
+                }
+            }
+            // Like UserPromptSent, the diff-comments prompt opens a turn.
+            Event::UserDiffCommentsPrompt { .. } => {
+                let steered = self.turn_active && self.steering;
+                self.turn_active = true;
+                if !steered {
+                    self.cancelling = false;
+                }
+            }
             // Surfaced to the web composer via replay and read by the
             // server prompt handler from the event store; no persistent
             // AcpState field consumes it, so this arm only bumps
             // seq/updated_at like the streaming events above.
-            Event::PromptCapabilities { .. } => {}
+            Event::PromptCapabilities { steering, .. } => {
+                self.steering = steering;
+            }
             Event::AcpSessionAssigned { .. } => {
                 // A fresh agent that passed the compatibility check
                 // has come online; heal any sticky startup error so a
@@ -1356,8 +1418,11 @@ impl AcpState {
             // mirror, so nothing to mutate here; both surfaces rebuild
             // the flag from the event stream. Bumps seq so the WS replay
             // surfaces it to live clients. See #3219.
-            Event::ConversationCompactionStarted => {}
+            Event::ConversationCompactionStarted => {
+                self.compacting = true;
+            }
             Event::ConversationCompacted => {
+                self.compacting = false;
                 // /compact replaces the model's context with a summary
                 // of the prior turns. The usage snapshot for the old
                 // raw turns no longer matches what the model holds;
@@ -1381,10 +1446,14 @@ impl AcpState {
             // Bumps seq so the WS replay surfaces it to live clients.
             Event::MonitorArmed { .. } => {}
             // Rejected follow-up prompt while another prompt was in flight.
-            // No durable in-memory mutation; the reducer surfaces a Retry
-            // pill from the broadcast frame and the event_store entry
-            // carries the historical record. See #1196.
-            Event::PromptRejected { .. } => {}
+            // No turn started, so clear the busy flag an optimistic client set;
+            // `cancelling` deliberately survives (a rejection is not a turn
+            // boundary, the targeted turn is still running). The reducer also
+            // surfaces a Retry pill from the broadcast frame and the event_store
+            // entry carries the historical record. See #1196.
+            Event::PromptRejected { .. } => {
+                self.turn_active = false;
+            }
             Event::AgentSwitched { from, to, reason } => {
                 // The new backend has no knowledge of the prior agent's
                 // session state. Drop everything tied to the previous
@@ -1530,6 +1599,120 @@ mod tests {
             AgentName("aoe-agent".into()),
             Some("claude-opus-4-7".into()),
         )
+    }
+
+    fn prompt(text: &str) -> Event {
+        Event::UserPromptSent {
+            text: text.into(),
+            attachments: Vec::new(),
+        }
+    }
+
+    fn caps(steering: bool) -> Event {
+        Event::PromptCapabilities {
+            image: false,
+            audio: false,
+            embedded_context: false,
+            steering,
+        }
+    }
+
+    // The four turn flags ported from the TUI's AcpTranscript (Tier 1: the
+    // daemon reduces them once so every client renders instead of re-deriving).
+    #[test]
+    fn turn_active_tracks_prompt_and_stop_edges() {
+        let mut s = fresh_state();
+        assert!(!s.turn_active, "fresh state is idle");
+        s.apply_event(prompt("hi")).unwrap();
+        assert!(s.turn_active, "UserPromptSent opens the turn");
+        s.apply_event(Event::ThinkingStarted).unwrap();
+        assert!(s.turn_active, "thinking keeps the turn open");
+        s.apply_event(Event::Stopped {
+            reason: "end_turn".into(),
+        })
+        .unwrap();
+        assert!(!s.turn_active, "Stopped closes the turn");
+    }
+
+    #[test]
+    fn turn_active_clears_on_error_and_rejection() {
+        let cases: &[Event] = &[
+            Event::AgentStartupError {
+                message: "boom".into(),
+            },
+            Event::PromptRuntimeError {
+                message: "boom".into(),
+            },
+            Event::PromptRejected {
+                reason: "agent_busy".into(),
+                text: "hi".into(),
+            },
+        ];
+        for terminal in cases {
+            let mut s = fresh_state();
+            s.apply_event(prompt("hi")).unwrap();
+            assert!(s.turn_active);
+            s.apply_event(terminal.clone()).unwrap();
+            assert!(!s.turn_active, "{terminal:?} clears turn_active");
+        }
+    }
+
+    #[test]
+    fn steering_reflects_latest_capabilities() {
+        let mut s = fresh_state();
+        assert!(!s.steering);
+        s.apply_event(caps(true)).unwrap();
+        assert!(s.steering);
+        s.apply_event(caps(false)).unwrap();
+        assert!(
+            !s.steering,
+            "a respawn onto a non-steering adapter clears it"
+        );
+    }
+
+    #[test]
+    fn cancelling_set_on_request_cleared_on_stop_and_fresh_turn() {
+        let mut s = fresh_state();
+        s.apply_event(prompt("hi")).unwrap();
+        s.apply_event(Event::CancelRequested {
+            escalates_at: Utc::now(),
+        })
+        .unwrap();
+        assert!(s.cancelling, "CancelRequested latches");
+        s.apply_event(Event::Stopped {
+            reason: "cancelled".into(),
+        })
+        .unwrap();
+        assert!(!s.cancelling, "Stopped clears the pending cancel");
+
+        // A fresh non-steered turn clears a leaked cancel; a steered
+        // continuation keeps it (the targeted turn is still running).
+        let mut s = fresh_state();
+        s.apply_event(prompt("one")).unwrap();
+        s.apply_event(Event::CancelRequested {
+            escalates_at: Utc::now(),
+        })
+        .unwrap();
+        s.apply_event(caps(true)).unwrap(); // steerable
+        s.apply_event(prompt("steered mid-turn")).unwrap();
+        assert!(s.cancelling, "a steered continuation keeps cancelling");
+    }
+
+    #[test]
+    fn compacting_latches_between_start_and_end() {
+        let mut s = fresh_state();
+        s.apply_event(Event::ConversationCompactionStarted).unwrap();
+        assert!(s.compacting);
+        s.apply_event(Event::ConversationCompacted).unwrap();
+        assert!(!s.compacting);
+        // Also self-heals on a turn-ending Stopped (dropped completion marker).
+        s.apply_event(Event::ConversationCompactionStarted).unwrap();
+        assert!(s.compacting);
+        s.apply_event(Event::Stopped {
+            reason: "end_turn".into(),
+        })
+        .unwrap();
+        assert!(!s.compacting, "Stopped self-heals a stuck compaction");
     }
 
     #[test]

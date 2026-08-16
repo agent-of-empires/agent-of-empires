@@ -66,19 +66,23 @@ Everything else the clients need is already on `AcpState` (mode, current_plan,
 todos, pending_approvals, pending_elicitations, usage, available_commands,
 config_options, rate_limit, last_agent_switch, background_agents).
 
-### The single writer
+### Where the reduction runs (implemented: per-connection)
 
-Hold `HashMap<SessionId, AcpState>` behind a per-session single writer. Events for
-one session are already totally ordered through the broadcast producer
-(`BroadcastSink::publish`, `src/acp/supervisor.rs`; funnels to
-`acp_ws::publish`, `src/server/acp_ws.rs`), so applying each event to its
-session's `AcpState` at that choke point preserves order without a new actor
-task. Placement: at `acp_ws::publish`, before/after `acp_events_tx.send(frame)`,
-apply the event to the session's `AcpState`, then emit the reduced frame (below).
+Each ACP WebSocket connection reduces its own event stream through
+`AcpState::apply_event` and pushes the result (`src/server/acp_ws.rs` `handle`).
+Reduction is per-connection but deterministic - the same reducer over the same
+ordered stream - so every client converges on the same control state. This
+avoids a central mutable `HashMap<SessionId, AcpState>`, a new actor task, and
+any change to the broadcast channel type, and it makes the connect snapshot
+fall out naturally (reduce over the replay drain, then send). The cost is
+re-reducing per connection; ACP sessions have few concurrent WS clients, so this
+is cheap. A central single-writer (reduce once at the broadcast choke point, fan
+the reduced frame out) stays available as an optimization if connection counts
+ever grow.
 
-Lifecycle: create the entry on session start (or lazily on first event), drop on
-session end. On daemon restart, rebuild by reducing over `EventStore::replay_from`
-at session load - no new persistence; the event log is the source of truth.
+No new persistence: on daemon restart the connection rebuilds state by reducing
+over `EventStore::replay_from` at connect (the on-connect drain), and the event
+log remains the source of truth.
 
 ### Wire: a kind-tagged reduced-state frame
 

@@ -35,6 +35,7 @@ use tracing::{debug, warn};
 const CLOSE_CODE_GOING_AWAY: u16 = 1001;
 
 use super::{AcpBroadcastFrame, AppState};
+use crate::acp::state::{AcpSessionId, AcpState, AgentName};
 
 /// Cadence at which the server emits an application-level Ping. The
 /// browser's WebSocket auto-replies with a Pong; axum forwards that
@@ -115,6 +116,29 @@ async fn handle(mut socket: WebSocket, session_id: String, state: Arc<AppState>,
     // events get dropped.
     let mut rx = state.acp_events_tx.subscribe();
 
+    // Server-side reduced control state for this connection (Tier 1, see
+    // docs/development/server-owned-sv-state.md). The daemon reduces the event
+    // stream through `AcpState::apply_event` and pushes the result as a
+    // `reduced_state` frame, so clients render control state (turn/steering/
+    // approvals/usage/modes) instead of re-deriving it. Reduction is
+    // per-connection but deterministic (same reducer over the same ordered
+    // stream), so every client converges. Agent/model seed the frame's identity
+    // fields; the reducer corrects `agent` on any `AgentSwitched`.
+    let (agent, model) = {
+        let instances = state.instances.read().await;
+        instances
+            .iter()
+            .find(|i| i.id == session_id)
+            .map(|i| {
+                (
+                    AgentName(i.agent_name.clone().unwrap_or_else(|| i.tool.clone())),
+                    i.agent_model.clone(),
+                )
+            })
+            .unwrap_or_else(|| (AgentName(String::new()), None))
+    };
+    let mut reduced = AcpState::new(AcpSessionId(session_id.clone()), agent, model);
+
     // Replay events newer than `since` immediately on connect. Without
     // this, any events published in the upgrade gap between the
     // client's POST /acp/spawn (or the first /acp/prompt) and
@@ -124,7 +148,8 @@ async fn handle(mut socket: WebSocket, session_id: String, state: Arc<AppState>,
     // captures every published event, so reading it here closes the
     // race without forcing the client to GET /acp/replay
     // separately.
-    let replay_count = drain_replay_into_socket(&mut socket, &state, &session_id, since).await;
+    let replay_count =
+        drain_replay_into_socket(&mut socket, &state, &session_id, since, &mut reduced).await;
     debug!(
         target: "acp.ws",
         session = %session_id,
@@ -219,6 +244,14 @@ async fn handle(mut socket: WebSocket, session_id: String, state: Arc<AppState>,
                         if socket.send(Message::Text(payload.into())).await.is_err() {
                             break;
                         }
+                        // Reduce this event into the connection's control state
+                        // and push the updated snapshot. Reduction errors
+                        // (e.g. a resolve for an approval pruned from history)
+                        // are lenient no-ops, matching the client reducers.
+                        let _ = reduced.apply_event((*frame.event).clone());
+                        if !send_reduced_state(&mut socket, &session_id, frame.seq, &reduced).await {
+                            break;
+                        }
                     }
                     Err(RecvError::Lagged(skipped)) => {
                         // Tell the client they missed events so they can
@@ -263,6 +296,7 @@ async fn drain_replay_into_socket(
     state: &AppState,
     session_id: &str,
     since: u64,
+    reduced: &mut AcpState,
 ) -> usize {
     // Offload the rusqlite read to the blocking pool. A session with
     // a large retained history may iterate thousands of rows; running
@@ -290,7 +324,12 @@ async fn drain_replay_into_socket(
         }
     };
     let mut sent = 0usize;
+    let mut snapshot_seq = since;
     for (seq, event) in entries {
+        // Reduce into the connection's control state as we forward the raw
+        // frame, so the post-drain snapshot reflects the full replayed history.
+        let _ = reduced.apply_event(event.clone());
+        snapshot_seq = seq;
         let frame = AcpBroadcastFrame {
             session_id: session_id.to_string(),
             seq,
@@ -308,7 +347,38 @@ async fn drain_replay_into_socket(
         }
         sent += 1;
     }
+    // Connect snapshot: one reduced_state frame carrying the full control state
+    // built from the replay, so a fresh client renders turn/steering/approvals/
+    // usage/modes without waiting for the next live event.
+    let _ = send_reduced_state(socket, session_id, snapshot_seq, reduced).await;
     sent
+}
+
+/// Serialize and send the reduced control state as a `kind`-tagged
+/// `reduced_state` frame. Backward compatible: the raw event frame carries no
+/// top-level `kind`, and clients ignore unknown kinds, so this is invisible to
+/// clients that don't consume it yet. Returns whether the socket is still live
+/// (a serialize failure is logged and treated as live, since it is a server
+/// bug, not a dead peer).
+async fn send_reduced_state(
+    socket: &mut WebSocket,
+    session_id: &str,
+    seq: u64,
+    reduced: &AcpState,
+) -> bool {
+    let frame = serde_json::json!({
+        "kind": "reduced_state",
+        "session_id": session_id,
+        "seq": seq,
+        "state": reduced,
+    });
+    match serde_json::to_string(&frame) {
+        Ok(payload) => socket.send(Message::Text(payload.into())).await.is_ok(),
+        Err(e) => {
+            warn!(target: "acp.ws", "serialise reduced_state: {e}");
+            true
+        }
+    }
 }
 
 /// Helper used by the worker supervisor (and integration tests) to
