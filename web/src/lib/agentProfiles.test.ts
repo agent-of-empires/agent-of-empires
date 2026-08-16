@@ -50,7 +50,6 @@ describe("resolveAgentProfile", () => {
 
   it("omp uses its native ACP clear boundary without guessed capabilities", () => {
     const p = resolveAgentProfile("omp");
-    expect(p.clearAliases).toEqual(["/new"]);
     expect(p.capabilities.todos).toBe(false);
     expect(p.capabilities.skills).toBe(false);
     expect(p.capabilities.wakeup).toBe(false);
@@ -84,15 +83,6 @@ describe("resolveAgentProfile", () => {
     expect(p.aliases.read).toContain("read_file");
     expect(p.aliases.read).toContain("read_many_files");
     expect(p.aliases.fetch).toEqual(["web_fetch"]);
-  });
-
-  it("clearAliases match the server-side rust profile", () => {
-    expect(resolveAgentProfile("claude").clearAliases).toEqual(["/clear"]);
-    expect(resolveAgentProfile("codex").clearAliases).toEqual(["/new"]);
-    expect(resolveAgentProfile("opencode").clearAliases).toEqual(["/new"]);
-    expect(resolveAgentProfile("gemini").clearAliases).toEqual([]);
-    expect(resolveAgentProfile("kimi").clearAliases).toEqual(["/new"]);
-    expect(resolveAgentProfile("omp").clearAliases).toEqual(["/new"]);
   });
 });
 

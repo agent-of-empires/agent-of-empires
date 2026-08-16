@@ -15,13 +15,22 @@ function mk(id: string, text: string): QueuedPrompt {
   return { id, text, queuedAt: "2026-05-21T00:00:00.000Z" };
 }
 
+// The clear-boundary hint reads server-owned `SessionResponse.clear_aliases`
+// (published through `AgentProfileProvider`), not the classifier profile, so
+// the test supplies them the way the server resolves them per agent.
+const SERVER_CLEAR_ALIASES: Record<string, string[]> = {
+  claude: ["/clear"],
+  codex: ["/new"],
+  gemini: [],
+};
+
 function renderWithProfile(
   toolKey: string,
   queued: QueuedPrompt[],
   opts: { onSendNow?: (prompt: QueuedPrompt) => void; canSendNow?: boolean; sendNowInterrupts?: boolean } = {},
 ) {
   return render(
-    <AgentProfileProvider toolKey={toolKey}>
+    <AgentProfileProvider toolKey={toolKey} clearAliases={SERVER_CLEAR_ALIASES[toolKey] ?? []}>
       <QueuedPromptsStrip
         queued={queued}
         onRemove={() => {}}

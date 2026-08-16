@@ -65,7 +65,7 @@ import {
 // "waiting on model/tool" badge and offers the "Force end turn" escape
 // hatch for a likely missed-Stopped wedge. See #1100, #1112.
 const FORCE_END_TURN_THRESHOLD_SECS = 30;
-import { AgentProfileProvider, useAgentProfile } from "../../lib/agentProfileContext";
+import { AgentProfileProvider, useClearAliases } from "../../lib/agentProfileContext";
 import { AcpSessionContext } from "../../lib/acpSessionContext";
 import { isClearAlias } from "../../lib/agentProfiles";
 import { AttentionChime } from "./AttentionChime";
@@ -104,6 +104,12 @@ interface Props {
    *  the modal can gray out the running backend on a never-switched session.
    *  See #2803. */
   acpAgent: string | null;
+  /** Server-owned conversation-reset slash aliases from
+   *  `SessionResponse.clear_aliases` (claude `/clear`, codex/opencode `/new`).
+   *  Published through `AgentProfileProvider` so the composer palette and the
+   *  queued-prompt clear-boundary hint read one source of truth instead of a
+   *  per-agent client-side mirror. */
+  clearAliases?: readonly string[];
   /** RFC3339 archived-at timestamp, or null. Drives the
    *  archived-specific "worker stopped" banner that replaces the
    *  generic `aoe acp stop`-style message when the user has
@@ -158,6 +164,7 @@ export function StructuredView(props: Props) {
     acpWorkerState,
     tool,
     acpAgent,
+    clearAliases,
     archivedAt,
     snoozedUntil,
     trashedAt,
@@ -178,7 +185,7 @@ export function StructuredView(props: Props) {
   return (
     <AcpFileRefContext.Provider value={{ onOpenFileRef, fileRefSession }}>
       <AcpSessionContext.Provider value={sessionId}>
-        <AgentProfileProvider toolKey={tool}>
+        <AgentProfileProvider toolKey={tool} clearAliases={clearAliases}>
           <ToolDisplayModeProvider density={toolDensity}>
             <AcpRuntime
               sessionId={sessionId}
@@ -2611,7 +2618,7 @@ export function QueuedPromptsStrip({
   // See #1232.
   const isMobile = useIsCoarsePointer();
   const [expanded, setExpanded] = useState(false);
-  const profile = useAgentProfile();
+  const aliases = useClearAliases();
   if (queued.length === 0) return null;
   const layout = queuedStripLayout({
     queuedCount: queued.length,
@@ -2619,7 +2626,6 @@ export function QueuedPromptsStrip({
     expanded,
   });
   const visible = queued.slice(0, layout.visibleCount);
-  const aliases = profile.clearAliases;
   return (
     <div className="border-t border-surface-800 bg-surface-900/60 px-4 py-2">
       <div className="mx-auto max-w-3xl xl:max-w-4xl 2xl:max-w-5xl">

@@ -41,7 +41,7 @@ import { clearDraft, clearDraftAttachments, getDraft, setDraft } from "../../lib
 import { isIOS, isStandalone } from "../../lib/platform";
 import { TOUR_ANCHORS, tourAnchor } from "../../lib/tourSteps";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
-import { useAgentProfile } from "../../lib/agentProfileContext";
+import { useAgentProfile, useClearAliases } from "../../lib/agentProfileContext";
 import { resolveModeChannel } from "../../lib/modeChannel";
 import { useFocusTerminalTarget } from "../../hooks/useFocusTerminalTarget";
 import { useDictationBurstGuard } from "./useDictationBurstGuard";
@@ -470,13 +470,14 @@ export function Composer({
   );
 
   // Slash commands: built from the agent's AvailableCommandsUpdate, plus
-  // any profile-declared clear aliases the agent doesn't advertise
+  // any server-declared clear aliases the agent doesn't advertise
   // itself (codex / opencode emit `/new` as a UI affordance but their
   // ACP servers don't list it in `available_commands_update`, so the
   // palette would otherwise be missing the very command we detect
-  // server-side as a session-clear boundary). See #1133 + multi-agent
-  // parity follow-up.
-  const profile = useAgentProfile();
+  // server-side as a session-clear boundary). Server-owned via
+  // `SessionResponse.clear_aliases`. See #1133 + multi-agent parity
+  // follow-up.
+  const clearAliases = useClearAliases();
   const slashItems: Unstable_TriggerItem[] = useMemo(() => {
     const advertised = new Set(availableCommands.map((c) => c.name));
     const items: Unstable_TriggerItem[] = availableCommands.map((c) => ({
@@ -486,7 +487,7 @@ export function Composer({
       description: c.description,
       acceptsInput: c.accepts_input,
     }));
-    for (const alias of profile.clearAliases ?? []) {
+    for (const alias of clearAliases) {
       const name = alias.startsWith("/") ? alias.slice(1) : alias;
       if (!name || advertised.has(name)) continue;
       const item = {
@@ -500,7 +501,7 @@ export function Composer({
       advertised.add(name);
     }
     return items;
-  }, [availableCommands, profile]);
+  }, [availableCommands, clearAliases]);
   const slashAdapter: Unstable_TriggerAdapter = useMemo(
     () => ({
       categories: () => [],
