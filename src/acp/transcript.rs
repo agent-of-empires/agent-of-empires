@@ -788,7 +788,12 @@ fn synth_tool_start_row(
 ///
 /// The web reducer additionally preserves `raw_name` (#3070), but the Rust
 /// `ToolCall` has no such field, so that branch is not portable here.
-fn merge_tool_start(prev: &ToolCall, incoming: &ToolCall) -> ToolCall {
+///
+/// `pub(crate)` so the native TUI's server-row merge (which folds
+/// `?view=rows` pages and WS snapshots by id) can guard a rich `tool_start`
+/// against a sparse synth start from a later page, matching the web's
+/// `mergeServerRows`.
+pub(crate) fn merge_tool_start(prev: &ToolCall, incoming: &ToolCall) -> ToolCall {
     ToolCall {
         id: incoming.id.clone(),
         name: if !incoming.name.is_empty() {
@@ -824,6 +829,45 @@ fn merge_tool_start(prev: &ToolCall, incoming: &ToolCall) -> ToolCall {
         } else {
             prev.diffs.clone()
         },
+    }
+}
+
+/// Reconcile one server-folded row into a client's row buffer by id, the
+/// Rust twin of the web's `mergeServerRows` per-row step. A new id appends
+/// in order; an existing id is replaced, except that two `tool_start` rows
+/// for one id are merged so a sparse synth start folded on a later
+/// `?view=rows` page cannot clobber a richer start already buffered
+/// (#1713/#2711). Idempotent, so it absorbs the WS/replay overlap without a
+/// seq gate.
+pub(crate) fn upsert_transcript_row(rows: &mut Vec<TranscriptRow>, incoming: TranscriptRow) {
+    let Some(idx) = rows.iter().position(|r| r.id == incoming.id) else {
+        rows.push(incoming);
+        return;
+    };
+    let prev = &rows[idx];
+    if prev.kind == TranscriptRowKind::ToolStart && incoming.kind == TranscriptRowKind::ToolStart {
+        if let (Some(prev_tool), Some(inc_tool)) = (prev.tool.as_ref(), incoming.tool.as_ref()) {
+            let merged = merge_tool_start(prev_tool, inc_tool);
+            let name = merged.name.clone();
+            let started_at = merged.started_at;
+            let row = &mut rows[idx];
+            row.text = name;
+            row.at = started_at;
+            row.tool = Some(merged);
+            return;
+        }
+    }
+    rows[idx] = incoming;
+}
+
+/// Replace the row with `row.id` by the server's authoritative new row (a
+/// `Patch` delta carries the full row), appending when the id is absent
+/// (e.g. a Patch that lands before its Append after a reconnect). The Rust
+/// twin of the web's `patchServerRow`.
+pub(crate) fn patch_transcript_row(rows: &mut Vec<TranscriptRow>, row: TranscriptRow) {
+    match rows.iter().position(|r| r.id == row.id) {
+        Some(idx) => rows[idx] = row,
+        None => rows.push(row),
     }
 }
 

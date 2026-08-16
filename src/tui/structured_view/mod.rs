@@ -32,7 +32,6 @@ use self::state::{
     ChoicePicker, ChoicePurpose, FileIndex, MentionSession, StructuredViewState, ToastBanner,
     ToastKind,
 };
-use crate::acp::approvals::ApprovalDecision;
 use crate::acp::client::{
     require_daemon, ws_connect, DaemonEndpoint, HttpClient, HttpError, ManagerError,
     PluginCommandView, WsError, WsMessage, REPLAY_PAGE_SIZE,
@@ -340,6 +339,11 @@ async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSe
         }
     };
 
+    // Seed the server-owned transcript rows via `?view=rows` so the activity
+    // stream paints immediately, before the WS connect snapshot lands. The WS
+    // transcript_snapshot reconciles by id, so the overlap is a no-op.
+    reseed_server_rows(&mut state).await;
+
     let ws_err_text = ws_err.map(|e| {
         tracing::warn!(target: "acp.tui.ws", "initial ws connect failed: {e}");
         e.to_string()
@@ -554,6 +558,16 @@ async fn apply_ws_message(
                 refresh_queue(state).await;
             }
         }
+        Ok(WsMessage::TranscriptSnapshot(rows)) => {
+            // Server-folded transcript rows on connect / reconnect. Reconcile
+            // by id, so an overlap with the initial `?view=rows` replay (or a
+            // reconnect that raced live deltas) is idempotent.
+            state.transcript.merge_server_rows(rows);
+        }
+        Ok(WsMessage::TranscriptDelta(delta)) => {
+            // One incremental row change folded from a live event.
+            state.transcript.apply_transcript_delta(*delta);
+        }
         Ok(WsMessage::Lagged) => {
             // Daemon evicted events we hadn't seen yet. Drop
             // local reducer state and rehydrate from /replay.
@@ -588,6 +602,10 @@ async fn apply_ws_message(
                     );
                 }
             }
+            // Reseed the server-owned rows too: no reconnect happens on a
+            // lag, so there is no fresh transcript_snapshot coming. The
+            // `?view=rows` replay rebuilds the buffer that `reset()` cleared.
+            reseed_server_rows(state).await;
         }
         Err(e) => {
             // WS dropped; show a banner and try to reconnect
@@ -914,9 +932,7 @@ async fn handle_terminal_event(
                     // Clear the card now instead of waiting on the
                     // ApprovalResolved broadcast, which the seq dedupe can
                     // drop and leave the card stuck. See #1821.
-                    state
-                        .transcript
-                        .resolve_approval_locally(&pending.nonce, ApprovalDecision::from(decision));
+                    state.transcript.resolve_approval_locally(&pending.nonce);
                     // The selected/last approval may have just disappeared;
                     // re-anchor focus like the replay/live-frame paths do.
                     state.reconcile_selection();
@@ -932,9 +948,7 @@ async fn handle_terminal_event(
                 // cancel, or no matching option). Clear the card without an
                 // error toast. See #1821.
                 Err(HttpError::ApprovalGone) => {
-                    state
-                        .transcript
-                        .resolve_approval_locally(&pending.nonce, ApprovalDecision::from(decision));
+                    state.transcript.resolve_approval_locally(&pending.nonce);
                     state.reconcile_selection();
                     set_toast(
                         state,
@@ -1706,6 +1720,32 @@ async fn clear_queue(state: &mut StructuredViewState, toast_deadline: &mut Optio
     }
 }
 
+/// Fetch the server-folded transcript rows via `?view=rows` and reconcile
+/// them into the row buffer. Used on open and after a lag (a lag does not
+/// reconnect the socket, so no fresh `transcript_snapshot` arrives).
+/// Best-effort: a transient failure leaves the buffer for the WS snapshot or
+/// the next reseed to fill.
+async fn reseed_server_rows(state: &mut StructuredViewState) {
+    match state
+        .http
+        .replay_rows_paged(&state.session_id, 0, REPLAY_PAGE_SIZE)
+        .await
+    {
+        Ok((rows, lost)) => {
+            if lost {
+                state.transcript.set_lagged();
+            }
+            state.transcript.merge_server_rows(rows);
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: "acp.tui",
+                "transcript rows replay failed; waiting for the WS snapshot: {e}"
+            );
+        }
+    }
+}
+
 /// Pull a fresh daemon queue snapshot into the mirror, preserving an active
 /// recall browse. Best-effort: a transient failure keeps the last snapshot
 /// rather than blanking the strip.
@@ -1867,6 +1907,10 @@ mod tests {
             .pending_approvals
             .push(reducer::PendingApproval {
                 nonce: "approval-1".into(),
+                title: "Read file".into(),
+                kind: "read".into(),
+                args: r#"{"path":"src/lib.rs"}"#.into(),
+                destructive: false,
             });
         state.reconcile_selection();
         assert_eq!(state.focus, Focus::Approval);

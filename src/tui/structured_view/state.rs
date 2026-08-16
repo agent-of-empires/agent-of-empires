@@ -1033,15 +1033,15 @@ mod tests {
     fn approval_selection_tracks_nonce_as_pending_list_advances() {
         use super::super::reducer::PendingApproval;
 
+        let pending = |nonce: &str| PendingApproval {
+            nonce: nonce.into(),
+            title: "Read file".into(),
+            kind: "read".into(),
+            args: String::new(),
+            destructive: false,
+        };
         let mut state = test_state(None);
-        state.transcript.pending_approvals = vec![
-            PendingApproval {
-                nonce: "approval-b".into(),
-            },
-            PendingApproval {
-                nonce: "approval-c".into(),
-            },
-        ];
+        state.transcript.pending_approvals = vec![pending("approval-b"), pending("approval-c")];
         state.reconcile_selection();
         assert_eq!(state.selected_approval.as_deref(), Some("approval-b"));
         assert_eq!(state.focus, Focus::Approval);

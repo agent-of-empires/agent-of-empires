@@ -201,6 +201,64 @@ impl HttpClient {
         })
     }
 
+    /// `GET /api/sessions/{id}/acp/replay?since=N&limit=L&view=rows`. One
+    /// page of the server-folded transcript rows (`TranscriptRow[]` in
+    /// `rows`, `frames` empty), same pagination metadata as the raw
+    /// projection.
+    async fn replay_rows_page(
+        &self,
+        session_id: &str,
+        since: u64,
+        limit: u64,
+    ) -> Result<ReplayResponse, HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/acp/replay?since={}&limit={}&view=rows",
+            self.endpoint.base_url, session_id, since, limit
+        );
+        let res = self.auth(self.http.get(&url)).send().await?;
+        let res = check_status(res, session_id).await?;
+        Ok(res.json::<ReplayResponse>().await?)
+    }
+
+    /// Page through the server-folded transcript rows from `since`,
+    /// accumulating every page's `rows` in order and reconciling by row id
+    /// (the server folds each page in isolation, so a `tool_start` split
+    /// across a page seam can repeat under one id; last non-sparse wins).
+    /// The transcript twin of [`replay_paged`](Self::replay_paged): same
+    /// snapshot-window cap and retention-gap (`lost`) handling. Returns the
+    /// merged rows plus whether a page reported a gap.
+    pub async fn replay_rows_paged(
+        &self,
+        session_id: &str,
+        since: u64,
+        page_size: u64,
+    ) -> Result<(Vec<crate::acp::transcript::TranscriptRow>, bool), HttpError> {
+        let mut rows: Vec<crate::acp::transcript::TranscriptRow> = Vec::new();
+        let mut cursor = since;
+        let mut target: Option<u64> = None;
+        let mut lost = false;
+        loop {
+            let page = self.replay_rows_page(session_id, cursor, page_size).await?;
+            let cap = *target.get_or_insert(page.highest_seq);
+            if let Some(page_rows) = page.rows {
+                for row in page_rows {
+                    crate::acp::transcript::upsert_transcript_row(&mut rows, row);
+                }
+            }
+            if page.lost {
+                lost = true;
+                break;
+            }
+            match page.next_cursor {
+                Some(next) if page.has_more && next > cursor && next < cap => {
+                    cursor = next;
+                }
+                _ => break,
+            }
+        }
+        Ok((rows, lost))
+    }
+
     /// `GET /api/sessions/{id}/acp/files`. Workspace file list for
     /// the composer's `@`-mention picker.
     pub async fn files(&self, session_id: &str) -> Result<FilesResponse, HttpError> {

@@ -38,6 +38,7 @@ use tracing::{debug, warn};
 
 use super::discovery::DaemonEndpoint;
 use crate::acp::protocol::AcpBroadcastFrame;
+use crate::acp::transcript::{TranscriptDelta, TranscriptRow};
 
 #[derive(Debug, Error)]
 pub enum WsError {
@@ -57,12 +58,23 @@ pub enum WsError {
 /// One message off the structured view WebSocket.
 #[derive(Debug, Clone)]
 pub enum WsMessage {
-    /// A normal structured view event frame.
+    /// A normal structured view event frame. Still the source of truth for
+    /// CONTROL state (turn/approvals/usage/modes), which every client folds
+    /// from the raw events; the transcript ROWS come from the two variants
+    /// below instead.
     Frame(Arc<AcpBroadcastFrame>),
     /// Daemon's in-memory ring evicted events the client missed.
     /// Consumer should drop local reducer state and call
     /// `HttpClient::replay(since=last_seq)` to rehydrate.
     Lagged,
+    /// Connect (and reconnect) snapshot of the server-folded transcript
+    /// rows. The consumer reconciles these into its row buffer by id, so an
+    /// overlap with an initial `?view=rows` replay is idempotent.
+    TranscriptSnapshot(Vec<TranscriptRow>),
+    /// One incremental row change the server folded from a live event.
+    /// Boxed: a `Patch` carries a full `TranscriptRow`, which would otherwise
+    /// bloat every `WsMessage` (and the `EmbeddedEvent` that wraps it).
+    TranscriptDelta(Box<TranscriptDelta>),
 }
 
 /// Handle to a running WebSocket reader task. Drop or call
@@ -216,6 +228,14 @@ fn parse_text(raw: &str) -> Result<Option<WsMessage>, WsError> {
     struct KindProbe<'a> {
         kind: Option<&'a str>,
     }
+    #[derive(serde::Deserialize)]
+    struct TranscriptSnapshotFrame {
+        rows: Vec<TranscriptRow>,
+    }
+    #[derive(serde::Deserialize)]
+    struct TranscriptDeltaFrame {
+        delta: TranscriptDelta,
+    }
     if let Ok(probe) = serde_json::from_str::<KindProbe>(raw) {
         match probe.kind {
             Some("lagged") => return Ok(Some(WsMessage::Lagged)),
@@ -223,6 +243,24 @@ fn parse_text(raw: &str) -> Result<Option<WsMessage>, WsError> {
             // `session_id`/`seq`/`event` and never a `kind`, so this
             // cannot shadow one.
             Some("heartbeat") => return Ok(None),
+            // Server-folded transcript rows (Tier 4). The connect snapshot
+            // carries every row; each live event carries its row delta.
+            Some("transcript_snapshot") => {
+                let frame: TranscriptSnapshotFrame =
+                    serde_json::from_str(raw).map_err(|e| WsError::Parse(e.to_string()))?;
+                return Ok(Some(WsMessage::TranscriptSnapshot(frame.rows)));
+            }
+            Some("transcript_delta") => {
+                let frame: TranscriptDeltaFrame =
+                    serde_json::from_str(raw).map_err(|e| WsError::Parse(e.to_string()))?;
+                return Ok(Some(WsMessage::TranscriptDelta(Box::new(frame.delta))));
+            }
+            // Server-folded CONTROL-state snapshot (Tier 1.3). The native
+            // view still folds control state from the raw frames above, so
+            // this projection is ignored rather than parsed. Dropping it
+            // here keeps an unconsumed sentinel from reading as a dead
+            // socket. See #2287.
+            Some("reduced_state") => return Ok(None),
             _ => {}
         }
     }
@@ -384,6 +422,64 @@ mod tests {
             }
             other => panic!("expected frame, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_text_transcript_snapshot_and_delta() {
+        // The connect snapshot yields the row buffer; a live delta yields
+        // one row change. Both are keyed by id so the consumer reconciles
+        // idempotently against a `?view=rows` replay overlap.
+        let snapshot = serde_json::json!({
+            "kind": "transcript_snapshot",
+            "session_id": "s-1",
+            "seq": 3,
+            "rows": [{
+                "id": "msg-1",
+                "group_id": "g1",
+                "kind": "message",
+                "at": "2024-01-01T00:00:00Z",
+                "text": "hi",
+            }],
+        })
+        .to_string();
+        match parse_text(&snapshot).unwrap() {
+            Some(WsMessage::TranscriptSnapshot(rows)) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].id, "msg-1");
+                assert_eq!(rows[0].text, "hi");
+            }
+            other => panic!("expected snapshot, got {other:?}"),
+        }
+
+        let delta = serde_json::json!({
+            "kind": "transcript_delta",
+            "session_id": "s-1",
+            "seq": 4,
+            "delta": { "Remove": "msg-1" },
+        })
+        .to_string();
+        match parse_text(&delta).unwrap() {
+            Some(WsMessage::TranscriptDelta(boxed)) => match *boxed {
+                TranscriptDelta::Remove(id) => assert_eq!(id, "msg-1"),
+                other => panic!("expected Remove, got {other:?}"),
+            },
+            other => panic!("expected delta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_text_ignores_reduced_state_sentinel() {
+        // The native view folds control state from raw frames, so the
+        // server's reduced_state projection is dropped rather than surfacing
+        // as a parse error (which the consumer would treat as a dead socket).
+        let raw = serde_json::json!({
+            "kind": "reduced_state",
+            "session_id": "s-1",
+            "seq": 1,
+            "state": {},
+        })
+        .to_string();
+        assert!(matches!(parse_text(&raw), Ok(None)));
     }
 
     #[test]
