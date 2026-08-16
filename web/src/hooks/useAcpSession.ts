@@ -27,17 +27,7 @@ import {
   type PromptAttachmentInput,
   type QueuedPrompt,
 } from "../lib/acpTypes";
-import {
-  armForBackgroundDrain,
-  emitQueueRetired,
-  isDraining,
-  onAnyQueueRetired,
-  onQueueRetired,
-  withDrainLock,
-} from "../lib/acpDrainCoordinator";
 import { useAcpPrefs } from "../lib/acpPrefs";
-import { isClearAlias } from "../lib/agentProfiles";
-import { useAgentProfile } from "../lib/agentProfileContext";
 import { getOrCreateDeviceBindingSecret } from "../lib/deviceBinding";
 import { safeSetItem } from "../lib/safeStorage";
 import {
@@ -49,7 +39,17 @@ import {
   type PersistedEntry,
 } from "../lib/acpStateStorage";
 import { getToken } from "../lib/token";
-import { reportAcpInteraction, setSessionArchive, setSessionSnooze } from "../lib/api";
+import {
+  clearServerQueue,
+  editServerQueuedPrompt,
+  enqueueServerPrompt,
+  listServerQueue,
+  removeServerQueuedPrompt,
+  reportAcpInteraction,
+  setSessionArchive,
+  setSessionSnooze,
+  type ServerQueuedPrompt,
+} from "../lib/api";
 
 /** Outcome of an immediate prompt POST, used by the drain effect to
  *  decide whether to retire queued items (delivered or permanently
@@ -74,13 +74,17 @@ export type Action =
   | { kind: "hydrate"; state: AcpState }
   | {
       kind: "enqueue_prompt";
+      /** Caller-minted stable id, so the enqueue POST + confirm can target
+       *  this exact optimistic row and the server row reconciles against it. */
+      id: string;
       text: string;
       attachments?: PromptAttachmentInput[];
     }
   | { kind: "dequeue_prompt"; id: string }
-  | { kind: "dequeue_prompts_by_id"; ids: string[] }
   | { kind: "edit_queued_prompt"; id: string; text: string }
   | { kind: "clear_queue" }
+  | { kind: "hydrate_server_queue"; rows: ServerQueuedPrompt[] }
+  | { kind: "confirm_queued_prompt"; id: string }
   | { kind: "dismiss_primer" }
   | { kind: "dismiss_compaction_reminder" }
   | { kind: "dismiss_rejected_prompt"; id: string }
@@ -337,32 +341,6 @@ function cacheSet(sessionId: string, value: AcpState): void {
   notifyStateListeners(sessionId);
 }
 
-/** Drop delivered rows out of the shared cache (and therefore out of
- *  localStorage).
- *
- *  Registered once per module load for EVERY session's retirements, local
- *  or arriving from another tab, because it has to run whether or not a
- *  hook for that session is mounted here:
- *
- *   - Across an unmount: a drain started by the headless background
- *     drainer can resolve after the user has navigated into that chat, by
- *     which point the drainer's `dispatch` goes nowhere. Without the cache
- *     write the freshly mounted hook hydrates the already-sent rows and
- *     POSTs them again.
- *   - Across tabs: the drain lock stops two tabs sending at the same
- *     moment, but the losing tab still holds the delivered rows, so it
- *     would re-persist and re-send them once the lock frees.
- *
- *  See #3331. */
-onAnyQueueRetired((sessionId, ids) => {
-  const cached = stateCache.get(sessionId);
-  if (!cached) return;
-  const drop = new Set(ids);
-  const remaining = cached.queuedPrompts.filter((q) => !drop.has(q.id));
-  if (remaining.length === cached.queuedPrompts.length) return;
-  cacheSet(sessionId, { ...cached, queuedPrompts: remaining });
-});
-
 // Lightweight per-session subscription over `stateCache` so a component
 // that is NOT a child of <StructuredView> (the Background agents panel
 // lives in a sibling Dock) can read derived ACP state without opening a
@@ -471,20 +449,6 @@ function initialState(sessionId: string | null): AcpState {
 
 export function acpHookReducer(state: AcpState, action: Action): AcpState {
   return reducer(state, action);
-}
-
-/** Build the single combined prompt fired when the agent transitions
- *  to idle with a non-empty queue. Joins every queued entry's text
- *  with a blank line so the agent sees them as one batch follow-up.
- *  Extracted for testability; consumed by the drain effect below.
- *  See #1031. */
-export function combineQueuedPrompts(queue: ReadonlyArray<QueuedPrompt>): string {
-  // Skip empty entries: an attachment-only queued prompt carries no
-  // text, and gluing its "" in would leave stray blank-line separators.
-  return queue
-    .map((q) => q.text)
-    .filter((t) => t.length > 0)
-    .join("\n\n");
 }
 
 /** Outcome of an approval-resolve POST: the card should clear, or an
@@ -705,10 +669,14 @@ export function reducer(state: AcpState, action: Action): AcpState {
     };
   }
   if (action.kind === "enqueue_prompt") {
+    // Optimistic row: shown immediately, marked `pending` until the server
+    // enqueue POST is confirmed. The id is the stable key the server row
+    // reconciles against (a re-POST of the same id updates in place).
     const entry: QueuedPrompt = {
-      id: `q-${Date.now()}-${state.queuedPrompts.length}`,
+      id: action.id,
       text: action.text,
       queuedAt: new Date().toISOString(),
+      pending: true,
       ...(action.attachments && action.attachments.length > 0 ? { attachments: action.attachments } : {}),
     };
     return { ...state, queuedPrompts: state.queuedPrompts.concat(entry) };
@@ -719,14 +687,6 @@ export function reducer(state: AcpState, action: Action): AcpState {
       queuedPrompts: state.queuedPrompts.filter((q) => q.id !== action.id),
     };
   }
-  if (action.kind === "dequeue_prompts_by_id") {
-    if (action.ids.length === 0) return state;
-    const drop = new Set(action.ids);
-    return {
-      ...state,
-      queuedPrompts: state.queuedPrompts.filter((q) => !drop.has(q.id)),
-    };
-  }
   if (action.kind === "edit_queued_prompt") {
     return {
       ...state,
@@ -735,6 +695,46 @@ export function reducer(state: AcpState, action: Action): AcpState {
   }
   if (action.kind === "clear_queue") {
     return { ...state, queuedPrompts: [] };
+  }
+  if (action.kind === "hydrate_server_queue") {
+    // Reconcile the local optimistic queue with the server's authoritative
+    // snapshot (ordered by seq). For a row we queued on this client, keep the
+    // in-memory attachment bytes so the strip can still render a thumbnail;
+    // for a row we've never seen (reload / another device) build a
+    // metadata-only attachment view from the server refs (bytes stay
+    // server-side and are delivered on drain).
+    const rows = Array.isArray(action.rows) ? action.rows : [];
+    const serverIds = new Set(rows.map((r) => r.id));
+    const localById = new Map(state.queuedPrompts.map((q) => [q.id, q]));
+    const merged: QueuedPrompt[] = rows.map((r) => {
+      const local = localById.get(r.id);
+      const attachments: PromptAttachmentInput[] | undefined = local?.attachments?.length
+        ? local.attachments
+        : r.attachments && r.attachments.length > 0
+          ? r.attachments.map((a) => ({
+              kind: a.kind,
+              mimeType: a.mime_type,
+              name: a.name ?? undefined,
+              dataB64: "",
+            }))
+          : undefined;
+      return {
+        id: r.id,
+        text: r.text,
+        queuedAt: r.created_at || local?.queuedAt || new Date().toISOString(),
+        ...(attachments ? { attachments } : {}),
+      };
+    });
+    // Keep optimistic rows whose enqueue POST is still in flight (not yet in
+    // the server snapshot) so a hydrate racing the POST doesn't drop them.
+    const stillPending = state.queuedPrompts.filter((q) => q.pending && !serverIds.has(q.id));
+    return { ...state, queuedPrompts: merged.concat(stillPending) };
+  }
+  if (action.kind === "confirm_queued_prompt") {
+    return {
+      ...state,
+      queuedPrompts: state.queuedPrompts.map((q) => (q.id === action.id ? { ...q, pending: false } : q)),
+    };
   }
   if (action.kind === "dismiss_primer") {
     // Clear the offer entirely so it doesn't re-render on session
@@ -869,18 +869,11 @@ export function useAcpSession(
     snoozedUntilRef.current = snoozedUntil;
   }, [snoozedUntil]);
   const { replayEvents } = useAcpPrefs();
-  // Clear-conversation aliases for the session's active agent. The drain
-  // effect needs them to slice the queued-prompt snapshot at clear-command
-  // boundaries so `/clear` (claude) / `/new` (codex, opencode) fires as a
-  // standalone POST instead of being glued into a multi-paragraph combined
-  // prompt; the server's `is_clear_command` is head-anchored on a trimmed
-  // prompt, and an agent SDK receiving `/clear\n\n<follow-up>` does not
-  // see a clean clear boundary. See #1356.
-  const agentProfile = useAgentProfile();
-  const clearAliasesRef = useRef(agentProfile.clearAliases);
-  useEffect(() => {
-    clearAliasesRef.current = agentProfile.clearAliases;
-  }, [agentProfile.clearAliases]);
+  // The `/clear`-boundary batching that used to happen here (slicing the
+  // queued-prompt snapshot so `/clear` fires as its own turn) is now server-
+  // side, in the queue drain (`queue_drain_batch`). See #1356 and the
+  // server-side prompt queue design.
+  //
   // Mirror the server-side retention cap onto the reducer's
   // in-memory activity buffer. Without this, a frontend-only 200-row
   // cap clipped the rendered transcript regardless of what the user
@@ -942,6 +935,12 @@ export function useAcpSession(
   useEffect(() => {
     lastSeqRef.current = state.lastSeq;
   }, [state.lastSeq]);
+  // Mirror the queue so the one-time server-migration read (below) sees the
+  // current rows without a stale closure or a queue-sized dep array.
+  const queuedPromptsRef = useRef(state.queuedPrompts);
+  useEffect(() => {
+    queuedPromptsRef.current = state.queuedPrompts;
+  }, [state.queuedPrompts]);
   // Older-history paging (#2236). `oldestSeqRef` mirrors the recent-first
   // load watermark so `loadOlder` (a stable callback) reads it without
   // re-creating. `hasMoreOlder` / `loadingOlder` drive the scroll-up
@@ -1692,9 +1691,38 @@ export function useAcpSession(
     [sessionId],
   );
 
-  // Public sendPrompt. Enqueues locally whenever the session is not in
-  // a state where an immediate POST would succeed; the drain effect
-  // below dispatches once the session resumes. Inactive states covered:
+  // Queue a prompt on the server with an optimistic local row. The row shows
+  // immediately (marked `pending`); the enqueue POST persists it (and buffers
+  // any attachment bytes) server-side, then the daemon drains it at turn-end
+  // with no tab open. On confirm the `pending` flag clears; on failure the row
+  // stays visible with an error so the message is not silently lost. Attachment
+  // shapes match (`PromptAttachmentInput` == `QueueAttachmentUpload`), so they
+  // pass straight through.
+  const enqueueServer = useCallback(
+    (text: string, attachments?: PromptAttachmentInput[]) => {
+      if (!sessionId) return;
+      const id = `q-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      dispatch({ kind: "enqueue_prompt", id, text, attachments });
+      // Queue depth is now server-owned, but keep the opt-in telemetry signal.
+      reportAcpInteraction("prompt_queued");
+      void (async () => {
+        const row = await enqueueServerPrompt(sessionId, { id, text, attachments });
+        if (row) {
+          dispatch({ kind: "confirm_queued_prompt", id });
+        } else {
+          dispatch({
+            kind: "error",
+            message: "Couldn't queue your message on the server; it may not send. Remove it and try again.",
+          });
+        }
+      })();
+    },
+    [sessionId],
+  );
+
+  // Public sendPrompt. Enqueues on the server whenever the session is not in
+  // a state where an immediate POST would succeed; the server drain dispatches
+  // once the session resumes. Inactive states covered:
   //   - WS not open (disconnected, reconnecting): #1359.
   //   - turn already in flight: #1031.
   //   - worker not in `running` (cold start, restart, stopped): #1088.
@@ -1771,35 +1799,21 @@ export function useAcpSession(
         ? blockedAsideFromWorker
         : blockedAsideFromWorker || workerNotRunning;
       if (shouldEnqueue) {
-        // Park the prompt (with any attachments) so the drain effect
-        // fires it once the agent is idle and connected, instead of
-        // dropping the image. The attachment bytes ride the queued row
-        // in memory only; `persistState` keeps them out of localStorage
-        // (and drops the whole row on reload) so the quota invariant
-        // holds. See #1833 / #1000.
-        dispatch({ kind: "enqueue_prompt", text, attachments });
-        // A prompt parked in this page's lifetime is unambiguously still
-        // wanted, so let it drain even once this chat is unmounted. See #3331.
-        armForBackgroundDrain(sessionId);
-        // The agent was busy, so this prompt is genuinely queued. Report it for
-        // opt-in telemetry (queue depth lives only in client state, so the
-        // daemon cannot observe queueing on its own).
-        reportAcpInteraction("prompt_queued");
+        // Queue the prompt (with any attachments) on the SERVER, which drains
+        // it once the agent is idle, even with no tab open. The optimistic row
+        // shows immediately; the bytes ride to the server's pending-attachment
+        // store and are delivered on drain. See the server-side prompt queue.
+        enqueueServer(text, attachments);
         return;
       }
       const result = await dispatchPromptNow(text, attachments);
       // Idle-dormant direct send: the worker was respawning and did not
       // come online within send_prompt's wait window, so the POST returned
-      // a retryable typed 503. Park the prompt (with its attachments)
-      // instead of dropping it; the drain effect re-fires it once
-      // AcpSessionAssigned brings the worker online. See #1748 / #1833.
+      // a retryable typed 503. Queue the prompt server-side instead of
+      // dropping it; the server drain fires it once the worker wakes. See
+      // #1748 / #1833.
       if (result === "retryable_failure" && state.workerIdleStopped) {
-        dispatch({ kind: "enqueue_prompt", text, attachments });
-        armForBackgroundDrain(sessionId);
-        // Same parked-prompt telemetry as the busy-agent path above: the
-        // idle-dormant wake POST failed retryably, so this prompt is queued
-        // too and the daemon cannot observe it on its own.
-        reportAcpInteraction("prompt_queued");
+        enqueueServer(text, attachments);
       }
     },
     [
@@ -1812,180 +1826,119 @@ export function useAcpSession(
       state.workerRestarting,
       state.workerIdleStopped,
       dispatchPromptNow,
+      enqueueServer,
     ],
   );
 
-  // Drain effect: when the agent transitions to idle and the queue is
-  // non-empty, join every queued entry with `\n\n` and fire one
-  // prompt; the agent's single response covers the batch.
-  // Guarded by the drain coordinator's per-session lock, which is
-  // module-scoped rather than instance-scoped so a re-render, a second
-  // hook for the same session (the headless background drainer handing
-  // off to the real view), or a second tab cannot fire the same head
-  // twice. See #1031 / #3331.
-  // Skipped while a worker-stopped / restarting banner is showing; a
-  // fresh `AcpSessionAssigned` (which clears both flags) re-runs this
-  // effect and drains then. See #1031.
-  useEffect(() => {
-    const drainSessionId = sessionIdRef.current;
-    if (!drainSessionId) return;
-    if (isDraining(drainSessionId)) return;
-    if (state.turnActive) return;
-    if (state.workerStopped || state.workerRestarting) return;
-    // Worker still mid-resume from a daemon cold start (or it never
-    // came online). Park queued prompts so they don't POST into a
-    // worker that's not online yet; the next REST poll flips
-    // workerState to "running" and re-runs this effect. See #1088.
-    //
-    // Exception: an idle-auto-stopped (dormant) worker reads "absent"
-    // too, but here the POST is the wake path, so we must let the drain
-    // fire to issue it. The server's `touch_and_wake_if_sunk` clears
-    // dormancy and `send_prompt`'s `wait_for_worker` holds the POST
-    // until the respawned worker is ready. Without this, a prompt the
-    // user queued while the worker was dormant would never drain. #1689.
-    if (workerStateRef.current !== "running" && !state.workerIdleStopped) return;
-    // Reconnect race: connect() awaits fetchReplay BEFORE opening the
-    // WS, and replay can dispatch a Stopped frame that flips turnActive
-    // off. If we drain here while the WS is still in "connecting",
-    // dispatchPromptNow will bail (statusRef !== "open"), surface an
-    // error banner, and (under the prior optimistic-clear ordering)
-    // permanently drop the queued items. Park the drain until status
-    // flips to "open"; the `status` value is in the dep array below
-    // so this effect re-runs on transition. See #1144.
-    if (statusRef.current !== "open") return;
-    if (state.queuedPrompts.length === 0) return;
-    // Slice the leading sub-batch out of the queue and POST only that.
-    // The boundary is each clear-command alias (`/clear`, `/new`); when
-    // the head is a clear alias it fires alone, otherwise the run of
-    // non-clear entries up to the next alias is joined into one
-    // combined POST. The remaining entries stay queued and the next
-    // `Stopped` re-runs this effect, dispatching the next sub-batch.
-    // Single-pass POST per drain matches the existing combined-mode
-    // contract (one prompt fires per turn cycle), and the agent sees a
-    // clean clear-command boundary instead of `/clear\n\n<text>`.
-    // See #1356.
-    //
-    // The user can enqueue MORE prompts during the await; on success
-    // we only clear the items in the snapshot so newly-typed entries
-    // survive into the next turn. On failure (POST non-OK / network
-    // blip / WS dropped mid-send) we leave the queue untouched so the
-    // next Stopped retries.
-    const queue = state.queuedPrompts;
-    const aliases = clearAliasesRef.current;
-    const headIsClear = aliases.length > 0 && isClearAlias(queue[0]!.text, aliases);
-    let batchEnd = 1;
-    if (!headIsClear && aliases.length > 0) {
-      while (batchEnd < queue.length && !isClearAlias(queue[batchEnd]!.text, aliases)) {
-        batchEnd += 1;
-      }
-    } else if (aliases.length === 0) {
-      batchEnd = queue.length;
-    }
-    const snapshot = queue.slice(0, batchEnd);
-    const combined = combineQueuedPrompts(snapshot);
-    // Merge every attachment in the sub-batch into the one combined
-    // POST. If that overflows the server's per-prompt cap the POST
-    // 4xx-rejects and the batch retires via the non-retryable path
-    // below, same as any other rejected combined send. See #1833.
-    const combinedAttachments = snapshot.flatMap((q) => q.attachments ?? []);
-    const sentIds = snapshot.map((q) => q.id);
-    void withDrainLock(drainSessionId, async () => {
-      const result = await dispatchPromptNow(
-        combined,
-        combinedAttachments.length > 0 ? combinedAttachments : undefined,
-      );
-      // Retire on success and on non-retryable rejection; only a
-      // transient failure keeps the batch queued for the next retry.
-      // Routed through the coordinator rather than a bare dispatch so the
-      // retirement lands in the shared cache and reaches every live hook
-      // and every other tab, including when this instance unmounted while
-      // the POST was in flight. A transient failure deliberately stays
-      // silent: broadcasting it would re-run this effect immediately and
-      // turn the retry into a hot loop. See #3331.
-      if (result !== "retryable_failure") {
-        emitQueueRetired(drainSessionId, sentIds);
-      }
-    }).catch((e: unknown) => {
-      // `dispatchPromptNow` handles its own failures, so reaching here
-      // means the lock itself failed (`navigator.locks` rejecting the
-      // request). Surface it rather than leaving an unhandled rejection.
-      // The queue is untouched, so the next state change retries.
-      dispatch({
-        kind: "error",
-        message: `Could not send queued messages: ${describeError(e)}`,
-      });
-    });
-  }, [
-    status,
-    workerState,
-    state.turnActive,
-    state.workerStopped,
-    state.workerRestarting,
-    state.workerIdleStopped,
-    state.queuedPrompts,
-    dispatchPromptNow,
-  ]);
-
-  // Converge on a drain owned by another hook instance for this same
-  // session. The background drainer and the visible chat overlap for one
-  // commit when the user navigates in, and the drainer's POST can resolve
-  // on either side of that swap; whoever is mounted drops the delivered
-  // rows. Idempotent, so receiving a retirement for rows already gone is
-  // a no-op. See #3331.
+  // Server-queue hydration. The daemon owns the queue and drains it (even
+  // with no tab open), so the client's job is to reflect the server snapshot,
+  // not to drain. Re-list on connect and whenever a turn ends (a server drain
+  // fires at turn-end, so the drained rows disappear on the following list)
+  // and dispatch a reconcile that keeps this session's optimistic thumbnails
+  // and any still-in-flight enqueue.
+  //
+  // The FIRST run also migrates: it pushes any rows queued before the server
+  // owned the queue (rows restored from localStorage, or in-flight) to the
+  // server, keyed by their existing id so the POST is idempotent, then lists.
+  // Attachments survive migration only for rows still in memory (localStorage
+  // drops the bytes), matching the prior reload behavior. See the server-side
+  // prompt queue design.
+  const queueMigratedRef = useRef(false);
   useEffect(() => {
     if (!sessionId) return;
-    return onQueueRetired(sessionId, (ids) => {
-      dispatch({ kind: "dequeue_prompts_by_id", ids });
-    });
-  }, [sessionId]);
+    if (status !== "open") return;
+    let cancelled = false;
+    void (async () => {
+      if (!queueMigratedRef.current) {
+        queueMigratedRef.current = true;
+        for (const q of queuedPromptsRef.current) {
+          if (cancelled) return;
+          await enqueueServerPrompt(sessionId, {
+            id: q.id,
+            text: q.text,
+            createdAt: q.queuedAt,
+            attachments: q.attachments,
+          });
+        }
+      }
+      const rows = await listServerQueue(sessionId);
+      if (cancelled) return;
+      dispatch({ kind: "hydrate_server_queue", rows });
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [sessionId, status, state.turnActive]);
 
-  const removeQueuedPrompt = useCallback((id: string) => {
-    dispatch({ kind: "dequeue_prompt", id });
-  }, []);
+  // Optimistic local update + server mutation. The server is authoritative;
+  // a later hydrate reconciles. A failed mutation is best-effort (the row
+  // reappears on the next hydrate), so we don't roll the optimistic edit back.
+  const removeQueuedPrompt = useCallback(
+    (id: string) => {
+      dispatch({ kind: "dequeue_prompt", id });
+      if (sessionId) void removeServerQueuedPrompt(sessionId, id);
+    },
+    [sessionId],
+  );
 
-  const editQueuedPrompt = useCallback((id: string, text: string) => {
-    dispatch({ kind: "edit_queued_prompt", id, text });
-  }, []);
+  const editQueuedPrompt = useCallback(
+    (id: string, text: string) => {
+      dispatch({ kind: "edit_queued_prompt", id, text });
+      if (sessionId) void editServerQueuedPrompt(sessionId, id, text);
+    },
+    [sessionId],
+  );
 
   const clearQueue = useCallback(() => {
     dispatch({ kind: "clear_queue" });
-  }, []);
+    if (sessionId) void clearServerQueue(sessionId);
+  }, [sessionId]);
 
   // Stable handle to `cancelPrompt` (defined below) so `sendQueuedNow` can
   // interrupt a running turn without a forward reference. Assigned in the
   // render body right after `cancelPrompt` is created.
   const cancelPromptRef = useRef<() => Promise<void> | void>(() => {});
 
-  // Force-send a queued prompt now instead of waiting for the turn-end
-  // auto-drain. Two cases:
-  //   - Idle / steerable / dormant worker: send this row immediately (under the
-  //     per-session drain lock so it can't race or duplicate the auto-drain),
-  //     and retire it through the shared coordinator so the visible view and
-  //     any background drainer stay in sync.
+  // Force-send a queued prompt now instead of waiting for the server's
+  // turn-end drain. Two cases:
+  //   - Idle / steerable / dormant worker: send this row immediately via the
+  //     live prompt path, and remove it from the server queue so the server
+  //     drain doesn't also deliver it (dedup). The optimistic dequeue keeps the
+  //     strip in sync; a hydrate reconciles.
   //   - A live, non-steerable turn is blocking it: interrupt. Cancel the
-  //     current turn; the queued prompts then drain via the normal turn-end
-  //     path (which the drain effect fires when `turnActive` flips false). We
-  //     deliberately do NOT POST during the cancel: the daemon treats a prompt
-  //     arriving mid-cancel as a wedge and restarts the runner (see
-  //     `sendPrompt`). The clicked row rides that drain with the rest of the
-  //     queue. This is the destructive "interrupt and send" the user opted into.
+  //     current turn; the server then drains the queue (this row included) on
+  //     turn-end. We deliberately do NOT POST during the cancel: the daemon
+  //     treats a prompt arriving mid-cancel as a wedge and restarts the runner
+  //     (see `sendPrompt`). This is the destructive "interrupt and send" the
+  //     user opted into.
   const sendQueuedNow = useCallback(
     async (prompt: QueuedPrompt) => {
-      const drainSessionId = sessionIdRef.current;
-      if (!drainSessionId) return;
+      const sid = sessionIdRef.current;
+      if (!sid) return;
       const steerable = !!state.promptCapabilities?.steering && !state.cancelling && !state.compacting;
       if (state.turnActive && !steerable) {
         await cancelPromptRef.current();
         return;
       }
-      await withDrainLock(drainSessionId, async () => {
-        const result = await dispatchPromptNow(prompt.text, prompt.attachments);
-        if (result !== "retryable_failure") {
-          emitQueueRetired(drainSessionId, [prompt.id]);
-        }
-      });
+      // Remove server-side first so the turn-end drain can't also deliver this
+      // row, then send it directly. The optimistic dequeue hides it locally.
+      dispatch({ kind: "dequeue_prompt", id: prompt.id });
+      await removeServerQueuedPrompt(sid, prompt.id);
+      const result = await dispatchPromptNow(prompt.text, prompt.attachments);
+      if (result === "retryable_failure") {
+        // The immediate send bounced (worker still resuming); re-queue it
+        // server-side so the drain re-fires it, and restore the optimistic row.
+        enqueueServer(prompt.text, prompt.attachments);
+      }
     },
-    [dispatchPromptNow, state.turnActive, state.promptCapabilities?.steering, state.cancelling, state.compacting],
+    [
+      dispatchPromptNow,
+      enqueueServer,
+      state.turnActive,
+      state.promptCapabilities?.steering,
+      state.cancelling,
+      state.compacting,
+    ],
   );
 
   const dismissPrimer = useCallback(() => {

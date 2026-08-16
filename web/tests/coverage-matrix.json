@@ -2206,32 +2206,15 @@
       "components": ["web/src/lib/acpDrafts.ts"]
     },
     {
-      "id": "acp.queue-drain-ownership",
+      "id": "acp.server-queue-overlay",
       "kind": "vitest",
       "risk": "high",
-      "specs": [
-        "src/lib/acpDrainCoordinator.test.ts",
-        "src/hooks/useAcpSession.queue.test.ts",
-        "src/components/acp/AcpQueueDrainer.test.tsx"
-      ],
+      "specs": ["src/hooks/useAcpSession.queue.test.ts"],
       "components": [
-        "web/src/lib/acpDrainCoordinator.ts",
         "web/src/hooks/useAcpSession.ts",
         "web/src/hooks/useAcpQueueCount.ts",
-        "web/src/components/acp/AcpQueueDrainer.tsx",
         "web/src/lib/acpStateStorage.ts",
-        "web/src/App.tsx"
-      ]
-    },
-    {
-      "id": "acp.queue-drain-clear-split",
-      "kind": "vitest",
-      "risk": "high",
-      "specs": ["src/hooks/useAcpSession.queue.test.ts", "src/lib/agentProfiles.test.ts"],
-      "components": [
-        "web/src/hooks/useAcpSession.ts",
-        "web/src/lib/agentProfiles.ts",
-        "web/src/components/acp/StructuredView.tsx"
+        "web/src/lib/api.ts"
       ]
     },
     {

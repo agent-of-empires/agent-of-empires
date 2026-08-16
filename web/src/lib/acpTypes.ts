@@ -966,12 +966,20 @@ export interface QueuedPrompt {
   /** ISO-8601 client wall clock at enqueue time. Displayed as a
    *  relative age in the strip. */
   queuedAt: string;
-  /** Attachments staged with this queued prompt. EPHEMERAL: these carry
-   *  raw base64 bytes, so `persistState` drops any queued row that has
-   *  them rather than writing megabytes into the per-origin localStorage
-   *  quota. They survive a component remount (the in-memory `stateCache`
-   *  keeps the full row) but not a full page reload. See #1833 / #1000. */
+  /** Attachments staged with this queued prompt. The bytes now live
+   *  server-side (the pending-attachment store) and are delivered on drain;
+   *  a locally-queued row keeps the raw base64 in memory so the strip can
+   *  render a thumbnail until the server confirms. `persistState` still drops
+   *  any queued row that has them rather than writing megabytes into the
+   *  per-origin localStorage quota; a hydrate from the server repopulates the
+   *  metadata (id/kind/mime/name, no bytes) after reload. See #1833 / #1000. */
   attachments?: PromptAttachmentInput[];
+  /** True for an optimistic row whose server enqueue POST has not been
+   *  confirmed yet. A hydrate from the server keeps `pending` rows that are
+   *  not (yet) in the server snapshot, so an in-flight enqueue is not dropped
+   *  by a hydrate that races the POST. Cleared once the row appears in a
+   *  server snapshot. */
+  pending?: boolean;
 }
 
 export interface ActivityRow {

@@ -1,8 +1,9 @@
 # Design: server-side prompt queue (closed-app delivery + force-send)
 
-Status: partially implemented. Opened 2026-08-14.
+Status: implemented (G1, G2, G4; G3 force-send-now endpoint still open).
+Opened 2026-08-14.
 
-Implemented so far (backend + API client):
+Implemented:
 
 - Durable per-session queue on the `Instance` (`queued_prompts` +
   `queued_prompt_next_seq`, `QueuedPromptEntry`), persisted like
@@ -12,39 +13,47 @@ Implemented so far (backend + API client):
 - `SessionService` enqueue / edit / remove / clear / snapshot and
   `drain_queued_prompts_once`; a reconciler pass drains the head batch at
   turn-end (`Status::Idle`, live worker) with the `/clear`-boundary split
-  matching the client. `queued_prompts` is surfaced on `SessionResponse`.
+  (`queue_drain_batch`) that used to live in the client. `queued_prompts` is
+  surfaced on `SessionResponse`.
+- Wake-on-drain: a dormant (idle-auto-stopped) session with a queue has its
+  marker cleared so the resume pass respawns it, then the next tick drains
+  (deadlock-safe; see "Wake-on-drain" below).
+- Attachments ride with a queued prompt: the enqueue POST buffers the bytes in
+  the event store's `pending_attachments` table (keyed by prompt id, outside the
+  seq-keyed retention prune), the drain reloads and forwards them, and a
+  per-session byte cap + hourly TTL bound the buffer (Q5).
 - HTTP: `POST/GET/DELETE /api/sessions/{id}/queue`,
   `PATCH/DELETE /api/sessions/{id}/queue/{promptId}`, CityHall-classified like
   `acp/prompt`. Web API client wrappers + Vitest.
+- Client rewired to the server queue (`useAcpSession`): `sendPrompt`'s enqueue
+  branch POSTs to `/queue` with an optimistic `pending` row and confirms it;
+  edit/remove/clear mirror to the endpoints; the queue reconciles against the
+  server snapshot via `hydrate_server_queue` (on connect and turn-end), keeping
+  local attachment thumbnails and any in-flight enqueue. The old client drain,
+  `AcpQueueDrainer`/`AcpBackgroundDrainers`, and `acpDrainCoordinator` are
+  removed (the daemon drains now). A one-time migration on first connect pushes
+  any localStorage-restored rows to the server.
 
-Still to do, and each item is a real blocker with a design fork or a
-verification requirement, not a mechanical increment (investigated 2026-08-16,
-code citations below):
+Still open: the `send-now` endpoint (G3) — today "Send now" sends immediately
+when the agent is free and otherwise interrupts the turn so the server drain
+fires; a dedicated endpoint would let it force-send during a non-steerable turn
+without a client round-trip. Real-time cross-device queue updates (a WS event on
+queue mutation) are also future work; today other devices see queue changes on
+their next connect / turn-end hydrate.
 
-1. **Attachments on a queued prompt cannot reuse `acp_attachments` as-is.**
-   That store keys blobs by the `seq` of the `UserPromptSent` event they ride
-   with, and the retention prune drops any blob whose owning event no longer
-   exists (`src/events/mod.rs:349`, `DELETE ... WHERE seq <= cutoff AND seq NOT
-   IN (SELECT seq FROM events)`). A queued-but-unsent prompt has no
-   `UserPromptSent` seq, so its bytes would either be pruned early or need a
-   synthetic-seq hack that fights the retention invariant. `pending_initial_turn`
-   avoids this only because it replays refs whose bytes were already stored under
-   a prior real prompt's seq. Doing queued attachments right needs a dedicated
-   blob store keyed by `(session_id, prompt_id, attachment_id)` with its own
-   lifecycle (a new table + migration), plus an upload endpoint and a per-session
-   byte cap. This is Q1/Q5, still open.
-2. **The client rewire regresses dormant-worker delivery unless wake-on-drain
-   lands first.** The server drain pass skips any session whose worker is not
-   live (`src/server/acp_reconciler.rs`, `if is_running { drain } else ...`). The
-   client drain, by contrast, wakes an idle-auto-stopped worker by letting the
-   POST itself fire the resume (`web/src/hooks/useAcpSession.ts` `workerIdleStopped`
-   exception). This is now handled server-side (see "Wake-on-drain" below), so
-   dropping the client drain no longer strands a prompt queued against a dormant
-   session.
+### Why queued attachments get their own store (resolved)
 
-Also still to do (straightforward once the above are settled): the `send-now`
-endpoint (G3), the one-time localStorage migration (Q2), and the live-daemon
-e2e for the full closed-app round-trip.
+Attachments could not reuse the `acp_attachments` store: it keys blobs by the
+`seq` of the `UserPromptSent` event they ride with, and the retention prune drops
+any blob whose owning event no longer exists (`src/events/mod.rs`, `DELETE ...
+WHERE seq <= cutoff AND seq NOT IN (SELECT seq FROM events)`). A queued-but-unsent
+prompt has no `UserPromptSent` seq, so its bytes would be pruned early or need a
+synthetic-seq hack that fights the retention invariant. (`pending_initial_turn`
+sidesteps this only because it replays refs whose bytes were already stored under
+a prior real prompt's seq.) So queued attachments live in a dedicated
+`pending_attachments` table keyed by `(session_id, ref_id=prompt_id,
+attachment_id)`, outside the seq-keyed prune; the drain re-records them under the
+real `UserPromptSent` seq and drops the pending copy. This resolves Q1/Q5.
 
 ### Wake-on-drain (implemented)
 
@@ -76,14 +85,6 @@ ever revives sessions the idle reaper auto-stopped. Covered by
 reaper -> dormant -> enqueue -> wake -> drain cycle is exercised by the client
 rewire's live queue round-trip (cheaper and more representative than a
 config-forced-dormancy Rust e2e).
-
-**Net:** the backend store + endpoints + live-worker drain are done and green,
-but they are inert until the client POSTs into the queue, and the client rewire
-that would do that (a) cannot be verified from CI/sandbox (needs a live daemon +
-real agent + the iOS PWA) and (b) regresses dormant delivery until wake-on-drain
-is built, which itself needs the deadlock-careful refactor above. The rewire and
-wake-on-drain should land together, verified on-device, not as blind increments
-on top of a working PR.
 
 ## Problem
 

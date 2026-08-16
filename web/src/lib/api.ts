@@ -1512,14 +1512,34 @@ export async function acpDisable(sessionId: string): Promise<ViewSwitchResponse 
 // server-side. These wrap the /queue endpoints; the queue itself reflects to
 // the client on `SessionResponse.queued_prompts`.
 
+/** Metadata-only view of one queued-prompt attachment. The bytes live
+ *  server-side (the pending-attachment store) and are delivered on drain, so
+ *  the client only receives id/kind/mime/name/size for display. */
+export interface ServerQueuedAttachmentRef {
+  id: string;
+  kind: "image" | "audio" | "resource";
+  mime_type: string;
+  name?: string | null;
+  size: number;
+}
+
 /** One entry of a session's server-owned queue, as the API returns it. */
 export interface ServerQueuedPrompt {
   id: string;
   seq: number;
   text: string;
-  attachments?: unknown[];
+  attachments?: ServerQueuedAttachmentRef[];
   created_at: string;
   origin_device?: string | null;
+}
+
+/** Attachment upload shape for the queue enqueue, matching `/acp/prompt`'s
+ *  `PromptAttachmentUpload` (base64 `data`, no `data:` prefix). */
+export interface QueueAttachmentUpload {
+  kind: "image" | "audio" | "resource";
+  mimeType: string;
+  name?: string;
+  dataB64: string;
 }
 
 async function fetchOk(url: string, init?: RequestInit): Promise<boolean> {
@@ -1542,7 +1562,13 @@ const jsonInit = (method: string, body: unknown): RequestInit => ({
  *  (with its assigned `seq`) or null on non-2xx. */
 export async function enqueueServerPrompt(
   sessionId: string,
-  prompt: { id: string; text: string; createdAt?: string; originDevice?: string },
+  prompt: {
+    id: string;
+    text: string;
+    createdAt?: string;
+    originDevice?: string;
+    attachments?: QueueAttachmentUpload[];
+  },
 ): Promise<ServerQueuedPrompt | null> {
   return fetchJson<ServerQueuedPrompt>(
     `/api/sessions/${encodeURIComponent(sessionId)}/queue`,
@@ -1551,13 +1577,22 @@ export async function enqueueServerPrompt(
       text: prompt.text,
       created_at: prompt.createdAt,
       origin_device: prompt.originDevice,
+      attachments: (prompt.attachments ?? []).map((a) => ({
+        kind: a.kind,
+        mime_type: a.mimeType,
+        data: a.dataB64,
+        name: a.name,
+      })),
     }),
   );
 }
 
-/** The session's server queue, ordered by `seq` (GET /queue). */
+/** The session's server queue, ordered by `seq` (GET /queue). Always returns an
+ *  array: a non-array body (error page, unexpected shape) yields `[]` so callers
+ *  can `.map` without guarding. */
 export async function listServerQueue(sessionId: string): Promise<ServerQueuedPrompt[]> {
-  return (await fetchJson<ServerQueuedPrompt[]>(`/api/sessions/${encodeURIComponent(sessionId)}/queue`)) ?? [];
+  const rows = await fetchJson<ServerQueuedPrompt[]>(`/api/sessions/${encodeURIComponent(sessionId)}/queue`);
+  return Array.isArray(rows) ? rows : [];
 }
 
 /** Replace a queued prompt's text (PATCH /queue/{id}). */

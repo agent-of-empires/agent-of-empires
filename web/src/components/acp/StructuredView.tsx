@@ -2786,13 +2786,16 @@ function QueuedPromptRow({
                   className="flex items-center gap-1 rounded border border-sky-700/40 bg-sky-950/30 py-0.5 pl-0.5 pr-1.5 text-[10px] text-sky-200"
                   title={att.name ?? att.kind}
                 >
-                  {att.kind === "image" ? (
+                  {att.kind === "image" && att.dataB64 ? (
                     <img
                       src={`data:${att.mimeType};base64,${att.dataB64}`}
                       alt={att.name ?? "attachment"}
                       className="h-5 w-5 rounded object-cover"
                     />
                   ) : (
+                    // No local bytes (a row hydrated from the server carries
+                    // metadata only; the bytes live server-side and deliver on
+                    // drain), so show a paperclip rather than a broken image.
                     <Paperclip className="h-3 w-3" />
                   )}
                   <span className="max-w-[100px] truncate">{att.name ?? att.kind}</span>
