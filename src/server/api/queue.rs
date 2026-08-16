@@ -6,8 +6,11 @@
 //! server-side. These handlers are the client's view/editor of that queue;
 //! the drain and force-send-now live in the reconciler / supervisor.
 //!
-//! Attachments on a queued prompt are added in a later increment; enqueue is
-//! text-only for now and rejects an empty prompt.
+//! Attachments ride with a queued prompt: the enqueue POST carries the same
+//! `PromptAttachmentUpload` shape as `/acp/prompt`, the bytes are validated and
+//! buffered in the event store's pending-attachment table (keyed by the prompt
+//! id, outside the seq-keyed retention prune), and the drain reloads and
+//! forwards them. A per-session byte cap bounds how much a client can buffer.
 
 use std::sync::Arc;
 
@@ -18,8 +21,15 @@ use axum::response::IntoResponse;
 use axum::Json;
 use serde::Deserialize;
 
-use super::acp::read_only_block;
+use super::acp::{read_only_block, validate_attachments};
+use crate::acp::protocol::PromptAttachmentUpload;
+use crate::acp::state::PromptAttachmentRef;
 use crate::server::AppState;
+
+/// Cap on total queued-attachment bytes buffered per session. Generous enough
+/// for several image follow-ups (`/acp/prompt` caps one prompt at 20 MiB) while
+/// bounding what an undrained queue can hold on disk.
+const MAX_QUEUED_ATTACHMENT_BYTES_PER_SESSION: u64 = 64 * 1024 * 1024;
 
 #[derive(Debug, Deserialize)]
 pub struct EnqueueRequest {
@@ -33,6 +43,11 @@ pub struct EnqueueRequest {
     /// Optional provenance: which device queued it.
     #[serde(default)]
     pub origin_device: Option<String>,
+    /// Image/file attachments to deliver with the prompt when it drains. Same
+    /// untrusted wire shape as `/acp/prompt`; `#[serde(default)]` keeps
+    /// text-only enqueues working unchanged.
+    #[serde(default)]
+    pub attachments: Vec<PromptAttachmentUpload>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -60,19 +75,91 @@ pub async fn queue_enqueue(
     if !session_exists(&state, &id).await {
         return (StatusCode::NOT_FOUND, "session not found").into_response();
     }
-    if req.text.trim().is_empty() {
+    // A text-only prompt may be empty ONLY if it carries attachments (an
+    // image-only follow-up). A truly empty enqueue is rejected.
+    if req.text.trim().is_empty() && req.attachments.is_empty() {
         return (StatusCode::BAD_REQUEST, "empty prompt").into_response();
     }
+
+    // Decode + validate + capability-gate the attachments exactly as the live
+    // prompt path does (size / MIME / count caps, image magic-byte sniff).
+    let blobs = match validate_attachments(&state, &id, &req.attachments) {
+        Ok(b) => b,
+        Err((status, msg)) => return (status, msg).into_response(),
+    };
+    // Per-session buffer cap: reject rather than let an undrained queue grow
+    // without bound. Re-enqueuing the same id replaces its blobs, so subtract
+    // what this prompt already holds before checking headroom.
+    if !blobs.is_empty() {
+        let incoming: u64 = blobs.iter().map(|b| b.data.len() as u64).sum();
+        let existing_for_prompt: u64 = state
+            .acp_event_store
+            .load_pending_attachments_for_ref(&id, &req.id)
+            .iter()
+            .map(|b| b.data.len() as u64)
+            .sum();
+        let session_total = state.acp_event_store.pending_attachment_bytes(&id);
+        let projected = session_total.saturating_sub(existing_for_prompt) + incoming;
+        if projected > MAX_QUEUED_ATTACHMENT_BYTES_PER_SESSION {
+            return (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                format!(
+                    "queued attachments exceed the {} MiB per-session limit",
+                    MAX_QUEUED_ATTACHMENT_BYTES_PER_SESSION / (1024 * 1024)
+                ),
+            )
+                .into_response();
+        }
+    }
+
+    // Buffer the bytes keyed by the prompt id, then hand the metadata-only refs
+    // to the store. Re-enqueue is idempotent: clear any prior blobs for this id
+    // first so a re-post with a different attachment set replaces cleanly.
+    let refs: Vec<PromptAttachmentRef> = blobs
+        .iter()
+        .map(|b| PromptAttachmentRef {
+            id: b.id.clone(),
+            kind: b.kind,
+            mime_type: b.mime_type.clone(),
+            name: b.name.clone(),
+            size: b.data.len() as u64,
+        })
+        .collect();
+    if !req.attachments.is_empty() {
+        state
+            .acp_event_store
+            .delete_pending_attachments_for_ref(&id, &req.id);
+        for blob in &blobs {
+            state
+                .acp_event_store
+                .record_pending_attachment(&id, &req.id, blob);
+        }
+    }
+
     let created_at = req
         .created_at
         .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
     match state
         .session_service
-        .enqueue_prompt(&id, req.id, req.text, vec![], req.origin_device, created_at)
+        .enqueue_prompt(
+            &id,
+            req.id.clone(),
+            req.text,
+            refs,
+            req.origin_device,
+            created_at,
+        )
         .await
     {
         Some(entry) => (StatusCode::OK, Json(entry)).into_response(),
-        None => (StatusCode::NOT_FOUND, "session not found").into_response(),
+        None => {
+            // Session vanished between the existence check and the enqueue;
+            // drop any blobs we just buffered so they don't leak.
+            state
+                .acp_event_store
+                .delete_pending_attachments_for_ref(&id, &req.id);
+            (StatusCode::NOT_FOUND, "session not found").into_response()
+        }
     }
 }
 

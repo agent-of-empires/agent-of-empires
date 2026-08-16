@@ -247,6 +247,12 @@ pub struct CleanupDefaultsCache {
 
 pub const CLEANUP_DEFAULTS_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long attachment bytes buffered for a queued prompt live before the
+/// hourly sweep reclaims them (Q5 in the server-side prompt queue design). A
+/// queued prompt normally drains within seconds; this only catches bytes
+/// stranded by a session that never becomes idle again.
+const PENDING_ATTACHMENT_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
 impl CleanupDefaultsCache {
     pub fn stale(&self) -> bool {
         self.refreshed_at.elapsed() >= CLEANUP_DEFAULTS_TTL
@@ -1328,6 +1334,19 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
                     tokio::select! {
                         _ = interval.tick() => {
                             crate::server::api::purge_expired_trash(&sweep_state).await;
+                            // Q5: reclaim attachment bytes buffered for a queued
+                            // prompt that never drained (a session that never went
+                            // idle again). Removal/clear/drain/session-delete drop
+                            // these already, so this only catches the stranded tail.
+                            let store = sweep_state.acp_event_store.clone();
+                            let pruned = tokio::task::spawn_blocking(move || {
+                                store.prune_pending_attachments_older_than(PENDING_ATTACHMENT_TTL)
+                            })
+                            .await
+                            .unwrap_or(0);
+                            if pruned > 0 {
+                                tracing::info!(target: "acp.queue", pruned, "pruned stale queued-prompt attachments past TTL");
+                            }
                         }
                         _ = shutdown.cancelled() => break,
                     }

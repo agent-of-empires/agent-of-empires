@@ -97,7 +97,7 @@ pub(crate) fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
 /// and forward, or an HTTP `(status, message)` to return verbatim.
 /// Runs entirely before the prompt is published so a rejected prompt
 /// never leaves a half-rendered attachment in the transcript.
-fn validate_attachments(
+pub(crate) fn validate_attachments(
     state: &AppState,
     session_id: &str,
     uploads: &[PromptAttachmentUpload],

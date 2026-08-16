@@ -866,27 +866,46 @@ impl SessionService {
         .unwrap_or(false)
     }
 
-    /// Remove a queued prompt by id. Returns `true` if a row was removed.
+    /// Remove a queued prompt by id. Returns `true` if a row was removed. Also
+    /// drops any attachment bytes buffered for that prompt so they don't leak.
     #[cfg(feature = "serve")]
     pub(crate) async fn remove_queued_prompt(
         self: &Arc<Self>,
         id: &str,
         prompt_id: String,
     ) -> bool {
-        self.mutate_instance_persisted(id, move |inst| {
-            let before = inst.queued_prompts.len();
-            inst.queued_prompts.retain(|q| q.id != prompt_id);
-            inst.queued_prompts.len() != before
-        })
-        .await
-        .unwrap_or(false)
+        let prompt_id_cleanup = prompt_id.clone();
+        let removed = self
+            .mutate_instance_persisted(id, move |inst| {
+                let before = inst.queued_prompts.len();
+                inst.queued_prompts.retain(|q| q.id != prompt_id);
+                inst.queued_prompts.len() != before
+            })
+            .await
+            .unwrap_or(false);
+        if removed {
+            self.acp_event_store
+                .delete_pending_attachments_for_ref(id, &prompt_id_cleanup);
+        }
+        removed
     }
 
-    /// Drop every queued prompt for a session.
+    /// Drop every queued prompt for a session, plus every attachment blob
+    /// buffered for those prompts.
     #[cfg(feature = "serve")]
     pub(crate) async fn clear_queued_prompts(self: &Arc<Self>, id: &str) {
-        self.mutate_instance_persisted(id, move |inst| inst.queued_prompts.clear())
-            .await;
+        let cleared_ids = self
+            .mutate_instance_persisted(id, move |inst| {
+                let ids: Vec<String> = inst.queued_prompts.iter().map(|q| q.id.clone()).collect();
+                inst.queued_prompts.clear();
+                ids
+            })
+            .await
+            .unwrap_or_default();
+        for prompt_id in cleared_ids {
+            self.acp_event_store
+                .delete_pending_attachments_for_ref(id, &prompt_id);
+        }
     }
 
     /// Snapshot the session's queue, ordered by `seq`.
@@ -970,23 +989,51 @@ impl SessionService {
         // Leading batch up to a clear boundary (mirrors the client's split).
         let profile = crate::acp::agent_profiles::resolve(&agent_key);
         let (sub, combined) = queue_drain_batch(&queue, profile);
-        let sent_ids: std::collections::HashSet<String> =
-            sub.iter().map(|e| e.id.clone()).collect();
-        if combined.trim().is_empty() {
+        let sent_ids: Vec<String> = sub.iter().map(|e| e.id.clone()).collect();
+        // Reload every buffered attachment blob for the batch, in queue order,
+        // so a queued screenshot/file is forwarded with the text (matches the
+        // client's old `snapshot.flatMap(q => q.attachments)`). Bytes live in
+        // the pending-attachment store keyed by prompt id; a locking SQLite
+        // read, so do it off the runtime.
+        let attachments: Vec<crate::acp::event_store::AttachmentBlob> = {
+            let store = Arc::clone(&self.acp_event_store);
+            let session_id = id.to_string();
+            let batch_ids = sent_ids.clone();
+            tokio::task::spawn_blocking(move || {
+                batch_ids
+                    .iter()
+                    .flat_map(|pid| store.load_pending_attachments_for_ref(&session_id, pid))
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default()
+        };
+        // An attachment-only batch has empty combined text but real blobs; only
+        // a batch with neither is a no-op.
+        if combined.trim().is_empty() && attachments.is_empty() {
             return;
         }
 
-        // Deliver as a fresh turn on the live worker (attachments follow in a
-        // later increment). On failure leave the rows queued; the next tick
-        // retries once the worker settles.
-        if let Err(e) = self.send_turn(&caller, id, &combined, &[], false).await {
+        // Deliver as a fresh turn on the live worker. `send_turn` re-records the
+        // blobs under the real `UserPromptSent` seq. On failure leave the rows
+        // (and their buffered blobs) queued; the next tick retries.
+        if let Err(e) = self
+            .send_turn(&caller, id, &combined, &attachments, false)
+            .await
+        {
             tracing::warn!(target: "acp.queue", session = %id, "queue drain delivery failed; will retry: {e}");
             return;
         }
         // Retire only the delivered rows; prompts enqueued during the send
-        // survive into the next drain.
+        // survive into the next drain. Drop their buffered blobs now that they
+        // are re-recorded under the prompt event's seq.
+        for pid in &sent_ids {
+            self.acp_event_store
+                .delete_pending_attachments_for_ref(id, pid);
+        }
+        let retire: std::collections::HashSet<String> = sent_ids.into_iter().collect();
         self.mutate_instance_persisted(id, move |inst| {
-            inst.queued_prompts.retain(|q| !sent_ids.contains(&q.id));
+            inst.queued_prompts.retain(|q| !retire.contains(&q.id));
         })
         .await;
     }

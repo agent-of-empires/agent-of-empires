@@ -595,6 +595,18 @@ impl PromptAttachmentKind {
             PromptAttachmentKind::Resource => "resource",
         }
     }
+
+    /// Parse the lowercase tag written by [`as_str`], for reading the kind
+    /// back out of the attachment store's TEXT column. `None` on an unknown
+    /// tag (a corrupt or forward-version row), so the caller can skip it.
+    pub fn from_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "image" => Some(PromptAttachmentKind::Image),
+            "audio" => Some(PromptAttachmentKind::Audio),
+            "resource" => Some(PromptAttachmentKind::Resource),
+            _ => None,
+        }
+    }
 }
 
 /// Replay-side view of one prompt attachment. Carries metadata only,
@@ -622,9 +634,11 @@ pub struct PromptAttachmentRef {
 /// `docs/development/server-side-prompt-queue.md`.
 ///
 /// Attachments carry metadata only, exactly like [`PromptAttachmentRef`]
-/// on a live prompt: the bytes live in the `acp_attachments` store keyed by
-/// `(session_id, id)` and are reloaded at drain time, so a queued
-/// screenshot does not bloat the session file.
+/// on a live prompt: the bytes live in the event store's pending-attachment
+/// table keyed by `(session_id, prompt_id, attachment_id)` (outside the
+/// seq-keyed retention prune, since a queued prompt has no event seq yet) and
+/// are reloaded at drain time, so a queued screenshot does not bloat the
+/// session file.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct QueuedPromptEntry {
     /// Client-minted stable id, unchanged across edits. Doubles as the
