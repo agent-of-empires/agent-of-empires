@@ -38,6 +38,7 @@ use tracing::{debug, warn};
 
 use super::discovery::DaemonEndpoint;
 use crate::acp::protocol::AcpBroadcastFrame;
+use crate::acp::state::AcpState;
 use crate::acp::transcript::{TranscriptDelta, TranscriptRow};
 
 #[derive(Debug, Error)]
@@ -58,11 +59,14 @@ pub enum WsError {
 /// One message off the structured view WebSocket.
 #[derive(Debug, Clone)]
 pub enum WsMessage {
-    /// A normal structured view event frame. Still the source of truth for
-    /// CONTROL state (turn/approvals/usage/modes), which every client folds
-    /// from the raw events; the transcript ROWS come from the two variants
-    /// below instead.
+    /// A normal structured view event frame. Consumed by `aoe acp tail`,
+    /// which dumps the raw stream; the structured view reads the two folded
+    /// projections below instead (control state and transcript rows).
     Frame(Arc<AcpBroadcastFrame>),
+    /// The server-folded CONTROL state (turn flags, approvals, elicitations,
+    /// usage, modes, commands, plan), sent on connect and after every event.
+    /// Boxed because `AcpState` dwarfs the other variants. Tier 1.3.
+    ReducedState { seq: u64, state: Box<AcpState> },
     /// Daemon's in-memory ring evicted events the client missed.
     /// Consumer should drop local reducer state and call
     /// `HttpClient::replay(since=last_seq)` to rehydrate.
@@ -236,6 +240,11 @@ fn parse_text(raw: &str) -> Result<Option<WsMessage>, WsError> {
     struct TranscriptDeltaFrame {
         delta: TranscriptDelta,
     }
+    #[derive(serde::Deserialize)]
+    struct ReducedStateFrame {
+        seq: u64,
+        state: AcpState,
+    }
     if let Ok(probe) = serde_json::from_str::<KindProbe>(raw) {
         match probe.kind {
             Some("lagged") => return Ok(Some(WsMessage::Lagged)),
@@ -255,12 +264,16 @@ fn parse_text(raw: &str) -> Result<Option<WsMessage>, WsError> {
                     serde_json::from_str(raw).map_err(|e| WsError::Parse(e.to_string()))?;
                 return Ok(Some(WsMessage::TranscriptDelta(Box::new(frame.delta))));
             }
-            // Server-folded CONTROL-state snapshot (Tier 1.3). The native
-            // view still folds control state from the raw frames above, so
-            // this projection is ignored rather than parsed. Dropping it
-            // here keeps an unconsumed sentinel from reading as a dead
-            // socket. See #2287.
-            Some("reduced_state") => return Ok(None),
+            // Server-folded control state (Tier 1.3), sent on connect and
+            // after every event.
+            Some("reduced_state") => {
+                let frame: ReducedStateFrame =
+                    serde_json::from_str(raw).map_err(|e| WsError::Parse(e.to_string()))?;
+                return Ok(Some(WsMessage::ReducedState {
+                    seq: frame.seq,
+                    state: Box::new(frame.state),
+                }));
+            }
             _ => {}
         }
     }
@@ -468,18 +481,40 @@ mod tests {
     }
 
     #[test]
-    fn parse_text_ignores_reduced_state_sentinel() {
-        // The native view folds control state from raw frames, so the
-        // server's reduced_state projection is dropped rather than surfacing
-        // as a parse error (which the consumer would treat as a dead socket).
+    fn parse_text_reads_the_reduced_state_frame() {
+        // The whole control state rides on this frame, and the fields the
+        // sender omits must default rather than fail the parse: a parse error
+        // reads as a dead socket to the consumer.
         let raw = serde_json::json!({
             "kind": "reduced_state",
             "session_id": "s-1",
-            "seq": 1,
-            "state": {},
+            "seq": 7,
+            "state": {
+                "session_id": "s-1",
+                "agent": "claude",
+                "model": null,
+                "mode": "Default",
+                "current_plan": null,
+                "todos": [],
+                "in_flight_tool": null,
+                "pending_approvals": [],
+                "recent_diffs": [],
+                "thinking": null,
+                "rate_limit": null,
+                "turn_active": true,
+                "last_seq": 7,
+                "updated_at": "2026-08-16T00:00:00Z",
+            },
         })
         .to_string();
-        assert!(matches!(parse_text(&raw), Ok(None)));
+        match parse_text(&raw) {
+            Ok(Some(WsMessage::ReducedState { seq, state })) => {
+                assert_eq!(seq, 7);
+                assert!(state.turn_active);
+                assert!(state.available_modes.is_empty(), "absent field defaults");
+            }
+            other => panic!("expected reduced state, got {other:?}"),
+        }
     }
 
     #[test]

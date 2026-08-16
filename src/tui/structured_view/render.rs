@@ -984,7 +984,7 @@ fn render_status(
             Style::default().fg(theme.running),
         ));
     }
-    if state.transcript.context_primer_pending {
+    if state.transcript.context_primer_pending() {
         spans.push(Span::styled(
             " context lost; next prompt re-primes ",
             Style::default().fg(theme.error),

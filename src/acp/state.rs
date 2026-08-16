@@ -464,6 +464,18 @@ pub struct AcpState {
     /// commands instead of a hard-coded placeholder list.
     #[serde(default)]
     pub available_commands: Vec<AvailableCommand>,
+    /// Permission modes the agent advertised in its most recent
+    /// `ModesAvailable`. Empty until the agent announces any. Distinct from
+    /// `mode`, which is the coarse AoE-side permission posture: these are the
+    /// adapter's own modes, keyed by the id `session/set_mode` takes back.
+    /// Drives the TUI mode picker and the web mode pills. See #1403.
+    #[serde(default)]
+    pub available_modes: Vec<ModeInfo>,
+    /// Id of the currently selected entry in `available_modes`, from
+    /// `ModesAvailable` / `CurrentModeChanged`. None until the agent
+    /// announces one, and cleared with the mode list.
+    #[serde(default)]
+    pub current_mode_id: Option<String>,
     /// Most recent `AgentSwitched` snapshot. Used by the UI to render a
     /// transcript divider (e.g. "Switched claude -> codex due to
     /// rate_limit") and by the post-switch context-primer fetch. None
@@ -545,6 +557,8 @@ impl AcpState {
             rate_limit: None,
             usage: None,
             available_commands: Vec::new(),
+            available_modes: Vec::new(),
+            current_mode_id: None,
             last_agent_switch: None,
             startup_error: None,
             config_options: Vec::new(),
@@ -1298,12 +1312,19 @@ impl AcpState {
             Event::RateLimitAutoResumed { .. } => self.rate_limit = None,
             Event::UsageUpdated { usage } => self.usage = Some(usage),
             Event::ModeChanged { mode } => self.mode = mode,
-            // ModesAvailable + CurrentModeChanged carry the real ACP-
-            // advertised modes. The structured view's persistent state doesn't
-            // track them yet (the UI stores them in the broadcast
-            // replay), so this is just a no-op that bumps seq.
-            Event::ModesAvailable { .. } => {}
-            Event::CurrentModeChanged { .. } => {}
+            // The real ACP-advertised modes, reduced here so a client renders
+            // the picker from this state instead of re-folding the broadcast
+            // replay (Tier 1.2 / 1.3).
+            Event::ModesAvailable {
+                current_mode_id,
+                modes,
+            } => {
+                self.available_modes = modes;
+                self.current_mode_id = Some(current_mode_id);
+            }
+            Event::CurrentModeChanged { current_mode_id } => {
+                self.current_mode_id = Some(current_mode_id);
+            }
             Event::ModeSwitchFailed { .. } => {}
             Event::AvailableCommandsUpdated { commands } => {
                 self.available_commands = commands;
@@ -1422,6 +1443,9 @@ impl AcpState {
                 self.mode = SessionMode::Default;
                 self.pending_approvals = Vec::new();
                 self.pending_elicitations = Vec::new();
+                // The mode list is an adapter capability and outlives /clear,
+                // but the selection is session-scoped, so only the id drops.
+                self.current_mode_id = None;
             }
             // Transient UI phase: the clients latch it to relabel the
             // spinner and park follow-up prompts. No durable server-side
@@ -1480,6 +1504,11 @@ impl AcpState {
                 self.pending_elicitations = Vec::new();
                 self.usage = None;
                 self.available_commands = Vec::new();
+                // Modes are adapter-scoped like commands: the new backend
+                // advertises its own set, so the old one must not linger in
+                // the picker until it does.
+                self.available_modes = Vec::new();
+                self.current_mode_id = None;
                 self.current_plan = None;
                 self.mode = SessionMode::Default;
                 // Per-adapter selectors (model, effort, etc.) belong
@@ -2019,6 +2048,47 @@ mod tests {
         assert_eq!(s.available_commands.len(), 2);
         assert_eq!(s.available_commands[0].name, "review");
         assert!(s.available_commands[0].accepts_input);
+    }
+
+    #[test]
+    fn advertised_modes_reduce_and_follow_their_adapter_scope() {
+        let mode = |id: &str| ModeInfo {
+            id: id.into(),
+            name: id.to_uppercase(),
+            description: None,
+        };
+        let mut s = fresh_state();
+        assert!(s.available_modes.is_empty() && s.current_mode_id.is_none());
+
+        s.apply_event(Event::ModesAvailable {
+            current_mode_id: "default".into(),
+            modes: vec![mode("default"), mode("plan")],
+        })
+        .unwrap();
+        assert_eq!(s.available_modes.len(), 2);
+        assert_eq!(s.current_mode_id.as_deref(), Some("default"));
+
+        s.apply_event(Event::CurrentModeChanged {
+            current_mode_id: "plan".into(),
+        })
+        .unwrap();
+        assert_eq!(s.current_mode_id.as_deref(), Some("plan"));
+        assert_eq!(s.available_modes.len(), 2, "list survives a selection");
+
+        // /clear forgets the selection; the adapter still supports the modes.
+        s.apply_event(Event::SessionCleared).unwrap();
+        assert_eq!(s.current_mode_id, None);
+        assert_eq!(s.available_modes.len(), 2);
+
+        // A backend switch invalidates both: the new adapter advertises its own.
+        s.apply_event(Event::AgentSwitched {
+            from: "claude".into(),
+            to: "codex".into(),
+            reason: "rate_limit".into(),
+        })
+        .unwrap();
+        assert!(s.available_modes.is_empty());
+        assert_eq!(s.current_mode_id, None);
     }
 
     fn sample_config_options() -> Vec<ConfigOptionDescriptor> {

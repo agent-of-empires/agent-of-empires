@@ -265,10 +265,6 @@ pub(crate) struct ViewSideInfo {
 async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSetup> {
     let http = HttpClient::new(endpoint.clone()).context("build structured view HTTP client")?;
 
-    // Hydrate the transcript via /replay before opening the WebSocket
-    // so the user sees the historical conversation immediately instead
-    // of a blank pane until live frames start arriving.
-    let initial = http.replay_paged(session_id, 0, REPLAY_PAGE_SIZE).await;
     let ws_result = ws_connect(&endpoint, session_id, 0).await;
 
     let (ws, ws_err) = match ws_result {
@@ -315,34 +311,19 @@ async fn setup_view(endpoint: DaemonEndpoint, session_id: &str) -> Result<ViewSe
         });
     }
 
-    // Capture both startup-path errors before showing a toast so we
-    // can fold them into a single message when both fail (they
-    // usually share a root cause, e.g. 401 from the auth middleware).
-    let replay_err = match initial {
-        Ok(replay) => {
-            if replay.lost {
-                state.transcript.set_lagged();
-            }
-            for frame in &replay.frames {
-                state.transcript.apply(frame);
-            }
-            // `reconcile_selection` also focus-grabs a pending approval
-            // (modal). A pending elicitation is auto-presented by the
-            // caller, which owns the toast deadline its menu needs.
-            state.reconcile_selection();
-            state.reconcile_slash_selection();
-            None
-        }
-        Err(e) => {
-            tracing::warn!(target: "acp.tui", "initial replay failed: {e}");
-            Some(e.to_string())
-        }
-    };
-
     // Seed the server-owned transcript rows via `?view=rows` so the activity
-    // stream paints immediately, before the WS connect snapshot lands. The WS
-    // transcript_snapshot reconciles by id, so the overlap is a no-op.
-    reseed_server_rows(&mut state).await;
+    // stream paints the historical conversation instead of a blank pane. The
+    // WS transcript_snapshot reconciles by id, so the overlap is a no-op.
+    // Control state needs no seed of its own: the socket opens with a
+    // `reduced_state` snapshot. Capture the error rather than toasting here,
+    // so a shared root cause (e.g. a 401 from the auth middleware) folds into
+    // one message with the WS error below.
+    let replay_err = reseed_server_rows(&mut state).await;
+    // `reconcile_selection` also focus-grabs a pending approval (modal). A
+    // pending elicitation is auto-presented by the caller, which owns the
+    // toast deadline its menu needs.
+    state.reconcile_selection();
+    state.reconcile_slash_selection();
 
     let ws_err_text = ws_err.map(|e| {
         tracing::warn!(target: "acp.tui.ws", "initial ws connect failed: {e}");
@@ -538,9 +519,16 @@ async fn apply_ws_message(
     msg: Result<WsMessage, WsError>,
 ) {
     match msg {
-        Ok(WsMessage::Frame(frame)) => {
+        // Raw frames still stream (they feed `aoe acp tail`), but the view
+        // renders the two server-folded projections instead: this one for
+        // control state, the transcript channel below for the rows.
+        Ok(WsMessage::Frame(_)) => {}
+        Ok(WsMessage::ReducedState {
+            seq,
+            state: reduced,
+        }) => {
             let was_active = state.transcript.turn_active;
-            state.transcript.apply(&frame);
+            state.transcript.apply_reduced_state(seq, *reduced);
             state.reconcile_selection();
             auto_present_elicitation(state, toast_deadline);
             state.reconcile_slash_selection();
@@ -569,43 +557,27 @@ async fn apply_ws_message(
             state.transcript.apply_transcript_delta(*delta);
         }
         Ok(WsMessage::Lagged) => {
-            // Daemon evicted events we hadn't seen yet. Drop
-            // local reducer state and rehydrate from /replay.
-            state.transcript.reset();
-            match state
-                .http
-                .replay_paged(&state.session_id, 0, REPLAY_PAGE_SIZE)
-                .await
-            {
-                Ok(replay) => {
-                    if replay.lost {
-                        state.transcript.set_lagged();
-                    }
-                    for frame in &replay.frames {
-                        state.transcript.apply(frame);
-                    }
-                    state.reconcile_selection();
-                    auto_present_elicitation(state, toast_deadline);
-                    state.reconcile_slash_selection();
-                    // Re-derived turn state from the rebuilt
-                    // transcript; the lock no longer reflects
-                    // anything observable. Resync the queue mirror too.
-                    state.in_flight = false;
-                    refresh_queue(state).await;
-                }
-                Err(e) => {
-                    set_toast(
-                        state,
-                        toast_deadline,
-                        format!("replay failed: {e}"),
-                        ToastKind::Error,
-                    );
-                }
+            // The daemon evicted events we never saw. Control state rides
+            // through it: every `reduced_state` frame is a whole-state
+            // snapshot, so the gap costs nothing and the next one is
+            // authoritative. Only the row buffer needs rebuilding, and no
+            // reconnect happens on a lag, so nothing else will resend it.
+            state.transcript.drop_rows();
+            if let Some(e) = reseed_server_rows(state).await {
+                set_toast(
+                    state,
+                    toast_deadline,
+                    format!("replay failed: {e}"),
+                    ToastKind::Error,
+                );
             }
-            // Reseed the server-owned rows too: no reconnect happens on a
-            // lag, so there is no fresh transcript_snapshot coming. The
-            // `?view=rows` replay rebuilds the buffer that `reset()` cleared.
-            reseed_server_rows(state).await;
+            state.reconcile_selection();
+            auto_present_elicitation(state, toast_deadline);
+            state.reconcile_slash_selection();
+            // The optimistic lock no longer reflects anything observable.
+            // Resync the queue mirror too.
+            state.in_flight = false;
+            refresh_queue(state).await;
         }
         Err(e) => {
             // WS dropped; show a banner and try to reconnect
@@ -1724,8 +1696,8 @@ async fn clear_queue(state: &mut StructuredViewState, toast_deadline: &mut Optio
 /// them into the row buffer. Used on open and after a lag (a lag does not
 /// reconnect the socket, so no fresh `transcript_snapshot` arrives).
 /// Best-effort: a transient failure leaves the buffer for the WS snapshot or
-/// the next reseed to fill.
-async fn reseed_server_rows(state: &mut StructuredViewState) {
+/// the next reseed to fill, and is returned so the caller can surface it.
+async fn reseed_server_rows(state: &mut StructuredViewState) -> Option<String> {
     match state
         .http
         .replay_rows_paged(&state.session_id, 0, REPLAY_PAGE_SIZE)
@@ -1736,12 +1708,14 @@ async fn reseed_server_rows(state: &mut StructuredViewState) {
                 state.transcript.set_lagged();
             }
             state.transcript.merge_server_rows(rows);
+            None
         }
         Err(e) => {
             tracing::warn!(
                 target: "acp.tui",
                 "transcript rows replay failed; waiting for the WS snapshot: {e}"
             );
+            Some(e.to_string())
         }
     }
 }

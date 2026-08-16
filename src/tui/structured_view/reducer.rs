@@ -1,5 +1,6 @@
-//! Control-state reducer over `AcpBroadcastFrame` plus a server-fed
-//! transcript row buffer, for the native TUI structured view.
+//! Server-fed view state for the native TUI structured view: the daemon's
+//! folded control state plus its ordered transcript rows. Nothing here
+//! reduces the raw event stream any more.
 //!
 //! Since Tier 4 the ORDERED TRANSCRIPT (assistant messages, tool cards,
 //! dividers, elicitation answers) is owned by the daemon: it folds the
@@ -11,27 +12,27 @@
 //! TUI's text presentation. The web reducer (`web/src/hooks/useAcpSession.ts`)
 //! is the authoritative reference for this split.
 //!
-//! What still lives here is CONTROL state: whether a turn is active, the
-//! pending approvals / elicitations, usage, mode, available commands, the
-//! plan snapshot, and the compaction / cancel phases. Server-owned control
-//! state (`reduced_state`, Tier 1.3) is not consumed yet, so the raw frames
-//! are still folded for it. Notes:
+//! CONTROL state (turn flags, pending approvals / elicitations, usage, mode,
+//! available commands, the plan snapshot, the compaction / cancel phases)
+//! arrives the same way since Tier 1.3: the daemon folds `AcpState` once and
+//! pushes it as a `reduced_state` frame, which
+//! [`AcpTranscript::apply_reduced_state`] adopts wholesale. Notes:
 //!
 //! - Approvals are pure control state (`pending_approvals`), rendered as the
 //!   modal approval shelf, not interleaved into the transcript. This matches
 //!   the migrated web, whose `ActivityRow` union carries no approval kind:
 //!   the tool card the approval gates already sits in `server_rows`.
-//! - `AvailableCommandsUpdated` is retained for the composer's slash picker.
-//! - `SessionContextReset` flips `context_primer_pending` so the view layer
-//!   can offer the "paste a context primer" affordance.
+//! - The two `resolve_*_locally` helpers are the only optimism left: they hide
+//!   a card the user just answered until the server's list catches up.
+//! - The "context lost, re-prime?" banner is derived from the rows rather than
+//!   latched from an event. See [`AcpTranscript::context_primer_pending`].
 
 use crate::acp::elicitations::ElicitationQuestion;
-use crate::acp::protocol::AcpBroadcastFrame;
 use crate::acp::state::{
-    AvailableCommand, DiffPreview, Event, ModeInfo, PlanStepStatus, SessionUsage,
+    AcpState, AvailableCommand, DiffPreview, ModeInfo, PlanStepStatus, SessionUsage,
 };
 use crate::acp::transcript::{
-    patch_transcript_row, upsert_transcript_row, TranscriptDelta, TranscriptRow,
+    patch_transcript_row, upsert_transcript_row, TranscriptDelta, TranscriptRow, TranscriptRowKind,
 };
 
 #[derive(Debug, Clone)]
@@ -53,10 +54,11 @@ pub struct AcpTranscript {
     /// lets the user skip/cancel so the agent's turn never hangs. See the
     /// `ElicitationRequested` arm.
     pub pending_elicitations: Vec<PendingElicitation>,
-    /// Live status banner (e.g. "thinking…", "ended: completed").
+    /// Live status banner ("thinking…" / "compacting…"), shown only while a
+    /// turn runs. Derived from the server's phase in `apply_reduced_state`.
     pub status_text: Option<String>,
-    /// Latest mode id the agent reported. `None` until the agent
-    /// emits `ModesAvailable` / `CurrentModeChanged`.
+    /// Id of the agent's currently selected mode. `None` until the agent
+    /// advertises one.
     pub current_mode: Option<String>,
     /// Permission modes the agent advertised (`ModesAvailable`). Drives
     /// the `m` mode picker; empty when the agent never announced any.
@@ -64,38 +66,29 @@ pub struct AcpTranscript {
     /// Slash commands the agent has advertised. Drives the composer's
     /// `/` picker (followup #1018).
     pub available_commands: Vec<AvailableCommand>,
-    /// Set after a `SessionContextReset`; the view layer drops a
-    /// "context lost, re-prime?" banner until the user dismisses it
-    /// or sends the next prompt.
-    pub context_primer_pending: bool,
-    /// Whether the agent is mid-turn, derived purely from daemon events:
-    /// true on `UserPromptSent` / `ThinkingStarted`, false on `Stopped`
-    /// / `AgentStartupError` / `PromptRejected`. Server truth (mirrors
-    /// the web reducer's `turnActive`), so it lives here and is rebuilt
-    /// by `/replay` after a `reset()`. The composer reads it to decide
-    /// whether Enter sends now or parks the prompt in the local queue.
+    /// Nonces of approvals / elicitations the user resolved here, held until
+    /// the daemon's own pending list stops carrying them. See
+    /// [`Self::apply_reduced_state`].
+    locally_resolved: Vec<String>,
+    /// Whether the agent is mid-turn. The composer reads it to decide whether
+    /// Enter sends now or parks the prompt in the daemon's queue.
     pub turn_active: bool,
-    /// Whether the agent accepts `_session/steering`, from the latest
-    /// `PromptCapabilities`. When true the composer sends a mid-turn
-    /// prompt straight through instead of parking it: the daemon injects
-    /// it into the running turn. Rebuilt by `/replay` like `turn_active`,
-    /// and re-emitted as `false` on a respawn onto an adapter that lacks
-    /// the capability, so it cannot go stale. See #2805.
+    /// Whether the agent accepts `_session/steering`. When true the composer
+    /// sends a mid-turn prompt straight through instead of parking it: the
+    /// daemon injects it into the running turn. Re-derived as `false` on a
+    /// respawn onto an adapter that lacks the capability, so it cannot go
+    /// stale. See #2805.
     pub steering: bool,
-    /// Whether a `/compact` cycle is running, from
-    /// `ConversationCompactionStarted` until the matching
-    /// `ConversationCompacted` or the turn's `Stopped`. The adapter goes
-    /// silent for 90 to 170 seconds in that window, so the composer must
-    /// park a send instead of steering it: a summarization turn has
-    /// nothing to steer and never answers the injected message. Rebuilt
-    /// by `/replay` like `turn_active`. See #3219.
+    /// Whether a `/compact` cycle is running. The adapter goes silent for 90
+    /// to 170 seconds in that window, so the composer must park a send rather
+    /// than steer it: a summarization turn has nothing to steer and never
+    /// answers the injected message. See #3219.
     pub compacting: bool,
-    /// Whether a `session/cancel` is in flight, from `CancelRequested`
-    /// until the turn's `Stopped`. Only consulted by the composer's park
-    /// decision: the daemon reads a prompt arriving mid-cancel as a
-    /// wedged agent and escalates to a runner restart, so a steerable
-    /// agent must still park here rather than route Stop-then-type into
-    /// that path. See #2805 / #1727.
+    /// Whether a `session/cancel` is in flight. Only consulted by the
+    /// composer's park decision: the daemon reads a prompt arriving mid-cancel
+    /// as a wedged agent and escalates to a runner restart, so a steerable
+    /// agent must still park here rather than route Stop-then-type into that
+    /// path. See #2805 / #1727.
     pub cancelling: bool,
     /// Latest context-window usage / cost snapshot the agent reported.
     /// Rendered as a token meter in the status line, mirroring the web
@@ -105,11 +98,11 @@ pub struct AcpTranscript {
     /// repeated progress updates render as one sticky summary instead of a
     /// growing stack of near-identical checklists.
     pub current_plan: Vec<PlanLine>,
-    /// Set when the WS layer reports `{"kind":"lagged"}`; the view
-    /// layer should clear and rehydrate via HTTP /replay.
+    /// Set when the WS layer reports `{"kind":"lagged"}`; the view layer
+    /// rebuilds the rows via `?view=rows`. See [`Self::drop_rows`].
     pub lagged: bool,
-    /// Highest seq the reducer has consumed. Used as the `since`
-    /// cursor for reconnect.
+    /// Highest seq applied from a `reduced_state` frame. Used as the `since`
+    /// cursor for reconnect and to drop stale frames.
     pub last_seq: u64,
 }
 
@@ -181,19 +174,6 @@ pub enum NoteKind {
 }
 
 impl AcpTranscript {
-    /// Whether an arriving user prompt is a message steered into the turn
-    /// already running rather than the start of a new one (#2805).
-    ///
-    /// The daemon injects a mid-turn prompt via `_session/steering`
-    /// instead of starting a turn for it, so the same condition the
-    /// composer used to send it identifies it on the way back. Such a
-    /// prompt must not run the fresh-turn bookkeeping: no new turn began,
-    /// and the running turn's `Stopped` still owns the state it built up.
-    /// Call before mutating `turn_active`.
-    fn is_steered_continuation(&self) -> bool {
-        self.turn_active && self.steering
-    }
-
     pub fn new(session_id: impl Into<String>) -> Self {
         Self {
             session_id: session_id.into(),
@@ -206,7 +186,7 @@ impl AcpTranscript {
             current_mode: None,
             available_modes: Vec::new(),
             available_commands: Vec::new(),
-            context_primer_pending: false,
+            locally_resolved: Vec::new(),
             steering: false,
             cancelling: false,
             compacting: false,
@@ -240,16 +220,12 @@ impl AcpTranscript {
         }
     }
 
-    /// Drop all accumulated state and start over. Used when the
-    /// daemon signals `lagged` on the WebSocket and we need to
-    /// rehydrate via HTTP /replay.
-    pub fn reset(&mut self) {
-        let session_id = std::mem::take(&mut self.session_id);
-        let session_title = self.session_title.take();
-        let agent_name = self.agent_name.take();
-        *self = Self::new(session_id);
-        self.session_title = session_title;
-        self.agent_name = agent_name;
+    /// Drop the transcript rows ahead of a `?view=rows` rebuild, used when the
+    /// daemon signals `lagged` and rows we never saw may have been evicted.
+    /// Control state is deliberately untouched: it arrives as a whole-state
+    /// snapshot, so a gap in the event stream cannot make it stale.
+    pub fn drop_rows(&mut self) {
+        self.server_rows.clear();
     }
 
     /// Optimistically clear an approval card by nonce after the resolve
@@ -259,12 +235,14 @@ impl AcpTranscript {
     /// `ApprovalResolved` event arm. See #1821.
     pub fn resolve_approval_locally(&mut self, nonce: &str) {
         self.pending_approvals.retain(|p| p.nonce != nonce);
+        self.locally_resolved.push(nonce.to_string());
     }
 
     /// Optimistically clear a pending elicitation after the skip/cancel
     /// POST succeeded (or 404'd), mirroring `resolve_approval_locally`.
     pub fn resolve_elicitation_locally(&mut self, nonce: &str) {
         self.pending_elicitations.retain(|p| p.nonce != nonce);
+        self.locally_resolved.push(nonce.to_string());
     }
 
     /// Mark `lagged = true`. The view layer notices this (the status line
@@ -274,238 +252,129 @@ impl AcpTranscript {
         self.lagged = true;
     }
 
-    /// Apply one broadcast frame.
-    pub fn apply(&mut self, frame: &AcpBroadcastFrame) {
-        if frame.seq <= self.last_seq && self.last_seq > 0 {
-            // Already consumed; dedupe against the replay-vs-live
-            // overlap. The web reducer does the same. Log at debug
-            // so an unexpected drop (e.g. true reordering) leaves a
-            // trail without spamming on every normal overlap.
+    /// Adopt the daemon's folded control state, carried by a WS
+    /// `reduced_state` frame on connect and after every event. This is the
+    /// whole control reduction now: nothing here folds raw events, so the
+    /// native view and the web render the same server-derived truth.
+    ///
+    /// A frame older than the last one applied is dropped, so a snapshot that
+    /// races live deltas cannot rewind the view.
+    pub fn apply_reduced_state(&mut self, seq: u64, state: AcpState) {
+        if seq < self.last_seq {
             tracing::debug!(
                 target: "acp.tui.reducer",
                 session = %self.session_id,
-                seq = frame.seq,
+                seq,
                 last_seq = self.last_seq,
-                "dropped duplicate or out-of-order frame"
+                "dropped stale reduced_state frame"
             );
             return;
         }
-        self.last_seq = frame.seq;
-        self.apply_event(&frame.event);
+        self.last_seq = seq;
+
+        self.agent_name = Some(state.agent.0);
+        self.turn_active = state.turn_active;
+        self.steering = state.steering;
+        self.cancelling = state.cancelling;
+        self.compacting = state.compacting;
+        self.usage = state.usage;
+        self.available_commands = state.available_commands;
+        self.available_modes = state.available_modes;
+        self.current_mode = state.current_mode_id;
+        self.current_plan = state
+            .current_plan
+            .map(|plan| {
+                plan.steps
+                    .into_iter()
+                    .map(|s| PlanLine {
+                        title: s.title,
+                        status: s.status,
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // The status banner only renders while a turn is running, so the
+        // phases that end one (stopped, startup / prompt errors) never reach
+        // the screen. Compaction outranks thinking: the adapter goes silent
+        // for 90 to 170 seconds there and the user needs to know why.
+        self.status_text = if state.compacting {
+            Some("compacting…".to_string())
+        } else if state.thinking.is_some() {
+            Some("thinking…".to_string())
+        } else {
+            None
+        };
+
+        // A locally-resolved card stays hidden until the daemon's own list
+        // agrees. The shelf clears on the resolve POST's 204/404 rather than
+        // waiting for the broadcast (#1821), and without this filter the very
+        // next event's reduced state would paint the card straight back.
+        let still_pending: Vec<&str> = state
+            .pending_approvals
+            .iter()
+            .map(|a| a.nonce.0.as_str())
+            .chain(
+                state
+                    .pending_elicitations
+                    .iter()
+                    .map(|e| e.nonce.0.as_str()),
+            )
+            .collect();
+        self.locally_resolved
+            .retain(|n| still_pending.contains(&n.as_str()));
+
+        self.pending_approvals = state
+            .pending_approvals
+            .into_iter()
+            .filter(|a| !self.locally_resolved.contains(&a.nonce.0))
+            .map(|a| PendingApproval {
+                nonce: a.nonce.0,
+                title: a.tool_call.name,
+                kind: a.tool_call.kind,
+                args: a.tool_call.args_preview,
+                destructive: a.destructive,
+            })
+            .collect();
+        self.pending_elicitations = state
+            .pending_elicitations
+            .into_iter()
+            .filter(|e| !self.locally_resolved.contains(&e.nonce.0))
+            .map(|e| PendingElicitation {
+                nonce: e.nonce.0,
+                message: e.message,
+                questions: e.questions,
+            })
+            .collect();
     }
 
-    /// Fold one event into CONTROL state only. The ordered transcript is
-    /// server-owned since Tier 4, so every arm that used to build an
-    /// `ActivityRow` (assistant messages, tool cards, dividers, elicitation
-    /// answers) is gone; what remains is turn / approval / elicitation /
-    /// usage / mode / plan / phase state. Events that carry no control state
-    /// (message chunks, the tool lifecycle, notices, summaries) are no-ops
-    /// here: their rows arrive over the transcript channel.
-    fn apply_event(&mut self, event: &Event) {
-        match event {
-            Event::UserPromptSent { .. } | Event::UserDiffCommentsPrompt { .. } => {
-                // Sending a prompt dismisses any context-primer hint and opens
-                // the turn. A steered mid-turn prompt is not a fresh turn, so
-                // it must not clear the running turn's pending cancel; a genuine
-                // fresh turn supersedes a stale one (#1727 / #2805). Web routes
-                // both prompt kinds through the same `applyNewTurnResets`.
-                self.context_primer_pending = false;
-                let steered = self.is_steered_continuation();
-                self.turn_active = true;
-                if !steered {
-                    self.cancelling = false;
-                }
-            }
-            Event::ThinkingStarted => {
-                self.status_text = Some("thinking…".to_string());
-                // Deliberately does NOT clear `cancelling`, even though it
-                // sets `turn_active`. This fires repeatedly *within* a
-                // running turn, so clearing here would drop the pending
-                // cancel the moment the agent emits its next thought,
-                // which is exactly when a user is waiting on a stop.
-                self.turn_active = true;
-            }
-            Event::ThinkingEnded => {
-                if self.status_text.as_deref() == Some("thinking…") {
-                    self.status_text = None;
-                }
-            }
-            Event::ApprovalRequested { approval } => {
-                // Approvals are pure control state: the shelf renders from
-                // this list, and the gated tool card is already a server row.
-                self.pending_approvals.push(PendingApproval {
-                    nonce: approval.nonce.0.clone(),
-                    title: approval.tool_call.name.clone(),
-                    kind: approval.tool_call.kind.clone(),
-                    args: approval.tool_call.args_preview.clone(),
-                    destructive: approval.destructive,
-                });
-            }
-            Event::ApprovalResolved { nonce, .. } => {
-                self.pending_approvals.retain(|p| p.nonce != nonce.0);
-            }
-            Event::ElicitationRequested { elicitation } => {
-                self.pending_elicitations.push(PendingElicitation {
-                    nonce: elicitation.nonce.0.clone(),
-                    message: elicitation.message.clone(),
-                    questions: elicitation.questions.clone(),
-                });
-            }
-            Event::ElicitationResolved { nonce, .. } => {
-                // The server transcript emits the `elicitation_answered` row;
-                // here we only clear the pending card. Idempotent on a
-                // re-broadcast (cancel-on-teardown racing a POST).
-                self.pending_elicitations.retain(|p| p.nonce != nonce.0);
-            }
-            Event::PlanUpdated { plan } => {
-                self.current_plan = plan
-                    .steps
-                    .iter()
-                    .map(|s| PlanLine {
-                        title: s.title.clone(),
-                        status: s.status.clone(),
-                    })
-                    .collect();
-            }
-            Event::Stopped { reason } => {
-                self.status_text = Some(format!("stopped: {reason}"));
-                self.turn_active = false;
-                self.cancelling = false;
-                // The turn is over however it ended, so any compaction it
-                // was running is over too. This is the self-healing clear:
-                // a dropped completion marker, a killed worker, or a user
-                // cancel all arrive here. See #3219.
-                self.compacting = false;
-            }
-            Event::AgentStartupError { .. } => {
-                self.status_text = Some("startup error".to_string());
-                self.turn_active = false;
-                self.cancelling = false;
-            }
-            Event::PromptRuntimeError { .. } => {
-                self.status_text = Some("prompt error".to_string());
-                self.turn_active = false;
-                self.cancelling = false;
-            }
-            Event::SessionContextReset { .. } => {
-                self.context_primer_pending = true;
-            }
-            Event::SessionCleared => {
-                // /clear wiped the model's memory: drop session-scoped
-                // capability caches the agent no longer recognises. The
-                // divider row itself arrives over the transcript channel.
-                self.available_commands.clear();
-                self.current_mode = None;
-            }
-            Event::ConversationCompactionStarted => {
-                // The adapter is about to go silent for 90 to 170 seconds.
-                // Latch the phase so the composer parks a send rather than
-                // steering it into a turn that will never answer it. See #3219.
-                self.compacting = true;
-                self.status_text = Some("compacting…".to_string());
-            }
-            Event::ConversationCompacted => {
-                self.compacting = false;
-                // Drop the pre-compaction usage snapshot: the model's context
-                // is now a summary, so the latched "160k/200k" describes a
-                // window that no longer exists. The web reducer nulls it at the
-                // same boundary. See #3253.
-                self.usage = None;
-            }
-            Event::AvailableCommandsUpdated { commands } => {
-                self.available_commands = commands.clone();
-            }
-            Event::ModesAvailable {
-                current_mode_id,
-                modes,
-            } => {
-                self.current_mode = Some(current_mode_id.clone());
-                self.available_modes = modes.clone();
-            }
-            Event::CurrentModeChanged { current_mode_id } => {
-                self.current_mode = Some(current_mode_id.clone());
-            }
-            Event::ModeChanged { mode } => {
-                // Legacy hard-coded mode enum, always emitted right after a
-                // CurrentModeChanged that already carries the real adapter mode
-                // id. Only fall back to the coerced enum label when no raw id
-                // was seen, so an OpenCode `build`/custom agent (which the enum
-                // collapses to `Default`) keeps its real id in the title. See
-                // #1827.
-                if self.current_mode.is_none() {
-                    self.current_mode = Some(format!("{mode:?}"));
-                }
-            }
-            Event::PromptRejected { .. } => {
-                // The daemon refused the prompt (e.g. read-only mode); no turn
-                // started, so clear the busy flag the optimistic submit path
-                // may have set. `cancelling` deliberately survives: a rejection
-                // is not a turn boundary, and clearing here would let the next
-                // send take the steering path into the daemon's escalation.
-                self.turn_active = false;
-            }
-            Event::UsageUpdated { usage } => {
-                // Latest snapshot wins; the agent typically resends after each
-                // turn. Rendered as the status-line token meter.
-                self.usage = Some(usage.clone());
-            }
-            Event::PromptCapabilities { steering, .. } => {
-                self.steering = *steering;
-            }
-            Event::CancelRequested { .. } => {
-                self.cancelling = true;
-            }
-            Event::AgentSwitched { to, .. } => {
-                self.agent_name = Some(to.clone());
-                self.current_plan.clear();
-            }
-            // Everything else carries no control state for the native view:
-            // the assistant-message stream, the whole tool lifecycle, the
-            // divider / summary / rate-limit-resume / mode-switch-failed
-            // notices, and the events other surfaces own. Their transcript
-            // rows (where any) arrive over the server transcript channel.
-            Event::SessionTitleSuggested { .. }
-            | Event::AgentMessageChunk { .. }
-            | Event::ToolCallStarted { .. }
-            | Event::ToolCallUpdated { .. }
-            | Event::ToolCallContent { .. }
-            | Event::ToolCallCompleted { .. }
-            | Event::TodoListUpdated { .. }
-            | Event::IncompatibleAgent { .. }
-            | Event::ConversationSummary { .. }
-            | Event::AcpSessionAssigned { .. }
-            | Event::RateLimitAutoResumed { .. }
-            | Event::ModeSwitchFailed { .. }
-            | Event::DiffEmitted { .. }
-            | Event::RateLimit { .. }
-            | Event::RawAgentUpdate { .. }
-            | Event::BackgroundAgentLaunched { .. }
-            | Event::BackgroundAgentProgress { .. }
-            | Event::BackgroundAgentCompleted { .. }
-            | Event::WakeupScheduled { .. }
-            | Event::MonitorArmed { .. }
-            | Event::ConfigOptionsUpdated { .. }
-            | Event::ConfigOptionSwitchFailed { .. } => {}
-        }
+    /// Whether the model lost its context and the next prompt re-primes it.
+    /// Derived from the server rows (the newest `context_reset` row with no
+    /// prompt after it) rather than latched from a raw event, so it survives
+    /// a reconnect without any client-side reduction.
+    pub fn context_primer_pending(&self) -> bool {
+        self.server_rows
+            .iter()
+            .rev()
+            .find_map(|row| match row.kind {
+                TranscriptRowKind::ContextReset => Some(true),
+                TranscriptRowKind::UserPrompt | TranscriptRowKind::UserDiffComments => Some(false),
+                _ => None,
+            })
+            .unwrap_or(false)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::acp::approvals::{Approval, ApprovalDecision, Nonce};
-    use crate::acp::state::{Plan, PlanStep, PlanStepStatus, SessionMode, ToolCall};
+    use crate::acp::approvals::{Approval, Nonce};
+    use crate::acp::elicitations::Elicitation;
+    use crate::acp::state::{
+        AcpSessionId, AgentName, Event, Plan, PlanStep, ThinkingSignal, ToolCall,
+    };
     use crate::acp::transcript::{TranscriptModel, TranscriptRowKind};
     use chrono::Utc;
-    use std::sync::Arc;
-
-    fn frame(seq: u64, event: Event) -> AcpBroadcastFrame {
-        AcpBroadcastFrame {
-            session_id: "s-1".into(),
-            seq,
-            event: Arc::new(event),
-        }
-    }
 
     fn tool(id: &str, name: &str) -> ToolCall {
         ToolCall {
@@ -522,8 +391,8 @@ mod tests {
 
     /// Build the server's transcript rows for a sequence of events, the way
     /// the daemon does before shipping them over the WS transcript channel /
-    /// `?view=rows`. Lets a reducer test feed realistic rows without
-    /// hand-writing `TranscriptRow` literals.
+    /// `?view=rows`. Lets a test feed realistic rows without hand-writing
+    /// `TranscriptRow` literals.
     fn server_rows(events: &[Event]) -> Vec<TranscriptRow> {
         let mut m = TranscriptModel::new();
         for (i, e) in events.iter().enumerate() {
@@ -532,373 +401,235 @@ mod tests {
         m.rows().to_vec()
     }
 
-    /// The composer parks a mid-turn send while a cancel is pending even
-    /// on a steerable agent (#2805). Both directions matter: a
-    /// `cancelling` left set would park every later mid-turn send on a
-    /// session that had been stopped once, while one cleared too early
-    /// lets the next send take the steering path into the daemon's
-    /// wedged-agent escalation.
-    #[test]
-    fn cancelling_tracks_the_turn_not_the_rejection() {
-        let cancel = || Event::CancelRequested {
-            escalates_at: Utc::now(),
-        };
-
-        // A rejection is not a turn boundary. The daemon rejects a
-        // mid-cancel prompt and then escalates, so the cancel is still
-        // pending and its real `Stopped` is still to come.
-        let mut t = AcpTranscript::new("s-1");
-        assert!(!t.cancelling);
-        t.apply(&frame(1, cancel()));
-        assert!(t.cancelling);
-        t.apply(&frame(
-            2,
-            Event::PromptRejected {
-                reason: "agent_busy".into(),
-                text: "hi".into(),
-            },
-        ));
-        assert!(
-            t.cancelling,
-            "a rejected prompt must not clear a pending cancel"
+    /// The daemon's control state, folded from `events` exactly as the WS
+    /// handler does before emitting a `reduced_state` frame.
+    fn reduced(events: &[Event]) -> AcpState {
+        let mut s = AcpState::new(
+            AcpSessionId("s-1".into()),
+            AgentName("claude".into()),
+            Some("claude-opus-5".into()),
         );
-
-        // `ThinkingStarted` also sets `turn_active`, but it fires within
-        // a running turn, so it must NOT count as a fresh turn: clearing
-        // there would drop the cancel the moment the agent thinks again.
-        let mut t = AcpTranscript::new("s-1");
-        t.apply(&frame(1, cancel()));
-        t.apply(&frame(2, Event::ThinkingStarted));
-        assert!(
-            t.cancelling,
-            "mid-turn thinking must not clear a pending cancel"
-        );
-
-        // Terminal turn events clear it, and so does either fresh-turn
-        // branch: web routes both prompt kinds through the same
-        // `applyNewTurnResets`.
-        let clearing = [
-            Event::Stopped {
-                reason: "cancelled".into(),
-            },
-            Event::AgentStartupError {
-                message: "boom".into(),
-            },
-            Event::PromptRuntimeError {
-                message: "boom".into(),
-            },
-            Event::UserPromptSent {
-                prompt_id: None,
-                text: "next turn".into(),
-                attachments: Vec::new(),
-            },
-            Event::UserDiffCommentsPrompt {
-                intro: "look".into(),
-                outro: "thanks".into(),
-                is_multi_repo: false,
-                comments: Vec::new(),
-                assembled_markdown: "next turn".into(),
-            },
-        ];
-        for event in clearing {
-            let label = format!("{event:?}");
-            let mut t = AcpTranscript::new("s-1");
-            t.apply(&frame(1, cancel()));
-            t.apply(&frame(2, event));
-            assert!(!t.cancelling, "{label} must clear the pending cancel");
+        for e in events {
+            s.apply_event(e.clone()).expect("apply ok");
         }
+        s
     }
 
-    /// #3219: the compaction phase latches on the start marker and clears
-    /// on exactly two events. A mid-compaction `UserPromptSent` must NOT
-    /// clear it, or a prompt confirmed during the silent window would
-    /// re-arm the force-end hatch while the compaction is still running.
-    #[test]
-    fn compaction_phase_clears_only_on_completion_or_stopped() {
-        let started = || Event::ConversationCompactionStarted;
-        let cases = [
-            (Event::ConversationCompacted, false),
-            (
-                Event::Stopped {
-                    reason: "prompt_complete".into(),
-                },
-                false,
-            ),
-            (
-                Event::Stopped {
-                    reason: "cancelled".into(),
-                },
-                false,
-            ),
-            // A steered follow-up the daemon confirmed mid-compaction.
-            (
-                Event::UserPromptSent {
-                    prompt_id: None,
-                    text: "also check the tests".into(),
-                    attachments: Vec::new(),
-                },
-                true,
-            ),
-            // Ordinary streaming inside the window changes nothing.
-            (Event::ThinkingStarted, true),
-        ];
-        for (event, expected) in cases {
-            let label = format!("{event:?}");
-            let mut t = AcpTranscript::new("s-1");
-            t.apply(&frame(1, started()));
-            assert!(t.compacting, "the start marker must latch the phase");
-            t.apply(&frame(2, event));
-            assert_eq!(t.compacting, expected, "after {label}");
-        }
-    }
-
-    #[test]
-    fn user_prompt_opens_turn_and_builds_no_local_rows() {
-        // The transcript rows are server-owned now: a UserPromptSent mutates
-        // only control state (turn open, primer hint cleared) and appends
-        // nothing to the local buffer.
-        let mut t = AcpTranscript::new("s-1");
-        t.context_primer_pending = true;
-        t.apply(&frame(
-            1,
-            Event::UserPromptSent {
-                prompt_id: None,
-                text: "hi".into(),
-                attachments: Vec::new(),
-            },
-        ));
-        assert!(t.turn_active);
-        assert!(!t.context_primer_pending);
-        assert!(t.server_rows.is_empty(), "reducer must not build rows");
-        assert_eq!(t.last_seq, 1);
-    }
-
-    #[test]
-    fn current_mode_keeps_real_id_when_legacy_enum_follows() {
-        // acp_client emits [CurrentModeChanged{real id}, ModeChanged{enum}].
-        // An OpenCode `build`/custom agent has no SessionMode variant, so the
-        // enum coerces to Default; the raw id must survive. See #1827.
-        let mut t = AcpTranscript::new("s-1");
-        t.apply(&frame(
-            1,
-            Event::CurrentModeChanged {
-                current_mode_id: "build".into(),
-            },
-        ));
-        t.apply(&frame(
-            2,
-            Event::ModeChanged {
-                mode: SessionMode::Default,
-            },
-        ));
-        assert_eq!(t.current_mode.as_deref(), Some("build"));
-    }
-
-    #[test]
-    fn current_mode_falls_back_to_enum_when_no_raw_id() {
-        let mut t = AcpTranscript::new("s-1");
-        t.apply(&frame(
-            1,
-            Event::ModeChanged {
-                mode: SessionMode::Plan,
-            },
-        ));
-        assert_eq!(t.current_mode.as_deref(), Some("Plan"));
-    }
-
-    #[test]
-    fn approval_request_enriches_pending_and_resolution_clears() {
-        // Approvals are control state: the request adds an enriched pending
-        // entry (title/kind/args/destructive for the shelf) and never a row;
-        // the resolution clears it.
-        let mut t = AcpTranscript::new("s-1");
-        let mut tc = tool("t-1", "Bash");
-        tc.kind = "execute".into();
-        tc.args_preview = r#"{"command":"rm -rf /"}"#.into();
-        let approval = Approval {
-            nonce: Nonce("nonce-1".into()),
-            tool_call: tc,
+    fn approval(nonce: &str) -> Approval {
+        Approval {
+            nonce: Nonce(nonce.into()),
+            tool_call: tool("t-1", "Edit a file"),
             destructive: true,
             requested_at: Utc::now(),
             resolved: None,
-        };
-        t.apply(&frame(1, Event::ApprovalRequested { approval }));
-        assert_eq!(t.pending_approvals.len(), 1);
-        let p = &t.pending_approvals[0];
-        assert_eq!(p.nonce, "nonce-1");
-        assert_eq!(p.title, "Bash");
-        assert_eq!(p.kind, "execute");
-        assert!(p.destructive);
-        assert!(p.args.contains("rm -rf"));
-        assert!(t.server_rows.is_empty(), "no inline approval row");
-        t.apply(&frame(
-            2,
-            Event::ApprovalResolved {
-                nonce: Nonce("nonce-1".into()),
-                decision: ApprovalDecision::Allow,
-            },
-        ));
-        assert!(t.pending_approvals.is_empty());
-        assert!(t.server_rows.is_empty());
+        }
     }
 
+    /// Every control field the view renders comes off the frame verbatim: the
+    /// TUI holds no derivation of its own any more, so a mapping slip here is
+    /// the whole class of bug this tier can still introduce.
     #[test]
-    fn elicitation_request_and_resolution_track_pending_only() {
-        use crate::acp::elicitations::{Elicitation, ElicitationOutcome};
+    fn reduced_state_maps_every_rendered_control_field() {
         let mut t = AcpTranscript::new("s-1");
-        let elicitation = Elicitation {
-            nonce: Nonce("e-1".into()),
-            message: "Pick one".into(),
+        let mut s = reduced(&[
+            Event::UserPromptSent {
+                prompt_id: None,
+                text: "go".into(),
+                attachments: vec![],
+            },
+            Event::PromptCapabilities {
+                steering: true,
+                image: false,
+                audio: false,
+                embedded_context: false,
+            },
+            Event::CancelRequested {
+                escalates_at: Utc::now(),
+            },
+            Event::ModesAvailable {
+                current_mode_id: "plan".into(),
+                modes: vec![ModeInfo {
+                    id: "plan".into(),
+                    name: "Plan".into(),
+                    description: None,
+                }],
+            },
+            Event::AvailableCommandsUpdated {
+                commands: vec![AvailableCommand {
+                    name: "review".into(),
+                    description: "Review".into(),
+                    accepts_input: true,
+                }],
+            },
+            Event::PlanUpdated {
+                plan: Plan {
+                    plan_id: "p-1".into(),
+                    version: 1,
+                    steps: vec![PlanStep {
+                        id: "s-1".into(),
+                        title: "Step one".into(),
+                        detail: None,
+                        status: PlanStepStatus::InProgress,
+                    }],
+                },
+            },
+            Event::UsageUpdated {
+                usage: SessionUsage {
+                    used: 5_000,
+                    size: 200_000,
+                    cost: None,
+                },
+            },
+        ]);
+        s.pending_approvals = vec![approval("n-1")];
+        s.pending_elicitations = vec![Elicitation {
+            nonce: Nonce("n-2".into()),
+            message: "Which one?".into(),
             title: None,
             description: None,
             tool_call_id: None,
             questions: Vec::new(),
             requested_at: Utc::now(),
             resolved: None,
-        };
-        t.apply(&frame(1, Event::ElicitationRequested { elicitation }));
-        assert_eq!(t.pending_elicitations.len(), 1);
-        assert_eq!(t.pending_elicitations[0].nonce, "e-1");
-        // No local rows: the `elicitation_answered` trace is a server row.
-        assert!(t.server_rows.is_empty());
-        t.apply(&frame(
-            2,
-            Event::ElicitationResolved {
-                nonce: Nonce("e-1".into()),
-                outcome: ElicitationOutcome::Declined,
-                answers: Vec::new(),
-            },
-        ));
-        assert!(t.pending_elicitations.is_empty());
-        assert!(t.server_rows.is_empty());
-    }
+        }];
 
-    #[test]
-    fn resolve_approval_locally_clears_card_without_broadcast() {
-        // #1821: the optimistic clear removes the pending approval without an
-        // ApprovalResolved frame, since the broadcast can be swallowed by the
-        // seq dedupe.
-        let mut t = AcpTranscript::new("s-1");
-        let approval = Approval {
-            nonce: Nonce("approval-correlation-id".into()),
-            tool_call: tool("t-1", "Bash"),
-            destructive: true,
-            requested_at: Utc::now(),
-            resolved: None,
-        };
-        let nonce = approval.nonce.0.to_string();
-        t.apply(&frame(1, Event::ApprovalRequested { approval }));
-        assert_eq!(t.pending_approvals.len(), 1);
+        t.apply_reduced_state(9, s);
 
-        t.resolve_approval_locally(&nonce);
-        assert!(t.pending_approvals.is_empty());
-
-        // A late ApprovalResolved for the same nonce is a harmless no-op.
-        t.apply(&frame(
-            2,
-            Event::ApprovalResolved {
-                nonce: Nonce(nonce.as_str().into()),
-                decision: ApprovalDecision::Deny,
-            },
-        ));
-        assert!(t.pending_approvals.is_empty());
-    }
-
-    #[test]
-    fn duplicate_seq_is_ignored() {
-        // Replay-vs-live overlap can deliver the same seq twice; the reducer
-        // dedupes on seq, so a re-delivered older frame cannot mutate control
-        // state. A lower seq is dropped too.
-        let mut t = AcpTranscript::new("s-1");
-        t.apply(&frame(
-            2,
-            Event::UsageUpdated {
-                usage: SessionUsage {
-                    used: 1_000,
-                    size: 200_000,
-                    cost: None,
-                },
-            },
-        ));
-        t.apply(&frame(
-            2,
-            Event::UsageUpdated {
-                usage: SessionUsage {
-                    used: 9_999,
-                    size: 200_000,
-                    cost: None,
-                },
-            },
-        ));
-        t.apply(&frame(
-            1,
-            Event::UsageUpdated {
-                usage: SessionUsage {
-                    used: 5,
-                    size: 200_000,
-                    cost: None,
-                },
-            },
-        ));
-        assert_eq!(t.usage.as_ref().map(|u| u.used), Some(1_000));
-        assert_eq!(t.last_seq, 2);
-    }
-
-    #[test]
-    fn session_context_reset_sets_pending_primer_flag() {
-        let mut t = AcpTranscript::new("s-1");
-        t.apply(&frame(
-            1,
-            Event::SessionContextReset {
-                reason: "session/load failed".into(),
-            },
-        ));
-        assert!(t.context_primer_pending);
-        t.apply(&frame(
-            2,
-            Event::UserPromptSent {
-                prompt_id: None,
-                text: "go".into(),
-                attachments: Vec::new(),
-            },
-        ));
-        assert!(!t.context_primer_pending);
-    }
-
-    #[test]
-    fn available_commands_stored_for_future_slash_picker() {
-        let mut t = AcpTranscript::new("s-1");
-        t.apply(&frame(
-            1,
-            Event::AvailableCommandsUpdated {
-                commands: vec![AvailableCommand {
-                    name: "test".into(),
-                    description: "run tests".into(),
-                    accepts_input: false,
-                }],
-            },
-        ));
+        assert_eq!(t.last_seq, 9);
+        assert_eq!(t.agent_name.as_deref(), Some("claude"));
+        assert!(t.turn_active && t.steering && t.cancelling);
+        assert!(!t.compacting);
+        assert_eq!(t.usage.as_ref().map(|u| u.used), Some(5_000));
+        assert_eq!(t.current_mode.as_deref(), Some("plan"));
+        assert_eq!(t.available_modes.len(), 1);
         assert_eq!(t.available_commands.len(), 1);
-        assert_eq!(t.available_commands[0].name, "test");
-    }
-
-    #[test]
-    fn plan_update_replaces_sticky_plan_snapshot() {
-        let mut t = AcpTranscript::new("s-1");
-        let plan = Plan {
-            plan_id: "p-1".into(),
-            version: 1,
-            steps: vec![PlanStep {
-                id: "s-1".into(),
-                title: "Step one".into(),
-                detail: None,
-                status: PlanStepStatus::Pending,
-            }],
-        };
-        t.apply(&frame(1, Event::PlanUpdated { plan }));
-        assert!(t.server_rows.is_empty());
         assert_eq!(t.current_plan.len(), 1);
         assert_eq!(t.current_plan[0].title, "Step one");
+        // Approvals carry the whole request: the shelf renders from these
+        // fields, since the transcript holds no approval row.
+        assert_eq!(t.pending_approvals.len(), 1);
+        assert_eq!(t.pending_approvals[0].nonce, "n-1");
+        assert_eq!(t.pending_approvals[0].title, "Edit a file");
+        assert_eq!(t.pending_approvals[0].kind, "execute");
+        assert_eq!(t.pending_approvals[0].args, "ls");
+        assert!(t.pending_approvals[0].destructive);
+        assert_eq!(t.pending_elicitations.len(), 1);
+        assert_eq!(t.pending_elicitations[0].message, "Which one?");
+    }
+
+    /// The banner only shows inside a running turn, so the phases that end
+    /// one never reach it; compaction outranks thinking because the adapter
+    /// goes silent for minutes there.
+    #[test]
+    fn status_banner_follows_the_server_phase() {
+        let cases: [(&str, Option<ThinkingSignal>, bool, Option<&str>); 4] = [
+            ("idle", None, false, None),
+            (
+                "thinking",
+                Some(ThinkingSignal {
+                    started_at: Utc::now(),
+                }),
+                false,
+                Some("thinking…"),
+            ),
+            ("compacting", None, true, Some("compacting…")),
+            (
+                "compacting outranks thinking",
+                Some(ThinkingSignal {
+                    started_at: Utc::now(),
+                }),
+                true,
+                Some("compacting…"),
+            ),
+        ];
+        for (label, thinking, compacting, expected) in cases {
+            let mut t = AcpTranscript::new("s-1");
+            let mut s = reduced(&[]);
+            s.thinking = thinking;
+            s.compacting = compacting;
+            t.apply_reduced_state(1, s);
+            assert_eq!(t.status_text.as_deref(), expected, "{label}");
+        }
+    }
+
+    /// A snapshot that races live deltas must not rewind the view.
+    #[test]
+    fn stale_reduced_state_frame_is_dropped() {
+        let mut t = AcpTranscript::new("s-1");
+        let mut live = reduced(&[]);
+        live.turn_active = true;
+        t.apply_reduced_state(7, live);
+        assert!(t.turn_active);
+
+        t.apply_reduced_state(3, reduced(&[]));
+        assert!(t.turn_active, "an older frame cannot clear a live turn");
+        assert_eq!(t.last_seq, 7);
+
+        // The same seq is applied: the connect snapshot lands on the seq the
+        // socket dialled from, and it is the authority there.
+        t.apply_reduced_state(7, reduced(&[]));
+        assert!(!t.turn_active);
+    }
+
+    /// The shelf clears on the resolve POST's 204/404 rather than waiting for
+    /// the broadcast (#1821). Without the optimistic filter the next event's
+    /// reduced state would paint the answered card straight back.
+    #[test]
+    fn locally_resolved_card_stays_hidden_until_the_server_agrees() {
+        let mut t = AcpTranscript::new("s-1");
+        let mut with_approval = reduced(&[]);
+        with_approval.pending_approvals = vec![approval("n-1")];
+        t.apply_reduced_state(1, with_approval.clone());
+        assert_eq!(t.pending_approvals.len(), 1);
+
+        t.resolve_approval_locally("n-1");
+        assert!(t.pending_approvals.is_empty());
+
+        // An unrelated event still lists the approval: the daemon has not
+        // processed the resolve yet.
+        t.apply_reduced_state(2, with_approval);
+        assert!(
+            t.pending_approvals.is_empty(),
+            "a locally-resolved card must not come back"
+        );
+
+        // Once the daemon drops it, the local memory of it goes too, so a
+        // later approval reusing the nonce is not swallowed.
+        t.apply_reduced_state(3, reduced(&[]));
+        assert!(t.pending_approvals.is_empty());
+        let mut again = reduced(&[]);
+        again.pending_approvals = vec![approval("n-1")];
+        t.apply_reduced_state(4, again);
+        assert_eq!(t.pending_approvals.len(), 1, "the filter must not latch");
+    }
+
+    /// Derived from the rows, so it survives a reconnect with no client-side
+    /// latch: a reset with no prompt after it means the context is gone.
+    #[test]
+    fn context_primer_pending_tracks_the_newest_reset_or_prompt() {
+        let prompt = || Event::UserPromptSent {
+            prompt_id: None,
+            text: "go".into(),
+            attachments: vec![],
+        };
+        let reset = || Event::SessionContextReset {
+            reason: "worker restarted".into(),
+        };
+        let cases: [(&str, Vec<Event>, bool); 4] = [
+            ("empty", vec![], false),
+            ("reset with nothing after", vec![prompt(), reset()], true),
+            ("prompt re-primed it", vec![reset(), prompt()], false),
+            (
+                "the newest reset wins",
+                vec![reset(), prompt(), reset()],
+                true,
+            ),
+        ];
+        for (label, events, expected) in cases {
+            let mut t = AcpTranscript::new("s-1");
+            t.merge_server_rows(server_rows(&events));
+            assert_eq!(t.context_primer_pending(), expected, "{label}");
+        }
     }
 
     #[test]
@@ -909,120 +640,25 @@ mod tests {
         assert!(t.server_rows.is_empty());
     }
 
+    /// A lag rebuilds the rows but leaves control state alone: every frame is
+    /// a whole-state snapshot, so a gap in the event stream cannot stale it.
     #[test]
-    fn turn_active_tracks_prompt_and_stop_edges() {
+    fn drop_rows_clears_the_buffer_and_keeps_control_state() {
         let mut t = AcpTranscript::new("s-1");
-        assert!(!t.turn_active, "fresh transcript is idle");
-        t.apply(&frame(
-            1,
-            Event::UserPromptSent {
-                prompt_id: None,
-                text: "go".into(),
-                attachments: vec![],
-            },
-        ));
-        assert!(t.turn_active, "UserPromptSent opens the turn");
-        t.apply(&frame(2, Event::ThinkingStarted));
-        assert!(t.turn_active, "thinking keeps the turn open");
-        t.apply(&frame(
-            3,
-            Event::Stopped {
-                reason: "completed".into(),
-            },
-        ));
-        assert!(!t.turn_active, "Stopped closes the turn");
-    }
-
-    #[test]
-    fn turn_active_clears_on_startup_error_and_rejection() {
-        let mut t = AcpTranscript::new("s-1");
-        t.apply(&frame(
-            1,
-            Event::UserPromptSent {
-                prompt_id: None,
-                text: "go".into(),
-                attachments: vec![],
-            },
-        ));
-        t.apply(&frame(
-            2,
-            Event::AgentStartupError {
-                message: "boom".into(),
-            },
-        ));
-        assert!(!t.turn_active, "startup error ends any in-flight turn");
-
-        t.apply(&frame(
-            3,
-            Event::UserPromptSent {
-                prompt_id: None,
-                text: "again".into(),
-                attachments: vec![],
-            },
-        ));
-        assert!(t.turn_active);
-        t.apply(&frame(
-            4,
-            Event::PromptRejected {
-                text: "again".into(),
-                reason: "read-only".into(),
-            },
-        ));
-        assert!(!t.turn_active, "a rejected prompt never started a turn");
-    }
-
-    #[test]
-    fn reset_returns_to_idle_and_drops_rows() {
-        let mut t = AcpTranscript::new("s-1");
-        t.apply(&frame(
-            1,
-            Event::UserPromptSent {
-                prompt_id: None,
-                text: "go".into(),
-                attachments: vec![],
-            },
-        ));
+        let mut s = reduced(&[]);
+        s.turn_active = true;
+        s.pending_approvals = vec![approval("n-1")];
+        t.apply_reduced_state(4, s);
         t.merge_server_rows(server_rows(&[Event::AgentMessageChunk {
             text: "hi".into(),
         }]));
-        assert!(t.turn_active);
         assert!(!t.server_rows.is_empty());
-        t.reset();
-        assert!(!t.turn_active, "reset drops derived turn state for replay");
-        assert!(t.server_rows.is_empty(), "reset drops the row buffer");
-        assert_eq!(t.session_id, "s-1");
-        assert_eq!(t.last_seq, 0);
-    }
 
-    #[test]
-    fn usage_updated_stores_latest_snapshot() {
-        let mut t = AcpTranscript::new("s-1");
-        assert!(t.usage.is_none());
-        t.apply(&frame(
-            1,
-            Event::UsageUpdated {
-                usage: SessionUsage {
-                    used: 1_000,
-                    size: 200_000,
-                    cost: None,
-                },
-            },
-        ));
-        t.apply(&frame(
-            2,
-            Event::UsageUpdated {
-                usage: SessionUsage {
-                    used: 5_000,
-                    size: 200_000,
-                    cost: None,
-                },
-            },
-        ));
-        assert_eq!(t.usage.as_ref().map(|u| u.used), Some(5_000));
-        // A compaction rewrites the model's context, so the replaced snapshot
-        // no longer describes anything. Matching the web reducer.
-        t.apply(&frame(3, Event::ConversationCompacted));
-        assert!(t.usage.is_none());
+        t.drop_rows();
+        assert!(t.server_rows.is_empty());
+        assert!(t.turn_active, "a lag does not end the running turn");
+        assert_eq!(t.pending_approvals.len(), 1, "the shelf survives a lag");
+        assert_eq!(t.last_seq, 4, "the reconnect cursor survives a lag");
     }
 
     #[test]

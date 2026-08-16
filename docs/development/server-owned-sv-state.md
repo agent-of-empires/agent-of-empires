@@ -1,6 +1,8 @@
 # Design: server-owned structured-view state (live reduced-state channel)
 
-Status: planned. Opened 2026-08-16. Follows the server-owned prompt queue
+Status: in progress. Opened 2026-08-16. The server side is complete and the
+native TUI renders both projections; the web still folds control state from raw
+events (increment 2 below). Follows the server-owned prompt queue
 (`server-side-prompt-queue.md`) as the next step of moving structured-view (SV)
 logic off the clients so a web UI and a native TUI share one implementation.
 
@@ -123,11 +125,35 @@ truth for the steady state. The web reducer's other derivations
    `AcpState` at the publish choke point; emit the `reduced_state` frame after
    each event and on connect. No client render changes; the web WS parser learns
    to accept and store the frame (asserted in Vitest) so the channel is exercised.
+   **Shipped** (Tier 1.1).
 2. **Web renders from the frame**: turn/steering/cancelling/compacting/approvals/
    usage/modes read the reduced state; keep the thin optimistic turn-active
    overlay. Delete the now-dead client derivations. Playwright + Vitest.
+   **Not started.** `useAcpSession` still drops the frame explicitly and folds
+   control state from raw events.
 3. **TUI renders from the frame**: `AcpTranscript` drops its control-state
    derivation and reads the reduced state; the transcript-row building stays.
+   **Shipped** (Tier 1.3), and by then the row building had already moved to the
+   server too (Tier 4 below), so `AcpTranscript` reduces nothing at all: it holds
+   the server's control state and the server's rows. Two gaps had to close first:
+   `AcpState` no-op'd `ModesAvailable` / `CurrentModeChanged` (now reduced into
+   `available_modes` / `current_mode_id`), and the "context lost, re-prime?"
+   latch became a derivation over the transcript rows.
+
+## Tier 4: the transcript follows the control state
+
+Tier 1 left each client folding raw events into transcript rows, which was the
+larger half of the duplication. That moved server-side too: `TranscriptModel`
+(`src/acp/transcript.rs`) folds the ordered rows once, the WS ships them as
+`transcript_snapshot` / `transcript_delta`, and `GET /acp/replay?view=rows`
+serves them for history. The web migrated first (Tier 4 C1), then the native TUI
+(Tier 4 D). Presentation stays client-side: markdown, tool cards, path
+shortening and diff rendering all read the rows.
+
+One behavior changed in the process. Approvals are control state, not rows, so
+the native TUI stopped recording a resolved approval inline in the transcript;
+the modal shelf shows it while pending and nothing persists after. The web never
+had such a record, so the two clients now agree.
 
 ## Alternatives considered
 

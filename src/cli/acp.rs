@@ -961,9 +961,11 @@ async fn tail(session: &str, since: u64) -> Result<()> {
                 eprintln!("warning: ring buffer lagged; some events lost. Refetch with `aoe acp history <session>`.");
             }
             // `aoe acp tail` dumps the raw event frames; the server-folded
-            // transcript projections are derived from those, so they add
-            // nothing here.
-            Ok(WsMessage::TranscriptSnapshot(_)) | Ok(WsMessage::TranscriptDelta(_)) => {}
+            // control-state and transcript projections are derived from
+            // those, so they add nothing here.
+            Ok(WsMessage::TranscriptSnapshot(_))
+            | Ok(WsMessage::TranscriptDelta(_))
+            | Ok(WsMessage::ReducedState { .. }) => {}
             Err(e) => {
                 eprintln!("ws error: {e}");
                 anyhow::bail!("ws disconnected: {e}");
