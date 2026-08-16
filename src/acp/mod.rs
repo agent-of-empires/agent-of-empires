@@ -44,6 +44,7 @@ pub mod session_tee;
 pub mod state;
 pub mod supervisor;
 pub mod terminal_handler;
+pub mod transcript;
 #[cfg(feature = "serve")]
 pub mod version_probe;
 

@@ -36,6 +36,7 @@ const CLOSE_CODE_GOING_AWAY: u16 = 1001;
 
 use super::{AcpBroadcastFrame, AppState};
 use crate::acp::state::{AcpSessionId, AcpState, AgentName};
+use crate::acp::transcript::TranscriptModel;
 
 /// Cadence at which the server emits an application-level Ping. The
 /// browser's WebSocket auto-replies with a Pong; axum forwards that
@@ -139,6 +140,15 @@ async fn handle(mut socket: WebSocket, session_id: String, state: Arc<AppState>,
     };
     let mut reduced = AcpState::new(AcpSessionId(session_id.clone()), agent, model);
 
+    // Server-side transcript render model for this connection (Tier 4, see
+    // docs/development/server-owned-sv-state.md). Alongside the reduced control
+    // state, the daemon folds the event stream into ordered transcript rows and
+    // streams them as a `transcript_snapshot` on connect plus per-event
+    // `transcript_delta` frames, so clients render the activity stream from the
+    // server model instead of re-reducing it. Same deterministic-reducer,
+    // per-connection story as `reduced`.
+    let mut transcript = TranscriptModel::new();
+
     // Replay events newer than `since` immediately on connect. Without
     // this, any events published in the upgrade gap between the
     // client's POST /acp/spawn (or the first /acp/prompt) and
@@ -148,8 +158,15 @@ async fn handle(mut socket: WebSocket, session_id: String, state: Arc<AppState>,
     // captures every published event, so reading it here closes the
     // race without forcing the client to GET /acp/replay
     // separately.
-    let replay_count =
-        drain_replay_into_socket(&mut socket, &state, &session_id, since, &mut reduced).await;
+    let replay_count = drain_replay_into_socket(
+        &mut socket,
+        &state,
+        &session_id,
+        since,
+        &mut reduced,
+        &mut transcript,
+    )
+    .await;
     debug!(
         target: "acp.ws",
         session = %session_id,
@@ -252,6 +269,23 @@ async fn handle(mut socket: WebSocket, session_id: String, state: Arc<AppState>,
                         if !send_reduced_state(&mut socket, &session_id, frame.seq, &reduced).await {
                             break;
                         }
+                        // Fold the same event into the transcript render model and
+                        // push each resulting row change as a `transcript_delta`.
+                        // Per-event emission is correctness-first; coalescing bursts
+                        // into fewer frames is a later optimization.
+                        let deltas = transcript.apply_event(frame.seq, &frame.event);
+                        let mut socket_dead = false;
+                        for delta in &deltas {
+                            if !send_transcript_delta(&mut socket, &session_id, frame.seq, delta)
+                                .await
+                            {
+                                socket_dead = true;
+                                break;
+                            }
+                        }
+                        if socket_dead {
+                            break;
+                        }
                     }
                     Err(RecvError::Lagged(skipped)) => {
                         // Tell the client they missed events so they can
@@ -297,6 +331,7 @@ async fn drain_replay_into_socket(
     session_id: &str,
     since: u64,
     reduced: &mut AcpState,
+    transcript: &mut TranscriptModel,
 ) -> usize {
     // Offload the rusqlite read to the blocking pool. A session with
     // a large retained history may iterate thousands of rows; running
@@ -329,6 +364,9 @@ async fn drain_replay_into_socket(
         // Reduce into the connection's control state as we forward the raw
         // frame, so the post-drain snapshot reflects the full replayed history.
         let _ = reduced.apply_event(event.clone());
+        // Fold into the transcript model too; the deltas are discarded here
+        // because the transcript_snapshot below carries the built rows.
+        let _ = transcript.apply_event(seq, &event);
         snapshot_seq = seq;
         let frame = AcpBroadcastFrame {
             session_id: session_id.to_string(),
@@ -351,6 +389,11 @@ async fn drain_replay_into_socket(
     // built from the replay, so a fresh client renders turn/steering/approvals/
     // usage/modes without waiting for the next live event.
     let _ = send_reduced_state(socket, session_id, snapshot_seq, reduced).await;
+    // Transcript connect snapshot: one transcript_snapshot frame carrying the
+    // ordered rows built from the replay, so a fresh client renders the activity
+    // stream without waiting for the next live delta. Sent after the reduced_state
+    // snapshot to keep a stable connect order.
+    let _ = send_transcript_snapshot(socket, session_id, snapshot_seq, transcript).await;
     sent
 }
 
@@ -376,6 +419,56 @@ async fn send_reduced_state(
         Ok(payload) => socket.send(Message::Text(payload.into())).await.is_ok(),
         Err(e) => {
             warn!(target: "acp.ws", "serialise reduced_state: {e}");
+            true
+        }
+    }
+}
+
+/// Serialize and send the full transcript row list as a `kind`-tagged
+/// `transcript_snapshot` frame on connect. Backward compatible in the same way
+/// as `reduced_state`: clients that don't consume the kind ignore it. Returns
+/// whether the socket is still live (a serialize failure is logged and treated
+/// as live, since it is a server bug, not a dead peer).
+async fn send_transcript_snapshot(
+    socket: &mut WebSocket,
+    session_id: &str,
+    seq: u64,
+    transcript: &TranscriptModel,
+) -> bool {
+    let frame = serde_json::json!({
+        "kind": "transcript_snapshot",
+        "session_id": session_id,
+        "seq": seq,
+        "rows": transcript.rows(),
+    });
+    match serde_json::to_string(&frame) {
+        Ok(payload) => socket.send(Message::Text(payload.into())).await.is_ok(),
+        Err(e) => {
+            warn!(target: "acp.ws", "serialise transcript_snapshot: {e}");
+            true
+        }
+    }
+}
+
+/// Serialize and send one incremental transcript row change as a `kind`-tagged
+/// `transcript_delta` frame. Same backward-compatibility and return contract as
+/// `send_reduced_state`.
+async fn send_transcript_delta(
+    socket: &mut WebSocket,
+    session_id: &str,
+    seq: u64,
+    delta: &crate::acp::transcript::TranscriptDelta,
+) -> bool {
+    let frame = serde_json::json!({
+        "kind": "transcript_delta",
+        "session_id": session_id,
+        "seq": seq,
+        "delta": delta,
+    });
+    match serde_json::to_string(&frame) {
+        Ok(payload) => socket.send(Message::Text(payload.into())).await.is_ok(),
+        Err(e) => {
+            warn!(target: "acp.ws", "serialise transcript_delta: {e}");
             true
         }
     }
@@ -728,5 +821,80 @@ mod tests {
     #[test]
     fn heartbeat_frame_shape_is_stable() {
         assert_eq!(heartbeat_frame(), r#"{"kind":"heartbeat"}"#);
+    }
+
+    /// Pins the transcript wire contract that the live loop emits. The
+    /// `send_transcript_*` helpers need a live socket, so the socket write is
+    /// covered by the Stage C live e2e; here we drive the same choke-point fold
+    /// (`TranscriptModel::apply_event`) over a scripted sequence and assert the
+    /// snapshot and delta envelopes are shaped as clients expect. The envelopes
+    /// are built the same way the helpers build them.
+    #[test]
+    fn transcript_frames_carry_kind_seq_and_payload() {
+        use crate::acp::transcript::{TranscriptModel, TranscriptRowKind};
+
+        let mut transcript = TranscriptModel::new();
+        // A prompt then a tool start: two live events, each yielding one Append.
+        let script = [
+            (
+                7u64,
+                crate::acp::Event::UserPromptSent {
+                    text: "hi".into(),
+                    attachments: Vec::new(),
+                },
+            ),
+            (
+                8u64,
+                crate::acp::Event::ToolCallStarted {
+                    tool_call: crate::acp::state::ToolCall {
+                        id: "t-1".into(),
+                        name: "Bash".into(),
+                        kind: "execute".into(),
+                        args_preview: "{}".into(),
+                        started_at: chrono::Utc::now(),
+                        parent_tool_call_id: None,
+                        memory_recall: None,
+                        diffs: Vec::new(),
+                    },
+                },
+            ),
+        ];
+
+        // Mirror the drain: fold every event, keep only the last delta batch and
+        // build the connect snapshot from the accumulated rows.
+        let mut last_deltas = Vec::new();
+        let mut last_seq = 0u64;
+        for (seq, ev) in &script {
+            last_deltas = transcript.apply_event(*seq, ev);
+            last_seq = *seq;
+        }
+
+        // The connect snapshot envelope carries the built rows under `rows`.
+        let snapshot = serde_json::json!({
+            "kind": "transcript_snapshot",
+            "session_id": "s1",
+            "seq": last_seq,
+            "rows": transcript.rows(),
+        });
+        assert_eq!(snapshot["kind"], "transcript_snapshot");
+        assert_eq!(snapshot["seq"], 8);
+        assert_eq!(snapshot["rows"].as_array().unwrap().len(), 2);
+        assert_eq!(transcript.rows()[0].kind, TranscriptRowKind::UserPrompt);
+        assert_eq!(transcript.rows()[1].kind, TranscriptRowKind::ToolStart);
+
+        // The last live event produced exactly one Append delta; its envelope
+        // tags `kind`, `seq`, and nests the serialized delta under `delta`.
+        assert_eq!(last_deltas.len(), 1);
+        let delta_frame = serde_json::json!({
+            "kind": "transcript_delta",
+            "session_id": "s1",
+            "seq": last_seq,
+            "delta": &last_deltas[0],
+        });
+        assert_eq!(delta_frame["kind"], "transcript_delta");
+        assert_eq!(delta_frame["seq"], 8);
+        // TranscriptDelta serializes as an externally tagged enum, so an Append
+        // is `{"Append": {..row..}}`; clients switch on that key.
+        assert_eq!(delta_frame["delta"]["Append"]["id"], "start-t-1");
     }
 }

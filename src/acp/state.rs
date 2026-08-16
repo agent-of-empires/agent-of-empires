@@ -53,7 +53,7 @@ pub struct Todo {
     pub completed: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ToolCall {
     pub id: String,
     pub name: String,
@@ -110,7 +110,7 @@ pub struct MemoryRecall {
     pub synthesized_text: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DiffPreview {
     pub path: String,
     pub old_text: Option<String>,
@@ -576,7 +576,7 @@ pub enum StateError {
 /// assembled markdown. Field names mirror the frontend `DiffComment`
 /// type (`web/src/components/diff/comments/types.ts`) one-for-one; the
 /// server never interprets these, it only stores and replays them.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiffComment {
     pub id: String,
