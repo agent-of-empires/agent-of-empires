@@ -17,12 +17,52 @@ Implemented so far (backend + API client):
   `PATCH/DELETE /api/sessions/{id}/queue/{promptId}`, CityHall-classified like
   `acp/prompt`. Web API client wrappers + Vitest.
 
-Still to do: attachments on a queued prompt (reuse the `PromptAttachmentRef`
-+ `acp_attachments` pattern as `pending_initial_turn_attachments` does),
-retention TTL (Q5), the `send-now` endpoint (G3), waking an idle-auto-stopped
-worker on drain, the client rewire (point `sendPrompt`/`sendQueuedNow` at the
-server queue and remove the client drain + `AcpBackgroundDrainers`), the
-one-time localStorage migration (Q2), and the live-daemon e2e.
+Still to do, and each item is a real blocker with a design fork or a
+verification requirement, not a mechanical increment (investigated 2026-08-16,
+code citations below):
+
+1. **Attachments on a queued prompt cannot reuse `acp_attachments` as-is.**
+   That store keys blobs by the `seq` of the `UserPromptSent` event they ride
+   with, and the retention prune drops any blob whose owning event no longer
+   exists (`src/events/mod.rs:349`, `DELETE ... WHERE seq <= cutoff AND seq NOT
+   IN (SELECT seq FROM events)`). A queued-but-unsent prompt has no
+   `UserPromptSent` seq, so its bytes would either be pruned early or need a
+   synthetic-seq hack that fights the retention invariant. `pending_initial_turn`
+   avoids this only because it replays refs whose bytes were already stored under
+   a prior real prompt's seq. Doing queued attachments right needs a dedicated
+   blob store keyed by `(session_id, prompt_id, attachment_id)` with its own
+   lifecycle (a new table + migration), plus an upload endpoint and a per-session
+   byte cap. This is Q1/Q5, still open.
+2. **The client rewire regresses dormant-worker delivery unless wake-on-drain
+   lands first.** The server drain pass skips any session whose worker is not
+   live (`src/server/acp_reconciler.rs:1589`, `if !is_running { continue }`). The
+   client drain, by contrast, wakes an idle-auto-stopped worker by letting the
+   POST itself fire the resume (`web/src/hooks/useAcpSession.ts` `workerIdleStopped`
+   exception). Drop the client drain before the server can wake a dormant worker
+   and a prompt queued against a dormant session never delivers.
+3. **Wake-on-drain hits the #3172 re-entrant-spawn deadlock.** `send_turn`
+   already wakes a dormant/dead worker (`src/server/session_service.rs:453`,
+   `needs_resume = woke_idle_dormant || !is_running`), so the fix looks like
+   "let the drain run for dormant sessions too." But `drain_queued_prompts_once`
+   holds the session `instance_lock` across `send_turn`, and its own doc says
+   that is safe *only because callers pre-gate on `is_running`* so no spawn
+   happens under the lock. `trigger_resume_background`'s detached spawn takes that
+   same `instance_lock` (`src/server/acp_reconciler.rs:1782`, "Callers MUST NOT
+   hold the session's `instance_lock`"), so waking under the drain lock
+   deadlocks. Safe wake-on-drain needs the drain restructured to not hold the
+   lock across a waking `send_turn`, validated by a live-daemon e2e.
+
+Also still to do (straightforward once the above are settled): the `send-now`
+endpoint (G3), the one-time localStorage migration (Q2), and the live-daemon
+e2e for the full closed-app round-trip.
+
+**Net:** the backend store + endpoints + live-worker drain are done and green,
+but they are inert until the client POSTs into the queue, and the client rewire
+that would do that (a) cannot be verified from CI/sandbox (needs a live daemon +
+real agent + the iOS PWA) and (b) regresses dormant delivery until wake-on-drain
+is built, which itself needs the deadlock-careful refactor above. The rewire and
+wake-on-drain should land together, verified on-device, not as blind increments
+on top of a working PR.
 
 ## Problem
 
