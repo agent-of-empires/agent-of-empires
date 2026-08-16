@@ -1541,6 +1541,7 @@ mod serve {
             }
 
             let non_stop = Event::UserPromptSent {
+                prompt_id: None,
                 text: "hi".into(),
                 attachments: vec![],
             };

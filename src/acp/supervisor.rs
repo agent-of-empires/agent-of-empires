@@ -1258,7 +1258,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// is text-based but routed through the session's `AgentProfile`
     /// so each agent's aliases match the right surface. See #1101.
     pub async fn publish_user_prompt(&self, session_id: &str, text: String) -> PromptDisposition {
-        self.publish_user_prompt_with_attachments(session_id, text, &[])
+        self.publish_user_prompt_with_attachments(session_id, text, &[], None)
             .await
     }
 
@@ -1272,6 +1272,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
         text: String,
         attachments: &[crate::acp::event_store::AttachmentBlob],
+        prompt_id: Option<String>,
     ) -> PromptDisposition {
         let agent_key = self.agent_key_for_session(session_id).await;
         let profile = super::agent_profiles::resolve(&agent_key);
@@ -1308,6 +1309,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             &Event::UserPromptSent {
                 text,
                 attachments: refs,
+                prompt_id,
             },
         );
         if !persisted {
@@ -6279,6 +6281,7 @@ cursor-acp-bridge = "agent acp"
             "s-42",
             1,
             &Event::UserPromptSent {
+                prompt_id: None,
                 text: "hello world".into(),
                 attachments: Vec::new(),
             },

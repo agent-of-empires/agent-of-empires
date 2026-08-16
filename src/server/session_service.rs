@@ -447,6 +447,7 @@ impl SessionService {
         text: &str,
         attachments: &[crate::acp::event_store::AttachmentBlob],
         woke_idle_dormant: bool,
+        prompt_id: Option<String>,
     ) -> Result<(), SendTurnError> {
         use crate::server::acp_reconciler::ResumeTrigger;
         // Ownership gate, before ANY side effect (no wake, resume, publish,
@@ -538,7 +539,7 @@ impl SessionService {
         // unresumable across a worker restart (upstream #906).
         let disposition = self
             .acp_supervisor
-            .publish_user_prompt_with_attachments(id, text.to_string(), attachments)
+            .publish_user_prompt_with_attachments(id, text.to_string(), attachments, prompt_id)
             .await;
         let outcome = match disposition {
             crate::acp::supervisor::PromptDisposition::Forward => {
@@ -646,7 +647,7 @@ impl SessionService {
             .unwrap_or_default()
         };
         if let Err(e) = self
-            .send_turn(&caller, id, &text, &attachments, false)
+            .send_turn(&caller, id, &text, &attachments, false, None)
             .await
         {
             tracing::warn!(
@@ -1122,7 +1123,7 @@ impl SessionService {
         // blobs under the real `UserPromptSent` seq. On failure leave the rows
         // (and their buffered blobs) queued; the next tick retries.
         if let Err(e) = self
-            .send_turn(&caller, id, &combined, &attachments, false)
+            .send_turn(&caller, id, &combined, &attachments, false, None)
             .await
         {
             tracing::warn!(target: "acp.queue", session = %id, "queue drain delivery failed; will retry: {e}");
@@ -1602,19 +1603,19 @@ mod tests {
         // plugin's session, or a missing session.
         assert!(matches!(
             service
-                .send_turn(&cron, "sess-user", "hi", &[], false)
+                .send_turn(&cron, "sess-user", "hi", &[], false, None)
                 .await,
             Err(SendTurnError::NotOwner)
         ));
         assert!(matches!(
             service
-                .send_turn(&other, "sess-cron", "hi", &[], false)
+                .send_turn(&other, "sess-cron", "hi", &[], false, None)
                 .await,
             Err(SendTurnError::NotOwner)
         ));
         assert!(matches!(
             service
-                .send_turn(&cron, "sess-gone", "hi", &[], false)
+                .send_turn(&cron, "sess-gone", "hi", &[], false, None)
                 .await,
             Err(SendTurnError::SessionNotFound)
         ));
@@ -1625,13 +1626,13 @@ mod tests {
         // ownership check specifically.
         assert!(!matches!(
             service
-                .send_turn(&cron, "sess-cron", "hi", &[], false)
+                .send_turn(&cron, "sess-cron", "hi", &[], false, None)
                 .await,
             Ok(()) | Err(SendTurnError::NotOwner)
         ));
         assert!(!matches!(
             service
-                .send_turn(&SessionCaller::User, "sess-user", "hi", &[], false)
+                .send_turn(&SessionCaller::User, "sess-user", "hi", &[], false, None)
                 .await,
             Ok(()) | Err(SendTurnError::NotOwner)
         ));

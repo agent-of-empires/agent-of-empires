@@ -839,6 +839,7 @@ mod tests {
             (
                 7u64,
                 crate::acp::Event::UserPromptSent {
+                    prompt_id: None,
                     text: "hi".into(),
                     attachments: Vec::new(),
                 },

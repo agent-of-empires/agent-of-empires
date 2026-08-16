@@ -1193,7 +1193,9 @@ impl EventStore {
             });
         let (prompt_seq, prompt_json) = prompt?;
         let (text, attachments) = match serde_json::from_str::<Event>(&prompt_json).ok()? {
-            Event::UserPromptSent { text, attachments } => (text, attachments),
+            Event::UserPromptSent {
+                text, attachments, ..
+            } => (text, attachments),
             _ => return None,
         };
         let terminator: Option<String> = conn
@@ -2023,6 +2025,7 @@ mod tests {
 
     fn user_prompt(text: &str) -> Event {
         Event::UserPromptSent {
+            prompt_id: None,
             text: text.into(),
             attachments: vec![],
         }
@@ -2134,6 +2137,7 @@ mod tests {
 
     fn prompt_with_attachment(id: &str) -> Event {
         Event::UserPromptSent {
+            prompt_id: None,
             text: "look at this".into(),
             attachments: vec![crate::acp::state::PromptAttachmentRef {
                 id: id.to_string(),
@@ -2149,6 +2153,7 @@ mod tests {
     fn first_user_prompt_returns_earliest_prompt_text() {
         let (_tmp, store) = open_store(1000);
         let prompt = |text: &str| Event::UserPromptSent {
+            prompt_id: None,
             text: text.into(),
             attachments: vec![],
         };
@@ -2398,7 +2403,9 @@ mod tests {
         let json = r#"{"UserPromptSent":{"text":"legacy"}}"#;
         let event: Event = serde_json::from_str(json).expect("legacy event deserialises");
         match event {
-            Event::UserPromptSent { text, attachments } => {
+            Event::UserPromptSent {
+                text, attachments, ..
+            } => {
                 assert_eq!(text, "legacy");
                 assert!(attachments.is_empty());
             }
@@ -2449,6 +2456,7 @@ mod tests {
                 "s-real",
                 1,
                 &Event::UserPromptSent {
+                    prompt_id: None,
                     text: "hello".into(),
                     attachments: Vec::new(),
                 },
@@ -2658,6 +2666,7 @@ mod tests {
                 "s-1",
                 1,
                 &Event::UserPromptSent {
+                    prompt_id: None,
                     text: "hi".into(),
                     attachments: Vec::new(),
                 },
@@ -2965,6 +2974,7 @@ mod tests {
                 "s-1",
                 1,
                 &Event::UserPromptSent {
+                    prompt_id: None,
                     text: "go".into(),
                     attachments: Vec::new(),
                 },
@@ -3026,6 +3036,7 @@ mod tests {
                 "s-1",
                 1,
                 &Event::UserPromptSent {
+                    prompt_id: None,
                     text: "go".into(),
                     attachments: Vec::new(),
                 },
@@ -3070,6 +3081,7 @@ mod tests {
                 "s-1",
                 1,
                 &Event::UserPromptSent {
+                    prompt_id: None,
                     text: "go".into(),
                     attachments: Vec::new(),
                 },
@@ -3095,6 +3107,7 @@ mod tests {
                 "s-1",
                 1,
                 &Event::UserPromptSent {
+                    prompt_id: None,
                     text: "go".into(),
                     attachments: Vec::new(),
                 },
@@ -3129,6 +3142,7 @@ mod tests {
                 "s-1",
                 1,
                 &Event::UserPromptSent {
+                    prompt_id: None,
                     text: "go".into(),
                     attachments: Vec::new(),
                 },
@@ -3156,6 +3170,7 @@ mod tests {
                 "s-1",
                 1,
                 &Event::UserPromptSent {
+                    prompt_id: None,
                     text: "keep working".into(),
                     attachments: Vec::new(),
                 },
@@ -3193,6 +3208,7 @@ mod tests {
                 "s-1",
                 1,
                 &Event::UserPromptSent {
+                    prompt_id: None,
                     text: "look at this".into(),
                     attachments: vec![att.clone()],
                 },
@@ -3222,6 +3238,7 @@ mod tests {
                 "s-1",
                 1,
                 &Event::UserPromptSent {
+                    prompt_id: None,
                     text: "go".into(),
                     attachments: Vec::new(),
                 },
@@ -3249,6 +3266,7 @@ mod tests {
                 "s-1",
                 1,
                 &Event::UserPromptSent {
+                    prompt_id: None,
                     text: "old prompt".into(),
                     attachments: Vec::new(),
                 },
@@ -3291,6 +3309,7 @@ mod tests {
                 "s-1",
                 1,
                 &Event::UserPromptSent {
+                    prompt_id: None,
                     text: "first".into(),
                     attachments: Vec::new(),
                 },
@@ -3310,6 +3329,7 @@ mod tests {
                 "s-1",
                 3,
                 &Event::UserPromptSent {
+                    prompt_id: None,
                     text: "second".into(),
                     attachments: Vec::new(),
                 },
@@ -3336,6 +3356,7 @@ mod tests {
                 "s-1",
                 1,
                 &Event::UserPromptSent {
+                    prompt_id: None,
                     text: "schedule a wake in 2m".into(),
                     attachments: Vec::new(),
                 },
@@ -3357,6 +3378,7 @@ mod tests {
                 "s-1",
                 3,
                 &Event::UserPromptSent {
+                    prompt_id: None,
                     text: "btw, ping me when you wake".into(),
                     attachments: Vec::new(),
                 },
@@ -3472,6 +3494,7 @@ mod tests {
                 "s-1",
                 2,
                 &Event::UserPromptSent {
+                    prompt_id: None,
                     text: "stop watching".into(),
                     attachments: Vec::new(),
                 },
@@ -3567,6 +3590,7 @@ mod tests {
                 "s-1",
                 1,
                 &Event::UserPromptSent {
+                    prompt_id: None,
                     text: "hi".into(),
                     attachments: Vec::new(),
                 },
@@ -3591,6 +3615,7 @@ mod tests {
                 "s-1",
                 1,
                 &Event::UserPromptSent {
+                    prompt_id: None,
                     text: "schedule a wake".into(),
                     attachments: Vec::new(),
                 },
@@ -3612,6 +3637,7 @@ mod tests {
                 "s-1",
                 3,
                 &Event::UserPromptSent {
+                    prompt_id: None,
                     text: "ping me when you wake".into(),
                     attachments: Vec::new(),
                 },
@@ -3642,6 +3668,7 @@ mod tests {
                 "s-1",
                 2,
                 &Event::UserPromptSent {
+                    prompt_id: None,
                     text: "Wake-up fired. Confirm.".into(),
                     attachments: Vec::new(),
                 },
@@ -3667,6 +3694,7 @@ mod tests {
                 "s-1",
                 2,
                 &Event::UserPromptSent {
+                    prompt_id: None,
                     text: "first prompt past at".into(),
                     attachments: Vec::new(),
                 },
@@ -3677,6 +3705,7 @@ mod tests {
                 "s-1",
                 3,
                 &Event::UserPromptSent {
+                    prompt_id: None,
                     text: "second prompt past at".into(),
                     attachments: Vec::new(),
                 },
@@ -3700,6 +3729,7 @@ mod tests {
                     "s-1",
                     1,
                     &Event::UserPromptSent {
+                        prompt_id: None,
                         text: "hello".into(),
                         attachments: Vec::new(),
                     },
@@ -3734,6 +3764,7 @@ mod tests {
                 "s-1",
                 1,
                 &Event::UserPromptSent {
+                    prompt_id: None,
                     text: "hi".into(),
                     attachments: Vec::new(),
                 },
@@ -3783,6 +3814,7 @@ mod tests {
                 "s-1",
                 1,
                 &Event::UserPromptSent {
+                    prompt_id: None,
                     text: "go".into(),
                     attachments: Vec::new(),
                 },
@@ -4192,6 +4224,7 @@ mod tests {
             )
             .unwrap();
         let prompt = |t: &str| Event::UserPromptSent {
+            prompt_id: None,
             text: t.into(),
             attachments: vec![],
         };

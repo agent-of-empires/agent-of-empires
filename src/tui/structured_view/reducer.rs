@@ -336,7 +336,7 @@ impl AcpTranscript {
                 self.rows.push(ActivityRow::AgentMessage(text.clone()));
                 self.pending_message_idx = Some(self.rows.len() - 1);
             }
-            Event::UserPromptSent { text, attachments } => {
+            Event::UserPromptSent { text, attachments, .. } => {
                 self.flush_pending_chunk();
                 // The TUI structured view renders text only; note the
                 // attachment count inline so a prompt sent from the web
@@ -866,6 +866,7 @@ mod tests {
                 message: "boom".into(),
             },
             Event::UserPromptSent {
+                prompt_id: None,
                 text: "next turn".into(),
                 attachments: Vec::new(),
             },
@@ -914,6 +915,7 @@ mod tests {
             // A steered follow-up the daemon confirmed mid-compaction.
             (
                 Event::UserPromptSent {
+                    prompt_id: None,
                     text: "also check the tests".into(),
                     attachments: Vec::new(),
                 },
@@ -938,6 +940,7 @@ mod tests {
         t.apply(&frame(
             1,
             Event::UserPromptSent {
+                prompt_id: None,
                 text: "hi".into(),
                 attachments: Vec::new(),
             },
@@ -1268,6 +1271,7 @@ mod tests {
         t.apply(&frame(
             1,
             Event::UserPromptSent {
+                prompt_id: None,
                 text: "hi".into(),
                 attachments: Vec::new(),
             },
@@ -1277,6 +1281,7 @@ mod tests {
         t.apply(&frame(
             1,
             Event::UserPromptSent {
+                prompt_id: None,
                 text: "ignored".into(),
                 attachments: Vec::new(),
             },
@@ -1298,6 +1303,7 @@ mod tests {
         t.apply(&frame(
             2,
             Event::UserPromptSent {
+                prompt_id: None,
                 text: "go".into(),
                 attachments: Vec::new(),
             },
@@ -1363,6 +1369,7 @@ mod tests {
         t.apply(&frame(
             1,
             Event::UserPromptSent {
+                prompt_id: None,
                 text: "go".into(),
                 attachments: vec![],
             },
@@ -1385,6 +1392,7 @@ mod tests {
         t.apply(&frame(
             1,
             Event::UserPromptSent {
+                prompt_id: None,
                 text: "go".into(),
                 attachments: vec![],
             },
@@ -1400,6 +1408,7 @@ mod tests {
         t.apply(&frame(
             3,
             Event::UserPromptSent {
+                prompt_id: None,
                 text: "again".into(),
                 attachments: vec![],
             },
@@ -1421,6 +1430,7 @@ mod tests {
         t.apply(&frame(
             1,
             Event::UserPromptSent {
+                prompt_id: None,
                 text: "go".into(),
                 attachments: vec![],
             },
@@ -1522,6 +1532,7 @@ mod tests {
         t.apply(&frame(
             1,
             Event::UserPromptSent {
+                prompt_id: None,
                 text: "hi".into(),
                 attachments: Vec::new(),
             },

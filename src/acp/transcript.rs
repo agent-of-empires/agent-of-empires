@@ -230,15 +230,22 @@ impl TranscriptModel {
                     text.clone(),
                 ))]
             }
-            Event::UserPromptSent { text, attachments } => {
+            Event::UserPromptSent {
+                text,
+                attachments,
+                prompt_id,
+            } => {
                 self.begin_turn();
                 let group_id = self.fresh_group();
-                let mut row = TranscriptRow::new(
-                    format!("user-seq-{seq}"),
-                    group_id,
-                    TranscriptRowKind::UserPrompt,
-                    text.clone(),
-                );
+                // When the client minted a prompt id, key the row by it so an
+                // optimistic client row reconciles by id; otherwise fall back
+                // to the seq-derived id both reducers use.
+                let id = match prompt_id {
+                    Some(pid) if !pid.is_empty() => pid.clone(),
+                    _ => format!("user-seq-{seq}"),
+                };
+                let mut row =
+                    TranscriptRow::new(id, group_id, TranscriptRowKind::UserPrompt, text.clone());
                 row.attachments = attachments.clone();
                 vec![self.append(row)]
             }
@@ -861,6 +868,7 @@ mod tests {
         Event::UserPromptSent {
             text: text.into(),
             attachments: Vec::new(),
+            prompt_id: None,
         }
     }
 
@@ -924,6 +932,7 @@ mod tests {
                 name: Some("shot.png".into()),
                 size: 1234,
             }],
+            prompt_id: None,
         };
         let mut m = TranscriptModel::new();
         let deltas = m.apply_event(3, &ev);
@@ -934,6 +943,28 @@ mod tests {
         assert_eq!(row.kind, TranscriptRowKind::UserPrompt);
         assert_eq!(row.attachments.len(), 1);
         assert_eq!(row.attachments[0].id, "att-1");
+    }
+
+    #[test]
+    fn client_minted_prompt_id_keys_the_user_row() {
+        // A client-minted prompt_id becomes the row id so an optimistic client
+        // row reconciles by id; absent/empty falls back to the seq-derived id.
+        let cases: [(Option<&str>, &str); 3] = [
+            (Some("cmp-abc"), "cmp-abc"),
+            (None, "user-seq-7"),
+            (Some(""), "user-seq-7"),
+        ];
+        for (pid, expect_id) in cases {
+            let ev = Event::UserPromptSent {
+                text: "hi".into(),
+                attachments: Vec::new(),
+                prompt_id: pid.map(|s| s.to_string()),
+            };
+            let mut m = TranscriptModel::new();
+            m.apply_event(7, &ev);
+            assert_eq!(m.rows()[0].id, expect_id, "prompt_id={pid:?}");
+            assert_eq!(m.rows()[0].kind, TranscriptRowKind::UserPrompt);
+        }
     }
 
     #[test]

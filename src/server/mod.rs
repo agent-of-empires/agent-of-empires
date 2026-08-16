@@ -9197,6 +9197,7 @@ mod tests {
         };
         assert_eq!(
             derive_acp_status(&Event::UserPromptSent {
+                prompt_id: None,
                 text: "hi".into(),
                 attachments: Vec::new(),
             }),
@@ -9477,6 +9478,7 @@ mod tests {
                 &id,
                 1,
                 &Event::UserPromptSent {
+                    prompt_id: None,
                     text: "go".into(),
                     attachments: Vec::new(),
                 },

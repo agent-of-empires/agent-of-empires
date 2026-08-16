@@ -5159,6 +5159,7 @@ fn map_update_to_events(
             ContentBlock::Text(text) => vec![Event::UserPromptSent {
                 text: text.text,
                 attachments: Vec::new(),
+                prompt_id: None,
             }],
             other => vec![raw_event(&other)],
         },
@@ -14347,7 +14348,9 @@ done
         );
         assert_eq!(events.len(), 1);
         match &events[0] {
-            Event::UserPromptSent { text, attachments } => {
+            Event::UserPromptSent {
+                text, attachments, ..
+            } => {
                 assert_eq!(text, "hello from the past");
                 assert!(attachments.is_empty());
             }

@@ -1016,6 +1016,16 @@ pub enum Event {
         /// no migration is needed. See #1000 / #965.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         attachments: Vec<PromptAttachmentRef>,
+        /// Client-minted stable id for the prompt, echoed back so a web
+        /// client can reconcile its optimistic row against the
+        /// authoritative `UserPromptSent` by id rather than by text/seq.
+        /// `None` for prompts from surfaces that mint no id (CLI/TUI
+        /// verbs, drained queue entries) and for events persisted before
+        /// this field landed; `#[serde(default, skip_serializing_if)]`
+        /// keeps those deserialising and re-serialising unchanged, so no
+        /// migration is needed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        prompt_id: Option<String>,
     },
     /// The agent's prompt capabilities, captured from the ACP
     /// `initialize` response right after the handshake (and re-emitted
@@ -1603,6 +1613,7 @@ mod tests {
 
     fn prompt(text: &str) -> Event {
         Event::UserPromptSent {
+            prompt_id: None,
             text: text.into(),
             attachments: Vec::new(),
         }

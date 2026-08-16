@@ -2356,6 +2356,7 @@ mod tests {
         let finished_agent_turn = |extra: Vec<Event>| {
             let mut evs = vec![
                 Event::UserPromptSent {
+                    prompt_id: None,
                     text: "continue".to_string(),
                     attachments: Vec::new(),
                 },
@@ -2427,6 +2428,7 @@ mod tests {
                 name: "user prompt still lacks its terminator",
                 events: vec![
                     Event::UserPromptSent {
+                        prompt_id: None,
                         text: "go".to_string(),
                         attachments: Vec::new(),
                     },
