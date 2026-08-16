@@ -177,6 +177,35 @@ test.describe("mobile jump-to-bottom", () => {
     await expect(page.getByTestId("acp-jump-to-bottom")).toBeVisible();
   });
 
+  test("reopening a session with loadable earlier history still lands at the bottom", async ({ page }) => {
+    // 100 turns (200 activity rows) overflow the 150-row window, so
+    // canLoadEarlierHistory is true. On reopen the initial sample() runs at
+    // scrollTop 0 (before the restore pins) and trips the auto-load-earlier,
+    // which stamps a scroll anchor. Stick-to-bottom intent must win over that
+    // anchor so the session opens pinned to the latest message instead of
+    // stranded scrolled up. Regression for the mount-time anchor race that made
+    // reopen land scrolled up despite a bottom-stick intent.
+    const userPrompt = (text: string) => ({ UserPromptSent: { text } });
+    const events: unknown[] = [];
+    for (let i = 0; i < 100; i++) {
+      events.push(userPrompt(`prompt number ${i}`), agentMessageChunk(`reply number ${i}`), stopped());
+    }
+    const mock = await mockAcpSession(page, { title: "story-reopen-history", initialEvents: events });
+    await openStructuredSession(page, mock);
+    await waitForComposerConnected(page);
+
+    const viewport = page.getByTestId("acp-viewport");
+    const isPinned = () => viewport.evaluate((el) => el.scrollTop + el.clientHeight >= el.scrollHeight - 16);
+    await expect.poll(isPinned).toBe(true);
+
+    // Reopen (hard reload, localStorage kept). Must still land at the bottom
+    // even though loadable earlier history triggers the mount auto-load.
+    await page.reload();
+    await waitForComposerConnected(page);
+    await expect.poll(isPinned).toBe(true);
+    await expect(page.getByTestId("acp-jump-to-bottom")).toBeHidden();
+  });
+
   test("does not yank a scrolled-up reader to the bottom on new content", async ({ page }) => {
     const longText = Array.from({ length: 120 }, (_, i) => `history line ${i}`).join("\n");
     const mock = await mockAcpSession(page, {

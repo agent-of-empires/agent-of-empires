@@ -534,7 +534,15 @@ function AcpChrome({
         // Persist the stick intent the moment it flips (user scrolled off / back
         // to the bottom), so a PWA reopen restores it even if `pagehide` never
         // fires. The offset save on hide/unmount refines the exact position.
-        if (pinned !== prevStuck) saveScrollState(sessionId, { stuck: pinned, top: vp.scrollTop });
+        // Gate on the restore having run: the forced mount `sample(true)` below
+        // fires before the restore block, and with a tall transcript scrollTop
+        // is still 0 there, which reads as "not pinned". Saving that would
+        // clobber the persisted intent with `stuck:false, top:0`, and the
+        // restore block would then read it back and strand the reopen at the
+        // top. See the restore block and #3386.
+        if (pinned !== prevStuck && didRestoreScrollRef.current) {
+          saveScrollState(sessionId, { stuck: pinned, top: vp.scrollTop });
+        }
         // Momentum after a flick keeps firing `scroll` with no fresh touchmove;
         // keep the gesture alive so those frames still count as the user's.
         if (gestureActive) scheduleGestureClear();
