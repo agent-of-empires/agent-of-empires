@@ -35,26 +35,47 @@ code citations below):
    byte cap. This is Q1/Q5, still open.
 2. **The client rewire regresses dormant-worker delivery unless wake-on-drain
    lands first.** The server drain pass skips any session whose worker is not
-   live (`src/server/acp_reconciler.rs:1589`, `if !is_running { continue }`). The
+   live (`src/server/acp_reconciler.rs`, `if is_running { drain } else ...`). The
    client drain, by contrast, wakes an idle-auto-stopped worker by letting the
    POST itself fire the resume (`web/src/hooks/useAcpSession.ts` `workerIdleStopped`
-   exception). Drop the client drain before the server can wake a dormant worker
-   and a prompt queued against a dormant session never delivers.
-3. **Wake-on-drain hits the #3172 re-entrant-spawn deadlock.** `send_turn`
-   already wakes a dormant/dead worker (`src/server/session_service.rs:453`,
-   `needs_resume = woke_idle_dormant || !is_running`), so the fix looks like
-   "let the drain run for dormant sessions too." But `drain_queued_prompts_once`
-   holds the session `instance_lock` across `send_turn`, and its own doc says
-   that is safe *only because callers pre-gate on `is_running`* so no spawn
-   happens under the lock. `trigger_resume_background`'s detached spawn takes that
-   same `instance_lock` (`src/server/acp_reconciler.rs:1782`, "Callers MUST NOT
-   hold the session's `instance_lock`"), so waking under the drain lock
-   deadlocks. Safe wake-on-drain needs the drain restructured to not hold the
-   lock across a waking `send_turn`, validated by a live-daemon e2e.
+   exception). This is now handled server-side (see "Wake-on-drain" below), so
+   dropping the client drain no longer strands a prompt queued against a dormant
+   session.
 
 Also still to do (straightforward once the above are settled): the `send-now`
 endpoint (G3), the one-time localStorage migration (Q2), and the live-daemon
 e2e for the full closed-app round-trip.
+
+### Wake-on-drain (implemented)
+
+A queued prompt normally drains at turn-end while the worker is still live, so
+the queue empties before the idle reaper can auto-stop the worker. But a prompt
+enqueued against an already-dormant session (a laptop queuing to a phone-session
+whose worker was auto-stopped, or a drain that kept failing until dormancy) must
+still deliver. The naive "let the drain run for dormant sessions too" deadlocks:
+`send_turn` does wake a dormant/dead worker (`src/server/session_service.rs`,
+`needs_resume = woke_idle_dormant || !is_running`), but `drain_queued_prompts_once`
+holds the session `instance_lock` across `send_turn`, and `trigger_resume_background`'s
+detached spawn takes that same lock (`src/server/acp_reconciler.rs`, "Callers MUST
+NOT hold the session's `instance_lock`"; #3172).
+
+The fix sidesteps the lock entirely. `drain_queued_prompts` splits by worker
+state: a live worker drains as before; a **dormant** session with a queue has
+its idle-dormant marker cleared (`SessionService::wake_dormant_for_queue_drain`,
+persisted via the instances-write path, never `instance_lock`). Clearing the
+marker un-excludes the session from the reconciler's resume pass, which respawns
+the worker under its normal respawn budget/park guard; the following tick then
+drains via the live-worker branch. No `trigger_resume_background` is ever called
+from the drain, so the #3172 lock-order hazard cannot occur. The idle reaper is
+guarded to skip sessions with a non-empty queue, so it cannot re-sink a session
+faster than wake-on-drain revives it (no oscillation). A deliberately-stopped
+session (status `Stopped`, not `Idle`) is never a drain candidate, so this only
+ever revives sessions the idle reaper auto-stopped. Covered by
+`wake_dormant_for_queue_drain_clears_only_when_dormant` and
+`drain_queued_prompts_wakes_a_dormant_session_with_a_queue`; the full
+reaper -> dormant -> enqueue -> wake -> drain cycle is exercised by the client
+rewire's live queue round-trip (cheaper and more representative than a
+config-forced-dormancy Rust e2e).
 
 **Net:** the backend store + endpoints + live-worker drain are done and green,
 but they are inert until the client POSTs into the queue, and the client rewire

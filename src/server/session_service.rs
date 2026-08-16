@@ -991,6 +991,28 @@ impl SessionService {
         .await;
     }
 
+    /// Clear the idle-dormant marker for a session that has queued work so the
+    /// reconciler's resume pass respawns its worker, after which the next tick
+    /// drains the queue (see `acp_reconciler::drain_queued_prompts`).
+    ///
+    /// Deliberately does NOT kick a resume directly: routing the wake through
+    /// the resume pass keeps that pass's respawn budget/park guard and never
+    /// spawns while holding a lock, so it cannot hit the #3172 re-entrant-spawn
+    /// deadlock the way a `send_turn`-under-lock wake would. Persists the clear
+    /// via the instances-write path (not `instance_lock`), so a daemon restart
+    /// keeps the session awake and the write never blocks a spawn. Guards on
+    /// `is_idle_dormant` so a session woken by another path between the
+    /// reconciler snapshot and this call is left untouched.
+    #[cfg(feature = "serve")]
+    pub(crate) async fn wake_dormant_for_queue_drain(self: &Arc<Self>, id: &str) {
+        self.mutate_instance_persisted(id, |inst| {
+            if inst.is_idle_dormant() {
+                inst.idle_dormant_since = None;
+            }
+        })
+        .await;
+    }
+
     /// Same lazy per-instance mutex registry as `AppState::instance_lock`;
     /// both operate on the shared map, so a lock taken through either handle
     /// excludes the other.
@@ -1553,6 +1575,44 @@ mod tests {
             )
             .await
             .is_none());
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn wake_dormant_for_queue_drain_clears_only_when_dormant() {
+        // A session the idle reaper auto-stopped: dormant, so the resume pass
+        // skips it. Wake-on-drain must clear the marker so the queue can drain.
+        let mut dormant = Instance::new("queue", "/tmp/aoe-queue-dormant");
+        dormant.id = "sess-dormant".to_string();
+        dormant.view = crate::session::View::Structured;
+        dormant.mark_idle_dormant();
+        assert!(dormant.is_idle_dormant());
+
+        // A live/idle session that is not dormant must be left untouched: the
+        // wake only ever clears the marker, never sets it.
+        let mut awake = Instance::new("queue", "/tmp/aoe-queue-awake");
+        awake.id = "sess-awake".to_string();
+        awake.view = crate::session::View::Structured;
+
+        let state = crate::server::test_support::build_test_app_state(vec![dormant, awake]);
+        let service = state.session_service.clone();
+
+        service.wake_dormant_for_queue_drain("sess-dormant").await;
+        service.wake_dormant_for_queue_drain("sess-awake").await;
+        // A gone session is a no-op, never a panic.
+        service.wake_dormant_for_queue_drain("sess-gone").await;
+
+        let instances = state.instances.read().await;
+        let dormant_after = instances.iter().find(|i| i.id == "sess-dormant").unwrap();
+        let awake_after = instances.iter().find(|i| i.id == "sess-awake").unwrap();
+        assert!(
+            !dormant_after.is_idle_dormant(),
+            "dormant queued session must be woken so the resume pass respawns it"
+        );
+        assert!(
+            !awake_after.is_idle_dormant(),
+            "a non-dormant session must stay non-dormant (no spurious wake)"
+        );
     }
 
     #[cfg(feature = "serve")]
