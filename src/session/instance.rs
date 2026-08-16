@@ -864,6 +864,23 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_initial_turn_attachments: Vec<crate::acp::state::PromptAttachmentRef>,
 
+    /// Server-owned prompt queue: follow-ups the user lined up while a turn
+    /// was busy. The daemon is the source of truth, so the queue survives a
+    /// client reload / closed PWA and drains on turn-end with no tab open
+    /// (see `docs/development/server-side-prompt-queue.md`). Ordered by
+    /// `QueuedPromptEntry::seq`. Serve-only: the queue exists only for the
+    /// web dashboard's structured view. `#[serde(default)]` + skip-when-empty
+    /// keeps pre-existing rows deserialising unchanged, so no migration.
+    #[cfg(feature = "serve")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queued_prompts: Vec<crate::acp::state::QueuedPromptEntry>,
+
+    /// Monotonic counter for `QueuedPromptEntry::seq`, so ordering is stable
+    /// even after rows drain or are removed. Never reused within a session.
+    #[cfg(feature = "serve")]
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub queued_prompt_next_seq: u64,
+
     /// Explicit ACP approval-mode id this session should run under (#2897),
     /// applied via `session/set_mode` after every worker (re)spawn, taking
     /// precedence over the legacy `yolo_mode` bool (which stays authoritative
@@ -1584,6 +1601,10 @@ impl Instance {
             pending_initial_turn: None,
             #[cfg(feature = "serve")]
             pending_initial_turn_attachments: Vec::new(),
+            #[cfg(feature = "serve")]
+            queued_prompts: Vec::new(),
+            #[cfg(feature = "serve")]
+            queued_prompt_next_seq: 0,
             acp_mode_id: None,
             prior_tool_session_ids: HashMap::new(),
             scratch: false,

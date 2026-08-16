@@ -615,6 +615,34 @@ pub struct PromptAttachmentRef {
     pub size: u64,
 }
 
+/// One entry in a session's server-owned prompt queue: a follow-up the
+/// user lined up while a turn was busy. The daemon is the source of truth
+/// (persisted on the `Instance`), so the queue survives a client reload or
+/// a closed PWA and drains on turn-end with no tab open. See
+/// `docs/development/server-side-prompt-queue.md`.
+///
+/// Attachments carry metadata only, exactly like [`PromptAttachmentRef`]
+/// on a live prompt: the bytes live in the `acp_attachments` store keyed by
+/// `(session_id, id)` and are reloaded at drain time, so a queued
+/// screenshot does not bloat the session file.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QueuedPromptEntry {
+    /// Client-minted stable id, unchanged across edits. Doubles as the
+    /// optimistic-echo reconcile key on the client.
+    pub id: String,
+    /// Server-assigned monotonic order; the queue drains by ascending `seq`.
+    pub seq: u64,
+    pub text: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attachments: Vec<PromptAttachmentRef>,
+    /// RFC3339 enqueue time, for retention and provenance.
+    pub created_at: String,
+    /// Which device enqueued it, for multi-device provenance. `None` for
+    /// rows migrated from a pre-server-queue client localStorage.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_device: Option<String>,
+}
+
 /// Discriminated union of state mutations. ACP `session/update`
 /// notifications become specific variants; client approval taps also
 /// become variants and flow through the same path.

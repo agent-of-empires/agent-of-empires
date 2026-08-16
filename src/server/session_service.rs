@@ -732,6 +732,147 @@ impl SessionService {
         }
     }
 
+    /// Apply `mutate` to a session's in-memory `Instance` and persist the same
+    /// change to disk, mirroring the `pending_initial_turn` write path. Returns
+    /// what `mutate` produced on the in-memory instance, or `None` if the
+    /// session is gone. `mutate` runs twice, once in memory and once against the
+    /// on-disk copy under the storage lock, so it must be deterministic given
+    /// the instance state; every queue mutation goes through here, so the two
+    /// copies stay in lockstep (the on-disk run re-derives the same `seq`).
+    #[cfg(feature = "serve")]
+    async fn mutate_instance_persisted<T, F>(self: &Arc<Self>, id: &str, mutate: F) -> Option<T>
+    where
+        T: Send + 'static,
+        F: Fn(&mut crate::session::Instance) -> T + Send + 'static,
+    {
+        let (profile, result) = {
+            let mut instances = self.instances.write().await;
+            let inst = instances.iter_mut().find(|i| i.id == id)?;
+            let r = mutate(inst);
+            (inst.source_profile.clone(), r)
+        };
+        match crate::session::Storage::new(&profile, self.file_watch.clone()) {
+            Ok(storage) => {
+                let id_persist = id.to_string();
+                let persisted = tokio::task::spawn_blocking(move || {
+                    storage.update(|instances, _groups| {
+                        if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
+                            mutate(inst);
+                        }
+                        Ok(())
+                    })
+                })
+                .await;
+                if !matches!(persisted, Ok(Ok(()))) {
+                    tracing::warn!(target: "acp.queue", session = %id, "failed to persist queue mutation; it holds this daemon life");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(target: "acp.queue", session = %id, "failed to open storage for queue mutation: {e}");
+            }
+        }
+        Some(result)
+    }
+
+    /// Append a prompt to the session's server-owned queue and return the
+    /// stored entry (with its assigned `seq`). Idempotent on `prompt_id`:
+    /// re-enqueuing an existing id updates its text/attachments in place instead
+    /// of adding a duplicate, so an optimistic client retry cannot double-queue.
+    #[cfg(feature = "serve")]
+    pub(crate) async fn enqueue_prompt(
+        self: &Arc<Self>,
+        id: &str,
+        prompt_id: String,
+        text: String,
+        attachments: Vec<crate::acp::state::PromptAttachmentRef>,
+        origin_device: Option<String>,
+        created_at: String,
+    ) -> Option<crate::acp::state::QueuedPromptEntry> {
+        self.mutate_instance_persisted(id, move |inst| {
+            if let Some(existing) = inst.queued_prompts.iter_mut().find(|q| q.id == prompt_id) {
+                existing.text = text.clone();
+                existing.attachments = attachments.clone();
+                return existing.clone();
+            }
+            let seq = inst.queued_prompt_next_seq;
+            inst.queued_prompt_next_seq = seq.saturating_add(1);
+            let entry = crate::acp::state::QueuedPromptEntry {
+                id: prompt_id.clone(),
+                seq,
+                text: text.clone(),
+                attachments: attachments.clone(),
+                created_at: created_at.clone(),
+                origin_device: origin_device.clone(),
+            };
+            inst.queued_prompts.push(entry.clone());
+            entry
+        })
+        .await
+    }
+
+    /// Replace a queued prompt's text in place. Returns `true` if a row with
+    /// `prompt_id` existed.
+    #[cfg(feature = "serve")]
+    pub(crate) async fn edit_queued_prompt(
+        self: &Arc<Self>,
+        id: &str,
+        prompt_id: String,
+        text: String,
+    ) -> bool {
+        self.mutate_instance_persisted(id, move |inst| {
+            match inst.queued_prompts.iter_mut().find(|q| q.id == prompt_id) {
+                Some(q) => {
+                    q.text = text.clone();
+                    true
+                }
+                None => false,
+            }
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Remove a queued prompt by id. Returns `true` if a row was removed.
+    #[cfg(feature = "serve")]
+    pub(crate) async fn remove_queued_prompt(
+        self: &Arc<Self>,
+        id: &str,
+        prompt_id: String,
+    ) -> bool {
+        self.mutate_instance_persisted(id, move |inst| {
+            let before = inst.queued_prompts.len();
+            inst.queued_prompts.retain(|q| q.id != prompt_id);
+            inst.queued_prompts.len() != before
+        })
+        .await
+        .unwrap_or(false)
+    }
+
+    /// Drop every queued prompt for a session.
+    #[cfg(feature = "serve")]
+    pub(crate) async fn clear_queued_prompts(self: &Arc<Self>, id: &str) {
+        self.mutate_instance_persisted(id, move |inst| inst.queued_prompts.clear())
+            .await;
+    }
+
+    /// Snapshot the session's queue, ordered by `seq`.
+    #[cfg(feature = "serve")]
+    pub(crate) async fn queued_prompts_snapshot(
+        &self,
+        id: &str,
+    ) -> Vec<crate::acp::state::QueuedPromptEntry> {
+        let instances = self.instances.read().await;
+        instances
+            .iter()
+            .find(|i| i.id == id)
+            .map(|i| {
+                let mut q = i.queued_prompts.clone();
+                q.sort_by_key(|e| e.seq);
+                q
+            })
+            .unwrap_or_default()
+    }
+
     /// Same lazy per-instance mutex registry as `AppState::instance_lock`;
     /// both operate on the shared map, so a lock taken through either handle
     /// excludes the other.
@@ -1204,5 +1345,95 @@ mod tests {
                 .is_empty(),
             "drain must release its claim on the no-op paths"
         );
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn queue_store_enqueue_edit_remove_clear() {
+        let mut inst = Instance::new("queue", "/tmp/aoe-queue-project");
+        inst.id = "sess-q".to_string();
+        inst.view = crate::session::View::Structured;
+        let service = crate::server::test_support::build_test_app_state(vec![inst])
+            .session_service
+            .clone();
+
+        // Enqueue two: seqs are assigned monotonically and the snapshot is
+        // ordered by seq.
+        let a = service
+            .enqueue_prompt(
+                "sess-q",
+                "a".into(),
+                "first".into(),
+                vec![],
+                None,
+                "t0".into(),
+            )
+            .await
+            .expect("session exists");
+        let b = service
+            .enqueue_prompt(
+                "sess-q",
+                "b".into(),
+                "second".into(),
+                vec![],
+                None,
+                "t1".into(),
+            )
+            .await
+            .expect("session exists");
+        assert_eq!((a.seq, b.seq), (0, 1));
+        let snap = service.queued_prompts_snapshot("sess-q").await;
+        assert_eq!(
+            snap.iter().map(|q| q.text.as_str()).collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+
+        // Re-enqueue by the same id is an idempotent update, not a duplicate:
+        // an optimistic client retry cannot double-queue.
+        let a2 = service
+            .enqueue_prompt(
+                "sess-q",
+                "a".into(),
+                "first edited".into(),
+                vec![],
+                None,
+                "t2".into(),
+            )
+            .await
+            .expect("session exists");
+        assert_eq!(a2.seq, 0, "re-enqueue keeps the original seq");
+        assert_eq!(service.queued_prompts_snapshot("sess-q").await.len(), 2);
+
+        // Edit / remove / clear.
+        assert!(
+            service
+                .edit_queued_prompt("sess-q", "b".into(), "second edited".into())
+                .await
+        );
+        assert!(
+            !service
+                .edit_queued_prompt("sess-q", "missing".into(), "x".into())
+                .await
+        );
+        assert!(service.remove_queued_prompt("sess-q", "a".into()).await);
+        assert!(!service.remove_queued_prompt("sess-q", "a".into()).await);
+        let snap = service.queued_prompts_snapshot("sess-q").await;
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].text, "second edited");
+        service.clear_queued_prompts("sess-q").await;
+        assert!(service.queued_prompts_snapshot("sess-q").await.is_empty());
+
+        // A gone session is a None/no-op, never a panic.
+        assert!(service
+            .enqueue_prompt(
+                "sess-gone",
+                "z".into(),
+                "x".into(),
+                vec![],
+                None,
+                "t".into()
+            )
+            .await
+            .is_none());
     }
 }
