@@ -1,6 +1,28 @@
 # Design: server-side prompt queue (closed-app delivery + force-send)
 
-Status: proposal, not yet implemented. Owner: TBD. Opened 2026-08-14.
+Status: partially implemented. Opened 2026-08-14.
+
+Implemented so far (backend + API client):
+
+- Durable per-session queue on the `Instance` (`queued_prompts` +
+  `queued_prompt_next_seq`, `QueuedPromptEntry`), persisted like
+  `pending_initial_turn`. Chosen over a dedicated SQLite table for consistency
+  with the existing pending-turn pattern and free WS/multi-device sync via the
+  session list (revises Q1).
+- `SessionService` enqueue / edit / remove / clear / snapshot and
+  `drain_queued_prompts_once`; a reconciler pass drains the head batch at
+  turn-end (`Status::Idle`, live worker) with the `/clear`-boundary split
+  matching the client. `queued_prompts` is surfaced on `SessionResponse`.
+- HTTP: `POST/GET/DELETE /api/sessions/{id}/queue`,
+  `PATCH/DELETE /api/sessions/{id}/queue/{promptId}`, CityHall-classified like
+  `acp/prompt`. Web API client wrappers + Vitest.
+
+Still to do: attachments on a queued prompt (reuse the `PromptAttachmentRef`
++ `acp_attachments` pattern as `pending_initial_turn_attachments` does),
+retention TTL (Q5), the `send-now` endpoint (G3), waking an idle-auto-stopped
+worker on drain, the client rewire (point `sendPrompt`/`sendQueuedNow` at the
+server queue and remove the client drain + `AcpBackgroundDrainers`), the
+one-time localStorage migration (Q2), and the live-daemon e2e.
 
 ## Problem
 

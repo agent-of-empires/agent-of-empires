@@ -1505,6 +1505,81 @@ export async function acpDisable(sessionId: string): Promise<ViewSwitchResponse 
   });
 }
 
+// --- Server-owned prompt queue (docs/development/server-side-prompt-queue.md) ---
+//
+// The daemon owns the structured-view prompt queue, so a follow-up queued
+// behind a busy turn survives a client reload / closed PWA and drains
+// server-side. These wrap the /queue endpoints; the queue itself reflects to
+// the client on `SessionResponse.queued_prompts`.
+
+/** One entry of a session's server-owned queue, as the API returns it. */
+export interface ServerQueuedPrompt {
+  id: string;
+  seq: number;
+  text: string;
+  attachments?: unknown[];
+  created_at: string;
+  origin_device?: string | null;
+}
+
+async function fetchOk(url: string, init?: RequestInit): Promise<boolean> {
+  try {
+    return (await fetch(url, init)).ok;
+  } catch {
+    return false;
+  }
+}
+
+const jsonInit = (method: string, body: unknown): RequestInit => ({
+  method,
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify(body),
+});
+
+/** Enqueue a prompt server-side (POST /queue). `id` is the client-minted stable
+ *  id so an optimistic row reconciles against the returned entry; re-posting the
+ *  same id updates it in place rather than duplicating. Returns the stored entry
+ *  (with its assigned `seq`) or null on non-2xx. */
+export async function enqueueServerPrompt(
+  sessionId: string,
+  prompt: { id: string; text: string; createdAt?: string; originDevice?: string },
+): Promise<ServerQueuedPrompt | null> {
+  return fetchJson<ServerQueuedPrompt>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/queue`,
+    jsonInit("POST", {
+      id: prompt.id,
+      text: prompt.text,
+      created_at: prompt.createdAt,
+      origin_device: prompt.originDevice,
+    }),
+  );
+}
+
+/** The session's server queue, ordered by `seq` (GET /queue). */
+export async function listServerQueue(sessionId: string): Promise<ServerQueuedPrompt[]> {
+  return (await fetchJson<ServerQueuedPrompt[]>(`/api/sessions/${encodeURIComponent(sessionId)}/queue`)) ?? [];
+}
+
+/** Replace a queued prompt's text (PATCH /queue/{id}). */
+export async function editServerQueuedPrompt(sessionId: string, promptId: string, text: string): Promise<boolean> {
+  return fetchOk(
+    `/api/sessions/${encodeURIComponent(sessionId)}/queue/${encodeURIComponent(promptId)}`,
+    jsonInit("PATCH", { text }),
+  );
+}
+
+/** Remove one queued prompt (DELETE /queue/{id}). */
+export async function removeServerQueuedPrompt(sessionId: string, promptId: string): Promise<boolean> {
+  return fetchOk(`/api/sessions/${encodeURIComponent(sessionId)}/queue/${encodeURIComponent(promptId)}`, {
+    method: "DELETE",
+  });
+}
+
+/** Drop the whole server queue for a session (DELETE /queue). */
+export async function clearServerQueue(sessionId: string): Promise<boolean> {
+  return fetchOk(`/api/sessions/${encodeURIComponent(sessionId)}/queue`, { method: "DELETE" });
+}
+
 // --- Acp install agent (Tier 2 of #2109) ---
 
 export interface InstallAgentResponse {

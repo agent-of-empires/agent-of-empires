@@ -449,6 +449,13 @@
       "components": ["web/src/hooks/useAcpSession.ts", "web/src/lib/api.ts"]
     },
     {
+      "id": "acp.server-queue",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/__tests__/queueApi.test.ts"],
+      "components": ["web/src/lib/api.ts"]
+    },
+    {
       "id": "telemetry.feature-usage-signals",
       "kind": "live-playwright",
       "risk": "medium",
