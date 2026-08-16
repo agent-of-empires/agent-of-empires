@@ -62,6 +62,17 @@ test.describe("Mobile right panel picker (#1452)", () => {
     const paired = page.locator('[data-term="paired"]');
     await paired.waitFor({ state: "visible", timeout: 10_000 });
 
+    // The paired shell must carry the bottom home-indicator inset that the App
+    // root no longer reserves (it moved per-surface; see index.css
+    // .safe-area-inset). This layer was missed in that move, so the last
+    // terminal row and toolbar sat under the home indicator. The agent
+    // terminal and diff panes already reserve it; the paired shell is the same
+    // LiveTerminalView and must match.
+    const pairedInset = await page
+      .getByTestId("mobile-paired-layer")
+      .evaluate((el) => (el as HTMLElement).style.paddingBottom);
+    expect(pairedInset).toContain("safe-area-inset-bottom");
+
     // The bug: keyboard padding collapsed the paired terminal to ~0px.
     // Now it owns the viewport, so it stays comfortably tall.
     await simulateKeyboardOpen(page, 300);
