@@ -1,12 +1,14 @@
 # Design: server-owned structured-view state (live reduced-state channel)
 
-Status: in progress. Opened 2026-08-16. The server side is complete and both
-clients render both projections. What the web still folds from raw events is
-the state the daemon does not model: the worker-lifecycle latches, the monitor
-and wakeup badges, the usage cost baseline, rejected prompts, and the
-optimistic turn counters. Follows the server-owned prompt queue
-(`server-side-prompt-queue.md`) as the next step of moving structured-view (SV)
-logic off the clients so a web UI and a native TUI share one implementation.
+Status: in progress. Opened 2026-08-16. The server side is complete, both
+clients render both projections, and the daemon owns the send / steer / queue
+decision (Tier 3, `server-owned-prompt-dispatch.md`). What the web still folds
+from raw events is the state the daemon does not model: the worker-lifecycle
+latches, the monitor and wakeup badges, the usage cost baseline, rejected
+prompts, and the optimistic turn counters. Follows the server-owned prompt
+queue (`server-side-prompt-queue.md`) as the next step of moving
+structured-view (SV) logic off the clients so a web UI and a native TUI share
+one implementation.
 
 This is "Tier 1" of the SV server-ownership plan. Tier 0 (the native TUI adopts
 the server-owned prompt queue, retiring its local `PromptQueue`) shipped
@@ -158,6 +160,16 @@ One behavior changed in the process. Approvals are control state, not rows, so
 the native TUI stopped recording a resolved approval inline in the transcript;
 the modal shelf shows it while pending and nothing persists after. The web never
 had such a record, so the two clients now agree.
+
+## Tier 3: the dispatch decision follows the state
+
+With both projections server-owned, the last thing each client still derived
+was whether a prompt could be sent at all: a `shouldEnqueue` expression on the
+web and `should_queue_prompt_for` in the TUI, each re-deriving four fixed
+incidents (#2805 / #1727 / #3219 / #1689) from an event projection. That moved
+to `acp::dispatch::decide`, applied by `POST /acp/prompt`, which now answers
+with what it did instead of a bare 202. Both clients post and render the
+answer. Full design and the incident table: `server-owned-prompt-dispatch.md`.
 
 ## Alternatives considered
 

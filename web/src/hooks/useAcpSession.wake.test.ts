@@ -90,6 +90,12 @@ describe("useAcpSession auto-wake on sendPrompt (#1581)", () => {
         if (url.includes("/acp/replay")) {
           return new Response(JSON.stringify({ frames: [], lost: false, highest_seq: 0 }), { status: 200 });
         }
+        // These sessions have an absent worker, so a real daemon parks the
+        // prompt (`QueueReason::WorkerDown`) rather than starting a turn. The
+        // client no longer predicts that; it renders what this says.
+        if (url.includes("/acp/prompt") && method === "POST") {
+          return new Response(JSON.stringify({ disposition: "queued", queued_id: "srv-queued-1" }), { status: 202 });
+        }
         if (url.endsWith("/archive") && method === "PATCH") {
           return new Response(JSON.stringify({ id: "sess-wake-PLACEHOLDER", archived_at: null }), { status: 200 });
         }

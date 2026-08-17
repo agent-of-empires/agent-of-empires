@@ -52,17 +52,6 @@ impl QueueMirror {
         self.items = entries;
     }
 
-    /// Fold in a just-enqueued entry the daemon echoed back. Deduped by id so
-    /// a later snapshot refresh cannot double it, and re-sorted so an
-    /// out-of-order echo still lands in drain order.
-    pub fn upsert(&mut self, entry: QueuedPromptEntry) {
-        match self.items.iter_mut().find(|e| e.id == entry.id) {
-            Some(slot) => *slot = entry,
-            None => self.items.push(entry),
-        }
-        self.items.sort_by_key(|e| e.seq);
-    }
-
     /// Optimistically replace a queued entry's text after an edit POST; a
     /// no-op if the id already drained out of the mirror.
     pub fn set_text(&mut self, id: &str, text: &str) {
@@ -136,32 +125,6 @@ mod tests {
         q.set_snapshot(vec![entry("b", 5, "second"), entry("a", 2, "first")]);
         assert_eq!(q.text_at(0), Some("first"));
         assert_eq!(q.text_at(1), Some("second"));
-    }
-
-    #[test]
-    fn upsert_dedupes_by_id_and_appends_new() {
-        let mut q = mirror(&["a"]);
-        // Re-echo of the same id replaces in place, not a duplicate row.
-        q.upsert(QueuedPromptEntry {
-            id: "test-0".into(),
-            seq: 0,
-            text: "A".into(),
-            attachments: Vec::new(),
-            created_at: String::new(),
-            origin_device: None,
-        });
-        assert_eq!(q.len(), 1);
-        assert_eq!(q.text_at(0), Some("A"));
-        q.upsert(QueuedPromptEntry {
-            id: "new".into(),
-            seq: 9,
-            text: "b".into(),
-            attachments: Vec::new(),
-            created_at: String::new(),
-            origin_device: None,
-        });
-        assert_eq!(q.len(), 2);
-        assert_eq!(q.text_at(1), Some("b"));
     }
 
     #[test]

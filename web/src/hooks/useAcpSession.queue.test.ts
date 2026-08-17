@@ -185,6 +185,10 @@ interface Recorded {
 describe("useAcpSession server-queue integration", () => {
   let calls: Recorded[];
   let serverQueue: Map<string, ServerQueuedPrompt>;
+  /** Whether the fake daemon has a turn in flight. Since Tier 3 the daemon,
+   *  not the client, decides whether a prompt is sent or parked, so the fake
+   *  has to hold that state and answer `/acp/prompt` accordingly. */
+  let serverBusy: boolean;
 
   const queueCalls = (suffix: string) => calls.filter((c) => c.url.includes(suffix));
 
@@ -192,6 +196,7 @@ describe("useAcpSession server-queue integration", () => {
     sockets.length = 0;
     calls = [];
     serverQueue = new Map();
+    serverBusy = false;
     clearAcpCache();
     vi.mocked(reportAcpInteraction).mockClear();
     vi.stubGlobal(
@@ -235,7 +240,22 @@ describe("useAcpSession server-queue integration", () => {
           }
           if (method === "PATCH") return new Response(null, { status: 204 });
         }
-        if (url.includes("/acp/prompt")) return new Response("{}", { status: 200 });
+        if (url.includes("/acp/prompt")) {
+          // The daemon's dispatch decision (Tier 3). Busy means it parks the
+          // prompt on its own queue and reports the row id back.
+          if (method === "POST" && serverBusy) {
+            const parsed = JSON.parse(body ?? "{}") as { prompt_id?: string; text?: string };
+            const id = parsed.prompt_id ?? `srv-${serverQueue.size}`;
+            serverQueue.set(id, {
+              id,
+              seq: serverQueue.size,
+              text: parsed.text ?? "",
+              created_at: "2026-01-01T00:00:00.000Z",
+            });
+            return new Response(JSON.stringify({ disposition: "queued", queued_id: id }), { status: 202 });
+          }
+          return new Response(JSON.stringify({ disposition: "sent" }), { status: 202 });
+        }
         if (url.includes("/acp/cancel")) return new Response("{}", { status: 200 });
         return new Response("{}", { status: 200 });
       }),
@@ -262,9 +282,10 @@ describe("useAcpSession server-queue integration", () => {
     return { ...hook, ws };
   }
 
-  it("enqueues optimistically and POSTs to the server queue when a turn is busy", async () => {
+  it("renders the queue row the daemon reports when it parks a busy-turn prompt", async () => {
     const { result, ws } = await openSession("sess-busy");
-    // Kick a turn so turnActive flips on; a follow-up must queue.
+    // Kick a turn so the daemon is busy; a follow-up must come back `queued`.
+    serverBusy = true;
     act(() => {
       ws.onmessage?.({
         data: JSON.stringify({ session_id: "sess-busy", seq: 1, event: { UserPromptSent: { text: "kick" } } }),
@@ -278,14 +299,16 @@ describe("useAcpSession server-queue integration", () => {
     });
     await flushAsync();
 
-    // Optimistic row shows immediately, then the enqueue POST confirms it. No
-    // direct /acp/prompt fires (the server drains it).
+    // Exactly one POST, to /acp/prompt. The client no longer decides to queue,
+    // so it must NOT also POST to /queue: the daemon already created the row
+    // and a second POST would be a duplicate.
+    const prompts = queueCalls("/acp/prompt").filter((c) => c.method === "POST");
+    expect(prompts).toHaveLength(1);
+    expect(JSON.parse(prompts[0]!.body!)).toMatchObject({ text: "follow-up" });
+    expect(queueCalls("/queue").filter((c) => c.method === "POST")).toHaveLength(0);
+    // And the row the daemon reported renders as confirmed, not pending.
     expect(result.current.state.queuedPrompts.map((q) => q.text)).toEqual(["follow-up"]);
     expect(result.current.state.queuedPrompts[0]?.pending).toBe(false);
-    const posts = queueCalls("/queue").filter((c) => c.method === "POST");
-    expect(posts).toHaveLength(1);
-    expect(JSON.parse(posts[0]!.body!)).toMatchObject({ text: "follow-up" });
-    expect(queueCalls("/acp/prompt").filter((c) => c.method === "POST")).toHaveLength(0);
     expect(reportAcpInteraction).toHaveBeenCalledWith("prompt_queued");
   });
 
@@ -301,6 +324,7 @@ describe("useAcpSession server-queue integration", () => {
 
   it("remove / edit / clear mirror to the server endpoints", async () => {
     const { result, ws } = await openSession("sess-mut");
+    serverBusy = true;
     act(() => {
       ws.onmessage?.({
         data: JSON.stringify({ session_id: "sess-mut", seq: 1, event: { UserPromptSent: { text: "kick" } } }),

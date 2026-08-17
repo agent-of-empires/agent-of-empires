@@ -840,22 +840,15 @@ async fn handle_terminal_event(
                 }
                 return Ok(false);
             }
-            if state.should_queue_prompt() {
-                // A turn is running on an agent that cannot be steered (or the
-                // socket is down): park the prompt on the daemon-owned queue,
-                // which drains it server-side at the next turn edge even if this
-                // client closes first.
-                enqueue_prompt(state, toast_deadline, &text).await;
+            // Double-submit lock, not a dispatch decision: this covers only the
+            // window between our POST and its response. Whether the prompt can
+            // be sent at all is the daemon's call (Tier 3), made in the POST
+            // below. See `docs/development/server-owned-prompt-dispatch.md`.
+            if state.in_flight {
+                state.set_composer_text(&text);
                 return Ok(false);
             }
-            if send_prompt_now(state, toast_deadline, &text).await {
-                set_toast(
-                    state,
-                    toast_deadline,
-                    format!("prompt sent ({} bytes)", text.len()),
-                    ToastKind::Info,
-                );
-            }
+            send_prompt_now(state, toast_deadline, &text).await;
             Ok(false)
         }
         Intent::ClearQueue => {
@@ -1581,55 +1574,50 @@ fn set_toast(
 /// echo clears it) so a rapid second Enter queues instead of double-
 /// firing; it is released on failure since no turn began. Returns whether
 /// the POST succeeded.
+/// POST a prompt and reflect whatever the daemon says it did with it.
+///
+/// The daemon owns the send / steer / queue decision (Tier 3), so this no
+/// longer predicts it. A `queued` disposition means the row already exists
+/// server-side, so pull the authoritative snapshot rather than synthesizing a
+/// local mirror entry. On a transport failure the composer text is restored so
+/// the prompt is never lost.
 async fn send_prompt_now(
     state: &mut StructuredViewState,
     toast_deadline: &mut Option<Instant>,
     text: &str,
-) -> bool {
+) {
+    use crate::acp::client::http::PromptDispositionWire;
     state.in_flight = true;
     match state.http.prompt(&state.session_id, text).await {
-        Ok(()) => true,
+        Ok(dispatch) => match dispatch.disposition {
+            PromptDispositionWire::Queued => {
+                // A queued prompt starts no turn, so nothing will clear the
+                // submit lock for us.
+                state.in_flight = false;
+                refresh_queue(state).await;
+                set_toast(
+                    state,
+                    toast_deadline,
+                    format!("queued ({} waiting)", state.queue.len()),
+                    ToastKind::Info,
+                );
+            }
+            PromptDispositionWire::Sent | PromptDispositionWire::Steered => {
+                set_toast(
+                    state,
+                    toast_deadline,
+                    format!("prompt sent ({} bytes)", text.len()),
+                    ToastKind::Info,
+                );
+            }
+        },
         Err(e) => {
             state.in_flight = false;
-            set_toast(
-                state,
-                toast_deadline,
-                format!("send failed: {e}"),
-                ToastKind::Error,
-            );
-            false
-        }
-    }
-}
-
-/// Enqueue a prompt on the daemon-owned queue and fold the stored entry into
-/// the local mirror. The daemon drains the queue server-side at the turn edge,
-/// so there is no client drain to schedule. On failure the composer text is
-/// restored so the prompt is never lost.
-async fn enqueue_prompt(
-    state: &mut StructuredViewState,
-    toast_deadline: &mut Option<Instant>,
-    text: &str,
-) {
-    let http = state.http.clone();
-    let session_id = state.session_id.clone();
-    let id = uuid::Uuid::new_v4().to_string();
-    match http.queue_enqueue(&session_id, &id, text).await {
-        Ok(entry) => {
-            state.queue.upsert(entry);
-            set_toast(
-                state,
-                toast_deadline,
-                format!("queued ({} waiting)", state.queue.len()),
-                ToastKind::Info,
-            );
-        }
-        Err(e) => {
             state.set_composer_text(text);
             set_toast(
                 state,
                 toast_deadline,
-                format!("queue failed: {e}"),
+                format!("send failed: {e}"),
                 ToastKind::Error,
             );
         }

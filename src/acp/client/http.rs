@@ -69,6 +69,29 @@ struct PluginCommandsEnvelope {
     commands: Vec<PluginCommandView>,
 }
 
+/// What the daemon did with a prompt, from the `/acp/prompt` 202 body. Wire
+/// mirror of the server's `PromptDispatchResponse`; see
+/// `docs/development/server-owned-prompt-dispatch.md`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct PromptDispatchWire {
+    /// `sent` / `steered` / `queued`. Defaults to `sent`, which is what the
+    /// pre-Tier-3 empty 202 body meant.
+    #[serde(default)]
+    pub disposition: PromptDispositionWire,
+    /// The queue row's id, present only on `queued`.
+    #[serde(default)]
+    pub queued_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptDispositionWire {
+    #[default]
+    Sent,
+    Steered,
+    Queued,
+}
+
 /// Page size requested by [`HttpClient::replay_paged`]. Stays at or
 /// under the server's `MAX_REPLAY_PAGE` so it is never clamped down.
 pub const REPLAY_PAGE_SIZE: u64 = 1000;
@@ -272,7 +295,17 @@ impl HttpClient {
     }
 
     /// `POST /api/sessions/{id}/acp/prompt`.
-    pub async fn prompt(&self, session_id: &str, text: &str) -> Result<(), HttpError> {
+    ///
+    /// The daemon decides whether the prompt is sent, steered into the running
+    /// turn, or parked on the server queue, and the response says which (Tier
+    /// 3, `docs/development/server-owned-prompt-dispatch.md`). A body the
+    /// client cannot parse is read as `Sent`, which is what a pre-Tier-3
+    /// daemon's bare 202 meant.
+    pub async fn prompt(
+        &self,
+        session_id: &str,
+        text: &str,
+    ) -> Result<PromptDispatchWire, HttpError> {
         let url = format!(
             "{}/api/sessions/{}/acp/prompt",
             self.endpoint.base_url, session_id
@@ -283,8 +316,8 @@ impl HttpClient {
             prompt_id: None,
         };
         let res = self.auth(self.http.post(&url)).json(&body).send().await?;
-        check_status(res, session_id).await?;
-        Ok(())
+        let res = check_status(res, session_id).await?;
+        Ok(res.json::<PromptDispatchWire>().await.unwrap_or_default())
     }
 
     /// `GET /api/plugins/ui-state`. The daemon-wide plugin UI snapshot
@@ -382,26 +415,10 @@ impl HttpClient {
         Ok(res.json().await?)
     }
 
-    /// `POST /api/sessions/{id}/queue`: append a text prompt to the server
-    /// queue. `id` is a client-minted stable id so an optimistic row reconciles
-    /// against the returned entry and a retry does not double-queue. Returns the
-    /// daemon's stored entry (with its assigned `seq`). Attachments are web-only
-    /// today, so the native view enqueues text.
-    pub async fn queue_enqueue(
-        &self,
-        session_id: &str,
-        id: &str,
-        text: &str,
-    ) -> Result<crate::acp::state::QueuedPromptEntry, HttpError> {
-        let url = format!(
-            "{}/api/sessions/{}/queue",
-            self.endpoint.base_url, session_id
-        );
-        let body = serde_json::json!({ "id": id, "text": text });
-        let res = self.auth(self.http.post(&url)).json(&body).send().await?;
-        let res = check_status(res, session_id).await?;
-        Ok(res.json().await?)
-    }
+    // No `queue_enqueue` here: since Tier 3 the native view never decides to
+    // queue. It POSTs every prompt to `/acp/prompt` and the daemon parks it if
+    // it must, so a client-side enqueue would be a second, competing decision.
+    // `POST /api/sessions/{id}/queue` still exists for the web's own paths.
 
     /// `PATCH /api/sessions/{id}/queue/{promptId}`: replace a queued prompt's
     /// text in place, keeping its position. The prompt id is client-minted and

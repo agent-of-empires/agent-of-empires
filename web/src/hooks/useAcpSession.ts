@@ -61,7 +61,22 @@ import {
 /** Outcome of an immediate prompt POST, used by the drain effect to
  *  decide whether to retire queued items (delivered or permanently
  *  rejected) or keep them for a later retry (transient failure). */
-type PromptSendResult = "ok" | "retryable_failure" | "non_retryable_failure";
+type PromptSendResult =
+  /** The daemon started a fresh turn or steered the prompt into the running
+   *  one. Either way the optimistic transcript row stands. */
+  | { kind: "dispatched" }
+  /** The daemon parked it on the server queue and returned the row id, so the
+   *  optimistic transcript row becomes a queue row. See Tier 3 in
+   *  `docs/development/server-owned-prompt-dispatch.md`. */
+  | { kind: "queued"; queuedId: string }
+  | { kind: "retryable_failure" }
+  | { kind: "non_retryable_failure" };
+
+/** Wire shape of the `/acp/prompt` 202 body (Rust `PromptDispatchResponse`). */
+interface PromptDispatchBody {
+  disposition?: "sent" | "steered" | "queued";
+  queued_id?: string;
+}
 
 export type Action =
   | { kind: "frame"; frame: AcpFrame }
@@ -939,12 +954,6 @@ export function useAcpSession(
   sweepExpiredStorage();
   const [state, dispatch] = useReducer(reducer, sessionId, initialState);
   const [status, setStatus] = useState<ConnectionStatus>("connecting");
-  // Mirror the worker state into a ref so the drain effect always sees
-  // the latest value without re-running on every poll.
-  const workerStateRef = useRef(workerState);
-  useEffect(() => {
-    workerStateRef.current = workerState;
-  }, [workerState]);
   // Mirror the triage timestamps onto refs so `sendPrompt`'s wake
   // step always sees the freshest value without forcing a re-create
   // of the callback (the dep churn would also blow `dispatchPromptNow`
@@ -964,10 +973,9 @@ export function useAcpSession(
   // (Tier 4) and the daemon enforces the `acp.replay_events` retention cap,
   // so there is no longer a client-side row cap to mirror (#1111).
   //
-  // Mirror status into a ref so sendPrompt's stable callback can short
-  // circuit when the WS is closed without re-creating the callback on
-  // every status flip (which would invalidate downstream memoised
-  // handlers).
+  // Mirror status into a ref so the WS lifecycle can read the latest value
+  // without re-creating callbacks on every status flip (which would
+  // invalidate downstream memoised handlers).
   const statusRef = useRef<ConnectionStatus>("connecting");
   useEffect(() => {
     statusRef.current = status;
@@ -1736,11 +1744,11 @@ export function useAcpSession(
     [sessionId],
   );
 
-  // Dispatch a prompt immediately, no queueing. Internal helper used by
-  // both sendPrompt (when the turn is idle) and the drain effect below
-  // (when popping the head of queuedPrompts on Stopped). The result tells
-  // the drain effect what to do with the items it just sent:
-  //   - "ok": delivered, retire them.
+  // POST a prompt and report what the daemon did with it. Internal helper
+  // used by both sendPrompt and the drain effect below (when popping the head
+  // of queuedPrompts on Stopped). The result tells the drain effect what to do
+  // with the items it just sent:
+  //   - "dispatched" / "queued": the daemon accepted it, retire them.
   //   - "non_retryable_failure": the server rejected them with a 4xx, so
   //     retrying would just re-POST the same failing batch every turn-end;
   //     retire them too (the error banner already surfaced the reason).
@@ -1748,14 +1756,7 @@ export function useAcpSession(
   //     so keep the queue intact for the next turn-end retry.
   const dispatchPromptNow = useCallback(
     async (text: string, attachments?: PromptAttachmentInput[]): Promise<PromptSendResult> => {
-      if (!sessionId) return "retryable_failure";
-      if (statusRef.current !== "open") {
-        dispatch({
-          kind: "error",
-          message: "Acp disconnected; message not sent. Reconnect to retry.",
-        });
-        return "retryable_failure";
-      }
+      if (!sessionId) return { kind: "retryable_failure" };
       // Optimistic preview rows: render the attachment inline from a
       // local data URL so the bubble shows immediately, before the
       // server confirms and replay would otherwise back it with the
@@ -1838,15 +1839,25 @@ export function useAcpSession(
               message: `Could not send prompt (${res.status}). ${detail}`.trim(),
             });
           }
-          return rejected ? "non_retryable_failure" : "retryable_failure";
+          return { kind: rejected ? "non_retryable_failure" : "retryable_failure" };
         }
-        return "ok";
+        // The daemon reports what it did (Tier 3). A `queued` disposition means
+        // it parked the prompt rather than starting a turn, so the optimistic
+        // transcript row has to become a queue row: the turn-end drain will
+        // deliver it, and leaving the transcript row would show the message as
+        // sent while it waits.
+        const dispatched = (await safeJson<PromptDispatchBody>(res)) ?? {};
+        if (dispatched.disposition === "queued") {
+          dispatch({ kind: "rollback_optimistic_prompt", id: promptId });
+          return { kind: "queued", queuedId: dispatched.queued_id ?? promptId };
+        }
+        return { kind: "dispatched" };
       } catch (e) {
         dispatch({
           kind: "error",
           message: `Network error sending prompt: ${describeError(e)}`,
         });
-        return "retryable_failure";
+        return { kind: "retryable_failure" };
       }
     },
     [sessionId],
@@ -1881,18 +1892,16 @@ export function useAcpSession(
     [sessionId],
   );
 
-  // Public sendPrompt. Enqueues on the server whenever the session is not in
-  // a state where an immediate POST would succeed; the server drain dispatches
-  // once the session resumes. Inactive states covered:
-  //   - WS not open (disconnected, reconnecting): #1359.
-  //   - turn already in flight: #1031.
-  //   - worker not in `running` (cold start, restart, stopped): #1088.
-  //   - worker stopped or restarting at the session level: #1359.
-  // Only when every gate clears does the prompt take the immediate POST
-  // path. The guard set mirrors the drain effect below so the moment
-  // the last gate flips the parked prompts fire. dispatchPromptNow keeps
-  // its own status guard for the drain effect, which can race the WS
-  // reopen window (see #1144).
+  // Public sendPrompt. Posts unconditionally and renders whatever the daemon
+  // says it did (Tier 3, `docs/development/server-owned-prompt-dispatch.md`).
+  //
+  // This used to be a `shouldEnqueue` expression over turnActive, steering,
+  // cancelling, compacting, three worker latches, the REST worker-state poll
+  // and the socket state, each clause a fixed incident (#2805 / #1727 / #3219 /
+  // #1689) that the native TUI re-derived independently. The daemon knows all
+  // of it first-hand, so it decides and the client renders. The socket term is
+  // gone rather than moved: "can my socket reach the daemon" was always a proxy
+  // for a question the POST's own response answers.
   const sendPrompt = useCallback(
     async (text: string, attachments?: PromptAttachmentInput[]) => {
       if (!sessionId) return;
@@ -1923,72 +1932,24 @@ export function useAcpSession(
           return;
         }
       }
-      const wsClosed = statusRef.current !== "open";
-      const workerNotRunning = workerStateRef.current !== "running";
-      // An idle-auto-stopped worker is dormant, not dead: the prompt POST
-      // itself wakes it (the server clears dormancy, the reconciler
-      // respawns, and `send_prompt`'s `wait_for_worker` holds the request
-      // until the fresh worker is ready). So a dormant worker must NOT
-      // park the prompt on `workerNotRunning` (the REST poll reads
-      // "absent" until the respawn lands); parking would leave it in the
-      // local queue forever and the worker would never come back. Only a
-      // non-dormant cold worker (genuine mid-resume) still parks. See #1689.
-      // A steerable agent takes a mid-turn prompt directly: the daemon
-      // injects it into the running turn via `_session/steering` rather
-      // than refusing it, so parking here would put back the queue-after
-      // behavior steering replaces. Only the turn-active term is dropped;
-      // the socket and worker gates below still park, because steering
-      // does nothing for a prompt that cannot reach the daemon. See #2805.
-      //
-      // A pending cancel is the exception: the daemon refuses a prompt
-      // that arrives while it is cancelling AND escalates to a runner
-      // restart, reading it as "the user hit Stop and re-typed, so the
-      // agent is wedged". Steering must not route the composer into that
-      // path, or Stop-then-type would respawn the worker where it used
-      // to just queue. That turn is ending either way, so park and let
-      // the drain fire it as the next turn.
-      //
-      // A running `/compact` is the same shape of exception: that turn is
-      // only summarizing context, so the adapter answers `Injected` and
-      // swallows the message into a turn that never replies to it, with no
-      // retry affordance. Park it and let the drain fire it as the next
-      // turn, against the freshly compacted context. See #3219.
-      const turnBlocks =
-        state.turnActive && !(state.promptCapabilities?.steering && !state.cancelling && !state.compacting);
-      const blockedAsideFromWorker = wsClosed || turnBlocks || state.workerStopped || state.workerRestarting;
-      const shouldEnqueue = state.workerIdleStopped
-        ? blockedAsideFromWorker
-        : blockedAsideFromWorker || workerNotRunning;
-      if (shouldEnqueue) {
-        // Queue the prompt (with any attachments) on the SERVER, which drains
-        // it once the agent is idle, even with no tab open. The optimistic row
-        // shows immediately; the bytes ride to the server's pending-attachment
-        // store and are delivered on drain. See the server-side prompt queue.
-        enqueueServer(text, attachments);
+      const result = await dispatchPromptNow(text, attachments);
+      if (result.kind === "queued") {
+        // The daemon parked it. The row already exists server-side, so show it
+        // in the strip as confirmed rather than POSTing a second copy.
+        dispatch({ kind: "enqueue_prompt", id: result.queuedId, text, attachments });
+        dispatch({ kind: "confirm_queued_prompt", id: result.queuedId });
+        reportAcpInteraction("prompt_queued");
         return;
       }
-      const result = await dispatchPromptNow(text, attachments);
-      // Idle-dormant direct send: the worker was respawning and did not
-      // come online within send_prompt's wait window, so the POST returned
-      // a retryable typed 503. Queue the prompt server-side instead of
-      // dropping it; the server drain fires it once the worker wakes. See
-      // #1748 / #1833.
-      if (result === "retryable_failure" && state.workerIdleStopped) {
+      // A transient 503 means the daemon accepted the request but its worker
+      // did not come online within `send_prompt`'s wait window (#1748 / #1833).
+      // The prompt is not on the queue (the daemon decided to send it), so
+      // enqueue it here or it is lost.
+      if (result.kind === "retryable_failure" && state.workerIdleStopped) {
         enqueueServer(text, attachments);
       }
     },
-    [
-      sessionId,
-      state.turnActive,
-      state.promptCapabilities?.steering,
-      state.cancelling,
-      state.compacting,
-      state.workerStopped,
-      state.workerRestarting,
-      state.workerIdleStopped,
-      dispatchPromptNow,
-      enqueueServer,
-    ],
+    [sessionId, state.workerIdleStopped, dispatchPromptNow, enqueueServer],
   );
 
   // Server-queue hydration. The daemon owns the queue and drains it (even
@@ -2116,7 +2077,12 @@ export function useAcpSession(
         return;
       }
       const result = await dispatchPromptNow(prompt.text, prompt.attachments);
-      if (result === "retryable_failure") {
+      if (result.kind === "queued") {
+        // The daemon parked it again (the turn it would jump ahead of is still
+        // running). Put the row back so the strip keeps showing it.
+        dispatch({ kind: "enqueue_prompt", id: result.queuedId, text: prompt.text, attachments: prompt.attachments });
+        dispatch({ kind: "confirm_queued_prompt", id: result.queuedId });
+      } else if (result.kind === "retryable_failure") {
         // The immediate send bounced (worker still resuming); re-queue it
         // server-side so the drain re-fires it, and restore the optimistic row.
         enqueueServer(prompt.text, prompt.attachments);
@@ -2366,6 +2332,16 @@ async function safeText(res: Response): Promise<string> {
     return (await res.text()).slice(0, 200);
   } catch {
     return "";
+  }
+}
+
+/** Parse a JSON body, `null` on anything unparseable. Used where a missing or
+ *  malformed body has a sane default rather than being an error. */
+async function safeJson<T>(res: Response): Promise<T | null> {
+  try {
+    return (await res.json()) as T;
+  } catch {
+    return null;
   }
 }
 

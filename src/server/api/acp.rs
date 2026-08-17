@@ -1255,6 +1255,23 @@ async fn touch_and_wake_if_sunk(state: &Arc<AppState>, id: &str) -> bool {
     woke_idle_dormant
 }
 
+/// `POST /api/sessions/{id}/acp/prompt` success body.
+///
+/// **Breaking**: this endpoint used to answer a bare 202 with no body. It now
+/// reports what the daemon did with the prompt, because the daemon is what
+/// decides (Tier 3). Flattened, so the wire shape is
+/// `{"disposition":"sent"}` / `{"disposition":"steered"}` /
+/// `{"disposition":"queued","reason":"cancelling","queued_id":"..."}`.
+#[derive(Debug, serde::Serialize)]
+pub struct PromptDispatchResponse {
+    #[serde(flatten)]
+    pub dispatch: crate::acp::dispatch::PromptDispatch,
+    /// The queue row's id on a `queued` disposition, so a client reconciles its
+    /// optimistic row the same way the transcript reconciles by row id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queued_id: Option<String>,
+}
+
 pub async fn acp_prompt(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -1306,6 +1323,57 @@ pub async fn acp_prompt(
         let _serialized = inst_lock.lock().await;
         state.session_service.clear_pending_initial_turn(&id).await;
     }
+    // Tier 3: the daemon, not the client, decides whether this prompt can be
+    // sent now. See `docs/development/server-owned-prompt-dispatch.md`.
+    let dispatch = {
+        let control = crate::server::acp_ws::fold_control_state(&state, &id).await;
+        let liveness = crate::acp::dispatch::WorkerLiveness {
+            running: state.acp_supervisor.is_running(&id).await,
+            // `touch_and_wake_if_sunk` above already cleared the marker for a
+            // dormant session, so read the pre-clear answer it returned rather
+            // than the instance, which now says "awake".
+            idle_dormant: woke_idle_dormant,
+        };
+        crate::acp::dispatch::decide(&control, liveness)
+    };
+    if let crate::acp::dispatch::PromptDispatch::Queued { reason } = dispatch {
+        // Park it on the server-owned queue the turn-end drain already
+        // services. A client-minted id reconciles the caller's optimistic row;
+        // without one the server mints the id it returns.
+        let prompt_id = req
+            .prompt_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        return match super::queue::buffer_and_enqueue(
+            &state,
+            &id,
+            &prompt_id,
+            req.text.clone(),
+            &attachments,
+            None,
+            chrono::Utc::now().to_rfc3339(),
+        )
+        .await
+        {
+            Ok(entry) => (
+                StatusCode::ACCEPTED,
+                Json(PromptDispatchResponse {
+                    dispatch,
+                    queued_id: Some(entry.id),
+                }),
+            )
+                .into_response(),
+            Err((status, msg)) => {
+                tracing::warn!(
+                    target: "http.api.acp",
+                    session = %id,
+                    ?reason,
+                    "prompt dispatch chose the queue but enqueue failed: {msg}"
+                );
+                (status, msg).into_response()
+            }
+        };
+    }
     let outcome = state
         .session_service
         .send_turn(
@@ -1322,7 +1390,14 @@ pub async fn acp_prompt(
     // races this handler's live worker for the provider API. See
     // `session::smart_rename` and #2348.
     match outcome {
-        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            Json(PromptDispatchResponse {
+                dispatch,
+                queued_id: None,
+            }),
+        )
+            .into_response(),
         Err(SendTurnError::SessionNotFound) => {
             (StatusCode::NOT_FOUND, "session not found").into_response()
         }

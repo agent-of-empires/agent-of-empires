@@ -1,8 +1,9 @@
 # Design: server-owned prompt dispatch (send / steer / queue)
 
-Status: planned. Opened 2026-08-16. Tier 3 of the SV server-ownership plan, and
-the last duplicated decision after Tier 1 (control state) and Tier 4
-(transcript) moved server-side. See `server-owned-sv-state.md`.
+Status: shipped. Opened 2026-08-16, landed 2026-08-17. Tier 3 of the SV
+server-ownership plan, and the last duplicated decision after Tier 1 (control
+state) and Tier 4 (transcript) moved server-side. See
+`server-owned-sv-state.md`.
 
 ## Problem
 
@@ -48,15 +49,29 @@ predicts the outcome.
 
 ### The decision moves to one function
 
-A pure `PromptDisposition::decide(&AcpState, &WorkerLiveness) -> Disposition`
-in `src/acp/`, returning `SendNow`, `Steer`, or `Queue { reason }`. It ports
-the four incident clauses above and is table-tested against them by name, so a
-future edit that reintroduces #1727 fails a test that says so.
+A pure `dispatch::decide(&AcpState, WorkerLiveness) -> PromptDispatch`
+(`src/acp/dispatch.rs`), returning `Sent`, `Steered`, or `Queued { reason }`.
+It ports the four incident clauses above and is table-tested against them by
+name, so a future edit that reintroduces #1727 fails a test that says so.
 
 It reads `AcpState`, which since Tier 1.1 already carries `turn_active`,
 `steering`, `cancelling` and `compacting`, and a small worker-liveness input
 the handler already computes (`touch_and_wake_if_sunk`'s `woke_idle_dormant`
 plus the supervisor's readiness).
+
+**Where the `AcpState` comes from.** The live folds are per-connection
+(`acp_ws::handle`), so an HTTP handler has none to read.
+`acp_ws::fold_control_state` rebuilds one on demand from the durable event log,
+the same way a fresh WS connection does: one keyset scan plus a fold, paid at
+human typing speed. A cached per-session projection is the obvious optimization
+if it ever shows up in a profile, and is deliberately not here yet, because a
+cache would be a third fold to keep coherent with the two that already exist.
+
+**Why a stale latch is not a wedge.** If a worker dies mid-turn without a
+terminal `Stopped`, the fold keeps `turn_active` set and every later prompt
+parks. That delays rather than strands them: the turn-end drain gates on the
+*instance* `Status::Idle`, not on the fold, so it fires the queue from a
+signal this decision does not share.
 
 ### The endpoint applies it
 
@@ -65,14 +80,23 @@ the existing server-owned queue (Tier 0) instead of the supervisor. The queue
 and its drain already exist and already wake dormant workers, so this is
 wiring, not new machinery.
 
-The response grows from a bare 202 into a typed body:
+The response grows from a bare 202 into a typed body (**breaking**: the
+endpoint used to answer 202 with no body):
 
 ```json
-{ "disposition": "sent" | "steered" | "queued", "queued_id": "..." }
+{ "disposition": "sent" }
+{ "disposition": "steered" }
+{ "disposition": "queued", "reason": "cancelling", "queued_id": "..." }
 ```
 
 `queued_id` lets the client reconcile its optimistic row against the queue
-entry the same way the transcript reconciles by row id.
+entry the same way the transcript reconciles by row id. `reason` names the
+gate, so a client can explain the wait.
+
+The queue row a parked prompt creates goes through the same
+`buffer_and_enqueue` helper as `POST /queue`, so it is byte-for-byte the row a
+client would have created itself: same per-session attachment cap, same
+idempotent-by-id replace, same blob bookkeeping.
 
 ### Clients stop deciding
 
@@ -97,10 +121,17 @@ exists, not part of dispatch.
 1. **Decide + apply, web only.** The decision function with its incident table,
    the endpoint change, the typed response, and the web rewired to it. The
    three live specs that cover the incidents (`acp-mid-turn-steering`,
-   `acp-compaction-phase`, `acp-cancel`) are the acceptance gate.
-2. **TUI rewired**, deleting its copy of the decision.
+   `acp-compaction-phase`, `acp-cancel`) are the acceptance gate. **Shipped.**
+2. **TUI rewired**, deleting its copy of the decision. **Shipped.**
 3. **Delete the now-unused control fields** the clients kept only to feed the
-   decision.
+   decision. **Shipped**: the web's `workerStateRef` and the TUI's
+   `should_queue_prompt` / `should_queue_prompt_for` are gone, and with the
+   native view no longer choosing to queue, so are `HttpClient::queue_enqueue`,
+   the TUI's `enqueue_prompt`, and `QueueMirror::upsert`.
+
+The TUI's `in_flight` survives as the design predicted, but only as a
+double-submit lock over the POST round trip; it is no longer a term in any
+dispatch decision.
 
 ## Alternatives considered
 

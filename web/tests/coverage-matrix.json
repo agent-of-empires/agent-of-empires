@@ -456,6 +456,17 @@
       "components": ["web/src/lib/api.ts"]
     },
     {
+      "id": "acp.server-owned-prompt-dispatch",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/live/acp-mid-turn-steering.spec.ts",
+        "tests/live/acp-compaction-phase.spec.ts",
+        "src/hooks/useAcpSession.queue.test.ts"
+      ],
+      "components": ["web/src/hooks/useAcpSession.ts"]
+    },
+    {
       "id": "telemetry.feature-usage-signals",
       "kind": "live-playwright",
       "risk": "medium",

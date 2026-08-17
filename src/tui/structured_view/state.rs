@@ -347,39 +347,6 @@ impl StructuredViewState {
         self.transcript.turn_active || self.in_flight || self.ws.is_none()
     }
 
-    /// Whether a fresh Enter should park in the queue rather than send
-    /// now.
-    ///
-    /// Same as [`Self::is_busy`] except for a steerable agent, where a
-    /// mid-turn send is the point: the daemon injects it into the running
-    /// turn rather than refusing it, so parking it locally would
-    /// reintroduce the queue-after behavior steering replaces (#2805).
-    /// The other two terms still park. `in_flight` covers the POST
-    /// round-trip, where a second Enter would double-fire, and a dead
-    /// socket means an immediate send fires into a daemon whose turn
-    /// boundaries we can no longer observe.
-    ///
-    /// A pending cancel parks even on a steerable agent: the daemon reads
-    /// a prompt arriving mid-cancel as a wedged agent and escalates to a
-    /// runner restart, so sending there would respawn the worker on a
-    /// Stop-then-type that used to just queue.
-    ///
-    /// A running `/compact` parks for the same shape of reason: the turn
-    /// is only summarizing context, so the adapter accepts a steered
-    /// message into a turn that never answers it and no retry affordance
-    /// appears. Parking sends it as the next turn instead, against the
-    /// freshly compacted context. See #3219.
-    pub fn should_queue_prompt(&self) -> bool {
-        should_queue_prompt_for(
-            self.in_flight,
-            self.ws.is_some(),
-            self.transcript.turn_active,
-            self.transcript.steering,
-            self.transcript.cancelling,
-            self.transcript.compacting,
-        )
-    }
-
     /// Drain the composer's current text and clear it so the user can
     /// start the next prompt.
     pub fn take_composer_text(&mut self) -> String {
@@ -630,25 +597,10 @@ impl StructuredViewState {
     }
 }
 
-/// Pure form of [`StructuredViewState::should_queue_prompt`]. Split out
-/// because a `WsHandle` cannot be built in a unit test, so the decision
-/// table would otherwise only be reachable with the socket down.
-///
-/// Takes the raw transcript flags rather than a pre-folded `steerable`
-/// so every term of the policy is reachable from the table test. Folding
-/// at the call site instead would let a dropped term pass a test that
-/// only ever sees the folded result.
-fn should_queue_prompt_for(
-    in_flight: bool,
-    socket_up: bool,
-    turn_active: bool,
-    steering: bool,
-    cancelling: bool,
-    compacting: bool,
-) -> bool {
-    let steerable = steering && !cancelling && !compacting;
-    in_flight || !socket_up || (turn_active && !steerable)
-}
+// The send / steer / queue decision that used to live here as
+// `should_queue_prompt_for` is the daemon's now: `crate::acp::dispatch::decide`
+// makes it once for every client and the endpoint reports what it did. See
+// `docs/development/server-owned-prompt-dispatch.md`.
 
 #[cfg(test)]
 mod tests {
@@ -688,62 +640,6 @@ mod tests {
         // boundaries can't be observed to drive an immediate send.
         let state = test_state(None);
         assert!(state.is_busy());
-    }
-
-    /// Steering removes the mid-turn park and nothing else (#2805). The
-    /// in-flight POST and dead-socket terms must keep parking even for a
-    /// steerable agent: the first would double-fire, the second fires at
-    /// a daemon whose turn boundaries we can no longer observe.
-    #[test]
-    fn steering_only_unblocks_the_mid_turn_park() {
-        // (in_flight, socket_up, turn_active, steering, expect_queue)
-        let cases = [
-            (false, true, false, false, false),
-            (false, true, false, true, false),
-            // The behavior change: mid-turn sends through when steerable.
-            (false, true, true, false, true),
-            (false, true, true, true, false),
-            // Steering does not override the other two gates.
-            (true, true, false, true, true),
-            (false, false, false, true, true),
-            (true, true, true, true, true),
-            (false, false, true, true, true),
-        ];
-        for (in_flight, socket_up, turn_active, steering, expected) in cases {
-            assert_eq!(
-                should_queue_prompt_for(in_flight, socket_up, turn_active, steering, false, false),
-                expected,
-                "in_flight={in_flight} socket_up={socket_up} turn_active={turn_active} steering={steering}"
-            );
-        }
-    }
-
-    /// #3219: a running `/compact` parks a mid-turn send even on a
-    /// steerable agent. The summarization turn has nothing to steer, and
-    /// the adapter answers `Injected`, swallowing the message into a turn
-    /// that never replies and offers no retry affordance. Parking sends it
-    /// as the next turn instead, against the compacted context.
-    #[test]
-    fn compaction_parks_the_mid_turn_send_like_a_pending_cancel() {
-        // (turn_active, steering, cancelling, compacting, expect_queue)
-        let cases = [
-            // The regression: steerable and mid-turn used to send through.
-            (true, true, false, true, true),
-            (true, true, false, false, false),
-            // Cancel and compaction park independently, and together.
-            (true, true, true, false, true),
-            (true, true, true, true, true),
-            // Between turns nothing parks: the compaction phase cannot
-            // outlive its turn, since `Stopped` clears it.
-            (false, true, false, true, false),
-        ];
-        for (turn_active, steering, cancelling, compacting, expected) in cases {
-            assert_eq!(
-                should_queue_prompt_for(false, true, turn_active, steering, cancelling, compacting),
-                expected,
-                "turn_active={turn_active} steering={steering} cancelling={cancelling} compacting={compacting}"
-            );
-        }
     }
 
     fn composer_text(state: &StructuredViewState) -> String {

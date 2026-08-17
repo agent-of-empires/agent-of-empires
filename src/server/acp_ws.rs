@@ -143,19 +143,7 @@ async fn handle(
     // per-connection but deterministic (same reducer over the same ordered
     // stream), so every client converges. Agent/model seed the frame's identity
     // fields; the reducer corrects `agent` on any `AgentSwitched`.
-    let (agent, model) = {
-        let instances = state.instances.read().await;
-        instances
-            .iter()
-            .find(|i| i.id == session_id)
-            .map(|i| {
-                (
-                    AgentName(i.agent_name.clone().unwrap_or_else(|| i.tool.clone())),
-                    i.agent_model.clone(),
-                )
-            })
-            .unwrap_or_else(|| (AgentName(String::new()), None))
-    };
+    let (agent, model) = seed_identity(&state, &session_id).await;
     // Kept so a lag can rebuild the fold from the same identity seed.
     let seed = (agent.clone(), model.clone());
     let mut reduced = AcpState::new(AcpSessionId(session_id.clone()), agent, model);
@@ -512,6 +500,53 @@ const COLD_STATE_FIELDS: [&str; 5] = [
 /// plan, and any pending approval on every reconnect. The transcript fold and
 /// the raw frames stay scoped to `since`, since both are incremental and the
 /// client already holds the earlier rows (reconciled by row id).
+/// Identity fields to seed a fresh `AcpState` with: the reducer corrects
+/// `agent` on any `AgentSwitched`, but a fold that never sees one keeps this
+/// seed, so both the WS connection fold and the on-demand
+/// [`fold_control_state`] must start from the same place.
+async fn seed_identity(state: &AppState, session_id: &str) -> (AgentName, Option<String>) {
+    let instances = state.instances.read().await;
+    instances
+        .iter()
+        .find(|i| i.id == session_id)
+        .map(|i| {
+            (
+                AgentName(i.agent_name.clone().unwrap_or_else(|| i.tool.clone())),
+                i.agent_model.clone(),
+            )
+        })
+        .unwrap_or_else(|| (AgentName(String::new()), None))
+}
+
+/// The daemon's current control state for a session, folded on demand from the
+/// durable event log.
+///
+/// The live folds are per-connection (see `handle`), so an HTTP handler has no
+/// `AcpState` to read; this rebuilds one the same way a fresh WS connection
+/// does. Used by prompt dispatch (Tier 3,
+/// `docs/development/server-owned-prompt-dispatch.md`), where the alternative
+/// is asking the client what the daemon's own state is.
+///
+/// Cost is one keyset scan plus a fold per call, which is bounded by the
+/// session's event count and paid at human typing speed. A cached per-session
+/// projection is the obvious optimization if this ever shows up in a profile;
+/// it is deliberately not here yet, because a cache would be a third fold to
+/// keep coherent with the two that already exist.
+pub(crate) async fn fold_control_state(state: &AppState, session_id: &str) -> AcpState {
+    let (agent, model) = seed_identity(state, session_id).await;
+    let mut reduced = AcpState::new(AcpSessionId(session_id.to_string()), agent, model);
+    let store = Arc::clone(&state.acp_event_store);
+    let sid = session_id.to_string();
+    // Locking SQLite read; keep it off the runtime like the queue drain does.
+    let events = tokio::task::spawn_blocking(move || store.replay_from(&sid, 0))
+        .await
+        .unwrap_or_default();
+    for (_seq, event) in events {
+        let _ = reduced.apply_event(event);
+    }
+    reduced
+}
+
 fn fold_connect_history(
     entries: Vec<(u64, Event)>,
     since: u64,
@@ -1004,6 +1039,111 @@ mod tests {
         assert!(!cold_folds.transcript.rows().is_empty());
         assert_eq!(cold_folds.reduced.available_commands.len(), 1);
         assert_eq!(cold_folds.reduced.pending_approvals.len(), 1);
+    }
+
+    /// Prompt dispatch (Tier 3) reads the daemon's own control state through
+    /// `fold_control_state`, so the whole decision is only as good as this
+    /// fold: a wrong replay bound or a lost turn flag would send a prompt into
+    /// a running turn (which, mid-cancel, restarts the worker).
+    ///
+    /// The fold is whole-log by construction, so this drives the turn edges an
+    /// event at a time and asserts the flags the decision reads.
+    #[tokio::test]
+    async fn fold_control_state_tracks_the_turn_flags_dispatch_reads() {
+        let mut inst = crate::session::Instance::new("t", "/tmp/aoe-fold-control");
+        inst.id = "s-fold".to_string();
+        inst.agent_name = Some("claude".to_string());
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        let record = |seq: u64, event: Event| {
+            state
+                .acp_event_store
+                .record("s-fold", seq, &event)
+                .expect("record event");
+        };
+        // A live steerable turn: the daemon must report it as steerable, or a
+        // mid-turn prompt gets parked and #2805 comes back.
+        record(
+            1,
+            Event::PromptCapabilities {
+                image: false,
+                audio: false,
+                embedded_context: false,
+                steering: true,
+            },
+        );
+        record(
+            2,
+            Event::UserPromptSent {
+                text: "go".into(),
+                attachments: Vec::new(),
+                prompt_id: None,
+            },
+        );
+        let folded = fold_control_state(&state, "s-fold").await;
+        assert!(folded.turn_active, "the prompt opened a turn");
+        assert!(folded.steering, "capabilities survive the fold");
+        assert!(!folded.cancelling);
+        assert_eq!(
+            crate::acp::dispatch::decide(
+                &folded,
+                crate::acp::dispatch::WorkerLiveness {
+                    running: true,
+                    idle_dormant: false,
+                },
+            ),
+            crate::acp::dispatch::PromptDispatch::Steered
+        );
+
+        // A pending cancel flips the same live turn to "park", which is the
+        // gate that keeps Stop-then-type from restarting the runner (#1727).
+        record(
+            3,
+            Event::CancelRequested {
+                escalates_at: chrono::Utc::now(),
+            },
+        );
+        let folded = fold_control_state(&state, "s-fold").await;
+        assert!(folded.cancelling);
+        assert_eq!(
+            crate::acp::dispatch::decide(
+                &folded,
+                crate::acp::dispatch::WorkerLiveness {
+                    running: true,
+                    idle_dormant: false,
+                },
+            ),
+            crate::acp::dispatch::PromptDispatch::Queued {
+                reason: crate::acp::dispatch::QueueReason::Cancelling,
+            }
+        );
+
+        // Turn end reopens the send path.
+        record(
+            4,
+            Event::Stopped {
+                reason: "cancelled".into(),
+            },
+        );
+        let folded = fold_control_state(&state, "s-fold").await;
+        assert!(!folded.turn_active, "Stopped closed the turn");
+        assert!(!folded.cancelling, "and cleared the pending cancel");
+        assert_eq!(
+            crate::acp::dispatch::decide(
+                &folded,
+                crate::acp::dispatch::WorkerLiveness {
+                    running: true,
+                    idle_dormant: false,
+                },
+            ),
+            crate::acp::dispatch::PromptDispatch::Sent
+        );
+
+        // An unknown session folds to a default (idle) state rather than
+        // erroring, so a prompt for a session the daemon has not seen is not
+        // parked forever on a phantom turn.
+        let unknown = fold_control_state(&state, "s-missing").await;
+        assert!(!unknown.turn_active);
     }
 
     /// `AcpState::apply_event` takes no seq and is not idempotent, and the

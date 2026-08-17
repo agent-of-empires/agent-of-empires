@@ -122,6 +122,42 @@ pub async fn queue_enqueue(
         Ok(b) => b,
         Err((status, msg)) => return (status, msg).into_response(),
     };
+    let created_at = req
+        .created_at
+        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
+    match buffer_and_enqueue(
+        &state,
+        &id,
+        &req.id,
+        req.text,
+        &blobs,
+        req.origin_device,
+        created_at,
+    )
+    .await
+    {
+        Ok(entry) => (StatusCode::OK, Json(entry)).into_response(),
+        Err((status, msg)) => (status, msg).into_response(),
+    }
+}
+
+/// Buffer already-validated attachment blobs under `prompt_id` and append the
+/// prompt to the session's server-owned queue.
+///
+/// Shared by `queue_enqueue` and the prompt endpoint's `Queued` disposition
+/// (Tier 3), so a prompt the daemon decides to park is byte-for-byte the same
+/// queue row a client would have created itself: same per-session cap, same
+/// idempotent-by-id replace, same blob bookkeeping.
+#[allow(clippy::too_many_arguments)]
+pub(super) async fn buffer_and_enqueue(
+    state: &Arc<AppState>,
+    id: &str,
+    prompt_id: &str,
+    text: String,
+    blobs: &[crate::acp::event_store::AttachmentBlob],
+    origin_device: Option<String>,
+    created_at: String,
+) -> Result<crate::acp::state::QueuedPromptEntry, (StatusCode, String)> {
     // Per-session buffer cap: reject rather than let an undrained queue grow
     // without bound. Re-enqueuing the same id replaces its blobs, so subtract
     // what this prompt already holds before checking headroom.
@@ -129,21 +165,20 @@ pub async fn queue_enqueue(
         let incoming: u64 = blobs.iter().map(|b| b.data.len() as u64).sum();
         let existing_for_prompt: u64 = state
             .acp_event_store
-            .load_pending_attachments_for_ref(&id, &req.id)
+            .load_pending_attachments_for_ref(id, prompt_id)
             .iter()
             .map(|b| b.data.len() as u64)
             .sum();
-        let session_total = state.acp_event_store.pending_attachment_bytes(&id);
+        let session_total = state.acp_event_store.pending_attachment_bytes(id);
         let projected = session_total.saturating_sub(existing_for_prompt) + incoming;
         if projected > MAX_QUEUED_ATTACHMENT_BYTES_PER_SESSION {
-            return (
+            return Err((
                 StatusCode::PAYLOAD_TOO_LARGE,
                 format!(
                     "queued attachments exceed the {} MiB per-session limit",
                     MAX_QUEUED_ATTACHMENT_BYTES_PER_SESSION / (1024 * 1024)
                 ),
-            )
-                .into_response();
+            ));
         }
     }
 
@@ -160,43 +195,40 @@ pub async fn queue_enqueue(
             size: b.data.len() as u64,
         })
         .collect();
-    // Unconditional, not gated on `!req.attachments.is_empty()`: `enqueue_prompt`
-    // replaces the row's refs with whatever came in, so a re-enqueue that drops
-    // the attachments would otherwise orphan the prior blobs, holding bytes
-    // against the per-session cap that nothing can ever deliver or reclaim
-    // before the 24h sweep.
+    // Unconditional, not gated on whether this request carried attachments:
+    // `enqueue_prompt` replaces the row's refs with whatever came in, so a
+    // re-enqueue that drops the attachments would otherwise orphan the prior
+    // blobs, holding bytes against the per-session cap that nothing can ever
+    // deliver or reclaim before the 24h sweep.
     state
         .acp_event_store
-        .delete_pending_attachments_for_ref(&id, &req.id);
-    for blob in &blobs {
+        .delete_pending_attachments_for_ref(id, prompt_id);
+    for blob in blobs {
         state
             .acp_event_store
-            .record_pending_attachment(&id, &req.id, blob);
+            .record_pending_attachment(id, prompt_id, blob);
     }
 
-    let created_at = req
-        .created_at
-        .unwrap_or_else(|| chrono::Utc::now().to_rfc3339());
     match state
         .session_service
         .enqueue_prompt(
-            &id,
-            req.id.clone(),
-            req.text,
+            id,
+            prompt_id.to_string(),
+            text,
             refs,
-            req.origin_device,
+            origin_device,
             created_at,
         )
         .await
     {
-        Some(entry) => (StatusCode::OK, Json(entry)).into_response(),
+        Some(entry) => Ok(entry),
         None => {
             // Session vanished between the existence check and the enqueue;
             // drop any blobs we just buffered so they don't leak.
             state
                 .acp_event_store
-                .delete_pending_attachments_for_ref(&id, &req.id);
-            (StatusCode::NOT_FOUND, "session not found").into_response()
+                .delete_pending_attachments_for_ref(id, prompt_id);
+            Err((StatusCode::NOT_FOUND, "session not found".to_string()))
         }
     }
 }
