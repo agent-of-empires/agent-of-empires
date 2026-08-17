@@ -2597,12 +2597,23 @@ impl Instance {
 
     /// Resolve the effective `environment` list for this session's profile,
     /// falling back to the global list when the profile has no override.
-    pub(crate) fn profile_host_environment(&self) -> Vec<String> {
+    fn profile_host_environment(&self) -> Vec<String> {
         let profile = self.effective_profile();
         super::profile_config::resolve_config_or_warn(&profile).environment
     }
 
-    fn omp_host_environment(&self) -> Vec<String> {
+    /// The host environment the agent process will actually see: the static
+    /// profile `environment` list with every `before_session`-minted key
+    /// dropped, then the minted pairs appended. This is the same precedence
+    /// `build_launch_command` applies to the pane, so anything that has to
+    /// agree with the launched agent about a variable's value must read it
+    /// here rather than from `profile_host_environment` alone.
+    ///
+    /// Minted pairs are `#[serde(skip)]` runtime state, so outside a launch
+    /// (a poller repair, a daemon-side read of a stored row) this degrades to
+    /// the profile list. That is the best available answer: the minted values
+    /// are deliberately not persisted because they may be short-lived secrets.
+    pub(crate) fn resolved_host_environment(&self) -> Vec<String> {
         let mut environment = super::environment::drop_shadowed_host_entries(
             self.profile_host_environment(),
             &self.pending_host_env,
@@ -2649,7 +2660,7 @@ impl Instance {
             )
         } else {
             resolve_omp_store_layout_with_environment(
-                &self.omp_host_environment(),
+                &self.resolved_host_environment(),
                 &self.project_path,
                 options,
             )
@@ -2704,9 +2715,12 @@ impl Instance {
         if launched_at_ms == 0 || self.is_sandboxed() {
             return None;
         }
-        let layout =
-            resolve_omp_store_layout(&self.omp_host_environment(), &self.project_path, options)
-                .ok()?;
+        let layout = resolve_omp_store_layout(
+            &self.resolved_host_environment(),
+            &self.project_path,
+            options,
+        )
+        .ok()?;
         Some(OmpCaptureMetadata {
             layout,
             launched_at_ms,
@@ -3005,7 +3019,7 @@ impl Instance {
                 && super::capture::claude_host_transcript_confirmed_absent(
                     &self.project_path,
                     &stored,
-                    &self.profile_host_environment(),
+                    &self.resolved_host_environment(),
                 )
             {
                 tracing::info!(
@@ -3126,7 +3140,7 @@ impl Instance {
                         &self.project_path,
                         None,
                         &exclusion,
-                        &self.profile_host_environment(),
+                        &self.resolved_host_environment(),
                     )
                     .ok()
                 }
@@ -4446,7 +4460,9 @@ impl Instance {
                 // true absence, so tmux's frozen server environment cannot
                 // select another OMP store. The in-pane fingerprint still
                 // detects login-file drift.
-                env.extend(omp_host_routing_environment(&self.omp_host_environment()));
+                env.extend(omp_host_routing_environment(
+                    &self.resolved_host_environment(),
+                ));
             }
             (
                 result.0,
@@ -5598,7 +5614,7 @@ impl Instance {
                         initial_known.clone(),
                         instance_id.clone(),
                         extra_excludes.clone(),
-                        self.profile_host_environment(),
+                        self.resolved_host_environment(),
                     ))
                 }
             }
@@ -13525,6 +13541,33 @@ mod tests {
                          must resume with --resume, not launch fresh-pinned"
                     );
                 }
+
+                // A `before_session` hook minting CLAUDE_CONFIG_DIR is the
+                // documented account-switcher pattern, and its value wins over
+                // the profile's on the launched pane. Reading the shadowed
+                // profile value here would resolve a config dir the agent
+                // never opens, reintroducing the same downgrade.
+                let (shadowed_profile, other_sid) = (cases[0].0, cases[1].1);
+                let mut inst = Instance::new("minted-switcher", project_path);
+                inst.source_profile = shadowed_profile.to_string();
+                inst.tool = "claude".to_string();
+                inst.agent_session_id = Some(other_sid.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+                inst.pending_host_env = vec![(
+                    "CLAUDE_CONFIG_DIR".to_string(),
+                    temp.path()
+                        .join(format!(".claude-{}", cases[1].0))
+                        .to_string_lossy()
+                        .into_owned(),
+                )];
+
+                let (acquired, is_existing) = inst.acquire_session_id();
+                assert_eq!(acquired.as_deref(), Some(other_sid));
+                assert!(
+                    is_existing,
+                    "a before_session-minted CLAUDE_CONFIG_DIR must win over the \
+                     profile's, matching what the launch injects into the pane"
+                );
             }
 
             #[test]
