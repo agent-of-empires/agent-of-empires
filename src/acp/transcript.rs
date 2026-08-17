@@ -45,7 +45,7 @@ pub struct TranscriptRow {
     /// Grouping key. Consecutive `AgentMessageChunk` rows share one group so a
     /// client renders them as one assistant bubble; a tool call's rows share
     /// `tool-<tool_call_id>`; every other row gets a fresh group. See
-    /// [`TranscriptModel::message_group`].
+    /// `TranscriptModel::message_group`.
     pub group_id: String,
     pub kind: TranscriptRowKind,
     pub at: DateTime<Utc>,
