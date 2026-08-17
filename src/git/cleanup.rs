@@ -325,7 +325,10 @@ pub fn deinit_submodules_if_present(worktree_path: &Path) {
     if !worktree_path.join(".gitmodules").exists() {
         return;
     }
-    let output = super::command::run_git(worktree_path, ["submodule", "deinit", "-f", "--all"]);
+    // `run_git_quiet`: every outcome below is already classified and logged
+    // here at DEBUG, so a second WARN from the wrapper would only be noise.
+    let output =
+        super::command::run_git_quiet(worktree_path, ["submodule", "deinit", "-f", "--all"]);
     match output {
         Ok(o) if o.status.success() => {
             tracing::debug!(target: "git.worktree",

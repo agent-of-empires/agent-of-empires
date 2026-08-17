@@ -40,6 +40,15 @@ Top-level roots:
 - **debug**: frequent / per-operation detail (every git invocation, every signal)
 - **trace**: per-byte / per-message firehose (`terminal.ws.bytes`, ACP JSON-RPC transport)
 
+An outcome the call site has already classified as expected is **debug**, even
+when it is a failure underneath: a best-effort `git worktree unlock` that finds
+nothing to unlock, or a plugin that is not launching because the user switched
+it off. Those are the configuration and the code working as intended, and at
+warn they crowd out the failures nobody chose. Where a shared helper cannot
+tell the two apart, give it a quiet variant the classifying caller opts into
+(`git::command::run_git_quiet`) rather than dropping the record entirely; the
+stderr summary is what makes a surprise diagnosable later.
+
 ## Env variables
 
 Resolved once at startup in `LogConfig::from_env`:

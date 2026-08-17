@@ -5773,6 +5773,15 @@ fn map_acp_config_option(
         SessionConfigOptionCategory::Mode => ConfigOptionCategory::Mode,
         SessionConfigOptionCategory::Model => ConfigOptionCategory::Model,
         SessionConfigOptionCategory::ThoughtLevel => ConfigOptionCategory::ThoughtLevel,
+        // "Model-related configuration parameter", a sibling of `Model`
+        // rather than another model picker (an adapter ships both), so it
+        // must not collapse into `ConfigOptionCategory::Model`. Nothing
+        // renders it specially yet, so it carries its upstream wire name
+        // through the generic `Other` arm instead of the `Other("")` the
+        // catch-all below used to produce (#3403).
+        SessionConfigOptionCategory::ModelConfig => {
+            ConfigOptionCategory::Other("model_config".to_string())
+        }
         SessionConfigOptionCategory::Other(s) => ConfigOptionCategory::Other(s),
         // The schema enum is `#[non_exhaustive]`, so this arm is required
         // to compile. Unknown category *names* arrive via the untagged
@@ -9891,6 +9900,44 @@ async fn handle_elicitation_request(
 mod tests {
     use super::*;
     use rusqlite::Connection;
+    use tracing_test::traced_test;
+
+    /// `ModelConfig` is a category upstream already names, so it must map
+    /// through the explicit arm: the catch-all's "bump claude-agent-acp"
+    /// warning is for variants this build has genuinely never seen, and it
+    /// discards the category name on the way past (#3403).
+    #[traced_test]
+    #[test]
+    fn model_config_category_maps_without_the_unknown_variant_warning() {
+        use agent_client_protocol::schema::v1::{
+            SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+        };
+        tracing::callsite::rebuild_interest_cache();
+        let mapped = map_acp_config_option(
+            SessionConfigOption::select(
+                "reasoning-effort",
+                "Reasoning effort",
+                "high",
+                vec![SessionConfigSelectOption::new("high", "High")],
+            )
+            .category(SessionConfigOptionCategory::ModelConfig),
+        )
+        .expect("a select option maps");
+        assert_eq!(
+            mapped.category,
+            ConfigOptionCategory::Other("model_config".to_string())
+        );
+        logs_assert(|lines: &[&str]| {
+            match lines
+                .iter()
+                .filter(|l| l.contains("unknown SessionConfigOptionCategory"))
+                .count()
+            {
+                0 => Ok(()),
+                n => Err(format!("expected no unknown-category warning, got {n}")),
+            }
+        });
+    }
 
     /// The steer wire contract (#2805). `sessionId` must be camelCase and
     /// the `_meta` opt-in must be spelled exactly as the adapter reads it:
