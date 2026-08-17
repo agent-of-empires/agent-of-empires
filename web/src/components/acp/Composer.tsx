@@ -9,7 +9,7 @@
 //
 // Icons via lucide-react.
 
-import { ComposerPrimitive, useComposerRuntime, useThreadRuntime } from "@assistant-ui/react";
+import { ComposerPrimitive, useAui, useAuiState } from "@assistant-ui/react";
 import {
   unstable_defaultDirectiveFormatter as defaultDirectiveFormatter,
   type Unstable_TriggerAdapter,
@@ -58,6 +58,11 @@ export {
   type DictationDecision,
   type DictationEvent,
 } from "./useDictationBurstGuard";
+
+/** Live handle onto the composer scope: the slice of `aui.composer` this file
+ *  drives. Replaces the `useComposerRuntime()` hook dropped in
+ *  @assistant-ui/react 0.15. */
+export type ComposerClient = Pick<ReturnType<typeof useAui>["composer"], "getState" | "setText">;
 
 /** Decision returned by {@link decideEnterAction} for an Enter
  *  keystroke on the structured view composer textarea.
@@ -518,19 +523,49 @@ export function Composer({
   // and the SkillToolCard.
   const skillIndex = useSkillIndex();
 
-  const composerRuntime = useComposerRuntime();
+  // 0.15 swapped the stable `useComposerRuntime()` handle for `aui.composer`,
+  // a bound accessor that gets a fresh identity on every store update and
+  // whose `getState()` is the snapshot of the render it came from. The
+  // handlers below are long-lived (a debounced draft writer, keydown recall,
+  // plugin draft ops), so hand them a stable wrapper that always reads
+  // through to the current scope. Without this, an effect keyed on the
+  // accessor tears down on every keystroke and its cleanup persists a stale
+  // draft (#3094 regression).
+  const aui = useAui();
+  const composerRef = useRef(aui.composer);
+  useEffect(() => {
+    composerRef.current = aui.composer;
+  }, [aui]);
+  const composerText = useAuiState((s) => s.composer.text);
+  // The text that draft persistence should write. The store applies `setText`
+  // on a scheduled task, so `getState()` still reports the pre-send text for a
+  // tick after a send clears the composer; a persist racing that window would
+  // put the just-sent prompt back (#3094). This ref is stamped synchronously
+  // by the `setText` wrapper below and reconciled from the store whenever it
+  // actually changes, so it is never behind either source.
+  const draftTextRef = useRef(composerText);
+  useEffect(() => {
+    draftTextRef.current = composerText;
+  }, [composerText]);
+  const composerRuntime = useMemo<ComposerClient>(
+    () => ({
+      getState: () => composerRef.current.getState(),
+      setText: (text: string) => {
+        draftTextRef.current = text;
+        composerRef.current.setText(text);
+      },
+    }),
+    [],
+  );
 
   // Reactive send-eligibility: the send buttons are grayed out and inert
   // unless there is something to send, i.e. non-whitespace text OR at least
   // one supported attachment (an attachment-only prompt is valid, e.g. a
   // pasted screenshot). Mirrors the guard in `sendFromTextarea`, so clicking
   // Send with an empty composer can no longer be a silent no-op. The text
-  // lives in the assistant-ui composer runtime (an external store), so read it
-  // through useSyncExternalStore rather than a subscribe-in-effect.
-  const composerHasText = useSyncExternalStore(
-    useCallback((onChange) => composerRuntime.subscribe(onChange), [composerRuntime]),
-    () => composerRuntime.getState().text.trim().length > 0,
-  );
+  // lives in the assistant-ui composer store, which 0.15 exposes through the
+  // `useAuiState` selector above rather than a per-scope `subscribe`.
+  const composerHasText = composerText.trim().length > 0;
   const canSend = composerHasText || supportedPendingAttachments.length > 0;
 
   // ArrowUp/ArrowDown queue recall (shell-history style). recallRef holds
@@ -796,25 +831,14 @@ export function Composer({
       });
     }
 
-    let writeTimer: number | null = null;
-    const flush = () => {
-      if (writeTimer !== null) {
-        window.clearTimeout(writeTimer);
-        writeTimer = null;
-      }
-      setDraft(sessionId, composerRuntime.getState().text);
-    };
-    const unsub = composerRuntime.subscribe(() => {
-      if (writeTimer !== null) window.clearTimeout(writeTimer);
-      writeTimer = window.setTimeout(flush, 250);
-    });
     // Page-unload flush. Effect cleanup runs on React unmount (sidebar
     // navigation) but not on a full reload, PWA cold start, or mobile
-    // OS evicting the tab. Without these listeners, whatever sits in
-    // writeTimer at the moment the page dies is lost; on a fast typer
-    // that's the last sentence or two of the draft (#1358).
+    // OS evicting the tab. Without these listeners, whatever the debounce
+    // below is still holding at the moment the page dies is lost; on a fast
+    // typer that's the last sentence or two of the draft (#1358).
     // visibilitychange covers iOS Safari, which fires pagehide only on
     // real unload, not on app-switch.
+    const flush = () => setDraft(sessionId, draftTextRef.current);
     const onHidden = () => {
       if (document.visibilityState === "hidden") flush();
     };
@@ -822,13 +846,23 @@ export function Composer({
     window.addEventListener("pagehide", flush);
     document.addEventListener("visibilitychange", onHidden);
     return () => {
-      unsub();
       window.removeEventListener("beforeunload", flush);
       window.removeEventListener("pagehide", flush);
       document.removeEventListener("visibilitychange", onHidden);
       flush();
     };
   }, [composerRuntime, sessionId]);
+
+  // Debounced mirror of the live composer text. Re-running on each edit is
+  // the debounce: the cleanup cancels the pending write before the next one
+  // is scheduled. Kept separate from the effect above so the unload listeners
+  // and its unmount flush survive individual keystrokes. The value is read at
+  // fire time, not captured, so a write scheduled just before a send persists
+  // the cleared text rather than resurrecting the sent prompt.
+  useEffect(() => {
+    const writeTimer = window.setTimeout(() => setDraft(sessionId, draftTextRef.current), 250);
+    return () => window.clearTimeout(writeTimer);
+  }, [composerText, sessionId]);
 
   // Claim focus on mount, then re-claim a couple of times if focus fell to
   // <body> (some surfaces grab and release focus shortly after mount). Only
@@ -1304,23 +1338,30 @@ function PopoverItems({ trigger, skillIndex }: { trigger: string; skillIndex?: S
   );
 }
 
-/** Insert the picked slash command into the composer text. The Action
- *  popover already stripped the user's `/<typed>` from the input via
- *  `removeOnExecute`, so we set the canonical `/<name>` form and add
- *  a trailing space. The trailing space halts assistant-ui's
- *  `detectTrigger` backward scan (which keys off whitespace as the
- *  trigger boundary) so the popover does not immediately re-open on
- *  the inserted `/<name>` and consume the next Enter as a re-pick;
- *  it also positions the cursor for free-form arg typing when the
- *  agent advertised the command as `acceptsInput=true`. See #1512. */
-export function insertSlashCommand(runtime: ReturnType<typeof useComposerRuntime>, item: Unstable_TriggerItem) {
+/** The user's in-progress `/<typed>` token, which sits at the end of the
+ *  buffer because `detectTrigger` scans back from the caret to the previous
+ *  whitespace. */
+const TYPED_SLASH_TOKEN = /\/\S*\s*$/;
+
+/** Insert the picked slash command into the composer text as the canonical
+ *  `/<name>` form plus a trailing space. The trailing space halts
+ *  assistant-ui's `detectTrigger` backward scan (which keys off whitespace as
+ *  the trigger boundary) so the popover does not immediately re-open on the
+ *  inserted `/<name>` and consume the next Enter as a re-pick; it also
+ *  positions the cursor for free-form arg typing when the agent advertised the
+ *  command as `acceptsInput=true`. See #1512. */
+export function insertSlashCommand(runtime: ComposerClient, item: Unstable_TriggerItem) {
   if (!runtime) return;
-  const current = runtime.getState().text;
+  // The Action popover strips the typed `/<typed>` via `removeOnExecute`, but
+  // @assistant-ui/react 0.15 applies composer writes on a scheduled task, so
+  // reading the text back here still yields the un-stripped buffer. Drop the
+  // token ourselves rather than trusting the snapshot; our write is scheduled
+  // after the popover's, so ours is the one that lands.
+  const current = runtime.getState().text.replace(TYPED_SLASH_TOKEN, "");
   const suffix = " ";
   // Preserve any text that was already in the buffer (e.g. user typed
   // a long prompt then ran `/foo` mid-message). We just append the
-  // command at the end; the typed `/typed` token has already been
-  // removed by removeOnExecute, so trailing whitespace is rare.
+  // command at the end.
   const sep = current.length > 0 && !current.endsWith(" ") ? " " : "";
   runtime.setText(`${current}${sep}/${item.id}${suffix}`);
 }
@@ -1698,13 +1739,13 @@ function SendButton({
 }
 
 function StopButton() {
-  const runtime = useThreadRuntime();
+  const aui = useAui();
   return (
     <button
       type="button"
       aria-label="Stop"
       title="Stop the agent"
-      onClick={() => runtime.cancelRun()}
+      onClick={() => aui.thread.cancelRun()}
       className={[
         "inline-flex items-center justify-center gap-1.5",
         "rounded-lg border border-surface-600 bg-surface-800",
@@ -1779,7 +1820,7 @@ function QueueSendButton({
  *  button and the Enter-while-running keyboard handler. */
 function sendFromTextarea(
   taRef: React.RefObject<HTMLTextAreaElement | null>,
-  composerRuntime: ReturnType<typeof useComposerRuntime>,
+  composerRuntime: ComposerClient,
   enqueuePrompt: (text: string, attachments?: PromptAttachmentInput[]) => void | Promise<void>,
   sessionId: string,
   attachments: PromptAttachmentInput[] = [],
