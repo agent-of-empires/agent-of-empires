@@ -35,6 +35,7 @@ use tracing::{debug, warn};
 pub struct Schema {
     events_table: String,
     attachments_table: String,
+    pending_attachments_table: String,
 }
 
 impl Schema {
@@ -48,6 +49,7 @@ impl Schema {
         Ok(Self {
             events_table: format!("{prefix}_events"),
             attachments_table: format!("{prefix}_attachments"),
+            pending_attachments_table: format!("{prefix}_pending_attachments"),
         })
     }
 
@@ -57,6 +59,16 @@ impl Schema {
 
     pub fn attachments_table(&self) -> &str {
         &self.attachments_table
+    }
+
+    /// Attachment blobs buffered for an event that has not been written yet,
+    /// keyed by a caller-supplied opaque `ref_id` (e.g. a queued prompt's id)
+    /// rather than an event `seq`. Deliberately outside the seq-keyed
+    /// retention prune: these bytes must survive until their owning action
+    /// (a queued prompt draining) fires, at which point the caller re-records
+    /// them under the real event seq and deletes the pending copy.
+    pub fn pending_attachments_table(&self) -> &str {
+        &self.pending_attachments_table
     }
 }
 
@@ -117,6 +129,7 @@ pub fn open(db_path: &Path, schema: &Schema) -> Result<Connection> {
         .context("set synchronous=NORMAL")?;
     let events = schema.events_table();
     let attachments = schema.attachments_table();
+    let pending_attachments = schema.pending_attachments_table();
     conn.execute_batch(&format!(
         "CREATE TABLE IF NOT EXISTS {events} (
             session_id   TEXT    NOT NULL,
@@ -142,7 +155,22 @@ pub fn open(db_path: &Path, schema: &Schema) -> Result<Connection> {
             PRIMARY KEY (session_id, attachment_id)
         );
         CREATE INDEX IF NOT EXISTS idx_{attachments}_session_seq
-            ON {attachments}(session_id, seq);"
+            ON {attachments}(session_id, seq);
+        CREATE TABLE IF NOT EXISTS {pending_attachments} (
+            session_id    TEXT    NOT NULL,
+            ref_id        TEXT    NOT NULL,
+            attachment_id TEXT    NOT NULL,
+            kind          TEXT    NOT NULL,
+            mime_type     TEXT    NOT NULL,
+            name          TEXT,
+            data          BLOB    NOT NULL,
+            created_at    INTEGER NOT NULL,
+            PRIMARY KEY (session_id, attachment_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_{pending_attachments}_session_ref
+            ON {pending_attachments}(session_id, ref_id);
+        CREATE INDEX IF NOT EXISTS idx_{pending_attachments}_created_at
+            ON {pending_attachments}(created_at);"
     ))
     .context("create event log schema")?;
     ensure_discriminant_column(&conn, events)?;
@@ -641,6 +669,163 @@ pub fn load_attachment(
     })
 }
 
+/// Persist one attachment blob buffered for a not-yet-written event, keyed to
+/// `(topic, attachment_id)` and tagged with the opaque `ref_id` its owning
+/// action supplies (a queued prompt's id). Outside the seq-keyed retention
+/// prune, so it survives until the action fires. Idempotent on
+/// `(topic, attachment_id)`. Returns `true` on success.
+#[allow(clippy::too_many_arguments)]
+pub fn insert_pending_attachment(
+    conn: &Connection,
+    schema: &Schema,
+    topic: &str,
+    ref_id: &str,
+    attachment_id: &str,
+    kind: &str,
+    mime_type: &str,
+    name: Option<&str>,
+    data: &[u8],
+    created_at: i64,
+) -> bool {
+    let sql = format!(
+        "INSERT OR IGNORE INTO {}
+            (session_id, ref_id, attachment_id, kind, mime_type, name, data, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        schema.pending_attachments_table()
+    );
+    if let Err(e) = conn.execute(
+        &sql,
+        params![
+            topic,
+            ref_id,
+            attachment_id,
+            kind,
+            mime_type,
+            name,
+            data,
+            created_at
+        ],
+    ) {
+        warn!(
+            target: "events",
+            topic = %topic,
+            attachment = %attachment_id,
+            "insert pending attachment failed: {e}"
+        );
+        return false;
+    }
+    true
+}
+
+/// Load every pending attachment buffered under `(topic, ref_id)` as
+/// `(attachment_id, kind, mime_type, name, data)`, in stable insertion order.
+/// Used at drain time to reconstitute a queued prompt's blobs before it is
+/// forwarded to the agent.
+#[allow(clippy::type_complexity)]
+pub fn load_pending_attachments_for_ref(
+    conn: &Connection,
+    schema: &Schema,
+    topic: &str,
+    ref_id: &str,
+) -> Vec<(String, String, String, Option<String>, Vec<u8>)> {
+    let sql = format!(
+        "SELECT attachment_id, kind, mime_type, name, data FROM {}
+         WHERE session_id = ?1 AND ref_id = ?2
+         ORDER BY rowid",
+        schema.pending_attachments_table()
+    );
+    let mut stmt = match conn.prepare(&sql) {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(target: "events", topic = %topic, "prepare load pending attachments: {e}");
+            return Vec::new();
+        }
+    };
+    let rows = stmt.query_map(params![topic, ref_id], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Option<String>>(3)?,
+            row.get::<_, Vec<u8>>(4)?,
+        ))
+    });
+    match rows {
+        Ok(iter) => iter.filter_map(|r| r.ok()).collect(),
+        Err(e) => {
+            warn!(target: "events", topic = %topic, "load pending attachments: {e}");
+            Vec::new()
+        }
+    }
+}
+
+/// Drop every pending attachment buffered under `(topic, ref_id)`. Called when
+/// a queued prompt is removed, cleared, or retired after a successful drain.
+pub fn delete_pending_attachments_for_ref(
+    conn: &Connection,
+    schema: &Schema,
+    topic: &str,
+    ref_id: &str,
+) {
+    if let Err(e) = conn.execute(
+        &format!(
+            "DELETE FROM {} WHERE session_id = ?1 AND ref_id = ?2",
+            schema.pending_attachments_table()
+        ),
+        params![topic, ref_id],
+    ) {
+        warn!(
+            target: "events",
+            topic = %topic,
+            ref_id = %ref_id,
+            "delete pending attachments failed: {e}"
+        );
+    }
+}
+
+/// Total bytes of pending attachments buffered for `topic`, for the
+/// per-session enqueue cap. Zero on error (fail open on the read; the insert
+/// still enforces the single-blob caps).
+pub fn pending_attachment_bytes_for_session(
+    conn: &Connection,
+    schema: &Schema,
+    topic: &str,
+) -> u64 {
+    conn.query_row(
+        &format!(
+            "SELECT COALESCE(SUM(LENGTH(data)), 0) FROM {} WHERE session_id = ?1",
+            schema.pending_attachments_table()
+        ),
+        params![topic],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|n| n.max(0) as u64)
+    .unwrap_or(0)
+}
+
+/// Prune pending attachments whose `created_at` is at or before `cutoff_ms`,
+/// so a queued prompt that never drains (a session that never becomes idle
+/// again) cannot buffer bytes forever (Q5). Returns rows deleted.
+pub fn prune_pending_attachments_older_than(
+    conn: &Connection,
+    schema: &Schema,
+    cutoff_ms: i64,
+) -> usize {
+    match conn.execute(
+        &format!(
+            "DELETE FROM {} WHERE created_at <= ?1",
+            schema.pending_attachments_table()
+        ),
+        params![cutoff_ms],
+    ) {
+        Ok(n) => n,
+        Err(e) => {
+            warn!(target: "events", "prune pending attachments: {e}");
+            0
+        }
+    }
+}
+
 /// Drop every event and attachment for `topic`. Returns the number of event
 /// rows deleted.
 pub fn delete_topic(conn: &Connection, schema: &Schema, topic: &str) -> usize {
@@ -666,6 +851,15 @@ pub fn delete_topic(conn: &Connection, schema: &Schema, topic: &str) -> usize {
     ) {
         warn!(target: "events", "delete attachments {topic}: {e}");
     }
+    if let Err(e) = conn.execute(
+        &format!(
+            "DELETE FROM {} WHERE session_id = ?1",
+            schema.pending_attachments_table()
+        ),
+        params![topic],
+    ) {
+        warn!(target: "events", "delete pending attachments {topic}: {e}");
+    }
     deleted
 }
 
@@ -679,10 +873,12 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         let events = schema.events_table();
         let attachments = schema.attachments_table();
+        let pending = schema.pending_attachments_table();
         conn.execute_batch(&format!(
             "CREATE TABLE {events} (session_id TEXT NOT NULL, seq INTEGER NOT NULL, event_json TEXT NOT NULL, created_at INTEGER NOT NULL, discriminant TEXT, PRIMARY KEY (session_id, seq));
              CREATE INDEX idx_{events}_session_discriminant_seq ON {events}(session_id, discriminant, seq);
-             CREATE TABLE {attachments} (session_id TEXT NOT NULL, seq INTEGER NOT NULL, attachment_id TEXT NOT NULL, kind TEXT NOT NULL, mime_type TEXT NOT NULL, name TEXT, data BLOB NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (session_id, attachment_id));"
+             CREATE TABLE {attachments} (session_id TEXT NOT NULL, seq INTEGER NOT NULL, attachment_id TEXT NOT NULL, kind TEXT NOT NULL, mime_type TEXT NOT NULL, name TEXT, data BLOB NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (session_id, attachment_id));
+             CREATE TABLE {pending} (session_id TEXT NOT NULL, ref_id TEXT NOT NULL, attachment_id TEXT NOT NULL, kind TEXT NOT NULL, mime_type TEXT NOT NULL, name TEXT, data BLOB NOT NULL, created_at INTEGER NOT NULL, PRIMARY KEY (session_id, attachment_id));"
         ))
         .unwrap();
         conn
@@ -963,5 +1159,88 @@ mod tests {
             latest_by_discriminant(&conn, &schema, "t", "Chunk"),
             Some((2, "{\"Chunk\":{}}".to_string()))
         );
+    }
+
+    /// The pending-attachment store buffers bytes keyed by an opaque ref id,
+    /// loads them back in insertion order, sums per session for the cap,
+    /// deletes per ref, and is dropped by `delete_topic`. Crucially it is NOT
+    /// touched by the seq-keyed retention prune, since a queued prompt has no
+    /// event seq yet.
+    #[test]
+    fn pending_attachments_store_roundtrip_survives_retention_prune() {
+        let schema = Schema::new("demo").unwrap();
+        let conn = mem(&schema);
+        let put = |ref_id: &str, att: &str, data: &[u8], at: i64| {
+            assert!(insert_pending_attachment(
+                &conn,
+                &schema,
+                "t",
+                ref_id,
+                att,
+                "image",
+                "image/png",
+                Some("a.png"),
+                data,
+                at,
+            ));
+        };
+        put("q1", "a1", b"one", 100);
+        put("q1", "a2", b"twotwo", 100);
+        put("q2", "b1", b"three", 100);
+
+        // Load per ref in insertion order.
+        let q1 = load_pending_attachments_for_ref(&conn, &schema, "t", "q1");
+        assert_eq!(
+            q1.iter().map(|r| r.0.as_str()).collect::<Vec<_>>(),
+            ["a1", "a2"]
+        );
+        assert_eq!(q1[0].4, b"one");
+
+        // Per-session byte sum backs the enqueue cap (3 + 6 + 5 = 14).
+        assert_eq!(
+            pending_attachment_bytes_for_session(&conn, &schema, "t"),
+            14
+        );
+
+        // Insert is idempotent on (session, attachment_id): re-inserting a1 is
+        // ignored, not a duplicate.
+        put("q1", "a1", b"ignored", 100);
+        assert_eq!(
+            pending_attachment_bytes_for_session(&conn, &schema, "t"),
+            14
+        );
+
+        // A no-op event insert + retention prune must NOT drop pending rows
+        // (they have no event seq). Prune the events table hard, then re-read.
+        prune_retention(&conn, &schema, "t", 0, &[]);
+        assert_eq!(
+            pending_attachment_bytes_for_session(&conn, &schema, "t"),
+            14
+        );
+
+        // Delete per ref drops only that ref's blobs.
+        delete_pending_attachments_for_ref(&conn, &schema, "t", "q1");
+        assert!(load_pending_attachments_for_ref(&conn, &schema, "t", "q1").is_empty());
+        assert_eq!(pending_attachment_bytes_for_session(&conn, &schema, "t"), 5);
+
+        // TTL prune drops rows at/older than the cutoff; a newer row survives.
+        assert!(insert_pending_attachment(
+            &conn,
+            &schema,
+            "t",
+            "q3",
+            "c1",
+            "image",
+            "image/png",
+            None,
+            b"new",
+            500,
+        ));
+        assert_eq!(prune_pending_attachments_older_than(&conn, &schema, 100), 1);
+        assert_eq!(pending_attachment_bytes_for_session(&conn, &schema, "t"), 3);
+
+        // delete_topic cascades to the pending table.
+        delete_topic(&conn, &schema, "t");
+        assert_eq!(pending_attachment_bytes_for_session(&conn, &schema, "t"), 0);
     }
 }

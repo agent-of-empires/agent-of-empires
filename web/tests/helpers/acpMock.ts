@@ -46,6 +46,89 @@ export interface AcpSessionMock {
   pushEvents: (events: unknown[]) => void;
 }
 
+/** Test double for the daemon's `TranscriptModel` (src/acp/transcript.rs),
+ *  covering only the event kinds the mocked specs push: agent message chunks,
+ *  user prompts, and the two tool-lifecycle edges. Everything else folds to no
+ *  row, which is what the server does for the control-only events these specs
+ *  use (`Stopped`, `ConfigOptionsUpdated`, ...).
+ *
+ *  Row ids and group ids mirror the server's (`msg-<seq>`, `user-seq-<seq>`,
+ *  `start-<id>` / `done-<id>` grouped under `tool-<id>`, `g<n>` for the rest)
+ *  so merge-by-id behaves as it does in production. Fold *correctness* is not
+ *  what this suite tests: the Rust unit tests in `transcript.rs` and the live
+ *  Playwright specs cover that against the real fold. This exists so mocked
+ *  browser-behavior specs (fonts, scrolling, touch, card layout) have a
+ *  transcript to render at all now that the client no longer folds events
+ *  itself.
+ */
+function foldEventToRow(event: unknown, seq: number, nextGroup: () => string, openMessageGroup: { id: string | null }) {
+  const now = new Date().toISOString();
+  // Unit variants serialize as a bare string.
+  if (event === "SessionCleared") {
+    openMessageGroup.id = null;
+    return {
+      id: `cleared-${seq}`,
+      group_id: nextGroup(),
+      kind: "session_cleared",
+      at: now,
+      text: "Conversation cleared, the model no longer remembers earlier turns.",
+    };
+  }
+  if (typeof event !== "object" || event === null) return null;
+  const ev = event as Record<string, Record<string, unknown>>;
+  if (ev.AgentMessageChunk) {
+    // Consecutive chunks share one group; any other event closes the run.
+    const group = openMessageGroup.id ?? nextGroup();
+    openMessageGroup.id = group;
+    return {
+      id: `msg-${seq}`,
+      group_id: group,
+      kind: "message",
+      at: now,
+      text: String(ev.AgentMessageChunk.text ?? ""),
+    };
+  }
+  openMessageGroup.id = null;
+  if (ev.UserPromptSent) {
+    const promptId = ev.UserPromptSent.prompt_id;
+    return {
+      id: typeof promptId === "string" && promptId ? promptId : `user-seq-${seq}`,
+      group_id: nextGroup(),
+      kind: "user_prompt",
+      at: now,
+      text: String(ev.UserPromptSent.text ?? ""),
+      attachments: ev.UserPromptSent.attachments ?? [],
+    };
+  }
+  if (ev.ToolCallStarted) {
+    const tc = ev.ToolCallStarted.tool_call as Record<string, unknown>;
+    return {
+      id: `start-${String(tc.id)}`,
+      group_id: `tool-${String(tc.id)}`,
+      kind: "tool_start",
+      at: String(tc.started_at ?? now),
+      text: String(tc.name ?? ""),
+      tool_call_id: String(tc.id),
+      tool: tc,
+    };
+  }
+  if (ev.ToolCallCompleted) {
+    const c = ev.ToolCallCompleted;
+    const isError = Boolean(c.is_error);
+    const content = String(c.content ?? "");
+    return {
+      id: `done-${String(c.tool_call_id)}`,
+      group_id: `tool-${String(c.tool_call_id)}`,
+      kind: isError ? "tool_error" : "tool_complete",
+      at: String(c.completed_at ?? now),
+      text: content || (isError ? "tool failed" : "completed"),
+      tool_call_id: String(c.tool_call_id),
+      output: c.output ?? [],
+    };
+  }
+  return null;
+}
+
 export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {}): Promise<AcpSessionMock> {
   const sessionId = opts.sessionId ?? "sess-1";
   const title = opts.title ?? "acp-mock";
@@ -53,11 +136,25 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
   let seq = 0;
   let ws: WebSocketRoute | null = null;
   const frameLog: string[] = [];
+  // Server-folded transcript rows, tagged with the seq that produced them so
+  // the replay route can page rows over the same seq window as the frames.
+  const rowLog: Array<{ seq: number; row: Record<string, unknown> }> = [];
+  let groupCounter = 0;
+  const nextGroup = () => `g${++groupCounter}`;
+  const openMessageGroup: { id: string | null } = { id: null };
   const pushEvents = (events: unknown[]) => {
     for (const event of events) {
-      const frame = JSON.stringify({ session_id: sessionId, seq: ++seq, event });
+      const at = ++seq;
+      const frame = JSON.stringify({ session_id: sessionId, seq: at, event });
       frameLog.push(frame);
       ws?.send(frame);
+      // The daemon folds the event and ships the row separately (Tier 4); the
+      // raw frame above now feeds the client's control reducer only.
+      const row = foldEventToRow(event, at, nextGroup, openMessageGroup);
+      if (row) {
+        rowLog.push({ seq: at, row });
+        ws?.send(JSON.stringify({ kind: "transcript_delta", delta: { Append: row } }));
+      }
     }
   };
 
@@ -144,8 +241,18 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
   // See #2236.
   const isBoundary = (event: unknown): boolean =>
     typeof event === "object" && event !== null && ("UserPromptSent" in event || "UserDiffCommentsPrompt" in event);
+  // Rows covering the same seq window as a frame page. `?view=rows` returns
+  // the folded rows with an EMPTY `frames`, exactly like the daemon, so the
+  // client's two-projection fetch gets its cursors from the frames leg.
+  const rowsForWindow = (page: Array<{ seq: number }>) => {
+    if (page.length === 0) return [];
+    const lo = page[0]!.seq;
+    const hi = page[page.length - 1]!.seq;
+    return rowLog.filter((e) => e.seq >= lo && e.seq <= hi).map((e) => e.row);
+  };
   await page.route(/\/acp\/replay(\?|$)/, (r) => {
     const url = new URL(r.request().url());
+    const wantsRows = url.searchParams.get("view") === "rows";
     const limit = Number(url.searchParams.get("limit") ?? "1000");
     const frames = frameLog.map((f) => JSON.parse(f) as { seq: number; event: unknown });
     const highestSeq = frames.length > 0 ? frames[frames.length - 1]!.seq : 0;
@@ -162,7 +269,8 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
       }
       return r.fulfill({
         json: {
-          frames: page,
+          frames: wantsRows ? [] : page,
+          ...(wantsRows ? { rows: rowsForWindow(page) } : {}),
           lost: false,
           highest_seq: highestSeq,
           lowest_seq: lowestSeq,
@@ -176,7 +284,8 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
     const page = newer.slice(0, limit);
     return r.fulfill({
       json: {
-        frames: page,
+        frames: wantsRows ? [] : page,
+        ...(wantsRows ? { rows: rowsForWindow(page) } : {}),
         lost: false,
         highest_seq: highestSeq,
         lowest_seq: lowestSeq,
@@ -208,6 +317,9 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
   await page.routeWebSocket(/\/sessions\/[^/]+\/acp\/ws/, (route) => {
     ws = route;
     for (const frame of frameLog) route.send(frame);
+    // The daemon's on-connect transcript snapshot. Merged by row id, so
+    // re-sending rows the client already has from replay is a no-op.
+    route.send(JSON.stringify({ kind: "transcript_snapshot", rows: rowLog.map((e) => e.row) }));
   });
 
   pushEvents(opts.initialEvents ?? []);

@@ -428,12 +428,12 @@ fn disable_delete_to_trash() {
     .unwrap();
 }
 
-/// Turn on `session.confirm_delete` so `d` guards the trash with a
-/// confirmation dialog instead of trashing on the keystroke. Must run after
-/// `setup_test_home` so it writes into the test HOME. See #2583.
-fn enable_confirm_delete() {
+/// Turn off `session.confirm_delete` so `d` trashes on the keystroke instead
+/// of opening the confirmation dialog. Must run after `setup_test_home` so it
+/// writes into the test HOME. See #2583, #3364.
+fn disable_confirm_delete() {
     crate::session::config::update_config(|config| {
-        config.session.confirm_delete = true;
+        config.session.confirm_delete = false;
     })
     .unwrap();
 }
@@ -9223,17 +9223,28 @@ fn w_skips_archived_idle_session_in_fallback() {
     );
 }
 
+/// The default gesture: `d` opens the confirm dialog and a second `d` accepts
+/// it, trashing the session both in memory and on disk. See #3364.
 #[test]
 #[serial]
-fn d_on_session_with_default_trash_persists_trash_marker() {
+fn d_then_d_confirms_the_trash_and_persists_the_marker() {
     let mut env = create_test_env_with_sessions(2);
     let id = env.view.selected_session.clone().unwrap();
 
     env.view.handle_key(key(KeyCode::Char('d')), None);
+    assert!(
+        !env.view.get_instance(&id).unwrap().is_trashed(),
+        "the first d must only open the dialog"
+    );
+    env.view.handle_key(key(KeyCode::Char('d')), None);
 
     assert!(
+        env.view.confirm_dialog.is_none(),
+        "the confirming d must close the dialog"
+    );
+    assert!(
         env.view.get_instance(&id).unwrap().is_trashed(),
-        "pressing d with default trash-first config must mark the row trashed in memory"
+        "a confirmed delete with default trash-first config must mark the row trashed in memory"
     );
     assert!(
         env.view.unified_delete_dialog.is_none(),
@@ -9248,18 +9259,65 @@ fn d_on_session_with_default_trash_persists_trash_marker() {
         .expect("disk row present");
     assert!(
         disk_row.is_trashed(),
-        "pressing d must persist trashed_at so a storage refresh cannot resurrect a killed session"
+        "confirming must persist trashed_at so a storage refresh cannot resurrect a killed session"
     );
 }
 
-/// With `session.confirm_delete` on, `d` opens a confirmation dialog and does
-/// not trash until the dialog is accepted; accepting then runs the same trash
-/// path as the instant flow. See #2583.
+/// Turning `session.confirm_delete` off restores the historical
+/// one-keystroke trash. See #3364.
+#[test]
+#[serial]
+fn d_with_confirm_delete_off_trashes_on_the_keystroke() {
+    let mut env = create_test_env_with_sessions(2);
+    disable_confirm_delete();
+    let id = env.view.selected_session.clone().unwrap();
+
+    env.view.handle_key(key(KeyCode::Char('d')), None);
+
+    assert!(
+        env.view.confirm_dialog.is_none(),
+        "confirm_delete off must not open a dialog"
+    );
+    assert!(
+        env.view.get_instance(&id).unwrap().is_trashed(),
+        "confirm_delete off must trash on the keystroke"
+    );
+}
+
+/// Ticking the dialog's "don't warn me again" checkbox trashes the session
+/// and persists `confirm_delete = false`, so the next `d` goes back to the
+/// one-keystroke trash without a trip through the settings pane. See #3364.
+#[test]
+#[serial]
+fn confirm_delete_dont_ask_again_persists_the_opt_out() {
+    let mut env = create_test_env_with_sessions(2);
+    let id = env.view.selected_session.clone().unwrap();
+
+    env.view.handle_key(key(KeyCode::Char('d')), None);
+    // Space ticks the checkbox, the second `d` accepts.
+    env.view.handle_key(key(KeyCode::Char(' ')), None);
+    env.view.handle_key(key(KeyCode::Char('d')), None);
+
+    assert!(
+        env.view.get_instance(&id).unwrap().is_trashed(),
+        "accepting with the checkbox ticked must still trash the session"
+    );
+    assert!(
+        !crate::session::config::Config::load()
+            .unwrap()
+            .session
+            .confirm_delete,
+        "the opt-out must be persisted to config"
+    );
+}
+
+/// With `session.confirm_delete` on (the default), `d` opens a confirmation
+/// dialog and does not trash until the dialog is accepted; accepting then runs
+/// the same trash path as the instant flow. See #2583.
 #[test]
 #[serial]
 fn d_with_confirm_delete_prompts_before_trashing() {
     let mut env = create_test_env_with_sessions(2);
-    enable_confirm_delete();
     let id = env.view.selected_session.clone().unwrap();
 
     env.view.handle_key(key(KeyCode::Char('d')), None);
@@ -9298,7 +9356,6 @@ fn d_with_confirm_delete_prompts_before_trashing() {
 #[serial]
 fn confirm_delete_dialog_cancel_leaves_session() {
     let mut env = create_test_env_with_sessions(2);
-    enable_confirm_delete();
     let id = env.view.selected_session.clone().unwrap();
 
     env.view.handle_key(key(KeyCode::Char('d')), None);

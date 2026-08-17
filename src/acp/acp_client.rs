@@ -2306,6 +2306,25 @@ impl AcpClient {
         (client, event_tx)
     }
 
+    /// Like `fake_for_test`, but with a live `cmd_tx` whose consumer is
+    /// already gone, reproducing a worker between its connection task
+    /// ending (force-stop teardown) and the respawn installing a fresh
+    /// client: every `ClientCmd` send fails immediately with
+    /// `AgentExited`. See #3401.
+    #[cfg(test)]
+    pub fn fake_for_test_dead_connection(session_id: AcpSessionId) -> Self {
+        let (_event_tx, event_rx) = mpsc::channel(64);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<ClientCmd>(16);
+        drop(cmd_rx);
+        Self {
+            session_id,
+            inbound: Some(event_rx),
+            cmd_tx: Some(cmd_tx),
+            pending_responders: Arc::new(Mutex::new(HashMap::new())),
+            _child: None,
+        }
+    }
+
     /// Like `fake_for_test`, but wires a live `cmd_tx` whose consumer
     /// records whether a `session/delete` RPC was issued. The returned
     /// `AtomicBool` flips to `true` the moment a
@@ -5140,6 +5159,7 @@ fn map_update_to_events(
             ContentBlock::Text(text) => vec![Event::UserPromptSent {
                 text: text.text,
                 attachments: Vec::new(),
+                prompt_id: None,
             }],
             other => vec![raw_event(&other)],
         },
@@ -5773,6 +5793,15 @@ fn map_acp_config_option(
         SessionConfigOptionCategory::Mode => ConfigOptionCategory::Mode,
         SessionConfigOptionCategory::Model => ConfigOptionCategory::Model,
         SessionConfigOptionCategory::ThoughtLevel => ConfigOptionCategory::ThoughtLevel,
+        // "Model-related configuration parameter", a sibling of `Model`
+        // rather than another model picker (an adapter ships both), so it
+        // must not collapse into `ConfigOptionCategory::Model`. Nothing
+        // renders it specially yet, so it carries its upstream wire name
+        // through the generic `Other` arm instead of the `Other("")` the
+        // catch-all below used to produce (#3403).
+        SessionConfigOptionCategory::ModelConfig => {
+            ConfigOptionCategory::Other("model_config".to_string())
+        }
         SessionConfigOptionCategory::Other(s) => ConfigOptionCategory::Other(s),
         // The schema enum is `#[non_exhaustive]`, so this arm is required
         // to compile. Unknown category *names* arrive via the untagged
@@ -6465,6 +6494,19 @@ async fn run_connection_task<W, R>(
         &cwd,
     );
 
+    // Async sub-agent transcripts live inside the container for a sandboxed
+    // session (their path is not on a mounted volume), so the tailer must
+    // read them via `<runtime> exec`, not host `tokio::fs`. Capture the
+    // container name once; a host session reads the file directly. See
+    // `background_agent::TranscriptSource`.
+    let bg_transcript_source = match resources.sandbox.as_ref() {
+        Some(sandbox) => crate::acp::background_agent::TranscriptSource::Container {
+            runtime: crate::containers::get_container_runtime().base.binary,
+            container: sandbox.container_name.clone(),
+        },
+        None => crate::acp::background_agent::TranscriptSource::Host,
+    };
+
     // After a successful `session/load`, claude-agent-acp re-emits the
     // full prior transcript as `session/update` notifications (each
     // historical assistant turn replayed as agent_message_chunk
@@ -6573,6 +6615,7 @@ async fn run_connection_task<W, R>(
     let between_prompt_tools_for_notif = between_prompt_tools.clone();
     let between_prompt_off_protocol_for_notif = between_prompt_off_protocol.clone();
     let between_prompt_bg_agents_for_notif = between_prompt_bg_agents.clone();
+    let bg_transcript_source_for_notif = bg_transcript_source.clone();
     let adopted_turn_active_for_notif = adopted_turn_active.clone();
     let prompt_in_flight_for_notif = prompt_in_flight.clone();
 
@@ -6603,6 +6646,7 @@ async fn run_connection_task<W, R>(
                 let lifecycle_signal_tx = lifecycle_signal_tx_for_notif.clone();
                 let current_prompt_epoch = current_prompt_epoch_for_notif.clone();
                 let agent_msg_dedup = agent_msg_dedup_for_notif.clone();
+                let bg_transcript_source = bg_transcript_source_for_notif.clone();
                 let last_lifecycle_at = last_lifecycle_at_for_notif.clone();
                 let between_prompt_active = between_prompt_active_for_notif.clone();
                 let terminal_claim = terminal_claim_for_notif.clone();
@@ -6866,6 +6910,7 @@ async fn run_connection_task<W, R>(
                                 crate::acp::background_agent::spawn_tailer(
                                     agent_id.clone(),
                                     output_file.clone(),
+                                    bg_transcript_source.clone(),
                                     event_tx.clone(),
                                     between_prompt_bg_agents.clone(),
                                 );
@@ -9891,6 +9936,44 @@ async fn handle_elicitation_request(
 mod tests {
     use super::*;
     use rusqlite::Connection;
+    use tracing_test::traced_test;
+
+    /// `ModelConfig` is a category upstream already names, so it must map
+    /// through the explicit arm: the catch-all's "bump claude-agent-acp"
+    /// warning is for variants this build has genuinely never seen, and it
+    /// discards the category name on the way past (#3403).
+    #[traced_test]
+    #[test]
+    fn model_config_category_maps_without_the_unknown_variant_warning() {
+        use agent_client_protocol::schema::v1::{
+            SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+        };
+        tracing::callsite::rebuild_interest_cache();
+        let mapped = map_acp_config_option(
+            SessionConfigOption::select(
+                "reasoning-effort",
+                "Reasoning effort",
+                "high",
+                vec![SessionConfigSelectOption::new("high", "High")],
+            )
+            .category(SessionConfigOptionCategory::ModelConfig),
+        )
+        .expect("a select option maps");
+        assert_eq!(
+            mapped.category,
+            ConfigOptionCategory::Other("model_config".to_string())
+        );
+        logs_assert(|lines: &[&str]| {
+            match lines
+                .iter()
+                .filter(|l| l.contains("unknown SessionConfigOptionCategory"))
+                .count()
+            {
+                0 => Ok(()),
+                n => Err(format!("expected no unknown-category warning, got {n}")),
+            }
+        });
+    }
 
     /// The steer wire contract (#2805). `sessionId` must be camelCase and
     /// the `_meta` opt-in must be spelled exactly as the adapter reads it:
@@ -14265,7 +14348,9 @@ done
         );
         assert_eq!(events.len(), 1);
         match &events[0] {
-            Event::UserPromptSent { text, attachments } => {
+            Event::UserPromptSent {
+                text, attachments, ..
+            } => {
                 assert_eq!(text, "hello from the past");
                 assert!(attachments.is_empty());
             }

@@ -419,6 +419,7 @@ mod tests {
 
     fn user(text: &str) -> Event {
         Event::UserPromptSent {
+            prompt_id: None,
             text: text.into(),
             attachments: vec![],
         }

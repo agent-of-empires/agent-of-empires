@@ -64,6 +64,14 @@ test.describe("Mobile plugin pane picker (#2514)", () => {
     await expect(page.getByTestId("plugin-pane-body")).toBeVisible();
     await expect(page.getByTestId("plugin-pane-body")).toContainText("PR #1 open");
 
+    // The plugin pane reserves the bottom home-indicator inset the App root no
+    // longer does (moved per-surface; see index.css .safe-area-inset), matching
+    // the diff and paired panes so its content clears the home indicator.
+    const pluginInset = await page
+      .getByTestId("mobile-plugin-layer")
+      .evaluate((el) => (el as HTMLElement).style.paddingBottom);
+    expect(pluginInset).toContain("safe-area-inset-bottom");
+
     // The plugin view carries the persistent back-to-agent affordance.
     const back = page.getByTestId("mobile-back-to-agent");
     await expect(back).toBeVisible();

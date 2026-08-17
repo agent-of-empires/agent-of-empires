@@ -837,6 +837,18 @@ impl<S: BroadcastSink> Supervisor<S> {
                 AgentSpec::from_acp_cmd(name, cmd).map_err(SupervisorError::InvalidAgentCommand)?;
             return Ok((spec, false));
         }
+        // A custom agent that inherits a registry-backed base via
+        // `agent_detect_as` resolves to the base agent's spec. The normal
+        // spawn path resolves to the base key up front (see
+        // `pick_agent_for_tool`), so this branch only fires when a caller
+        // passes the wrapper name directly (e.g. an explicit switch-agent
+        // target). `true` marks it registry-backed so the command-override
+        // overlay and the compatibility version gate still apply.
+        if let Some(base) = crate::acp::inherited_acp_base(name, &config.agent_detect_as) {
+            if let Some(spec) = self.registry.lock().await.get(&base).cloned() {
+                return Ok((spec, true));
+            }
+        }
         Err(SupervisorError::UnknownAgent(name.into()))
     }
 
@@ -847,7 +859,11 @@ impl<S: BroadcastSink> Supervisor<S> {
     ///      `opencode acp`, etc.)
     ///   3. custom agent declaring an ACP command via
     ///      `agent_acp_cmd` in the session's profile config
-    ///   4. legacy fallback: `claude` for the claude tool, otherwise
+    ///   4. custom agent inheriting a registry-backed base via
+    ///      `agent_detect_as` (e.g. a Claude wrapper); resolves to the *base*
+    ///      registry key so the base agent's adapter, version gate, env
+    ///      allowlist, and `AgentProfile` all apply
+    ///   5. legacy fallback: `claude` for the claude tool, otherwise
     ///      `aoe-agent` (our bundled multi-provider agent)
     ///
     /// `profile` is the session's source profile (`""` resolves the
@@ -882,12 +898,48 @@ impl<S: BroadcastSink> Supervisor<S> {
         {
             return tool.to_string();
         }
-        // Step 4: legacy fallbacks.
+        // Step 4: custom agent inheriting a registry-backed base. Resolve to
+        // the base key so the built-in adapter path serves it; the wrapper's
+        // identity stays on the session's `tool`.
+        if let Some(base) = self
+            .custom_agent_inherited_base(tool, profile, project_path)
+            .await
+        {
+            return base;
+        }
+        // Step 5: legacy fallbacks.
         if tool == "claude" {
             "claude".into()
         } else {
             "aoe-agent".into()
         }
+    }
+
+    /// The registry-backed base key `tool` inherits via `agent_detect_as` in
+    /// its profile + repo-resolved config, or `None`. See
+    /// [`crate::acp::inherited_acp_base`].
+    pub async fn custom_agent_inherited_base(
+        &self,
+        tool: &str,
+        profile: &str,
+        project_path: &std::path::Path,
+    ) -> Option<String> {
+        let tool = tool.to_string();
+        let profile = profile.to_string();
+        let project_path = project_path.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            crate::acp::inherited_acp_base(
+                &tool,
+                &crate::session::repo_config::resolve_config_with_repo_or_warn(
+                    &profile,
+                    &project_path,
+                )
+                .session
+                .agent_detect_as,
+            )
+        })
+        .await
+        .unwrap_or(None)
     }
 
     /// True iff `tool` is a custom agent that declares an
@@ -941,6 +993,10 @@ impl<S: BroadcastSink> Supervisor<S> {
         }
         self.custom_agent_has_acp_cmd(name, profile, project_path)
             .await
+            || self
+                .custom_agent_inherited_base(name, profile, project_path)
+                .await
+                .is_some()
     }
 
     /// Allocate the session's next seq and publish `event` on the sink in
@@ -1202,7 +1258,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// is text-based but routed through the session's `AgentProfile`
     /// so each agent's aliases match the right surface. See #1101.
     pub async fn publish_user_prompt(&self, session_id: &str, text: String) -> PromptDisposition {
-        self.publish_user_prompt_with_attachments(session_id, text, &[])
+        self.publish_user_prompt_with_attachments(session_id, text, &[], None)
             .await
     }
 
@@ -1216,6 +1272,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
         text: String,
         attachments: &[crate::acp::event_store::AttachmentBlob],
+        prompt_id: Option<String>,
     ) -> PromptDisposition {
         let agent_key = self.agent_key_for_session(session_id).await;
         let profile = super::agent_profiles::resolve(&agent_key);
@@ -1252,6 +1309,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             &Event::UserPromptSent {
                 text,
                 attachments: refs,
+                prompt_id,
             },
         );
         if !persisted {
@@ -2529,10 +2587,21 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// Cancel the current turn for a running structured view worker. Best-effort:
     /// returns Ok if the worker exists even when no turn is in flight.
+    ///
+    /// A worker whose connection task has already ended counts as
+    /// cancelled rather than failed. That is the window a force stop
+    /// opens: the task exits, its command receiver drops, and the (now
+    /// dead) `WorkerHandle` stays in the map until the respawn swaps it,
+    /// so a cancel arriving in between fails to send instantly. There is
+    /// nothing left to cancel by then, and the resumed worker starts
+    /// idle, so answering the user's stop with an error was reporting a
+    /// fault for an outcome they got. See #3401.
     pub async fn cancel_prompt(&self, session_id: &str) -> Result<(), SupervisorError> {
         let client = self.ready_client(session_id).await?;
-        client.cancel_prompt().await?;
-        Ok(())
+        match client.cancel_prompt().await {
+            Ok(()) | Err(AcpError::AgentExited) => Ok(()),
+            Err(e) => Err(SupervisorError::Acp(e)),
+        }
     }
 
     /// User-initiated "Force stop". Two failure modes to cover:
@@ -3396,6 +3465,10 @@ pub struct ChannelSink {
     /// which is hydrated from this store at startup, so seqs survive
     /// `aoe serve` restart without coordination.
     pub event_store: Arc<crate::acp::event_store::EventStore>,
+    /// Live control-state projection, folded here so prompt dispatch can read
+    /// it without replaying the log (`crate::acp::control_cache`). Shared with
+    /// `AppState`, which is where the readers live.
+    pub control_cache: Arc<crate::acp::control_cache::ControlStateCache>,
 }
 
 /// Reset time a fresh rejection can inherit from the session's previous
@@ -3416,6 +3489,8 @@ impl BroadcastSink for ChannelSink {
 
     fn clear_session_events(&self, session_id: &str) {
         self.event_store.delete_session(session_id);
+        // The cached fold is a projection of the log we just deleted.
+        self.control_cache.forget(session_id);
     }
 
     fn publish_persisted(&self, session_id: &str, seq: u64, event: &Event) -> bool {
@@ -3491,6 +3566,18 @@ impl BroadcastSink for ChannelSink {
                 &event_to_publish
             }
         };
+
+        // Fold into the live control-state projection before broadcasting, in
+        // the same seq order the on-disk log is written in. On a failed
+        // persist drop the fold instead: the log is now missing this seq, and
+        // a projection that has an event its log does not is worse than no
+        // projection, since the next reader would trust it.
+        if persisted {
+            self.control_cache
+                .apply_if_cached(session_id, seq, event_ref);
+        } else {
+            self.control_cache.forget(session_id);
+        }
 
         let frame = crate::server::AcpBroadcastFrame {
             session_id: session_id.to_string(),
@@ -3705,6 +3792,10 @@ mod tests {
         let mut cfg = crate::session::config::SessionConfig::default();
         cfg.agent_acp_cmd
             .insert("oc-superpowers".into(), "ocp run sp acp".into());
+        // A custom agent that inherits a registry-backed base via
+        // `agent_detect_as` resolves to the base agent's registry spec.
+        cfg.agent_detect_as
+            .insert("lenovo-claude".into(), "claude".into());
 
         #[derive(Debug)]
         enum Want {
@@ -3714,11 +3805,13 @@ mod tests {
             Unknown,
         }
         let cases = [
-            // Unrestricted: both branches resolve as before.
+            // Unrestricted: all three branches resolve as before.
             (false, &[][..], "claude", Want::Registry),
             (false, &[][..], "oc-superpowers", Want::Custom),
+            // An inheriting wrapper resolves to the base's registry spec.
+            (false, &[][..], "lenovo-claude", Want::Registry),
             (false, &[][..], "no-such-agent", Want::Unknown),
-            // Restricted: only listed keys resolve, on either branch.
+            // Restricted: only listed keys resolve, on any branch.
             (true, &["claude"][..], "claude", Want::Registry),
             (true, &["claude"][..], "codex", Want::NotAllowed),
             (
@@ -3728,6 +3821,15 @@ mod tests {
                 Want::Custom,
             ),
             (true, &["claude"][..], "oc-superpowers", Want::NotAllowed),
+            // The allowlist is keyed on the name the caller passes: allowing the
+            // wrapper permits it, allowing only the base does not.
+            (
+                true,
+                &["lenovo-claude"][..],
+                "lenovo-claude",
+                Want::Registry,
+            ),
+            (true, &["claude"][..], "lenovo-claude", Want::NotAllowed),
             // Policy is checked before resolution, so an agent that is both
             // unlisted and unregistered reports the policy refusal. The
             // operator's list is the reason it will not run.
@@ -3778,6 +3880,10 @@ mod tests {
 [session.agent_acp_cmd]
 cursor-acp-bridge = "agent acp"
 broken = ""
+
+[session.agent_detect_as]
+lenovo-claude = "claude"
+my-cursor = "cursor"
 "#,
         )
         .unwrap();
@@ -3787,6 +3893,10 @@ broken = ""
             ("cursor-acp-bridge", true),
             ("unknown-agent", false),
             ("broken", false),
+            // Inherits a registry-backed base → valid structured target.
+            ("lenovo-claude", true),
+            // Inherits a terminal-only base (no ACP adapter) → not a target.
+            ("my-cursor", false),
         ];
         for (name, expected) in cases {
             let got = sup.agent_is_valid_switch_target(name, "", tmp.path()).await;
@@ -4375,6 +4485,43 @@ cursor-acp-bridge = "agent acp"
         assert!(
             matches!(decision, RestartDecision::UserStopped),
             "expected UserStopped when registry entry is absent, got {decision:?}"
+        );
+    }
+
+    /// #3401: a force stop ends the connection task and leaves the dead
+    /// `WorkerHandle` in the map until the respawn swaps it, so requests
+    /// landing in that window fail their command send instantly. The
+    /// user's own stop must not read back as a failure, and a prompt
+    /// that raced it has to stay distinguishable as the transient the
+    /// REST layer answers with a retryable status.
+    #[tokio::test]
+    async fn requests_racing_a_force_stop_teardown_are_not_faults() {
+        let sup = Supervisor::new(VecSink::new());
+        {
+            let mut workers = sup.workers.lock().await;
+            workers.insert(
+                "s-3401".into(),
+                WorkerHandle {
+                    client: Arc::new(AcpClient::fake_for_test_dead_connection(AcpSessionId(
+                        "acp-3401".into(),
+                    ))),
+                    drain_task: tokio::spawn(async {}),
+                    restart_history: vec![],
+                    kind: WorkerKind::Stdio,
+                },
+            );
+        }
+
+        assert!(
+            sup.cancel_prompt("s-3401").await.is_ok(),
+            "the turn a cancel would have ended is already over"
+        );
+        assert!(
+            matches!(
+                sup.send_prompt("s-3401", "hi", &[]).await,
+                Err(SupervisorError::Acp(AcpError::AgentExited))
+            ),
+            "a prompt genuinely did not land, and the reason must stay typed"
         );
     }
 
@@ -6146,12 +6293,14 @@ cursor-acp-bridge = "agent acp"
         let sink = Arc::new(ChannelSink {
             tx,
             event_store: event_store.clone(),
+            control_cache: Arc::new(crate::acp::control_cache::ControlStateCache::new()),
         });
 
         sink.publish(
             "s-42",
             1,
             &Event::UserPromptSent {
+                prompt_id: None,
                 text: "hello world".into(),
                 attachments: Vec::new(),
             },
@@ -6203,6 +6352,7 @@ cursor-acp-bridge = "agent acp"
         let sink = Arc::new(ChannelSink {
             tx,
             event_store: event_store.clone(),
+            control_cache: Arc::new(crate::acp::control_cache::ControlStateCache::new()),
         });
         let resets_at = chrono::Utc::now() + chrono::Duration::hours(3);
         let info = |resets_at| RateLimitInfo {
@@ -6248,6 +6398,7 @@ cursor-acp-bridge = "agent acp"
             let sink = Arc::new(ChannelSink {
                 tx,
                 event_store: event_store.clone(),
+                control_cache: Arc::new(crate::acp::control_cache::ControlStateCache::new()),
             });
             let sup = Supervisor::new(sink);
             sup.publish_user_prompt("s-99", "first".into()).await;
@@ -6266,6 +6417,7 @@ cursor-acp-bridge = "agent acp"
         let sink = Arc::new(ChannelSink {
             tx,
             event_store: event_store.clone(),
+            control_cache: Arc::new(crate::acp::control_cache::ControlStateCache::new()),
         });
         let sup = Supervisor::new(sink);
         sup.hydrate_seqs(event_store.all_session_seqs());

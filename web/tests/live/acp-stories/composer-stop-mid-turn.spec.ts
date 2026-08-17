@@ -72,7 +72,7 @@ base("Stop button cancels a running turn", async ({ page }, testInfo) => {
     await expect(page.getByText("Thinking...")).toBeVisible({
       timeout: 10_000,
     });
-    const stopButton = page.getByRole("button", { name: "Stop" });
+    const stopButton = page.getByTestId("composer-actions").getByRole("button", { name: "Stop" });
     await expect(stopButton).toBeVisible({ timeout: 5_000 });
     await stopButton.click();
 

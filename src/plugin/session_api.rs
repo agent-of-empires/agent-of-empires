@@ -566,6 +566,7 @@ async fn sessions_turn_send(
                 &req.text,
                 &[],
                 false,
+                None,
             )
             .await
             .map_err(map_send_error)

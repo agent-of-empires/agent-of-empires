@@ -714,6 +714,7 @@ mod tests {
         (
             seq,
             Event::UserPromptSent {
+                prompt_id: None,
                 text: text.to_string(),
                 attachments: Vec::new(),
             },

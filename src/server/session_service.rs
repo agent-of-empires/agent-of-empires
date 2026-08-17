@@ -75,6 +75,64 @@ enum IdempotentMatch {
     None,
 }
 
+/// The `Instance` fields `mutate_instance_persisted` copies from memory to
+/// disk. Deliberately explicit: the disk write no longer re-runs the caller's
+/// closure, so a field that is not listed here is simply not persisted.
+#[cfg(feature = "serve")]
+struct MirroredFields {
+    queued_prompts: Vec<crate::acp::state::QueuedPromptEntry>,
+    queued_prompt_next_seq: u64,
+    idle_dormant_since: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+/// Result of `SessionService::edit_queued_prompt`.
+#[cfg(feature = "serve")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EditQueuedOutcome {
+    Updated,
+    /// No row with that `prompt_id` in the session's queue.
+    NotFound,
+    /// The edit would leave a row with neither text nor attachments, which the
+    /// drain cannot deliver. Refused at the door: the drain now retires such a
+    /// row rather than wedging on it, but silently discarding what the user
+    /// typed is a worse outcome than a 400.
+    WouldEmpty,
+}
+
+/// Pick the leading drain batch from a session's queue and its combined text,
+/// matching the client's `useAcpSession` split exactly: a clear-command row at
+/// the head fires as its own turn; otherwise the leading run of non-clear rows
+/// combines with blank-line separators (empty-text rows skipped). An agent with
+/// no clear aliases combines the whole queue. Pure, so the boundary logic is
+/// unit-tested without a live worker.
+#[cfg(feature = "serve")]
+fn queue_drain_batch<'a>(
+    queue: &'a [crate::acp::state::QueuedPromptEntry],
+    profile: &crate::acp::agent_profiles::AgentProfile,
+) -> (&'a [crate::acp::state::QueuedPromptEntry], String) {
+    if queue.is_empty() {
+        return (&[], String::new());
+    }
+    let batch_end = if profile.clear_aliases.is_empty() {
+        queue.len()
+    } else if profile.is_clear_command(&queue[0].text) {
+        1
+    } else {
+        queue
+            .iter()
+            .position(|e| profile.is_clear_command(&e.text))
+            .unwrap_or(queue.len())
+    };
+    let sub = &queue[..batch_end];
+    let combined = sub
+        .iter()
+        .map(|e| e.text.as_str())
+        .filter(|t| !t.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n\n");
+    (sub, combined)
+}
+
 pub struct SessionService {
     /// Live in-memory session list, shared with `AppState.instances`.
     pub instances: Arc<RwLock<Vec<Instance>>>,
@@ -105,6 +163,11 @@ pub struct SessionService {
     /// fast path and the reconciler tick cannot queue duplicate drains.
     /// Sync mutex: critical sections are tiny and never span an `await`.
     pending_drains: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Per-session persist locks for `mutate_instance_persisted`, held across
+    /// snapshot AND disk write so the two cannot be reordered. Distinct from
+    /// `instance_locks`: the drain holds that one across `send_turn` and then
+    /// calls this path, so reusing it would self-deadlock.
+    persist_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// Who is asking the session service to act. Constructed only by the
@@ -186,6 +249,7 @@ impl SessionService {
             acp_event_store,
             create_in_flight: std::sync::Mutex::new(HashMap::new()),
             pending_drains: std::sync::Mutex::new(std::collections::HashSet::new()),
+            persist_locks: RwLock::new(HashMap::new()),
         }
     }
 
@@ -203,6 +267,7 @@ impl SessionService {
             telemetry_session_creates,
             create_in_flight: std::sync::Mutex::new(HashMap::new()),
             pending_drains: std::sync::Mutex::new(std::collections::HashSet::new()),
+            persist_locks: RwLock::new(HashMap::new()),
         }
     }
 
@@ -382,6 +447,7 @@ impl SessionService {
         text: &str,
         attachments: &[crate::acp::event_store::AttachmentBlob],
         woke_idle_dormant: bool,
+        prompt_id: Option<String>,
     ) -> Result<(), SendTurnError> {
         use crate::server::acp_reconciler::ResumeTrigger;
         // Ownership gate, before ANY side effect (no wake, resume, publish,
@@ -473,7 +539,7 @@ impl SessionService {
         // unresumable across a worker restart (upstream #906).
         let disposition = self
             .acp_supervisor
-            .publish_user_prompt_with_attachments(id, text.to_string(), attachments)
+            .publish_user_prompt_with_attachments(id, text.to_string(), attachments, prompt_id)
             .await;
         let outcome = match disposition {
             crate::acp::supervisor::PromptDisposition::Forward => {
@@ -581,7 +647,7 @@ impl SessionService {
             .unwrap_or_default()
         };
         if let Err(e) = self
-            .send_turn(&caller, id, &text, &attachments, false)
+            .send_turn(&caller, id, &text, &attachments, false, None)
             .await
         {
             tracing::warn!(
@@ -732,9 +798,402 @@ impl SessionService {
         }
     }
 
+    /// Apply `mutate` to a session's in-memory `Instance`, then mirror the
+    /// resulting state to disk. Returns what `mutate` produced, or `None` if
+    /// the session is gone.
+    ///
+    /// `mutate` runs exactly once, against the in-memory instance, which is the
+    /// authoritative copy: every queue mutation takes `instances.write()`, so
+    /// that list is always correctly ordered. The disk write then *copies* the
+    /// post-mutation fields rather than re-running the closure.
+    ///
+    /// Re-running it was wrong under concurrency. The instances lock is
+    /// released before the disk write, so two concurrent enqueues could reach
+    /// `storage.update` in either order and each re-derive `seq` from whatever
+    /// the on-disk copy happened to hold, persisting an order the in-memory
+    /// list never had (or losing a row entirely). Copying instead means the
+    /// last writer persists the complete, correct state.
+    ///
+    /// Only the fields listed in `MirroredFields` survive to disk, which covers
+    /// every caller today (the five queue mutations plus the dormancy clear).
+    /// A new caller that mutates something else must extend that struct, so the
+    /// set is explicit rather than implied by whatever the closure touched.
+    ///
+    /// Snapshot and disk write happen under one per-session persist lock.
+    /// `Storage::update` serializes the writes themselves but not their order,
+    /// so without this two concurrent mutations could snapshot as `[a]` then
+    /// `[a, b]` and land in the opposite order, leaving `b` off disk and losing
+    /// it on the next daemon restart. Copying a whole snapshot makes ordering
+    /// load-bearing in a way that re-running the closure did not, so the lock
+    /// comes with it.
+    #[cfg(feature = "serve")]
+    async fn mutate_instance_persisted<T, F>(self: &Arc<Self>, id: &str, mutate: F) -> Option<T>
+    where
+        T: Send + 'static,
+        F: FnOnce(&mut crate::session::Instance) -> T,
+    {
+        let persist_lock = self.persist_lock(id).await;
+        let _ordered = persist_lock.lock().await;
+        let (profile, result, mirrored) = {
+            let mut instances = self.instances.write().await;
+            let inst = instances.iter_mut().find(|i| i.id == id)?;
+            let r = mutate(inst);
+            (
+                inst.source_profile.clone(),
+                r,
+                MirroredFields {
+                    queued_prompts: inst.queued_prompts.clone(),
+                    queued_prompt_next_seq: inst.queued_prompt_next_seq,
+                    idle_dormant_since: inst.idle_dormant_since,
+                },
+            )
+        };
+        match crate::session::Storage::new(&profile, self.file_watch.clone()) {
+            Ok(storage) => {
+                let id_persist = id.to_string();
+                let persisted = tokio::task::spawn_blocking(move || {
+                    storage.update(|instances, _groups| {
+                        if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
+                            inst.queued_prompts = mirrored.queued_prompts;
+                            inst.queued_prompt_next_seq = mirrored.queued_prompt_next_seq;
+                            inst.idle_dormant_since = mirrored.idle_dormant_since;
+                        }
+                        Ok(())
+                    })
+                })
+                .await;
+                if !matches!(persisted, Ok(Ok(()))) {
+                    tracing::warn!(target: "acp.queue", session = %id, "failed to persist queue mutation; it holds this daemon life");
+                }
+            }
+            Err(e) => {
+                tracing::warn!(target: "acp.queue", session = %id, "failed to open storage for queue mutation: {e}");
+            }
+        }
+        Some(result)
+    }
+
+    /// Append a prompt to the session's server-owned queue and return the
+    /// stored entry (with its assigned `seq`). Idempotent on `prompt_id`:
+    /// re-enqueuing an existing id updates its text/attachments in place instead
+    /// of adding a duplicate, so an optimistic client retry cannot double-queue.
+    #[cfg(feature = "serve")]
+    pub(crate) async fn enqueue_prompt(
+        self: &Arc<Self>,
+        id: &str,
+        prompt_id: String,
+        text: String,
+        attachments: Vec<crate::acp::state::PromptAttachmentRef>,
+        origin_device: Option<String>,
+        created_at: String,
+    ) -> Option<crate::acp::state::QueuedPromptEntry> {
+        self.mutate_instance_persisted(id, move |inst| {
+            if let Some(existing) = inst.queued_prompts.iter_mut().find(|q| q.id == prompt_id) {
+                existing.text = text.clone();
+                existing.attachments = attachments.clone();
+                return existing.clone();
+            }
+            let seq = inst.queued_prompt_next_seq;
+            inst.queued_prompt_next_seq = seq.saturating_add(1);
+            let entry = crate::acp::state::QueuedPromptEntry {
+                id: prompt_id.clone(),
+                seq,
+                text: text.clone(),
+                attachments: attachments.clone(),
+                created_at: created_at.clone(),
+                origin_device: origin_device.clone(),
+            };
+            inst.queued_prompts.push(entry.clone());
+            entry
+        })
+        .await
+    }
+
+    /// Replace a queued prompt's text in place.
+    ///
+    /// Enforces the same non-empty invariant `queue_enqueue` does, because the
+    /// drain relies on it: a row whose text is blank and which carries no
+    /// attachments makes `drain_queued_prompts_once` return without retiring
+    /// the batch, so it retries on every reconciler tick, nothing behind it
+    /// ever drains, and the idle reaper (which skips a session with a queue)
+    /// keeps its worker alive forever.
+    #[cfg(feature = "serve")]
+    pub(crate) async fn edit_queued_prompt(
+        self: &Arc<Self>,
+        id: &str,
+        prompt_id: String,
+        text: String,
+    ) -> EditQueuedOutcome {
+        self.mutate_instance_persisted(id, move |inst| {
+            match inst.queued_prompts.iter_mut().find(|q| q.id == prompt_id) {
+                Some(q) if text.trim().is_empty() && q.attachments.is_empty() => {
+                    EditQueuedOutcome::WouldEmpty
+                }
+                Some(q) => {
+                    q.text = text.clone();
+                    EditQueuedOutcome::Updated
+                }
+                None => EditQueuedOutcome::NotFound,
+            }
+        })
+        .await
+        .unwrap_or(EditQueuedOutcome::NotFound)
+    }
+
+    /// Remove a queued prompt by id. Returns `true` if a row was removed. Also
+    /// drops any attachment bytes buffered for that prompt so they don't leak.
+    ///
+    /// Takes the per-instance lock the drain holds across its whole
+    /// snapshot -> send -> retire, so a removal cannot land in the middle of a
+    /// delivery. Without it the web's "Send now" (which removes the row, then
+    /// POSTs the same text itself) could tap inside the drain window: the drain
+    /// already holds its own copy of the batch, so both would deliver and the
+    /// agent would see the prompt twice. Serialized, the removal either beats
+    /// the drain's snapshot (the drain never sees the row) or follows its
+    /// retire (the removal reports `false`, and the caller sends nothing).
+    #[cfg(feature = "serve")]
+    pub(crate) async fn remove_queued_prompt(
+        self: &Arc<Self>,
+        id: &str,
+        prompt_id: String,
+    ) -> bool {
+        let inst_lock = self.instance_lock(id).await;
+        let _serialized = inst_lock.lock().await;
+        let prompt_id_cleanup = prompt_id.clone();
+        let removed = self
+            .mutate_instance_persisted(id, move |inst| {
+                let before = inst.queued_prompts.len();
+                inst.queued_prompts.retain(|q| q.id != prompt_id);
+                inst.queued_prompts.len() != before
+            })
+            .await
+            .unwrap_or(false);
+        if removed {
+            self.acp_event_store
+                .delete_pending_attachments_for_ref(id, &prompt_id_cleanup);
+        }
+        removed
+    }
+
+    /// Drop every queued prompt for a session, plus every attachment blob
+    /// buffered for those prompts.
+    #[cfg(feature = "serve")]
+    pub(crate) async fn clear_queued_prompts(self: &Arc<Self>, id: &str) {
+        let cleared_ids = self
+            .mutate_instance_persisted(id, move |inst| {
+                let ids: Vec<String> = inst.queued_prompts.iter().map(|q| q.id.clone()).collect();
+                inst.queued_prompts.clear();
+                ids
+            })
+            .await
+            .unwrap_or_default();
+        for prompt_id in cleared_ids {
+            self.acp_event_store
+                .delete_pending_attachments_for_ref(id, &prompt_id);
+        }
+    }
+
+    /// Snapshot the session's queue, ordered by `seq`.
+    #[cfg(feature = "serve")]
+    pub(crate) async fn queued_prompts_snapshot(
+        &self,
+        id: &str,
+    ) -> Vec<crate::acp::state::QueuedPromptEntry> {
+        let instances = self.instances.read().await;
+        instances
+            .iter()
+            .find(|i| i.id == id)
+            .map(|i| {
+                let mut q = i.queued_prompts.clone();
+                q.sort_by_key(|e| e.seq);
+                q
+            })
+            .unwrap_or_default()
+    }
+
+    /// Drain the leading batch of a session's server-owned queue into the live
+    /// worker once the current turn has ended. Mirrors
+    /// `drain_pending_initial_turn`'s single-owner `pending_drains` claim +
+    /// per-instance-lock delivery, so a batch is never sent twice concurrently.
+    ///
+    /// Only drains an idle turn: `Status::Idle` means the prior turn emitted its
+    /// terminal `Stopped`, so this starts a fresh turn rather than racing a live
+    /// one. Callers (the reconciler tick) gate on `is_running`, so the worker is
+    /// live and `send_turn` will not spawn, making it safe to hold the instance
+    /// lock across delivery (the #3172 re-entrant-spawn deadlock cannot occur on
+    /// a live worker). The `/clear`-boundary split matches the client
+    /// (`useAcpSession`): a clear-command row fires as its own turn; a leading
+    /// run of non-clear rows combines into one with blank-line separators.
+    /// A batch's buffered attachment bytes are reloaded and forwarded with it.
+    #[cfg(feature = "serve")]
+    pub(crate) async fn drain_queued_prompts_once(self: &Arc<Self>, id: &str) {
+        {
+            let mut drains = self
+                .pending_drains
+                .lock()
+                .expect("pending_drains mutex poisoned");
+            if !drains.insert(id.to_string()) {
+                return;
+            }
+        }
+        let _claim = PendingDrainGuard {
+            service: Arc::clone(self),
+            id: id.to_string(),
+        };
+        let inst_lock = self.instance_lock(id).await;
+        let _serialized = inst_lock.lock().await;
+
+        let (caller, agent_key, queue) = {
+            let instances = self.instances.read().await;
+            let Some(inst) = instances.iter().find(|i| i.id == id) else {
+                return;
+            };
+            if !inst.is_structured()
+                || inst.is_archived()
+                || inst.is_snoozed()
+                || inst.is_trashed()
+                || inst.status != crate::session::Status::Idle
+            {
+                return;
+            }
+            let mut queue = inst.queued_prompts.clone();
+            queue.sort_by_key(|e| e.seq);
+            if queue.is_empty() {
+                return;
+            }
+            let caller = match &inst.created_by_plugin {
+                Some(plugin_id) => SessionCaller::Plugin {
+                    plugin_id: plugin_id.clone(),
+                },
+                None => SessionCaller::User,
+            };
+            let agent_key = inst.agent_name.clone().unwrap_or_else(|| inst.tool.clone());
+            (caller, agent_key, queue)
+        };
+
+        // Leading batch up to a clear boundary (mirrors the client's split).
+        let profile = crate::acp::agent_profiles::resolve(&agent_key);
+        let (sub, combined) = queue_drain_batch(&queue, profile);
+        let sent_ids: Vec<String> = sub.iter().map(|e| e.id.clone()).collect();
+        // Reload every buffered attachment blob for the batch, in queue order,
+        // so a queued screenshot/file is forwarded with the text (matches the
+        // client's old `snapshot.flatMap(q => q.attachments)`). Bytes live in
+        // the pending-attachment store keyed by prompt id; a locking SQLite
+        // read, so do it off the runtime.
+        let attachments: Vec<crate::acp::event_store::AttachmentBlob> = {
+            let store = Arc::clone(&self.acp_event_store);
+            let session_id = id.to_string();
+            let batch_ids = sent_ids.clone();
+            tokio::task::spawn_blocking(move || {
+                batch_ids
+                    .iter()
+                    .flat_map(|pid| store.load_pending_attachments_for_ref(&session_id, pid))
+                    .collect::<Vec<_>>()
+            })
+            .await
+            .unwrap_or_default()
+        };
+        // An attachment-only batch has empty combined text but real blobs. A
+        // batch with neither cannot be delivered at all, and must be retired
+        // rather than left queued.
+        //
+        // This guard used to `return`, which wedged the session: the batch
+        // stayed at the head of the queue, the drain retried it on every
+        // reconciler tick, nothing behind it ever drained, and
+        // `reap_idle_workers` (which skips a session holding a queue) kept the
+        // agent subprocess alive forever. Two routes reach the state, so
+        // guarding the entry points is not enough on its own: an attachment-only
+        // prompt whose buffered bytes the 24h `PENDING_ATTACHMENT_TTL` sweep
+        // reclaimed, and (before it was rejected) an edit that blanked a
+        // text-only row. There is nothing left to send by this point, so the
+        // rows are husks; log loudly and clear them.
+        if combined.trim().is_empty() && attachments.is_empty() {
+            tracing::warn!(
+                target: "acp.queue",
+                session = %id,
+                rows = sent_ids.len(),
+                "queued prompts have neither text nor attachment bytes (buffered bytes expired?); \
+                 retiring them so the queue behind them can drain"
+            );
+            self.retire_drained_rows(id, sent_ids).await;
+            return;
+        }
+
+        // Deliver as a fresh turn on the live worker. `send_turn` re-records the
+        // blobs under the real `UserPromptSent` seq. On failure leave the rows
+        // (and their buffered blobs) queued; the next tick retries.
+        if let Err(e) = self
+            .send_turn(&caller, id, &combined, &attachments, false, None)
+            .await
+        {
+            tracing::warn!(target: "acp.queue", session = %id, "queue drain delivery failed; will retry: {e}");
+            return;
+        }
+        // Retire only the delivered rows; prompts enqueued during the send
+        // survive into the next drain.
+        self.retire_drained_rows(id, sent_ids).await;
+    }
+
+    /// Drop a set of queue rows and the attachment bytes buffered for them.
+    /// Shared by the delivered path and the undeliverable-husk path so both
+    /// leave the queue and the pending-attachment store consistent.
+    #[cfg(feature = "serve")]
+    async fn retire_drained_rows(self: &Arc<Self>, id: &str, ids: Vec<String>) {
+        for pid in &ids {
+            self.acp_event_store
+                .delete_pending_attachments_for_ref(id, pid);
+        }
+        let retire: std::collections::HashSet<String> = ids.into_iter().collect();
+        self.mutate_instance_persisted(id, move |inst| {
+            inst.queued_prompts.retain(|q| !retire.contains(&q.id));
+        })
+        .await;
+    }
+
+    /// Clear the idle-dormant marker for a session that has queued work so the
+    /// reconciler's resume pass respawns its worker, after which the next tick
+    /// drains the queue (see `acp_reconciler::drain_queued_prompts`).
+    ///
+    /// Deliberately does NOT kick a resume directly: routing the wake through
+    /// the resume pass keeps that pass's respawn budget/park guard and never
+    /// spawns while holding a lock, so it cannot hit the #3172 re-entrant-spawn
+    /// deadlock the way a `send_turn`-under-lock wake would. Persists the clear
+    /// via the instances-write path (not `instance_lock`), so a daemon restart
+    /// keeps the session awake and the write never blocks a spawn. Guards on
+    /// `is_idle_dormant` so a session woken by another path between the
+    /// reconciler snapshot and this call is left untouched.
+    #[cfg(feature = "serve")]
+    pub(crate) async fn wake_dormant_for_queue_drain(self: &Arc<Self>, id: &str) {
+        self.mutate_instance_persisted(id, |inst| {
+            if inst.is_idle_dormant() {
+                inst.idle_dormant_since = None;
+            }
+        })
+        .await;
+    }
+
     /// Same lazy per-instance mutex registry as `AppState::instance_lock`;
     /// both operate on the shared map, so a lock taken through either handle
     /// excludes the other.
+    /// Per-session lock ordering the snapshot-and-persist in
+    /// `mutate_instance_persisted`. Always acquired BEFORE `instances.write()`
+    /// and never while holding it, and nothing acquires `instance_lock` while
+    /// holding this, so it cannot form a cycle with either.
+    #[cfg(feature = "serve")]
+    async fn persist_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        {
+            let guard = self.persist_locks.read().await;
+            if let Some(lock) = guard.get(id) {
+                return lock.clone();
+            }
+        }
+        let mut guard = self.persist_locks.write().await;
+        guard
+            .entry(id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     pub async fn instance_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
         {
             let guard = self.instance_locks.read().await;
@@ -1144,19 +1603,19 @@ mod tests {
         // plugin's session, or a missing session.
         assert!(matches!(
             service
-                .send_turn(&cron, "sess-user", "hi", &[], false)
+                .send_turn(&cron, "sess-user", "hi", &[], false, None)
                 .await,
             Err(SendTurnError::NotOwner)
         ));
         assert!(matches!(
             service
-                .send_turn(&other, "sess-cron", "hi", &[], false)
+                .send_turn(&other, "sess-cron", "hi", &[], false, None)
                 .await,
             Err(SendTurnError::NotOwner)
         ));
         assert!(matches!(
             service
-                .send_turn(&cron, "sess-gone", "hi", &[], false)
+                .send_turn(&cron, "sess-gone", "hi", &[], false, None)
                 .await,
             Err(SendTurnError::SessionNotFound)
         ));
@@ -1167,13 +1626,13 @@ mod tests {
         // ownership check specifically.
         assert!(!matches!(
             service
-                .send_turn(&cron, "sess-cron", "hi", &[], false)
+                .send_turn(&cron, "sess-cron", "hi", &[], false, None)
                 .await,
             Ok(()) | Err(SendTurnError::NotOwner)
         ));
         assert!(!matches!(
             service
-                .send_turn(&SessionCaller::User, "sess-user", "hi", &[], false)
+                .send_turn(&SessionCaller::User, "sess-user", "hi", &[], false, None)
                 .await,
             Ok(()) | Err(SendTurnError::NotOwner)
         ));
@@ -1204,5 +1663,367 @@ mod tests {
                 .is_empty(),
             "drain must release its claim on the no-op paths"
         );
+    }
+
+    /// A queued prompt whose buffered attachment bytes have gone (the 24h
+    /// `PENDING_ATTACHMENT_TTL` sweep reclaims them; the row is not swept with
+    /// them) has neither text nor blobs, so the drain can never deliver it.
+    ///
+    /// It must be retired anyway. Leaving it queued wedged the session: the
+    /// drain retried the same head-of-queue batch every reconciler tick,
+    /// nothing behind it drained, and `reap_idle_workers` skips a session
+    /// holding a queue, so the agent subprocess was never reaped.
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn an_undeliverable_queue_row_is_retired_instead_of_wedging_the_queue() {
+        let mut inst = Instance::new("queue", "/tmp/aoe-queue-husk");
+        inst.id = "sess-husk".to_string();
+        inst.view = crate::session::View::Structured;
+        inst.status = crate::session::Status::Idle;
+        let service = crate::server::test_support::build_test_app_state(vec![inst])
+            .session_service
+            .clone();
+
+        // An attachment-only prompt: empty text, refs but no buffered bytes,
+        // which is exactly the post-sweep state.
+        service
+            .enqueue_prompt(
+                "sess-husk",
+                "husk".into(),
+                String::new(),
+                vec![crate::acp::state::PromptAttachmentRef {
+                    id: "att-1".into(),
+                    kind: crate::acp::state::PromptAttachmentKind::Image,
+                    mime_type: "image/png".into(),
+                    name: Some("shot.png".into()),
+                    size: 9,
+                }],
+                None,
+                "t0".into(),
+            )
+            .await
+            .expect("session exists");
+        assert_eq!(service.queued_prompts_snapshot("sess-husk").await.len(), 1);
+
+        // The husk has to be the whole batch to wedge: a deliverable row in the
+        // same batch supplies the text, and the batch then sends and retires
+        // normally. Alone (or alone ahead of a `/clear` boundary) it is the
+        // head the drain retries forever.
+        service.drain_queued_prompts_once("sess-husk").await;
+        assert!(
+            service
+                .queued_prompts_snapshot("sess-husk")
+                .await
+                .is_empty(),
+            "the husk is retired rather than retried forever"
+        );
+
+        // And the queue is genuinely usable again, not just empty: a fresh
+        // prompt queues and is not blocked behind a ghost.
+        service
+            .enqueue_prompt(
+                "sess-husk",
+                "next".into(),
+                "still deliverable".into(),
+                vec![],
+                None,
+                "t1".into(),
+            )
+            .await
+            .expect("session exists");
+        assert_eq!(
+            service
+                .queued_prompts_snapshot("sess-husk")
+                .await
+                .iter()
+                .map(|q| q.id.clone())
+                .collect::<Vec<_>>(),
+            ["next"]
+        );
+    }
+
+    /// Concurrent enqueues all survive with distinct seqs, in memory and on
+    /// disk. Guards review finding 8: the disk copy used to re-run the caller's
+    /// closure and re-derive `seq` from whatever the file happened to hold, so
+    /// racing enqueues could persist duplicate or reordered seqs.
+    ///
+    /// It does NOT prove the per-session persist lock. Copying a whole snapshot
+    /// makes write ordering load-bearing (a stale `[a]` landing after `[a, b]`
+    /// would drop `b`), and the lock exists to make that ordering guaranteed
+    /// rather than incidental, but 32-way concurrency here never reordered the
+    /// two `Storage::update` calls, so the lock is defensive and unproven.
+    #[cfg(feature = "serve")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial]
+    async fn concurrent_enqueues_all_survive_to_disk() {
+        use crate::session::test_support::isolate_app_dir;
+        let _tmp = isolate_app_dir();
+        let profile = "default";
+
+        let mut inst = Instance::new("queue", "/tmp/aoe-queue-concurrent");
+        inst.id = "sess-cc".to_string();
+        inst.view = crate::session::View::Structured;
+        inst.source_profile = profile.to_string();
+        let seed = inst.clone();
+        crate::session::Storage::new_unwatched(profile)
+            .unwrap()
+            .update(|instances, _groups| {
+                instances.push(seed);
+                Ok(())
+            })
+            .unwrap();
+        let service = crate::server::test_support::build_test_app_state(vec![inst])
+            .session_service
+            .clone();
+
+        // Fire them together, the way two quick taps on Queue do.
+        let mut tasks = Vec::new();
+        for i in 0..32 {
+            let svc = Arc::clone(&service);
+            tasks.push(tokio::spawn(async move {
+                svc.enqueue_prompt(
+                    "sess-cc",
+                    format!("p{i}"),
+                    format!("prompt {i}"),
+                    vec![],
+                    None,
+                    "t".into(),
+                )
+                .await
+            }));
+        }
+        for t in tasks {
+            t.await.expect("task").expect("session exists");
+        }
+
+        let in_memory = service.queued_prompts_snapshot("sess-cc").await;
+        assert_eq!(in_memory.len(), 32, "every enqueue lands in memory");
+        // Seqs are unique, so the drain order is well defined.
+        let mut seqs: Vec<u64> = in_memory.iter().map(|q| q.seq).collect();
+        seqs.sort_unstable();
+        seqs.dedup();
+        assert_eq!(seqs.len(), 32, "no two rows share a seq");
+
+        let on_disk = crate::session::Storage::new_unwatched(profile)
+            .unwrap()
+            .load()
+            .unwrap();
+        let persisted = &on_disk
+            .iter()
+            .find(|i| i.id == "sess-cc")
+            .expect("session on disk")
+            .queued_prompts;
+        assert_eq!(persisted.len(), 32, "every enqueue reaches disk");
+        // The disk-side check is the one that fails on finding 8: re-deriving
+        // `seq` per copy let two rows persist the same one.
+        let mut disk_seqs: Vec<u64> = persisted.iter().map(|q| q.seq).collect();
+        disk_seqs.sort_unstable();
+        disk_seqs.dedup();
+        assert_eq!(disk_seqs.len(), 32, "no two persisted rows share a seq");
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn queue_store_enqueue_edit_remove_clear() {
+        let mut inst = Instance::new("queue", "/tmp/aoe-queue-project");
+        inst.id = "sess-q".to_string();
+        inst.view = crate::session::View::Structured;
+        let service = crate::server::test_support::build_test_app_state(vec![inst])
+            .session_service
+            .clone();
+
+        // Enqueue two: seqs are assigned monotonically and the snapshot is
+        // ordered by seq.
+        let a = service
+            .enqueue_prompt(
+                "sess-q",
+                "a".into(),
+                "first".into(),
+                vec![],
+                None,
+                "t0".into(),
+            )
+            .await
+            .expect("session exists");
+        let b = service
+            .enqueue_prompt(
+                "sess-q",
+                "b".into(),
+                "second".into(),
+                vec![],
+                None,
+                "t1".into(),
+            )
+            .await
+            .expect("session exists");
+        assert_eq!((a.seq, b.seq), (0, 1));
+        let snap = service.queued_prompts_snapshot("sess-q").await;
+        assert_eq!(
+            snap.iter().map(|q| q.text.as_str()).collect::<Vec<_>>(),
+            ["first", "second"]
+        );
+
+        // Re-enqueue by the same id is an idempotent update, not a duplicate:
+        // an optimistic client retry cannot double-queue.
+        let a2 = service
+            .enqueue_prompt(
+                "sess-q",
+                "a".into(),
+                "first edited".into(),
+                vec![],
+                None,
+                "t2".into(),
+            )
+            .await
+            .expect("session exists");
+        assert_eq!(a2.seq, 0, "re-enqueue keeps the original seq");
+        assert_eq!(service.queued_prompts_snapshot("sess-q").await.len(), 2);
+
+        // Edit / remove / clear.
+        assert_eq!(
+            service
+                .edit_queued_prompt("sess-q", "b".into(), "second edited".into())
+                .await,
+            EditQueuedOutcome::Updated
+        );
+        assert_eq!(
+            service
+                .edit_queued_prompt("sess-q", "missing".into(), "x".into())
+                .await,
+            EditQueuedOutcome::NotFound
+        );
+        // Blanking a text-only row is refused and leaves the text intact. The
+        // drain can neither deliver nor retire such a row, so accepting the
+        // edit would wedge the queue behind it (and pin the worker alive,
+        // since the idle reaper skips a session that has one).
+        for blank in ["", "   ", "\n\t "] {
+            assert_eq!(
+                service
+                    .edit_queued_prompt("sess-q", "b".into(), blank.into())
+                    .await,
+                EditQueuedOutcome::WouldEmpty,
+                "{blank:?}"
+            );
+        }
+        assert_eq!(
+            service
+                .queued_prompts_snapshot("sess-q")
+                .await
+                .iter()
+                .find(|q| q.id == "b")
+                .map(|q| q.text.as_str()),
+            Some("second edited"),
+            "a refused edit must not have mutated the row"
+        );
+        assert!(service.remove_queued_prompt("sess-q", "a".into()).await);
+        assert!(!service.remove_queued_prompt("sess-q", "a".into()).await);
+        let snap = service.queued_prompts_snapshot("sess-q").await;
+        assert_eq!(snap.len(), 1);
+        assert_eq!(snap[0].text, "second edited");
+        service.clear_queued_prompts("sess-q").await;
+        assert!(service.queued_prompts_snapshot("sess-q").await.is_empty());
+
+        // A gone session is a None/no-op, never a panic.
+        assert!(service
+            .enqueue_prompt(
+                "sess-gone",
+                "z".into(),
+                "x".into(),
+                vec![],
+                None,
+                "t".into()
+            )
+            .await
+            .is_none());
+    }
+
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn wake_dormant_for_queue_drain_clears_only_when_dormant() {
+        // A session the idle reaper auto-stopped: dormant, so the resume pass
+        // skips it. Wake-on-drain must clear the marker so the queue can drain.
+        let mut dormant = Instance::new("queue", "/tmp/aoe-queue-dormant");
+        dormant.id = "sess-dormant".to_string();
+        dormant.view = crate::session::View::Structured;
+        dormant.mark_idle_dormant();
+        assert!(dormant.is_idle_dormant());
+
+        // A live/idle session that is not dormant must be left untouched: the
+        // wake only ever clears the marker, never sets it.
+        let mut awake = Instance::new("queue", "/tmp/aoe-queue-awake");
+        awake.id = "sess-awake".to_string();
+        awake.view = crate::session::View::Structured;
+
+        let state = crate::server::test_support::build_test_app_state(vec![dormant, awake]);
+        let service = state.session_service.clone();
+
+        service.wake_dormant_for_queue_drain("sess-dormant").await;
+        service.wake_dormant_for_queue_drain("sess-awake").await;
+        // A gone session is a no-op, never a panic.
+        service.wake_dormant_for_queue_drain("sess-gone").await;
+
+        let instances = state.instances.read().await;
+        let dormant_after = instances.iter().find(|i| i.id == "sess-dormant").unwrap();
+        let awake_after = instances.iter().find(|i| i.id == "sess-awake").unwrap();
+        assert!(
+            !dormant_after.is_idle_dormant(),
+            "dormant queued session must be woken so the resume pass respawns it"
+        );
+        assert!(
+            !awake_after.is_idle_dormant(),
+            "a non-dormant session must stay non-dormant (no spurious wake)"
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn queue_drain_batch_splits_on_clear_boundary() {
+        use crate::acp::state::QueuedPromptEntry;
+        let entry = |id: &str, seq: u64, text: &str| QueuedPromptEntry {
+            id: id.into(),
+            seq,
+            text: text.into(),
+            attachments: vec![],
+            created_at: "t".into(),
+            origin_device: None,
+        };
+        // claude's profile clears with "/clear".
+        let claude = crate::acp::agent_profiles::resolve("claude");
+        assert!(
+            !claude.clear_aliases.is_empty(),
+            "test assumes claude has a clear alias"
+        );
+
+        // A leading run of non-clear rows combines up to (not including) the
+        // first clear command.
+        let q = vec![
+            entry("a", 0, "one"),
+            entry("b", 1, "two"),
+            entry("c", 2, "/clear"),
+            entry("d", 3, "three"),
+        ];
+        let (sub, combined) = queue_drain_batch(&q, claude);
+        assert_eq!(
+            sub.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+            ["a", "b"]
+        );
+        assert_eq!(combined, "one\n\ntwo");
+
+        // A clear command at the head fires as its own turn.
+        let q = vec![entry("c", 0, "/clear"), entry("a", 1, "one")];
+        let (sub, combined) = queue_drain_batch(&q, claude);
+        assert_eq!(sub.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["c"]);
+        assert_eq!(combined, "/clear");
+
+        // No clear anywhere: the whole queue combines and empty-text rows are
+        // skipped (so no stray blank-line separators).
+        let q = vec![
+            entry("a", 0, "one"),
+            entry("b", 1, ""),
+            entry("c", 2, "three"),
+        ];
+        let (sub, combined) = queue_drain_batch(&q, claude);
+        assert_eq!(sub.len(), 3);
+        assert_eq!(combined, "one\n\nthree");
     }
 }

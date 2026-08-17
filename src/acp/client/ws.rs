@@ -38,6 +38,8 @@ use tracing::{debug, warn};
 
 use super::discovery::DaemonEndpoint;
 use crate::acp::protocol::AcpBroadcastFrame;
+use crate::acp::state::AcpState;
+use crate::acp::transcript::{TranscriptDelta, TranscriptRow};
 
 #[derive(Debug, Error)]
 pub enum WsError {
@@ -57,12 +59,35 @@ pub enum WsError {
 /// One message off the structured view WebSocket.
 #[derive(Debug, Clone)]
 pub enum WsMessage {
-    /// A normal structured view event frame.
+    /// A normal structured view event frame. Consumed by `aoe acp tail`,
+    /// which dumps the raw stream; the structured view reads the two folded
+    /// projections below instead (control state and transcript rows).
     Frame(Arc<AcpBroadcastFrame>),
+    /// The server-folded CONTROL state (turn flags, approvals, elicitations,
+    /// usage, modes, commands, plan), sent on connect and after every event.
+    /// Boxed because `AcpState` dwarfs the other variants. Tier 1.3.
+    ///
+    /// `unchanged` names the cold fields the server omitted because this
+    /// connection already has them (see `COLD_STATE_FIELDS` in
+    /// `src/server/acp_ws.rs`). They deserialize to their empty defaults, so a
+    /// consumer must keep what it holds for those rather than adopt the blank.
+    ReducedState {
+        seq: u64,
+        state: Box<AcpState>,
+        unchanged: Vec<String>,
+    },
     /// Daemon's in-memory ring evicted events the client missed.
     /// Consumer should drop local reducer state and call
     /// `HttpClient::replay(since=last_seq)` to rehydrate.
     Lagged,
+    /// Connect (and reconnect) snapshot of the server-folded transcript
+    /// rows. The consumer reconciles these into its row buffer by id, so an
+    /// overlap with an initial `?view=rows` replay is idempotent.
+    TranscriptSnapshot(Vec<TranscriptRow>),
+    /// One incremental row change the server folded from a live event.
+    /// Boxed: a `Patch` carries a full `TranscriptRow`, which would otherwise
+    /// bloat every `WsMessage` (and the `EmbeddedEvent` that wraps it).
+    TranscriptDelta(Box<TranscriptDelta>),
 }
 
 /// Handle to a running WebSocket reader task. Drop or call
@@ -119,7 +144,21 @@ pub async fn connect(
     session_id: &str,
     since: u64,
 ) -> Result<WsHandle, WsError> {
-    let url = ws_url(endpoint, session_id, since);
+    connect_with(endpoint, session_id, since, true).await
+}
+
+/// [`connect`], with control over whether the server forwards the raw event
+/// frames. A consumer that renders only the folded projections (the native
+/// structured view since Tier 1.3) passes `forward_frames: false` so a long
+/// session's whole event history is not shipped on every open; the server
+/// still folds it to build the connect snapshots.
+pub async fn connect_with(
+    endpoint: &DaemonEndpoint,
+    session_id: &str,
+    since: u64,
+    forward_frames: bool,
+) -> Result<WsHandle, WsError> {
+    let url = ws_url(endpoint, session_id, since, forward_frames);
     debug!(
         target: "acp.client.ws",
         // Log the path without the token query param.
@@ -216,6 +255,21 @@ fn parse_text(raw: &str) -> Result<Option<WsMessage>, WsError> {
     struct KindProbe<'a> {
         kind: Option<&'a str>,
     }
+    #[derive(serde::Deserialize)]
+    struct TranscriptSnapshotFrame {
+        rows: Vec<TranscriptRow>,
+    }
+    #[derive(serde::Deserialize)]
+    struct TranscriptDeltaFrame {
+        delta: TranscriptDelta,
+    }
+    #[derive(serde::Deserialize)]
+    struct ReducedStateFrame {
+        seq: u64,
+        state: AcpState,
+        #[serde(default)]
+        unchanged: Vec<String>,
+    }
     if let Ok(probe) = serde_json::from_str::<KindProbe>(raw) {
         match probe.kind {
             Some("lagged") => return Ok(Some(WsMessage::Lagged)),
@@ -223,6 +277,29 @@ fn parse_text(raw: &str) -> Result<Option<WsMessage>, WsError> {
             // `session_id`/`seq`/`event` and never a `kind`, so this
             // cannot shadow one.
             Some("heartbeat") => return Ok(None),
+            // Server-folded transcript rows (Tier 4). The connect snapshot
+            // carries every row; each live event carries its row delta.
+            Some("transcript_snapshot") => {
+                let frame: TranscriptSnapshotFrame =
+                    serde_json::from_str(raw).map_err(|e| WsError::Parse(e.to_string()))?;
+                return Ok(Some(WsMessage::TranscriptSnapshot(frame.rows)));
+            }
+            Some("transcript_delta") => {
+                let frame: TranscriptDeltaFrame =
+                    serde_json::from_str(raw).map_err(|e| WsError::Parse(e.to_string()))?;
+                return Ok(Some(WsMessage::TranscriptDelta(Box::new(frame.delta))));
+            }
+            // Server-folded control state (Tier 1.3), sent on connect and
+            // after every event.
+            Some("reduced_state") => {
+                let frame: ReducedStateFrame =
+                    serde_json::from_str(raw).map_err(|e| WsError::Parse(e.to_string()))?;
+                return Ok(Some(WsMessage::ReducedState {
+                    seq: frame.seq,
+                    state: Box::new(frame.state),
+                    unchanged: frame.unchanged,
+                }));
+            }
             _ => {}
         }
     }
@@ -233,12 +310,15 @@ fn parse_text(raw: &str) -> Result<Option<WsMessage>, WsError> {
     Ok(Some(WsMessage::Frame(Arc::new(frame))))
 }
 
-fn ws_url(endpoint: &DaemonEndpoint, session_id: &str, since: u64) -> String {
+fn ws_url(endpoint: &DaemonEndpoint, session_id: &str, since: u64, forward_frames: bool) -> String {
     let base = endpoint.ws_base_url();
     let path = format!("/sessions/{session_id}/acp/ws");
     let mut params: Vec<String> = Vec::new();
     if since > 0 {
         params.push(format!("since={since}"));
+    }
+    if !forward_frames {
+        params.push("frames=0".to_string());
     }
     if let Some(token) = endpoint.resolved_token() {
         params.push(format!("token={token}"));
@@ -277,10 +357,15 @@ mod tests {
     #[test]
     fn ws_url_appends_since_and_token() {
         let e = endpoint("http://127.0.0.1:8080", Some("abc"));
-        let url = ws_url(&e, "s-1", 42);
+        let url = ws_url(&e, "s-1", 42, true);
         assert_eq!(
             url,
             "ws://127.0.0.1:8080/sessions/s-1/acp/ws?since=42&token=abc"
+        );
+        // A projections-only consumer asks the daemon to skip the raw frames.
+        assert_eq!(
+            ws_url(&e, "s-1", 42, false),
+            "ws://127.0.0.1:8080/sessions/s-1/acp/ws?since=42&frames=0&token=abc"
         );
     }
 
@@ -298,7 +383,7 @@ mod tests {
         .with_local_token_path(token_path);
 
         assert_eq!(
-            ws_url(&endpoint, "s-1", 0),
+            ws_url(&endpoint, "s-1", 0, true),
             format!("ws://127.0.0.1:8080/sessions/s-1/acp/ws?token={rotated}")
         );
     }
@@ -307,7 +392,7 @@ mod tests {
     fn ws_url_omits_since_when_zero() {
         let e = endpoint("http://127.0.0.1:8080", None);
         assert_eq!(
-            ws_url(&e, "s-1", 0),
+            ws_url(&e, "s-1", 0, true),
             "ws://127.0.0.1:8080/sessions/s-1/acp/ws"
         );
     }
@@ -315,7 +400,7 @@ mod tests {
     #[test]
     fn ws_url_uses_wss_for_https_endpoint() {
         let e = endpoint("https://remote.example.com", Some("t"));
-        assert!(ws_url(&e, "s-1", 0).starts_with("wss://"));
+        assert!(ws_url(&e, "s-1", 0, true).starts_with("wss://"));
     }
 
     /// How each `{"kind":...}` sentinel the daemon can send must classify.
@@ -383,6 +468,86 @@ mod tests {
                 assert!(matches!(*f.event, Event::ThinkingStarted));
             }
             other => panic!("expected frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_text_transcript_snapshot_and_delta() {
+        // The connect snapshot yields the row buffer; a live delta yields
+        // one row change. Both are keyed by id so the consumer reconciles
+        // idempotently against a `?view=rows` replay overlap.
+        let snapshot = serde_json::json!({
+            "kind": "transcript_snapshot",
+            "session_id": "s-1",
+            "seq": 3,
+            "rows": [{
+                "id": "msg-1",
+                "group_id": "g1",
+                "kind": "message",
+                "at": "2024-01-01T00:00:00Z",
+                "text": "hi",
+            }],
+        })
+        .to_string();
+        match parse_text(&snapshot).unwrap() {
+            Some(WsMessage::TranscriptSnapshot(rows)) => {
+                assert_eq!(rows.len(), 1);
+                assert_eq!(rows[0].id, "msg-1");
+                assert_eq!(rows[0].text, "hi");
+            }
+            other => panic!("expected snapshot, got {other:?}"),
+        }
+
+        let delta = serde_json::json!({
+            "kind": "transcript_delta",
+            "session_id": "s-1",
+            "seq": 4,
+            "delta": { "Remove": "msg-1" },
+        })
+        .to_string();
+        match parse_text(&delta).unwrap() {
+            Some(WsMessage::TranscriptDelta(boxed)) => match *boxed {
+                TranscriptDelta::Remove(id) => assert_eq!(id, "msg-1"),
+                other => panic!("expected Remove, got {other:?}"),
+            },
+            other => panic!("expected delta, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_text_reads_the_reduced_state_frame() {
+        // The whole control state rides on this frame, and the fields the
+        // sender omits must default rather than fail the parse: a parse error
+        // reads as a dead socket to the consumer.
+        let raw = serde_json::json!({
+            "kind": "reduced_state",
+            "session_id": "s-1",
+            "seq": 7,
+            "state": {
+                "session_id": "s-1",
+                "agent": "claude",
+                "model": null,
+                "mode": "Default",
+                "current_plan": null,
+                "todos": [],
+                "in_flight_tool": null,
+                "pending_approvals": [],
+                "recent_diffs": [],
+                "thinking": null,
+                "rate_limit": null,
+                "turn_active": true,
+                "last_seq": 7,
+                "updated_at": "2026-08-16T00:00:00Z",
+            },
+        })
+        .to_string();
+        match parse_text(&raw) {
+            Ok(Some(WsMessage::ReducedState { seq, state, .. })) => {
+                assert_eq!(seq, 7);
+                assert!(state.turn_active);
+                assert!(state.available_modes.is_empty(), "absent field defaults");
+            }
+            other => panic!("expected reduced state, got {other:?}"),
         }
     }
 

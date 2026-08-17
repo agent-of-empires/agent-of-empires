@@ -135,7 +135,7 @@ Notification = "waiting"
 | `agent_extra_args` | `{}` | Per-agent extra arguments appended after the binary (e.g., `{ opencode = "--port 8080" }`). |
 | `agent_command_override` | `{}` | Per-agent command override replacing the binary entirely (e.g., `{ claude = "my-claude-wrapper" }`). |
 | `custom_agents` | `{}` | User-defined agents: name to command mapping. Custom agent names appear in the TUI agent picker alongside built-in agents. |
-| `agent_detect_as` | `{}` | Status detection mapping: maps an agent name to a built-in agent whose status heuristics should be used. |
+| `agent_detect_as` | `{}` | Maps a custom agent to a built-in agent it inherits. Reuses that built-in's status heuristics, and (when the built-in has an ACP adapter) makes the custom agent structured view-capable through it without an `agent_acp_cmd`. |
 | `agent_acp_cmd` | `{}` | ACP launch command for a custom agent, enabling it to run in structured view (e.g., `{ "oc-superpowers" = "ocp run sp acp" }`). A custom agent with an entry here is structured view-capable; without one it stays tmux-only. Unlike `custom_agents`, the value is split into argv and run directly, with no shell. |
 | `acp.restrict_agents` | `false` | Restrict structured view sessions to `acp.allowed_agents`. Off leaves every registered agent available. Read from the global config only: a profile override cannot widen it, so a shared or locked-down deployment cannot be loosened by its own users. Changing the web value requires the passphrase step-up. |
 | `acp.allowed_agents` | `[]` | ACP registry keys a structured view session may run while `acp.restrict_agents` is on, e.g. `["claude", "codex"]`. These are registry keys, not binary names, and each alias counts separately (allowing `claude` does not allow `claude-code`). With the restriction on, an empty list denies every agent. Governs the structured view only; a terminal session runs in a pane where any binary can be launched, so it is not constrained here. A policy change applies to new sessions immediately and to an already-running worker when it next respawns or when the daemon restarts, at which point a worker on a now-disallowed agent is terminated rather than reattached. |
@@ -194,7 +194,7 @@ agent_detect_as = { "lenovo-claude" = "claude" }
 ```
 
 - **`custom_agents`**: Maps a display name to the shell command AoE runs in a tmux pane when that agent is selected. Names appear in the TUI picker alongside built-ins like `claude`, `opencode`, and `codex`, and work with `aoe add --tool <name>`.
-- **`agent_detect_as`** (optional): Reuses a built-in agent's status detection for the custom agent. Without it (and without `status_rules`, below), custom agents default to `Idle`. Best for wrappers that run the *same* binary differently (SSH, scripts); for an agent whose output differs from every built-in, use `status_rules` instead.
+- **`agent_detect_as`** (optional): Reuses a built-in agent's status detection for the custom agent, and marks the custom agent as inheriting that built-in. Without it (and without `status_rules`, below), custom agents default to `Idle`. Best for wrappers that run the *same* binary differently (SSH, scripts); for an agent whose output differs from every built-in, use `status_rules` instead. When the base agent has an ACP adapter, this mapping also lets the wrapper run in the structured view through that adapter (see [Running a custom agent in the structured view](#running-a-custom-agent-in-the-structured-view)).
 - **`agent_acp_cmd`** (optional): ACP launch command that lets the agent run in the structured view (see below).
 - **`default_tool`** (optional): Can point at a custom-agent name to default new sessions to it.
 
@@ -232,6 +232,18 @@ Give an agent an ACP launch command in `agent_acp_cmd` to run it in the structur
 ```
 
 The `agent_acp_cmd` value is split into argv and executed directly with no shell, so for shell features wrap explicitly, e.g. `"sh -lc 'source ~/.profile && ocp run sp acp'"`. The name must match a `custom_agents` entry and cannot shadow a built-in. A custom agent with no `agent_acp_cmd` runs in the terminal view.
+
+**Inheriting a supported agent.** If your custom agent only wraps a supported one (for example separate tools that each run Claude Code against a different profile / oauth location), you do not need to spell out `agent_acp_cmd` at all. Map the wrapper to its base with `agent_detect_as`, and it inherits the base's ACP adapter automatically:
+
+```toml
+[session.custom_agents]
+"work-claude" = "CLAUDE_CONFIG_DIR=/Users/me/.claude-work claude"
+
+[session.agent_detect_as]
+"work-claude" = "claude"
+```
+
+`work-claude` is now structured view-capable through `claude-agent-acp`, and the existing terminal session's **Switch to structured view** action becomes available. The wrapper runs through the base adapter (inheriting its version gate and env allowlist), so it renders exactly like the base agent. Its profile/oauth overrides reach the structured worker through the session's `extra_env` / [Host Environment](#host-environment) (for example `environment = ["CLAUDE_CONFIG_DIR=/Users/me/.claude-work"]`) or `session.inherit_host_environment`, the same as any other agent. This only works when the base has a built-in ACP adapter (`claude`, `codex`, `opencode`, `gemini`, `vibe`, `pi`, `omp`, `kimi`); a wrapper mapped to a terminal-only base (e.g. `cursor`) stays tmux-only. An explicit `agent_acp_cmd` still wins if you set both.
 
 ## Host Environment
 

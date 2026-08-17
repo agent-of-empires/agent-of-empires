@@ -41,7 +41,7 @@ import { clearDraft, clearDraftAttachments, getDraft, setDraft } from "../../lib
 import { isIOS, isStandalone } from "../../lib/platform";
 import { TOUR_ANCHORS, tourAnchor } from "../../lib/tourSteps";
 import { useMobileKeyboard } from "../../hooks/useMobileKeyboard";
-import { useAgentProfile } from "../../lib/agentProfileContext";
+import { useAgentProfile, useClearAliases } from "../../lib/agentProfileContext";
 import { resolveModeChannel } from "../../lib/modeChannel";
 import { useFocusTerminalTarget } from "../../hooks/useFocusTerminalTarget";
 import { useDictationBurstGuard } from "./useDictationBurstGuard";
@@ -173,30 +173,46 @@ export function decideBeforeInputAction(
  *  the standard iOS accessory-bar height; a device tweak may refine it. */
 export const IOS_ACCESSORY_BAR_PX = 44;
 
-/** Wrapper class + inline style for the composer's outer <div>. When the
- *  soft keyboard is open we drop the bottom padding and apply a negative
- *  bottom margin equal to the App root's safe-area-inset-bottom so the
- *  composer sits flush with the top of the keyboard instead of leaving a
- *  visible gap (the home-indicator inset is physically occluded by the
- *  keyboard anyway). `accessoryBarPx` adds bottom padding that lifts the footer
- *  above the iOS accessory bar (see IOS_ACCESSORY_BAR_PX); it is 0 off iOS-PWA.
+/** Wrapper class + inline style for the composer's outer <div>.
+ *
+ *  Both keyboard states cancel the App root's `safe-area-inset-bottom` padding
+ *  with a negative bottom margin so the composer's background and top border
+ *  reach the physical bottom of the screen. Without this the App root reserves
+ *  its home-indicator inset (~34px) BELOW the composer, leaving a visible empty
+ *  strip under the input on an installed iOS PWA. See #1143 and the
+ *  keyboard-closed bottom-gap fix.
+ *
+ *  The App root no longer reserves the bottom safe-area inset (see
+ *  `.safe-area-inset` in index.css), so the composer sits at the physical
+ *  bottom edge on its own; there is no App-root padding to cancel, hence no
+ *  negative margin.
+ *
+ *  Keyboard CLOSED: just the base `pb-3` gap. The input hugs the bottom (no
+ *  home-indicator reservation, per the user preference for the composer).
+ *
+ *  Keyboard OPEN: drop the bottom padding (the home indicator is occluded by
+ *  the keyboard). `accessoryBarPx` re-adds padding that lifts the footer above
+ *  the iOS predictive/AutoFill accessory bar (see IOS_ACCESSORY_BAR_PX); it is
+ *  0 off iOS-PWA. The keyboard lift itself is handled by the structured-view
+ *  root's `keyboardHeight` padding, not here.
+ *
  *  Extracted as a pure helper so the layout decision can be unit-tested without
- *  mounting the whole composer. See #1143. */
+ *  mounting the whole composer. */
 export function composerWrapperLayout(opts: { keyboardOpen: boolean; accessoryBarPx?: number }): {
   className: string;
   style: React.CSSProperties | undefined;
 } {
   if (!opts.keyboardOpen) {
-    return { className: "border-t border-surface-800 bg-surface-900 px-4 pt-3 pb-3", style: undefined };
+    return {
+      className: "border-t border-surface-800 bg-surface-900 px-4 pt-3 pb-3",
+      style: undefined,
+    };
   }
   const clearance = opts.accessoryBarPx ?? 0;
   return {
     className: "border-t border-surface-800 bg-surface-900 px-4 pt-3 pb-0",
     // Inline paddingBottom overrides pb-0 when we need accessory-bar clearance.
-    style: {
-      marginBottom: "calc(-1 * env(safe-area-inset-bottom))",
-      ...(clearance > 0 ? { paddingBottom: clearance } : {}),
-    },
+    style: clearance > 0 ? { paddingBottom: clearance } : undefined,
   };
 }
 
@@ -295,9 +311,6 @@ interface Props {
    *  #1031). When false the regular ComposerPrimitive.Send path runs as
    *  before. */
   turnActive: boolean;
-  /** Number of items already enqueued for after the current turn.
-   *  Drives the badge on the queue-send button. */
-  queuedCount: number;
   /** Push the composer text straight onto the structured view queue. Bypasses
    *  the ComposerPrimitive.Send path (which assistant-ui hard-disables
    *  while `thread.isRunning && !capabilities.queue`). Used by the
@@ -340,7 +353,6 @@ export function Composer({
   availableCommands,
   connected,
   turnActive,
-  queuedCount,
   enqueuePrompt,
   promptCapabilities,
   pendingAttachments,
@@ -458,13 +470,14 @@ export function Composer({
   );
 
   // Slash commands: built from the agent's AvailableCommandsUpdate, plus
-  // any profile-declared clear aliases the agent doesn't advertise
+  // any server-declared clear aliases the agent doesn't advertise
   // itself (codex / opencode emit `/new` as a UI affordance but their
   // ACP servers don't list it in `available_commands_update`, so the
   // palette would otherwise be missing the very command we detect
-  // server-side as a session-clear boundary). See #1133 + multi-agent
-  // parity follow-up.
-  const profile = useAgentProfile();
+  // server-side as a session-clear boundary). Server-owned via
+  // `SessionResponse.clear_aliases`. See #1133 + multi-agent parity
+  // follow-up.
+  const clearAliases = useClearAliases();
   const slashItems: Unstable_TriggerItem[] = useMemo(() => {
     const advertised = new Set(availableCommands.map((c) => c.name));
     const items: Unstable_TriggerItem[] = availableCommands.map((c) => ({
@@ -474,7 +487,7 @@ export function Composer({
       description: c.description,
       acceptsInput: c.accepts_input,
     }));
-    for (const alias of profile.clearAliases ?? []) {
+    for (const alias of clearAliases) {
       const name = alias.startsWith("/") ? alias.slice(1) : alias;
       if (!name || advertised.has(name)) continue;
       const item = {
@@ -488,7 +501,7 @@ export function Composer({
       advertised.add(name);
     }
     return items;
-  }, [availableCommands, profile]);
+  }, [availableCommands, clearAliases]);
   const slashAdapter: Unstable_TriggerAdapter = useMemo(
     () => ({
       categories: () => [],
@@ -506,6 +519,19 @@ export function Composer({
   const skillIndex = useSkillIndex();
 
   const composerRuntime = useComposerRuntime();
+
+  // Reactive send-eligibility: the send buttons are grayed out and inert
+  // unless there is something to send, i.e. non-whitespace text OR at least
+  // one supported attachment (an attachment-only prompt is valid, e.g. a
+  // pasted screenshot). Mirrors the guard in `sendFromTextarea`, so clicking
+  // Send with an empty composer can no longer be a silent no-op. The text
+  // lives in the assistant-ui composer runtime (an external store), so read it
+  // through useSyncExternalStore rather than a subscribe-in-effect.
+  const composerHasText = useSyncExternalStore(
+    useCallback((onChange) => composerRuntime.subscribe(onChange), [composerRuntime]),
+    () => composerRuntime.getState().text.trim().length > 0,
+  );
+  const canSend = composerHasText || supportedPendingAttachments.length > 0;
 
   // ArrowUp/ArrowDown queue recall (shell-history style). recallRef holds
   // the id of the queued prompt currently loaded into the composer plus
@@ -1196,12 +1222,12 @@ export function Composer({
                     <QueueSendButton
                       connected={connected}
                       steering={!!promptCapabilities?.steering}
-                      queuedCount={queuedCount}
+                      disabled={!canSend}
                       onSend={submitComposer}
                     />
                   </>
                 ) : (
-                  <SendButton connected={connected} onSend={submitComposer} />
+                  <SendButton connected={connected} disabled={!canSend} onSend={submitComposer} />
                 )}
               </div>
             </div>
@@ -1626,7 +1652,15 @@ function formatCost(amount: number, currency: string): string {
 
 /* ── Send / Stop ─────────────────────────────────────────────────── */
 
-function SendButton({ connected = true, onSend }: { connected?: boolean; onSend: () => void }) {
+function SendButton({
+  connected = true,
+  disabled = false,
+  onSend,
+}: {
+  connected?: boolean;
+  disabled?: boolean;
+  onSend: () => void;
+}) {
   // When the session is inactive (WS closed, worker stopped, worker
   // restarting) we leave the button clickable: `sendPrompt` routes the
   // text into the local queue and the drain effect fires it on resume.
@@ -1634,7 +1668,15 @@ function SendButton({ connected = true, onSend }: { connected?: boolean; onSend:
   // sent. A custom button (not ComposerPrimitive.Send) drives submit so
   // the staged attachments ride along and an attachment-only prompt can
   // send even with empty text. See #1359 / #1000.
-  const title = connected ? "Send, Enter" : "Session not active, will send on resume";
+  //
+  // `disabled` grays it out and blocks the click when there is nothing to
+  // send (empty text, no attachments), so an empty click is no longer a
+  // silent no-op.
+  const title = disabled
+    ? "Type a message to send"
+    : connected
+      ? "Send, Enter"
+      : "Session not active, will send on resume";
   const label = connected ? "Send message" : "Queue message until session resumes";
   return (
     <button
@@ -1642,11 +1684,12 @@ function SendButton({ connected = true, onSend }: { connected?: boolean; onSend:
       aria-label={label}
       title={title}
       onClick={onSend}
+      disabled={disabled}
       className={[
         "group/send inline-flex items-center justify-center gap-1",
         "rounded-lg bg-brand-600 px-2.5 py-1.5 text-white shadow-sm",
-        "hover:bg-brand-500 active:scale-[0.98]",
         "transition-all duration-100",
+        disabled ? "cursor-not-allowed opacity-40" : "hover:bg-brand-500 active:scale-[0.98]",
       ].join(" ")}
     >
       <PaperPlaneIcon />
@@ -1687,26 +1730,29 @@ function StopButton() {
 function QueueSendButton({
   connected,
   steering,
-  queuedCount,
+  disabled = false,
   onSend,
 }: {
   connected: boolean;
   steering: boolean;
-  queuedCount: number;
+  disabled?: boolean;
   onSend: () => void;
 }) {
   // A steerable agent takes the message into the turn already running,
   // so the queue-after copy would be wrong. Disconnected still wins:
   // steering does nothing for a prompt that cannot reach the daemon,
   // and those really do park. See #2805.
-  const title = !connected
-    ? queuedCount > 0
-      ? `Queue follow-up (${queuedCount} pending), will send on resume, Enter`
-      : "Queue follow-up, will send on resume, Enter"
-    : steering
-      ? "Send into the current turn, Enter"
-      : queuedCount > 0
-        ? `Queue follow-up (${queuedCount} pending), Enter`
+  //
+  // No queue-count badge here: the QueuedPromptsStrip above the composer
+  // already lists the queued items and their count, so a badge on this
+  // button just duplicated it. `disabled` grays it out when there is nothing
+  // to queue (empty composer, no attachments).
+  const title = disabled
+    ? "Type a message to queue"
+    : !connected
+      ? "Queue follow-up, will send on resume, Enter"
+      : steering
+        ? "Send into the current turn, Enter"
         : "Queue follow-up (sent when current turn ends), Enter";
   return (
     <button
@@ -1715,26 +1761,15 @@ function QueueSendButton({
       {...tourAnchor(TOUR_ANCHORS.queueSend)}
       title={title}
       onClick={onSend}
+      disabled={disabled}
       className={[
         "group/send relative inline-flex items-center justify-center gap-1",
         "rounded-lg bg-brand-600 px-2.5 py-1.5 text-white shadow-sm",
-        "hover:bg-brand-500 active:scale-[0.98]",
         "transition-all duration-100",
+        disabled ? "cursor-not-allowed opacity-40" : "hover:bg-brand-500 active:scale-[0.98]",
       ].join(" ")}
     >
       <PaperPlaneIcon />
-      {queuedCount > 0 && (
-        <span
-          aria-hidden
-          className={[
-            "absolute -right-1.5 -top-1.5 inline-flex h-4 min-w-[16px] items-center justify-center",
-            "rounded-full bg-sky-500 px-1 text-[10px] font-semibold text-surface-900",
-            "ring-2 ring-surface-900",
-          ].join(" ")}
-        >
-          {queuedCount}
-        </span>
-      )}
     </button>
   );
 }
