@@ -265,7 +265,8 @@ pub(crate) enum ResumeAttemptPolicy {
 /// `start_with_resume_fallback` matches on `Existing` to gate the Tier-1
 /// settle probe; without the gate, fresh Claude launches mislabel as
 /// `StartOutcome::Resumed` because `acquire_session_id` always assigns a
-/// UUID for Claude.
+/// UUID for Claude. `Fresh` carries its own probe gate for the launches that
+/// pin an already-stored id (see `pinned_prior_sid`).
 #[must_use]
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LaunchSidOutcome {
@@ -275,10 +276,21 @@ pub enum LaunchSidOutcome {
     Existing { sid: String },
     /// `acquire_session_id` returned a fresh sid (Claude UUID generation)
     /// or `None`. No prior conversation continued.
-    Fresh,
+    Fresh {
+        /// Set when the fresh launch pinned an id the session already had
+        /// stored, rather than a UUID minted for a brand-new conversation:
+        /// the #2700 empty-thread downgrade (`--session-id <sid>`) and a fork
+        /// (whose child id is pre-generated at creation). Both can die on the
+        /// spot, for a live id or an unresolvable parent, so both are worth
+        /// probing; a genuinely new session cannot and skips the probe.
+        /// See #3399.
+        pinned_prior_sid: Option<String>,
+    },
     /// `start_with_size_opts` short-circuited before `apply_session_flags`
-    /// ran: structured view-mode session, or pre-existing tmux pane (kill_clean
-    /// cache race). `agent_session_id` was not mutated this call.
+    /// ran: structured view-mode session, or a pre-existing tmux pane that is
+    /// still alive (kill_clean cache race). `agent_session_id` was not mutated
+    /// this call. A pre-existing *dead* pane is not skipped; it is torn down
+    /// and relaunched (#3399).
     Skipped,
 }
 
@@ -2590,7 +2602,18 @@ impl Instance {
         super::profile_config::resolve_config_or_warn(&profile).environment
     }
 
-    fn omp_host_environment(&self) -> Vec<String> {
+    /// The host environment the agent process will actually see: the static
+    /// profile `environment` list with every `before_session`-minted key
+    /// dropped, then the minted pairs appended. This is the same precedence
+    /// `build_launch_command` applies to the pane, so anything that has to
+    /// agree with the launched agent about a variable's value must read it
+    /// here rather than from `profile_host_environment` alone.
+    ///
+    /// Minted pairs are `#[serde(skip)]` runtime state, so outside a launch
+    /// (a poller repair, a daemon-side read of a stored row) this degrades to
+    /// the profile list. That is the best available answer: the minted values
+    /// are deliberately not persisted because they may be short-lived secrets.
+    pub(crate) fn resolved_host_environment(&self) -> Vec<String> {
         let mut environment = super::environment::drop_shadowed_host_entries(
             self.profile_host_environment(),
             &self.pending_host_env,
@@ -2637,7 +2660,7 @@ impl Instance {
             )
         } else {
             resolve_omp_store_layout_with_environment(
-                &self.omp_host_environment(),
+                &self.resolved_host_environment(),
                 &self.project_path,
                 options,
             )
@@ -2692,9 +2715,12 @@ impl Instance {
         if launched_at_ms == 0 || self.is_sandboxed() {
             return None;
         }
-        let layout =
-            resolve_omp_store_layout(&self.omp_host_environment(), &self.project_path, options)
-                .ok()?;
+        let layout = resolve_omp_store_layout(
+            &self.resolved_host_environment(),
+            &self.project_path,
+            options,
+        )
+        .ok()?;
         Some(OmpCaptureMetadata {
             layout,
             launched_at_ms,
@@ -2993,6 +3019,7 @@ impl Instance {
                 && super::capture::claude_host_transcript_confirmed_absent(
                     &self.project_path,
                     &stored,
+                    &self.resolved_host_environment(),
                 )
             {
                 tracing::info!(
@@ -3109,7 +3136,13 @@ impl Instance {
                     )
                     .ok()
                 } else {
-                    capture_claude_session_id(&self.project_path, None, &exclusion).ok()
+                    capture_claude_session_id(
+                        &self.project_path,
+                        None,
+                        &exclusion,
+                        &self.resolved_host_environment(),
+                    )
+                    .ok()
                 }
             }
             "opencode" => {
@@ -3968,9 +4001,22 @@ impl Instance {
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to acquire instance launch lock")?;
         self.reconcile_from_disk();
-        if self.is_structured() || self.tmux_session()?.exists() {
+        if self.is_structured() {
             return Ok(LaunchSidOutcome::Skipped);
         }
+        // A `remain-on-exit` corpse still owns the tmux name, so plain
+        // `exists()` reads a crashed agent as a running session and start
+        // becomes a silent no-op the caller reports as success. Recreate the
+        // pane instead, the way restart already does. See #3399.
+        let session = self.tmux_session()?;
+        let corpse_pane = if session.exists() {
+            if !session.is_pane_dead() {
+                return Ok(LaunchSidOutcome::Skipped);
+            }
+            true
+        } else {
+            false
+        };
         self.acquire_lifecycle_reservation(
             &storage,
             LifecycleOperation::Launch,
@@ -4000,12 +4046,14 @@ impl Instance {
                 return Err(error);
             }
         };
-        let result = self
-            .spawn_prepared_launch(size, &profile, prepared)
-            .and_then(|outcome| {
-                self.commit_lifecycle_launch(&storage, false)?;
-                Ok(outcome)
-            });
+        let result = (|| {
+            if corpse_pane {
+                self.kill_clean_locked()?;
+            }
+            let outcome = self.spawn_prepared_launch(size, &profile, prepared)?;
+            self.commit_lifecycle_launch(&storage, false)?;
+            Ok(outcome)
+        })();
         if let Err(error) = result {
             self.fail_reserved_launch(&storage, &error, true);
             return Err(error);
@@ -4120,6 +4168,11 @@ impl Instance {
         } else {
             None
         };
+        // Read before `finalize_launch`, which may replace `agent_session_id`.
+        let pinned_prior_sid = self
+            .agent_session_id
+            .clone()
+            .filter(|sid| prepared.expected_prior_sid.as_deref() == Some(sid.as_str()));
 
         tracing::debug!(
             target: "session.store",
@@ -4208,7 +4261,7 @@ impl Instance {
 
         Ok(match launch_sid {
             Some(sid) => LaunchSidOutcome::Existing { sid },
-            None => LaunchSidOutcome::Fresh,
+            None => LaunchSidOutcome::Fresh { pinned_prior_sid },
         })
     }
 
@@ -4407,7 +4460,9 @@ impl Instance {
                 // true absence, so tmux's frozen server environment cannot
                 // select another OMP store. The in-pane fingerprint still
                 // detects login-file drift.
-                env.extend(omp_host_routing_environment(&self.omp_host_environment()));
+                env.extend(omp_host_routing_environment(
+                    &self.resolved_host_environment(),
+                ));
             }
             (
                 result.0,
@@ -5559,6 +5614,7 @@ impl Instance {
                         initial_known.clone(),
                         instance_id.clone(),
                         extra_excludes.clone(),
+                        self.resolved_host_environment(),
                     ))
                 }
             }
@@ -6005,6 +6061,11 @@ impl Instance {
     ///      `resume_probe_failed_sid` loop-breaker, and return
     ///      `StartOutcome::ResumeFailed`. A dead pane is not proof that the
     ///      sid is invalid, so this path must not clear it or launch fresh.
+    ///   3. A launch that pins an already-stored id without resuming it
+    ///      (`--session-id <sid>`, or a fork's pre-generated child id) is
+    ///      probed the same way, but a death there fails the call outright
+    ///      rather than arming the resume loop-breaker: nothing was resumed,
+    ///      so there is no resume to break. See `probe_pinned_fresh_launch`.
     ///
     /// `resume_policy` gates step 1: `HonorAutoResumeSetting` additionally
     /// requires `SessionConfig::auto_resume_on_restart`; `Allow` always
@@ -6014,12 +6075,12 @@ impl Instance {
     /// `StartOutcome::FreshAfterFailedResume` instead of repeating the same
     /// doomed probe. See #2609.
     ///
-    /// Latency: only fires the probe when `--resume <sid>` is being passed
-    /// to a freshly-created tmux session. Healthy resumes on real agents
-    /// pay `RESUME_PROBE_POST_SHELL_GRACE` (~2s) once on cold start;
-    /// warm sessions and non-resume launches pay nothing. Shell-wrapper
-    /// command overrides pay the full `RESUME_PROBE_MAX` (~3s) on every
-    /// healthy resume because `is_pane_running_shell` never clears for
+    /// Latency: only fires the probe when a freshly-created tmux session is
+    /// being handed an id AoE already had stored (step 1 or step 3). Healthy
+    /// launches on real agents pay `RESUME_PROBE_POST_SHELL_GRACE` (~2s) once
+    /// on cold start; warm sessions and brand-new ones pay nothing.
+    /// Shell-wrapper command overrides pay the full `RESUME_PROBE_MAX` (~3s) on
+    /// every healthy resume because `is_pane_running_shell` never clears for
     /// them; see `probe_settle`. When the failure path fires, add
     /// `kill_clean` (~100ms macOS grace) before returning.
     ///
@@ -6143,19 +6204,75 @@ impl Instance {
         None
     }
 
+    /// Fail the launch when a fresh-but-pinned start (`--session-id <sid>` on
+    /// an id the session already had stored) died inside the probe window.
+    ///
+    /// The agent rejects a `--session-id` it considers live ("Session ID ... is
+    /// already in use") and exits at once. `remain-on-exit` then holds the dead
+    /// pane, so the tmux name stays claimed and every later start sees an
+    /// existing session and no-ops without saying why. Returning `Err` routes
+    /// through `fail_reserved_launch`, which tears the corpse down and records
+    /// the pane's own message on the session. See #3399.
+    ///
+    /// Latency: the same window a resume attempt pays (~2s to settle, 3s max),
+    /// on the two launch shapes that can carry a doomed id. A brand-new
+    /// session never reaches here.
+    fn probe_pinned_fresh_launch(&mut self, sid: &str) -> Result<()> {
+        let probe = self.probe_settle(RESUME_PROBE_MAX, RESUME_PROBE_POLL);
+        if matches!(probe, Ok(ProbeResult::Alive)) {
+            return Ok(());
+        }
+        self.stop_poller();
+        self.session_id_poller = None;
+        probe?;
+        let detail = self.dead_pane_detail();
+        anyhow::bail!("agent exited immediately when pinned to session id {sid}{detail}")
+    }
+
+    /// Last line of the agent's own output in the dead pane, as a ": <line>"
+    /// suffix for an error message. `remain-on-exit` keeps the content
+    /// readable, so this surfaces the agent's diagnosis ("Session ID ... is
+    /// already in use") rather than a generic failure. tmux appends its own
+    /// `Pane is dead (status N)` banner below that output; skip it, since the
+    /// caller already knows the pane died.
+    ///
+    /// `capture_pane` captures with `-e`, so the agent's line still carries the
+    /// SGR sequences it was printed with (an agent error line is routinely red).
+    /// Strip them before this lands in `last_error`, which is persisted and
+    /// rendered as plain text by the TUI and the dashboard; stripping first also
+    /// keeps the banner filter working when `remain-on-exit-format` is styled.
+    fn dead_pane_detail(&self) -> String {
+        self.tmux_session()
+            .ok()
+            .and_then(|session| session.capture_pane(20).ok())
+            .and_then(|output| {
+                crate::tmux::utils::strip_ansi(&output)
+                    .lines()
+                    .rev()
+                    .map(str::trim)
+                    .find(|line| !line.is_empty() && !line.starts_with("Pane is dead"))
+                    .map(|line| format!(": {line}"))
+            })
+            .unwrap_or_default()
+    }
+
     fn finish_resume_launch(
         &mut self,
         launch_outcome: LaunchSidOutcome,
         skipped_failed_resume_sid: Option<String>,
         profile: &str,
     ) -> Result<StartOutcome> {
-        let attempted_sid = match launch_outcome {
+        let (attempted_sid, pinned_prior_sid) = match launch_outcome {
             LaunchSidOutcome::Existing { sid } if should_attempt_resume(Some(&sid), &self.tool) => {
-                Some(sid)
+                (Some(sid), None)
             }
-            _ => None,
+            LaunchSidOutcome::Fresh { pinned_prior_sid } => (None, pinned_prior_sid),
+            _ => (None, None),
         };
         let Some(stale_sid) = attempted_sid else {
+            if let Some(sid) = pinned_prior_sid {
+                self.probe_pinned_fresh_launch(&sid)?;
+            }
             return Ok(match skipped_failed_resume_sid {
                 Some(sid) => StartOutcome::FreshAfterFailedResume { sid },
                 None => StartOutcome::Fresh,
@@ -12328,7 +12445,8 @@ mod tests {
             let end = source.find("pub fn ensure_pane_ready").unwrap();
             let fallback_source = &source[start..end];
 
-            assert!(fallback_source.contains("let attempted_sid = match launch_outcome"));
+            assert!(fallback_source
+                .contains("let (attempted_sid, pinned_prior_sid) = match launch_outcome"));
             assert!(fallback_source.contains("LaunchSidOutcome::Existing { sid }"));
             assert!(
                 !fallback_source.contains("should_attempt_resume(self.agent_session_id.as_deref()")
@@ -13368,6 +13486,93 @@ mod tests {
                     "a real (if idle) transcript on disk must resume with --resume"
                 );
                 assert_eq!(inst.agent_session_id.as_deref(), Some(stored));
+            }
+
+            /// #3399: two sessions share a `project_path` but sit in profiles
+            /// pinned to different `CLAUDE_CONFIG_DIR`s. Each must resume its
+            /// own conversation. Resolving the default `~/.claude` instead
+            /// reports both transcripts absent and downgrades every launch to
+            /// `--session-id <sid>`, which the agent rejects as already in use.
+            #[test]
+            #[serial]
+            fn same_cwd_sessions_resume_their_own_profile_scoped_conversation() {
+                let temp = tempdir().unwrap();
+                let _guard = claude_home_guard(&temp);
+
+                let project_path = "/tmp/aoe-test-3399-shared-cwd";
+                let cases = [
+                    ("aoe-3399-personal", "11111111-1111-4111-8111-111111111111"),
+                    ("aoe-3399-work", "22222222-2222-4222-8222-222222222222"),
+                ];
+                for (profile, sid) in cases {
+                    let claude_home = temp.path().join(format!(".claude-{profile}"));
+                    let dir = claude_home
+                        .join("projects")
+                        .join(encode_claude_project_path(project_path));
+                    fs::create_dir_all(&dir).unwrap();
+                    // Older than the live-capture window, so the mtime scan
+                    // stays out of it and the transcript gate is what decides.
+                    write_jsonl_with_mtime(
+                        &dir.join(format!("{sid}.jsonl")),
+                        SystemTime::now() - Duration::from_secs(3600),
+                    );
+
+                    let config_path = crate::session::get_profile_dir_path(profile)
+                        .unwrap()
+                        .join("config.toml");
+                    fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+                    fs::write(
+                        &config_path,
+                        format!(
+                            "environment = [\"CLAUDE_CONFIG_DIR={}\"]\n",
+                            claude_home.display()
+                        ),
+                    )
+                    .unwrap();
+                }
+
+                for (profile, sid) in cases {
+                    let mut inst = Instance::new(profile, project_path);
+                    inst.source_profile = profile.to_string();
+                    inst.tool = "claude".to_string();
+                    inst.agent_session_id = Some(sid.to_string());
+                    inst.resume_intent = ResumeIntent::Default;
+
+                    let (acquired, is_existing) = inst.acquire_session_id();
+                    assert_eq!(acquired.as_deref(), Some(sid));
+                    assert!(
+                        is_existing,
+                        "{profile}: transcript under the profile's own CLAUDE_CONFIG_DIR \
+                         must resume with --resume, not launch fresh-pinned"
+                    );
+                }
+
+                // A `before_session` hook minting CLAUDE_CONFIG_DIR is the
+                // documented account-switcher pattern, and its value wins over
+                // the profile's on the launched pane. Reading the shadowed
+                // profile value here would resolve a config dir the agent
+                // never opens, reintroducing the same downgrade.
+                let (shadowed_profile, other_sid) = (cases[0].0, cases[1].1);
+                let mut inst = Instance::new("minted-switcher", project_path);
+                inst.source_profile = shadowed_profile.to_string();
+                inst.tool = "claude".to_string();
+                inst.agent_session_id = Some(other_sid.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+                inst.pending_host_env = vec![(
+                    "CLAUDE_CONFIG_DIR".to_string(),
+                    temp.path()
+                        .join(format!(".claude-{}", cases[1].0))
+                        .to_string_lossy()
+                        .into_owned(),
+                )];
+
+                let (acquired, is_existing) = inst.acquire_session_id();
+                assert_eq!(acquired.as_deref(), Some(other_sid));
+                assert!(
+                    is_existing,
+                    "a before_session-minted CLAUDE_CONFIG_DIR must win over the \
+                     profile's, matching what the launch injects into the pane"
+                );
             }
 
             #[test]
