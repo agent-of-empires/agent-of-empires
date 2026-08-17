@@ -518,33 +518,53 @@ async fn seed_identity(state: &AppState, session_id: &str) -> (AgentName, Option
         .unwrap_or_else(|| (AgentName(String::new()), None))
 }
 
-/// The daemon's current control state for a session, folded on demand from the
-/// durable event log.
+/// The daemon's current control state for a session.
 ///
-/// The live folds are per-connection (see `handle`), so an HTTP handler has no
-/// `AcpState` to read; this rebuilds one the same way a fresh WS connection
-/// does. Used by prompt dispatch (Tier 3,
-/// `docs/development/server-owned-prompt-dispatch.md`), where the alternative
-/// is asking the client what the daemon's own state is.
+/// The WS folds are per-connection (see `handle`), so an HTTP handler has no
+/// `AcpState` to read. This serves one from the live projection
+/// (`crate::acp::control_cache`), which the publish choke point keeps folded,
+/// and rebuilds it from the durable log on a miss. Used by prompt dispatch
+/// (Tier 3, `docs/development/server-owned-prompt-dispatch.md`), where the
+/// alternative is asking the client what the daemon's own state is.
 ///
-/// Cost is one keyset scan plus a fold per call, which is bounded by the
-/// session's event count and paid at human typing speed. A cached per-session
-/// projection is the obvious optimization if this ever shows up in a profile;
-/// it is deliberately not here yet, because a cache would be a third fold to
-/// keep coherent with the two that already exist.
+/// The rebuild is the reason this is cached rather than folded per call. It
+/// measured 68ms at 20k events and 342ms at 100k, on a store whose retention
+/// default is unlimited, and it holds the event store's connection mutex for
+/// the whole scan, so a prompt on one long session would stall event recording
+/// for every session. Cached, that cost is paid once per session per daemon
+/// life instead of on every prompt.
 pub(crate) async fn fold_control_state(state: &AppState, session_id: &str) -> AcpState {
     let (agent, model) = seed_identity(state, session_id).await;
-    let mut reduced = AcpState::new(AcpSessionId(session_id.to_string()), agent, model);
     let store = Arc::clone(&state.acp_event_store);
+    let cache = Arc::clone(&state.acp_control_cache);
     let sid = session_id.to_string();
-    // Locking SQLite read; keep it off the runtime like the queue drain does.
-    let events = tokio::task::spawn_blocking(move || store.replay_from(&sid, 0))
-        .await
-        .unwrap_or_default();
-    for (_seq, event) in events {
-        let _ = reduced.apply_event(event);
-    }
-    reduced
+    // The hydrate closure runs under the cache's per-session lock and does a
+    // locking SQLite scan, so the whole thing goes off the runtime rather than
+    // just the scan.
+    tokio::task::spawn_blocking(move || {
+        cache.get_or_hydrate(&sid.clone(), || {
+            let mut reduced = AcpState::new(AcpSessionId(sid.clone()), agent, model);
+            let mut last_seq = 0;
+            for (seq, event) in store.replay_from(&sid, 0) {
+                let _ = reduced.apply_event(event);
+                last_seq = seq;
+            }
+            (reduced, last_seq)
+        })
+    })
+    .await
+    .unwrap_or_else(|_| {
+        // The blocking pool panicked or shut down. An empty state reads as
+        // "idle", and dispatch's fall-through would then send into whatever
+        // turn is running, so hand back one that parks instead.
+        let mut fallback = AcpState::new(
+            AcpSessionId(session_id.to_string()),
+            AgentName(String::new()),
+            None,
+        );
+        fallback.turn_active = true;
+        fallback
+    })
 }
 
 fn fold_connect_history(
@@ -1055,11 +1075,21 @@ mod tests {
         inst.agent_name = Some("claude".to_string());
         let state = crate::server::test_support::build_test_app_state(vec![inst]);
 
+        // Publish through the real choke point rather than writing straight to
+        // the store: that is what folds the live projection dispatch reads, so
+        // going around it would test the hydrate path four times over and
+        // prove nothing about the wiring.
+        use crate::acp::supervisor::BroadcastSink;
+        let sink = crate::acp::supervisor::ChannelSink {
+            tx: state.acp_events_tx.clone(),
+            event_store: Arc::clone(&state.acp_event_store),
+            control_cache: Arc::clone(&state.acp_control_cache),
+        };
         let record = |seq: u64, event: Event| {
-            state
-                .acp_event_store
-                .record("s-fold", seq, &event)
-                .expect("record event");
+            assert!(
+                sink.publish_persisted("s-fold", seq, &event),
+                "publish must reach the event store"
+            );
         };
         // A live steerable turn: the daemon must report it as steerable, or a
         // mid-turn prompt gets parked and #2805 comes back.

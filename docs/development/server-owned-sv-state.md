@@ -69,9 +69,15 @@ it: a connect snapshot folded from the client's `since` cursor rather than the
 whole log, a missing seq guard where the drain overlaps the live broadcast, and
 a permanent desync after a lag. All three are fixed and pinned by tests, but a
 single per-session writer folding from seq 0 would have made them impossible by
-construction rather than by patch. That remains the obvious follow-up, and
-Tier 3's `fold_control_state` (which rebuilds a state per HTTP call because no
-live one exists to read) is a second argument for it.
+construction rather than by patch. That remains the obvious follow-up.
+
+Tier 3 pushed it half way there. `src/acp/control_cache.rs` keeps one folded
+`AcpState` per session at the publish choke point, because dispatch needed a
+control state on an HTTP request and rebuilding one per POST cost up to 342ms
+while holding the event store's connection mutex. So the daemon now has a
+single-writer control-state fold; the per-connection folds in `acp_ws::handle`
+still exist alongside it, and collapsing them onto it is what the follow-up
+would finish. The transcript fold has no equivalent yet.
 
 No new persistence: on daemon restart a connection rebuilds state by reducing
 over `EventStore::replay_from` at connect, and the event log remains the source

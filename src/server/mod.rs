@@ -458,6 +458,11 @@ pub struct AppState {
     /// rather than 1.
     #[cfg(feature = "serve")]
     pub acp_event_store: Arc<crate::acp::event_store::EventStore>,
+    /// Live control-state projection per session, folded at the publish choke
+    /// point and shared with `ChannelSink`. Prompt dispatch reads it instead
+    /// of replaying the log on every POST; see `crate::acp::control_cache`.
+    #[cfg(feature = "serve")]
+    pub acp_control_cache: Arc<crate::acp::control_cache::ControlStateCache>,
     /// Owns the per-session ACP agent subprocesses.
     #[cfg(feature = "serve")]
     pub acp_supervisor:
@@ -873,6 +878,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         )
     };
     #[cfg(feature = "serve")]
+    let acp_control_cache = Arc::new(crate::acp::control_cache::ControlStateCache::new());
+    #[cfg(feature = "serve")]
     let acp_supervisor = {
         // Approval pushes are dispatched from `acp_event_listener`,
         // which subscribes to the broadcast that ChannelSink::publish
@@ -881,6 +888,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         let sink = std::sync::Arc::new(crate::acp::supervisor::ChannelSink {
             tx: acp_events_tx.clone(),
             event_store: acp_event_store.clone(),
+            control_cache: acp_control_cache.clone(),
         });
         let supervisor = std::sync::Arc::new(crate::acp::supervisor::Supervisor::with_capacity(
             sink,
@@ -1230,6 +1238,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         acp_events_tx: acp_events_tx.clone(),
         #[cfg(feature = "serve")]
         acp_event_store: acp_event_store.clone(),
+        #[cfg(feature = "serve")]
+        acp_control_cache: acp_control_cache.clone(),
         #[cfg(feature = "serve")]
         acp_supervisor: acp_supervisor.clone(),
         #[cfg(feature = "serve")]
@@ -6125,9 +6135,11 @@ pub mod test_support {
         let event_store =
             Arc::new(crate::acp::event_store::EventStore::open(&acp_db, 100).expect("event store"));
         let acp_events_tx = broadcast::channel::<AcpBroadcastFrame>(8).0;
+        let acp_control_cache = Arc::new(crate::acp::control_cache::ControlStateCache::new());
         let sink = std::sync::Arc::new(crate::acp::supervisor::ChannelSink {
             tx: acp_events_tx.clone(),
             event_store: event_store.clone(),
+            control_cache: acp_control_cache.clone(),
         });
         let supervisor =
             std::sync::Arc::new(crate::acp::supervisor::Supervisor::with_capacity(sink, 1));
@@ -6181,6 +6193,7 @@ pub mod test_support {
             status_tx: broadcast::channel(STATUS_CHANNEL_CAPACITY).0,
             acp_events_tx,
             acp_event_store: event_store,
+            acp_control_cache,
             acp_supervisor: supervisor,
             plugin_host: None,
             plugin_jobs: Arc::new(api::plugins::PluginJobRegistry::new()),

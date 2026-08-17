@@ -3465,6 +3465,10 @@ pub struct ChannelSink {
     /// which is hydrated from this store at startup, so seqs survive
     /// `aoe serve` restart without coordination.
     pub event_store: Arc<crate::acp::event_store::EventStore>,
+    /// Live control-state projection, folded here so prompt dispatch can read
+    /// it without replaying the log (`crate::acp::control_cache`). Shared with
+    /// `AppState`, which is where the readers live.
+    pub control_cache: Arc<crate::acp::control_cache::ControlStateCache>,
 }
 
 /// Reset time a fresh rejection can inherit from the session's previous
@@ -3485,6 +3489,8 @@ impl BroadcastSink for ChannelSink {
 
     fn clear_session_events(&self, session_id: &str) {
         self.event_store.delete_session(session_id);
+        // The cached fold is a projection of the log we just deleted.
+        self.control_cache.forget(session_id);
     }
 
     fn publish_persisted(&self, session_id: &str, seq: u64, event: &Event) -> bool {
@@ -3560,6 +3566,18 @@ impl BroadcastSink for ChannelSink {
                 &event_to_publish
             }
         };
+
+        // Fold into the live control-state projection before broadcasting, in
+        // the same seq order the on-disk log is written in. On a failed
+        // persist drop the fold instead: the log is now missing this seq, and
+        // a projection that has an event its log does not is worse than no
+        // projection, since the next reader would trust it.
+        if persisted {
+            self.control_cache
+                .apply_if_cached(session_id, seq, event_ref);
+        } else {
+            self.control_cache.forget(session_id);
+        }
 
         let frame = crate::server::AcpBroadcastFrame {
             session_id: session_id.to_string(),
@@ -6275,6 +6293,7 @@ cursor-acp-bridge = "agent acp"
         let sink = Arc::new(ChannelSink {
             tx,
             event_store: event_store.clone(),
+            control_cache: Arc::new(crate::acp::control_cache::ControlStateCache::new()),
         });
 
         sink.publish(
@@ -6333,6 +6352,7 @@ cursor-acp-bridge = "agent acp"
         let sink = Arc::new(ChannelSink {
             tx,
             event_store: event_store.clone(),
+            control_cache: Arc::new(crate::acp::control_cache::ControlStateCache::new()),
         });
         let resets_at = chrono::Utc::now() + chrono::Duration::hours(3);
         let info = |resets_at| RateLimitInfo {
@@ -6378,6 +6398,7 @@ cursor-acp-bridge = "agent acp"
             let sink = Arc::new(ChannelSink {
                 tx,
                 event_store: event_store.clone(),
+                control_cache: Arc::new(crate::acp::control_cache::ControlStateCache::new()),
             });
             let sup = Supervisor::new(sink);
             sup.publish_user_prompt("s-99", "first".into()).await;
@@ -6396,6 +6417,7 @@ cursor-acp-bridge = "agent acp"
         let sink = Arc::new(ChannelSink {
             tx,
             event_store: event_store.clone(),
+            control_cache: Arc::new(crate::acp::control_cache::ControlStateCache::new()),
         });
         let sup = Supervisor::new(sink);
         sup.hydrate_seqs(event_store.all_session_seqs());

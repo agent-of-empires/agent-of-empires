@@ -54,13 +54,28 @@ The failure modes are asymmetric: wrongly sending where the old code parked can
 restart a worker (#1727), while wrongly parking only delays a turn. So every
 path not positively classified as sendable falls through to `Queued`.
 
-**Where the `AcpState` comes from.** The live folds are per-connection
+**Where the `AcpState` comes from.** The WS folds are per-connection
 (`acp_ws::handle`), so an HTTP handler has none to read.
-`acp_ws::fold_control_state` rebuilds one on demand from the durable event log,
-the same way a fresh WS connection does: one keyset scan plus a fold, paid at
-human typing speed. A cached per-session projection is the obvious optimization
-if it ever shows up in a profile, and is deliberately not here yet, because a
-cache would be a third fold to keep coherent with the two that already exist.
+`acp_ws::fold_control_state` serves one from a live per-session projection
+(`src/acp/control_cache.rs`) that `ChannelSink::publish_persisted` keeps folded
+as it records and broadcasts each event, rebuilding from the durable log only
+on a miss.
+
+That cache is not premature. The first cut rebuilt from the log on every POST,
+which measured 4ms at 1k events, 68ms at 20k and **342ms at 100k**, against a
+store whose retention default (`acp.replay_events`) is unlimited and where every
+streamed message chunk is an event. Worse than the latency, `record()` and
+`replay_page()` share one `Mutex<Connection>` on a single daemon-wide store, so
+a prompt on one long session stalled event recording for every session. Cached,
+the same read is ~12µs and the scan is paid once per session per daemon life.
+
+The projection is only ever populated by a full hydrate, never by starting a
+fold mid-stream: `PromptCapabilities` sits near seq 1 and never repeats, so a
+partial fold would report a steerable agent as unsteerable and bring #2805
+back. A seq that does not continue the sequence (a gap, or the counter reset by
+an `acp_disable` / `acp_enable` round trip) evicts rather than folds, and a
+failed persist evicts too, since a projection of a log missing an event is not
+a projection of that log.
 
 **Why a stale latch is not a wedge.** If a worker dies mid-turn without a
 terminal `Stopped`, the fold keeps `turn_active` set and every later prompt
