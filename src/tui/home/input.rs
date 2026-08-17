@@ -5528,17 +5528,32 @@ impl HomeView {
                     // (dispatch_confirm_submit "trash_session") runs the same
                     // trash_session_by_id as the instant path.
                     if session_cfg.confirm_delete {
-                        let delete_key = if self.strict_hotkeys { 'D' } else { 'd' };
-                        let message = format!(
-                            "Move '{}' to the trash? It can be restored from the Trash section.\n\
-                             Press {delete_key} again to confirm, Esc to cancel.",
-                            inst.title
-                        );
+                        // Read the accept key off the binding table instead of
+                        // spelling it out here, so relocating Delete can't drift
+                        // the hint (or the key that accepts) from the key that
+                        // opened the dialog. A chord that isn't a bare character
+                        // (a hypothetical Ctrl+D) can't be an opt-in confirm
+                        // char, so it falls back to the dialog's own y/Enter.
+                        let delete_key = bindings::label(ActionId::Delete, self.strict_hotkeys);
+                        let mut key_chars = delete_key.chars();
+                        let accept_char = match (key_chars.next(), key_chars.next()) {
+                            (Some(c), None) => Some(c),
+                            _ => None,
+                        };
+                        let hint = match accept_char {
+                            Some(_) => {
+                                format!("Press {delete_key} again to confirm, Esc to cancel.")
+                            }
+                            None => "Press y to confirm, Esc to cancel.".to_string(),
+                        };
+                        let message = format!("Move '{}' to the trash?\n{hint}", inst.title);
                         self.pending_trash_session = Some(sid);
-                        self.confirm_dialog = Some(
-                            ConfirmDialog::new("Confirm Delete", &message, "trash_session")
-                                .confirmed_by(delete_key),
-                        );
+                        let mut dialog =
+                            ConfirmDialog::new("Confirm Delete", &message, "trash_session");
+                        if let Some(c) = accept_char {
+                            dialog = dialog.confirmed_by(c);
+                        }
+                        self.confirm_dialog = Some(dialog);
                         return;
                     }
                     self.trash_session_by_id(&sid);
