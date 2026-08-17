@@ -50,7 +50,7 @@ pub fn worktree_leaf_from_title(title: &str) -> String {
 /// The single source of truth for the sanitizer chain (git-ref sanitizer, then
 /// the path-safe one) so [`worktree_move_required`] cannot drift from the
 /// operation it gates.
-fn target_worktree_path(current_path: &Path, new_name: &str) -> Option<PathBuf> {
+pub(crate) fn target_worktree_path(current_path: &Path, new_name: &str) -> Option<PathBuf> {
     let parent = current_path.parent()?;
     let new_leaf = sanitize_branch_name(&git_sanitize_branch_name(new_name));
     Some(parent.join(new_leaf))

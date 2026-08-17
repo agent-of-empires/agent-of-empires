@@ -2,7 +2,8 @@
 
 use crate::session::builder::{self, InstanceParams};
 use crate::session::{
-    list_profiles, GroupTree, Instance, Item, LifecycleOperation, Status, Storage,
+    acquire_title_mutation_lock, duplicate_session_error, is_duplicate_session, list_profiles,
+    GroupTree, Instance, Item, LifecycleOperation, Status, Storage,
 };
 use crate::tui::deletion_poller::DeletionRequest;
 use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions, InfoDialog, NewSessionData};
@@ -1106,11 +1107,29 @@ impl HomeView {
         if let Some(id) = &self.selected_session {
             let id = id.clone();
 
-            // Get current values for comparison
-            let (current_title, current_group) = self
+            let live = self
                 .get_instance(&id)
-                .map(|i| (i.title.clone(), i.group_path.clone()))
-                .unwrap_or_default();
+                .cloned()
+                .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
+            let current_profile = live.source_profile.clone();
+            // The app-wide guard covers profile-changing renames too, so the
+            // authoritative target-profile check and both profile writes are
+            // one identity transaction without nesting profile locks.
+            let _title_lock = acquire_title_mutation_lock()?;
+            let stored = if let Some(storage) = self.storages.get(&current_profile) {
+                storage.load()?
+            } else {
+                Storage::new(&current_profile, self.file_watch.clone())?.load()?
+            };
+            let mut previous = stored
+                .into_iter()
+                .find(|instance| instance.id == id)
+                .ok_or_else(|| anyhow::anyhow!("Session not found"))?;
+            previous.source_profile.clone_from(&current_profile);
+            previous.merge_runtime_from_reload(&live);
+            self.instances.insert(id.clone(), previous.clone());
+            let current_title = previous.title.clone();
+            let current_group = previous.group_path.clone();
 
             // Determine effective title (keep current if empty)
             let effective_title = if new_title.is_empty() {
@@ -1125,6 +1144,53 @@ impl HomeView {
                 Some(g) => g.to_string(),      // Set new (empty string means ungroup)
             };
 
+            let target_profile = new_profile.unwrap_or(&current_profile);
+            if target_profile != current_profile {
+                let profiles = list_profiles()?;
+                if !profiles.contains(&target_profile.to_string()) {
+                    anyhow::bail!("Profile '{}' does not exist", target_profile);
+                }
+            }
+
+            let tied = self.tie_workdir_applies_for(&id);
+            let tied_edit = tied && (current_title != effective_title || rename_branch);
+            let duplicate_path = if tied_edit {
+                let leaf =
+                    crate::session::worktree_edit::worktree_leaf_from_title(&effective_title);
+                crate::session::worktree_edit::target_worktree_path(
+                    std::path::Path::new(&previous.project_path),
+                    &leaf,
+                )
+                .unwrap_or_else(|| std::path::PathBuf::from(&previous.project_path))
+                .to_string_lossy()
+                .into_owned()
+            } else {
+                previous.project_path.clone()
+            };
+            let pair_changed = current_title != effective_title
+                || target_profile != current_profile
+                || duplicate_path.trim_end_matches('/')
+                    != previous.project_path.trim_end_matches('/');
+            if pair_changed {
+                let candidates = if let Some(storage) = self.storages.get(target_profile) {
+                    storage.load()?
+                } else {
+                    Storage::new(target_profile, self.file_watch.clone())?.load()?
+                };
+                if is_duplicate_session(
+                    candidates.iter(),
+                    &effective_title,
+                    &duplicate_path,
+                    Some(&id),
+                ) {
+                    self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
+                        "Rename Failed",
+                        &duplicate_session_error(&effective_title).to_string(),
+                    ));
+                    return Ok(());
+                }
+            }
+
             // Tied mode (#1927): a worktree session's directory leaf follows
             // its title, so move the directory in lockstep before persisting
             // the new title. The move is gated on a stopped session; a running
@@ -1135,9 +1201,7 @@ impl HomeView {
             // Fire when the title changed (dir follows it) OR the user opted to
             // rename the branch (which may be requested even with the title
             // unchanged, to bring a drifted branch back in line with the dir).
-            if (current_title != effective_title || rename_branch)
-                && self.tie_workdir_applies_for(&id)
-            {
+            if tied_edit {
                 let snapshot = self.get_instance(&id).map(|i| {
                     (
                         i.worktree_info.clone(),
@@ -1226,17 +1290,7 @@ impl HomeView {
 
             // Handle profile change (move session to different profile)
             if let Some(target_profile) = new_profile {
-                let current_profile = self
-                    .get_instance(&id)
-                    .map(|i| i.source_profile.clone())
-                    .unwrap_or_else(|| self.config_profile());
                 if target_profile != current_profile {
-                    // Validate target profile exists
-                    let profiles = list_profiles()?;
-                    if !profiles.contains(&target_profile.to_string()) {
-                        anyhow::bail!("Profile '{}' does not exist", target_profile);
-                    }
-
                     // Get the instance to move
                     let mut instance = self
                         .get_instance(&id)
