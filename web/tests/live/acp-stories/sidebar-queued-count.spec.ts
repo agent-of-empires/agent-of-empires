@@ -5,10 +5,10 @@
 // Single acp-enabled session: kick off a long turn, queue two
 // follow-ups via the composer's Queue button, then navigate to `/` so
 // the sidebar is the primary surface and StructuredView unmounts. The
-// queued prompts are client-only state mirrored into localStorage by
-// persistState, so the sidebar row reads the count (2) without the
-// structured view mounted. The queue does not drain while no structured view hook
-// is running, so the badge is stable on the dashboard.
+// daemon owns the queue; the confirmed reducer state is mirrored into
+// localStorage by persistState, so the sidebar row reads the count (2)
+// without the structured view mounted. The turn remains active long
+// enough for the badge assertion, so the daemon has not drained the queue.
 
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -80,11 +80,18 @@ base("sidebar row shows the queued-prompt count badge", async ({ page }, testInf
     await composer.fill("follow-up two");
     await queueBtn.click();
 
+    // Queueing is daemon-authoritative and asynchronous. Wait until both
+    // requests are confirmed and persisted before a hard navigation can
+    // abort them.
+    await expect(page.getByText("Queued (2)", { exact: true })).toBeVisible({
+      timeout: 5_000,
+    });
+
     // Navigate to the dashboard so the sidebar is the primary surface.
     await page.goto(serve.baseUrl);
 
     // The row for session A should carry a "2 queued" badge, read from
-    // the persisted client-only queue state.
+    // the confirmed queue state mirrored into localStorage.
     await expect(page.getByTitle("2 queued prompts")).toBeVisible({
       timeout: 15_000,
     });
