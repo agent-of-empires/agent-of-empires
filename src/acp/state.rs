@@ -596,7 +596,7 @@ impl PromptAttachmentKind {
         }
     }
 
-    /// Parse the lowercase tag written by [`as_str`], for reading the kind
+    /// Parse the lowercase tag written by [`Self::as_str`], for reading the kind
     /// back out of the attachment store's TEXT column. `None` on an unknown
     /// tag (a corrupt or forward-version row), so the caller can skip it.
     pub fn from_tag(tag: &str) -> Option<Self> {
