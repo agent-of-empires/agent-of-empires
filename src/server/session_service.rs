@@ -163,6 +163,11 @@ pub struct SessionService {
     /// fast path and the reconciler tick cannot queue duplicate drains.
     /// Sync mutex: critical sections are tiny and never span an `await`.
     pending_drains: std::sync::Mutex<std::collections::HashSet<String>>,
+    /// Per-session persist locks for `mutate_instance_persisted`, held across
+    /// snapshot AND disk write so the two cannot be reordered. Distinct from
+    /// `instance_locks`: the drain holds that one across `send_turn` and then
+    /// calls this path, so reusing it would self-deadlock.
+    persist_locks: RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 /// Who is asking the session service to act. Constructed only by the
@@ -244,6 +249,7 @@ impl SessionService {
             acp_event_store,
             create_in_flight: std::sync::Mutex::new(HashMap::new()),
             pending_drains: std::sync::Mutex::new(std::collections::HashSet::new()),
+            persist_locks: RwLock::new(HashMap::new()),
         }
     }
 
@@ -261,6 +267,7 @@ impl SessionService {
             telemetry_session_creates,
             create_in_flight: std::sync::Mutex::new(HashMap::new()),
             pending_drains: std::sync::Mutex::new(std::collections::HashSet::new()),
+            persist_locks: RwLock::new(HashMap::new()),
         }
     }
 
@@ -810,12 +817,22 @@ impl SessionService {
     /// every caller today (the five queue mutations plus the dormancy clear).
     /// A new caller that mutates something else must extend that struct, so the
     /// set is explicit rather than implied by whatever the closure touched.
+    ///
+    /// Snapshot and disk write happen under one per-session persist lock.
+    /// `Storage::update` serializes the writes themselves but not their order,
+    /// so without this two concurrent mutations could snapshot as `[a]` then
+    /// `[a, b]` and land in the opposite order, leaving `b` off disk and losing
+    /// it on the next daemon restart. Copying a whole snapshot makes ordering
+    /// load-bearing in a way that re-running the closure did not, so the lock
+    /// comes with it.
     #[cfg(feature = "serve")]
     async fn mutate_instance_persisted<T, F>(self: &Arc<Self>, id: &str, mutate: F) -> Option<T>
     where
         T: Send + 'static,
         F: FnOnce(&mut crate::session::Instance) -> T,
     {
+        let persist_lock = self.persist_lock(id).await;
+        let _ordered = persist_lock.lock().await;
         let (profile, result, mirrored) = {
             let mut instances = self.instances.write().await;
             let inst = instances.iter_mut().find(|i| i.id == id)?;
@@ -1157,6 +1174,25 @@ impl SessionService {
     /// Same lazy per-instance mutex registry as `AppState::instance_lock`;
     /// both operate on the shared map, so a lock taken through either handle
     /// excludes the other.
+    /// Per-session lock ordering the snapshot-and-persist in
+    /// `mutate_instance_persisted`. Always acquired BEFORE `instances.write()`
+    /// and never while holding it, and nothing acquires `instance_lock` while
+    /// holding this, so it cannot form a cycle with either.
+    #[cfg(feature = "serve")]
+    async fn persist_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        {
+            let guard = self.persist_locks.read().await;
+            if let Some(lock) = guard.get(id) {
+                return lock.clone();
+            }
+        }
+        let mut guard = self.persist_locks.write().await;
+        guard
+            .entry(id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     pub async fn instance_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
         {
             let guard = self.instance_locks.read().await;
@@ -1703,6 +1739,86 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["next"]
         );
+    }
+
+    /// Concurrent enqueues all survive with distinct seqs, in memory and on
+    /// disk. Guards review finding 8: the disk copy used to re-run the caller's
+    /// closure and re-derive `seq` from whatever the file happened to hold, so
+    /// racing enqueues could persist duplicate or reordered seqs.
+    ///
+    /// It does NOT prove the per-session persist lock. Copying a whole snapshot
+    /// makes write ordering load-bearing (a stale `[a]` landing after `[a, b]`
+    /// would drop `b`), and the lock exists to make that ordering guaranteed
+    /// rather than incidental, but 32-way concurrency here never reordered the
+    /// two `Storage::update` calls, so the lock is defensive and unproven.
+    #[cfg(feature = "serve")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    #[serial_test::serial]
+    async fn concurrent_enqueues_all_survive_to_disk() {
+        use crate::session::test_support::isolate_app_dir;
+        let _tmp = isolate_app_dir();
+        let profile = "default";
+
+        let mut inst = Instance::new("queue", "/tmp/aoe-queue-concurrent");
+        inst.id = "sess-cc".to_string();
+        inst.view = crate::session::View::Structured;
+        inst.source_profile = profile.to_string();
+        let seed = inst.clone();
+        crate::session::Storage::new_unwatched(profile)
+            .unwrap()
+            .update(|instances, _groups| {
+                instances.push(seed);
+                Ok(())
+            })
+            .unwrap();
+        let service = crate::server::test_support::build_test_app_state(vec![inst])
+            .session_service
+            .clone();
+
+        // Fire them together, the way two quick taps on Queue do.
+        let mut tasks = Vec::new();
+        for i in 0..32 {
+            let svc = Arc::clone(&service);
+            tasks.push(tokio::spawn(async move {
+                svc.enqueue_prompt(
+                    "sess-cc",
+                    format!("p{i}"),
+                    format!("prompt {i}"),
+                    vec![],
+                    None,
+                    "t".into(),
+                )
+                .await
+            }));
+        }
+        for t in tasks {
+            t.await.expect("task").expect("session exists");
+        }
+
+        let in_memory = service.queued_prompts_snapshot("sess-cc").await;
+        assert_eq!(in_memory.len(), 32, "every enqueue lands in memory");
+        // Seqs are unique, so the drain order is well defined.
+        let mut seqs: Vec<u64> = in_memory.iter().map(|q| q.seq).collect();
+        seqs.sort_unstable();
+        seqs.dedup();
+        assert_eq!(seqs.len(), 32, "no two rows share a seq");
+
+        let on_disk = crate::session::Storage::new_unwatched(profile)
+            .unwrap()
+            .load()
+            .unwrap();
+        let persisted = &on_disk
+            .iter()
+            .find(|i| i.id == "sess-cc")
+            .expect("session on disk")
+            .queued_prompts;
+        assert_eq!(persisted.len(), 32, "every enqueue reaches disk");
+        // The disk-side check is the one that fails on finding 8: re-deriving
+        // `seq` per copy let two rows persist the same one.
+        let mut disk_seqs: Vec<u64> = persisted.iter().map(|q| q.seq).collect();
+        disk_seqs.sort_unstable();
+        disk_seqs.dedup();
+        assert_eq!(disk_seqs.len(), 32, "no two persisted rows share a seq");
     }
 
     #[cfg(feature = "serve")]
