@@ -2033,7 +2033,10 @@ fn build_router(state: Arc<AppState>) -> Router {
 }
 
 /// Placeholder logged in place of a route template when axum matched no
-/// route (the SPA fallback, and 404/405 responses). The raw URI is never
+/// route: the SPA fallback, and the 405 that fallback returns for a
+/// non-GET method. A request whose *path* matched a registered route still
+/// carries its template even when the method router rejects it, because
+/// axum matches on path before it dispatches on method. The raw URI is never
 /// substituted here: it is attacker- or user-controlled text, and the whole
 /// point of [`log_route`] is that only strings we wrote ourselves reach the
 /// log file.
@@ -2053,6 +2056,29 @@ fn log_route(request: &axum::extract::Request) -> &str {
         .extensions()
         .get::<axum::extract::MatchedPath>()
         .map_or(UNMATCHED_ROUTE, |m| m.as_str())
+}
+
+/// Longest client-supplied `X-Request-Id` we are willing to echo. A
+/// correlation token needs far less; anything longer is a caller padding
+/// every one of its log lines.
+const MAX_CLIENT_REQUEST_ID: usize = 64;
+
+/// Whether a client-supplied `X-Request-Id` can be reused verbatim.
+///
+/// Held to the same rule as [`log_route`]. `request_id` is a field of the
+/// completion event, so it renders under the default `show_spans = false`
+/// formatter, and `HeaderValue::to_str` accepts any visible ASCII, spaces
+/// and `=` included. An unfiltered value therefore lets an unauthenticated
+/// caller (the event fires outside the auth layer) forge `status=` and
+/// `path=` pairs on the very line #3402 added for triage, or pad every 4xx
+/// line to churn the file through rotation. Anything outside a bounded
+/// token charset is replaced by a generated uuid.
+fn is_log_safe_request_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_CLIENT_REQUEST_ID
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
 }
 
 /// Middleware that wraps every request in an `http.request` span with a
@@ -2082,6 +2108,7 @@ async fn http_request_span(
         .headers()
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
+        .filter(|v| is_log_safe_request_id(v))
         .map(str::to_string)
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let method = request.method().clone();
@@ -7212,10 +7239,16 @@ mod tests {
 
             let line = take_line();
             for expected in [level, path_field, status, "method=GET", "request_id="] {
-                assert!(line.contains(expected), "{uri}: want {expected:?}, got {line}");
+                assert!(
+                    line.contains(expected),
+                    "{uri}: want {expected:?}, got {line}"
+                );
             }
             for secret in [TOKEN, SESSION] {
-                assert!(!line.contains(secret), "{uri}: leaked {secret:?} into {line}");
+                assert!(
+                    !line.contains(secret),
+                    "{uri}: leaked {secret:?} into {line}"
+                );
             }
         }
 
@@ -7245,7 +7278,40 @@ mod tests {
             "real router: got {line}"
         );
         for secret in [TOKEN, SESSION] {
-            assert!(!line.contains(secret), "real router leaked {secret:?}: {line}");
+            assert!(
+                !line.contains(secret),
+                "real router leaked {secret:?}: {line}"
+            );
+        }
+
+        // `request_id` is client-supplied, and it lands on the same line as
+        // `path`, so it is held to the same rule. `HeaderValue::to_str`
+        // admits spaces and `=`, so an unfiltered header forges fields on
+        // the line #3402 added for triage. (header value, echoed verbatim?)
+        let overlong = "x".repeat(MAX_CLIENT_REQUEST_ID + 1);
+        let ids: [(&str, bool); 3] = [
+            ("forged status=200 path=/pwned", false),
+            (overlong.as_str(), false),
+            // A uuid, which is what the dashboard's fetch interceptor sends.
+            ("6f1c2b7e-0f2a-4a1e-9d3c-2b8f5a0c7d11", true),
+        ];
+        for (header, echoed) in ids {
+            let app = axum::Router::new()
+                .route("/api/sessions", axum::routing::get(|| async { "[]" }))
+                .layer(axum::middleware::from_fn(http_request_span));
+            let req = axum::http::Request::builder()
+                .uri("/api/sessions")
+                .header("x-request-id", header)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            app.oneshot(req).await.unwrap();
+            let line = take_line();
+            assert_eq!(
+                line.contains(&format!("request_id={header}")),
+                echoed,
+                "{header:?}: got {line}"
+            );
+            assert!(line.contains("request_id="), "no request id at all: {line}");
         }
     }
 
