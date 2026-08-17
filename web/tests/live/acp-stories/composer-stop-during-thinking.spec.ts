@@ -58,7 +58,11 @@ base("Stop button cancels a thinking turn", async ({ page }, testInfo) => {
     await composer.fill("think about this");
     await composer.press("Enter");
 
-    const stopButton = page.getByRole("button", { name: "Stop" });
+    // Scoped to the composer: `name` matches by substring, so a bare
+    // `{ name: "Stop" }` also picks up the queued strip's "Stop the current
+    // turn and send this message now" button whenever a prompt is queued,
+    // and the two matches fail Playwright's strict mode.
+    const stopButton = page.getByTestId("composer-actions").getByRole("button", { name: "Stop" });
     await expect(stopButton).toBeVisible({ timeout: 10_000 });
     await stopButton.click();
 

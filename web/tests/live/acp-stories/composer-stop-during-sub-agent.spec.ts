@@ -68,7 +68,7 @@ base("Stop button cancels a turn during a sub-agent task", async ({ page }, test
     await composer.fill("delegate this");
     await composer.press("Enter");
 
-    const stopButton = page.getByRole("button", { name: "Stop" });
+    const stopButton = page.getByTestId("composer-actions").getByRole("button", { name: "Stop" });
     await expect(stopButton).toBeVisible({ timeout: 10_000 });
     await stopButton.click();
 
