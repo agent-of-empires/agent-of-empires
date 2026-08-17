@@ -30,6 +30,11 @@ pub struct ConfirmDialog {
     /// user can toggle with Space. The caller reads `dont_ask_again()`
     /// on Submit to persist the opt-out. `None` hides the checkbox.
     dont_ask_again: Option<bool>,
+    /// Extra character that confirms, alongside `y` and Enter-on-Yes. Set
+    /// for the delete confirm so the `d` that opened the dialog also
+    /// accepts it; left unset everywhere else so a stray keystroke can't
+    /// fire an unrelated destructive confirm.
+    confirm_char: Option<char>,
     yes_button_area: Rect,
     no_button_area: Rect,
     /// Which Yes/No button the mouse is over, for the hover highlight.
@@ -46,6 +51,7 @@ impl ConfirmDialog {
             selected: false,
             tone: Tone::Destructive,
             dont_ask_again: None,
+            confirm_char: None,
             yes_button_area: Rect::default(),
             no_button_area: Rect::default(),
             hover: HoverState::default(),
@@ -56,6 +62,15 @@ impl ConfirmDialog {
     /// destructive red. For confirmations that aren't about losing data.
     pub fn neutral(mut self) -> Self {
         self.tone = Tone::Neutral;
+        self
+    }
+
+    /// Also accept `c` (case-insensitively) as a confirm key, so a dialog
+    /// opened by a hotkey can be accepted by pressing that hotkey again.
+    /// Cancel keys still win: `Esc` / `n` cancel even when one of them is
+    /// passed here.
+    pub fn confirmed_by(mut self, c: char) -> Self {
+        self.confirm_char = Some(c);
         self
     }
 
@@ -109,6 +124,12 @@ impl ConfirmDialog {
         self.yes_button_area
     }
 
+    /// Whether `c` is the opt-in confirm key, ignoring ASCII case.
+    fn is_confirm_char(&self, c: char) -> bool {
+        self.confirm_char
+            .is_some_and(|k| k.eq_ignore_ascii_case(&c))
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) -> DialogResult<()> {
         match key.code {
             KeyCode::Esc | KeyCode::Char('n') | KeyCode::Char('N') => DialogResult::Cancel,
@@ -120,6 +141,7 @@ impl ConfirmDialog {
                 }
             }
             KeyCode::Char('y') | KeyCode::Char('Y') => DialogResult::Submit(()),
+            KeyCode::Char(c) if self.is_confirm_char(c) => DialogResult::Submit(()),
             KeyCode::Char(' ') if self.dont_ask_again.is_some() => {
                 self.dont_ask_again = Some(!self.dont_ask_again.unwrap_or(false));
                 DialogResult::Continue
@@ -381,6 +403,34 @@ mod tests {
         dialog.selected = true;
         dialog.handle_key(key(KeyCode::Char('l')));
         assert!(!dialog.selected);
+    }
+
+    /// `confirmed_by` opts a dialog into accepting the hotkey that opened
+    /// it, in either case, and only when it was asked for.
+    #[test]
+    fn confirmed_by_accepts_the_opening_hotkey() {
+        let mut opted_in =
+            ConfirmDialog::new("Confirm Delete", "Message", "trash_session").confirmed_by('d');
+        for code in [KeyCode::Char('d'), KeyCode::Char('D')] {
+            assert!(
+                matches!(opted_in.handle_key(key(code)), DialogResult::Submit(())),
+                "{code:?} should confirm"
+            );
+        }
+        // Cancel keys still win over an opt-in confirm char.
+        let mut cancel_wins =
+            ConfirmDialog::new("Confirm Delete", "Message", "trash_session").confirmed_by('n');
+        assert!(matches!(
+            cancel_wins.handle_key(key(KeyCode::Char('n'))),
+            DialogResult::Cancel
+        ));
+        // Without the opt-in, `d` is inert, so an unrelated confirm can't be
+        // fired by a stray keystroke.
+        let mut default_dialog = ConfirmDialog::new("Quit", "Quit?", "quit");
+        assert!(matches!(
+            default_dialog.handle_key(key(KeyCode::Char('d'))),
+            DialogResult::Continue
+        ));
     }
 
     #[test]

@@ -5520,21 +5520,25 @@ impl HomeView {
                 let delete_to_trash = session_cfg.delete_to_trash;
                 if delete_to_trash && !already_trashed {
                     let sid = session_id.clone();
-                    // When session.confirm_delete is on, guard the trash with a
-                    // confirmation dialog instead of trashing on the keystroke.
-                    // The accept path (dispatch_confirm_submit "trash_session")
-                    // runs the same trash_session_by_id as the instant path.
+                    // When session.confirm_delete is on (the default), guard the
+                    // trash with a confirmation dialog instead of trashing on the
+                    // keystroke. The delete key itself accepts the dialog, so the
+                    // deliberate gesture stays two taps of one key while a single
+                    // stray keystroke is harmless. The accept path
+                    // (dispatch_confirm_submit "trash_session") runs the same
+                    // trash_session_by_id as the instant path.
                     if session_cfg.confirm_delete {
+                        let delete_key = if self.strict_hotkeys { 'D' } else { 'd' };
                         let message = format!(
-                            "Move '{}' to the trash? It can be restored from the Trash section.",
+                            "Move '{}' to the trash? It can be restored from the Trash section.\n\
+                             Press {delete_key} again to confirm, Esc to cancel.",
                             inst.title
                         );
                         self.pending_trash_session = Some(sid);
-                        self.confirm_dialog = Some(ConfirmDialog::new(
-                            "Confirm Delete",
-                            &message,
-                            "trash_session",
-                        ));
+                        self.confirm_dialog = Some(
+                            ConfirmDialog::new("Confirm Delete", &message, "trash_session")
+                                .confirmed_by(delete_key),
+                        );
                         return;
                     }
                     self.trash_session_by_id(&sid);

@@ -1155,13 +1155,14 @@ pub struct SessionConfig {
     pub delete_to_trash: bool,
 
     /// Ask for confirmation before deleting a session with the TUI `d` key.
-    /// Off by default so the trash-first flow stays low-friction: `d` moves
-    /// the session straight to the trash. When on, `d` opens a confirmation
-    /// dialog first, guarding against a fumbled keystroke trashing the wrong
-    /// (possibly running) session. Only affects the TUI trash path; the web
-    /// delete dialog already confirms, and the permanent-delete/force-remove
-    /// paths are gated by their own dialogs regardless. See #2583.
-    #[serde(default)]
+    /// On by default: `d` opens a confirmation dialog that a second `d`
+    /// accepts and `Esc` dismisses, so typing into the sidebar while a
+    /// session is selected can no longer trash it outright. Turn it off to
+    /// get the historical one-keystroke trash back. Only affects the TUI
+    /// trash path; the web delete dialog already confirms, and the
+    /// permanent-delete/force-remove paths are gated by their own dialogs
+    /// regardless. See #2583, #3364.
+    #[serde(default = "default_true")]
     #[setting(label = "Confirm Before Delete", widget = "toggle")]
     pub confirm_delete: bool,
 
@@ -1590,7 +1591,7 @@ impl Default for SessionConfig {
             strict_hotkeys: false,
             snooze_duration_minutes: 30,
             delete_to_trash: true,
-            confirm_delete: false,
+            confirm_delete: true,
             trash_retention_days: default_trash_retention_days(),
             auto_stop_idle_secs: default_auto_stop_idle_secs(),
             prevent_sleep_when_active: false,
@@ -4901,7 +4902,7 @@ volume_ignores_strategy = "named"
         // call below. `update_config` loads fresh internally, so this must
         // survive.
         let mut external = Config::load().unwrap();
-        external.session.confirm_delete = true;
+        external.session.confirm_delete = false;
         let table = toml::Table::try_from(&external).unwrap();
         super::super::atomic_write(
             &config_path().unwrap(),
@@ -4920,7 +4921,7 @@ volume_ignores_strategy = "named"
             "the field update_config touched must be applied"
         );
         assert!(
-            final_config.session.confirm_delete,
+            !final_config.session.confirm_delete,
             "an external process's concurrent edit to an unrelated field must survive"
         );
     }
