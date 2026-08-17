@@ -99,7 +99,6 @@ Alternative runtimes that share the same code paths:
 
 Each session reports `Running`, `Waiting`, `Idle`, or `Error` based on tmux pane content and agent-specific heuristics. The TUI, web dashboard, and structured view all show the same status column.
 
-
 ### Auto-stop idle sessions
 
 Set `session.auto_stop_idle_secs` and a plain tmux session that sits `Idle` past the threshold is stopped automatically, leaving a restartable `Stopped` row. Off by default; never stops an attached or recently used session; runs from both the TUI and `aoe serve`. Agent workers use the separate `acp.auto_stop_idle_secs` knob.
