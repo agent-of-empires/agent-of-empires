@@ -435,4 +435,34 @@ fn test_empty_project_path_ignores_the_launch_directory() {
         loaded.unwrap().is_none(),
         "an empty project path must not pick up the launch directory's repo config"
     );
+
+    // The real callers reach the loader through `repo_config_source_path`, and
+    // its `.git` probe is relative too. From a linked worktree (whose `.git` is
+    // a file) it resolves to that worktree's main repo, which would hand the
+    // loader a non-empty path and reinstate the repo layer.
+    let main = setup_repo_config("[session]\ndefault_tool = \"codex\"\n");
+    fs::create_dir_all(main.path().join(".git/worktrees/wt")).unwrap();
+    let worktree = TempDir::new().unwrap();
+    fs::write(
+        worktree.path().join(".git"),
+        format!("gitdir: {}/.git/worktrees/wt\n", main.path().display()),
+    )
+    .unwrap();
+
+    let original_dir = std::env::current_dir().unwrap();
+    std::env::set_current_dir(worktree.path()).unwrap();
+    let source =
+        agent_of_empires::session::repo_config::repo_config_source_path(std::path::Path::new(""));
+    let loaded = agent_of_empires::session::repo_config::load_repo_config(&source);
+    std::env::set_current_dir(original_dir).unwrap();
+
+    assert_eq!(
+        source,
+        std::path::PathBuf::new(),
+        "an empty project path must not resolve to the launch worktree's main repo"
+    );
+    assert!(
+        loaded.unwrap().is_none(),
+        "an empty project path must carry no repo layer from a worktree launch dir"
+    );
 }

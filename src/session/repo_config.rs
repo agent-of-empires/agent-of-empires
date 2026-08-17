@@ -529,6 +529,15 @@ pub fn profile_to_repo_config(profile: &ProfileConfig) -> RepoConfig {
 /// matching the guard in `compute_volume_paths` (avoids `Repository::discover`
 /// walking up to an unrelated ancestor repo, e.g. a dotfile-managed `$HOME`).
 pub fn repo_config_source_path(project_path: &Path) -> PathBuf {
+    // An empty path means "no project repo" (scratch sessions, see
+    // `super::builder::build_instance`). Every probe below is relative to it,
+    // so it would interrogate the *launch directory* instead: a cwd whose
+    // `.git` is a file (a linked worktree) resolves to that worktree's main
+    // repo and hands `load_repo_config` a real path, putting back the repo
+    // layer that the empty path exists to suppress.
+    if project_path.as_os_str().is_empty() {
+        return PathBuf::new();
+    }
     if project_path.join(".git").exists() {
         if let Ok(main_repo) = crate::git::GitWorktree::find_main_repo(project_path) {
             return main_repo;
