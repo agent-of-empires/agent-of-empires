@@ -1808,7 +1808,7 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
     // Spinner: live loader, footer (last 3 non-empty lines) only.
     let footer = tail_lines(&non_empty_lines, 3);
     let footer_lower = footer.join("\n").to_lowercase();
-    if has_any_spinner(&footer)
+    if has_any_spinner(footer)
         && (footer_lower.contains("working") || footer_lower.contains("⟦esc⟧"))
     {
         let pos = footer
@@ -1855,12 +1855,12 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
     }
 
     // Pinned error banner anchor and terminal retry lines: window 6.
-    if let Some(pos) = lowest_matching_line(&window6, |l| {
+    if let Some(pos) = lowest_matching_line(window6, |l| {
         l.to_lowercase().contains(OMP_BANNER_DISMISSAL_ANCHOR)
     }) {
         consider(pos, OmpSignal::Anchor);
     }
-    if let Some(pos) = lowest_matching_line(&window6, |l| {
+    if let Some(pos) = lowest_matching_line(window6, |l| {
         let l = l.to_lowercase();
         OMP_TERMINAL_RETRY_MARKERS
             .iter()
@@ -1876,7 +1876,7 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
         && approval_footer.contains("approve")
         && approval_footer.contains("deny")
     {
-        if let Some(pos) = lowest_matching_line(&window8, |l| {
+        if let Some(pos) = lowest_matching_line(window8, |l| {
             let l = l.to_lowercase();
             l.contains("allow tool:") || l.contains("approve") || l.contains("deny")
         }) {
@@ -1886,7 +1886,7 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
 
     // Sub-agent retry labels and rule-repair progress: window 12.
     let window12 = tail_lines(&non_empty_lines, 12);
-    if let Some(pos) = lowest_matching_line(&window12, |l| {
+    if let Some(pos) = lowest_matching_line(window12, |l| {
         let l = l.to_lowercase();
         label_re().is_match(&l) || attempt_re().is_match(&l)
     }) {
@@ -1925,9 +1925,9 @@ enum OmpSignal {
     Labels,
 }
 
-/// Last `n` non-empty lines in pane order (top-down).
-fn tail_lines<'a>(lines: &[&'a str], n: usize) -> Vec<&'a str> {
-    lines.iter().rev().take(n).rev().copied().collect()
+/// Last `n` non-empty lines in pane order (top-down), without allocating.
+fn tail_lines<'slice, 'line>(lines: &'slice [&'line str], n: usize) -> &'slice [&'line str] {
+    &lines[lines.len().saturating_sub(n)..]
 }
 
 /// Position (1 = bottom) of the lowest line matching `matches`, within

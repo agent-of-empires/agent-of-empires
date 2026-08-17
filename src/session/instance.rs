@@ -7024,14 +7024,11 @@ fn summarize_error_from_pane(pane_content: &str) -> String {
             .iter()
             .any(|marker| lower.contains(marker))
     });
-    let anchor_is_lowest = match (anchor_idx, terminal_idx) {
-        (Some(a), Some(t)) => a <= t,
-        (Some(_), None) => true,
-        _ => false,
-    };
-    if anchor_is_lowest {
+    if let Some(anchor_idx) = anchor_idx
+        .filter(|anchor_idx| terminal_idx.is_none_or(|terminal_idx| *anchor_idx <= terminal_idx))
+    {
         let mut msg_lines: Vec<&str> = Vec::new();
-        for line in tail.iter().skip(anchor_idx.unwrap() + 1) {
+        for line in tail.iter().skip(anchor_idx + 1) {
             // Border line: the banner's DynamicBorder (U+2500 by default,
             // `-` under omp's ascii theme).
             let trimmed = line.trim();
