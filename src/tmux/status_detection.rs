@@ -504,8 +504,15 @@ pub(crate) fn claude_pane_is_ambiguous_typed_prompt(raw_content: &str) -> bool {
 /// menu. Requiring both keeps an assistant-authored numbered list from being
 /// mistaken for a prompt. `recent_lower` is the lowercased join of `recent`.
 fn claude_has_approval_prompt(recent: &[&str], recent_lower: &str) -> bool {
+    // The folder-trust prompt phrases its question without either stock
+    // opener, so a first launch in a new directory read as Idle and never
+    // reached the waiting count. Only the question is matched: its option
+    // label ("yes, i trust this folder", which the Antigravity detector below
+    // does carry) sits on a numbered-choice line, so matching that instead
+    // would let one quoted line satisfy both halves of the guard.
     let has_question = recent_lower.contains("do you want to")
-        || recent_lower.contains("would you like to proceed");
+        || recent_lower.contains("would you like to proceed")
+        || recent_lower.contains("is this a project you created or one you trust");
     has_question
         && recent
             .iter()
@@ -2610,6 +2617,50 @@ enter to select · esc to cancel";
         // turn's live spinner, so the fresh idle must read as Running.
         let pane = "✶ Working… (4s · ↓ 88 tokens)\n  esc to interrupt";
         assert_eq!(reconcile_claude_idle_hook_status(pane), Status::Running);
+    }
+
+    /// Verbatim `tmux capture-pane -p` of a claude pane parked at the
+    /// folder-trust prompt, 2026-08-15. `aoe status` read `0 waiting` while
+    /// this was on screen.
+    const CLAUDE_FOLDER_TRUST_PROMPT: &str = "\
+ Accessing workspace:
+ /tmp/scratch/exp
+ Quick safety check: Is this a project you created or one you trust? (Like your
+ own code, a well-known open source project, or work from your team). If not,
+ take a moment to review what's in this folder first.
+ Claude Code'll be able to read, edit, and execute files here.
+ Security guide
+ \u{276f} 1. Yes, I trust this folder
+   2. No, exit
+";
+
+    /// The trust prompt's option label is menu text, so matching it as the
+    /// question would collapse the two-signal guard: an assistant quoting the
+    /// option while working renders both signals on one line.
+    const CLAUDE_ASSISTANT_QUOTING_THE_TRUST_OPTION: &str = "\
+ I found the folder-trust handling in src/tmux/status_detection.rs. The two
+ menu options Claude renders are:
+   1. Yes, I trust this folder
+   2. No, exit
+ The detector matches those against the numbered-choice helper.
+ \u{2726} Working... (12s \u{b7} \u{2193} 431 tokens)
+   esc to interrupt
+";
+
+    #[test]
+    fn claude_assistant_quoting_the_trust_option_is_not_waiting() {
+        assert_eq!(
+            detect_claude_status(CLAUDE_ASSISTANT_QUOTING_THE_TRUST_OPTION),
+            Status::Running
+        );
+    }
+
+    #[test]
+    fn claude_folder_trust_prompt_is_waiting() {
+        assert_eq!(
+            detect_claude_status(CLAUDE_FOLDER_TRUST_PROMPT),
+            Status::Waiting
+        );
     }
 
     #[test]
