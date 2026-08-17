@@ -138,11 +138,12 @@ aoe status -q   # just the waiting count (for scripting)
   "tool": "claude",
   "command": "claude",
   "status": "running",
+  "state": "live",
   "profile": "default"
 }
 ```
 
-`parent_session_id` is included only for sub-sessions.
+`parent_session_id` is included only for sub-sessions. `state` is `live`, `archived`, or `trashed`, with `trashed_at` / `archived_at` present only in those states, the same vocabulary `aoe list --json` uses; `status` is the pane's live status and does not carry it, since an archived session can still be running.
 
 **JSON shape** (`aoe status --json`):
 ```json

@@ -141,9 +141,12 @@ aoe status -q   # just the waiting count (for scripting)
   "tool": "claude",
   "command": "claude",
   "status": "running",
+  "state": "live",
   "profile": "default"
 }
 ```
+
+`state` is `live`, `archived`, or `trashed`, with `trashed_at` / `archived_at` present only in those states, the same vocabulary `aoe list --json` uses; `status` is the pane's live status and does not carry it, since an archived session can still be running.
 
 **JSON output shape** (`aoe status --json`):
 ```json

@@ -2074,3 +2074,96 @@ fn test_cli_list_state_filter_and_json_shape() {
     assert_eq!(trashed[0]["state"], "trashed");
     assert!(trashed[0]["trashed_at"].is_string());
 }
+
+/// Companion to `test_cli_list_state_filter_and_json_shape` for the lookup
+/// path: a consumer that already holds the id should not have to fall back to
+/// a full `aoe list --json` to learn whether that session is still around.
+#[test]
+#[parallel]
+fn test_cli_session_show_json_carries_state() {
+    let h = TuiTestHarness::new("cli_show_state");
+    let project = h.project_path();
+
+    let add = h.run_cli(&["add", project.to_str().unwrap(), "-t", "Show Probe"]);
+    assert!(
+        add.status.success(),
+        "aoe add failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    let live: serde_json::Value = serde_json::from_slice(
+        &h.run_cli(&["session", "show", "Show Probe", "--json"])
+            .stdout,
+    )
+    .expect("session show --json must emit JSON");
+    assert_eq!(live["state"], "live");
+    assert!(live.get("trashed_at").is_none());
+    assert!(live.get("archived_at").is_none());
+
+    let rm = h.run_cli(&["rm", "Show Probe"]);
+    assert!(
+        rm.status.success(),
+        "aoe rm failed: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+
+    let trashed: serde_json::Value = serde_json::from_slice(
+        &h.run_cli(&["session", "show", "Show Probe", "--json"])
+            .stdout,
+    )
+    .expect("session show --json must emit JSON for a trashed row");
+    assert_eq!(trashed["state"], "trashed");
+    assert!(trashed["trashed_at"].is_string());
+}
+
+/// The archived half of the same contract, and the precedence between the two
+/// states: `trash()` deliberately keeps `archived_at`, so a row that was
+/// archived first must still report `trashed`.
+#[test]
+#[parallel]
+fn test_cli_session_show_json_reports_archived_and_precedence() {
+    let h = TuiTestHarness::new("cli_show_archived");
+    let project = h.project_path();
+
+    let add = h.run_cli(&["add", project.to_str().unwrap(), "-t", "Archive Probe"]);
+    assert!(
+        add.status.success(),
+        "aoe add failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    let archive = h.run_cli(&["session", "archive", "Archive Probe"]);
+    assert!(
+        archive.status.success(),
+        "aoe session archive failed: {}",
+        String::from_utf8_lossy(&archive.stderr)
+    );
+
+    let archived: serde_json::Value = serde_json::from_slice(
+        &h.run_cli(&["session", "show", "Archive Probe", "--json"])
+            .stdout,
+    )
+    .expect("session show --json must emit JSON for an archived row");
+    assert_eq!(archived["state"], "archived");
+    assert!(archived["archived_at"].is_string());
+    assert!(archived.get("trashed_at").is_none());
+
+    let rm = h.run_cli(&["rm", "Archive Probe"]);
+    assert!(
+        rm.status.success(),
+        "aoe rm failed: {}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+
+    let both: serde_json::Value = serde_json::from_slice(
+        &h.run_cli(&["session", "show", "Archive Probe", "--json"])
+            .stdout,
+    )
+    .expect("session show --json must emit JSON for an archived, trashed row");
+    assert_eq!(
+        both["state"], "trashed",
+        "trashed outranks archived, and archived_at survives the trash"
+    );
+    assert!(both["trashed_at"].is_string());
+    assert!(both["archived_at"].is_string());
+}
