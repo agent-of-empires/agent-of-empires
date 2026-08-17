@@ -2306,6 +2306,25 @@ impl AcpClient {
         (client, event_tx)
     }
 
+    /// Like `fake_for_test`, but with a live `cmd_tx` whose consumer is
+    /// already gone, reproducing a worker between its connection task
+    /// ending (force-stop teardown) and the respawn installing a fresh
+    /// client: every `ClientCmd` send fails immediately with
+    /// `AgentExited`. See #3401.
+    #[cfg(test)]
+    pub fn fake_for_test_dead_connection(session_id: AcpSessionId) -> Self {
+        let (_event_tx, event_rx) = mpsc::channel(64);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<ClientCmd>(16);
+        drop(cmd_rx);
+        Self {
+            session_id,
+            inbound: Some(event_rx),
+            cmd_tx: Some(cmd_tx),
+            pending_responders: Arc::new(Mutex::new(HashMap::new())),
+            _child: None,
+        }
+    }
+
     /// Like `fake_for_test`, but wires a live `cmd_tx` whose consumer
     /// records whether a `session/delete` RPC was issued. The returned
     /// `AtomicBool` flips to `true` the moment a

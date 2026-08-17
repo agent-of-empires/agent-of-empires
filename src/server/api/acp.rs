@@ -13,6 +13,7 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::acp::acp_client::AcpError;
 use crate::acp::approvals::Nonce;
 use crate::acp::elicitations::ElicitationResolution;
 use crate::acp::event_store::AttachmentBlob;
@@ -307,6 +308,21 @@ fn supervisor_error_response(context: &str, err: &SupervisorError) -> axum::resp
         SupervisorError::CapacityFull { .. } => {
             (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()
         }
+        // 503, not 500: the worker's connection task has ended but its
+        // handle is still in the map, so the command send fails
+        // instantly. That is the teardown window a user-initiated force
+        // stop opens (kill the process group, respawn with
+        // `session/load`), and the worker is on its way back, so the
+        // request lost a race with a restart the user asked for rather
+        // than hitting a fault. The `worker_not_ready` prefix is the
+        // marker the structured view already treats as transient: it
+        // re-queues and re-fires instead of retiring the prompt and
+        // banner-ing the user. See #3401.
+        SupervisorError::Acp(AcpError::AgentExited | AcpError::NotRunning) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("worker_not_ready: {context}: {err}"),
+        )
+            .into_response(),
         SupervisorError::Acp(_)
         | SupervisorError::InvalidAgentCommand(_)
         | SupervisorError::SpawnCancelled(_) => (
@@ -2733,6 +2749,54 @@ mod tests {
         DateTime::parse_from_rfc3339(raw)
             .unwrap()
             .with_timezone(&Utc)
+    }
+
+    /// #3401: pressing Stop tears the worker down and respawns it, and a
+    /// request that lands in that window fails its command send with
+    /// `AgentExited`. Answering the user's own stop with a 500 reported a
+    /// fault for a recovery that worked, so the window maps to the
+    /// retryable `worker_not_ready` contract the structured view already
+    /// re-queues on. A real protocol fault still has to reach 500.
+    #[tokio::test]
+    async fn agent_exited_maps_to_the_retryable_status_not_a_fault() {
+        let cases = [
+            (
+                SupervisorError::Acp(AcpError::AgentExited),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                SupervisorError::Acp(AcpError::NotRunning),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                SupervisorError::Acp(AcpError::Protocol("bad frame".into())),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                SupervisorError::UnknownSession("s-1".into()),
+                StatusCode::NOT_FOUND,
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(
+                supervisor_error_response("prompt failed", &err).status(),
+                expected,
+                "{err}"
+            );
+        }
+
+        // The prefix is load-bearing: the composer keys its re-queue (and
+        // its banner suppression) on a 503 body that starts with it.
+        let body = supervisor_error_response(
+            "prompt failed",
+            &SupervisorError::Acp(AcpError::AgentExited),
+        )
+        .into_body();
+        let bytes = axum::body::to_bytes(body, 4096).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&bytes).starts_with("worker_not_ready"),
+            "body must carry the transient marker, got {bytes:?}"
+        );
     }
 
     /// #3241: the switch-agent modal must not offer a target the policy refuses,

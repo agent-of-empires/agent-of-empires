@@ -2529,10 +2529,21 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// Cancel the current turn for a running structured view worker. Best-effort:
     /// returns Ok if the worker exists even when no turn is in flight.
+    ///
+    /// A worker whose connection task has already ended counts as
+    /// cancelled rather than failed. That is the window a force stop
+    /// opens: the task exits, its command receiver drops, and the (now
+    /// dead) `WorkerHandle` stays in the map until the respawn swaps it,
+    /// so a cancel arriving in between fails to send instantly. There is
+    /// nothing left to cancel by then, and the resumed worker starts
+    /// idle, so answering the user's stop with an error was reporting a
+    /// fault for an outcome they got. See #3401.
     pub async fn cancel_prompt(&self, session_id: &str) -> Result<(), SupervisorError> {
         let client = self.ready_client(session_id).await?;
-        client.cancel_prompt().await?;
-        Ok(())
+        match client.cancel_prompt().await {
+            Ok(()) | Err(AcpError::AgentExited) => Ok(()),
+            Err(e) => Err(SupervisorError::Acp(e)),
+        }
     }
 
     /// User-initiated "Force stop". Two failure modes to cover:
@@ -4375,6 +4386,43 @@ cursor-acp-bridge = "agent acp"
         assert!(
             matches!(decision, RestartDecision::UserStopped),
             "expected UserStopped when registry entry is absent, got {decision:?}"
+        );
+    }
+
+    /// #3401: a force stop ends the connection task and leaves the dead
+    /// `WorkerHandle` in the map until the respawn swaps it, so requests
+    /// landing in that window fail their command send instantly. The
+    /// user's own stop must not read back as a failure, and a prompt
+    /// that raced it has to stay distinguishable as the transient the
+    /// REST layer answers with a retryable status.
+    #[tokio::test]
+    async fn requests_racing_a_force_stop_teardown_are_not_faults() {
+        let sup = Supervisor::new(VecSink::new());
+        {
+            let mut workers = sup.workers.lock().await;
+            workers.insert(
+                "s-3401".into(),
+                WorkerHandle {
+                    client: Arc::new(AcpClient::fake_for_test_dead_connection(AcpSessionId(
+                        "acp-3401".into(),
+                    ))),
+                    drain_task: tokio::spawn(async {}),
+                    restart_history: vec![],
+                    kind: WorkerKind::Stdio,
+                },
+            );
+        }
+
+        assert!(
+            sup.cancel_prompt("s-3401").await.is_ok(),
+            "the turn a cancel would have ended is already over"
+        );
+        assert!(
+            matches!(
+                sup.send_prompt("s-3401", "hi", &[]).await,
+                Err(SupervisorError::Acp(AcpError::AgentExited))
+            ),
+            "a prompt genuinely did not land, and the reason must stay typed"
         );
     }
 
