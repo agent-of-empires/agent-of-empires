@@ -32,6 +32,18 @@ use crate::server::AppState;
 /// bounding what an undrained queue can hold on disk.
 const MAX_QUEUED_ATTACHMENT_BYTES_PER_SESSION: u64 = 64 * 1024 * 1024;
 
+/// Cap on queue depth per session. The queue lives on the `Instance`, and every
+/// mutation rewrites the whole profile session file, so depth costs disk I/O on
+/// each enqueue rather than just memory. Well above any plausible run of
+/// follow-ups a person lines up behind one turn.
+const MAX_QUEUED_PROMPTS_PER_SESSION: usize = 100;
+
+/// Cap on a single queued prompt's text. Matches nothing upstream because
+/// `/acp/prompt` streams straight to the agent, while this text is persisted to
+/// the session file and rewritten on every subsequent queue mutation. 256 KiB
+/// is far past a pasted stack trace and still bounds that rewrite.
+const MAX_QUEUED_TEXT_BYTES: usize = 256 * 1024;
+
 #[derive(Debug, Deserialize)]
 pub struct EnqueueRequest {
     /// Client-minted stable id, so an optimistic UI row reconciles against the
@@ -81,6 +93,28 @@ pub async fn queue_enqueue(
     if req.text.trim().is_empty() && req.attachments.is_empty() {
         return (StatusCode::BAD_REQUEST, "empty prompt").into_response();
     }
+    if req.text.len() > MAX_QUEUED_TEXT_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "queued prompt text exceeds the {} KiB limit",
+                MAX_QUEUED_TEXT_BYTES / 1024
+            ),
+        )
+            .into_response();
+    }
+    // Depth cap. Re-enqueuing an existing id replaces that row rather than
+    // adding one, so it must not count against a full queue.
+    {
+        let queue = state.session_service.queued_prompts_snapshot(&id).await;
+        if queue.len() >= MAX_QUEUED_PROMPTS_PER_SESSION && !queue.iter().any(|q| q.id == req.id) {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                format!("queue is full ({MAX_QUEUED_PROMPTS_PER_SESSION} prompts)"),
+            )
+                .into_response();
+        }
+    }
 
     // Decode + validate + capability-gate the attachments exactly as the live
     // prompt path does (size / MIME / count caps, image magic-byte sniff).
@@ -126,15 +160,18 @@ pub async fn queue_enqueue(
             size: b.data.len() as u64,
         })
         .collect();
-    if !req.attachments.is_empty() {
+    // Unconditional, not gated on `!req.attachments.is_empty()`: `enqueue_prompt`
+    // replaces the row's refs with whatever came in, so a re-enqueue that drops
+    // the attachments would otherwise orphan the prior blobs, holding bytes
+    // against the per-session cap that nothing can ever deliver or reclaim
+    // before the 24h sweep.
+    state
+        .acp_event_store
+        .delete_pending_attachments_for_ref(&id, &req.id);
+    for blob in &blobs {
         state
             .acp_event_store
-            .delete_pending_attachments_for_ref(&id, &req.id);
-        for blob in &blobs {
-            state
-                .acp_event_store
-                .record_pending_attachment(&id, &req.id, blob);
-        }
+            .record_pending_attachment(&id, &req.id, blob);
     }
 
     let created_at = req
@@ -185,6 +222,18 @@ pub async fn queue_edit(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
+    // Same bound as enqueue: an edit is another write of this text into the
+    // session file, so it cannot be a way around the cap.
+    if req.text.len() > MAX_QUEUED_TEXT_BYTES {
+        return (
+            StatusCode::PAYLOAD_TOO_LARGE,
+            format!(
+                "queued prompt text exceeds the {} KiB limit",
+                MAX_QUEUED_TEXT_BYTES / 1024
+            ),
+        )
+            .into_response();
+    }
     match state
         .session_service
         .edit_queued_prompt(&id, prompt_id, req.text)
@@ -195,8 +244,8 @@ pub async fn queue_edit(
             (StatusCode::NOT_FOUND, "queued prompt not found").into_response()
         }
         // Same rule as enqueue: a row with neither text nor attachments cannot
-        // be delivered, and the drain would retry it forever without retiring
-        // it, wedging the whole queue behind it.
+        // be delivered. The drain retires such a row rather than wedging on it
+        // now, but silently discarding what the user typed is worse than a 400.
         EditQueuedOutcome::WouldEmpty => (StatusCode::BAD_REQUEST, "empty prompt").into_response(),
     }
 }

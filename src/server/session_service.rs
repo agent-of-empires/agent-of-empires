@@ -924,12 +924,23 @@ impl SessionService {
 
     /// Remove a queued prompt by id. Returns `true` if a row was removed. Also
     /// drops any attachment bytes buffered for that prompt so they don't leak.
+    ///
+    /// Takes the per-instance lock the drain holds across its whole
+    /// snapshot -> send -> retire, so a removal cannot land in the middle of a
+    /// delivery. Without it the web's "Send now" (which removes the row, then
+    /// POSTs the same text itself) could tap inside the drain window: the drain
+    /// already holds its own copy of the batch, so both would deliver and the
+    /// agent would see the prompt twice. Serialized, the removal either beats
+    /// the drain's snapshot (the drain never sees the row) or follows its
+    /// retire (the removal reports `false`, and the caller sends nothing).
     #[cfg(feature = "serve")]
     pub(crate) async fn remove_queued_prompt(
         self: &Arc<Self>,
         id: &str,
         prompt_id: String,
     ) -> bool {
+        let inst_lock = self.instance_lock(id).await;
+        let _serialized = inst_lock.lock().await;
         let prompt_id_cleanup = prompt_id.clone();
         let removed = self
             .mutate_instance_persisted(id, move |inst| {
@@ -995,7 +1006,7 @@ impl SessionService {
     /// a live worker). The `/clear`-boundary split matches the client
     /// (`useAcpSession`): a clear-command row fires as its own turn; a leading
     /// run of non-clear rows combines into one with blank-line separators.
-    /// Attachments are a later increment; text-only rows drain here.
+    /// A batch's buffered attachment bytes are reloaded and forwarded with it.
     #[cfg(feature = "serve")]
     pub(crate) async fn drain_queued_prompts_once(self: &Arc<Self>, id: &str) {
         {
@@ -1614,6 +1625,83 @@ mod tests {
                 .expect("pending_drains mutex poisoned")
                 .is_empty(),
             "drain must release its claim on the no-op paths"
+        );
+    }
+
+    /// A queued prompt whose buffered attachment bytes have gone (the 24h
+    /// `PENDING_ATTACHMENT_TTL` sweep reclaims them; the row is not swept with
+    /// them) has neither text nor blobs, so the drain can never deliver it.
+    ///
+    /// It must be retired anyway. Leaving it queued wedged the session: the
+    /// drain retried the same head-of-queue batch every reconciler tick,
+    /// nothing behind it drained, and `reap_idle_workers` skips a session
+    /// holding a queue, so the agent subprocess was never reaped.
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn an_undeliverable_queue_row_is_retired_instead_of_wedging_the_queue() {
+        let mut inst = Instance::new("queue", "/tmp/aoe-queue-husk");
+        inst.id = "sess-husk".to_string();
+        inst.view = crate::session::View::Structured;
+        inst.status = crate::session::Status::Idle;
+        let service = crate::server::test_support::build_test_app_state(vec![inst])
+            .session_service
+            .clone();
+
+        // An attachment-only prompt: empty text, refs but no buffered bytes,
+        // which is exactly the post-sweep state.
+        service
+            .enqueue_prompt(
+                "sess-husk",
+                "husk".into(),
+                String::new(),
+                vec![crate::acp::state::PromptAttachmentRef {
+                    id: "att-1".into(),
+                    kind: crate::acp::state::PromptAttachmentKind::Image,
+                    mime_type: "image/png".into(),
+                    name: Some("shot.png".into()),
+                    size: 9,
+                }],
+                None,
+                "t0".into(),
+            )
+            .await
+            .expect("session exists");
+        assert_eq!(service.queued_prompts_snapshot("sess-husk").await.len(), 1);
+
+        // The husk has to be the whole batch to wedge: a deliverable row in the
+        // same batch supplies the text, and the batch then sends and retires
+        // normally. Alone (or alone ahead of a `/clear` boundary) it is the
+        // head the drain retries forever.
+        service.drain_queued_prompts_once("sess-husk").await;
+        assert!(
+            service
+                .queued_prompts_snapshot("sess-husk")
+                .await
+                .is_empty(),
+            "the husk is retired rather than retried forever"
+        );
+
+        // And the queue is genuinely usable again, not just empty: a fresh
+        // prompt queues and is not blocked behind a ghost.
+        service
+            .enqueue_prompt(
+                "sess-husk",
+                "next".into(),
+                "still deliverable".into(),
+                vec![],
+                None,
+                "t1".into(),
+            )
+            .await
+            .expect("session exists");
+        assert_eq!(
+            service
+                .queued_prompts_snapshot("sess-husk")
+                .await
+                .iter()
+                .map(|q| q.id.clone())
+                .collect::<Vec<_>>(),
+            ["next"]
         );
     }
 

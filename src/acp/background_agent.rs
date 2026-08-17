@@ -49,6 +49,17 @@ const STALL_AFTER: Duration = Duration::from_secs(90);
 const ABORT_AFTER: Duration = Duration::from_secs(300);
 /// Give the transcript file this long to appear after launch.
 const WAIT_FILE_FOR: Duration = Duration::from_secs(30);
+/// Bound on a single `docker`/`podman exec` used to read the transcript.
+///
+/// Both reads are awaited outside the tailer's `tokio::select!`, so a wedged
+/// container runtime would block the loop before it could observe
+/// `event_tx.closed()` or its own idle timeout, holding the task's
+/// `ActiveGuard` (and therefore the off-protocol work grace) indefinitely.
+/// Paired with `kill_on_drop`, so a timed-out exec is reaped rather than left
+/// behind. Comfortably above a healthy exec while still well under
+/// `POLL_INTERVAL * a few`, so a slow runtime degrades to fewer reads rather
+/// than a stuck tailer.
+const CONTAINER_EXEC_TIMEOUT: Duration = Duration::from_secs(10);
 /// Cap on the assistant-text preview carried in progress/result.
 const TEXT_PREVIEW_CHARS: usize = 240;
 
@@ -86,15 +97,16 @@ impl TranscriptSource {
         match self {
             TranscriptSource::Host => tokio::fs::metadata(path).await.is_ok(),
             TranscriptSource::Container { runtime, container } => {
-                tokio::process::Command::new(runtime)
-                    .args(["exec", container, "test", "-e", path])
+                let mut cmd = tokio::process::Command::new(runtime);
+                cmd.args(["exec", container, "test", "-e", path])
                     .stdin(std::process::Stdio::null())
                     .stdout(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
-                    .status()
-                    .await
-                    .map(|s| s.success())
-                    .unwrap_or(false)
+                    .kill_on_drop(true);
+                matches!(
+                    tokio::time::timeout(CONTAINER_EXEC_TIMEOUT, cmd.status()).await,
+                    Ok(Ok(s)) if s.success()
+                )
             }
         }
     }
@@ -123,14 +135,13 @@ impl TranscriptSource {
                 // EOF, so a 0-based `offset` maps to `+(offset + 1)`. On the
                 // first read (offset 0) this is `+1`, i.e. the whole file.
                 let start = format!("+{}", offset.saturating_add(1));
-                let output = tokio::process::Command::new(runtime)
-                    .args(["exec", container, "tail", "-c", &start, path])
+                let mut cmd = tokio::process::Command::new(runtime);
+                cmd.args(["exec", container, "tail", "-c", &start, path])
                     .stdin(std::process::Stdio::null())
                     .stderr(std::process::Stdio::null())
-                    .output()
-                    .await;
-                match output {
-                    Ok(out) if out.status.success() => out.stdout,
+                    .kill_on_drop(true);
+                match tokio::time::timeout(CONTAINER_EXEC_TIMEOUT, cmd.output()).await {
+                    Ok(Ok(out)) if out.status.success() => out.stdout,
                     _ => Vec::new(),
                 }
             }

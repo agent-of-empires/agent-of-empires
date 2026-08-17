@@ -34,7 +34,7 @@ Implemented:
   removed (the daemon drains now). A one-time migration on first connect pushes
   any localStorage-restored rows to the server.
 
-Still open: the `send-now` endpoint (G3) — today "Send now" sends immediately
+Still open: the `send-now` endpoint (G3). Today "Send now" sends immediately
 when the agent is free and otherwise interrupts the turn so the server drain
 fires; a dedicated endpoint would let it force-send during a non-steerable turn
 without a client round-trip. Real-time cross-device queue updates (a WS event on

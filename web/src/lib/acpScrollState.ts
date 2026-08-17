@@ -28,6 +28,11 @@ export function loadScrollState(sessionId: string): AcpScrollState | null {
   try {
     const parsed = JSON.parse(raw) as Partial<AcpScrollState>;
     if (typeof parsed.stuck !== "boolean" || typeof parsed.top !== "number") return null;
+    // `typeof x === "number"` still admits NaN, Infinity, and negatives, any of
+    // which would be handed straight to `scrollTop` on restore. Storage is
+    // shared-origin and survives across versions, so treat a nonsensical offset
+    // as no saved position rather than restoring to it.
+    if (!Number.isFinite(parsed.top) || parsed.top < 0) return null;
     return { stuck: parsed.stuck, top: parsed.top };
   } catch {
     return null;

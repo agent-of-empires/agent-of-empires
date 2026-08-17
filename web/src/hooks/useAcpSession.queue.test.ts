@@ -223,8 +223,14 @@ describe("useAcpSession server-queue integration", () => {
             return new Response(JSON.stringify(row), { status: 200 });
           }
           if (method === "DELETE") {
-            if (queueItem) serverQueue.delete(decodeURIComponent(queueItem[1]!));
-            else serverQueue.clear();
+            if (queueItem) {
+              // 404 on a row that is already gone, like the real handler: that
+              // is how the client learns the drain claimed it.
+              const rid = decodeURIComponent(queueItem[1]!);
+              if (!serverQueue.delete(rid)) return new Response("queued prompt not found", { status: 404 });
+              return new Response(null, { status: 204 });
+            }
+            serverQueue.clear();
             return new Response(null, { status: 204 });
           }
           if (method === "PATCH") return new Response(null, { status: 204 });
@@ -334,5 +340,77 @@ describe("useAcpSession server-queue integration", () => {
     // GET /queue ran on connect and hydrated the row.
     expect(queueCalls("/queue").some((c) => c.method === "GET")).toBe(true);
     expect(result.current.state.queuedPrompts.map((q) => q.text)).toEqual(["migrated"]);
+  });
+
+  // Regression tests for `sendQueuedNow`, the "Send now" affordance on a
+  // queued row. It is the one queue path that bypasses the server drain and
+  // re-POSTs the prompt itself, so it is also the one that can destroy or
+  // duplicate a prompt.
+  it("does not resend a queued row whose attachment bytes live only on the server", async () => {
+    // A row hydrated from the server (any reload, or a second device) carries
+    // attachment metadata with an empty `dataB64`: localStorage drops
+    // attachment-carrying rows and the server sends refs, not blobs.
+    serverQueue.set("img", {
+      id: "img",
+      seq: 0,
+      text: "caption",
+      created_at: "2026-01-01T00:00:00.000Z",
+      attachments: [{ id: "att1", kind: "image", mime_type: "image/png", name: "shot.png", size: 9 }],
+    });
+    const { result } = await openSession("sess-bytesless");
+    await flushAsync();
+    const row = result.current.state.queuedPrompts.find((q) => q.id === "img");
+    expect(row?.attachments?.[0]?.dataB64).toBe("");
+
+    calls.length = 0;
+    await act(async () => {
+      await result.current.sendQueuedNow(row!);
+    });
+    await flushAsync();
+
+    // Neither destructive step ran: the row and its server-side bytes survive
+    // for the turn-end drain, which is the only path that still has them.
+    // Previously this deleted the row, POSTed empty base64, took a 400, and
+    // lost prompt and image with nothing sent.
+    expect(calls.filter((c) => c.method === "DELETE")).toHaveLength(0);
+    expect(calls.filter((c) => c.url.includes("/acp/prompt"))).toHaveLength(0);
+    expect(serverQueue.has("img")).toBe(true);
+    expect(result.current.state.queuedPrompts.map((q) => q.id)).toContain("img");
+  });
+
+  it("sends a row it holds the bytes for, removing it server-side first", async () => {
+    // Text-only: no attachments at all, so nothing is missing its bytes.
+    serverQueue.set("t1", { id: "t1", seq: 0, text: "text only", created_at: "2026-01-01T00:00:00.000Z" });
+    const { result } = await openSession("sess-sendnow");
+    await flushAsync();
+    const row = result.current.state.queuedPrompts[0]!;
+
+    calls.length = 0;
+    await act(async () => {
+      await result.current.sendQueuedNow(row);
+    });
+    await flushAsync();
+
+    // Remove first (so the drain cannot also deliver it), then send.
+    expect(calls.filter((c) => c.method === "DELETE" && c.url.includes("/queue/"))).toHaveLength(1);
+    expect(calls.filter((c) => c.method === "POST" && c.url.includes("/acp/prompt"))).toHaveLength(1);
+    expect(serverQueue.has(row.id)).toBe(false);
+  });
+
+  it("sends nothing when the drain claimed the row first", async () => {
+    serverQueue.set("r1", { id: "r1", seq: 0, text: "raced", created_at: "2026-01-01T00:00:00.000Z" });
+    const { result } = await openSession("sess-raced");
+    await flushAsync();
+    const row = result.current.state.queuedPrompts[0]!;
+    // The drain retired it between the strip rendering and the tap, so the
+    // remove 404s. Sending anyway would deliver the same prompt twice.
+    serverQueue.delete(row.id);
+
+    calls.length = 0;
+    await act(async () => {
+      await result.current.sendQueuedNow(row);
+    });
+    await flushAsync();
+    expect(calls.filter((c) => c.url.includes("/acp/prompt"))).toHaveLength(0);
   });
 });

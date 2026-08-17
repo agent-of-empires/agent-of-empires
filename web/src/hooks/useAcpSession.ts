@@ -1843,14 +1843,19 @@ export function useAcpSession(
   // Attachments survive migration only for rows still in memory (localStorage
   // drops the bytes), matching the prior reload behavior. See the server-side
   // prompt queue design.
-  const queueMigratedRef = useRef(false);
+  // Keyed by session id, not a bare boolean: the hook instance outlives a
+  // session switch (the SPA swaps `sessionId` without remounting), so a single
+  // flag meant only the first session a tab ever opened got migrated and every
+  // later one silently skipped it, stranding its pre-server-queue rows in
+  // localStorage.
+  const queueMigratedRef = useRef<Set<string>>(new Set());
   useEffect(() => {
     if (!sessionId) return;
     if (status !== "open") return;
     let cancelled = false;
     void (async () => {
-      if (!queueMigratedRef.current) {
-        queueMigratedRef.current = true;
+      if (!queueMigratedRef.current.has(sessionId)) {
+        queueMigratedRef.current.add(sessionId);
         for (const q of queuedPromptsRef.current) {
           if (cancelled) return;
           await enqueueServerPrompt(sessionId, {
@@ -1920,10 +1925,35 @@ export function useAcpSession(
         await cancelPromptRef.current();
         return;
       }
+      // A row this client did not queue itself carries attachment metadata
+      // with no bytes: `toPersistedState` strips attachment-carrying rows from
+      // localStorage, and `hydrate_server_queue` rebuilds them from the
+      // server's refs with `dataB64: ""`. So after any reload (or on a second
+      // device) the bytes live only in the daemon's pending-attachment store.
+      //
+      // Taking the remove-then-resend path with such a row destroyed it: the
+      // remove drops the server row AND its buffered bytes, the POST then ships
+      // empty base64, `validate_attachments` rejects it 400, and a 4xx is not
+      // `retryable_failure`, so nothing re-queues. Prompt, caption and image
+      // all gone with nothing sent.
+      //
+      // The daemon can still deliver it, so leave the row alone and let the
+      // turn-end drain do it. The session is idle by this point (the branch
+      // above handles a live turn), and the reconciler drains an idle session
+      // within a tick, so the row fires on its own in about a second.
+      if (prompt.attachments?.some((a) => !a.dataB64)) return;
       // Remove server-side first so the turn-end drain can't also deliver this
       // row, then send it directly. The optimistic dequeue hides it locally.
+      // The remove takes the same per-instance lock the drain holds across its
+      // send, so it cannot interleave with a drain that already snapshotted
+      // this row.
       dispatch({ kind: "dequeue_prompt", id: prompt.id });
-      await removeServerQueuedPrompt(sid, prompt.id);
+      const removed = await removeServerQueuedPrompt(sid, prompt.id);
+      if (!removed) {
+        // The row was already gone, which means the drain claimed it while we
+        // were asking. It is being delivered; sending again would double it.
+        return;
+      }
       const result = await dispatchPromptNow(prompt.text, prompt.attachments);
       if (result === "retryable_failure") {
         // The immediate send bounced (worker still resuming); re-queue it
