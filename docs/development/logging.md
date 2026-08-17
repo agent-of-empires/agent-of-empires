@@ -24,7 +24,7 @@ Top-level roots:
 | `tui` | Key dispatch, screen transitions, dialog lifecycle, sampled render diagnostics. |
 | `session` | Session/profile/group CRUD, terminal capture, heartbeat, storage IO. |
 | `tmux` | tmux invocations, cache refresh, status detection, pane CRUD. |
-| `http` | Axum request span (`request_id`/`method`/`path`/`status`/`latency_ms`) + per-route events. |
+| `http` | Axum request span and one completion event per request, both carrying `request_id`/`method`/`path`/`status`/`latency_ms`, plus per-route events. `path` is the matched route template (`/api/sessions/{id}`), never the raw URI, so session ids and the query-string auth token stay out of the log. |
 | `serve` | `aoe serve` startup, PID/URL file IO, tunnel up/down, signal shutdown. |
 | `hooks` | Agent hook install/uninstall, status-file lifecycle, hook command + watcher failures. |
 | `sound` | Notification sound download/install and per-event playback. |

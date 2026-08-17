@@ -2032,11 +2032,42 @@ fn build_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+/// Placeholder logged in place of a route template when axum matched no
+/// route (the SPA fallback, and 404/405 responses). The raw URI is never
+/// substituted here: it is attacker- or user-controlled text, and the whole
+/// point of [`log_route`] is that only strings we wrote ourselves reach the
+/// log file.
+const UNMATCHED_ROUTE: &str = "<unmatched>";
+
+/// Route template for a request, for logging only.
+///
+/// Deliberately never the raw URI. `aoe serve` puts the auth token in the
+/// URL's query string, path segments carry session ids, and `debug.log` is a
+/// file users paste into issue reports. `MatchedPath` is the template we
+/// registered in [`build_router`] (`/api/sessions/{id}/acp/replay`), a
+/// compile-time constant with no request data in it, so logging it cannot
+/// leak a token or an id no matter what the client sent. Axum fills the
+/// extension during routing, before any `Router::layer` middleware runs.
+fn log_route(request: &axum::extract::Request) -> &str {
+    request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map_or(UNMATCHED_ROUTE, |m| m.as_str())
+}
+
 /// Middleware that wraps every request in an `http.request` span with a
 /// generated or echoed `X-Request-Id`, then emits one completion event at
 /// the level matching the response status. Logs fired inside the request
 /// (auth middleware, route handlers, downstream `tracing` events) inherit
 /// the span fields, so a single grep on `request_id` reconstructs the call.
+///
+/// The completion event repeats `request_id`, `method`, and `path` as its
+/// own fields rather than relying on the span: `[logging].show_spans` is
+/// `false` by default, which drops the span prefix from the rendered line
+/// and used to leave `completed status=500 latency_ms=0` with nothing to
+/// identify the request (#3402). For the same reason the event is emitted
+/// outside the span, so enabling `show_spans` prints each field once
+/// instead of twice.
 ///
 /// Successful completions (2xx/3xx) emit at `debug`, not `info`: the web
 /// UI polls `/api/sessions` every ~2s, so an info-level success log here
@@ -2054,27 +2085,40 @@ async fn http_request_span(
         .map(str::to_string)
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let method = request.method().clone();
-    let path = request.uri().path().to_string();
+    let route = log_route(&request).to_string();
     let span = tracing::debug_span!(
         target: "http.request",
         "http_request",
         request_id = %rid,
         method = %method,
-        path = %path,
+        path = %route,
     );
     let start = std::time::Instant::now();
-    let mut response = next.run(request).instrument(span.clone()).await;
+    let mut response = next.run(request).instrument(span).await;
     let latency_ms = start.elapsed().as_millis() as u64;
     let status = response.status().as_u16();
-    span.in_scope(|| {
-        if status >= 500 {
-            tracing::error!(target: "http.request", status, latency_ms, "completed");
-        } else if status >= 400 {
-            tracing::warn!(target: "http.request", status, latency_ms, "completed");
-        } else {
-            tracing::debug!(target: "http.request", status, latency_ms, "completed");
-        }
-    });
+    // `tracing` resolves the level at compile time, so the branches cannot
+    // share one call site; the macro keeps the field list written once.
+    macro_rules! completed {
+        ($level:ident) => {
+            tracing::$level!(
+                target: "http.request",
+                request_id = %rid,
+                method = %method,
+                path = %route,
+                status,
+                latency_ms,
+                "completed"
+            )
+        };
+    }
+    if status >= 500 {
+        completed!(error);
+    } else if status >= 400 {
+        completed!(warn);
+    } else {
+        completed!(debug);
+    }
     if let Ok(value) = rid.parse() {
         response.headers_mut().insert("x-request-id", value);
     }
@@ -7076,6 +7120,133 @@ mod tests {
             .unwrap();
         let resp = app.oneshot(req).await.unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
+    }
+
+    /// `MakeWriter` sink so the request-log test can read back exactly the
+    /// bytes a daemon would have appended to `debug.log`.
+    #[derive(Clone)]
+    struct LogSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogSink {
+        fn write(&mut self, src: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(src);
+            Ok(src.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// #3402: the `http.request` completion line must identify the request.
+    /// It is rendered with the default `show_spans = false` formatter, which
+    /// drops span fields, so `request_id` / `method` / `path` have to be
+    /// fields of the event itself. `path` is the route template, never the
+    /// raw URI: `aoe serve` ships its auth token in the query string and
+    /// session ids sit in path segments, and neither may reach the log.
+    #[tokio::test]
+    async fn http_request_log_identifies_request_without_leaking_uri() {
+        use tower::ServiceExt;
+        const TOKEN: &str = "super-secret-token";
+        const SESSION: &str = "sess-9f3a";
+
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let sink = LogSink(buf.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || sink.clone())
+            .with_ansi(false)
+            .event_format(crate::logging::NoSpanFormat)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // (request URI, expected level, expected `path` field, expected status)
+        let cases = [
+            (
+                format!("/api/sessions/{SESSION}/acp/replay?token={TOKEN}"),
+                "ERROR",
+                "path=/api/sessions/{id}/acp/replay",
+                "status=500",
+            ),
+            (
+                format!("/api/sessions?token={TOKEN}"),
+                "DEBUG",
+                "path=/api/sessions",
+                "status=200",
+            ),
+            // No route matched, so there is no template to log and the raw
+            // URI must not be substituted for one.
+            (
+                format!("/nope/{SESSION}?token={TOKEN}"),
+                "WARN",
+                "path=<unmatched>",
+                "status=404",
+            ),
+        ];
+
+        // Drains the sink and returns the one `http.request` completion line,
+        // ignoring whatever else the request happened to log.
+        let take_line = || {
+            let mut sink = buf.lock().unwrap();
+            let log = String::from_utf8(sink.clone()).unwrap();
+            sink.clear();
+            log.lines()
+                .find(|l| l.contains("http.request"))
+                .unwrap_or_else(|| panic!("no http.request line in {log}"))
+                .to_string()
+        };
+
+        for (uri, level, path_field, status) in cases {
+            let app = axum::Router::new()
+                .route(
+                    "/api/sessions/{id}/acp/replay",
+                    axum::routing::get(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
+                )
+                .route("/api/sessions", axum::routing::get(|| async { "[]" }))
+                .fallback(|| async { axum::http::StatusCode::NOT_FOUND })
+                .layer(axum::middleware::from_fn(http_request_span));
+            let req = axum::http::Request::builder()
+                .uri(&uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            app.oneshot(req).await.unwrap();
+
+            let line = take_line();
+            for expected in [level, path_field, status, "method=GET", "request_id="] {
+                assert!(line.contains(expected), "{uri}: want {expected:?}, got {line}");
+            }
+            for secret in [TOKEN, SESSION] {
+                assert!(!line.contains(secret), "{uri}: leaked {secret:?} into {line}");
+            }
+        }
+
+        // The cases above pin the middleware itself; this pins its position in
+        // the real stack, where a template exists only because axum routes the
+        // request before any `Router::layer` middleware runs. The token in the
+        // query string is wrong, so auth rejects it: exactly the 4xx a triager
+        // greps for, and the one request shape that carries a secret.
+        let state = test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vecs(&["localhost"]),
+            vecs(&["http://localhost:8080"]),
+            Some("real-token".to_string()),
+        );
+        let req = axum::http::Request::builder()
+            .uri(format!("/api/sessions/{SESSION}/acp/replay?token={TOKEN}"))
+            .header("host", "localhost")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        test_support::build_router_for_test(state)
+            .oneshot(req)
+            .await
+            .unwrap();
+        let line = take_line();
+        assert!(
+            line.contains("path=/api/sessions/{id}/acp/replay"),
+            "real router: got {line}"
+        );
+        for secret in [TOKEN, SESSION] {
+            assert!(!line.contains(secret), "real router leaked {secret:?}: {line}");
+        }
     }
 
     #[tokio::test]
