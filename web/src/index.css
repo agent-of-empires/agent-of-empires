@@ -638,5 +638,12 @@ select:focus-visible,
 }
 
 .safe-area-inset {
-  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  /* Top/right/left only. The BOTTOM inset is intentionally NOT reserved here:
+     the App root is `overflow-hidden`, so a bottom-anchored child (the ACP
+     composer, the terminal toolbar) that tried to reach the physical edge got
+     clipped at the padding edge on iOS. Instead each bottom-anchored surface
+     owns its own `env(safe-area-inset-bottom)` clearance, and the composer
+     hugs the bottom with no reservation. iOS reports the bottom inset as 0
+     while the keyboard is open, so the keyboard-lift math is unaffected. */
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);
 }

@@ -69,6 +69,29 @@ struct PluginCommandsEnvelope {
     commands: Vec<PluginCommandView>,
 }
 
+/// What the daemon did with a prompt, from the `/acp/prompt` 202 body. Wire
+/// mirror of the server's `PromptDispatchResponse`; see
+/// `docs/development/server-owned-prompt-dispatch.md`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
+pub struct PromptDispatchWire {
+    /// `sent` / `steered` / `queued`. Defaults to `sent`, which is what the
+    /// pre-Tier-3 empty 202 body meant.
+    #[serde(default)]
+    pub disposition: PromptDispositionWire,
+    /// The queue row's id, present only on `queued`.
+    #[serde(default)]
+    pub queued_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PromptDispositionWire {
+    #[default]
+    Sent,
+    Steered,
+    Queued,
+}
+
 /// Page size requested by [`HttpClient::replay_paged`]. Stays at or
 /// under the server's `MAX_REPLAY_PAGE` so it is never clamped down.
 pub const REPLAY_PAGE_SIZE: u64 = 1000;
@@ -197,7 +220,66 @@ impl HttpClient {
             lowest_seq,
             next_cursor: None,
             has_more: false,
+            rows: None,
         })
+    }
+
+    /// `GET /api/sessions/{id}/acp/replay?since=N&limit=L&view=rows`. One
+    /// page of the server-folded transcript rows (`TranscriptRow[]` in
+    /// `rows`, `frames` empty), same pagination metadata as the raw
+    /// projection.
+    async fn replay_rows_page(
+        &self,
+        session_id: &str,
+        since: u64,
+        limit: u64,
+    ) -> Result<ReplayResponse, HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/acp/replay?since={}&limit={}&view=rows",
+            self.endpoint.base_url, session_id, since, limit
+        );
+        let res = self.auth(self.http.get(&url)).send().await?;
+        let res = check_status(res, session_id).await?;
+        Ok(res.json::<ReplayResponse>().await?)
+    }
+
+    /// Page through the server-folded transcript rows from `since`,
+    /// accumulating every page's `rows` in order and reconciling by row id
+    /// (the server folds each page in isolation, so a `tool_start` split
+    /// across a page seam can repeat under one id; last non-sparse wins).
+    /// The transcript twin of [`replay_paged`](Self::replay_paged): same
+    /// snapshot-window cap and retention-gap (`lost`) handling. Returns the
+    /// merged rows plus whether a page reported a gap.
+    pub async fn replay_rows_paged(
+        &self,
+        session_id: &str,
+        since: u64,
+        page_size: u64,
+    ) -> Result<(Vec<crate::acp::transcript::TranscriptRow>, bool), HttpError> {
+        let mut rows: Vec<crate::acp::transcript::TranscriptRow> = Vec::new();
+        let mut cursor = since;
+        let mut target: Option<u64> = None;
+        let mut lost = false;
+        loop {
+            let page = self.replay_rows_page(session_id, cursor, page_size).await?;
+            let cap = *target.get_or_insert(page.highest_seq);
+            if let Some(page_rows) = page.rows {
+                for row in page_rows {
+                    crate::acp::transcript::upsert_transcript_row(&mut rows, row);
+                }
+            }
+            if page.lost {
+                lost = true;
+                break;
+            }
+            match page.next_cursor {
+                Some(next) if page.has_more && next > cursor && next < cap => {
+                    cursor = next;
+                }
+                _ => break,
+            }
+        }
+        Ok((rows, lost))
     }
 
     /// `GET /api/sessions/{id}/acp/files`. Workspace file list for
@@ -213,7 +295,17 @@ impl HttpClient {
     }
 
     /// `POST /api/sessions/{id}/acp/prompt`.
-    pub async fn prompt(&self, session_id: &str, text: &str) -> Result<(), HttpError> {
+    ///
+    /// The daemon decides whether the prompt is sent, steered into the running
+    /// turn, or parked on the server queue, and the response says which (Tier
+    /// 3, `docs/development/server-owned-prompt-dispatch.md`). A body the
+    /// client cannot parse is read as `Sent`, which is what a pre-Tier-3
+    /// daemon's bare 202 meant.
+    pub async fn prompt(
+        &self,
+        session_id: &str,
+        text: &str,
+    ) -> Result<PromptDispatchWire, HttpError> {
         let url = format!(
             "{}/api/sessions/{}/acp/prompt",
             self.endpoint.base_url, session_id
@@ -221,10 +313,11 @@ impl HttpClient {
         let body = PromptRequest {
             text: text.to_string(),
             attachments: Vec::new(),
+            prompt_id: None,
         };
         let res = self.auth(self.http.post(&url)).json(&body).send().await?;
-        check_status(res, session_id).await?;
-        Ok(())
+        let res = check_status(res, session_id).await?;
+        Ok(res.json::<PromptDispatchWire>().await.unwrap_or_default())
     }
 
     /// `GET /api/plugins/ui-state`. The daemon-wide plugin UI snapshot
@@ -301,6 +394,60 @@ impl HttpClient {
             self.endpoint.base_url, session_id
         );
         let res = self.auth(self.http.post(&url)).send().await?;
+        check_status(res, session_id).await?;
+        Ok(())
+    }
+
+    /// `GET /api/sessions/{id}/queue`: the server-owned prompt queue, ordered
+    /// by ascending `seq`. The daemon owns and drains this queue, so the native
+    /// view mirrors it rather than keeping its own (the web client does the
+    /// same). See `docs/development/server-side-prompt-queue.md`.
+    pub async fn queue_list(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<crate::acp::state::QueuedPromptEntry>, HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/queue",
+            self.endpoint.base_url, session_id
+        );
+        let res = self.auth(self.http.get(&url)).send().await?;
+        let res = check_status(res, session_id).await?;
+        Ok(res.json().await?)
+    }
+
+    // No `queue_enqueue` here: since Tier 3 the native view never decides to
+    // queue. It POSTs every prompt to `/acp/prompt` and the daemon parks it if
+    // it must, so a client-side enqueue would be a second, competing decision.
+    // `POST /api/sessions/{id}/queue` still exists for the web's own paths.
+
+    /// `PATCH /api/sessions/{id}/queue/{promptId}`: replace a queued prompt's
+    /// text in place, keeping its position. The prompt id is client-minted and
+    /// may be arbitrary, so it is percent-encoded to a single path segment.
+    pub async fn queue_edit(
+        &self,
+        session_id: &str,
+        prompt_id: &str,
+        text: &str,
+    ) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/queue/{}",
+            self.endpoint.base_url,
+            session_id,
+            utf8_percent_encode(prompt_id, PATH_SEGMENT)
+        );
+        let body = serde_json::json!({ "text": text });
+        let res = self.auth(self.http.patch(&url)).json(&body).send().await?;
+        check_status(res, session_id).await?;
+        Ok(())
+    }
+
+    /// `DELETE /api/sessions/{id}/queue`: drop every queued prompt.
+    pub async fn queue_clear(&self, session_id: &str) -> Result<(), HttpError> {
+        let url = format!(
+            "{}/api/sessions/{}/queue",
+            self.endpoint.base_url, session_id
+        );
+        let res = self.auth(self.http.delete(&url)).send().await?;
         check_status(res, session_id).await?;
         Ok(())
     }

@@ -116,6 +116,7 @@ export function MobileMainPane({
                 acpWorkerState={activeSession.acp_worker_state ?? "absent"}
                 tool={activeSession.tool}
                 acpAgent={activeSession.acp_agent ?? null}
+                clearAliases={activeSession.clear_aliases}
                 archivedAt={activeSession.archived_at ?? null}
                 snoozedUntil={activeSession.snoozed_until ?? null}
                 trashedAt={activeSession.trashed_at ?? null}
@@ -125,23 +126,50 @@ export function MobileMainPane({
               />
             </Suspense>
           ) : (
-            <TerminalSessionStack
-              activeSessionId={activeSessionId!}
-              sessions={sessions.filter((session) => session.view !== "structured")}
-              persistent={webSettings.persistentTerminals}
-              maxPersistentTerminals={webSettings.maxPersistentTerminals}
-            />
+            // Reserve the bottom home-indicator inset on this wrapper (the App
+            // root no longer does; see index.css .safe-area-inset) so the last
+            // terminal row clears it. Kept off the pane root itself, which owns
+            // the keyboard-open lift and must stay inset-free when closed (#1432).
+            // Collapses to 0 with the keyboard open (iOS reports the inset as 0)
+            // and on desktop.
+            <div
+              className="flex-1 flex flex-col min-h-0 overflow-hidden"
+              style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
+            >
+              <TerminalSessionStack
+                activeSessionId={activeSessionId!}
+                sessions={sessions.filter((session) => session.view !== "structured")}
+                persistent={webSettings.persistentTerminals}
+                maxPersistentTerminals={webSettings.maxPersistentTerminals}
+              />
+            </div>
           )}
         </div>
 
         {pairedMounted && (
-          <div className={layerClass(view === "paired")} inert={view !== "paired"}>
+          // Reserve the bottom home-indicator inset here too (the App root no
+          // longer does; see index.css .safe-area-inset), matching the agent
+          // terminal wrapper above. The paired shell is the same LiveTerminalView
+          // component, so it needs identical clearance; without it the last row
+          // and toolbar sat under the home indicator. Collapses to 0 with the
+          // keyboard open (iOS reports the inset as 0) and on desktop.
+          <div
+            className={layerClass(view === "paired")}
+            inert={view !== "paired"}
+            data-testid="mobile-paired-layer"
+            style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
+          >
             <PairedShellPane session={activeSession} sessionId={activeSessionId} />
           </div>
         )}
 
         {view === "diff" && (
-          <div className="absolute inset-0 z-10 flex flex-col min-h-0 overflow-hidden bg-surface-900">
+          // Reserve the bottom home-indicator inset here (the App root no longer
+          // does; see index.css .safe-area-inset) so the last diff row clears it.
+          <div
+            className="absolute inset-0 z-10 flex flex-col min-h-0 overflow-hidden bg-surface-900"
+            style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
+          >
             {selectedFilePath && activeSessionId ? (
               <DiffFileViewer
                 sessionId={activeSessionId}
@@ -183,7 +211,14 @@ export function MobileMainPane({
         )}
 
         {activePluginPane && (
-          <div className="absolute inset-0 z-10 flex flex-col min-h-0 overflow-hidden bg-surface-900">
+          // Reserve the bottom home-indicator inset here too (see the diff and
+          // paired wrappers); the App root no longer does. Collapses to 0 with
+          // the keyboard open and on desktop.
+          <div
+            className="absolute inset-0 z-10 flex flex-col min-h-0 overflow-hidden bg-surface-900"
+            data-testid="mobile-plugin-layer"
+            style={{ paddingBottom: "env(safe-area-inset-bottom)" }}
+          >
             <PluginPaneBody entry={activePluginPane.entry} />
           </div>
         )}

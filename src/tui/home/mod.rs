@@ -4424,6 +4424,27 @@ impl HomeView {
         }
     }
 
+    /// Persist the "don't warn me again" opt-out for whichever confirm
+    /// offered the checkbox. Both call sites (keyboard and click) route
+    /// through this so the two paths can't disagree about which confirms
+    /// are opt-out-able. Actions without a checkbox never reach it.
+    pub(super) fn apply_confirm_dont_ask_again(&mut self, action: &str) {
+        match action {
+            "quit" => self.disable_confirm_before_quit(),
+            // Written globally, matching the quit opt-out. A profile that
+            // overrides confirm_delete = true keeps prompting; that override
+            // is cleared from the settings pane, not from here.
+            "trash_session" => {
+                if let Err(e) = update_config(|config| {
+                    config.session.confirm_delete = false;
+                }) {
+                    tracing::warn!(target: "tui.home", "Failed to save config: {e}");
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Clean up a pending creation on TUI shutdown. Waits briefly for the
     /// background thread to finish so we can clean up worktrees/instances.
     /// If the thread doesn't finish in time, the hook subprocess will

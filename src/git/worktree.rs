@@ -883,12 +883,14 @@ impl GitWorktree {
     /// `git worktree unlock` resolves the entry from the admin side, so it
     /// still clears the lock when the checkout directory is already gone, and a
     /// non-zero exit (already unlocked, or no such worktree) is a harmless
-    /// no-op rather than an error.
+    /// no-op rather than an error. That classification is why the call goes
+    /// through `run_git_quiet`: the routine non-zero exit belongs at DEBUG,
+    /// not in the WARN stream.
     pub fn unlock_worktree(&self, path: &Path) {
         let Some(path_str) = path.to_str() else {
             return;
         };
-        let _ = super::command::run_git(&self.repo_path, ["worktree", "unlock", path_str]);
+        let _ = super::command::run_git_quiet(&self.repo_path, ["worktree", "unlock", path_str]);
     }
 
     /// Convert a worktree's .git file from absolute to relative path.

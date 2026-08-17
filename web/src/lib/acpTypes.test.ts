@@ -18,7 +18,6 @@ import {
   normaliseTurnCounters,
   type AcpFrame,
   type AcpState,
-  type ToolCall,
 } from "./acpTypes";
 
 function frame(seq: number, text: string): AcpFrame {
@@ -29,17 +28,16 @@ function frame(seq: number, text: string): AcpFrame {
   };
 }
 
-function withOptimisticPrompt(state: AcpState, text: string): AcpState {
-  // Mirrors the optimistic dispatch in useStructuredView.sendPrompt: row id
-  // includes the wall-clock timestamp (distinct from the `user-seq-N`
-  // form the reducer assigns when the server echoes), and
-  // `pendingUserPromptSeq` bumps so a subsequent server echo on the
-  // matching row doesn't double-count. See #1170.
+function withOptimisticPrompt(state: AcpState, text: string, id = "cmp-1"): AcpState {
+  // Mirrors the optimistic dispatch in useAcpSession.sendPrompt: an overlay
+  // row keyed by the minted prompt_id (never appended to the server-owned
+  // `activity`), with `pendingUserPromptSeq` bumped so a subsequent server
+  // echo carrying the same prompt_id doesn't double-count. See #1170 / #3173.
   const pendingUserPromptSeq = state.pendingUserPromptSeq + 1;
   return {
     ...state,
-    activity: state.activity.concat({
-      id: `user-${Date.now()}-${state.activity.length}`,
+    optimisticRows: state.optimisticRows.concat({
+      id,
       kind: "user_prompt",
       text,
       at: new Date().toISOString(),
@@ -49,491 +47,39 @@ function withOptimisticPrompt(state: AcpState, text: string): AcpState {
   };
 }
 
-describe("applyEvent / UserPromptSent", () => {
-  it("appends a user_prompt row when no optimistic placeholder exists", () => {
+describe("applyEvent / UserPromptSent (control state)", () => {
+  // The transcript row is server-owned now (Tier 4); applyEvent only advances
+  // the turn counter and applies the per-turn resets. The optimistic overlay
+  // reconcile-by-prompt_id lives in the hook + acpTypes.reducer.test.ts.
+  it("bumps the turn counter and marks the turn active, adding no activity row", () => {
     const next = applyEvent(emptyAcpState(), frame(1, "hi"));
-    expect(next.activity).toHaveLength(1);
-    expect(next.activity[0]).toMatchObject({
-      id: "user-seq-1",
-      kind: "user_prompt",
-      text: "hi",
-    });
-    expect(next.lastSeq).toBe(1);
+    expect(next.activity).toHaveLength(0);
+    expect(next.pendingUserPromptSeq).toBe(1);
     expect(next.turnActive).toBe(true);
+    expect(next.lastSeq).toBe(1);
   });
 
-  it("dedupes against the optimistic row by promoting its id", () => {
-    // Simulate: useStructuredView.sendPrompt fires an optimistic dispatch,
-    // then the server's UserPromptSent echo arrives over the WS.
-    const optimistic = withOptimisticPrompt(emptyAcpState(), "test prompt");
-    expect(optimistic.activity).toHaveLength(1);
-    expect(optimistic.activity[0].id.startsWith("user-seq-")).toBe(false);
-
-    const next = applyEvent(optimistic, frame(7, "test prompt"));
-    // Single row preserved, id rewritten to the authoritative form so
-    // future replays dedupe against it via seq.
-    expect(next.activity).toHaveLength(1);
-    expect(next.activity[0].id).toBe("user-seq-7");
-    expect(next.activity[0].text).toBe("test prompt");
-    expect(next.lastSeq).toBe(7);
-  });
-
-  it("does not dedupe when the optimistic text differs from the echo", () => {
-    // Edge case: user typed two prompts back-to-back. The optimistic
-    // row for the FIRST prompt should not be overwritten by the
-    // server echo of the SECOND prompt.
-    const optimistic = withOptimisticPrompt(emptyAcpState(), "first");
-    const next = applyEvent(optimistic, frame(2, "second"));
-    expect(next.activity).toHaveLength(2);
-    expect(next.activity[0].text).toBe("first");
-    expect(next.activity[1].id).toBe("user-seq-2");
-    expect(next.activity[1].text).toBe("second");
-  });
-
-  it("dedupes the OLDEST matching optimistic row when same text is sent twice", () => {
-    // Regression: user clicks Send with the same text twice in quick
-    // succession. Two optimistic rows are queued. The first server
-    // echo (seq=N) corresponds to the first submission and must
-    // promote row 0, not row 1. If we promoted the most-recent row,
-    // row 0 would be orphaned forever and the second echo (seq=N+1)
-    // would append a third row, leaving the user with three rows on
-    // screen for two prompts.
-    let state = withOptimisticPrompt(emptyAcpState(), "ping");
-    state = withOptimisticPrompt(state, "ping");
-    expect(state.activity).toHaveLength(2);
-
-    state = applyEvent(state, frame(10, "ping"));
-    state = applyEvent(state, frame(11, "ping"));
-
-    expect(state.activity).toHaveLength(2);
-    expect(state.activity[0].id).toBe("user-seq-10");
-    expect(state.activity[1].id).toBe("user-seq-11");
-    expect(state.activity[0].text).toBe("ping");
-    expect(state.activity[1].text).toBe("ping");
-  });
-
-  it("does not double-dedupe a prompt that already has a seq-based id", () => {
-    // Replay scenario: reducer applied frame(seq=3) once, then a
-    // later reconnect re-delivers the same frame. Without seq dedupe
-    // the reducer would walk the optimistic-promotion branch a second
-    // time and clobber the row's metadata.
-    let state = applyEvent(emptyAcpState(), frame(3, "echoed"));
-    expect(state.activity[0].id).toBe("user-seq-3");
-
-    // Re-deliver the same frame — frame.seq <= state.lastSeq must be
-    // a no-op so the same row isn't promoted again.
-    state = applyEvent(state, frame(3, "echoed"));
-    expect(state.activity).toHaveLength(1);
-    expect(state.activity[0].id).toBe("user-seq-3");
-    expect(state.lastSeq).toBe(3);
-  });
-
-  it("clears assistantMessage and turnActive flags so the new turn starts clean", () => {
+  it("clears startup/error flags so the new turn starts clean", () => {
     const stale: AcpState = {
       ...emptyAcpState(),
-      assistantMessage: "stale partial reply",
       startupError: "old error",
       lastError: "old action error",
       turnActive: false,
     };
     const next = applyEvent(stale, frame(1, "new prompt"));
-    expect(next.assistantMessage).toBe("");
     expect(next.startupError).toBeNull();
     expect(next.lastError).toBeNull();
     expect(next.turnActive).toBe(true);
   });
 
-  it("renders tool output from ToolCallCompleted.content", () => {
-    // Most agents (Claude's claude-agent-acp included) ship the tool's
-    // textual output on the *completion* update via fields.content. If
-    // we lose this, the bash card body literally reads "completed".
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: {
-        ToolCallStarted: {
-          tool_call: {
-            id: "tc-bash",
-            name: "Terminal",
-            kind: "execute",
-            args_preview: "{}",
-            started_at: new Date().toISOString(),
-          },
-        },
-      },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: {
-        ToolCallCompleted: {
-          tool_call_id: "tc-bash",
-          is_error: false,
-          content: "abc1234 first commit\ndef5678 second commit\n",
-        },
-      },
-    });
-    const done = state.activity.find((a) => a.id === "done-tc-bash");
-    expect(done).toBeDefined();
-    expect(done!.kind).toBe("tool_complete");
-    expect(done!.text).toBe("abc1234 first commit\ndef5678 second commit\n");
-    expect(state.inFlightTool).toBeNull();
-  });
-
-  it("preserves the wire tool name in raw_name when a later update overwrites name with a title (#3070)", () => {
-    // opencode's `task` subagent arrives as name:"task", then a
-    // ToolCallUpdated sets a human title. name becomes the title, but
-    // raw_name must stay "task" so classification keys on wire identity.
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: {
-        ToolCallStarted: {
-          tool_call: {
-            id: "tc-task",
-            name: "task",
-            kind: "think",
-            args_preview: "{}",
-            started_at: new Date().toISOString(),
-          },
-        },
-      },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: {
-        ToolCallUpdated: {
-          tool_call_id: "tc-task",
-          title: "Trace clear session resets",
-          args_preview: JSON.stringify({ description: "Trace clear session resets", prompt: "Research only" }),
-        },
-      },
-    });
-    const row = state.activity.find((a) => a.kind === "tool_start" && a.toolCallId === "tc-task");
-    expect(row?.tool?.name).toBe("Trace clear session resets");
-    expect(row?.tool?.raw_name).toBe("task");
-  });
-
-  it("carries structured media output from ToolCallCompleted.output", () => {
-    // #1818: a completion can ship images/audio/resources that the text
-    // concat drops. The reducer must attach the structured blocks to the
-    // tool_complete row so the card renders them.
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: {
-        ToolCallStarted: {
-          tool_call: {
-            id: "tc-img",
-            name: "screenshot",
-            kind: "other",
-            args_preview: "{}",
-            started_at: new Date().toISOString(),
-          },
-        },
-      },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: {
-        ToolCallCompleted: {
-          tool_call_id: "tc-img",
-          is_error: false,
-          content: "",
-          output: [
-            { kind: "image", mime_type: "image/png", data: "BASE64" },
-            {
-              kind: "resource_link",
-              uri: "file:///report.pdf",
-              name: "report.pdf",
-            },
-          ],
-        },
-      },
-    });
-    const done = state.activity.find((a) => a.id === "done-tc-img");
-    expect(done).toBeDefined();
-    expect(done!.output).toHaveLength(2);
-    expect(done!.output![0]).toMatchObject({
-      kind: "image",
-      mime_type: "image/png",
-    });
-    // Text fallback still applies for the collapsed label.
-    expect(done!.text).toBe("completed");
-  });
-
-  it("omits output on a text-only completion", () => {
-    const state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: {
-        ToolCallCompleted: {
-          tool_call_id: "tc-plain",
-          is_error: false,
-          content: "done",
-        },
-      },
-    });
-    const done = state.activity.find((a) => a.id === "done-tc-plain");
-    expect(done).toBeDefined();
-    expect(done!.output).toBeUndefined();
-  });
-
-  it("falls back to streamed ToolCallContent when completion has empty content", () => {
-    // Some agents stream stdout via interim ToolCallUpdate notifications
-    // (status=in_progress with content) and emit a final completion
-    // with empty content. The reducer buffers interim chunks keyed by
-    // tool_call_id and drains the buffer on completion.
-    let state = emptyAcpState();
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 1,
-      event: {
-        ToolCallContent: {
-          tool_call_id: "tc-bash",
-          content: "line1\n",
-        },
-      },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: {
-        ToolCallContent: {
-          tool_call_id: "tc-bash",
-          content: "line1\nline2\n",
-        },
-      },
-    });
-    expect(state.toolOutputs["tc-bash"]).toBe("line1\nline2\n");
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 3,
-      event: {
-        ToolCallCompleted: {
-          tool_call_id: "tc-bash",
-          is_error: false,
-          content: "",
-        },
-      },
-    });
-    const done = state.activity.find((a) => a.id === "done-tc-bash");
-    expect(done!.text).toBe("line1\nline2\n");
-    // Buffer drained so a re-completion (replay) doesn't double-render.
-    expect(state.toolOutputs["tc-bash"]).toBeUndefined();
-  });
-
-  it("falls back to status word when no content arrived at all", () => {
-    const state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: {
-        ToolCallCompleted: {
-          tool_call_id: "tc-x",
-          is_error: false,
-          content: "",
-        },
-      },
-    });
-    const done = state.activity.find((a) => a.id === "done-tc-x");
-    expect(done!.text).toBe("completed");
-  });
-
-  it("patches tool_start args/title when ToolCallUpdated arrives later", () => {
-    // Claude's claude-agent-acp emits the initial tool_call with an
-    // empty raw_input and a generic title ("Terminal"); the actual
-    // command lands in a follow-up ToolCallUpdate. The reducer must
-    // overwrite the row's tool payload so the card header shows
-    // `$ git log -n 10` rather than `$ Terminal`.
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: {
-        ToolCallStarted: {
-          tool_call: {
-            id: "tc-bash",
-            name: "Terminal",
-            kind: "execute",
-            args_preview: "{}",
-            started_at: new Date().toISOString(),
-          },
-        },
-      },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: {
-        ToolCallUpdated: {
-          tool_call_id: "tc-bash",
-          title: null,
-          args_preview: '{"command":"git log -n 10"}',
-        },
-      },
-    });
-    const startRow = state.activity.find((a) => a.kind === "tool_start" && a.toolCallId === "tc-bash");
-    expect(startRow?.tool?.args_preview).toBe('{"command":"git log -n 10"}');
-    expect(startRow?.tool?.name).toBe("Terminal");
-    expect(state.inFlightTool?.args_preview).toBe('{"command":"git log -n 10"}');
-  });
-
-  it("patches a Codex diff onto the edit card when it arrives via ToolCallUpdated, and preserves it on a later text-only update", () => {
-    // Codex emits the apply_patch diff on the update/completion frames,
-    // not the initial tool_call. A non-empty diff list replaces the
-    // card's diffs; a later text-only update must not blank them. See
-    // #1721.
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: {
-        ToolCallStarted: {
-          tool_call: {
-            id: "tc-edit",
-            name: "Edit src/foo.rs",
-            kind: "edit",
-            args_preview: "{}",
-            started_at: new Date().toISOString(),
-          },
-        },
-      },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: {
-        ToolCallUpdated: {
-          tool_call_id: "tc-edit",
-          title: null,
-          args_preview: null,
-          diffs: [
-            {
-              path: "src/foo.rs",
-              old_text: "old",
-              new_text: "new",
-              created_at: new Date().toISOString(),
-            },
-          ],
-        },
-      },
-    });
-    const row = state.activity.find((a) => a.kind === "tool_start" && a.toolCallId === "tc-edit");
-    expect(row?.tool?.diffs?.length).toBe(1);
-    expect(row?.tool?.diffs?.[0].path).toBe("src/foo.rs");
-    expect(state.inFlightTool?.diffs?.length).toBe(1);
-
-    // A subsequent text-only update (no diffs) must preserve them.
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 3,
-      event: {
-        ToolCallUpdated: {
-          tool_call_id: "tc-edit",
-          title: "Edit src/foo.rs",
-          args_preview: null,
-          diffs: null,
-        },
-      },
-    });
-    const rowAfter = state.activity.find((a) => a.kind === "tool_start" && a.toolCallId === "tc-edit");
-    expect(rowAfter?.tool?.diffs?.length).toBe(1);
-  });
-
-  it("patches OpenCode todowrite args when ToolCallUpdated supplies todos later", () => {
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: {
-        ToolCallStarted: {
-          tool_call: {
-            id: "tc-todos",
-            name: "todowrite",
-            kind: "other",
-            args_preview: "{}",
-            started_at: new Date().toISOString(),
-          },
-        },
-      },
-    });
-    const todos = JSON.stringify({
-      todos: [
-        {
-          content: "Render OpenCode todos",
-          priority: "high",
-          status: "in_progress",
-        },
-      ],
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: {
-        ToolCallUpdated: {
-          tool_call_id: "tc-todos",
-          title: "1 todos",
-          args_preview: todos,
-        },
-      },
-    });
-
-    const startRow = state.activity.find((a) => a.kind === "tool_start" && a.toolCallId === "tc-todos");
-    expect(startRow?.tool?.name).toBe("1 todos");
-    expect(startRow?.tool?.args_preview).toBe(todos);
-    expect(state.inFlightTool?.name).toBe("1 todos");
-    expect(state.inFlightTool?.args_preview).toBe(todos);
-  });
-
-  it("uses 'tool failed' when error event has no content", () => {
-    const state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: {
-        ToolCallCompleted: {
-          tool_call_id: "tc-y",
-          is_error: true,
-          content: "",
-        },
-      },
-    });
-    const done = state.activity.find((a) => a.id === "done-tc-y");
-    expect(done!.kind).toBe("tool_error");
-    expect(done!.text).toBe("tool failed");
-  });
-
-  it("reconstructs the user side of the conversation from a replay", () => {
-    // Server restart scenario: client connects, WS drain delivers all
-    // events from the on-disk store including UserPromptSent rows.
-    // Without these, the assistant chunks would collapse into a
-    // single blob; with them, each turn gets its own user message.
-    const replay: AcpFrame[] = [
-      { session_id: "s-1", seq: 1, event: { UserPromptSent: { text: "hi" } } },
-      {
-        session_id: "s-1",
-        seq: 2,
-        event: { AgentMessageChunk: { text: "Hello!" } },
-      },
-      {
-        session_id: "s-1",
-        seq: 3,
-        event: { UserPromptSent: { text: "thanks" } },
-      },
-      {
-        session_id: "s-1",
-        seq: 4,
-        event: { AgentMessageChunk: { text: "Anytime." } },
-      },
-    ];
-    const final = replay.reduce((state, f) => applyEvent(state, f), emptyAcpState());
-    const userPrompts = final.activity.filter((a) => a.kind === "user_prompt");
-    const messages = final.activity.filter((a) => a.kind === "message");
-    expect(userPrompts.map((u) => u.text)).toEqual(["hi", "thanks"]);
-    expect(messages.map((m) => m.text)).toEqual(["Hello!", "Anytime."]);
-    expect(final.lastSeq).toBe(4);
+  it("is a no-op for a frame at or below lastSeq (returns the same ref)", () => {
+    const seeded: AcpState = { ...emptyAcpState(), lastSeq: 3 };
+    const next = applyEvent(seeded, frame(3, "dup"));
+    expect(next).toBe(seeded);
   });
 });
 
-describe("applyEvent / UserDiffCommentsPrompt (#1123)", () => {
+describe("applyEvent / UserDiffCommentsPrompt (#1123) (control state)", () => {
   function diffCommentsFrame(seq: number): AcpFrame {
     return {
       session_id: "s-1",
@@ -543,63 +89,23 @@ describe("applyEvent / UserDiffCommentsPrompt (#1123)", () => {
           intro: "Take a look:",
           outro: "Please address these comments.",
           isMultiRepo: true,
-          comments: [
-            {
-              id: "c-1",
-              repoName: "repoA",
-              filePath: "src/main.rs",
-              side: "new",
-              startLine: 42,
-              endLine: 45,
-              body: "rename this",
-              capturedSnippet: "fn main() {}",
-              language: "rust",
-              createdAt: "2026-01-01T00:00:00Z",
-            },
-          ],
+          comments: [],
           assembledMarkdown: "Take a look:\n\n## Diff comments\n\n...\n",
         },
       },
     };
   }
 
-  it("appends a typed user_diff_comments row carrying the structured payload", () => {
+  it("bumps the turn counter (the typed row itself is server-owned)", () => {
     const next = applyEvent(emptyAcpState(), diffCommentsFrame(1));
-    expect(next.activity).toHaveLength(1);
-    const row = next.activity[0]!;
-    expect(row.id).toBe("user-seq-1");
-    expect(row.kind).toBe("user_diff_comments");
-    // text is the assembled markdown (agent-visible body / fallback),
-    // never a base64 sentinel.
-    expect(row.text).toContain("## Diff comments");
-    expect(row.text).not.toContain("aoe:diff-comments");
-    expect(row.diffComments).toEqual({
-      intro: "Take a look:",
-      outro: "Please address these comments.",
-      isMultiRepo: true,
-      comments: [
-        {
-          id: "c-1",
-          repoName: "repoA",
-          filePath: "src/main.rs",
-          side: "new",
-          startLine: 42,
-          endLine: 45,
-          body: "rename this",
-          capturedSnippet: "fn main() {}",
-          language: "rust",
-          createdAt: "2026-01-01T00:00:00Z",
-        },
-      ],
-    });
-    expect(next.lastSeq).toBe(1);
+    expect(next.activity).toHaveLength(0);
+    expect(next.pendingUserPromptSeq).toBe(1);
     expect(next.turnActive).toBe(true);
   });
 
   it("applies the same per-turn resets as a plain prompt", () => {
     const stale: AcpState = {
       ...emptyAcpState(),
-      assistantMessage: "stale partial reply",
       startupError: "old error",
       lastError: "old action error",
       workerStopped: true,
@@ -608,7 +114,6 @@ describe("applyEvent / UserDiffCommentsPrompt (#1123)", () => {
       turnActive: false,
     };
     const next = applyEvent(stale, diffCommentsFrame(1));
-    expect(next.assistantMessage).toBe("");
     expect(next.startupError).toBeNull();
     expect(next.lastError).toBeNull();
     expect(next.workerStopped).toBe(false);
@@ -617,75 +122,17 @@ describe("applyEvent / UserDiffCommentsPrompt (#1123)", () => {
     expect(next.turnActive).toBe(true);
   });
 
-  it("counts as a prior user turn for SessionContextReset (#1123)", () => {
-    // A session whose only turn is a diff-comments prompt must still
-    // surface the context-reset row + arm the primer; otherwise it is
-    // wrongly treated as a 0-message session.
+  it("counts as a prior user turn so a later SessionContextReset arms the primer (#1123)", () => {
     let state = applyEvent(emptyAcpState(), diffCommentsFrame(1));
     state = applyEvent(state, {
       session_id: "s-1",
       seq: 2,
       event: { SessionContextReset: { reason: "session/load failed: bad id" } },
     });
-    expect(state.activity.some((r) => r.kind === "context_reset")).toBe(true);
     expect(state.contextPrimerAvailable).toEqual({
       resetSeq: 2,
       reason: "session/load failed: bad id",
     });
-  });
-
-  it("reconstructs the diff-comments turn on replay (no optimistic row)", () => {
-    // The send dialog posts directly, so there is never a placeholder to
-    // promote; the server echo simply appends the typed row.
-    const final = [
-      diffCommentsFrame(1),
-      {
-        session_id: "s-1",
-        seq: 2,
-        event: { AgentMessageChunk: { text: "On it." } },
-      } as AcpFrame,
-    ].reduce((state, f) => applyEvent(state, f), emptyAcpState());
-    const rows = final.activity.filter((a) => a.kind === "user_diff_comments");
-    expect(rows).toHaveLength(1);
-    expect(rows[0]!.diffComments?.comments).toHaveLength(1);
-    expect(final.lastSeq).toBe(2);
-  });
-});
-
-describe("applyEvent / AvailableCommandsUpdated", () => {
-  it("populates availableCommands and replaces the prior list", () => {
-    const f1: AcpFrame = {
-      session_id: "s-1",
-      seq: 1,
-      event: {
-        AvailableCommandsUpdated: {
-          commands: [{ name: "help", description: "Show help", accepts_input: false }],
-        },
-      },
-    };
-    const s1 = applyEvent(emptyAcpState(), f1);
-    expect(s1.availableCommands).toHaveLength(1);
-    expect(s1.availableCommands[0].name).toBe("help");
-
-    const f2: AcpFrame = {
-      session_id: "s-1",
-      seq: 2,
-      event: {
-        AvailableCommandsUpdated: {
-          commands: [
-            { name: "review", description: "Review PR", accepts_input: true },
-            {
-              name: "clear",
-              description: "Clear context",
-              accepts_input: false,
-            },
-          ],
-        },
-      },
-    };
-    const s2 = applyEvent(s1, f2);
-    expect(s2.availableCommands.map((c) => c.name)).toEqual(["review", "clear"]);
-    expect(s2.availableCommands[0].accepts_input).toBe(true);
   });
 });
 
@@ -703,7 +150,10 @@ describe("applyEvent / ACP session id lifecycle", () => {
     expect(after.sessionUsage).toBeNull();
   });
 
-  it("SessionContextReset clears stale usage and appends a context_reset row", () => {
+  it("SessionContextReset clears stale usage and arms the primer after a prior prompt", () => {
+    // The context_reset transcript row is server-owned (Tier 4); applyEvent
+    // clears the usage/baseline and arms the one-shot primer affordance,
+    // gated on a prior user turn via pendingUserPromptSeq.
     let state = applyEvent(emptyAcpState(), {
       session_id: "s-1",
       seq: 1,
@@ -725,12 +175,13 @@ describe("applyEvent / ACP session id lifecycle", () => {
       },
     });
     expect(state.sessionUsage).toBeNull();
-    const last = state.activity[state.activity.length - 1];
-    expect(last?.kind).toBe("context_reset");
-    expect(last?.text).toContain("session/load failed");
+    expect(state.contextPrimerAvailable).toEqual({
+      resetSeq: 3,
+      reason: "session/load failed: bad id",
+    });
   });
 
-  it("SessionContextReset uses a fallback message when reason is empty", () => {
+  it("SessionContextReset uses a fallback primer reason when reason is empty", () => {
     let state = applyEvent(emptyAcpState(), {
       session_id: "s-1",
       seq: 1,
@@ -741,15 +192,12 @@ describe("applyEvent / ACP session id lifecycle", () => {
       seq: 2,
       event: { SessionContextReset: { reason: "" } },
     });
-    const last = state.activity[state.activity.length - 1];
-    expect(last?.kind).toBe("context_reset");
-    expect(last?.text.length).toBeGreaterThan(0);
+    expect(state.contextPrimerAvailable?.reason.length).toBeGreaterThan(0);
   });
 
   it("SessionContextReset is silent on a session with no prior user prompt", () => {
-    // 0-message session: agent never persisted a transcript, so
-    // session/load failing on the next spawn is expected. Don't
-    // surface a meaningless "context reset" warning.
+    // 0-message session: agent never persisted a transcript, so session/load
+    // failing on the next spawn is expected. Don't arm the primer.
     let state = applyEvent(emptyAcpState(), {
       session_id: "s-1",
       seq: 1,
@@ -764,8 +212,7 @@ describe("applyEvent / ACP session id lifecycle", () => {
     });
     // Usage still cleared (defensive — should already be safe to drop).
     expect(state.sessionUsage).toBeNull();
-    // No visible row appended.
-    expect(state.activity.some((r) => r.kind === "context_reset")).toBe(false);
+    expect(state.contextPrimerAvailable).toBeNull();
     expect(state.lastSeq).toBe(2);
   });
 
@@ -896,165 +343,6 @@ describe("applyEvent / ACP session id lifecycle", () => {
       event: { UserPromptSent: { text: "second" } },
     });
     expect(state.contextPrimerAvailable).toBeNull();
-  });
-});
-
-describe("applyEvent / Stopped empty-output fallback", () => {
-  it("appends an empty_output row when the turn ended with no agent output", () => {
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: { UserPromptSent: { text: "/usage" } },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: { Stopped: {} },
-    });
-    const last = state.activity[state.activity.length - 1];
-    expect(last?.kind).toBe("empty_output");
-    expect(last?.text).toContain("no output");
-    expect(state.turnActive).toBe(false);
-  });
-
-  // #2805 field report: a steered mid-turn prompt is not a new turn, so
-  // it must not reset the output flag the running turn already earned.
-  // Replays the reported trace: prompt, agent output, steered prompt,
-  // one Stopped. Before the fix the steered prompt cleared
-  // `turnHasOutput` and the single Stopped rendered a bogus notice.
-  it("does not append the notice when a steered prompt lands mid-turn (#2805)", () => {
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: {
-        PromptCapabilities: {
-          image: false,
-          audio: false,
-          embedded_context: false,
-          steering: true,
-        },
-      },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: { UserPromptSent: { text: "read every file in src/acp" } },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 3,
-      event: { AgentMessageChunk: { text: "I'll dispatch parallel readers." } },
-    });
-    expect(state.turnHasOutput).toBe(true);
-
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 4,
-      event: { UserPromptSent: { text: "actually, just do acp_client.rs" } },
-    });
-    // The steered message is a continuation: the turn keeps the output it
-    // has already produced, and no second turn was opened.
-    expect(state.turnHasOutput).toBe(true);
-
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 5,
-      event: { Stopped: { reason: "prompt_complete" } },
-    });
-    expect(state.activity.some((r) => r.kind === "empty_output")).toBe(false);
-  });
-
-  // The same shape without steering must keep today's behavior: that
-  // prompt really did open a turn, so the reset is correct.
-  it("still resets the output flag for a mid-turn prompt on a non-steerable agent", () => {
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: { UserPromptSent: { text: "first" } },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: { AgentMessageChunk: { text: "output" } },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 3,
-      event: { UserPromptSent: { text: "second" } },
-    });
-    expect(state.turnHasOutput).toBe(false);
-  });
-
-  it("does not append the notice when the agent emitted a message", () => {
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: { UserPromptSent: { text: "/context" } },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: { AgentMessageChunk: { text: "Context Usage" } },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 3,
-      event: { Stopped: {} },
-    });
-    expect(state.activity.find((r) => r.kind === "empty_output")).toBeUndefined();
-  });
-
-  it("does not append the notice when a tool call ran during the turn", () => {
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: { UserPromptSent: { text: "do a thing" } },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: {
-        ToolCallStarted: {
-          tool_call: {
-            id: "t1",
-            name: "Bash",
-            kind: "execute",
-            args_preview: "{}",
-            started_at: new Date().toISOString(),
-          },
-        },
-      },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 3,
-      event: { Stopped: {} },
-    });
-    expect(state.activity.find((r) => r.kind === "empty_output")).toBeUndefined();
-  });
-
-  it("suppresses the notice when a prompt runtime error was surfaced first", () => {
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: { UserPromptSent: { text: "/aoe-investigate bug" } },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: {
-        PromptRuntimeError: {
-          message: "Bad Request: model is not supported for this account.",
-        },
-      },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 3,
-      event: { Stopped: {} },
-    });
-    expect(state.lastError).toBe("Bad Request: model is not supported for this account.");
-    expect(state.activity.find((r) => r.kind === "empty_output")).toBeUndefined();
   });
 });
 
@@ -1352,146 +640,26 @@ describe("applyEvent / MonitorArmed lifecycle", () => {
   );
 });
 
-describe("applyEvent / CancelRequested lifecycle (#1727)", () => {
-  function startedTurn() {
-    // A turn must be active for cancelling to be meaningful.
-    return applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: { UserPromptSent: { text: "do a thing" } },
-    });
-  }
-
-  it("CancelRequested sets cancelling + the escalation deadline", () => {
-    const at = new Date(Date.now() + 10_000).toISOString();
-    const state = applyEvent(startedTurn(), {
-      session_id: "s-1",
-      seq: 2,
-      event: { CancelRequested: { escalates_at: at } },
-    });
-    expect(state.cancelling).toBe(true);
-    expect(state.cancelEscalatesAt).toBe(at);
-    // Turn is still active: CancelRequested is not a Stopped.
-    expect(state.turnActive).toBe(true);
-  });
-
-  it("any Stopped clears the cancelling state", () => {
-    const at = new Date(Date.now() + 10_000).toISOString();
-    let state = applyEvent(startedTurn(), {
-      session_id: "s-1",
-      seq: 2,
-      event: { CancelRequested: { escalates_at: at } },
-    });
-    expect(state.cancelling).toBe(true);
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 3,
-      event: { Stopped: { reason: "user_forced" } },
-    });
-    expect(state.cancelling).toBe(false);
-    expect(state.cancelEscalatesAt).toBeNull();
-    expect(state.turnActive).toBe(false);
-  });
-
-  it("a fresh user prompt clears a stale cancelling flag", () => {
-    const at = new Date(Date.now() + 10_000).toISOString();
-    let state = applyEvent(startedTurn(), {
-      session_id: "s-1",
-      seq: 2,
-      event: { CancelRequested: { escalates_at: at } },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 3,
-      event: { UserPromptSent: { text: "next turn" } },
-    });
-    expect(state.cancelling).toBe(false);
-    expect(state.cancelEscalatesAt).toBeNull();
-  });
-
-  it("replay reconstructs cancelling from the event stream", () => {
-    // REST replay applies the same ordered events; cancelling must
-    // survive a from-scratch rebuild, not depend on a local timer.
-    const at = new Date(Date.now() + 10_000).toISOString();
-    const frames = [
-      { session_id: "s-1", seq: 1, event: { UserPromptSent: { text: "go" } } },
-      {
-        session_id: "s-1",
-        seq: 2,
-        event: { CancelRequested: { escalates_at: at } },
-      },
-    ];
-    let state = emptyAcpState();
-    for (const f of frames) state = applyEvent(state, f);
-    expect(state.cancelling).toBe(true);
-    expect(state.cancelEscalatesAt).toBe(at);
-  });
-});
-
 describe("applyEvent / SessionCleared", () => {
-  // /clear wipes the model's memory. The reducer appends a divider row
-  // so the renderer can fold pre-clear turns behind a disclosure
-  // (#1101), and resets only the per-turn / in-flight fields the
-  // cleared context invalidates. Capability caches (slash commands,
-  // modes) are preserved because claude-agent-sdk caches them at
-  // Query init and does not rotate them on /clear (#1128).
-  it("appends a session_cleared divider row", () => {
-    const next = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 5,
-      event: "SessionCleared",
-    });
-    expect(next.activity).toHaveLength(1);
-    expect(next.activity[0]).toMatchObject({
-      id: "cleared-5",
-      kind: "session_cleared",
-    });
-    expect(next.lastSeq).toBe(5);
-  });
-
-  it("resets per-turn state but preserves capability caches (#1128)", () => {
+  // /clear wipes the model's memory. Everything it invalidates (plan, mode,
+  // pending cards, usage) is server-owned since Tier 1.2, including the
+  // capability caches the agent never re-advertises (#1128). What stays here
+  // is the cost baseline: the agent keeps reporting session-lifetime
+  // cumulative cost, so the boundary snapshot is what makes the footer read
+  // "since the most recent clear" (#1354).
+  it("snapshots the cost baseline and leaves the rest to the server", () => {
     const seeded: AcpState = {
       ...emptyAcpState(),
-      availableCommands: [{ name: "foo", description: "", accepts_input: false }],
-      availableModes: [{ id: "m1", name: "Mode One" }],
-      currentModeId: "m1",
-      plan: {
-        plan_id: "p-1",
-        version: 1,
-        steps: [{ id: "s-1", title: "step", status: "Pending" }],
-      },
-      mode: "Plan",
-      pendingApprovals: [
-        {
-          nonce: "n-1",
-          tool_call: {
-            id: "tc-1",
-            name: "Bash",
-            kind: "execute",
-            args_preview: "ls",
-            started_at: new Date().toISOString(),
-          },
-          destructive: false,
-          requested_at: new Date().toISOString(),
-        },
-      ],
-      sessionUsage: { used: 10, size: 200_000 },
+      sessionUsage: { used: 10, size: 200_000, cost: { amount: 1.5, currency: "USD" } },
+      usageBaseline: { cost: 2 },
     };
     const next = applyEvent(seeded, {
       session_id: "s-1",
       seq: 7,
       event: "SessionCleared",
     });
-    // Per-turn / in-flight state cleared:
-    expect(next.plan).toBeNull();
-    expect(next.mode).toBe("Default");
-    expect(next.pendingApprovals).toEqual([]);
+    expect(next.usageBaseline).toEqual({ cost: 3.5 });
     expect(next.sessionUsage).toBeNull();
-    // Capability caches preserved (slash palette + mode picker keep
-    // working after /clear):
-    expect(next.availableCommands).toEqual(seeded.availableCommands);
-    expect(next.availableModes).toEqual(seeded.availableModes);
-    expect(next.currentModeId).toBe("m1");
   });
 });
 
@@ -1501,7 +669,7 @@ describe("applyEvent / ConversationCompacted", () => {
   // a recap) is therefore inappropriate here, so this event variant
   // exists as a separate signal from SessionContextReset and leaves
   // contextPrimerAvailable alone. See #1109.
-  it("appends a compacted divider row and drops the stale usage snapshot", () => {
+  it("drops the stale usage snapshot (the compacted divider row is server-owned)", () => {
     const seeded: AcpState = {
       ...emptyAcpState(),
       sessionUsage: { used: 100, size: 200_000 },
@@ -1511,11 +679,7 @@ describe("applyEvent / ConversationCompacted", () => {
       seq: 9,
       event: "ConversationCompacted",
     });
-    expect(next.activity).toHaveLength(1);
-    expect(next.activity[0]).toMatchObject({
-      id: "compacted-9",
-      kind: "compacted",
-    });
+    expect(next.activity).toHaveLength(0);
     expect(next.sessionUsage).toBeNull();
   });
 
@@ -1529,88 +693,6 @@ describe("applyEvent / ConversationCompacted", () => {
       seq: 3,
       event: "ConversationCompacted",
     });
-    expect(next.contextPrimerAvailable).toBeNull();
-  });
-});
-
-describe("applyEvent / ConversationCompactionStarted (#3219)", () => {
-  // The adapter goes silent for 90 to 170 seconds between the two
-  // markers, so the phase has to be latched from an event rather than
-  // inferred from the absence of frames. It clears on exactly two
-  // events; `Stopped` is the self-healing one.
-  const started = (seq: number): AcpFrame => ({
-    session_id: "s-1",
-    seq,
-    event: "ConversationCompactionStarted",
-  });
-
-  it("latches the phase without adding a transcript row", () => {
-    // The visible "Compacting..." chunk is already its own row; this
-    // event is state only.
-    const next = applyEvent(emptyAcpState(), started(4));
-    expect(next.compacting).toBe(true);
-    expect(next.activity).toHaveLength(0);
-  });
-
-  it.each([
-    { label: "the completion marker", event: "ConversationCompacted" as const, expected: false },
-    {
-      label: "a clean Stopped",
-      event: { Stopped: { reason: "prompt_complete" } } as const,
-      expected: false,
-    },
-    {
-      label: "a cancelled Stopped",
-      event: { Stopped: { reason: "cancelled" } } as const,
-      expected: false,
-    },
-    // The regression guard for the clear that must NOT exist:
-    // applyNewTurnResets runs on every server-confirmed UserPromptSent,
-    // including a follow-up confirmed inside the silent window. Clearing
-    // there would relabel the spinner and re-arm the Force-end-turn
-    // hatch while the compaction is still running.
-    {
-      label: "a mid-compaction UserPromptSent",
-      event: { UserPromptSent: { text: "also check the tests" } } as const,
-      expected: true,
-    },
-    { label: "ordinary streaming", event: "ThinkingStarted" as const, expected: true },
-  ])("$label leaves compacting=$expected", ({ event, expected }) => {
-    const latched = applyEvent(emptyAcpState(), started(1));
-    expect(latched.compacting).toBe(true);
-    const next = applyEvent(latched, { session_id: "s-1", seq: 2, event });
-    expect(next.compacting).toBe(expected);
-  });
-});
-
-describe("applyEvent / ConversationSummary (#2808)", () => {
-  it("appends a summary row carrying the generated text", () => {
-    const next = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 12,
-      event: { ConversationSummary: { text: "- did the thing\n- next: wire the UI", summarized_until_seq: 11 } },
-    });
-    expect(next.activity).toHaveLength(1);
-    expect(next.activity[0]).toMatchObject({
-      id: "summary-12",
-      kind: "summary",
-      text: "- did the thing\n- next: wire the UI",
-    });
-  });
-
-  it("does not touch usage or the primer banner", () => {
-    const seeded: AcpState = {
-      ...emptyAcpState(),
-      sessionUsage: { used: 100, size: 200_000 },
-    };
-    const next = applyEvent(seeded, {
-      session_id: "s-1",
-      seq: 5,
-      event: { ConversationSummary: { text: "recap", summarized_until_seq: 4 } },
-    });
-    // Unlike /compact, a summary is a transcript artifact and changes no
-    // session state.
-    expect(next.sessionUsage).toEqual({ used: 100, size: 200_000 });
     expect(next.contextPrimerAvailable).toBeNull();
   });
 });
@@ -2055,28 +1137,15 @@ describe("applyEvent / AgentSwitched", () => {
   // to another. Reducer must drop everything tied to the prior
   // backend so the UI doesn't show Claude's usage bar / mode pills /
   // in-flight tool while talking to Codex.
-  it("clears prior-backend transient state and records the handoff", () => {
+  it("records the handoff and resets the cost baseline", () => {
+    // What the new backend re-advertises (agent, rate limit, in-flight tool,
+    // pending cards, commands, modes, plan, mode) is dropped server-side
+    // since Tier 1.2. What stays is the client's own bookkeeping: the new
+    // backend reports its cumulative cost from zero (#1354).
     const seeded: AcpState = {
       ...emptyAcpState(),
-      agent: "claude",
-      rateLimit: {
-        status: "limited",
-        resets_at: "2099-01-01T00:00:00Z",
-        kind: "rate_limit",
-      },
-      inFlightTool: {
-        id: "t-1",
-        name: "Read",
-        kind: "read",
-        args_preview: "{}",
-        started_at: new Date().toISOString(),
-      },
-      thinking: true,
       sessionUsage: { used: 100, size: 200_000 },
-      availableCommands: [{ name: "/clear", description: "wipe context", accepts_input: false }],
-      availableModes: [{ id: "m1", name: "Default" }],
-      currentModeId: "m1",
-      mode: "Plan",
+      usageBaseline: { cost: 4 },
     };
     const next = applyEvent(seeded, {
       session_id: "s-1",
@@ -2085,24 +1154,15 @@ describe("applyEvent / AgentSwitched", () => {
         AgentSwitched: { from: "claude", to: "codex", reason: "rate_limited" },
       },
     });
-    expect(next.agent).toBe("codex");
-    expect(next.rateLimit).toBeNull();
-    expect(next.inFlightTool).toBeNull();
-    expect(next.thinking).toBe(false);
     expect(next.sessionUsage).toBeNull();
-    expect(next.availableCommands).toEqual([]);
-    expect(next.availableModes).toEqual([]);
-    expect(next.currentModeId).toBeNull();
-    expect(next.mode).toBe("Default");
+    expect(next.usageBaseline).toBeNull();
     expect(next.lastAgentSwitch).toMatchObject({
       from: "claude",
       to: "codex",
       reason: "rate_limited",
     });
-    const lastRow = next.activity[next.activity.length - 1];
-    expect(lastRow?.id).toBe("agent-switched-11");
-    expect(lastRow?.text).toContain("claude");
-    expect(lastRow?.text).toContain("codex");
+    // The transcript divider row is server-owned (Tier 4); applyEvent adds none.
+    expect(next.activity).toHaveLength(0);
   });
 
   it("does not double-apply on replay", () => {
@@ -2266,20 +1326,21 @@ describe("turnActive derivation from prompt/stop counters (#1170)", () => {
     expect(state.turnActive).toBe(true);
   });
 
-  it("optimistic user_prompt + matching server echo only bump pending once", async () => {
-    // Avoids double-counting: the server's UserPromptSent that matches
-    // and promotes an existing optimistic row must not bump
-    // `pendingUserPromptSeq` again.
+  it("optimistic user_prompt + matching server echo (by prompt_id) only bump pending once", async () => {
+    // Avoids double-counting: the server's UserPromptSent whose prompt_id
+    // matches an outstanding optimistic overlay row must not bump
+    // `pendingUserPromptSeq` again. See #1170 / #3173.
     const { acpHookReducer } = await import("../hooks/useAcpSession");
     let state = acpHookReducer(emptyAcpState(), {
       kind: "user_prompt",
+      id: "cmp-echo",
       text: "echo me",
     });
     expect(state.pendingUserPromptSeq).toBe(1);
     state = applyEvent(state, {
       session_id: "s-1",
       seq: 5,
-      event: { UserPromptSent: { text: "echo me" } },
+      event: { UserPromptSent: { text: "echo me", prompt_id: "cmp-echo" } },
     });
     expect(state.pendingUserPromptSeq).toBe(1);
     expect(state.turnActive).toBe(true);
@@ -2301,16 +1362,12 @@ describe("turnActive derivation from prompt/stop counters (#1170)", () => {
     expect(state.startupError).toBe("boom");
   });
 
-  it("optimistic-match UserPromptSent resets per-turn flags (turnHasOutput, worker banners, wakeup)", () => {
-    // The optimistic-match branch used to early-return after just
-    // promoting the row id, leaving `turnHasOutput`, `workerStopped`,
-    // `workerRestarting`, and the wakeup countdown stale from the
-    // prior turn. With #1170's race-safe semantics that desync can
-    // suppress the empty-output notice on a follow-up that produces
-    // nothing, so the resets now run on BOTH UserPromptSent branches.
+  it("optimistic-match UserPromptSent (by prompt_id) resets per-turn flags without double-counting", () => {
+    // A server echo whose prompt_id matches the outstanding optimistic overlay
+    // still applies the per-turn resets (worker banners, wakeup countdown) but
+    // must NOT bump the counter again. See #1170 / #3173.
     const stale: AcpState = {
-      ...withOptimisticPrompt(emptyAcpState(), "follow-up"),
-      turnHasOutput: true,
+      ...withOptimisticPrompt(emptyAcpState(), "follow-up", "cmp-fu"),
       workerStopped: true,
       workerRestarting: true,
       nextWakeupAt: new Date(Date.now() - 1_000).toISOString(),
@@ -2319,18 +1376,13 @@ describe("turnActive derivation from prompt/stop counters (#1170)", () => {
     const next = applyEvent(stale, {
       session_id: "s-1",
       seq: 9,
-      event: { UserPromptSent: { text: "follow-up" } },
+      event: { UserPromptSent: { text: "follow-up", prompt_id: "cmp-fu" } },
     });
-    expect(next.activity).toHaveLength(1);
-    expect(next.activity[0].id).toBe("user-seq-9");
-    expect(next.turnHasOutput).toBe(false);
     expect(next.workerStopped).toBe(false);
     expect(next.workerRestarting).toBe(false);
     expect(next.nextWakeupAt).toBeNull();
     expect(next.nextWakeupReason).toBeNull();
-    // pendingUserPromptSeq must NOT double-count: withOptimisticPrompt
-    // bumped it to 1, the server echo matched the optimistic row, so
-    // it stays at 1.
+    // withOptimisticPrompt bumped it to 1; the matching echo keeps it at 1.
     expect(next.pendingUserPromptSeq).toBe(1);
     expect(next.turnActive).toBe(true);
   });
@@ -2493,8 +1545,9 @@ describe("applyEvent / ModeSwitchFailed", () => {
       seq: 2,
       event: { CurrentModeChanged: { current_mode_id: "acceptEdits" } },
     });
+    // The mode id itself is server-owned (Tier 1.2); the switch landing is
+    // what makes the notice stale.
     expect(state.modeSwitchFailed).toBeNull();
-    expect(state.currentModeId).toBe("acceptEdits");
   });
 });
 
@@ -2916,365 +1969,6 @@ describe("applyEvent / ConfigOptions (#1403)", () => {
   });
 });
 
-describe("applyEvent / thinking-state honesty (#1213)", () => {
-  // claude-agent-acp emits ThinkingStarted once per reasoning block but
-  // often skips ThinkingEnded when it transitions into tool calls or
-  // final text. Without these clears, `thinking` latches true through a
-  // whole turn and the WorkingSpinner shows "thinking" verbs while a
-  // Terminal command is actually running. See #1213.
-
-  function toolCall(id: string, name: string): ToolCall {
-    return {
-      id,
-      name,
-      kind: "execute",
-      args_preview: "{}",
-      started_at: "2026-01-01T00:00:00Z",
-    };
-  }
-
-  it("clears thinking when a tool call starts (no ThinkingEnded from adapter)", () => {
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: "ThinkingStarted",
-    });
-    expect(state.thinking).toBe(true);
-
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: { ToolCallStarted: { tool_call: toolCall("t1", "Terminal") } },
-    });
-    expect(state.thinking).toBe(false);
-    expect(state.inFlightTool?.name).toBe("Terminal");
-  });
-
-  it("clears thinking when assistant text starts streaming", () => {
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: "ThinkingStarted",
-    });
-    expect(state.thinking).toBe(true);
-
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: { AgentMessageChunk: { text: "Here is the answer" } },
-    });
-    expect(state.thinking).toBe(false);
-  });
-
-  it("clears thinking on Stopped so it does not leak across turns", () => {
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: "ThinkingStarted",
-    });
-    expect(state.thinking).toBe(true);
-
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: { Stopped: { reason: "prompt_complete" } },
-    });
-    expect(state.thinking).toBe(false);
-    expect(state.inFlightTool).toBeNull();
-  });
-
-  it("derives tool over thinking through an interleaved turn (full trace)", () => {
-    // Mirrors the affected session: ThinkingStarted, then a Terminal
-    // tool call with no intervening ThinkingEnded.
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: "ThinkingStarted",
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: { ToolCallStarted: { tool_call: toolCall("t1", "Terminal") } },
-    });
-    // The WorkingSpinner derives state as tool > thinking > working.
-    expect(state.thinking).toBe(false);
-    expect(state.inFlightTool).not.toBeNull();
-  });
-});
-
-describe("applyEvent / start-less tool flows (#1713)", () => {
-  // Gemini's permission flow ships completions/updates with no preceding
-  // ToolCallStarted frame. The reducer must synthesize a start row so the
-  // card still renders, and a sparse permission start must not clobber a
-  // richer real start frame for the same id.
-
-  function toolCall(id: string, over: Partial<ToolCall> = {}): ToolCall {
-    return {
-      id,
-      name: "Write file",
-      kind: "edit",
-      args_preview: "",
-      started_at: "2026-01-01T00:00:00Z",
-      ...over,
-    };
-  }
-
-  it("synthesizes a tool_start row when a completion arrives with no start", () => {
-    const state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: {
-        ToolCallCompleted: {
-          tool_call_id: "orphan-1",
-          is_error: false,
-          content: "done output",
-          completed_at: "2026-01-01T00:00:01Z",
-        },
-      },
-    });
-    const start = state.activity.find((r) => r.kind === "tool_start" && r.toolCallId === "orphan-1");
-    expect(start).toBeDefined();
-    const done = state.activity.find((r) => r.kind === "tool_complete" && r.toolCallId === "orphan-1");
-    expect(done?.text).toBe("done output");
-    // A synthesized card counts as turn output, so the turn-end logic
-    // must not append "Command produced no output."
-    expect(state.turnHasOutput).toBe(true);
-  });
-
-  it("synthesizes a tool_start row when an update arrives with no start", () => {
-    const state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: {
-        ToolCallUpdated: {
-          tool_call_id: "orphan-2",
-          title: "run_shell_command",
-          args_preview: '{"command":"ls"}',
-        },
-      },
-    });
-    const start = state.activity.find((r) => r.kind === "tool_start" && r.toolCallId === "orphan-2");
-    expect(start).toBeDefined();
-    expect(start?.tool?.name).toBe("run_shell_command");
-    expect(start?.tool?.args_preview).toBe('{"command":"ls"}');
-  });
-
-  it("a sparse permission start does not clobber a richer real start", () => {
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: {
-        ToolCallStarted: {
-          tool_call: toolCall("dup-1", {
-            kind: "execute",
-            args_preview: '{"command":"ls -la"}',
-          }),
-        },
-      },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: {
-        ToolCallStarted: {
-          tool_call: toolCall("dup-1", { kind: "other", args_preview: "" }),
-        },
-      },
-    });
-    const rows = state.activity.filter((r) => r.kind === "tool_start" && r.toolCallId === "dup-1");
-    expect(rows).toHaveLength(1);
-    expect(rows[0]?.tool?.args_preview).toBe('{"command":"ls -la"}');
-    expect(rows[0]?.tool?.kind).toBe("execute");
-  });
-
-  it("a later rich start frame fills in a sparse permission start", () => {
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: {
-        ToolCallStarted: {
-          tool_call: toolCall("dup-2", { kind: "other", args_preview: "" }),
-        },
-      },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: {
-        ToolCallStarted: {
-          tool_call: toolCall("dup-2", {
-            kind: "execute",
-            args_preview: '{"command":"pwd"}',
-          }),
-        },
-      },
-    });
-    const rows = state.activity.filter((r) => r.kind === "tool_start" && r.toolCallId === "dup-2");
-    expect(rows).toHaveLength(1);
-    expect(rows[0]?.tool?.args_preview).toBe('{"command":"pwd"}');
-    expect(rows[0]?.tool?.kind).toBe("execute");
-  });
-
-  it("prefers the later started_at when a real start follows a permission start", () => {
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: {
-        ToolCallStarted: {
-          tool_call: toolCall("dup-3", {
-            kind: "other",
-            args_preview: "",
-            started_at: "2026-01-01T00:00:00Z",
-          }),
-        },
-      },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: {
-        ToolCallStarted: {
-          tool_call: toolCall("dup-3", {
-            kind: "execute",
-            args_preview: '{"command":"pwd"}',
-            started_at: "2026-01-01T00:00:05Z",
-          }),
-        },
-      },
-    });
-    const row = state.activity.find((r) => r.kind === "tool_start" && r.toolCallId === "dup-3");
-    expect(row?.tool?.started_at).toBe("2026-01-01T00:00:05Z");
-    expect(row?.at).toBe("2026-01-01T00:00:05Z");
-  });
-});
-
-describe("applyEvent / RateLimitAutoResumed (#1722)", () => {
-  it("clears the rate-limit banner so the composer unlocks", () => {
-    let state: AcpState = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: {
-        RateLimit: {
-          info: {
-            status: "usage limit reached",
-            resets_at: "2026-06-01T12:10:00Z",
-            kind: "rate_limit",
-          },
-        },
-      },
-    });
-    expect(state.rateLimit).not.toBeNull();
-
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: { RateLimitAutoResumed: { resets_at: "2026-06-01T12:10:00Z" } },
-    });
-    expect(state.rateLimit).toBeNull();
-  });
-});
-
-describe("applyEvent / elicitation", () => {
-  const elicitation = {
-    nonce: "e-1",
-    message: "Pick one",
-    tool_call_id: null,
-    questions: [
-      {
-        field_key: "question_0",
-        title: "Color?",
-        description: null,
-        required: true,
-        kind: "single_select" as const,
-        options: [{ value: "Red", label: "Red" }],
-        min_items: null,
-        max_items: null,
-      },
-    ],
-    requested_at: "2026-06-10T00:00:00Z",
-    resolved: null,
-  };
-
-  it("adds a pending elicitation on ElicitationRequested and drops it on resolve", () => {
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: { ElicitationRequested: { elicitation } },
-    });
-    expect(state.pendingElicitations).toHaveLength(1);
-    expect(state.pendingElicitations[0].nonce).toBe("e-1");
-
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: { ElicitationResolved: { nonce: "e-1", outcome: "Accepted" } },
-    });
-    expect(state.pendingElicitations).toHaveLength(0);
-  });
-
-  it("suppresses the AskUserQuestion tool card when the tool call started first", () => {
-    const toolCall = {
-      id: "tc-ask",
-      name: "Asking for your input",
-      kind: "other",
-      args_preview: '{"questions":[]}',
-      started_at: "2026-06-10T00:00:00Z",
-    };
-    // Tool call arrives first -> a transcript row appears.
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: { ToolCallStarted: { tool_call: toolCall } },
-    });
-    expect(state.activity.some((r) => r.toolCallId === "tc-ask")).toBe(true);
-
-    // The matching elicitation then arrives -> the row + in-flight pointer
-    // are stripped and the id is remembered.
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: { ElicitationRequested: { elicitation: { ...elicitation, tool_call_id: "tc-ask" } } },
-    });
-    expect(state.activity.some((r) => r.toolCallId === "tc-ask")).toBe(false);
-    expect(state.inFlightTool).toBeNull();
-
-    // A later completion for the same id produces no card.
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 3,
-      event: {
-        ToolCallCompleted: { tool_call_id: "tc-ask", is_error: false, content: "", output: [] },
-      },
-    });
-    expect(state.activity.some((r) => r.toolCallId === "tc-ask")).toBe(false);
-  });
-
-  it("suppresses the AskUserQuestion tool card when the elicitation arrived first", () => {
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: { ElicitationRequested: { elicitation: { ...elicitation, tool_call_id: "tc-ask" } } },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: {
-        ToolCallStarted: {
-          tool_call: {
-            id: "tc-ask",
-            name: "Asking for your input",
-            kind: "other",
-            args_preview: "{}",
-            started_at: "2026-06-10T00:00:00Z",
-          },
-        },
-      },
-    });
-    expect(state.activity.some((r) => r.toolCallId === "tc-ask")).toBe(false);
-    expect(state.inFlightTool).toBeNull();
-  });
-});
-
 describe("applyEvent / UsageUpdated context-window latch (upstream #596 bandaid)", () => {
   function usageFrame(seq: number, used: number, size: number): AcpFrame {
     return {
@@ -3334,48 +2028,5 @@ describe("applyEvent / UsageUpdated context-window latch (upstream #596 bandaid)
     expect(state.sessionUsage).toBeNull();
     state = applyEvent(state, usageFrame(4, 5_000, 200_000));
     expect(state.sessionUsage?.size).toBe(200_000);
-  });
-});
-
-describe("applyEvent / rate-limit banner clears on resume-to-life", () => {
-  const info = {
-    status: "rate_limited",
-    resets_at: "2026-07-23T15:40:00Z",
-    kind: "rate_limit",
-  };
-  const rateLimitFrame = (seq: number): AcpFrame => ({
-    session_id: "s-1",
-    seq,
-    event: { RateLimit: { info } },
-  });
-
-  it("clears rateLimit on the next UserPromptSent (resumed via a plain prompt)", () => {
-    // Reproduces #3028: a rate-limited turn parks the banner, the session
-    // resumes via a prompt (or a draining queued follow-up), yet the
-    // banner never went away because UserPromptSent didn't clear it.
-    let state = applyEvent(emptyAcpState(), rateLimitFrame(1));
-    expect(state.rateLimit).toEqual(info);
-    state = applyEvent(state, frame(2, "continue"));
-    expect(state.rateLimit).toBeNull();
-  });
-
-  it("clears rateLimit on a fresh AcpSessionAssigned (a new worker healed the park)", () => {
-    let state = applyEvent(emptyAcpState(), rateLimitFrame(1));
-    expect(state.rateLimit).toEqual(info);
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: { AcpSessionAssigned: { acp_session_id: "acp-1" } },
-    });
-    expect(state.rateLimit).toBeNull();
-  });
-
-  it("re-derives rateLimit === null on replay when a turn resumed after the park", () => {
-    // The "stuck 4h later" symptom is replay: reconnect reapplies the
-    // event log, so the post-park UserPromptSent must clear the banner
-    // every time the state is rebuilt, not just on the live dispatch.
-    const log: AcpFrame[] = [rateLimitFrame(1), frame(2, "continue")];
-    const replayed = log.reduce(applyEvent, emptyAcpState());
-    expect(replayed.rateLimit).toBeNull();
   });
 });

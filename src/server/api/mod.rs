@@ -22,6 +22,8 @@ mod mcp;
 pub(crate) mod plugin_settings;
 pub mod plugins;
 mod projects;
+#[cfg(feature = "serve")]
+mod queue;
 pub(crate) mod sessions;
 mod skills;
 pub(crate) mod system;
@@ -37,6 +39,9 @@ pub use acp::{
     list_claude_sessions, resolve_approval, resolve_elicitation, shutdown_acp, spawn_acp,
     switch_acp_agent,
 };
+
+#[cfg(feature = "serve")]
+pub use queue::{queue_clear, queue_edit, queue_enqueue, queue_list, queue_remove};
 
 #[cfg(feature = "serve")]
 pub use client_log::post_client_log;

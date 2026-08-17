@@ -69,6 +69,16 @@ async function setup(page: Page) {
   await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
   // Prompt POSTs + replay succeed (empty), so the optimistic send sticks.
   await page.route("**/api/sessions/*/acp/**", (r) => r.fulfill({ json: {} }));
+  // The daemon owns the send / queue decision (Tier 3): the first prompt opens
+  // the turn and every follow-up parks behind it. Registered after the generic
+  // acp/** route so it wins Playwright's reverse-registration-order matching.
+  let promptPosts = 0;
+  await page.route(/\/acp\/prompt(\?|$)/, (r) => {
+    promptPosts += 1;
+    if (promptPosts === 1) return r.fulfill({ json: { disposition: "sent" } });
+    const id = `srv-q${promptPosts}`;
+    return r.fulfill({ json: { disposition: "queued", reason: "turn_active", queued_id: id } });
+  });
   // Accept both sockets as open-but-silent: the session reads as connected
   // so the first Enter sends (turn active) and the rest queue.
   await page.routeWebSocket(/\/sessions\/[^/]+\/ws(\?|$)/, () => {});

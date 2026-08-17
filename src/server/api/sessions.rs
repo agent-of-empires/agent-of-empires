@@ -196,6 +196,14 @@ pub struct SessionResponse {
     /// available, replacing the hardcoded client-side tool list.
     #[cfg(feature = "serve")]
     pub acp_capable: bool,
+    /// The session's server-owned prompt queue (follow-ups the user lined up
+    /// while a turn was busy), ordered by `seq`. The daemon owns it, so it is
+    /// visible across the user's devices and survives a client reload; the
+    /// structured view renders it and drains happen server-side. See
+    /// `docs/development/server-side-prompt-queue.md`.
+    #[cfg(feature = "serve")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queued_prompts: Vec<crate::acp::state::QueuedPromptEntry>,
     /// The session's captured ACP session id, present only once the
     /// structured-view worker has minted one. The web dashboard passes this
     /// as `fork_from` on a structured fork create, so the sidebar only offers
@@ -228,6 +236,24 @@ pub struct SessionResponse {
     #[cfg(feature = "serve")]
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub acp_can_fork: bool,
+    /// Whether switching this session between terminal and structured view
+    /// preserves the conversation (only claude pairings share one
+    /// CLI-resumable transcript). Server-owned via
+    /// `agents::acp_transcript_cli_resumable` so the dashboard and TUI stop
+    /// each recomputing it from `tool` + `acp_agent`. Omitted (read as false)
+    /// for non-preserving pairings. See docs/development/server-owned-sv-state.md.
+    #[cfg(feature = "serve")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keeps_context: bool,
+    /// Slash-command aliases that reset the conversation for this session's
+    /// agent (claude `/clear`, codex/opencode `/new`). Server-owned from
+    /// `acp::agent_profiles::resolve(...).clear_aliases` so the composer's `/`
+    /// palette and the queued-prompt clear-boundary hint stop mirroring the
+    /// per-agent list client-side. Omitted (read as empty) for agents with no
+    /// clear alias. See docs/development/server-owned-sv-state.md.
+    #[cfg(feature = "serve")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clear_aliases: Vec<String>,
     /// True when the session is a Claude Code session AND the user has
     /// enabled Claude's fullscreen renderer (`tui: "fullscreen"` in
     /// `~/.claude/settings.json`). The web client uses this to skip
@@ -421,6 +447,12 @@ impl SessionResponse {
             #[cfg(feature = "serve")]
             view: inst.view,
             #[cfg(feature = "serve")]
+            queued_prompts: {
+                let mut q = inst.queued_prompts.clone();
+                q.sort_by_key(|e| e.seq);
+                q
+            },
+            #[cfg(feature = "serve")]
             acp_worker_state,
             // Built-in ACP capability is resolved here from a process-wide
             // registry (cheap, no IO). Custom agents depend on profile
@@ -455,6 +487,30 @@ impl SessionResponse {
             // cannot drift: forkable = ACP-capable AND a real fork strategy.
             #[cfg(feature = "serve")]
             acp_can_fork: agent_is_structured_fork_capable(&inst.tool, inst.agent_name.as_deref()),
+            // Same agent resolution as `acp_agent` above; computed once here so
+            // the web dashboard and native TUI stop mirroring the gate.
+            #[cfg(feature = "serve")]
+            keeps_context: crate::agents::acp_transcript_cli_resumable(
+                &inst.tool,
+                inst.agent_name
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(inst.tool.as_str()),
+            ),
+            // Same agent resolution as `acp_agent` above; the composer palette
+            // and queued-prompt clear-boundary hint read these instead of a
+            // client-side per-agent mirror.
+            #[cfg(feature = "serve")]
+            clear_aliases: crate::acp::agent_profiles::resolve(
+                inst.agent_name
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(inst.tool.as_str()),
+            )
+            .clear_aliases
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
             claude_fullscreen: claude_fullscreen && inst.tool == "claude",
             // A session converted by `attach_project` (#3103) has a real
             // `workspace_info`, so this lists both repos with no special case:
@@ -532,14 +588,17 @@ fn builtin_acp_registry() -> &'static crate::acp::AgentRegistry {
     REG.get_or_init(crate::acp::AgentRegistry::with_defaults)
 }
 
-/// True iff this custom agent declares a valid `agent_acp_cmd` in the
-/// given profile-resolved map. Built-in capability is handled separately
-/// in the constructor, so this only covers the custom case.
+/// True iff this custom agent can run in structured view: it declares a valid
+/// `agent_acp_cmd`, or it inherits a registry-backed base via
+/// `agent_detect_as`. Built-in capability is handled separately in the
+/// constructor, so this only covers the custom case.
 #[cfg(feature = "serve")]
-fn custom_agent_acp_capable(agent_acp_cmd: &HashMap<String, String>, tool: &str) -> bool {
-    agent_acp_cmd
+fn custom_agent_acp_capable(session: &crate::session::config::SessionConfig, tool: &str) -> bool {
+    session
+        .agent_acp_cmd
         .get(tool)
         .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(tool, cmd).is_ok())
+        || crate::acp::inherited_acp_base(tool, &session.agent_detect_as).is_some()
 }
 
 /// Resolve the [`SessionConfig`] for `(profile, project_path)` through the
@@ -695,7 +754,7 @@ pub async fn list_sessions(
                 &inst.source_profile,
                 &inst.project_path,
             );
-            resp.acp_capable = custom_agent_acp_capable(&cfg.agent_acp_cmd, &inst.tool);
+            resp.acp_capable = custom_agent_acp_capable(cfg, &inst.tool);
         }
     }
 
@@ -4827,11 +4886,16 @@ fn agent_is_acp_capable(
     // custom map by that same name. Looking up `tool` here would report
     // not-capable for an agent that spawns fine, skipping the up-front 403 in
     // favor of a late refusal at spawn.
-    crate::session::repo_config::resolve_config_with_repo_or_warn(profile, project_path)
-        .session
+    let session =
+        crate::session::repo_config::resolve_config_with_repo_or_warn(profile, project_path)
+            .session;
+    session
         .agent_acp_cmd
         .get(resolved)
         .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(resolved, cmd).is_ok())
+        // A custom agent inheriting a registry-backed base via `agent_detect_as`
+        // spawns fine through the base adapter, so report it capable up front.
+        || crate::acp::inherited_acp_base(resolved, &session.agent_detect_as).is_some()
 }
 
 fn validate_session_tool_identity(
@@ -5707,13 +5771,12 @@ pub async fn create_session(
                         .tie_workdir_to_name;
                 }
                 if !resp.acp_capable {
-                    let acp_cmd = crate::session::repo_config::resolve_config_with_repo_or_warn(
+                    let session = crate::session::repo_config::resolve_config_with_repo_or_warn(
                         &instance.source_profile,
                         std::path::Path::new(&instance.project_path),
                     )
-                    .session
-                    .agent_acp_cmd;
-                    resp.acp_capable = custom_agent_acp_capable(&acp_cmd, &instance.tool);
+                    .session;
+                    resp.acp_capable = custom_agent_acp_capable(&session, &instance.tool);
                 }
             }
 
@@ -10509,6 +10572,7 @@ mod workspace_ordering_tests {
             view: crate::session::View::Terminal,
             #[cfg(feature = "serve")]
             acp_worker_state: crate::acp::supervisor::AcpWorkerState::Absent,
+            queued_prompts: Vec::new(),
             #[cfg(feature = "serve")]
             acp_capable: false,
             #[cfg(feature = "serve")]
@@ -10517,6 +10581,10 @@ mod workspace_ordering_tests {
             acp_agent: None,
             #[cfg(feature = "serve")]
             acp_can_fork: false,
+            #[cfg(feature = "serve")]
+            keeps_context: false,
+            #[cfg(feature = "serve")]
+            clear_aliases: Vec::new(),
             claude_fullscreen: false,
             workspace_repos: Vec::new(),
             warnings: Vec::new(),

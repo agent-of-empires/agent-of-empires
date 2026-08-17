@@ -171,6 +171,23 @@ describe("usePushSubscription initial refresh", () => {
     expect(result.current.state).toEqual({ kind: "enabled" });
   });
 
+  it("auto-heals by re-registering the existing subscription with the server on open", async () => {
+    // On open with a live browser subscription, the hook re-POSTs it to
+    // /api/push/subscribe so the server re-binds ownership to the current
+    // token and re-inserts it if the record was dropped by a rotation.
+    const calls = installFetch();
+    const { result } = await mountAndSettle();
+    expect(result.current.state).toEqual({ kind: "enabled" });
+    expect(calls.some((u) => u.includes("/api/push/subscribe"))).toBe(true);
+  });
+
+  it("stays enabled even if the auto-heal re-register call fails", async () => {
+    installFetch({ subscribe: { ok: false, status: 500 } });
+    const { result } = await mountAndSettle();
+    // Best-effort: a failed re-register must not knock the UI out of enabled.
+    expect(result.current.state).toEqual({ kind: "enabled" });
+  });
+
   it("resolves to off when granted but no active subscription", async () => {
     getSubscriptionImpl = async () => null;
     currentSubscription = null;

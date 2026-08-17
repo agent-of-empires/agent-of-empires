@@ -214,10 +214,10 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
     );
   }
 
-  // iOS regular Safari is the one platform where the layout viewport
-  // does NOT shrink with the keyboard; inset the pane by the measured
-  // keyboard height there. Everywhere else this is 0 and dvh shrink
-  // does the work.
+  // Keyboard-open lift only. The pane root deliberately carries no inset while
+  // the keyboard is closed (#1432): home-indicator clearance is reserved by an
+  // ancestor (see the terminal wrapper in MobileMainPane), not here, so the
+  // mobile-keyboard specs can read a bare `${keyboardHeight}px` off this node.
   const rootStyle = keyboardHeight > 0 ? { paddingBottom: keyboardHeight } : undefined;
 
   return (

@@ -1346,7 +1346,7 @@ mod dirty_tracking_tests {
         // Meanwhile a peer process writes an unrelated global field straight
         // to disk, after this view took its baseline snapshot.
         crate::session::config::update_config(|c| {
-            c.session.confirm_delete = true;
+            c.session.confirm_delete = false;
         })
         .unwrap();
 
@@ -1358,7 +1358,7 @@ mod dirty_tracking_tests {
             "the field the user edited must be applied"
         );
         assert!(
-            on_disk.session.confirm_delete,
+            !on_disk.session.confirm_delete,
             "a peer's concurrent edit to a field the user never touched must survive the save"
         );
     }
@@ -1372,14 +1372,14 @@ mod dirty_tracking_tests {
         view.scope = SettingsScope::Global;
 
         crate::session::config::update_config(|c| {
-            c.session.confirm_delete = true;
+            c.session.confirm_delete = false;
         })
         .unwrap();
 
         view.save().unwrap();
 
         assert!(
-            Config::load().unwrap().session.confirm_delete,
+            !Config::load().unwrap().session.confirm_delete,
             "an edit-free save must not revert a peer's write"
         );
     }

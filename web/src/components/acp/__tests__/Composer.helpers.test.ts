@@ -87,18 +87,18 @@ describe("decideBeforeInputAction", () => {
 });
 
 describe("composerWrapperLayout", () => {
-  it("uses pb-3 and no bottom-margin style when the keyboard is closed", () => {
+  it("uses just the base pb-3 gap and no inline style when the keyboard is closed", () => {
     const layout = composerWrapperLayout({ keyboardOpen: false });
     expect(layout.className).toContain("pb-3");
     expect(layout.className).not.toContain("pb-0");
     expect(layout.style).toBeUndefined();
   });
 
-  it("uses pb-0 and a negative safe-area bottom margin when the keyboard is open", () => {
+  it("uses pb-0 and no inline style when the keyboard is open (no accessory bar)", () => {
     const layout = composerWrapperLayout({ keyboardOpen: true });
     expect(layout.className).toContain("pb-0");
     expect(layout.className).not.toContain("pb-3");
-    expect(layout.style).toEqual({ marginBottom: "calc(-1 * env(safe-area-inset-bottom))" });
+    expect(layout.style).toBeUndefined();
   });
 });
 

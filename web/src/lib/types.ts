@@ -157,6 +157,18 @@ export interface SessionResponse {
    *  event that populates the reduced `state.agent`), so it can gray out the
    *  running backend on a never-switched session. See #2803. */
   acp_agent?: string;
+  /** Whether switching this session between terminal and structured view
+   *  preserves the conversation (only claude pairings share one CLI-resumable
+   *  transcript). Server-computed via `agents::acp_transcript_cli_resumable`;
+   *  the dashboard reads this instead of recomputing it. Absent (read as false)
+   *  for non-preserving pairings. */
+  keeps_context?: boolean;
+  /** Slash-command aliases that reset the conversation for this session's
+   *  agent (claude `/clear`, codex/opencode `/new`). Server-owned from the
+   *  Rust `AgentProfile::clear_aliases`; the composer's `/` palette and the
+   *  queued-prompt clear-boundary hint read this instead of a client-side
+   *  per-agent mirror. Absent (read as empty) for agents with no clear alias. */
+  clear_aliases?: string[];
   /** True when this session's agent can run a structured ACP `session/fork`:
    *  it is ACP-capable AND declares a real fork strategy. Resume-only ACP
    *  agents (e.g. the bundled `aoe-agent`, which advertises `loadSession` but

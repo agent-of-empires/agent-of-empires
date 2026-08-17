@@ -49,8 +49,105 @@ const STALL_AFTER: Duration = Duration::from_secs(90);
 const ABORT_AFTER: Duration = Duration::from_secs(300);
 /// Give the transcript file this long to appear after launch.
 const WAIT_FILE_FOR: Duration = Duration::from_secs(30);
+/// Bound on a single `docker`/`podman exec` used to read the transcript.
+///
+/// Both reads are awaited outside the tailer's `tokio::select!`, so a wedged
+/// container runtime would block the loop before it could observe
+/// `event_tx.closed()` or its own idle timeout, holding the task's
+/// `ActiveGuard` (and therefore the off-protocol work grace) indefinitely.
+/// Paired with `kill_on_drop`, so a timed-out exec is reaped rather than left
+/// behind. Comfortably above a healthy exec while still well under
+/// `POLL_INTERVAL * a few`, so a slow runtime degrades to fewer reads rather
+/// than a stuck tailer.
+const CONTAINER_EXEC_TIMEOUT: Duration = Duration::from_secs(10);
 /// Cap on the assistant-text preview carried in progress/result.
 const TEXT_PREVIEW_CHARS: usize = 240;
+
+/// Where a sub-agent transcript lives, and how to read it.
+///
+/// A host session's transcript is an ordinary file the daemon reads
+/// directly. A sandboxed session's transcript lives inside the container's
+/// home directory (`~/.claude/.../subagents/`), which is NOT one of the
+/// session's mounted volumes, so there is no host path to read and no mount
+/// to translate through. It must be read across the container boundary via
+/// the runtime's `exec`, exactly as `terminal_handler` runs sandboxed
+/// commands. Before this existed the tailer always used host `tokio::fs`, so
+/// a sandboxed sub-agent's transcript "never appeared" and every async Task
+/// in a sandbox reported a spurious error. See the module docs and #(sandbox
+/// sub-agent transcript).
+#[derive(Clone)]
+pub enum TranscriptSource {
+    /// Read the transcript directly from the host filesystem.
+    Host,
+    /// Read the transcript from inside the session's container via
+    /// `<runtime> exec <container> …` (`docker` / `podman`).
+    Container {
+        /// Container runtime binary, e.g. `docker`.
+        runtime: &'static str,
+        /// The session's container name for `<runtime> exec`.
+        container: String,
+    },
+}
+
+impl TranscriptSource {
+    /// Whether the transcript file exists yet. The launch payload's
+    /// `outputFile` is a symlink into the subagents dir; `test -e` and the
+    /// host `metadata` call both follow it to the real target.
+    async fn exists(&self, path: &str) -> bool {
+        match self {
+            TranscriptSource::Host => tokio::fs::metadata(path).await.is_ok(),
+            TranscriptSource::Container { runtime, container } => {
+                let mut cmd = tokio::process::Command::new(runtime);
+                cmd.args(["exec", container, "test", "-e", path])
+                    .stdin(std::process::Stdio::null())
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .kill_on_drop(true);
+                matches!(
+                    tokio::time::timeout(CONTAINER_EXEC_TIMEOUT, cmd.status()).await,
+                    Ok(Ok(s)) if s.success()
+                )
+            }
+        }
+    }
+
+    /// Read the bytes appended since `offset` (0-based). Returns an empty
+    /// vec when nothing is new or the file is momentarily unreadable, so the
+    /// poll loop keeps waiting rather than aborting; mirrors the host
+    /// open-failure path.
+    async fn read_from(&self, path: &str, offset: u64) -> Vec<u8> {
+        match self {
+            TranscriptSource::Host => {
+                let Ok(mut file) = tokio::fs::File::open(path).await else {
+                    return Vec::new();
+                };
+                if file.seek(SeekFrom::Start(offset)).await.is_err() {
+                    return Vec::new();
+                }
+                let mut chunk = Vec::new();
+                if file.read_to_end(&mut chunk).await.is_err() {
+                    return Vec::new();
+                }
+                chunk
+            }
+            TranscriptSource::Container { runtime, container } => {
+                // `tail -c +N` prints bytes from the 1-based byte offset N to
+                // EOF, so a 0-based `offset` maps to `+(offset + 1)`. On the
+                // first read (offset 0) this is `+1`, i.e. the whole file.
+                let start = format!("+{}", offset.saturating_add(1));
+                let mut cmd = tokio::process::Command::new(runtime);
+                cmd.args(["exec", container, "tail", "-c", &start, path])
+                    .stdin(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .kill_on_drop(true);
+                match tokio::time::timeout(CONTAINER_EXEC_TIMEOUT, cmd.output()).await {
+                    Ok(Ok(out)) if out.status.success() => out.stdout,
+                    _ => Vec::new(),
+                }
+            }
+        }
+    }
+}
 
 /// Removes an agent from the shared in-flight set on any tailer exit
 /// (terminal event, hard-idle abort, or `event_tx` close). The
@@ -78,6 +175,7 @@ impl Drop for ActiveGuard {
 pub fn spawn_tailer(
     agent_id: String,
     output_file: String,
+    source: TranscriptSource,
     event_tx: Sender<Event>,
     active: Arc<Mutex<HashSet<String>>>,
 ) {
@@ -110,7 +208,7 @@ pub fn spawn_tailer(
             active,
             agent_id: agent_id.clone(),
         };
-        run_tailer(agent_id, output_file, event_tx).await;
+        run_tailer(agent_id, output_file, source, event_tx).await;
     });
 }
 
@@ -157,11 +255,17 @@ struct Snapshot {
     unresolved_tools: HashSet<String>,
 }
 
-async fn run_tailer(agent_id: String, output_file: String, event_tx: Sender<Event>) {
+async fn run_tailer(
+    agent_id: String,
+    output_file: String,
+    source: TranscriptSource,
+    event_tx: Sender<Event>,
+) {
     // Wait for the transcript to appear (the SDK writes it shortly after
-    // the launch event). Bail to Error if it never shows.
+    // the launch event). Bail to Error if it never shows. For a sandboxed
+    // session this checks inside the container, not the host.
     let mut waited = Duration::ZERO;
-    while tokio::fs::metadata(&output_file).await.is_err() {
+    while !source.exists(&output_file).await {
         if waited >= WAIT_FILE_FOR {
             let _ = event_tx
                 .send(completed(
@@ -188,7 +292,8 @@ async fn run_tailer(agent_id: String, output_file: String, event_tx: Sender<Even
     let mut stalled_emitted = false;
 
     loop {
-        let grew = read_new_lines(&output_file, &mut offset, &mut line_buf, &mut snap).await;
+        let grew =
+            read_new_lines(&source, &output_file, &mut offset, &mut line_buf, &mut snap).await;
         let now = Utc::now();
         if grew {
             last_growth = now;
@@ -267,19 +372,14 @@ async fn run_tailer(agent_id: String, output_file: String, event_tx: Sender<Even
 /// folding complete JSONL records into `snap`. Returns true if the file
 /// grew. A partial trailing line stays in `line_buf` for the next poll.
 async fn read_new_lines(
+    source: &TranscriptSource,
     path: &str,
     offset: &mut u64,
     line_buf: &mut String,
     snap: &mut Snapshot,
 ) -> bool {
-    let Ok(mut file) = tokio::fs::File::open(path).await else {
-        return false;
-    };
-    if file.seek(SeekFrom::Start(*offset)).await.is_err() {
-        return false;
-    }
-    let mut chunk = Vec::new();
-    if file.read_to_end(&mut chunk).await.is_err() || chunk.is_empty() {
+    let chunk = source.read_from(path, *offset).await;
+    if chunk.is_empty() {
         return false;
     }
     *offset += chunk.len() as u64;
@@ -509,6 +609,42 @@ fn completed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The host read path returns only bytes appended since `offset`, and
+    /// `read_new_lines` folds each complete line while a partial trailing
+    /// line waits for the next poll. This is the same offset contract the
+    /// container `tail -c +N` path mirrors, so pinning it here guards both.
+    #[tokio::test]
+    async fn host_read_new_lines_reads_from_offset_and_buffers_partials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("transcript.jsonl");
+        let path_str = path.to_string_lossy().to_string();
+        let source = TranscriptSource::Host;
+
+        let line =
+            r#"{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Bash"}]}}"#;
+        // First write ends mid-line (no trailing newline): nothing folds yet.
+        tokio::fs::write(&path, format!("{line}")).await.unwrap();
+        let mut offset = 0u64;
+        let mut buf = String::new();
+        let mut snap = Snapshot::default();
+        assert!(read_new_lines(&source, &path_str, &mut offset, &mut buf, &mut snap).await);
+        assert_eq!(snap.tool_count, 0, "a partial line must not fold");
+        assert_eq!(offset, line.len() as u64);
+
+        // Append the newline plus a second full line; the read starts at the
+        // saved offset, so the first line completes and the second folds too.
+        tokio::fs::write(&path, format!("{line}\n{line}\n"))
+            .await
+            .unwrap();
+        assert!(read_new_lines(&source, &path_str, &mut offset, &mut buf, &mut snap).await);
+        assert_eq!(snap.tool_count, 2);
+
+        // No growth → no new bytes → false, offset unchanged.
+        let before = offset;
+        assert!(!read_new_lines(&source, &path_str, &mut offset, &mut buf, &mut snap).await);
+        assert_eq!(offset, before);
+    }
 
     #[test]
     fn fold_counts_tools_and_tracks_last_text() {

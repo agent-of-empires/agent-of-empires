@@ -90,15 +90,16 @@ test("a mid-turn prompt is steered into the running turn instead of rejected", a
   }
 });
 
-test("a mid-turn prompt is still rejected when the agent cannot be steered", async ({}, testInfo) => {
+test("a mid-turn prompt is queued, not rejected, when the agent cannot be steered", async ({}, testInfo) => {
   const scriptDir = mkdtempSync(join(tmpdir(), "aoe-pw-nosteer-"));
   const scriptPath = join(scriptDir, "script.json");
   writeFileSync(scriptPath, JSON.stringify(HELD_TURN_SCRIPT));
 
-  // Same fixture with steering off, so the only difference between the
-  // two specs is the capability. Guards the fallback: agents without
-  // steering must keep today's behavior, since their users rely on the
-  // composer's client-side queue-after.
+  // Same fixture with steering off, so the only difference between the two
+  // specs is the capability. Guards the fallback: an agent without steering
+  // must still get queue-after semantics. Since Tier 3 that is the daemon's
+  // job, not the composer's, so the prompt reaches the endpoint and comes back
+  // `queued` rather than being refused with `agent_busy`.
   const serve = await spawnAoeServe({
     authMode: "none",
     acp: true,
@@ -115,8 +116,22 @@ test("a mid-turn prompt is still rejected when the agent cannot be steered", asy
     await postPrompt(serve.baseUrl, sessionId, "start the turn");
     await waitForReplayContains(serve.baseUrl, sessionId, "working");
 
-    await postPrompt(serve.baseUrl, sessionId, "also check the tests");
-    await waitForReplayContains(serve.baseUrl, sessionId, "agent_busy");
+    const res = await postPrompt(serve.baseUrl, sessionId, "also check the tests");
+    expect(res.status).toBe(202);
+    const dispatch = (await res.json()) as { disposition?: string; reason?: string; queued_id?: string };
+    expect(dispatch.disposition).toBe("queued");
+    expect(dispatch.reason).toBe("turn_active");
+
+    // Parked on the server queue, so the turn-end drain delivers it. The old
+    // `agent_busy` rejection is gone: the daemon no longer refuses a prompt it
+    // can hold onto.
+    const queue = (await fetch(`${serve.baseUrl}/api/sessions/${sessionId}/queue`).then((r) => r.json())) as Array<{
+      id: string;
+      text: string;
+    }>;
+    expect(queue.map((q) => q.text)).toEqual(["also check the tests"]);
+    expect(queue[0]!.id).toBe(dispatch.queued_id);
+    expect(await replayJson(serve.baseUrl, sessionId)).not.toContain("agent_busy");
   } finally {
     await serve.stop();
   }

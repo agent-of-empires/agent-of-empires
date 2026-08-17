@@ -128,15 +128,17 @@ test("the spinner names the compaction phase and hides the force-end hatch", asy
   }
 });
 
-test("a prompt reaching the daemon mid-compaction is rejected, not steered", async ({}, testInfo) => {
+test("a prompt reaching the daemon mid-compaction is queued, not steered", async ({}, testInfo) => {
   const scriptDir = mkdtempSync(join(tmpdir(), "aoe-pw-compact-rest-"));
   const scriptPath = join(scriptDir, "script.json");
   writeFileSync(scriptPath, JSON.stringify(COMPACTING_SCRIPT));
 
-  // The composer gates cover the UI; this covers the POST that was
-  // already in flight when the marker landed, and any direct API caller
-  // that does not consume the event stream. Steering is enabled, so the
-  // only reason to refuse is the compaction phase.
+  // The composer gates cover the UI; this covers the POST that was already in
+  // flight when the marker landed, and any direct API caller that does not
+  // consume the event stream. Steering is enabled, so the compaction phase is
+  // the only reason to park it (#3219). Since Tier 3 the daemon parks it on
+  // its own queue rather than refusing, so the message is delivered against
+  // the freshly compacted context instead of being lost.
   const serve = await spawnAoeServe({
     authMode: "none",
     acp: true,
@@ -157,8 +159,13 @@ test("a prompt reaching the daemon mid-compaction is rejected, not steered", asy
     await postPrompt(serve.baseUrl, sessionId, "/compact");
     await waitForReplayContains(serve.baseUrl, sessionId, "ConversationCompactionStarted");
 
-    await postPrompt(serve.baseUrl, sessionId, "also check the tests");
-    await waitForReplayContains(serve.baseUrl, sessionId, "agent_busy");
+    const res = await postPrompt(serve.baseUrl, sessionId, "also check the tests");
+    expect(res.status).toBe(202);
+    const dispatch = (await res.json()) as { disposition?: string; reason?: string };
+    expect(dispatch.disposition).toBe("queued");
+    // Named per gate, so this fails loudly if the compaction clause is dropped
+    // and the prompt merely parks for some other reason.
+    expect(dispatch.reason).toBe("compacting");
 
     const json = await replayJson(serve.baseUrl, sessionId);
     expect(json).not.toContain("steered: also check the tests");

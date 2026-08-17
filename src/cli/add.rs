@@ -759,7 +759,14 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             .unwrap_or(instance.tool.as_str());
         let acp_capable = registry.get(capability_key).is_some()
             || config.session.agent_acp_cmd.contains_key(capability_key)
-            || config.session.agent_acp_cmd.contains_key(&instance.tool);
+            || config.session.agent_acp_cmd.contains_key(&instance.tool)
+            // A custom agent inheriting a registry-backed base via
+            // `agent_detect_as` (e.g. a Claude wrapper) runs in structured view
+            // through the base adapter.
+            || crate::acp::inherited_acp_base(capability_key, &config.session.agent_detect_as)
+                .is_some()
+            || crate::acp::inherited_acp_base(&instance.tool, &config.session.agent_detect_as)
+                .is_some();
 
         if user_picked_agent && !acp_capable {
             bail!(
@@ -806,7 +813,28 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
                                 .map_err(|e| anyhow::anyhow!(e))?,
                             false,
                         ),
-                        None => unreachable!("acp_capable implies a resolvable spec"),
+                        // A custom agent inheriting a registry-backed base runs
+                        // that base's adapter; check that binary is on PATH.
+                        // Resolve inheritance from the same keys the capability
+                        // check accepted (`capability_key` for an explicit
+                        // --agent wrapper, else the tool), so `--tool X --agent
+                        // <wrapper>` where only the wrapper inherits does not
+                        // fall through to `unreachable!`.
+                        None => match crate::acp::inherited_acp_base(
+                            capability_key,
+                            &config.session.agent_detect_as,
+                        )
+                        .or_else(|| {
+                            crate::acp::inherited_acp_base(
+                                &instance.tool,
+                                &config.session.agent_detect_as,
+                            )
+                        })
+                        .and_then(|base| registry.get(&base).cloned())
+                        {
+                            Some(spec) => (spec, true),
+                            None => unreachable!("acp_capable implies a resolvable spec"),
+                        },
                     },
                 },
             };
@@ -1408,8 +1436,9 @@ fn duplicate_session_error(title: &str) -> anyhow::Error {
 /// Sync mirror of `Supervisor::pick_agent_for_tool` so add-time
 /// precondition checks can resolve the agent without spinning up the
 /// async supervisor. Precedence: explicit override → tool-keyed
-/// registry entry → custom agent with `agent_acp_cmd` → legacy
-/// (`claude` → `claude`, else `aoe-agent`).
+/// registry entry → custom agent with `agent_acp_cmd` → custom agent
+/// inheriting a registry-backed base via `agent_detect_as` (resolves to
+/// the base key) → legacy (`claude` → `claude`, else `aoe-agent`).
 #[cfg(feature = "serve")]
 fn pick_acp_agent_name(
     registry: &crate::acp::agent_registry::AgentRegistry,
@@ -1427,6 +1456,11 @@ fn pick_acp_agent_name(
     }
     if session.agent_acp_cmd.contains_key(tool) {
         return tool.to_string();
+    }
+    // Custom agent inheriting a registry-backed base via `agent_detect_as`
+    // resolves to the base key so the built-in adapter path serves it.
+    if let Some(base) = crate::acp::inherited_acp_base(tool, &session.agent_detect_as) {
+        return base;
     }
     if tool == "claude" {
         "claude".into()
