@@ -154,7 +154,23 @@ pub(crate) fn capture_claude_session_id(
         let is_fresh = claude_json
             .and_then(|t| t.elapsed().ok())
             .is_some_and(|age| age <= Duration::from_secs(5 * 60));
-        if is_fresh && Uuid::parse_str(&id).is_ok() {
+        // `is_fresh` is the mtime of `.claude.json` itself, which any live
+        // Claude anywhere rewrites, so it says nothing about when *this*
+        // directory's `lastSessionId` was set and a value months old still
+        // reads as fresh. And unlike the dir scan above, which can only return
+        // ids it found as files, this slot can name a UUID no transcript was
+        // ever written for. Requiring the conversation to exist is what keeps
+        // `--resume` off an id Claude answers with "No conversation found",
+        // which leaves the pane dead on every restart from then on.
+        //
+        // The cost is the short window after `/clear` or `/new` where the slot
+        // names a thread Claude has not written to yet: the arm declines it,
+        // and the dir scan picks the new id up once content lands. Resuming it
+        // in that window would fail anyway.
+        if is_fresh
+            && Uuid::parse_str(&id).is_ok()
+            && !claude_host_transcript_confirmed_absent(&canonical.to_string_lossy(), &id, host_env)
+        {
             return Ok(id);
         }
     }
@@ -2855,6 +2871,120 @@ mod tests {
     use super::*;
     use crate::session::test_support::EnvGuard;
     use serial_test::serial;
+
+    /// Scaffold for the `.claude.json` fallback arm: a project dir whose only
+    /// jsonl is older than the 5-minute live-capture window, so
+    /// `capture_claude_session_id` falls past the dir scan, plus a
+    /// `.claude.json` naming `last_session_id` for that directory. Returns the
+    /// project path and the encoded transcript dir.
+    fn claude_json_fallback_home(
+        temp: &tempfile::TempDir,
+        project_path: &str,
+        stale_transcript: &str,
+        last_session_id: &str,
+    ) -> std::path::PathBuf {
+        let dir = temp
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join(encode_claude_project_path(
+                &canonicalize_or_raw(project_path).to_string_lossy(),
+            ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let jsonl = dir.join(format!("{stale_transcript}.jsonl"));
+        std::fs::write(&jsonl, "").unwrap();
+        let f = std::fs::File::options().write(true).open(&jsonl).unwrap();
+        f.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(3600)),
+        )
+        .unwrap();
+
+        // Placed and keyed the way production reads it. `.claude.json` sits
+        // *inside* the config dir when `CLAUDE_CONFIG_DIR` selects it (#3410),
+        // which this fixture sets, and the `projects` key is canonicalized: on
+        // macOS `/tmp` is a symlink, so a raw key would miss and the reject
+        // case below would pass without ever reaching the gate.
+        std::fs::write(
+            temp.path().join(".claude").join(".claude.json"),
+            serde_json::json!({
+                "projects": {
+                    canonicalize_or_raw(project_path).to_string_lossy().to_string():
+                        { "lastSessionId": last_session_id }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn claude_json_env(temp: &tempfile::TempDir) -> EnvGuard {
+        EnvGuard::set(&[
+            ("HOME", temp.path().to_path_buf()),
+            ("CLAUDE_CONFIG_DIR", temp.path().join(".claude")),
+        ])
+    }
+
+    /// `.claude.json`'s `lastSessionId` is one slot per *directory*, and the
+    /// freshness gate around it reads the mtime of `.claude.json` itself,
+    /// which any live Claude rewrites, so a months-old value still passes.
+    /// Handing that id out for `--resume` when no transcript backs it is a
+    /// guaranteed "No conversation found" and a dead pane on every restart.
+    #[test]
+    #[serial]
+    fn claude_json_fallback_rejects_sid_with_no_transcript() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_path = "/tmp/aoe-test-claude-json-phantom";
+        let _guard = claude_json_env(&temp);
+        claude_json_fallback_home(
+            &temp,
+            project_path,
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "11111111-2222-3333-4444-555555555555",
+        );
+
+        let err = capture_claude_session_id(project_path, None, &HashSet::new(), &[])
+            .expect_err("a lastSessionId with no transcript must not be captured");
+        assert!(
+            err.to_string().contains("No active Claude session found"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Companion: the arm still works when the named conversation exists. Only
+    /// the phantom case is rejected, so a genuinely idle session in a
+    /// single-session directory is still recoverable through this path.
+    #[test]
+    #[serial]
+    fn claude_json_fallback_accepts_sid_with_transcript() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_path = "/tmp/aoe-test-claude-json-real";
+        let named = "11111111-2222-3333-4444-555555555555";
+        let _guard = claude_json_env(&temp);
+        let dir = claude_json_fallback_home(
+            &temp,
+            project_path,
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            named,
+        );
+        // Same stale mtime as the decoy, so the dir scan still falls through
+        // and this is reached via the `.claude.json` arm, not the scan.
+        let jsonl = dir.join(format!("{named}.jsonl"));
+        std::fs::write(&jsonl, "").unwrap();
+        let f = std::fs::File::options().write(true).open(&jsonl).unwrap();
+        f.set_times(
+            std::fs::FileTimes::new()
+                .set_modified(std::time::SystemTime::now() - Duration::from_secs(3600)),
+        )
+        .unwrap();
+
+        assert_eq!(
+            capture_claude_session_id(project_path, None, &HashSet::new(), &[]).unwrap(),
+            named
+        );
+    }
 
     /// Pin a modification time so mtime ordering in tests never depends on the
     /// host filesystem's timestamp resolution. Opened read-only, which lets the
