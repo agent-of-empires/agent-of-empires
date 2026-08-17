@@ -1390,8 +1390,13 @@ fn transcript_lines(
             | TranscriptRowKind::ContextReset
             | TranscriptRowKind::SessionCleared
             | TranscriptRowKind::Compacted
-            | TranscriptRowKind::Summary => {
+            | TranscriptRowKind::Summary
+            | TranscriptRowKind::Notice => {
                 let kind = match row.kind {
+                    // A failed startup, a turn that died, a refused mode
+                    // switch: the user has to see these, so they read as
+                    // errors rather than as dividers.
+                    TranscriptRowKind::Notice => NoteKind::Error,
                     TranscriptRowKind::ContextReset | TranscriptRowKind::SessionCleared => {
                         NoteKind::Warning
                     }
@@ -1421,12 +1426,12 @@ fn is_tool_terminal(kind: TranscriptRowKind) -> bool {
     )
 }
 
-/// A divider / notice row: `· {text}`, dimmed for info and bold for a
-/// warning boundary, matching the old inline Note styling.
+/// A divider / notice row: `· {text}`, dimmed for info and bold for a warning
+/// boundary or an error, matching the old inline Note styling.
 fn note_line(kind: NoteKind, text: &str) -> Line<'static> {
     let modifier = match kind {
         NoteKind::Info => Modifier::DIM,
-        NoteKind::Warning => Modifier::BOLD,
+        NoteKind::Warning | NoteKind::Error => Modifier::BOLD,
     };
     Line::from(Span::styled(
         format!("· {text}"),

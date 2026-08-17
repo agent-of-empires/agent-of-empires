@@ -103,6 +103,13 @@ pub enum TranscriptRowKind {
     SessionCleared,
     Compacted,
     Summary,
+    /// An error or lifecycle notice the user needs in the timeline: a failed
+    /// startup, a turn that died mid-flight, an adapter refusing a mode
+    /// switch, or the reconciler auto-resuming a rate-limit park. The native
+    /// view renders these inline where it once built them itself; the web
+    /// renders the same information as dismissible banners from its own
+    /// control state and skips these rows. See #1722 / #3152 / #1233.
+    Notice,
 }
 
 /// Structured payload for a `user_diff_comments` row. Field-for-field the
@@ -357,8 +364,23 @@ impl TranscriptModel {
                 deltas
             }
             // Turn-ending errors sweep open tools but never add the empty-output
-            // notice (a real failure was already surfaced elsewhere).
-            Event::AgentStartupError { .. } | Event::IncompatibleAgent { .. } => {
+            // notice: the failure itself is the turn's visible product.
+            Event::AgentStartupError { message } => {
+                let mut deltas = self.sweep_open_tools(seq);
+                self.turn_active = false;
+                self.turn_has_output = true;
+                let group_id = self.fresh_group();
+                deltas.push(self.append(TranscriptRow::new(
+                    format!("notice-{seq}"),
+                    group_id,
+                    TranscriptRowKind::Notice,
+                    format!("agent startup failed: {message}"),
+                )));
+                deltas
+            }
+            // The structured payload drives a dedicated remediation screen, so
+            // the timeline stays quiet here.
+            Event::IncompatibleAgent { .. } => {
                 let deltas = self.sweep_open_tools(seq);
                 self.turn_active = false;
                 deltas
@@ -428,6 +450,34 @@ impl TranscriptModel {
                     text,
                 ))]
             }
+            Event::PromptRuntimeError { message } => {
+                let group_id = self.fresh_group();
+                self.turn_has_output = true;
+                vec![self.append(TranscriptRow::new(
+                    format!("notice-{seq}"),
+                    group_id,
+                    TranscriptRowKind::Notice,
+                    format!("prompt failed: {message}"),
+                ))]
+            }
+            Event::ModeSwitchFailed { mode_id, reason } => {
+                let group_id = self.fresh_group();
+                vec![self.append(TranscriptRow::new(
+                    format!("notice-{seq}"),
+                    group_id,
+                    TranscriptRowKind::Notice,
+                    format!("mode switch to \"{mode_id}\" failed: {reason}"),
+                ))]
+            }
+            Event::RateLimitAutoResumed { resets_at } => {
+                let group_id = self.fresh_group();
+                vec![self.append(TranscriptRow::new(
+                    format!("notice-{seq}"),
+                    group_id,
+                    TranscriptRowKind::Notice,
+                    format!("auto-resumed at {resets_at} after rate-limit park"),
+                ))]
+            }
             Event::ConversationSummary { text, .. } => {
                 let group_id = self.fresh_group();
                 vec![self.append(TranscriptRow::new(
@@ -436,12 +486,6 @@ impl TranscriptModel {
                     TranscriptRowKind::Summary,
                     text.clone(),
                 ))]
-            }
-            // A real turn-level failure was surfaced, so the terminal Stopped
-            // must not add the generic no-output notice for this turn.
-            Event::PromptRuntimeError { .. } => {
-                self.turn_has_output = true;
-                Vec::new()
             }
             // Opens the turn but is not itself output (the web reducer counts
             // ThinkingStarted as output so a pure-reasoning turn is not flagged
@@ -945,6 +989,63 @@ mod tests {
 
     fn row_by_id<'a>(m: &'a TranscriptModel, id: &str) -> Option<&'a TranscriptRow> {
         m.rows().iter().find(|r| r.id == id)
+    }
+
+    /// The native view used to build these notices itself; since Tier 4 the
+    /// transcript is server-owned, so the daemon has to emit them or they
+    /// vanish from the timeline with nothing else showing them.
+    #[test]
+    fn turn_level_failures_emit_a_notice_row() {
+        fn resets_at_fixture() -> chrono::DateTime<chrono::Utc> {
+            chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
+                .unwrap()
+                .with_timezone(&chrono::Utc)
+        }
+        let expected_resume = format!(
+            "auto-resumed at {} after rate-limit park",
+            resets_at_fixture()
+        );
+        let cases: [(&str, Event, &str); 4] = [
+            (
+                "startup",
+                Event::AgentStartupError {
+                    message: "node missing".into(),
+                },
+                "agent startup failed: node missing",
+            ),
+            (
+                "runtime",
+                Event::PromptRuntimeError {
+                    message: "stream died".into(),
+                },
+                "prompt failed: stream died",
+            ),
+            (
+                "mode switch",
+                Event::ModeSwitchFailed {
+                    mode_id: "bypassPermissions".into(),
+                    reason: "denied".into(),
+                },
+                "mode switch to \"bypassPermissions\" failed: denied",
+            ),
+            (
+                "rate-limit resume",
+                Event::RateLimitAutoResumed {
+                    resets_at: resets_at_fixture(),
+                },
+                expected_resume.as_str(),
+            ),
+        ];
+        for (label, event, expected) in cases {
+            let mut m = TranscriptModel::new();
+            m.apply_event(1, &event);
+            let row = m
+                .rows()
+                .iter()
+                .find(|r| r.kind == TranscriptRowKind::Notice)
+                .unwrap_or_else(|| panic!("{label}: no notice row"));
+            assert_eq!(row.text, expected, "{label}");
+        }
     }
 
     #[test]

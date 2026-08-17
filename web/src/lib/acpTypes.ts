@@ -1026,6 +1026,7 @@ export interface ActivityRow {
     | "elicitation_answered"
     | "empty_output"
     | "context_reset"
+    | "notice"
     | "session_cleared"
     | "compacted"
     | "summary";
@@ -1105,6 +1106,18 @@ export type TranscriptDelta =
  *  replay-GET url from the session id. `raw_name` is not on the wire (the Rust
  *  `ToolCall` has no such field, #3070), so it is best-effort seeded from
  *  `name`. */
+/** Whether this client renders a given server row.
+ *
+ *  The daemon emits a `notice` row for a failed startup, a turn that died
+ *  mid-flight, a refused mode switch, or a rate-limit auto-resume, because the
+ *  native view shows those inline in the timeline. The web surfaces the same
+ *  information as dismissible banners driven by `startupError` / `lastError` /
+ *  `modeSwitchFailed`, which it still folds from raw frames, so rendering the
+ *  row too would say it twice. */
+export function webRendersServerRow(row: TranscriptRow): boolean {
+  return row.kind !== "notice";
+}
+
 export function transcriptRowToActivity(row: TranscriptRow, sessionId: string): ActivityRow {
   const tool: ToolCall | undefined = row.tool
     ? { ...row.tool, raw_name: row.tool.raw_name ?? row.tool.name }

@@ -564,11 +564,11 @@ async fn apply_ws_message(
             state.transcript.apply_transcript_delta(*delta);
         }
         Ok(WsMessage::Lagged) => {
-            // The daemon evicted events we never saw. Control state rides
-            // through it: every `reduced_state` frame is a whole-state
-            // snapshot, so the gap costs nothing and the next one is
-            // authoritative. Only the row buffer needs rebuilding, and no
-            // reconnect happens on a lag, so nothing else will resend it.
+            // The daemon evicted events we never saw. It repairs its own
+            // control fold at the source and pushes a corrected whole-state
+            // frame, so nothing to do for that half here. The row buffer does
+            // need rebuilding, and no reconnect happens on a lag, so nothing
+            // else will resend it.
             state.transcript.drop_rows();
             if let Some(e) = reseed_server_rows(state).await {
                 set_toast(

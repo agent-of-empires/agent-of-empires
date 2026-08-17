@@ -1,8 +1,10 @@
 # Design: server-owned structured-view state (live reduced-state channel)
 
-Status: in progress. Opened 2026-08-16. The server side is complete and the
-native TUI renders both projections; the web still folds control state from raw
-events (increment 2 below). Follows the server-owned prompt queue
+Status: in progress. Opened 2026-08-16. The server side is complete and both
+clients render both projections. What the web still folds from raw events is
+the state the daemon does not model: the worker-lifecycle latches, the monitor
+and wakeup badges, the usage cost baseline, rejected prompts, and the
+optimistic turn counters. Follows the server-owned prompt queue
 (`server-side-prompt-queue.md`) as the next step of moving structured-view (SV)
 logic off the clients so a web UI and a native TUI share one implementation.
 
@@ -129,8 +131,10 @@ truth for the steady state. The web reducer's other derivations
 2. **Web renders from the frame**: turn/steering/cancelling/compacting/approvals/
    usage/modes read the reduced state; keep the thin optimistic turn-active
    overlay. Delete the now-dead client derivations. Playwright + Vitest.
-   **Not started.** `useAcpSession` still drops the frame explicitly and folds
-   control state from raw events.
+   **Shipped** (Tier 1.2), with two carve-outs. `turnActive` and its prompt /
+   stop counters stay client-side, since the optimistic overlay is the delicate
+   half and deserves its own pass. And the fields the daemon does not model
+   (listed in the status above) keep their client folds.
 3. **TUI renders from the frame**: `AcpTranscript` drops its control-state
    derivation and reads the reduced state; the transcript-row building stays.
    **Shipped** (Tier 1.3), and by then the row building had already moved to the

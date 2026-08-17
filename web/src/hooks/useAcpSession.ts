@@ -21,6 +21,7 @@ import {
   reduceFrames,
   summarizeAnswers,
   transcriptRowToActivity,
+  webRendersServerRow,
   type ActivityRow,
   type ApprovalDecision,
   type AcpAttachment,
@@ -854,9 +855,11 @@ export function reducer(state: AcpState, action: Action): AcpState {
  *  {@link ActivityRow} shape. Returns null for an unrecognized shape. */
 export function transcriptDeltaAction(delta: TranscriptDelta, sessionId: string): Action | null {
   if ("Append" in delta) {
+    if (!webRendersServerRow(delta.Append)) return null;
     return { kind: "transcript_append", row: transcriptRowToActivity(delta.Append, sessionId) };
   }
   if ("Patch" in delta) {
+    if (!webRendersServerRow(delta.Patch.row)) return null;
     return { kind: "transcript_patch", row: transcriptRowToActivity(delta.Patch.row, sessionId) };
   }
   if ("Remove" in delta) {
@@ -1202,8 +1205,10 @@ export function useAcpSession(
       // cache, lastSeq > 0) keeps the cheap forward seq-delta top-up.
       // See #2236.
       if (lastSeqRef.current === 0) {
-        // The transcript (activity) is server-owned (Tier 4), but control
-        // state is still client-reduced from raw frames (Tier 1.2 not done).
+        // The transcript (activity) and the bulk of control state are
+        // server-owned, but the frames leg still feeds what the daemon does
+        // not model (worker latches, monitor and wakeup badges, the usage cost
+        // baseline, rejected prompts, the optimistic turn counters).
         // `?view=rows` returns the folded rows with an EMPTY `frames`, so pull
         // both projections of the SAME page in parallel: default frames feed
         // the control reducer, `view=rows` feeds the transcript. Identical
@@ -1221,11 +1226,16 @@ export function useAcpSession(
           dispatch({ kind: "lagged", skipped: tail.highest_seq });
           return;
         }
-        const tailRows = tailRowsRes.ok ? (((await tailRowsRes.json()) as ReplayPageResponse).rows ?? []) : [];
+        // Bail rather than render a hole: the frames leg below advances
+        // `lastSeqRef`, and the WS then drains from that cursor, so a page of
+        // rows dropped here would never be resent. Returning leaves the
+        // cursors untouched so the next hydrate retries the same page.
+        if (!tailRowsRes.ok) return;
+        const tailRows = ((await tailRowsRes.json()) as ReplayPageResponse).rows ?? [];
         dispatch({
           kind: "frames",
           frames: tail.frames ?? [],
-          rows: tailRows.map((r) => transcriptRowToActivity(r, sid)),
+          rows: tailRows.filter(webRendersServerRow).map((r) => transcriptRowToActivity(r, sid)),
           oldestSeq: tail.next_cursor ?? 0,
         });
         setHasMoreOlder(tail.has_more ?? false);
@@ -1277,9 +1287,12 @@ export function useAcpSession(
             credentials: "same-origin",
           }),
         ]);
-        if (!res.ok) return;
+        // Both legs page the same window, so a failure on either one has to
+        // stop the loop: advancing the cursor past a page whose rows never
+        // arrived leaves a hole nothing refetches.
+        if (!res.ok || !rowsRes.ok) return;
         const data = (await res.json()) as ReplayPageResponse;
-        const pageRows = rowsRes.ok ? (((await rowsRes.json()) as ReplayPageResponse).rows ?? []) : [];
+        const pageRows = ((await rowsRes.json()) as ReplayPageResponse).rows ?? [];
         if (target === null) {
           target = data.highest_seq;
           // Detect a server-side seq reset: the supervisor's per-session
@@ -1305,7 +1318,7 @@ export function useAcpSession(
           dispatch({
             kind: "frames",
             frames: data.frames,
-            rows: pageRows.map((r) => transcriptRowToActivity(r, sid)),
+            rows: pageRows.filter(webRendersServerRow).map((r) => transcriptRowToActivity(r, sid)),
           });
         }
         const next = data.next_cursor;
@@ -1343,7 +1356,7 @@ export function useAcpSession(
       );
       if (!res.ok) return;
       const data = (await res.json()) as ReplayPageResponse;
-      const rows = (data.rows ?? []).map((r) => transcriptRowToActivity(r, sid));
+      const rows = (data.rows ?? []).filter(webRendersServerRow).map((r) => transcriptRowToActivity(r, sid));
       if (rows.length > 0) {
         dispatch({ kind: "prepend", rows, oldestSeq: data.next_cursor ?? before });
       }
@@ -1597,9 +1610,9 @@ export function useAcpSession(
               // Server-owned transcript connect snapshot (Tier 4). Usually
               // empty (the WS dials at the current lastSeq); carries gap rows
               // on a reconnect that raced live events. Merged by row id.
-              const rows = ((data as { rows?: TranscriptRow[] }).rows ?? []).map((r) =>
-                transcriptRowToActivity(r, sessionId),
-              );
+              const rows = ((data as { rows?: TranscriptRow[] }).rows ?? [])
+                .filter(webRendersServerRow)
+                .map((r) => transcriptRowToActivity(r, sessionId));
               lastActivityRef.current = Date.now();
               dispatch({ kind: "transcript_snapshot", rows });
               return;

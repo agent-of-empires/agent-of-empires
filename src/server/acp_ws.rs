@@ -35,7 +35,7 @@ use tracing::{debug, warn};
 const CLOSE_CODE_GOING_AWAY: u16 = 1001;
 
 use super::{AcpBroadcastFrame, AppState};
-use crate::acp::state::{AcpSessionId, AcpState, AgentName};
+use crate::acp::state::{AcpSessionId, AcpState, AgentName, Event};
 use crate::acp::transcript::TranscriptModel;
 
 /// Cadence at which the server emits an application-level Ping. The
@@ -156,6 +156,8 @@ async fn handle(
             })
             .unwrap_or_else(|| (AgentName(String::new()), None))
     };
+    // Kept so a lag can rebuild the fold from the same identity seed.
+    let seed = (agent.clone(), model.clone());
     let mut reduced = AcpState::new(AcpSessionId(session_id.clone()), agent, model);
 
     // Server-side transcript render model for this connection (Tier 4, see
@@ -172,6 +174,7 @@ async fn handle(
         reduced: &mut reduced,
         transcript: &mut transcript,
         cold: &mut cold,
+        last_applied_seq: 0,
     };
 
     // Replay events newer than `since` immediately on connect. Without
@@ -192,6 +195,9 @@ async fn handle(
         &mut folds,
     )
     .await;
+    // Carried out of `folds` so the live loop can keep the control fold
+    // idempotent against the drain/broadcast overlap.
+    let mut last_applied_seq = folds.last_applied_seq;
     debug!(
         target: "acp.ws",
         session = %session_id,
@@ -292,7 +298,14 @@ async fn handle(
                         // and push the updated snapshot. Reduction errors
                         // (e.g. a resolve for an approval pruned from history)
                         // are lenient no-ops, matching the client reducers.
-                        let _ = reduced.apply_event((*frame.event).clone());
+                        // The drain deliberately overlaps this channel, so skip
+                        // anything already folded: `AcpState::apply_event` is
+                        // not idempotent (a duplicate `ApprovalRequested` would
+                        // leave a second, unresolvable card in the shelf).
+                        if frame.seq > last_applied_seq {
+                            last_applied_seq = frame.seq;
+                            let _ = reduced.apply_event((*frame.event).clone());
+                        }
                         if !send_reduced_state(&mut socket, &session_id, frame.seq, &reduced, &mut cold).await {
                             break;
                         }
@@ -325,6 +338,47 @@ async fn handle(
                         let _ = socket
                             .send(Message::Text(gap.to_string().into()))
                             .await;
+                        // The skipped events never reached this connection's
+                        // control fold, and nothing else would ever repair it:
+                        // a missed `Stopped` leaves `turn_active` stuck true
+                        // (so the composer parks every later prompt) and a
+                        // missed `ApprovalRequested` never surfaces a card.
+                        // Rebuild from the store, which is the truth, and push
+                        // the repaired snapshot. The client's transcript half
+                        // self-heals over `?view=rows`; this is the half that
+                        // cannot.
+                        let mut rebuilt = AcpState::new(
+                            AcpSessionId(session_id.clone()),
+                            seed.0.clone(),
+                            seed.1.clone(),
+                        );
+                        let store = Arc::clone(&state.acp_event_store);
+                        let session_for_read = session_id.clone();
+                        let entries = tokio::task::spawn_blocking(move || {
+                            store.replay_from(&session_for_read, 0)
+                        })
+                        .await
+                        .unwrap_or_default();
+                        let mut highest = 0;
+                        for (seq, event) in entries {
+                            let _ = rebuilt.apply_event(event);
+                            highest = seq;
+                        }
+                        reduced = rebuilt;
+                        last_applied_seq = highest;
+                        // The cold-field cache still describes what this socket
+                        // holds, so an unchanged command list stays omitted.
+                        if !send_reduced_state(
+                            &mut socket,
+                            &session_id,
+                            highest,
+                            &reduced,
+                            &mut cold,
+                        )
+                        .await
+                        {
+                            break;
+                        }
                     }
                     Err(RecvError::Closed) => break,
                 }
@@ -368,35 +422,33 @@ async fn drain_replay_into_socket(
     // the same worker for the duration of the read.
     let store = Arc::clone(&state.acp_event_store);
     let session_id_owned = session_id.to_string();
-    let entries = match tokio::task::spawn_blocking(move || {
-        store.replay_from(&session_id_owned, since)
-    })
-    .await
-    {
-        Ok(rows) => rows,
-        Err(e) => {
-            // Blocking task panicked or was cancelled. Live broadcast still
-            // flows and the client dedupes by seq, so empty drain is benign,
-            // but the silent swallow would hide the panic from operators.
-            warn!(
-                target: "acp.ws",
-                session_id = %session_id,
-                error = %e,
-                "replay drain blocking task failed; sending zero frames"
-            );
-            Vec::new()
-        }
-    };
+    // Read from seq 0, not from `since`. The connect `reduced_state` snapshot
+    // is a WHOLE-state frame that clients adopt verbatim, so it has to be
+    // folded over the whole session: a fold that starts at the client's cursor
+    // produces an empty control state (no commands, no modes, no pending
+    // approvals, turn_active false) and blanks the client on every reconnect.
+    // Only the raw-frame forwarding and the transcript fold are scoped to
+    // `since`; the transcript is additionally reconciled by row id client-side.
+    let entries =
+        match tokio::task::spawn_blocking(move || store.replay_from(&session_id_owned, 0)).await {
+            Ok(rows) => rows,
+            Err(e) => {
+                // Blocking task panicked or was cancelled. Live broadcast still
+                // flows and the client dedupes by seq, so empty drain is benign,
+                // but the silent swallow would hide the panic from operators.
+                warn!(
+                    target: "acp.ws",
+                    session_id = %session_id,
+                    error = %e,
+                    "replay drain blocking task failed; sending zero frames"
+                );
+                Vec::new()
+            }
+        };
     let mut sent = 0usize;
-    let mut snapshot_seq = since;
-    for (seq, event) in entries {
-        // Reduce into the connection's control state as we forward the raw
-        // frame, so the post-drain snapshot reflects the full replayed history.
-        let _ = folds.reduced.apply_event(event.clone());
-        // Fold into the transcript model too; the deltas are discarded here
-        // because the transcript_snapshot below carries the built rows.
-        let _ = folds.transcript.apply_event(seq, &event);
-        snapshot_seq = seq;
+    let to_forward = fold_connect_history(entries, since, folds);
+    let snapshot_seq = folds.last_applied_seq.max(since);
+    for (seq, event) in to_forward {
         if !forward_frames {
             continue;
         }
@@ -438,7 +490,45 @@ async fn drain_replay_into_socket(
 /// after every event, re-serializing it each time cost ~1.9 MB over a single
 /// two-turn session. The other two are the same shape of data (adapter
 /// capabilities) and ride along for the same reason.
-const COLD_STATE_FIELDS: [&str; 3] = ["available_commands", "available_modes", "config_options"];
+const COLD_STATE_FIELDS: [&str; 5] = [
+    "available_commands",
+    "available_modes",
+    "config_options",
+    // Not static, but big and bursty: 16 diffs each carrying full old and new
+    // text, and a background-agent record carries its prompt, tools and
+    // result. Re-sending either after every `AgentMessageChunk` costs more on
+    // an edit-heavy turn than the command list does on any turn.
+    "recent_diffs",
+    "background_agents",
+];
+
+/// Fold a session's stored history into the connection's projections and
+/// return the entries the client still needs as raw frames.
+///
+/// The asymmetry is the whole point. `reduced` is folded over EVERY event,
+/// because the `reduced_state` frame it feeds is a whole-state snapshot the
+/// clients adopt verbatim: folding it from the client's `since` cursor yields
+/// an empty control state and blanks the slash palette, the mode picker, the
+/// plan, and any pending approval on every reconnect. The transcript fold and
+/// the raw frames stay scoped to `since`, since both are incremental and the
+/// client already holds the earlier rows (reconciled by row id).
+fn fold_connect_history(
+    entries: Vec<(u64, Event)>,
+    since: u64,
+    folds: &mut ConnectionFolds<'_>,
+) -> Vec<(u64, Event)> {
+    let mut to_forward = Vec::new();
+    for (seq, event) in entries {
+        let _ = folds.reduced.apply_event(event.clone());
+        folds.last_applied_seq = seq;
+        if seq <= since {
+            continue;
+        }
+        folds.transcript.apply_event(seq, &event);
+        to_forward.push((seq, event));
+    }
+    to_forward
+}
 
 /// The three folds a connection maintains over the event stream: the control
 /// state it pushes as `reduced_state`, the ordered rows it pushes as
@@ -448,6 +538,12 @@ struct ConnectionFolds<'a> {
     reduced: &'a mut AcpState,
     transcript: &'a mut TranscriptModel,
     cold: &'a mut ColdFieldCache,
+    /// Highest seq already folded into `reduced`. `AcpState::apply_event`
+    /// takes no seq and is not idempotent (`ApprovalRequested` pushes
+    /// unconditionally), and the drain overlaps the live broadcast by design
+    /// (see the `subscribe()` comment in `handle`), so the live loop needs
+    /// this guard. `TranscriptModel` carries the equivalent one internally.
+    last_applied_seq: u64,
 }
 
 /// Per-connection memory of the cold fields already sent, so an unchanged one
@@ -800,6 +896,173 @@ where
 #[cfg(all(test, feature = "serve"))]
 mod tests {
     use super::*;
+
+    /// The connect snapshot is a whole-state frame the clients adopt verbatim,
+    /// and every client dials with a non-zero `since` after its first connect
+    /// (the web seeds `lastSeq` from the tail before opening the socket; the
+    /// TUI reconnects from `last_seq`). Folding the control state from that
+    /// cursor instead of from 0 hands them an empty `AcpState`: no slash
+    /// commands, no modes, no plan, and a pending approval that never renders.
+    /// The transcript half must stay scoped to `since`, since it is
+    /// incremental and the client already holds the earlier rows.
+    #[test]
+    fn connect_fold_covers_all_history_while_frames_stay_scoped_to_since() {
+        let approval = crate::acp::approvals::Approval {
+            nonce: crate::acp::approvals::Nonce("n-1".into()),
+            tool_call: crate::acp::state::ToolCall {
+                id: "t-1".into(),
+                name: "Edit".into(),
+                kind: "edit".into(),
+                args_preview: "{}".into(),
+                started_at: chrono::Utc::now(),
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            },
+            destructive: false,
+            requested_at: chrono::Utc::now(),
+            resolved: None,
+        };
+        let history = vec![
+            (
+                1,
+                Event::AvailableCommandsUpdated {
+                    commands: vec![crate::acp::state::AvailableCommand {
+                        name: "review".into(),
+                        description: "Review".into(),
+                        accepts_input: false,
+                    }],
+                },
+            ),
+            (
+                2,
+                Event::ModesAvailable {
+                    current_mode_id: "plan".into(),
+                    modes: vec![crate::acp::state::ModeInfo {
+                        id: "plan".into(),
+                        name: "Plan".into(),
+                        description: None,
+                    }],
+                },
+            ),
+            (3, Event::ApprovalRequested { approval }),
+            (
+                4,
+                Event::AgentMessageChunk {
+                    text: "hello".into(),
+                },
+            ),
+        ];
+
+        // A reconnect: the client already has everything through seq 4.
+        let mut reduced =
+            AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
+        let mut transcript = TranscriptModel::new();
+        let mut cold = ColdFieldCache::default();
+        let mut folds = ConnectionFolds {
+            reduced: &mut reduced,
+            transcript: &mut transcript,
+            cold: &mut cold,
+            last_applied_seq: 0,
+        };
+        let forwarded = fold_connect_history(history.clone(), 4, &mut folds);
+
+        assert!(forwarded.is_empty(), "nothing new to forward");
+        assert_eq!(folds.last_applied_seq, 4);
+        assert!(
+            folds.transcript.rows().is_empty(),
+            "transcript stays scoped to since; the client holds those rows"
+        );
+        // The control state is whole-session regardless of the cursor.
+        let reduced = &folds.reduced;
+        assert_eq!(
+            reduced.available_commands.len(),
+            1,
+            "slash palette survives"
+        );
+        assert_eq!(reduced.available_modes.len(), 1, "mode picker survives");
+        assert_eq!(reduced.current_mode_id.as_deref(), Some("plan"));
+        assert_eq!(
+            reduced.pending_approvals.len(),
+            1,
+            "a pending approval must still render after a reconnect"
+        );
+
+        // A cold connect gets the same control state plus every row.
+        let mut cold_state =
+            AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
+        let mut cold_transcript = TranscriptModel::new();
+        let mut cold_cache = ColdFieldCache::default();
+        let mut cold_folds = ConnectionFolds {
+            reduced: &mut cold_state,
+            transcript: &mut cold_transcript,
+            cold: &mut cold_cache,
+            last_applied_seq: 0,
+        };
+        let forwarded = fold_connect_history(history, 0, &mut cold_folds);
+        assert_eq!(forwarded.len(), 4);
+        assert!(!cold_folds.transcript.rows().is_empty());
+        assert_eq!(cold_folds.reduced.available_commands.len(), 1);
+        assert_eq!(cold_folds.reduced.pending_approvals.len(), 1);
+    }
+
+    /// `AcpState::apply_event` takes no seq and is not idempotent, and the
+    /// drain overlaps the live broadcast by design, so a duplicated event
+    /// would leave a second, unresolvable approval card in the shelf.
+    #[test]
+    fn control_fold_skips_events_the_drain_already_applied() {
+        let approval = |nonce: &str| crate::acp::approvals::Approval {
+            nonce: crate::acp::approvals::Nonce(nonce.into()),
+            tool_call: crate::acp::state::ToolCall {
+                id: "t-1".into(),
+                name: "Edit".into(),
+                kind: "edit".into(),
+                args_preview: "{}".into(),
+                started_at: chrono::Utc::now(),
+                parent_tool_call_id: None,
+                memory_recall: None,
+                diffs: Vec::new(),
+            },
+            destructive: false,
+            requested_at: chrono::Utc::now(),
+            resolved: None,
+        };
+        let mut reduced =
+            AcpState::new(AcpSessionId("s-1".into()), AgentName("claude".into()), None);
+        let mut transcript = TranscriptModel::new();
+        let mut cold = ColdFieldCache::default();
+        let mut folds = ConnectionFolds {
+            reduced: &mut reduced,
+            transcript: &mut transcript,
+            cold: &mut cold,
+            last_applied_seq: 0,
+        };
+        fold_connect_history(
+            vec![(
+                7,
+                Event::ApprovalRequested {
+                    approval: approval("n-1"),
+                },
+            )],
+            0,
+            &mut folds,
+        );
+        assert_eq!(folds.reduced.pending_approvals.len(), 1);
+
+        // The same event arrives again over the broadcast channel. This mirrors
+        // the guard in the live loop.
+        let redelivered_seq = 7;
+        if redelivered_seq > folds.last_applied_seq {
+            let _ = folds.reduced.apply_event(Event::ApprovalRequested {
+                approval: approval("n-1"),
+            });
+        }
+        assert_eq!(
+            folds.reduced.pending_approvals.len(),
+            1,
+            "a redelivered event must not double the shelf"
+        );
+    }
 
     /// `frames` gates only the raw-frame forwarding, and its default has to
     /// stay "send them": the web reducer and `aoe acp tail` both still read

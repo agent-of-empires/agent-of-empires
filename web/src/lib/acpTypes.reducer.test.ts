@@ -4,6 +4,7 @@ import {
   appendElicitationAnswerRow,
   applyEvent,
   applyReducedState,
+  webRendersServerRow,
   emptyAcpState,
   mergeServerRows,
   patchServerRow,
@@ -13,6 +14,7 @@ import {
   type AcpState,
   type Elicitation,
   type ReducedState,
+  type TranscriptRow,
   type ToolCall,
 } from "./acpTypes";
 
@@ -55,6 +57,26 @@ function reducedState(over: Partial<ReducedState> = {}): ReducedState {
     ...over,
   };
 }
+
+describe("webRendersServerRow", () => {
+  // The daemon emits `notice` rows so the native view can show a failed
+  // startup or a refused mode switch inline. The web shows the same thing as
+  // a banner from its own control state, so rendering the row too would
+  // duplicate it.
+  it("skips notice rows and keeps everything else", () => {
+    const row = (kind: string): TranscriptRow => ({
+      id: `r-${kind}`,
+      group_id: "g-1",
+      kind: kind as TranscriptRow["kind"],
+      at: "2026-01-01T00:00:00Z",
+      text: "x",
+    });
+    expect(webRendersServerRow(row("notice"))).toBe(false);
+    for (const kind of ["message", "user_prompt", "tool_start", "context_reset", "summary"]) {
+      expect(webRendersServerRow(row(kind))).toBe(true);
+    }
+  });
+});
 
 describe("applyReducedState (Tier 1.2)", () => {
   it("adopts the server's control state verbatim", () => {

@@ -181,6 +181,7 @@ pub struct PendingElicitation {
 pub enum NoteKind {
     Info,
     Warning,
+    Error,
 }
 
 impl AcpTranscript {
@@ -232,8 +233,9 @@ impl AcpTranscript {
 
     /// Drop the transcript rows ahead of a `?view=rows` rebuild, used when the
     /// daemon signals `lagged` and rows we never saw may have been evicted.
-    /// Control state is deliberately untouched: it arrives as a whole-state
-    /// snapshot, so a gap in the event stream cannot make it stale.
+    /// Control state is left alone here because the daemon repairs it at the
+    /// source: on a lag it re-folds the session from the event store and
+    /// pushes a corrected `reduced_state`, so the next frame is authoritative.
     pub fn drop_rows(&mut self) {
         self.server_rows.clear();
     }
