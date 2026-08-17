@@ -6583,11 +6583,13 @@ impl Instance {
     /// file stat, plus one pane capture for Claude, gated on an actual
     /// transition, so steady-state polling pays nothing.
     fn log_status_transition(&self, prev: Status) {
-        let detection_tool = if self.detect_as.is_empty() {
-            &self.tool
-        } else {
-            &self.detect_as
-        };
+        // Resolved the same way the pane fallback resolves it, so the label and
+        // the `pane=` fingerprint describe the detector that actually ran. The
+        // ad-hoc `detect_as`-or-`tool` this used to do disagreed with the
+        // detector whenever the stored alias was stale, which is exactly the
+        // case a wrong-state report needs the log to be honest about.
+        let detection_tool =
+            tmux::status_rules::detection_tool(&self.source_profile, &self.tool, &self.detect_as);
         let hook = crate::hooks::read_hook_status(&self.id);
         let hook_age_ms = crate::hooks::read_hook_status_age(&self.id).map(|age| age.as_millis());
         if detection_tool == "claude" {
@@ -6778,10 +6780,15 @@ impl Instance {
         // hook reconciliation keeps the alias identity. The pane fallback
         // below instead prefers the session's own configured status rules
         // over the alias.
-        let hook_tool: &str = if self.detect_as.is_empty() {
+        let hook_alias = tmux::status_rules::effective_detect_as(
+            &self.source_profile,
+            &self.tool,
+            &self.detect_as,
+        );
+        let hook_tool: &str = if hook_alias.is_empty() {
             &self.tool
         } else {
-            &self.detect_as
+            &hook_alias
         };
 
         if let Some(hook_status) = crate::hooks::read_hook_status(&self.id) {
@@ -6870,7 +6877,7 @@ impl Instance {
             tmux::status_rules::detection_tool(&self.source_profile, &self.tool, &self.detect_as);
         let pane_content = session.capture_pane(50).unwrap_or_default();
         let detected =
-            tmux::detect_status_from_content_in(&self.source_profile, &pane_content, pane_tool);
+            tmux::detect_status_from_content_in(&self.source_profile, &pane_content, &pane_tool);
         tracing::trace!(target: "session.store",
             "status '{}': detected={:?}, cmd_override={}, custom_cmd={}",
             self.title,
