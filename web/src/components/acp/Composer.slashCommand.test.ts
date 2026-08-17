@@ -16,11 +16,10 @@
 // `acceptsInput=true` branch.
 
 import { describe, expect, it, vi } from "vitest";
-import type { useComposerRuntime } from "@assistant-ui/react";
 
-import { insertSlashCommand } from "./Composer";
+import { insertSlashCommand, type ComposerClient } from "./Composer";
 
-type RuntimeStub = ReturnType<typeof useComposerRuntime>;
+type RuntimeStub = ComposerClient;
 
 function makeRuntime(initialText: string) {
   const setText = vi.fn<(s: string) => void>();
@@ -64,6 +63,23 @@ describe("insertSlashCommand (#1512)", () => {
     const { runtime, setText } = makeRuntime("draft note ");
     insertSlashCommand(runtime, makeItem("clear", false));
     expect(setText).toHaveBeenCalledExactlyOnceWith("draft note /clear ");
+  });
+
+  // @assistant-ui/react 0.15 applies composer writes on a scheduled task, so
+  // the popover's `removeOnExecute` strip has not landed yet when this runs
+  // and the snapshot still carries the typed `/<query>`. Dropping it here is
+  // what keeps the result `/help ` rather than `/he /help `.
+  it("drops a typed query token the popover has not stripped from the snapshot yet", () => {
+    const cases: [string, string][] = [
+      ["/he", "/help "],
+      ["draft note /he", "draft note /help "],
+      ["draft note /he ", "draft note /help "],
+    ];
+    for (const [initial, expected] of cases) {
+      const { runtime, setText } = makeRuntime(initial);
+      insertSlashCommand(runtime, makeItem("help", false));
+      expect(setText, initial).toHaveBeenCalledExactlyOnceWith(expected);
+    }
   });
 
   it("is a no-op when the runtime is null", () => {

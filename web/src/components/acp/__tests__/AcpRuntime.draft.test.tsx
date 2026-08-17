@@ -8,7 +8,7 @@
 // the just-sent text. `onNew` must drop the draft itself.
 
 import { act, render } from "@testing-library/react";
-import { useThreadRuntime } from "@assistant-ui/react";
+import { useAui } from "@assistant-ui/react";
 import { describe, expect, it, vi } from "vitest";
 
 import { emptyAcpState } from "../../../lib/acpTypes";
@@ -59,7 +59,7 @@ import { AcpRuntime } from "../AcpRuntime";
 // Drives the runtime's onNew the same way assistant-ui's built-in
 // Enter-to-send keymap does.
 function Sender({ text }: { text: string }) {
-  const thread = useThreadRuntime();
+  const thread = useAui().thread;
   return (
     <button
       type="button"

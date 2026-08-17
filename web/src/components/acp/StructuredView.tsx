@@ -15,7 +15,7 @@
 // only renders what we feed it and surfaces user actions back.
 
 import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { MessagePrimitive, ThreadPrimitive, useMessage } from "@assistant-ui/react";
+import { MessagePrimitive, ThreadPrimitive, useAuiState } from "@assistant-ui/react";
 import {
   AlertTriangle,
   Check,
@@ -1026,11 +1026,13 @@ function UserMessage() {
  *  prompts, or from the decoded base64 sentinel for legacy persisted
  *  prompts. Falls back to the classic chat bubble otherwise. */
 function UserText({ text }: { text: string }) {
-  const typedPayload = useMessage((m) => (m.metadata?.custom as { diffComments?: unknown } | undefined)?.diffComments);
+  const typedPayload = useAuiState(
+    (s) => (s.message.metadata?.custom as { diffComments?: unknown } | undefined)?.diffComments,
+  );
   // An answered AskUserQuestion / elicitation: render the picked answer as
   // a tidy card from the typed payload on the message metadata. See #2209.
-  const answers = useMessage(
-    (m) => (m.metadata?.custom as { elicitationAnswers?: unknown } | undefined)?.elicitationAnswers,
+  const answers = useAuiState(
+    (s) => (s.message.metadata?.custom as { elicitationAnswers?: unknown } | undefined)?.elicitationAnswers,
   );
   if (isDiffCommentsCardPayload(typedPayload)) {
     return <DiffCommentsUserCard payload={typedPayload} />;
@@ -1084,7 +1086,7 @@ function AssistantText({ text }: { text: string }) {
   // session switch) render with the Markdown default `smooth={false}`
   // so the user doesn't watch the entire transcript type itself out
   // again. See #1132.
-  const isRunning = useMessage((m) => m.status?.type === "running");
+  const isRunning = useAuiState((s) => s.message.status?.type === "running");
   if (!text) return null;
   return <Markdown text={text} smooth={isRunning} />;
 }
