@@ -38,7 +38,6 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 - **plugin:** Drop aoe-plugin topic results that carry no manifest in [#3330](https://github.com/agent-of-empires/agent-of-empires/pull/3330) by [@Seluj78](https://github.com/Seluj78) ([`174a2fc`](https://github.com/agent-of-empires/agent-of-empires/commit/174a2fcee27a61a346875166e0084395ff57a5b3))
 - **web:** Drain queued structured-view prompts while the chat is unmounted in [#3332](https://github.com/agent-of-empires/agent-of-empires/pull/3332) by [@Seluj78](https://github.com/Seluj78) ([`47119c7`](https://github.com/agent-of-empires/agent-of-empires/commit/47119c7dc463c1aa7b654db8d3324a80abec2666))
 - Classify absent tmux socket as no-server, not error in [#3341](https://github.com/agent-of-empires/agent-of-empires/pull/3341) by [@jerome-benoit](https://github.com/jerome-benoit) ([`afdcaf2`](https://github.com/agent-of-empires/agent-of-empires/commit/afdcaf2bfcfbc0559039e4674ad7895eaa8e5274))
-- **session:** Scope hermes conversation capture to the target project in [#3381](https://github.com/agent-of-empires/agent-of-empires/pull/3381) by [@jerome-benoit](https://github.com/jerome-benoit) ([`3aad2ed`](https://github.com/agent-of-empires/agent-of-empires/commit/3aad2ed744bdf082804f802eab234232d288d554))
 
 
 ### Features
