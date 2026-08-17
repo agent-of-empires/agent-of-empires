@@ -6079,9 +6079,8 @@ impl Instance {
     /// being handed an id AoE already had stored (step 1 or step 3). Healthy
     /// launches on real agents pay `RESUME_PROBE_POST_SHELL_GRACE` (~2s) once
     /// on cold start; warm sessions and brand-new ones pay nothing.
-    /// Shell-wrapper
-    /// command overrides pay the full `RESUME_PROBE_MAX` (~3s) on every
-    /// healthy resume because `is_pane_running_shell` never clears for
+    /// Shell-wrapper command overrides pay the full `RESUME_PROBE_MAX` (~3s) on
+    /// every healthy resume because `is_pane_running_shell` never clears for
     /// them; see `probe_settle`. When the failure path fires, add
     /// `kill_clean` (~100ms macOS grace) before returning.
     ///
@@ -6236,12 +6235,18 @@ impl Instance {
     /// already in use") rather than a generic failure. tmux appends its own
     /// `Pane is dead (status N)` banner below that output; skip it, since the
     /// caller already knows the pane died.
+    ///
+    /// `capture_pane` captures with `-e`, so the agent's line still carries the
+    /// SGR sequences it was printed with (an agent error line is routinely red).
+    /// Strip them before this lands in `last_error`, which is persisted and
+    /// rendered as plain text by the TUI and the dashboard; stripping first also
+    /// keeps the banner filter working when `remain-on-exit-format` is styled.
     fn dead_pane_detail(&self) -> String {
         self.tmux_session()
             .ok()
             .and_then(|session| session.capture_pane(20).ok())
             .and_then(|output| {
-                output
+                crate::tmux::utils::strip_ansi(&output)
                     .lines()
                     .rev()
                     .map(str::trim)

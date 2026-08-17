@@ -182,10 +182,13 @@ fn restart_surfaces_a_pinned_fresh_launch_that_dies() {
     let workdir = temp.path().join("workdir");
     std::fs::create_dir_all(&workdir).expect("create workdir");
 
+    // Print the line in red: `capture_pane` captures with `-e`, so an agent
+    // whose error is styled (every real one is) would otherwise splice raw SGR
+    // sequences into the persisted `last_error`.
     let agent = temp.path().join("id-taken-agent");
     std::fs::write(
         &agent,
-        "#!/bin/sh\necho 'Error: Session ID is already in use.'\nexit 1\n",
+        "#!/bin/sh\nprintf '\\033[31mError: Session ID is already in use.\\033[0m\\n'\nexit 1\n",
     )
     .expect("write agent");
     std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).expect("chmod agent");
@@ -213,6 +216,10 @@ fn restart_surfaces_a_pinned_fresh_launch_that_dies() {
     assert!(
         message.contains("already in use"),
         "the pane's own diagnosis must reach the caller, got {message:?}"
+    );
+    assert!(
+        !message.contains('\u{1b}'),
+        "the persisted error must be plain text, got {message:?}"
     );
     assert_eq!(inst.status, Status::Error);
     assert!(
