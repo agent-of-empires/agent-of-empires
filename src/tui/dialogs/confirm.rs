@@ -5,7 +5,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use super::DialogResult;
-use crate::tui::components::buttons::render_yes_no;
+use crate::tui::components::buttons::render_buttons;
 use crate::tui::components::checkbox::{checkbox_line, CheckboxStyle};
 use crate::tui::components::hover::HoverState;
 use crate::tui::styles::Theme;
@@ -35,6 +35,10 @@ pub struct ConfirmDialog {
     /// accepts it; left unset everywhere else so a stray keystroke can't
     /// fire an unrelated destructive confirm.
     confirm_char: Option<char>,
+    /// Button labels, `("Yes", "No")` unless the caller names its verbs.
+    /// A confirm whose question can't be answered by "Yes" alone (the
+    /// trash prompt) says what each button does instead.
+    buttons: (String, String),
     yes_button_area: Rect,
     no_button_area: Rect,
     /// Which Yes/No button the mouse is over, for the hover highlight.
@@ -52,6 +56,7 @@ impl ConfirmDialog {
             tone: Tone::Destructive,
             dont_ask_again: None,
             confirm_char: None,
+            buttons: ("Yes".to_string(), "No".to_string()),
             yes_button_area: Rect::default(),
             no_button_area: Rect::default(),
             hover: HoverState::default(),
@@ -71,6 +76,13 @@ impl ConfirmDialog {
     /// passed here.
     pub fn confirmed_by(mut self, c: char) -> Self {
         self.confirm_char = Some(c);
+        self
+    }
+
+    /// Name what the buttons do instead of the default Yes/No, for a
+    /// confirm where "Yes" alone doesn't say what is about to happen.
+    pub fn buttons(mut self, yes: &str, no: &str) -> Self {
+        self.buttons = (yes.to_string(), no.to_string());
         self
     }
 
@@ -227,8 +239,14 @@ impl ConfirmDialog {
                 CheckboxStyle::confirm(theme),
             );
             frame.render_widget(Paragraph::new(line), chunks[2]);
-            let (yes, no) =
-                render_yes_no(frame, chunks[4], theme, self.selected, self.hover.current());
+            let (yes, no) = render_buttons(
+                frame,
+                chunks[4],
+                theme,
+                (&self.buttons.0, &self.buttons.1),
+                self.selected,
+                self.hover.current(),
+            );
             self.yes_button_area = yes;
             self.no_button_area = no;
         } else {
@@ -239,8 +257,14 @@ impl ConfirmDialog {
                 .split(inner);
 
             self.render_message(frame, chunks[0], theme);
-            let (yes, no) =
-                render_yes_no(frame, chunks[1], theme, self.selected, self.hover.current());
+            let (yes, no) = render_buttons(
+                frame,
+                chunks[1],
+                theme,
+                (&self.buttons.0, &self.buttons.1),
+                self.selected,
+                self.hover.current(),
+            );
             self.yes_button_area = yes;
             self.no_button_area = no;
         }

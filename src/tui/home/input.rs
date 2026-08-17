@@ -5554,6 +5554,7 @@ impl HomeView {
                         // setting. Ticking it persists confirm_delete = false.
                         let mut dialog =
                             ConfirmDialog::new("Confirm Delete", &message, "trash_session")
+                                .buttons("Delete", "Cancel")
                                 .offering_dont_ask_again();
                         if let Some(c) = accept_char {
                             dialog = dialog.confirmed_by(c);
