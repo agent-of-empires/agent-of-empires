@@ -68,7 +68,7 @@ pub struct ListArgs {
 /// Derived from [`Instance::effective_bucket`] so the `Trashed > Archived >
 /// Active` precedence has exactly one definition: an archived row that is then
 /// trashed keeps its `archived_at` but reports `trashed`.
-fn state_tag(inst: &Instance) -> &'static str {
+pub(crate) fn state_tag(inst: &Instance) -> &'static str {
     match inst.effective_bucket() {
         SessionBucket::Trashed => "trashed",
         SessionBucket::Archived => "archived",

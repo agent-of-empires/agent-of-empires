@@ -337,11 +337,39 @@ struct SessionDetails {
     tool: String,
     command: String,
     status: String,
+    /// The same `live`/`archived`/`trashed` tag `aoe list --json` carries
+    /// (#3350/#3361), so a consumer does not have to fall back to `list` to
+    /// learn whether the session it just looked up is still around. `status`
+    /// cannot carry it: an archived session can be running, so the two are
+    /// independent and collapsing them loses one.
+    state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trashed_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archived_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_session_id: Option<String>,
     profile: String,
+}
+
+fn session_details(inst: &Instance, profile: &str) -> SessionDetails {
+    SessionDetails {
+        id: inst.id.clone(),
+        title: inst.title.clone(),
+        path: inst.project_path.clone(),
+        group: inst.group_path.clone(),
+        tool: inst.tool.clone(),
+        command: inst.command.clone(),
+        status: format!("{:?}", inst.status).to_lowercase(),
+        state: super::list::state_tag(inst),
+        trashed_at: inst.trashed_at,
+        archived_at: inst.archived_at,
+        agent_session_id: inst.agent_session_id.clone(),
+        parent_session_id: inst.parent_session_id.clone(),
+        profile: profile.to_string(),
+    }
 }
 
 #[tracing::instrument(target = "cli.session", skip_all, fields(profile = %profile))]
@@ -1555,19 +1583,7 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
     inst.self_heal_session_id(profile, &contended);
 
     if args.json {
-        let details = SessionDetails {
-            id: inst.id.clone(),
-            title: inst.title.clone(),
-            path: inst.project_path.clone(),
-            group: inst.group_path.clone(),
-            tool: inst.tool.clone(),
-            command: inst.command.clone(),
-            status: format!("{:?}", inst.status).to_lowercase(),
-            agent_session_id: inst.agent_session_id.clone(),
-            parent_session_id: inst.parent_session_id.clone(),
-            profile: storage.profile().to_string(),
-        };
-        super::output::print_json(&details)?;
+        super::output::print_json(&session_details(&inst, storage.profile()))?;
     } else {
         println!("Session: {}", inst.title);
         println!("  ID:      {}", inst.id);
@@ -1576,6 +1592,16 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
         println!("  Tool:    {}", inst.tool);
         println!("  Command: {}", inst.command);
         println!("  Status:  {:?}", inst.status);
+        // Only for a session that is not live: an archived or trashed row is
+        // otherwise indistinguishable here from a stopped one, and `status`
+        // cannot carry it (a session can be archived and running at once).
+        if let Some(at) = inst.trashed_at.or(inst.archived_at) {
+            println!(
+                "  State:   {} ({})",
+                super::list::state_tag(&inst),
+                at.to_rfc3339()
+            );
+        }
         println!("  Profile: {}", storage.profile());
         if let Some(parent_id) = &inst.parent_session_id {
             println!("  Parent:  {}", parent_id);
@@ -2809,5 +2835,51 @@ mod import_tests {
         assert!(already_imported(&instances, "id-1"));
         assert!(already_imported(&instances, "id-2"));
         assert!(!already_imported(&instances, "id-3"));
+    }
+}
+
+#[cfg(test)]
+mod show_json_tests {
+    use super::*;
+
+    /// #3350 gave `aoe list --json` a `state` tag and both timestamps;
+    /// `session show --json` was left behind, so a scripted consumer that
+    /// looked a session up by id could not tell an archived one from a live
+    /// one without a second `aoe list` shellout.
+    #[test]
+    fn show_json_exposes_state_and_archived_at_for_an_archived_row() {
+        let mut inst = Instance::new("z", "/repo");
+        inst.archive();
+        let details = session_details(&inst, "p");
+        assert_eq!(details.state, "archived");
+        assert!(details.archived_at.is_some());
+        assert!(details.trashed_at.is_none());
+    }
+
+    /// `trash()` deliberately leaves `archived_at` alone so a restore is
+    /// faithful, so both keys can be present at once and `state` reports
+    /// `trashed`: the same precedence `list --json` reports, from the same
+    /// `state_tag`.
+    #[test]
+    fn show_json_reports_trashed_for_a_row_that_was_archived_first() {
+        let mut inst = Instance::new("z", "/repo");
+        inst.archive();
+        inst.trash();
+        let details = session_details(&inst, "p");
+        assert_eq!(details.state, "trashed");
+        assert!(details.trashed_at.is_some());
+        assert!(details.archived_at.is_some());
+    }
+
+    /// A live row must serialize exactly as wide as it did before, so a
+    /// consumer parsing today's output sees one new key (`state`) and no
+    /// `null` timestamps.
+    #[test]
+    fn show_json_omits_absent_timestamps_and_keeps_state_live() {
+        let inst = Instance::new("z", "/repo");
+        let serialized = serde_json::to_string(&session_details(&inst, "p")).unwrap();
+        assert!(!serialized.contains("trashed_at"), "{serialized}");
+        assert!(!serialized.contains("archived_at"), "{serialized}");
+        assert!(serialized.contains("\"state\":\"live\""), "{serialized}");
     }
 }
