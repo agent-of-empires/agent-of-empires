@@ -7,6 +7,12 @@ use std::sync::OnceLock;
 
 use super::utils::strip_ansi;
 
+/// Lowercase omp banner footer, shared with pane-error summarization.
+pub(crate) const OMP_BANNER_DISMISSAL_ANCHOR: &str = "dismissed when you send your next message";
+/// Lowercase omp terminal retry markers, shared with pane-error summarization.
+pub(crate) const OMP_TERMINAL_RETRY_MARKERS: &[&str] =
+    &["error: retry budget exhausted", "error: retry failed after"];
+
 const SPINNER_CHARS: &[&str] = &[
     "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "⠘", "⠣", "⠆", "⠳", "⠰", "⠞", "⣻",
 ];
@@ -1850,14 +1856,15 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
 
     // Pinned error banner anchor and terminal retry lines: window 6.
     if let Some(pos) = lowest_matching_line(&window6, |l| {
-        l.to_lowercase()
-            .contains("dismissed when you send your next message")
+        l.to_lowercase().contains(OMP_BANNER_DISMISSAL_ANCHOR)
     }) {
         consider(pos, OmpSignal::Anchor);
     }
     if let Some(pos) = lowest_matching_line(&window6, |l| {
         let l = l.to_lowercase();
-        l.contains("error: retry budget exhausted") || l.contains("error: retry failed after")
+        OMP_TERMINAL_RETRY_MARKERS
+            .iter()
+            .any(|marker| l.contains(marker))
     }) {
         consider(pos, OmpSignal::TerminalLines);
     }

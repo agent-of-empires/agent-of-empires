@@ -10,14 +10,14 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::containers::{self, DockerContainer};
-use crate::tmux;
-
 use super::container_config;
 use super::environment::{
     build_docker_env_args_with_managed_codex_home, resolved_sandbox_environment, shell_escape,
 };
 use super::poller::SessionPoller;
+use crate::containers::{self, DockerContainer};
+use crate::tmux;
+use crate::tmux::status_detection::{OMP_BANNER_DISMISSAL_ANCHOR, OMP_TERMINAL_RETRY_MARKERS};
 
 use crate::session::capture::{
     capture_claude_session_id, capture_claude_session_id_in_container, capture_codex_session_id,
@@ -6999,7 +6999,6 @@ fn generate_id() -> String {
 /// message; otherwise fall back to a generic "stopped responding" string so
 /// the UI never renders an Error state without any explanation.
 fn summarize_error_from_pane(pane_content: &str) -> String {
-    const ANCHOR: &str = "dismissed when you send your next message";
     const MAX_BANNER_LINES: usize = 3;
 
     let cleaned = crate::tmux::utils::strip_ansi(pane_content);
@@ -7016,11 +7015,14 @@ fn summarize_error_from_pane(pane_content: &str) -> String {
     // 1-based from the bottom of the tail), the banner message is the reason:
     // walk up from the anchor (excluded), collecting the consecutive message
     // lines until the first border line (all `─`), at most MAX_BANNER_LINES.
-    let anchor_idx = tail.iter().position(|l| l.to_lowercase().contains(ANCHOR));
+    let anchor_idx = tail
+        .iter()
+        .position(|l| l.to_lowercase().contains(OMP_BANNER_DISMISSAL_ANCHOR));
     let terminal_idx = tail.iter().position(|l| {
         let lower = l.to_lowercase();
-        lower.contains("error: retry budget exhausted")
-            || lower.contains("error: retry failed after")
+        OMP_TERMINAL_RETRY_MARKERS
+            .iter()
+            .any(|marker| lower.contains(marker))
     });
     let anchor_is_lowest = match (anchor_idx, terminal_idx) {
         (Some(a), Some(t)) => a <= t,
