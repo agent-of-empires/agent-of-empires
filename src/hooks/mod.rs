@@ -258,7 +258,7 @@ pub(crate) fn agent_settings_path_display_for_host_environment(
 /// session's host environment list and falling back to AoE's own env so a var
 /// exported in the shell that launched `aoe` (and thus inherited by the agent)
 /// is honored too. Empty values are treated as unset.
-fn resolve_config_dir_override(var: &str, host_env: &[String]) -> Option<String> {
+pub(crate) fn resolve_config_dir_override(var: &str, host_env: &[String]) -> Option<String> {
     crate::session::environment::resolve_host_environment_value(host_env, var)
         .or_else(|| std::env::var(var).ok())
         .filter(|v| !v.is_empty())

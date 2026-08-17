@@ -39,6 +39,35 @@ fn resolve_agent_home(env_var: Option<&str>, default_subdir: &str) -> Result<Pat
         .join(default_subdir))
 }
 
+/// Resolve the Claude config dir the *launched pane* will see.
+///
+/// The launch path injects the session's profile-scoped `environment` entries
+/// into the pane, so a profile pinning `CLAUDE_CONFIG_DIR` makes the agent read
+/// and write a config tree that is not `~/.claude`. Every host-side read of
+/// Claude's on-disk state has to resolve the same way or it inspects a tree the
+/// agent never touches: the transcript probe then reports a real conversation
+/// absent, and the project-dir scan can hand back a conversation belonging to
+/// another profile that happens to share the cwd. See #3399.
+///
+/// Precedence mirrors [`crate::hooks::agent_settings_path_in`]: the session's
+/// host environment first, then AoE's own env (a var exported in the shell that
+/// launched `aoe` is inherited by the agent too), then `~/.claude`.
+fn claude_home_for_host_environment(host_env: &[String]) -> Result<PathBuf> {
+    match claude_config_dir_override(host_env) {
+        Some(dir) => Ok(PathBuf::from(dir)),
+        None => resolve_agent_home(None, ".claude"),
+    }
+}
+
+/// The `CLAUDE_CONFIG_DIR` value the launched pane will see, if any: the
+/// session's host environment wins, then AoE's own env. Empty is unset.
+///
+/// Shares [`crate::hooks::resolve_config_dir_override`] with the hook-install
+/// path so the read side and the write side cannot drift on precedence.
+fn claude_config_dir_override(host_env: &[String]) -> Option<String> {
+    crate::hooks::resolve_config_dir_override("CLAUDE_CONFIG_DIR", host_env)
+}
+
 /// Resolve a path to a comparable identity: canonicalize when the directory
 /// exists, otherwise fall back to lexical `.`/`..` normalization so a
 /// historical unnormalized spelling (a pre-#2858 worktree `project_path` like
@@ -86,15 +115,20 @@ pub(crate) fn encode_claude_project_path(project_path: &str) -> String {
 }
 
 /// Capture Claude Code session ID from the most recently active project directory,
-/// falling back to `~/.claude.json` if the dir scan result is stale.
+/// falling back to `.claude.json` if the dir scan result is stale.
+///
+/// `host_env` is the session's profile-scoped host environment, which selects
+/// the config tree both reads resolve against (see
+/// [`claude_home_for_host_environment`]).
 ///
 /// Used as a fallback when hooks don't fire (e.g. after `/clear` or `/new`).
 pub(crate) fn capture_claude_session_id(
     project_path: &str,
     known_session_id: Option<&str>,
     exclusion: &HashSet<String>,
+    host_env: &[String],
 ) -> Result<String> {
-    let claude_home = resolve_agent_home(Some("CLAUDE_CONFIG_DIR"), ".claude")?;
+    let claude_home = claude_home_for_host_environment(host_env)?;
     let canonical = canonicalize_or_raw(project_path);
 
     if let Some((id, modified)) =
@@ -106,16 +140,16 @@ pub(crate) fn capture_claude_session_id(
         }
     }
 
-    if let Some(id) = read_claude_json_session_id(&canonical) {
+    let claude_json_path = claude_json_path(&claude_home, host_env);
+    if let Some(id) = read_claude_json_session_id(&claude_json_path, &canonical) {
         if exclusion.contains(&id) {
             return Err(anyhow::anyhow!(
                 "claude.json lastSessionId {} is excluded (claimed by another instance)",
                 id
             ));
         }
-        let claude_json = dirs::home_dir()
-            .map(|h| h.join(".claude.json"))
-            .and_then(|p| std::fs::metadata(&p).ok())
+        let claude_json = std::fs::metadata(&claude_json_path)
+            .ok()
             .and_then(|m| m.modified().ok());
         let is_fresh = claude_json
             .and_then(|t| t.elapsed().ok())
@@ -131,13 +165,20 @@ pub(crate) fn capture_claude_session_id(
 /// Whether we can affirmatively prove Claude has *no* persisted transcript for
 /// `session_id` under `project_path` on the host filesystem.
 ///
-/// Claude only writes `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` once a
+/// Claude only writes `<config>/projects/<encoded-cwd>/<uuid>.jsonl` once a
 /// conversation has real content. A session AoE minted a UUID for but that was
 /// killed before the first prompt (an "empty thread") therefore has a stored
 /// `agent_session_id` that never hit disk, and `claude --resume <uuid>` on it
 /// fails with "No conversation found" every time. Callers use this to launch
 /// such an id as a fresh pinned session (`--session-id <uuid>`) instead of a
 /// guaranteed-to-fail `--resume`.
+///
+/// `<config>` is resolved from the session's profile-scoped `host_env`, the
+/// same way the launch path resolves it (see
+/// [`claude_home_for_host_environment`]). Probing the default `~/.claude` for a
+/// profile pinned elsewhere would report every real conversation absent and
+/// downgrade it to `--session-id <uuid>`, which the agent rejects as already in
+/// use, killing the pane outright. See #3399.
 ///
 /// Returns `true` ONLY when the Claude home resolves and the transcript file is
 /// confirmed missing. Any uncertainty (home dir unresolved) returns `false` so
@@ -148,8 +189,9 @@ pub(crate) fn capture_claude_session_id(
 pub(crate) fn claude_host_transcript_confirmed_absent(
     project_path: &str,
     session_id: &str,
+    host_env: &[String],
 ) -> bool {
-    let Ok(claude_home) = resolve_agent_home(Some("CLAUDE_CONFIG_DIR"), ".claude") else {
+    let Ok(claude_home) = claude_home_for_host_environment(host_env) else {
         return false;
     };
     let canonical = canonicalize_or_raw(project_path);
@@ -240,10 +282,22 @@ fn scan_claude_project_dir(
     Ok(best)
 }
 
-/// Read `lastSessionId` from `~/.claude.json` for a given project path.
-fn read_claude_json_session_id(project_path: &Path) -> Option<String> {
-    let claude_json = dirs::home_dir()?.join(".claude.json");
-    let content = std::fs::read_to_string(&claude_json).ok()?;
+/// Where Claude keeps `.claude.json` for the config tree at `claude_home`.
+///
+/// It sits *inside* the dir when `CLAUDE_CONFIG_DIR` selects it, but next to
+/// (not inside) the default `~/.claude`, so the default case cannot be derived
+/// from `claude_home` alone.
+fn claude_json_path(claude_home: &Path, host_env: &[String]) -> PathBuf {
+    if claude_config_dir_override(host_env).is_some() {
+        claude_home.join(".claude.json")
+    } else {
+        claude_home.with_file_name(".claude.json")
+    }
+}
+
+/// Read `lastSessionId` from `.claude.json` for a given project path.
+fn read_claude_json_session_id(claude_json: &Path, project_path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(claude_json).ok()?;
     let content = content.trim();
     if content.is_empty() {
         return None;
@@ -267,7 +321,9 @@ fn read_claude_json_session_id(project_path: &Path) -> Option<String> {
 /// 1. Read `/tmp/aoe-hooks-<euid>/<instance_id>/session_id` (written by Claude's
 ///    `SessionStart` / `UserPromptSubmit` hooks). When present and ≤ 5 min
 ///    old, return it and skip the disk scan.
-/// 2. Otherwise scan `~/.claude/projects/<encoded-path>/`. The scan uses
+/// 2. Otherwise scan `<config>/projects/<encoded-path>/`, where `<config>` is
+///    the session's profile-scoped Claude config dir (`host_env`), so a
+///    same-cwd peer in another profile is never a candidate. The scan uses
 ///    `compose_exclusion(instance_id, extra_excludes)` to skip UUIDs claimed
 ///    by peers via tmux env, and the `last_known` mutex to anchor this
 ///    closure to its own session even when a peer's jsonl is more recent.
@@ -278,6 +334,7 @@ pub(crate) fn claude_poll_fn(
     known_session_id: Option<String>,
     instance_id: String,
     extra_excludes: HashSet<String>,
+    host_env: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     let last_known = std::sync::Mutex::new(known_session_id);
     move || {
@@ -304,6 +361,7 @@ pub(crate) fn claude_poll_fn(
             &project_path,
             current_known.as_deref(),
             &exclusion,
+            &host_env,
         )
         .map_err(|e| tracing::debug!(target: "session.capture", "Claude disk scan failed: {}", e))
         .ok()
@@ -2917,7 +2975,7 @@ mod tests {
         let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
         std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
 
-        let result = capture_claude_session_id("/tmp/myproject", None, &HashSet::new());
+        let result = capture_claude_session_id("/tmp/myproject", None, &HashSet::new(), &[]);
         assert_eq!(result.unwrap(), uuid_new);
 
         match old_val {
@@ -2951,23 +3009,79 @@ mod tests {
         std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
 
         assert!(
-            !claude_host_transcript_confirmed_absent("/tmp/myproject", present),
+            !claude_host_transcript_confirmed_absent("/tmp/myproject", present, &[]),
             "a transcript on disk (even stale) must not be reported absent"
         );
         assert!(
-            claude_host_transcript_confirmed_absent("/tmp/myproject", missing),
+            claude_host_transcript_confirmed_absent("/tmp/myproject", missing, &[]),
             "an unwritten sid must be reported confirmed-absent"
         );
         // A project dir that was never created is also confirmed-absent.
         assert!(claude_host_transcript_confirmed_absent(
             "/tmp/never-opened-project",
-            present
+            present,
+            &[]
         ));
 
         match old_val {
             Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
             None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
         }
+    }
+
+    /// #3399: both Claude reads resolve the config dir the launched pane will
+    /// see, so two profiles sharing a cwd each see only their own conversation.
+    /// Against the default tree neither transcript exists, so the probe would
+    /// call every real conversation absent and downgrade it to `--session-id`,
+    /// and the project-dir scan would hand back the other profile's sid.
+    #[test]
+    #[serial]
+    fn claude_reads_resolve_the_profile_scoped_config_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = "/tmp/aoe-3399-shared-cwd";
+        let personal_sid = "11111111-1111-4111-8111-111111111111";
+        let work_sid = "22222222-2222-4222-8222-222222222222";
+        let mut homes = Vec::new();
+        for (name, sid) in [("personal", personal_sid), ("work", work_sid)] {
+            let home = tmp.path().join(format!("claude-{name}"));
+            let dir = home
+                .join("projects")
+                .join(encode_claude_project_path(project));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("{sid}.jsonl")), "data\n").unwrap();
+            homes.push(vec![format!("CLAUDE_CONFIG_DIR={}", home.display())]);
+        }
+        let (personal_env, work_env) = (&homes[0], &homes[1]);
+
+        // The process-level dir stands in for "no profile override", and holds
+        // neither conversation.
+        let _guard = EnvGuard::set(&[("CLAUDE_CONFIG_DIR", tmp.path().join("claude-default"))]);
+
+        for (env, own, other) in [
+            (personal_env, personal_sid, work_sid),
+            (work_env, work_sid, personal_sid),
+        ] {
+            assert!(
+                !claude_host_transcript_confirmed_absent(project, own, env),
+                "{own} lives in this profile's config dir and must read as present"
+            );
+            assert!(
+                claude_host_transcript_confirmed_absent(project, other, env),
+                "{other} belongs to the other profile and must not read as present"
+            );
+            assert_eq!(
+                capture_claude_session_id(project, None, &HashSet::new(), env).unwrap(),
+                own,
+                "the project-dir scan must only see this profile's conversations"
+            );
+        }
+
+        // No profile override falls back to AoE's own env, which sees neither.
+        assert!(claude_host_transcript_confirmed_absent(
+            project,
+            personal_sid,
+            &[]
+        ));
     }
 
     #[test]
@@ -2993,29 +3107,32 @@ mod tests {
         std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
 
         assert_eq!(
-            capture_claude_session_id("/tmp/myproject", None, &HashSet::new()).unwrap(),
+            capture_claude_session_id("/tmp/myproject", None, &HashSet::new(), &[]).unwrap(),
             uuid_b
         );
 
         assert_eq!(
-            capture_claude_session_id("/tmp/myproject", Some(uuid_a), &HashSet::new()).unwrap(),
+            capture_claude_session_id("/tmp/myproject", Some(uuid_a), &HashSet::new(), &[])
+                .unwrap(),
             uuid_b
         );
 
         let exclusion: HashSet<String> = std::iter::once(uuid_b.to_string()).collect();
         assert_eq!(
-            capture_claude_session_id("/tmp/myproject", Some(uuid_a), &exclusion).unwrap(),
+            capture_claude_session_id("/tmp/myproject", Some(uuid_a), &exclusion, &[]).unwrap(),
             uuid_a
         );
 
         assert_eq!(
-            capture_claude_session_id("/tmp/myproject", Some(uuid_b), &HashSet::new()).unwrap(),
+            capture_claude_session_id("/tmp/myproject", Some(uuid_b), &HashSet::new(), &[])
+                .unwrap(),
             uuid_b
         );
 
         let absent = "99999999-9999-9999-9999-999999999999";
         assert_eq!(
-            capture_claude_session_id("/tmp/myproject", Some(absent), &HashSet::new()).unwrap(),
+            capture_claude_session_id("/tmp/myproject", Some(absent), &HashSet::new(), &[])
+                .unwrap(),
             uuid_b
         );
 
@@ -3050,7 +3167,8 @@ mod tests {
         std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
 
         assert_eq!(
-            capture_claude_session_id("/tmp/myproject", Some(uuid_known), &HashSet::new()).unwrap(),
+            capture_claude_session_id("/tmp/myproject", Some(uuid_known), &HashSet::new(), &[])
+                .unwrap(),
             uuid_fresh
         );
 
@@ -3090,6 +3208,7 @@ mod tests {
             Some(uuid_startup.to_string()),
             "test-instance-promote-last-known".to_string(),
             extra_excludes,
+            Vec::new(),
         );
 
         assert_eq!(poll().as_deref(), Some(uuid_post_fork));
@@ -3120,7 +3239,7 @@ mod tests {
         let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
         std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
 
-        let result = capture_claude_session_id("/tmp/myproject", None, &HashSet::new());
+        let result = capture_claude_session_id("/tmp/myproject", None, &HashSet::new(), &[]);
         assert!(result.is_err(), "Agent files should not be picked up");
 
         match old_val {
@@ -3152,7 +3271,7 @@ mod tests {
         let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
         std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
 
-        let result = capture_claude_session_id("/tmp/myproject", None, &HashSet::new());
+        let result = capture_claude_session_id("/tmp/myproject", None, &HashSet::new(), &[]);
         assert!(result.is_err(), "Stale session file should be rejected");
         assert!(
             result
@@ -3178,7 +3297,7 @@ mod tests {
         let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
         std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
 
-        let result = capture_claude_session_id("/tmp/myproject", None, &HashSet::new());
+        let result = capture_claude_session_id("/tmp/myproject", None, &HashSet::new(), &[]);
         assert!(result.is_err(), "Empty dir should return error");
 
         match old_val {
@@ -5456,6 +5575,7 @@ mod tests {
             None,
             instance_id.to_string(),
             HashSet::new(),
+            Vec::new(),
         );
         assert_eq!(poll().as_deref(), Some(sidecar_uuid));
 
@@ -5513,6 +5633,7 @@ mod tests {
             None,
             instance_id.to_string(),
             HashSet::new(),
+            Vec::new(),
         );
         assert_eq!(poll().as_deref(), Some(disk_uuid));
 
@@ -5546,7 +5667,7 @@ mod tests {
         std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
 
         assert_eq!(
-            capture_claude_session_id("/tmp/myproject", Some(uuid_anchor), &HashSet::new())
+            capture_claude_session_id("/tmp/myproject", Some(uuid_anchor), &HashSet::new(), &[])
                 .unwrap(),
             uuid_active
         );

@@ -2038,6 +2038,7 @@ pub async fn acp_enable(
                 !crate::session::capture::claude_host_transcript_confirmed_absent(
                     &instance.project_path,
                     sid,
+                    &instance.resolved_host_environment(),
                 )
             })
             .unwrap_or(false);
