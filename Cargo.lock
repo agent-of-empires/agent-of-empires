@@ -106,7 +106,7 @@ dependencies = [
  "aoe-settings-derive",
  "argon2",
  "axum",
- "base64 0.23.0",
+ "base64 0.23.1",
  "cap-std",
  "cargo-husky",
  "chrono",
@@ -153,7 +153,7 @@ dependencies = [
  "subtle",
  "tar",
  "tempfile",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tokio-tungstenite 0.30.0",
  "tokio-util",
@@ -215,7 +215,7 @@ dependencies = [
  "ratatui-core",
  "simdutf8",
  "smallvec",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -282,7 +282,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "toml",
 ]
 
@@ -518,9 +518,9 @@ checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
 name = "base64"
-version = "0.23.0"
+version = "0.23.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b25655df2c3cdd83c5e5b293b88acd880332b2ddadd7c30ac43144fdc0033da9"
+checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
 
 [[package]]
 name = "base64ct"
@@ -766,9 +766,9 @@ dependencies = [
 
 [[package]]
 name = "clap"
-version = "4.6.5"
+version = "4.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "301b56658598e48f3648647ac6fc887be7e7108eddfa4e9b63fcf3ec58c0cadf"
+checksum = "473c7e07f409a8d772161724aa8db6a765a2532a70f9667eeb7b49d3d02fbdca"
 dependencies = [
  "clap_builder",
  "clap_derive",
@@ -785,9 +785,9 @@ dependencies = [
 
 [[package]]
 name = "clap_builder"
-version = "4.6.5"
+version = "4.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "94a65403d1a1bd28f7dc68eb8506e8874808ee5eecb59298de588e2e1407a078"
+checksum = "7b48fea5a88e9ae728a2dcbedbfc0e730f7d60da42e1cb049a83c9fb8b789889"
 dependencies = [
  "anstream",
  "anstyle",
@@ -797,9 +797,9 @@ dependencies = [
 
 [[package]]
 name = "clap_complete"
-version = "4.6.8"
+version = "4.6.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b1f84a88507dbd05c695f2cb5e8558e747179134005e9893882dec964190ed89"
+checksum = "3be2ad0423bdbbb0e25bc89add796f3559706d4a95e1bc98e4d9662a957b6a19"
 dependencies = [
  "clap",
 ]
@@ -2180,7 +2180,7 @@ dependencies = [
  "jni-sys",
  "log",
  "simd_cesu8",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "walkdir",
  "windows-link",
 ]
@@ -2265,7 +2265,7 @@ checksum = "bde5057d6143cc94e861d90f591b9303d6716c6b9602309150bd068853c10899"
 dependencies = [
  "hashbrown 0.16.1",
  "portable-atomic",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -2339,9 +2339,9 @@ dependencies = [
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.38.1"
+version = "0.38.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f6c19a05435c21ac299d71b6a9c13db3e3f47c520517d58990a462a1397a61db"
+checksum = "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8"
 dependencies = [
  "cc",
  "pkg-config",
@@ -3189,7 +3189,7 @@ dependencies = [
  "rustc-hash",
  "rustls",
  "socket2",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tokio",
  "tracing",
  "web-time",
@@ -3212,7 +3212,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "slab",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "tinyvec",
  "tracing",
  "web-time",
@@ -3358,7 +3358,7 @@ dependencies = [
  "palette",
  "serde",
  "strum",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "unicode-segmentation",
  "unicode-truncate",
  "unicode-width",
@@ -3472,7 +3472,7 @@ checksum = "a4e608c6638b9c18977b00b475ac1f28d14e84b27d8d42f70e0bf1e3dec127ac"
 dependencies = [
  "getrandom 0.2.17",
  "libredox",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -3595,14 +3595,14 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a8a1f2315036ef6b1fbacd1972e8ee7688030b0a2121edfc2a6550febd41574d"
 dependencies = [
  "hashbrown 0.16.1",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "rusqlite"
-version = "0.40.1"
+version = "0.40.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "11438310b19e3109b6446c33d1ed5e889428cf2e278407bc7896bc4aaea43323"
+checksum = "23f2a97da3e3873c73cb2a2e71b35c40ff95e0b1eefa8d72d8499a6928c3b5b3"
 dependencies = [
  "bitflags 2.13.0",
  "fallible-iterator",
@@ -4195,9 +4195,9 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "similar"
-version = "3.1.1"
+version = "3.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e6505efef05804732ed8a3f2d4f279429eb485bd69d5b0cc6b19cc02005cda16"
+checksum = "85ee016af5d736b69fc89e19254540fa4b5f5492853fb5503920f084011c78b6"
 dependencies = [
  "bstr",
 ]
@@ -4210,7 +4210,7 @@ checksum = "0d585997b0ac10be3c5ee635f1bab02d512760d14b7c468801ac8a01d9ae5f1d"
 dependencies = [
  "num-bigint",
  "num-traits",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
  "time",
 ]
 
@@ -4473,11 +4473,11 @@ dependencies = [
 
 [[package]]
 name = "thiserror"
-version = "2.0.19"
+version = "2.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "09a43598840e33d5b0331f38c5e30d13bb11c11210a4b58f0d9b18a5a5eefcd9"
+checksum = "ec86235f5fcc2a73650310756d2ac5b138a5780bbbdfae3eeccec992c435ba4f"
 dependencies = [
- "thiserror-impl 2.0.19",
+ "thiserror-impl 2.0.20",
 ]
 
 [[package]]
@@ -4493,9 +4493,9 @@ dependencies = [
 
 [[package]]
 name = "thiserror-impl"
-version = "2.0.19"
+version = "2.0.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "43cbfe0cf76104d42a574802844187e84a305e531ed54455f11fbde0f10541cd"
+checksum = "bc04cd3e1236dd4a98afca4569f2deb3f120e5422a4023be2cb683f8486292af"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -4864,9 +4864,9 @@ checksum = "e421abadd41a4225275504ea4d6566923418b7f05506fbc9c0fe86ba7396114b"
 
 [[package]]
 name = "tui-input"
-version = "0.15.3"
+version = "0.15.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bd014a652e31cf25ea68d11b10a7b09549863449b19387505c9933f11eb05fa"
+checksum = "4eb7c7ddaef6dcc58fae905d0f89a3df49ef77e93822df7447a5bb0babc9ece3"
 dependencies = [
  "ratatui",
  "unicode-segmentation",
@@ -4886,7 +4886,7 @@ dependencies = [
  "log",
  "rand 0.9.4",
  "sha1 0.10.6",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -4904,7 +4904,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "sha1 0.11.0",
- "thiserror 2.0.19",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
@@ -5205,9 +5205,9 @@ dependencies = [
 
 [[package]]
 name = "webbrowser"
-version = "1.2.2"
+version = "1.2.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ef62a3d5f7b2411119a11b6f62570dbff91d7105e011a20fb83fbf8f5761c40f"
+checksum = "62c35be770821a214dbc362fc26908c853e776c0004294d0b10b8a6bad582f94"
 dependencies = [
  "jni",
  "log",
