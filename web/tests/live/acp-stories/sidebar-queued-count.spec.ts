@@ -5,10 +5,10 @@
 // Single acp-enabled session: kick off a long turn, queue two
 // follow-ups via the composer's Queue button, then navigate to `/` so
 // the sidebar is the primary surface and StructuredView unmounts. The
-// daemon owns the queue; the confirmed reducer state is mirrored into
-// localStorage by persistState, so the sidebar row reads the count (2)
-// without the structured view mounted. The turn remains active long
-// enough for the badge assertion, so the daemon has not drained the queue.
+// daemon owns the queue, so the test waits for each enqueue acknowledgement
+// before navigating. The confirmed reducer state is mirrored into localStorage
+// by persistState, so the sidebar row reads the count (2) without the structured
+// view mounted. The active turn keeps the daemon from draining the queue first.
 
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -75,17 +75,24 @@ base("sidebar row shows the queued-prompt count badge", async ({ page }, testInf
       name: /Queue follow-up message/i,
     });
     await expect(queueBtn).toBeVisible({ timeout: 5_000 });
-    await composer.fill("follow-up one");
-    await queueBtn.click();
-    await composer.fill("follow-up two");
-    await queueBtn.click();
+    const promptEndpoint = `${serve.baseUrl}/api/sessions/${encodeURIComponent(sessionA.id)}/acp/prompt`;
+    const queueFollowUp = async (text: string) => {
+      await composer.fill(text);
+      const responsePromise = page.waitForResponse(
+        (response) => response.url() === promptEndpoint && response.request().method() === "POST",
+      );
+      await queueBtn.click();
+      const response = await responsePromise;
+      expect(response.status()).toBe(202);
+      expect(await response.json()).toMatchObject({ disposition: "queued" });
+    };
 
-    // Queueing is daemon-authoritative and asynchronous. Wait until both
-    // requests are confirmed and persisted before a hard navigation can
-    // abort them.
-    await expect(page.getByText("Queued (2)", { exact: true })).toBeVisible({
-      timeout: 5_000,
-    });
+    await queueFollowUp("follow-up one");
+    await queueFollowUp("follow-up two");
+
+    // The reducer persists only confirmed queue rows for this path. Verify
+    // that local projection before the hard navigation.
+    await expect(page.getByText("Queued (2)", { exact: true })).toBeVisible();
 
     // Navigate to the dashboard so the sidebar is the primary surface.
     await page.goto(serve.baseUrl);
