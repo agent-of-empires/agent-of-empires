@@ -43,16 +43,23 @@
 //! `save_groups` helpers were removed entirely. This keeps it structurally
 //! impossible to bypass the locks.
 //!
-//! Lock-ordering rule across the process: server callers MUST drop
-//! `AppState.instances` (tokio RwLock) before acquiring `Storage`'s
-//! per-profile mutex via `tokio::task::spawn_blocking(... storage.update)`.
-//! The flock can park on a wedged peer for arbitrary time; holding the
-//! tokio RwLock across the wait would block every other reader/writer of
-//! `AppState.instances` and park the worker thread. The cross-process
-//! `flock` is acquired AFTER the in-process mutex and released BEFORE it
-//! (RAII drop order). The closure passed to `update` is
-//! `FnOnce(...) -> Result<R>` and cannot await, so `std::sync::Mutex` is
-//! safe across the body even on the tokio runtime.
+//! Lock-ordering rule across the process: a title mutation that can change or
+//! create a `(title, project_path)` pair MUST first acquire the app-wide title
+//! mutation flock, then acquire any profile `Storage` lock. The title lock is
+//! global so a profile-changing rename never needs to hold two profile locks at
+//! once. It stays held through the authoritative duplicate check, external
+//! rename effects, persistence, and cache publication. `aoe add` acquires it
+//! only after hooks, around its final check and insert. Code must never acquire
+//! the title lock while holding a profile `Storage` lock.
+//!
+//! Server callers MUST drop `AppState.instances` (tokio RwLock) before
+//! acquiring either flock via `tokio::task::spawn_blocking`. A flock can park
+//! on a wedged peer for arbitrary time; holding the tokio RwLock across the
+//! wait would block every other reader/writer and park the worker thread. The
+//! cross-process storage flock is acquired AFTER the in-process mutex and
+//! released BEFORE it (RAII drop order). The closure passed to `update` is
+//! `FnOnce(...) -> Result<R>` and cannot await, so `std::sync::Mutex` is safe
+//! across the body even on the tokio runtime.
 //! Session launch callers additionally hold a per-instance lifecycle flock.
 //! The only permitted order is lifecycle flock, then the short-lived storage
 //! mutex/flock taken by `update`; a caller that already holds a lifecycle lock
@@ -95,6 +102,10 @@ const WORKSPACE_LOCK_FILENAME: &str = ".workspace-ordering.lock";
 /// Sidecar lock prefix for one session's launch lifecycle. The validated
 /// instance id is appended verbatim, yielding one lock per (profile, instance).
 const INSTANCE_LIFECYCLE_LOCK_PREFIX: &str = ".instance-lifecycle-";
+/// Sidecar lock for every mutation that can create or change a session's
+/// `(title, project_path)` identity. It lives at app scope because TUI renames
+/// can move a row between profiles.
+const TITLE_MUTATION_LOCK_FILENAME: &str = ".title-mutation.lock";
 
 /// Emit a tracing warn if the cross-process `flock` is held by a peer for
 /// longer than this. Surfaces a wedged peer in `aoe logs` instead of a
@@ -365,6 +376,14 @@ pub(crate) fn acquire_storage_flock(dir: &Path, name: &str) -> Result<StorageFlo
         }
     }
     Ok(StorageFlock { file })
+}
+/// Acquire the app-wide session title-mutation lock.
+///
+/// Callers must take this before loading authoritative profile storage and
+/// retain it through duplicate validation, external rename effects, durable
+/// writes, and any in-memory cache publication. See the module lock order.
+pub(crate) fn acquire_title_mutation_lock() -> Result<StorageFlock> {
+    acquire_storage_flock(&get_app_dir()?, TITLE_MUTATION_LOCK_FILENAME)
 }
 
 pub struct Storage {

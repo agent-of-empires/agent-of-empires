@@ -6,7 +6,8 @@ use serde::Serialize;
 use std::collections::HashSet;
 
 use crate::session::{
-    GroupTree, Instance, LifecycleOperation, ResumeIntent, StartOutcome, Storage,
+    acquire_title_mutation_lock, duplicate_session_error, is_duplicate_session, GroupTree,
+    Instance, LifecycleOperation, ResumeIntent, StartOutcome, Storage,
 };
 
 #[derive(Subcommand)]
@@ -1723,8 +1724,17 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     };
 
     let id = inst.id.clone();
-    let old_title = inst.title.clone();
 
+    // The initial load only resolves the requested row. Serialize every
+    // identity-changing rename from the fresh duplicate check through git/tmux
+    // effects and the durable commit.
+    let _title_lock = acquire_title_mutation_lock()?;
+    let (authoritative_instances, _groups) = storage.load_with_groups()?;
+    let inst = authoritative_instances
+        .iter()
+        .find(|instance| instance.id == id)
+        .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
+    let old_title = inst.title.clone();
     let effective_title = args
         .title
         .clone()
@@ -1739,10 +1749,35 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     // the two cannot drift. Decided per-session from the resolved setting.
     let config = crate::session::profile_config::resolve_config_or_warn(profile);
     let tied = inst.tie_workdir_applies(config.session.tie_workdir_to_name);
+    let tied_edit = tied && (title_changed || args.rename_branch);
+    let duplicate_path = if tied_edit {
+        let leaf = crate::session::worktree_edit::worktree_leaf_from_title(&effective_title);
+        crate::session::worktree_edit::target_worktree_path(
+            std::path::Path::new(&inst.project_path),
+            &leaf,
+        )
+        .unwrap_or_else(|| std::path::PathBuf::from(&inst.project_path))
+        .to_string_lossy()
+        .into_owned()
+    } else {
+        inst.project_path.clone()
+    };
+    let pair_changed = title_changed
+        || duplicate_path.trim_end_matches('/') != inst.project_path.trim_end_matches('/');
+    if pair_changed
+        && is_duplicate_session(
+            authoritative_instances.iter(),
+            &effective_title,
+            &duplicate_path,
+            Some(&id),
+        )
+    {
+        return Err(duplicate_session_error(&effective_title));
+    }
 
     let mut new_path: Option<String> = None;
     let mut new_branch: Option<String> = None;
-    if tied && (title_changed || args.rename_branch) {
+    if tied_edit {
         let current_path = inst.project_path.clone();
         let worktree_info = inst
             .worktree_info
@@ -1751,6 +1786,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         // Persisted status can lag the live tmux pane; moving a running
         // worktree is unsafe, so recompute before enforcing the gate.
         let mut live = inst.clone();
+        live.source_profile = profile.to_string();
         crate::tmux::refresh_session_cache();
         live.update_status();
         let leaf = crate::session::worktree_edit::worktree_leaf_from_title(&effective_title);
@@ -1804,9 +1840,8 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         bail!("--rename-branch only applies to a tied aoe-managed worktree session (session.tie_workdir_to_name)");
     }
 
-    // Phase 2 (unlocked): tmux rename if the title changed. Side effect on
-    // the running tmux server, fast but external state, do it outside the
-    // closure.
+    // External effects deliberately remain under the app-wide title lock but
+    // outside the short profile Storage lock.
     if title_changed {
         let tmux_session = crate::tmux::Session::new(&id, &old_title)?;
         if tmux_session.exists() {
@@ -1819,11 +1854,8 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         }
     }
 
-    // Phase 3 (locked): persist the new title and (optional) new group.
-    // Re-resolve by id under the lock so concurrent mutations to other
-    // sessions are preserved. `create_group` is idempotent and only runs
-    // when the closure actually mutated `group_path`, so `groups.json` is
-    // rewritten only on real group changes (cf. `update`'s diff check).
+    // Persist by id under the profile lock while retaining the title lock.
+    // Concurrent mutations to unrelated fields and groups are preserved.
     let persist = storage.update(|instances, groups| {
         let inst = instances
             .iter_mut()
@@ -1858,6 +1890,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         return Err(e);
     }
 
+    drop(_title_lock);
     if let Some(path) = &new_path {
         println!("✓ Worktree moved to: {}", path);
         if let Some(branch) = &new_branch {
@@ -2714,7 +2747,112 @@ mod set_color_tests {
     }
 }
 
+#[cfg(test)]
+mod rename_tests {
+    use super::{rename_session, RenameArgs};
+    use crate::session::{Instance, Storage};
+    use serial_test::serial;
+
+    #[tokio::test]
+    #[serial]
+    async fn rename_rejects_duplicate_pair_but_allows_group_only_change() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let storage = Storage::new_unwatched("rename-duplicate").unwrap();
+        let existing = Instance::new("main branch", "/tmp/repo/");
+        let target = Instance::new("throwaway", "/tmp/repo");
+        let target_id = target.id.clone();
+        storage
+            .update(|instances, _groups| {
+                *instances = vec![existing, target];
+                Ok(())
+            })
+            .unwrap();
+
+        let error = rename_session(
+            "rename-duplicate",
+            RenameArgs {
+                identifier: Some(target_id.clone()),
+                title: Some("main branch".to_string()),
+                group: None,
+                rename_branch: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Session already exists with same title and path"));
+
+        rename_session(
+            "rename-duplicate",
+            RenameArgs {
+                identifier: Some(target_id.clone()),
+                title: None,
+                group: Some("work".to_string()),
+                rename_branch: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let instances = storage.load().unwrap();
+        let target = instances
+            .iter()
+            .find(|instance| instance.id == target_id)
+            .unwrap();
+        assert_eq!(target.title, "throwaway");
+        assert_eq!(target.group_path, "work");
+        // In tied mode the duplicate identity uses the derived destination
+        // path, not the row's current worktree path. The collision must reject
+        // before any git side effect is attempted.
+        crate::session::config::update_config(|config| {
+            config.session.tie_workdir_to_name = true;
+        })
+        .unwrap();
+        let existing = Instance::new("main branch", "/tmp/worktrees/main-branch");
+        let mut tied = Instance::new("throwaway", "/tmp/worktrees/throwaway");
+        tied.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "throwaway".to_string(),
+            main_repo_path: "/tmp/repo".to_string(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+        let tied_id = tied.id.clone();
+        storage
+            .update(|instances, _groups| {
+                *instances = vec![existing, tied];
+                Ok(())
+            })
+            .unwrap();
+
+        let error = rename_session(
+            "rename-duplicate",
+            RenameArgs {
+                identifier: Some(tied_id.clone()),
+                title: Some("main branch".to_string()),
+                group: None,
+                rename_branch: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Session already exists with same title and path"));
+        let tied = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|instance| instance.id == tied_id)
+            .unwrap();
+        assert_eq!(tied.title, "throwaway");
+        assert_eq!(tied.project_path, "/tmp/worktrees/throwaway");
+    }
+}
+
 #[cfg(all(test, feature = "serve"))]
+
 mod acp_reject_tests {
     use super::{set_session_id, SetSessionIdArgs};
     use crate::session::{Instance, Storage};

@@ -6167,6 +6167,144 @@ fn test_group_delete_dialog_scoped_to_owning_profile() {
     );
 }
 
+#[test]
+#[serial]
+fn test_rename_selected_rejects_all_identity_collisions_and_allows_group_only_change() {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+    let existing = Instance::new("main branch", "/tmp/repo/");
+    let target = Instance::new("throwaway", "/tmp/stale");
+    let target_id = target.id.clone();
+    storage
+        .update(|instances, _groups| {
+            *instances = vec![existing, target];
+            Ok(())
+        })
+        .unwrap();
+
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.selected_session = Some(target_id.clone());
+    storage
+        .update(|instances, _groups| {
+            instances
+                .iter_mut()
+                .find(|instance| instance.id == target_id)
+                .unwrap()
+                .project_path = "/tmp/repo".to_string();
+            Ok(())
+        })
+        .unwrap();
+
+    view.rename_selected("main branch", None, None, false)
+        .unwrap();
+    assert!(view.info_dialog.is_some());
+    assert_eq!(view.get_instance(&target_id).unwrap().title, "throwaway");
+    assert_eq!(
+        view.get_instance(&target_id).unwrap().project_path,
+        "/tmp/repo"
+    );
+
+    view.info_dialog = None;
+    view.rename_selected("", Some("work"), None, false).unwrap();
+    assert!(view.info_dialog.is_none());
+    assert_eq!(view.get_instance(&target_id).unwrap().group_path, "work");
+    let stored = storage.load().unwrap();
+    let target = stored
+        .iter()
+        .find(|instance| instance.id == target_id)
+        .unwrap();
+    assert_eq!(target.title, "throwaway");
+    assert_eq!(target.group_path, "work");
+
+    // Tied routing derives the destination path from the new title. Reject a
+    // collision on that final pair before attempting the git worktree move.
+    crate::session::config::update_config(|config| {
+        config.session.tie_workdir_to_name = true;
+    })
+    .unwrap();
+    let derived_existing = Instance::new("main branch", "/tmp/worktrees/main-branch");
+    let mut tied_target = Instance::new("throwaway", "/tmp/worktrees/throwaway");
+    tied_target.worktree_info = Some(crate::session::WorktreeInfo {
+        branch: "throwaway".to_string(),
+        main_repo_path: "/tmp/repo".to_string(),
+        managed_by_aoe: true,
+        created_at: chrono::Utc::now(),
+        base_branch: None,
+    });
+    let tied_id = tied_target.id.clone();
+    storage
+        .update(|instances, _groups| {
+            *instances = vec![derived_existing, tied_target];
+            Ok(())
+        })
+        .unwrap();
+    view.reload().unwrap();
+    view.selected_session = Some(tied_id.clone());
+    view.info_dialog = None;
+    view.rename_selected("main branch", None, None, false)
+        .unwrap();
+    assert!(
+        view.info_dialog.is_some(),
+        "tied derived-destination collision must be rejected"
+    );
+    let tied_stored = storage.load().unwrap();
+    let tied_target = tied_stored
+        .iter()
+        .find(|instance| instance.id == tied_id)
+        .unwrap();
+    assert_eq!(tied_target.title, "throwaway");
+    assert_eq!(tied_target.project_path, "/tmp/worktrees/throwaway");
+
+    // Moving between profiles checks the authoritative target storage, not
+    // only the source profile or unified-view cache.
+    let alpha = Storage::new_unwatched("alpha").unwrap();
+    let beta = Storage::new_unwatched("beta").unwrap();
+    let source = Instance::new("source", "/tmp/profile-collision");
+    let source_id = source.id.clone();
+    alpha
+        .update(|instances, _groups| {
+            *instances = vec![source];
+            Ok(())
+        })
+        .unwrap();
+    beta.update(|instances, _groups| {
+        *instances = vec![Instance::new("occupied", "/tmp/profile-collision")];
+        Ok(())
+    })
+    .unwrap();
+    let mut unified = HomeView::new(
+        None,
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    unified.selected_session = Some(source_id.clone());
+    unified
+        .rename_selected("occupied", None, Some("beta"), false)
+        .unwrap();
+    assert!(
+        unified.info_dialog.is_some(),
+        "target-profile identity collision must be rejected"
+    );
+    assert_eq!(
+        alpha
+            .load()
+            .unwrap()
+            .iter()
+            .find(|instance| instance.id == source_id)
+            .unwrap()
+            .title,
+        "source"
+    );
+    assert_eq!(beta.load().unwrap().len(), 1);
+}
+
 /// Changing a session's profile via the rename dialog must prune the
 /// source profile's now-empty group, just like the restart-with-edits
 /// path does. Without the prune the source keeps an empty group with the
