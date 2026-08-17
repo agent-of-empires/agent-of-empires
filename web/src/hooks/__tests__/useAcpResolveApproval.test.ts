@@ -133,9 +133,12 @@ describe("reducer elicitation_resolved_locally", () => {
       resolution: { action: "accept", answers: { question_0: "yes_internal" } },
     };
     const next = reducer(state, action);
-    const row = next.activity.find((r) => r.kind === "elicitation_answered");
+    // The answered row is an optimistic overlay now (Tier 4); the
+    // authoritative same-id row is server-owned and drops this once it lands.
+    const row = next.optimisticRows.find((r) => r.kind === "elicitation_answered");
     expect(row?.id).toBe("elicitation-e-1");
     expect(row?.elicitationAnswers).toEqual([{ question: "Proceed?", answer: "Yes" }]);
+    expect(next.activity).toHaveLength(0);
   });
 
   it("adds no answer row when the pending card is already gone", () => {

@@ -271,10 +271,52 @@ const REPO_CONFIG_PATH: &str = ".agent-of-empires/config.toml";
 /// Legacy path (pre-1.1) for backwards compatibility.
 const LEGACY_REPO_CONFIG_PATH: &str = ".aoe/config.toml";
 
+/// The user's global `config.toml`, resolved without creating the app dir
+/// (unlike [`super::config::config_path`], which goes through `get_app_dir`).
+/// `None` when the app dir cannot be resolved at all; no collision is provable
+/// then, so the repo layer proceeds as before.
+fn global_config_path() -> Option<PathBuf> {
+    super::get_app_dir_path()
+        .ok()
+        .map(|dir| dir.join("config.toml"))
+}
+
+/// Whether a `<project>/.agent-of-empires/config.toml` is in fact the user's
+/// global `config.toml`. On macOS and Windows the app dir is
+/// `~/.agent-of-empires`, so a project path of `$HOME` makes the repo layer
+/// resolve onto the global config file by construction (#3400).
+///
+/// The containing directories are compared canonicalized (see
+/// [`normalize_path`]), so the collision is still caught when the project path
+/// reaches the app dir through a symlink or a non-canonical prefix such as
+/// `/tmp` vs `/private/tmp`. Canonicalizing the directory rather than the file
+/// matters on the save path, where the target file need not exist yet while the
+/// app dir always does.
+fn resolves_to_global_config(candidate: &Path) -> bool {
+    let Some(global) = global_config_path() else {
+        return false;
+    };
+    match (candidate.parent(), global.parent()) {
+        (Some(candidate_dir), Some(global_dir)) => {
+            candidate.file_name() == global.file_name()
+                && normalize_path(candidate_dir) == normalize_path(global_dir)
+        }
+        _ => false,
+    }
+}
+
 /// Load repo config from `<project_path>/.agent-of-empires/config.toml`.
 /// Falls back to the legacy `.aoe/config.toml` path with a deprecation warning.
 /// Returns `None` if neither file exists.
 pub fn load_repo_config(project_path: &Path) -> Result<Option<RepoConfig>> {
+    // An empty path is how a project-less session (scratch, see
+    // `super::builder::build_instance`) says "no repo". Joining onto it yields
+    // the *relative* `.agent-of-empires/config.toml`, which would otherwise
+    // read whatever directory the process was launched in.
+    if project_path.as_os_str().is_empty() {
+        return Ok(None);
+    }
+
     let config_path = project_path.join(REPO_CONFIG_PATH);
     let (config_path, is_legacy) = if config_path.exists() {
         (config_path, false)
@@ -286,6 +328,19 @@ pub fn load_repo_config(project_path: &Path) -> Result<Option<RepoConfig>> {
             return Ok(None);
         }
     };
+
+    // A project path of `$HOME` resolves this to the user's own global
+    // `config.toml` on macOS and Windows (#3400). That file is not a repo
+    // config: loading it re-merges the global layer onto itself and reports
+    // every global-only section as a rejected repo override. Decline, and log
+    // the path so the upstream caller that passed such a path is findable.
+    if resolves_to_global_config(&config_path) {
+        tracing::debug!(target: "session.store",
+            path = %config_path.display(),
+            "Skipping repo config: this project path resolves to the global config.toml"
+        );
+        return Ok(None);
+    }
 
     if is_legacy {
         tracing::warn!(target: "session.store",
@@ -328,11 +383,23 @@ pub fn load_repo_config(project_path: &Path) -> Result<Option<RepoConfig>> {
 /// If a legacy `.aoe/config.toml` exists, it is removed after a successful save
 /// to prevent stale config from silently reactivating.
 pub fn save_repo_config(project_path: &Path, config: &RepoConfig) -> Result<()> {
+    let config_path = project_path.join(REPO_CONFIG_PATH);
+    // The read side's collision (#3400) is destructive here: writing the
+    // repo-permitted subset over the global `config.toml` drops every
+    // global-only section. Refuse loudly rather than truncating the user's
+    // config; the caller surfaces the error.
+    if resolves_to_global_config(&config_path) {
+        anyhow::bail!(
+            "Refusing to save repo config to {}: that file is the global config.toml, \
+             not a repo config (this project path resolves onto the app dir)",
+            config_path.display()
+        );
+    }
+
     let config_dir = project_path.join(".agent-of-empires");
     fs::create_dir_all(&config_dir)
         .with_context(|| format!("Failed to create {}", config_dir.display()))?;
 
-    let config_path = project_path.join(REPO_CONFIG_PATH);
     // Sanitize here rather than trusting callers, so a field the merge path
     // would strip is never written to disk in the first place.
     let (allowed, rejected) = sanitize_repo_overrides(&config.overrides);
@@ -462,6 +529,15 @@ pub fn profile_to_repo_config(profile: &ProfileConfig) -> RepoConfig {
 /// matching the guard in `compute_volume_paths` (avoids `Repository::discover`
 /// walking up to an unrelated ancestor repo, e.g. a dotfile-managed `$HOME`).
 pub fn repo_config_source_path(project_path: &Path) -> PathBuf {
+    // An empty path means "no project repo" (scratch sessions, see
+    // `super::builder::build_instance`). Every probe below is relative to it,
+    // so it would interrogate the *launch directory* instead: a cwd whose
+    // `.git` is a file (a linked worktree) resolves to that worktree's main
+    // repo and hands `load_repo_config` a real path, putting back the repo
+    // layer that the empty path exists to suppress.
+    if project_path.as_os_str().is_empty() {
+        return PathBuf::new();
+    }
     if project_path.join(".git").exists() {
         if let Ok(main_repo) = crate::git::GitWorktree::find_main_repo(project_path) {
             return main_repo;

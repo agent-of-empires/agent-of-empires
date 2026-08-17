@@ -104,6 +104,9 @@ export interface AcpContext {
   removeQueuedPrompt: (id: string) => void;
   editQueuedPrompt: (id: string, text: string) => void;
   clearQueue: () => void;
+  sendQueuedNow: ReturnType<typeof useAcpSession>["sendQueuedNow"];
+  canSendQueuedNow: boolean;
+  sendNowInterruptsTurn: boolean;
   dismissRejectedPrompt: (id: string) => void;
   dismissModeSwitchFailed: () => void;
   setConfigOption: (configId: string, value: string) => Promise<void>;
@@ -195,6 +198,20 @@ export function AcpRuntime({
     else if (action === "fetch") void loadOlder();
   }, [canLoadEarlier, hasMoreOlder, loadEarlier, loadOlder]);
 
+  // Overlay optimistic rows (an in-flight prompt, a just-answered
+  // elicitation) on top of the server-owned, windowed transcript. Each is
+  // dropped as soon as its authoritative same-id row lands in `state.activity`
+  // (checked against the full activity, not the window), so this stays a pure
+  // presentation layer and never a second source of truth. Overlay rows are
+  // always the most recent, so they append after the window. See Tier 4.
+  const displayActivity = useMemo(() => {
+    const optimistic = acp.state.optimisticRows;
+    if (optimistic.length === 0) return windowedActivity;
+    const serverIds = new Set(acp.state.activity.map((r) => r.id));
+    const pending = optimistic.filter((o) => !serverIds.has(o.id));
+    return pending.length > 0 ? windowedActivity.concat(pending) : windowedActivity;
+  }, [windowedActivity, acp.state.optimisticRows, acp.state.activity]);
+
   // Memoise the activity → ThreadMessageLike conversion. The function
   // walks the activity array, allocates a new AssistantBuilder
   // per turn, and produces brand-new message objects. Without
@@ -204,13 +221,13 @@ export function AcpRuntime({
   const messages = useMemo(
     () =>
       activityToThreadMessages(
-        windowedActivity,
+        displayActivity,
         acp.state.turnActive,
         showClearedTurns,
         agentProfile.capabilities.todos,
         agentProfile,
       ),
-    [windowedActivity, acp.state.turnActive, showClearedTurns, agentProfile],
+    [displayActivity, acp.state.turnActive, showClearedTurns, agentProfile],
   );
 
   const runtime = useExternalStoreRuntime<ThreadMessageLike>({
@@ -277,6 +294,9 @@ export function AcpRuntime({
         removeQueuedPrompt: acp.removeQueuedPrompt,
         editQueuedPrompt: acp.editQueuedPrompt,
         clearQueue: acp.clearQueue,
+        sendQueuedNow: acp.sendQueuedNow,
+        canSendQueuedNow: acp.canSendQueuedNow,
+        sendNowInterruptsTurn: acp.sendNowInterruptsTurn,
         dismissRejectedPrompt: acp.dismissRejectedPrompt,
         dismissModeSwitchFailed: acp.dismissModeSwitchFailed,
         setConfigOption: acp.setConfigOption,

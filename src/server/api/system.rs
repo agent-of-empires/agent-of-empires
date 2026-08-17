@@ -127,6 +127,7 @@ fn acp_command_fields(
 fn build_custom_agent_infos(
     custom_agents: &HashMap<String, String>,
     agent_acp_cmd: &HashMap<String, String>,
+    agent_detect_as: &HashMap<String, String>,
     policy: &crate::acp::agent_policy::AgentPolicy,
 ) -> Vec<AgentInfo> {
     let mut entries: Vec<_> = custom_agents
@@ -146,7 +147,8 @@ fn build_custom_agent_infos(
             oneshot_capable: false,
             acp_capable: agent_acp_cmd
                 .get(name)
-                .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(name, cmd).is_ok()),
+                .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(name, cmd).is_ok())
+                || crate::acp::inherited_acp_base(name, agent_detect_as).is_some(),
             acp_allowed: policy.allows(name),
             // Custom agents' acp_command is never serialized here (it can hold
             // hostnames or secrets), so we don't probe its install state; the
@@ -168,6 +170,7 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
         let config = crate::session::profile_config::resolve_config_or_warn(&profile);
         let custom_agents = config.session.custom_agents;
         let agent_acp_cmd = config.session.agent_acp_cmd;
+        let agent_detect_as = config.session.agent_detect_as;
         let tools = crate::tmux::AvailableTools::detect();
         let available = tools.available_list();
         let acp_registry = crate::acp::AgentRegistry::with_defaults();
@@ -201,6 +204,7 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
         agents.extend(build_custom_agent_infos(
             &custom_agents,
             &agent_acp_cmd,
+            &agent_detect_as,
             &policy,
         ));
         agents
@@ -2227,7 +2231,7 @@ mod tests {
             ("blocked", "ocp run blocked acp"),
         ]);
         let policy = crate::acp::agent_policy::AgentPolicy::for_test(true, &["oc-sp"]);
-        let entries = build_custom_agent_infos(&custom, &acp, &policy);
+        let entries = build_custom_agent_infos(&custom, &acp, &HashMap::new(), &policy);
 
         let oc_sp = entries.iter().find(|e| e.name == "oc-sp").unwrap();
         assert!(oc_sp.acp_capable && oc_sp.acp_allowed);
@@ -2240,7 +2244,7 @@ mod tests {
         assert!(!blocked.acp_allowed, "policy denies this agent");
 
         // Unrestricted leaves both true, so the default path is unchanged.
-        let entries = build_custom_agent_infos(&custom, &acp, &unrestricted());
+        let entries = build_custom_agent_infos(&custom, &acp, &HashMap::new(), &unrestricted());
         assert!(entries.iter().all(|e| e.acp_capable && e.acp_allowed));
     }
 
@@ -2248,6 +2252,7 @@ mod tests {
     fn custom_agent_entries_use_safe_placeholders() {
         let entries = build_custom_agent_infos(
             &custom_agents(&[("remote-claude", "ssh -t prod.example claude")]),
+            &HashMap::new(),
             &HashMap::new(),
             &unrestricted(),
         );
@@ -2269,6 +2274,7 @@ mod tests {
         let entries = build_custom_agent_infos(
             &custom_agents(&[("remote-agent", "ssh -t prod.example claude")]),
             &HashMap::new(),
+            &HashMap::new(),
             &unrestricted(),
         );
 
@@ -2283,6 +2289,7 @@ mod tests {
     fn serialized_custom_agent_response_contains_no_command_or_detect_as_data() {
         let entries = build_custom_agent_infos(
             &custom_agents(&[("remote-agent", "ssh -t prod.example claude")]),
+            &HashMap::new(),
             &HashMap::new(),
             &unrestricted(),
         );
@@ -2313,6 +2320,7 @@ mod tests {
                 ("remote-codex", "ssh -t prod.example codex"),
             ]),
             &HashMap::new(),
+            &HashMap::new(),
             &unrestricted(),
         );
 
@@ -2330,6 +2338,7 @@ mod tests {
                 ("middle", "middle-cmd"),
             ]),
             &HashMap::new(),
+            &HashMap::new(),
             &unrestricted(),
         );
 
@@ -2345,12 +2354,37 @@ mod tests {
             // An entry whose command is malformed must not flip capability on.
             ("broken", "ocp run \"unterminated"),
         ]);
-        let entries = build_custom_agent_infos(&custom, &acp, &unrestricted());
+        let entries = build_custom_agent_infos(&custom, &acp, &HashMap::new(), &unrestricted());
 
         let oc_sp = entries.iter().find(|e| e.name == "oc-sp").unwrap();
         assert!(oc_sp.acp_capable, "agent with a valid acp cmd is capable");
         let plain = entries.iter().find(|e| e.name == "plain").unwrap();
         assert!(!plain.acp_capable, "agent with no acp cmd is tmux-only");
+    }
+
+    #[test]
+    fn custom_agent_acp_capable_via_detect_as_inheritance() {
+        // A wrapper that inherits a registry-backed base (claude) is
+        // structured-capable through the base adapter, with no agent_acp_cmd.
+        // A wrapper inheriting a terminal-only base (cursor) stays tmux-only.
+        let custom = custom_agents(&[
+            ("lenovo-claude", "CLAUDE_CONFIG_DIR=/work claude"),
+            ("my-cursor", "agent"),
+        ]);
+        let detect_as = custom_agents(&[("lenovo-claude", "claude"), ("my-cursor", "cursor")]);
+        let entries =
+            build_custom_agent_infos(&custom, &HashMap::new(), &detect_as, &unrestricted());
+
+        let lenovo = entries.iter().find(|e| e.name == "lenovo-claude").unwrap();
+        assert!(
+            lenovo.acp_capable,
+            "wrapper inheriting claude is acp-capable via the base adapter"
+        );
+        let cursor = entries.iter().find(|e| e.name == "my-cursor").unwrap();
+        assert!(
+            !cursor.acp_capable,
+            "wrapper inheriting a terminal-only base stays tmux-only"
+        );
     }
 
     #[test]
@@ -2392,6 +2426,7 @@ mod tests {
         let entries = build_custom_agent_infos(
             &custom_agents(&[("oc-sp", "ocp run sp")]),
             &custom_agents(&[("oc-sp", "ocp run sp acp")]),
+            &HashMap::new(),
             &unrestricted(),
         );
         let value = serde_json::to_value(&entries).unwrap();

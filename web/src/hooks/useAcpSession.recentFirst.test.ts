@@ -56,9 +56,28 @@ const caps = (seq: number) => ({
   event: { PromptCapabilities: { image: true, audio: false, embedded_context: true } },
 });
 
-function replayBody(frames: unknown[], next: number | null, hasMore: boolean) {
+// Build the server-folded transcript rows (Tier 4) for the `?view=rows`
+// projection from the same UserPromptSent frames the page carries.
+function rowsFromFrames(frames: Array<{ seq: number; event: unknown }>) {
+  return frames
+    .filter((f) => typeof f.event === "object" && f.event !== null && "UserPromptSent" in (f.event as object))
+    .map((f) => ({
+      id: `user-seq-${f.seq}`,
+      group_id: `g${f.seq}`,
+      kind: "user_prompt",
+      at: "2026-01-01T00:00:00Z",
+      text: (f.event as { UserPromptSent: { text: string } }).UserPromptSent.text,
+    }));
+}
+
+function replayBody(frames: Array<{ seq: number; event: unknown }>, next: number | null, hasMore: boolean) {
   return JSON.stringify({
+    // The default projection returns `frames`; `?view=rows` returns `rows`
+    // (with `frames` empty). The hook reads `frames` from the default fetch and
+    // `rows` from the companion `view=rows` fetch, so returning both here (the
+    // mock ignores the query) exercises each path.
     frames,
+    rows: rowsFromFrames(frames),
     lost: false,
     highest_seq: 10,
     lowest_seq: 1,

@@ -1155,13 +1155,15 @@ pub struct SessionConfig {
     pub delete_to_trash: bool,
 
     /// Ask for confirmation before deleting a session with the TUI `d` key.
-    /// Off by default so the trash-first flow stays low-friction: `d` moves
-    /// the session straight to the trash. When on, `d` opens a confirmation
-    /// dialog first, guarding against a fumbled keystroke trashing the wrong
-    /// (possibly running) session. Only affects the TUI trash path; the web
-    /// delete dialog already confirms, and the permanent-delete/force-remove
-    /// paths are gated by their own dialogs regardless. See #2583.
-    #[serde(default)]
+    /// On by default: `d` opens a confirmation dialog that a second `d`
+    /// accepts and `Esc` dismisses, so typing into the sidebar while a
+    /// session is selected can no longer trash it outright. Turn it off (here
+    /// or with the dialog's "don't warn me again" checkbox) to get the
+    /// historical one-keystroke trash back. Only affects the TUI
+    /// trash path; the web delete dialog already confirms, and the
+    /// permanent-delete/force-remove paths are gated by their own dialogs
+    /// regardless. See #2583, #3364.
+    #[serde(default = "default_true")]
     #[setting(label = "Confirm Before Delete", widget = "toggle")]
     pub confirm_delete: bool,
 
@@ -1590,7 +1592,7 @@ impl Default for SessionConfig {
             strict_hotkeys: false,
             snooze_duration_minutes: 30,
             delete_to_trash: true,
-            confirm_delete: false,
+            confirm_delete: true,
             trash_retention_days: default_trash_retention_days(),
             auto_stop_idle_secs: default_auto_stop_idle_secs(),
             prevent_sleep_when_active: false,
@@ -4595,11 +4597,14 @@ mod tests {
     }
 
     #[test]
-    fn test_confirm_before_quit_absent_from_toml_defaults_on() {
-        // An older config.toml with no `confirm_before_quit` key must
-        // deserialize to the enabled default, not false.
+    fn test_default_on_guards_absent_from_toml_default_on() {
+        // An older config.toml with no key for a default-on guard must
+        // deserialize to the enabled default, not false. A plain
+        // `#[serde(default)]` would give `bool::default()` here and silently
+        // strand every pre-existing config on the old behavior.
         let session: SessionConfig = toml::from_str("").unwrap();
-        assert!(session.confirm_before_quit);
+        assert!(session.confirm_before_quit, "confirm_before_quit (#1569)");
+        assert!(session.confirm_delete, "confirm_delete (#3364)");
     }
 
     #[test]
@@ -4901,7 +4906,7 @@ volume_ignores_strategy = "named"
         // call below. `update_config` loads fresh internally, so this must
         // survive.
         let mut external = Config::load().unwrap();
-        external.session.confirm_delete = true;
+        external.session.confirm_delete = false;
         let table = toml::Table::try_from(&external).unwrap();
         super::super::atomic_write(
             &config_path().unwrap(),
@@ -4920,7 +4925,7 @@ volume_ignores_strategy = "named"
             "the field update_config touched must be applied"
         );
         assert!(
-            final_config.session.confirm_delete,
+            !final_config.session.confirm_delete,
             "an external process's concurrent edit to an unrelated field must survive"
         );
     }

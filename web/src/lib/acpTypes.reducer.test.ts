@@ -1,23 +1,31 @@
-import { afterEach, describe, expect, it } from "vitest";
+import { describe, expect, it } from "vitest";
 
 import {
   appendElicitationAnswerRow,
   applyEvent,
+  applyReducedState,
+  webRendersServerRow,
   emptyAcpState,
-  setActivityLimit,
+  mergeServerRows,
+  patchServerRow,
   summarizeAnswers,
+  transcriptRowToActivity,
   type AcpFrame,
   type AcpState,
   type Elicitation,
+  type ReducedState,
+  type TranscriptRow,
   type ToolCall,
 } from "./acpTypes";
 
 // Targets the AcpEvent variants and helper branches the canonical
-// acpTypes.test.ts leaves cold: PlanUpdated, ThinkingEnded, the
-// approval pair, DiffEmitted, ModeChanged / ModesAvailable,
-// PromptCapabilities, UserPromptSent attachment mapping, PromptRejected,
-// the suppressed-elicitation completion clear, sweepOpenToolCalls, the
-// activity-limit cap, and the mergeToolStart timestamp branches.
+// acpTypes.test.ts leaves cold: PromptCapabilities, PromptRejected, and the
+// client-side halves of the elicitation path. Both projections are
+// server-owned now: the transcript rows since Tier 4 and the control state
+// since Tier 1.2, so the folds themselves are covered by the Rust
+// `TranscriptModel` / `AcpState` tests. What is asserted here is the client's
+// side of the boundary: how a `reduced_state` frame lands, and what the
+// client still derives for itself.
 
 function tc(id: string, over: Partial<ToolCall> = {}): ToolCall {
   return {
@@ -30,101 +38,138 @@ function tc(id: string, over: Partial<ToolCall> = {}): ToolCall {
   };
 }
 
-afterEach(() => {
-  // The activity cap is module-level state; reset to unlimited so other
-  // suites are unaffected by the cap test below.
-  setActivityLimit(0);
-});
+function reducedState(over: Partial<ReducedState> = {}): ReducedState {
+  return {
+    agent: "claude",
+    model: null,
+    mode: "Default",
+    current_plan: null,
+    in_flight_tool: null,
+    pending_approvals: [],
+    pending_elicitations: [],
+    thinking: null,
+    rate_limit: null,
+    available_commands: [],
+    available_modes: [],
+    current_mode_id: null,
+    cancelling: false,
+    compacting: false,
+    ...over,
+  };
+}
 
-describe("applyEvent / seq gate + PlanUpdated", () => {
-  it("drops frames whose seq is not greater than lastSeq (returns the same ref)", () => {
-    const seeded: AcpState = { ...emptyAcpState(), lastSeq: 5 };
-    const out = applyEvent(seeded, {
-      session_id: "s-1",
-      seq: 5,
-      event: { PlanUpdated: { plan: { plan_id: "p", version: 1, steps: [] } } },
+describe("webRendersServerRow", () => {
+  // The daemon emits `notice` rows so the native view can show a failed
+  // startup or a refused mode switch inline. The web shows the same thing as
+  // a banner from its own control state, so rendering the row too would
+  // duplicate it.
+  it("skips notice rows and keeps everything else", () => {
+    const row = (kind: string): TranscriptRow => ({
+      id: `r-${kind}`,
+      group_id: "g-1",
+      kind: kind as TranscriptRow["kind"],
+      at: "2026-01-01T00:00:00Z",
+      text: "x",
     });
-    expect(out).toBe(seeded);
-  });
-
-  it("stores the plan on PlanUpdated", () => {
-    const next = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: {
-        PlanUpdated: {
-          plan: {
-            plan_id: "plan-1",
-            version: 2,
-            steps: [{ id: "st-1", title: "Do it", status: "InProgress" }],
-          },
-        },
-      },
-    });
-    expect(next.plan?.plan_id).toBe("plan-1");
-    expect(next.plan?.steps).toHaveLength(1);
-  });
-});
-
-describe("applyEvent / ThinkingEnded", () => {
-  it("clears the thinking flag", () => {
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: "ThinkingStarted",
-    });
-    expect(state.thinking).toBe(true);
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: "ThinkingEnded",
-    });
-    expect(state.thinking).toBe(false);
+    expect(webRendersServerRow(row("notice"))).toBe(false);
+    for (const kind of ["message", "user_prompt", "tool_start", "context_reset", "summary"]) {
+      expect(webRendersServerRow(row(kind))).toBe(true);
+    }
   });
 });
 
-describe("applyEvent / approval lifecycle", () => {
-  it("appends a pending approval on ApprovalRequested and removes it on ApprovalResolved", () => {
+describe("applyReducedState (Tier 1.2)", () => {
+  it("adopts the server's control state verbatim", () => {
     const approval = {
-      nonce: "ap-1",
-      tool_call: tc("tc-1"),
+      nonce: "n-1",
+      tool_call: tc("t-1"),
       destructive: true,
       requested_at: "2026-01-01T00:00:00Z",
     };
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: { ApprovalRequested: { approval } },
-    });
-    expect(state.pendingApprovals).toHaveLength(1);
-    expect(state.pendingApprovals[0].nonce).toBe("ap-1");
-
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: { ApprovalResolved: { nonce: "ap-1", decision: "Allow" } },
-    });
-    expect(state.pendingApprovals).toHaveLength(0);
+    const next = applyReducedState(
+      emptyAcpState(),
+      reducedState({
+        agent: "codex",
+        model: "gpt-5",
+        mode: "Plan",
+        current_plan: { plan_id: "p-1", version: 1, steps: [{ id: "s-1", title: "one", status: "Pending" }] },
+        in_flight_tool: tc("t-9"),
+        pending_approvals: [approval],
+        thinking: { started_at: "2026-01-01T00:00:00Z" },
+        rate_limit: { status: "limited", resets_at: null, kind: "usage" },
+        available_commands: [{ name: "review", description: "Review", accepts_input: true }],
+        available_modes: [{ id: "plan", name: "Plan" }],
+        current_mode_id: "plan",
+        cancelling: true,
+        compacting: true,
+      }),
+    );
+    expect(next.agent).toBe("codex");
+    expect(next.model).toBe("gpt-5");
+    expect(next.mode).toBe("Plan");
+    expect(next.plan?.steps).toHaveLength(1);
+    expect(next.inFlightTool?.id).toBe("t-9");
+    expect(next.pendingApprovals).toEqual([approval]);
+    // The wire carries a thinking signal object; the client renders a flag.
+    expect(next.thinking).toBe(true);
+    expect(next.rateLimit?.status).toBe("limited");
+    expect(next.availableCommands).toHaveLength(1);
+    expect(next.availableModes).toHaveLength(1);
+    expect(next.currentModeId).toBe("plan");
+    expect(next.cancelling).toBe(true);
+    expect(next.compacting).toBe(true);
   });
 
-  it("leaves unrelated approvals intact when a non-matching nonce resolves", () => {
+  // The server omits cold fields this socket already holds; they arrive as
+  // empty defaults, so adopting them would blank the pickers mid-session.
+  it("keeps omitted cold fields at their current value", () => {
+    const seeded = applyReducedState(
+      emptyAcpState(),
+      reducedState({
+        available_commands: [{ name: "review", description: "Review", accepts_input: false }],
+        available_modes: [{ id: "plan", name: "Plan" }],
+      }),
+    );
+    expect(seeded.availableCommands).toHaveLength(1);
+
+    const omitted = applyReducedState(seeded, reducedState(), ["available_commands", "available_modes"]);
+    expect(omitted.availableCommands).toHaveLength(1);
+    expect(omitted.availableModes).toHaveLength(1);
+
+    // A frame that does not name them is authoritative, including empty.
+    const cleared = applyReducedState(seeded, reducedState());
+    expect(cleared.availableCommands).toHaveLength(0);
+  });
+
+  it("leaves lastSeq alone so the raw-frame dedupe still governs replay", () => {
+    const seeded = { ...emptyAcpState(), lastSeq: 12 };
+    expect(applyReducedState(seeded, reducedState()).lastSeq).toBe(12);
+  });
+
+  // The card clears on the resolve POST rather than waiting for the
+  // broadcast (#1821); without the filter the next frame would paint it
+  // straight back, since the daemon has not folded the resolve yet.
+  it("keeps a locally-resolved card hidden until the server drops it", () => {
     const approval = {
-      nonce: "keep",
-      tool_call: tc("tc-1"),
+      nonce: "n-1",
+      tool_call: tc("t-1"),
       destructive: false,
       requested_at: "2026-01-01T00:00:00Z",
     };
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: { ApprovalRequested: { approval } },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: { ApprovalResolved: { nonce: "other", decision: "Deny" } },
-    });
-    expect(state.pendingApprovals.map((a) => a.nonce)).toEqual(["keep"]);
+    const pending = reducedState({ pending_approvals: [approval] });
+    let state = applyReducedState(emptyAcpState(), pending);
+    expect(state.pendingApprovals).toHaveLength(1);
+
+    state = { ...state, pendingApprovals: [], locallyResolved: ["n-1"] };
+    state = applyReducedState(state, pending);
+    expect(state.pendingApprovals).toEqual([]);
+
+    // Once the daemon stops listing it the nonce is forgotten, so a later
+    // request reusing it is not swallowed.
+    state = applyReducedState(state, reducedState());
+    expect(state.locallyResolved).toEqual([]);
+    state = applyReducedState(state, pending);
+    expect(state.pendingApprovals).toHaveLength(1);
   });
 });
 
@@ -199,137 +244,6 @@ describe("appendElicitationAnswerRow (#2209)", () => {
   });
 });
 
-describe("applyEvent / elicitation answer (#2209)", () => {
-  const elicitation = {
-    nonce: "el-1",
-    message: "Pick",
-    questions: [],
-    requested_at: "2026-01-01T00:00:00Z",
-  };
-
-  it("records an elicitation_answered row on ElicitationResolved and clears the card", () => {
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: { ElicitationRequested: { elicitation } },
-    });
-    expect(state.pendingElicitations).toHaveLength(1);
-
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: {
-        ElicitationResolved: {
-          nonce: "el-1",
-          outcome: "Accepted",
-          answers: [{ question: "Proceed?", answer: "Yes" }],
-        },
-      },
-    });
-    expect(state.pendingElicitations).toHaveLength(0);
-    const row = state.activity.find((r) => r.kind === "elicitation_answered");
-    expect(row?.id).toBe("elicitation-el-1");
-    expect(row?.elicitationAnswers).toEqual([{ question: "Proceed?", answer: "Yes" }]);
-  });
-
-  it("dedupes by id so a re-broadcast does not add a second row", () => {
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: {
-        ElicitationResolved: {
-          nonce: "el-1",
-          outcome: "Accepted",
-          answers: [{ question: "Q", answer: "A" }],
-        },
-      },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: {
-        ElicitationResolved: {
-          nonce: "el-1",
-          outcome: "Accepted",
-          answers: [{ question: "Q", answer: "A" }],
-        },
-      },
-    });
-    expect(state.activity.filter((r) => r.kind === "elicitation_answered")).toHaveLength(1);
-  });
-
-  it("adds no row when the elicitation was skipped or cancelled (empty answers)", () => {
-    const state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: { ElicitationResolved: { nonce: "el-1", outcome: "Declined", answers: [] } },
-    });
-    expect(state.activity.some((r) => r.kind === "elicitation_answered")).toBe(false);
-  });
-
-  it("tolerates an event with no answers field (pre-#2209 stored events)", () => {
-    const state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: { ElicitationResolved: { nonce: "el-1", outcome: "Accepted" } },
-    });
-    expect(state.activity.some((r) => r.kind === "elicitation_answered")).toBe(false);
-  });
-});
-
-describe("applyEvent / DiffEmitted", () => {
-  it("appends diffs and caps the buffer at 16 most-recent", () => {
-    let state = emptyAcpState();
-    for (let i = 0; i < 20; i++) {
-      state = applyEvent(state, {
-        session_id: "s-1",
-        seq: i + 1,
-        event: {
-          DiffEmitted: {
-            diff: { path: `f${i}.rs`, created_at: "2026-01-01T00:00:00Z" },
-          },
-        },
-      });
-    }
-    expect(state.recentDiffs).toHaveLength(16);
-    // Oldest four dropped; first retained is f4.
-    expect(state.recentDiffs[0].path).toBe("f4.rs");
-    expect(state.recentDiffs[15].path).toBe("f19.rs");
-  });
-});
-
-describe("applyEvent / mode events", () => {
-  it("ModeChanged updates the legacy mode enum", () => {
-    const next = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: { ModeChanged: { mode: "Plan" } },
-    });
-    expect(next.mode).toBe("Plan");
-  });
-
-  it("ModesAvailable populates the advertised modes and current id, normalising missing descriptions", () => {
-    const next = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: {
-        ModesAvailable: {
-          current_mode_id: "m2",
-          modes: [
-            { id: "m1", name: "Default", description: "the default" },
-            { id: "m2", name: "Plan" },
-          ],
-        },
-      },
-    });
-    expect(next.currentModeId).toBe("m2");
-    expect(next.availableModes).toEqual([
-      { id: "m1", name: "Default", description: "the default" },
-      { id: "m2", name: "Plan", description: null },
-    ]);
-  });
-});
-
 describe("applyEvent / PromptCapabilities", () => {
   it("maps the wire snake_case fields onto camelCase capability flags", () => {
     const next = applyEvent(emptyAcpState(), {
@@ -368,62 +282,6 @@ describe("applyEvent / PromptCapabilities", () => {
   });
 });
 
-describe("applyEvent / UserPromptSent attachments", () => {
-  it("maps server attachment refs to replay-backed AcpAttachments on the no-optimistic path", () => {
-    const next = applyEvent(emptyAcpState(), {
-      session_id: "sess id/weird",
-      seq: 3,
-      event: {
-        UserPromptSent: {
-          text: "look at this",
-          attachments: [{ id: "att 1", kind: "image", mime_type: "image/png", name: "shot.png", size: 1234 }],
-        },
-      },
-    });
-    const row = next.activity[0];
-    expect(row.kind).toBe("user_prompt");
-    expect(row.attachments).toHaveLength(1);
-    const att = row.attachments![0];
-    expect(att.id).toBe("att 1");
-    expect(att.mimeType).toBe("image/png");
-    expect(att.size).toBe(1234);
-    // session_id and attachment id are URL-encoded into the replay path.
-    expect(att.url).toBe("/api/sessions/sess%20id%2Fweird/acp/attachments/att%201");
-  });
-
-  it("adopts server attachment refs when promoting an optimistic row that had none", () => {
-    const optimistic: AcpState = {
-      ...emptyAcpState(),
-      activity: [
-        {
-          id: "user-local-1",
-          kind: "user_prompt",
-          text: "with file",
-          at: new Date().toISOString(),
-        },
-      ],
-      pendingUserPromptSeq: 1,
-      turnActive: true,
-    };
-    const next = applyEvent(optimistic, {
-      session_id: "s-1",
-      seq: 4,
-      event: {
-        UserPromptSent: {
-          text: "with file",
-          attachments: [{ id: "a1", kind: "audio", mime_type: "audio/wav", size: 9 }],
-        },
-      },
-    });
-    expect(next.activity).toHaveLength(1);
-    expect(next.activity[0].id).toBe("user-seq-4");
-    expect(next.activity[0].attachments).toHaveLength(1);
-    expect(next.activity[0].attachments![0].kind).toBe("audio");
-    // Optimistic match must not bump the prompt counter again.
-    expect(next.pendingUserPromptSeq).toBe(1);
-  });
-});
-
 describe("applyEvent / PromptRejected (#1196)", () => {
   function rejectFrame(seq: number, text: string): AcpFrame {
     return {
@@ -458,316 +316,6 @@ describe("applyEvent / PromptRejected (#1196)", () => {
     expect(state.rejectedPrompts).toHaveLength(5);
     expect(state.rejectedPrompts[0].text).toBe("p2");
     expect(state.rejectedPrompts[4].text).toBe("p6");
-  });
-});
-
-describe("applyEvent / suppressed elicitation completion clears inFlight", () => {
-  it("nulls inFlightTool when the suppressed AskUserQuestion call completes", () => {
-    const elicitation = {
-      nonce: "e-1",
-      message: "Pick",
-      tool_call_id: "tc-ask",
-      questions: [],
-      requested_at: "2026-01-01T00:00:00Z",
-      resolved: null,
-    };
-    // Tool starts first (in-flight pointer set), then the elicitation
-    // arrives and strips the row but keeps the in-flight pointer cleared,
-    // then a completion lands. Re-arm in-flight to a different tool to
-    // assert the completion only clears it when it matches.
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: { ToolCallStarted: { tool_call: tc("tc-ask", { name: "Asking" }) } },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: { ElicitationRequested: { elicitation } },
-    });
-    // ElicitationRequested already cleared inFlightTool; re-point it at the
-    // suppressed id so the completion arm exercises the matching clear.
-    state = { ...state, inFlightTool: tc("tc-ask", { name: "Asking" }) };
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 3,
-      event: { ToolCallCompleted: { tool_call_id: "tc-ask", is_error: false, content: "x" } },
-    });
-    expect(state.inFlightTool).toBeNull();
-    // No transcript card materialised for the suppressed id.
-    expect(state.activity.some((r) => r.toolCallId === "tc-ask")).toBe(false);
-  });
-});
-
-describe("sweepOpenToolCalls via Stopped", () => {
-  it("synthesizes a tool_stopped row for an open tool, draining its buffered output", () => {
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: { UserPromptSent: { text: "run" } },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: { ToolCallStarted: { tool_call: tc("open-1", { name: "LongTask" }) } },
-    });
-    // Buffer some streamed output that never got a completion.
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 3,
-      event: { ToolCallContent: { tool_call_id: "open-1", content: "partial out" } },
-    });
-    expect(state.toolOutputs["open-1"]).toBe("partial out");
-
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 4,
-      event: { Stopped: { reason: "prompt_complete" } },
-    });
-    const stopped = state.activity.find((r) => r.kind === "tool_stopped" && r.toolCallId === "open-1");
-    expect(stopped).toBeDefined();
-    expect(stopped!.text).toBe("partial out");
-    expect(stopped!.id).toBe("stopped-open-1-4");
-    // Buffer drained so a replay can't double-render it.
-    expect(state.toolOutputs["open-1"]).toBeUndefined();
-    expect(state.inFlightTool).toBeNull();
-  });
-
-  it("does not sweep a tool that already has a terminal completion row", () => {
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: { UserPromptSent: { text: "run" } },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: { ToolCallStarted: { tool_call: tc("done-1") } },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 3,
-      event: { ToolCallCompleted: { tool_call_id: "done-1", is_error: false, content: "ok" } },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 4,
-      event: { Stopped: { reason: "prompt_complete" } },
-    });
-    expect(state.activity.some((r) => r.kind === "tool_stopped" && r.toolCallId === "done-1")).toBe(false);
-  });
-});
-
-describe("pushActivity respects the configured activity cap", () => {
-  it("retains only the most recent N rows when a cap is set", () => {
-    setActivityLimit(3);
-    let state = emptyAcpState();
-    for (let i = 1; i <= 6; i++) {
-      state = applyEvent(state, {
-        session_id: "s-1",
-        seq: i,
-        event: { AgentMessageChunk: { text: `chunk ${i}` } },
-      });
-    }
-    expect(state.activity).toHaveLength(3);
-    expect(state.activity.map((r) => r.text)).toEqual(["chunk 4", "chunk 5", "chunk 6"]);
-  });
-});
-
-describe("applyEvent / pass-through and non-matching update rows", () => {
-  it("passes RawAgentUpdate and TodoListUpdated through with only seq advanced", () => {
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: { RawAgentUpdate: { payload: { whatever: true } } },
-    });
-    expect(state.lastSeq).toBe(1);
-    expect(state.activity).toEqual([]);
-
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: { TodoListUpdated: { todos: [{ id: "t1", text: "x", completed: false }] } },
-    });
-    expect(state.lastSeq).toBe(2);
-    expect(state.activity).toEqual([]);
-  });
-
-  it("ToolCallUpdated leaves non-matching tool_start rows untouched while patching the target", () => {
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: { ToolCallStarted: { tool_call: tc("other", { name: "Other", args_preview: '{"k":1}' }) } },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: { ToolCallStarted: { tool_call: tc("target", { name: "Target" }) } },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 3,
-      event: { ToolCallUpdated: { tool_call_id: "target", title: "Renamed", args_preview: '{"k":2}' } },
-    });
-    const other = state.activity.find((r) => r.kind === "tool_start" && r.toolCallId === "other");
-    const target = state.activity.find((r) => r.kind === "tool_start" && r.toolCallId === "target");
-    // The non-matching row is returned unchanged by the map.
-    expect(other?.tool?.name).toBe("Other");
-    expect(other?.tool?.args_preview).toBe('{"k":1}');
-    // The matching row is patched.
-    expect(target?.tool?.name).toBe("Renamed");
-    expect(target?.tool?.args_preview).toBe('{"k":2}');
-  });
-
-  it("ignores heartbeat-suffixed ToolCallUpdated for a claude session so replayed keepalives make no phantom card (#3084)", () => {
-    // One long-running Terminal tool, then several claude keepalive pings
-    // under the derived `<base>-heartbeat-N` id (no start, no completion).
-    let state: AcpState = { ...emptyAcpState(), agent: "claude" };
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 1,
-      event: { ToolCallStarted: { tool_call: tc("toolu_01ABC", { name: "Terminal" }) } },
-    });
-    for (let i = 0; i < 4; i++) {
-      state = applyEvent(state, {
-        session_id: "s-1",
-        seq: 2 + i,
-        event: {
-          ToolCallUpdated: {
-            tool_call_id: `toolu_01ABC-heartbeat-${i}`,
-            title: null,
-            args_preview: null,
-            started_at: "2026-01-01T00:00:00Z",
-          },
-        },
-      });
-    }
-    const starts = state.activity.filter((r) => r.kind === "tool_start");
-    expect(starts).toHaveLength(1);
-    expect(starts[0].toolCallId).toBe("toolu_01ABC");
-    // No phantom "tool call" / "other" card was synthesized.
-    expect(state.activity.some((r) => r.toolCallId?.includes("-heartbeat-"))).toBe(false);
-  });
-
-  it("keeps a heartbeat-suffixed ToolCallUpdated for a non-claude session (#3084)", () => {
-    // The drop is gated on the agent profile: a non-claude adapter that
-    // uses a `-heartbeat-N` id for a real tool must not be silenced.
-    const state = applyEvent(
-      { ...emptyAcpState(), agent: "codex" },
-      {
-        session_id: "s-1",
-        seq: 1,
-        event: {
-          ToolCallUpdated: {
-            tool_call_id: "real-tool-heartbeat-0",
-            title: "Real tool",
-            args_preview: null,
-            started_at: "2026-01-01T00:00:00Z",
-          },
-        },
-      },
-    );
-    expect(state.activity.some((r) => r.toolCallId === "real-tool-heartbeat-0")).toBe(true);
-  });
-});
-
-describe("mergeToolStart timestamp branches", () => {
-  it("keeps the earlier started_at when the duplicate start carries an older timestamp", () => {
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: {
-        ToolCallStarted: {
-          tool_call: tc("dup", { started_at: "2026-01-01T00:00:10Z", args_preview: '{"x":1}' }),
-        },
-      },
-    });
-    // Second start has an EARLIER started_at; the existing later one wins.
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: {
-        ToolCallStarted: {
-          tool_call: tc("dup", { started_at: "2026-01-01T00:00:05Z", kind: "other", args_preview: "" }),
-        },
-      },
-    });
-    const row = state.activity.find((r) => r.kind === "tool_start" && r.toolCallId === "dup");
-    expect(row?.tool?.started_at).toBe("2026-01-01T00:00:10Z");
-    // Richer args/kind from the first frame survive the sparse second.
-    expect(row?.tool?.args_preview).toBe('{"x":1}');
-    expect(row?.tool?.kind).toBe("execute");
-  });
-
-  it("carries parent_tool_call_id and memory_recall through a merge", () => {
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: { ToolCallStarted: { tool_call: tc("dup2", { args_preview: "" }) } },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: {
-        ToolCallStarted: {
-          tool_call: tc("dup2", {
-            parent_tool_call_id: "parent-9",
-            memory_recall: { mode: "recall", paths: ["/a"] },
-            args_preview: '{"y":2}',
-          }),
-        },
-      },
-    });
-    const row = state.activity.find((r) => r.kind === "tool_start" && r.toolCallId === "dup2");
-    expect(row?.tool?.parent_tool_call_id).toBe("parent-9");
-    expect(row?.tool?.memory_recall?.mode).toBe("recall");
-  });
-
-  it("preserves inFlightTool.diffs across a duplicate start frame that races a diff update", () => {
-    let state = applyEvent(emptyAcpState(), {
-      session_id: "s-1",
-      seq: 1,
-      event: { ToolCallStarted: { tool_call: tc("write-1", { name: "Write", kind: "edit" }) } },
-    });
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 2,
-      event: {
-        ToolCallUpdated: {
-          tool_call_id: "write-1",
-          title: null,
-          args_preview: null,
-          started_at: null,
-          diffs: [
-            {
-              path: "src/new.rs",
-              old_text: null,
-              new_text: "created",
-              created_at: "2026-01-01T00:00:00Z",
-            },
-          ],
-        },
-      },
-    });
-    expect(state.inFlightTool?.diffs).toHaveLength(1);
-    // The adapter re-emits a second `tool_call` frame for the same id once
-    // full args are known; it must not clobber the diff attached above.
-    state = applyEvent(state, {
-      session_id: "s-1",
-      seq: 3,
-      event: {
-        ToolCallStarted: {
-          tool_call: tc("write-1", {
-            name: "Write src/new.rs",
-            kind: "edit",
-            args_preview: '{"file_path":"src/new.rs"}',
-          }),
-        },
-      },
-    });
-    expect(state.inFlightTool?.name).toBe("Write src/new.rs");
-    expect(state.inFlightTool?.diffs).toHaveLength(1);
-    expect(state.inFlightTool?.diffs?.[0]?.path).toBe("src/new.rs");
   });
 });
 
@@ -903,5 +451,157 @@ describe("applyEvent / background agents", () => {
     });
     expect(s.backgroundAgents[0]!.status).toBe("completed");
     expect(s.backgroundAgents[0]!.toolCount).toBe(0);
+  });
+});
+
+describe("transcriptRowToActivity (Tier 4 wire mapping)", () => {
+  it("maps snake_case wire fields to the camelCase ActivityRow shape", () => {
+    const row = transcriptRowToActivity(
+      {
+        id: "done-t-1",
+        group_id: "tool-t-1",
+        kind: "tool_complete",
+        at: "2026-01-01T00:00:00Z",
+        text: "ok",
+        tool_call_id: "t-1",
+        output: [{ kind: "text", text: "hi" }],
+        async_subagent: true,
+      },
+      "s-1",
+    );
+    expect(row.toolCallId).toBe("t-1");
+    expect(row.output).toEqual([{ kind: "text", text: "hi" }]);
+    expect(row.asyncSubagent).toBe(true);
+  });
+
+  it("builds the replay-GET url for attachments and seeds raw_name from name", () => {
+    const row = transcriptRowToActivity(
+      {
+        id: "start-t-1",
+        group_id: "tool-t-1",
+        kind: "tool_start",
+        at: "2026-01-01T00:00:00Z",
+        text: "Bash",
+        tool_call_id: "t-1",
+        tool: {
+          id: "t-1",
+          name: "Bash",
+          kind: "execute",
+          args_preview: "{}",
+          started_at: "2026-01-01T00:00:00Z",
+        },
+        attachments: [{ id: "att-1", kind: "image", mime_type: "image/png", name: "x.png", size: 9 }],
+      },
+      "s 1",
+    );
+    expect(row.tool?.raw_name).toBe("Bash");
+    expect(row.attachments?.[0]!.url).toBe("/api/sessions/s%201/acp/attachments/att-1");
+  });
+
+  it("maps a diff_comments payload to the camelCase card shape", () => {
+    const row = transcriptRowToActivity(
+      {
+        id: "user-seq-3",
+        group_id: "g1",
+        kind: "user_diff_comments",
+        at: "2026-01-01T00:00:00Z",
+        text: "# body",
+        diff_comments: { intro: "look", outro: "thanks", is_multi_repo: true, comments: [] },
+      },
+      "s-1",
+    );
+    expect(row.diffComments).toEqual({ intro: "look", outro: "thanks", isMultiRepo: true, comments: [] });
+  });
+});
+
+describe("mergeServerRows (Tier 4 reconcile-by-id)", () => {
+  const start = (id: string, over: Partial<ToolCall> = {}) => ({
+    id: `start-${id}`,
+    kind: "tool_start" as const,
+    text: "Bash",
+    toolCallId: id,
+    at: "2026-01-01T00:00:00Z",
+    tool: tc(id, over),
+  });
+
+  it("appends new rows in order and returns the same ref for an empty batch", () => {
+    const existing = [start("a")];
+    expect(mergeServerRows(existing, [])).toBe(existing);
+    const merged = mergeServerRows(existing, [
+      { id: "done-a", kind: "tool_complete", text: "ok", toolCallId: "a", at: "2026-01-01T00:00:01Z" },
+    ]);
+    expect(merged.map((r) => r.id)).toEqual(["start-a", "done-a"]);
+  });
+
+  it("replaces a non-tool row by id in place (server authoritative), idempotent on re-append", () => {
+    const existing = [{ id: "msg-1", kind: "message" as const, text: "old", at: "2026-01-01T00:00:00Z" }];
+    const merged = mergeServerRows(existing, [
+      { id: "msg-1", kind: "message", text: "new", at: "2026-01-01T00:00:00Z" },
+    ]);
+    expect(merged).toHaveLength(1);
+    expect(merged[0]!.text).toBe("new");
+  });
+
+  it("merges a sparse synth tool_start into a richer existing start at the seam (#2711)", () => {
+    // A later replay page folds in isolation and synthesizes a sparse start
+    // (kind "other", empty args) for a tool whose real start is already loaded.
+    const existing = [start("a", { kind: "execute", args_preview: '{"x":1}' })];
+    const sparse = {
+      id: "start-a",
+      kind: "tool_start" as const,
+      text: "tool call",
+      toolCallId: "a",
+      at: "2026-01-01T00:00:00Z",
+      tool: tc("a", { kind: "other", args_preview: "" }),
+    };
+    const merged = mergeServerRows(existing, [sparse]);
+    expect(merged).toHaveLength(1);
+    expect(merged[0]!.tool?.kind).toBe("execute");
+    expect(merged[0]!.tool?.args_preview).toBe('{"x":1}');
+  });
+});
+
+describe("patchServerRow (Tier 4 delta Patch)", () => {
+  it("replaces the row by id, or appends when the id is not present", () => {
+    const existing = [{ id: "start-a", kind: "tool_start" as const, text: "Bash", toolCallId: "a", at: "t" }];
+    const patched = patchServerRow(existing, {
+      id: "start-a",
+      kind: "tool_start",
+      text: "Terminal",
+      toolCallId: "a",
+      at: "t",
+    });
+    expect(patched[0]!.text).toBe("Terminal");
+    const appended = patchServerRow(existing, { id: "msg-9", kind: "message", text: "hi", at: "t" });
+    expect(appended.map((r) => r.id)).toEqual(["start-a", "msg-9"]);
+  });
+});
+
+describe("applyEvent / UserPromptSent turn counter (Tier 4)", () => {
+  it("bumps pendingUserPromptSeq for a prompt with no matching optimistic overlay", () => {
+    const next = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { UserPromptSent: { text: "hi", prompt_id: "cmp-1" } },
+    });
+    expect(next.pendingUserPromptSeq).toBe(1);
+    expect(next.turnActive).toBe(true);
+    // The transcript row is server-owned; applyEvent adds none.
+    expect(next.activity).toHaveLength(0);
+  });
+
+  it("does NOT double-bump when the echoed prompt_id matches an optimistic overlay row", () => {
+    const seeded: AcpState = {
+      ...emptyAcpState(),
+      optimisticRows: [{ id: "cmp-1", kind: "user_prompt", text: "hi", at: "t" }],
+      pendingUserPromptSeq: 1,
+      turnActive: true,
+    };
+    const next = applyEvent(seeded, {
+      session_id: "s-1",
+      seq: 1,
+      event: { UserPromptSent: { text: "hi", prompt_id: "cmp-1" } },
+    });
+    expect(next.pendingUserPromptSeq).toBe(1);
   });
 });

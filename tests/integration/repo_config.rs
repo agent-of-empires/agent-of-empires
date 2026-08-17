@@ -311,6 +311,54 @@ bare_repo_path_template = "../{branch}"
     );
 }
 
+/// #3400: on macOS and Windows the app dir is `~/.agent-of-empires`, so a
+/// project path of `$HOME` makes `<project>/.agent-of-empires/config.toml`
+/// resolve to the user's own global config. Neither side of the repo layer may
+/// act on that file: reading it re-merges the global layer onto itself (and
+/// reports every global-only section as a rejected repo override), and saving
+/// truncates the global config to the repo-permitted subset.
+///
+/// A debug build namespaces the app dir (`.agent-of-empires-dev`), so `$HOME`
+/// alone cannot produce the collision here. Symlinking the project's
+/// `.agent-of-empires` at the app dir yields the identical resolved file, which
+/// is what both guards compare.
+#[test]
+#[serial]
+#[cfg(unix)]
+fn test_project_path_that_resolves_to_global_config_is_not_a_repo_config() {
+    use agent_of_empires::session::repo_config::{load_repo_config, save_repo_config, RepoConfig};
+
+    let temp_home = TempDir::new().unwrap();
+    set_temp_home(temp_home.path());
+
+    let app_dir = agent_of_empires::session::get_app_dir().unwrap();
+    let global_config = app_dir.join("config.toml");
+    let global_content =
+        "[session]\ndefault_tool = \"claude\"\n\n[logging]\ndefault_level = \"debug\"\n";
+    fs::write(&global_config, global_content).unwrap();
+
+    let project = temp_home.path().join("project");
+    fs::create_dir_all(&project).unwrap();
+    std::os::unix::fs::symlink(&app_dir, project.join(".agent-of-empires")).unwrap();
+
+    assert!(
+        load_repo_config(&project).unwrap().is_none(),
+        "the global config.toml must not be loaded as a repo config layer"
+    );
+
+    let repo_config: RepoConfig = toml::from_str("[session]\ndefault_tool = \"codex\"\n").unwrap();
+    let err = save_repo_config(&project, &repo_config).unwrap_err();
+    assert!(
+        err.to_string().contains("global config.toml"),
+        "save should name the collision, got: {err}"
+    );
+    assert_eq!(
+        fs::read_to_string(&global_config).unwrap(),
+        global_content,
+        "the global config must be left byte-identical"
+    );
+}
+
 /// Legacy `.aoe/config.toml` should still be loaded via backwards compat fallback.
 #[test]
 fn test_legacy_aoe_path_still_loads() {
@@ -366,5 +414,55 @@ on_create = ["echo legacy"]
         hooks.on_create,
         vec!["echo new"],
         "new path should take priority over legacy"
+    );
+}
+
+/// An empty project path means "this session has no project repo" (scratch
+/// sessions pass one, see `session::builder::build_instance`). It must carry no
+/// repo layer at all: `Path::new("")` joins to the *relative*
+/// `.agent-of-empires/config.toml`, which resolves against whatever directory
+/// the process happens to be running in.
+#[test]
+#[serial]
+fn test_empty_project_path_ignores_the_launch_directory() {
+    let tmp = setup_repo_config("[session]\ndefault_tool = \"codex\"\n");
+    let original_dir = std::env::current_dir().unwrap();
+    std::env::set_current_dir(tmp.path()).unwrap();
+    let loaded = agent_of_empires::session::repo_config::load_repo_config(std::path::Path::new(""));
+    std::env::set_current_dir(original_dir).unwrap();
+
+    assert!(
+        loaded.unwrap().is_none(),
+        "an empty project path must not pick up the launch directory's repo config"
+    );
+
+    // The real callers reach the loader through `repo_config_source_path`, and
+    // its `.git` probe is relative too. From a linked worktree (whose `.git` is
+    // a file) it resolves to that worktree's main repo, which would hand the
+    // loader a non-empty path and reinstate the repo layer.
+    let main = setup_repo_config("[session]\ndefault_tool = \"codex\"\n");
+    fs::create_dir_all(main.path().join(".git/worktrees/wt")).unwrap();
+    let worktree = TempDir::new().unwrap();
+    fs::write(
+        worktree.path().join(".git"),
+        format!("gitdir: {}/.git/worktrees/wt\n", main.path().display()),
+    )
+    .unwrap();
+
+    let original_dir = std::env::current_dir().unwrap();
+    std::env::set_current_dir(worktree.path()).unwrap();
+    let source =
+        agent_of_empires::session::repo_config::repo_config_source_path(std::path::Path::new(""));
+    let loaded = agent_of_empires::session::repo_config::load_repo_config(&source);
+    std::env::set_current_dir(original_dir).unwrap();
+
+    assert_eq!(
+        source,
+        std::path::PathBuf::new(),
+        "an empty project path must not resolve to the launch worktree's main repo"
+    );
+    assert!(
+        loaded.unwrap().is_none(),
+        "an empty project path must carry no repo layer from a worktree launch dir"
     );
 }

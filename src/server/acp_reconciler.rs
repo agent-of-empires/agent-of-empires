@@ -348,6 +348,10 @@ pub async fn reconcile_acp_workers(
     // between a plugin create and its first successful delivery.
     drain_pending_initial_turns(state).await;
 
+    // Drain each session's server-owned prompt queue when its turn has ended,
+    // with no client tab open. Same shape as the pending-turn drain above.
+    drain_queued_prompts(state).await;
+
     // Build the work list. Skip ids already in `attempted` (a
     // permanently-failing spawn shouldn't loop every tick) and ids the
     // supervisor already knows about (REST-triggered spawn or
@@ -825,6 +829,12 @@ async fn reap_idle_workers(state: &Arc<AppState>) {
                     && !i.is_snoozed()
                     && !i.is_trashed()
                     && !i.is_idle_dormant()
+                    // A session with queued work waiting to drain is not idle:
+                    // reaping it here would fight wake-on-drain, which clears
+                    // dormancy to respawn exactly these sessions. Leave it alive
+                    // until its queue drains; the next idle window (empty queue)
+                    // reaps it normally. See `drain_queued_prompts`.
+                    && i.queued_prompts.is_empty()
             })
             .map(|i| (i.id.clone(), i.source_profile.clone()))
             .collect()
@@ -1558,6 +1568,68 @@ async fn drain_pending_initial_turns(state: &Arc<AppState>) {
     }
 }
 
+/// Deliver each session's server-owned prompt queue once its turn has ended,
+/// so a follow-up queued behind a busy turn drains with no client tab open
+/// (see `docs/development/server-side-prompt-queue.md`). Candidates are idle
+/// (turn ended), structured, live sessions with a non-empty queue; the drain
+/// itself re-checks state under the per-instance lock and applies the
+/// `/clear`-boundary split. Gating on `is_running` here means the worker is
+/// live, so the drain can hold the instance lock across delivery safely.
+async fn drain_queued_prompts(state: &Arc<AppState>) {
+    // Snapshot `(id, is_idle_dormant)`: dormant sessions have no live worker
+    // but are excluded from the resume pass, so wake-on-drain must clear their
+    // marker to get them respawned. A deliberately-stopped session is not a
+    // candidate (its status is `Stopped`, not `Idle`), so this only ever wakes
+    // sessions the idle reaper auto-stopped.
+    let candidates: Vec<(String, bool)> = {
+        let instances = state.instances.read().await;
+        instances
+            .iter()
+            .filter(|i| {
+                !i.queued_prompts.is_empty()
+                    && i.status == crate::session::Status::Idle
+                    && i.is_structured()
+                    && !i.is_archived()
+                    && !i.is_snoozed()
+                    && !i.is_trashed()
+            })
+            .map(|i| (i.id.clone(), i.is_idle_dormant()))
+            .collect()
+    };
+    for (id, dormant) in candidates {
+        let service = Arc::clone(&state.session_service);
+        if state.acp_supervisor.is_running(&id).await {
+            // Live (or mid-respawn) worker: drain now. `drain_queued_prompts_once`
+            // holds the instance lock across delivery, which is safe only because
+            // a live worker makes `send_turn`'s resume a no-op (no spawn under the
+            // lock, so the #3172 re-entrant-spawn deadlock cannot occur).
+            crate::task_util::spawn_supervised(
+                "acp.queue_drain",
+                crate::task_util::PanicPolicy::Log,
+                async move {
+                    service.drain_queued_prompts_once(&id).await;
+                },
+            );
+        } else if dormant {
+            // No live worker and the session was auto-stopped for inactivity:
+            // clear the dormant marker so the resume pass respawns it under its
+            // normal respawn budget; a following tick then drains via the branch
+            // above once the worker is live. Waking through the resume pass
+            // rather than kicking a resume here is deliberate: it keeps the
+            // budget/park guard and never spawns while holding a lock (#3172).
+            crate::task_util::spawn_supervised(
+                "acp.queue_drain_wake",
+                crate::task_util::PanicPolicy::Log,
+                async move {
+                    service.wake_dormant_for_queue_drain(&id).await;
+                },
+            );
+        }
+        // else: a dead / respawn-budget-parked non-dormant worker. The resume
+        // pass already owns its respawn, so there is nothing to do here.
+    }
+}
+
 /// Build a fresh-spawn `SpawnRequest` for a resume target: pick the
 /// agent, resolve the cwd, and ensure the sandbox container. On a sandbox
 /// failure it publishes a startup error (so the UI banner matches the
@@ -2284,6 +2356,7 @@ mod tests {
         let finished_agent_turn = |extra: Vec<Event>| {
             let mut evs = vec![
                 Event::UserPromptSent {
+                    prompt_id: None,
                     text: "continue".to_string(),
                     attachments: Vec::new(),
                 },
@@ -2355,6 +2428,7 @@ mod tests {
                 name: "user prompt still lacks its terminator",
                 events: vec![
                     Event::UserPromptSent {
+                        prompt_id: None,
                         text: "go".to_string(),
                         attachments: Vec::new(),
                     },
@@ -2853,6 +2927,61 @@ mod tests {
         assert!(
             generic_msg.contains("Failed to start structured view agent"),
             "non-capacity errors keep the generic message, got: {generic_msg}"
+        );
+    }
+
+    /// Wake-on-drain: a dormant (idle-auto-stopped) structured session that has
+    /// queued work must have its dormant marker cleared by the drain pass, so
+    /// the resume pass respawns its worker and a following tick drains the
+    /// queue. The test supervisor has no worker, so `is_running` is false and
+    /// the dormant branch fires. Regression guard for the closed-app queue
+    /// delivery gap: without this the queue would sit undrained forever behind
+    /// a worker the resume pass deliberately never respawns while dormant.
+    #[tokio::test]
+    async fn drain_queued_prompts_wakes_a_dormant_session_with_a_queue() {
+        use super::drain_queued_prompts;
+        use crate::acp::state::QueuedPromptEntry;
+        use crate::server::test_support::build_test_app_state;
+        use crate::session::{Instance, Status, View};
+
+        let mut inst = Instance::new("queue", "/tmp/aoe-drain-wake");
+        inst.id = "sess-dw".to_string();
+        inst.view = View::Structured;
+        inst.status = Status::Idle;
+        inst.mark_idle_dormant();
+        inst.queued_prompts.push(QueuedPromptEntry {
+            id: "q0".into(),
+            seq: 0,
+            text: "queued while busy".into(),
+            attachments: vec![],
+            created_at: "t0".into(),
+            origin_device: None,
+        });
+        assert!(inst.is_idle_dormant());
+
+        let state = build_test_app_state(vec![inst]);
+        drain_queued_prompts(&state).await;
+
+        // The wake runs in a spawned task; poll briefly for the marker to clear.
+        let mut woken = false;
+        for _ in 0..50 {
+            let dormant = state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|i| i.id == "sess-dw")
+                .unwrap()
+                .is_idle_dormant();
+            if !dormant {
+                woken = true;
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        assert!(
+            woken,
+            "a dormant session with a queue must be woken so the resume pass respawns it"
         );
     }
 }

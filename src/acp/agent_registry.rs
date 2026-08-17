@@ -216,6 +216,32 @@ impl AgentRegistry {
     }
 }
 
+/// If `tool` is a custom agent that inherits a built-in agent through
+/// `[session.agent_detect_as]` (e.g. `lenovo-claude = claude`), and that base
+/// agent has a built-in ACP adapter in the default registry, return the base
+/// registry key.
+///
+/// This is what lets a wrapper that "inherits Claude Code" (a distinct tool
+/// that only overrides profile/oauth locations) run in the structured view
+/// through the base agent's adapter without the operator hand-writing an
+/// `[session.agent_acp_cmd]` argv. Resolving to the *base* key (rather than the
+/// wrapper name) is deliberate: the spawn then reuses the base agent's version
+/// gate, env allowlist, and `AgentProfile`, so the wrapper renders in
+/// structured view exactly as the base agent would. The wrapper's own identity
+/// stays on `Instance.tool`, which drives status detection (via the same
+/// `agent_detect_as` map) and `AOE_TOOL` host hooks.
+///
+/// Returns `None` when `tool` is itself a registry key (handled by the direct
+/// registry lookup at every call site, which runs first), has no
+/// `agent_detect_as` mapping, or maps to a base that is terminal-only
+/// (e.g. `cursor`, `copilot`), which cannot back a structured session.
+pub fn inherited_acp_base(tool: &str, agent_detect_as: &HashMap<String, String>) -> Option<String> {
+    let base = agent_detect_as.get(tool)?;
+    AgentRegistry::with_defaults()
+        .get(base)
+        .map(|_| base.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,6 +382,34 @@ mod tests {
                 .collect::<std::collections::BTreeSet<_>>(),
             "the set of adapters with an env_allowlist changed; update env_allowlist_for and this assertion together"
         );
+    }
+
+    #[test]
+    fn inherited_acp_base_resolves_only_registry_backed_bases() {
+        let mut detect_as = HashMap::new();
+        // Wrapper inheriting a base that has an ACP adapter → resolves to base.
+        detect_as.insert("lenovo-claude".to_string(), "claude".to_string());
+        detect_as.insert("work-codex".to_string(), "codex".to_string());
+        // Wrapper inheriting a terminal-only base (no ACP adapter) → None.
+        detect_as.insert("my-cursor".to_string(), "cursor".to_string());
+        // Base is another custom name, not a registry key → None.
+        detect_as.insert("chain".to_string(), "lenovo-claude".to_string());
+
+        let cases = [
+            ("lenovo-claude", Some("claude")),
+            ("work-codex", Some("codex")),
+            ("my-cursor", None),
+            ("chain", None),
+            // No mapping at all.
+            ("unmapped", None),
+        ];
+        for (tool, expected) in cases {
+            assert_eq!(
+                inherited_acp_base(tool, &detect_as).as_deref(),
+                expected,
+                "{tool}"
+            );
+        }
     }
 
     #[test]

@@ -513,7 +513,11 @@ pub fn init_subscriber(target: SubscriberTarget, filter: String) -> InitResult {
 /// `http_request{request_id=... method=GET path=...}` prefixes on every
 /// downstream event. The full default formatter is still available when
 /// the user opts in via the settings toggle.
-struct NoSpanFormat;
+///
+/// `pub(crate)` so tests elsewhere can render events exactly the way a
+/// default-configured daemon writes them, which is the only rendering in
+/// which a missing event field is actually observable.
+pub(crate) struct NoSpanFormat;
 
 impl<S, N> tracing_subscriber::fmt::FormatEvent<S, N> for NoSpanFormat
 where

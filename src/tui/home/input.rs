@@ -1435,8 +1435,8 @@ impl HomeView {
                             self.pending_dialog_click_action =
                                 Some(self.discard_settings_changes());
                         } else {
-                            if action == "quit" && dont_ask_again {
-                                self.disable_confirm_before_quit();
+                            if dont_ask_again {
+                                self.apply_confirm_dont_ask_again(&action);
                             }
                             self.pending_dialog_click_action =
                                 self.dispatch_confirm_submit(&action);
@@ -2252,8 +2252,8 @@ impl HomeView {
                     let action = dialog.action().to_string();
                     let dont_ask_again = dialog.dont_ask_again();
                     self.confirm_dialog = None;
-                    if action == "quit" && dont_ask_again {
-                        self.disable_confirm_before_quit();
+                    if dont_ask_again {
+                        self.apply_confirm_dont_ask_again(&action);
                     }
                     if let Some(emit) = self.dispatch_confirm_submit(&action) {
                         return Some(emit);
@@ -5520,21 +5520,46 @@ impl HomeView {
                 let delete_to_trash = session_cfg.delete_to_trash;
                 if delete_to_trash && !already_trashed {
                     let sid = session_id.clone();
-                    // When session.confirm_delete is on, guard the trash with a
-                    // confirmation dialog instead of trashing on the keystroke.
-                    // The accept path (dispatch_confirm_submit "trash_session")
-                    // runs the same trash_session_by_id as the instant path.
+                    // When session.confirm_delete is on (the default), guard the
+                    // trash with a confirmation dialog instead of trashing on the
+                    // keystroke. The delete key itself accepts the dialog, so the
+                    // deliberate gesture stays two taps of one key while a single
+                    // stray keystroke is harmless. The accept path
+                    // (dispatch_confirm_submit "trash_session") runs the same
+                    // trash_session_by_id as the instant path.
                     if session_cfg.confirm_delete {
-                        let message = format!(
-                            "Move '{}' to the trash? It can be restored from the Trash section.",
-                            inst.title
-                        );
+                        // Read the accept key off the binding table instead of
+                        // spelling it out here, so relocating Delete can't drift
+                        // the hint (or the key that accepts) from the key that
+                        // opened the dialog. A chord that isn't a bare character
+                        // (a hypothetical Ctrl+D) can't be an opt-in confirm
+                        // char, so it falls back to the dialog's own y/Enter.
+                        let delete_key = bindings::label(ActionId::Delete, self.strict_hotkeys);
+                        let mut key_chars = delete_key.chars();
+                        let accept_char = match (key_chars.next(), key_chars.next()) {
+                            (Some(c), None) => Some(c),
+                            _ => None,
+                        };
+                        let hint = match accept_char {
+                            Some(_) => {
+                                format!("Press {delete_key} again to confirm, Esc to cancel.")
+                            }
+                            None => "Press y to confirm, Esc to cancel.".to_string(),
+                        };
+                        let message = format!("Move '{}' to the trash?\n{hint}", inst.title);
                         self.pending_trash_session = Some(sid);
-                        self.confirm_dialog = Some(ConfirmDialog::new(
-                            "Confirm Delete",
-                            &message,
-                            "trash_session",
-                        ));
+                        // Offer the same in-dialog opt-out the quit confirm has:
+                        // this guard is on by default, so a user who wants the
+                        // one-keystroke trash back shouldn't have to go find the
+                        // setting. Ticking it persists confirm_delete = false.
+                        let mut dialog =
+                            ConfirmDialog::new("Confirm Delete", &message, "trash_session")
+                                .buttons("Delete", "Cancel")
+                                .offering_dont_ask_again();
+                        if let Some(c) = accept_char {
+                            dialog = dialog.confirmed_by(c);
+                        }
+                        self.confirm_dialog = Some(dialog);
                         return;
                     }
                     self.trash_session_by_id(&sid);

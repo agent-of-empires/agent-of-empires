@@ -19,7 +19,12 @@
 //! (TUI boot, `aoe serve`, the session CLI) passes through, so editing the
 //! rules takes effect on the next config resolve instead of requiring the
 //! session to be re-created.
+//!
+//! The same registry carries `[session.agent_detect_as]`, for the same reason
+//! and with the same freshness guarantee: see [`effective_detect_as`] for why
+//! the copy persisted on each `Instance` cannot be the authority.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::sync::{OnceLock, RwLock};
 
@@ -49,6 +54,15 @@ type Registry = HashMap<(String, String), Vec<CompiledRule>>;
 fn registry() -> &'static RwLock<Registry> {
     static REGISTRY: OnceLock<RwLock<Registry>> = OnceLock::new();
     REGISTRY.get_or_init(|| RwLock::new(HashMap::new()))
+}
+
+/// `[session.agent_detect_as]` keyed the same way, so [`effective_detect_as`]
+/// can answer from the live config without the poll loop loading it.
+type Aliases = HashMap<(String, String), String>;
+
+fn aliases() -> &'static RwLock<Aliases> {
+    static ALIASES: OnceLock<RwLock<Aliases>> = OnceLock::new();
+    ALIASES.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 fn hook_status_to_status(status: HookStatus) -> Status {
@@ -94,17 +108,35 @@ fn compile_rules(agent: &str, rules: &[StatusRule]) -> Vec<CompiledRule> {
     compiled
 }
 
-/// Install `profile`'s rules from `config`, replacing only that profile's
-/// entries and leaving every other profile's rules standing. Called on every
-/// config resolve, once per profile; an agent whose rules all fail to compile
-/// ends up with no entry (falling back to the built-in detector or Idle),
-/// matching the behavior of not configuring rules at all.
+/// Install `profile`'s rules and `agent_detect_as` aliases from `config`,
+/// replacing only that profile's entries and leaving every other profile's
+/// standing. Called on every config resolve, once per profile; an agent whose
+/// rules all fail to compile ends up with no entry (falling back to the
+/// built-in detector or Idle), matching the behavior of not configuring rules
+/// at all.
 pub fn install_from_config(profile: &str, config: &crate::session::Config) {
     // Normalize so an empty `source_profile` keys the same slot as the resolved
     // default profile; the lookup side (`detect` / `has_rules`) normalizes the
     // same way, so an unpopulated field degrades to the default profile's rules
     // instead of silently missing.
     let profile = crate::session::config::effective_profile(profile);
+
+    // Held in its own scope: `install_from_config` is the only place that
+    // writes both registries, and taking them one at a time keeps it that way.
+    {
+        let mut map = aliases().write().unwrap_or_else(|p| p.into_inner());
+        map.retain(|(p, _), _| p != &profile);
+        for (agent, target) in &config.session.agent_detect_as {
+            // Malformed entries are reported by `Config::validate`; skipping
+            // them here leaves the tool unaliased, which is what an absent
+            // entry would have done.
+            if agent.is_empty() || target.is_empty() {
+                continue;
+            }
+            map.insert((profile.clone(), agent.clone()), target.clone());
+        }
+    }
+
     let mut map = registry().write().unwrap_or_else(|p| p.into_inner());
     // Drop this profile's previous entries; other profiles' keys are untouched.
     map.retain(|(p, _), _| p != &profile);
@@ -164,17 +196,54 @@ pub fn detect(profile: &str, tool: &str, clean_content: &str) -> Option<Status> 
     Some(Status::Idle)
 }
 
+/// The `agent_detect_as` alias in force for `tool` under `profile`, or `""`
+/// when the tool is not aliased.
+///
+/// `Instance::detect_as` is resolved once at session build and persisted, so a
+/// session outlives the config that produced it: a `[session.agent_detect_as]`
+/// entry added, renamed, or removed after the session was created leaves the
+/// stored field stale, and an empty one is indistinguishable from "never had an
+/// alias". A session created in that window loses its detector entirely, since
+/// `detect_status_from_content_in` falls through to `Status::Idle` for a tool
+/// with neither rules nor a built-in, so its status freezes at Idle forever.
+///
+/// So the stored value is a cache, not the authority: when it is empty this
+/// consults the registry the config resolve installed. A non-empty stored value
+/// still wins outright, keeping the hot path allocation-free for the sessions
+/// that have one and preserving the per-session pin for anything that rewrites
+/// the field directly. That precedence bounds what this heals: a session whose
+/// stored alias is empty tracks the config live (an entry added, retargeted, or
+/// removed later all take effect on the next resolve), while a session that
+/// already has one is pinned to it until something rewrites the field.
+pub fn effective_detect_as<'a>(profile: &str, tool: &str, detect_as: &'a str) -> Cow<'a, str> {
+    if !detect_as.is_empty() {
+        return Cow::Borrowed(detect_as);
+    }
+    let profile = crate::session::config::effective_profile(profile);
+    aliases()
+        .read()
+        .unwrap_or_else(|p| p.into_inner())
+        .get(&(profile, tool.to_string()))
+        .map(|alias| Cow::Owned(alias.clone()))
+        .unwrap_or(Cow::Borrowed(""))
+}
+
 /// The tool whose *pane* detection heuristics apply to a session: the
 /// session's own tool when it has configured rules, else the
 /// `agent_detect_as` alias when set, else the tool itself. Hook
 /// reconciliation deliberately does not use this helper: hooks are
 /// installed for the alias, so their reconcilers keep the alias identity
-/// (see `Instance::update_status_with_metadata`).
-pub fn detection_tool<'a>(profile: &str, tool: &'a str, detect_as: &'a str) -> &'a str {
-    if detect_as.is_empty() || has_rules(profile, tool) {
-        tool
+/// (see `Instance::update_status_with_metadata`), though they resolve that
+/// identity through [`effective_detect_as`] for the same staleness reason.
+pub fn detection_tool<'a>(profile: &str, tool: &'a str, detect_as: &'a str) -> Cow<'a, str> {
+    if has_rules(profile, tool) {
+        return Cow::Borrowed(tool);
+    }
+    let alias = effective_detect_as(profile, tool, detect_as);
+    if alias.is_empty() {
+        Cow::Borrowed(tool)
     } else {
-        detect_as
+        alias
     }
 }
 
@@ -205,6 +274,15 @@ mod tests {
             .entry(agent.to_string())
             .or_default()
             .status_rules = rules;
+        config
+    }
+
+    fn config_with_alias(agent: &str, target: &str) -> crate::session::Config {
+        let mut config = crate::session::Config::default();
+        config
+            .session
+            .agent_detect_as
+            .insert(agent.to_string(), target.to_string());
         config
     }
 
@@ -388,6 +466,69 @@ mod tests {
         // No rules: alias applies, and no alias means the tool itself.
         assert_eq!(detection_tool("default", "other-agent", "claude"), "claude");
         assert_eq!(detection_tool("default", "other-agent", ""), "other-agent");
+        install_from_config("default", &crate::session::Config::default());
+    }
+
+    /// A session built before its tool was added to `[session.agent_detect_as]`
+    /// persists an empty alias, which used to strand it on the `Status::Idle`
+    /// fallback forever. The stored value is a cache, so an empty one defers to
+    /// the config the resolve installed.
+    #[test]
+    fn effective_detect_as_falls_back_to_installed_config() {
+        let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        install_from_config("default", &config_with_alias("claude-personal", "claude"));
+
+        // (tool, stored detect_as, expected alias, expected detection tool)
+        let cases = [
+            // The bug: empty stored alias now resolves from config.
+            ("claude-personal", "", "claude", "claude"),
+            // A stored alias still wins, so a hand-pinned session is not
+            // retargeted by an unrelated config edit.
+            ("claude-personal", "codex", "codex", "codex"),
+            // A tool with no entry stays unaliased and detects as itself.
+            ("unmapped-agent", "", "", "unmapped-agent"),
+        ];
+        for (tool, stored, want_alias, want_detection) in cases {
+            assert_eq!(
+                effective_detect_as("default", tool, stored),
+                want_alias,
+                "alias for {tool:?} stored={stored:?}"
+            );
+            assert_eq!(
+                detection_tool("default", tool, stored),
+                want_detection,
+                "detection tool for {tool:?} stored={stored:?}"
+            );
+        }
+
+        // The fallback is scoped per profile like the rules are.
+        assert_eq!(
+            effective_detect_as("other-profile", "claude-personal", ""),
+            ""
+        );
+
+        install_from_config("default", &crate::session::Config::default());
+        // Cleared with its profile's install, so a removed entry stops applying.
+        assert_eq!(effective_detect_as("default", "claude-personal", ""), "");
+    }
+
+    /// Own rules outrank the alias whether the alias came from the stored field
+    /// or from the config fallback, so the fallback cannot silently take over an
+    /// agent the user wrote rules for.
+    #[test]
+    fn own_rules_outrank_the_config_fallback() {
+        let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let mut config = config_with_alias("rules-agent", "claude");
+        config
+            .agents
+            .entry("rules-agent".to_string())
+            .or_default()
+            .status_rules = vec![rule(HookStatus::Running, Some("spin"), None)];
+        install_from_config("default", &config);
+
+        assert_eq!(effective_detect_as("default", "rules-agent", ""), "claude");
+        assert_eq!(detection_tool("default", "rules-agent", ""), "rules-agent");
+
         install_from_config("default", &crate::session::Config::default());
     }
 

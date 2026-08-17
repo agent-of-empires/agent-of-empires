@@ -1638,7 +1638,7 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
             }
         } else {
             tmux_session
-                .detect_status(profile, detection_tool)
+                .detect_status(profile, &detection_tool)
                 .unwrap_or_default()
         };
         let content = if args.strip_ansi {

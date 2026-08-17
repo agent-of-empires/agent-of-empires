@@ -63,13 +63,6 @@ export interface AgentProfile {
    *  wraps MCP calls as `mcp__server__verb`; other adapters may use
    *  the same convention or not advertise MCP at all. */
   mcpPrefixes: string[];
-  /** Slash-command aliases that reset the conversation. Mirrors
-   *  `AgentProfile::clear_aliases` on the Rust side. Used by the
-   *  composer's `/` palette to surface clear commands the agent's own
-   *  `available_commands_update` channel may not advertise (codex's
-   *  `/new`, opencode's `/new`) so the user can discover them via
-   *  autocomplete. Each entry should include the leading `/`. */
-  clearAliases: string[];
   /** Per-CardKind list of agent-emitted tool names (or titles) that
    *  should route to that card when the wire `tool.kind` lands as
    *  `"other"` or doesn't otherwise indicate the right surface. */
@@ -106,7 +99,6 @@ const CLAUDE: AgentProfile = {
   },
   parentMetaNamespaces: ["claudeCode"],
   mcpPrefixes: ["mcp__"],
-  clearAliases: ["/clear"],
   aliases: {},
   specialTitles: {
     skillNames: ["skill", "claude-skill"],
@@ -133,7 +125,6 @@ const CODEX: AgentProfile = {
   },
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
-  clearAliases: ["/new"],
   aliases: {
     execute: ["shell", "bash"],
     edit: ["apply_patch"],
@@ -159,7 +150,6 @@ const OPENCODE: AgentProfile = {
   },
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
-  clearAliases: ["/new"],
   aliases: {
     execute: ["bash"],
     read: ["read"],
@@ -183,7 +173,6 @@ const GEMINI: AgentProfile = {
   },
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
-  clearAliases: [],
   aliases: {
     execute: ["run_shell_command"],
     read: ["read_file", "read_many_files"],
@@ -207,7 +196,6 @@ const VIBE: AgentProfile = {
   },
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
-  clearAliases: [],
   aliases: {},
   specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
 };
@@ -225,7 +213,6 @@ const PI: AgentProfile = {
   },
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
-  clearAliases: [],
   aliases: {},
   specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
 };
@@ -246,7 +233,6 @@ const OMP: AgentProfile = {
   },
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
-  clearAliases: ["/new"],
   aliases: {},
   specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
 };
@@ -269,7 +255,6 @@ const KIMI: AgentProfile = {
   },
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
-  clearAliases: ["/new"],
   aliases: {},
   specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
 };
@@ -295,7 +280,6 @@ export const DEFAULT_AGENT_PROFILE: AgentProfile = {
   },
   parentMetaNamespaces: [],
   mcpPrefixes: ["mcp__"],
-  clearAliases: [],
   aliases: {},
   specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
 };

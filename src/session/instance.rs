@@ -864,6 +864,23 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_initial_turn_attachments: Vec<crate::acp::state::PromptAttachmentRef>,
 
+    /// Server-owned prompt queue: follow-ups the user lined up while a turn
+    /// was busy. The daemon is the source of truth, so the queue survives a
+    /// client reload / closed PWA and drains on turn-end with no tab open
+    /// (see `docs/development/server-side-prompt-queue.md`). Ordered by
+    /// `QueuedPromptEntry::seq`. Serve-only: the queue exists only for the
+    /// web dashboard's structured view. `#[serde(default)]` + skip-when-empty
+    /// keeps pre-existing rows deserialising unchanged, so no migration.
+    #[cfg(feature = "serve")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queued_prompts: Vec<crate::acp::state::QueuedPromptEntry>,
+
+    /// Monotonic counter for `QueuedPromptEntry::seq`, so ordering is stable
+    /// even after rows drain or are removed. Never reused within a session.
+    #[cfg(feature = "serve")]
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub queued_prompt_next_seq: u64,
+
     /// Explicit ACP approval-mode id this session should run under (#2897),
     /// applied via `session/set_mode` after every worker (re)spawn, taking
     /// precedence over the legacy `yolo_mode` bool (which stays authoritative
@@ -1584,6 +1601,10 @@ impl Instance {
             pending_initial_turn: None,
             #[cfg(feature = "serve")]
             pending_initial_turn_attachments: Vec::new(),
+            #[cfg(feature = "serve")]
+            queued_prompts: Vec::new(),
+            #[cfg(feature = "serve")]
+            queued_prompt_next_seq: 0,
             acp_mode_id: None,
             prior_tool_session_ids: HashMap::new(),
             scratch: false,
@@ -6583,11 +6604,13 @@ impl Instance {
     /// file stat, plus one pane capture for Claude, gated on an actual
     /// transition, so steady-state polling pays nothing.
     fn log_status_transition(&self, prev: Status) {
-        let detection_tool = if self.detect_as.is_empty() {
-            &self.tool
-        } else {
-            &self.detect_as
-        };
+        // Resolved the same way the pane fallback resolves it, so the label and
+        // the `pane=` fingerprint describe the detector that actually ran. The
+        // ad-hoc `detect_as`-or-`tool` this used to do disagreed with the
+        // detector whenever the stored alias was stale, which is exactly the
+        // case a wrong-state report needs the log to be honest about.
+        let detection_tool =
+            tmux::status_rules::detection_tool(&self.source_profile, &self.tool, &self.detect_as);
         let hook = crate::hooks::read_hook_status(&self.id);
         let hook_age_ms = crate::hooks::read_hook_status_age(&self.id).map(|age| age.as_millis());
         if detection_tool == "claude" {
@@ -6778,10 +6801,15 @@ impl Instance {
         // hook reconciliation keeps the alias identity. The pane fallback
         // below instead prefers the session's own configured status rules
         // over the alias.
-        let hook_tool: &str = if self.detect_as.is_empty() {
+        let hook_alias = tmux::status_rules::effective_detect_as(
+            &self.source_profile,
+            &self.tool,
+            &self.detect_as,
+        );
+        let hook_tool: &str = if hook_alias.is_empty() {
             &self.tool
         } else {
-            &self.detect_as
+            &hook_alias
         };
 
         if let Some(hook_status) = crate::hooks::read_hook_status(&self.id) {
@@ -6870,7 +6898,7 @@ impl Instance {
             tmux::status_rules::detection_tool(&self.source_profile, &self.tool, &self.detect_as);
         let pane_content = session.capture_pane(50).unwrap_or_default();
         let detected =
-            tmux::detect_status_from_content_in(&self.source_profile, &pane_content, pane_tool);
+            tmux::detect_status_from_content_in(&self.source_profile, &pane_content, &pane_tool);
         tracing::trace!(target: "session.store",
             "status '{}': detected={:?}, cmd_override={}, custom_cmd={}",
             self.title,

@@ -449,6 +449,24 @@
       "components": ["web/src/hooks/useAcpSession.ts", "web/src/lib/api.ts"]
     },
     {
+      "id": "acp.server-queue",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/__tests__/queueApi.test.ts"],
+      "components": ["web/src/lib/api.ts"]
+    },
+    {
+      "id": "acp.server-owned-prompt-dispatch",
+      "kind": "live-playwright",
+      "risk": "high",
+      "specs": [
+        "tests/live/acp-mid-turn-steering.spec.ts",
+        "tests/live/acp-compaction-phase.spec.ts",
+        "src/hooks/useAcpSession.queue.test.ts"
+      ],
+      "components": ["web/src/hooks/useAcpSession.ts"]
+    },
+    {
       "id": "telemetry.feature-usage-signals",
       "kind": "live-playwright",
       "risk": "medium",
@@ -593,6 +611,13 @@
       "risk": "medium",
       "specs": ["src/__tests__/sw.test.ts"],
       "components": ["web/public/sw.js"]
+    },
+    {
+      "id": "notifications.push-subscription",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/hooks/usePushSubscription.test.ts"],
+      "components": ["web/src/hooks/usePushSubscription.ts"]
     },
     {
       "id": "settings.security-readonly",
@@ -1748,7 +1773,8 @@
         "src/components/diff/find/changedLines.test.ts",
         "src/components/diff/find/FindBar.test.tsx",
         "src/components/diff/comments/extractSnippetFromContents.test.ts",
-        "src/components/diff/comments/anchorToContents.test.ts"
+        "src/components/diff/comments/anchorToContents.test.ts",
+        "src/components/diff/pierre/__tests__/DiffWorkerPoolProvider.test.tsx"
       ],
       "components": [
         "web/src/components/diff/find/FindBar.tsx",
@@ -2014,11 +2040,11 @@
       ]
     },
     {
-      "id": "acp.thread-tap-focus",
+      "id": "acp.thread-tap-no-keyboard",
       "kind": "mocked-playwright",
       "risk": "medium",
-      "specs": ["tests/acp-thread-tap-focus.spec.ts", "src/components/acp/threadTapFocus.test.ts"],
-      "components": ["web/src/components/acp/StructuredView.tsx", "web/src/components/acp/threadTapFocus.ts"]
+      "specs": ["tests/acp-thread-tap-focus.spec.ts"],
+      "components": ["web/src/components/acp/StructuredView.tsx"]
     },
     {
       "id": "acp.composer-queue-recall",
@@ -2184,6 +2210,13 @@
       "components": ["web/src/lib/acpTypes.ts"]
     },
     {
+      "id": "acp.reduced-state-channel",
+      "kind": "vitest",
+      "risk": "high",
+      "specs": ["src/lib/acpTypes.reducer.test.ts"],
+      "components": ["web/src/lib/acpTypes.ts", "web/src/hooks/useAcpSession.ts"]
+    },
+    {
       "id": "acp.drafts",
       "kind": "vitest",
       "risk": "medium",
@@ -2191,32 +2224,15 @@
       "components": ["web/src/lib/acpDrafts.ts"]
     },
     {
-      "id": "acp.queue-drain-ownership",
+      "id": "acp.server-queue-overlay",
       "kind": "vitest",
       "risk": "high",
-      "specs": [
-        "src/lib/acpDrainCoordinator.test.ts",
-        "src/hooks/useAcpSession.queue.test.ts",
-        "src/components/acp/AcpQueueDrainer.test.tsx"
-      ],
+      "specs": ["src/hooks/useAcpSession.queue.test.ts"],
       "components": [
-        "web/src/lib/acpDrainCoordinator.ts",
         "web/src/hooks/useAcpSession.ts",
         "web/src/hooks/useAcpQueueCount.ts",
-        "web/src/components/acp/AcpQueueDrainer.tsx",
         "web/src/lib/acpStateStorage.ts",
-        "web/src/App.tsx"
-      ]
-    },
-    {
-      "id": "acp.queue-drain-clear-split",
-      "kind": "vitest",
-      "risk": "high",
-      "specs": ["src/hooks/useAcpSession.queue.test.ts", "src/lib/agentProfiles.test.ts"],
-      "components": [
-        "web/src/hooks/useAcpSession.ts",
-        "web/src/lib/agentProfiles.ts",
-        "web/src/components/acp/StructuredView.tsx"
+        "web/src/lib/api.ts"
       ]
     },
     {
@@ -2361,14 +2377,31 @@
       "components": ["web/src/components/acp/StructuredView.tsx"]
     },
     {
+      "id": "acp.queue-send-now",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": [
+        "src/components/acp/QueuedPromptsStrip.test.tsx",
+        "src/components/acp/Composer.toolbarButtons.test.tsx"
+      ],
+      "components": [
+        "web/src/components/acp/StructuredView.tsx",
+        "web/src/components/acp/Composer.tsx",
+        "web/src/hooks/useAcpSession.ts"
+      ]
+    },
+    {
+      "id": "acp.mobile-jump-to-bottom",
+      "kind": "mocked-playwright",
+      "risk": "medium",
+      "specs": ["tests/acp-mobile-jump-to-bottom.spec.ts"],
+      "components": ["web/src/components/acp/StructuredView.tsx"]
+    },
+    {
       "id": "acp.tool-stopped-sweep",
       "kind": "vitest",
       "risk": "high",
-      "specs": [
-        "src/lib/acpStopSweep.test.ts",
-        "src/components/acp/AcpRuntime.test.ts",
-        "src/components/acp/ToolCards.render.test.tsx"
-      ],
+      "specs": ["src/components/acp/AcpRuntime.test.ts", "src/components/acp/ToolCards.render.test.tsx"],
       "components": [
         "web/src/components/acp/AcpRuntime.tsx",
         "web/src/components/acp/StructuredView.tsx",

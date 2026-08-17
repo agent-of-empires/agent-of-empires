@@ -38,7 +38,6 @@ function Harness() {
         availableCommands={[]}
         connected
         turnActive={false}
-        queuedCount={0}
         enqueuePrompt={() => {}}
         promptCapabilities={null}
         pendingAttachments={[]}
@@ -103,5 +102,21 @@ describe("Composer toolbar trigger buttons", () => {
     fireEvent.click(screen.getByRole("button", { name: "Add file context (@)" }));
     fireEvent.click(screen.getByRole("button", { name: "Slash command (/)" }));
     expect(textarea.value).toMatch(/@.*\//s);
+  });
+
+  it("disables Send while the composer is empty and enables it once text is typed", () => {
+    const { container } = render(<Harness />);
+    const textarea = container.querySelector("textarea");
+    if (!textarea) throw new Error("composer textarea not rendered");
+
+    const send = screen.getByRole("button", { name: "Send message" }) as HTMLButtonElement;
+    expect(send.disabled).toBe(true);
+
+    fireEvent.change(textarea, { target: { value: "hello" } });
+    expect(send.disabled).toBe(false);
+
+    // Whitespace-only is still nothing to send.
+    fireEvent.change(textarea, { target: { value: "   " } });
+    expect(send.disabled).toBe(true);
   });
 });
