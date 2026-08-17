@@ -98,6 +98,27 @@ describe("applyReducedState (Tier 1.2)", () => {
     expect(next.compacting).toBe(true);
   });
 
+  // The server omits cold fields this socket already holds; they arrive as
+  // empty defaults, so adopting them would blank the pickers mid-session.
+  it("keeps omitted cold fields at their current value", () => {
+    const seeded = applyReducedState(
+      emptyAcpState(),
+      reducedState({
+        available_commands: [{ name: "review", description: "Review", accepts_input: false }],
+        available_modes: [{ id: "plan", name: "Plan" }],
+      }),
+    );
+    expect(seeded.availableCommands).toHaveLength(1);
+
+    const omitted = applyReducedState(seeded, reducedState(), ["available_commands", "available_modes"]);
+    expect(omitted.availableCommands).toHaveLength(1);
+    expect(omitted.availableModes).toHaveLength(1);
+
+    // A frame that does not name them is authoritative, including empty.
+    const cleared = applyReducedState(seeded, reducedState());
+    expect(cleared.availableCommands).toHaveLength(0);
+  });
+
   it("leaves lastSeq alone so the raw-frame dedupe still governs replay", () => {
     const seeded = { ...emptyAcpState(), lastSeq: 12 };
     expect(applyReducedState(seeded, reducedState()).lastSeq).toBe(12);

@@ -65,7 +65,7 @@ type PromptSendResult = "ok" | "retryable_failure" | "non_retryable_failure";
 export type Action =
   | { kind: "frame"; frame: AcpFrame }
   /** The daemon's folded control state, adopted verbatim (Tier 1.2). */
-  | { kind: "reduced_state"; state: ReducedState }
+  | { kind: "reduced_state"; state: ReducedState; unchanged: string[] }
   | { kind: "frames"; frames: AcpFrame[]; rows?: ActivityRow[]; oldestSeq?: number }
   | { kind: "prepend"; rows: ActivityRow[]; oldestSeq: number }
   | { kind: "handshake"; frames: AcpFrame[] }
@@ -543,7 +543,7 @@ export function reducer(state: AcpState, action: Action): AcpState {
     return applyEvent(state, action.frame);
   }
   if (action.kind === "reduced_state") {
-    return applyReducedState(state, action.state);
+    return applyReducedState(state, action.state, action.unchanged);
   }
   if (action.kind === "frames") {
     // Reduce the raw frames for CONTROL state (turn/approvals/usage/modes),
@@ -1588,7 +1588,8 @@ export function useAcpSession(
               const reduced = (data as { state?: ReducedState }).state;
               if (reduced) {
                 lastActivityRef.current = Date.now();
-                dispatch({ kind: "reduced_state", state: reduced });
+                const unchanged = (data as { unchanged?: string[] }).unchanged ?? [];
+                dispatch({ kind: "reduced_state", state: reduced, unchanged });
               }
               return;
             }

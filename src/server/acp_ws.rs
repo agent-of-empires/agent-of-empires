@@ -166,6 +166,13 @@ async fn handle(
     // server model instead of re-reducing it. Same deterministic-reducer,
     // per-connection story as `reduced`.
     let mut transcript = TranscriptModel::new();
+    // Per-connection memory of the cold state fields already delivered.
+    let mut cold = ColdFieldCache::default();
+    let mut folds = ConnectionFolds {
+        reduced: &mut reduced,
+        transcript: &mut transcript,
+        cold: &mut cold,
+    };
 
     // Replay events newer than `since` immediately on connect. Without
     // this, any events published in the upgrade gap between the
@@ -182,8 +189,7 @@ async fn handle(
         &session_id,
         since,
         forward_frames,
-        &mut reduced,
-        &mut transcript,
+        &mut folds,
     )
     .await;
     debug!(
@@ -287,7 +293,7 @@ async fn handle(
                         // (e.g. a resolve for an approval pruned from history)
                         // are lenient no-ops, matching the client reducers.
                         let _ = reduced.apply_event((*frame.event).clone());
-                        if !send_reduced_state(&mut socket, &session_id, frame.seq, &reduced).await {
+                        if !send_reduced_state(&mut socket, &session_id, frame.seq, &reduced, &mut cold).await {
                             break;
                         }
                         // Fold the same event into the transcript render model and
@@ -354,8 +360,7 @@ async fn drain_replay_into_socket(
     session_id: &str,
     since: u64,
     forward_frames: bool,
-    reduced: &mut AcpState,
-    transcript: &mut TranscriptModel,
+    folds: &mut ConnectionFolds<'_>,
 ) -> usize {
     // Offload the rusqlite read to the blocking pool. A session with
     // a large retained history may iterate thousands of rows; running
@@ -387,10 +392,10 @@ async fn drain_replay_into_socket(
     for (seq, event) in entries {
         // Reduce into the connection's control state as we forward the raw
         // frame, so the post-drain snapshot reflects the full replayed history.
-        let _ = reduced.apply_event(event.clone());
+        let _ = folds.reduced.apply_event(event.clone());
         // Fold into the transcript model too; the deltas are discarded here
         // because the transcript_snapshot below carries the built rows.
-        let _ = transcript.apply_event(seq, &event);
+        let _ = folds.transcript.apply_event(seq, &event);
         snapshot_seq = seq;
         if !forward_frames {
             continue;
@@ -415,13 +420,71 @@ async fn drain_replay_into_socket(
     // Connect snapshot: one reduced_state frame carrying the full control state
     // built from the replay, so a fresh client renders turn/steering/approvals/
     // usage/modes without waiting for the next live event.
-    let _ = send_reduced_state(socket, session_id, snapshot_seq, reduced).await;
+    let _ = send_reduced_state(socket, session_id, snapshot_seq, folds.reduced, folds.cold).await;
     // Transcript connect snapshot: one transcript_snapshot frame carrying the
     // ordered rows built from the replay, so a fresh client renders the activity
     // stream without waiting for the next live delta. Sent after the reduced_state
     // snapshot to keep a stable connect order.
-    let _ = send_transcript_snapshot(socket, session_id, snapshot_seq, transcript).await;
+    let _ = send_transcript_snapshot(socket, session_id, snapshot_seq, folds.transcript).await;
     sent
+}
+
+/// State fields large enough, and static enough, to be worth suppressing when
+/// they have not changed since the last frame on this connection.
+///
+/// `available_commands` is the reason this exists. On a session whose agent
+/// advertises the user's skills it measured ~30 KB, 91% of the frame, and it
+/// changes a handful of times per session at most. Since the frame is sent
+/// after every event, re-serializing it each time cost ~1.9 MB over a single
+/// two-turn session. The other two are the same shape of data (adapter
+/// capabilities) and ride along for the same reason.
+const COLD_STATE_FIELDS: [&str; 3] = ["available_commands", "available_modes", "config_options"];
+
+/// The three folds a connection maintains over the event stream: the control
+/// state it pushes as `reduced_state`, the ordered rows it pushes as
+/// transcript frames, and the memory of which cold fields this client already
+/// holds. Bundled so the drain takes one parameter for them rather than three.
+struct ConnectionFolds<'a> {
+    reduced: &'a mut AcpState,
+    transcript: &'a mut TranscriptModel,
+    cold: &'a mut ColdFieldCache,
+}
+
+/// Per-connection memory of the cold fields already sent, so an unchanged one
+/// can be omitted. Keyed by field name, valued by a hash of the serialized
+/// field. Lives for the life of the socket: a reconnect starts empty and
+/// therefore re-sends everything, which is what makes the omission safe.
+#[derive(Default)]
+struct ColdFieldCache {
+    hashes: std::collections::HashMap<&'static str, u64>,
+}
+
+impl ColdFieldCache {
+    /// Strip the cold fields whose value this connection already has, and
+    /// return their names so the client knows to keep what it holds rather
+    /// than read the absence as "now empty".
+    fn strip_unchanged(&mut self, state: &mut serde_json::Value) -> Vec<&'static str> {
+        use std::hash::{Hash, Hasher};
+        let Some(obj) = state.as_object_mut() else {
+            return Vec::new();
+        };
+        let mut unchanged = Vec::new();
+        for field in COLD_STATE_FIELDS {
+            let Some(value) = obj.get(field) else {
+                continue;
+            };
+            let mut hasher = std::collections::hash_map::DefaultHasher::new();
+            value.to_string().hash(&mut hasher);
+            let digest = hasher.finish();
+            if self.hashes.get(field) == Some(&digest) {
+                obj.remove(field);
+                unchanged.push(field);
+            } else {
+                self.hashes.insert(field, digest);
+            }
+        }
+        unchanged
+    }
 }
 
 /// Serialize and send the reduced control state as a `kind`-tagged
@@ -435,12 +498,22 @@ async fn send_reduced_state(
     session_id: &str,
     seq: u64,
     reduced: &AcpState,
+    cold: &mut ColdFieldCache,
 ) -> bool {
+    let mut state = match serde_json::to_value(reduced) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!(target: "acp.ws", "serialise reduced_state: {e}");
+            return true;
+        }
+    };
+    let unchanged = cold.strip_unchanged(&mut state);
     let frame = serde_json::json!({
         "kind": "reduced_state",
         "session_id": session_id,
         "seq": seq,
-        "state": reduced,
+        "state": state,
+        "unchanged": unchanged,
     });
     match serde_json::to_string(&frame) {
         Ok(payload) => socket.send(Message::Text(payload.into())).await.is_ok(),

@@ -1749,7 +1749,11 @@ export function reduceFrames(frames: AcpFrame[]): AcpState {
  *  broadcast (#1821), and without the filter the very next frame would paint
  *  it straight back. A nonce is forgotten once the server stops listing it,
  *  so a later request reusing it is not swallowed. */
-export function applyReducedState(state: AcpState, reduced: ReducedState): AcpState {
+export function applyReducedState(state: AcpState, reduced: ReducedState, unchanged: string[] = []): AcpState {
+  // Cold fields the server omitted because this socket already holds them
+  // (a ~30 KB command list re-sent after every event dominated the frame).
+  // They arrive as empty defaults, so adopting them would blank the pickers.
+  const holds = (field: string) => unchanged.includes(field);
   const stillPending = new Set<string>([
     ...reduced.pending_approvals.map((a) => a.nonce),
     ...reduced.pending_elicitations.map((e) => e.nonce),
@@ -1767,8 +1771,8 @@ export function applyReducedState(state: AcpState, reduced: ReducedState): AcpSt
     pendingElicitations: reduced.pending_elicitations.filter((e) => !resolved.has(e.nonce)),
     thinking: reduced.thinking != null,
     rateLimit: reduced.rate_limit,
-    availableCommands: reduced.available_commands,
-    availableModes: reduced.available_modes,
+    availableCommands: holds("available_commands") ? state.availableCommands : reduced.available_commands,
+    availableModes: holds("available_modes") ? state.availableModes : reduced.available_modes,
     currentModeId: reduced.current_mode_id,
     cancelling: reduced.cancelling,
     compacting: reduced.compacting,

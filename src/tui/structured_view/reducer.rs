@@ -269,7 +269,11 @@ impl AcpTranscript {
     ///
     /// A frame older than the last one applied is dropped, so a snapshot that
     /// races live deltas cannot rewind the view.
-    pub fn apply_reduced_state(&mut self, seq: u64, state: AcpState) {
+    ///
+    /// `unchanged` names cold fields the server omitted because this
+    /// connection already holds them; they arrive as empty defaults, so
+    /// adopting them blindly would blank the pickers.
+    pub fn apply_reduced_state(&mut self, seq: u64, state: AcpState, unchanged: &[String]) {
         if seq < self.last_seq {
             tracing::debug!(
                 target: "acp.tui.reducer",
@@ -288,8 +292,13 @@ impl AcpTranscript {
         self.cancelling = state.cancelling;
         self.compacting = state.compacting;
         self.usage = state.usage;
-        self.available_commands = state.available_commands;
-        self.available_modes = state.available_modes;
+        let holds = |field: &str| unchanged.iter().any(|f| f == field);
+        if !holds("available_commands") {
+            self.available_commands = state.available_commands;
+        }
+        if !holds("available_modes") {
+            self.available_modes = state.available_modes;
+        }
         self.current_mode = state.current_mode_id;
         self.current_plan = state
             .current_plan
@@ -503,7 +512,7 @@ mod tests {
             resolved: None,
         }];
 
-        t.apply_reduced_state(9, s);
+        t.apply_reduced_state(9, s, &[]);
 
         assert_eq!(t.last_seq, 9);
         assert_eq!(t.agent_name.as_deref(), Some("claude"));
@@ -557,9 +566,55 @@ mod tests {
             let mut s = reduced(&[]);
             s.thinking = thinking;
             s.compacting = compacting;
-            t.apply_reduced_state(1, s);
+            t.apply_reduced_state(1, s, &[]);
             assert_eq!(t.status_text.as_deref(), expected, "{label}");
         }
+    }
+
+    /// The server omits cold fields this connection already holds (a ~30 KB
+    /// command list re-sent after every event dominated the socket). They
+    /// arrive as empty defaults, so adopting them blindly would blank the
+    /// slash and mode pickers mid-session.
+    #[test]
+    fn omitted_cold_fields_keep_their_current_value() {
+        let mut t = AcpTranscript::new("s-1");
+        let full = reduced(&[
+            Event::AvailableCommandsUpdated {
+                commands: vec![AvailableCommand {
+                    name: "review".into(),
+                    description: "Review".into(),
+                    accepts_input: false,
+                }],
+            },
+            Event::ModesAvailable {
+                current_mode_id: "plan".into(),
+                modes: vec![ModeInfo {
+                    id: "plan".into(),
+                    name: "Plan".into(),
+                    description: None,
+                }],
+            },
+        ]);
+        t.apply_reduced_state(1, full, &[]);
+        assert_eq!(t.available_commands.len(), 1);
+        assert_eq!(t.available_modes.len(), 1);
+
+        // The next frame omits both, naming them as unchanged.
+        t.apply_reduced_state(
+            2,
+            reduced(&[]),
+            &[
+                "available_commands".to_string(),
+                "available_modes".to_string(),
+            ],
+        );
+        assert_eq!(t.available_commands.len(), 1, "commands survived");
+        assert_eq!(t.available_modes.len(), 1, "modes survived");
+
+        // A frame that does NOT name them is authoritative, including empty.
+        t.apply_reduced_state(3, reduced(&[]), &[]);
+        assert!(t.available_commands.is_empty());
+        assert!(t.available_modes.is_empty());
     }
 
     /// A snapshot that races live deltas must not rewind the view.
@@ -568,16 +623,16 @@ mod tests {
         let mut t = AcpTranscript::new("s-1");
         let mut live = reduced(&[]);
         live.turn_active = true;
-        t.apply_reduced_state(7, live);
+        t.apply_reduced_state(7, live, &[]);
         assert!(t.turn_active);
 
-        t.apply_reduced_state(3, reduced(&[]));
+        t.apply_reduced_state(3, reduced(&[]), &[]);
         assert!(t.turn_active, "an older frame cannot clear a live turn");
         assert_eq!(t.last_seq, 7);
 
         // The same seq is applied: the connect snapshot lands on the seq the
         // socket dialled from, and it is the authority there.
-        t.apply_reduced_state(7, reduced(&[]));
+        t.apply_reduced_state(7, reduced(&[]), &[]);
         assert!(!t.turn_active);
     }
 
@@ -589,7 +644,7 @@ mod tests {
         let mut t = AcpTranscript::new("s-1");
         let mut with_approval = reduced(&[]);
         with_approval.pending_approvals = vec![approval("n-1")];
-        t.apply_reduced_state(1, with_approval.clone());
+        t.apply_reduced_state(1, with_approval.clone(), &[]);
         assert_eq!(t.pending_approvals.len(), 1);
 
         t.resolve_approval_locally("n-1");
@@ -597,7 +652,7 @@ mod tests {
 
         // An unrelated event still lists the approval: the daemon has not
         // processed the resolve yet.
-        t.apply_reduced_state(2, with_approval);
+        t.apply_reduced_state(2, with_approval, &[]);
         assert!(
             t.pending_approvals.is_empty(),
             "a locally-resolved card must not come back"
@@ -605,11 +660,11 @@ mod tests {
 
         // Once the daemon drops it, the local memory of it goes too, so a
         // later approval reusing the nonce is not swallowed.
-        t.apply_reduced_state(3, reduced(&[]));
+        t.apply_reduced_state(3, reduced(&[]), &[]);
         assert!(t.pending_approvals.is_empty());
         let mut again = reduced(&[]);
         again.pending_approvals = vec![approval("n-1")];
-        t.apply_reduced_state(4, again);
+        t.apply_reduced_state(4, again, &[]);
         assert_eq!(t.pending_approvals.len(), 1, "the filter must not latch");
     }
 
@@ -658,7 +713,7 @@ mod tests {
         let mut s = reduced(&[]);
         s.turn_active = true;
         s.pending_approvals = vec![approval("n-1")];
-        t.apply_reduced_state(4, s);
+        t.apply_reduced_state(4, s, &[]);
         t.merge_server_rows(server_rows(&[Event::AgentMessageChunk {
             text: "hi".into(),
         }]));

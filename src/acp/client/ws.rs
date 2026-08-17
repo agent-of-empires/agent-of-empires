@@ -66,7 +66,16 @@ pub enum WsMessage {
     /// The server-folded CONTROL state (turn flags, approvals, elicitations,
     /// usage, modes, commands, plan), sent on connect and after every event.
     /// Boxed because `AcpState` dwarfs the other variants. Tier 1.3.
-    ReducedState { seq: u64, state: Box<AcpState> },
+    ///
+    /// `unchanged` names the cold fields the server omitted because this
+    /// connection already has them (see `COLD_STATE_FIELDS` in
+    /// `src/server/acp_ws.rs`). They deserialize to their empty defaults, so a
+    /// consumer must keep what it holds for those rather than adopt the blank.
+    ReducedState {
+        seq: u64,
+        state: Box<AcpState>,
+        unchanged: Vec<String>,
+    },
     /// Daemon's in-memory ring evicted events the client missed.
     /// Consumer should drop local reducer state and call
     /// `HttpClient::replay(since=last_seq)` to rehydrate.
@@ -258,6 +267,8 @@ fn parse_text(raw: &str) -> Result<Option<WsMessage>, WsError> {
     struct ReducedStateFrame {
         seq: u64,
         state: AcpState,
+        #[serde(default)]
+        unchanged: Vec<String>,
     }
     if let Ok(probe) = serde_json::from_str::<KindProbe>(raw) {
         match probe.kind {
@@ -286,6 +297,7 @@ fn parse_text(raw: &str) -> Result<Option<WsMessage>, WsError> {
                 return Ok(Some(WsMessage::ReducedState {
                     seq: frame.seq,
                     state: Box::new(frame.state),
+                    unchanged: frame.unchanged,
                 }));
             }
             _ => {}
@@ -530,7 +542,7 @@ mod tests {
         })
         .to_string();
         match parse_text(&raw) {
-            Ok(Some(WsMessage::ReducedState { seq, state })) => {
+            Ok(Some(WsMessage::ReducedState { seq, state, .. })) => {
                 assert_eq!(seq, 7);
                 assert!(state.turn_active);
                 assert!(state.available_modes.is_empty(), "absent field defaults");

@@ -530,9 +530,12 @@ async fn apply_ws_message(
         Ok(WsMessage::ReducedState {
             seq,
             state: reduced,
+            unchanged,
         }) => {
             let was_active = state.transcript.turn_active;
-            state.transcript.apply_reduced_state(seq, *reduced);
+            state
+                .transcript
+                .apply_reduced_state(seq, *reduced, &unchanged);
             state.reconcile_selection();
             auto_present_elicitation(state, toast_deadline);
             state.reconcile_slash_selection();
