@@ -1157,8 +1157,9 @@ pub struct SessionConfig {
     /// Ask for confirmation before deleting a session with the TUI `d` key.
     /// On by default: `d` opens a confirmation dialog that a second `d`
     /// accepts and `Esc` dismisses, so typing into the sidebar while a
-    /// session is selected can no longer trash it outright. Turn it off to
-    /// get the historical one-keystroke trash back. Only affects the TUI
+    /// session is selected can no longer trash it outright. Turn it off (here
+    /// or with the dialog's "don't warn me again" checkbox) to get the
+    /// historical one-keystroke trash back. Only affects the TUI
     /// trash path; the web delete dialog already confirms, and the
     /// permanent-delete/force-remove paths are gated by their own dialogs
     /// regardless. See #2583, #3364.

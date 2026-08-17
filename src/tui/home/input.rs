@@ -1435,8 +1435,8 @@ impl HomeView {
                             self.pending_dialog_click_action =
                                 Some(self.discard_settings_changes());
                         } else {
-                            if action == "quit" && dont_ask_again {
-                                self.disable_confirm_before_quit();
+                            if dont_ask_again {
+                                self.apply_confirm_dont_ask_again(&action);
                             }
                             self.pending_dialog_click_action =
                                 self.dispatch_confirm_submit(&action);
@@ -2252,8 +2252,8 @@ impl HomeView {
                     let action = dialog.action().to_string();
                     let dont_ask_again = dialog.dont_ask_again();
                     self.confirm_dialog = None;
-                    if action == "quit" && dont_ask_again {
-                        self.disable_confirm_before_quit();
+                    if dont_ask_again {
+                        self.apply_confirm_dont_ask_again(&action);
                     }
                     if let Some(emit) = self.dispatch_confirm_submit(&action) {
                         return Some(emit);
@@ -5548,8 +5548,13 @@ impl HomeView {
                         };
                         let message = format!("Move '{}' to the trash?\n{hint}", inst.title);
                         self.pending_trash_session = Some(sid);
+                        // Offer the same in-dialog opt-out the quit confirm has:
+                        // this guard is on by default, so a user who wants the
+                        // one-keystroke trash back shouldn't have to go find the
+                        // setting. Ticking it persists confirm_delete = false.
                         let mut dialog =
-                            ConfirmDialog::new("Confirm Delete", &message, "trash_session");
+                            ConfirmDialog::new("Confirm Delete", &message, "trash_session")
+                                .offering_dont_ask_again();
                         if let Some(c) = accept_char {
                             dialog = dialog.confirmed_by(c);
                         }

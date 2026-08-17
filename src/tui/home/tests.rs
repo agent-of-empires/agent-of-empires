@@ -9284,6 +9284,33 @@ fn d_with_confirm_delete_off_trashes_on_the_keystroke() {
     );
 }
 
+/// Ticking the dialog's "don't warn me again" checkbox trashes the session
+/// and persists `confirm_delete = false`, so the next `d` goes back to the
+/// one-keystroke trash without a trip through the settings pane. See #3364.
+#[test]
+#[serial]
+fn confirm_delete_dont_ask_again_persists_the_opt_out() {
+    let mut env = create_test_env_with_sessions(2);
+    let id = env.view.selected_session.clone().unwrap();
+
+    env.view.handle_key(key(KeyCode::Char('d')), None);
+    // Space ticks the checkbox, the second `d` accepts.
+    env.view.handle_key(key(KeyCode::Char(' ')), None);
+    env.view.handle_key(key(KeyCode::Char('d')), None);
+
+    assert!(
+        env.view.get_instance(&id).unwrap().is_trashed(),
+        "accepting with the checkbox ticked must still trash the session"
+    );
+    assert!(
+        !crate::session::config::Config::load()
+            .unwrap()
+            .session
+            .confirm_delete,
+        "the opt-out must be persisted to config"
+    );
+}
+
 /// With `session.confirm_delete` on (the default), `d` opens a confirmation
 /// dialog and does not trash until the dialog is accepted; accepting then runs
 /// the same trash path as the instant flow. See #2583.
