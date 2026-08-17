@@ -32,13 +32,14 @@ mod v021_split_app_state_to_state_toml;
 mod v022_prune_tuning_settings;
 mod v023_clear_structured_container_error;
 mod v024_backfill_detect_as;
+mod v025_reenable_confirm_delete;
 
 use anyhow::Result;
 use std::fs;
 use std::path::PathBuf;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 24;
+const CURRENT_VERSION: u32 = 25;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -167,6 +168,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 24,
         name: "backfill_detect_as",
         run: v024_backfill_detect_as::run,
+    },
+    Migration {
+        version: 25,
+        name: "reenable_confirm_delete",
+        run: v025_reenable_confirm_delete::run,
     },
 ];
 

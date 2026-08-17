@@ -4597,11 +4597,14 @@ mod tests {
     }
 
     #[test]
-    fn test_confirm_before_quit_absent_from_toml_defaults_on() {
-        // An older config.toml with no `confirm_before_quit` key must
-        // deserialize to the enabled default, not false.
+    fn test_default_on_guards_absent_from_toml_default_on() {
+        // An older config.toml with no key for a default-on guard must
+        // deserialize to the enabled default, not false. A plain
+        // `#[serde(default)]` would give `bool::default()` here and silently
+        // strand every pre-existing config on the old behavior.
         let session: SessionConfig = toml::from_str("").unwrap();
-        assert!(session.confirm_before_quit);
+        assert!(session.confirm_before_quit, "confirm_before_quit (#1569)");
+        assert!(session.confirm_delete, "confirm_delete (#3364)");
     }
 
     #[test]
