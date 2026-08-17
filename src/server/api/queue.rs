@@ -24,6 +24,7 @@ use serde::Deserialize;
 use super::acp::{read_only_block, validate_attachments};
 use crate::acp::protocol::PromptAttachmentUpload;
 use crate::acp::state::PromptAttachmentRef;
+use crate::server::session_service::EditQueuedOutcome;
 use crate::server::AppState;
 
 /// Cap on total queued-attachment bytes buffered per session. Generous enough
@@ -184,14 +185,19 @@ pub async fn queue_edit(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
-    if state
+    match state
         .session_service
         .edit_queued_prompt(&id, prompt_id, req.text)
         .await
     {
-        StatusCode::NO_CONTENT.into_response()
-    } else {
-        (StatusCode::NOT_FOUND, "queued prompt not found").into_response()
+        EditQueuedOutcome::Updated => StatusCode::NO_CONTENT.into_response(),
+        EditQueuedOutcome::NotFound => {
+            (StatusCode::NOT_FOUND, "queued prompt not found").into_response()
+        }
+        // Same rule as enqueue: a row with neither text nor attachments cannot
+        // be delivered, and the drain would retry it forever without retiring
+        // it, wedging the whole queue behind it.
+        EditQueuedOutcome::WouldEmpty => (StatusCode::BAD_REQUEST, "empty prompt").into_response(),
     }
 }
 

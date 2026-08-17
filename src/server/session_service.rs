@@ -85,6 +85,20 @@ struct MirroredFields {
     idle_dormant_since: Option<chrono::DateTime<chrono::Utc>>,
 }
 
+/// Result of `SessionService::edit_queued_prompt`.
+#[cfg(feature = "serve")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EditQueuedOutcome {
+    Updated,
+    /// No row with that `prompt_id` in the session's queue.
+    NotFound,
+    /// The edit would leave a row with neither text nor attachments, which the
+    /// drain cannot deliver. Refused at the door: the drain now retires such a
+    /// row rather than wedging on it, but silently discarding what the user
+    /// typed is a worse outcome than a 400.
+    WouldEmpty,
+}
+
 /// Pick the leading drain batch from a session's queue and its combined text,
 /// matching the client's `useAcpSession` split exactly: a clear-command row at
 /// the head fires as its own turn; otherwise the leading run of non-clear rows
@@ -877,26 +891,35 @@ impl SessionService {
         .await
     }
 
-    /// Replace a queued prompt's text in place. Returns `true` if a row with
-    /// `prompt_id` existed.
+    /// Replace a queued prompt's text in place.
+    ///
+    /// Enforces the same non-empty invariant `queue_enqueue` does, because the
+    /// drain relies on it: a row whose text is blank and which carries no
+    /// attachments makes `drain_queued_prompts_once` return without retiring
+    /// the batch, so it retries on every reconciler tick, nothing behind it
+    /// ever drains, and the idle reaper (which skips a session with a queue)
+    /// keeps its worker alive forever.
     #[cfg(feature = "serve")]
     pub(crate) async fn edit_queued_prompt(
         self: &Arc<Self>,
         id: &str,
         prompt_id: String,
         text: String,
-    ) -> bool {
+    ) -> EditQueuedOutcome {
         self.mutate_instance_persisted(id, move |inst| {
             match inst.queued_prompts.iter_mut().find(|q| q.id == prompt_id) {
+                Some(q) if text.trim().is_empty() && q.attachments.is_empty() => {
+                    EditQueuedOutcome::WouldEmpty
+                }
                 Some(q) => {
                     q.text = text.clone();
-                    true
+                    EditQueuedOutcome::Updated
                 }
-                None => false,
+                None => EditQueuedOutcome::NotFound,
             }
         })
         .await
-        .unwrap_or(false)
+        .unwrap_or(EditQueuedOutcome::NotFound)
     }
 
     /// Remove a queued prompt by id. Returns `true` if a row was removed. Also
@@ -1652,15 +1675,40 @@ mod tests {
         assert_eq!(service.queued_prompts_snapshot("sess-q").await.len(), 2);
 
         // Edit / remove / clear.
-        assert!(
+        assert_eq!(
             service
                 .edit_queued_prompt("sess-q", "b".into(), "second edited".into())
-                .await
+                .await,
+            EditQueuedOutcome::Updated
         );
-        assert!(
-            !service
+        assert_eq!(
+            service
                 .edit_queued_prompt("sess-q", "missing".into(), "x".into())
+                .await,
+            EditQueuedOutcome::NotFound
+        );
+        // Blanking a text-only row is refused and leaves the text intact. The
+        // drain can neither deliver nor retire such a row, so accepting the
+        // edit would wedge the queue behind it (and pin the worker alive,
+        // since the idle reaper skips a session that has one).
+        for blank in ["", "   ", "\n\t "] {
+            assert_eq!(
+                service
+                    .edit_queued_prompt("sess-q", "b".into(), blank.into())
+                    .await,
+                EditQueuedOutcome::WouldEmpty,
+                "{blank:?}"
+            );
+        }
+        assert_eq!(
+            service
+                .queued_prompts_snapshot("sess-q")
                 .await
+                .iter()
+                .find(|q| q.id == "b")
+                .map(|q| q.text.as_str()),
+            Some("second edited"),
+            "a refused edit must not have mutated the row"
         );
         assert!(service.remove_queued_prompt("sess-q", "a".into()).await);
         assert!(!service.remove_queued_prompt("sess-q", "a".into()).await);
