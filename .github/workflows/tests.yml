@@ -35,7 +35,7 @@ jobs:
           # release.yml.
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Cache compiled binaries too. Same-PR pushes that don't
           # touch Rust deps get a warm `target/` and skip the cold
@@ -228,7 +228,7 @@ jobs:
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         if: github.event_name != 'pull_request'
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         if: github.event_name != 'pull_request'
         with:
           cache-bin: "true"
@@ -456,7 +456,7 @@ jobs:
         with:
           node-version: '22'
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # Cache compiled binaries too. Same-PR pushes that don't
           # touch Rust deps get a warm `target/` and skip the 4-minute
