@@ -3,8 +3,10 @@ name: CI
 on:
   push:
     branches: [main]
+  # No branch filter: a stacked PR targets its parent branch rather than main,
+  # and a base filter would leave every PR but the bottom of the stack with no
+  # checks at all.
   pull_request:
-    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
