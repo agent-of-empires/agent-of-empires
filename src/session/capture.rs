@@ -61,10 +61,11 @@ fn claude_home_for_host_environment(host_env: &[String]) -> Result<PathBuf> {
 
 /// The `CLAUDE_CONFIG_DIR` value the launched pane will see, if any: the
 /// session's host environment wins, then AoE's own env. Empty is unset.
+///
+/// Shares [`crate::hooks::resolve_config_dir_override`] with the hook-install
+/// path so the read side and the write side cannot drift on precedence.
 fn claude_config_dir_override(host_env: &[String]) -> Option<String> {
-    crate::session::environment::resolve_host_environment_value(host_env, "CLAUDE_CONFIG_DIR")
-        .or_else(|| std::env::var("CLAUDE_CONFIG_DIR").ok())
-        .filter(|value| !value.is_empty())
+    crate::hooks::resolve_config_dir_override("CLAUDE_CONFIG_DIR", host_env)
 }
 
 /// Resolve a path to a comparable identity: canonicalize when the directory
