@@ -1114,24 +1114,25 @@ pub async fn run_terminal_rename(
     };
 
     let tmux = crate::tmux::Session::new(session_id, &title)?;
-    let detect_tool = if detect_as.is_empty() {
-        tool.as_str()
-    } else {
-        detect_as.as_str()
-    };
+    // Same resolution the status poller uses: own status rules first, then the
+    // `agent_detect_as` alias, resolved through the live registry so a session
+    // whose alias entry landed after it was created is not stranded on the raw
+    // tool name here (which would skip `strip_agent_banner` and read the pane
+    // with no detector).
+    let detect_tool = crate::tmux::status_rules::detection_tool(profile, &tool, &detect_as);
 
     // Best-effort no-race: the poller fired on Running -> Idle, but the user may
     // have started another turn since. Only proceed while the pane still reads
     // idle; a later idle edge retries.
     if let Ok(content) = tmux.capture_pane(50) {
-        if crate::tmux::detect_status_from_content_in(profile, &content, detect_tool)
+        if crate::tmux::detect_status_from_content_in(profile, &content, &detect_tool)
             == crate::session::Status::Running
         {
             return Ok(());
         }
     }
 
-    let Some(context) = capture_terminal_context(&tmux, detect_tool) else {
+    let Some(context) = capture_terminal_context(&tmux, &detect_tool) else {
         tracing::debug!(target: "smart_rename", session = %session_id, "terminal skip: unusable pane capture");
         return Ok(());
     };

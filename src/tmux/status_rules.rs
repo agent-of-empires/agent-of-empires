@@ -211,7 +211,10 @@ pub fn detect(profile: &str, tool: &str, clean_content: &str) -> Option<Status> 
 /// consults the registry the config resolve installed. A non-empty stored value
 /// still wins outright, keeping the hot path allocation-free for the sessions
 /// that have one and preserving the per-session pin for anything that rewrites
-/// the field directly.
+/// the field directly. That precedence bounds what this heals: a session whose
+/// stored alias is empty tracks the config live (an entry added, retargeted, or
+/// removed later all take effect on the next resolve), while a session that
+/// already has one is pinned to it until something rewrites the field.
 pub fn effective_detect_as<'a>(profile: &str, tool: &str, detect_as: &'a str) -> Cow<'a, str> {
     if !detect_as.is_empty() {
         return Cow::Borrowed(detect_as);

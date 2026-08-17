@@ -18,11 +18,16 @@
 //! distrust it. Per `AGENTS.md > Data Migrations` the stored data gets fixed
 //! rather than accumulating read-side shims.
 //!
-//! The runtime fallback is not made redundant by this: `agent_detect_as` can be
-//! edited, renamed, or removed at any point after a session is built, so the
-//! staleness this heals is reachable again the moment a user renames a custom
-//! agent. The migration fixes the rows that exist; the fallback keeps the next
-//! ones correct.
+//! The runtime fallback is not made redundant by this: this is a one-shot, and
+//! a session built after it runs but before its tool is added to
+//! `[session.agent_detect_as]` lands in exactly the same state. The migration
+//! fixes the rows that exist; the fallback keeps the next ones correct.
+//!
+//! The converse is also true: because a non-empty stored alias wins over the
+//! registry, backfilling a row converts a value the fallback was tracking live
+//! into a fixed pin, so a later retarget or removal of the entry no longer
+//! reaches it. That is deliberate: it is the same state a session built with the
+//! entry in place would have had.
 //!
 //! ## Failure policy
 //!
