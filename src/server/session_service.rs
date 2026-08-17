@@ -75,6 +75,16 @@ enum IdempotentMatch {
     None,
 }
 
+/// The `Instance` fields `mutate_instance_persisted` copies from memory to
+/// disk. Deliberately explicit: the disk write no longer re-runs the caller's
+/// closure, so a field that is not listed here is simply not persisted.
+#[cfg(feature = "serve")]
+struct MirroredFields {
+    queued_prompts: Vec<crate::acp::state::QueuedPromptEntry>,
+    queued_prompt_next_seq: u64,
+    idle_dormant_since: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 /// Pick the leading drain batch from a session's queue and its combined text,
 /// matching the client's `useAcpSession` split exactly: a clear-command row at
 /// the head fires as its own turn; otherwise the leading run of non-clear rows
@@ -766,24 +776,45 @@ impl SessionService {
         }
     }
 
-    /// Apply `mutate` to a session's in-memory `Instance` and persist the same
-    /// change to disk, mirroring the `pending_initial_turn` write path. Returns
-    /// what `mutate` produced on the in-memory instance, or `None` if the
-    /// session is gone. `mutate` runs twice, once in memory and once against the
-    /// on-disk copy under the storage lock, so it must be deterministic given
-    /// the instance state; every queue mutation goes through here, so the two
-    /// copies stay in lockstep (the on-disk run re-derives the same `seq`).
+    /// Apply `mutate` to a session's in-memory `Instance`, then mirror the
+    /// resulting state to disk. Returns what `mutate` produced, or `None` if
+    /// the session is gone.
+    ///
+    /// `mutate` runs exactly once, against the in-memory instance, which is the
+    /// authoritative copy: every queue mutation takes `instances.write()`, so
+    /// that list is always correctly ordered. The disk write then *copies* the
+    /// post-mutation fields rather than re-running the closure.
+    ///
+    /// Re-running it was wrong under concurrency. The instances lock is
+    /// released before the disk write, so two concurrent enqueues could reach
+    /// `storage.update` in either order and each re-derive `seq` from whatever
+    /// the on-disk copy happened to hold, persisting an order the in-memory
+    /// list never had (or losing a row entirely). Copying instead means the
+    /// last writer persists the complete, correct state.
+    ///
+    /// Only the fields listed in `MirroredFields` survive to disk, which covers
+    /// every caller today (the five queue mutations plus the dormancy clear).
+    /// A new caller that mutates something else must extend that struct, so the
+    /// set is explicit rather than implied by whatever the closure touched.
     #[cfg(feature = "serve")]
     async fn mutate_instance_persisted<T, F>(self: &Arc<Self>, id: &str, mutate: F) -> Option<T>
     where
         T: Send + 'static,
-        F: Fn(&mut crate::session::Instance) -> T + Send + 'static,
+        F: FnOnce(&mut crate::session::Instance) -> T,
     {
-        let (profile, result) = {
+        let (profile, result, mirrored) = {
             let mut instances = self.instances.write().await;
             let inst = instances.iter_mut().find(|i| i.id == id)?;
             let r = mutate(inst);
-            (inst.source_profile.clone(), r)
+            (
+                inst.source_profile.clone(),
+                r,
+                MirroredFields {
+                    queued_prompts: inst.queued_prompts.clone(),
+                    queued_prompt_next_seq: inst.queued_prompt_next_seq,
+                    idle_dormant_since: inst.idle_dormant_since,
+                },
+            )
         };
         match crate::session::Storage::new(&profile, self.file_watch.clone()) {
             Ok(storage) => {
@@ -791,7 +822,9 @@ impl SessionService {
                 let persisted = tokio::task::spawn_blocking(move || {
                     storage.update(|instances, _groups| {
                         if let Some(inst) = instances.iter_mut().find(|i| i.id == id_persist) {
-                            mutate(inst);
+                            inst.queued_prompts = mirrored.queued_prompts;
+                            inst.queued_prompt_next_seq = mirrored.queued_prompt_next_seq;
+                            inst.idle_dormant_since = mirrored.idle_dormant_since;
                         }
                         Ok(())
                     })
@@ -1008,9 +1041,29 @@ impl SessionService {
             .await
             .unwrap_or_default()
         };
-        // An attachment-only batch has empty combined text but real blobs; only
-        // a batch with neither is a no-op.
+        // An attachment-only batch has empty combined text but real blobs. A
+        // batch with neither cannot be delivered at all, and must be retired
+        // rather than left queued.
+        //
+        // This guard used to `return`, which wedged the session: the batch
+        // stayed at the head of the queue, the drain retried it on every
+        // reconciler tick, nothing behind it ever drained, and
+        // `reap_idle_workers` (which skips a session holding a queue) kept the
+        // agent subprocess alive forever. Two routes reach the state, so
+        // guarding the entry points is not enough on its own: an attachment-only
+        // prompt whose buffered bytes the 24h `PENDING_ATTACHMENT_TTL` sweep
+        // reclaimed, and (before it was rejected) an edit that blanked a
+        // text-only row. There is nothing left to send by this point, so the
+        // rows are husks; log loudly and clear them.
         if combined.trim().is_empty() && attachments.is_empty() {
+            tracing::warn!(
+                target: "acp.queue",
+                session = %id,
+                rows = sent_ids.len(),
+                "queued prompts have neither text nor attachment bytes (buffered bytes expired?); \
+                 retiring them so the queue behind them can drain"
+            );
+            self.retire_drained_rows(id, sent_ids).await;
             return;
         }
 
@@ -1025,13 +1078,20 @@ impl SessionService {
             return;
         }
         // Retire only the delivered rows; prompts enqueued during the send
-        // survive into the next drain. Drop their buffered blobs now that they
-        // are re-recorded under the prompt event's seq.
-        for pid in &sent_ids {
+        // survive into the next drain.
+        self.retire_drained_rows(id, sent_ids).await;
+    }
+
+    /// Drop a set of queue rows and the attachment bytes buffered for them.
+    /// Shared by the delivered path and the undeliverable-husk path so both
+    /// leave the queue and the pending-attachment store consistent.
+    #[cfg(feature = "serve")]
+    async fn retire_drained_rows(self: &Arc<Self>, id: &str, ids: Vec<String>) {
+        for pid in &ids {
             self.acp_event_store
                 .delete_pending_attachments_for_ref(id, pid);
         }
-        let retire: std::collections::HashSet<String> = sent_ids.into_iter().collect();
+        let retire: std::collections::HashSet<String> = ids.into_iter().collect();
         self.mutate_instance_persisted(id, move |inst| {
             inst.queued_prompts.retain(|q| !retire.contains(&q.id));
         })
