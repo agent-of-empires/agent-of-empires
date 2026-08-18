@@ -2162,14 +2162,23 @@ export async function logout(): Promise<void> {
  * to match and returns 409 if the session is running, so the message is
  * surfaced to the caller. See #1927.
  */
-export async function renameSession(id: string, title: string): Promise<{ ok: boolean; message?: string }> {
+export async function renameSession(
+  id: string,
+  title: string,
+): Promise<{ ok: boolean; message?: string; warnings?: string[] }> {
   try {
     const res = await fetch(`/api/sessions/${id}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ title }),
     });
-    if (res.ok) return { ok: true };
+    if (res.ok) {
+      const body = await res.json().catch(() => null);
+      const warnings = Array.isArray(body?.warnings)
+        ? body.warnings.filter((warning: unknown): warning is string => typeof warning === "string")
+        : [];
+      return warnings.length > 0 ? { ok: true, warnings } : { ok: true };
+    }
     let message: string | undefined;
     try {
       const body = await res.json();

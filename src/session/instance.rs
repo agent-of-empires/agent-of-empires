@@ -597,11 +597,13 @@ pub enum SessionBucket {
 
 /// One durable ownership protocol for every session lifecycle transition.
 ///
-/// A transition first acquires the per-instance lifecycle flock, then records
-/// a fresh generation under `Storage::update`. The durable reservation stays
-/// held through hooks, external side effects, and the exact-generation commit;
-/// callers may release the flock while running reentrant hooks. `status` is
-/// presentation state and never proves ownership.
+/// A transition acquires the per-instance lifecycle flock, then records a
+/// fresh generation under `Storage::update`. Terminal launch is the ordered
+/// exception: it first takes the app-global per-session title flock so title
+/// writers and launch cannot derive different tmux names. The durable
+/// reservation stays held through hooks, external side effects, and the
+/// exact-generation commit; callers may release outer flocks for reentrant hooks.
+/// `status` is presentation state and never proves ownership.
 ///
 /// A crashed owner loses both the flock and, after the TTL, its reservation.
 /// Recovery may then acquire a newer generation; exact-generation commits
@@ -4011,6 +4013,8 @@ impl Instance {
         let storage = super::storage::Storage::new(&profile, self.resolve_file_watch())
             .context("failed to open lifecycle lock storage")?;
 
+        let title_lock = super::storage::acquire_session_title_lock(&self.id)
+            .context("failed to acquire instance launch title lock")?;
         let lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to acquire instance launch lock")?;
@@ -4038,10 +4042,14 @@ impl Instance {
         )?;
 
         // The durable reservation excludes peer launches while user hooks run.
-        // The flock itself must be absent because a hook may invoke aoe for
-        // this same session.
+        // Both flocks must be absent because a hook may invoke aoe for this
+        // same session. Reacquire in the global order afterward and reload the
+        // authoritative title before deriving the tmux launch name.
         drop(lifecycle_lock);
+        drop(title_lock);
         let hook_result = self.run_pre_launch_hooks(skip_on_launch, &profile);
+        let _title_lock = super::storage::acquire_session_title_lock(&self.id)
+            .context("failed to reacquire instance launch title lock after hooks")?;
         let _lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to reacquire instance launch lock after hooks")?;
@@ -6124,6 +6132,8 @@ impl Instance {
         let storage = super::storage::Storage::new(&profile, self.resolve_file_watch())
             .context("failed to open lifecycle lock storage")?;
 
+        let title_lock = super::storage::acquire_session_title_lock(&self.id)
+            .context("failed to acquire instance start title lock")?;
         let lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to acquire instance start lock")?;
@@ -6150,9 +6160,13 @@ impl Instance {
         }
 
         // Keep the generation reservation durable, but allow hooks to invoke
-        // aoe against this session without waiting on our flock.
+        // aoe against this session without waiting on either flock. Reacquire
+        // title before lifecycle and reload before deriving the launch name.
         drop(lifecycle_lock);
+        drop(title_lock);
         let hook_result = self.run_pre_launch_hooks(skip_on_launch, &profile);
+        let _title_lock = super::storage::acquire_session_title_lock(&self.id)
+            .context("failed to reacquire instance start title lock after hooks")?;
         let _lifecycle_lock = storage
             .acquire_instance_lifecycle_lock(&self.id)
             .context("failed to reacquire instance start lock after hooks")?;

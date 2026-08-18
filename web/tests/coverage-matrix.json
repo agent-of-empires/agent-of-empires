@@ -3379,6 +3379,13 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx", "web/src/lib/api.ts"]
     },
     {
+      "id": "sidebar.rename-success-warning",
+      "kind": "vitest",
+      "risk": "medium",
+      "specs": ["src/lib/api.coverage.test.ts", "src/components/__tests__/WorkdirNameEdit.test.tsx"],
+      "components": ["web/src/lib/api.ts", "web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
       "id": "sidebar.add-project",
       "kind": "vitest",
       "risk": "high",
