@@ -1580,8 +1580,18 @@ impl LiveCaptureWorker {
 /// coalescing ordering via `coalesce` directly without needing a real
 /// session.
 fn dispatch_batch(tmux_name: &str, batch: Vec<WorkerMsg>) {
-    for action in coalesce(batch) {
-        if let Err(err) = dispatch_via_fork(tmux_name, &action) {
+    let actions = coalesce(batch);
+    // A `Paste` can only go through tmux (`paste-buffer -p` is what decides
+    // whether the pane gets bracketed-paste markers), so a batch holding one
+    // would otherwise split across two writers: the paste via tmux and its
+    // neighbouring keystrokes via the vt socket. The socket hands bytes to the
+    // `pipe-pane -I` forwarder, which writes to the pty independently, so the
+    // two can land out of order and scramble a type-then-paste sequence. Pin
+    // the whole batch to tmux instead, which serializes its own writes, and
+    // keep the single-writer invariant in `tmux::vt::input_mode` intact.
+    let force_tmux = actions.iter().any(|a| matches!(a, TmuxAction::Paste(_)));
+    for action in actions {
+        if let Err(err) = dispatch_via_fork(tmux_name, &action, force_tmux) {
             tracing::warn!(
                 target: "tui.live_send",
                 error = %err,
@@ -1595,7 +1605,7 @@ fn dispatch_batch(tmux_name: &str, batch: Vec<WorkerMsg>) {
 /// Execute one `TmuxAction` as a one-shot `tmux` subprocess. Module-
 /// level fn (rather than a method on the worker) so it stays callable
 /// from the spawned thread without holding a worker reference.
-fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()> {
+fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction, force_tmux: bool) -> anyhow::Result<()> {
     use std::process::Stdio;
 
     // Fast path (`[tmux] vt_live`): when a *live* input channel is armed for this
@@ -1622,7 +1632,7 @@ fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()>
     // failure to prove the writer is dead, so falling back here could race a
     // still-live socket writer.
     #[cfg(unix)]
-    if let Some(app_cursor) = crate::tmux::vt::input_mode(tmux_name) {
+    if let Some(app_cursor) = crate::tmux::vt::input_mode(tmux_name).filter(|_| !force_tmux) {
         if !matches!(action, TmuxAction::Resize { .. } | TmuxAction::Paste(_)) {
             let bytes = encode_action_bytes(action, app_cursor);
             if bytes.is_empty() {
@@ -2020,7 +2030,8 @@ pub(super) fn send_key_oneshot(tmux_name: &str, key: TmuxKey) {
         .name("aoe-wheel-forward".to_string())
         .spawn(move || {
             let _slot = OneshotSlot;
-            if let Err(err) = dispatch_via_fork(&tmux_name, &action) {
+            // A wheel notch is never a paste, so the vt fast path stays open.
+            if let Err(err) = dispatch_via_fork(&tmux_name, &action, false) {
                 tracing::warn!(
                     target: "tui.live_send",
                     error = %err,

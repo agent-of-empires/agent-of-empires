@@ -103,15 +103,26 @@ fn test_live_send_paste_into_non_bracketed_pane_has_no_marker_debris() {
     h.wait_for_timeout("LIVE", Duration::from_secs(10));
 
     h.send_paste("SELECT id\nFROM users;");
-    std::thread::sleep(Duration::from_millis(800));
 
+    // Poll rather than sleep a fixed span: a paste crosses the TUI, the
+    // live-send worker, a tmux fork, and the pane program, and any fixed
+    // budget is either flaky on a loaded box or slow on an idle one. The
+    // marker assertion below still holds on the buggy build, because the
+    // debris arrives in the same write as the text it brackets.
     let socket = h.home_path().join("tmux.sock");
-    let pane = capture(&socket, &agent_session_on(&socket));
-
-    assert!(
-        pane.contains("SELECT id") && pane.contains("FROM users"),
-        "pasted query should reach the agent pane, got:\n{pane}"
-    );
+    let session = agent_session_on(&socket);
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let pane = loop {
+        let pane = capture(&socket, &session);
+        if pane.contains("SELECT id") && pane.contains("FROM users") {
+            break pane;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "pasted query never reached the agent pane, last capture:\n{pane}"
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    };
     assert!(
         !pane.contains("200~") && !pane.contains("201~"),
         "bracketed-paste markers must not reach a pane that never set \

@@ -1282,7 +1282,7 @@ impl Session {
     /// and simple REPLs that never asked for them, which render the leftovers
     /// as literal `00~` / `01~` text (#3364-adjacent, live-send paste).
     ///
-    /// See [`Self::send_via_paste_buffer`] for the buffer-naming and cleanup
+    /// See `send_via_paste_buffer` for the buffer-naming and cleanup
     /// contract. tmux translates LF to CR in the buffer by default, matching
     /// the raw-byte encoding this replaces.
     pub fn paste_text(&self, text: &str) -> Result<()> {
