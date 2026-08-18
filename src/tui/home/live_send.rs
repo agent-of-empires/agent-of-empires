@@ -2902,6 +2902,32 @@ mod tests {
     }
 
     #[test]
+    fn coalesce_paste_breaks_literal_run_and_never_merges() {
+        // A paste must stay its own action: folding it into a
+        // neighbouring literal run would put the payload back on the
+        // `send-keys` path, where tmux never gets to decide about the
+        // bracketed-paste markers (the `00~` / `01~` bug), and would
+        // also drop the #1546 one-paste framing for agents that DO set
+        // DECSET 2004. Ordering across the batch has to survive too.
+        let out = coalesce(vec![
+            snd_lit("a"),
+            snd_lit("b"),
+            WorkerMsg::Send(TmuxKey::Paste("x\ny".into())),
+            snd_lit("c"),
+            WorkerMsg::Send(TmuxKey::Paste("p\nq".into())),
+        ]);
+        assert_eq!(
+            out,
+            vec![
+                TmuxAction::Literal("ab".into()),
+                TmuxAction::Paste("x\ny".into()),
+                TmuxAction::Literal("c".into()),
+                TmuxAction::Paste("p\nq".into()),
+            ]
+        );
+    }
+
+    #[test]
     fn unhandled_keys_are_ignored() {
         assert_eq!(translate(k(KeyCode::Null)), LiveDispatch::Ignore);
         assert_eq!(translate(k(KeyCode::CapsLock)), LiveDispatch::Ignore);

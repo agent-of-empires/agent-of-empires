@@ -1280,7 +1280,7 @@ impl Session {
     /// receiving program actually set DECSET 2004. Hand-rolling the markers
     /// instead (as a raw `send-keys -H` payload) delivers them to raw shells
     /// and simple REPLs that never asked for them, which render the leftovers
-    /// as literal `00~` / `01~` text (#3364-adjacent, live-send paste).
+    /// as literal `00~` / `01~` text on the live-send paste path.
     ///
     /// See `send_via_paste_buffer` for the buffer-naming and cleanup
     /// contract. tmux translates LF to CR in the buffer by default, matching
