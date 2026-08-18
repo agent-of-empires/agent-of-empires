@@ -6,7 +6,7 @@
 // are kept side-effect-free precisely so they can be exercised without
 // mounting the assistant-ui runtime; see the doc comments on each helper.
 
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import {
   composerWrapperLayout,
   decideBeforeInputAction,
@@ -178,28 +178,33 @@ describe("insertAtCaret", () => {
 });
 
 describe("insertSlashCommand", () => {
-  it("is a no-op when the runtime is missing", () => {
-    expect(() => insertSlashCommand(null as never, { id: "foo" } as never)).not.toThrow();
+  it("is a no-op when the textarea is missing", () => {
+    const ref = { current: null } as React.RefObject<HTMLTextAreaElement | null>;
+    expect(() => insertSlashCommand(ref, { id: "foo" } as never)).not.toThrow();
   });
 
-  it("sets the canonical /<id> form with a trailing space when buffer is empty", () => {
-    const setText = vi.fn();
-    const runtime = { getState: () => ({ text: "" }), setText } as never;
-    insertSlashCommand(runtime, { id: "compact" } as never);
-    expect(setText).toHaveBeenCalledWith("/compact ");
-  });
+  it("replaces the caret's token and leaves the caret past the command (#3418)", () => {
+    // The range math itself is covered in slashCompletion.test.ts; this
+    // locks the textarea wiring: value written, caret moved, and an
+    // InputEvent dispatched so assistant-ui applies both together.
+    const ref = textareaRef("fix /he the bug", 7);
+    const events: { inputType: string; data: string | null; caretAtDispatch: number | null }[] = [];
+    ref.current!.addEventListener("input", (e) => {
+      const ev = e as InputEvent;
+      events.push({ inputType: ev.inputType, data: ev.data, caretAtDispatch: ref.current!.selectionStart });
+    });
 
-  it("appends a separating space when the buffer does not end in whitespace", () => {
-    const setText = vi.fn();
-    const runtime = { getState: () => ({ text: "hello" }), setText } as never;
-    insertSlashCommand(runtime, { id: "foo" } as never);
-    expect(setText).toHaveBeenCalledWith("hello /foo ");
-  });
+    insertSlashCommand(ref, { id: "help" } as never);
 
-  it("does not double-space when the buffer already ends in whitespace", () => {
-    const setText = vi.fn();
-    const runtime = { getState: () => ({ text: "hello " }), setText } as never;
-    insertSlashCommand(runtime, { id: "foo" } as never);
-    expect(setText).toHaveBeenCalledWith("hello /foo ");
+    expect(ref.current!.value).toBe("fix /help the bug");
+    expect(ref.current!.selectionStart).toBe(10);
+    expect(events).toHaveLength(1);
+    expect(events[0]!.inputType).toBe("insertText");
+    expect(events[0]!.data).toBe("/help");
+    // The caret must already be in place when the event fires, because
+    // ComposerPrimitive.Input reads selectionStart inside the same
+    // onChange that applies the text. Dispatching first would hand the
+    // popover the end-of-value caret and leave it detecting stale text.
+    expect(events[0]!.caretAtDispatch).toBe(10);
   });
 });

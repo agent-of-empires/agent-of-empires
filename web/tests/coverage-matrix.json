@@ -3122,9 +3122,10 @@
       "risk": "high",
       "specs": [
         "tests/live/acp-stories/composer-slash-pick-no-arg.spec.ts",
-        "src/components/acp/Composer.slashCommand.test.ts"
+        "src/components/acp/Composer.slashCommand.dom.test.tsx",
+        "src/components/acp/slashCompletion.test.ts"
       ],
-      "components": ["web/src/components/acp/Composer.tsx"]
+      "components": ["web/src/components/acp/Composer.tsx", "web/src/components/acp/slashCompletion.ts"]
     },
     {
       "id": "acp.story.queue-fold-unfold",

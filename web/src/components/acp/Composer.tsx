@@ -19,6 +19,7 @@ import { useCallback, useEffect, useMemo, useRef, useState, useSyncExternalStore
 import { AtSign, ChevronUp, Paperclip, Pencil, Slash, Square, X } from "lucide-react";
 
 import { useFilesIndex, fuzzyFilter } from "./useFilesIndex";
+import { replaceSlashCommand } from "./slashCompletion";
 import { SessionConfigControls } from "./SessionConfigControls";
 import { Tooltip } from "../Tooltip";
 import { ProvenanceBadge } from "../ProvenanceBadge";
@@ -962,7 +963,7 @@ export function Composer({
               className="absolute bottom-full left-0 right-0 mb-2 z-30 overflow-hidden rounded-lg border border-surface-700 bg-surface-850 shadow-xl"
             >
               <ComposerPrimitive.Unstable_TriggerPopover.Action
-                onExecute={(item) => insertSlashCommand(composerRuntime, item)}
+                onExecute={(item) => insertSlashCommand(taRef, item)}
                 removeOnExecute
               />
               <PopoverItems trigger="/" skillIndex={skillIndex} />
@@ -1338,32 +1339,55 @@ function PopoverItems({ trigger, skillIndex }: { trigger: string; skillIndex?: S
   );
 }
 
-/** The user's in-progress `/<typed>` token, which sits at the end of the
- *  buffer because `detectTrigger` scans back from the caret to the previous
- *  whitespace. */
-const TYPED_SLASH_TOKEN = /\/\S*\s*$/;
+/** Write the picked slash command into the composer, replacing the
+ *  `/token` the caret sits in (or inserting at the caret when there is
+ *  no token, the toolbar-button path).
+ *
+ *  Goes through the DOM rather than `runtime.setText` on purpose.
+ *  assistant-ui keeps its own cursor position for trigger detection and
+ *  only advances it from composer input events, so a bare `setText`
+ *  moves the text out from under a stale cursor: detection keeps
+ *  matching the old prefix, the popover never closes, and its keyboard
+ *  handler claims the next Enter and re-picks with a stale trigger
+ *  range, which is how `/address-pr-comments` came back as
+ *  `ess-pr-comments /address-pr-comments` (#3418). Writing through the
+ *  textarea and dispatching a real `InputEvent` makes
+ *  `ComposerPrimitive.Input`'s own `onChange` apply the text and the
+ *  caret together, in one handler.
+ *
+ *  The trailing space `replaceSlashCommand` leaves after the command is
+ *  what keeps detection from re-firing on the text we just wrote, for
+ *  no-arg commands as much as for ones taking arguments (#1512).
+ *
+ *  Runs after the popover's `removeOnExecute` strip, which rebuilds the
+ *  buffer from its own trigger snapshot; ours is the last write in
+ *  `selectItem`, so it is the one that lands. */
+export function insertSlashCommand(ref: React.RefObject<HTMLTextAreaElement | null>, item: Unstable_TriggerItem) {
+  const ta = ref.current;
+  if (!ta) return;
+  const caret = ta.selectionStart ?? ta.value.length;
+  const { text, cursor } = replaceSlashCommand(ta.value, caret, ta.selectionEnd ?? caret, item.id);
+  writeComposerValue(ta, text, cursor, "insertText", `/${item.id}`);
+}
 
-/** Insert the picked slash command into the composer text as the canonical
- *  `/<name>` form plus a trailing space. The trailing space halts
- *  assistant-ui's `detectTrigger` backward scan (which keys off whitespace as
- *  the trigger boundary) so the popover does not immediately re-open on the
- *  inserted `/<name>` and consume the next Enter as a re-pick; it also
- *  positions the cursor for free-form arg typing when the agent advertised the
- *  command as `acceptsInput=true`. See #1512. */
-export function insertSlashCommand(runtime: ComposerClient, item: Unstable_TriggerItem) {
-  if (!runtime) return;
-  // The Action popover strips the typed `/<typed>` via `removeOnExecute`, but
-  // @assistant-ui/react 0.15 applies composer writes on a scheduled task, so
-  // reading the text back here still yields the un-stripped buffer. Drop the
-  // token ourselves rather than trusting the snapshot; our write is scheduled
-  // after the popover's, so ours is the one that lands.
-  const current = runtime.getState().text.replace(TYPED_SLASH_TOKEN, "");
-  const suffix = " ";
-  // Preserve any text that was already in the buffer (e.g. user typed
-  // a long prompt then ran `/foo` mid-message). We just append the
-  // command at the end.
-  const sep = current.length > 0 && !current.endsWith(" ") ? " " : "";
-  runtime.setText(`${current}${sep}/${item.id}${suffix}`);
+/** Replace the textarea's value the way a keystroke would, so
+ *  assistant-ui picks it up.
+ *
+ *  Uses the native `value` setter because React patches its own on the
+ *  instance, and dispatches an `InputEvent` carrying `inputType` and
+ *  `data` because the trigger popover keys off those fields (#1149).
+ *
+ *  The caret is set BEFORE the dispatch: `ComposerPrimitive.Input`'s
+ *  `onChange` reads `selectionStart` in the same handler that applies
+ *  the text, and assigning `value` parks the caret at the end, so
+ *  dispatching first hands the popover a cursor pointing past the text
+ *  it is about to detect against. */
+function writeComposerValue(ta: HTMLTextAreaElement, next: string, caret: number, inputType: string, data?: string) {
+  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
+  setter?.call(ta, next);
+  ta.focus();
+  ta.setSelectionRange(caret, caret);
+  ta.dispatchEvent(new InputEvent("input", { bubbles: true, inputType, ...(data === undefined ? {} : { data }) }));
 }
 
 /** Insert a literal "\n" at the textarea's caret. Used by the
@@ -1381,17 +1405,7 @@ export function insertNewlineAtCaret(ref: React.RefObject<HTMLTextAreaElement | 
   const end = ta.selectionEnd ?? start;
   const before = ta.value.slice(0, start);
   const after = ta.value.slice(end);
-  const next = `${before}\n${after}`;
-  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
-  setter?.call(ta, next);
-  ta.dispatchEvent(
-    new InputEvent("input", {
-      bubbles: true,
-      inputType: "insertLineBreak",
-    }),
-  );
-  const pos = before.length + 1;
-  ta.setSelectionRange(pos, pos);
+  writeComposerValue(ta, `${before}\n${after}`, before.length + 1, "insertLineBreak");
 }
 
 /** Insert `text` at the textarea's caret and re-focus. The toolbar
@@ -1415,36 +1429,14 @@ export function insertAtCaret(ref: React.RefObject<HTMLTextAreaElement | null>, 
   // the trigger char; pad if we're mid-word.
   const needsSpace = before.length > 0 && !/[\s\n\t]$/.test(before) ? " " : "";
   const next = before + needsSpace + text + ta.value.slice(end);
-  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
-  setter?.call(ta, next);
-  ta.dispatchEvent(
-    new InputEvent("input", {
-      bubbles: true,
-      inputType: "insertText",
-      data: text,
-    }),
-  );
-  const pos = before.length + needsSpace.length + text.length;
-  ta.focus();
-  ta.setSelectionRange(pos, pos);
+  writeComposerValue(ta, next, before.length + needsSpace.length + text.length, "insertText", text);
 }
 
 function insertRawTextAtCaret(ta: HTMLTextAreaElement, text: string, replaceSelection: boolean) {
   const start = ta.selectionStart ?? ta.value.length;
   const end = replaceSelection ? (ta.selectionEnd ?? start) : start;
   const next = ta.value.slice(0, start) + text + ta.value.slice(end);
-  const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
-  setter?.call(ta, next);
-  ta.dispatchEvent(
-    new InputEvent("input", {
-      bubbles: true,
-      inputType: "insertText",
-      data: text,
-    }),
-  );
-  const pos = start + text.length;
-  ta.focus();
-  ta.setSelectionRange(pos, pos);
+  writeComposerValue(ta, next, start + text.length, "insertText", text);
   ta.style.height = "auto";
   ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
 }
