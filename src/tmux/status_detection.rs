@@ -497,13 +497,14 @@ pub(crate) fn claude_pane_is_ambiguous_typed_prompt(raw_content: &str) -> bool {
     })
 }
 
-/// Claude renders a blocking numbered-choice prompt when it needs an answer
-/// before it can continue: a tool asking permission (Bash command, file edit,
-/// plan exit, ...), and the first-run folder-trust check, which is not a tool
-/// permission at all. Every variant pairs a question ("Do you want to
-/// proceed?", "Do you want to make this edit to <file>?", "Would you like to
-/// proceed?", "Is this a project you created or one you trust?") with a
-/// numbered choice menu. Requiring both keeps an assistant-authored numbered list from being
+/// The blocking prompts this rule covers: a tool asking permission (Bash
+/// command, file edit, plan exit, ...), and the first-run folder-trust check,
+/// which is not a tool permission at all. Each of those pairs a question
+/// ("Do you want to proceed?", "Do you want to make this edit to <file>?",
+/// "Would you like to proceed?", "Is this a project you created or one you
+/// trust?") with a numbered choice menu. It does NOT cover every prompt Claude
+/// blocks on: `AskUserQuestion` carries none of these phrasings and has its
+/// own detector below. Requiring both keeps an assistant-authored numbered list from being
 /// mistaken for a prompt. `recent_lower` is the lowercased join of `recent`.
 fn claude_has_approval_prompt(recent: &[&str], recent_lower: &str) -> bool {
     // The folder-trust prompt phrases its question without either stock
@@ -514,20 +515,46 @@ fn claude_has_approval_prompt(recent: &[&str], recent_lower: &str) -> bool {
     // would let one quoted line satisfy both halves of the guard.
     let has_question = recent_lower.contains("do you want to")
         || recent_lower.contains("would you like to proceed")
-        // Collapsed, unlike the two arms above: this phrase is 46 characters of
-        // prose, so Claude word-wraps it in a narrow pane and `recent_lower` is
-        // a newline join, which breaks a plain `contains`. AoE produces that
-        // width band itself (a side-by-side preview is roughly viewport minus
-        // `list_width` + 2, so a viewport between `STACKED_BREAKPOINT` and
-        // ~106 lands in it). `||` short-circuits, so the allocation is only
-        // paid once the two cheap arms have missed. Same reason
-        // `claude_pane_has_running_signal` collapses its footer hints.
-        || collapse_ascii_whitespace(recent_lower)
-            .contains("is this a project you created or one you trust");
+        || claude_has_folder_trust_question(recent, recent_lower);
     has_question
         && recent
             .iter()
             .any(|line| claude_line_is_numbered_choice(line))
+}
+
+/// The folder-trust question, including when Claude has word-wrapped it.
+///
+/// It is 46 characters of prose, so a narrow pane breaks it across lines and
+/// `recent_lower` is a newline join, which defeats a plain `contains`. AoE
+/// produces the affected widths itself: the side-by-side preview pane is
+/// `viewport - list_width - 4` (borders plus the block's horizontal padding),
+/// so with the default `list_width` of 35 the question only fits unwrapped
+/// from a viewport of about 107 up. Below `STACKED_BREAKPOINT` the stacked
+/// layout gives `viewport - 4`, which fits from 72 up, so the wrapped case
+/// covers viewports up to 71 as well as 80..=106 — the phone range in
+/// `responsive.rs` included.
+///
+/// Collapsing whitespace is how `claude_pane_has_running_signal` handles the
+/// same wrap problem, but its safety argument does NOT carry over and that is
+/// the trap here: its comment notes that false joins across unrelated lines
+/// "only bias toward Running, the safe direction". This match biases toward
+/// Waiting, which outranks Running, so a collapsed-only match would let an
+/// actively generating turn that merely renders this question across a line
+/// break report Waiting. Measured, before the option-label requirement below
+/// was added: a pane with a live spinner, a live token counter and
+/// `esc to interrupt` flipped Running -> Waiting.
+///
+/// So the collapsed form is paired with the prompt's own option label on a
+/// numbered-choice line. Prose that quotes the question does not also render
+/// the menu row, and the label alone cannot stand in for the question, so both
+/// halves still need distinct content on distinct lines. The label check runs
+/// first because it is a cheap line scan; the collapse only allocates once a
+/// real menu row is already on screen.
+fn claude_has_folder_trust_question(recent: &[&str], recent_lower: &str) -> bool {
+    recent.iter().any(|line| {
+        claude_line_is_numbered_choice(line) && line.to_lowercase().contains("trust this folder")
+    }) && collapse_ascii_whitespace(recent_lower)
+        .contains("is this a project you created or one you trust")
 }
 
 /// Claude's `AskUserQuestion` tool renders an interactive selection UI: an
@@ -2660,16 +2687,22 @@ enter to select · esc to cancel";
 
     #[test]
     fn claude_assistant_quoting_the_trust_option_is_not_waiting() {
-        // Pinned, not implied: the fixture rendered its spinner with ASCII
-        // dots, which `claude_line_is_active_spinner` does not match, so the
-        // `Running` below came from the interrupt hint alone and the fixture
-        // did not model the working session its name claims. Raised by njbrake
-        // in review.
+        // Pinned, not implied. The fixture's spinner line failed to match for
+        // TWO independent reasons: it used ASCII dots rather than U+2026, and
+        // its frame char was U+2726, which is not in `CLAUDE_SPINNER_CHARS`.
+        // Both are fixed above. `Running` still did not rest on the interrupt
+        // hint alone - the live token counter is a second signal - so both are
+        // asserted here rather than left to the verdict. Raised by njbrake in
+        // review.
         assert!(
             CLAUDE_ASSISTANT_QUOTING_THE_TRUST_OPTION
                 .lines()
                 .any(claude_line_is_active_spinner),
             "fixture must carry a live spinner",
+        );
+        assert!(
+            has_claude_live_token_counter(CLAUDE_ASSISTANT_QUOTING_THE_TRUST_OPTION),
+            "fixture must carry a live token counter",
         );
         assert_eq!(
             detect_claude_status(CLAUDE_ASSISTANT_QUOTING_THE_TRUST_OPTION),
@@ -2694,6 +2727,40 @@ enter to select · esc to cancel";
  \u{276f} 1. Yes, I trust this folder
    2. No, exit
 ";
+
+    /// The collapsed match joins across newlines, and unlike
+    /// `claude_pane_has_running_signal`'s collapse it biases toward Waiting,
+    /// which outranks Running. Without the option-label requirement these all
+    /// read `Waiting`; the last one is an actively generating turn.
+    #[test]
+    fn claude_wrapped_trust_question_in_prose_is_not_a_prompt() {
+        let quoted_across_a_break = "\
+\u{25cf} The detector asks: Is this a project you created or
+ one you trust? That phrase is the third arm.
+ 1. the first arm
+ 2. the second arm
+";
+        assert_eq!(detect_claude_status(quoted_across_a_break), Status::Idle);
+
+        let unrelated_lines_that_join = "\
+ Q: what is this
+ a project you created or one you trust is one you can vouch for.
+ 1. yes
+";
+        assert_eq!(
+            detect_claude_status(unrelated_lines_that_join),
+            Status::Idle
+        );
+
+        let while_generating = "\
+\u{25cf} The detector asks: Is this a project you created or
+ one you trust? That phrase is the third arm.
+ 1. the first arm
+ \u{2736} Working\u{2026} (12s \u{b7} \u{2193} 431 tokens)
+   esc to interrupt
+";
+        assert_eq!(detect_claude_status(while_generating), Status::Running);
+    }
 
     #[test]
     fn claude_folder_trust_prompt_wrapped_is_waiting() {
