@@ -1876,10 +1876,15 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
         && approval_footer.contains("approve")
         && approval_footer.contains("deny")
     {
-        if let Some(pos) = lowest_matching_line(window8, |l| {
-            let l = l.to_lowercase();
-            l.contains("allow tool:") || l.contains("approve") || l.contains("deny")
-        }) {
+        // Position on `allow tool:` alone. `approve` / `deny` gate the
+        // prompt's presence but are too weak to place it: `approve` is a
+        // substring of omp's own "Plan approved." render and of any prose or
+        // composer draft the user types, and the composer line is position 1,
+        // so positioning on them let a granted approval outrank a live loader
+        // three lines above it.
+        if let Some(pos) =
+            lowest_matching_line(window8, |l| l.to_lowercase().contains("allow tool:"))
+        {
             consider(pos, OmpSignal::Approval);
         }
     }
@@ -5132,6 +5137,15 @@ You can monitor progress with aoe session logs.\n\
                     "⠋ Retrying (2/3) in 30s… (esc to cancel)\nAllow tool: bash\nApprove\nDeny\n{prompt_box}"
                 ),
                 Status::Waiting,
+            ),
+            // A granted approval still in window 8 must not outrank the live
+            // loader just because the composer draft below it contains
+            // "approve"/"deny" (`test_detect_omp_status_running_over_stale
+            // _approval` guards only the empty-composer form).
+            (
+                "live loader over granted approval, composer draft",
+                "Allow tool: bash\nApprove\nDeny\n⠋ Working… ⟦esc⟧\n╭── π  > GPT-5.6 Sol ─╮\n╰─ deny that         ─╯".to_string(),
+                Status::Running,
             ),
             (
                 "anchor over label",
