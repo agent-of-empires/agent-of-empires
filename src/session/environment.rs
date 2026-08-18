@@ -771,6 +771,7 @@ pub(crate) fn build_docker_env_args_with_managed_codex_home(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::test_support::EnvGuard;
 
     fn owned(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
         pairs
@@ -1919,72 +1920,43 @@ environment = ["GH_TOKEN=write_token"]
     #[test]
     #[serial_test::serial(shell_env)]
     fn test_user_shell_reads_env() {
-        let original = std::env::var("SHELL").ok();
-        std::env::set_var("SHELL", "/bin/zsh");
+        let _shell = EnvGuard::set(&[("SHELL", "/bin/zsh")]);
         assert_eq!(user_shell(), "/bin/zsh");
-        match original {
-            Some(v) => std::env::set_var("SHELL", v),
-            None => std::env::remove_var("SHELL"),
-        }
     }
 
     #[test]
     #[serial_test::serial(shell_env)]
     fn test_user_shell_fallback() {
-        let original = std::env::var("SHELL").ok();
-        std::env::remove_var("SHELL");
+        let _shell = EnvGuard::unset(&["SHELL"]);
         assert_eq!(user_shell(), "bash");
-        if let Some(v) = original {
-            std::env::set_var("SHELL", v);
-        }
     }
 
     #[test]
     #[serial_test::serial(shell_env)]
     fn test_user_shell_empty_falls_back() {
-        let original = std::env::var("SHELL").ok();
-        std::env::set_var("SHELL", "  ");
+        let _shell = EnvGuard::set(&[("SHELL", "  ")]);
         assert_eq!(user_shell(), "bash");
-        match original {
-            Some(v) => std::env::set_var("SHELL", v),
-            None => std::env::remove_var("SHELL"),
-        }
     }
 
     #[test]
     #[serial_test::serial(shell_env)]
     fn test_user_posix_shell_returns_posix() {
-        let original = std::env::var("SHELL").ok();
-        std::env::set_var("SHELL", "/bin/zsh");
+        let _shell = EnvGuard::set(&[("SHELL", "/bin/zsh")]);
         assert_eq!(user_posix_shell(), "/bin/zsh");
-        match original {
-            Some(v) => std::env::set_var("SHELL", v),
-            None => std::env::remove_var("SHELL"),
-        }
     }
 
     #[test]
     #[serial_test::serial(shell_env)]
     fn test_user_posix_shell_falls_back_for_fish() {
-        let original = std::env::var("SHELL").ok();
-        std::env::set_var("SHELL", "/usr/bin/fish");
+        let _shell = EnvGuard::set(&[("SHELL", "/usr/bin/fish")]);
         assert_eq!(user_posix_shell(), "bash");
-        match original {
-            Some(v) => std::env::set_var("SHELL", v),
-            None => std::env::remove_var("SHELL"),
-        }
     }
 
     #[test]
     #[serial_test::serial(shell_env)]
     fn test_user_posix_shell_falls_back_for_nu() {
-        let original = std::env::var("SHELL").ok();
-        std::env::set_var("SHELL", "/usr/bin/nu");
+        let _shell = EnvGuard::set(&[("SHELL", "/usr/bin/nu")]);
         assert_eq!(user_posix_shell(), "bash");
-        match original {
-            Some(v) => std::env::set_var("SHELL", v),
-            None => std::env::remove_var("SHELL"),
-        }
     }
 
     #[test]

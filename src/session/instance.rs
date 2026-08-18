@@ -10522,9 +10522,8 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn test_wrap_command_uses_stdin_script() {
-        let original = std::env::var("SHELL").ok();
         for shell in &["/bin/bash", "/bin/zsh", "/usr/bin/fish", "/usr/bin/nu"] {
-            std::env::set_var("SHELL", shell);
+            let _shell = EnvGuard::set(&[("SHELL", shell)]);
             let wrapped = wrap_command_ignore_suspend("claude", "/tmp/proj");
             assert!(
                 wrapped.contains("/dev/fd/3 3<<'AOE_LAUNCH_BODY'"),
@@ -10533,33 +10532,23 @@ mod tests {
             assert!(wrapped.contains("\nstty susp undef\nexec env claude\n"));
             assert!(!wrapped.contains(" -c "));
         }
-        match original {
-            Some(v) => std::env::set_var("SHELL", v),
-            None => std::env::remove_var("SHELL"),
-        }
     }
 
     #[test]
     #[serial_test::serial(shell_env)]
     fn test_wrap_command_posix_shell_uses_login() {
-        let original = std::env::var("SHELL").ok();
-        std::env::set_var("SHELL", "/bin/zsh");
+        let _shell = EnvGuard::set(&[("SHELL", "/bin/zsh")]);
         let wrapped = wrap_command_ignore_suspend("claude", "/tmp/proj");
         assert!(
             wrapped.starts_with("'/bin/zsh' -l /dev/fd/3 "),
             "POSIX shell should use a login descriptor script: {wrapped}",
         );
-        match original {
-            Some(v) => std::env::set_var("SHELL", v),
-            None => std::env::remove_var("SHELL"),
-        }
     }
 
     #[test]
     #[serial_test::serial(shell_env)]
     fn test_wrap_command_fish_skips_login() {
-        let original = std::env::var("SHELL").ok();
-        std::env::set_var("SHELL", "/usr/bin/fish");
+        let _shell = EnvGuard::set(&[("SHELL", "/usr/bin/fish")]);
         let wrapped = wrap_command_ignore_suspend("claude", "/tmp/proj");
         // The bash fallback must not load bash login files because the user's
         // PATH setup belongs to fish.
@@ -10567,26 +10556,17 @@ mod tests {
             wrapped.starts_with("'bash' /dev/fd/3 "),
             "fish should use a non-login bash descriptor script: {wrapped}",
         );
-        match original {
-            Some(v) => std::env::set_var("SHELL", v),
-            None => std::env::remove_var("SHELL"),
-        }
     }
 
     #[test]
     #[serial_test::serial(shell_env)]
     fn test_wrap_command_nu_skips_login() {
-        let original = std::env::var("SHELL").ok();
-        std::env::set_var("SHELL", "/usr/bin/nu");
+        let _shell = EnvGuard::set(&[("SHELL", "/usr/bin/nu")]);
         let wrapped = wrap_command_ignore_suspend("claude", "/tmp/proj");
         assert!(
             wrapped.starts_with("'bash' /dev/fd/3 "),
             "nu should use a non-login bash descriptor script: {wrapped}",
         );
-        match original {
-            Some(v) => std::env::set_var("SHELL", v),
-            None => std::env::remove_var("SHELL"),
-        }
     }
 
     /// #3265: a login shell's own profile/rc files can `cd` elsewhere
@@ -11762,6 +11742,16 @@ mod tests {
     #[test]
     fn omp_capture_gate_executes_nested_stdin_scripts() {
         use std::os::unix::fs::PermissionsExt;
+
+        // Held purely as a lock, per the precedent in
+        // `src/server/api/plugins.rs`. Reading the inherited PATH means this
+        // test is no longer immune to the peers that scrub PATH
+        // process-globally (`crate::acp::node` removes it,
+        // `crate::acp::acp_client` points it at an empty tempdir). Those
+        // carry `#[serial]`, which excludes annotated peers but not this
+        // one, so take the same lock rather than add an annotation nothing
+        // else here needs.
+        let _env_lock = EnvGuard::unset(&[]);
 
         let temp = tempfile::tempdir().unwrap();
         let bin = temp.path().join("bin");
