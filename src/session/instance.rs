@@ -10585,10 +10585,14 @@ mod tests {
         // `EnvGuard` rather than a bare `set_var` plus a manual restore at the
         // end: it restores on the unwind if an assertion below fails, and it
         // serialises against other `EnvGuard` users. It does NOT hide the
-        // override from tests that take no guard - `ENV_LOCK` is only ever
-        // acquired by `EnvGuard` - which is why resolving a real `bash` above
-        // still matters: the concurrent readers of `$SHELL` see the override
+        // override from tests that take no guard - `test_support::ENV_LOCK` is
+        // only ever acquired by `EnvGuard` (note `logging.rs` has a separate,
+        // unrelated `ENV_LOCK` that is locked directly) - which is why
+        // resolving a real `bash` above still matters: 12 of the 14
+        // `repo_config` hook tests take no guard, so they see the override
         // either way, and what they must not see is a path that cannot run.
+        // The other two do hold the lock, and `EnvGuard` alone would have
+        // covered those.
         let _shell = EnvGuard::set(&[("SHELL", &bash)]);
         let temp = tempfile::tempdir().unwrap();
         let working_dir = temp.path().join("some project's dir");
