@@ -10603,9 +10603,12 @@ mod tests {
         // (NixOS, a minimal container) has no `/bin/bash` for it to reach.
         let bash = which::which("bash").expect("bash on PATH");
         // `EnvGuard` rather than a bare `set_var` plus a manual restore at the
-        // end: it holds the process-global env lock for the whole scope, so a
-        // concurrent test cannot observe the override, and it restores on the
-        // unwind if an assertion below fails.
+        // end: it restores on the unwind if an assertion below fails, and it
+        // serialises against other `EnvGuard` users. It does NOT hide the
+        // override from tests that take no guard - `ENV_LOCK` is only ever
+        // acquired by `EnvGuard` - which is why resolving a real `bash` above
+        // still matters: the concurrent readers of `$SHELL` see the override
+        // either way, and what they must not see is a path that cannot run.
         let _shell = EnvGuard::set(&[("SHELL", &bash)]);
         let temp = tempfile::tempdir().unwrap();
         let working_dir = temp.path().join("some project's dir");
@@ -11671,9 +11674,10 @@ mod tests {
             command
                 .args(["-c", &script])
                 .env_clear()
-                // Same reason as `test_path_with_shim`: `env_clear` is here to
-                // control the OMP_STORE_ENV_KEYS the fingerprint folds in, not
-                // to pin a filesystem layout, so inherit the caller's PATH.
+                // `env_clear` is here to control which OMP_STORE_ENV_KEYS the
+                // fingerprint folds in, not to pin a filesystem layout, so the
+                // PATH comes from the caller rather than a literal
+                // `/usr/bin:/bin`.
                 .env("PATH", std::env::var_os("PATH").unwrap_or_default());
             // Pin the exact routing environment a host launch installs into the
             // pane for this HOME, so the check reproduces the fingerprint's env
@@ -11741,7 +11745,13 @@ mod tests {
     /// `PATH` entry need not be UTF-8, and `to_string_lossy` would corrupt it.
     #[cfg(unix)]
     fn test_path_with_shim(bin: &std::path::Path) -> std::ffi::OsString {
-        let inherited = std::env::var_os("PATH").unwrap_or_default();
+        // An unset or empty PATH is handled separately: `split_paths("")`
+        // yields one EMPTY entry, and an empty PATH element means the current
+        // directory, so joining it would hand the child `<shim>:` and put cwd
+        // on its PATH.
+        let Some(inherited) = std::env::var_os("PATH").filter(|p| !p.is_empty()) else {
+            return bin.as_os_str().to_os_string();
+        };
         let entries = std::iter::once(bin.to_path_buf())
             .chain(std::env::split_paths(&inherited))
             .collect::<Vec<_>>();
