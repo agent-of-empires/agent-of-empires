@@ -4037,7 +4037,7 @@ mod tests {
         let payload_path = file.container_env_path.as_ref().unwrap().clone();
         let command = format!(
             "printf '%s\\n%s' \"$PATH\" \"${{DOCKER_HOST-unset}}\" > {}; \
-             /bin/cat {} > {}",
+             cat {} > {}",
             script_shell_escape(&host_output.to_string_lossy()),
             crate::session::environment::CONTAINER_EXEC_ENV_PATH,
             script_shell_escape(&payload_output.to_string_lossy()),
@@ -4061,9 +4061,13 @@ mod tests {
             );
         }
 
+        // The PATH is asserted back below to prove the env file did not mutate
+        // the host process environment, so it has to be a value this host can
+        // actually resolve `cat` on rather than a hardcoded `/usr/bin:/bin`.
+        let host_path = std::env::var("PATH").unwrap_or_default();
         let status = std::process::Command::new("/bin/sh")
             .args(["-c", &wrapper])
-            .env("PATH", "/usr/bin:/bin")
+            .env("PATH", &host_path)
             .env_remove("DOCKER_HOST")
             .env_remove("BASH_ENV")
             .env_remove("ENV")
@@ -4072,7 +4076,7 @@ mod tests {
         assert!(status.success());
         assert_eq!(
             std::fs::read_to_string(host_output).unwrap(),
-            "/usr/bin:/bin\nunset"
+            format!("{host_path}\nunset")
         );
         assert_eq!(
             std::fs::read_to_string(payload_output).unwrap(),

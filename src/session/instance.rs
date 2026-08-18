@@ -11672,7 +11672,10 @@ mod tests {
             command
                 .args(["-c", &script])
                 .env_clear()
-                .env("PATH", "/usr/bin:/bin");
+                // Same reason as `test_path_with_shim`: `env_clear` is here to
+                // control the OMP_STORE_ENV_KEYS the fingerprint folds in, not
+                // to pin a filesystem layout, so inherit the caller's PATH.
+                .env("PATH", std::env::var_os("PATH").unwrap_or_default());
             // Pin the exact routing environment a host launch installs into the
             // pane for this HOME, so the check reproduces the fingerprint's env
             // instead of assuming the ambient OMP_STORE_ENV_KEYS are empty. They
@@ -11730,17 +11733,23 @@ mod tests {
         assert!(!command.contains("/dev/pts/*"));
         assert!(command.find("printf").unwrap() < command.rfind("exec sh -c").unwrap());
     }
+    /// The shim dir ahead of the caller's real `PATH`. Inheriting the caller's
+    /// value rather than forcing a literal `/usr/bin:/bin` is what lets these
+    /// run on a host whose coreutils live outside the FHS layout. The shim
+    /// stays first, so the fake `tmux` still wins over any real one.
+    ///
+    /// Built with `join_paths` over `OsString` rather than formatting: a
+    /// `PATH` entry need not be UTF-8, and `to_string_lossy` would corrupt it.
     #[cfg(unix)]
-    /// The shim dir ahead of the caller's real `PATH`. Appending the inherited
-    /// value rather than a literal `/usr/bin:/bin` is what lets these run on a
-    /// host whose coreutils live outside the FHS layout.
-    fn test_path_with_shim(bin: &std::path::Path) -> String {
-        match std::env::var_os("PATH") {
-            Some(path) => format!("{}:{}", bin.display(), path.to_string_lossy()),
-            None => bin.display().to_string(),
-        }
+    fn test_path_with_shim(bin: &std::path::Path) -> std::ffi::OsString {
+        let inherited = std::env::var_os("PATH").unwrap_or_default();
+        let entries = std::iter::once(bin.to_path_buf())
+            .chain(std::env::split_paths(&inherited))
+            .collect::<Vec<_>>();
+        std::env::join_paths(entries).expect("PATH entries contain no separator")
     }
 
+    #[cfg(unix)]
     #[test]
     fn omp_capture_gate_executes_nested_stdin_scripts() {
         use std::os::unix::fs::PermissionsExt;
