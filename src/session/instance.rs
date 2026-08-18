@@ -10599,7 +10599,11 @@ mod tests {
     #[serial_test::serial(shell_env)]
     fn test_wrap_command_reasserts_working_dir_after_login_shell() {
         let original = std::env::var("SHELL").ok();
-        std::env::set_var("SHELL", "/bin/bash");
+        // Resolved rather than hardcoded to `/bin/bash`: the wrapper execs
+        // `$SHELL`, and a host that keeps its shells outside the FHS layout
+        // (NixOS, a minimal container) has no `/bin/bash` for it to reach.
+        let bash = which::which("bash").expect("bash on PATH");
+        std::env::set_var("SHELL", &bash);
         let temp = tempfile::tempdir().unwrap();
         let working_dir = temp.path().join("some project's dir");
         std::fs::create_dir(&working_dir).unwrap();
@@ -11727,6 +11731,16 @@ mod tests {
         assert!(command.find("printf").unwrap() < command.rfind("exec sh -c").unwrap());
     }
     #[cfg(unix)]
+    /// The shim dir ahead of the caller's real `PATH`. Appending the inherited
+    /// value rather than a literal `/usr/bin:/bin` is what lets these run on a
+    /// host whose coreutils live outside the FHS layout.
+    fn test_path_with_shim(bin: &std::path::Path) -> String {
+        match std::env::var_os("PATH") {
+            Some(path) => format!("{}:{}", bin.display(), path.to_string_lossy()),
+            None => bin.display().to_string(),
+        }
+    }
+
     #[test]
     fn omp_capture_gate_executes_nested_stdin_scripts() {
         use std::os::unix::fs::PermissionsExt;
@@ -11754,7 +11768,7 @@ mod tests {
         std::fs::write(&script, outer).unwrap();
         let status = std::process::Command::new("sh")
             .arg(&script)
-            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("PATH", test_path_with_shim(&bin))
             .env("TMUX_PANE", "%1")
             .status()
             .unwrap();
@@ -11776,7 +11790,7 @@ mod tests {
         std::fs::write(&script, large_outer).unwrap();
         let status = std::process::Command::new("sh")
             .arg(&script)
-            .env("PATH", format!("{}:/usr/bin:/bin", bin.display()))
+            .env("PATH", test_path_with_shim(&bin))
             .env("TMUX_PANE", "%1")
             .status()
             .unwrap();
