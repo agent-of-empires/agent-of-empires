@@ -566,46 +566,80 @@ fn claude_has_folder_trust_question(recent: &[&str], recent_lower: &str) -> bool
             .contains("is this a project you created or one you trust")
 }
 
-/// How many lines a wrapped option label may occupy. Its longest word is six
-/// characters, so even the ~16-column pane at the bottom of `responsive.rs`'s
-/// documented range needs no more than this.
+/// How many lines a wrapped option label may occupy. It is 24 characters, and
+/// the narrowest layout `responsive.rs` documents (a ~26 viewport, so a
+/// 22-column stacked pane) wraps it onto two; four leaves room down to a
+/// 10-column pane, below which the label is lost.
 const CLAUDE_TRUST_LABEL_WRAP_LINES: usize = 4;
 
 /// The trust prompt's option label, matched over the choice row *and its
-/// wrapped continuations* rather than a single line or the whole window.
+/// wrapped continuations*, and required to be the option's own text.
 ///
-/// Both extremes fail. A single-line match loses the label as soon as the pane
-/// is narrow enough to wrap it, which is the band this whole change is about.
-/// Collapsing the entire window instead finds the label anywhere, including in
-/// ordinary prose, and that costs the anti-echo property the rest of this file
-/// relies on: a pane merely *describing* the prompt would satisfy it, and since
-/// a blocking rule outranks the running signal, an actively generating turn
-/// would report Waiting. Measured, when the match was window-wide: a pane with
-/// a live spinner, a live token counter and `esc to interrupt` flipped
-/// Running -> Waiting on prose alone, and a second one spliced the label out of
-/// two unrelated lines.
+/// Three things are load-bearing, each closing a false positive that was
+/// measured on a pane carrying a live spinner, a live token counter and
+/// `esc to interrupt`, i.e. an actively generating turn reported as blocked:
 ///
-/// Anchoring to the block that starts at a numbered-choice line keeps the
-/// wrap tolerance and restores the anchor: prose that mentions the label
-/// without rendering it as a menu row never enters the haystack.
+/// 1. The block is anchored to a choice row. Collapsing the whole window
+///    instead finds the label in ordinary prose.
+/// 2. The row must carry no echo prefix. `claude_line_is_numbered_choice`
+///    strips a leading `>`, so a markdown blockquote quoting this prompt opened
+///    a block; line-number prefixes from `grep -n` output did the same when
+///    they fell inside a block another row had opened.
+/// 3. The label must START the option text. Without that, a numbered *prose*
+///    list whose item happens to be followed by the label two lines down
+///    matches - "1. read the prompt, which asks ..." then "the highlighted
+///    option is Yes, I trust this folder" - which is not a menu row by any
+///    reading.
 ///
-/// Residual, and deliberately not closed: prose that puts the label within
-/// `CLAUDE_TRUST_LABEL_WRAP_LINES` lines *after* a numbered-choice line still
-/// matches. That shape is a rendered menu row by any structural reading, so
-/// there is nothing left to distinguish it here.
+/// What remains reachable: prose that renders a genuine-looking menu row whose
+/// option text begins with the label. That is a rendered menu row, and nothing
+/// structural separates it from one.
 fn claude_has_trust_option_label(recent: &[&str]) -> bool {
     recent.iter().enumerate().any(|(start, line)| {
-        if !claude_line_is_numbered_choice(line) {
+        let Some(option) = claude_trust_choice_option_text(line) else {
             return false;
-        }
+        };
         let next_choice = recent[start + 1..]
             .iter()
             .position(|l| claude_line_is_numbered_choice(l))
             .map_or(recent.len(), |offset| start + 1 + offset);
         let end = next_choice.min(start + CLAUDE_TRUST_LABEL_WRAP_LINES);
-        collapse_ascii_whitespace(&recent[start..end].join("\n").to_lowercase())
-            .contains("yes, i trust this folder")
+        let continuations: Vec<&str> = recent[start + 1..end]
+            .iter()
+            .copied()
+            .filter(|l| claude_line_is_unechoed(l))
+            .collect();
+        let joined = std::iter::once(option)
+            .chain(continuations)
+            .collect::<Vec<_>>()
+            .join(" ")
+            .to_lowercase();
+        collapse_ascii_whitespace(&joined).starts_with("yes, i trust this folder")
     })
+}
+
+/// The option text of an unechoed numbered choice: `❯ 1. Yes` -> `Yes`.
+/// Only the `❯` cursor is tolerated ahead of the number. A `>` is not, because
+/// that is how a markdown blockquote and quoted terminal output render.
+fn claude_trust_choice_option_text(line: &str) -> Option<&str> {
+    let trimmed = line.trim_start();
+    let rest = trimmed.strip_prefix('❯').map_or(trimmed, str::trim_start);
+    let mut chars = rest.chars();
+    if !matches!(chars.next(), Some('1'..='9')) || !matches!(chars.next(), Some('.')) {
+        return None;
+    }
+    Some(chars.as_str().trim_start())
+}
+
+/// A line that is pane content rather than content echoed inside it. Echoed
+/// rows carry a prefix: a `grep -n` line number, a diff `+`, a tool-result
+/// `⎿`, or a blockquote `>`.
+fn claude_line_is_unechoed(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    !trimmed.starts_with(['+', '⎿', '>'])
+        && !trimmed
+            .split_once(char::is_whitespace)
+            .is_some_and(|(head, _)| !head.is_empty() && head.chars().all(|c| c.is_ascii_digit()))
 }
 
 /// Claude's `AskUserQuestion` tool renders an interactive selection UI: an
@@ -2885,6 +2919,41 @@ enter to select · esc to cancel";
    esc to interrupt
 ";
         assert_eq!(detect_claude_status(echoed), Status::Running);
+    }
+
+    /// The three shapes a whole-window or bare-line anchor let through, each
+    /// an actively generating turn that reported `Waiting`.
+    #[test]
+    fn claude_trust_label_outside_a_menu_row_is_not_a_prompt() {
+        let blockquote = "\
+\u{25cf} Here is what the docs show:
+> 1. Yes, I trust this folder
+> 2. No, exit
+\u{25cf} And the question was: Is this a project you created or one you trust?
+ \u{273b} Working\u{2026} (12s \u{b7} \u{2193} 431 tokens)
+   esc to interrupt
+";
+        assert_eq!(detect_claude_status(blockquote), Status::Running);
+
+        let echoed_after_a_list = "\
+\u{25cf} That is the fixture. Is this a project you created or one you trust?
+ 1. an unrelated list item
+  2812 \u{276f} 1. Yes, I trust this folder
+  2813   2. No, exit
+ \u{273b} Working\u{2026} (4s)
+   esc to interrupt
+";
+        assert_eq!(detect_claude_status(echoed_after_a_list), Status::Running);
+
+        let numbered_prose_plan = "\
+\u{25cf} The plan:
+ 1. read the prompt, which asks: Is this a project you created or one you trust?
+ the highlighted option is Yes, I trust this folder
+ and then we proceed.
+ \u{273b} Working\u{2026} (9s)
+   esc to interrupt
+";
+        assert_eq!(detect_claude_status(numbered_prose_plan), Status::Running);
     }
 
     #[test]
