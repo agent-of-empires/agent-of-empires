@@ -1974,6 +1974,23 @@ impl Instance {
         self.session_id_poller = previous.session_id_poller.clone();
         self.retroactive_capture_excludes = previous.retroactive_capture_excludes.clone();
     }
+    /// Carry every in-process field from a pre-move live row onto the
+    /// committed disk-derived candidate published by `HomeView`.
+    pub(crate) fn merge_runtime_for_profile_move(&mut self, previous: &Self) {
+        self.merge_runtime_from_reload(previous);
+        self.live_status_baseline = previous.live_status_baseline;
+        self.ever_confirmed_present = previous.ever_confirmed_present;
+        self.unknown_since = previous.unknown_since;
+        self.pane_dead_observed = previous.pane_dead_observed;
+        self.force_fresh_next_launch = previous.force_fresh_next_launch;
+        self.pending_host_env = previous.pending_host_env.clone();
+        self.file_watch = previous.file_watch.clone();
+        if let (Some(reloaded_sandbox), Some(runtime_sandbox)) =
+            (self.sandbox_info.as_mut(), previous.sandbox_info.as_ref())
+        {
+            reloaded_sandbox.before_start_env = runtime_sandbox.before_start_env.clone();
+        }
+    }
 
     /// Splice TUI-mirrored, persisted fields from `src` onto `self`. Used by
     /// `HomeView::save` for fields the TUI is the canonical disk writer of
@@ -2125,6 +2142,26 @@ impl Instance {
             return;
         }
         self.last_accessed_at = Some(incoming);
+    }
+
+    /// Merge the complete user-requested delta for a cross-profile move while
+    /// preserving unrelated fields refreshed by a peer after `pre` was read.
+    /// A tool change is one atomic state transition: the tool name and every
+    /// conversation field staged by `swap_tool` must travel together.
+    pub(crate) fn merge_profile_move_diff(&mut self, pre: &Self, post: &Self) {
+        self.merge_user_action_diff(pre, post);
+        if pre.tool != post.tool {
+            // Apply the requested transition to the freshly locked disk row.
+            // The TUI post snapshot can carry parked session ids captured
+            // before a poller or peer refreshed the durable conversation state.
+            self.swap_tool(&post.tool);
+        }
+        if pre.command != post.command {
+            self.command = post.command.clone();
+        }
+        if pre.extra_args != post.extra_args {
+            self.extra_args = post.extra_args.clone();
+        }
     }
 
     /// Per-field-conditional splice: copy `post.X` onto `self.X` only when

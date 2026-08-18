@@ -8,7 +8,7 @@ use tui_input::Input;
 
 use super::{ConfigRefreshOrigin, ConfigWatchKey, HomeView, PreviewSelection, ViewMode};
 use crate::session::{
-    GroupTree, Instance, Item, LifecycleOperation, LifecycleReservation, Status, Storage,
+    Group, GroupTree, Instance, Item, LifecycleOperation, LifecycleReservation, Status, Storage,
 };
 use crate::tmux::AvailableTools;
 use crate::tui::app::Action;
@@ -20,10 +20,6 @@ fn key(code: KeyCode) -> KeyEvent {
 
 fn setup_test_home(temp: &TempDir) -> AppDirGuard {
     isolate_app_dir_at(temp.path())
-}
-
-fn seed_instances(view: &mut HomeView, insts: &[Instance]) {
-    view.instances = insts.iter().cloned().map(|i| (i.id.clone(), i)).collect();
 }
 
 struct TestEnv {
@@ -6312,11 +6308,10 @@ fn test_rename_selected_rejects_all_identity_collisions_and_allows_group_only_ch
     assert_eq!(beta.load().unwrap().len(), 1);
 }
 
-/// Changing a session's profile via the rename dialog must prune the
-/// source profile's now-empty group, just like the restart-with-edits
-/// path does. Without the prune the source keeps an empty group with the
-/// same name as the target's copy, which renders as a duplicate header and
-/// collides on the shared group key.
+/// Changing a session's profile via the rename dialog must transfer its group
+/// metadata in the same storage transaction. Otherwise the source can reload
+/// an empty duplicate while the target row renders under a separately-created
+/// group.
 #[test]
 #[serial]
 fn test_rename_profile_change_prunes_source_group() {
@@ -6364,6 +6359,16 @@ fn test_rename_profile_change_prunes_source_group() {
             .unwrap_or(false),
         "alpha's now-empty 'work' group should be pruned after the profile move"
     );
+    let (_, source_groups) = Storage::new_unwatched("alpha")
+        .unwrap()
+        .load_with_groups()
+        .unwrap();
+    let (_, target_groups) = Storage::new_unwatched("beta")
+        .unwrap()
+        .load_with_groups()
+        .unwrap();
+    assert!(!source_groups.iter().any(|group| group.path == "work"));
+    assert!(target_groups.iter().any(|group| group.path == "work"));
 }
 
 #[test]
@@ -7142,6 +7147,98 @@ fn test_rename_group_empty_group() {
 
 #[test]
 #[serial]
+fn test_move_explicit_empty_group_between_profiles() {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let source = Storage::new_unwatched("alpha").unwrap();
+    source
+        .update(|_instances, groups| {
+            let mut group = Group::new("empty", "empty");
+            group.collapsed = true;
+            groups.push(group);
+            Ok(())
+        })
+        .unwrap();
+    let _target = Storage::new_unwatched("beta").unwrap();
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.group_rename_context = Some(super::GroupRenameContext {
+        old_path: "empty".to_string(),
+        old_profile: "alpha".to_string(),
+    });
+
+    view.rename_selected_group(Some("moved-empty"), Some("beta"))
+        .unwrap();
+
+    assert!(Storage::new_unwatched("alpha")
+        .unwrap()
+        .load_with_groups()
+        .unwrap()
+        .1
+        .iter()
+        .all(|group| group.path != "empty"));
+    let moved = Storage::new_unwatched("beta")
+        .unwrap()
+        .load_with_groups()
+        .unwrap()
+        .1
+        .into_iter()
+        .find(|group| group.path == "moved-empty")
+        .expect("empty group metadata moved to target profile");
+    assert!(moved.collapsed);
+}
+
+#[test]
+#[serial]
+fn test_group_profile_move_rejects_concurrent_fresh_member_without_metadata_split() {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let source = Storage::new_unwatched("alpha").unwrap();
+    let mut known = Instance::new("known", "/tmp/known");
+    known.group_path = "team".to_string();
+    source
+        .update(|instances, groups| {
+            instances.push(known.clone());
+            groups.push(Group::new("team", "team"));
+            Ok(())
+        })
+        .unwrap();
+    let _target = Storage::new_unwatched("beta").unwrap();
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.group_rename_context = Some(super::GroupRenameContext {
+        old_path: "team".to_string(),
+        old_profile: "alpha".to_string(),
+    });
+
+    source
+        .update(|instances, _groups| {
+            let mut concurrent = Instance::new("concurrent", "/tmp/concurrent");
+            concurrent.group_path = "team/fresh".to_string();
+            instances.push(concurrent);
+            Ok(())
+        })
+        .unwrap();
+    let result = view.rename_selected_group(Some("moved-team"), Some("beta"));
+
+    assert!(result.is_err());
+    let (source_rows, source_groups) = source.load_with_groups().unwrap();
+    assert_eq!(source_rows.len(), 2);
+    assert!(source_rows
+        .iter()
+        .all(|instance| instance.group_path.starts_with("team")));
+    assert!(source_groups.iter().any(|group| group.path == "team"));
+    assert!(Storage::new_unwatched("beta")
+        .unwrap()
+        .load()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+#[serial]
 fn test_rename_group_duplicate_returns_error() {
     use crate::session::GroupTree;
 
@@ -7181,6 +7278,137 @@ fn test_rename_group_duplicate_returns_error() {
 
     let result = view.rename_selected_group(Some("personal"), None);
     assert!(result.is_err(), "renaming to an existing group should fail");
+}
+
+#[test]
+#[serial]
+fn test_group_profile_move_is_all_or_nothing() {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let source = Storage::new_unwatched("alpha").unwrap();
+    let mut first = Instance::new("first", "/tmp/first");
+    first.group_path = "work".to_string();
+    let mut second = Instance::new("second", "/tmp/second");
+    second.group_path = "work".to_string();
+    let mut work_group = Group::new("work", "work");
+    work_group.collapsed = true;
+    let source_empty = Group::new("keep-empty", "keep-empty");
+    source
+        .update(|instances, groups| {
+            *instances = vec![first.clone(), second.clone()];
+            *groups = vec![work_group.clone(), source_empty.clone()];
+            Ok(())
+        })
+        .unwrap();
+    let target = Storage::new_unwatched("beta").unwrap();
+    let target_empty = Group::new("target-empty", "target-empty");
+    target
+        .update(|instances, groups| {
+            instances.push(Instance::new("second", "/tmp/second/"));
+            groups.push(target_empty.clone());
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(
+        None,
+        tools.clone(),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.group_rename_context = Some(super::GroupRenameContext {
+        old_path: "work".to_string(),
+        old_profile: "alpha".to_string(),
+    });
+    assert!(view.rename_selected_group(None, Some("beta")).is_err());
+    assert_eq!(source.load().unwrap().len(), 2);
+    assert_eq!(target.load().unwrap().len(), 1);
+    let (_, source_groups) = source.load_with_groups().unwrap();
+    let (_, target_groups) = target.load_with_groups().unwrap();
+    assert_eq!(
+        source_groups,
+        vec![work_group.clone(), source_empty.clone()]
+    );
+    assert_eq!(target_groups, vec![target_empty.clone()]);
+
+    target
+        .update(|instances, _groups| {
+            instances.clear();
+            Ok(())
+        })
+        .unwrap();
+    view.group_rename_context = Some(super::GroupRenameContext {
+        old_path: "work".to_string(),
+        old_profile: "alpha".to_string(),
+    });
+    view.rename_selected_group(None, Some("beta")).unwrap();
+    assert!(source.load().unwrap().is_empty());
+    assert_eq!(target.load().unwrap().len(), 2);
+    assert!(view
+        .instances()
+        .filter(|instance| instance.group_path == "work")
+        .all(|instance| instance.source_profile == "beta"));
+    let (_, source_groups) = source.load_with_groups().unwrap();
+    assert_eq!(source_groups, vec![source_empty]);
+    let (_, target_groups) = target.load_with_groups().unwrap();
+    assert!(target_groups
+        .iter()
+        .any(|group| group.path == "work" && group.collapsed));
+    assert!(target_groups
+        .iter()
+        .any(|group| group.path == "target-empty"));
+    let reloaded = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    assert!(!reloaded.group_trees["alpha"].group_exists("work"));
+    assert!(reloaded.group_trees["alpha"].group_exists("keep-empty"));
+    assert!(reloaded.group_trees["beta"].group_exists("work"));
+    assert!(reloaded.group_trees["beta"].group_exists("target-empty"));
+}
+
+#[test]
+#[serial]
+fn group_profile_move_preflights_every_creating_member_before_mutation() {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let source = Storage::new_unwatched("alpha").unwrap();
+    let mut first = Instance::new("first", "/tmp/preflight-first");
+    first.group_path = "work".to_string();
+    let mut second = Instance::new("second", "/tmp/preflight-second");
+    second.group_path = "work".to_string();
+    source
+        .update(|instances, groups| {
+            *instances = vec![first.clone(), second.clone()];
+            groups.push(Group::new("work", "work"));
+            Ok(())
+        })
+        .unwrap();
+    let target = Storage::new_unwatched("beta").unwrap();
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view =
+        HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    view.mutate_instance(&second.id, |instance| {
+        instance.status = Status::Creating;
+    });
+    view.group_rename_context = Some(super::GroupRenameContext {
+        old_path: "work".to_string(),
+        old_profile: "alpha".to_string(),
+    });
+
+    let error = view
+        .rename_selected_group(Some("moved"), Some("beta"))
+        .expect_err("a creating member must reject the complete group move");
+
+    assert!(error.to_string().contains("being created"));
+    assert!(view
+        .instances()
+        .filter(|instance| instance.id == first.id || instance.id == second.id)
+        .all(|instance| instance.source_profile == "alpha" && instance.group_path == "work"));
+    let source_rows = source.load().unwrap();
+    assert_eq!(source_rows.len(), 2);
+    assert!(source_rows
+        .iter()
+        .all(|instance| instance.group_path == "work"));
+    assert!(target.load().unwrap().is_empty());
 }
 
 #[test]
@@ -12055,167 +12283,11 @@ fn manual_grouping_attention_sort_stays_flat() {
     );
 }
 
-/// `prune_empty_group` is the post-move cleanup that drops the source
-/// profile's now-empty copy of a group after a session moves to a
-/// different profile. Without it, both profiles end up with the same
-/// group name in unified view, the source one empty and the target one
-/// populated, which reads as a duplicate group header.
+/// A profile move commits the source-group removal with the row transfer, so
+/// reloading cannot resurrect metadata from the source profile.
 #[test]
 #[serial]
-fn prune_empty_group_drops_source_when_no_session_remains() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let _ = Storage::new_unwatched("alpha").unwrap();
-    let _ = Storage::new_unwatched("beta").unwrap();
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
-
-    // Pre-state: alpha has one session in group "work", beta is empty.
-    let mut moved = Instance::new("moved", "/tmp/moved");
-    moved.source_profile = "alpha".to_string();
-    moved.group_path = "work".to_string();
-    let insts = vec![moved];
-    seed_instances(&mut view, &insts);
-    view.group_trees.clear();
-    view.group_trees
-        .insert("alpha".to_string(), GroupTree::new_with_groups(&insts, &[]));
-    view.group_trees
-        .insert("beta".to_string(), GroupTree::new_with_groups(&[], &[]));
-    assert!(view.group_trees["alpha"].group_exists("work"));
-
-    // Simulate the move: re-tag source_profile, then prune the now-empty
-    // source group.
-    view.instance_at_mut(0).source_profile = "beta".to_string();
-    view.prune_empty_group("alpha", "work");
-
-    assert!(
-        !view.group_trees["alpha"].group_exists("work"),
-        "alpha should no longer own the now-empty 'work' group after the move"
-    );
-}
-
-/// Prune must NOT drop the source group when the source profile still
-/// has other sessions sitting at the same path (or nested under it).
-/// Two sessions, only one moved → source profile keeps the group.
-#[test]
-#[serial]
-fn prune_empty_group_keeps_source_when_sibling_session_remains() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let _ = Storage::new_unwatched("alpha").unwrap();
-    let _ = Storage::new_unwatched("beta").unwrap();
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
-
-    let mut moved = Instance::new("moved", "/tmp/moved");
-    moved.source_profile = "alpha".to_string();
-    moved.group_path = "work".to_string();
-    let mut sibling = Instance::new("sibling", "/tmp/sibling");
-    sibling.source_profile = "alpha".to_string();
-    sibling.group_path = "work".to_string();
-    let insts = vec![moved, sibling];
-    seed_instances(&mut view, &insts);
-    view.group_trees.clear();
-    view.group_trees
-        .insert("alpha".to_string(), GroupTree::new_with_groups(&insts, &[]));
-    view.group_trees
-        .insert("beta".to_string(), GroupTree::new_with_groups(&[], &[]));
-
-    view.instance_at_mut(0).source_profile = "beta".to_string();
-    view.prune_empty_group("alpha", "work");
-
-    assert!(
-        view.group_trees["alpha"].group_exists("work"),
-        "alpha must keep 'work' because the sibling session still lives there"
-    );
-}
-
-/// Prune must also keep the source group when a session sits in a
-/// *descendant* path. Only the leaf moved out; the parent still has
-/// rows under it.
-#[test]
-#[serial]
-fn prune_empty_group_keeps_source_when_descendant_session_remains() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let _ = Storage::new_unwatched("alpha").unwrap();
-    let _ = Storage::new_unwatched("beta").unwrap();
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
-
-    let mut moved = Instance::new("moved", "/tmp/moved");
-    moved.source_profile = "alpha".to_string();
-    moved.group_path = "work".to_string();
-    let mut nested = Instance::new("nested", "/tmp/nested");
-    nested.source_profile = "alpha".to_string();
-    nested.group_path = "work/frontend".to_string();
-    let insts = vec![moved, nested];
-    seed_instances(&mut view, &insts);
-    view.group_trees.clear();
-    view.group_trees
-        .insert("alpha".to_string(), GroupTree::new_with_groups(&insts, &[]));
-    view.group_trees
-        .insert("beta".to_string(), GroupTree::new_with_groups(&[], &[]));
-
-    view.instance_at_mut(0).source_profile = "beta".to_string();
-    view.prune_empty_group("alpha", "work");
-
-    assert!(
-        view.group_trees["alpha"].group_exists("work"),
-        "alpha must keep 'work' because the nested session still lives under it"
-    );
-}
-
-/// Prune must keep the source group when the profile's tree carries a
-/// descendant *group* (even with no session under it). Lets users keep
-/// hand-built structure like `work/anchor` that survives moves of every
-/// session out of the parent. Without this guard, `delete_group`'s
-/// `starts_with(prefix)` cascade nukes the anchor sub-group too.
-#[test]
-#[serial]
-fn prune_empty_group_keeps_source_when_descendant_group_remains() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let _ = Storage::new_unwatched("alpha").unwrap();
-    let _ = Storage::new_unwatched("beta").unwrap();
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
-
-    let mut moved = Instance::new("moved", "/tmp/moved");
-    moved.source_profile = "alpha".to_string();
-    moved.group_path = "work".to_string();
-    let insts = vec![moved];
-    seed_instances(&mut view, &insts);
-    view.group_trees.clear();
-    let mut alpha_tree = GroupTree::new_with_groups(&insts, &[]);
-    alpha_tree.create_group("work/anchor");
-    view.group_trees.insert("alpha".to_string(), alpha_tree);
-    view.group_trees
-        .insert("beta".to_string(), GroupTree::new_with_groups(&[], &[]));
-    assert!(view.group_trees["alpha"].group_exists("work/anchor"));
-
-    view.instance_at_mut(0).source_profile = "beta".to_string();
-    view.prune_empty_group("alpha", "work");
-
-    assert!(
-        view.group_trees["alpha"].group_exists("work"),
-        "alpha must keep 'work' because of the user-anchored 'work/anchor' sub-group"
-    );
-    assert!(
-        view.group_trees["alpha"].group_exists("work/anchor"),
-        "anchor sub-group must survive the no-op prune"
-    );
-}
-
-/// The prune must persist through save+reload. Without tombstoning in
-/// `pending_group_deletions`, the in-memory delete is reverted on next
-/// startup because `HomeView::new` reloads `existing_groups` from disk
-/// and reseeds the tree with the supposedly-pruned group. Mirrors the
-/// restart_selected_session sequence: seed + persist, then move + prune
-/// + persist.
-#[test]
-#[serial]
-fn prune_empty_group_survives_save_and_reload() {
+fn profile_move_group_metadata_survives_reload() {
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
     let _ = Storage::new_unwatched("alpha").unwrap();
@@ -12250,11 +12322,9 @@ fn prune_empty_group_survives_save_and_reload() {
         view.group_trees
             .entry("beta".to_string())
             .or_insert_with(|| GroupTree::new_with_groups(&[], &[]));
-        let old_path = view.instances["moved"].group_path.clone();
-        view.move_to_profile("moved", "beta", old_path.clone())
+        let requested = view.instances["moved"].clone();
+        view.move_to_profile("moved", "beta", requested, None)
             .unwrap();
-        view.prune_empty_group("alpha", &old_path);
-        view.save().unwrap();
     }
 
     let reloaded = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
@@ -12266,6 +12336,20 @@ fn prune_empty_group_survives_save_and_reload() {
         !reloaded.group_trees["alpha"].group_exists("work"),
         "pruned 'work' must stay gone after save+reload, not get re-seeded from disk"
     );
+    assert!(
+        reloaded.group_trees["beta"].group_exists("work"),
+        "target group metadata must be committed with the moved row"
+    );
+    let (_, source_groups) = Storage::new_unwatched("alpha")
+        .unwrap()
+        .load_with_groups()
+        .unwrap();
+    let (_, target_groups) = Storage::new_unwatched("beta")
+        .unwrap()
+        .load_with_groups()
+        .unwrap();
+    assert!(!source_groups.iter().any(|group| group.path == "work"));
+    assert!(target_groups.iter().any(|group| group.path == "work"));
 }
 
 /// Favorite, snooze, and urgent decorations only render in Attention sort.
@@ -17623,6 +17707,7 @@ mod default_attach_mode {
 
 mod save_field_merge {
     use super::*;
+    use crate::session::Status;
     use chrono::Utc;
 
     fn boot_view_with_one_session(
@@ -18005,31 +18090,56 @@ mod save_field_merge {
 
     #[test]
     #[serial]
-    fn test_move_to_profile_marks_tombstone_and_pending_added() {
+    fn test_move_to_profile_commits_without_pending_bookkeeping() {
         let (_temp, _guard, mut view, id) = boot_view_with_one_session("victim", "/tmp/move");
         view.storages.insert(
             "target".to_string(),
             Storage::new_unwatched("target").unwrap(),
         );
+        let runtime_sentinel = std::time::Instant::now();
+        view.mutate_instance(&id, |instance| {
+            instance.last_error = Some("live-only-error".to_string());
+            instance.last_error_check = Some(runtime_sentinel);
+            instance.last_start_time = Some(runtime_sentinel);
+            instance.live_status_baseline = Some(Status::Waiting);
+            instance.ever_confirmed_present = true;
+            instance.unknown_since = Some(runtime_sentinel);
+            instance.pane_dead_observed = true;
+            instance.force_fresh_next_launch = true;
+        });
 
-        view.move_to_profile(&id, "target", "moved/group".to_string())
+        let mut requested = view.get_instance(&id).unwrap().clone();
+        requested.group_path = "moved/group".to_string();
+        view.move_to_profile(&id, "target", requested, None)
+            .unwrap();
+        view.reload_preserving_profile_move_runtime(std::slice::from_ref(&id))
             .unwrap();
 
-        assert!(
-            view.pending_deletions
-                .get("test")
-                .is_some_and(|s| s.contains(&id)),
-            "old profile must have tombstone"
+        assert!(!view.pending_deletions.values().any(|ids| ids.contains(&id)));
+        assert!(!view.pending_added.values().any(|ids| ids.contains(&id)));
+        let source = Storage::new_unwatched("test").unwrap().load().unwrap();
+        let target = Storage::new_unwatched("target").unwrap().load().unwrap();
+        assert!(!source.iter().any(|instance| instance.id == id));
+        let moved = target
+            .iter()
+            .find(|instance| instance.id == id)
+            .expect("target row committed");
+        assert_eq!(moved.group_path, "moved/group");
+        let in_memory = view.get_instance(&id).unwrap();
+        assert_eq!(in_memory.source_profile, "target");
+        assert_eq!(in_memory.group_path, "moved/group");
+        assert_eq!(
+            in_memory.last_error.as_deref(),
+            Some("live-only-error"),
+            "runtime-only error must survive publication"
         );
-        assert!(
-            view.pending_added
-                .get("target")
-                .is_some_and(|s| s.contains(&id)),
-            "new profile must have pending_added entry"
-        );
-        let inst = view.get_instance(&id).unwrap();
-        assert_eq!(inst.source_profile, "target");
-        assert_eq!(inst.group_path, "moved/group");
+        assert_eq!(in_memory.last_error_check, Some(runtime_sentinel));
+        assert_eq!(in_memory.last_start_time, Some(runtime_sentinel));
+        assert_eq!(in_memory.live_status_baseline, Some(Status::Waiting));
+        assert!(in_memory.ever_confirmed_present);
+        assert_eq!(in_memory.unknown_since, Some(runtime_sentinel));
+        assert!(in_memory.pane_dead_observed);
+        assert!(in_memory.force_fresh_next_launch);
     }
 
     #[test]
@@ -18041,7 +18151,10 @@ mod save_field_merge {
             Storage::new_unwatched("target").unwrap(),
         );
 
-        view.move_to_profile(&id, "target", String::new()).unwrap();
+        let mut requested = view.get_instance(&id).unwrap().clone();
+        requested.group_path.clear();
+        view.move_to_profile(&id, "target", requested, None)
+            .unwrap();
         view.save().expect("save must succeed across profiles");
 
         let old_disk = Storage::new_unwatched("test").unwrap().load().unwrap();
@@ -18133,12 +18246,14 @@ mod save_field_merge {
             .unwrap();
 
         let _guards = view.lock_session_mutation_and_reload(&id).unwrap();
-        let authoritative = view.get_instance(&id).unwrap();
+        let authoritative = view.get_instance(&id).cloned().unwrap();
         assert_eq!(authoritative.title, "peer-new-title");
         assert_eq!(authoritative.lifecycle_generation, 7);
         assert_eq!(authoritative.status, Status::Running);
 
-        view.move_to_profile(&id, "target", String::new()).unwrap();
+        let requested = authoritative.clone();
+        view.move_to_profile(&id, "target", requested, None)
+            .unwrap();
         view.save().unwrap();
 
         let target = Storage::new_unwatched("target")
@@ -18184,8 +18299,9 @@ mod save_field_merge {
             .unwrap();
 
         let _guards = view.lock_session_mutation_and_reload(&id).unwrap();
+        let requested = view.get_instance(&id).cloned().unwrap();
         let error = view
-            .move_to_profile(&id, "target", String::new())
+            .move_to_profile(&id, "target", requested, None)
             .expect_err("reserved session must not move profiles");
 
         assert!(error
@@ -18283,8 +18399,9 @@ mod save_field_merge {
     fn test_move_to_profile_same_profile_only_updates_group_path() {
         let (_temp, _guard, mut view, id) = boot_view_with_one_session("victim", "/tmp/move");
 
-        view.move_to_profile(&id, "test", "newgrp".to_string())
-            .unwrap();
+        let mut requested = view.get_instance(&id).unwrap().clone();
+        requested.group_path = "newgrp".to_string();
+        view.move_to_profile(&id, "test", requested, None).unwrap();
 
         assert!(
             !view.pending_deletions.contains_key("test")
@@ -18353,6 +18470,7 @@ mod save_field_merge {
                 _ => false,
             })
         };
+
         assert!(
             archived_section_present(&view.flat_items),
             "precondition: Archived section header rendered"
@@ -18379,6 +18497,225 @@ mod save_field_merge {
             !archived_section_present(&view.flat_items),
             "Archived section must disappear once the only archived row is unsunk"
         );
+    }
+    #[test]
+    #[serial]
+    fn restart_profile_move_commits_staged_launch_edit() {
+        let (_temp, _guard, mut view, id) =
+            boot_view_with_one_session("victim", "/tmp/profile-launch");
+        fn seed_swap_state(instance: &mut Instance) {
+            instance.tool = "claude".to_string();
+            instance.agent_session_id = Some("claude-session".to_string());
+        }
+        view.mutate_instance(&id, seed_swap_state);
+        view.storages["test"]
+            .update(|instances, _groups| {
+                seed_swap_state(instances.iter_mut().find(|row| row.id == id).unwrap());
+                Ok(())
+            })
+            .unwrap();
+        view.storages["test"]
+            .update(|instances, _groups| {
+                let fresh = instances.iter_mut().find(|row| row.id == id).unwrap();
+                fresh.agent_session_id = Some("fresh-claude-session".to_string());
+                Ok(())
+            })
+            .unwrap();
+        view.storages.insert(
+            "target".to_string(),
+            Storage::new_unwatched("target").unwrap(),
+        );
+        view.selected_session = Some(id.clone());
+
+        view.restart_selected_session(
+            Some("target"),
+            Some("codex"),
+            Some("--fast"),
+            Some("codex-wrapper"),
+        )
+        .unwrap();
+
+        let (source_rows, _) = Storage::new_unwatched("test")
+            .unwrap()
+            .load_with_groups()
+            .unwrap();
+        assert!(!source_rows.iter().any(|row| row.id == id));
+        let target_rows = Storage::new_unwatched("target").unwrap().load().unwrap();
+        let moved = target_rows.iter().find(|row| row.id == id).unwrap();
+        assert_eq!(moved.tool, "codex");
+        assert_eq!(moved.command, "codex-wrapper");
+        assert_eq!(moved.extra_args, "--fast");
+        assert_eq!(moved.agent_session_id, None);
+        assert_eq!(
+            moved.prior_tool_session_ids["claude"]
+                .agent_session_id
+                .as_deref(),
+            Some("fresh-claude-session")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn restart_profile_move_rejection_leaves_source_tool_state_unchanged() {
+        let (_temp, _guard, mut view, id) =
+            boot_view_with_one_session("victim", "/tmp/profile-reject");
+        view.mutate_instance(&id, |instance| {
+            instance.tool = "claude".to_string();
+            instance.agent_session_id = Some("source-durable-sid".to_string());
+        });
+        view.storages["test"]
+            .update(|instances, _groups| {
+                let source = instances.iter_mut().find(|row| row.id == id).unwrap();
+                source.tool = "claude".to_string();
+                source.agent_session_id = Some("source-durable-sid".to_string());
+                Ok(())
+            })
+            .unwrap();
+        let target = Storage::new_unwatched("target").unwrap();
+        target
+            .update(|instances, _groups| {
+                instances.push(Instance::new("victim", "/tmp/profile-reject/"));
+                Ok(())
+            })
+            .unwrap();
+        view.storages.insert("target".to_string(), target);
+        view.selected_session = Some(id.clone());
+
+        let result = view.restart_selected_session(
+            Some("target"),
+            Some("codex"),
+            Some("--new"),
+            Some("codex-wrapper"),
+        );
+        assert!(result.is_err());
+
+        let source = Storage::new_unwatched("test")
+            .unwrap()
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        assert_eq!(source.tool, "claude");
+        assert_eq!(
+            source.agent_session_id.as_deref(),
+            Some("source-durable-sid")
+        );
+        assert!(source.prior_tool_session_ids.is_empty());
+        let live = view.get_instance(&id).unwrap();
+        assert_eq!(live.source_profile, "test");
+        assert_eq!(live.tool, "claude");
+        assert_eq!(live.agent_session_id.as_deref(), Some("source-durable-sid"));
+        assert!(!view.restart_in_flight.contains(&id));
+        assert!(!view.restart_cooldown_at.contains_key(&id));
+    }
+
+    #[test]
+    #[serial]
+    fn rename_profile_move_validates_complete_candidate_before_commit() {
+        let (_temp, _guard, mut view, id) =
+            boot_view_with_one_session("old-name", "/tmp/profile-rename");
+        let target = Storage::new_unwatched("target").unwrap();
+        target
+            .update(|instances, groups| {
+                let mut collision = Instance::new("new-name", "/tmp/profile-rename/");
+                collision.source_profile = "target".to_string();
+                instances.push(collision);
+                groups.push(Group::new("existing", "existing"));
+                Ok(())
+            })
+            .unwrap();
+        view.storages.insert("target".to_string(), target);
+        view.selected_session = Some(id.clone());
+
+        let result = view.rename_selected("new-name", Some("renamed/group"), Some("target"), false);
+        assert!(result.is_err());
+
+        let (source_rows, source_groups) = Storage::new_unwatched("test")
+            .unwrap()
+            .load_with_groups()
+            .unwrap();
+        let source = source_rows.iter().find(|row| row.id == id).unwrap();
+        assert_eq!(source.title, "old-name");
+        assert!(source.group_path.is_empty());
+        assert!(source_groups.is_empty());
+        let (target_rows, target_groups) = Storage::new_unwatched("target")
+            .unwrap()
+            .load_with_groups()
+            .unwrap();
+        assert_eq!(target_rows.len(), 1);
+        assert_eq!(target_groups.len(), 1);
+        assert_eq!(target_groups[0].path, "existing");
+        let in_memory = view.get_instance(&id).unwrap();
+        assert_eq!(in_memory.source_profile, "test");
+        assert_eq!(in_memory.title, "old-name");
+    }
+
+    #[test]
+    #[serial]
+    fn tied_cross_profile_collision_rejects_before_worktree_effects() {
+        let temp = TempDir::new().unwrap();
+        let old_path = temp.path().join("old-name");
+        let new_path = temp.path().join("new-name");
+        std::fs::create_dir_all(&old_path).unwrap();
+        std::fs::write(old_path.join("sentinel"), b"untouched").unwrap();
+        let (_home, _guard, mut view, id) =
+            boot_view_with_one_session("old-name", old_path.to_str().unwrap());
+        let worktree = crate::session::WorktreeInfo {
+            branch: "old-name".to_string(),
+            main_repo_path: temp
+                .path()
+                .join("missing-repo")
+                .to_string_lossy()
+                .to_string(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        };
+        view.mutate_instance(&id, |instance| {
+            instance.worktree_info = Some(worktree.clone());
+            instance.status = Status::Stopped;
+        });
+        view.storages["test"]
+            .update(|instances, _groups| {
+                let source = instances.iter_mut().find(|row| row.id == id).unwrap();
+                source.worktree_info = Some(worktree.clone());
+                source.status = Status::Stopped;
+                Ok(())
+            })
+            .unwrap();
+        let target = Storage::new_unwatched("target").unwrap();
+        target
+            .update(|instances, _groups| {
+                instances.push(Instance::new(
+                    "new-name",
+                    new_path.to_string_lossy().as_ref(),
+                ));
+                Ok(())
+            })
+            .unwrap();
+        view.storages.insert("target".to_string(), target);
+        view.selected_session = Some(id.clone());
+
+        let result = view.rename_selected("new-name", None, Some("target"), true);
+
+        assert!(result.is_err());
+        assert!(old_path.exists());
+        assert_eq!(
+            std::fs::read(old_path.join("sentinel")).unwrap(),
+            b"untouched"
+        );
+        assert!(!new_path.join("sentinel").exists());
+        let source = Storage::new_unwatched("test")
+            .unwrap()
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        assert_eq!(source.title, "old-name");
+        assert_eq!(source.project_path, old_path.to_string_lossy().to_string());
+        assert_eq!(source.worktree_info.unwrap().branch, "old-name");
     }
 
     /// Snoozed siblings of the archive case: `snoozed_until` is also cleared
