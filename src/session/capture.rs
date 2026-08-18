@@ -2876,7 +2876,7 @@ mod tests {
     /// jsonl is older than the 5-minute live-capture window, so
     /// `capture_claude_session_id` falls past the dir scan, plus a
     /// `.claude.json` naming `last_session_id` for that directory. Returns the
-    /// project path and the encoded transcript dir.
+    /// encoded transcript dir.
     fn claude_json_fallback_home(
         temp: &tempfile::TempDir,
         project_path: &str,
