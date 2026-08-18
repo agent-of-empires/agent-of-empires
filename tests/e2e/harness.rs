@@ -713,6 +713,38 @@ last_seen_version = "{}"
         std::thread::sleep(Duration::from_millis(100));
     }
 
+    /// Deliver `text` to the TUI as a bracketed paste, the way a real
+    /// terminal does when the user hits Cmd/Ctrl+V. aoe enables bracketed
+    /// paste at startup, so crossterm turns this into one `Event::Paste`
+    /// rather than N key events, which is the only way to exercise the
+    /// paste path (`handle_paste`) rather than the keystroke path.
+    ///
+    /// Bytes go out as hex so an embedded newline or semicolon in `text`
+    /// cannot be reinterpreted by tmux's literal-mode argument parser.
+    pub fn send_paste(&self, text: &str) {
+        assert!(self.spawned, "must call spawn_tui() or spawn() first");
+        let mut bytes = b"\x1b[200~".to_vec();
+        bytes.extend_from_slice(text.as_bytes());
+        bytes.extend_from_slice(b"\x1b[201~");
+        let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let output = Command::new("tmux")
+            .arg("-S")
+            .arg(&self.socket_path)
+            .arg("send-keys")
+            .arg("-t")
+            .arg(&self.session_name)
+            .arg("-H")
+            .args(&hex)
+            .output()
+            .expect("failed to send paste");
+        assert!(
+            output.status.success(),
+            "send_paste failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::thread::sleep(Duration::from_millis(150));
+    }
+
     /// Send literal text (prevents "Enter" in text from being interpreted as
     /// the Enter key).
     pub fn type_text(&self, text: &str) {
