@@ -4020,9 +4020,10 @@ mod tests {
     }
 
     /// `#[serial]` because the assertion reads the inherited PATH, and the
-    /// peers that scrub it process-globally (`crate::acp::node`,
-    /// `crate::acp::acp_client`) carry that annotation. Not an `EnvGuard` lock:
-    /// they never take `test_support::ENV_LOCK`.
+    /// tests that scrub it process-globally carry that annotation:
+    /// `crate::acp::node`, `crate::acp::acp_client`, and four more in
+    /// `crate::update::install`. Not an `EnvGuard` lock: none of them takes
+    /// `test_support::ENV_LOCK`.
     #[test]
     #[serial_test::serial]
     fn test_container_env_file_does_not_mutate_host_process_environment() {

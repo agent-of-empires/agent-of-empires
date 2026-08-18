@@ -11733,11 +11733,12 @@ mod tests {
         std::env::join_paths(entries).expect("PATH entries contain no separator")
     }
 
-    /// `#[serial]` because this reads the inherited PATH, and the peers that
-    /// scrub PATH process-globally (`crate::acp::node`, `crate::acp::acp_client`)
-    /// carry that annotation. Not an `EnvGuard` lock: those three never take
-    /// `test_support::ENV_LOCK`, so it would exclude unrelated guard users and
-    /// leave this window open.
+    /// `#[serial]` because this reads the inherited PATH, and the tests that
+    /// scrub PATH process-globally carry that annotation: `crate::acp::node`,
+    /// `crate::acp::acp_client`, and four more in `crate::update::install`.
+    /// Not an `EnvGuard` lock: none of them takes `test_support::ENV_LOCK`, so
+    /// a guard would exclude unrelated guard users and leave this window open.
+    /// A future PATH mutator outside the default serial group would reopen it.
     #[cfg(unix)]
     #[test]
     #[serial_test::serial]
