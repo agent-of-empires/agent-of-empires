@@ -295,9 +295,16 @@ export async function mockAcpSession(page: Page, opts: AcpSessionMockOptions = {
     });
   });
   await page.route("**/api/sessions/*/acp/prompt", async (r) => {
-    const body = JSON.parse(r.request().postData() ?? "{}") as { text: string };
+    const body = JSON.parse(r.request().postData() ?? "{}") as { text: string; prompt_id?: string };
     handle.promptBodies.push(body);
     await r.fulfill({ json: {} });
+    // The daemon publishes `UserPromptSent` carrying the client-minted
+    // `prompt_id` BEFORE it forwards the prompt to the agent
+    // (`send_turn` -> `publish_user_prompt_with_attachments`). That echo is
+    // what settles the client's optimistic in-flight marker and opens the
+    // turn, so a mock that jumps straight to the agent's reply leaves the
+    // composer wedged in its "working" state. See #3417.
+    pushEvents([{ UserPromptSent: { text: body.text, prompt_id: body.prompt_id ?? null } }]);
     pushEvents(opts.onPrompt?.(body) ?? []);
   });
   await page.route("**/api/sessions/*/acp/config-option", async (r) => {
