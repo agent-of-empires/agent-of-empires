@@ -34,16 +34,25 @@ export function CommentsBanner({ count, sendEnabled, sendDisabledReason, onSend,
         >
           Discard all
         </button>
-        {/* Tooltip, not the native `title`: a `disabled` button receives no
-            pointer events, so the browser never shows its `title` and the
-            reason the send is blocked stays invisible. The Tooltip's hover
-            handlers live on the wrapper span, which is not disabled. */}
+        {/* Tooltip, not the native `title`: the browser never renders a
+            `title` on a button it won't send pointer events to, so the reason
+            the send is blocked stayed invisible. `aria-disabled` rather than
+            `disabled` for the same reason one rung up: a natively disabled
+            button is not focusable, so a keyboard user could never reach the
+            explanation at all. The button stays in the tab order, announces
+            itself as disabled, and `onSend` guards the click. */}
         <Tooltip text={sendEnabled ? "Send comments to agent" : sendDisabledReason} multiline>
           <button
             type="button"
-            onClick={onSend}
-            disabled={!sendEnabled}
-            className="px-2 py-0.5 rounded bg-brand-600 text-white hover:bg-brand-500 disabled:bg-surface-700 disabled:text-text-dim disabled:cursor-not-allowed cursor-pointer transition-colors"
+            onClick={() => {
+              if (sendEnabled) onSend();
+            }}
+            aria-disabled={!sendEnabled}
+            className={`px-2 py-0.5 rounded-md transition-colors ${
+              sendEnabled
+                ? "bg-brand-600 text-white hover:bg-brand-500 cursor-pointer"
+                : "bg-surface-700 text-text-dim cursor-not-allowed"
+            }`}
           >
             Send
           </button>

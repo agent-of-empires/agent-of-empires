@@ -58,6 +58,7 @@ export function SendCommentsDialog({
 
   const preview = useMemo(() => buildCommentsMarkdown(comments, { isMultiRepo }), [comments, isMultiRepo]);
 
+  const sendBlocked = busy || comments.length === 0 || !sendEnabled;
   // One tooltip covering every reason Send can be disabled, so it never
   // explains the wrong one.
   const sendTooltip = !sendEnabled
@@ -198,15 +199,21 @@ export function SendCommentsDialog({
             >
               Cancel
             </button>
-            {/* Same reason as the banner: a `disabled` button never shows its
-                native `title`, so the blocked-send explanation needs a hover
-                target that isn't disabled. */}
+            {/* Tooltip + `aria-disabled` rather than `title` + `disabled`, for
+                the reasons spelled out in `CommentsBanner`: the browser renders
+                neither a `title` nor a focus ring on a natively disabled
+                button, so both pointer and keyboard users were left without the
+                explanation. `send()` re-checks every condition itself. */}
             <Tooltip text={sendTooltip} multiline>
               <button
                 type="button"
                 onClick={() => void send()}
-                disabled={busy || comments.length === 0 || !sendEnabled}
-                className="text-[12px] px-3 py-1.5 rounded bg-brand-600 text-white hover:bg-brand-500 disabled:bg-surface-700 disabled:text-text-dim disabled:cursor-not-allowed cursor-pointer transition-colors"
+                aria-disabled={sendBlocked}
+                className={`text-[12px] px-3 py-1.5 rounded-md transition-colors ${
+                  sendBlocked
+                    ? "bg-surface-700 text-text-dim cursor-not-allowed"
+                    : "bg-brand-600 text-white hover:bg-brand-500 cursor-pointer"
+                }`}
               >
                 {busy ? "Sending..." : "Send"}
               </button>

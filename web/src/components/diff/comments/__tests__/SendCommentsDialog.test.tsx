@@ -101,19 +101,34 @@ describe("SendCommentsDialog", () => {
   it("shows the empty-state preview and disables Send when there are no comments", () => {
     const { container } = setup({ comments: [] });
     expect(container.textContent).toContain("No comments.");
-    expect(sendButton(container).disabled).toBe(true);
+    expect(sendButton(container).getAttribute("aria-disabled")).toBe("true");
   });
 
-  it("disables Send and exposes the reason on hover when sendEnabled is false", async () => {
+  it("disables Send and exposes the reason to pointer and keyboard when sendEnabled is false", async () => {
     const { container } = setup({ sendEnabled: false, sendDisabledReason: "session is trashed" });
     const btn = sendButton(container);
-    expect(btn.disabled).toBe(true);
-    // The reason lives on the Tooltip wrapper, not the button's native
-    // `title`: a disabled button gets no pointer events, so a `title` on it
-    // would never render. Hovering the wrapper is what a user can actually do.
+    // `aria-disabled`, not `disabled`: a natively disabled button is not
+    // focusable and gets no pointer events, so neither a hover nor a keyboard
+    // user could ever reach the explanation.
+    expect(btn.getAttribute("aria-disabled")).toBe("true");
+    expect(btn.disabled).toBe(false);
+
     const wrapper = btn.parentElement as HTMLElement;
     fireEvent.mouseEnter(wrapper);
     await waitFor(() => expect(document.body.textContent).toContain("session is trashed"));
+    fireEvent.mouseLeave(wrapper);
+    await waitFor(() => expect(document.body.textContent).not.toContain("session is trashed"));
+
+    // Tabbing to the button surfaces the same reason.
+    btn.focus();
+    fireEvent.focus(btn);
+    await waitFor(() => expect(document.body.textContent).toContain("session is trashed"));
+  });
+
+  it("does not send when the button is aria-disabled", () => {
+    const { container } = setup({ sendEnabled: false });
+    fireEvent.click(sendButton(container));
+    expect(fetchMock).not.toHaveBeenCalled();
   });
 
   it("submits the assembled prompt payload to the diff-comments endpoint and fires onSent", async () => {
