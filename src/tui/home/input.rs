@@ -99,17 +99,6 @@ fn persist_telemetry_consent(opt_in: bool) {
     crate::telemetry::apply_opt_in_change(opt_in);
 }
 
-/// xterm bracketed-paste start sequence: `ESC [ 2 0 0 ~`. An agent that
-/// has enabled bracketed paste mode (`\e[?2004h`) treats everything
-/// between this marker and the matching end marker as one paste rather
-/// than as keystrokes, so interior newlines accumulate in the input
-/// buffer instead of firing `submit` per line.
-const BRACKETED_PASTE_START: &[u8] = &[0x1b, b'[', b'2', b'0', b'0', b'~'];
-
-/// xterm bracketed-paste end sequence: `ESC [ 2 0 1 ~`. Pairs with
-/// [`BRACKETED_PASTE_START`].
-const BRACKETED_PASTE_END: &[u8] = &[0x1b, b'[', b'2', b'0', b'1', b'~'];
-
 /// Decompose pasted text into a series of `TmuxKey`s safe for the
 /// live-send worker to dispatch.
 ///
@@ -120,17 +109,17 @@ const BRACKETED_PASTE_END: &[u8] = &[0x1b, b'[', b'2', b'0', b'1', b'~'];
 /// literal text. Tabs in single-line pastes still go through as
 /// `Named("Tab")` to mirror the historical path.
 ///
-/// Multi-line pastes get wrapped in xterm bracketed-paste markers
-/// (`\e[200~` / `\e[201~`) so the receiving agent sees the entire
-/// payload as one paste rather than as N independent Enter keypresses.
+/// Multi-line pastes are handed to tmux as a single paste
+/// (`load-buffer` + `paste-buffer -p`), so the receiving agent sees the
+/// entire payload as one paste rather than as N independent Enter
+/// keypresses, and tmux emits the bracketed-paste markers only for panes
+/// that actually set DECSET 2004.
 /// Without the wrapping, agents that submit on Enter (Claude Code,
 /// Codex, OpenCode, ...) post one user message per pasted line, which
-/// is the bug behind #1546. The whole payload (markers, printable
-/// runs, interior CRs, and tabs) goes through as a single `HexBytes`
-/// action, which the worker dispatches as one or more size-bounded
-/// `tmux send-keys -H` forks (a per-byte argv overflows `ARG_MAX` on a
-/// large paste, so it can't always be one fork). `\r\n` pairs coalesce
-/// to a single CR so
+/// is the bug behind #1546. The whole payload goes through as a single
+/// `Paste` action, which the worker delivers with one `load-buffer` +
+/// `paste-buffer` pair (no `ARG_MAX` chunking, unlike the per-byte hex
+/// encoding this replaced). `\r\n` pairs coalesce to a single newline so
 /// Windows-line-ending pastes don't double up; other control bytes
 /// (BEL, ESC, ...) are dropped rather than risk that an embedded
 /// escape closes the bracketed-paste sequence on the agent's side.
@@ -167,40 +156,38 @@ fn split_inline_paste(text: &str) -> Vec<live_send::TmuxKey> {
 }
 
 fn split_bracketed_paste(text: &str) -> Vec<live_send::TmuxKey> {
-    // Build one contiguous byte payload: start marker, then the paste
-    // content with printables as their UTF-8 bytes / interior newlines
-    // as CR (0x0d) / tabs as 0x09, then the end marker. Sending it as
-    // one `HexBytes` means the worker fires exactly one `tmux send-keys
-    // -H` subprocess per paste rather than one per chunk.
-    let mut bytes = Vec::with_capacity(text.len() + BRACKETED_PASTE_START.len() * 2);
-    bytes.extend_from_slice(BRACKETED_PASTE_START);
-
+    // Hand the payload to tmux as one paste and let `paste-buffer -p` decide
+    // about the markers. Emitting `\e[200~` / `\e[201~` ourselves delivered
+    // them to every pane, including raw shells and SQL REPLs that never set
+    // DECSET 2004; those parse `\e[2` as a partial Insert-key sequence, drop
+    // it, and self-insert the leftover `00~` / `01~` into the user's text.
+    // tmux tracks the pane's paste mode and brackets only when the program
+    // asked for it, which keeps the #1546 fix for agents intact.
+    //
+    // tmux replaces LF with CR in the buffer by default, so interior newlines
+    // land exactly as the old raw-byte encoding delivered them. `\r\n` pairs
+    // still coalesce here so Windows-line-ending pastes don't double up, and
+    // other control bytes (BEL, ESC, ...) are still dropped rather than risk
+    // an embedded escape closing the bracketed-paste sequence on the agent's
+    // side.
+    let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
-    let mut utf8_buf = [0u8; 4];
     while let Some(ch) = chars.next() {
         match ch {
-            '\n' => bytes.push(0x0d),
+            '\n' => out.push('\n'),
             '\r' => {
                 if chars.peek() == Some(&'\n') {
                     chars.next();
                 }
-                bytes.push(0x0d);
+                out.push('\n');
             }
-            '\t' => bytes.push(0x09),
-            c if (c as u32) < 0x20 || c == '\x7f' => {
-                // Embedded ESC / BEL / etc. has no safe encoding
-                // inside the paste payload; drop rather than risk a
-                // bogus terminal escape closing the paste early.
-            }
-            c => {
-                let s = c.encode_utf8(&mut utf8_buf);
-                bytes.extend_from_slice(s.as_bytes());
-            }
+            '\t' => out.push('\t'),
+            c if (c as u32) < 0x20 || c == '\x7f' => {}
+            c => out.push(c),
         }
     }
 
-    bytes.extend_from_slice(BRACKETED_PASTE_END);
-    vec![live_send::TmuxKey::HexBytes(bytes)]
+    vec![live_send::TmuxKey::Paste(out)]
 }
 
 /// The rectangle mouse coordinates are mapped into, or `None` when the pointer

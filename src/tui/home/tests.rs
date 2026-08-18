@@ -16181,21 +16181,15 @@ mod live_send_mode {
             TmuxKey::Named(name.to_string())
         }
 
-        /// xterm bracketed-paste start: `ESC [ 2 0 0 ~`.
-        const BP_START: &[u8] = &[0x1b, b'[', b'2', b'0', b'0', b'~'];
-        /// xterm bracketed-paste end: `ESC [ 2 0 1 ~`.
-        const BP_END: &[u8] = &[0x1b, b'[', b'2', b'0', b'1', b'~'];
-
-        /// Build the expected `HexBytes` payload for a multi-line
-        /// paste: start marker, then the per-line `body` bytes, then
-        /// end marker. Keeps each test focused on the *shape* of the
-        /// paste content rather than on hand-rolled byte arithmetic.
-        fn wrap(body: &[u8]) -> Vec<TmuxKey> {
-            let mut out = Vec::with_capacity(BP_START.len() + body.len() + BP_END.len());
-            out.extend_from_slice(BP_START);
-            out.extend_from_slice(body);
-            out.extend_from_slice(BP_END);
-            vec![TmuxKey::HexBytes(out)]
+        /// Expected shape for a multi-line paste: one `Paste` action
+        /// carrying the payload verbatim. No bracketed-paste markers
+        /// appear here on purpose. tmux adds them via `paste-buffer -p`
+        /// only for panes that set DECSET 2004, so a raw shell or SQL
+        /// REPL no longer receives markers it would render as literal
+        /// `00~` / `01~` text. Interior newlines stay `\n`; tmux
+        /// translates them to CR when it performs the paste.
+        fn paste(body: &str) -> Vec<TmuxKey> {
+            vec![TmuxKey::Paste(body.to_string())]
         }
 
         #[test]
@@ -16208,13 +16202,12 @@ mod live_send_mode {
 
         #[test]
         fn newline_wraps_in_bracketed_paste() {
-            // Two-line paste must wrap in `\e[200~` / `\e[201~` markers,
-            // with the interior newline riding as a raw CR. Without the
-            // wrapping the agent treats the `\n` as Enter -> submit and
-            // posts each line as its own user message (#1546).
+            // Two-line paste travels as one tmux paste. Without it the
+            // agent treats the `\n` as Enter -> submit and posts each
+            // line as its own user message (#1546).
             assert_eq!(
                 split_paste_for_live_send("first\nsecond"),
-                wrap(b"first\x0dsecond"),
+                paste("first\nsecond"),
             );
         }
 
@@ -16226,25 +16219,25 @@ mod live_send_mode {
             // review before sending.
             assert_eq!(
                 split_paste_for_live_send("only line\n"),
-                wrap(b"only line\x0d"),
+                paste("only line\n"),
             );
         }
 
         #[test]
         fn leading_newline_stays_inside_bracketed_paste() {
-            assert_eq!(split_paste_for_live_send("\nbody"), wrap(b"\x0dbody"));
+            assert_eq!(split_paste_for_live_send("\nbody"), paste("\nbody"));
         }
 
         #[test]
         fn crlf_coalesces_to_single_cr() {
-            // Windows-style line endings collapse to one CR inside the
-            // bracketed paste so the agent doesn't see a double newline.
-            assert_eq!(split_paste_for_live_send("a\r\nb"), wrap(b"a\x0db"));
+            // Windows-style line endings collapse to one newline so the
+            // agent doesn't see a double newline.
+            assert_eq!(split_paste_for_live_send("a\r\nb"), paste("a\nb"));
         }
 
         #[test]
         fn bare_cr_becomes_cr_inside_bracketed_paste() {
-            assert_eq!(split_paste_for_live_send("a\rb"), wrap(b"a\x0db"));
+            assert_eq!(split_paste_for_live_send("a\rb"), paste("a\nb"));
         }
 
         #[test]
@@ -16258,10 +16251,9 @@ mod live_send_mode {
 
         #[test]
         fn tab_in_multiline_paste_rides_as_raw_byte() {
-            // Inside a bracketed paste, tab is a literal character of
-            // the paste content, not a key event, so we send it as a
-            // raw 0x09 byte alongside the rest of the payload.
-            assert_eq!(split_paste_for_live_send("a\tb\nc"), wrap(b"a\x09b\x0dc"),);
+            // Inside a paste, tab is a literal character of the paste
+            // content, not a key event, so it rides in the payload.
+            assert_eq!(split_paste_for_live_send("a\tb\nc"), paste("a\tb\nc"),);
         }
 
         #[test]
@@ -16276,38 +16268,57 @@ mod live_send_mode {
 
         #[test]
         fn other_control_bytes_are_dropped_inside_bracketed_paste() {
-            // Same drop policy applies inside the bracketed paste: an
-            // embedded ESC could prematurely close the paste sequence
-            // on the agent's side, so we strip it rather than forward.
-            assert_eq!(
-                split_paste_for_live_send("a\x07b\x1bc\nd"),
-                wrap(b"abc\x0dd"),
-            );
+            // Same drop policy applies inside the paste: an embedded
+            // ESC could prematurely close the paste sequence on the
+            // agent's side, so we strip it rather than forward.
+            assert_eq!(split_paste_for_live_send("a\x07b\x1bc\nd"), paste("abc\nd"),);
+        }
+
+        /// The bug: we used to hand-roll `\e[200~` / `\e[201~` into the
+        /// payload and ship it as raw bytes, so every pane got the markers
+        /// whether or not it had set DECSET 2004. A raw shell or SQL REPL
+        /// parses `\e[2` as a partial Insert-key sequence, discards it, and
+        /// self-inserts the leftover `00~` / `01~` into the user's text.
+        /// The payload must now carry no escape bytes at all; tmux decides.
+        #[test]
+        fn multiline_paste_carries_no_escape_markers() {
+            let keys = split_paste_for_live_send("SELECT id\nFROM users;");
+            assert_eq!(keys, paste("SELECT id\nFROM users;"));
+            match &keys[0] {
+                TmuxKey::Paste(body) => {
+                    assert!(
+                        !body.contains('\x1b'),
+                        "paste payload must not carry ESC: {body:?}"
+                    );
+                    assert!(!body.contains("200~") && !body.contains("201~"));
+                }
+                other => panic!("expected Paste, got {other:?}"),
+            }
         }
 
         #[test]
         fn multiline_drag_select_paste_round_trip() {
             // Exact shape that comes back from drag-select copy: lines
             // joined with `\n` and no trailing newline. After the fix
-            // for #1546 this wraps in bracketed-paste markers so the
-            // agent sees one paste instead of three Enter keypresses.
+            // for #1546 this travels as one paste so the agent sees one
+            // paste instead of three Enter keypresses.
             assert_eq!(
                 split_paste_for_live_send("alpha beta\nsecond line\nthird"),
-                wrap(b"alpha beta\x0dsecond line\x0dthird"),
+                paste("alpha beta\nsecond line\nthird"),
             );
         }
 
         #[test]
-        fn multiline_paste_dispatches_as_one_hex_payload() {
-            // Single-fork dispatch: the entire paste (markers, content,
-            // CRs) is one `HexBytes` so the worker fires exactly one
-            // `tmux send-keys -H` subprocess. Verifies the length-of-1
-            // invariant the worker relies on for paste latency.
+        fn multiline_paste_dispatches_as_one_payload() {
+            // Single-dispatch: the entire paste is one `Paste` action, so
+            // the worker fires exactly one `load-buffer` + `paste-buffer`
+            // pair. Verifies the length-of-1 invariant the worker relies
+            // on for paste latency.
             let out = split_paste_for_live_send("a\nb\nc\nd");
             assert_eq!(out.len(), 1, "multiline paste must be one TmuxKey");
             match &out[0] {
-                TmuxKey::HexBytes(_) => {}
-                other => panic!("expected HexBytes, got {other:?}"),
+                TmuxKey::Paste(_) => {}
+                other => panic!("expected Paste, got {other:?}"),
             }
         }
 
@@ -16317,16 +16328,12 @@ mod live_send_mode {
             // UTF-8 byte sequences so the agent receives the same text
             // the user copied. Regression guard for any future "ASCII
             // only" filter.
-            assert_eq!(
-                split_paste_for_live_send("café\n🚀"),
-                wrap("café\x0d🚀".as_bytes()),
-            );
+            assert_eq!(split_paste_for_live_send("café\n🚀"), paste("café\n🚀"),);
         }
 
         #[test]
         fn empty_paste_is_empty() {
-            // An empty paste should drop the entire bracketed-paste
-            // wrapper too: pushing `\e[200~\e[201~` with no payload
+            // An empty paste emits nothing at all: an empty tmux paste
             // would still flash through some agents' paste handlers.
             assert!(split_paste_for_live_send("").is_empty());
         }

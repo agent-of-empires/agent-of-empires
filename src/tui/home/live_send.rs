@@ -351,6 +351,8 @@ pub(super) enum TmuxAction {
         count: usize,
     },
     HexBytes(Vec<u8>),
+    /// A multi-line paste routed through `paste-buffer -p`.
+    Paste(String),
     Resize {
         cols: u16,
         rows: u16,
@@ -395,6 +397,13 @@ pub(super) fn coalesce(batch: Vec<WorkerMsg>) -> Vec<TmuxAction> {
                     Some(TmuxAction::HexBytes(prev)) => prev.extend_from_slice(&bytes),
                     _ => out.push(TmuxAction::HexBytes(bytes)),
                 }
+            }
+            WorkerMsg::Send(TmuxKey::Paste(text)) => {
+                // Never merged: a paste is one discrete tmux paste-buffer
+                // call, and folding it into a neighbouring run would put the
+                // payload back on the literal path the markers came from.
+                flush(&mut out, &mut run);
+                out.push(TmuxAction::Paste(text));
             }
             WorkerMsg::Resize { cols, rows } => {
                 flush(&mut out, &mut run);
@@ -1614,7 +1623,7 @@ fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()>
     // still-live socket writer.
     #[cfg(unix)]
     if let Some(app_cursor) = crate::tmux::vt::input_mode(tmux_name) {
-        if !matches!(action, TmuxAction::Resize { .. }) {
+        if !matches!(action, TmuxAction::Resize { .. } | TmuxAction::Paste(_)) {
             let bytes = encode_action_bytes(action, app_cursor);
             if bytes.is_empty() {
                 return Ok(());
@@ -1678,6 +1687,12 @@ fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()>
             // (the web live view's input path uses the same fn).
             return crate::tmux::Session::from_name(tmux_name).send_raw_bytes(bytes);
         }
+        TmuxAction::Paste(text) => {
+            // tmux emits the bracketed-paste markers only if the program in
+            // the pane set DECSET 2004, so a raw shell or a SQL REPL gets
+            // clean text instead of literal `00~` / `01~` leftovers.
+            return crate::tmux::Session::from_name(tmux_name).paste_text(text);
+        }
         TmuxAction::Resize { cols, rows } => {
             // Size the window through `Session::resize_window` so the pane lands
             // at exactly `rows` after tmux's status-bar chrome, the same math the
@@ -1716,6 +1731,9 @@ fn encode_action_bytes(action: &TmuxAction, app_cursor: bool) -> Vec<u8> {
             let one = encode_named_key(name, app_cursor);
             one.repeat(*count)
         }
+        // Paste never reaches here: the vt fast path is skipped for it so
+        // tmux can make the bracketed-paste decision.
+        TmuxAction::Paste(_) => Vec::new(),
         TmuxAction::Resize { .. } => Vec::new(),
     }
 }
@@ -1991,6 +2009,7 @@ pub(super) fn send_key_oneshot(tmux_name: &str, key: TmuxKey) {
         TmuxKey::Named(name) => TmuxAction::Named(name),
         TmuxKey::NamedRepeat { name, count } => TmuxAction::NamedRepeat { name, count },
         TmuxKey::HexBytes(bytes) => TmuxAction::HexBytes(bytes),
+        TmuxKey::Paste(text) => TmuxAction::Paste(text),
     };
     // `Builder::spawn` returns the OS error instead of panicking (`spawn`
     // panics if the OS refuses a new thread), so a thread-creation failure
@@ -2091,6 +2110,10 @@ pub(super) enum TmuxKey {
         count: usize,
     },
     HexBytes(Vec<u8>),
+    /// A multi-line paste, delivered through tmux's `paste-buffer -p` so
+    /// tmux decides whether the receiving program gets bracketed-paste
+    /// markers. Never merged with neighbours: it is one discrete paste.
+    Paste(String),
 }
 
 /// Map one crossterm `KeyEvent` onto a `LiveDispatch`.

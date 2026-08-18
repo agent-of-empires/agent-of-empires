@@ -1275,6 +1275,21 @@ impl Session {
         Ok(())
     }
 
+    /// Paste `text` into the session's first pane through tmux's own paste
+    /// path, so the bracketed-paste markers are emitted only when the
+    /// receiving program actually set DECSET 2004. Hand-rolling the markers
+    /// instead (as a raw `send-keys -H` payload) delivers them to raw shells
+    /// and simple REPLs that never asked for them, which render the leftovers
+    /// as literal `00~` / `01~` text (#3364-adjacent, live-send paste).
+    ///
+    /// See [`Self::send_via_paste_buffer`] for the buffer-naming and cleanup
+    /// contract. tmux translates LF to CR in the buffer by default, matching
+    /// the raw-byte encoding this replaces.
+    pub fn paste_text(&self, text: &str) -> Result<()> {
+        let target = format!("{}:^.0", self.name);
+        Self::send_via_paste_buffer(&target, text)
+    }
+
     pub fn get_pane_pid(&self) -> Option<u32> {
         process::get_pane_pid(&self.name)
     }
