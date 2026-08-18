@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { Tooltip } from "../../Tooltip";
 import { CommentMarkdown } from "./CommentMarkdown";
 import { buildCommentsMarkdown, buildDiffCommentsPrompt } from "./buildPrompt";
 import type { DiffComment } from "./types";
@@ -9,11 +10,11 @@ interface Props {
   comments: DiffComment[];
   isMultiRepo: boolean;
   /** Same gate as the banner Send button. Reflects
-   *  `structured_view && acp_worker_state === "running"`. False
-   *  disables the Send button so prompts don't sink when the worker
-   *  isn't ready. */
+   *  `structured_view && !trashed`. False disables the Send button so
+   *  prompts don't sink into a session the reconciler never resumes. */
   sendEnabled: boolean;
-  sendDisabledReason?: string;
+  /** Required, and phrased as cause + remedy. See `CommentsBanner`. */
+  sendDisabledReason: string;
   introDraft: string;
   outroDraft: string;
   clearAfterSend: boolean;
@@ -56,6 +57,16 @@ export function SendCommentsDialog({
   }, []);
 
   const preview = useMemo(() => buildCommentsMarkdown(comments, { isMultiRepo }), [comments, isMultiRepo]);
+
+  // One tooltip covering every reason Send can be disabled, so it never
+  // explains the wrong one.
+  const sendTooltip = !sendEnabled
+    ? sendDisabledReason
+    : comments.length === 0
+      ? "Add at least one diff comment to send."
+      : busy
+        ? "Sending your comments to the agent..."
+        : "Send comments to agent";
 
   const send = useCallback(async () => {
     if (busy || comments.length === 0 || !sendEnabled) return;
@@ -187,15 +198,19 @@ export function SendCommentsDialog({
             >
               Cancel
             </button>
-            <button
-              type="button"
-              onClick={() => void send()}
-              disabled={busy || comments.length === 0 || !sendEnabled}
-              title={sendEnabled ? undefined : sendDisabledReason}
-              className="text-[12px] px-3 py-1.5 rounded bg-brand-600 text-white hover:bg-brand-500 disabled:bg-surface-700 disabled:text-text-dim disabled:cursor-not-allowed cursor-pointer transition-colors"
-            >
-              {busy ? "Sending..." : "Send"}
-            </button>
+            {/* Same reason as the banner: a `disabled` button never shows its
+                native `title`, so the blocked-send explanation needs a hover
+                target that isn't disabled. */}
+            <Tooltip text={sendTooltip} multiline>
+              <button
+                type="button"
+                onClick={() => void send()}
+                disabled={busy || comments.length === 0 || !sendEnabled}
+                className="text-[12px] px-3 py-1.5 rounded bg-brand-600 text-white hover:bg-brand-500 disabled:bg-surface-700 disabled:text-text-dim disabled:cursor-not-allowed cursor-pointer transition-colors"
+              >
+                {busy ? "Sending..." : "Send"}
+              </button>
+            </Tooltip>
           </div>
         </div>
       </div>

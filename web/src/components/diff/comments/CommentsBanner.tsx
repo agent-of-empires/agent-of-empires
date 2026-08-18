@@ -1,15 +1,19 @@
+import { Tooltip } from "../../Tooltip";
+
 interface Props {
   count: number;
   sendEnabled: boolean;
-  sendDisabledReason?: string;
+  /** Required, and phrased as cause + remedy: this is the only place the user
+   *  ever learns why the Send button is dead. */
+  sendDisabledReason: string;
   onSend: () => void;
   onDiscardAll: () => void;
 }
 
 /** Floating chip rendered above the right-panel diff list. Visible
  *  whenever the active session has at least one comment and supports
- *  the feature (acp-only). The send button is disabled while the
- *  structured view worker is not running so the prompt doesn't sink. */
+ *  the feature (acp-only). The send button is disabled only for a
+ *  trashed session, which never resumes a worker to drain into. */
 export function CommentsBanner({ count, sendEnabled, sendDisabledReason, onSend, onDiscardAll }: Props) {
   if (count === 0) return null;
   return (
@@ -30,15 +34,20 @@ export function CommentsBanner({ count, sendEnabled, sendDisabledReason, onSend,
         >
           Discard all
         </button>
-        <button
-          type="button"
-          onClick={onSend}
-          disabled={!sendEnabled}
-          title={sendEnabled ? "Send comments to agent" : sendDisabledReason}
-          className="px-2 py-0.5 rounded bg-brand-600 text-white hover:bg-brand-500 disabled:bg-surface-700 disabled:text-text-dim disabled:cursor-not-allowed cursor-pointer transition-colors"
-        >
-          Send
-        </button>
+        {/* Tooltip, not the native `title`: a `disabled` button receives no
+            pointer events, so the browser never shows its `title` and the
+            reason the send is blocked stays invisible. The Tooltip's hover
+            handlers live on the wrapper span, which is not disabled. */}
+        <Tooltip text={sendEnabled ? "Send comments to agent" : sendDisabledReason} multiline>
+          <button
+            type="button"
+            onClick={onSend}
+            disabled={!sendEnabled}
+            className="px-2 py-0.5 rounded bg-brand-600 text-white hover:bg-brand-500 disabled:bg-surface-700 disabled:text-text-dim disabled:cursor-not-allowed cursor-pointer transition-colors"
+          >
+            Send
+          </button>
+        </Tooltip>
       </div>
     </div>
   );

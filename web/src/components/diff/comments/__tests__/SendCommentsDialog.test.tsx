@@ -52,7 +52,7 @@ function setup(overrides?: {
       comments={overrides?.comments ?? [comment()]}
       isMultiRepo={overrides?.isMultiRepo ?? false}
       sendEnabled={overrides?.sendEnabled ?? true}
-      sendDisabledReason={overrides?.sendDisabledReason}
+      sendDisabledReason={overrides?.sendDisabledReason ?? "session is trashed"}
       introDraft={overrides?.introDraft ?? ""}
       outroDraft={overrides?.outroDraft ?? ""}
       clearAfterSend={overrides?.clearAfterSend ?? false}
@@ -104,11 +104,16 @@ describe("SendCommentsDialog", () => {
     expect(sendButton(container).disabled).toBe(true);
   });
 
-  it("disables Send and exposes the reason when sendEnabled is false", () => {
-    const { container } = setup({ sendEnabled: false, sendDisabledReason: "worker not running" });
+  it("disables Send and exposes the reason on hover when sendEnabled is false", async () => {
+    const { container } = setup({ sendEnabled: false, sendDisabledReason: "session is trashed" });
     const btn = sendButton(container);
     expect(btn.disabled).toBe(true);
-    expect(btn.getAttribute("title")).toBe("worker not running");
+    // The reason lives on the Tooltip wrapper, not the button's native
+    // `title`: a disabled button gets no pointer events, so a `title` on it
+    // would never render. Hovering the wrapper is what a user can actually do.
+    const wrapper = btn.parentElement as HTMLElement;
+    fireEvent.mouseEnter(wrapper);
+    await waitFor(() => expect(document.body.textContent).toContain("session is trashed"));
   });
 
   it("submits the assembled prompt payload to the diff-comments endpoint and fires onSent", async () => {

@@ -774,10 +774,18 @@ function AppContent({
   // DiffFileViewer, so the store is lifted here and threaded to both.
   const diffComments = useDiffComments(activeSessionId);
   const commentsEnabled = activeSession?.view === "structured";
-  const commentSendEnabled = commentsEnabled && activeSession?.acp_worker_state === "running";
+  // Sending does not require a live worker: the diff-comments handler runs the
+  // same auto-wake as a plain composer prompt (touch_and_wake_if_sunk +
+  // trigger_resume_background, #1748), so an archived / snoozed / idle-dormant
+  // session respawns its worker on send instead of sinking the prompt. A
+  // trashed session is the one exception: the reconciler never resumes it, so
+  // there is nothing to drain into.
+  const commentSendEnabled = commentsEnabled && !activeSession?.trashed_at;
+  // Every disabled state names its cause and what the user can do about it: a
+  // tooltip that only says "unavailable" leaves them staring at a dead button.
   const commentSendDisabledReason = !commentsEnabled
-    ? "Diff comments require an acp session"
-    : "Acp worker is not running";
+    ? "Diff comments can only be sent from the agent view. Switch this session to the agent view first."
+    : "This session is in the trash. Restore it to send comments to the agent.";
   const commentsIsMultiRepo = (activeSession?.workspace_repos.length ?? 0) > 0;
   const [sendDialogOpen, setSendDialogOpen] = useState(false);
 

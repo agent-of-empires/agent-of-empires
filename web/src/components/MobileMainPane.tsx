@@ -38,7 +38,7 @@ interface Props {
   onDiffRefresh: () => void;
   commentsEnabled: boolean;
   commentSendEnabled: boolean;
-  commentSendDisabledReason?: string;
+  commentSendDisabledReason: string;
   diffComments: ReturnType<typeof useDiffComments>;
   commentsIsMultiRepo: boolean;
   sendDialogOpen: boolean;
