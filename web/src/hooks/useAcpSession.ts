@@ -13,10 +13,11 @@ import {
   applyEvent,
   applyReducedState,
   emptyAcpState,
-  isTurnActive,
+  deriveTurnActive,
+  withTurnActive,
   mergePrependedActivity,
   mergeServerRows,
-  normaliseTurnCounters,
+  normaliseTurnState,
   patchServerRow,
   reduceFrames,
   summarizeAnswers,
@@ -100,7 +101,8 @@ export type Action =
   | { kind: "transcript_remove"; id: string }
   | { kind: "lagged"; skipped: number }
   | { kind: "user_prompt"; text: string; attachments?: AcpAttachment[]; id?: string }
-  | { kind: "prompt_send_rejected" }
+  | { kind: "prompt_send_rejected"; id: string }
+  | { kind: "settle_inflight_prompt"; id: string }
   | { kind: "rollback_optimistic_prompt"; id: string }
   | { kind: "error"; message: string }
   | { kind: "clear_error" }
@@ -218,8 +220,13 @@ function evictOldestPersistedAcpState(currentKey: string): boolean {
 function toPersistedState(state: AcpState): AcpState {
   // Optimistic overlay rows are ephemeral client presentation: a confirmed
   // prompt is already in the server-owned `activity` (re-fetched on reload),
-  // so persisting the overlay would risk a stale duplicate. Drop it.
-  const base = state.optimisticRows.length > 0 ? { ...state, optimisticRows: [] } : state;
+  // so persisting the overlay would risk a stale duplicate. Drop it, and
+  // with it the in-flight prompt ids: after a reload no POST is left to
+  // acknowledge them, so a persisted id would latch the spinner forever.
+  const base: AcpState =
+    state.optimisticRows.length > 0 || state.inflightPromptIds.length > 0
+      ? { ...state, optimisticRows: [], inflightPromptIds: [] }
+      : state;
   if (!base.queuedPrompts.some((q) => q.attachments?.length)) return base;
   return {
     ...base,
@@ -279,10 +286,10 @@ function loadPersistedState(sessionId: string): AcpState | undefined {
     // Merge over the current defaults so an entry persisted by an older
     // bundle gains any fields added since (e.g. `pendingElicitations`);
     // without this the new code reads `undefined` for a freshly-added
-    // array and crashes on `.map`. Then backfill the seq-counter pair
-    // introduced by #1170; see `normaliseTurnCounters` for the rules.
+    // array and crashes on `.map`. Then backfill the turn state; see
+    // `normaliseTurnState` for the rules.
     const merged: AcpState = { ...emptyAcpState(), ...(state as AcpState) };
-    return normaliseTurnCounters(merged);
+    return normaliseTurnState(merged);
   } catch {
     return undefined;
   }
@@ -546,6 +553,17 @@ export function classifyElicitationResolveResponse(
  *  `activity` (same deterministic id), so the overlay never double-renders a
  *  confirmed prompt / elicitation answer. Returns `state` unchanged when
  *  nothing was pruned. */
+/** Drop one in-flight prompt id and re-derive `turnActive`. Called for every
+ *  POST outcome that no `UserPromptSent` echo will follow. */
+function settleInflightPrompt(state: AcpState, id: string): AcpState {
+  const inflightPromptIds = state.inflightPromptIds.filter((p) => p !== id);
+  if (inflightPromptIds.length === state.inflightPromptIds.length) return state;
+  return withTurnActive(
+    { ...state, inflightPromptIds },
+    deriveTurnActive({ serverTurnActive: state.serverTurnActive, inflightPromptIds }),
+  );
+}
+
 function pruneOptimisticRows(state: AcpState): AcpState {
   if (state.optimisticRows.length === 0) return state;
   const serverIds = new Set(state.activity.map((r) => r.id));
@@ -692,13 +710,12 @@ export function reducer(state: AcpState, action: Action): AcpState {
     // echoes reconciles it (the overlay is dropped once that row lands in
     // `activity`). Never appended to `activity` (that is server-owned).
     //
-    // Bump `pendingUserPromptSeq` (the source of truth for `turnActive`,
-    // derived from `pendingUserPromptSeq > lastStoppedSeq`) so the spinner
-    // shows immediately; the server `UserPromptSent` control frame recognizes
-    // this optimistic id and does NOT double-bump. See #1170 / #3173.
-    const pendingUserPromptSeq = state.pendingUserPromptSeq + 1;
+    // Record the minted id as in flight so the spinner shows immediately;
+    // the server `UserPromptSent` echo settles it by the same id, and every
+    // POST failure path settles it too. See #3417 / #3173.
+    const id = action.id ?? `user-opt-${Date.now()}-${state.optimisticRows.length}`;
     const row: ActivityRow = {
-      id: action.id ?? `user-opt-${Date.now()}-${state.optimisticRows.length}`,
+      id,
       kind: "user_prompt",
       text: action.text,
       attachments: action.attachments && action.attachments.length > 0 ? action.attachments : undefined,
@@ -711,48 +728,44 @@ export function reducer(state: AcpState, action: Action): AcpState {
       // trying again, so don't keep nagging them.
       startupError: null,
       lastError: null,
-      pendingUserPromptSeq,
-      turnActive: isTurnActive({
-        pendingUserPromptSeq,
-        lastStoppedSeq: state.lastStoppedSeq,
-      }),
+      inflightPromptIds: state.inflightPromptIds.includes(id)
+        ? state.inflightPromptIds
+        : state.inflightPromptIds.concat(id),
+      ...withTurnActive({ turnActive: state.turnActive, turnSeq: state.turnSeq }, true),
     };
   }
   if (action.kind === "prompt_send_rejected") {
-    // Optimistic submit already bumped pendingUserPromptSeq. When the
-    // prompt POST is rejected client-side (for example unsupported
-    // attachments), retire exactly one pending turn so Stop unlocks and
-    // the composer returns to idle without waiting for a Stopped frame
-    // that will never arrive.
-    const lastStoppedSeq = Math.min(state.lastStoppedSeq + 1, state.pendingUserPromptSeq);
-    return {
-      ...state,
-      inFlightTool: null,
-      lastStoppedSeq,
-      turnActive: isTurnActive({
-        pendingUserPromptSeq: state.pendingUserPromptSeq,
-        lastStoppedSeq,
-      }),
-    };
+    // The prompt POST was rejected with a 4xx (for example unsupported
+    // attachments), so no `UserPromptSent` will ever acknowledge this id.
+    // Settle it so Stop unlocks. The overlay row deliberately stays so the
+    // user still sees what they tried to send.
+    return settleInflightPrompt({ ...state, inFlightTool: null }, action.id);
+  }
+  if (action.kind === "settle_inflight_prompt") {
+    // Every other POST outcome that no `UserPromptSent` will follow: a 5xx,
+    // a network exception, a daemon `queued` disposition. Without this the
+    // optimistic id latches the spinner forever, which is the same defect
+    // class as #3417 arriving by a different route.
+    return settleInflightPrompt(state, action.id);
   }
   if (action.kind === "rollback_optimistic_prompt") {
     // A transient send failure (worker_not_ready 503 while resuming) re-queues
     // the prompt, so its optimistic overlay row must be removed: otherwise the
     // drain's re-send would echo a second copy the server `UserPromptSent`
     // cannot reconcile. Remove exactly the overlay row we added; the prompt now
-    // lives only in `queuedPrompts` (the QUEUED strip).
-    //
-    // Deliberately DO NOT touch `pendingUserPromptSeq` / `turnActive`: leaving
-    // the turn pending keeps the drain effect braked on `if (state.turnActive)
-    // return` so it does not hot-loop re-POSTing the wake while the worker is
-    // still resuming. The phantom turn is retired instead on the next
-    // `AcpSessionAssigned` (the worker-online signal). See #3094 / #3087.
+    // lives only in `queuedPrompts` (the QUEUED strip), which is server-owned
+    // and drains on its own. Settle the id with it: a queued prompt is not a
+    // running turn, and leaving it in flight would hold Stop over an idle
+    // session. See #3094 / #3087.
     const idx = state.optimisticRows.findIndex((r) => r.id === action.id);
-    if (idx === -1) return state;
-    return {
-      ...state,
-      optimisticRows: state.optimisticRows.slice(0, idx).concat(state.optimisticRows.slice(idx + 1)),
-    };
+    if (idx === -1) return settleInflightPrompt(state, action.id);
+    return settleInflightPrompt(
+      {
+        ...state,
+        optimisticRows: state.optimisticRows.slice(0, idx).concat(state.optimisticRows.slice(idx + 1)),
+      },
+      action.id,
+    );
   }
   if (action.kind === "enqueue_prompt") {
     // Optimistic row: shown immediately, marked `pending` until the server
@@ -1826,12 +1839,17 @@ export function useAcpSession(
           // suppress the banner for attachment sends too. See #1833.
           const workerNotReady = res.status === 503 && detail.startsWith("worker_not_ready");
           if (rejected) {
-            dispatch({ kind: "prompt_send_rejected" });
+            dispatch({ kind: "prompt_send_rejected", id: promptId });
           } else if (workerNotReady) {
             // Undo the optimistic overlay row: the caller re-queues this
             // prompt, so it must live only in the queue until the drain
             // resends it once the worker is back online. See #3094 / #3087.
             dispatch({ kind: "rollback_optimistic_prompt", id: promptId });
+          } else {
+            // Any other 5xx. No `UserPromptSent` is coming, so settle the
+            // optimistic marker; the overlay row stays so the user can see
+            // what they tried to send. See #3417.
+            dispatch({ kind: "settle_inflight_prompt", id: promptId });
           }
           if (!workerNotReady) {
             dispatch({
@@ -1853,6 +1871,10 @@ export function useAcpSession(
         }
         return { kind: "dispatched" };
       } catch (e) {
+        // The POST never completed, so nothing will acknowledge this id.
+        // Settling it is the safe direction: a brief false idle converges on
+        // the next control frame, a false active never converges. See #3417.
+        dispatch({ kind: "settle_inflight_prompt", id: promptId });
         dispatch({
           kind: "error",
           message: `Network error sending prompt: ${describeError(e)}`,
