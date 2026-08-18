@@ -1400,7 +1400,9 @@ export const SessionRow = memo(function SessionRow({
     // For a tied worktree session the rename also moves the directory and can
     // fail (e.g. 409 while running); surface the server message. See #1927.
     const result = await renameSession(sessionId, trimmed);
-    if (!result.ok && result.message) {
+    if (result.ok) {
+      result.warnings?.forEach((warning) => reportError(warning));
+    } else if (result.message) {
       reportError(result.message);
     }
   };

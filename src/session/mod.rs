@@ -137,7 +137,9 @@ pub use repo_config::{
     RepoConfig, RepoTrust, TrustSurface,
 };
 pub use scope::SessionScope;
-pub(crate) use storage::{atomic_write, resolve_symlink_chain};
+pub(crate) use storage::{
+    acquire_session_title_lock, atomic_write, resolve_symlink_chain, StorageFlock,
+};
 pub use storage::{
     load_recent_projects, load_workspace_ordering, recent_project_entry_for, record_recent_project,
     update_workspace_ordering, RecentProjectEntry, Storage, WorkspaceOrdering,

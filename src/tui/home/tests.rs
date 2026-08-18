@@ -7,7 +7,7 @@ use tempfile::TempDir;
 use tui_input::Input;
 
 use super::{ConfigRefreshOrigin, ConfigWatchKey, HomeView, PreviewSelection, ViewMode};
-use crate::session::{GroupTree, Instance, Item, Storage};
+use crate::session::{GroupTree, Instance, Item, Status, Storage};
 use crate::tmux::AvailableTools;
 use crate::tui::app::Action;
 use crate::tui::dialogs::{InfoDialog, NewSessionData, NewSessionDialog};
@@ -18039,7 +18039,8 @@ mod save_field_merge {
             Storage::new_unwatched("target").unwrap(),
         );
 
-        view.move_to_profile(&id, "target", String::new()).unwrap();
+        view.move_to_profile(&id, "target", String::new())
+            .unwrap();
         view.save().expect("save must succeed across profiles");
 
         let old_disk = Storage::new_unwatched("test").unwrap().load().unwrap();
@@ -18052,6 +18053,53 @@ mod save_field_merge {
             new_disk.iter().any(|i| i.id == id),
             "new profile disk MUST contain the moved row"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn profile_only_move_seeds_target_from_authoritative_title_and_lifecycle() {
+        let (_temp, _guard, mut view, id) =
+            boot_view_with_one_session("stale-title", "/tmp/profile-authority");
+        view.storages.insert(
+            "target".to_string(),
+            Storage::new_unwatched("target").unwrap(),
+        );
+
+        view.mutate_instance(&id, |row| {
+            row.lifecycle_generation = 7;
+            row.status = Status::Idle;
+        });
+        let source = Storage::new_unwatched("test").unwrap();
+        source
+            .update(|instances, _groups| {
+                let row = instances.iter_mut().find(|row| row.id == id).unwrap();
+                row.title = "peer-new-title".to_string();
+                row.lifecycle_generation = 7;
+                row.status = Status::Running;
+                Ok(())
+            })
+            .unwrap();
+
+        let guards = view.lock_session_mutation_and_reload(&id).unwrap();
+        let authoritative = view.get_instance(&id).unwrap();
+        assert_eq!(authoritative.title, "peer-new-title");
+        assert_eq!(authoritative.lifecycle_generation, 7);
+        assert_eq!(authoritative.status, Status::Running);
+
+        view.move_to_profile(&id, "target", String::new())
+            .unwrap();
+        view.save().unwrap();
+
+        let target = Storage::new_unwatched("target")
+            .unwrap()
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        assert_eq!(target.title, "peer-new-title");
+        assert_eq!(target.lifecycle_generation, 7);
+        assert_eq!(target.status, Status::Running);
     }
 
     #[test]

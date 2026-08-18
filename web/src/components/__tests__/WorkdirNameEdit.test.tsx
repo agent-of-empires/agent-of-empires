@@ -85,6 +85,7 @@ const fetchSpy = vi.fn<typeof fetch>();
 
 beforeEach(() => {
   fetchSpy.mockReset();
+  vi.mocked(reportError).mockClear();
   vi.stubGlobal("fetch", fetchSpy);
   fetchSpy.mockImplementation(
     async () =>
@@ -177,6 +178,30 @@ describe("sidebar Edit workdir name", () => {
     expect(url).toBe("/api/sessions/s1");
     expect(init?.method).toBe("PATCH");
     expect(JSON.parse(init?.body as string)).toEqual({ title: "new title" });
+  });
+
+  it("surfaces warnings returned by a successful inline rename", async () => {
+    fetchSpy.mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          id: "s1",
+          warnings: ["Session was saved, but its live tmux session could not be rekeyed"],
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    openMenu(workspace("w", [session()]));
+    fireEvent.click(screen.getByTestId("sidebar-context-menu-rename"));
+    fireEvent.change(screen.getByTestId("sidebar-rename-input"), {
+      target: { value: "new title" },
+    });
+    fireEvent.keyDown(screen.getByTestId("sidebar-rename-input"), {
+      key: "Enter",
+    });
+
+    await vi.waitFor(() =>
+      expect(reportError).toHaveBeenCalledWith("Session was saved, but its live tmux session could not be rekeyed"),
+    );
   });
 
   it("surfaces the server message when a tied rename is rejected (#1927)", async () => {

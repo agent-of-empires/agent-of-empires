@@ -929,7 +929,10 @@ fn apply_terminal_title(
 ) -> anyhow::Result<()> {
     let id = id.to_string();
     let new_title = new_title.map(str::to_string);
-    storage.update(|instances, _groups| {
+    let _session_title_lock = crate::session::storage::acquire_session_title_lock(&id)?;
+    let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(&id)?;
+    let rekey = storage.update(|instances, _groups| {
+        let mut rekey = None;
         if let Some(index) = instances.iter().position(|instance| instance.id == id) {
             instances[index].smart_rename_attempted = true;
             if let Some(title) = &new_title {
@@ -950,42 +953,21 @@ fn apply_terminal_title(
                     tracing::warn!(target: "smart_rename", session = %id, title = %title, "skipped duplicate auto-title");
                 } else if should_write {
                     let instance = &mut instances[index];
-                    // The tmux session name embeds the title
-                    // (Session::generate_name), and both status pollers derive
-                    // the name from the current title. Rekey the live session
-                    // to match, else attach/stop/poll would target a name the
-                    // running pane no longer has. Best-effort, mirroring the
-                    // manual TUI rename (src/tui/home/operations.rs).
-                    rekey_tmux_session(&id, &instance.title, title);
+                    rekey = Some((instance.title.clone(), title.clone()));
                     tracing::info!(target: "smart_rename", session = %id, old = %instance.title, new = %title, "auto-renamed terminal session");
                     instance.title = title.clone();
                     instance.last_auto_title = Some(title.clone());
                 }
             }
         }
-        Ok(())
+        Ok(rekey)
     })?;
-    Ok(())
-}
-
-/// Rename the live tmux session from its old title-derived name to the new one,
-/// keeping the pane reachable after the stored title changes. Best-effort: a
-/// missing session or a failed rename is logged, not fatal (matches the manual
-/// rename path).
-fn rekey_tmux_session(id: &str, old_title: &str, new_title: &str) {
-    let Ok(session) = crate::tmux::Session::new(id, old_title) else {
-        return;
-    };
-    if !session.exists() {
-        return;
-    }
-    let new_name = crate::tmux::Session::generate_name(id, new_title);
-    match session.rename(&new_name) {
-        Ok(()) => crate::tmux::refresh_session_cache(),
-        Err(e) => {
-            tracing::warn!(target: "smart_rename", session = %id, "tmux rename failed: {e}")
+    if let Some((old_title, new_title)) = rekey {
+        if let Err(error) = crate::tmux::rekey_session(&id, &old_title, &new_title) {
+            tracing::warn!(target: "smart_rename", session = %id, "tmux rename failed: {error}");
         }
     }
+    Ok(())
 }
 
 /// Entry point for the detached `aoe __smart-rename [--force] <profile> <id>`
@@ -1416,11 +1398,13 @@ mod serve {
     /// is still a default civ name or still equals the last auto title we wrote
     /// (`title_is_auto_overwritable`), so a manual rename is never clobbered.
     /// Serializes against manual renames / worktree edits on this session via
-    /// the per-session instance lock, and mirrors memory only when the storage
-    /// write actually happened so the two never diverge. Two further cases skip
-    /// the write silently: the generated title already equalling the current
-    /// one (a no-op, new here relative to the pre-fix unconditional write), and
-    /// another session in this profile already owning the (title, path) pair.
+    /// both the process-local instance lock and the cross-process per-session
+    /// title lock. The latter is retained from the authoritative storage commit
+    /// through the AppState mirror so an external title writer cannot land in
+    /// the gap and then be overwritten in memory. The mirror changes only when
+    /// the storage write actually happened. Two further cases skip the write
+    /// silently: the generated title already equals the current one, and another
+    /// session in this profile already owns the (title, path) pair.
     pub(crate) async fn apply_auto_title(
         state: &Arc<AppState>,
         id: &str,
@@ -1444,8 +1428,10 @@ mod serve {
         // mirror after the join reuses the borrowed `new_title` directly.
         let id_owned = id.to_string();
         let title_owned = new_title.to_string();
-        let persisted = tokio::task::spawn_blocking(move || {
-            storage.update(|instances, _groups| {
+        let persisted = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let session_title_lock =
+                crate::session::storage::acquire_session_title_lock(&id_owned)?;
+            let wrote = storage.update(|instances, _groups| {
                 let Some(index) = instances
                     .iter()
                     .position(|instance| instance.id == id_owned)
@@ -1477,11 +1463,12 @@ mod serve {
                 } else {
                     Ok(false)
                 }
-            })
+            })?;
+            Ok((wrote, session_title_lock))
         })
         .await;
-        let wrote = match persisted {
-            Ok(Ok(wrote)) => wrote,
+        let (wrote, _session_title_lock) = match persisted {
+            Ok(Ok(result)) => result,
             Ok(Err(e)) => {
                 tracing::warn!(target: "smart_rename", session = %id, "persist failed: {e}");
                 return;
@@ -2730,20 +2717,46 @@ claude = "repo-wrapper"
 
     #[test]
     #[serial_test::serial]
-    fn apply_terminal_title_marks_attempted_and_respects_manual_rename() {
+    fn terminal_title_commit_controls_tmux_rekey_and_warning_contracts() {
         use crate::session::instance::Instance;
         use crate::session::storage::Storage;
+        use crate::tmux::test_helpers::TmuxTestSession;
+
         let home = tempfile::tempdir().expect("tempdir HOME");
-        // SAFETY: serialized by `#[serial]`; matches the sibling config test.
-        unsafe {
-            std::env::set_var("HOME", home.path());
-            std::env::set_var("XDG_CONFIG_HOME", home.path().join(".config"));
-        }
-        let storage = Storage::new_unwatched("default").expect("storage");
+        let _home_guard = crate::session::test_support::isolate_home(home.path());
+        let mut storage = Storage::new_unwatched("default").expect("storage");
 
         // Story 1: a still-civ-named session gets renamed and marked attempted.
         let civ = Instance::new("Vikings", "/tmp/x");
         let civ_id = civ.id.clone();
+        let old_tmux_name = crate::tmux::Session::generate_name(&civ_id, &civ.title);
+        let new_tmux_name = crate::tmux::Session::generate_name(&civ_id, "Fix login bug");
+
+        // The title lock is keyed only by validated session id at the app
+        // root, so a second writer cannot enter while the first is between
+        // commit and rekey, regardless of which profile Storage it will use.
+        assert!(crate::session::storage::acquire_session_title_lock("../unsafe").is_err());
+        let first_title_lock =
+            crate::session::storage::acquire_session_title_lock(&civ_id).unwrap();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let competing_id = civ_id.clone();
+        let competing_writer = std::thread::spawn(move || {
+            let _lock =
+                crate::session::storage::acquire_session_title_lock(&competing_id).unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+        assert!(
+            acquired_rx
+                .recv_timeout(std::time::Duration::from_millis(150))
+                .is_err(),
+            "a competing title writer entered before the current writer released the lock"
+        );
+        drop(first_title_lock);
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("competing writer should enter after release");
+        competing_writer.join().unwrap();
+
         // Story 2: a manually-named session must never be overwritten.
         let mut manual = Instance::new("Britons", "/tmp/y");
         manual.title = "Hand-picked".to_string();
@@ -2754,19 +2767,91 @@ claude = "repo-wrapper"
         let duplicate_id = duplicate_candidate.id.clone();
         let mut duplicate_owner = Instance::new("Saxons", "/tmp/z");
         duplicate_owner.title = "Already owned".to_string();
+
+        // Story 4: a deterministic sessions write failure must leave both
+        // durable metadata and the live tmux destination untouched.
+        let failed = Instance::new("Franks", "/tmp/write-failure");
+        let failed_id = failed.id.clone();
+        let failed_tmux_name = crate::tmux::Session::generate_name(&failed_id, &failed.title);
         storage
             .update(|instances, _groups| {
                 instances.push(civ);
                 instances.push(manual);
                 instances.push(duplicate_candidate);
                 instances.push(duplicate_owner);
+                instances.push(failed);
                 Ok(())
             })
             .unwrap();
 
+        let tmux_available = crate::tmux::tmux_command()
+            .arg("-V")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        let _tmux_guards = if tmux_available {
+            let civ_guard = TmuxTestSession::from_name(old_tmux_name.clone());
+            let failed_guard = TmuxTestSession::from_name(failed_tmux_name.clone());
+            for name in [civ_guard.name(), failed_guard.name()] {
+                let output = crate::tmux::tmux_command()
+                    .args(["new-session", "-d", "-s", name, "sleep 60"])
+                    .output()
+                    .expect("tmux new-session");
+                assert!(
+                    output.status.success(),
+                    "failed to create tmux session {name}: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            crate::tmux::refresh_session_cache();
+            Some((civ_guard, failed_guard))
+        } else {
+            None
+        };
+
         apply_terminal_title(&storage, &civ_id, Some("Fix login bug")).unwrap();
         apply_terminal_title(&storage, &manual_id, Some("Should Not Apply")).unwrap();
         apply_terminal_title(&storage, &duplicate_id, Some("Already owned")).unwrap();
+
+        if tmux_available {
+            assert!(!crate::tmux::Session::from_name(&old_tmux_name).exists());
+            assert!(
+                crate::tmux::Session::from_name(&new_tmux_name).exists(),
+                "the committed title must determine the tmux destination"
+            );
+
+            // Simulate a sibling process rekeying the live pane without
+            // refreshing this process's cache. `rekey_session` must scan
+            // before resolving Session::new, adopt the id-matching peer name,
+            // and move that same pane to the requested destination.
+            let peer_tmux_name = crate::tmux::Session::generate_name(&civ_id, "Peer rename");
+            let final_tmux_name = crate::tmux::Session::generate_name(&civ_id, "Final rename");
+            let peer_rename = crate::tmux::tmux_command()
+                .args(["rename-session", "-t", &new_tmux_name, &peer_tmux_name])
+                .output()
+                .expect("peer tmux rename");
+            assert!(peer_rename.status.success());
+            assert!(crate::tmux::rekey_session(&civ_id, "Fix login bug", "Final rename").unwrap());
+            assert!(crate::tmux::Session::from_name(&final_tmux_name).exists());
+
+            // Populate a positive cache entry, remove the target without
+            // refreshing it, then exercise the absence path. The authoritative
+            // refresh must classify the vanished pane as `Ok(false)`, which
+            // keeps API/TUI callers from showing a warning.
+            let killed = crate::tmux::tmux_command()
+                .args(["kill-session", "-t", &final_tmux_name])
+                .output()
+                .expect("tmux kill-session");
+            assert!(killed.status.success());
+            assert!(!crate::tmux::rekey_session(&civ_id, "Final rename", "No live pane").unwrap());
+        }
+
+        storage.set_fail_writes_for_test(true);
+        let error = apply_terminal_title(&storage, &failed_id, Some("Must Not Land"))
+            .expect_err("injected persistence failure must abort the title mutation");
+        assert!(error
+            .to_string()
+            .contains("injected sessions write failure"));
 
         let (instances, _) = storage.load_with_groups().unwrap();
         let civ = instances.iter().find(|i| i.id == civ_id).unwrap();
@@ -2785,5 +2870,15 @@ claude = "repo-wrapper"
         assert_eq!(duplicate.title, "Franks");
         assert_eq!(duplicate.last_auto_title, None);
         assert!(duplicate.smart_rename_attempted);
+
+        let failed = instances.iter().find(|i| i.id == failed_id).unwrap();
+        assert_eq!(failed.title, "Franks");
+        assert!(!failed.smart_rename_attempted);
+        if tmux_available {
+            assert!(
+                crate::tmux::Session::from_name(&failed_tmux_name).exists(),
+                "tmux must not rekey when the title commit fails"
+            );
+        }
     }
 }

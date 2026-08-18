@@ -27,6 +27,12 @@ impl TmuxTestSession {
         }
     }
 
+    /// Guard an exact name derived by production naming code. The caller is
+    /// still responsible for choosing a unique name and creating the session.
+    pub(crate) fn from_name(name: impl Into<String>) -> Self {
+        Self { name: name.into() }
+    }
+
     pub(crate) fn name(&self) -> &str {
         &self.name
     }

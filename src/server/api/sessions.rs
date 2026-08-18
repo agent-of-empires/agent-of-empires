@@ -1226,6 +1226,32 @@ async fn ensure_sandbox_container_released_blocking(id: &str, is_sandboxed: bool
     })
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum RenamePersistOutcome {
+    Updated { old_title: String },
+    Missing,
+}
+
+fn persist_rename_metadata(
+    storage: &Storage,
+    id: &str,
+    title: &str,
+    new_path: Option<&str>,
+    new_branch: Option<&str>,
+) -> anyhow::Result<RenamePersistOutcome> {
+    storage.update(|instances, _groups| {
+        let Some(inst) = instances.iter_mut().find(|instance| instance.id == id) else {
+            return Ok(RenamePersistOutcome::Missing);
+        };
+        let old_title = inst.title.clone();
+        if let Some(path) = new_path {
+            apply_worktree_name_edit(inst, path, new_branch);
+        }
+        apply_session_title_rename(inst, title.to_string());
+        Ok(RenamePersistOutcome::Updated { old_title })
+    })
+}
+
 /// Rename a session's title (and, when tied, its worktree directory).
 ///
 /// The sandbox container probe runs on the blocking pool via
@@ -1280,11 +1306,9 @@ pub async fn rename_session(
         inst.clone()
     };
     let profile = live.source_profile.clone();
-    let profile_for_load = profile.clone();
-    let file_watch = state.file_watch.clone();
-    // Acquiring an app-wide flock may wait on another process, so never do it
-    // on a Tokio worker. Keep the guard through external effects, persistence,
-    // and cache publication; profile Storage locks are always nested beneath it.
+    // App-wide and per-session flocks may wait on another process, so never
+    // acquire them on a Tokio worker. Identity nests outside session title,
+    // source lifecycle, and profile Storage.
     let _identity_lock = match tokio::task::spawn_blocking(
         crate::session::acquire_session_identity_lock,
     )
@@ -1300,21 +1324,44 @@ pub async fn rename_session(
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
-    let disk_instances = match tokio::task::spawn_blocking(move || {
-        Storage::new(&profile_for_load, file_watch)?.load()
-    })
-    .await
-    {
-        Ok(Ok(instances)) => instances,
-        Ok(Err(error)) => {
-            tracing::error!(target: "http.api.sessions", session = %id, %error, "Failed to load authoritative session state before rename");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-        Err(error) => {
-            tracing::error!(target: "http.api.sessions", session = %id, %error, "Session reload task failed before rename");
-            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-        }
-    };
+    let lock_id = id.clone();
+    let lock_profile = profile.clone();
+    let lock_file_watch = state.file_watch.clone();
+    let (_session_title_lock, _lifecycle_lock, storage, disk_instances) =
+        match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let session_title_lock =
+                crate::session::acquire_session_title_lock(&lock_id)?;
+            let storage = Storage::new(&lock_profile, lock_file_watch)?;
+            let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&lock_id)?;
+            let instances = storage.load()?;
+            Ok((session_title_lock, lifecycle_lock, storage, instances))
+        })
+        .await
+        {
+            Ok(Ok(locks)) => locks,
+            Ok(Err(error)) => {
+                tracing::error!(target: "http.api.sessions", session = %id, "failed to acquire rename locks or load authoritative state: {error}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "title_lock_failed",
+                        "message": "Could not serialize the session rename"
+                    })),
+                )
+                    .into_response();
+            }
+            Err(error) => {
+                tracing::error!(target: "http.api.sessions", session = %id, "rename lock task failed: {error}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "title_lock_failed",
+                        "message": "Could not serialize the session rename"
+                    })),
+                )
+                    .into_response();
+            }
+        };
     let Some(mut fresh) = disk_instances
         .iter()
         .find(|instance| instance.id == id)
@@ -1483,46 +1530,31 @@ pub async fn rename_session(
     // silent persist failure would otherwise leave metadata pointing at the
     // old path after a daemon restart, so it returns 500 rather than a
     // misleading 200.
-    let persisted = {
-        let storage = Storage::new(&profile, state.file_watch.clone());
-        let title_clone = title.clone();
-        let id_clone = id.clone();
-        let new_path_clone = new_path.clone();
-        let new_branch_clone = new_branch.clone();
-        match storage {
-            Ok(storage) => tokio::task::spawn_blocking(move || {
-                storage.update(|instances, _groups| {
-                    let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) else {
-                        return Ok(false);
-                    };
-                    if let Some(path) = new_path_clone.as_deref() {
-                        apply_worktree_name_edit(inst, path, new_branch_clone.as_deref());
-                    }
-                    apply_session_title_rename(inst, title_clone);
-                    Ok(true)
-                })
-            })
-            .await
-            .map_err(|e| e.to_string())
-            .and_then(|r| r.map_err(|e| e.to_string())),
-            Err(e) => Err(e.to_string()),
-        }
-    };
-    match persisted {
-        Ok(true) => {}
-        Ok(false) => {
-            if let Some(path) = new_path.as_deref() {
-                tracing::warn!(
-                    target: "http.api.sessions",
-                    session = %id,
-                    moved_to = %path,
-                    "session row was removed by a peer after the worktree move landed; the moved directory is unreferenced"
-                );
-            }
+    let title_clone = title.clone();
+    let id_clone = id.clone();
+    let new_path_clone = new_path.clone();
+    let new_branch_clone = new_branch.clone();
+    let persisted = tokio::task::spawn_blocking(move || {
+        persist_rename_metadata(
+            &storage,
+            &id_clone,
+            &title_clone,
+            new_path_clone.as_deref(),
+            new_branch_clone.as_deref(),
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())
+    .and_then(|result| result.map_err(|error| error.to_string()));
+    let persisted_old_title = match persisted {
+        Ok(RenamePersistOutcome::Updated { old_title }) => old_title,
+        Ok(RenamePersistOutcome::Missing) => {
+            // AppState can lag an external delete. A missing authoritative row
+            // is not a successful rename and must not trigger tmux/cache work.
             return super::session_not_found();
         }
-        Err(e) => {
-            tracing::error!(target: "http.api.sessions", session = %id, "Failed to save after rename: {e}");
+        Err(error) => {
+            tracing::error!(target: "http.api.sessions", session = %id, "Failed to save after rename: {error}");
             // Persist-first: never fall through to mutate in-memory state on a
             // failed write, or the rename silently reverts on restart. When a
             // dir move already landed, say so; otherwise it is a plain title
@@ -1538,7 +1570,8 @@ pub async fn rename_session(
             )
                 .into_response();
         }
-    }
+    };
+
 
     let published_path = new_path.as_deref().unwrap_or(&current_path);
     let renamed_path = new_path
@@ -1577,6 +1610,36 @@ pub async fn rename_session(
     // untied until the next list refresh.
     response.tie_workdir_to_name = tied;
     drop(_identity_lock);
+
+    let tmux_warning = if persisted_old_title != title && !is_structured {
+        let rekey_id = id.clone();
+        let rekey_old_title = persisted_old_title.clone();
+        let rekey_new_title = title.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::tmux::rekey_session(&rekey_id, &rekey_old_title, &rekey_new_title)
+        })
+        .await
+        {
+            Ok(Ok(_)) => None,
+            Ok(Err(error)) => {
+                tracing::warn!(target: "http.api.sessions", session = %id, "tmux rename failed after persistence: {error}");
+                Some(format!(
+                    "Session metadata was renamed, but its live tmux session could not be rekeyed: {error}"
+                ))
+            }
+            Err(error) => {
+                tracing::warn!(target: "http.api.sessions", session = %id, "tmux rename task failed after persistence: {error}");
+                Some(format!(
+                    "Session metadata was renamed, but its live tmux session could not be rekeyed: {error}"
+                ))
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(warning) = tmux_warning {
+        response.warnings.push(warning);
+    }
 
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
@@ -1683,20 +1746,65 @@ pub async fn set_worktree_name(
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
-    let (worktree_info, current_path, status, profile, is_sandboxed, is_structured) = {
+    let live = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return super::session_not_found();
         };
-        (
-            inst.worktree_info.clone(),
-            inst.project_path.clone(),
-            inst.status,
-            inst.source_profile.clone(),
-            inst.is_sandboxed(),
-            inst.is_structured(),
-        )
+        inst.clone()
     };
+    let profile = live.source_profile.clone();
+    let _identity_lock = match tokio::task::spawn_blocking(
+        crate::session::acquire_session_identity_lock,
+    )
+    .await
+    {
+        Ok(Ok(lock)) => lock,
+        Ok(Err(error)) => {
+            tracing::error!(target: "http.api.sessions", session = %id, %error, "Failed to acquire worktree identity lock");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        Err(error) => {
+            tracing::error!(target: "http.api.sessions", session = %id, %error, "Worktree identity lock task failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let lock_id = id.clone();
+    let lock_profile = profile.clone();
+    let lock_file_watch = state.file_watch.clone();
+    let (_lifecycle_lock, storage, authoritative_instances) =
+        match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let storage = Storage::new(&lock_profile, lock_file_watch)?;
+            let lifecycle = storage.acquire_instance_lifecycle_lock(&lock_id)?;
+            let instances = storage.load()?;
+            Ok((lifecycle, storage, instances))
+        })
+        .await
+        {
+            Ok(Ok(locked)) => locked,
+            Ok(Err(error)) => {
+                tracing::error!(target: "http.api.sessions", session = %id, %error, "Failed to lock or load worktree rename");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+            Err(error) => {
+                tracing::error!(target: "http.api.sessions", session = %id, %error, "Worktree rename lock task failed");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+    let Some(mut fresh) = authoritative_instances
+        .iter()
+        .find(|instance| instance.id == id)
+        .cloned()
+    else {
+        return super::session_not_found();
+    };
+    fresh.source_profile.clone_from(&profile);
+    fresh.merge_runtime_from_reload(&live);
+    let worktree_info = fresh.worktree_info.clone();
+    let current_path = fresh.project_path.clone();
+    let status = fresh.status;
+    let is_sandboxed = fresh.is_sandboxed();
+    let is_structured = fresh.is_structured();
 
     let Some(worktree_info) = worktree_info else {
         return (
@@ -1718,6 +1826,31 @@ pub async fn set_worktree_name(
             Json(serde_json::json!({
                 "error": "tied",
                 "message": "Renaming is unified while \"Tie Worktree Directory to Session Name\" is on; rename the session instead, and its directory follows."
+            })),
+        )
+            .into_response();
+    }
+    let duplicate_path = crate::session::worktree_edit::target_worktree_path(
+        std::path::Path::new(&current_path),
+        &name,
+    )
+    .unwrap_or_else(|| std::path::PathBuf::from(&current_path))
+    .to_string_lossy()
+    .into_owned();
+    if duplicate_path.trim_end_matches('/') != current_path.trim_end_matches('/')
+        && is_duplicate_session(
+            authoritative_instances.iter(),
+            &fresh.title,
+            &duplicate_path,
+            Some(&id),
+        )
+    {
+        let message = duplicate_session_error(&fresh.title).to_string();
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "duplicate_session",
+                "message": message,
             })),
         )
             .into_response();
@@ -1828,27 +1961,22 @@ pub async fn set_worktree_name(
             .into_response()
     };
 
-    let storage = match Storage::new(&profile, state.file_watch.clone()) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(target: "http.api.sessions", session = %id, "Storage::new failed after worktree edit: {e}");
-            return persist_failed();
-        }
-    };
     let id_clone = id.clone();
     let new_path_clone = new_path.clone();
     let new_branch_clone = new_branch.clone();
     match tokio::task::spawn_blocking(move || {
         storage.update(|instances, _groups| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
-                apply_worktree_name_edit(inst, &new_path_clone, new_branch_clone.as_deref());
-            }
-            Ok(())
+            let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) else {
+                return Ok(false);
+            };
+            apply_worktree_name_edit(inst, &new_path_clone, new_branch_clone.as_deref());
+            Ok(true)
         })
     })
     .await
     {
-        Ok(Ok(())) => {}
+        Ok(Ok(true)) => {}
+        Ok(Ok(false)) => return super::session_not_found(),
         Ok(Err(e)) => {
             tracing::error!(target: "http.api.sessions", "Failed to save after worktree edit: {e}");
             return persist_failed();
@@ -1867,6 +1995,7 @@ pub async fn set_worktree_name(
         apply_worktree_name_edit(inst, &new_path, new_branch.as_deref());
         SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen())
     };
+    drop(_identity_lock);
 
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
@@ -10377,6 +10506,23 @@ mod tests {
     // impractical (AppState has no test constructor), so these lock the
     // helper's two guarantees directly: a success durably writes, and every
     // storage failure surfaces as `Err`.
+
+    #[test]
+    #[serial_test::serial]
+    fn rename_persistence_reports_missing_authoritative_row() {
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let _ = isolated_app_dir(temp_home.path());
+        let storage = Storage::new_unwatched("rename-missing").unwrap();
+
+        let outcome =
+            persist_rename_metadata(&storage, "missing-id", "New title", None, None).unwrap();
+        assert_eq!(outcome, RenamePersistOutcome::Missing);
+        assert!(
+            storage.load().unwrap().is_empty(),
+            "a missing row must not be synthesized by rename persistence"
+        );
+    }
 
     #[tokio::test]
     #[serial_test::serial]
