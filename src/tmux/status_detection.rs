@@ -560,6 +560,11 @@ fn claude_has_approval_prompt(recent: &[&str], recent_lower: &str) -> bool {
 /// known limit: a turn that quotes the whole prompt, question and menu row
 /// together, reads Waiting. `"do you want to"` has the same exposure on
 /// `main`; scoping the signals to one prompt block is a separate change.
+/// Note for anyone hardening the shared guard later: for THIS arm the trailing
+/// `any(claude_line_is_numbered_choice)` in `claude_has_approval_prompt` is
+/// already implied, because `claude_trust_choice_option_text` succeeding is
+/// strictly stronger than that predicate. The trust path is one anchored
+/// signal plus one substring, not two independent ones.
 fn claude_has_folder_trust_question(recent: &[&str], recent_lower: &str) -> bool {
     claude_has_trust_option_label(recent)
         && collapse_ascii_whitespace(recent_lower)
@@ -578,9 +583,11 @@ const CLAUDE_TRUST_LABEL_WRAP_LINES: usize = 4;
 /// The trust prompt's option label, matched over the choice row *and its
 /// wrapped continuations*, and required to start the option's own text.
 ///
-/// Two requirements, each closing a false positive measured on a pane carrying
-/// a live spinner, a live token counter and `esc to interrupt` — an actively
-/// generating turn reported as blocked on the user:
+/// Two requirements, each closing a false positive measured on an actively
+/// generating pane. The requirement-1 fixture carries a live spinner, a live
+/// token counter and `esc to interrupt`; the requirement-2 fixtures carry a
+/// live spinner alone, which is enough, since a blocking rule outranks every
+/// running signal:
 ///
 /// 1. The row must be a choice row with no `>` ahead of the number.
 ///    Collapsing the whole window instead found the label in ordinary prose,
@@ -2899,12 +2906,17 @@ enter to select · esc to cancel";
         );
     }
 
-    /// Echoed rows are rejected by the anchor, but not uniformly, and the `>`
-    /// case is the one worth knowing: `claude_line_is_numbered_choice` STRIPS a
-    /// leading `>`, so a blockquote row is a valid numbered choice to it. What
-    /// rejects the blockquote here is `claude_trust_choice_option_text`, which
-    /// tolerates only `❯`. A `grep -n` prefix (`N:content`, no space) is not
-    /// rejected as an echo at all; that pane fails on the option text instead.
+    /// A `cat -n` / `nl` echo of this file's own fixture. It is rejected by the
+    /// option-text requirement, not by anything that recognises the `  2812 `
+    /// prefix — the anchor row the block opens on is ` 1. an unrelated list
+    /// item`, whose text does not start with the label.
+    ///
+    /// The `>` blockquote and `grep -n` (`N:content`, no space) cases live in
+    /// `claude_trust_label_outside_a_menu_row_is_not_a_prompt`. Worth knowing
+    /// which rejects what: `claude_line_is_numbered_choice` STRIPS a leading
+    /// `>`, so a blockquote row is a valid numbered choice to it, and only
+    /// `claude_trust_choice_option_text` (which tolerates just `❯`) turns it
+    /// away.
     #[test]
     fn claude_echoed_trust_fixture_is_not_a_prompt() {
         let echoed = "\
