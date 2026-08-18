@@ -753,7 +753,7 @@ impl HomeView {
         if let Some(inst) = instance {
             std::thread::spawn(move || {
                 if let Err(panic) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    inst.kill_all_tmux_sessions_after_forced_removal()
+                    inst.kill_all_tmux_sessions_without_lifecycle_row()
                 })) {
                     tracing::error!(
                         target: "session.delete",

@@ -1417,15 +1417,22 @@ fn cleanup_partial_session(
     }
 }
 
-pub fn is_duplicate_session(instances: &[Instance], title: &str, path: &str) -> bool {
+pub(crate) fn find_duplicate_session<'a>(
+    instances: &'a [Instance],
+    title: &str,
+    path: &str,
+) -> Option<&'a Instance> {
     let normalized_path = path.trim_end_matches('/');
-    instances.iter().any(|inst| {
-        let existing_path = inst.project_path.trim_end_matches('/');
-        existing_path == normalized_path && inst.title == title
+    instances.iter().find(|instance| {
+        instance.title == title && instance.project_path.trim_end_matches('/') == normalized_path
     })
 }
 
-fn duplicate_session_error(title: &str) -> anyhow::Error {
+pub fn is_duplicate_session(instances: &[Instance], title: &str, path: &str) -> bool {
+    find_duplicate_session(instances, title, path).is_some()
+}
+
+pub(crate) fn duplicate_session_error(title: &str) -> anyhow::Error {
     anyhow::anyhow!(
         "Session already exists with same title and path: {}\n\
          Tip: use a different --title or remove the existing session first",

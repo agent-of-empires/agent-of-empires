@@ -30,7 +30,31 @@ use crate::session::{
 };
 use crate::tmux::AvailableTools;
 
-use super::creation_poller::{CreationPoller, CreationRequest};
+use super::creation_poller::{CreatedWorktreeInfo, CreationPoller, CreationRequest};
+
+fn cleanup_creation_resources(
+    instance: &Instance,
+    created_worktree: Option<&CreatedWorktreeInfo>,
+    created_workspace_worktrees: &[CreatedWorktreeInfo],
+    protected_owner: Option<&Instance>,
+) {
+    let worktree = created_worktree.map(crate::session::builder::CreatedWorktree::from);
+    let workspace_worktrees: Vec<_> = created_workspace_worktrees
+        .iter()
+        .map(crate::session::builder::CreatedWorktree::from)
+        .collect();
+    crate::session::builder::cleanup_instance(
+        instance,
+        worktree.as_ref(),
+        &workspace_worktrees,
+        protected_owner,
+    );
+}
+
+enum CreationCommit {
+    Inserted,
+    Duplicate(Box<Instance>),
+}
 use super::deletion_poller::DeletionPoller;
 #[cfg(feature = "serve")]
 use super::dialogs::ServeView;
@@ -804,6 +828,10 @@ pub struct HomeView {
     pub(super) creating_hook_progress: HashMap<String, CreatingHookProgress>,
     /// The stub instance ID for the current background creation
     pub(super) creating_stub_id: Option<String>,
+    /// Group paths introduced only to display the current Creating stub.
+    /// Finalization removes these from persisted metadata before replacing the
+    /// stub, while preserving groups that were already present when requested.
+    creating_provisional_group_paths: HashSet<String>,
 
     // Performance: preview caching
     pub(super) preview_cache: PreviewCache,
@@ -2320,6 +2348,7 @@ impl HomeView {
             on_launch_hooks_ran: HashSet::new(),
             creating_hook_progress: HashMap::new(),
             creating_stub_id: None,
+            creating_provisional_group_paths: HashSet::new(),
             preview_cache: PreviewCache::default(),
             preview_timings: PreviewTimings::default(),
             terminal_preview_cache: PreviewCache::default(),
@@ -2616,9 +2645,8 @@ impl HomeView {
         self.group_trees.retain(|k, _| storage_keys.contains(k));
 
         // Snapshot the in-flight Creating stub before `self.instances` is
-        // overwritten. The stub isn't on disk (added via `add_instance` from
-        // `create_session` before the async worker starts) and would
-        // otherwise vanish across reload.
+        // overwritten. An intervening save may have persisted it, but while it
+        // is still memory-only it would otherwise vanish across reload.
         let creating_stub_snapshot: Option<Instance> = self
             .creating_stub_id
             .as_ref()
@@ -4156,6 +4184,16 @@ impl HomeView {
 
         let stub_id = stub.id.clone();
         let target_profile = data.profile.clone();
+        let existing_group_paths: HashSet<String> = self
+            .group_trees
+            .get(&target_profile)
+            .map(|tree| {
+                tree.get_all_groups()
+                    .into_iter()
+                    .map(|group| group.path)
+                    .collect()
+            })
+            .unwrap_or_default();
 
         // Add stub to instance list
         self.add_instance(stub);
@@ -4165,6 +4203,17 @@ impl HomeView {
                 tree.create_group(&data.group);
             }
         }
+        self.creating_provisional_group_paths = self
+            .group_trees
+            .get(&target_profile)
+            .map(|tree| {
+                tree.get_all_groups()
+                    .into_iter()
+                    .map(|group| group.path)
+                    .filter(|path| !existing_group_paths.contains(path))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         // Initialize progress tracking and select the stub
         self.creating_hook_progress.insert(
@@ -4214,6 +4263,7 @@ impl HomeView {
         }
         // Remove the stub instance
         if let Some(stub_id) = self.creating_stub_id.take() {
+            self.creating_provisional_group_paths.clear();
             self.remove_instance(&stub_id);
             self.creating_hook_progress.remove(&stub_id);
             self.rebuild_group_trees();
@@ -4227,13 +4277,12 @@ impl HomeView {
     /// Returns Some(session_id) if creation succeeded and we should attach.
     pub fn apply_creation_results(&mut self) -> Option<String> {
         use super::creation_poller::CreationResult;
-        use crate::session::builder::{self, CreatedWorktree};
-        use std::path::PathBuf;
 
         let result = self.creation_poller.try_recv_result()?;
 
         // Clean up the stub and progress tracking
         let stub_id = self.creating_stub_id.take();
+        let provisional_group_paths = std::mem::take(&mut self.creating_provisional_group_paths);
         if let Some(ref id) = stub_id {
             self.creating_hook_progress.remove(id);
         }
@@ -4247,14 +4296,16 @@ impl HomeView {
             if let CreationResult::Success {
                 ref instance,
                 ref created_worktree,
+                ref created_workspace_worktrees,
                 ..
             } = result
             {
-                let worktree = created_worktree.as_ref().map(|wt| CreatedWorktree {
-                    path: PathBuf::from(&wt.path),
-                    main_repo_path: PathBuf::from(&wt.main_repo_path),
-                });
-                builder::cleanup_instance(instance, worktree.as_ref(), &[]);
+                cleanup_creation_resources(
+                    instance,
+                    created_worktree.as_ref(),
+                    created_workspace_worktrees,
+                    None,
+                );
             }
             self.rebuild_group_trees();
             self.rebuild_flat_items();
@@ -4266,9 +4317,10 @@ impl HomeView {
             CreationResult::Success {
                 session_id,
                 instance,
+                created_worktree,
+                created_workspace_worktrees,
                 on_launch_hooks_ran,
-                warnings,
-                ..
+                mut warnings,
             } => {
                 // Remove the stub instance
                 if let Some(id) = &stub_id {
@@ -4283,24 +4335,141 @@ impl HomeView {
                 });
                 instance.source_profile = target_profile.clone();
 
-                // Ensure target profile storage exists
                 if !self.storages.contains_key(&target_profile) {
-                    if let Ok(s) = Storage::new(&target_profile, self.file_watch.clone()) {
-                        self.storages.insert(target_profile.clone(), s);
+                    match Storage::new(&target_profile, self.file_watch.clone()) {
+                        Ok(storage) => {
+                            self.storages.insert(target_profile.clone(), storage);
+                        }
+                        Err(error) => {
+                            cleanup_creation_resources(
+                                &instance,
+                                created_worktree.as_ref(),
+                                &created_workspace_worktrees,
+                                None,
+                            );
+                            self.info_dialog = Some(InfoDialog::sized_to_fit(
+                                "Creation Failed",
+                                &format!("Failed to open profile storage: {error}"),
+                            ));
+                            self.new_dialog = None;
+                            self.rebuild_group_trees();
+                            self.rebuild_flat_items();
+                            self.update_selected();
+                            return None;
+                        }
                     }
                 }
 
-                self.add_instance(instance.clone());
-                self.rebuild_group_trees();
-                if !instance.group_path.is_empty() {
-                    if let Some(tree) = self.group_trees.get_mut(&target_profile) {
+                let storage = self
+                    .storages
+                    .get(&target_profile)
+                    .expect("target profile storage was just ensured");
+                let persist_result = storage.update(|instances, groups| {
+                    // `save()` can run while the builder is working and persist
+                    // the placeholder. Remove that exact row under the same
+                    // storage lock used for collision detection and insertion,
+                    // otherwise the placeholder collides with its own result.
+                    let removed_persisted_stub = stub_id.as_deref().is_some_and(|stub_id| {
+                        let before = instances.len();
+                        instances.retain(|row| row.id != stub_id);
+                        instances.len() != before
+                    });
+                    if removed_persisted_stub && !provisional_group_paths.is_empty() {
+                        groups.retain(|group| !provisional_group_paths.contains(&group.path));
+                        // A peer may have committed another row into one of
+                        // these paths. Rebuild from the remaining rows so its
+                        // group survives even though the stub-created metadata
+                        // was provisional.
+                        *groups = GroupTree::new_with_groups(instances, groups).get_all_groups();
+                    }
+                    if let Some(owner) = crate::cli::add::find_duplicate_session(
+                        instances,
+                        &instance.title,
+                        &instance.project_path,
+                    ) {
+                        return Ok(CreationCommit::Duplicate(Box::new(owner.clone())));
+                    }
+                    instances.push(instance.clone());
+                    if !instance.group_path.is_empty() {
+                        let mut tree = GroupTree::new_with_groups(instances, groups);
                         tree.create_group(&instance.group_path);
+                        *groups = tree.get_all_groups();
                     }
+                    Ok(CreationCommit::Inserted)
+                });
+                match persist_result {
+                    Ok(CreationCommit::Inserted) => {}
+                    Ok(CreationCommit::Duplicate(owner)) => {
+                        cleanup_creation_resources(
+                            &instance,
+                            created_worktree.as_ref(),
+                            &created_workspace_worktrees,
+                            Some(&owner),
+                        );
+                        self.info_dialog = Some(InfoDialog::sized_to_fit(
+                            "Creation Failed",
+                            &crate::cli::add::duplicate_session_error(&instance.title).to_string(),
+                        ));
+                        self.new_dialog = None;
+                        if let Err(error) = self.reload() {
+                            tracing::warn!(
+                                target: "tui.home",
+                                "Failed to reload authoritative state after creation collision: {error}"
+                            );
+                        }
+                        return None;
+                    }
+                    Err(error) => match storage.load() {
+                        Ok(instances) if instances.iter().any(|row| row.id == instance.id) => {
+                            warnings.push(format!(
+                                "Session metadata was written, but finalizing profile storage reported an error: {error}"
+                            ));
+                        }
+                        Ok(instances) => {
+                            let owner = crate::cli::add::find_duplicate_session(
+                                &instances,
+                                &instance.title,
+                                &instance.project_path,
+                            )
+                            .cloned();
+                            cleanup_creation_resources(
+                                &instance,
+                                created_worktree.as_ref(),
+                                &created_workspace_worktrees,
+                                owner.as_ref(),
+                            );
+                            self.info_dialog = Some(InfoDialog::sized_to_fit(
+                                "Creation Failed",
+                                &format!("Failed to save session: {error}"),
+                            ));
+                            self.new_dialog = None;
+                            if let Err(reload_error) = self.reload() {
+                                tracing::warn!(
+                                    target: "tui.home",
+                                    "Failed to reload authoritative state after creation rollback: {reload_error}"
+                                );
+                            }
+                            return None;
+                        }
+                        Err(verify_error) => {
+                            self.info_dialog = Some(InfoDialog::sized_to_fit(
+                                "Creation Failed",
+                                &format!(
+                                    "Failed to save session and could not verify the result: {error}\n\
+                                     Created resources were retained to avoid deleting a persisted session: {verify_error}"
+                                ),
+                            ));
+                            self.new_dialog = None;
+                            self.rebuild_group_trees();
+                            self.rebuild_flat_items();
+                            self.update_selected();
+                            return None;
+                        }
+                    },
                 }
 
-                if let Err(e) = self.save() {
-                    tracing::error!(target: "tui.home", "Failed to save after creation: {}", e);
-                }
+                self.publish_persisted_instance(instance.clone());
+                self.rebuild_group_trees();
 
                 if on_launch_hooks_ran {
                     self.on_launch_hooks_ran.insert(session_id.clone());
@@ -4468,17 +4637,16 @@ impl HomeView {
         if let Some(crate::tui::creation_poller::CreationResult::Success {
             ref instance,
             ref created_worktree,
+            ref created_workspace_worktrees,
             ..
         }) = result
         {
-            let worktree =
-                created_worktree
-                    .as_ref()
-                    .map(|wt| crate::session::builder::CreatedWorktree {
-                        path: std::path::PathBuf::from(&wt.path),
-                        main_repo_path: std::path::PathBuf::from(&wt.main_repo_path),
-                    });
-            crate::session::builder::cleanup_instance(instance, worktree.as_ref(), &[]);
+            cleanup_creation_resources(
+                instance,
+                created_worktree.as_ref(),
+                created_workspace_worktrees,
+                None,
+            );
             tracing::info!(target: "tui.home", "Cleaned up cancelled session on exit");
         }
     }
@@ -6492,6 +6660,22 @@ impl HomeView {
             .or_default()
             .insert(instance.id.clone());
         self.instances.insert(instance.id.clone(), instance);
+    }
+
+    /// Publish a row that this process already committed through
+    /// `Storage::update`. Unlike a provisional TUI add, a later missing disk row
+    /// is a peer deletion and must not be recreated by `save()`.
+    fn publish_persisted_instance(&mut self, instance: Instance) {
+        let profile = instance.source_profile.clone();
+        let id = instance.id.clone();
+        self.add_instance(instance);
+        let remove_profile_entry = self.pending_added.get_mut(&profile).is_some_and(|pending| {
+            pending.remove(&id);
+            pending.is_empty()
+        });
+        if remove_profile_entry {
+            self.pending_added.remove(&profile);
+        }
     }
 
     /// Centralized instance removal: shift-removes from the ordered map

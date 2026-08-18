@@ -6555,12 +6555,12 @@ impl Instance {
         self.kill_all_tmux_sessions_uncoordinated();
     }
 
-    /// Break-glass teardown after force-removal has durably deleted the row.
+    /// Tear down tmux resources when no durable lifecycle row exists.
     ///
-    /// A lifecycle reservation cannot be acquired once the row is absent.
-    /// Force-removal is limited to an already-Deleting row, so no launch can
-    /// race this idempotent cleanup.
-    pub(crate) fn kill_all_tmux_sessions_after_forced_removal(&self) {
+    /// Used after force-removal and when rolling back an instance that failed
+    /// before its row was committed. With no row, lifecycle reservation is
+    /// impossible; callers must already know the id cannot race a launch.
+    pub(crate) fn kill_all_tmux_sessions_without_lifecycle_row(&self) {
         self.kill_all_tmux_sessions_uncoordinated();
     }
 

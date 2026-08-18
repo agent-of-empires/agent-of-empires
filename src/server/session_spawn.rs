@@ -394,6 +394,7 @@ pub(crate) async fn spawn_structured_session(
                 &instance,
                 created_worktree.as_ref(),
                 &created_workspace_worktrees,
+                None,
             );
             return Err(anyhow::anyhow!("on_create hook failed: {e:#}"));
         }

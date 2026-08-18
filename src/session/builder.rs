@@ -3,7 +3,10 @@
 //! This module provides shared logic for building new session instances,
 //! used by both synchronous (TUI operations) and asynchronous (background poller) code paths.
 
-use std::{collections::HashSet, path::PathBuf};
+use std::{
+    collections::HashSet,
+    path::{Path, PathBuf},
+};
 
 use anyhow::{bail, Result};
 use chrono::Utc;
@@ -71,10 +74,12 @@ pub struct BuildResult {
     pub warnings: Vec<String>,
 }
 
-/// Info about a worktree created during instance building.
+/// A worktree provisioned during instance building and owned by this build.
 pub struct CreatedWorktree {
     pub path: PathBuf,
     pub main_repo_path: PathBuf,
+    /// Branch created by this build. `None` when attaching an existing branch.
+    pub owned_branch: Option<String>,
 }
 
 /// Result of creating a multi-repo workspace.
@@ -273,10 +278,9 @@ pub fn create_workspace(
     }
 
     let cleanup = |created: &[CreatedWorktree], ws_path: &std::path::Path| {
-        for wt in created {
-            if let Ok(git_wt) = GitWorktree::new(wt.main_repo_path.clone()) {
-                let _ = git_wt.remove_worktree(&wt.path, false);
-            }
+        let protection = CleanupProtection::default();
+        for worktree in created {
+            cleanup_created_worktree(worktree, "workspace worktree", &protection);
         }
         let _ = std::fs::remove_dir_all(ws_path);
     };
@@ -389,6 +393,7 @@ pub fn create_workspace(
                 created_worktrees.push(CreatedWorktree {
                     path: plan.worktree_subdir.clone(),
                     main_repo_path: plan.main_repo_path.clone(),
+                    owned_branch: create_new_branch.then(|| branch.to_string()),
                 });
                 repos.push(WorkspaceRepo {
                     name: plan.repo_name.clone(),
@@ -661,6 +666,7 @@ pub fn build_instance(
                     created_worktree = Some(CreatedWorktree {
                         path: worktree_path,
                         main_repo_path: main_repo_path.clone(),
+                        owned_branch: None,
                     });
                     worktree_info = Some(WorktreeInfo {
                         branch: branch.clone(),
@@ -706,6 +712,7 @@ pub fn build_instance(
                 created_worktree = Some(CreatedWorktree {
                     path: worktree_path,
                     main_repo_path: main_repo_path.clone(),
+                    owned_branch: Some(branch.clone()),
                 });
                 worktree_info = Some(WorktreeInfo {
                     branch: branch.clone(),
@@ -850,17 +857,128 @@ pub fn build_instance(
     })
 }
 
+#[derive(Default)]
+struct CleanupProtection<'a> {
+    owner: Option<&'a Instance>,
+}
+
+impl CleanupProtection<'_> {
+    fn paths_equal(left: &Path, right: &Path) -> bool {
+        left == right
+            || left
+                .canonicalize()
+                .ok()
+                .zip(right.canonicalize().ok())
+                .is_some_and(|(left, right)| left == right)
+    }
+
+    fn path_references_target(reference: &Path, target: &Path) -> bool {
+        if reference == target || reference.starts_with(target) {
+            return true;
+        }
+        reference
+            .canonicalize()
+            .ok()
+            .zip(target.canonicalize().ok())
+            .is_some_and(|(reference, target)| reference == target || reference.starts_with(target))
+    }
+
+    fn references_path(&self, target: &Path) -> bool {
+        let Some(owner) = self.owner else {
+            return false;
+        };
+        if Self::path_references_target(Path::new(&owner.project_path), target) {
+            return true;
+        }
+        owner.workspace_info.as_ref().is_some_and(|workspace| {
+            Self::path_references_target(Path::new(&workspace.workspace_dir), target)
+                || workspace.repos.iter().any(|repo| {
+                    Self::path_references_target(Path::new(&repo.worktree_path), target)
+                })
+        })
+    }
+
+    fn references_branch(&self, main_repo_path: &Path, branch: &str) -> bool {
+        let Some(owner) = self.owner else {
+            return false;
+        };
+        owner.worktree_info.as_ref().is_some_and(|worktree| {
+            Self::paths_equal(Path::new(&worktree.main_repo_path), main_repo_path)
+                && worktree.branch == branch
+        }) || owner.workspace_info.as_ref().is_some_and(|workspace| {
+            workspace.repos.iter().any(|repo| {
+                Self::paths_equal(Path::new(&repo.main_repo_path), main_repo_path)
+                    && repo.branch == branch
+            })
+        })
+    }
+}
+
+/// Remove a worktree and then its build-owned branch. The branch stays intact
+/// when worktree removal fails because Git still considers it checked out.
+fn cleanup_created_worktree(
+    created: &CreatedWorktree,
+    label: &str,
+    protection: &CleanupProtection<'_>,
+) {
+    if protection.references_path(&created.path) {
+        tracing::debug!(
+            target: "session.create",
+            path = %created.path.display(),
+            "Preserving {label} referenced by the persisted uniqueness winner"
+        );
+        return;
+    }
+    let Ok(worktree) = GitWorktree::new(created.main_repo_path.clone()) else {
+        return;
+    };
+    if let Err(error) = worktree.remove_worktree(&created.path, false) {
+        tracing::warn!(target: "session.create", "Failed to clean up {label}: {error}");
+        return;
+    }
+    if let Some(branch) = created
+        .owned_branch
+        .as_deref()
+        .filter(|branch| !protection.references_branch(&created.main_repo_path, branch))
+    {
+        if let Err(error) = worktree.delete_branch(branch) {
+            tracing::warn!(target: "session.create", branch, "Failed to clean up branch: {error}");
+        }
+    }
+}
+
 /// Clean up resources created during a failed or cancelled instance build.
 ///
-/// This handles:
-/// - Removing worktrees created by aoe
-/// - Removing Docker containers
-/// - Killing tmux sessions
+/// Runtime resources always belong to the losing build and are stopped first,
+/// so a sandbox bind mount cannot block worktree removal. `protected_owner`
+/// is the persisted row that won a final uniqueness race; filesystem and Git
+/// resources referenced by that row are retained.
 pub fn cleanup_instance(
     instance: &Instance,
     created_worktree: Option<&CreatedWorktree>,
     created_workspace_worktrees: &[CreatedWorktree],
+    protected_owner: Option<&Instance>,
 ) {
+    // The loser may never have reached storage, so lifecycle-coordinated stop
+    // cannot reserve its row. Tear down only tmux resources named by its id.
+    instance.kill_all_tmux_sessions_without_lifecycle_row();
+
+    if let Some(sandbox) = &instance.sandbox_info {
+        if sandbox.enabled {
+            // Direct idempotent teardown, never gated on a separate existence
+            // probe. This must precede filesystem cleanup because the
+            // container bind-mounts the worktree.
+            let container = containers::DockerContainer::from_session_id(&instance.id);
+            if let containers::Teardown::Failed(e) = container.teardown(&instance.id) {
+                tracing::warn!(target: "session.create", "Failed to clean up container: {}", e);
+            }
+        }
+    }
+
+    let protection = CleanupProtection {
+        owner: protected_owner,
+    };
+
     // Scratch dirs are provisioned eagerly inside `build_instance`
     // (well before this helper's other cleanup targets exist), so an
     // abort between provisioning and the caller finishing the session
@@ -869,7 +987,9 @@ pub fn cleanup_instance(
     // wipe unrelated app data.
     if instance.scratch {
         let scratch_path = PathBuf::from(&instance.project_path);
-        if super::scratch::is_scratch_path(&scratch_path) {
+        if !protection.references_path(&scratch_path)
+            && super::scratch::is_scratch_path(&scratch_path)
+        {
             if let Err(e) = std::fs::remove_dir_all(&scratch_path) {
                 tracing::warn!(
                     target: "session.create",
@@ -880,40 +1000,19 @@ pub fn cleanup_instance(
         }
     }
 
-    if let Some(wt) = created_worktree {
-        if let Ok(git_wt) = GitWorktree::new(wt.main_repo_path.clone()) {
-            if let Err(e) = git_wt.remove_worktree(&wt.path, false) {
-                tracing::warn!(target: "session.create", "Failed to clean up worktree: {}", e);
-            }
-        }
+    if let Some(worktree) = created_worktree {
+        cleanup_created_worktree(worktree, "worktree", &protection);
     }
 
-    // Workspace worktree cleanup
-    for wt in created_workspace_worktrees {
-        if let Ok(git_wt) = GitWorktree::new(wt.main_repo_path.clone()) {
-            if let Err(e) = git_wt.remove_worktree(&wt.path, false) {
-                tracing::warn!(target: "session.create", "Failed to clean up workspace worktree: {}", e);
-            }
+    for worktree in created_workspace_worktrees {
+        cleanup_created_worktree(worktree, "workspace worktree", &protection);
+    }
+    if let Some(workspace) = &instance.workspace_info {
+        let workspace_dir = Path::new(&workspace.workspace_dir);
+        if !protection.references_path(workspace_dir) {
+            let _ = std::fs::remove_dir_all(workspace_dir);
         }
     }
-    // Clean up workspace directory if workspace was created
-    if let Some(ws_info) = &instance.workspace_info {
-        let _ = std::fs::remove_dir_all(&ws_info.workspace_dir);
-    }
-
-    if let Some(sandbox) = &instance.sandbox_info {
-        if sandbox.enabled {
-            // Direct idempotent teardown, never gated on a separate existence
-            // probe: a transient `inspect` failure must not skip removal and
-            // orphan a live container. Volumes are swept inside `teardown`.
-            let container = containers::DockerContainer::from_session_id(&instance.id);
-            if let containers::Teardown::Failed(e) = container.teardown(&instance.id) {
-                tracing::warn!(target: "session.create", "Failed to clean up container: {}", e);
-            }
-        }
-    }
-
-    let _ = instance.kill();
 }
 
 /// Structured-view (ACP) helpers for the TUI create paths. The web create
@@ -1864,6 +1963,17 @@ mod tests {
             None,
             "a repo with no configured base records none, so the diff falls through to detection"
         );
+        assert!(result
+            .created_worktrees
+            .iter()
+            .all(|worktree| worktree.owned_branch.as_deref() == Some("feature-x")));
+        for worktree in &result.created_worktrees {
+            cleanup_created_worktree(worktree, "test worktree", &CleanupProtection::default());
+            let repo = git2::Repository::open(&worktree.main_repo_path).unwrap();
+            assert!(repo
+                .find_branch("feature-x", git2::BranchType::Local)
+                .is_err());
+        }
     }
 
     /// A repo whose branch aoe did not create has no base of its own: the base
@@ -1895,6 +2005,42 @@ mod tests {
         .expect("workspace creation should succeed");
 
         assert_eq!(result.workspace_info.repos[0].base_branch, None);
+        assert_eq!(result.created_worktrees[0].owned_branch, None);
+        let worktree = &result.created_worktrees[0];
+        cleanup_created_worktree(worktree, "test worktree", &CleanupProtection::default());
+        let repo = git2::Repository::open(&worktree.main_repo_path).unwrap();
+        assert!(repo
+            .find_branch("feature-x", git2::BranchType::Local)
+            .is_ok());
+    }
+
+    #[test]
+    fn cleanup_keeps_owned_branch_when_worktree_removal_fails() {
+        let (parent, _) = init_repo_with_branch("cleanup", "release");
+        let main_repo_path = parent.path().join("cleanup");
+        let worktree_path = parent.path().join("dirty-worktree");
+        let git = GitWorktree::new(main_repo_path.clone()).unwrap();
+        git.create_worktree("rollback-branch", &worktree_path, true, None)
+            .unwrap();
+        std::fs::write(worktree_path.join("README.md"), "dirty\n").unwrap();
+
+        let created = CreatedWorktree {
+            path: worktree_path.clone(),
+            main_repo_path: main_repo_path.clone(),
+            owned_branch: Some("rollback-branch".to_string()),
+        };
+        cleanup_created_worktree(&created, "test worktree", &CleanupProtection::default());
+
+        assert!(worktree_path.exists(), "dirty worktree must survive");
+        let repo = git2::Repository::open(&main_repo_path).unwrap();
+        assert!(
+            repo.find_branch("rollback-branch", git2::BranchType::Local)
+                .is_ok(),
+            "owned branch must not be deleted while its worktree remains"
+        );
+
+        git.remove_worktree(&worktree_path, true).unwrap();
+        git.delete_branch("rollback-branch").unwrap();
     }
 
     #[test]
