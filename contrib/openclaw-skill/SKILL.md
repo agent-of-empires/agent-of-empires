@@ -92,7 +92,7 @@ aoe list --json --state=live
 ]
 ```
 
-`command` is omitted when empty; `worktree` appears only for worktree-backed sessions. `state` is `live`, `archived`, or `trashed`; `trashed_at` and `archived_at` are set independently and each persists once set, so a session archived and then trashed carries both and reports `trashed`. A trashed session stays in the listing and keeps its title, so check `state` before treating a row as a live session. `list --json` does not include live status; use `aoe status --json` or `aoe session capture --json` for that.
+`command` is omitted when empty; `worktree` appears only for worktree-backed sessions. `state` is `live`, `archived`, or `trashed`; `trashed_at` and `archived_at` are set independently, and trashing leaves `archived_at` alone, so a session archived and then trashed carries both keys and reports `trashed`. Neither is durable: each is cleared when the session leaves that state, including by anything that wakes it, so key off `state` rather than caching a timestamp. A trashed session stays in the listing and keeps its title, so check `state` before treating a row as a live session. `list --json` does not include live status; use `aoe status --json` or `aoe session capture --json` for that.
 
 ### Session lifecycle
 
@@ -146,7 +146,7 @@ aoe status -q   # just the waiting count (for scripting)
 }
 ```
 
-`state` is `live`, `archived`, or `trashed`, the same vocabulary `aoe list --json` uses; `trashed_at` and `archived_at` are set independently and each persists once set, so a session archived and then trashed carries both and reports `trashed`; `status` is the pane's live status and does not carry it, since an archived session can still be running.
+`state` is `live`, `archived`, or `trashed`, the same vocabulary `aoe list --json` uses; `trashed_at` and `archived_at` are set independently, and `trash()` deliberately leaves `archived_at` alone, so a session archived and then trashed carries both keys and reports `trashed`. Neither is durable: each is cleared when the session leaves that state, including by anything that wakes it (`aoe session restart`, `aoe send`, favourite, pin), so read the current `state` rather than caching a timestamp; `status` is the pane's live status and does not carry it, since an archived session can still be running.
 
 **JSON output shape** (`aoe status --json`):
 ```json
