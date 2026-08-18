@@ -3,8 +3,17 @@
 // dependencies on the rest of the crate: build scripts compile in isolation.
 
 /// The git files cargo should watch so `AOE_BUILD_VERSION` is recomputed when
-/// the checkout's revision or staged state changes: `HEAD` moves on
-/// checkout/commit, `index` moves on stage.
+/// the checkout's revision changes: `HEAD` moves on checkout/commit.
+///
+/// `index` used to be watched too, so the embedded dirty flag would update as
+/// soon as you staged something. That backfired: git rewrites `index`'s stat
+/// cache on a plain `git status` (racily-clean revalidation), not just on
+/// real staging, so anything that runs `git status` in the background (shell
+/// prompts, editor/IDE git integrations) touched `index`'s mtime and made
+/// cargo treat the crate as dirty on every single build, even with zero
+/// source changes. `HEAD` alone is a coarser but reliable
+/// signal: the dirty suffix now only recomputes on the next real rebuild
+/// trigger rather than on every restart.
 ///
 /// Paths are resolved for the repository rooted at `dir` via
 /// `git rev-parse --git-path`, which is correct for both a normal checkout
@@ -20,7 +29,7 @@
 /// checkout (e.g. a source tarball), leaving the build version pinned to
 /// `CARGO_PKG_VERSION` with no spurious rerun trigger.
 pub fn git_watch_paths(dir: &std::path::Path) -> Vec<String> {
-    ["HEAD", "index"]
+    ["HEAD"]
         .iter()
         .filter_map(|file| git_path(dir, file))
         .filter(|path| watched_path_exists(dir, path))

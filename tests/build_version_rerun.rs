@@ -1,8 +1,8 @@
 //! Regression test for issue #1962: inside a git worktree the build script
-//! must watch the *real* per-worktree `HEAD`/`index`, not the literal
-//! `.git/HEAD` (which does not exist there). A missing `rerun-if-changed`
-//! input makes cargo treat the build script as perpetually stale, recompiling
-//! the lib + binary on every build.
+//! must watch the *real* per-worktree `HEAD`, not the literal `.git/HEAD`
+//! (which does not exist there). A missing `rerun-if-changed` input makes
+//! cargo treat the build script as perpetually stale, recompiling the lib +
+//! binary on every build.
 //!
 //! The test drives the actual watch-path logic used by `build.rs`
 //! (`build_git_watch.rs`, shared via `include!`) against a temporary git
@@ -90,8 +90,8 @@ fn watch_paths_resolve_in_a_git_worktree() {
     let paths = build_git_watch::git_watch_paths(&worktree);
     assert_eq!(
         paths.len(),
-        2,
-        "expected HEAD and index watch paths, got {paths:?}"
+        1,
+        "expected only the HEAD watch path, got {paths:?}"
     );
     for watched in &paths {
         assert!(
