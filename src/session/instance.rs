@@ -10578,21 +10578,15 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn test_wrap_command_reasserts_working_dir_after_login_shell() {
-        // Resolved rather than hardcoded to `/bin/bash`: the wrapper execs
-        // `$SHELL`, and a host that keeps its shells outside the FHS layout
-        // (NixOS, a minimal container) has no `/bin/bash` for it to reach.
-        let bash = which::which("bash").expect("bash on PATH");
-        // `EnvGuard` rather than a bare `set_var` plus a manual restore at the
-        // end: it restores on the unwind if an assertion below fails, and it
-        // serialises against other `EnvGuard` users. It does NOT hide the
-        // override from tests that take no guard - `test_support::ENV_LOCK` is
-        // only ever acquired by `EnvGuard` (note `logging.rs` has a separate,
-        // unrelated `ENV_LOCK` that is locked directly) - which is why
-        // resolving a real `bash` above still matters: 12 of the 14
-        // `repo_config` hook tests take no guard, so they see the override
-        // either way, and what they must not see is a path that cannot run.
-        // The other two do hold the lock, and `EnvGuard` alone would have
-        // covered those.
+        // The wrapper execs `$SHELL`, so it has to be a shell that exists here.
+        let Ok(bash) = which::which("bash") else {
+            eprintln!("skipping: bash not found on PATH");
+            return;
+        };
+        // The guard restores on unwind; the resolved path matters separately,
+        // because `test_support::ENV_LOCK` is taken only by `EnvGuard` and 12
+        // of the 14 `repo_config` hook tests take none, so they read this
+        // override regardless and must not read a path that cannot run.
         let _shell = EnvGuard::set(&[("SHELL", &bash)]);
         let temp = tempfile::tempdir().unwrap();
         let working_dir = temp.path().join("some project's dir");
@@ -11720,13 +11714,10 @@ mod tests {
         assert!(!command.contains("/dev/pts/*"));
         assert!(command.find("printf").unwrap() < command.rfind("exec sh -c").unwrap());
     }
-    /// The shim dir ahead of the caller's real `PATH`. Inheriting the caller's
-    /// value rather than forcing a literal `/usr/bin:/bin` is what lets these
-    /// run on a host whose coreutils live outside the FHS layout. The shim
-    /// stays first, so the fake `tmux` still wins over any real one.
-    ///
-    /// Built with `join_paths` over `OsString` rather than formatting: a
-    /// `PATH` entry need not be UTF-8, and `to_string_lossy` would corrupt it.
+    /// The shim dir, then the caller's `PATH`. Shim first, so the fake `tmux`
+    /// wins over any real one; inherited rather than a literal `/usr/bin:/bin`,
+    /// so a host whose coreutils sit outside the FHS layout still resolves
+    /// them. `OsString` throughout: a `PATH` entry need not be UTF-8.
     #[cfg(unix)]
     fn test_path_with_shim(bin: &std::path::Path) -> std::ffi::OsString {
         // An unset or empty PATH is handled separately: `split_paths("")`
@@ -11742,20 +11733,16 @@ mod tests {
         std::env::join_paths(entries).expect("PATH entries contain no separator")
     }
 
+    /// `#[serial]` because this reads the inherited PATH, and the peers that
+    /// scrub PATH process-globally (`crate::acp::node`, `crate::acp::acp_client`)
+    /// carry that annotation. Not an `EnvGuard` lock: those three never take
+    /// `test_support::ENV_LOCK`, so it would exclude unrelated guard users and
+    /// leave this window open.
     #[cfg(unix)]
     #[test]
+    #[serial_test::serial]
     fn omp_capture_gate_executes_nested_stdin_scripts() {
         use std::os::unix::fs::PermissionsExt;
-
-        // Held purely as a lock, per the precedent in
-        // `src/server/api/plugins.rs`. Reading the inherited PATH means this
-        // test is no longer immune to the peers that scrub PATH
-        // process-globally (`crate::acp::node` removes it,
-        // `crate::acp::acp_client` points it at an empty tempdir). Those
-        // carry `#[serial]`, which excludes annotated peers but not this
-        // one, so take the same lock rather than add an annotation nothing
-        // else here needs.
-        let _env_lock = EnvGuard::unset(&[]);
 
         let temp = tempfile::tempdir().unwrap();
         let bin = temp.path().join("bin");

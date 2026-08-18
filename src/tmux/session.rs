@@ -4019,14 +4019,13 @@ mod tests {
         file.disarm();
     }
 
+    /// `#[serial]` because the assertion reads the inherited PATH, and the
+    /// peers that scrub it process-globally (`crate::acp::node`,
+    /// `crate::acp::acp_client`) carry that annotation. Not an `EnvGuard` lock:
+    /// they never take `test_support::ENV_LOCK`.
     #[test]
+    #[serial_test::serial]
     fn test_container_env_file_does_not_mutate_host_process_environment() {
-        // Held purely as a lock (see `src/server/api/plugins.rs`): the
-        // assertion now reads the inherited PATH, so it has to be linearized
-        // against the peers that scrub PATH process-globally in
-        // `crate::acp::node` and `crate::acp::acp_client`.
-        let _env_lock = crate::session::test_support::EnvGuard::unset(&[]);
-
         let temp = tempfile::tempdir().unwrap();
         let host_output = temp.path().join("host-env");
         let payload_output = temp.path().join("container-env");
