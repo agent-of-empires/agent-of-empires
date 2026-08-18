@@ -204,7 +204,7 @@ unchanged.
 
 ## Star History
 
-[![Star History Chart](https://api.star-history.com/svg?repos=agent-of-empires/agent-of-empires&type=date&legend=top-left)](https://www.star-history.com/#agent-of-empires/agent-of-empires&type=date&legend=top-left)
+[![Star History Chart](https://star-history.dera.page/svg?repos=agent-of-empires/agent-of-empires&type=date&legend=top-left)](https://star-history.dera.page/#agent-of-empires/agent-of-empires&type=date&legend=top-left)
 
 ## Acknowledgments
 
