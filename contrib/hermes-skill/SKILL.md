@@ -89,7 +89,7 @@ aoe list --json --state=live   # skip trashed and archived rows
 ]
 ```
 
-`command` is omitted when empty; `worktree` appears only for worktree-backed sessions. `state` is `live`, `archived`, or `trashed`, with `trashed_at` / `archived_at` present only in those states; a trashed session stays in the listing and keeps its title, so check `state` before treating a row as a live session. `list --json` does not include live status: use `aoe status --json` or `aoe session capture --json` for that.
+`command` is omitted when empty; `worktree` appears only for worktree-backed sessions. `state` is `live`, `archived`, or `trashed`; `trashed_at` and `archived_at` are set independently and each persists once set, so a session archived and then trashed carries both and reports `trashed`. A trashed session stays in the listing and keeps its title, so check `state` before treating a row as a live session. `list --json` does not include live status: use `aoe status --json` or `aoe session capture --json` for that.
 
 ## Session Lifecycle
 
@@ -143,7 +143,7 @@ aoe status -q   # just the waiting count (for scripting)
 }
 ```
 
-`parent_session_id` is included only for sub-sessions. `state` is `live`, `archived`, or `trashed`, with `trashed_at` / `archived_at` present only in those states, the same vocabulary `aoe list --json` uses; `status` is the pane's live status and does not carry it, since an archived session can still be running.
+`parent_session_id` is included only for sub-sessions. `state` is `live`, `archived`, or `trashed`, the same vocabulary `aoe list --json` uses; `trashed_at` and `archived_at` are set independently and each persists once set, so a session archived and then trashed carries both and reports `trashed`; `status` is the pane's live status and does not carry it, since an archived session can still be running.
 
 **JSON shape** (`aoe status --json`):
 ```json
