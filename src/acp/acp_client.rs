@@ -15447,6 +15447,24 @@ done
             !codex_env.contains_key("ANTHROPIC_API_KEY"),
             "Codex must not receive another adapter's ambient credential, got {codex_env:#?}"
         );
+
+        // A custom `agent_acp_cmd` adapter carries no allowlist at all, so it
+        // gets no ambient provider credential: the whole point of moving the
+        // Claude keys off `ALWAYS_FORWARD_ENV`.
+        config.spec = crate::acp::AgentSpec::from_acp_cmd("custom", "/bin/true").expect("spec");
+        let mut custom_cmd = std::process::Command::new("/bin/true");
+        custom_cmd.env_clear();
+        apply_env_filter(&mut custom_cmd, &config);
+        let custom_keys: Vec<String> = custom_cmd
+            .get_envs()
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        for key in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"] {
+            assert!(
+                !custom_keys.iter().any(|k| k == key),
+                "a custom adapter must not receive the ambient {key}, got {custom_keys:?}"
+            );
+        }
     }
 
     /// #3238 security posture: `spec.env_allowlist` (which a custom-agent

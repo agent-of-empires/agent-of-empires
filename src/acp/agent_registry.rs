@@ -8,8 +8,8 @@ use std::collections::HashMap;
 
 /// Convert the static per-binary slice from `install_hints::env_allowlist_for`
 /// into the owned `Option<Vec<String>>` field on `AgentSpec`. Empty slice maps
-/// to `None` so Claude/deferred adapters serialize the same as before, and
-/// the JSON shape of a persisted default registry does not change.
+/// to `None`, the shape a deferred or custom adapter carries, so a registry
+/// entry with no verified provider keys serializes as it always has.
 fn default_env_allowlist(binary: &str) -> Option<Vec<String>> {
     let keys = env_allowlist_for(binary);
     (!keys.is_empty()).then(|| keys.iter().map(|s| s.to_string()).collect())
@@ -332,6 +332,10 @@ mod tests {
         // exported must authenticate.
         let opencode = al("opencode").unwrap_or_default();
         for key in [
+            // The `anthropic` entry declares this one; opencode against a
+            // Claude model reads it from the environment like any other
+            // models.dev provider key.
+            "ANTHROPIC_API_KEY",
             "OPENROUTER_API_KEY",
             "OPENCODE_API_KEY",
             "GOOGLE_GENERATIVE_AI_API_KEY",
