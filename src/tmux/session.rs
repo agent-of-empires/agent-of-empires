@@ -4021,9 +4021,9 @@ mod tests {
 
     /// `#[serial]` because the assertion reads the inherited PATH, and the
     /// tests that scrub it process-globally carry that annotation:
-    /// `crate::acp::node`, `crate::acp::acp_client`, and four more in
-    /// `crate::update::install`. Not an `EnvGuard` lock: none of them takes
-    /// `test_support::ENV_LOCK`.
+    /// `crate::acp::node`, `crate::acp::acp_client` and `crate::update::install`
+    /// — eleven tests across four PATH-setting helper sites. Not an `EnvGuard`
+    /// lock: none of them takes `test_support::ENV_LOCK`.
     #[test]
     #[serial_test::serial]
     fn test_container_env_file_does_not_mutate_host_process_environment() {
@@ -4070,9 +4070,10 @@ mod tests {
         // The PATH is asserted back below to prove the env file did not mutate
         // the host process environment, so it has to be a value this host can
         // actually resolve `cat` on rather than a hardcoded `/usr/bin:/bin`.
-        // `var_os`, not `var`: a PATH entry need not be UTF-8, and `var` would
-        // hand back an empty string for one that isn't, silently emptying the
-        // PATH instead of failing.
+        // `var_os`, not `var`: a PATH entry need not be UTF-8, and `var`
+        // returns `Err(VarError::NotUnicode)` for one that isn't — which the
+        // `unwrap_or_default` below would turn into an empty PATH rather than
+        // a failure.
         let host_path = std::env::var_os("PATH").unwrap_or_default();
         let status = std::process::Command::new("/bin/sh")
             .args(["-c", &wrapper])
