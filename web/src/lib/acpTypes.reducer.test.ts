@@ -577,24 +577,25 @@ describe("patchServerRow (Tier 4 delta Patch)", () => {
   });
 });
 
-describe("applyEvent / UserPromptSent turn counter (Tier 4)", () => {
-  it("bumps pendingUserPromptSeq for a prompt with no matching optimistic overlay", () => {
+describe("applyEvent / UserPromptSent prompt counter (Tier 4)", () => {
+  it("bumps promptSeq for a prompt this client did not dispatch", () => {
     const next = applyEvent(emptyAcpState(), {
       session_id: "s-1",
       seq: 1,
       event: { UserPromptSent: { text: "hi", prompt_id: "cmp-1" } },
     });
-    expect(next.pendingUserPromptSeq).toBe(1);
+    expect(next.promptSeq).toBe(1);
     expect(next.turnActive).toBe(true);
     // The transcript row is server-owned; applyEvent adds none.
     expect(next.activity).toHaveLength(0);
   });
 
-  it("does NOT double-bump when the echoed prompt_id matches an optimistic overlay row", () => {
+  it("does NOT double-bump when the echoed prompt_id is one we have in flight", () => {
     const seeded: AcpState = {
       ...emptyAcpState(),
       optimisticRows: [{ id: "cmp-1", kind: "user_prompt", text: "hi", at: "t" }],
-      pendingUserPromptSeq: 1,
+      inflightPromptIds: ["cmp-1"],
+      promptSeq: 1,
       turnActive: true,
     };
     const next = applyEvent(seeded, {
@@ -602,6 +603,7 @@ describe("applyEvent / UserPromptSent turn counter (Tier 4)", () => {
       seq: 1,
       event: { UserPromptSent: { text: "hi", prompt_id: "cmp-1" } },
     });
-    expect(next.pendingUserPromptSeq).toBe(1);
+    expect(next.promptSeq).toBe(1);
+    expect(next.inflightPromptIds).toEqual([]);
   });
 });

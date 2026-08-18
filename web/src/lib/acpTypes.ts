@@ -767,15 +767,17 @@ export interface AcpState {
    *  so one prompt settling cannot retire another's turn. Request-local,
    *  never persisted. */
   inflightPromptIds: string[];
-  /** Monotonic count of turns opened, bumped on every false to true edge of
-   *  {@link AcpState.turnActive} and never decremented. A steered prompt
-   *  joins the running turn without an edge, so it does not bump.
+  /** Monotonic count of user prompts dispatched, never decremented. Bumped
+   *  by the optimistic `user_prompt` action and by any `UserPromptSent` with
+   *  no matching outstanding optimistic id (a replay, another device, a
+   *  drained queue entry), so an echo of this client's own prompt counts once.
    *
-   *  Two readers: `useCancelEscalation` tokenises "already pressed Stop this
-   *  turn" as `(sessionId, turnSeq)` so the next turn's first Stop is graceful
-   *  again (#2237), and the `SessionContextReset` arm treats zero as "this
-   *  session never had a prompt to lose" and suppresses the re-prime offer. */
-  turnSeq: number;
+   *  Two readers: `useCancelEscalation` tokenises "already pressed Stop for
+   *  this prompt" as `(sessionId, promptSeq)` so the next prompt's first Stop
+   *  is graceful again (#2237), and the `SessionContextReset` arm treats zero
+   *  as "this session never had a prompt to lose" and suppresses the re-prime
+   *  offer. Deliberately not turn truth: see {@link deriveTurnActive}. */
+  promptSeq: number;
   /** Real ACP-advertised modes from the agent's NewSessionResponse,
    *  plus the agent's currently-active mode id. Empty until the
    *  agent reports them; the picker falls back to the hard-coded
@@ -1256,7 +1258,7 @@ export function emptyAcpState(): AcpState {
     turnActive: false,
     serverTurnActive: false,
     inflightPromptIds: [],
-    turnSeq: 0,
+    promptSeq: 0,
     availableModes: [],
     currentModeId: null,
     availableCommands: [],
@@ -1368,6 +1370,13 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // model: the agent reports session-lifetime cumulative cost, so each
     // boundary snapshots it to keep the footer reading "since the most recent
     // boundary". See #1354 / #1109.
+    if (event === "ThinkingStarted") {
+      // Agent-initiated work with no prompt behind it still opens a turn.
+      // Mirrors `AcpState::apply_event`; see closeTurn's note on why the raw
+      // fold tracks these edges at all.
+      next.serverTurnActive = true;
+      next.turnActive = true;
+    }
     if (event === "ConversationCompacted" || event === "SessionCleared") {
       const priorUsage = state.sessionUsage?.cost?.amount ?? 0;
       const priorBaseline = state.usageBaseline?.cost ?? 0;
@@ -1470,9 +1479,11 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // thinking, cancelling, compacting) is server-owned since Tier 1.2, and
     // closing the turn joined them in #3417: whether this `Stopped` ends the
     // turn or only one of several prompts steered into it is the daemon's
-    // call, and the `reduced_state` frame that always follows this event
-    // carries the answer. Only the escalation deadline is ours to drop.
+    // call, and the `reduced_state` frame that follows this event on the WS
+    // carries the answer. The raw edge is mirrored for the history fold; see
+    // closeTurn.
     next.cancelEscalatesAt = null;
+    closeTurn(next);
     // Clear the "monitoring" badge once the monitor has fired and that turn
     // ends. See #2325.
     if (next.monitorArmed && next.monitorWorkSeen) {
@@ -1528,10 +1539,12 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.startupError = event.AgentStartupError.message;
     // A failed respawn supersedes any in-progress unresponsive escalation.
     next.agentUnresponsive = false;
+    closeTurn(next);
     return next;
   }
   if ("PromptRuntimeError" in event) {
     next.lastError = event.PromptRuntimeError.message;
+    closeTurn(next);
     return next;
   }
   if ("PromptCapabilities" in event) {
@@ -1553,11 +1566,14 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // the id would drop `turnActive` for the single frame between the two.
     // The following `reduced_state` stays authoritative.
     const pid = event.UserPromptSent.prompt_id;
-    if (pid != null && pid.length > 0) {
+    const wasInflight = pid != null && pid.length > 0 && next.inflightPromptIds.includes(pid);
+    if (wasInflight) {
       next.inflightPromptIds = next.inflightPromptIds.filter((id) => id !== pid);
+    } else {
+      next.promptSeq += 1;
     }
     next.serverTurnActive = true;
-    openTurn(next);
+    next.turnActive = true;
     if (!isSteeredContinuation(state)) {
       applyNewTurnResets(next);
     }
@@ -1566,8 +1582,9 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   if ("UserDiffCommentsPrompt" in event) {
     // The "Send diff comments" dialog posts directly with no optimistic
     // overlay, so there is no id to settle. The typed row is server-owned.
+    next.promptSeq += 1;
     next.serverTurnActive = true;
-    openTurn(next);
+    next.turnActive = true;
     if (!isSteeredContinuation(state)) {
       applyNewTurnResets(next);
     }
@@ -1595,9 +1612,9 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     // Suppress the primer offer on a session that never saw a user prompt
     // (a 0-prompt session's session/load failure is expected). The visible
     // reset row is server-owned; here we only gate the primer affordance.
-    // `turnSeq` counts turns opened before this event (frames are applied in
-    // seq order), so zero is the "never had a prompt" signal.
-    if (state.turnSeq <= 0) {
+    // `promptSeq` counts prompts applied before this event (frames are applied
+    // in seq order), so zero is the "never had a prompt" signal.
+    if (state.promptSeq <= 0) {
       return next;
     }
     // Offer the opt-in primer affordance; one-shot, cleared by the next
@@ -1668,9 +1685,9 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     };
     const REJECTED_PROMPTS_CAP = 5;
     next.rejectedPrompts = [...next.rejectedPrompts, entry].slice(-REJECTED_PROMPTS_CAP);
-    // The turn this rejection leaves running (or not) is the daemon's call
-    // and arrives on the following `reduced_state`; the composer's own
-    // optimistic marker is settled by the POST that got the rejection.
+    // The composer's own optimistic marker is settled by the POST that got
+    // the rejection; this closes the turn the daemon closed. See closeTurn.
+    closeTurn(next);
     return next;
   }
   if ("BackgroundAgentLaunched" in event) {
@@ -1789,10 +1806,10 @@ export function applyReducedState(state: AcpState, reduced: ReducedState, unchan
     // POST is still unacknowledged, so an unrelated frame arriving in that
     // window does not flicker the composer back to idle. See #3417.
     serverTurnActive: reduced.turn_active,
-    ...withTurnActive(
-      { turnActive: state.turnActive, turnSeq: state.turnSeq },
-      deriveTurnActive({ serverTurnActive: reduced.turn_active, inflightPromptIds: state.inflightPromptIds }),
-    ),
+    turnActive: deriveTurnActive({
+      serverTurnActive: reduced.turn_active,
+      inflightPromptIds: state.inflightPromptIds,
+    }),
     cancelling: reduced.cancelling,
     compacting: reduced.compacting,
     locallyResolved,
@@ -1904,19 +1921,19 @@ export function deriveTurnActive(state: Pick<AcpState, "serverTurnActive" | "inf
   return state.serverTurnActive || state.inflightPromptIds.length > 0;
 }
 
-/** Set the rendered turn flag, bumping {@link AcpState.turnSeq} on each
- *  false to true edge. Steered prompts arrive while the flag is already true,
- *  so they extend the running turn rather than opening a new one. */
-export function withTurnActive<S extends Pick<AcpState, "turnActive" | "turnSeq">>(state: S, active: boolean): S {
-  if (active === state.turnActive) return state;
-  return { ...state, turnActive: active, turnSeq: active ? state.turnSeq + 1 : state.turnSeq };
-}
-
-/** In-place {@link withTurnActive}`(next, true)` for the `applyEvent` arms,
- *  which mutate a pre-spread `next`. */
-function openTurn(next: AcpState): void {
-  if (!next.turnActive) next.turnSeq += 1;
-  next.turnActive = true;
+/** Close the turn from a raw event, mirroring `AcpState::apply_event`'s own
+ *  `turn_active = false` edges (`src/acp/state.rs`).
+ *
+ *  The `reduced_state` frame the daemon pushes after every event is still
+ *  authoritative, so this looks redundant on the WS path. It is not on the
+ *  history path: `GET /acp/replay` serves raw events with no `reduced_state`
+ *  alongside, so a cold open that folded only the opening edges would paint a
+ *  spinner over a session that finished hours ago until the WS connect
+ *  snapshot corrected it. Mirroring the same seven edges the daemon uses
+ *  keeps the raw fold self-consistent. See #3417. */
+function closeTurn(next: AcpState): void {
+  next.serverTurnActive = false;
+  next.turnActive = deriveTurnActive(next);
 }
 
 /** Whether the structured view should show the compaction reminder.
@@ -1954,7 +1971,7 @@ export function normaliseTurnState(
   state: AcpState & {
     oldestSeq?: number;
     serverTurnActive?: boolean;
-    turnSeq?: number;
+    promptSeq?: number;
     rejectedPrompts?: RejectedPrompt[];
     agentUnresponsive?: boolean;
     agentOrphaned?: boolean;
@@ -1967,11 +1984,11 @@ export function normaliseTurnState(
 ): AcpState {
   const serverTurnActive =
     typeof state.serverTurnActive === "boolean" ? state.serverTurnActive : state.turnActive === true;
-  // A hydrate that already has prompt rows already had turns; a cold entry
+  // A hydrate that already has prompt rows already had prompts; a cold entry
   // re-folds its history and counts them on the way through.
-  const turnSeq =
-    typeof state.turnSeq === "number" && Number.isFinite(state.turnSeq)
-      ? Math.max(0, Math.floor(state.turnSeq))
+  const promptSeq =
+    typeof state.promptSeq === "number" && Number.isFinite(state.promptSeq)
+      ? Math.max(0, Math.floor(state.promptSeq))
       : (state.activity ?? []).filter((r) => r.kind === "user_prompt").length;
   // Pre-#1196 persisted entries lack rejectedPrompts / agentUnresponsive;
   // backfill so the reducer and renderers see well-typed values instead
@@ -2017,7 +2034,7 @@ export function normaliseTurnState(
     pendingConfigOption,
     compactionReminderDismissed,
     serverTurnActive,
-    turnSeq,
+    promptSeq,
     inflightPromptIds: [],
     turnActive: serverTurnActive,
   };

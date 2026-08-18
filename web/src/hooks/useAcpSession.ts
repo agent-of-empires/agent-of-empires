@@ -14,7 +14,6 @@ import {
   applyReducedState,
   emptyAcpState,
   deriveTurnActive,
-  withTurnActive,
   mergePrependedActivity,
   mergeServerRows,
   normaliseTurnState,
@@ -558,10 +557,11 @@ export function classifyElicitationResolveResponse(
 function settleInflightPrompt(state: AcpState, id: string): AcpState {
   const inflightPromptIds = state.inflightPromptIds.filter((p) => p !== id);
   if (inflightPromptIds.length === state.inflightPromptIds.length) return state;
-  return withTurnActive(
-    { ...state, inflightPromptIds },
-    deriveTurnActive({ serverTurnActive: state.serverTurnActive, inflightPromptIds }),
-  );
+  return {
+    ...state,
+    inflightPromptIds,
+    turnActive: deriveTurnActive({ serverTurnActive: state.serverTurnActive, inflightPromptIds }),
+  };
 }
 
 function pruneOptimisticRows(state: AcpState): AcpState {
@@ -731,7 +731,8 @@ export function reducer(state: AcpState, action: Action): AcpState {
       inflightPromptIds: state.inflightPromptIds.includes(id)
         ? state.inflightPromptIds
         : state.inflightPromptIds.concat(id),
-      ...withTurnActive({ turnActive: state.turnActive, turnSeq: state.turnSeq }, true),
+      promptSeq: state.promptSeq + 1,
+      turnActive: true,
     };
   }
   if (action.kind === "prompt_send_rejected") {

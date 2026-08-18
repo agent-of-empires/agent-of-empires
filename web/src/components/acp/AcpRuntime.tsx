@@ -173,7 +173,7 @@ export function AcpRuntime({
   // lifecycle. See #2237.
   const onCancel = useCancelEscalation(
     sessionId,
-    acp.state.turnSeq,
+    acp.state.promptSeq,
     acp.state.cancelling,
     acp.cancelPrompt,
     acp.forceEndTurn,

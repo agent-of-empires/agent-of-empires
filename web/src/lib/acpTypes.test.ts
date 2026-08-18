@@ -13,11 +13,13 @@ import { describe, expect, it } from "vitest";
 
 import {
   applyEvent,
+  applyReducedState,
+  deriveTurnActive,
   emptyAcpState,
-  isTurnActive,
-  normaliseTurnCounters,
+  normaliseTurnState,
   type AcpFrame,
   type AcpState,
+  type ReducedState,
 } from "./acpTypes";
 
 function frame(seq: number, text: string): AcpFrame {
@@ -31,9 +33,8 @@ function frame(seq: number, text: string): AcpFrame {
 function withOptimisticPrompt(state: AcpState, text: string, id = "cmp-1"): AcpState {
   // Mirrors the optimistic dispatch in useAcpSession.sendPrompt: an overlay
   // row keyed by the minted prompt_id (never appended to the server-owned
-  // `activity`), with `pendingUserPromptSeq` bumped so a subsequent server
-  // echo carrying the same prompt_id doesn't double-count. See #1170 / #3173.
-  const pendingUserPromptSeq = state.pendingUserPromptSeq + 1;
+  // `activity`), with the same id recorded in flight so the server echo
+  // carrying it settles this exact prompt. See #3417 / #3173.
   return {
     ...state,
     optimisticRows: state.optimisticRows.concat({
@@ -42,20 +43,22 @@ function withOptimisticPrompt(state: AcpState, text: string, id = "cmp-1"): AcpS
       text,
       at: new Date().toISOString(),
     }),
-    pendingUserPromptSeq,
-    turnActive: pendingUserPromptSeq > state.lastStoppedSeq,
+    inflightPromptIds: state.inflightPromptIds.concat(id),
+    promptSeq: state.promptSeq + 1,
+    turnActive: true,
   };
 }
 
 describe("applyEvent / UserPromptSent (control state)", () => {
-  // The transcript row is server-owned now (Tier 4); applyEvent only advances
-  // the turn counter and applies the per-turn resets. The optimistic overlay
+  // The transcript row is server-owned now (Tier 4); applyEvent only opens
+  // the turn and applies the per-turn resets. The optimistic overlay
   // reconcile-by-prompt_id lives in the hook + acpTypes.reducer.test.ts.
-  it("bumps the turn counter and marks the turn active, adding no activity row", () => {
+  it("opens the turn and marks it active, adding no activity row", () => {
     const next = applyEvent(emptyAcpState(), frame(1, "hi"));
     expect(next.activity).toHaveLength(0);
-    expect(next.pendingUserPromptSeq).toBe(1);
+    expect(next.serverTurnActive).toBe(true);
     expect(next.turnActive).toBe(true);
+    expect(next.promptSeq).toBe(1);
     expect(next.lastSeq).toBe(1);
   });
 
@@ -96,11 +99,12 @@ describe("applyEvent / UserDiffCommentsPrompt (#1123) (control state)", () => {
     };
   }
 
-  it("bumps the turn counter (the typed row itself is server-owned)", () => {
+  it("opens the turn (the typed row itself is server-owned)", () => {
     const next = applyEvent(emptyAcpState(), diffCommentsFrame(1));
     expect(next.activity).toHaveLength(0);
-    expect(next.pendingUserPromptSeq).toBe(1);
+    expect(next.serverTurnActive).toBe(true);
     expect(next.turnActive).toBe(true);
+    expect(next.promptSeq).toBe(1);
   });
 
   it("applies the same per-turn resets as a plain prompt", () => {
@@ -153,7 +157,7 @@ describe("applyEvent / ACP session id lifecycle", () => {
   it("SessionContextReset clears stale usage and arms the primer after a prior prompt", () => {
     // The context_reset transcript row is server-owned (Tier 4); applyEvent
     // clears the usage/baseline and arms the one-shot primer affordance,
-    // gated on a prior user turn via pendingUserPromptSeq.
+    // gated on a prior user turn via turnSeq.
     let state = applyEvent(emptyAcpState(), {
       session_id: "s-1",
       seq: 1,
@@ -1211,91 +1215,142 @@ describe("applyEvent / AgentSwitched", () => {
   });
 });
 
-describe("turnActive derivation from prompt/stop counters (#1170)", () => {
-  // `turnActive` derives from `pendingUserPromptSeq > lastStoppedSeq`.
-  // The boolean field is kept on `AcpState` as a memoised alias so
-  // existing `state.turnActive` reads stay correct, but the counters
-  // are the source of truth a late `Stopped` cannot clobber.
+describe("turnActive: daemon truth plus an optimistic overlay (#3417)", () => {
+  // `turnActive` is `serverTurnActive || inflightPromptIds.length > 0`. The
+  // daemon owns the steady state (only it knows whether a mid-turn prompt was
+  // steered into the running turn or opened one of its own); the client owns
+  // only the gap between its own prompt POST and the server echo of it.
 
-  it("isTurnActive flips on / off when counters cross", () => {
-    expect(isTurnActive({ pendingUserPromptSeq: 2, lastStoppedSeq: 1 })).toBe(true);
-    expect(isTurnActive({ pendingUserPromptSeq: 1, lastStoppedSeq: 1 })).toBe(false);
-    expect(isTurnActive({ pendingUserPromptSeq: 0, lastStoppedSeq: 0 })).toBe(false);
+  function reduced(turn_active: boolean): ReducedState {
+    return {
+      agent: "claude",
+      model: null,
+      mode: "Default",
+      current_plan: null,
+      in_flight_tool: null,
+      pending_approvals: [],
+      pending_elicitations: [],
+      thinking: null,
+      rate_limit: null,
+      available_commands: [],
+      available_modes: [],
+      current_mode_id: null,
+      turn_active,
+      cancelling: false,
+      compacting: false,
+    };
+  }
+
+  it("deriveTurnActive ORs daemon truth with an unacknowledged prompt", () => {
+    const cases: Array<[boolean, string[], boolean]> = [
+      [true, [], true],
+      [false, [], false],
+      [false, ["p1"], true], // POST sent, echo not yet applied
+      [true, ["p1"], true],
+    ];
+    for (const [serverTurnActive, inflightPromptIds, expected] of cases) {
+      expect(deriveTurnActive({ serverTurnActive, inflightPromptIds })).toBe(expected);
+    }
   });
 
-  it("Stopped advances lastStoppedSeq by one and recomputes turnActive", () => {
-    // Single-prompt happy path: send → Stopped flips turnActive off.
+  it("N prompts steered into one turn are all closed by its single Stopped", async () => {
+    // The bug. A steering-capable agent gets follow-ups injected into the
+    // running turn, and the daemon deliberately emits no extra terminal event
+    // for them, so five prompts closed with one Stopped. The old counters
+    // ended 5 vs 1 and the composer showed Stop plus a spinner forever.
+    const { acpHookReducer } = await import("../hooks/useAcpSession");
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: { PromptCapabilities: { image: false, audio: false, embedded_context: false, steering: true } },
+    });
+    let seq = 1;
+    for (const id of ["p1", "p2", "p3", "p4", "p5"]) {
+      state = acpHookReducer(state, { kind: "user_prompt", id, text: id });
+      expect(state.turnActive).toBe(true);
+      seq += 1;
+      state = applyEvent(state, {
+        session_id: "s-1",
+        seq,
+        event: { UserPromptSent: { text: id, prompt_id: id } },
+      });
+      state = applyReducedState(state, reduced(true));
+      expect(state.turnActive).toBe(true);
+    }
+    expect(state.inflightPromptIds).toEqual([]);
+    // Five prompts dispatched, each counted once despite the server echo.
+    expect(state.promptSeq).toBe(5);
+
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: seq + 1,
+      event: { Stopped: { reason: "prompt_complete" } },
+    });
+    state = applyReducedState(state, reduced(false));
+    expect(state.turnActive).toBe(false);
+    expect(state.serverTurnActive).toBe(false);
+  });
+
+  it("a Stopped ends the turn on the happy single-prompt path", () => {
     let state = applyEvent(emptyAcpState(), {
       session_id: "s-1",
       seq: 1,
       event: { UserPromptSent: { text: "hi" } },
     });
-    expect(state.pendingUserPromptSeq).toBe(1);
-    expect(state.lastStoppedSeq).toBe(0);
     expect(state.turnActive).toBe(true);
-
     state = applyEvent(state, {
       session_id: "s-1",
       seq: 2,
       event: { Stopped: { reason: "prompt_complete" } },
     });
-    expect(state.pendingUserPromptSeq).toBe(1);
-    expect(state.lastStoppedSeq).toBe(1);
     expect(state.turnActive).toBe(false);
   });
 
-  it("late Stopped from prior turn does NOT clobber turnActive after a fresh follow-up", async () => {
-    // The bug. Prior turn: pendingUserPromptSeq=1, lastStoppedSeq=0
-    // (turnActive=true). User submits a follow-up before the prior
-    // turn's Stopped frame has been applied client-side; the
-    // optimistic `user_prompt` action bumps pending to 2. A beat
-    // later the Stopped frame for turn 1 lands. Under the old
-    // unconditional `turnActive=false`, the spinner died and the
-    // late agent chunks reordered visually below the new prompt.
-    // Under the counter model, lastStoppedSeq advances to 1
-    // (capped at pending) and `2 > 1` keeps turnActive true.
+  it("late Stopped from a prior turn does NOT clobber a fresh follow-up", async () => {
+    // #1170. The user taps Send the instant the prior turn ends, so the
+    // optimistic dispatch lands before that turn's Stopped frame. The
+    // unacknowledged id holds the spinner up through it.
     const { acpHookReducer } = await import("../hooks/useAcpSession");
-
     let state = applyEvent(emptyAcpState(), {
       session_id: "s-1",
       seq: 1,
       event: { UserPromptSent: { text: "first turn" } },
     });
     expect(state.turnActive).toBe(true);
-    // User taps Send the instant the turn ends; the optimistic
-    // dispatch lands BEFORE the Stopped frame for the prior turn.
-    state = acpHookReducer(state, {
-      kind: "user_prompt",
-      text: "follow-up",
-    });
-    expect(state.pendingUserPromptSeq).toBe(2);
-    expect(state.turnActive).toBe(true);
-    // Late Stopped (was for turn 1) now arrives. Must NOT kill the
-    // spinner because turn 2 is the active turn.
+    state = acpHookReducer(state, { kind: "user_prompt", id: "cmp-fu", text: "follow-up" });
+    expect(state.inflightPromptIds).toEqual(["cmp-fu"]);
+
     state = applyEvent(state, {
       session_id: "s-1",
       seq: 2,
       event: { Stopped: { reason: "prompt_complete" } },
     });
-    expect(state.pendingUserPromptSeq).toBe(2);
-    expect(state.lastStoppedSeq).toBe(1);
+    expect(state.serverTurnActive).toBe(false);
+    expect(state.turnActive).toBe(true);
+    // Even an authoritative idle frame cannot suppress it while the POST is
+    // still unacknowledged.
+    state = applyReducedState(state, reduced(false));
     expect(state.turnActive).toBe(true);
 
-    // Eventually turn 2's own Stopped lands and flips it off.
+    // The echo lands: the id settles and the daemon confirms the new turn.
     state = applyEvent(state, {
       session_id: "s-1",
       seq: 3,
+      event: { UserPromptSent: { text: "follow-up", prompt_id: "cmp-fu" } },
+    });
+    expect(state.inflightPromptIds).toEqual([]);
+    expect(state.turnActive).toBe(true);
+    expect(state.promptSeq).toBe(2);
+
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 4,
       event: { Stopped: { reason: "prompt_complete" } },
     });
-    expect(state.lastStoppedSeq).toBe(2);
     expect(state.turnActive).toBe(false);
   });
 
-  it("spurious Stopped on an idle session does not flip a future prompt off", () => {
-    // Defence-in-depth: a Stopped frame arriving with no outstanding
-    // turn must not advance `lastStoppedSeq` past `pendingUserPromptSeq`,
-    // otherwise the next prompt's increment wouldn't catch up and
-    // `turnActive` would stay false even with a real turn in flight.
+  it("a spurious Stopped on an idle session does not poison the next prompt", () => {
     let state = applyEvent(emptyAcpState(), {
       session_id: "s-1",
       seq: 1,
@@ -1307,46 +1362,38 @@ describe("turnActive derivation from prompt/stop counters (#1170)", () => {
       event: { Stopped: { reason: "prompt_complete" } },
     });
     expect(state.turnActive).toBe(false);
-    // Spurious extra Stopped (e.g. duplicate replay of the close).
+    // Duplicate replay of the close.
     state = applyEvent(state, {
       session_id: "s-1",
       seq: 3,
       event: { Stopped: { reason: "prompt_complete" } },
     });
-    expect(state.lastStoppedSeq).toBe(1);
-    expect(state.pendingUserPromptSeq).toBe(1);
-    // Next real prompt: turn must reactivate.
+    expect(state.turnActive).toBe(false);
     state = applyEvent(state, {
       session_id: "s-1",
       seq: 4,
       event: { UserPromptSent: { text: "second" } },
     });
-    expect(state.pendingUserPromptSeq).toBe(2);
-    expect(state.lastStoppedSeq).toBe(1);
     expect(state.turnActive).toBe(true);
+    expect(state.promptSeq).toBe(2);
   });
 
-  it("optimistic user_prompt + matching server echo (by prompt_id) only bump pending once", async () => {
-    // Avoids double-counting: the server's UserPromptSent whose prompt_id
-    // matches an outstanding optimistic overlay row must not bump
-    // `pendingUserPromptSeq` again. See #1170 / #3173.
+  it("optimistic user_prompt plus its matching echo settles exactly that id", async () => {
     const { acpHookReducer } = await import("../hooks/useAcpSession");
-    let state = acpHookReducer(emptyAcpState(), {
-      kind: "user_prompt",
-      id: "cmp-echo",
-      text: "echo me",
-    });
-    expect(state.pendingUserPromptSeq).toBe(1);
+    let state = acpHookReducer(emptyAcpState(), { kind: "user_prompt", id: "cmp-echo", text: "echo me" });
+    expect(state.inflightPromptIds).toEqual(["cmp-echo"]);
     state = applyEvent(state, {
       session_id: "s-1",
       seq: 5,
       event: { UserPromptSent: { text: "echo me", prompt_id: "cmp-echo" } },
     });
-    expect(state.pendingUserPromptSeq).toBe(1);
+    expect(state.inflightPromptIds).toEqual([]);
     expect(state.turnActive).toBe(true);
+    // One prompt, not two: the echo of our own dispatch does not double count.
+    expect(state.promptSeq).toBe(1);
   });
 
-  it("AgentStartupError advances lastStoppedSeq, preserving the race-safe semantics", () => {
+  it("AgentStartupError closes the turn", () => {
     let state = applyEvent(emptyAcpState(), {
       session_id: "s-1",
       seq: 1,
@@ -1357,15 +1404,14 @@ describe("turnActive derivation from prompt/stop counters (#1170)", () => {
       seq: 2,
       event: { AgentStartupError: { message: "boom" } },
     });
-    expect(state.lastStoppedSeq).toBe(1);
     expect(state.turnActive).toBe(false);
     expect(state.startupError).toBe("boom");
   });
 
-  it("optimistic-match UserPromptSent (by prompt_id) resets per-turn flags without double-counting", () => {
+  it("optimistic-match UserPromptSent still applies the per-turn resets", () => {
     // A server echo whose prompt_id matches the outstanding optimistic overlay
-    // still applies the per-turn resets (worker banners, wakeup countdown) but
-    // must NOT bump the counter again. See #1170 / #3173.
+    // applies the per-turn resets (worker banners, wakeup countdown) and
+    // settles that id. See #3173.
     const stale: AcpState = {
       ...withOptimisticPrompt(emptyAcpState(), "follow-up", "cmp-fu"),
       workerStopped: true,
@@ -1382,52 +1428,57 @@ describe("turnActive derivation from prompt/stop counters (#1170)", () => {
     expect(next.workerRestarting).toBe(false);
     expect(next.nextWakeupAt).toBeNull();
     expect(next.nextWakeupReason).toBeNull();
-    // withOptimisticPrompt bumped it to 1; the matching echo keeps it at 1.
-    expect(next.pendingUserPromptSeq).toBe(1);
+    expect(next.inflightPromptIds).toEqual([]);
     expect(next.turnActive).toBe(true);
   });
 });
 
-describe("normaliseTurnCounters (#1170 persisted-state backfill)", () => {
-  it("backfills counters from cached turnActive=true", () => {
+describe("normaliseTurnState (#3417 persisted-state backfill)", () => {
+  it("seeds serverTurnActive from a cached turnActive=true", () => {
     const cached = {
       ...emptyAcpState(),
       turnActive: true,
-    } as AcpState & { pendingUserPromptSeq?: number; lastStoppedSeq?: number };
-    delete cached.pendingUserPromptSeq;
-    delete cached.lastStoppedSeq;
-    const normalised = normaliseTurnCounters(cached);
-    expect(normalised.pendingUserPromptSeq).toBe(1);
-    expect(normalised.lastStoppedSeq).toBe(0);
+    } as AcpState & { serverTurnActive?: boolean };
+    delete cached.serverTurnActive;
+    const normalised = normaliseTurnState(cached);
+    expect(normalised.serverTurnActive).toBe(true);
     expect(normalised.turnActive).toBe(true);
   });
 
-  it("backfills counters from cached turnActive=false", () => {
+  it("seeds serverTurnActive from a cached turnActive=false", () => {
     const cached = {
       ...emptyAcpState(),
       turnActive: false,
-    } as AcpState & { pendingUserPromptSeq?: number; lastStoppedSeq?: number };
-    delete cached.pendingUserPromptSeq;
-    delete cached.lastStoppedSeq;
-    const normalised = normaliseTurnCounters(cached);
-    expect(normalised.pendingUserPromptSeq).toBe(0);
-    expect(normalised.lastStoppedSeq).toBe(0);
+    } as AcpState & { serverTurnActive?: boolean };
+    delete cached.serverTurnActive;
+    const normalised = normaliseTurnState(cached);
+    expect(normalised.serverTurnActive).toBe(false);
     expect(normalised.turnActive).toBe(false);
   });
 
-  it("passes through entries that already carry counters", () => {
-    const fresh: AcpState = {
+  it("never restores in-flight prompt ids: no POST survives a reload", () => {
+    const cached = {
       ...emptyAcpState(),
-      pendingUserPromptSeq: 5,
-      lastStoppedSeq: 3,
-      turnActive: false,
-    };
-    const normalised = normaliseTurnCounters(fresh);
-    expect(normalised.pendingUserPromptSeq).toBe(5);
-    expect(normalised.lastStoppedSeq).toBe(3);
-    // Even if the cached `turnActive` boolean was stale, the derived
-    // value wins so the spinner gate matches the counters.
-    expect(normalised.turnActive).toBe(true);
+      serverTurnActive: false,
+      turnActive: true,
+      inflightPromptIds: ["cmp-stale"],
+    } as AcpState;
+    const normalised = normaliseTurnState(cached);
+    expect(normalised.inflightPromptIds).toEqual([]);
+    expect(normalised.turnActive).toBe(false);
+  });
+
+  it("backfills promptSeq from the persisted prompt rows on a pre-#3417 entry", () => {
+    const cached = {
+      ...emptyAcpState(),
+      activity: [
+        { id: "a", kind: "user_prompt", text: "one", at: "" },
+        { id: "b", kind: "agent_message", text: "hi", at: "" },
+        { id: "c", kind: "user_prompt", text: "two", at: "" },
+      ],
+    } as AcpState & { promptSeq?: number };
+    delete cached.promptSeq;
+    expect(normaliseTurnState(cached).promptSeq).toBe(2);
   });
 });
 
@@ -1490,7 +1541,7 @@ describe("compaction reminder dismissal", () => {
       compactionReminderDismissed?: AcpState["compactionReminderDismissed"];
     };
     delete persisted.compactionReminderDismissed;
-    expect(normaliseTurnCounters(persisted).compactionReminderDismissed).toBeNull();
+    expect(normaliseTurnState(persisted).compactionReminderDismissed).toBeNull();
   });
 });
 
@@ -1586,8 +1637,9 @@ describe("AcpState reducer / silent-orphan watchdog (#1240)", () => {
   it("sets agentOrphaned and workerRestarting on prompt_orphaned", () => {
     let state: AcpState = {
       ...emptyAcpState(),
-      pendingUserPromptSeq: 1,
-      lastStoppedSeq: 0,
+      serverTurnActive: true,
+      turnActive: true,
+      promptSeq: 1,
     };
     state = applyEvent(state, stoppedFrame("prompt_orphaned", 1));
     expect(state.agentOrphaned).toBe(true);
@@ -1599,8 +1651,9 @@ describe("AcpState reducer / silent-orphan watchdog (#1240)", () => {
   it("clears agentUnresponsive when prompt_orphaned arrives after it", () => {
     let state: AcpState = {
       ...emptyAcpState(),
-      pendingUserPromptSeq: 2,
-      lastStoppedSeq: 0,
+      serverTurnActive: true,
+      turnActive: true,
+      promptSeq: 2,
     };
     state = applyEvent(state, stoppedFrame("agent_unresponsive", 1));
     expect(state.agentUnresponsive).toBe(true);
@@ -1613,8 +1666,9 @@ describe("AcpState reducer / silent-orphan watchdog (#1240)", () => {
   it("clears agentOrphaned on AcpSessionAssigned (respawn completed)", () => {
     let state: AcpState = {
       ...emptyAcpState(),
-      pendingUserPromptSeq: 1,
-      lastStoppedSeq: 0,
+      serverTurnActive: true,
+      turnActive: true,
+      promptSeq: 1,
     };
     state = applyEvent(state, stoppedFrame("prompt_orphaned", 1));
     expect(state.agentOrphaned).toBe(true);
@@ -1630,8 +1684,9 @@ describe("AcpState reducer / silent-orphan watchdog (#1240)", () => {
   it("clears agentOrphaned on UserPromptSent (user moving on)", () => {
     let state: AcpState = {
       ...emptyAcpState(),
-      pendingUserPromptSeq: 1,
-      lastStoppedSeq: 0,
+      serverTurnActive: true,
+      turnActive: true,
+      promptSeq: 1,
     };
     state = applyEvent(state, stoppedFrame("prompt_orphaned", 1));
     expect(state.agentOrphaned).toBe(true);
@@ -1646,8 +1701,9 @@ describe("AcpState reducer / silent-orphan watchdog (#1240)", () => {
   it("clears agentOrphaned on user_stopped", () => {
     let state: AcpState = {
       ...emptyAcpState(),
-      pendingUserPromptSeq: 1,
-      lastStoppedSeq: 0,
+      serverTurnActive: true,
+      turnActive: true,
+      promptSeq: 1,
     };
     state = applyEvent(state, stoppedFrame("prompt_orphaned", 1));
     expect(state.agentOrphaned).toBe(true);
@@ -1657,44 +1713,41 @@ describe("AcpState reducer / silent-orphan watchdog (#1240)", () => {
 
   it("backfills agentOrphaned=false on pre-#1240 persisted state", () => {
     // Simulate a localStorage entry written before #1240: agentOrphaned
-    // absent. normaliseTurnCounters must default it to false so the
+    // absent. normaliseTurnState must default it to false so the
     // reducer and banner code see a well-typed value.
     const stale = {
       ...emptyAcpState(),
-      pendingUserPromptSeq: 0,
-      lastStoppedSeq: 0,
+      promptSeq: 0,
     } as AcpState & { agentOrphaned?: boolean };
     delete stale.agentOrphaned;
-    const normalised = normaliseTurnCounters(stale);
+    const normalised = normaliseTurnState(stale);
     expect(normalised.agentOrphaned).toBe(false);
   });
 
   it("backfills usageBaseline=null on pre-#1354 persisted state", () => {
     // Simulate a localStorage entry written before #1354: usageBaseline
-    // absent. normaliseTurnCounters must default it to null so the
+    // absent. normaliseTurnState must default it to null so the
     // UsageUpdated reducer arm's `next.usageBaseline && ...` check sees
     // a well-typed value rather than `undefined`.
     const stale = {
       ...emptyAcpState(),
-      pendingUserPromptSeq: 0,
-      lastStoppedSeq: 0,
+      promptSeq: 0,
     } as AcpState & { usageBaseline?: { cost: number } | null };
     delete stale.usageBaseline;
-    const normalised = normaliseTurnCounters(stale);
+    const normalised = normaliseTurnState(stale);
     expect(normalised.usageBaseline).toBeNull();
   });
 
-  it("preserves a non-null usageBaseline through normaliseTurnCounters", () => {
+  it("preserves a non-null usageBaseline through normaliseTurnState", () => {
     // A session that ran /clear before reload writes a baseline into
     // localStorage. Hydration must keep it so post-reload UsageUpdate
     // frames continue subtracting the boundary cumulative.
     const cached: AcpState = {
       ...emptyAcpState(),
-      pendingUserPromptSeq: 3,
-      lastStoppedSeq: 3,
+      promptSeq: 3,
       usageBaseline: { cost: 0.42 },
     };
-    const normalised = normaliseTurnCounters(cached);
+    const normalised = normaliseTurnState(cached);
     expect(normalised.usageBaseline?.cost).toBeCloseTo(0.42, 6);
   });
 
@@ -1705,8 +1758,9 @@ describe("AcpState reducer / silent-orphan watchdog (#1240)", () => {
     // "Restarting…" copy. See CodeRabbit review on #1248.
     let state: AcpState = {
       ...emptyAcpState(),
-      pendingUserPromptSeq: 1,
-      lastStoppedSeq: 0,
+      serverTurnActive: true,
+      turnActive: true,
+      promptSeq: 1,
     };
     state = applyEvent(state, stoppedFrame("prompt_orphaned", 1));
     expect(state.agentOrphaned).toBe(true);
@@ -1724,8 +1778,9 @@ describe("AcpState reducer / silent-orphan watchdog (#1240)", () => {
     // escalation copy that matches the active recovery phase.
     let state: AcpState = {
       ...emptyAcpState(),
-      pendingUserPromptSeq: 2,
-      lastStoppedSeq: 0,
+      serverTurnActive: true,
+      turnActive: true,
+      promptSeq: 2,
     };
     state = applyEvent(state, stoppedFrame("prompt_orphaned", 1));
     expect(state.agentOrphaned).toBe(true);
