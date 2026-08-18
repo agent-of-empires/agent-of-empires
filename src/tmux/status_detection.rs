@@ -568,11 +568,11 @@ fn claude_has_folder_trust_question(recent: &[&str], recent_lower: &str) -> bool
 
 /// How many lines a wrapped option label may occupy. It is 24 characters, and
 /// every viewport `responsive.rs` documents (~26 and up, so a 22-column
-/// stacked pane) wraps it onto two. Four is slack beyond that, not a measured
-/// bound: it holds down to an 11-column pane and loses the label at 10, both
-/// of which need viewports below the documented floor. Kept at four because
-/// the cost of slack here is a wider splice window, which requirement 2 above
-/// already bounds.
+/// stacked pane) wraps it onto two. Four is slack, not a measured bound — where
+/// exactly it fails depends on a wrap model this file has no evidence for, and
+/// the 30-non-empty-line window drops the question phrase before the label
+/// budget binds anyway. Kept at four because the cost of slack is a wider
+/// splice window, which the option-text requirement already bounds.
 const CLAUDE_TRUST_LABEL_WRAP_LINES: usize = 4;
 
 /// The trust prompt's option label, matched over the choice row *and its
@@ -589,13 +589,21 @@ const CLAUDE_TRUST_LABEL_WRAP_LINES: usize = 4;
 /// 2. The label must START the option text. Without it, a numbered *prose*
 ///    list matches when the label merely appears a line or two below the item.
 ///
-/// What remains reachable, stated as measured rather than as a shape argument:
-/// `starts_with` admits anything after the label, so `1. Yes, I trust this
-/// folder is what you pick at the first-run check` matches; and the four-line
-/// block still lets the label be spliced across a row and its follower. Both
-/// need the question phrase in the same window. Narrowing further wants a
-/// position anchor, not another substring rule — three attempts at substring
-/// rules in this series have each been falsified.
+/// What remains reachable, each measured rather than argued:
+///
+/// - a verbatim menu row quoted in prose, or echoed by `cat`/`less`/a diff
+///   context line (one leading space, eaten by `trim_start`). This is the
+///   broadest class and needs no trailing prose and no splice.
+/// - `starts_with` admits anything after the label, so `1. Yes, I trust this
+///   folder is what you pick at the first-run check` matches.
+/// - a splice across the whole four-line block, not merely a row and its
+///   follower. Blank rows do not consume the budget: `with_claude_recent_pane`
+///   drops empty lines before the window, so a splice separated by blank lines
+///   on screen still matches.
+///
+/// All need the question phrase in the same window. Narrowing further wants a
+/// position anchor, not another substring rule — three substring attempts in
+/// this series have each been falsified by the next reader.
 fn claude_has_trust_option_label(recent: &[&str]) -> bool {
     recent.iter().enumerate().any(|(start, line)| {
         let Some(option) = claude_trust_choice_option_text(line) else {
@@ -2891,9 +2899,12 @@ enter to select · esc to cancel";
         );
     }
 
-    /// Echoed content carries a prefix (`+`, `\u{23bf}`, `>`, line numbers), so
-    /// it fails `claude_line_is_numbered_choice` and never opens a block. A
-    /// window-wide collapse threw that away; this pins it.
+    /// Echoed rows are rejected by the anchor, but not uniformly, and the `>`
+    /// case is the one worth knowing: `claude_line_is_numbered_choice` STRIPS a
+    /// leading `>`, so a blockquote row is a valid numbered choice to it. What
+    /// rejects the blockquote here is `claude_trust_choice_option_text`, which
+    /// tolerates only `❯`. A `grep -n` prefix (`N:content`, no space) is not
+    /// rejected as an echo at all; that pane fails on the option text instead.
     #[test]
     fn claude_echoed_trust_fixture_is_not_a_prompt() {
         let echoed = "\
