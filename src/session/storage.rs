@@ -102,8 +102,10 @@ const INSTANCE_LIFECYCLE_LOCK_PREFIX: &str = ".instance-lifecycle-";
 /// observability only, not a timeout.
 const FLOCK_WAIT_WARN_AFTER: Duration = Duration::from_secs(1);
 
-/// Write `content` to `path` atomically (temp file + fsync + rename + dir fsync).
+/// Write `content` to `path` atomically (temp file + data/metadata fsync + rename + dir fsync).
 /// Existing perms are preserved; on a fresh file the result is tempfile's 0o600 default.
+/// All fallible file mutations complete before the final rename, so an error
+/// means the destination was not replaced.
 ///
 /// A symlink at `path` is resolved first and the write lands on the target, so
 /// a user who symlinks `config.toml` (or any other file we own) into a dotfiles
@@ -122,11 +124,11 @@ pub(crate) fn atomic_write(path: &Path, content: &[u8]) -> Result<()> {
     let existing_perms = fs::metadata(path).ok().map(|m| m.permissions());
     let mut tmp = tempfile::NamedTempFile::new_in(dir)?;
     tmp.write_all(content)?;
-    tmp.as_file().sync_data()?;
-    let file = tmp.persist(path)?;
     if let Some(perms) = existing_perms {
-        file.set_permissions(perms)?;
+        tmp.as_file().set_permissions(perms)?;
     }
+    tmp.as_file().sync_all()?;
+    tmp.persist(path)?;
     // Best-effort dir fsync so the rename itself survives power loss.
     if let Ok(dir_file) = fs::File::open(dir) {
         let _ = dir_file.sync_all();
