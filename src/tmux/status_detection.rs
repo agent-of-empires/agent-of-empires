@@ -567,33 +567,35 @@ fn claude_has_folder_trust_question(recent: &[&str], recent_lower: &str) -> bool
 }
 
 /// How many lines a wrapped option label may occupy. It is 24 characters, and
-/// the narrowest layout `responsive.rs` documents (a ~26 viewport, so a
-/// 22-column stacked pane) wraps it onto two; four leaves room down to a
-/// 10-column pane, below which the label is lost.
+/// every viewport `responsive.rs` documents (~26 and up, so a 22-column
+/// stacked pane) wraps it onto two. Four is slack beyond that, not a measured
+/// bound: it holds down to an 11-column pane and loses the label at 10, both
+/// of which need viewports below the documented floor. Kept at four because
+/// the cost of slack here is a wider splice window, which requirement 2 above
+/// already bounds.
 const CLAUDE_TRUST_LABEL_WRAP_LINES: usize = 4;
 
 /// The trust prompt's option label, matched over the choice row *and its
-/// wrapped continuations*, and required to be the option's own text.
+/// wrapped continuations*, and required to start the option's own text.
 ///
-/// Three things are load-bearing, each closing a false positive that was
-/// measured on a pane carrying a live spinner, a live token counter and
-/// `esc to interrupt`, i.e. an actively generating turn reported as blocked:
+/// Two requirements, each closing a false positive measured on a pane carrying
+/// a live spinner, a live token counter and `esc to interrupt` — an actively
+/// generating turn reported as blocked on the user:
 ///
-/// 1. The block is anchored to a choice row. Collapsing the whole window
-///    instead finds the label in ordinary prose.
-/// 2. The row must carry no echo prefix. `claude_line_is_numbered_choice`
-///    strips a leading `>`, so a markdown blockquote quoting this prompt opened
-///    a block; line-number prefixes from `grep -n` output did the same when
-///    they fell inside a block another row had opened.
-/// 3. The label must START the option text. Without that, a numbered *prose*
-///    list whose item happens to be followed by the label two lines down
-///    matches - "1. read the prompt, which asks ..." then "the highlighted
-///    option is Yes, I trust this folder" - which is not a menu row by any
-///    reading.
+/// 1. The row must be a choice row with no `>` ahead of the number.
+///    Collapsing the whole window instead found the label in ordinary prose,
+///    and `claude_line_is_numbered_choice` tolerates a leading `>`, so a
+///    markdown blockquote quoting this prompt opened a block.
+/// 2. The label must START the option text. Without it, a numbered *prose*
+///    list matches when the label merely appears a line or two below the item.
 ///
-/// What remains reachable: prose that renders a genuine-looking menu row whose
-/// option text begins with the label. That is a rendered menu row, and nothing
-/// structural separates it from one.
+/// What remains reachable, stated as measured rather than as a shape argument:
+/// `starts_with` admits anything after the label, so `1. Yes, I trust this
+/// folder is what you pick at the first-run check` matches; and the four-line
+/// block still lets the label be spliced across a row and its follower. Both
+/// need the question phrase in the same window. Narrowing further wants a
+/// position anchor, not another substring rule — three attempts at substring
+/// rules in this series have each been falsified.
 fn claude_has_trust_option_label(recent: &[&str]) -> bool {
     recent.iter().enumerate().any(|(start, line)| {
         let Some(option) = claude_trust_choice_option_text(line) else {
@@ -604,13 +606,8 @@ fn claude_has_trust_option_label(recent: &[&str]) -> bool {
             .position(|l| claude_line_is_numbered_choice(l))
             .map_or(recent.len(), |offset| start + 1 + offset);
         let end = next_choice.min(start + CLAUDE_TRUST_LABEL_WRAP_LINES);
-        let continuations: Vec<&str> = recent[start + 1..end]
-            .iter()
-            .copied()
-            .filter(|l| claude_line_is_unechoed(l))
-            .collect();
         let joined = std::iter::once(option)
-            .chain(continuations)
+            .chain(recent[start + 1..end].iter().copied())
             .collect::<Vec<_>>()
             .join(" ")
             .to_lowercase();
@@ -629,17 +626,6 @@ fn claude_trust_choice_option_text(line: &str) -> Option<&str> {
         return None;
     }
     Some(chars.as_str().trim_start())
-}
-
-/// A line that is pane content rather than content echoed inside it. Echoed
-/// rows carry a prefix: a `grep -n` line number, a diff `+`, a tool-result
-/// `⎿`, or a blockquote `>`.
-fn claude_line_is_unechoed(line: &str) -> bool {
-    let trimmed = line.trim_start();
-    !trimmed.starts_with(['+', '⎿', '>'])
-        && !trimmed
-            .split_once(char::is_whitespace)
-            .is_some_and(|(head, _)| !head.is_empty() && head.chars().all(|c| c.is_ascii_digit()))
 }
 
 /// Claude's `AskUserQuestion` tool renders an interactive selection UI: an
@@ -2935,6 +2921,8 @@ enter to select · esc to cancel";
 ";
         assert_eq!(detect_claude_status(blockquote), Status::Running);
 
+        // Defended by requirement 2, not by any echo filter: the anchor row is
+        // ` 1. an unrelated list item`, whose option text fails `starts_with`.
         let echoed_after_a_list = "\
 \u{25cf} That is the fixture. Is this a project you created or one you trust?
  1. an unrelated list item
