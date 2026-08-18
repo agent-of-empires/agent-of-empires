@@ -4,7 +4,8 @@ Status: shipped 2026-08-17. The daemon owns the structured-view (SV) control
 state, the transcript, and the prompt-dispatch decision; both clients render
 them. What the web still folds from raw events is the state the daemon does not
 model: the worker-lifecycle latches, the monitor and wakeup badges, the usage
-cost baseline, rejected prompts, and the optimistic turn counters.
+cost baseline, rejected prompts, and the optimistic overlay for prompts this
+client has POSTed but not yet seen echoed.
 
 This doc is the record of why the arc happened and what was rejected along the
 way. For what the wire actually looks like today, read
@@ -85,14 +86,35 @@ of truth.
 
 ### The optimism decision
 
-The open question when this was planned was turn-active latency: the web bumps
-`pendingUserPromptSeq` optimistically before the server echoes, so the composer
-flips to "working" instantly. The answer was **server-authoritative with a thin
-client optimistic overlay**: the client keeps a local "I just sent a prompt"
-flag that OR's into the rendered turn-active until the next `reduced_state`
-frame arrives, then defers to the server. That preserves instant feedback
-without a second source of truth for the steady state. `turnActive` and its
-prompt / stop counters are the one carve-out that stayed client-side.
+The open question when this was planned was turn-active latency: the client
+wants the composer to flip to "working" the instant the user hits send, before
+the server echoes the prompt back. The answer was **server-authoritative with a
+thin client optimistic overlay**: the client keeps its own "I just sent a
+prompt" marker that OR's into the rendered turn-active, and defers to the
+server for the steady state.
+
+That is what shipped in the end, but only in #3417; the original migration left
+`turnActive` deriving from a client-side `pendingUserPromptSeq >
+lastStoppedSeq` counter pair, and never read the `turn_active` the daemon was
+already sending. The counters assumed one terminal `Stopped` per prompt, which
+mid-turn steering (#2805) does not honor: the daemon injects the prompt into
+the running turn and emits no extra terminal event, so N prompts closed with
+one `Stopped` and the composer showed Stop plus a spinner forever.
+
+Today `turnActive` is `serverTurnActive || inflightPromptIds.length > 0`.
+`serverTurnActive` is adopted from every `reduced_state` frame.
+`inflightPromptIds` holds the client-minted `prompt_id` of each POSTed prompt,
+correlated so one prompt settling cannot retire another's turn, and settled by
+the server's `UserPromptSent` echo or by whatever the POST returned instead. It
+is request-local and never persisted: after a reload there is no POST left to
+acknowledge it.
+
+`applyEvent` still mirrors the daemon's seven `turn_active` edges
+(`src/acp/state.rs`) rather than waiting for `reduced_state`. That is not
+belt-and-braces: `GET /acp/replay` serves raw events with no `reduced_state`
+alongside, so a cold open that folded only the opening edges would paint a
+spinner over a session that finished hours ago until the WS connect snapshot
+corrected it. `reduced_state` stays authoritative wherever both arrive.
 
 ## Alternatives considered
 
