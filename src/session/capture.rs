@@ -2823,10 +2823,14 @@ fn select_hermes_session_in_container(
 ///
 /// With a signal-capable schema (at least one of `cwd`/`git_repo_root`
 /// present), only rows whose canonicalized `cwd` or `git_repo_root` equals
-/// the canonicalized project path are eligible, and the most recent such row
-/// not in `exclusion` wins. Rows with no signal, or with a signal pointing
-/// at a different project, are never returned: resuming them would bind the
-/// wrong conversation, the #3373 bug class.
+/// the canonicalized project path are eligible. The `cwd` signal is tried
+/// first across the whole active set and only then `git_repo_root`, because
+/// a repo-root match is weaker: it also holds for a conversation started in
+/// a subdirectory of the same repo, which may be a sibling AoE session's.
+/// Within each pass the most recent row not in `exclusion` wins. Rows with
+/// no signal, or with a signal pointing at a different project, are never
+/// returned: resuming them would bind the wrong conversation, the #3373 bug
+/// class.
 ///
 /// A project path spelled through a now-deleted symlink falls back to its
 /// raw spelling in [`canonicalize_or_raw`] and never equals Hermes' recorded
@@ -2855,19 +2859,21 @@ fn select_hermes_session_id(
 ) -> Result<String> {
     if scan.signal_columns_present {
         let needle = canonicalize_or_raw(project_path);
+        // Two passes, cwd first: a row whose `cwd` IS the project directory is
+        // unambiguously this project's conversation, while a `git_repo_root`
+        // match only proves same-repo membership and can point at a sibling
+        // AoE session running in a subdirectory of the same repo. Scanning
+        // both signals in one pass let a newer subdir row outrank this
+        // project's own conversation.
+        let matched =
+            |signal: Option<&str>| signal.is_some_and(|s| canonicalize_or_raw(s) == needle);
         for row in &scan.rows {
-            if exclusion.contains(&row.id) {
-                continue;
+            if !exclusion.contains(&row.id) && matched(row.cwd.as_deref()) {
+                return Ok(row.id.clone());
             }
-            let matches = row
-                .cwd
-                .as_deref()
-                .is_some_and(|cwd| canonicalize_or_raw(cwd) == needle)
-                || row
-                    .git_repo_root
-                    .as_deref()
-                    .is_some_and(|root| canonicalize_or_raw(root) == needle);
-            if matches {
+        }
+        for row in &scan.rows {
+            if !exclusion.contains(&row.id) && matched(row.git_repo_root.as_deref()) {
                 return Ok(row.id.clone());
             }
         }
@@ -5210,6 +5216,50 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_capture_hermes_prefers_exact_cwd_over_repo_root() {
+        // A conversation started in a subdirectory of the same repo carries
+        // this project's git_repo_root once a hermes gateway/TUI enriches it
+        // (or backfill_repo_roots runs), and is usually a sibling AoE
+        // session's. The row whose cwd IS this project must win even when the
+        // subdir row is newer.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let sub_str = std::fs::canonicalize(&sub)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+        seed_hermes_db(
+            tmp.path(),
+            &[
+                (
+                    "20260429_193246_own",
+                    "cli",
+                    1000.0,
+                    Some(&repo_str),
+                    Some(&repo_str),
+                ),
+                (
+                    "20260429_193246_sub",
+                    "cli",
+                    2000.0,
+                    Some(&sub_str),
+                    Some(&repo_str),
+                ),
+            ],
+            true,
+        );
+        assert_eq!(
+            capture_hermes_session_id(&repo_str, &HashSet::new()).unwrap(),
+            "20260429_193246_own"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn test_capture_hermes_matches_git_repo_root() {
         let tmp = tempfile::tempdir().unwrap();
         let project = std::fs::canonicalize(tmp.path()).unwrap();
@@ -5376,9 +5426,14 @@ mod tests {
     #[serial]
     fn test_capture_hermes_null_cwd_never_resumed() {
         // Full-schema rows with NULL (or empty) cwd carry no project signal
-        // and are never returned: they are foreign by construction (aoe-launched
-        // local rows always record cwd; a non-local TERMINAL_ENV backend makes
-        // hermes record None), and resuming one is the #3373 bug shape.
+        // and are never returned; resuming one is the #3373 bug shape. Hermes
+        // stamps cwd on the row it creates for a local CLI launch, and records
+        // None for a non-local TERMINAL_ENV backend. Two known gaps leave a
+        // no-signal row this capture then skips: a `/new` inside a running
+        // hermes pane rotates to a fresh row created without a cwd, and a
+        // hermes upgrade that predates the column leaves history unstamped.
+        // Such a session keeps whatever agent_session_id it already had rather
+        // than following the rotation.
         for cwd in [None, Some("")] {
             let tmp = tempfile::tempdir().unwrap();
             let project = std::fs::canonicalize(tmp.path()).unwrap();
