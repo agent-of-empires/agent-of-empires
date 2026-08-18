@@ -550,7 +550,8 @@ fn claude_has_approval_prompt(recent: &[&str], recent_lower: &str) -> bool {
 /// question never carries. Both are matched on the collapsed join rather than
 /// on a single line: the menu row wraps too (`1. Yes, I trust this folder`
 /// with its cursor is 30 columns, so the stacked preview loses it below a
-/// viewport of 34 and `responsive.rs` documents viewports down to ~26), and
+/// viewport of 34 on the stacked path, or 37 with the sidebar collapsed, and
+/// `responsive.rs` documents viewports down to ~26), and
 /// anchoring the label to one line reintroduces the same wrap miss the
 /// collapse exists to fix. The cheap numbered-choice line scan gates the
 /// allocation.
@@ -560,15 +561,51 @@ fn claude_has_approval_prompt(recent: &[&str], recent_lower: &str) -> bool {
 /// together, reads Waiting. `"do you want to"` has the same exposure on
 /// `main`; scoping the signals to one prompt block is a separate change.
 fn claude_has_folder_trust_question(recent: &[&str], recent_lower: &str) -> bool {
-    if !recent
-        .iter()
-        .any(|line| claude_line_is_numbered_choice(line))
-    {
-        return false;
-    }
-    let collapsed = collapse_ascii_whitespace(recent_lower);
-    collapsed.contains("is this a project you created or one you trust")
-        && collapsed.contains("yes, i trust this folder")
+    claude_has_trust_option_label(recent)
+        && collapse_ascii_whitespace(recent_lower)
+            .contains("is this a project you created or one you trust")
+}
+
+/// How many lines a wrapped option label may occupy. Its longest word is six
+/// characters, so even the ~16-column pane at the bottom of `responsive.rs`'s
+/// documented range needs no more than this.
+const CLAUDE_TRUST_LABEL_WRAP_LINES: usize = 4;
+
+/// The trust prompt's option label, matched over the choice row *and its
+/// wrapped continuations* rather than a single line or the whole window.
+///
+/// Both extremes fail. A single-line match loses the label as soon as the pane
+/// is narrow enough to wrap it, which is the band this whole change is about.
+/// Collapsing the entire window instead finds the label anywhere, including in
+/// ordinary prose, and that costs the anti-echo property the rest of this file
+/// relies on: a pane merely *describing* the prompt would satisfy it, and since
+/// a blocking rule outranks the running signal, an actively generating turn
+/// would report Waiting. Measured, when the match was window-wide: a pane with
+/// a live spinner, a live token counter and `esc to interrupt` flipped
+/// Running -> Waiting on prose alone, and a second one spliced the label out of
+/// two unrelated lines.
+///
+/// Anchoring to the block that starts at a numbered-choice line keeps the
+/// wrap tolerance and restores the anchor: prose that mentions the label
+/// without rendering it as a menu row never enters the haystack.
+///
+/// Residual, and deliberately not closed: prose that puts the label within
+/// `CLAUDE_TRUST_LABEL_WRAP_LINES` lines *after* a numbered-choice line still
+/// matches. That shape is a rendered menu row by any structural reading, so
+/// there is nothing left to distinguish it here.
+fn claude_has_trust_option_label(recent: &[&str]) -> bool {
+    recent.iter().enumerate().any(|(start, line)| {
+        if !claude_line_is_numbered_choice(line) {
+            return false;
+        }
+        let next_choice = recent[start + 1..]
+            .iter()
+            .position(|l| claude_line_is_numbered_choice(l))
+            .map_or(recent.len(), |offset| start + 1 + offset);
+        let end = next_choice.min(start + CLAUDE_TRUST_LABEL_WRAP_LINES);
+        collapse_ascii_whitespace(&recent[start..end].join("\n").to_lowercase())
+            .contains("yes, i trust this folder")
+    })
 }
 
 /// Claude's `AskUserQuestion` tool renders an interactive selection UI: an
@@ -2776,9 +2813,12 @@ enter to select · esc to cancel";
         assert_eq!(detect_claude_status(while_generating), Status::Running);
     }
 
-    /// The prompt on a 22-column pane (the stacked preview at the ~26-column
-    /// viewport `responsive.rs` documents): the option label wraps too, so a
-    /// label match anchored to the numbered-choice line misses it.
+    /// The prompt on an 18-column pane, i.e. the stacked preview at a
+    /// 22-column viewport (`responsive.rs` documents viewports down to ~26,
+    /// so this is below the documented floor and deliberately so). The option
+    /// label wraps too, which a label match anchored to a single
+    /// numbered-choice line misses. Abridged, not verbatim: the trailing prose
+    /// and the `Security guide` row are dropped to keep the fixture short.
     const CLAUDE_FOLDER_TRUST_PROMPT_NARROW: &str = "\
  Quick safety
  check: Is this a
@@ -2799,6 +2839,52 @@ enter to select · esc to cancel";
             detect_claude_status(CLAUDE_FOLDER_TRUST_PROMPT_NARROW),
             Status::Waiting
         );
+    }
+
+    /// The label match is anchored to the choice block, not the whole window.
+    /// Window-wide collapsing found the label in ordinary prose, and because a
+    /// blocking rule outranks the running signal these all reported `Waiting`
+    /// on an actively generating turn.
+    #[test]
+    fn claude_trust_label_in_prose_is_not_a_prompt() {
+        let label_in_prose = "\
+\u{25cf} The prompt asks: Is this a project you created or one you trust?
+ The highlighted option reads Yes, I trust this folder.
+ 1. the first arm
+ 2. the second arm
+ \u{2736} Working\u{2026} (12s \u{b7} \u{2193} 431 tokens)
+   esc to interrupt
+";
+        assert_eq!(detect_claude_status(label_in_prose), Status::Running);
+
+        let label_spliced_from_two_lines = "\
+ \u{25cf} the answer the user gives is Yes,
+ I trust this folder more than the upstream mirror. Is this a project
+ you created or one you trust? was the wording.
+ 1. unrelated
+ \u{2736} Working\u{2026} (3s)
+   esc to interrupt
+";
+        assert_eq!(
+            detect_claude_status(label_spliced_from_two_lines),
+            Status::Running
+        );
+    }
+
+    /// Echoed content carries a prefix (`+`, `\u{23bf}`, `>`, line numbers), so
+    /// it fails `claude_line_is_numbered_choice` and never opens a block. A
+    /// window-wide collapse threw that away; this pins it.
+    #[test]
+    fn claude_echoed_trust_fixture_is_not_a_prompt() {
+        let echoed = "\
+  2812 \u{276f} 1. Yes, I trust this folder
+  2813   2. No, exit
+\u{25cf} That is the fixture. Is this a project you created or one you trust?
+ 1. an unrelated list item
+ \u{2736} Working\u{2026} (4s)
+   esc to interrupt
+";
+        assert_eq!(detect_claude_status(echoed), Status::Running);
     }
 
     #[test]
