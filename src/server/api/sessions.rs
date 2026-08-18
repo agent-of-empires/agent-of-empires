@@ -1236,51 +1236,56 @@ pub async fn rename_session(
     let mut new_branch: Option<String> = None;
 
     if tied {
-        // The dir move is gated on a quiescent worktree, exactly like the
-        // standalone worktree-name edit. A running session must be stopped
-        // first; the setting is the escape hatch for free-form relabeling.
+        // A directory move or branch rename is gated on a quiescent worktree,
+        // exactly like the standalone worktree-name edit. A running session
+        // must be stopped first; the setting is the escape hatch for
+        // free-form relabeling.
+        //
         // A sandbox session's container keeps the worktree dir mounted even
-        // while the agent is Idle, so the move would fail. The helper drops a
-        // merely-stopped container to free the mount and only reports held for
-        // a live one, which the user has to stop.
+        // while the agent is Idle, so a directory move would fail. The helper
+        // drops a merely-stopped container to free the mount and only reports
+        // held for a live one, which the user has to stop.
+        //
         // Short-circuited twice, because the helper removes a stopped
         // container: once on the status check, so a request about to be
         // rejected never discards, and once on whether the directory is
         // actually going to move, so a no-op or branch-only rename does not
-        // either. The tied leaf comes from the title, matching what is handed
-        // to `edit_worktree_workdir` below.
+        // either.
+        let leaf = crate::session::worktree_edit::worktree_leaf_from_title(&title);
         let moves_worktree = crate::session::worktree_edit::worktree_move_required(
             std::path::Path::new(&current_path),
-            &crate::session::worktree_edit::worktree_leaf_from_title(&title),
+            &leaf,
         );
+        let renames_branch =
+            body.rename_branch && worktree_info.as_ref().is_some_and(|wt| wt.branch != leaf);
         let container_holds = !status.blocks_worktree_edit()
             && moves_worktree
             && ensure_sandbox_container_released_blocking(&id, is_sandboxed).await;
-        if status.blocks_worktree_edit() || container_holds {
+        if (moves_worktree || renames_branch) && (status.blocks_worktree_edit() || container_holds)
+        {
             return (
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
                     "error": "session_running",
-                    "message": "Stop the session before renaming it: its worktree directory moves to match the new name. Disable \"Tie Worktree Directory to Session Name\" to relabel a running session."
+                    "message": "Stop the session before renaming its worktree directory or branch. Disable \"Tie Worktree Directory to Session Name\" to relabel a running session."
                 })),
             )
                 .into_response();
         }
 
-        // Stop any live structured-view worker before the move so it can't
-        // crash on the pulled-out cwd and respawn-loop at the stale path
-        // (#2260). Done under the instance_lock held since the top of this
-        // function. Preserves the agent transcript so the reconciler resumes
-        // context at the new path.
-        if let Err(resp) =
-            quiesce_structured_worker_for_worktree_move(&state, &id, is_structured).await
-        {
-            return resp;
+        // Stop a live structured-view worker only when its cwd will move. A
+        // title-only or branch-only edit leaves the cwd valid and must not
+        // interrupt the worker.
+        if moves_worktree {
+            if let Err(response) =
+                quiesce_structured_worker_for_worktree_move(&state, &id, is_structured).await
+            {
+                return response;
+            }
         }
 
         let wt = worktree_info.expect("tied implies worktree_info is Some");
         let cur = current_path.clone();
-        let leaf = crate::session::worktree_edit::worktree_leaf_from_title(&title);
         let rename_branch = body.rename_branch;
         let edit = tokio::task::spawn_blocking(move || {
             crate::session::worktree_edit::edit_worktree_workdir(
@@ -8739,6 +8744,123 @@ mod tests {
         assert_eq!(
             inst.worktree_info.as_ref().map(|wt| wt.branch.as_str()),
             Some("feature/test")
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rename_session_distinguishes_cwd_stable_title_and_branch_changes() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let paths = tempfile::tempdir().unwrap();
+        let title_path = paths.path().join("my-session");
+        let branch_path = paths.path().join("branch-only");
+        let title_id = "rename-title-only".to_string();
+        let branch_id = "rename-branch-only".to_string();
+
+        let mut title_only = Instance::new(
+            "Original title",
+            title_path.to_str().expect("UTF-8 temp path"),
+        );
+        title_only.id = title_id.clone();
+        title_only.status = Status::Running;
+        title_only.view = crate::session::View::Structured;
+        title_only.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "my-session".to_string(),
+            main_repo_path: paths
+                .path()
+                .join("missing-repo")
+                .to_string_lossy()
+                .into_owned(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+
+        let mut branch_only = Instance::new(
+            "Branch Only",
+            branch_path.to_str().expect("UTF-8 temp path"),
+        );
+        branch_only.id = branch_id.clone();
+        branch_only.status = Status::Running;
+        branch_only.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "existing-branch".to_string(),
+            main_repo_path: paths
+                .path()
+                .join("missing-repo")
+                .to_string_lossy()
+                .into_owned(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+
+        let state =
+            crate::server::test_support::build_test_app_state(vec![title_only, branch_only]);
+        state.acp_supervisor.test_insert_worker(&title_id).await;
+
+        // The title changes, but its slug already matches both the cwd leaf
+        // and branch. Even with the branch toggle armed, this is title-only.
+        let title_response = rename_session(
+            State(state.clone()),
+            Path(title_id.clone()),
+            Ok(Json(RenameSessionBody {
+                title: "My Session!".to_string(),
+                rename_branch: true,
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(title_response.status(), StatusCode::OK);
+        let title_json: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(title_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(title_json["tie_workdir_to_name"], true);
+        assert!(
+            state.acp_supervisor.is_running(&title_id).await,
+            "a cwd-stable title-only rename must not stop the structured worker"
+        );
+
+        {
+            let instances = state.instances.read().await;
+            let renamed = instances.iter().find(|inst| inst.id == title_id).unwrap();
+            assert_eq!(renamed.title, "My Session!");
+            assert_eq!(renamed.project_path, title_path.to_str().unwrap());
+            assert_eq!(
+                renamed.worktree_info.as_ref().map(|wt| wt.branch.as_str()),
+                Some("my-session")
+            );
+        }
+
+        let branch_response = rename_session(
+            State(state.clone()),
+            Path(branch_id.clone()),
+            Ok(Json(RenameSessionBody {
+                title: "Branch Only".to_string(),
+                rename_branch: true,
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(branch_response.status(), StatusCode::CONFLICT);
+        let branch_json: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(branch_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(branch_json["error"], "session_running");
+
+        let instances = state.instances.read().await;
+        let rejected = instances.iter().find(|inst| inst.id == branch_id).unwrap();
+        assert_eq!(rejected.title, "Branch Only");
+        assert_eq!(rejected.project_path, branch_path.to_str().unwrap());
+        assert_eq!(
+            rejected.worktree_info.as_ref().map(|wt| wt.branch.as_str()),
+            Some("existing-branch"),
+            "the active branch-only request must be rejected before git mutation"
         );
     }
 
