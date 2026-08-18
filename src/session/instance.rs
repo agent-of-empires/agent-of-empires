@@ -10598,12 +10598,15 @@ mod tests {
     #[test]
     #[serial_test::serial(shell_env)]
     fn test_wrap_command_reasserts_working_dir_after_login_shell() {
-        let original = std::env::var("SHELL").ok();
         // Resolved rather than hardcoded to `/bin/bash`: the wrapper execs
         // `$SHELL`, and a host that keeps its shells outside the FHS layout
         // (NixOS, a minimal container) has no `/bin/bash` for it to reach.
         let bash = which::which("bash").expect("bash on PATH");
-        std::env::set_var("SHELL", &bash);
+        // `EnvGuard` rather than a bare `set_var` plus a manual restore at the
+        // end: it holds the process-global env lock for the whole scope, so a
+        // concurrent test cannot observe the override, and it restores on the
+        // unwind if an assertion below fails.
+        let _shell = EnvGuard::set(&[("SHELL", &bash)]);
         let temp = tempfile::tempdir().unwrap();
         let working_dir = temp.path().join("some project's dir");
         std::fs::create_dir(&working_dir).unwrap();
@@ -10631,10 +10634,6 @@ mod tests {
             String::from_utf8_lossy(&output.stdout).trim(),
             working_dir.to_string_lossy(),
         );
-        match original {
-            Some(v) => std::env::set_var("SHELL", v),
-            None => std::env::remove_var("SHELL"),
-        }
     }
 
     // Additional tests for is_sandboxed

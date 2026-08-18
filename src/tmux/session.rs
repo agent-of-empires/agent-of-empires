@@ -4064,7 +4064,10 @@ mod tests {
         // The PATH is asserted back below to prove the env file did not mutate
         // the host process environment, so it has to be a value this host can
         // actually resolve `cat` on rather than a hardcoded `/usr/bin:/bin`.
-        let host_path = std::env::var("PATH").unwrap_or_default();
+        // `var_os`, not `var`: a PATH entry need not be UTF-8, and `var` would
+        // hand back an empty string for one that isn't, silently emptying the
+        // PATH instead of failing.
+        let host_path = std::env::var_os("PATH").unwrap_or_default();
         let status = std::process::Command::new("/bin/sh")
             .args(["-c", &wrapper])
             .env("PATH", &host_path)
@@ -4074,10 +4077,11 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success());
-        assert_eq!(
-            std::fs::read_to_string(host_output).unwrap(),
-            format!("{host_path}\nunset")
-        );
+        // Compared as bytes for the same reason: a non-UTF-8 PATH survives the
+        // round trip through the shell but not through `read_to_string`.
+        let mut expected = host_path.as_encoded_bytes().to_vec();
+        expected.extend_from_slice(b"\nunset");
+        assert_eq!(std::fs::read(host_output).unwrap(), expected);
         assert_eq!(
             std::fs::read_to_string(payload_output).unwrap(),
             "PATH=/repo-controlled/bin\n\
