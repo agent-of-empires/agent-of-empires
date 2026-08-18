@@ -497,11 +497,13 @@ pub(crate) fn claude_pane_is_ambiguous_typed_prompt(raw_content: &str) -> bool {
     })
 }
 
-/// Claude renders a blocking approval prompt when a tool needs the user's
-/// permission (Bash command, file edit, plan exit, ...). Every variant pairs
-/// a yes/no question ("Do you want to proceed?", "Do you want to make this
-/// edit to <file>?", "Would you like to proceed?") with a numbered choice
-/// menu. Requiring both keeps an assistant-authored numbered list from being
+/// Claude renders a blocking numbered-choice prompt when it needs an answer
+/// before it can continue: a tool asking permission (Bash command, file edit,
+/// plan exit, ...), and the first-run folder-trust check, which is not a tool
+/// permission at all. Every variant pairs a question ("Do you want to
+/// proceed?", "Do you want to make this edit to <file>?", "Would you like to
+/// proceed?", "Is this a project you created or one you trust?") with a
+/// numbered choice menu. Requiring both keeps an assistant-authored numbered list from being
 /// mistaken for a prompt. `recent_lower` is the lowercased join of `recent`.
 fn claude_has_approval_prompt(recent: &[&str], recent_lower: &str) -> bool {
     // The folder-trust prompt phrases its question without either stock
@@ -512,7 +514,16 @@ fn claude_has_approval_prompt(recent: &[&str], recent_lower: &str) -> bool {
     // would let one quoted line satisfy both halves of the guard.
     let has_question = recent_lower.contains("do you want to")
         || recent_lower.contains("would you like to proceed")
-        || recent_lower.contains("is this a project you created or one you trust");
+        // Collapsed, unlike the two arms above: this phrase is 46 characters of
+        // prose, so Claude word-wraps it in a narrow pane and `recent_lower` is
+        // a newline join, which breaks a plain `contains`. AoE produces that
+        // width band itself (a side-by-side preview is roughly viewport minus
+        // `list_width` + 2, so a viewport between `STACKED_BREAKPOINT` and
+        // ~106 lands in it). `||` short-circuits, so the allocation is only
+        // paid once the two cheap arms have missed. Same reason
+        // `claude_pane_has_running_signal` collapses its footer hints.
+        || collapse_ascii_whitespace(recent_lower)
+            .contains("is this a project you created or one you trust");
     has_question
         && recent
             .iter()
@@ -2643,15 +2654,52 @@ enter to select · esc to cancel";
    1. Yes, I trust this folder
    2. No, exit
  The detector matches those against the numbered-choice helper.
- \u{2726} Working... (12s \u{b7} \u{2193} 431 tokens)
+ \u{2736} Working\u{2026} (12s \u{b7} \u{2193} 431 tokens)
    esc to interrupt
 ";
 
     #[test]
     fn claude_assistant_quoting_the_trust_option_is_not_waiting() {
+        // Pinned, not implied: the fixture rendered its spinner with ASCII
+        // dots, which `claude_line_is_active_spinner` does not match, so the
+        // `Running` below came from the interrupt hint alone and the fixture
+        // did not model the working session its name claims. Raised by njbrake
+        // in review.
+        assert!(
+            CLAUDE_ASSISTANT_QUOTING_THE_TRUST_OPTION
+                .lines()
+                .any(claude_line_is_active_spinner),
+            "fixture must carry a live spinner",
+        );
         assert_eq!(
             detect_claude_status(CLAUDE_ASSISTANT_QUOTING_THE_TRUST_OPTION),
             Status::Running
+        );
+    }
+
+    /// The same prompt as Claude wraps it once the pane is too narrow to hold
+    /// the question on one line. `recent_lower` is a newline join, so the
+    /// unwrapped `contains` misses here and the pane read `Idle` again - the
+    /// bug this whole change exists to fix, in the width band AoE's own
+    /// side-by-side preview produces. Raised by njbrake in review.
+    const CLAUDE_FOLDER_TRUST_PROMPT_WRAPPED: &str = "\
+ Accessing workspace:
+ /tmp/scratch/exp
+ Quick safety check: Is this a project you created or one you
+ trust? (Like your own code, a well-known open source project,
+ or work from your team). If not, take a moment to review what's
+ in this folder first.
+ Claude Code'll be able to read, edit, and execute files here.
+ Security guide
+ \u{276f} 1. Yes, I trust this folder
+   2. No, exit
+";
+
+    #[test]
+    fn claude_folder_trust_prompt_wrapped_is_waiting() {
+        assert_eq!(
+            detect_claude_status(CLAUDE_FOLDER_TRUST_PROMPT_WRAPPED),
+            Status::Waiting
         );
     }
 
