@@ -1408,6 +1408,53 @@ describe("turnActive: daemon truth plus an optimistic overlay (#3417)", () => {
     expect(state.startupError).toBe("boom");
   });
 
+  it("an idle session's own first prompt is not a steered continuation", async () => {
+    // Regression: `turnActive` is true through the POST-to-echo gap of this
+    // client's own prompt, so gating the steered-continuation branch on it
+    // made the echo of an idle session's FIRST prompt look steered. The
+    // per-turn resets were then skipped and the worker banners survived a
+    // prompt that actually opened a fresh turn.
+    const { acpHookReducer } = await import("../hooks/useAcpSession");
+    let state = applyEvent(emptyAcpState(), {
+      session_id: "s-1",
+      seq: 1,
+      event: {
+        PromptCapabilities: { image: false, audio: false, embedded_context: false, steering: true },
+      },
+    });
+    state = { ...state, workerStopped: true, workerRestarting: true };
+    state = acpHookReducer(state, { kind: "user_prompt", id: "cmp-first", text: "first" });
+    // Optimism alone must not read as "a turn was already running".
+    expect(state.turnActive).toBe(true);
+    expect(state.serverTurnActive).toBe(false);
+
+    state = applyEvent(state, {
+      session_id: "s-1",
+      seq: 2,
+      event: { UserPromptSent: { text: "first", prompt_id: "cmp-first" } },
+    });
+    expect(state.workerStopped).toBe(false);
+    expect(state.workerRestarting).toBe(false);
+  });
+
+  it("a genuinely steered mid-turn prompt still skips the per-turn resets", () => {
+    // The other side of the same gate: the daemon's flag is true, so this
+    // prompt joined a running turn and must not reset its accumulated state.
+    const running: AcpState = {
+      ...emptyAcpState(),
+      promptCapabilities: { image: false, audio: false, embeddedContext: false, steering: true },
+      serverTurnActive: true,
+      turnActive: true,
+      cancelEscalatesAt: new Date(Date.now() + 10_000).toISOString(),
+    };
+    const next = applyEvent(running, {
+      session_id: "s-1",
+      seq: 2,
+      event: { UserPromptSent: { text: "steered" } },
+    });
+    expect(next.cancelEscalatesAt).not.toBeNull();
+  });
+
   it("optimistic-match UserPromptSent still applies the per-turn resets", () => {
     // A server echo whose prompt_id matches the outstanding optimistic overlay
     // applies the per-turn resets (worker banners, wakeup countdown) and
@@ -1473,7 +1520,7 @@ describe("normaliseTurnState (#3417 persisted-state backfill)", () => {
       ...emptyAcpState(),
       activity: [
         { id: "a", kind: "user_prompt", text: "one", at: "" },
-        { id: "b", kind: "agent_message", text: "hi", at: "" },
+        { id: "b", kind: "message", text: "hi", at: "" },
         { id: "c", kind: "user_prompt", text: "two", at: "" },
       ],
     } as AcpState & { promptSeq?: number };

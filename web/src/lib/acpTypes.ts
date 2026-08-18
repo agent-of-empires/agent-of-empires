@@ -1299,9 +1299,15 @@ export function emptyAcpState(): AcpState {
  *
  *  Takes the pre-event state, since the arms open the turn before they
  *  reach the reset.
+ *
+ *  Reads `serverTurnActive`, not the rendered `turnActive`: since #3417 the
+ *  latter is also true through the POST-to-echo gap of this client's own
+ *  prompt, so an idle session's very first prompt would look steered to its
+ *  own echo and skip the resets it needs. Only the daemon's flag means "a
+ *  turn was already running".
  */
 function isSteeredContinuation(state: AcpState): boolean {
-  return state.turnActive && !!state.promptCapabilities?.steering;
+  return state.serverTurnActive && !!state.promptCapabilities?.steering;
 }
 
 /** Per-turn state resets shared by every "a new user turn started"
