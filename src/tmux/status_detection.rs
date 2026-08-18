@@ -509,10 +509,11 @@ pub(crate) fn claude_pane_is_ambiguous_typed_prompt(raw_content: &str) -> bool {
 fn claude_has_approval_prompt(recent: &[&str], recent_lower: &str) -> bool {
     // The folder-trust prompt phrases its question without either stock
     // opener, so a first launch in a new directory read as Idle and never
-    // reached the waiting count. Only the question is matched: its option
+    // reached the waiting count. Its arm needs the question AND the option
     // label ("yes, i trust this folder", which the Antigravity detector below
-    // does carry) sits on a numbered-choice line, so matching that instead
-    // would let one quoted line satisfy both halves of the guard.
+    // also carries): the label alone sits on a numbered-choice line, so
+    // matching it on its own would let one quoted line satisfy both halves of
+    // the guard.
     let has_question = recent_lower.contains("do you want to")
         || recent_lower.contains("would you like to proceed")
         || claude_has_folder_trust_question(recent, recent_lower);
@@ -531,7 +532,7 @@ fn claude_has_approval_prompt(recent: &[&str], recent_lower: &str) -> bool {
 /// so with the default `list_width` of 35 the question only fits unwrapped
 /// from a viewport of about 107 up. Below `STACKED_BREAKPOINT` the stacked
 /// layout gives `viewport - 4`, which fits from 72 up, so the wrapped case
-/// covers viewports up to 71 as well as 80..=106 — the phone range in
+/// covers viewports up to 71 as well as 80..=106, the phone range in
 /// `responsive.rs` included.
 ///
 /// Collapsing whitespace is how `claude_pane_has_running_signal` handles the
@@ -544,17 +545,30 @@ fn claude_has_approval_prompt(recent: &[&str], recent_lower: &str) -> bool {
 /// was added: a pane with a live spinner, a live token counter and
 /// `esc to interrupt` flipped Running -> Waiting.
 ///
-/// So the collapsed form is paired with the prompt's own option label on a
-/// numbered-choice line. Prose that quotes the question does not also render
-/// the menu row, and the label alone cannot stand in for the question, so both
-/// halves still need distinct content on distinct lines. The label check runs
-/// first because it is a cheap line scan; the collapse only allocates once a
-/// real menu row is already on screen.
+/// So the collapsed form is paired with the prompt's own option label, which
+/// the question alone never implies and which prose reproducing only the
+/// question never carries. Both are matched on the collapsed join rather than
+/// on a single line: the menu row wraps too (`1. Yes, I trust this folder`
+/// with its cursor is 30 columns, so the stacked preview loses it below a
+/// viewport of 34 and `responsive.rs` documents viewports down to ~26), and
+/// anchoring the label to one line reintroduces the same wrap miss the
+/// collapse exists to fix. The cheap numbered-choice line scan gates the
+/// allocation.
+///
+/// This is still the shared two-signal guard, so it inherits that guard's
+/// known limit: a turn that quotes the whole prompt, question and menu row
+/// together, reads Waiting. `"do you want to"` has the same exposure on
+/// `main`; scoping the signals to one prompt block is a separate change.
 fn claude_has_folder_trust_question(recent: &[&str], recent_lower: &str) -> bool {
-    recent.iter().any(|line| {
-        claude_line_is_numbered_choice(line) && line.to_lowercase().contains("trust this folder")
-    }) && collapse_ascii_whitespace(recent_lower)
-        .contains("is this a project you created or one you trust")
+    if !recent
+        .iter()
+        .any(|line| claude_line_is_numbered_choice(line))
+    {
+        return false;
+    }
+    let collapsed = collapse_ascii_whitespace(recent_lower);
+    collapsed.contains("is this a project you created or one you trust")
+        && collapsed.contains("yes, i trust this folder")
 }
 
 /// Claude's `AskUserQuestion` tool renders an interactive selection UI: an
@@ -2760,6 +2774,31 @@ enter to select · esc to cancel";
    esc to interrupt
 ";
         assert_eq!(detect_claude_status(while_generating), Status::Running);
+    }
+
+    /// The prompt on a 22-column pane (the stacked preview at the ~26-column
+    /// viewport `responsive.rs` documents): the option label wraps too, so a
+    /// label match anchored to the numbered-choice line misses it.
+    const CLAUDE_FOLDER_TRUST_PROMPT_NARROW: &str = "\
+ Quick safety
+ check: Is this a
+ project you
+ created or one
+ you trust? (Like
+ your own code, a
+ well-known open
+ source project.)
+ \u{276f} 1. Yes, I trust
+   this folder
+   2. No, exit
+";
+
+    #[test]
+    fn claude_folder_trust_prompt_narrow_is_waiting() {
+        assert_eq!(
+            detect_claude_status(CLAUDE_FOLDER_TRUST_PROMPT_NARROW),
+            Status::Waiting
+        );
     }
 
     #[test]
