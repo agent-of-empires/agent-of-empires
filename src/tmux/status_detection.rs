@@ -573,7 +573,7 @@ fn claude_has_folder_trust_question(recent: &[&str], recent_lower: &str) -> bool
 
 /// How many lines a wrapped option label may occupy. It is 24 characters, and
 /// every viewport `responsive.rs` documents (~26 and up, so a 22-column
-/// stacked pane) wraps it onto two. Four is slack, not a measured bound — where
+/// stacked pane) wraps it onto two. Four is slack, not a measured bound; where
 /// exactly it fails depends on a wrap model this file has no evidence for, and
 /// the 30-non-empty-line window drops the question phrase before the label
 /// budget binds anyway. Kept at four because the cost of slack is a wider
@@ -609,7 +609,7 @@ const CLAUDE_TRUST_LABEL_WRAP_LINES: usize = 4;
 ///   on screen still matches.
 ///
 /// All need the question phrase in the same window. Narrowing further wants a
-/// position anchor, not another substring rule — three substring attempts in
+/// position anchor, not another substring rule; three substring attempts in
 /// this series have each been falsified by the next reader.
 fn claude_has_trust_option_label(recent: &[&str]) -> bool {
     recent.iter().enumerate().any(|(start, line)| {
@@ -2908,7 +2908,7 @@ enter to select · esc to cancel";
 
     /// A `cat -n` / `nl` echo of this file's own fixture. It is rejected by the
     /// option-text requirement, not by anything that recognises the `  2812 `
-    /// prefix — the anchor row the block opens on is ` 1. an unrelated list
+    /// prefix; the anchor row the block opens on is ` 1. an unrelated list
     /// item`, whose text does not start with the label.
     ///
     /// The `>` blockquote and `grep -n` (`N:content`, no space) cases live in
