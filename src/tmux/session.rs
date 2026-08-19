@@ -4019,11 +4019,11 @@ mod tests {
         file.disarm();
     }
 
-    /// `#[serial]` because the assertion reads the inherited PATH, and the
-    /// tests that scrub it process-globally carry that annotation:
-    /// `crate::acp::node`, `crate::acp::acp_client` and `crate::update::install`
-    /// — eleven tests across four PATH-setting helper sites. Not an `EnvGuard`
-    /// lock: none of them takes `test_support::ENV_LOCK`.
+    /// `#[serial]` because the assertion reads the inherited PATH, and every
+    /// test that scrubs PATH process-globally carries that same default-key
+    /// annotation: `crate::acp::node`, `crate::acp::acp_client`, and
+    /// `crate::update::install`. Not an `EnvGuard` lock: none of them takes
+    /// `test_support::ENV_LOCK`.
     #[test]
     #[serial_test::serial]
     fn test_container_env_file_does_not_mutate_host_process_environment() {
@@ -4069,9 +4069,9 @@ mod tests {
 
         // The PATH is asserted back below to prove the env file did not mutate
         // the host process environment, so it has to be a value this host can
-        // actually resolve `cat` on rather than a hardcoded `/usr/bin:/bin`.
+        // actually resolve `cat` on.
         // `var_os`, not `var`: a PATH entry need not be UTF-8, and `var`
-        // returns `Err(VarError::NotUnicode)` for one that isn't — which the
+        // returns `Err(VarError::NotUnicode)` for one that isn't, which the
         // `unwrap_or_default` below would turn into an empty PATH rather than
         // a failure.
         let host_path = std::env::var_os("PATH").unwrap_or_default();
@@ -4088,7 +4088,16 @@ mod tests {
         // round trip through the shell but not through `read_to_string`.
         let mut expected = host_path.as_encoded_bytes().to_vec();
         expected.extend_from_slice(b"\nunset");
-        assert_eq!(std::fs::read(host_output).unwrap(), expected);
+        // Rendered lossily in the message only: `assert_eq!` on `Vec<u8>`
+        // prints decimal byte arrays, which is unreadable for a whole PATH.
+        let actual = std::fs::read(host_output).unwrap();
+        assert_eq!(
+            actual,
+            expected,
+            "env file mutated the host environment: {:?} != {:?}",
+            String::from_utf8_lossy(&actual),
+            String::from_utf8_lossy(&expected),
+        );
         assert_eq!(
             std::fs::read_to_string(payload_output).unwrap(),
             "PATH=/repo-controlled/bin\n\

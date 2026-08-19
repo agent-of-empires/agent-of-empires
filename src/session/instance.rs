@@ -11653,9 +11653,9 @@ mod tests {
                 .args(["-c", &script])
                 .env_clear()
                 // `env_clear` is here to control which OMP_STORE_ENV_KEYS the
-                // fingerprint folds in, not to pin a filesystem layout, so the
-                // PATH comes from the caller rather than a literal
-                // `/usr/bin:/bin`.
+                // fingerprint folds in, not to pin a filesystem layout. The
+                // child still needs a PATH that resolves `sha256sum` / `tr`,
+                // so it inherits the caller's.
                 .env("PATH", std::env::var_os("PATH").unwrap_or_default());
             // Pin the exact routing environment a host launch installs into the
             // pane for this HOME, so the check reproduces the fingerprint's env
@@ -11715,9 +11715,9 @@ mod tests {
         assert!(command.find("printf").unwrap() < command.rfind("exec sh -c").unwrap());
     }
     /// The shim dir, then the caller's `PATH`. Shim first, so the fake `tmux`
-    /// wins over any real one; inherited rather than a literal `/usr/bin:/bin`,
-    /// so a host whose coreutils sit outside the FHS layout still resolves
-    /// them. `OsString` throughout: a `PATH` entry need not be UTF-8.
+    /// wins over any real one; inherited, so a host whose coreutils sit
+    /// outside the FHS layout still resolves them. `OsString` throughout: a
+    /// `PATH` entry need not be UTF-8.
     #[cfg(unix)]
     fn test_path_with_shim(bin: &std::path::Path) -> std::ffi::OsString {
         // An unset or empty PATH is handled separately: `split_paths("")`
@@ -11733,10 +11733,10 @@ mod tests {
         std::env::join_paths(entries).expect("PATH entries contain no separator")
     }
 
-    /// `#[serial]` because this reads the inherited PATH, and the tests that
-    /// scrub PATH process-globally carry that annotation: `crate::acp::node`,
-    /// `crate::acp::acp_client`, and `crate::update::install` (eleven such
-    /// tests in total, across four PATH-setting helper sites).
+    /// `#[serial]` because this reads the inherited PATH, and every test that
+    /// scrubs PATH process-globally carries that same default-key annotation:
+    /// `crate::acp::node`, `crate::acp::acp_client`, and
+    /// `crate::update::install`.
     /// Not an `EnvGuard` lock: none of them takes `test_support::ENV_LOCK`, so
     /// a guard would exclude unrelated guard users and leave this window open.
     /// A future PATH mutator outside the default serial group would reopen it.
