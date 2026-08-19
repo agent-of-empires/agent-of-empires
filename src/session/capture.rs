@@ -2876,6 +2876,10 @@ mod tests {
     use crate::session::test_support::EnvGuard;
     use serial_test::serial;
 
+    /// Well before the 5-minute live-capture window, in the same absolute-epoch
+    /// form the other mtime-ordering tests in this module pin.
+    const STALE_JSONL_MTIME: u64 = 1_700_000_000;
+
     /// Scaffold for the `.claude.json` fallback arm: a project dir whose only
     /// jsonl is older than the 5-minute live-capture window, so
     /// `capture_claude_session_id` falls past the dir scan, plus a
@@ -2898,12 +2902,7 @@ mod tests {
 
         let jsonl = dir.join(format!("{stale_transcript}.jsonl"));
         std::fs::write(&jsonl, "").unwrap();
-        let f = std::fs::File::options().write(true).open(&jsonl).unwrap();
-        f.set_times(
-            std::fs::FileTimes::new()
-                .set_modified(std::time::SystemTime::now() - Duration::from_secs(3600)),
-        )
-        .unwrap();
+        set_mtime_secs(&jsonl, STALE_JSONL_MTIME);
 
         // Placed and keyed the way production reads it. `.claude.json` sits
         // *inside* the config dir when `CLAUDE_CONFIG_DIR` selects it (#3410),
@@ -2977,12 +2976,7 @@ mod tests {
         // and this is reached via the `.claude.json` arm, not the scan.
         let jsonl = dir.join(format!("{named}.jsonl"));
         std::fs::write(&jsonl, "").unwrap();
-        let f = std::fs::File::options().write(true).open(&jsonl).unwrap();
-        f.set_times(
-            std::fs::FileTimes::new()
-                .set_modified(std::time::SystemTime::now() - Duration::from_secs(3600)),
-        )
-        .unwrap();
+        set_mtime_secs(&jsonl, STALE_JSONL_MTIME);
 
         assert_eq!(
             capture_claude_session_id(project_path, None, &HashSet::new(), &[]).unwrap(),
