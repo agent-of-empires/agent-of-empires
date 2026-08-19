@@ -102,7 +102,7 @@ const INSTANCE_LIFECYCLE_LOCK_PREFIX: &str = ".instance-lifecycle-";
 /// observability only, not a timeout.
 const FLOCK_WAIT_WARN_AFTER: Duration = Duration::from_secs(1);
 
-/// Write `content` to `path` atomically (temp file + data/metadata fsync + rename + dir fsync).
+/// Write `content` atomically (temp file + data/metadata fsync + rename + best-effort dir fsync).
 /// Existing perms are preserved; on a fresh file the result is tempfile's 0o600 default.
 /// All fallible file mutations complete before the final rename, so an error
 /// means the destination was not replaced.
@@ -235,6 +235,9 @@ where
     let result = mutate(&mut value);
     if result.is_ok() {
         atomic_write(path, serialize(&value)?.as_bytes())?;
+        // Best-effort here, unlike atomic_write's "every fallible mutation
+        // before the rename" contract: the content is already durably committed,
+        // so re-tightening a pre-existing file to 0o600 must not fail the write.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -996,6 +999,36 @@ mod tests {
             .unwrap()
             .file_type()
             .is_symlink());
+    }
+
+    /// A pre-existing file's non-default mode survives the write: `atomic_write`
+    /// copies the destination's permissions onto the temp file before the
+    /// rename, so a 0o644 file stays 0o644 rather than reverting to
+    /// `NamedTempFile`'s 0o600 default.
+    ///
+    /// The dual half of the contract, that a failure inside `set_permissions`
+    /// leaves the destination unreplaced, is deliberately not exercised here:
+    /// `set_permissions` on a freshly created temp file we own has no reachable
+    /// failure mode without a fault-injection seam, so that guarantee rests on
+    /// the ordering in the code (every fallible step precedes `persist`) rather
+    /// than on a test.
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_existing_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("perms.txt");
+        std::fs::write(&path, "old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+        atomic_write(&path, b"new").unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "new");
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o644,
+            "a pre-existing non-default mode must survive the rename"
+        );
     }
 
     #[cfg(unix)]
