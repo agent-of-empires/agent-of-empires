@@ -1156,6 +1156,11 @@ pub struct BrowseQuery {
     pub path: String,
     pub limit: Option<usize>,
     pub filter: Option<String>,
+    /// Include dotfile-prefixed directories in the listing. Mirrors the TUI
+    /// picker's Ctrl+H toggle (`src/tui/components/dir_picker.rs`). Omitted
+    /// means false, so existing callers keep the old behavior.
+    #[serde(default)]
+    pub show_hidden: bool,
 }
 
 #[derive(Serialize)]
@@ -1247,7 +1252,7 @@ pub async fn browse_filesystem(
 
         for entry in read_dir.flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            if name.starts_with('.') {
+            if !query.show_hidden && name.starts_with('.') {
                 continue;
             }
             let entry_path = entry.path();
