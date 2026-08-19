@@ -872,6 +872,8 @@ impl CleanupProtection<'_> {
                 .is_some_and(|(left, right)| left == right)
     }
 
+    /// Exact matches protect a winner-owned worktree; containment protects a
+    /// winner path nested under a workspace root from recursive root cleanup.
     fn path_references_target(reference: &Path, target: &Path) -> bool {
         if reference == target || reference.starts_with(target) {
             return true;
@@ -961,6 +963,12 @@ pub fn cleanup_instance(
 ) {
     // The loser may never have reached storage, so lifecycle-coordinated stop
     // cannot reserve its row. Tear down only tmux resources named by its id.
+    // There is no per-build poller/monitor thread to stop here: the build
+    // path's only extra threads are the scoped worktree-creation threads that
+    // join before `build_instance` returns, and the async creation poller's
+    // build thread has already finished delivering its result before a rollback
+    // reaches this helper. So the tmux (below) and container (further down)
+    // teardown reclaim every runtime resource with no thread left running.
     instance.kill_all_tmux_sessions_without_lifecycle_row();
 
     if let Some(sandbox) = &instance.sandbox_info {

@@ -4282,6 +4282,10 @@ impl HomeView {
 
         // Clean up the stub and progress tracking
         let stub_id = self.creating_stub_id.take();
+        // Taken (not borrowed) so every early return below leaves the field
+        // empty: the provisional group paths belong to this stub alone, and a
+        // rolled-back or failed finalize must not carry them into the next
+        // creation.
         let provisional_group_paths = std::mem::take(&mut self.creating_provisional_group_paths);
         if let Some(ref id) = stub_id {
             self.creating_hook_progress.remove(id);
@@ -4360,10 +4364,12 @@ impl HomeView {
                     }
                 }
 
-                let storage = self
-                    .storages
-                    .get(&target_profile)
-                    .expect("target profile storage was just ensured");
+                let Some(storage) = self.storages.get(&target_profile) else {
+                    // The block above either found or inserted this profile's
+                    // storage, so this is unreachable; bail without attaching
+                    // rather than panicking on a production path.
+                    return None;
+                };
                 let persist_result = storage.update(|instances, groups| {
                     // `save()` can run while the builder is working and persist
                     // the placeholder. Remove that exact row under the same
@@ -4468,6 +4474,11 @@ impl HomeView {
                     },
                 }
 
+                // `publish_persisted_instance` records the create-count and
+                // clears the id from `pending_added` (the row is authoritative
+                // now, not a provisional add). Its in-memory insert is
+                // superseded by the `reload()` below on success, but is the
+                // fallback that keeps the row visible if that reload fails.
                 self.publish_persisted_instance(instance.clone());
                 self.rebuild_group_trees();
 
