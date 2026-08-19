@@ -225,7 +225,8 @@ export function DirectoryBrowser({ initialPath, onSelect }: Props) {
             type="checkbox"
             checked={showHidden}
             onChange={toggleHidden}
-            className="accent-brand-600 cursor-pointer"
+            disabled={!currentPath}
+            className="accent-brand-600 cursor-pointer disabled:cursor-not-allowed disabled:opacity-50"
           />
           Show hidden folders
         </label>
