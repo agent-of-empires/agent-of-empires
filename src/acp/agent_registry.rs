@@ -363,6 +363,7 @@ mod tests {
             // models.dev provider key.
             "ANTHROPIC_API_KEY",
             "OPENROUTER_API_KEY",
+            "ORCAROUTER_API_KEY",
             "OPENCODE_API_KEY",
             "GOOGLE_GENERATIVE_AI_API_KEY",
             "GOOGLE_API_KEY",

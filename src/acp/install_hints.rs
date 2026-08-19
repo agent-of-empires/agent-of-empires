@@ -100,9 +100,9 @@ pub fn env_allowlist_for(binary: &str) -> &'static [&'static str] {
         // GOOGLE_GENERATIVE_AI_API_KEY, and GEMINI_API_KEY alike, so all three
         // are here, and its `anthropic` entry declares ANTHROPIC_API_KEY, which
         // opencode needs for a Claude model now that the key no longer rides
-        // the shared forward list. OPENROUTER_API_KEY and OPENCODE_API_KEY
-        // (OpenCode Zen) are the `openrouter` / `opencode` entries' declared
-        // env.
+        // the shared forward list. OPENROUTER_API_KEY, ORCAROUTER_API_KEY and
+        // OPENCODE_API_KEY (OpenCode Zen) are the `openrouter` / `orcarouter`
+        // / `opencode` entries' declared env.
         "opencode" => &[
             "ANTHROPIC_API_KEY",
             "OPENAI_API_KEY",
@@ -110,6 +110,7 @@ pub fn env_allowlist_for(binary: &str) -> &'static [&'static str] {
             "GOOGLE_API_KEY",
             "GEMINI_API_KEY",
             "OPENROUTER_API_KEY",
+            "ORCAROUTER_API_KEY",
             "OPENCODE_API_KEY",
         ],
         // Verified from @google/gemini-cli 0.55.1: CLI-native GEMINI_API_KEY /
