@@ -9,7 +9,7 @@ use crate::containers;
 use crate::session::builder;
 use crate::session::repo_config;
 use crate::session::{
-    acquire_title_mutation_lock, civilizations, duplicate_session_error, is_duplicate_session,
+    acquire_session_identity_lock, civilizations, duplicate_session_error, is_duplicate_session,
     GroupTree, Instance, SandboxInfo, Storage,
 };
 
@@ -1122,7 +1122,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
     // Hooks and all slow preparation are complete. Serialize only the final
     // authoritative identity check and insert so a concurrent add or rename
     // cannot commit the same `(title, project_path)` pair.
-    let _title_lock = match acquire_title_mutation_lock() {
+    let _identity_lock = match acquire_session_identity_lock() {
         Ok(lock) => lock,
         Err(error) => {
             cleanup_partial_session(
@@ -1191,7 +1191,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
             return Err(e);
         }
     }
-    drop(_title_lock);
+    drop(_identity_lock);
 
     println!("✓ Added session: {}", final_title);
     println!("  Profile: {}", storage.profile());
@@ -1442,29 +1442,6 @@ fn cleanup_partial_session(
             let _ = std::fs::remove_dir_all(scratch);
         }
     }
-}
-
-pub(crate) fn find_duplicate_session<'a>(
-    instances: &'a [Instance],
-    title: &str,
-    path: &str,
-) -> Option<&'a Instance> {
-    let normalized_path = path.trim_end_matches('/');
-    instances.iter().find(|instance| {
-        instance.title == title && instance.project_path.trim_end_matches('/') == normalized_path
-    })
-}
-
-pub fn is_duplicate_session(instances: &[Instance], title: &str, path: &str) -> bool {
-    find_duplicate_session(instances, title, path).is_some()
-}
-
-pub(crate) fn duplicate_session_error(title: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "Session already exists with same title and path: {}\n\
-         Tip: use a different --title or remove the existing session first",
-        title
-    )
 }
 
 /// Sync mirror of `Supervisor::pick_agent_for_tool` so add-time

@@ -6167,6 +6167,12 @@ fn test_group_delete_dialog_scoped_to_owning_profile() {
     );
 }
 
+// Four rename-collision behaviors (untied duplicate-pair reject, group-only
+// change allowed, tied derived-destination collision, cross-profile target
+// collision) share one test because they need the same `#[serial]`-forcing
+// setup: an isolated home, multiple `HomeView`/`Storage` instances, and a
+// process-global `tie_workdir_to_name` flip. Splitting would multiply that
+// setup and the serial critical-path time; each behavior asserts independently.
 #[test]
 #[serial]
 fn test_rename_selected_rejects_all_identity_collisions_and_allows_group_only_change() {
@@ -6224,10 +6230,7 @@ fn test_rename_selected_rejects_all_identity_collisions_and_allows_group_only_ch
 
     // Tied routing derives the destination path from the new title. Reject a
     // collision on that final pair before attempting the git worktree move.
-    crate::session::config::update_config(|config| {
-        config.session.tie_workdir_to_name = true;
-    })
-    .unwrap();
+    let tie_guard = crate::session::test_support::TieWorkdirToNameGuard::set(true);
     let derived_existing = Instance::new("main branch", "/tmp/worktrees/main-branch");
     let mut tied_target = Instance::new("throwaway", "/tmp/worktrees/throwaway");
     tied_target.worktree_info = Some(crate::session::WorktreeInfo {
@@ -6260,6 +6263,8 @@ fn test_rename_selected_rejects_all_identity_collisions_and_allows_group_only_ch
         .unwrap();
     assert_eq!(tied_target.title, "throwaway");
     assert_eq!(tied_target.project_path, "/tmp/worktrees/throwaway");
+
+    drop(tie_guard);
 
     // Moving between profiles checks the authoritative target storage, not
     // only the source profile or unified-view cache.

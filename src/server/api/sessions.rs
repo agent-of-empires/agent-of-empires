@@ -1101,22 +1101,48 @@ struct SessionRenameCachePatch<'a> {
     renamed_branch: Option<&'a str>,
 }
 
+/// Reconcile one identity field the rename transaction does not own, returning
+/// the value to write or `None` to keep the current cached value.
+///
+/// `renamed` is `Some` when the rename explicitly changed the field and always
+/// wins. Otherwise the field is adopted from the `authoritative` disk snapshot
+/// only while the live `cached` value still equals the `baseline` captured at
+/// the start of the request; if a watcher or user action advanced it since,
+/// `None` is returned so the newer cached value survives. `path` and `branch`
+/// share this exact rule, so both route through here.
+fn reconcile_unowned_identity<'a>(
+    cached: Option<&str>,
+    baseline: Option<&str>,
+    authoritative: Option<&'a str>,
+    renamed: Option<&'a str>,
+) -> Option<&'a str> {
+    match renamed {
+        Some(_) => renamed,
+        None if cached == baseline => authoritative,
+        None => None,
+    }
+}
+
 fn apply_session_rename_cache_patch(inst: &mut Instance, patch: SessionRenameCachePatch<'_>) {
     inst.title = patch.title.to_string();
-    if let Some(path) = patch.renamed_path {
+    if let Some(path) = reconcile_unowned_identity(
+        Some(inst.project_path.as_str()),
+        Some(patch.initial_path),
+        Some(patch.authoritative_path),
+        patch.renamed_path,
+    ) {
         inst.project_path = path.to_string();
-    } else if inst.project_path == patch.initial_path {
-        inst.project_path = patch.authoritative_path.to_string();
     }
     let cached_branch = inst
         .worktree_info
         .as_ref()
         .map(|worktree| worktree.branch.as_str());
-    let branch = match patch.renamed_branch {
-        Some(branch) => Some(branch),
-        None if cached_branch == patch.initial_branch => patch.authoritative_branch,
-        None => None,
-    };
+    let branch = reconcile_unowned_identity(
+        cached_branch,
+        patch.initial_branch,
+        patch.authoritative_branch,
+        patch.renamed_branch,
+    );
     if let (Some(worktree), Some(branch)) = (inst.worktree_info.as_mut(), branch) {
         worktree.branch = branch.to_string();
     }
@@ -1259,16 +1285,18 @@ pub async fn rename_session(
     // Acquiring an app-wide flock may wait on another process, so never do it
     // on a Tokio worker. Keep the guard through external effects, persistence,
     // and cache publication; profile Storage locks are always nested beneath it.
-    let _title_lock = match tokio::task::spawn_blocking(crate::session::acquire_title_mutation_lock)
-        .await
+    let _identity_lock = match tokio::task::spawn_blocking(
+        crate::session::acquire_session_identity_lock,
+    )
+    .await
     {
         Ok(Ok(lock)) => lock,
         Ok(Err(error)) => {
-            tracing::error!(target: "http.api.sessions", session = %id, %error, "Failed to acquire title mutation lock");
+            tracing::error!(target: "http.api.sessions", session = %id, %error, "Failed to acquire session identity lock");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
         Err(error) => {
-            tracing::error!(target: "http.api.sessions", session = %id, %error, "Title mutation lock task failed");
+            tracing::error!(target: "http.api.sessions", session = %id, %error, "Session identity lock task failed");
             return StatusCode::INTERNAL_SERVER_ERROR.into_response();
         }
     };
@@ -1308,19 +1336,16 @@ pub async fn rename_session(
 
     // Tied mode (#1927): renaming an aoe-managed worktree session also moves
     // its directory leaf to match the title, so title and dir cannot drift.
-    let tied = crate::session::profile_config::resolve_config_or_warn(&profile)
-        .session
-        .tie_workdir_to_name
-        && worktree_info.as_ref().is_some_and(|w| w.managed_by_aoe);
+    let tied = fresh.tie_workdir_applies(
+        crate::session::profile_config::resolve_config_or_warn(&profile)
+            .session
+            .tie_workdir_to_name,
+    );
     let duplicate_path = if tied {
-        let leaf = crate::session::worktree_edit::worktree_leaf_from_title(&title);
-        crate::session::worktree_edit::target_worktree_path(
+        crate::session::worktree_edit::derived_worktree_path(
             std::path::Path::new(&current_path),
-            &leaf,
+            &title,
         )
-        .unwrap_or_else(|| std::path::PathBuf::from(&current_path))
-        .to_string_lossy()
-        .into_owned()
     } else {
         current_path.clone()
     };
@@ -1485,7 +1510,17 @@ pub async fn rename_session(
     };
     match persisted {
         Ok(true) => {}
-        Ok(false) => return super::session_not_found(),
+        Ok(false) => {
+            if let Some(path) = new_path.as_deref() {
+                tracing::warn!(
+                    target: "http.api.sessions",
+                    session = %id,
+                    moved_to = %path,
+                    "session row was removed by a peer after the worktree move landed; the moved directory is unreferenced"
+                );
+            }
+            return super::session_not_found();
+        }
         Err(e) => {
             tracing::error!(target: "http.api.sessions", session = %id, "Failed to save after rename: {e}");
             // Persist-first: never fall through to mutate in-memory state on a
@@ -1541,7 +1576,7 @@ pub async fn rename_session(
     // trusts the mutation response would see a managed worktree claim it is
     // untied until the next list refresh.
     response.tie_workdir_to_name = tied;
-    drop(_title_lock);
+    drop(_identity_lock);
 
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
@@ -7486,9 +7521,24 @@ pub async fn serve_session_artifact(Path((id, path)): Path<(String, String)>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn build_rename_test_state(
+        persisted: Vec<Instance>,
+        cached: Vec<Instance>,
+    ) -> (Storage, std::sync::Arc<crate::server::AppState>) {
+        let storage = Storage::new_unwatched("default").unwrap();
+        storage
+            .update(|instances, _groups| {
+                *instances = persisted;
+                Ok(())
+            })
+            .unwrap();
+        let state = crate::server::test_support::build_test_app_state(cached);
+        (storage, state)
+    }
+
     #[tokio::test]
     #[serial_test::serial]
-    async fn rename_session_rejects_duplicate_title_and_path() {
+    async fn rename_session_rejects_duplicate_and_preserves_newer_cache() {
         use axum::body::to_bytes;
 
         let _guard = crate::session::test_support::isolate_app_dir();
@@ -7497,19 +7547,12 @@ mod tests {
         let mut target = Instance::new("throwaway", "/tmp/repo");
         target.source_profile = "default".to_string();
         let target_id = target.id.clone();
-        let storage = Storage::new_unwatched("default").unwrap();
-        storage
-            .update(|instances, _groups| {
-                *instances = vec![existing.clone(), target.clone()];
-                Ok(())
-            })
-            .unwrap();
-        let mut stale_existing = existing;
+        let mut stale_existing = existing.clone();
         stale_existing.title = "previous title".to_string();
-        let mut stale_target = target;
+        let mut stale_target = target.clone();
         stale_target.project_path = "/tmp/stale".to_string();
-        let state =
-            crate::server::test_support::build_test_app_state(vec![stale_existing, stale_target]);
+        let (storage, state) =
+            build_rename_test_state(vec![existing, target], vec![stale_existing, stale_target]);
 
         let response = rename_session(
             State(state.clone()),
@@ -7536,6 +7579,7 @@ mod tests {
                 .title,
             "throwaway"
         );
+
         storage
             .update(|instances, _groups| {
                 instances
@@ -7567,6 +7611,7 @@ mod tests {
         )
         .await
         .into_response();
+
         assert_eq!(response.status(), StatusCode::OK);
         let instances = state.instances.read().await;
         let target = instances
@@ -7580,15 +7625,13 @@ mod tests {
             target.is_favorited(),
             "newer cached user action must survive rename publication"
         );
+    }
 
-        drop(instances);
-
-        // A tied rename can reconcile a drifted directory even when the title
-        // is unchanged, so uniqueness must be checked against that final path.
-        crate::session::config::update_config(|config| {
-            config.session.tie_workdir_to_name = true;
-        })
-        .unwrap();
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rename_session_rejects_tied_drifted_path_collision() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let _tie_guard = crate::session::test_support::TieWorkdirToNameGuard::set(true);
         let mut existing = Instance::new("main branch", "/tmp/worktrees/main-branch");
         existing.source_profile = "default".to_string();
         let mut drifted = Instance::new("main branch", "/tmp/worktrees/drifted");
@@ -7601,13 +7644,10 @@ mod tests {
             base_branch: None,
         });
         let drifted_id = drifted.id.clone();
-        storage
-            .update(|instances, _groups| {
-                *instances = vec![existing.clone(), drifted.clone()];
-                Ok(())
-            })
-            .unwrap();
-        let state = crate::server::test_support::build_test_app_state(vec![existing, drifted]);
+        let (_storage, state) = build_rename_test_state(
+            vec![existing.clone(), drifted.clone()],
+            vec![existing, drifted],
+        );
 
         let response = rename_session(
             State(state),
@@ -7619,6 +7659,7 @@ mod tests {
         )
         .await
         .into_response();
+
         assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
@@ -9221,8 +9262,10 @@ mod tests {
             base_branch: None,
         });
 
-        let state =
-            crate::server::test_support::build_test_app_state(vec![title_only, branch_only]);
+        let (_storage, state) = build_rename_test_state(
+            vec![title_only.clone(), branch_only.clone()],
+            vec![title_only, branch_only],
+        );
         state.acp_supervisor.test_insert_worker(&title_id).await;
 
         // The title changes, but its slug already matches both the cwd leaf
@@ -9353,7 +9396,7 @@ mod tests {
                 base_branch: None,
             });
 
-            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            let (_storage, state) = build_rename_test_state(vec![inst.clone()], vec![inst]);
             state.acp_supervisor.test_insert_worker(case.id).await;
 
             let _ = rename_session(

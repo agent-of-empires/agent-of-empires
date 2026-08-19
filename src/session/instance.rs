@@ -4666,9 +4666,8 @@ impl Instance {
     }
 
     fn install_codex_host_hooks(&self, events: &[crate::agents::ResolvedHookEvent]) {
-        match crate::hooks::codex_hooks_json_path_for_host_environment(
-            &self.profile_host_environment(),
-        ) {
+        let environment = self.resolved_host_environment();
+        match crate::hooks::codex_hooks_json_path_for_host_environment(&environment) {
             Ok(hooks_path) => {
                 if let Err(e) = crate::hooks::install_hooks(
                     &hooks_path,
@@ -4692,10 +4691,8 @@ impl Instance {
         // Install hooks in the agent's host settings file, honoring a
         // config-dir override env var (e.g. CLAUDE_CONFIG_DIR) so hooks
         // land where the agent actually reads them.
-        match crate::hooks::agent_settings_path_for_host_environment(
-            hook_cfg,
-            &self.profile_host_environment(),
-        ) {
+        let environment = self.resolved_host_environment();
+        match crate::hooks::agent_settings_path_for_host_environment(hook_cfg, &environment) {
             Ok(settings_path) => {
                 if let Err(e) = crate::hooks::install_hooks(
                     &settings_path,
@@ -7577,27 +7574,36 @@ fn pane_has_agent_content(raw_content: &str, tool: &str) -> bool {
     false
 }
 
-/// Whether another session already owns the exact title and normalized path.
+/// Find another session that owns the exact title and normalized path.
 ///
 /// `exclude_id` lets mutation paths ignore the row being renamed.
-pub(crate) fn is_duplicate_session<'a>(
+pub(crate) fn find_duplicate_session<'a>(
     instances: impl IntoIterator<Item = &'a Instance>,
     title: &str,
     path: &str,
     exclude_id: Option<&str>,
-) -> bool {
+) -> Option<&'a Instance> {
     let normalized_path = path.trim_end_matches('/');
-    instances.into_iter().any(|inst| {
+    instances.into_iter().find(|inst| {
         exclude_id != Some(inst.id.as_str())
             && inst.project_path.trim_end_matches('/') == normalized_path
             && inst.title == title
     })
 }
 
+pub(crate) fn is_duplicate_session<'a>(
+    instances: impl IntoIterator<Item = &'a Instance>,
+    title: &str,
+    path: &str,
+    exclude_id: Option<&str>,
+) -> bool {
+    find_duplicate_session(instances, title, path, exclude_id).is_some()
+}
+
 pub(crate) fn duplicate_session_error(title: &str) -> anyhow::Error {
     anyhow::anyhow!(
         "Session already exists with same title and path: {}\n\
-         Tip: use a different --title or remove the existing session first",
+         Tip: use a different title or remove the existing session first",
         title
     )
 }
@@ -7665,6 +7671,7 @@ mod tests {
         for (name, pane, expected) in cases {
             assert_eq!(summarize_error_from_pane(pane), expected, "{name}");
         }
+    }
 
     #[test]
     fn duplicate_session_normalizes_path_and_excludes_self() {
@@ -7978,18 +7985,22 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_codex_hook_installer_uses_profile_codex_home() {
+    fn test_codex_hook_installer_uses_resolved_codex_home() {
         let tmp = tempfile::TempDir::new().unwrap();
         let _codex_home_guard = EnvGuard::unset(&["CODEX_HOME"]);
         std::env::set_var("HOME", tmp.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
 
-        let codex_home = tmp.path().join("profile-codex-home");
+        let profile_codex_home = tmp.path().join("profile-codex-home");
+        let resolved_codex_home = tmp.path().join("before-session-codex-home");
         let profile_dir = crate::session::get_profile_dir("codex-profile").unwrap();
         std::fs::write(
             profile_dir.join("config.toml"),
-            format!("environment = [\"CODEX_HOME={}\"]\n", codex_home.display()),
+            format!(
+                "environment = [\"CODEX_HOME={}\"]\n",
+                profile_codex_home.display()
+            ),
         )
         .unwrap();
 
@@ -7997,13 +8008,18 @@ mod tests {
         inst.tool = "codex".to_string();
         inst.detect_as = "codex".to_string();
         inst.source_profile = "codex-profile".to_string();
+        inst.pending_host_env = vec![(
+            "CODEX_HOME".to_string(),
+            resolved_codex_home.to_string_lossy().into_owned(),
+        )];
         inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as));
 
-        let hooks_path = codex_home.join("hooks.json");
+        let hooks_path = resolved_codex_home.join("hooks.json");
         let hooks = std::fs::read_to_string(hooks_path).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&hooks).unwrap();
         assert!(parsed["hooks"]["PreToolUse"].is_array());
         assert!(hooks.contains("aoe-hooks"));
+        assert!(!profile_codex_home.join("hooks.json").exists());
         assert!(!tmp.path().join(".codex").join("hooks.json").exists());
     }
 

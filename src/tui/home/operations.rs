@@ -2,7 +2,7 @@
 
 use crate::session::builder::{self, InstanceParams};
 use crate::session::{
-    acquire_title_mutation_lock, duplicate_session_error, is_duplicate_session, list_profiles,
+    acquire_session_identity_lock, duplicate_session_error, is_duplicate_session, list_profiles,
     GroupTree, Instance, Item, LifecycleOperation, Status, Storage,
 };
 use crate::tui::deletion_poller::DeletionRequest;
@@ -1115,7 +1115,7 @@ impl HomeView {
             // The app-wide guard covers profile-changing renames too, so the
             // authoritative target-profile check and both profile writes are
             // one identity transaction without nesting profile locks.
-            let _title_lock = acquire_title_mutation_lock()?;
+            let _identity_lock = acquire_session_identity_lock()?;
             let stored = if let Some(storage) = self.storages.get(&current_profile) {
                 storage.load()?
             } else {
@@ -1155,15 +1155,10 @@ impl HomeView {
             let tied = self.tie_workdir_applies_for(&id);
             let tied_edit = tied && (current_title != effective_title || rename_branch);
             let duplicate_path = if tied_edit {
-                let leaf =
-                    crate::session::worktree_edit::worktree_leaf_from_title(&effective_title);
-                crate::session::worktree_edit::target_worktree_path(
+                crate::session::worktree_edit::derived_worktree_path(
                     std::path::Path::new(&previous.project_path),
-                    &leaf,
+                    &effective_title,
                 )
-                .unwrap_or_else(|| std::path::PathBuf::from(&previous.project_path))
-                .to_string_lossy()
-                .into_owned()
             } else {
                 previous.project_path.clone()
             };

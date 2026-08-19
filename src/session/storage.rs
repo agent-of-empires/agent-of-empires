@@ -43,14 +43,15 @@
 //! `save_groups` helpers were removed entirely. This keeps it structurally
 //! impossible to bypass the locks.
 //!
-//! Lock-ordering rule across the process: a title mutation that can change or
-//! create a `(title, project_path)` pair MUST first acquire the app-wide title
-//! mutation flock, then acquire any profile `Storage` lock. The title lock is
-//! global so a profile-changing rename never needs to hold two profile locks at
-//! once. It stays held through the authoritative duplicate check, external
-//! rename effects, persistence, and cache publication. `aoe add` acquires it
-//! only after hooks, around its final check and insert. Code must never acquire
-//! the title lock while holding a profile `Storage` lock.
+//! Lock-ordering rule across the process: a mutation that can change or create
+//! a `(title, project_path)` pair MUST first acquire the app-wide session
+//! identity flock via `acquire_session_identity_lock`, then acquire any profile
+//! `Storage` lock. The identity lock is global so a profile-changing rename
+//! never needs to hold two profile locks at once. It stays held through the
+//! authoritative duplicate check, external rename effects, persistence, and
+//! cache publication. `aoe add` acquires it only after hooks, around its final
+//! check and insert. Code must never acquire the identity lock while holding a
+//! profile `Storage` lock.
 //!
 //! Server callers MUST drop `AppState.instances` (tokio RwLock) before
 //! acquiring either flock via `tokio::task::spawn_blocking`. A flock can park
@@ -105,7 +106,9 @@ const INSTANCE_LIFECYCLE_LOCK_PREFIX: &str = ".instance-lifecycle-";
 /// Sidecar lock for every mutation that can create or change a session's
 /// `(title, project_path)` identity. It lives at app scope because TUI renames
 /// can move a row between profiles.
-const TITLE_MUTATION_LOCK_FILENAME: &str = ".title-mutation.lock";
+/// The historical filename is retained so mixed-version processes still
+/// coordinate during an upgrade.
+const SESSION_IDENTITY_LOCK_FILENAME: &str = ".title-mutation.lock";
 
 /// Emit a tracing warn if the cross-process `flock` is held by a peer for
 /// longer than this. Surfaces a wedged peer in `aoe logs` instead of a
@@ -377,13 +380,35 @@ pub(crate) fn acquire_storage_flock(dir: &Path, name: &str) -> Result<StorageFlo
     }
     Ok(StorageFlock { file })
 }
-/// Acquire the app-wide session title-mutation lock.
+/// Acquire the app-wide session identity-mutation lock.
 ///
 /// Callers must take this before loading authoritative profile storage and
 /// retain it through duplicate validation, external rename effects, durable
 /// writes, and any in-memory cache publication. See the module lock order.
-pub(crate) fn acquire_title_mutation_lock() -> Result<StorageFlock> {
-    acquire_storage_flock(&get_app_dir()?, TITLE_MUTATION_LOCK_FILENAME)
+///
+/// Held across slow external effects. The tied worktree rename path
+/// (`session::worktree_edit::edit_worktree_workdir`) runs `git branch -m` and
+/// `git worktree move`, and the callers refresh tmux state, all while this
+/// cross-process `flock` is held so duplicate validation and durable commit
+/// are one transaction with no TOCTOU window. Those git effects are therefore
+/// bounded (`WORKTREE_MUTATION_TIMEOUT` in `git::worktree`): a stalled
+/// filesystem turns into a surfaced error instead of pinning the lock, and
+/// thus every peer `aoe` process, indefinitely. The `flock` itself is released
+/// by the kernel on process exit, so a crashed holder cannot wedge peers
+/// either.
+///
+/// Scope deliberately left OUTSIDE this lock, so `(title, project_path)`
+/// uniqueness is NOT a global invariant:
+///   - `session::smart_rename` rewrites a structured session's title from a
+///     detached one-shot without taking this lock (it only ever touches the
+///     title, never the worktree directory), so it can land a title that
+///     collides with another row.
+///   - Session-creation surfaces other than the guarded `aoe add` / rename
+///     paths (imports, restores, ACP-driven creation) do not serialize through
+///     here. The lock guarantees the add/rename endpoints cannot *introduce* a
+///     duplicate; it does not retroactively dedup rows created elsewhere.
+pub(crate) fn acquire_session_identity_lock() -> Result<StorageFlock> {
+    acquire_storage_flock(&get_app_dir()?, SESSION_IDENTITY_LOCK_FILENAME)
 }
 
 pub struct Storage {
