@@ -1729,10 +1729,12 @@ export async function browseFilesystem(
   path: string,
   limit?: number,
   filter?: string,
+  showHidden = false,
 ): Promise<BrowseResponse & { ok: boolean }> {
   const params = new URLSearchParams({ path });
   if (limit != null) params.set("limit", String(limit));
   if (filter) params.set("filter", filter);
+  if (showHidden) params.set("show_hidden", "true");
   const data = await fetchJson<BrowseResponse>(`/api/filesystem/browse?${params}`);
   if (!data) return { entries: [], has_more: false, ok: false };
   return { ...data, ok: true };
