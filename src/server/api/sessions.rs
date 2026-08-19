@@ -1256,8 +1256,13 @@ pub async fn rename_session(
             std::path::Path::new(&current_path),
             &leaf,
         );
-        let renames_branch =
-            body.rename_branch && worktree_info.as_ref().is_some_and(|wt| wt.branch != leaf);
+        let renames_branch = worktree_info.as_ref().is_some_and(|wt| {
+            crate::session::worktree_edit::worktree_branch_rename_required(
+                wt,
+                &leaf,
+                body.rename_branch,
+            )
+        });
         let container_holds = !status.blocks_worktree_edit()
             && moves_worktree
             && ensure_sandbox_container_released_blocking(&id, is_sandboxed).await;
@@ -1573,10 +1578,18 @@ pub async fn set_worktree_name(
 
     // Stop any live structured-view worker before the move so it can't crash on
     // the pulled-out cwd and respawn-loop at the stale path (#2260). Held under
-    // the instance_lock acquired at the top of this function.
-    if let Err(resp) = quiesce_structured_worker_for_worktree_move(&state, &id, is_structured).await
-    {
-        return resp;
+    // the instance_lock acquired at the top of this function. Gated on
+    // `moves_worktree` for the same reason as the tied `rename_session` path: a
+    // branch-only edit (name unchanged, `rename_branch` set) leaves the cwd
+    // valid, so interrupting the worker would be a needless respawn. When the
+    // name is unchanged and no branch rename is requested, `edit_worktree_workdir`
+    // rejects with `Unchanged` below and nothing is touched either way.
+    if moves_worktree {
+        if let Err(resp) =
+            quiesce_structured_worker_for_worktree_move(&state, &id, is_structured).await
+        {
+            return resp;
+        }
     }
 
     let wt = worktree_info.clone();
@@ -8862,6 +8875,200 @@ mod tests {
             Some("existing-branch"),
             "the active branch-only request must be rejected before git mutation"
         );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rename_session_quiesces_structured_worker_only_when_its_cwd_moves() {
+        // Invariant #2260: a live structured-view worker is pinned to its cwd,
+        // so a tied rename that MOVES the worktree directory must stop the
+        // worker first (else it crash-loops at the pulled-out path), while a
+        // rename that leaves the cwd in place must NOT interrupt it. The
+        // quiesce runs before the git edit, so the cwd-moving assertion holds
+        // even though the edit itself then fails on a fixture with no real
+        // worktree to move: what #2260 pins is that the worker is gone by then.
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+
+        struct Case {
+            id: &'static str,
+            leaf: &'static str,
+            new_title: &'static str,
+            // Whether the new title's slug relocates the worktree directory.
+            moves_cwd: bool,
+        }
+        // The cwd-stable row's slug ("my-session") equals the existing leaf, so
+        // the edit is a no-op move; the cwd-moving row's slug differs, forcing
+        // a relocation.
+        let cases = [
+            Case {
+                id: "quiesce-cwd-stable",
+                leaf: "my-session",
+                new_title: "My Session!",
+                moves_cwd: false,
+            },
+            Case {
+                id: "quiesce-cwd-moving",
+                leaf: "old-leaf",
+                new_title: "A Brand New Name",
+                moves_cwd: true,
+            },
+        ];
+
+        for case in cases {
+            let paths = tempfile::tempdir().unwrap();
+            let project_path = paths.path().join(case.leaf);
+            let mut inst = Instance::new(
+                "Original title",
+                project_path.to_str().expect("UTF-8 temp path"),
+            );
+            inst.id = case.id.to_string();
+            // Idle, not Running: a structured session the user "stopped" sits
+            // at Idle yet still owns a live worker, which is exactly the gap
+            // `blocks_worktree_edit` misses and quiesce closes.
+            inst.status = Status::Idle;
+            inst.view = crate::session::View::Structured;
+            inst.worktree_info = Some(crate::session::WorktreeInfo {
+                branch: case.leaf.to_string(),
+                main_repo_path: paths
+                    .path()
+                    .join("missing-repo")
+                    .to_string_lossy()
+                    .into_owned(),
+                managed_by_aoe: true,
+                created_at: chrono::Utc::now(),
+                base_branch: None,
+            });
+
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            state.acp_supervisor.test_insert_worker(case.id).await;
+
+            let _ = rename_session(
+                State(state.clone()),
+                Path(case.id.to_string()),
+                Ok(Json(RenameSessionBody {
+                    title: case.new_title.to_string(),
+                    rename_branch: false,
+                })),
+            )
+            .await
+            .into_response();
+
+            assert_eq!(
+                state.acp_supervisor.is_running(case.id).await,
+                !case.moves_cwd,
+                "{}: worker should be {} for moves_cwd={}",
+                case.id,
+                if case.moves_cwd {
+                    "stopped"
+                } else {
+                    "preserved"
+                },
+                case.moves_cwd
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn set_worktree_name_quiesces_structured_worker_only_when_its_cwd_moves() {
+        // The standalone-endpoint mirror of the rename_session gate above: both
+        // stop a live structured-view worker only when the edit actually moves
+        // the worktree cwd (#2260), never for a cwd-stable or branch-only edit.
+        // The quiesce precedes the git edit, so the cwd-moving assertion holds
+        // even though the edit itself then fails on a fixture with no real
+        // worktree to move: what #2260 pins is that the worker is gone by then.
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        // set_worktree_name refuses a tied managed worktree (tied callers must
+        // go through rename_session), so untie the profile to reach the worker
+        // gate that this test exercises.
+        let mut overrides = serde_json::Map::new();
+        overrides.insert(
+            "session".to_string(),
+            serde_json::json!({ "tie_workdir_to_name": false }),
+        );
+        crate::session::profile_config::save_profile_config(
+            "test",
+            &crate::session::profile_config::ProfileConfig {
+                description: None,
+                overrides,
+            },
+        )
+        .expect("write test profile override");
+
+        struct Case {
+            id: &'static str,
+            leaf: &'static str,
+            new_name: &'static str,
+            // Whether the requested name relocates the worktree directory.
+            moves_cwd: bool,
+        }
+        // The cwd-stable row's name equals the existing leaf (a no-op move); the
+        // cwd-moving row's name differs, forcing a relocation.
+        let cases = [
+            Case {
+                id: "sw-cwd-stable",
+                leaf: "my-session",
+                new_name: "my-session",
+                moves_cwd: false,
+            },
+            Case {
+                id: "sw-cwd-moving",
+                leaf: "old-leaf",
+                new_name: "new-leaf",
+                moves_cwd: true,
+            },
+        ];
+
+        for case in cases {
+            let paths = tempfile::tempdir().unwrap();
+            let project_path = paths.path().join(case.leaf);
+            let mut inst = Instance::new(
+                "Original title",
+                project_path.to_str().expect("UTF-8 temp path"),
+            );
+            inst.id = case.id.to_string();
+            inst.source_profile = "test".to_string();
+            inst.status = Status::Idle;
+            inst.view = crate::session::View::Structured;
+            inst.worktree_info = Some(crate::session::WorktreeInfo {
+                branch: case.leaf.to_string(),
+                main_repo_path: paths
+                    .path()
+                    .join("missing-repo")
+                    .to_string_lossy()
+                    .into_owned(),
+                managed_by_aoe: true,
+                created_at: chrono::Utc::now(),
+                base_branch: None,
+            });
+
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            state.acp_supervisor.test_insert_worker(case.id).await;
+
+            let _ = set_worktree_name(
+                State(state.clone()),
+                Path(case.id.to_string()),
+                Ok(Json(SetWorktreeNameBody {
+                    name: case.new_name.to_string(),
+                    rename_branch: false,
+                })),
+            )
+            .await
+            .into_response();
+
+            assert_eq!(
+                state.acp_supervisor.is_running(case.id).await,
+                !case.moves_cwd,
+                "{}: worker should be {} for moves_cwd={}",
+                case.id,
+                if case.moves_cwd {
+                    "stopped"
+                } else {
+                    "preserved"
+                },
+                case.moves_cwd
+            );
+        }
     }
 
     #[test]
