@@ -159,7 +159,7 @@ pub fn detect_claude_status(content: &str) -> Status {
         // this pane fallback (hooks disabled, or the sandbox hook-dir
         // bind-mount failed) would otherwise match the spinner and report
         // Running the whole time it is blocked. See #1913.
-        if let Some(rule) = claude_blocking_prompt_rule(recent, recent_lower) {
+        if let Some(rule) = claude_blocking_prompt_rule(recent, recent_joined, recent_lower) {
             tracing::trace!(target: "tmux.status", "claude pane detector: Waiting ({rule})");
             return Status::Waiting;
         }
@@ -196,9 +196,16 @@ fn with_claude_recent_pane<T>(raw_content: &str, f: impl FnOnce(&[&str], &str, &
 /// Which blocking-prompt rule matches the recent pane lines, if any. The rule
 /// name feeds status-decision tracing so a wrong-state report can be resolved
 /// by grepping debug.log for which detector fired.
-fn claude_blocking_prompt_rule(recent: &[&str], recent_lower: &str) -> Option<&'static str> {
+fn claude_blocking_prompt_rule(
+    recent: &[&str],
+    recent_joined: &str,
+    recent_lower: &str,
+) -> Option<&'static str> {
     if claude_has_approval_prompt(recent, recent_lower) {
         return Some("approval_prompt");
+    }
+    if claude_has_folder_trust_prompt(recent, recent_joined, recent_lower) {
+        return Some("folder_trust_prompt");
     }
     if claude_has_ask_user_question(recent) {
         return Some("ask_user_question");
@@ -497,7 +504,7 @@ fn claude_line_is_input_box_chrome(line: &str) -> bool {
 /// Idle the moment the user pre-types their next prompt.
 pub(crate) fn claude_pane_is_ambiguous_typed_prompt(raw_content: &str) -> bool {
     with_claude_recent_pane(raw_content, |recent, recent_joined, recent_lower| {
-        claude_blocking_prompt_rule(recent, recent_lower).is_none()
+        claude_blocking_prompt_rule(recent, recent_joined, recent_lower).is_none()
             && !claude_pane_has_running_signal(recent, recent_joined, recent_lower)
             && matches!(
                 claude_typed_prompt_verdict(recent),
@@ -506,120 +513,102 @@ pub(crate) fn claude_pane_is_ambiguous_typed_prompt(raw_content: &str) -> bool {
     })
 }
 
-/// The blocking prompts this rule covers: a tool asking permission (Bash
-/// command, file edit, plan exit, ...), and the first-run folder-trust check,
-/// which is not a tool permission at all. Each of those pairs a question
-/// ("Do you want to proceed?", "Do you want to make this edit to <file>?",
-/// "Would you like to proceed?", "Is this a project you created or one you
-/// trust?") with a numbered choice menu. It does NOT cover every prompt Claude
-/// blocks on: `AskUserQuestion` carries none of these phrasings and has its
-/// own detector below. Requiring both keeps an assistant-authored numbered list from being
-/// mistaken for a prompt. `recent_lower` is the lowercased join of `recent`.
+/// Claude renders a blocking approval prompt when a tool needs the user's
+/// permission (Bash command, file edit, plan exit, ...). Every variant pairs
+/// a yes/no question ("Do you want to proceed?", "Do you want to make this
+/// edit to <file>?", "Would you like to proceed?") with a numbered choice
+/// menu. Requiring both keeps an assistant-authored numbered list from being
+/// mistaken for a prompt. It does NOT cover every prompt Claude blocks on:
+/// the first-run folder-trust check and `AskUserQuestion` carry none of these
+/// phrasings and have their own rules. `recent_lower` is the lowercased join
+/// of `recent`.
 fn claude_has_approval_prompt(recent: &[&str], recent_lower: &str) -> bool {
-    // The folder-trust prompt phrases its question without either stock
-    // opener, so a first launch in a new directory read as Idle and never
-    // reached the waiting count. Its arm needs the question AND the option
-    // label ("yes, i trust this folder", which the Antigravity detector below
-    // also carries): the label alone sits on a numbered-choice line, so
-    // matching it on its own would let one quoted line satisfy both halves of
-    // the guard.
     let has_question = recent_lower.contains("do you want to")
-        || recent_lower.contains("would you like to proceed")
-        || claude_has_folder_trust_question(recent, recent_lower);
+        || recent_lower.contains("would you like to proceed");
     has_question
         && recent
             .iter()
             .any(|line| claude_line_is_numbered_choice(line))
 }
 
-/// The folder-trust question, including when Claude has word-wrapped it.
+/// The first-run folder-trust prompt: `Accessing workspace:` over
+/// `Quick safety check: Is this a project you created or one you trust?`, the
+/// `1. Yes, I trust this folder` / `2. No, exit` menu, and an
+/// `Enter to confirm` footer. It is not a tool permission, so it phrases its
+/// question without either stock opener and read Idle, which kept a session
+/// parked on a first launch out of the waiting count.
 ///
-/// It is 46 characters of prose, so a narrow pane breaks it across lines and
-/// `recent_lower` is a newline join, which defeats a plain `contains`. AoE
-/// produces the affected widths itself: the side-by-side preview pane is
-/// `viewport - list_width - 4` (borders plus the block's horizontal padding),
-/// so with the default `list_width` of 35 the question only fits unwrapped
-/// from a viewport of about 107 up. Below `STACKED_BREAKPOINT` the stacked
-/// layout gives `viewport - 4`, which fits from 72 up, so the wrapped case
-/// covers viewports up to 71 as well as 80..=106, the phone range in
-/// `responsive.rs` included.
+/// Three requirements, because a substring pair is not enough here. Widths are
+/// measured against Claude Code 2.1.234, not derived:
 ///
-/// Collapsing whitespace is how `claude_pane_has_running_signal` handles the
-/// same wrap problem, but its safety argument does NOT carry over and that is
-/// the trap here: its comment notes that false joins across unrelated lines
-/// "only bias toward Running, the safe direction". This match biases toward
-/// Waiting, which outranks Running, so a collapsed-only match would let an
-/// actively generating turn that merely renders this question across a line
-/// break report Waiting. Measured, before the option-label requirement below
-/// was added: a pane with a live spinner, a live token counter and
-/// `esc to interrupt` flipped Running -> Waiting.
-///
-/// So the collapsed form is paired with the prompt's own option label, which
-/// the question alone never implies and which prose reproducing only the
-/// question never carries. Both are matched on the collapsed join rather than
-/// on a single line: the menu row wraps too (`1. Yes, I trust this folder`
-/// with its cursor is 30 columns, so the stacked preview loses it below a
-/// viewport of 34 on the stacked path, or 37 with the sidebar collapsed, and
-/// `responsive.rs` documents viewports down to ~26), and
-/// anchoring the label to one line reintroduces the same wrap miss the
-/// collapse exists to fix. The cheap numbered-choice line scan gates the
-/// allocation.
-///
-/// This is still the shared two-signal guard, so it inherits that guard's
-/// known limit: a turn that quotes the whole prompt, question and menu row
-/// together, reads Waiting. `"do you want to"` has the same exposure on
-/// `main`; scoping the signals to one prompt block is a separate change.
-/// Note for anyone hardening the shared guard later: for THIS arm the trailing
-/// `any(claude_line_is_numbered_choice)` in `claude_has_approval_prompt` is
-/// already implied, because `claude_trust_choice_option_text` succeeding is
-/// strictly stronger than that predicate. The trust path is one anchored
-/// signal plus one substring, not two independent ones.
-fn claude_has_folder_trust_question(recent: &[&str], recent_lower: &str) -> bool {
+/// 1. The question, matched on the whitespace-collapsed window. It holds one
+///    line down to a 69-column pane and wraps below that, and AoE produces the
+///    wrapping widths itself: the side-by-side preview pane is
+///    `viewport - list_width - 4`, so at the default `list_width` of 35 it
+///    needs a viewport of 108, and the stacked pane below `STACKED_BREAKPOINT`
+///    is `viewport - 4`, so it needs 73. Viewports up to 72 and 80..=107
+///    therefore wrap, which is most of the phone range in `responsive.rs`.
+///    `recent_lower` is a newline join, so a plain `contains` misses those.
+/// 2. The option label, anchored to a choice row *and its wrapped
+///    continuations* and required to start the option's own text. The label
+///    holds one line down to a 30-column pane, so the continuation join is
+///    what covers the narrow end. The row must carry no `>`, because
+///    `claude_line_is_numbered_choice` strips one and a markdown blockquote
+///    quoting this prompt would otherwise open a block.
+/// 3. No running signal on the pane. This rule reports Waiting, which outranks
+///    Running, so the collapse here is NOT covered by the safety argument in
+///    `claude_pane_has_running_signal` ("false joins only bias toward
+///    Running"). Without this conjunct a turn that merely reproduces the menu
+///    row and the question (a `cat` of a captured prompt, a `--nocapture`
+///    fixture dump, an unprefixed quote) flipped an actively generating pane
+///    to Waiting. The real dialog renders before any turn starts, so it never
+///    carries a spinner, a live token counter or the interrupt hint; requiring
+///    their absence costs the true positive nothing, and it is checked last so
+///    only a trust-shaped pane pays for it.
+fn claude_has_folder_trust_prompt(
+    recent: &[&str],
+    recent_joined: &str,
+    recent_lower: &str,
+) -> bool {
     claude_has_trust_option_label(recent)
         && collapse_ascii_whitespace(recent_lower)
             .contains("is this a project you created or one you trust")
+        && !claude_pane_has_running_signal(recent, recent_joined, recent_lower)
 }
 
 /// How many lines a wrapped option label may occupy. It is 24 characters, and
 /// every viewport `responsive.rs` documents (~26 and up, so a 22-column
-/// stacked pane) wraps it onto two. Four is slack, not a measured bound; where
-/// exactly it fails depends on a wrap model this file has no evidence for, and
-/// the 30-non-empty-line window drops the question phrase before the label
-/// budget binds anyway. Kept at four because the cost of slack is a wider
-/// splice window, which the option-text requirement already bounds.
+/// stacked pane) wraps it onto two. Four is slack, not a measured bound;
+/// exactly where it fails depends on a wrap model this file has no evidence
+/// for. Kept at four because the cost of slack is a wider splice window, which
+/// the option-text requirement already bounds.
 const CLAUDE_TRUST_LABEL_WRAP_LINES: usize = 4;
 
 /// The trust prompt's option label, matched over the choice row *and its
 /// wrapped continuations*, and required to start the option's own text.
 ///
-/// Two requirements, each closing a false positive measured on an actively
-/// generating pane. The requirement-1 fixture carries a live spinner, a live
-/// token counter and `esc to interrupt`; the requirement-2 fixtures carry a
-/// live spinner alone, which is enough, since a blocking rule outranks every
-/// running signal:
+/// Two requirements, each closing a false positive measured on a pane that was
+/// echoing the prompt rather than showing it:
 ///
 /// 1. The row must be a choice row with no `>` ahead of the number.
 ///    Collapsing the whole window instead found the label in ordinary prose,
 ///    and `claude_line_is_numbered_choice` tolerates a leading `>`, so a
-///    markdown blockquote quoting this prompt opened a block.
+///    markdown blockquote quoting this prompt opened a block. Prefixed echoes
+///    (`grep -n`, a diff `+`, `cat -n` line numbers) fail here too, though
+///    that is a side effect of the choice-row shape and not an echo filter.
 /// 2. The label must START the option text. Without it, a numbered *prose*
 ///    list matches when the label merely appears a line or two below the item.
 ///
-/// What remains reachable, each measured rather than argued:
-///
-/// - a verbatim menu row quoted in prose, or echoed by `cat`/`less`/a diff
-///   context line (one leading space, eaten by `trim_start`). This is the
-///   broadest class and needs no trailing prose and no splice.
-/// - `starts_with` admits anything after the label, so `1. Yes, I trust this
-///   folder is what you pick at the first-run check` matches.
-/// - a splice across the whole four-line block, not merely a row and its
-///   follower. Blank rows do not consume the budget: `with_claude_recent_pane`
-///   drops empty lines before the window, so a splice separated by blank lines
-///   on screen still matches.
-///
-/// All need the question phrase in the same window. Narrowing further wants a
-/// position anchor, not another substring rule; three substring attempts in
-/// this series have each been falsified by the next reader.
+/// What this still admits, each measured rather than argued: an unprefixed
+/// verbatim menu row (`cat`/`less`/a diff context line, whose one leading
+/// space `trim_start` eats), trailing prose after the label (`starts_with`),
+/// and a splice across the whole four-line block, which blank rows do not
+/// consume because `with_claude_recent_pane` drops empty lines before the
+/// window. All of them need the question phrase in the same window AND a pane
+/// with no running signal (requirement 3 in
+/// `claude_has_folder_trust_prompt`), so what is left is an idle pane
+/// displaying quoted prompt text, where Waiting is the cheap direction to be
+/// wrong in: the next capture of a real turn clears it.
 fn claude_has_trust_option_label(recent: &[&str]) -> bool {
     recent.iter().enumerate().any(|(start, line)| {
         let Some(option) = claude_trust_choice_option_text(line) else {
@@ -862,7 +851,7 @@ pub(crate) fn reconcile_claude_hook_status(
         return hook_status;
     }
     with_claude_recent_pane(raw_content, |recent, recent_joined, recent_lower| {
-        if let Some(rule) = claude_blocking_prompt_rule(recent, recent_lower) {
+        if let Some(rule) = claude_blocking_prompt_rule(recent, recent_joined, recent_lower) {
             tracing::debug!(target: "tmux.status",
                 "claude reconciler: hook Running downgraded to Waiting ({rule})");
             return Status::Waiting;
@@ -958,13 +947,18 @@ pub(crate) fn reconcile_waiting_hook(agent: &str, raw_content: &str) -> Status {
 /// counter only render on the spinner line itself, so a live turn that shows
 /// either also shows the anchored spinner shape.
 ///
+/// `claude_blocking_prompt_rule`'s folder-trust arm does consult
+/// `claude_pane_has_running_signal`, in the other direction: there it can only
+/// withhold a Waiting upgrade, which lands on the same bounded staleness this
+/// comment already accepts for a missed Running upgrade.
+///
 /// The caller gates this on the session having last been observed Running or
 /// Waiting: parked sessions (the dominant steady state) never pay the pane
 /// capture, and the reconciliation disarms once a genuine turn end is
 /// accepted.
 pub(crate) fn reconcile_claude_idle_hook_status(raw_content: &str) -> Status {
-    with_claude_recent_pane(raw_content, |recent, _recent_joined, recent_lower| {
-        if let Some(rule) = claude_blocking_prompt_rule(recent, recent_lower) {
+    with_claude_recent_pane(raw_content, |recent, recent_joined, recent_lower| {
+        if let Some(rule) = claude_blocking_prompt_rule(recent, recent_joined, recent_lower) {
             tracing::debug!(target: "tmux.status",
                 "claude reconciler: hook Idle upgraded to Waiting ({rule})");
             return Status::Waiting;
@@ -1012,7 +1006,7 @@ pub(crate) fn claude_pane_marker_fingerprint(raw_content: &str) -> String {
         if claude_line_above_input_box(recent).is_some_and(claude_line_is_background_wait) {
             markers.push("bg_wait");
         }
-        if let Some(rule) = claude_blocking_prompt_rule(recent, recent_lower) {
+        if let Some(rule) = claude_blocking_prompt_rule(recent, recent_joined, recent_lower) {
             markers.push(rule);
         }
         if recent.iter().any(|line| line.trim() == "❯") {
@@ -3138,6 +3132,30 @@ enter to select · esc to cancel";
             detect_claude_status(CLAUDE_FOLDER_TRUST_PROMPT),
             Status::Waiting
         );
+    }
+
+    /// The shapes the label anchor admits: an unprefixed verbatim menu row, a
+    /// `cat`-style echo indented under a tool result, a `--nocapture` dump of
+    /// this file's own fixtures, and trailing prose after the label. Each one
+    /// reproduces the whole prompt, so the label and the question both match;
+    /// the running signal is what keeps them Running.
+    #[test]
+    fn claude_echoed_trust_prompt_during_a_turn_is_not_waiting() {
+        let bodies = [
+            " \u{276f} 1. Yes, I trust this folder\n   2. No, exit",
+            "     \u{276f} 1. Yes, I trust this folder\n       2. No, exit",
+            "  \u{276f} 1. Yes, I trust this folder\n    2. No, exit\n     test result: FAILED",
+            " 1. Yes, I trust this folder is what you pick, and then\n 2. the session starts",
+        ];
+        for body in bodies {
+            let pane = format!(
+                "\u{25cf} The first-run dialog reads:\n \
+                 Quick safety check: Is this a project you created or one you trust?\n\
+                 {body}\n \u{2736} Working\u{2026} (12s \u{b7} \u{2193} 431 tokens)\n   \
+                 esc to interrupt\n"
+            );
+            assert_eq!(detect_claude_status(&pane), Status::Running, "{body:?}");
+        }
     }
 
     #[test]
