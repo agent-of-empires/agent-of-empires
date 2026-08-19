@@ -6770,26 +6770,39 @@ impl HomeView {
             .cloned()
             .ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))?;
         let source_profile = snapshot.source_profile.clone();
-        let session_title = crate::session::acquire_session_title_lock(id).map_err(|error| {
-            anyhow::anyhow!("failed to acquire session title lock: {error}")
-        })?;
-        let storage = Storage::new(&source_profile, self.file_watch.clone())?;
+        let session_title = crate::session::acquire_session_title_lock(id)
+            .map_err(|error| anyhow::anyhow!("failed to acquire session title lock: {error}"))?;
+        if !self.storages.contains_key(&source_profile) {
+            self.storages.insert(
+                source_profile.clone(),
+                Storage::open(&source_profile, self.file_watch.clone())?,
+            );
+        }
+        let storage = self
+            .storages
+            .get(&source_profile)
+            .expect("source storage was registered above");
         let lifecycle = storage
             .acquire_instance_lifecycle_lock(id)
             .map_err(|error| {
                 anyhow::anyhow!("failed to acquire session lifecycle lock: {error}")
             })?;
-        let mut authoritative = storage.update(|instances, _groups| {
-            instances
-                .iter()
-                .find(|instance| instance.id == id)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("Session not found in source profile: {id}"))
-        })?;
+        // Read-only: both flocks (title + lifecycle) are already held above, so
+        // a plain `load()` gives the authoritative on-disk row without going
+        // through `update()`, which would unconditionally rewrite sessions.json
+        // and fire a `notify_local_change` even when nothing changed. Callers
+        // like `move_group_to_profile` acquire these guards per member in a
+        // loop, so an update-per-read would be N identical rewrites.
+        let mut authoritative = storage
+            .load()?
+            .into_iter()
+            .find(|instance| instance.id == id)
+            .ok_or_else(|| anyhow::anyhow!("Session not found in source profile: {id}"))?;
         let authoritative_generation = authoritative.lifecycle_generation;
         let authoritative_status = authoritative.status;
         let authoritative_idle_entered_at = authoritative.idle_entered_at;
         let authoritative_last_accessed_at = authoritative.last_accessed_at;
+        authoritative.merge_runtime_from_reload(&snapshot);
         authoritative.merge_from_tui(&snapshot);
         authoritative.source_profile.clone_from(&source_profile);
         authoritative.lifecycle_generation = authoritative_generation;
@@ -6819,19 +6832,28 @@ impl HomeView {
         target: &str,
         new_group_path: String,
     ) -> anyhow::Result<()> {
-        let Some(old_profile) = self.instances.get(id).map(|i| i.source_profile.clone()) else {
+        let now = chrono::Utc::now();
+        let Some((old_profile, lifecycle_reserved)) = self.instances.get(id).map(|instance| {
+            (
+                instance.source_profile.clone(),
+                instance.has_fresh_lifecycle_reservation(now),
+            )
+        }) else {
             return Ok(());
         };
         if old_profile == target {
             self.mutate_instance(id, |inst| inst.group_path = new_group_path);
             return Ok(());
         }
-
+        anyhow::ensure!(
+            !lifecycle_reserved,
+            "Cannot move session {id} between profiles while a lifecycle operation is in progress"
+        );
 
         if !self.storages.contains_key(target) {
             self.storages.insert(
                 target.to_string(),
-                Storage::new(target, self.file_watch.clone())?,
+                Storage::open(target, self.file_watch.clone())?,
             );
         }
 

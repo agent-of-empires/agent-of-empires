@@ -421,7 +421,6 @@ impl HomeView {
                 return Ok(());
             }
         }
-        self.restart_cooldown_at.insert(id.clone(), now);
 
         // A restart-dialog profile move owns the ordered title/source
         // lifecycle guards before any tool/config persistence. This prevents
@@ -440,11 +439,31 @@ impl HomeView {
                 anyhow::bail!("Profile '{}' does not exist", target_profile);
             }
         }
+        let profile_identity_guard = if moving_profiles {
+            Some(acquire_session_identity_lock()?)
+        } else {
+            None
+        };
         let profile_move_guards = if moving_profiles {
             Some(self.lock_session_mutation_and_reload(&id)?)
         } else {
             None
         };
+        if let Some(target_profile) = new_profile.filter(|_| moving_profiles) {
+            let authoritative = self
+                .get_instance(&id)
+                .ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))?;
+            let target_rows = Storage::open(target_profile, self.file_watch.clone())?.load()?;
+            if is_duplicate_session(
+                target_rows.iter(),
+                &authoritative.title,
+                &authoritative.project_path,
+                None,
+            ) {
+                return Err(duplicate_session_error(&authoritative.title));
+            }
+        }
+        self.restart_cooldown_at.insert(id.clone(), now);
 
         // Outside Attention sort, restart on a snoozed row clears the
         // snooze flag so the persisted state matches what the user sees
@@ -489,25 +508,11 @@ impl HomeView {
             });
         }
 
-        // Apply profile move. Validates the target exists, lazily creates
-        // its Storage, and rebuilds group trees so the row renders under
-        // the new profile immediately.
+        // Apply profile move. The target was validated above; `move_to_profile`
+        // opens its existing Storage and rebuilds group trees so the row renders
+        // under the new profile immediately.
         if let Some(target_profile) = new_profile {
-            let current_profile = self
-                .get_instance(&id)
-                .map(|i| i.source_profile.clone())
-                .unwrap_or_else(|| {
-                    self.active_profile
-                        .clone()
-                        .unwrap_or_else(|| "default".to_string())
-                });
-            if target_profile != current_profile {
-                if !self.storages.contains_key(target_profile) {
-                    self.storages.insert(
-                        target_profile.to_string(),
-                        Storage::new(target_profile, self.file_watch.clone())?,
-                    );
-                }
+            if target_profile != source_profile {
                 if !self.group_trees.contains_key(target_profile) {
                     self.group_trees.insert(
                         target_profile.to_string(),
@@ -525,7 +530,7 @@ impl HomeView {
                     .map(|i| i.group_path.clone())
                     .unwrap_or_default();
                 self.move_to_profile(&id, target_profile, old_group_path.clone())?;
-                self.prune_empty_group(&current_profile, &old_group_path);
+                self.prune_empty_group(&source_profile, &old_group_path);
                 self.rebuild_group_trees();
                 // Rebuild the visible row list too; otherwise the row still
                 // renders under the old profile until the next reload, and
@@ -540,9 +545,14 @@ impl HomeView {
         // state. The worker owns the Starting reservation; publishing that
         // status here would make it reject its own request as concurrent.
         self.save()?;
+        drop(profile_identity_guard);
         // A profile move retains title -> source lifecycle ordering through
-        // both profile writes. The restart worker acquires its own ordered
-        // guards when it later launches the terminal.
+        // both profile writes. These MUST be dropped before the restart is
+        // dispatched: the launch reacquires the very same title flock (see
+        // `Instance::orchestrate_resume_launch`), and flock is not reentrant
+        // across a second open of the file, so holding the guards into the
+        // cascade would self-deadlock. The restart worker acquires its own
+        // ordered guards when it later launches the terminal.
         drop(profile_move_guards);
 
         // The start cascade shells out to docker (image pull, container
@@ -859,6 +869,7 @@ impl HomeView {
 
         // Defense-in-depth: reject duplicate names (dialog validates inline, but guard here too)
         let target_profile = new_profile.unwrap_or(&ctx.old_profile);
+        let profile_changed = target_profile != ctx.old_profile;
         if new_path != ctx.old_path {
             if let Some(tree) = self.group_trees.get(target_profile) {
                 if tree.group_exists(new_path) {
@@ -871,63 +882,98 @@ impl HomeView {
             }
         }
 
-        // Validate target profile exists when moving across profiles
-        if let Some(target) = new_profile {
-            if target != ctx.old_profile {
-                let profiles = list_profiles()?;
-                if !profiles.contains(&target.to_string()) {
-                    anyhow::bail!("Profile '{}' does not exist", target);
-                }
+        if profile_changed {
+            let profiles = list_profiles()?;
+            if !profiles.contains(&target_profile.to_string()) {
+                anyhow::bail!("Profile '{}' does not exist", target_profile);
             }
         }
 
         let old_prefix = format!("{}/", ctx.old_path);
-
-        // Collect sessions belonging to this group and its descendants.
         let is_member = group_membership(&ctx.old_path, &old_prefix, Some(&ctx.old_profile));
-        let affected_ids: Vec<String> = self
+        let _identity_guard = if profile_changed {
+            Some(acquire_session_identity_lock()?)
+        } else {
+            None
+        };
+        let mut affected_ids: Vec<String> = self
             .instances
             .values()
-            .filter(|i| is_member(i))
-            .map(|i| i.id.clone())
+            .filter(|instance| is_member(instance))
+            .map(|instance| instance.id.clone())
             .collect();
+        if profile_changed {
+            affected_ids.sort();
+        }
 
+        let _mutation_guards = if profile_changed {
+            let mut guards = Vec::with_capacity(affected_ids.len());
+            for id in &affected_ids {
+                guards.push(self.lock_session_mutation_and_reload(id)?);
+            }
+            let now = chrono::Utc::now();
+            for id in &affected_ids {
+                let authoritative = self
+                    .get_instance(id)
+                    .ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))?;
+                anyhow::ensure!(
+                    authoritative.source_profile == ctx.old_profile && is_member(authoritative),
+                    "Group membership changed while the cross-profile move was pending"
+                );
+                anyhow::ensure!(
+                    authoritative.status != Status::Creating
+                        && !authoritative.has_fresh_lifecycle_reservation(now),
+                    "Cannot move group while session {id} has a lifecycle operation in progress"
+                );
+            }
+            if !self.storages.contains_key(target_profile) {
+                self.storages.insert(
+                    target_profile.to_string(),
+                    Storage::open(target_profile, self.file_watch.clone())?,
+                );
+            }
+            Some(guards)
+        } else {
+            None
+        };
+
+        let mut changes = Vec::with_capacity(affected_ids.len());
+        for id in &affected_ids {
+            let instance = self
+                .get_instance(id)
+                .ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))?;
+            let new_group_path = if new_path != ctx.old_path {
+                if instance.group_path == ctx.old_path {
+                    new_path.to_string()
+                } else {
+                    let rest = instance
+                        .group_path
+                        .strip_prefix(&old_prefix)
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "Group membership changed while the cross-profile move was pending"
+                            )
+                        })?;
+                    format!("{new_path}/{rest}")
+                }
+            } else {
+                instance.group_path.clone()
+            };
+            changes.push((id.clone(), new_group_path));
+        }
 
         // Update group_path (and optionally source_profile) for all affected sessions.
-        for id in &affected_ids {
-            let new_group_path = if new_path != ctx.old_path {
-                let inst = self.get_instance(id);
-                match inst {
-                    Some(i) if i.group_path == ctx.old_path => new_path.to_string(),
-                    Some(i) => format!("{}{}", new_path, &i.group_path[ctx.old_path.len()..]),
-                    None => continue,
-                }
-            } else {
-                match self.get_instance(id) {
-                    Some(i) => i.group_path.clone(),
-                    None => continue,
-                }
-            };
-
+        for (id, new_group_path) in changes {
             if let Some(tp) = new_profile {
-                self.move_to_profile(id, tp, new_group_path.clone())?;
+                self.move_to_profile(&id, tp, new_group_path)?;
             } else {
-                self.apply_user_action(id, |inst| {
+                self.apply_user_action(&id, |inst| {
                     inst.group_path = new_group_path.clone();
                 })?;
             }
         }
 
-        // Ensure target profile storage exists when moving across profiles.
-        if let Some(tp) = new_profile {
-            if tp != ctx.old_profile && !self.storages.contains_key(tp) {
-                self.storages
-                    .insert(tp.to_string(), Storage::new(tp, self.file_watch.clone())?);
-            }
-        }
-
         let path_changed = new_path != ctx.old_path;
-        let profile_changed = new_profile.is_some_and(|profile| profile != ctx.old_profile);
 
         // Capture old_path and its descendants from the pre-rebuild tree:
         // rebuild_group_trees below derives groups from instance.group_path,
@@ -1234,7 +1280,7 @@ impl HomeView {
                 let candidates = if let Some(storage) = self.storages.get(target_profile) {
                     storage.load()?
                 } else {
-                    Storage::new(target_profile, self.file_watch.clone())?.load()?
+                    Storage::open(target_profile, self.file_watch.clone())?.load()?
                 };
                 if is_duplicate_session(
                     candidates.iter(),
@@ -1354,14 +1400,6 @@ impl HomeView {
                     let profiles = list_profiles()?;
                     if !profiles.contains(&target_profile.to_string()) {
                         anyhow::bail!("Profile '{}' does not exist", target_profile);
-                    }
-
-                    // Ensure target profile storage exists.
-                    if !self.storages.contains_key(target_profile) {
-                        self.storages.insert(
-                            target_profile.to_string(),
-                            Storage::new(target_profile, self.file_watch.clone())?,
-                        );
                     }
 
                     let moved_path = new_path.clone();
