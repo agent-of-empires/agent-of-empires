@@ -122,6 +122,10 @@ pub(crate) fn encode_claude_project_path(project_path: &str) -> String {
 /// [`claude_home_for_host_environment`]).
 ///
 /// Used as a fallback when hooks don't fire (e.g. after `/clear` or `/new`).
+/// Both arms only ever yield an id with a transcript on disk: the dir scan by
+/// construction, and the `.claude.json` arm because it is gated on one. A
+/// freshly cleared thread is therefore declined until its first content lands,
+/// which is the one case this narrows.
 pub(crate) fn capture_claude_session_id(
     project_path: &str,
     known_session_id: Option<&str>,
