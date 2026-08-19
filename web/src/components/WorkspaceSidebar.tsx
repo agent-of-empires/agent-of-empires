@@ -1398,12 +1398,15 @@ export const SessionRow = memo(function SessionRow({
     // the prefilled value should still set the title.
     if (!trimmed || trimmed === sessionTitle || !sessionId) return;
     // For a tied worktree session the rename also moves the directory and can
-    // fail (e.g. 409 while running); surface the server message. See #1927.
+    // fail (e.g. 409 while running); surface that as an error toast. See #1927.
     const result = await renameSession(sessionId, trimmed);
     if (result.ok) {
-      result.warnings?.forEach((warning) => reportError(warning));
-    } else if (result.message) {
-      reportError(result.message);
+      // Non-fatal: the title persisted, but the live tmux session could not be
+      // rekeyed. Route to the info channel, not reportError, so it reads as a
+      // heads-up rather than a failed rename (the rename itself succeeded).
+      result.warnings?.forEach((warning) => reportInfo(warning));
+    } else {
+      reportError(result.message ?? "Could not rename this session. Please try again.");
     }
   };
 

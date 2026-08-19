@@ -264,11 +264,13 @@ pub struct SessionResponse {
     /// Each entry mirrors `WorkspaceRepo` minus paths the dashboard does
     /// not need to display.
     pub workspace_repos: Vec<WorkspaceRepoSummary>,
-    /// Non-fatal warnings emitted during worktree creation (e.g.
-    /// post-checkout hook failures where the worktree was created
-    /// successfully). Only populated on the create-session response;
-    /// omitted from subsequent fetches because it lives on `BuildResult`
-    /// and is not persisted to the instance.
+    /// Non-fatal warnings surfaced by a mutation response. On create these are
+    /// worktree-creation warnings (e.g. post-checkout hook failures where the
+    /// worktree was still created successfully). On rename these carry the
+    /// tmux rekey warning emitted when the title was persisted durably but the
+    /// live tmux session could not be renamed afterwards. Both live on the
+    /// response only: the field is not persisted to the instance, so it is
+    /// omitted from list/fetch responses.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
     /// Latest plan snapshot summarised for the sidebar. Present only on
@@ -1329,8 +1331,7 @@ pub async fn rename_session(
     let lock_file_watch = state.file_watch.clone();
     let (_session_title_lock, _lifecycle_lock, storage, disk_instances) =
         match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
-            let session_title_lock =
-                crate::session::acquire_session_title_lock(&lock_id)?;
+            let session_title_lock = crate::session::acquire_session_title_lock(&lock_id)?;
             let storage = Storage::new(&lock_profile, lock_file_watch)?;
             let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&lock_id)?;
             let instances = storage.load()?;
@@ -1551,6 +1552,14 @@ pub async fn rename_session(
         Ok(RenamePersistOutcome::Missing) => {
             // AppState can lag an external delete. A missing authoritative row
             // is not a successful rename and must not trigger tmux/cache work.
+            if let Some(path) = new_path.as_deref() {
+                tracing::warn!(
+                    target: "http.api.sessions",
+                    session = %id,
+                    new_path = %path,
+                    "authoritative row vanished after the worktree move; the moved directory is unreferenced"
+                );
+            }
             return super::session_not_found();
         }
         Err(error) => {
@@ -1571,7 +1580,6 @@ pub async fn rename_session(
                 .into_response();
         }
     };
-
 
     let published_path = new_path.as_deref().unwrap_or(&current_path);
     let renamed_path = new_path
@@ -1772,25 +1780,26 @@ pub async fn set_worktree_name(
     let lock_id = id.clone();
     let lock_profile = profile.clone();
     let lock_file_watch = state.file_watch.clone();
-    let (_lifecycle_lock, storage, authoritative_instances) =
-        match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+    let (_lifecycle_lock, storage, authoritative_instances) = match tokio::task::spawn_blocking(
+        move || -> anyhow::Result<_> {
             let storage = Storage::new(&lock_profile, lock_file_watch)?;
             let lifecycle = storage.acquire_instance_lifecycle_lock(&lock_id)?;
             let instances = storage.load()?;
             Ok((lifecycle, storage, instances))
-        })
-        .await
-        {
-            Ok(Ok(locked)) => locked,
-            Ok(Err(error)) => {
-                tracing::error!(target: "http.api.sessions", session = %id, %error, "Failed to lock or load worktree rename");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-            Err(error) => {
-                tracing::error!(target: "http.api.sessions", session = %id, %error, "Worktree rename lock task failed");
-                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
-            }
-        };
+        },
+    )
+    .await
+    {
+        Ok(Ok(locked)) => locked,
+        Ok(Err(error)) => {
+            tracing::error!(target: "http.api.sessions", session = %id, %error, "Failed to lock or load worktree rename");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        Err(error) => {
+            tracing::error!(target: "http.api.sessions", session = %id, %error, "Worktree rename lock task failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
     let Some(mut fresh) = authoritative_instances
         .iter()
         .find(|instance| instance.id == id)
@@ -1976,7 +1985,15 @@ pub async fn set_worktree_name(
     .await
     {
         Ok(Ok(true)) => {}
-        Ok(Ok(false)) => return super::session_not_found(),
+        Ok(Ok(false)) => {
+            tracing::warn!(
+                target: "http.api.sessions",
+                session = %id,
+                new_path = %new_path,
+                "authoritative row vanished after the worktree move; the moved directory is unreferenced"
+            );
+            return super::session_not_found();
+        }
         Ok(Err(e)) => {
             tracing::error!(target: "http.api.sessions", "Failed to save after worktree edit: {e}");
             return persist_failed();
@@ -9628,6 +9645,13 @@ mod tests {
                 base_branch: None,
             });
 
+            let storage = Storage::new_unwatched("test").unwrap();
+            storage
+                .update(|instances, _groups| {
+                    *instances = vec![inst.clone()];
+                    Ok(())
+                })
+                .unwrap();
             let state = crate::server::test_support::build_test_app_state(vec![inst]);
             state.acp_supervisor.test_insert_worker(case.id).await;
 

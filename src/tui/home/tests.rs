@@ -7,7 +7,9 @@ use tempfile::TempDir;
 use tui_input::Input;
 
 use super::{ConfigRefreshOrigin, ConfigWatchKey, HomeView, PreviewSelection, ViewMode};
-use crate::session::{GroupTree, Instance, Item, Status, Storage};
+use crate::session::{
+    GroupTree, Instance, Item, LifecycleOperation, LifecycleReservation, Status, Storage,
+};
 use crate::tmux::AvailableTools;
 use crate::tui::app::Action;
 use crate::tui::dialogs::{InfoDialog, NewSessionData, NewSessionDialog};
@@ -18039,8 +18041,7 @@ mod save_field_merge {
             Storage::new_unwatched("target").unwrap(),
         );
 
-        view.move_to_profile(&id, "target", String::new())
-            .unwrap();
+        view.move_to_profile(&id, "target", String::new()).unwrap();
         view.save().expect("save must succeed across profiles");
 
         let old_disk = Storage::new_unwatched("test").unwrap().load().unwrap();
@@ -18057,6 +18058,57 @@ mod save_field_merge {
 
     #[test]
     #[serial]
+    fn group_profile_move_reloads_members_and_registers_fallback_source() {
+        let temp = TempDir::new().unwrap();
+        let _guard = setup_test_home(&temp);
+        let source = Storage::new_unwatched("alpha").unwrap();
+        let mut row = Instance::new("stale-title", "/tmp/group-profile-authority");
+        row.group_path = "work".to_string();
+        let id = row.id.clone();
+        source
+            .update(|instances, groups| {
+                instances.push(row);
+                groups.push(crate::session::Group::new("work", "work"));
+                Ok(())
+            })
+            .unwrap();
+        let target = Storage::new_unwatched("beta").unwrap();
+        let tools = AvailableTools::with_tools(&["claude"]);
+        let mut view =
+            HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+        view.mutate_instance(&id, |instance| {
+            instance.title = "stale-memory-title".to_string();
+            instance.lifecycle_generation = 3;
+        });
+        source
+            .update(|instances, _groups| {
+                let authoritative = instances.iter_mut().find(|row| row.id == id).unwrap();
+                authoritative.title = "peer-title".to_string();
+                authoritative.lifecycle_generation = 7;
+                Ok(())
+            })
+            .unwrap();
+        view.storages.remove("alpha");
+        view.group_rename_context = Some(super::super::GroupRenameContext {
+            old_path: "work".to_string(),
+            old_profile: "alpha".to_string(),
+        });
+
+        view.rename_selected_group(None, Some("beta")).unwrap();
+
+        assert!(source.load().unwrap().is_empty());
+        let moved = target
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .expect("authoritative row must move to the target");
+        assert_eq!(moved.title, "peer-title");
+        assert_eq!(moved.lifecycle_generation, 7);
+    }
+
+    #[test]
+    #[serial]
     fn profile_only_move_seeds_target_from_authoritative_title_and_lifecycle() {
         let (_temp, _guard, mut view, id) =
             boot_view_with_one_session("stale-title", "/tmp/profile-authority");
@@ -18066,7 +18118,7 @@ mod save_field_merge {
         );
 
         view.mutate_instance(&id, |row| {
-            row.lifecycle_generation = 7;
+            row.lifecycle_generation = 3;
             row.status = Status::Idle;
         });
         let source = Storage::new_unwatched("test").unwrap();
@@ -18080,14 +18132,13 @@ mod save_field_merge {
             })
             .unwrap();
 
-        let guards = view.lock_session_mutation_and_reload(&id).unwrap();
+        let _guards = view.lock_session_mutation_and_reload(&id).unwrap();
         let authoritative = view.get_instance(&id).unwrap();
         assert_eq!(authoritative.title, "peer-new-title");
         assert_eq!(authoritative.lifecycle_generation, 7);
         assert_eq!(authoritative.status, Status::Running);
 
-        view.move_to_profile(&id, "target", String::new())
-            .unwrap();
+        view.move_to_profile(&id, "target", String::new()).unwrap();
         view.save().unwrap();
 
         let target = Storage::new_unwatched("target")
@@ -18100,6 +18151,131 @@ mod save_field_merge {
         assert_eq!(target.title, "peer-new-title");
         assert_eq!(target.lifecycle_generation, 7);
         assert_eq!(target.status, Status::Running);
+    }
+
+    #[test]
+    #[serial]
+    fn profile_move_blocks_fresh_but_allows_stale_lifecycle_reservation() {
+        let (_temp, _guard, mut view, id) =
+            boot_view_with_one_session("reserved", "/tmp/profile-reserved");
+        view.storages.insert(
+            "target".to_string(),
+            Storage::new_unwatched("target").unwrap(),
+        );
+        let reservation = LifecycleReservation {
+            op: LifecycleOperation::Launch,
+            generation: 1,
+            at: chrono::Utc::now(),
+        };
+        view.mutate_instance(&id, |row| {
+            row.lifecycle_generation = 1;
+            row.lifecycle_reservation = Some(reservation.clone());
+            row.status = Status::Starting;
+        });
+        let source = Storage::new_unwatched("test").unwrap();
+        source
+            .update(|instances, _groups| {
+                let row = instances.iter_mut().find(|row| row.id == id).unwrap();
+                row.lifecycle_generation = 1;
+                row.lifecycle_reservation = Some(reservation);
+                row.status = Status::Starting;
+                Ok(())
+            })
+            .unwrap();
+
+        let _guards = view.lock_session_mutation_and_reload(&id).unwrap();
+        let error = view
+            .move_to_profile(&id, "target", String::new())
+            .expect_err("reserved session must not move profiles");
+
+        assert!(error
+            .to_string()
+            .contains("lifecycle operation is in progress"));
+        assert_eq!(view.get_instance(&id).unwrap().source_profile, "test");
+        assert!(view
+            .pending_deletions
+            .get("test")
+            .is_none_or(|ids| !ids.contains(&id)));
+        assert!(Storage::new_unwatched("target")
+            .unwrap()
+            .load()
+            .unwrap()
+            .is_empty());
+        assert!(source.load().unwrap().iter().any(|row| row.id == id));
+
+        let stale_at =
+            chrono::Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1);
+        view.mutate_instance(&id, |row| {
+            row.lifecycle_reservation.as_mut().unwrap().at = stale_at;
+        });
+        source
+            .update(|instances, _groups| {
+                instances
+                    .iter_mut()
+                    .find(|row| row.id == id)
+                    .unwrap()
+                    .lifecycle_reservation
+                    .as_mut()
+                    .unwrap()
+                    .at = stale_at;
+                Ok(())
+            })
+            .unwrap();
+
+        view.move_to_profile(&id, "target", String::new())
+            .expect("stale reservation must not block profile move");
+        view.save().unwrap();
+        assert!(source.load().unwrap().is_empty());
+        assert!(Storage::new_unwatched("target")
+            .unwrap()
+            .load()
+            .unwrap()
+            .iter()
+            .any(|row| row.id == id));
+    }
+
+    #[test]
+    #[serial]
+    fn restart_profile_move_rejects_target_identity_collision_before_mutation() {
+        let (_temp, _guard, mut view, id) =
+            boot_view_with_one_session("source", "/tmp/profile-restart-collision");
+        let target = Storage::new_unwatched("target").unwrap();
+        target
+            .update(|instances, _groups| {
+                let mut collision = Instance::new("source", "/tmp/profile-restart-collision/");
+                collision.source_profile = "target".to_string();
+                instances.push(collision);
+                Ok(())
+            })
+            .unwrap();
+        view.storages.insert("target".to_string(), target);
+        view.selected_session = Some(id.clone());
+
+        let error = view
+            .restart_selected_session(Some("target"), Some("claude"), None, None)
+            .expect_err("target identity collision must reject restart profile move");
+
+        assert!(error
+            .to_string()
+            .contains("Session already exists with same title and path"));
+        assert_eq!(view.get_instance(&id).unwrap().source_profile, "test");
+        assert!(!view.restart_cooldown_at.contains_key(&id));
+        assert_eq!(
+            Storage::new_unwatched("test")
+                .unwrap()
+                .load()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            Storage::new_unwatched("target")
+                .unwrap()
+                .load()
+                .unwrap()
+                .len(),
+            1
+        );
     }
 
     #[test]

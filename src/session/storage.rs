@@ -59,9 +59,12 @@
 //! identity lock is retained through the durable commit and cache publication,
 //! then released before post-commit tmux rekey; the session-title and lifecycle
 //! locks remain held through rekey. `aoe add` has no existing session id, so it
-//! takes identity directly before Storage. Launch and restart do not take
-//! identity: their order is session title, lifecycle, then Storage. Code must
-//! never acquire identity or session title while holding lifecycle or Storage.
+//! takes identity directly before Storage. Launch and same-profile restart do
+//! not take identity: their order is session title, lifecycle, then Storage.
+//! A `restart_selected_session` profile move is the exception: it acquires
+//! identity before the session-title and lifecycle locks even when the
+//! `(title, project_path)` pair is unchanged. Code must never acquire identity
+//! or session title while holding lifecycle or Storage.
 //!
 //! Server callers MUST drop `AppState.instances` (tokio RwLock) before
 //! acquiring any flock via `tokio::task::spawn_blocking`. A flock can park on

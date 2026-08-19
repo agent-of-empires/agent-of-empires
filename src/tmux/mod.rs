@@ -378,18 +378,17 @@ fn resolved_agent_existence(
     let Some(names) = cache.data.as_ref() else {
         return SessionExistence::Unknown;
     };
+    if names.contains_key(session.name()) {
+        return SessionExistence::Present;
+    }
     let suffix = id_suffix(id);
     let shape = NameShape::agent(&suffix);
     if !names.keys().any(|name| shape.matches(name)) {
         return SessionExistence::Absent;
     }
-    if names.contains_key(session.name()) {
-        SessionExistence::Present
-    } else {
-        // Multiple id-shaped candidates make `Session::new` deliberately
-        // retain the derived name. That is unresolved, not absence.
-        SessionExistence::Unknown
-    }
+    // Multiple id-shaped candidates make `Session::new` deliberately retain
+    // the derived name. That is unresolved, not absence.
+    SessionExistence::Unknown
 }
 
 /// Rekey a live title-derived tmux session after its new title is durable.
@@ -1428,6 +1427,19 @@ mod tests {
         );
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn aux_shaped_live_derived_name_is_present_not_absent() {
+        let guard = SessionCacheGuard::capture();
+        let id = "auxshapedeadbeef";
+        let session = Session::new(id, "term rewriting").unwrap();
+        guard.force_present(&[session.name()]);
+        assert_eq!(
+            resolved_agent_existence(id, &session, SessionCacheRefresh::Populated),
+            SessionExistence::Present
+        );
+    }
+
     /// A session id long enough that `truncate_id(.., 8)` actually truncates,
     /// so the tests exercise the real `_<id8>` tail.
     const ID: &str = "abc12345deadbeef";
@@ -1857,6 +1869,75 @@ mod tests {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rekey_session_adopts_peer_renamed_pane() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let start_name = Session::generate_name(ID, "Fix login bug");
+        let peer_name = Session::generate_name(ID, "Peer rename");
+        let final_name = Session::generate_name(ID, "Final rename");
+        let start_guard = TmuxTestSession::from_name(start_name.clone());
+        let peer_guard = TmuxTestSession::from_name(peer_name.clone());
+        let final_guard = TmuxTestSession::from_name(final_name.clone());
+        let created = tmux_command()
+            .args(["new-session", "-d", "-s", start_guard.name(), "sleep 60"])
+            .output()
+            .expect("tmux new-session");
+        assert!(created.status.success());
+        refresh_session_cache();
+
+        // A sibling process renames the live pane without refreshing this
+        // process's cache. `rekey_session` must scan first, adopt the
+        // id-matching peer name, and move that same pane to the destination.
+        let peer_rename = tmux_command()
+            .args(["rename-session", "-t", &start_name, &peer_name])
+            .output()
+            .expect("peer tmux rename");
+        assert!(peer_rename.status.success());
+        assert!(rekey_session(ID, "Fix login bug", "Final rename").unwrap());
+        assert!(Session::from_name(&final_name).exists());
+        drop((start_guard, peer_guard, final_guard));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn rekey_session_reports_false_for_vanished_pane() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        // Keep the isolated tmux server alive after the target is killed, so
+        // the assertion distinguishes an absent session from a vanished server.
+        let dummy_guard = TmuxTestSession::new("aoe_test_rekey_dummy");
+        let dummy_created = tmux_command()
+            .args(["new-session", "-d", "-s", dummy_guard.name(), "sleep 60"])
+            .output()
+            .expect("dummy tmux new-session");
+        assert!(dummy_created.status.success());
+        let name = Session::generate_name(ID, "Final rename");
+        let guard = TmuxTestSession::from_name(name.clone());
+        let created = tmux_command()
+            .args(["new-session", "-d", "-s", guard.name(), "sleep 60"])
+            .output()
+            .expect("tmux new-session");
+        assert!(created.status.success());
+        // Populate a positive cache entry, then remove the target without
+        // refreshing it. The authoritative refresh inside `rekey_session` must
+        // classify the vanished pane as `Ok(false)`, keeping API/TUI callers
+        // from showing a warning.
+        refresh_session_cache();
+        let killed = tmux_command()
+            .args(["kill-session", "-t", &name])
+            .output()
+            .expect("tmux kill-session");
+        assert!(killed.status.success());
+        assert!(!rekey_session(ID, "Final rename", "No live pane").unwrap());
+        drop((guard, dummy_guard));
     }
 
     /// Verify that the compound-command approach (export + exec) correctly

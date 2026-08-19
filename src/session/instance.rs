@@ -3993,6 +3993,41 @@ impl Instance {
         Ok(())
     }
 
+    /// Reacquire launch locks after user hooks, preserving the global
+    /// title-before-lifecycle order and failing the reservation consistently.
+    fn reacquire_launch_locks_after_hooks(
+        &mut self,
+        storage: &super::storage::Storage,
+        hook_result: Result<()>,
+    ) -> Result<(super::storage::StorageFlock, super::storage::StorageFlock)> {
+        let title_lock = match super::storage::acquire_session_title_lock(&self.id)
+            .context("failed to reacquire instance title lock after hooks")
+        {
+            Ok(lock) => lock,
+            Err(error) => {
+                self.fail_reserved_launch(storage, &error, false);
+                return Err(error);
+            }
+        };
+        let lifecycle_lock = match storage
+            .acquire_instance_lifecycle_lock(&self.id)
+            .context("failed to reacquire instance lifecycle lock after hooks")
+        {
+            Ok(lock) => lock,
+            Err(error) => {
+                self.fail_reserved_launch(storage, &error, false);
+                return Err(error);
+            }
+        };
+        self.reconcile_from_disk();
+        if let Err(error) = hook_result {
+            self.fail_reserved_launch(storage, &error, false);
+            return Err(error);
+        }
+        self.ensure_reservation_current_or_fail(storage)?;
+        Ok((title_lock, lifecycle_lock))
+    }
+
     pub fn start_with_size(&mut self, size: Option<(u16, u16)>) -> Result<()> {
         self.start_with_size_opts(size, false).map(|_| ())
     }
@@ -4044,21 +4079,16 @@ impl Instance {
         // The durable reservation excludes peer launches while user hooks run.
         // Both flocks must be absent because a hook may invoke aoe for this
         // same session. Reacquire in the global order afterward and reload the
-        // authoritative title before deriving the tmux launch name.
+        // authoritative title (via `reconcile_from_disk`) before deriving the
+        // tmux launch name: `spawn_prepared_launch`'s `tmux_session()` reads
+        // `self.title`, so the reload guarantees the name comes from the
+        // committed title a concurrent rename may have written during hooks,
+        // never the pre-hook value.
         drop(lifecycle_lock);
         drop(title_lock);
         let hook_result = self.run_pre_launch_hooks(skip_on_launch, &profile);
-        let _title_lock = super::storage::acquire_session_title_lock(&self.id)
-            .context("failed to reacquire instance launch title lock after hooks")?;
-        let _lifecycle_lock = storage
-            .acquire_instance_lifecycle_lock(&self.id)
-            .context("failed to reacquire instance launch lock after hooks")?;
-        self.reconcile_from_disk();
-        if let Err(error) = hook_result {
-            self.fail_reserved_launch(&storage, &error, false);
-            return Err(error);
-        }
-        self.ensure_reservation_current_or_fail(&storage)?;
+        let (_title_lock, _lifecycle_lock) =
+            self.reacquire_launch_locks_after_hooks(&storage, hook_result)?;
         self.apply_fresh_launch_intent();
 
         let prepared = match self.prepare_launch_command() {
@@ -6161,21 +6191,15 @@ impl Instance {
 
         // Keep the generation reservation durable, but allow hooks to invoke
         // aoe against this session without waiting on either flock. Reacquire
-        // title before lifecycle and reload before deriving the launch name.
+        // title before lifecycle and reload (`reconcile_from_disk`) before
+        // deriving the launch name: `spawn_prepared_launch`'s `tmux_session()`
+        // reads `self.title`, so the reload guarantees the tmux name comes
+        // from the authoritative committed title, not a pre-hook value.
         drop(lifecycle_lock);
         drop(title_lock);
         let hook_result = self.run_pre_launch_hooks(skip_on_launch, &profile);
-        let _title_lock = super::storage::acquire_session_title_lock(&self.id)
-            .context("failed to reacquire instance start title lock after hooks")?;
-        let _lifecycle_lock = storage
-            .acquire_instance_lifecycle_lock(&self.id)
-            .context("failed to reacquire instance start lock after hooks")?;
-        self.reconcile_from_disk();
-        if let Err(error) = hook_result {
-            self.fail_reserved_launch(&storage, &error, false);
-            return Err(error);
-        }
-        self.ensure_reservation_current_or_fail(&storage)?;
+        let (_title_lock, _lifecycle_lock) =
+            self.reacquire_launch_locks_after_hooks(&storage, hook_result)?;
         let skipped_failed_resume_sid = self.apply_resume_policy(resume_policy);
         self.apply_fresh_launch_intent();
 
@@ -8646,7 +8670,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn launch_hooks_run_without_the_instance_lifecycle_flock() {
+    fn launch_hooks_run_without_title_or_lifecycle_flocks() {
         if !crate::tmux::tmux_command()
             .arg("-V")
             .output()
@@ -8709,17 +8733,25 @@ mod tests {
             let lock_storage = crate::session::storage::Storage::new_unwatched(&profile).unwrap();
             let id = storage.load().unwrap()[0].id.clone();
             let release_for_lock = release.clone();
+            let (title_tx, title_rx) = std::sync::mpsc::channel();
             let (lock_tx, lock_rx) = std::sync::mpsc::channel();
             let lock = std::thread::spawn(move || {
-                let guard = lock_storage.acquire_instance_lifecycle_lock(&id).unwrap();
-                drop(guard);
+                let title_guard = crate::session::storage::acquire_session_title_lock(&id).unwrap();
+                title_tx.send(()).unwrap();
+                let lifecycle_guard = lock_storage.acquire_instance_lifecycle_lock(&id).unwrap();
+                drop(lifecycle_guard);
+                drop(title_guard);
                 std::fs::write(release_for_lock, b"release").unwrap();
                 lock_tx.send(()).unwrap();
             });
-            let acquired = lock_rx
+            let title_acquired = title_rx
                 .recv_timeout(std::time::Duration::from_secs(2))
                 .is_ok();
-            if !acquired {
+            let both_acquired = title_acquired
+                && lock_rx
+                    .recv_timeout(std::time::Duration::from_secs(2))
+                    .is_ok();
+            if !both_acquired {
                 std::fs::write(&release, b"release").unwrap();
             }
 
@@ -8730,7 +8762,11 @@ mod tests {
             lock.join().unwrap();
             let _ = instance.tmux_session().unwrap().kill();
             assert!(
-                acquired,
+                title_acquired,
+                "{label} hook ran while the title mutation flock was held"
+            );
+            assert!(
+                both_acquired,
                 "{label} hook ran while the lifecycle flock was held"
             );
             result.unwrap();
