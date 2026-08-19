@@ -935,14 +935,21 @@ fn apply_terminal_title(
             if let Some(title) = &new_title {
                 let should_write = title_is_auto_overwritable(&instances[index])
                     && instances[index].title != *title;
+                // `is_duplicate_session` scans every instance and does not skip
+                // this session by id, so the `title != current` half of
+                // `should_write` is what keeps a session from reading its own
+                // row as the collision. Self-exclusion by id lives in the manual
+                // rename predicate (#3411), which owns the shared surfaces.
                 let duplicate = should_write
                     && crate::cli::add::is_duplicate_session(
                         instances,
                         title,
                         &instances[index].project_path,
                     );
-                let instance = &mut instances[index];
-                if should_write && !duplicate {
+                if duplicate {
+                    tracing::warn!(target: "smart_rename", session = %id, title = %title, "skipped duplicate auto-title");
+                } else if should_write {
+                    let instance = &mut instances[index];
                     // The tmux session name embeds the title
                     // (Session::generate_name), and both status pollers derive
                     // the name from the current title. Rekey the live session
@@ -953,8 +960,6 @@ fn apply_terminal_title(
                     tracing::info!(target: "smart_rename", session = %id, old = %instance.title, new = %title, "auto-renamed terminal session");
                     instance.title = title.clone();
                     instance.last_auto_title = Some(title.clone());
-                } else if duplicate {
-                    tracing::warn!(target: "smart_rename", session = %id, title = %title, "skipped duplicate auto-title");
                 }
             }
         }
@@ -1412,7 +1417,10 @@ mod serve {
     /// (`title_is_auto_overwritable`), so a manual rename is never clobbered.
     /// Serializes against manual renames / worktree edits on this session via
     /// the per-session instance lock, and mirrors memory only when the storage
-    /// write actually happened so the two never diverge.
+    /// write actually happened so the two never diverge. Two further cases skip
+    /// the write silently: the generated title already equalling the current
+    /// one (a no-op, new here relative to the pre-fix unconditional write), and
+    /// another session in this profile already owning the (title, path) pair.
     pub(crate) async fn apply_auto_title(
         state: &Arc<AppState>,
         id: &str,
@@ -1430,6 +1438,10 @@ mod serve {
                 return;
             }
         };
+        // Own copies for the closure below: `storage.update` runs inside
+        // `spawn_blocking`, whose body must be `'static + Send`, so the borrowed
+        // `id`/`new_title` cannot cross the thread boundary. The in-memory
+        // mirror after the join reuses the borrowed `new_title` directly.
         let id_owned = id.to_string();
         let title_owned = new_title.to_string();
         let persisted = tokio::task::spawn_blocking(move || {
@@ -1440,6 +1452,12 @@ mod serve {
                 else {
                     return Ok(false);
                 };
+                // Skip a no-op rename: when the generated title already equals
+                // the current one there is nothing to write, and this same
+                // `title != current` guard is what excludes this session from
+                // its own duplicate scan below, since `is_duplicate_session`
+                // matches by (title, path) with no id filter. Id-based
+                // self-exclusion lives in the manual rename predicate (#3411).
                 let should_write = title_is_auto_overwritable(&instances[index])
                     && instances[index].title != title_owned;
                 let duplicate = should_write
@@ -1450,14 +1468,16 @@ mod serve {
                     );
                 if duplicate {
                     tracing::warn!(target: "smart_rename", session = %id_owned, title = %title_owned, "skipped duplicate auto-title");
-                    return Ok(false);
-                }
-                if should_write {
+                    Ok(false)
+                } else if should_write {
                     instances[index].title = title_owned.clone();
-                    instances[index].last_auto_title = Some(title_owned.clone());
-                    return Ok(true);
+                    // Last owned use of `title_owned`: move it into the field
+                    // rather than cloning a second time.
+                    instances[index].last_auto_title = Some(title_owned);
+                    Ok(true)
+                } else {
+                    Ok(false)
                 }
-                Ok(false)
             })
         })
         .await;
@@ -1528,6 +1548,35 @@ mod serve {
                     .title,
                 "Franks"
             );
+        }
+
+        #[test]
+        fn is_duplicate_session_normalizes_trailing_slash() {
+            // The skip in `apply_auto_title` / `apply_terminal_title` reuses the
+            // creation predicate, which trims trailing '/' on both sides before
+            // comparing paths. Pin that normalization explicitly: an existing
+            // session at "/tmp/shared" collides with a candidate whose path
+            // differs only by a trailing slash.
+            let mut existing = crate::session::Instance::new("Already owned", "/tmp/shared");
+            existing.source_profile = "default".to_string();
+            let instances = vec![existing];
+            let cases = [
+                ("Already owned", "/tmp/shared", true),
+                // "/tmp/shared/" and "/tmp/shared" are equal after trim_end_matches('/').
+                ("Already owned", "/tmp/shared/", true),
+                // trim_end_matches removes every trailing slash, not just one.
+                ("Already owned", "/tmp/shared//", true),
+                ("Already owned", "/tmp/other", false),
+                // Same path, different title: not a duplicate.
+                ("Different", "/tmp/shared", false),
+            ];
+            for (title, path, expected) in cases {
+                assert_eq!(
+                    crate::cli::add::is_duplicate_session(&instances, title, path),
+                    expected,
+                    "title {title:?} path {path:?}"
+                );
+            }
         }
 
         #[tokio::test]
