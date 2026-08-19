@@ -79,10 +79,24 @@
 //!
 //! `Storage::update` closures must remain CPU/memory only (no network, user
 //! input, or tmux work). The profile-move transaction has one explicit
-//! exception: its `before_commit` effect may perform the already-preflighted
-//! tied worktree/tmux rename while both profile locks prevent a final target
-//! race. That effect must not re-enter storage. A closure that hangs holds both
-//! layers indefinitely and blocks every peer process.
+//! exception: its `before_commit` effect may perform an already-preflighted
+//! worktree move or sandbox-container release, never a tmux rekey. Across that
+//! effect BOTH per-profile mutexes and BOTH cross-process storage flocks are
+//! held (they are acquired in canonical directory order before `load` and
+//! released only after the final write), so every peer process is excluded from
+//! both profiles. Every subprocess is bounded: Git mutations use the worktree
+//! mutation timeout and container commands use the runtime timeout. The effect
+//! must not re-enter storage.
+//!
+//! Residual window (medium, never data loss): `before_commit` can move the
+//! worktree directory before the target/source rows are written. A later
+//! write/fsync failure may retain both source and target rows with the same
+//! global session id, or retain only the source row pointing at the old leaf.
+//! There is no safe automatic winner for every historical duplicate. The TUI
+//! therefore excludes ambiguous duplicate ids from its in-memory map instead of
+//! picking one by profile iteration order; a dedicated migration must inspect
+//! and repair the durable copies (#3459). Effect-first ordering still makes the common
+//! failure, the worktree move itself failing, a clean abort that touches no row.
 //!
 //! `update_workspace_ordering` and `Storage::update` must NOT be called from
 //! inside each other's closures. They use distinct lock files but acquiring
@@ -336,6 +350,18 @@ fn paths_share_filesystem_identity(left: &Path, right: &Path) -> Result<bool> {
     ))
 }
 
+fn existing_paths_share_filesystem_identity(left: &Path, right: &Path) -> Result<bool> {
+    let left = resolve_symlink_chain(left)?;
+    let right = resolve_symlink_chain(right)?;
+    match (fs::metadata(&left), fs::metadata(&right)) {
+        (Ok(left), Ok(right)) => Ok(same_filesystem_identity(&left, &right)),
+        (Err(error), _) | (_, Err(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+            Ok(false)
+        }
+        (Err(error), _) | (_, Err(error)) => Err(error.into()),
+    }
+}
+
 fn open_storage_lock_file(dir: &Path, name: &str) -> Result<(fs::File, PathBuf)> {
     fs::create_dir_all(dir)?;
     let path = dir.join(name);
@@ -453,13 +479,27 @@ fn sync_resolved_parent_directory(path: &Path) -> Result<()> {
         .parent()
         .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
     fs::File::open(parent)
-        .with_context(|| format!("opening target profile directory {}", parent.display()))?
+        .with_context(|| format!("opening profile directory {}", parent.display()))?
         .sync_all()
-        .with_context(|| format!("syncing target profile directory {}", parent.display()))
+        .with_context(|| format!("syncing profile directory {}", parent.display()))
 }
 
 fn atomic_write_verified(path: &Path, content: &[u8]) -> Result<()> {
     atomic_write_verified_resolved(path, content).map(|_| ())
+}
+
+fn restore_file_durably<W, S>(
+    path: &Path,
+    content: &[u8],
+    write_context: W,
+    sync_context: S,
+) -> Result<()>
+where
+    W: FnOnce() -> String,
+    S: FnOnce() -> String,
+{
+    atomic_write_verified(path, content).with_context(write_context)?;
+    sync_parent_directory(path).with_context(sync_context)
 }
 
 fn atomic_write_verified_resolved(path: &Path, content: &[u8]) -> Result<PathBuf> {
@@ -609,6 +649,15 @@ fn apply_group_move(
         }
     }
 
+    // Re-tree both sides so a group implied only by a moved instance's path
+    // materialises as an explicit row. This is order-stable, not a renormalise:
+    // `new_with_groups` seeds `insertion_order` from the passed groups verbatim
+    // and only appends paths that were missing, and `get_all_groups` replays
+    // that order, so when the input already covers every referenced group the
+    // output is byte-identical to the input. That is what keeps
+    // `source_groups_changed` (a byte comparison at the call site) a true
+    // semantic-change signal, so an unchanged source is never rewritten or
+    // fsynced. See `apply_group_move_is_byte_stable_without_semantic_change`.
     *source_groups =
         super::GroupTree::new_with_groups(source_instances, source_groups).get_all_groups();
     *target_groups =
@@ -1063,6 +1112,19 @@ impl Storage {
         let _first_flock = acquire_open_storage_flock(first_lock_file, &first_lock_path)?;
         let _second_flock = acquire_open_storage_flock(second_lock_file, &second_lock_path)?;
 
+        let source_groups_path = self.sessions_path.with_file_name("groups.json");
+        let target_groups_path = target.sessions_path.with_file_name("groups.json");
+        if existing_paths_share_filesystem_identity(&self.sessions_path, &target.sessions_path)? {
+            return Err(anyhow!(
+                "source and target profiles resolve to the same physical sessions file"
+            ));
+        }
+        if existing_paths_share_filesystem_identity(&source_groups_path, &target_groups_path)? {
+            return Err(anyhow!(
+                "source and target profiles resolve to the same physical groups file"
+            ));
+        }
+
         let (mut source_instances, mut source_groups) = self.load_with_groups()?;
         let (mut target_instances, mut target_groups) = target.load_with_groups()?;
         let mut ids = std::collections::HashSet::with_capacity(changes.len());
@@ -1107,12 +1169,17 @@ impl Storage {
             }
         }
         validate_target(&target_instances, &moved)?;
+        // Effect-first ordering: this moves the worktree directory / renames tmux
+        // before any row is written, so the common failure (the move itself
+        // failing) aborts cleanly with every row untouched. The tradeoff is the
+        // documented residual window if a later write fails, see the module docs.
         before_commit(&moved)?;
 
         let source_groups_before = serde_json::to_vec_pretty(&source_groups)?;
         let target_instances_before = serde_json::to_vec_pretty(&target_instances)?;
         let target_groups_before = serde_json::to_vec_pretty(&target_groups)?;
 
+        let source_instances_before = serde_json::to_vec_pretty(&source_instances)?;
         source_instances.retain(|instance| !ids.contains(instance.id.as_str()));
         target_instances.extend(moved.iter().cloned());
         apply_group_move(
@@ -1128,8 +1195,6 @@ impl Storage {
         let target_groups_after = serde_json::to_vec_pretty(&target_groups)?;
         let source_groups_changed = source_groups_after != source_groups_before;
         let target_groups_changed = target_groups_after != target_groups_before;
-        let source_groups_path = self.sessions_path.with_file_name("groups.json");
-        let target_groups_path = target.sessions_path.with_file_name("groups.json");
 
         let resolved_target_groups_path = if target_groups_changed {
             Some(atomic_write_verified_resolved(
@@ -1146,17 +1211,25 @@ impl Storage {
             Ok(path) => path,
             Err(target_error) => {
                 if target_groups_changed {
-                    if let Err(rollback_error) =
-                        atomic_write_verified(&target_groups_path, &target_groups_before)
-                    {
+                    if let Err(rollback_error) = restore_file_durably(
+                        &target_groups_path,
+                        &target_groups_before,
+                        || "target group rollback failed".to_string(),
+                        || "target group rollback was not durable".to_string(),
+                    ) {
                         return Err(anyhow!(
-                                "target profile write failed ({target_error}); target group rollback also failed ({rollback_error})"
-                            ));
+                            "target profile write failed ({target_error}); target group rollback also failed or was not durable ({rollback_error})"
+                        ));
                     }
                 }
                 return Err(target_error);
             }
         };
+        // Double fsync of the target parent is deliberate. `atomic_write` inside
+        // `atomic_write_verified_resolved` already fsyncs the directory
+        // best-effort so the rename survives power loss; this second fsync is the
+        // verified durability barrier whose failure aborts the transaction before
+        // any source row is removed. Keep the verified one.
         if let Some(path) = resolved_target_groups_path.as_deref() {
             sync_target_parent(path)?;
         }
@@ -1171,26 +1244,49 @@ impl Storage {
                 atomic_write_verified(&source_groups_path, &source_groups_after)
                     .and_then(|()| sync_parent_directory(&source_groups_path));
             if let Err(source_group_error) = source_group_result {
-                atomic_write_verified(&source_groups_path, &source_groups_before).with_context(
+                restore_file_durably(
+                    &source_groups_path,
+                    &source_groups_before,
                     || {
                         format!(
                             "source group write failed ({source_group_error}); source group rollback failed"
                         )
                     },
+                    || {
+                        format!(
+                            "source group write failed ({source_group_error}); source group rollback was not durable"
+                        )
+                    },
                 )?;
-                atomic_write_verified(&target.sessions_path, &target_instances_before)
-                    .with_context(|| {
+                restore_file_durably(
+                    &target.sessions_path,
+                    &target_instances_before,
+                    || {
                         format!(
                             "source group write failed ({source_group_error}); target session rollback failed"
                         )
-                    })?;
+                    },
+                    || {
+                        format!(
+                            "source group write failed ({source_group_error}); target session rollback was not durable"
+                        )
+                    },
+                )?;
                 if target_groups_changed {
-                    atomic_write_verified(&target_groups_path, &target_groups_before)
-                        .with_context(|| {
+                    restore_file_durably(
+                        &target_groups_path,
+                        &target_groups_before,
+                        || {
                             format!(
                                 "source group write failed ({source_group_error}); target group rollback failed"
                             )
-                        })?;
+                        },
+                        || {
+                            format!(
+                                "source group write failed ({source_group_error}); target group rollback was not durable"
+                            )
+                        },
+                    )?;
                 }
                 self.file_watch.notify_local_change(&source_groups_path);
                 target.file_watch.notify_local_change(&target.sessions_path);
@@ -1213,26 +1309,50 @@ impl Storage {
                 }
                 Ok(_) => {
                     if source_groups_changed {
-                        atomic_write_verified(&source_groups_path, &source_groups_before)
-                            .with_context(|| {
+                        restore_file_durably(
+                            &source_groups_path,
+                            &source_groups_before,
+                            || {
                                 format!(
                                     "source session write failed ({source_error}); source group rollback failed"
                                 )
-                            })?;
+                            },
+                            || {
+                                format!(
+                                    "source session write failed ({source_error}); source group rollback was not durable"
+                                )
+                            },
+                        )?;
                     }
-                    atomic_write_verified(&target.sessions_path, &target_instances_before)
-                        .with_context(|| {
+                    restore_file_durably(
+                        &target.sessions_path,
+                        &target_instances_before,
+                        || {
                             format!(
                                 "source session write failed ({source_error}); target session rollback failed"
                             )
-                        })?;
+                        },
+                        || {
+                            format!(
+                                "source session write failed ({source_error}); target session rollback was not durable"
+                            )
+                        },
+                    )?;
                     if target_groups_changed {
-                        atomic_write_verified(&target_groups_path, &target_groups_before)
-                            .with_context(|| {
+                        restore_file_durably(
+                            &target_groups_path,
+                            &target_groups_before,
+                            || {
                                 format!(
                                     "source session write failed ({source_error}); target group rollback failed"
                                 )
-                            })?;
+                            },
+                            || {
+                                format!(
+                                    "source session write failed ({source_error}); target group rollback was not durable"
+                                )
+                            },
+                        )?;
                     }
                     if source_groups_changed {
                         self.file_watch.notify_local_change(&source_groups_path);
@@ -1249,6 +1369,43 @@ impl Storage {
                     ));
                 }
             }
+        }
+        if let Err(sync_error) = sync_parent_directory(&self.sessions_path) {
+            if source_groups_changed {
+                restore_file_durably(
+                    &source_groups_path,
+                    &source_groups_before,
+                    || {
+                        format!(
+                            "source session directory sync failed ({sync_error}); source group restore failed"
+                        )
+                    },
+                    || {
+                        format!(
+                            "source session directory sync failed ({sync_error}); restored source groups were not durable"
+                        )
+                    },
+                )?;
+                self.file_watch.notify_local_change(&source_groups_path);
+            }
+            restore_file_durably(
+                &self.sessions_path,
+                &source_instances_before,
+                || {
+                    format!(
+                        "source session directory sync failed ({sync_error}); source row restore failed"
+                    )
+                },
+                || {
+                    format!(
+                        "source session directory sync failed ({sync_error}); restored source rows were not durable"
+                    )
+                },
+            )?;
+            self.file_watch.notify_local_change(&self.sessions_path);
+            return Err(anyhow!(
+                "source session removal was not durable ({sync_error}); source rows were restored and target copies retained"
+            ));
         }
         if source_groups_changed {
             self.file_watch.notify_local_change(&source_groups_path);
@@ -3193,6 +3350,109 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn profile_move_retains_recoverable_source_after_effect_ran_and_write_fails() -> Result<()> {
+        // D2 residual window: `before_commit` moves the worktree directory before
+        // any row is written, so a write failure after it aborts with the effect
+        // applied. The transaction does not auto-reverse the effect; instead it
+        // keeps both the source row and the durable target copy, leaving a
+        // reconcilable state (never a lost row) that recovery can repair.
+        let temp = tempdir()?;
+        let source_dir = temp.path().join("source-effect-window");
+        let target_dir = temp.path().join("target-effect-window");
+        fs::create_dir_all(&source_dir)?;
+        fs::create_dir_all(&target_dir)?;
+        let source = Storage::new_for_test_path("window-source", source_dir.join("sessions.json"));
+        let target = Storage::new_for_test_path("window-target", target_dir.join("sessions.json"));
+        let mut before = Instance::new("session", "/repo/session");
+        before.source_profile = "window-source".to_string();
+        before.group_path = "work".to_string();
+        source.update(|instances, groups| {
+            instances.push(before.clone());
+            groups.push(Group::new("work", "work"));
+            Ok(())
+        })?;
+        target.update(|_instances, _groups| Ok(()))?;
+        let after = before.clone();
+        let plan = GroupMovePlan::single("work", "work");
+        let effect_ran = std::cell::Cell::new(false);
+
+        let result = source.move_instances_to_inner(
+            &target,
+            &[(before.clone(), after)],
+            MoveTransactionPlan {
+                group_move: &plan,
+                merge_complete_post: true,
+            },
+            |_existing, _candidates| Ok(()),
+            |_moved| {
+                // Stand in for the worktree move / tmux rename effect.
+                effect_ran.set(true);
+                Ok(())
+            },
+            |_path| {
+                Err(anyhow!(
+                    "forced target directory sync failure after the effect"
+                ))
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(
+            effect_ran.get(),
+            "the external effect runs before the failing write"
+        );
+        let source_rows = source.load()?;
+        assert_eq!(
+            source_rows.len(),
+            1,
+            "the source row is retained so the moved directory is reconcilable, not lost"
+        );
+        assert_eq!(
+            target.load()?.len(),
+            1,
+            "the durable target copy is retained"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn apply_group_move_is_byte_stable_without_semantic_change() -> Result<()> {
+        // When a group the move touches is still used by a remaining source
+        // instance, `apply_group_move` must leave the source groups byte-for-byte
+        // unchanged: the re-tree replays insertion order and preserves metadata,
+        // so `source_groups_changed` stays a true semantic signal and an unchanged
+        // source is never rewritten or fsynced (point 4 of the review).
+        let mut mover = Instance::new("mover", "/repo/mover");
+        mover.group_path = "work".to_string();
+        let mut stayer = Instance::new("stayer", "/repo/stayer");
+        stayer.group_path = "work".to_string();
+
+        // Post-retain source still holds `stayer` in "work"; the mover has left.
+        let source_instances = vec![stayer];
+        let mut work_group = Group::new("work", "work");
+        work_group.collapsed = true;
+        work_group.archived_at = Some(chrono::Utc::now());
+        let mut source_groups = vec![work_group];
+        let target_instances = vec![mover];
+        let mut target_groups = Vec::new();
+
+        let before = serde_json::to_vec_pretty(&source_groups)?;
+        apply_group_move(
+            &GroupMovePlan::single("work", "work"),
+            &source_instances,
+            &mut source_groups,
+            &target_instances,
+            &mut target_groups,
+        );
+        let after = serde_json::to_vec_pretty(&source_groups)?;
+        assert_eq!(
+            before, after,
+            "source groups must be byte-stable, including collapsed/archived metadata"
+        );
+        Ok(())
+    }
+
     #[cfg(unix)]
     #[test]
     fn profile_move_rejects_shared_storage_lock_inode() -> Result<()> {
@@ -3205,11 +3465,16 @@ mod tests {
         let target = Storage::new_for_test_path("inode-target", target_dir.join("sessions.json"));
         let mut before = Instance::new("session", "/repo/session");
         before.source_profile = "inode-source".to_string();
-        source.update(|instances, _groups| {
+        before.group_path = "work".to_string();
+        source.update(|instances, groups| {
             instances.push(before.clone());
+            groups.push(Group::new("work", "work"));
             Ok(())
         })?;
-        target.update(|_instances, _groups| Ok(()))?;
+        target.update(|_instances, groups| {
+            groups.push(Group::new("target", "target"));
+            Ok(())
+        })?;
         let source_lock = source_dir.join(STORAGE_LOCK_FILENAME);
         let target_lock = target_dir.join(STORAGE_LOCK_FILENAME);
         fs::remove_file(&target_lock)?;
@@ -3228,6 +3493,28 @@ mod tests {
         assert!(error.to_string().contains("physical storage lock"));
         assert_eq!(source.load()?.len(), 1);
         assert!(target.load()?.is_empty());
+
+        fs::remove_file(&target_lock)?;
+        fs::File::create(&target_lock)?;
+        let source_groups = source_dir.join("groups.json");
+        let target_groups = target_dir.join("groups.json");
+        fs::remove_file(&target_groups)?;
+        fs::hard_link(&source_groups, &target_groups)?;
+        let effect_ran = std::cell::Cell::new(false);
+        let error = source
+            .move_instance_to_with_effect(
+                &target,
+                &before,
+                &before,
+                |_instances, _candidate| Ok(()),
+                |_| {
+                    effect_ran.set(true);
+                    Ok(())
+                },
+            )
+            .expect_err("shared groups inode must be rejected before external effects");
+        assert!(error.to_string().contains("physical groups file"));
+        assert!(!effect_ran.get());
         Ok(())
     }
 

@@ -3,7 +3,7 @@
 use crate::session::builder::{self, InstanceParams};
 use crate::session::{
     acquire_session_identity_lock, duplicate_session_error, is_duplicate_session, list_profiles,
-    GroupMovePlan, GroupTree, Instance, Item, LifecycleOperation, Status, Storage,
+    GroupMovePlan, Instance, Item, LifecycleOperation, Status, Storage,
 };
 use crate::tui::deletion_poller::DeletionRequest;
 use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions, InfoDialog, NewSessionData};
@@ -87,6 +87,13 @@ fn worktree_rename_block(
         Some(WorktreeRenameBlock::SandboxContainer)
     } else {
         None
+    }
+}
+
+fn worktree_rename_block_message(reason: &WorktreeRenameBlock) -> &'static str {
+    match reason {
+        WorktreeRenameBlock::ActiveAgent => "This worktree session's directory moves to match the new name, which can't happen while it's running. Stop the session first, or disable \"Tie Worktree Directory to Session Name\" to relabel it freely.",
+        WorktreeRenameBlock::SandboxContainer => "This sandbox session's container is mounting the worktree directory, so it can't be moved to match the new name. Stop the session first, or disable \"Tie Worktree Directory to Session Name\" to relabel it freely.",
     }
 }
 
@@ -429,6 +436,12 @@ impl HomeView {
         let profile_move_target = new_profile
             .filter(|target| *target != current_profile.as_str())
             .map(str::to_string);
+        if let Some(target_profile) = profile_move_target.as_ref() {
+            let profiles = list_profiles()?;
+            if !profiles.contains(target_profile) {
+                anyhow::bail!("Profile '{}' does not exist", target_profile);
+            }
+        }
 
         // Identity-changing restart edits follow the global order: app-wide
         // identity, then the session title and authoritative source lifecycle.
@@ -458,20 +471,15 @@ impl HomeView {
                 return Err(duplicate_session_error(&restart_edit_authoritative.title));
             }
         }
-        self.restart_cooldown_at.insert(id.clone(), now);
 
         // A cross-profile restart is staged entirely on a detached candidate.
         // In particular, do not persist a tool swap into the source row before
         // the target transaction has accepted the complete candidate.
         if let Some(target_profile) = profile_move_target.as_deref() {
-            let profiles = list_profiles()?;
-            if !profiles.contains(&target_profile.to_string()) {
-                anyhow::bail!("Profile '{}' does not exist", target_profile);
-            }
             if !self.storages.contains_key(target_profile) {
                 self.storages.insert(
                     target_profile.to_string(),
-                    Storage::new(target_profile, self.file_watch.clone())?,
+                    Storage::open(target_profile, self.file_watch.clone())?,
                 );
             }
 
@@ -882,65 +890,6 @@ impl HomeView {
             .filter(|instance| is_member(instance))
             .map(|instance| instance.id.clone())
             .collect();
-        if profile_changed {
-            affected_ids.sort();
-        }
-
-        let _mutation_guards = if profile_changed {
-            let mut guards = Vec::with_capacity(affected_ids.len());
-            for id in &affected_ids {
-                guards.push(self.lock_session_mutation_and_reload(id)?);
-            }
-            let now = chrono::Utc::now();
-            for id in &affected_ids {
-                let authoritative = self
-                    .get_instance(id)
-                    .ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))?;
-                anyhow::ensure!(
-                    authoritative.source_profile == ctx.old_profile && is_member(authoritative),
-                    "Group membership changed while the cross-profile move was pending"
-                );
-                anyhow::ensure!(
-                    authoritative.status != Status::Creating
-                        && !authoritative.has_fresh_lifecycle_reservation(now),
-                    "Cannot move group while session {id} has a lifecycle operation in progress"
-                );
-            }
-            if !self.storages.contains_key(target_profile) {
-                self.storages.insert(
-                    target_profile.to_string(),
-                    Storage::open(target_profile, self.file_watch.clone())?,
-                );
-            }
-            Some(guards)
-        } else {
-            None
-        };
-
-        let mut changes = Vec::with_capacity(affected_ids.len());
-        for id in &affected_ids {
-            let instance = self
-                .get_instance(id)
-                .ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))?;
-            let new_group_path = if new_path != ctx.old_path {
-                if instance.group_path == ctx.old_path {
-                    new_path.to_string()
-                } else {
-                    let rest = instance
-                        .group_path
-                        .strip_prefix(&old_prefix)
-                        .ok_or_else(|| {
-                            anyhow::anyhow!(
-                                "Group membership changed while the cross-profile move was pending"
-                            )
-                        })?;
-                    format!("{new_path}/{rest}")
-                }
-            } else {
-                instance.group_path.clone()
-            };
-            changes.push((id.clone(), new_group_path));
-        }
 
         if profile_changed {
             // Refuse every transient member before taking any guard or
@@ -1015,10 +964,14 @@ impl HomeView {
             if !self.storages.contains_key(target_profile) {
                 self.storages.insert(
                     target_profile.to_string(),
-                    Storage::new(target_profile, self.file_watch.clone())?,
+                    Storage::open(target_profile, self.file_watch.clone())?,
                 );
             }
-            let moved = {
+            // Run the batch transaction for its durable effect only. The moved
+            // rows are republished from disk by the reload below, which also
+            // re-merges runtime-only state onto them, so inserting the returned
+            // rows in memory here would just be overwritten by that reload.
+            {
                 let source = self
                     .storages
                     .get(&ctx.old_profile)
@@ -1026,7 +979,7 @@ impl HomeView {
                 let target = self
                     .storages
                     .get(target_profile)
-                    .expect("target profile storage was just ensured");
+                    .ok_or_else(|| anyhow::anyhow!("Target profile storage is not loaded"))?;
                 let group_move = GroupMovePlan::subtree(&ctx.old_path, new_path);
                 source.move_instances_to(
                     target,
@@ -1052,14 +1005,7 @@ impl HomeView {
                         }
                         Ok(())
                     },
-                )?
-            };
-            for mut instance in moved {
-                if let Some(previous) = self.instances.get(&instance.id) {
-                    instance.merge_runtime_for_profile_move(previous);
-                }
-                instance.source_profile = target_profile.to_string();
-                self.instances.insert(instance.id.clone(), instance);
+                )?;
             }
             self.reload_preserving_profile_move_runtime(&affected_ids)?;
             drop(identity_guard);
@@ -1404,9 +1350,13 @@ impl HomeView {
                     &duplicate_path,
                     Some(&id),
                 ) {
+                    let error = duplicate_session_error(&effective_title);
+                    if target_profile != current_profile {
+                        return Err(error);
+                    }
                     self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
                         "Rename Failed",
-                        &duplicate_session_error(&effective_title).to_string(),
+                        &error.to_string(),
                     ));
                     return Ok(());
                 }
@@ -1495,10 +1445,7 @@ impl HomeView {
                     if let Some(reason) =
                         worktree_rename_block(status, is_sandboxed, container_holds_worktree)
                     {
-                        let body = match reason {
-                            WorktreeRenameBlock::ActiveAgent => "This worktree session's directory moves to match the new name, which can't happen while it's running. Stop the session first, or disable \"Tie Worktree Directory to Session Name\" to relabel it freely.",
-                            WorktreeRenameBlock::SandboxContainer => "This sandbox session's container is mounting the worktree directory, so it can't be moved to match the new name. Stop the session first, or disable \"Tie Worktree Directory to Session Name\" to relabel it freely.",
-                        };
+                        let body = worktree_rename_block_message(&reason);
                         self.info_dialog = Some(crate::tui::dialogs::InfoDialog::new(
                             "Stop the Session to Rename",
                             body,
@@ -1544,7 +1491,7 @@ impl HomeView {
                 if !self.storages.contains_key(target_profile) {
                     self.storages.insert(
                         target_profile.to_string(),
-                        Storage::new(target_profile, self.file_watch.clone())?,
+                        Storage::open(target_profile, self.file_watch.clone())?,
                     );
                 }
                 let tied_edit = (current_title != effective_title || rename_branch)
@@ -1580,7 +1527,7 @@ impl HomeView {
                                     candidate.is_sandboxed(),
                                     container_holds_worktree,
                                 ) {
-                                    anyhow::bail!("worktree rename blocked: {reason:?}");
+                                    anyhow::bail!("{}", worktree_rename_block_message(&reason));
                                 }
                                 match crate::session::worktree_edit::edit_worktree_workdir(
                                     crate::session::worktree_edit::WorktreeEditRequest {
@@ -1593,6 +1540,25 @@ impl HomeView {
                                     },
                                 ) {
                                     Ok(outcome) => {
+                                        // The row published to the target profile
+                                        // carries `candidate.project_path`, which
+                                        // was precomputed by `target_worktree_path`
+                                        // in `projected_move` above. `edit_worktree_workdir`
+                                        // relocates the directory to its own
+                                        // `outcome.new_path`, also derived by
+                                        // `target_worktree_path` from the same
+                                        // current path and the same title-derived
+                                        // leaf, so the two are guaranteed identical
+                                        // and the published row always points at the
+                                        // directory that actually moved. Assert it so
+                                        // any future drift in either sanitizer chain
+                                        // fails loudly in debug rather than silently
+                                        // stranding the row on a wrong path.
+                                        debug_assert_eq!(
+                                            outcome.new_path,
+                                            std::path::Path::new(&candidate.project_path),
+                                            "published project_path must match the moved worktree directory"
+                                        );
                                         if outcome.new_path
                                             != std::path::Path::new(&effect_instance.project_path)
                                         {
@@ -1612,12 +1578,10 @@ impl HomeView {
                 )?;
                 self.reload_preserving_profile_move_runtime(std::slice::from_ref(&id))?;
                 drop(_identity_lock);
-                let tmux_warning =
-                    rekey_tmux_after_persist(&id, &current_title, &effective_title);
+                let tmux_warning = rekey_tmux_after_persist(&id, &current_title, &effective_title);
                 drop(_mutation_guards);
                 if let Some(warning) = tmux_warning {
-                    self.info_dialog =
-                        Some(InfoDialog::new("Rename Saved with Warning", &warning));
+                    self.info_dialog = Some(InfoDialog::new("Rename Saved with Warning", &warning));
                 }
                 return Ok(());
             }

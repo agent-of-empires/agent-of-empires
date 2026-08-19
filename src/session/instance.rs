@@ -2168,7 +2168,9 @@ impl Instance {
     /// `pre.X != post.X`. Peer writes to fields the mutation did not touch
     /// survive even when the field is in the user-action set.
     /// `last_accessed_at` is monotone-max (no diff guard).
-    /// `source_profile` is excluded; cross-profile moves bypass this path.
+    /// `source_profile` is excluded from this splice. Same-profile actions call
+    /// this directly; cross-profile moves call it through
+    /// `merge_profile_move_diff` and assign `source_profile` separately.
     /// Post-splice rules enforce the same cross-field invariants the
     /// per-mutation methods enforce (archive XOR favorite, touch unarchives)
     /// so concurrent peer writes cannot violate them.
@@ -2225,9 +2227,9 @@ impl Instance {
         // user-action diff, so the value on disk is already authoritative here.
         // Assigning `post`'s copy would let a stale TUI snapshot clobber a
         // conversion a peer landed between the `pre` snapshot and this merge.
-        if pre.status != post.status {
-            self.status = post.status;
-        }
+        // `status` deliberately has no arm. It is runtime state, not user
+        // intent; copying it from a stale TUI snapshot could overwrite a
+        // lifecycle transition loaded under the storage lock.
         // Lifecycle ownership is intentionally never spliced from a TUI
         // snapshot. Only transition code holding the per-instance flock may
         // mutate the durable reservation and generation.
@@ -9512,21 +9514,28 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_diff_uses_self_not_post_for_touch_detection() {
+    fn test_merge_diff_preserves_runtime_state_and_peer_touch() {
         let mut pre = Instance::new("s", "/tmp/x");
         pre.last_accessed_at = Some(Utc::now() - chrono::Duration::seconds(60));
         pre.archived_at = Some(Utc::now() - chrono::Duration::seconds(120));
 
         let mut post = pre.clone();
         post.title = "renamed".into();
+        post.status = Status::Running;
 
         let mut disk = pre.clone();
         disk.touch_last_accessed();
+        disk.status = Status::Waiting;
 
         disk.merge_user_action_diff(&pre, &post);
 
         assert_eq!(disk.title, "renamed");
         assert!(disk.archived_at.is_none());
+        assert_eq!(
+            disk.status,
+            Status::Waiting,
+            "runtime status must remain authoritative"
+        );
     }
 
     #[test]

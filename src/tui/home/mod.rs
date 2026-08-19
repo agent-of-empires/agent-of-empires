@@ -5176,17 +5176,29 @@ impl HomeView {
     }
 
     /// Build the id-keyed `IndexMap` from a `Vec<Instance>` (the storage-load
-    /// shape). Logs a warning on a duplicate id so a corrupt disk state
-    /// surfaces in logs rather than silently keeping only the last row.
+    /// shape). Duplicate ids across profiles are ambiguous after an interrupted
+    /// profile move: selecting either row by iteration order can route lifecycle
+    /// work to the wrong profile. Exclude every copy and fail closed until the
+    /// durable state is reconciled.
     fn build_instances_map(all_instances: Vec<Instance>) -> indexmap::IndexMap<String, Instance> {
-        let mut map = indexmap::IndexMap::with_capacity(all_instances.len());
+        let mut map: indexmap::IndexMap<String, Instance> =
+            indexmap::IndexMap::with_capacity(all_instances.len());
+        let mut duplicate_ids = std::collections::HashSet::new();
         for inst in all_instances {
-            if let Some(prev) = map.insert(inst.id.clone(), inst) {
-                tracing::warn!(
+            if duplicate_ids.contains(&inst.id) {
+                continue;
+            }
+            if let Some(previous) = map.shift_remove(&inst.id) {
+                duplicate_ids.insert(inst.id.clone());
+                tracing::error!(
                     target: "tui.home",
-                    id = %prev.id,
-                    "duplicate session id in loaded rows; keeping later entry"
+                    id = %inst.id,
+                    first_profile = %previous.source_profile,
+                    second_profile = %inst.source_profile,
+                    "duplicate session id across profiles; excluding every copy until durable reconciliation"
                 );
+            } else {
+                map.insert(inst.id.clone(), inst);
             }
         }
         map
@@ -6847,7 +6859,7 @@ impl HomeView {
         let target_storage = self
             .storages
             .get(target)
-            .expect("target profile storage was just ensured");
+            .ok_or_else(|| anyhow::anyhow!("Target profile storage is not loaded"))?;
         let mut moved = source.move_instance_to_with_effect(
             target_storage,
             &before,

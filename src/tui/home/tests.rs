@@ -22,6 +22,22 @@ fn setup_test_home(temp: &TempDir) -> AppDirGuard {
     isolate_app_dir_at(temp.path())
 }
 
+#[test]
+fn duplicate_session_ids_are_excluded_from_home_map() {
+    let mut first = Instance::new("first", "/tmp/first");
+    first.id = "duplicate-id".to_string();
+    first.source_profile = "alpha".to_string();
+    let mut second = first.clone();
+    second.source_profile = "beta".to_string();
+    let unique = Instance::new("unique", "/tmp/unique");
+    let unique_id = unique.id.clone();
+
+    let map = HomeView::build_instances_map(vec![first, unique, second]);
+
+    assert!(!map.contains_key("duplicate-id"));
+    assert!(map.contains_key(&unique_id));
+}
+
 struct TestEnv {
     view: HomeView,
     _guard: AppDirGuard,
@@ -6288,12 +6304,14 @@ fn test_rename_selected_rejects_all_identity_collisions_and_allows_group_only_ch
     )
     .unwrap();
     unified.selected_session = Some(source_id.clone());
-    unified
+    let error = unified
         .rename_selected("occupied", None, Some("beta"), false)
-        .unwrap();
+        .expect_err("target-profile identity collision must reject the transaction");
     assert!(
-        unified.info_dialog.is_some(),
-        "target-profile identity collision must be rejected"
+        error
+            .to_string()
+            .contains("Session already exists with same title and path"),
+        "unexpected collision error: {error:#}"
     );
     assert_eq!(
         alpha
@@ -7221,9 +7239,14 @@ fn test_group_profile_move_rejects_concurrent_fresh_member_without_metadata_spli
             Ok(())
         })
         .unwrap();
-    let result = view.rename_selected_group(Some("moved-team"), Some("beta"));
-
-    assert!(result.is_err());
+    let error = view
+        .rename_selected_group(Some("moved-team"), Some("beta"))
+        .expect_err("a concurrent group member must abort the move");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("group membership changed while the cross-profile move was pending"),
+        "unexpected profile-move rejection: {message}"
+    );
     let (source_rows, source_groups) = source.load_with_groups().unwrap();
     assert_eq!(source_rows.len(), 2);
     assert!(source_rows
@@ -7345,9 +7368,17 @@ fn test_group_profile_move_is_all_or_nothing() {
     view.rename_selected_group(None, Some("beta")).unwrap();
     assert!(source.load().unwrap().is_empty());
     assert_eq!(target.load().unwrap().len(), 2);
-    assert!(view
+    let published: Vec<_> = view
         .instances()
         .filter(|instance| instance.group_path == "work")
+        .collect();
+    assert_eq!(
+        published.len(),
+        2,
+        "both members must be published in memory"
+    );
+    assert!(published
+        .iter()
         .all(|instance| instance.source_profile == "beta"));
     let (_, source_groups) = source.load_with_groups().unwrap();
     assert_eq!(source_groups, vec![source_empty]);
@@ -7384,8 +7415,7 @@ fn group_profile_move_preflights_every_creating_member_before_mutation() {
         .unwrap();
     let target = Storage::new_unwatched("beta").unwrap();
     let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view =
-        HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
     view.mutate_instance(&second.id, |instance| {
         instance.status = Status::Creating;
     });
@@ -16760,10 +16790,10 @@ mod live_send_mode {
         //! tmux operations the live-send worker can actually deliver.
         //! Single-line pastes stay on the simple `Literal` + `Named("Tab")`
         //! path so raw shells and bracketed-paste-unaware agents keep
-        //! working. Multi-line pastes get wrapped in xterm bracketed-
-        //! paste markers (#1546) and dispatched as a single `HexBytes`
-        //! payload so the receiving agent sees one paste instead of one
-        //! `Enter` per line.
+        //! working. Multi-line pastes are dispatched as one `TmuxKey::Paste`
+        //! payload without escape markers; tmux delegates bracketed-paste
+        //! handling to `paste-buffer -p`, so the agent sees one paste instead
+        //! of one `Enter` per line.
 
         use crate::tui::home::input::split_paste_for_live_send;
         use crate::tui::home::live_send::TmuxKey;
@@ -18338,9 +18368,10 @@ mod save_field_merge {
             })
             .unwrap();
 
-        view.move_to_profile(&id, "target", String::new())
+        let requested = view.get_instance(&id).unwrap().clone();
+        let baseline = requested.clone();
+        view.move_to_profile(&id, "target", requested, Some(&baseline))
             .expect("stale reservation must not block profile move");
-        view.save().unwrap();
         assert!(source.load().unwrap().is_empty());
         assert!(Storage::new_unwatched("target")
             .unwrap()
@@ -18352,9 +18383,23 @@ mod save_field_merge {
 
     #[test]
     #[serial]
-    fn restart_profile_move_rejects_target_identity_collision_before_mutation() {
+    fn restart_profile_move_rejects_invalid_targets_before_mutation() {
         let (_temp, _guard, mut view, id) =
             boot_view_with_one_session("source", "/tmp/profile-restart-collision");
+        view.selected_session = Some(id.clone());
+
+        let error = view
+            .restart_selected_session(Some("missing-target"), Some("claude"), None, None)
+            .expect_err("missing target profile must reject restart profile move");
+        assert!(error
+            .to_string()
+            .contains("Profile 'missing-target' does not exist"));
+        assert!(!crate::session::list_profiles()
+            .unwrap()
+            .contains(&"missing-target".to_string()));
+        assert_eq!(view.get_instance(&id).unwrap().source_profile, "test");
+        assert!(!view.restart_cooldown_at.contains_key(&id));
+
         let target = Storage::new_unwatched("target").unwrap();
         target
             .update(|instances, _groups| {
@@ -18365,7 +18410,6 @@ mod save_field_merge {
             })
             .unwrap();
         view.storages.insert("target".to_string(), target);
-        view.selected_session = Some(id.clone());
 
         let error = view
             .restart_selected_session(Some("target"), Some("claude"), None, None)
@@ -18705,7 +18749,10 @@ mod save_field_merge {
             std::fs::read(old_path.join("sentinel")).unwrap(),
             b"untouched"
         );
-        assert!(!new_path.join("sentinel").exists());
+        assert!(
+            !new_path.exists(),
+            "no target directory may be created before validation"
+        );
         let source = Storage::new_unwatched("test")
             .unwrap()
             .load()
