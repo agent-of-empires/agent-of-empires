@@ -3,17 +3,21 @@
 // dependencies on the rest of the crate: build scripts compile in isolation.
 
 /// The git files cargo should watch so `AOE_BUILD_VERSION` is recomputed when
-/// the checkout's revision changes: `HEAD` moves on checkout/commit.
+/// the checkout's revision changes: `HEAD` for a checkout or a detached-HEAD
+/// move, and the per-worktree reflog `logs/HEAD` for everything that advances
+/// the branch `HEAD` points at (commit, pull, merge, rebase, reset), which
+/// leaves the `HEAD` file itself untouched.
 ///
-/// `index` used to be watched too, so the embedded dirty flag would update as
-/// soon as you staged something. That backfired: git rewrites `index`'s stat
-/// cache on a plain `git status` (racily-clean revalidation), not just on
-/// real staging, so anything that runs `git status` in the background (shell
-/// prompts, editor/IDE git integrations) touched `index`'s mtime and made
-/// cargo treat the crate as dirty on every single build, even with zero
-/// source changes. `HEAD` alone is a coarser but reliable
-/// signal: the dirty suffix now only recomputes on the next real rebuild
-/// trigger rather than on every restart.
+/// `index` is deliberately not watched. It looks like the natural trigger for
+/// the dirty-flag suffix, but git rewrites its stat cache on a plain
+/// `git status` (racily-clean revalidation), not just on real staging, so a
+/// shell prompt or editor git integration running in the background made
+/// cargo recompile the lib + binary for a build with zero source changes.
+/// The cost is that the dirty suffix now lags: staging or editing files no
+/// longer refreshes it on its own, so a binary rebuilt after an edit can
+/// still report the flag computed at the last revision change. That was
+/// already true for unstaged edits before, and the flag is documented as
+/// coarse (see `emit_build_version` in `build.rs`).
 ///
 /// Paths are resolved for the repository rooted at `dir` via
 /// `git rev-parse --git-path`, which is correct for both a normal checkout
@@ -29,7 +33,7 @@
 /// checkout (e.g. a source tarball), leaving the build version pinned to
 /// `CARGO_PKG_VERSION` with no spurious rerun trigger.
 pub fn git_watch_paths(dir: &std::path::Path) -> Vec<String> {
-    ["HEAD"]
+    ["HEAD", "logs/HEAD"]
         .iter()
         .filter_map(|file| git_path(dir, file))
         .filter(|path| watched_path_exists(dir, path))
