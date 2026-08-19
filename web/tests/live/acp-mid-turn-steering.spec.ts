@@ -21,12 +21,18 @@ import { enableStructuredViewAndWait, waitForReplayContains } from "../helpers/a
 // One turn that stays open long enough for a second prompt to land
 // inside it. `wait_ms` is the fake agent's hold primitive; it sleeps in
 // slices so a cancel is still observed promptly.
+//
+// The hold also has to outlast the assertions made inside the turn, not
+// just the prompt that lands in it: the queued spec reads `/queue` back
+// while the turn is still running, and a turn that ends first drains the
+// queue to empty. Neither spec waits for the turn to end, so a generous
+// hold costs no wall time; 4s lost that race on a loaded runner.
 const HELD_TURN_SCRIPT = {
   turns: [
     {
       updates: [
         { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "working" } },
-        { sessionUpdate: "wait_ms", ms: 4000 },
+        { sessionUpdate: "wait_ms", ms: 30_000 },
       ],
       stopReason: "end_turn",
     },
