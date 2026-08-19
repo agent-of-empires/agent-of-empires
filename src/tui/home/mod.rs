@@ -4388,10 +4388,11 @@ impl HomeView {
                         // was provisional.
                         *groups = GroupTree::new_with_groups(instances, groups).get_all_groups();
                     }
-                    if let Some(owner) = crate::cli::add::find_duplicate_session(
-                        instances,
+                    if let Some(owner) = crate::session::find_duplicate_session(
+                        instances.iter(),
                         &instance.title,
                         &instance.project_path,
+                        None,
                     ) {
                         return Ok(CreationCommit::Duplicate(Box::new(owner.clone())));
                     }
@@ -4414,7 +4415,7 @@ impl HomeView {
                         );
                         self.info_dialog = Some(InfoDialog::sized_to_fit(
                             "Creation Failed",
-                            &crate::cli::add::duplicate_session_error(&instance.title).to_string(),
+                            &crate::session::duplicate_session_error(&instance.title).to_string(),
                         ));
                         self.new_dialog = None;
                         if let Err(error) = self.reload() {
@@ -4432,10 +4433,11 @@ impl HomeView {
                             ));
                         }
                         Ok(instances) => {
-                            let owner = crate::cli::add::find_duplicate_session(
+                            let owner = crate::session::find_duplicate_session(
                                 &instances,
                                 &instance.title,
                                 &instance.project_path,
+                                None,
                             )
                             .cloned();
                             cleanup_creation_resources(

@@ -85,7 +85,7 @@ export function collectRecentProjects(sessions: SessionResponse[]): RecentProjec
     // workspace from one path, so keep them out of the list entirely.
     if (s.workspace_repos.length > 0) continue;
     // Normalize the trailing slash before keying, mirroring the backend's
-    // dedup convention (`src/cli/add.rs` is_duplicate_session and
+    // dedup convention (`src/session/instance.rs` is_duplicate_session and
     // `src/server/api/sessions.rs` workspace_id_for_session both
     // `trim_end_matches('/')`). Without this, `/foo/bar` and `/foo/bar/`
     // become two separate entries with split session counts. The `|| "/"`

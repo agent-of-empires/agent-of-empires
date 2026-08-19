@@ -85,7 +85,7 @@ fn test_cli_add_duplicate_errors_and_preserves_original_command() {
     let stderr = String::from_utf8_lossy(&duplicate.stderr);
     assert!(
         stderr.contains("Session already exists with same title and path")
-            && stderr.contains("different --title"),
+            && stderr.contains("different title"),
         "duplicate error should identify the collision and offer remediation.\nstderr: {stderr}"
     );
 

@@ -74,9 +74,9 @@ pub use groups::{
 };
 pub(crate) use instance::ResumeAttemptPolicy;
 pub(crate) use instance::{
-    duplicate_session_error, is_duplicate_session, persist_omp_session_to_storage,
-    persist_session_to_storage, PassiveStatusPatch, ResumeIntent, SidWrite,
-    NEWER_GENERATION_BUSY_REASON,
+    duplicate_session_error, find_duplicate_session, is_duplicate_session,
+    persist_omp_session_to_storage, persist_session_to_storage, PassiveStatusPatch, ResumeIntent,
+    SidWrite, NEWER_GENERATION_BUSY_REASON,
 };
 pub use instance::{
     is_valid_session_color, EnsureReadyError, EnsureReadyOutcome, Instance, LaunchSidOutcome,
@@ -84,7 +84,7 @@ pub use instance::{
     SandboxInfo, SessionBucket, StartOutcome, Status, TerminalInfo, View, WorkspaceInfo,
     WorkspaceRepo, WorktreeInfo, SESSION_COLORS, TMUX_SESSION_GONE_ERROR,
 };
-pub(crate) use storage::acquire_title_mutation_lock;
+pub(crate) use storage::acquire_session_identity_lock;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

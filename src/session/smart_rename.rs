@@ -935,16 +935,16 @@ fn apply_terminal_title(
             if let Some(title) = &new_title {
                 let should_write = title_is_auto_overwritable(&instances[index])
                     && instances[index].title != *title;
-                // `is_duplicate_session` scans every instance and does not skip
-                // this session by id, so the `title != current` half of
-                // `should_write` is what keeps a session from reading its own
-                // row as the collision. Self-exclusion by id lives in the manual
-                // rename predicate (#3411), which owns the shared surfaces.
+                // Manual and automatic rename paths share one domain predicate;
+                // exclude this row explicitly so the uniqueness contract does
+                // not depend on `should_write` remaining title-sensitive.
+                let path = instances[index].project_path.clone();
                 let duplicate = should_write
-                    && crate::cli::add::is_duplicate_session(
-                        instances,
+                    && crate::session::is_duplicate_session(
+                        instances.iter(),
                         title,
-                        &instances[index].project_path,
+                        &path,
+                        Some(&id),
                     );
                 if duplicate {
                     tracing::warn!(target: "smart_rename", session = %id, title = %title, "skipped duplicate auto-title");
@@ -1452,19 +1452,18 @@ mod serve {
                 else {
                     return Ok(false);
                 };
-                // Skip a no-op rename: when the generated title already equals
-                // the current one there is nothing to write, and this same
-                // `title != current` guard is what excludes this session from
-                // its own duplicate scan below, since `is_duplicate_session`
-                // matches by (title, path) with no id filter. Id-based
-                // self-exclusion lives in the manual rename predicate (#3411).
+                // Manual and automatic rename paths share one domain predicate;
+                // exclude this row explicitly so a future no-op policy change
+                // cannot make the row collide with itself.
                 let should_write = title_is_auto_overwritable(&instances[index])
                     && instances[index].title != title_owned;
+                let path = instances[index].project_path.clone();
                 let duplicate = should_write
-                    && crate::cli::add::is_duplicate_session(
-                        instances,
+                    && crate::session::is_duplicate_session(
+                        instances.iter(),
                         &title_owned,
-                        &instances[index].project_path,
+                        &path,
+                        Some(&id_owned),
                     );
                 if duplicate {
                     tracing::warn!(target: "smart_rename", session = %id_owned, title = %title_owned, "skipped duplicate auto-title");
@@ -1572,7 +1571,7 @@ mod serve {
             ];
             for (title, path, expected) in cases {
                 assert_eq!(
-                    crate::cli::add::is_duplicate_session(&instances, title, path),
+                    crate::session::is_duplicate_session(instances.iter(), title, path, None),
                     expected,
                     "title {title:?} path {path:?}"
                 );

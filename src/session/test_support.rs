@@ -192,6 +192,54 @@ impl Drop for EnvGuard {
     }
 }
 
+/// Restores the process-global tied-worktree setting even when a test panics.
+///
+/// Declare this after the app-directory isolation guard. Rust drops locals in
+/// reverse declaration order, and this guard's `Drop` must restore the setting
+/// while `HOME` and `XDG_CONFIG_HOME` still point at the test configuration.
+#[must_use = "TieWorkdirToNameGuard restores config on Drop"]
+pub(crate) struct TieWorkdirToNameGuard {
+    previous: bool,
+    _lock: Option<MutexGuard<'static, ()>>,
+}
+
+impl TieWorkdirToNameGuard {
+    pub(crate) fn set(enabled: bool) -> Self {
+        let lock = acquire_env_lock();
+        let previous = super::config::load_config()
+            .ok()
+            .flatten()
+            .unwrap_or_default()
+            .session
+            .tie_workdir_to_name;
+        let guard = Self {
+            previous,
+            _lock: lock,
+        };
+        super::config::update_config(|config| {
+            config.session.tie_workdir_to_name = enabled;
+        })
+        .unwrap();
+        guard
+    }
+}
+
+impl Drop for TieWorkdirToNameGuard {
+    fn drop(&mut self) {
+        if let Err(error) = super::config::update_config(|config| {
+            config.session.tie_workdir_to_name = self.previous;
+        }) {
+            tracing::warn!(
+                target: "session.test",
+                "failed to restore tie_workdir_to_name after test: {error}"
+            );
+        }
+        if self._lock.is_some() {
+            ENV_LOCK_HELD.with(|held| held.set(false));
+        }
+    }
+}
+
 /// RAII guard: isolates `HOME`, `XDG_CONFIG_HOME`, and `XDG_DATA_HOME`
 /// for one test; restores them on `Drop`. See the
 /// [module documentation](crate::session::test_support) for the
