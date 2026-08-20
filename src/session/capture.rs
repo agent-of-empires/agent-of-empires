@@ -15,8 +15,14 @@ pub(crate) use omp::*;
 /// Iterate directory entries, silently skipping unreadable ones.
 ///
 /// Wraps `std::fs::read_dir` and filters out individual entry errors (e.g.
-/// broken symlinks, transient permission failures) so that one bad entry
-/// doesn't abort the entire directory scan.
+/// transient permission failures) so that one bad entry doesn't abort the
+/// entire directory scan.
+///
+/// This filters `read_dir`'s per-entry `Err` only, which is a much narrower
+/// guarantee than it sounds. Nothing here stats the entry, so a dangling
+/// symlink, a symlink cycle, a directory, or a FIFO is yielded as an ordinary
+/// entry. Callers that need a real file behind the name have to check for
+/// themselves; see `scan_claude_project_dir`.
 pub(crate) fn resilient_read_dir(
     dir: &std::path::Path,
 ) -> Result<impl Iterator<Item = std::fs::DirEntry> + '_> {
