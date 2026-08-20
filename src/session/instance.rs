@@ -10719,9 +10719,9 @@ mod tests {
             return;
         };
         // The guard restores on unwind; the resolved path matters separately,
-        // because `test_support::ENV_LOCK` is taken only by `EnvGuard` and 12
-        // of the 14 `repo_config` hook tests take none, so they read this
-        // override regardless and must not read a path that cannot run.
+        // because `wrap_command_ignore_suspend` execs `$SHELL` below. The
+        // `repo_config` hook tests used to read this override too and now pin
+        // their own (#3449).
         let _shell = EnvGuard::set(&[("SHELL", &bash)]);
         let temp = tempfile::tempdir().unwrap();
         let working_dir = temp.path().join("some project's dir");

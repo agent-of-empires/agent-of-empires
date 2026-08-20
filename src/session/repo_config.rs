@@ -1709,6 +1709,20 @@ mod tests {
     use super::*;
     use tracing_test::traced_test;
 
+    /// Pin `SHELL` for a test that spawns a local hook. `build_hook_command`'s
+    /// local arm runs `user_shell()`, so an ambient `SHELL` this host cannot
+    /// run, or one another test is mid-way through exporting, surfaces here as
+    /// a hook failure naming the wrong cause. Resolved rather than hardcoded so
+    /// the FHS assumption #3421 removed stays removed; the guard also takes
+    /// `ENV_LOCK`, which closes the window from the writer side. See #3449.
+    #[must_use = "bind it to `_shell`; dropped immediately, it unpins SHELL again"]
+    fn pin_host_shell() -> Option<crate::session::test_support::EnvGuard> {
+        let sh = which::which("sh").ok()?;
+        Some(crate::session::test_support::EnvGuard::set(&[(
+            "SHELL", &sh,
+        )]))
+    }
+
     #[test]
     fn test_hooks_config_empty() {
         let hooks = HooksConfig::default();
@@ -1793,7 +1807,8 @@ mod tests {
 
     #[test]
     fn test_run_before_start_hooks_collects_kv() {
-        // Real host shell; multiple commands, later command's keys appended.
+        let _shell = pin_host_shell();
+        // Multiple commands; later command's keys appended.
         let tmp = tempfile::tempdir().unwrap();
         let cmds = vec![
             "echo GH_TOKEN=ghs_abc".to_string(),
@@ -1812,6 +1827,7 @@ mod tests {
 
     #[test]
     fn test_run_before_start_hooks_reads_session_env() {
+        let _shell = pin_host_shell();
         // A per-session value reaches the hook and can scope what it mints.
         let tmp = tempfile::tempdir().unwrap();
         let cmds = vec!["echo \"GH_TOKEN=tok-$TEST_VAR\"".to_string()];
@@ -1826,6 +1842,7 @@ mod tests {
 
     #[test]
     fn test_run_before_start_hooks_hard_fail() {
+        let _shell = pin_host_shell();
         let tmp = tempfile::tempdir().unwrap();
         let cmds = vec!["exit 3".to_string()];
         let err = run_before_start_hooks(&cmds, tmp.path(), &[], &[])
@@ -1835,6 +1852,7 @@ mod tests {
 
     #[test]
     fn test_run_before_start_hooks_error_omits_stdout_secret() {
+        let _shell = pin_host_shell();
         // A failing hook may have already printed secret KEY=VALUE lines; those
         // must never appear in the error (which can be logged/displayed). The
         // secret is supplied via env so it lives only in the hook's stdout, not
@@ -1888,6 +1906,7 @@ mod tests {
 
     #[test]
     fn test_run_before_session_hooks_collects_kv() {
+        let _shell = pin_host_shell();
         // The host counterpart of `before_start`: same stdout contract, so the
         // account/provider env a switcher prints is picked up verbatim.
         let tmp = tempfile::tempdir().unwrap();
@@ -1914,6 +1933,7 @@ mod tests {
 
     #[test]
     fn test_run_before_session_hooks_reads_lifecycle_env() {
+        let _shell = pin_host_shell();
         // The hook resolves what to mint from the session's identity, which is
         // the whole point of running it per launch rather than reading a file.
         let tmp = tempfile::tempdir().unwrap();
@@ -1932,6 +1952,7 @@ mod tests {
 
     #[test]
     fn test_run_before_session_hooks_error_names_before_session() {
+        let _shell = pin_host_shell();
         // A failure must point at the config key the user wrote, not at
         // `before_start`, and must still withhold stdout (the secret channel).
         let tmp = tempfile::tempdir().unwrap();
@@ -2729,6 +2750,7 @@ trusted_at = "2026-01-31T00:00:00Z"
     ///   3. `GIT_ASKPASS` / `SSH_ASKPASS` are defanged
     #[test]
     fn streamed_hook_detached_from_tty() {
+        let _shell = pin_host_shell();
         let tmp = tempfile::tempdir().unwrap();
         let probe = r#"
             if [ -t 0 ]; then echo "STDIN=tty"; else echo "STDIN=notty"; fi
@@ -2779,6 +2801,7 @@ trusted_at = "2026-01-31T00:00:00Z"
     /// that explains why the hook failed.
     #[test]
     fn streamed_hook_failure_error_includes_output() {
+        let _shell = pin_host_shell();
         let tmp = tempfile::tempdir().unwrap();
         // The failure detail lives in a script file, not the hook command
         // line, mirroring real hooks (`npm install`, `./setup.sh`) whose
@@ -2808,6 +2831,7 @@ trusted_at = "2026-01-31T00:00:00Z"
     /// later hooks ran.
     #[test]
     fn streamed_hook_failure_names_position_when_multiple() {
+        let _shell = pin_host_shell();
         let tmp = tempfile::tempdir().unwrap();
         let hooks = vec![
             "true".to_string(),
@@ -2829,6 +2853,7 @@ trusted_at = "2026-01-31T00:00:00Z"
     /// text omits the "remaining hooks skipped" suffix.
     #[test]
     fn streamed_hook_failure_omits_skip_note_for_last_hook() {
+        let _shell = pin_host_shell();
         let tmp = tempfile::tempdir().unwrap();
         let hooks = vec!["true".to_string(), "sh -c 'exit 7'".to_string()];
         let (tx, _rx) = mpsc::channel();
@@ -2842,6 +2867,7 @@ trusted_at = "2026-01-31T00:00:00Z"
     /// A single hook keeps the error free of position noise.
     #[test]
     fn streamed_hook_failure_omits_position_when_single() {
+        let _shell = pin_host_shell();
         let tmp = tempfile::tempdir().unwrap();
         let (tx, _rx) = mpsc::channel();
         let err = execute_hooks_streamed(&["sh -c 'exit 7'".to_string()], tmp.path(), &tx, &[])
@@ -2858,6 +2884,7 @@ trusted_at = "2026-01-31T00:00:00Z"
     #[serial_test::serial]
     fn captured_hook_does_not_force_git_env() {
         let _env = crate::session::test_support::EnvGuard::unset(&["GIT_TERMINAL_PROMPT"]);
+        let _shell = pin_host_shell();
         let tmp = tempfile::tempdir().unwrap();
         let probe = "echo \"GIT_TERMINAL_PROMPT=${GIT_TERMINAL_PROMPT:-unset}\" > out.txt";
         execute_hooks(&[probe.to_string()], tmp.path(), &[]).unwrap();
@@ -2927,6 +2954,7 @@ trusted_at = "2026-01-31T00:00:00Z"
     /// `detach_tty` flag on `execute_hooks_best_effort` actually flows through.
     #[test]
     fn best_effort_hook_detaches_when_requested() {
+        let _shell = pin_host_shell();
         let tmp = tempfile::tempdir().unwrap();
         let probe = "echo \"GIT_TERMINAL_PROMPT=${GIT_TERMINAL_PROMPT:-unset}\" > out.txt";
         let errors = execute_hooks_best_effort(&[probe.to_string()], tmp.path(), true, &[]);
@@ -2947,6 +2975,7 @@ trusted_at = "2026-01-31T00:00:00Z"
     #[serial_test::serial]
     fn best_effort_hook_attached_for_cli() {
         let _env = crate::session::test_support::EnvGuard::unset(&["GIT_TERMINAL_PROMPT"]);
+        let _shell = pin_host_shell();
         let tmp = tempfile::tempdir().unwrap();
         let probe = "echo \"GIT_TERMINAL_PROMPT=${GIT_TERMINAL_PROMPT:-unset}\" > out.txt";
         let errors = execute_hooks_best_effort(&[probe.to_string()], tmp.path(), false, &[]);
@@ -3027,6 +3056,7 @@ trusted_at = "2026-01-31T00:00:00Z"
     /// paths so a regression in any one of them fails this test.
     #[test]
     fn local_hooks_see_session_env_vars() {
+        let _shell = pin_host_shell();
         use crate::session::Instance;
 
         let tmp = tempfile::tempdir().unwrap();
