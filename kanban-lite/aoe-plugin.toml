@@ -1,0 +1,70 @@
+id = "dev.karl.kanban-lite"
+name = "Kanban Lite"
+version = "0.1.0"
+api_version = 12
+aoe_version = ">=1.14.0, <2.0.0"
+description = "Read-only Kanban board view of your Agent of Empires sessions."
+icon = "layout-grid"
+
+capabilities = ["runtime.worker", "session.read"]
+
+[[settings]]
+key = "default_grouping"
+label = "Default board grouping"
+description = "How sessions are grouped into columns on the Kanban board."
+type = "select"
+options = ["status", "repo"]
+default = "status"
+
+[[settings]]
+key = "refresh_secs"
+label = "Board refresh interval (seconds)"
+description = "How often the worker polls AOE for session changes. The dashboard polls the worker's settings-page entry independently every few seconds."
+type = "integer"
+default = 30
+min = 0
+max = 300
+advanced = true
+
+[[settings]]
+key = "show_row_column"
+label = "Show Kanban status in session row"
+description = "Show a compact status cell on each session row in the sidebar."
+type = "boolean"
+default = true
+
+[[settings]]
+key = "excluded_statuses"
+label = "Excluded statuses"
+description = "Comma-separated list of status columns to hide from the board: running, waiting, idle, error, starting, stopped, unknown, deleting, creating."
+type = "string"
+default = "stopped,unknown"
+advanced = true
+
+[[ui]]
+slot = "settings-page"
+id = "kanban_board"
+
+[[ui]]
+slot = "row-column"
+id = "kanban_status"
+
+[[ui]]
+slot = "sort-key"
+id = "kanban_status_sort"
+
+[[ui]]
+slot = "filter-facet"
+id = "kanban_status_filter"
+
+[runtime]
+kind = "command"
+command = [".aoe-build/venv/bin/aoe-kanban-lite-worker"]
+
+[[runtime.build]]
+command = ["python3", "-m", "venv", "--copies", ".aoe-build/venv"]
+platforms = ["linux", "macos"]
+
+[[runtime.build]]
+command = [".aoe-build/venv/bin/pip", "install", "."]
+platforms = ["linux", "macos"]
