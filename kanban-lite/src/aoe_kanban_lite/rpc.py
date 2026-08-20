@@ -4,32 +4,50 @@ from __future__ import annotations
 
 import json
 import sys
-from dataclasses import dataclass, field
 from typing import Any, TextIO
 
 
 class EOFReached(Exception):
-    """Raised when stdin reaches EOF."""
+    """Raised when stdin reaches EOF or closes mid-line."""
+
+
+class ProtocolTimeout(Exception):
+    """Raised when the host does not respond to a JSON-RPC request in time."""
 
 
 def read_message(stream: TextIO) -> dict[str, Any] | None:
     """Read one newline-delimited JSON-RPC message.
 
-    Returns None on EOF. Raises EOFReached if the stream closes mid-line after
-    non-whitespace content.
+    Blank and malformed frames are skipped so a single bad line cannot shut
+    down the worker. Returns ``None`` only when the stream reaches a clean EOF.
+    Raises ``EOFReached`` if the stream closes mid-line after non-whitespace
+    content. Rejects JSON values that are not objects.
     """
-    line = stream.readline()
-    if not line:
-        return None
-    line = line.strip()
-    if not line:
-        return None
-    try:
-        return json.loads(line)
-    except json.JSONDecodeError as exc:
-        # Log to stderr so it shows up in the worker log but does not crash us.
-        print(f"[kanban-lite] malformed JSON-RPC line: {exc}", file=sys.stderr)
-        return None
+    while True:
+        raw_line = stream.readline()
+        if raw_line == "":
+            return None
+
+        # A line that is not newline-terminated and contains non-whitespace
+        # data means the stream closed mid-frame.
+        if not raw_line.endswith("\n") and raw_line.strip():
+            raise EOFReached()
+
+        line = raw_line.strip()
+        if not line:
+            continue
+
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError as exc:
+            print(f"[kanban-lite] malformed JSON-RPC line: {exc}", file=sys.stderr)
+            continue
+
+        if not isinstance(message, dict):
+            print("[kanban-lite] JSON-RPC frame must be an object", file=sys.stderr)
+            continue
+
+        return message
 
 
 def write_message(stream: TextIO, msg: dict[str, Any]) -> None:
@@ -64,35 +82,3 @@ def make_response(req_id: int, result: Any) -> dict[str, Any]:
 
 def make_error(req_id: int, code: int, message: str) -> dict[str, Any]:
     return {"jsonrpc": "2.0", "id": req_id, "error": {"code": code, "message": message}}
-
-
-@dataclass
-class JsonRpcClient:
-    """Synchronous JSON-RPC client that reads/writes a single stream pair.
-
-    The AOE plugin host speaks newline-delimited JSON-RPC over the worker's
-    stdin/stdout. This client is intentionally simple: one request in flight at
-    a time, blocking reads. The stdin reader thread enqueues incoming messages;
-    the main loop uses this client to pull responses.
-    """
-
-    in_stream: TextIO
-    out_stream: TextIO
-    next_id: int = field(default=1)
-
-    def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
-        """Send a request and block until the matching response arrives."""
-        req_id = self.next_id
-        self.next_id += 1
-        write_message(self.out_stream, make_request(method, params, req_id))
-        while True:
-            msg = read_message(self.in_stream)
-            if msg is None:
-                raise EOFReached()
-            if is_response(msg) and msg.get("id") == req_id:
-                if "error" in msg:
-                    raise RuntimeError(f"RPC error: {msg['error']}")
-                return msg.get("result", {})
-
-    def notify(self, method: str, params: dict[str, Any]) -> None:
-        write_message(self.out_stream, make_notification(method, params))

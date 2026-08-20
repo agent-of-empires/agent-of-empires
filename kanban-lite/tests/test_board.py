@@ -68,6 +68,15 @@ def test_group_by_repo_overflow():
     assert len(columns[-1].sessions) == 15 - 4
 
 
+def test_group_by_repo_scratch_counts_toward_max_columns():
+    sessions = [_session(str(i), f"S{i}", "Running", f"/work/repo-{i}") for i in range(12)]
+    sessions.append(_session("scratch", "No repo", "Idle", None))
+    columns = group_by_repo(sessions)  # default max_columns=12
+    assert len(columns) == 12
+    assert columns[0].title == "Scratch / no repo"
+    assert columns[-1].title.startswith("More repos")
+
+
 def test_parse_excluded_statuses():
     assert parse_excluded_statuses("stopped, unknown") == {"stopped", "unknown"}
     assert parse_excluded_statuses("") == set()

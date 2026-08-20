@@ -70,3 +70,26 @@ def test_settings_page_payload_fits_64k():
     payload = build_settings_page_payload("status", columns)
     encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     assert len(encoded) <= 64 * 1024
+
+
+def test_settings_page_payload_clamps_oversized_fields():
+    long_title = "x" * 10_000
+    long_path = "/work/" + "y" * 10_000
+    sessions = [_session("1", long_title, "Running", long_path)]
+    columns = group_by_status(sessions, set())
+    payload = build_settings_page_payload("status", columns)
+    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    assert len(encoded) <= 64 * 1024
+
+
+def test_settings_page_payload_adds_truncation_warning():
+    sessions = [_session(str(i), f"Session {i}", "Running", f"/work/repo-{i}") for i in range(2000)]
+    columns = group_by_status(sessions, set())
+    payload = build_settings_page_payload("status", columns)
+    encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+    assert len(encoded) <= 64 * 1024
+    # The warning note is only appended when rows were dropped.
+    kinds = [b["kind"] for b in payload["blocks"]]
+    assert "note" in kinds
+    notes = [b for b in payload["blocks"] if b["kind"] == "note"]
+    assert any("Showing" in b.get("text", "") for b in notes)

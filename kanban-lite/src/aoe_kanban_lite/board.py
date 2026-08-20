@@ -67,17 +67,20 @@ def group_by_repo(sessions: list[Session], max_columns: int = 12) -> list[Column
         return Column(title=title, tone="neutral", sessions=sessions_in_group)
 
     columns: list[Column] = []
+    # Reserve one column for Scratch so total columns never exceed max_columns.
+    repo_capacity = max_columns - 1 if scratch else max_columns
+
     if scratch:
         columns.append(make_column("Scratch / no repo", scratch))
 
-    if len(sorted_repos) <= max_columns:
+    if len(sorted_repos) <= repo_capacity:
         for repo in sorted_repos:
             columns.append(make_column(repo, groups[repo]))
     else:
-        for repo in sorted_repos[: max_columns - 1]:
+        for repo in sorted_repos[: repo_capacity - 1]:
             columns.append(make_column(repo, groups[repo]))
         overflow: list[Session] = []
-        for repo in sorted_repos[max_columns - 1 :]:
+        for repo in sorted_repos[repo_capacity - 1 :]:
             overflow.extend(groups[repo])
         columns.append(make_column(f"More repos ({len(overflow)})", overflow))
 

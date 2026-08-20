@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import json
+import queue
 import subprocess
+import threading
 import time
 from pathlib import Path
 
@@ -41,11 +43,32 @@ def worker_path() -> Path:
     return WORKER
 
 
-def _read_line(proc: subprocess.Popen) -> dict | None:
-    line = proc.stdout.readline()
-    if not line:
-        return None
-    return json.loads(line)
+class _TimeoutReader:
+    """Background reader so stdout.readline() cannot block a test forever."""
+
+    def __init__(self, stream):
+        self._stream = stream
+        self._queue: queue.Queue[dict | None] = queue.Queue()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _run(self) -> None:
+        for line in self._stream:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                self._queue.put(json.loads(line))
+            except json.JSONDecodeError:
+                # Mirroring the worker: skip malformed frames.
+                pass
+        self._queue.put(None)
+
+    def get(self, timeout: float) -> dict | None:
+        try:
+            return self._queue.get(timeout=timeout)
+        except queue.Empty as exc:
+            raise TimeoutError(f"no worker output within {timeout}s") from exc
 
 
 def _write_line(proc: subprocess.Popen, msg: dict) -> None:
@@ -65,11 +88,14 @@ def _reply_to_config_get(proc: subprocess.Popen, msg: dict) -> None:
     )
 
 
-def _collect_ui_state_sets(proc: subprocess.Popen, min_count: int, deadline: float = 5.0) -> list[dict]:
+def _collect_ui_state_sets(
+    reader: _TimeoutReader, min_count: int, deadline: float = 5.0
+) -> list[dict]:
     payloads: list[dict] = []
     end = time.time() + deadline
     while time.time() < end and len(payloads) < min_count:
-        msg = _read_line(proc)
+        remaining = max(0.0, end - time.time())
+        msg = reader.get(timeout=remaining)
         if msg is None:
             break
         if msg.get("method") == "ui.state.set":
@@ -84,17 +110,18 @@ def test_worker_startup_and_refresh(worker_path: Path) -> None:
         stdout=subprocess.PIPE,
         text=True,
     )
+    reader = _TimeoutReader(proc.stdout)
 
     try:
         # Reply to the four startup config.get requests.
         for _ in range(len(CONFIG_VALUES)):
-            msg = _read_line(proc)
+            msg = reader.get(timeout=5.0)
             assert msg is not None
             assert msg["method"] == "config.get"
             _reply_to_config_get(proc, msg)
 
         # The worker should now call sessions.list.
-        msg = _read_line(proc)
+        msg = reader.get(timeout=5.0)
         assert msg is not None
         assert msg["method"] == "sessions.list"
         sessions_id = msg["id"]
@@ -104,7 +131,7 @@ def test_worker_startup_and_refresh(worker_path: Path) -> None:
             {"jsonrpc": "2.0", "id": sessions_id, "result": SAMPLE_SESSIONS},
         )
 
-        payloads = _collect_ui_state_sets(proc, min_count=4)
+        payloads = _collect_ui_state_sets(reader, min_count=4)
         slots = {p["slot"] for p in payloads}
         assert "settings-page" in slots
         assert "sort-key" in slots
@@ -125,7 +152,8 @@ def test_worker_startup_and_refresh(worker_path: Path) -> None:
         seen_keys: set[str] = set()
         end = time.time() + 5.0
         while time.time() < end and len(seen_keys) < len(CONFIG_VALUES):
-            msg = _read_line(proc)
+            remaining = max(0.0, end - time.time())
+            msg = reader.get(timeout=remaining)
             if msg is None:
                 break
             if msg.get("method") == "config.get":
@@ -135,9 +163,47 @@ def test_worker_startup_and_refresh(worker_path: Path) -> None:
         assert seen_keys == set(CONFIG_VALUES.keys())
 
         # After re-reading settings, it should refresh sessions again.
-        msg = _read_line(proc)
+        msg = reader.get(timeout=5.0)
         assert msg is not None
         assert msg["method"] == "sessions.list"
+
+    finally:
+        proc.stdin.close()
+        proc.terminate()
+        proc.wait(timeout=5)
+
+
+def test_worker_skips_malformed_input(worker_path: Path) -> None:
+    proc = subprocess.Popen(
+        [str(worker_path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    reader = _TimeoutReader(proc.stdout)
+
+    try:
+        # Answer startup config.get requests.
+        for _ in range(len(CONFIG_VALUES)):
+            msg = reader.get(timeout=5.0)
+            assert msg is not None
+            assert msg["method"] == "config.get"
+            _reply_to_config_get(proc, msg)
+
+        msg = reader.get(timeout=5.0)
+        assert msg is not None
+        assert msg["method"] == "sessions.list"
+        sessions_id = msg["id"]
+
+        # Send garbage that the worker should skip, then a valid response.
+        proc.stdin.write("\n")
+        proc.stdin.write("not json\n")
+        proc.stdin.write("42\n")
+        _write_line(proc, {"jsonrpc": "2.0", "id": sessions_id, "result": SAMPLE_SESSIONS})
+
+        payloads = _collect_ui_state_sets(reader, min_count=4)
+        slots = {p["slot"] for p in payloads}
+        assert "settings-page" in slots
 
     finally:
         proc.stdin.close()

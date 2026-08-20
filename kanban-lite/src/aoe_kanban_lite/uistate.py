@@ -51,14 +51,23 @@ def ui_state_remove(
     return msg
 
 
+def _clamp_text(value: str | None, max_len: int = 200) -> str | None:
+    """Clamp long strings so a single row cannot blow the payload budget."""
+    if value is None:
+        return None
+    if len(value) <= max_len:
+        return value
+    return value[: max_len - 1] + "…"
+
+
 def _row_block(session: Session) -> dict[str, Any]:
     """Build a row block for a session inside a column."""
-    sublabel_parts = [session.tool] if session.tool else []
+    sublabel_parts = [_clamp_text(session.tool)] if session.tool else []
     if session.project_path:
-        sublabel_parts.append(session.project_path)
+        sublabel_parts.append(_clamp_text(session.project_path))
     return {
         "kind": "row",
-        "label": session.title or "Untitled",
+        "label": _clamp_text(session.title) or "Untitled",
         "sublabel": " · ".join(sublabel_parts) if sublabel_parts else None,
         "icon": "play" if session.kanban_status == "running" else "circle",
         "tone": STATUS_TONES.get(session.kanban_status, "neutral"),
@@ -112,6 +121,10 @@ def build_settings_page_payload(
     return _truncate_settings_payload(payload)
 
 
+def _count_rows(section: dict[str, Any]) -> int:
+    return len([c for c in section.get("children", []) if c.get("kind") == "row"])
+
+
 def _truncate_settings_payload(
     payload: dict[str, Any],
     max_bytes: int = MAX_PAYLOAD_BYTES,
@@ -119,7 +132,8 @@ def _truncate_settings_payload(
     """Trim the payload to fit within max_bytes.
 
     Keeps at least one row per non-empty column. Adds a note when truncation
-    occurs.
+    occurs. Performs a final size check after adding the warning and, if the
+    payload is still too large, drops whole columns from the end.
     """
     encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     if len(encoded) <= max_bytes:
@@ -136,7 +150,7 @@ def _truncate_settings_payload(
         return payload
 
     total_sessions = sum(
-        len(section.get("children", [])) - 1
+        _count_rows(section)
         for section in columns_block.get("children", [])
         if section.get("kind") == "section"
     )
@@ -150,9 +164,9 @@ def _truncate_settings_payload(
         longest_section: dict[str, Any] | None = None
         longest_len = 0
         for section in columns_block.get("children", []):
-            children = [c for c in section.get("children", []) if c.get("kind") == "row"]
-            if len(children) > longest_len:
-                longest_len = len(children)
+            rows = _count_rows(section)
+            if rows > longest_len:
+                longest_len = rows
                 longest_section = section
 
         if longest_section is None or longest_len <= 1:
@@ -167,19 +181,17 @@ def _truncate_settings_payload(
                 break
         longest_section["children"] = children
         # Update title/badge count.
-        row_count = len([c for c in children if c.get("kind") == "row"])
+        row_count = _count_rows(longest_section)
         title = longest_section.get("title", "")
-        if " (" in title:
-            base = title.split(" (")[0]
-        else:
-            base = title
+        base = title.split(" (")[0] if " (" in title else title
         longest_section["title"] = f"{base} ({row_count})"
         badge = longest_section.get("badges", [{}])[0]
         badge["text"] = str(row_count)
 
     remaining = sum(
-        len([c for c in section.get("children", []) if c.get("kind") == "row"])
+        _count_rows(section)
         for section in columns_block.get("children", [])
+        if section.get("kind") == "section"
     )
     if remaining < total_sessions:
         blocks.append(
@@ -193,6 +205,17 @@ def _truncate_settings_payload(
             }
         )
         payload["blocks"] = blocks
+
+    # Final safety pass: if the warning note pushed us back over the limit,
+    # drop columns from the end until we fit.
+    while True:
+        encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
+        if len(encoded) <= max_bytes:
+            break
+        children = columns_block.get("children", [])
+        if len(children) <= 1:
+            break
+        children.pop()
 
     return payload
 

@@ -8,7 +8,7 @@ import threading
 from typing import Any
 
 from .board import group_by_repo, group_by_status, parse_excluded_statuses
-from .rpc import EOFReached, is_notification, is_response, read_message, write_message
+from .rpc import EOFReached, ProtocolTimeout, is_notification, is_response, read_message, write_message
 from .session_model import session_from_json
 from .uistate import (
     build_filter_facet_payload,
@@ -27,6 +27,9 @@ DEFAULT_SETTINGS: dict[str, Any] = {
 }
 
 SETTING_KEYS = list(DEFAULT_SETTINGS.keys())
+
+# How long the worker waits for a single JSON-RPC response before giving up.
+PROTOCOL_TIMEOUT_SECS = 10.0
 
 
 class KanbanWorker:
@@ -97,7 +100,12 @@ class KanbanWorker:
             {"jsonrpc": "2.0", "id": req_id, "method": method, "params": params},
         )
         while True:
-            msg = self.inbound_queue.get()
+            try:
+                msg = self.inbound_queue.get(timeout=PROTOCOL_TIMEOUT_SECS)
+            except queue.Empty as exc:
+                raise ProtocolTimeout(
+                    f"no response to {method} after {PROTOCOL_TIMEOUT_SECS}s"
+                ) from exc
             if msg is None:
                 raise EOFReached()
             if is_response(msg):
