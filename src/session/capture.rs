@@ -241,10 +241,20 @@ fn scan_claude_project_dir(
             continue;
         }
 
-        let modified = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        // `fs::metadata` rather than `DirEntry::metadata`/`file_type`, which
+        // describe the link rather than its target. A symlinked transcript has
+        // to keep counting (#3399's workaround tells users to make one), and
+        // following the link reports the target's mtime, the one that advances
+        // as Claude appends. A directory, FIFO or dangling link named
+        // `<uuid>.jsonl` is otherwise handed back as a resume id with no
+        // transcript behind it.
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
         if known == Some(stem) && !exclusion.contains(stem) {
             known_hit = Some((stem.to_string(), modified));
@@ -6600,5 +6610,42 @@ mod tests {
             "drain must be bounded by the deadline even while the pipe stays open"
         );
         assert!(out.is_empty() || out == b"done");
+    }
+
+    #[test]
+    fn test_scan_skips_a_directory_named_like_a_transcript() {
+        let home = tempfile::tempdir().unwrap();
+        let project = std::path::Path::new("/tmp/scan-dir-probe");
+        let dir = home
+            .path()
+            .join("projects")
+            .join(encode_claude_project_path(&project.to_string_lossy()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Same shape a real transcript has: `.jsonl` extension, UUID stem.
+        std::fs::create_dir(dir.join("11111111-1111-4111-8111-111111111111.jsonl")).unwrap();
+
+        assert_eq!(
+            scan_claude_project_dir(home.path(), project, None, &HashSet::new()).unwrap(),
+            None,
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_scan_follows_a_symlinked_transcript() {
+        let home = tempfile::tempdir().unwrap();
+        let project = std::path::Path::new("/tmp/scan-link-probe");
+        let dir = home
+            .path()
+            .join("projects")
+            .join(encode_claude_project_path(&project.to_string_lossy()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = home.path().join("real.jsonl");
+        std::fs::write(&real, "{}\n").unwrap();
+        let sid = "22222222-2222-4222-8222-222222222222";
+        std::os::unix::fs::symlink(&real, dir.join(format!("{sid}.jsonl"))).unwrap();
+
+        let found = scan_claude_project_dir(home.path(), project, None, &HashSet::new()).unwrap();
+        assert_eq!(found.map(|(id, _)| id), Some(sid.to_string()));
     }
 }
