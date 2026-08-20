@@ -6,8 +6,8 @@
 
 use std::ffi::OsStr;
 use std::path::Path;
-use std::process::{Command, Output};
-use std::time::Instant;
+use std::process::{Command, Output, Stdio};
+use std::time::{Duration, Instant};
 
 /// Run `git <args>` in `cwd`, instrumented with target `git.command`.
 /// Logs a debug line before, then debug (success) or warn (failure)
@@ -96,6 +96,71 @@ where
     Ok(output)
 }
 
+/// Like [`run_git`], but kills the child if it outlives `timeout` and reports
+/// the timeout as `Ok(None)`.
+///
+/// Used for bounded git mutations that normally finish quickly but could
+/// otherwise hang indefinitely on a stalled filesystem. stdin is nulled so a
+/// child can never block on a prompt, and `run_with_timeout` drains
+/// stdout/stderr on a deadline so a grandchild holding a pipe cannot stall the
+/// wait past `timeout`.
+pub fn run_git_with_timeout<I, S>(
+    cwd: &Path,
+    args: I,
+    timeout: Duration,
+) -> std::io::Result<Option<Output>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    let argv: Vec<std::ffi::OsString> = args.into_iter().map(|a| a.as_ref().to_owned()).collect();
+    let redacted: Vec<String> = argv.iter().map(|a| redact(a.as_os_str())).collect();
+    let start = Instant::now();
+    tracing::debug!(
+        target: "git.command",
+        args = ?redacted,
+        cwd = %cwd.display(),
+        timeout_s = timeout.as_secs(),
+        "running git with timeout"
+    );
+    let mut cmd = Command::new("git");
+    cmd.args(&argv)
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .env("LC_ALL", "C");
+    let result = crate::process::run_with_timeout_process_group(&mut cmd, timeout)?;
+    let dur = start.elapsed().as_millis() as u64;
+    match &result {
+        Some(output) if output.status.success() => tracing::debug!(
+            target: "git.command",
+            args = ?redacted,
+            exit = output.status.code(),
+            duration_ms = dur,
+            "git command completed"
+        ),
+        Some(output) => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let stderr_summary: String = stderr.chars().take(200).collect();
+            tracing::warn!(
+                target: "git.command",
+                args = ?redacted,
+                exit = output.status.code(),
+                duration_ms = dur,
+                stderr_summary = %stderr_summary,
+                "git command failed"
+            );
+        }
+        None => tracing::warn!(
+            target: "git.command",
+            args = ?redacted,
+            duration_ms = dur,
+            timeout_s = timeout.as_secs(),
+            "git command timed out and was killed"
+        ),
+    }
+    Ok(result)
+}
+
 fn redact(arg: &OsStr) -> String {
     let s = arg.to_string_lossy();
     if let Some(scheme_end) = s.find("://") {
@@ -146,6 +211,22 @@ mod tests {
                 )),
             }
         });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn run_git_with_timeout_kills_a_stalled_command() {
+        let tmp = tempfile::tempdir().unwrap();
+        let fifo = tmp.path().join("blocked-input");
+        let status = Command::new("mkfifo")
+            .arg(&fifo)
+            .status()
+            .expect("mkfifo should spawn");
+        assert!(status.success(), "mkfifo should create the fixture");
+        let args = [OsString::from("hash-object"), fifo.into_os_string()];
+        let result = run_git_with_timeout(tmp.path(), args, Duration::from_millis(10))
+            .expect("git should spawn");
+        assert!(result.is_none(), "git blocked on the FIFO must time out");
     }
 
     #[test]

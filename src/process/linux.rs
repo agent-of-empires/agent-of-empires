@@ -6,6 +6,10 @@ use std::path::Path;
 #[cfg(feature = "serve")]
 use std::process::{Child, ChildStdin, Command, Stdio};
 
+pub(super) use super::unix::{
+    configure_process_group, kill_process_group, terminate_process_group,
+};
+
 /// Collect `pid` and every descendant by walking `/proc` once to build a
 /// parent -> children map, then descending it. One `/proc` scan regardless of
 /// tree depth.

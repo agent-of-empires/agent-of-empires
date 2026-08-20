@@ -3,6 +3,10 @@
 use std::collections::HashMap;
 use std::process::Command;
 
+pub(super) use super::unix::{
+    configure_process_group, kill_process_group, terminate_process_group,
+};
+
 /// Collect `pid` and every descendant by parsing `ps -A` once and walking the map.
 pub(super) fn collect_pid_tree(pid: u32) -> Vec<u32> {
     let children_map = build_children_map();
