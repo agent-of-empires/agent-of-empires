@@ -10710,6 +10710,7 @@ mod tests {
     /// the agent in the wrong directory. The wrapper must re-assert
     /// `working_dir` inside the login shell's own script, after profile
     /// sourcing, so it wins regardless of what those files did.
+    ///
     /// `#[serial]` on the default key, not `shell_env`: this resolves `bash`
     /// through the inherited `PATH`, and every test that mutates `PATH`
     /// process-globally (`update::install`, `acp::node`, `acp::acp_client`)
