@@ -2238,8 +2238,15 @@ impl Instance {
     }
 
     /// Mark the session archived. Archived sessions sink to the bottom of
-    /// the Attention sort and render in italic+dim style, but remain
-    /// visible. Auto-cleared by the attention-signal hook on Waiting/Error.
+    /// the Attention sort and render in italic+dim style, but remain visible.
+    /// Archive suppresses the attention signal rather than the signal
+    /// clearing archive: `is_urgent` returns false while archived, and the
+    /// attention sort short-circuits the row to its bottom tier.
+    ///
+    /// Cleared by `unarchive`, by `touch_last_accessed`, and by `favorite`
+    /// and `pin` through the mutual exclusion below; not by `snooze`.
+    /// `merge_user_action_diff` mirrors those onto disk, and #3465 tracks a
+    /// status transition reaching that mirror without a user gesture.
     ///
     /// Mutual exclusion with `favorite`, `snooze`, and `pin`: archiving
     /// clears `favorited_at`, `snoozed_until`, and `pinned_at`. Archive
