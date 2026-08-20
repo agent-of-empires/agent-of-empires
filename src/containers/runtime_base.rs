@@ -10,6 +10,22 @@ use std::time::{Duration, Instant};
 /// image on a slow link still completes; it only fires on a wedged pull.
 const PULL_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Upper bound on a single short-lived container-runtime control command
+/// (inspect, start, stop, rm, volume ls/rm) issued through
+/// [`RuntimeBase::probe_output`]. Unlike an image pull, these are local
+/// control-plane round-trips that return in well under a second against a
+/// healthy Docker, Podman, or Apple Container runtime; the only way one blocks
+/// is a wedged daemon or a `stop`/`rm -f` whose target ignores SIGTERM through
+/// its grace period. Sized above the default 10s stop grace so a legitimate
+/// slow stop still completes, yet bounded so a hung runtime cannot park a
+/// caller forever.
+const RUNTIME_CMD_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Upper bound for arbitrary commands executed inside a container. The only
+/// direct caller deletes a sandbox worktree tree, which can legitimately take
+/// much longer than a local control-plane probe but must not hang forever.
+const RUNTIME_EXEC_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// Shared implementation for container runtimes.
 ///
 /// Captures the behavioral differences between runtimes (Docker, Apple Container, etc.)
@@ -256,48 +272,72 @@ impl RuntimeBase {
         Command::new(self.binary)
     }
 
-    /// Run `cmd` and capture its output, mapping a missing-binary spawn
-    /// failure to the actionable [`DockerError::NotInstalled`].
+    /// Run `cmd` under `RUNTIME_CMD_TIMEOUT` and capture its output, mapping a
+    /// missing-binary spawn failure to the actionable [`DockerError::NotInstalled`]
+    /// and a timeout to a single-line [`DockerError::IoError`].
     ///
-    /// `Command::output()` short-circuits with `io::ErrorKind::NotFound` when
-    /// the runtime binary is not on `PATH`. The bare `?` conversion routes
-    /// that through `#[from] std::io::Error` into the opaque
-    /// [`DockerError::IoError`], hiding the one variant whose Display tells
-    /// the operator how to fix it ("Docker is not installed or not in PATH.
-    /// Install: ..."). Every `.output()?` call site that propagates its
-    /// error goes through this wrapper so the not-installed case surfaces
-    /// with its remediation intact; all other IO errors propagate unchanged.
+    /// `cmd.spawn()` short-circuits with `io::ErrorKind::NotFound` when the
+    /// runtime binary is not on `PATH`. The bare `?` conversion routes that
+    /// through `#[from] std::io::Error` into the opaque [`DockerError::IoError`],
+    /// hiding the one variant whose Display tells the operator how to fix it
+    /// ("Docker is not installed or not in PATH. Install: ..."). Every call site
+    /// that propagates its error goes through this wrapper so the not-installed
+    /// case surfaces with its remediation intact; all other IO errors propagate
+    /// unchanged.
+    ///
+    /// The timeout is what makes every short container-runtime control command
+    /// (inspect, start, stop, rm, volume ls/rm) bounded: a wedged runtime is
+    /// killed at the deadline instead of blocking the caller forever. A timed-out
+    /// probe surfaces as an `Err`, which the running-state gate treats
+    /// conservatively as [`super::Probe::Unknown`] (fail-closed), and a timed-out
+    /// removal as [`super::Teardown::Failed`]. Stdin is closed so a child that
+    /// unexpectedly reads never blocks on the parent terminal.
     pub fn probe_output(&self, cmd: &mut Command) -> Result<std::process::Output> {
-        cmd.output().map_err(|e| {
-            if e.kind() == std::io::ErrorKind::NotFound {
-                DockerError::NotInstalled
-            } else {
-                DockerError::IoError(e)
-            }
-        })
+        self.probe_output_with_timeout(cmd, RUNTIME_CMD_TIMEOUT)
+    }
+
+    fn probe_output_with_timeout(
+        &self,
+        cmd: &mut Command,
+        timeout: Duration,
+    ) -> Result<std::process::Output> {
+        cmd.stdin(Stdio::null());
+        match crate::process::run_with_timeout(cmd, timeout) {
+            Ok(Some(output)) => Ok(output),
+            Ok(None) => Err(DockerError::IoError(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                format!(
+                    "{} command timed out after {}s and was killed",
+                    self.binary,
+                    timeout.as_secs()
+                ),
+            ))),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(DockerError::NotInstalled),
+            Err(e) => Err(DockerError::IoError(e)),
+        }
     }
 
     pub fn is_available(&self) -> bool {
-        self.command()
-            .arg("--version")
-            .output()
-            .map(|o| o.status.success())
+        let mut cmd = self.command();
+        cmd.arg("--version");
+        self.probe_output(&mut cmd)
+            .map(|output| output.status.success())
             .unwrap_or(false)
     }
 
     pub fn is_daemon_running(&self) -> bool {
-        self.command()
-            .args(self.daemon_check_args)
-            .output()
-            .map(|o| o.status.success())
+        let mut cmd = self.command();
+        cmd.args(self.daemon_check_args);
+        self.probe_output(&mut cmd)
+            .map(|output| output.status.success())
             .unwrap_or(false)
     }
 
     pub fn image_exists_locally(&self, image: &str) -> bool {
-        self.command()
-            .args(["image", "inspect", image])
-            .output()
-            .map(|o| o.status.success())
+        let mut cmd = self.command();
+        cmd.args(["image", "inspect", image]);
+        self.probe_output(&mut cmd)
+            .map(|output| output.status.success())
             .unwrap_or(false)
     }
 
@@ -688,9 +728,7 @@ impl RuntimeBase {
 
         let mut command = self.command();
         command.args(&args);
-        let output = self.probe_output(&mut command)?;
-
-        Ok(output)
+        self.probe_output_with_timeout(&mut command, RUNTIME_EXEC_TIMEOUT)
     }
 }
 
@@ -940,6 +978,24 @@ mod tests {
         assert!(matches!(
             RuntimeBase::DOCKER.probe_output(&mut cmd),
             Err(DockerError::NotInstalled)
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn probe_output_maps_timeout_to_timed_out_io_error() {
+        assert!(
+            RUNTIME_EXEC_TIMEOUT > RUNTIME_CMD_TIMEOUT,
+            "arbitrary container work must have a wider bound than control probes"
+        );
+        let mut cmd = Command::new("sh");
+        cmd.args(["-c", "sleep 5"]);
+        let result =
+            RuntimeBase::DOCKER.probe_output_with_timeout(&mut cmd, Duration::from_millis(10));
+        assert!(matches!(
+            &result,
+            Err(DockerError::IoError(error))
+                if error.kind() == std::io::ErrorKind::TimedOut
         ));
     }
 

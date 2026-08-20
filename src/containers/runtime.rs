@@ -23,6 +23,13 @@ pub struct ContainerRuntime {
     pub(crate) kind: RuntimeKind,
 }
 
+fn is_runtime_timeout(error: &DockerError) -> bool {
+    matches!(
+        error,
+        DockerError::IoError(error) if error.kind() == std::io::ErrorKind::TimedOut
+    )
+}
+
 impl ContainerRuntime {
     pub fn docker() -> Self {
         Self {
@@ -71,18 +78,15 @@ impl ContainerRuntime {
                 // `RepoDigests` holds `repo@sha256:...` entries for the pulled
                 // manifest. One subprocess, newline-joined so a multi-registry
                 // image still lets us pick the entry matching this reference.
-                let output = self
-                    .base
-                    .command()
-                    .args([
-                        "image",
-                        "inspect",
-                        "--format",
-                        "{{range .RepoDigests}}{{println .}}{{end}}",
-                        image,
-                    ])
-                    .output()
-                    .ok()?;
+                let mut cmd = self.base.command();
+                cmd.args([
+                    "image",
+                    "inspect",
+                    "--format",
+                    "{{range .RepoDigests}}{{println .}}{{end}}",
+                    image,
+                ]);
+                let output = self.base.probe_output(&mut cmd).ok()?;
                 if !output.status.success() {
                     return None;
                 }
@@ -236,6 +240,58 @@ impl ContainerRuntime {
             })
     }
 
+    /// Read the runtime's authoritative container identifier after a create
+    /// command whose client-side timeout made its result indeterminate.
+    fn inspect_container_id(&self, name: &str) -> Result<String> {
+        let mut cmd = self.base.command();
+        match self.kind {
+            RuntimeKind::Docker | RuntimeKind::Podman => {
+                cmd.args(["container", "inspect", "-f", "{{.Id}}", name]);
+            }
+            RuntimeKind::AppleContainer => {
+                cmd.args(["inspect", name]);
+            }
+        }
+        let output = self.base.probe_output(&mut cmd)?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            self.base.classify_probe_failure(&stderr)?;
+            return Err(DockerError::ContainerNotFound(name.to_string()));
+        }
+
+        let id = match self.kind {
+            RuntimeKind::Docker | RuntimeKind::Podman => {
+                String::from_utf8_lossy(&output.stdout).trim().to_string()
+            }
+            RuntimeKind::AppleContainer => {
+                let payload: Value = serde_json::from_slice(&output.stdout)
+                    .map_err(|error| DockerError::InspectFailed(error.to_string()))?;
+                Self::apple_container_inspect_id(&payload)?.to_string()
+            }
+        };
+        if id.is_empty() {
+            return Err(DockerError::InspectFailed(
+                "container inspect returned an empty id".to_string(),
+            ));
+        }
+        Ok(id)
+    }
+
+    fn apple_container_inspect_id(payload: &Value) -> Result<&str> {
+        payload
+            .pointer("/0/id")
+            .or_else(|| payload.pointer("/0/configuration/id"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| {
+                DockerError::InspectFailed(
+                    "apple container inspect: no non-empty /0/id or /0/configuration/id"
+                        .to_string(),
+                )
+            })
+    }
+
     /// The container's configured working directory (`Config.WorkingDir`), or
     /// `None` if it can't be determined (container gone, inspect failed, or the
     /// field is empty). Used to backfill the create-time-pinned workdir for
@@ -249,12 +305,9 @@ impl ContainerRuntime {
         if !matches!(self.kind, RuntimeKind::Docker | RuntimeKind::Podman) {
             return None;
         }
-        let output = self
-            .base
-            .command()
-            .args(["container", "inspect", "-f", "{{.Config.WorkingDir}}", name])
-            .output()
-            .ok()?;
+        let mut cmd = self.base.command();
+        cmd.args(["container", "inspect", "-f", "{{.Config.WorkingDir}}", name]);
+        let output = self.base.probe_output(&mut cmd).ok()?;
         if !output.status.success() {
             return None;
         }
@@ -280,19 +333,43 @@ impl ContainerRuntime {
         if self.does_container_exist(name)? {
             return Err(DockerError::ContainerAlreadyExists(name.to_string()));
         }
-        self.base.run_create(name, image, config)
+        match self.base.run_create(name, image, config) {
+            Err(error) if is_runtime_timeout(&error) => match self.inspect_container_id(name) {
+                Ok(id) => Ok(id),
+                Err(_) => Err(error),
+            },
+            result => result,
+        }
     }
 
     pub fn start_container(&self, name: &str) -> Result<()> {
-        self.base.start_container(name)
+        match self.base.start_container(name) {
+            Err(error) if is_runtime_timeout(&error) => match self.is_container_running(name) {
+                Ok(true) => Ok(()),
+                _ => Err(error),
+            },
+            result => result,
+        }
     }
 
     pub fn stop_container(&self, name: &str) -> Result<()> {
-        self.base.stop_container(name)
+        match self.base.stop_container(name) {
+            Err(error) if is_runtime_timeout(&error) => match self.is_container_running(name) {
+                Ok(false) => Ok(()),
+                _ => Err(error),
+            },
+            result => result,
+        }
     }
 
     pub fn remove(&self, name: &str, force: bool) -> Result<()> {
-        self.base.remove(name, force)
+        match self.base.remove(name, force) {
+            Err(error) if is_runtime_timeout(&error) => match self.does_container_exist(name) {
+                Ok(false) => Ok(()),
+                _ => Err(error),
+            },
+            result => result,
+        }
     }
 
     pub fn exec_command(&self, name: &str, options: Option<&str>, cmd: &str) -> String {
@@ -368,21 +445,17 @@ impl ContainerRuntime {
     pub fn batch_running_states(&self, prefix: &str) -> HashMap<String, bool> {
         match self.kind {
             RuntimeKind::Docker | RuntimeKind::Podman => {
-                let output = self
-                    .base
-                    .command()
-                    .args([
-                        "ps",
-                        "-a",
-                        "--filter",
-                        &format!("name={}", prefix),
-                        "--format",
-                        "{{.Names}}\t{{.State}}",
-                    ])
-                    .output();
-
-                let output = match output {
-                    Ok(o) if o.status.success() => o,
+                let mut cmd = self.base.command();
+                cmd.args([
+                    "ps",
+                    "-a",
+                    "--filter",
+                    &format!("name={}", prefix),
+                    "--format",
+                    "{{.Names}}\t{{.State}}",
+                ]);
+                let output = match self.base.probe_output(&mut cmd) {
+                    Ok(output) if output.status.success() => output,
                     _ => return HashMap::new(),
                 };
 
@@ -424,22 +497,18 @@ impl ContainerRuntime {
                 // naming containers positionally fails the whole call with
                 // "No such container" if any one of them is gone, which is a
                 // normal state for a session whose sandbox has stopped.
-                let output = self
-                    .base
-                    .command()
-                    .args([
-                        "stats",
-                        "--no-stream",
-                        "--format",
-                        // A literal tab, not the `\t` escape: the argv reaches
-                        // the runtime without a shell, and Go template text is
-                        // emitted verbatim either way.
-                        "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.PIDs}}",
-                    ])
-                    .output();
-
-                let output = match output {
-                    Ok(o) if o.status.success() => o,
+                let mut cmd = self.base.command();
+                cmd.args([
+                    "stats",
+                    "--no-stream",
+                    "--format",
+                    // A literal tab, not the `\t` escape: the argv reaches
+                    // the runtime without a shell, and Go template text is
+                    // emitted verbatim either way.
+                    "{{.Name}}\t{{.CPUPerc}}\t{{.MemUsage}}\t{{.PIDs}}",
+                ]);
+                let output = match self.base.probe_output(&mut cmd) {
+                    Ok(output) if output.status.success() => output,
                     _ => return super::stats::StatsMap::new(),
                 };
 
@@ -554,7 +623,7 @@ mod tests {
     }
 
     #[test]
-    fn test_apple_container_inspect_state_shapes() {
+    fn test_apple_container_inspect_shapes() {
         use serde_json::json;
         // Both CLI generations (#3239) plus the drift shapes that must stay
         // Err so lifecycle gates fail closed rather than fail open (#2596).
@@ -584,6 +653,30 @@ mod tests {
                     let parsed = result.unwrap_or_else(|e| panic!("{payload}: {e}"));
                     assert_eq!(parsed, state);
                 }
+                None => assert!(result.is_err(), "expected Err for {payload}"),
+            }
+        }
+
+        let id_cases = [
+            (json!([{"id": "new-id"}]), Some("new-id")),
+            (
+                json!([{"configuration": {"id": "legacy-id"}}]),
+                Some("legacy-id"),
+            ),
+            (json!([{"id": ""}]), None),
+            (json!([{"id": "  trimmed-id  "}]), Some("trimmed-id")),
+            (json!([{"id": "   "}]), None),
+            (json!([{"id": 3}]), None),
+            (json!([{}]), None),
+            (json!([]), None),
+        ];
+        for (payload, expected) in id_cases {
+            let result = ContainerRuntime::apple_container_inspect_id(&payload);
+            match expected {
+                Some(id) => assert_eq!(
+                    result.unwrap_or_else(|error| panic!("{payload}: {error}")),
+                    id
+                ),
                 None => assert!(result.is_err(), "expected Err for {payload}"),
             }
         }
