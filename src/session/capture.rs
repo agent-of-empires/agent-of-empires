@@ -6618,22 +6618,52 @@ mod tests {
         assert!(out.is_empty() || out == b"done");
     }
 
+    /// Every entry here has the exact shape a real transcript has, a `.jsonl`
+    /// extension and a UUID stem, and nothing behind it. `main` hands all four
+    /// back as resume ids: `DirEntry::metadata` is an `lstat`, which succeeds
+    /// on all of them and reports the creation time, so they read as *fresh*
+    /// and win the `best` comparison outright.
     #[test]
-    fn test_scan_skips_a_directory_named_like_a_transcript() {
-        let home = tempfile::tempdir().unwrap();
-        let project = std::path::Path::new("/tmp/scan-dir-probe");
-        let dir = home
-            .path()
-            .join("projects")
-            .join(encode_claude_project_path(&project.to_string_lossy()));
-        std::fs::create_dir_all(&dir).unwrap();
-        // Same shape a real transcript has: `.jsonl` extension, UUID stem.
-        std::fs::create_dir(dir.join("11111111-1111-4111-8111-111111111111.jsonl")).unwrap();
+    fn test_scan_skips_entries_that_are_not_regular_files() {
+        let sid = "11111111-1111-4111-8111-111111111111";
+        for kind in ["directory", "dangling-link", "symlink-cycle", "fifo"] {
+            let home = tempfile::tempdir().unwrap();
+            let project_path = format!("/tmp/scan-probe-{kind}");
+            let project = std::path::Path::new(&project_path);
+            let dir = home
+                .path()
+                .join("projects")
+                .join(encode_claude_project_path(&project.to_string_lossy()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let entry = dir.join(format!("{sid}.jsonl"));
+            match kind {
+                "directory" => std::fs::create_dir(&entry).unwrap(),
+                #[cfg(unix)]
+                "dangling-link" => {
+                    std::os::unix::fs::symlink(dir.join("gone.jsonl"), &entry).unwrap()
+                }
+                // `fs::metadata` returns `ELOOP` here rather than spinning, so
+                // the `Err` arm is what rejects this one, not `is_file`.
+                #[cfg(unix)]
+                "symlink-cycle" => std::os::unix::fs::symlink(&entry, &entry).unwrap(),
+                #[cfg(unix)]
+                "fifo" => {
+                    // Skipped rather than failed where `mkfifo` is unavailable;
+                    // the other three rows still gate the guard.
+                    match std::process::Command::new("mkfifo").arg(&entry).status() {
+                        Ok(s) if s.success() => {}
+                        _ => continue,
+                    }
+                }
+                _ => continue,
+            }
 
-        assert_eq!(
-            scan_claude_project_dir(home.path(), project, None, &HashSet::new()).unwrap(),
-            None,
-        );
+            assert_eq!(
+                scan_claude_project_dir(home.path(), project, None, &HashSet::new()).unwrap(),
+                None,
+                "{kind} must not be handed back as a resume id",
+            );
+        }
     }
 
     #[cfg(unix)]
