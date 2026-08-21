@@ -39,8 +39,10 @@ export interface WebSettings {
   /** Auto-open a terminal pane in newly opened sessions (#3035). */
   autoOpenTerminalPane: boolean;
   /** Auto-open plugin panes (e.g. the GitHub PR pane) when available (#3035).
-   *  Unlike the diff/terminal flags this is an ongoing policy: turning it back
-   *  on can add newly available plugin panes to existing sessions too. */
+   *  Off keeps plugin panes closed by default; the activity-bar toggle still
+   *  opens them on demand. Unlike the diff/terminal flags this is an ongoing
+   *  policy: turning it back on can add newly available plugin panes to
+   *  existing sessions too. */
   autoOpenPluginPanes: boolean;
 }
 
@@ -62,7 +64,7 @@ function getDefaults(): WebSettings {
     sidebarCompact: false,
     autoOpenDiffPane: true,
     autoOpenTerminalPane: true,
-    autoOpenPluginPanes: true,
+    autoOpenPluginPanes: false,
   };
 }
 
