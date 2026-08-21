@@ -34,8 +34,8 @@ vi.mock("../diff/comments/SendCommentsDialog", () => ({
     </button>
   ),
 }));
-vi.mock("../acp/StructuredView", () => ({
-  StructuredView: () => <div data-testid="acp-view" />,
+vi.mock("../StructuredViewStack", () => ({
+  StructuredViewStack: () => <div data-testid="acp-view" />,
 }));
 
 import { MobileMainPane } from "../MobileMainPane";
@@ -90,7 +90,14 @@ function setup(overrides: Partial<Parameters<typeof MobileMainPane>[0]> = {}) {
     activeSessionId: "s1",
     sessions: [session()],
     serverAbout: null,
-    webSettings: { persistentTerminals: false, maxPersistentTerminals: 3 },
+    webSettings: {
+      persistentTerminals: false,
+      maxPersistentTerminals: 3,
+      persistentStructuredViews: false,
+      maxPersistentStructuredViews: 2,
+    },
+    onOpenAgentsPane: vi.fn(),
+    onRestoreSession: vi.fn(),
     selectedFilePath: null,
     selectedRepoName: undefined,
     revision: 0,

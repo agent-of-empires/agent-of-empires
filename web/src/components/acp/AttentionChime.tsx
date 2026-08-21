@@ -5,6 +5,9 @@ interface Props {
   approvals: number;
   /** Number of pending AskUserQuestion elicitations. */
   elicitations: number;
+  /** When false the session is mounted but inactive; suppress the chime so
+   *  backgrounded sessions don't steal audio focus. */
+  active?: boolean;
 }
 
 // Browser-side attention chime, extracted from StructuredView so the wiring
@@ -15,7 +18,7 @@ interface Props {
 // backgrounded) and the in-app toast (when foregrounded). A question
 // arriving while an approval is already pending does not re-chime, but its
 // OS push still fires on the live event edge regardless. See #1038, #2146.
-export function AttentionChime({ approvals, elicitations }: Props): null {
-  useApprovalSound(approvals + elicitations);
+export function AttentionChime({ approvals, elicitations, active = true }: Props): null {
+  useApprovalSound(active ? approvals + elicitations : 0);
   return null;
 }

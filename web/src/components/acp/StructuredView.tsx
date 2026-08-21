@@ -150,6 +150,11 @@ interface Props {
   /** Open (or focus) the Sub agents dock pane. Lets an inline async
    *  sub-agent card jump to its panel entry. */
   onOpenAgentsPane?: () => void;
+  /** When false the session is mounted but inactive (kept warm by the
+   *  persistent structured-view stack). It stays subscribed and renders,
+   *  but scroll observers, autofocus, audio, and reconnect storms are
+   *  gated so only the active session is interactive. */
+  active?: boolean;
 }
 
 const STARTER_PROMPTS = [
@@ -173,6 +178,7 @@ export function StructuredView(props: Props) {
     fileRefSession,
     onOpenAgentsPane,
     isSandboxed,
+    active = true,
   } = props;
   // Folds rows above the most recent `/clear` divider out of the
   // thread by default; the disclosure banner toggles this. Lives on
@@ -193,6 +199,7 @@ export function StructuredView(props: Props) {
               archivedAt={archivedAt}
               snoozedUntil={snoozedUntil}
               showClearedTurns={showClearedTurns}
+              active={active}
             >
               {(ctx) => (
                 <BackgroundAgentsContext.Provider
@@ -211,6 +218,7 @@ export function StructuredView(props: Props) {
                     trashedAt={trashedAt}
                     onRestore={onRestore}
                     isSandboxed={isSandboxed}
+                    active={active}
                     {...ctx}
                   />
                 </BackgroundAgentsContext.Provider>
@@ -267,15 +275,15 @@ function structuredViewFontStyle(
  *  reservation (see {@link structuredViewRootStyle}). Exported and kept tiny so
  *  the hook-to-style wiring is testable without mounting the assistant-ui
  *  runtime, mirroring the #1282 rate-limit-recovery extraction. */
-export function StructuredViewRoot({ children }: { children: React.ReactNode }) {
-  const { keyboardHeight } = useMobileKeyboard();
+export function StructuredViewRoot({ active = true, children }: { active?: boolean; children: React.ReactNode }) {
+  const { keyboardHeight } = useMobileKeyboard(active);
   const { settings } = useWebSettings();
   return (
     <div
       data-testid="structured-view-root"
       className="acp-conversation-scope flex h-full flex-col bg-surface-900 text-text-primary"
       style={structuredViewFontStyle(
-        keyboardHeight,
+        active ? keyboardHeight : 0,
         settings.structuredMobileFontSize,
         settings.structuredDesktopFontSize,
       )}
@@ -329,6 +337,7 @@ function AcpChrome({
   loadEarlierHistory,
   loadingEarlierHistory,
   isSandboxed,
+  active,
 }: AcpContext & {
   sessionId: string;
   acpWorkerState: "absent" | "resuming" | "running";
@@ -342,6 +351,7 @@ function AcpChrome({
   trashedAt: string | null;
   onRestore?: () => Promise<boolean> | void;
   isSandboxed?: boolean;
+  active: boolean;
 }) {
   // Count how many activity rows precede the latest `session_cleared`
   // divider so the banner can say "12 earlier turns hidden". The
@@ -500,6 +510,7 @@ function AcpChrome({
   }, [loadingEarlierHistory]);
 
   useLayoutEffect(() => {
+    if (!active) return;
     const vp = viewportRef.current;
     const below = belowViewportRef.current;
     const content = messagesContentRef.current;
@@ -666,7 +677,7 @@ function AcpChrome({
       saveScroll();
       if (gestureClearTimer) window.clearTimeout(gestureClearTimer);
     };
-  }, [requestEarlierHistory, isCoarse, sessionId]);
+  }, [active, requestEarlierHistory, isCoarse, sessionId]);
 
   // Hold the bottom pin across a chrome transition that resizes the viewport:
   // the soft keyboard opening/closing, and the composer ("hide text input")
@@ -682,7 +693,8 @@ function AcpChrome({
     // The first paint's scroll-to-bottom is handled by autoScroll + the content
     // observer, and pinning here on mount would fight a user scrolling up right
     // after the view appears.
-    if (chromeTransitionInitRef.current) {
+    // Inactive sessions don't own the viewport; skip the animation pinning.
+    if (!active || chromeTransitionInitRef.current) {
       chromeTransitionInitRef.current = false;
       return;
     }
@@ -706,7 +718,58 @@ function AcpChrome({
     };
     raf = requestAnimationFrame(pin);
     return () => cancelAnimationFrame(raf);
-  }, [keyboardOpen, composerCollapsed]);
+  }, [active, keyboardOpen, composerCollapsed]);
+
+  // Save/restore scroll position when the session is deactivated or
+  // reactivated by the persistent structured-view stack. Save on
+  // active -> inactive; restore on inactive -> active once the
+  // transcript has stabilized. A ref latch prevents rapid toggles from
+  // interleaving save and restore.
+  const activeTransitionLatchRef = useRef(false);
+  const prevActiveRef = useRef(active);
+  /* eslint-disable react-you-might-not-need-an-effect/no-event-handler */
+  useEffect(() => {
+    const prev = prevActiveRef.current;
+    prevActiveRef.current = active;
+    if (active === prev || activeTransitionLatchRef.current) return;
+
+    const vp = viewportRef.current;
+    if (!vp) return;
+
+    if (active) {
+      // Activation: restore the saved scroll intent once the transcript is
+      // stable (open connection or non-empty activity).
+      if (!hasEverOpened && status !== "open" && state.activity.length === 0) return;
+      activeTransitionLatchRef.current = true;
+      const saved = loadScrollState(sessionId);
+      const stick = !saved || saved.stuck;
+      wasAtBottomRef.current = stick;
+      if (stick) lastAtBottomAtRef.current = performance.now();
+      const applyStart = () => {
+        if (stick) {
+          vp.scrollTop = vp.scrollHeight;
+        } else if (saved) {
+          vp.scrollTop = Math.max(0, Math.min(saved.top, vp.scrollHeight - vp.clientHeight));
+        }
+      };
+      requestAnimationFrame(() => requestAnimationFrame(applyStart));
+      if (stick) window.setTimeout(applyStart, 150);
+      requestAnimationFrame(() => {
+        activeTransitionLatchRef.current = false;
+      });
+      return;
+    }
+
+    // Deactivation: persist the current scroll intent so reactivation can
+    // pick up where the user left off.
+    activeTransitionLatchRef.current = true;
+    saveScrollState(sessionId, { stuck: wasAtBottomRef.current, top: vp.scrollTop });
+    requestAnimationFrame(() => {
+      activeTransitionLatchRef.current = false;
+    });
+  }, [active, sessionId, status, hasEverOpened, state.activity.length]);
+  /* eslint-enable react-you-might-not-need-an-effect/no-event-handler */
+
   // Short-circuit: when the per-adapter compatibility check rejected
   // the adapter, replace the chat layout with a dedicated screen that
   // renders the exact remediation command. We never reach Running, so
@@ -721,14 +784,19 @@ function AcpChrome({
     );
   }
   return (
-    <StructuredViewRoot>
-      <AttentionChime approvals={state.pendingApprovals.length} elicitations={state.pendingElicitations.length} />
+    <StructuredViewRoot active={active}>
+      <AttentionChime
+        approvals={state.pendingApprovals.length}
+        elicitations={state.pendingElicitations.length}
+        active={active}
+      />
       <PlanStrip plan={state.plan} />
 
       <RateLimitRecoverySection
         sessionId={sessionId}
         currentAgent={state.agent ?? acpAgent}
         onPrefill={recoveryHandoffPrefill}
+        active={active}
       >
         {({ onSwitchAgent }) =>
           status !== "open" || state.lagged || state.rateLimit || reconnecting ? (
@@ -802,7 +870,7 @@ function AcpChrome({
             the bottom of the scroll area, just above the composer. */}
         <div className="relative flex min-h-0 flex-1 flex-col">
           <ThreadPrimitive.Viewport
-            autoScroll
+            autoScroll={active}
             ref={viewportRef}
             data-testid="acp-viewport"
             className="flex-1 overflow-x-hidden overflow-y-auto"
@@ -993,9 +1061,10 @@ function AcpChrome({
                   promptCapabilities={state.promptCapabilities}
                   pendingAttachments={pendingAttachments}
                   setPendingAttachments={setPendingAttachments}
-                  primerPrefill={primerPrefill}
+                  primerPrefill={active ? primerPrefill : null}
                   queuedPrompts={state.queuedPrompts}
                   editQueuedPrompt={editQueuedPrompt}
+                  active={active}
                 />
               </CollapsibleRegion>
             </>
@@ -1730,19 +1799,24 @@ export function RateLimitRecoverySection({
   sessionId,
   currentAgent,
   onPrefill,
+  active = true,
   children,
 }: {
   sessionId: string;
   currentAgent: string | null;
   onPrefill: (text: string) => void;
+  active?: boolean;
   children: (renderProps: { onSwitchAgent: () => void }) => React.ReactNode;
 }) {
   const [open, setOpen] = useState(false);
+  // Close the modal when this session becomes inactive; derive the effective
+  // open state so no setState in an effect is needed.
+  const effectiveOpen = active && open;
   return (
     <>
       {children({ onSwitchAgent: () => setOpen(true) })}
       <SwitchAgentModal
-        open={open}
+        open={effectiveOpen}
         sessionId={sessionId}
         currentAgent={currentAgent}
         onClose={() => setOpen(false)}

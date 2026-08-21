@@ -78,4 +78,14 @@ describe("StructuredViewRoot (#2011)", () => {
     expect(root.style.getPropertyValue("--acp-conversation-font-size-mobile")).toBe("0.875rem");
     expect(root.style.getPropertyValue("--acp-conversation-font-size-desktop")).toBe("0.875rem");
   });
+
+  it("reserves no keyboard padding when inactive even if the keyboard is open", () => {
+    mockKeyboard.current = { isMobile: true, keyboardOpen: true, keyboardHeight: 280 };
+    render(
+      <StructuredViewRoot active={false}>
+        <div>child</div>
+      </StructuredViewRoot>,
+    );
+    expect(screen.getByTestId("structured-view-root").style.paddingBottom).toBe("");
+  });
 });

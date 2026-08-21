@@ -344,6 +344,10 @@ interface Props {
    *  when the user submits while browsing the queue, so an edit does not
    *  enqueue a duplicate. */
   editQueuedPrompt: (id: string, text: string) => void;
+  /** When false the session is mounted but inactive (kept warm by the
+   *  persistent structured-view stack). The composer avoids autofocus,
+   *  imperative focus, and draft persistence work. */
+  active?: boolean;
 }
 
 export function Composer({
@@ -366,8 +370,29 @@ export function Composer({
   primerPrefill,
   queuedPrompts,
   editQueuedPrompt,
+  active = true,
 }: Props) {
   const taRef = useRef<HTMLTextAreaElement | null>(null);
+
+  // Imperative focus helper. Inactive sessions stay in the background; they
+  // must never steal focus from the active session or other surfaces.
+  const focusTextArea = useCallback(
+    (end = true) => {
+      if (!active) return;
+      const el = taRef.current;
+      if (!el) return;
+      el.focus();
+      if (end) {
+        const len = el.value.length;
+        try {
+          el.setSelectionRange(len, len);
+        } catch {
+          // ignore: setSelectionRange can throw on detached nodes
+        }
+      }
+    },
+    [active],
+  );
   const fileInputRef = useRef<HTMLInputElement | null>(null);
   const { files } = useFilesIndex(sessionId);
 
@@ -598,18 +623,12 @@ export function Composer({
       requestAnimationFrame(() => {
         const el = taRef.current;
         if (!el) return;
-        el.focus();
-        const len = el.value.length;
-        try {
-          el.setSelectionRange(len, len);
-        } catch {
-          // ignore: setSelectionRange can throw on detached nodes
-        }
+        focusTextArea();
         el.style.height = "auto";
         el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
       });
     },
-    [composerRuntime],
+    [composerRuntime, focusTextArea],
   );
 
   // Apply a pure recall navigation decision to the composer.
@@ -713,9 +732,7 @@ export function Composer({
         requestAnimationFrame(() => {
           const el = taRef.current;
           if (!el) return;
-          el.focus();
-          const len = operation.text.length;
-          el.setSelectionRange(len, len);
+          focusTextArea();
           el.style.height = "auto";
           el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
         });
@@ -723,7 +740,7 @@ export function Composer({
       }
       insertRawTextAtCaret(ta, operation.text, operation.kind === "replace-selection");
     },
-    [composerRuntime],
+    [composerRuntime, focusTextArea],
   );
   const pluginUiEntries = usePluginUiEntries();
   const pluginComposerEntries = useMemo(
@@ -752,7 +769,10 @@ export function Composer({
     getPendingSwitchAgent,
     () => null,
   );
-  const switchAgentOpen = pendingSwitchAgentSessionId === sessionId;
+  // Inactive sessions must not keep the switch-agent modal open; it is a
+  // portal outside the inert subtree and would stay open over the active
+  // session. Derive the effective open state and clear the trigger on close.
+  const switchAgentOpen = active && pendingSwitchAgentSessionId === sessionId;
 
   // iOS Safari native dictation (#1431): WebKit fires `beforeinput` /
   // `input` with `inputType: "insertReplacementText"` per partial
@@ -791,17 +811,11 @@ export function Composer({
     requestAnimationFrame(() => {
       const el = taRef.current;
       if (!el) return;
-      el.focus();
-      const len = el.value.length;
-      try {
-        el.setSelectionRange(len, len);
-      } catch {
-        // ignore: non-text inputs can throw here
-      }
+      focusTextArea();
       el.style.height = "auto";
       el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
     });
-  }, [composerRuntime, primerId]);
+  }, [composerRuntime, focusTextArea, primerId]);
 
   // Auto-grow the textarea up to ~6 visible lines.
   const onInput = (e: React.FormEvent<HTMLTextAreaElement>) => {
@@ -874,15 +888,18 @@ export function Composer({
   // the soft keyboard on every session open / switch, which is the wrong
   // default for the read-traffic that dominates mobile usage. Users tap
   // the composer when they want to type.
+  //
+  // focusTextArea returns early for inactive sessions, so only the active
+  // structured-view session claims keyboard focus.
   useEffect(() => {
     if (isMobile) return;
     const el = taRef.current;
     if (!el) return;
-    el.focus();
+    focusTextArea();
     const reclaim = () => {
-      const active = document.activeElement as HTMLElement | null;
-      if (!active || active === document.body || active === el) {
-        el.focus();
+      const focused = document.activeElement as HTMLElement | null;
+      if (!focused || focused === document.body || focused === el) {
+        focusTextArea();
       }
     };
     const t1 = window.setTimeout(reclaim, 250);
@@ -891,14 +908,14 @@ export function Composer({
       window.clearTimeout(t1);
       window.clearTimeout(t2);
     };
-  }, [isMobile]);
+  }, [focusTextArea, isMobile]);
 
   // Explicit focus from sidebar session selection (#1454). Lands focus on
   // the composer even when it is already mounted (re-selecting the active
   // session, where the keyed remount above never fires); the latch inside
   // the hook covers the first-open race. App only dispatches "composer" on
   // desktop, so no coarse-pointer gate is needed here.
-  useFocusTerminalTarget("composer", taRef);
+  useFocusTerminalTarget("composer", taRef, active);
 
   const wrapperLayout = composerWrapperLayout({
     keyboardOpen,
@@ -1140,7 +1157,7 @@ export function Composer({
                 e.preventDefault();
                 void addFiles(files);
               }}
-              autoFocus={!isMobile}
+              autoFocus={active && !isMobile}
               className={[
                 "min-h-[56px] max-h-[200px] resize-none bg-transparent",
                 "px-4 pt-3 pb-1 text-sm leading-6 text-text-primary",
@@ -1279,13 +1296,7 @@ export function Composer({
           requestAnimationFrame(() => {
             const el = taRef.current;
             if (!el) return;
-            el.focus();
-            const len = el.value.length;
-            try {
-              el.setSelectionRange(len, len);
-            } catch {
-              // ignore: non-text inputs can throw here
-            }
+            focusTextArea();
             el.style.height = "auto";
             el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
           });

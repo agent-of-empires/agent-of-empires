@@ -122,7 +122,9 @@ describe("useAcpSession auto-wake on sendPrompt (#1581)", () => {
 
   it("clears the archived flag via PATCH before enqueueing the prompt", async () => {
     const sessionId = "sess-wake-archive";
-    const { result } = renderHook(() => useAcpSession(sessionId, "absent", "2026-01-01T00:00:00Z", null), { wrapper });
+    const { result } = renderHook(() => useAcpSession(sessionId, true, "absent", "2026-01-01T00:00:00Z", null), {
+      wrapper,
+    });
     await flushAsync();
 
     await act(async () => {
@@ -143,7 +145,9 @@ describe("useAcpSession auto-wake on sendPrompt (#1581)", () => {
 
   it("clears the snoozed flag via PATCH before enqueueing the prompt", async () => {
     const sessionId = "sess-wake-snooze";
-    const { result } = renderHook(() => useAcpSession(sessionId, "absent", null, "2099-01-01T00:00:00Z"), { wrapper });
+    const { result } = renderHook(() => useAcpSession(sessionId, true, "absent", null, "2099-01-01T00:00:00Z"), {
+      wrapper,
+    });
     await flushAsync();
 
     await act(async () => {
@@ -159,7 +163,7 @@ describe("useAcpSession auto-wake on sendPrompt (#1581)", () => {
 
   it("does not call wake endpoints when the session is live", async () => {
     const sessionId = "sess-wake-live";
-    const { result } = renderHook(() => useAcpSession(sessionId, "absent", null, null), { wrapper });
+    const { result } = renderHook(() => useAcpSession(sessionId, true, "absent", null, null), { wrapper });
     await flushAsync();
 
     await act(async () => {
@@ -206,7 +210,9 @@ describe("useAcpSession auto-wake on sendPrompt (#1581)", () => {
       }),
     );
 
-    const { result } = renderHook(() => useAcpSession(sessionId, "absent", "2026-01-01T00:00:00Z", null), { wrapper });
+    const { result } = renderHook(() => useAcpSession(sessionId, true, "absent", "2026-01-01T00:00:00Z", null), {
+      wrapper,
+    });
     await flushAsync();
 
     await act(async () => {
@@ -244,7 +250,9 @@ describe("useAcpSession auto-wake on sendPrompt (#1581)", () => {
       }),
     );
 
-    const { result } = renderHook(() => useAcpSession(sessionId, "absent", null, "2099-01-01T00:00:00Z"), { wrapper });
+    const { result } = renderHook(() => useAcpSession(sessionId, true, "absent", null, "2099-01-01T00:00:00Z"), {
+      wrapper,
+    });
     await flushAsync();
 
     await act(async () => {
@@ -265,7 +273,7 @@ describe("useAcpSession auto-wake on sendPrompt (#1581)", () => {
     // merge_user_action_diff on the server side.
     const sessionId = "sess-wake-both";
     const { result } = renderHook(
-      () => useAcpSession(sessionId, "absent", "2026-01-01T00:00:00Z", "2099-01-01T00:00:00Z"),
+      () => useAcpSession(sessionId, true, "absent", "2026-01-01T00:00:00Z", "2099-01-01T00:00:00Z"),
       { wrapper },
     );
     await flushAsync();

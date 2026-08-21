@@ -47,9 +47,9 @@ function createKeyboardStore() {
 
 type KeyboardStore = ReturnType<typeof createKeyboardStore>;
 
-export function useMobileKeyboard() {
+export function useMobileKeyboard(enabled = true) {
   const [store] = useState<KeyboardStore>(() => createKeyboardStore());
-  const state = useSyncExternalStore(store.subscribe, store.getSnapshot);
+  const state = useSyncExternalStore(enabled ? store.subscribe : () => () => {}, store.getSnapshot);
 
   const rafRef = useRef(0);
   const stableCountRef = useRef(0);
@@ -57,6 +57,7 @@ export function useMobileKeyboard() {
   const fullHeightRef = useRef(0);
 
   useEffect(() => {
+    if (!enabled) return;
     if (typeof window === "undefined" || !window.matchMedia) return;
     const mql = window.matchMedia("(pointer: coarse)");
     const onChange = () => {
@@ -74,9 +75,10 @@ export function useMobileKeyboard() {
     };
     mql.addEventListener?.("change", onChange);
     return () => mql.removeEventListener?.("change", onChange);
-  }, [store]);
+  }, [enabled, store]);
 
   useEffect(() => {
+    if (!enabled) return;
     if (!state.isMobile) return;
     const vv = window.visualViewport;
     if (!vv) return;
@@ -170,7 +172,7 @@ export function useMobileKeyboard() {
       window.removeEventListener("orientationchange", handleOrientationChange);
       window.removeEventListener("scroll", handleViewportChange);
     };
-  }, [state.isMobile, store]);
+  }, [enabled, state.isMobile, store]);
 
   return {
     isMobile: state.isMobile,

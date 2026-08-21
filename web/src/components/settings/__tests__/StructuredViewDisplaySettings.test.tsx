@@ -82,6 +82,30 @@ describe("StructuredViewDisplaySettings localStorage contract", () => {
     expect((getByTestId("structured-desktop-font-size-select") as HTMLInputElement).value).toBe("10");
   });
 
+  it("defaults persistent structured views off and hides the limit input", () => {
+    const { getByTestId, queryByTestId } = render(<StructuredViewDisplaySettings />);
+    expect((getByTestId("persistent-structured-views-toggle") as HTMLInputElement).checked).toBe(false);
+    expect(queryByTestId("max-persistent-structured-views")).toBeNull();
+  });
+
+  it("persists the toggle and reveals the limit input when enabled", () => {
+    const { getByTestId } = render(<StructuredViewDisplaySettings />);
+    fireEvent.click(getByTestId("persistent-structured-views-toggle"));
+    expect(readStored().persistentStructuredViews).toBe(true);
+    expect((getByTestId("max-persistent-structured-views") as HTMLInputElement).value).toBe("2");
+  });
+
+  it("persists and clamps the limit input", () => {
+    window.localStorage.setItem(KEY, JSON.stringify({ persistentStructuredViews: true }));
+    const { getByTestId } = render(<StructuredViewDisplaySettings />);
+    fireEvent.change(getByTestId("max-persistent-structured-views"), { target: { value: "0" } });
+    expect(readStored().maxPersistentStructuredViews).toBe(1);
+    fireEvent.change(getByTestId("max-persistent-structured-views"), { target: { value: "99" } });
+    expect(readStored().maxPersistentStructuredViews).toBe(5);
+    fireEvent.change(getByTestId("max-persistent-structured-views"), { target: { value: "3" } });
+    expect(readStored().maxPersistentStructuredViews).toBe(3);
+  });
+
   it("survives a reread and reflects the stored values on remount", () => {
     const first = render(<StructuredViewDisplaySettings />);
     fireEvent.change(first.getByTestId("structured-mobile-font-size-slider"), { target: { value: "12" } });

@@ -114,10 +114,8 @@ import { TerminalSessionStack } from "./components/TerminalSessionStack";
 // dependency tree. Cuts ~hundreds of KB off the cold-start bundle
 // for the (currently default) tmux-only flow. The Suspense fallback
 // below covers the brief load while the chunk arrives.
-const StructuredView = lazy(() =>
-  import("./components/acp/StructuredView").then((m) => ({
-    default: m.StructuredView,
-  })),
+const StructuredViewStack = lazy(() =>
+  import("./components/StructuredViewStack").then((m) => ({ default: m.StructuredViewStack })),
 );
 import { type PaneDisplay } from "./components/Dock";
 import { DockGroups, type DockGroupView } from "./components/DockGroups";
@@ -1878,31 +1876,23 @@ function AppContent({
             onToggleCollapse={toggleRightDock}
             left={
               <div className="flex-1 flex flex-col min-h-0 overflow-hidden relative">
-                <div className={selectedFilePath ? "hidden" : "flex-1 flex flex-col min-h-0 overflow-hidden"}>
-                  {activeSession?.view === "structured" ? (
-                    <Suspense fallback={<AcpLoadingFallback />}>
-                      <StructuredView
-                        key={activeSessionId}
-                        sessionId={activeSessionId!}
-                        acpWorkerState={activeSession.acp_worker_state ?? "absent"}
-                        tool={activeSession.tool}
-                        acpAgent={activeSession.acp_agent ?? null}
-                        clearAliases={activeSession.clear_aliases}
-                        archivedAt={activeSession.archived_at ?? null}
-                        snoozedUntil={activeSession.snoozed_until ?? null}
-                        trashedAt={activeSession.trashed_at ?? null}
-                        onRestore={
-                          activeSession.trashed_at
-                            ? () => handleRestoreSession(trashedWorkspaceRestoreIds(workspaces, activeSessionId!))
-                            : undefined
-                        }
-                        onOpenFileRef={handleOpenFileRef}
-                        fileRefSession={activeSession}
-                        onOpenAgentsPane={openAgentsPane}
-                        isSandboxed={activeSession.is_sandboxed}
-                      />
-                    </Suspense>
-                  ) : (
+                <div className={selectedFilePath ? "hidden" : "relative flex-1 flex flex-col min-h-0 overflow-hidden"}>
+                  <Suspense fallback={<AcpLoadingFallback />}>
+                    <StructuredViewStack
+                      activeSessionId={activeSessionId}
+                      sessions={sessions}
+                      persistent={webSettings.persistentStructuredViews}
+                      maxPersistentStructuredViews={webSettings.maxPersistentStructuredViews}
+                      visible={activeSession?.view === "structured"}
+                      onOpenFileRef={handleOpenFileRef}
+                      onOpenAgentsPane={openAgentsPane}
+                      onRestoreSession={async (sessionId) => {
+                        const restored = await handleRestoreSession(trashedWorkspaceRestoreIds(workspaces, sessionId));
+                        return restored;
+                      }}
+                    />
+                  </Suspense>
+                  {activeSession?.view !== "structured" && (
                     <TerminalSessionStack
                       activeSessionId={activeSessionId!}
                       sessions={sessions.filter((session) => session.view !== "structured")}

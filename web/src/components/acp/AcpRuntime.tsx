@@ -72,6 +72,11 @@ interface Props {
    *  has forgotten. The `ClearedTurnsBanner` in `StructuredView` provides
    *  the toggle. See #1101. */
   showClearedTurns?: boolean;
+  /** When false the session is mounted but inactive (kept warm by the
+   *  persistent structured-view stack). The runtime skips localStorage
+   *  cache writes and avoids aggressive reconnects so inactive sessions
+   *  stay warm without stealing resources. */
+  active?: boolean;
   children: (ctx: AcpContext) => ReactNode;
 }
 
@@ -135,9 +140,10 @@ export function AcpRuntime({
   archivedAt = null,
   snoozedUntil = null,
   showClearedTurns = false,
+  active = true,
   children,
 }: Props) {
-  const acp = useAcpSession(sessionId, acpWorkerState, archivedAt, snoozedUntil);
+  const acp = useAcpSession(sessionId, active, acpWorkerState, archivedAt, snoozedUntil);
   const agentProfile = useAgentProfile();
   // Staged attachments for the next prompt. A ref mirror keeps `onNew`
   // (recreated each render by useExternalStoreRuntime) reading the

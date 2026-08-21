@@ -12,8 +12,11 @@ import { isPluginPaneId, type PluginPane } from "../lib/pluginPanes";
 import type { RepoBase, RichDiffFile, SessionResponse } from "../lib/types";
 import type { useDiffComments } from "../hooks/useDiffComments";
 import type { FileRef } from "../lib/fileRef";
+import type { WebSettings } from "../hooks/useWebSettings";
 
-const StructuredView = lazy(() => import("./acp/StructuredView").then((m) => ({ default: m.StructuredView })));
+const StructuredViewStack = lazy(() =>
+  import("./StructuredViewStack").then((m) => ({ default: m.StructuredViewStack })),
+);
 
 interface Props {
   view: RightPanelView;
@@ -23,7 +26,12 @@ interface Props {
   activeSession: SessionResponse | null;
   activeSessionId: string | null;
   sessions: SessionResponse[];
-  webSettings: { persistentTerminals: boolean; maxPersistentTerminals: number };
+  webSettings: Pick<
+    WebSettings,
+    "persistentTerminals" | "maxPersistentTerminals" | "persistentStructuredViews" | "maxPersistentStructuredViews"
+  >;
+  onOpenAgentsPane?: () => void;
+  onRestoreSession?: (sessionId: string) => Promise<boolean> | void;
   selectedFilePath: string | null;
   selectedRepoName: string | undefined;
   selectedFileLine: number | undefined;
@@ -66,6 +74,8 @@ export function MobileMainPane({
   activeSessionId,
   sessions,
   webSettings,
+  onOpenAgentsPane,
+  onRestoreSession,
   selectedFilePath,
   selectedRepoName,
   selectedFileLine,
@@ -108,24 +118,19 @@ export function MobileMainPane({
       )}
       <div className="relative flex-1 flex flex-col min-h-0 overflow-hidden">
         <div className={layerClass(view === "agent")} inert={view !== "agent"}>
-          {activeSession?.view === "structured" ? (
-            <Suspense fallback={null}>
-              <StructuredView
-                key={activeSessionId}
-                sessionId={activeSessionId!}
-                acpWorkerState={activeSession.acp_worker_state ?? "absent"}
-                tool={activeSession.tool}
-                acpAgent={activeSession.acp_agent ?? null}
-                clearAliases={activeSession.clear_aliases}
-                archivedAt={activeSession.archived_at ?? null}
-                snoozedUntil={activeSession.snoozed_until ?? null}
-                trashedAt={activeSession.trashed_at ?? null}
-                onOpenFileRef={onOpenFileRef}
-                fileRefSession={activeSession}
-                isSandboxed={activeSession.is_sandboxed}
-              />
-            </Suspense>
-          ) : (
+          <Suspense fallback={null}>
+            <StructuredViewStack
+              activeSessionId={activeSessionId}
+              sessions={sessions}
+              persistent={webSettings.persistentStructuredViews}
+              maxPersistentStructuredViews={webSettings.maxPersistentStructuredViews}
+              visible={view === "agent"}
+              onOpenFileRef={onOpenFileRef}
+              onOpenAgentsPane={onOpenAgentsPane}
+              onRestoreSession={onRestoreSession}
+            />
+          </Suspense>
+          {activeSession?.view !== "structured" && (
             // Reserve the bottom home-indicator inset on this wrapper (the App
             // root no longer does; see index.css .safe-area-inset) so the last
             // terminal row clears it. Kept off the pane root itself, which owns

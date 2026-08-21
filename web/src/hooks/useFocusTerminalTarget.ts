@@ -20,8 +20,14 @@ import {
  * Mirrors the inline wiring TerminalView uses for the "agent" target; the
  * structured view Composer uses it for "composer".
  */
-export function useFocusTerminalTarget(target: TerminalFocusTarget, ref: React.RefObject<HTMLElement | null>): void {
+export function useFocusTerminalTarget(
+  target: TerminalFocusTarget,
+  ref: React.RefObject<HTMLElement | null>,
+  enabled = true,
+): void {
+  /* eslint-disable react-you-might-not-need-an-effect/no-event-handler */
   useEffect(() => {
+    if (!enabled) return;
     const onFocusEvent = (e: Event) => {
       const detail = (e as CustomEvent<FocusTerminalDetail>).detail;
       if (detail?.target !== target) return;
@@ -31,9 +37,11 @@ export function useFocusTerminalTarget(target: TerminalFocusTarget, ref: React.R
     };
     window.addEventListener(FOCUS_TERMINAL_EVENT, onFocusEvent);
     return () => window.removeEventListener(FOCUS_TERMINAL_EVENT, onFocusEvent);
-  }, [target, ref]);
+  }, [target, ref, enabled]);
 
   useEffect(() => {
+    if (!enabled) return;
     if (consumePendingTerminalFocus(target)) ref.current?.focus();
-  }, [target, ref]);
+  }, [target, ref, enabled]);
+  /* eslint-enable react-you-might-not-need-an-effect/no-event-handler */
 }

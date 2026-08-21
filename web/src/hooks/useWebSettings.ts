@@ -2,6 +2,10 @@ import { useCallback, useSyncExternalStore } from "react";
 
 import { DEFAULT_CONVERSATION_FONT_SIZE, normalizeConversationFontSize } from "../lib/conversationFontSize";
 import { DEFAULT_PERSISTENT_TERMINALS, normalizePersistentTerminalLimit } from "../lib/persistentTerminals";
+import {
+  DEFAULT_PERSISTENT_STRUCTURED_VIEWS,
+  normalizePersistentStructuredViewLimit,
+} from "../lib/persistentStructuredViews";
 import { safeGetItem, safeSetItem } from "../lib/safeStorage";
 
 const STORAGE_KEY = "aoe-web-settings";
@@ -42,6 +46,13 @@ export interface WebSettings {
    *  Unlike the diff/terminal flags this is an ongoing policy: turning it back
    *  on can add newly available plugin panes to existing sessions too. */
   autoOpenPluginPanes: boolean;
+  /** Keep recently viewed structured-view sessions mounted (but inert) so
+   *  switching back to them is instant. Default off to avoid extra resource
+   *  use; capped by `maxPersistentStructuredViews`. See #persistent-structured-views. */
+  persistentStructuredViews: boolean;
+  /** Maximum number of recent structured-view sessions to keep mounted when
+   *  `persistentStructuredViews` is enabled. Clamped 1-5; default 2. */
+  maxPersistentStructuredViews: number;
 }
 
 function getDefaults(): WebSettings {
@@ -63,6 +74,8 @@ function getDefaults(): WebSettings {
     autoOpenDiffPane: true,
     autoOpenTerminalPane: true,
     autoOpenPluginPanes: true,
+    persistentStructuredViews: false,
+    maxPersistentStructuredViews: DEFAULT_PERSISTENT_STRUCTURED_VIEWS,
   };
 }
 
@@ -93,6 +106,8 @@ function normalizeSnapshot(settings: WebSettings): WebSettings {
       settings.markdownPreview === "rendered" || settings.markdownPreview === "raw"
         ? settings.markdownPreview
         : defaults.markdownPreview,
+    persistentStructuredViews: normalizeBool(settings.persistentStructuredViews, defaults.persistentStructuredViews),
+    maxPersistentStructuredViews: normalizePersistentStructuredViewLimit(settings.maxPersistentStructuredViews),
   };
 }
 

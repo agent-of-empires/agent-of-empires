@@ -947,6 +947,10 @@ function optimisticPromptId(): string {
 
 export function useAcpSession(
   sessionId: string | null,
+  /** When false the session is mounted but inactive (kept warm by the
+   *  persistent structured-view stack). Cache writes and aggressive
+   *  reconnects are skipped. Defaults to true. */
+  active = true,
   /** Live structured view worker lifecycle from `SessionResponse.acp_worker_state`.
    *  When not `"running"`, the drain effect parks queued prompts so they
    *  don't dispatch into a worker that isn't online yet. Defaults to
@@ -1004,8 +1008,10 @@ export function useAcpSession(
   const sessionIdRef = useRef(sessionId);
   sessionIdRef.current = sessionId;
   useEffect(() => {
+    // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
+    if (!active) return;
     if (sessionIdRef.current) cacheSet(sessionIdRef.current, state);
-  }, [state]);
+  }, [active, state]);
   const wsRef = useRef<WebSocket | null>(null);
   // Auto-reconnect machinery (#1130). retryCountRef is the persistent
   // attempt counter across `onclose` -> scheduled `connect()` cycles;
@@ -1114,8 +1120,11 @@ export function useAcpSession(
   // Stable callback ref for visibility/online/pageshow triggers so the
   // reactive effects below can reconnect without depending on sessionId
   // (satisfies react-you-might-not-need-an-effect/no-event-handler).
+  const activeRef = useRef(active);
+  activeRef.current = active;
   const tryAutoReconnectRef = useRef<() => void>(() => {});
   tryAutoReconnectRef.current = () => {
+    if (!activeRef.current) return;
     const ws = wsRef.current;
     const ready = ws?.readyState;
     if (ready === WebSocket.CONNECTING) return;
