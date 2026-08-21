@@ -30,9 +30,10 @@ pub fn clone_bare_repo(url: &str, destination: &Path) -> Result<String> {
         "spawning git clone --bare"
     );
     // Stdin is piped to null so SSH passphrase prompts fail immediately;
-    // stdout/stderr draining and the kill-on-deadline are handled by
-    // run_with_timeout, so a grandchild holding the pipe (credential
-    // helper, pager) cannot block past the timeout.
+    // output capture and the kill-on-deadline are handled by
+    // run_with_timeout, which writes stdout/stderr to temporary regular
+    // files, so a grandchild that inherits them (credential helper, pager)
+    // cannot block past the timeout.
     let mut cmd = std::process::Command::new("git");
     cmd.args(["clone", "--bare", url, bare_str])
         .stdin(std::process::Stdio::null());
@@ -238,9 +239,9 @@ pub fn clone_repo(url: &str, destination: &Path, shallow: bool) -> Result<()> {
     let mut cmd = std::process::Command::new("git");
     cmd.args(&args).stdin(std::process::Stdio::null());
 
-    // 5-minute timeout to avoid blocking the thread pool forever; output
-    // draining is deadline-bounded too, so a grandchild holding the pipe
-    // cannot hang the wait.
+    // 5-minute timeout to avoid blocking the thread pool forever; output is
+    // captured in temporary regular files, so a grandchild that inherits the
+    // handles cannot hang the wait.
     let timeout = std::time::Duration::from_secs(300);
 
     match crate::process::run_with_timeout(&mut cmd, timeout) {

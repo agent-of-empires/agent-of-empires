@@ -101,13 +101,42 @@ where
 ///
 /// Used for bounded git mutations that normally finish quickly but could
 /// otherwise hang indefinitely on a stalled filesystem. stdin is nulled so a
-/// child can never block on a prompt, and `run_with_timeout` drains
-/// stdout/stderr on a deadline so a grandchild holding a pipe cannot stall the
-/// wait past `timeout`.
+/// child can never block on a prompt, and `run_with_timeout_process_group`
+/// captures stdout/stderr in temporary regular files rather than pipes, so a
+/// grandchild that inherits the handles cannot stall the wait past `timeout`.
 pub fn run_git_with_timeout<I, S>(
     cwd: &Path,
     args: I,
     timeout: Duration,
+) -> std::io::Result<Option<Output>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    run_timed(cwd, args, timeout, false)
+}
+
+/// [`run_git_with_timeout`] for callers that have already classified a
+/// non-zero exit as an expected, no-op outcome, mirroring the
+/// [`run_git`] / [`run_git_quiet`] pair. The timeout itself still logs at
+/// WARN: a killed child is never routine.
+pub fn run_git_quiet_with_timeout<I, S>(
+    cwd: &Path,
+    args: I,
+    timeout: Duration,
+) -> std::io::Result<Option<Output>>
+where
+    I: IntoIterator<Item = S>,
+    S: AsRef<OsStr>,
+{
+    run_timed(cwd, args, timeout, true)
+}
+
+fn run_timed<I, S>(
+    cwd: &Path,
+    args: I,
+    timeout: Duration,
+    quiet: bool,
 ) -> std::io::Result<Option<Output>>
 where
     I: IntoIterator<Item = S>,
@@ -141,14 +170,25 @@ where
         Some(output) => {
             let stderr = String::from_utf8_lossy(&output.stderr);
             let stderr_summary: String = stderr.chars().take(200).collect();
-            tracing::warn!(
-                target: "git.command",
-                args = ?redacted,
-                exit = output.status.code(),
-                duration_ms = dur,
-                stderr_summary = %stderr_summary,
-                "git command failed"
-            );
+            if quiet {
+                tracing::debug!(
+                    target: "git.command",
+                    args = ?redacted,
+                    exit = output.status.code(),
+                    duration_ms = dur,
+                    stderr_summary = %stderr_summary,
+                    "git command failed (expected by caller)"
+                );
+            } else {
+                tracing::warn!(
+                    target: "git.command",
+                    args = ?redacted,
+                    exit = output.status.code(),
+                    duration_ms = dur,
+                    stderr_summary = %stderr_summary,
+                    "git command failed"
+                );
+            }
         }
         None => tracing::warn!(
             target: "git.command",

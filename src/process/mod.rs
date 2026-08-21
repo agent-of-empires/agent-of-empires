@@ -1077,7 +1077,7 @@ mod tests {
             .expect("the sh child exits quickly, so an Output is produced");
         assert!(
             start.elapsed() < Duration::from_secs(4),
-            "drain must be bounded by the deadline even while the pipe stays open"
+            "output capture must not wait on a descendant that still holds the handle"
         );
         assert!(output.status.success());
     }
