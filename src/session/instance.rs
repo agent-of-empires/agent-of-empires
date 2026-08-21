@@ -11490,6 +11490,31 @@ mod tests {
     }
 
     #[test]
+    fn test_build_resume_flags_for_flag_agents() {
+        let cases = [
+            ("cursor", "--resume"),
+            ("droid", "--resume"),
+            ("antigravity", "--conversation"),
+        ];
+        let session_id = "abc123-def456";
+        for (tool, flag) in cases {
+            assert_eq!(
+                build_resume_flags(tool, session_id, true),
+                format!("{flag} {session_id}"),
+                "{tool} existing"
+            );
+            assert_eq!(
+                build_resume_flags(tool, session_id, false),
+                format!("{flag} {session_id}"),
+                "{tool} new"
+            );
+        }
+        for (tool, _) in cases {
+            assert_eq!(build_resume_flags(tool, "", true), "");
+        }
+    }
+
+    #[test]
     fn test_acquire_session_id_idempotence() {
         let mut inst = Instance::new("Test", "/tmp/test");
         inst.tool = "claude".to_string();
@@ -12563,13 +12588,16 @@ mod tests {
             assert!(should_attempt_resume(Some("uuid-abc-123"), "codex"));
             assert!(should_attempt_resume(Some("uuid-abc-123"), "gemini"));
             assert!(should_attempt_resume(Some("uuid-abc-123"), "copilot"));
+            assert!(should_attempt_resume(Some("uuid-abc-123"), "cursor"));
+            assert!(should_attempt_resume(Some("uuid-abc-123"), "droid"));
+            assert!(should_attempt_resume(Some("uuid-abc-123"), "antigravity"));
         }
 
         #[test]
         fn unsupported_agent_does_not_attempt_resume() {
             assert!(!should_attempt_resume(
                 Some("11111111-1111-1111-1111-111111111111"),
-                "cursor"
+                "settl"
             ));
         }
 
@@ -13740,15 +13768,19 @@ mod tests {
                 let temp = tempdir().unwrap();
                 let _guard = claude_home_guard(&temp);
 
-                let mut inst = Instance::new("verify-cursor", "/tmp/aoe-test-2291-cursor");
-                inst.tool = "cursor".to_string();
-                inst.agent_session_id = Some("stored-cursor-sid".to_string());
+                let mut inst =
+                    Instance::new("verify-unsupported", "/tmp/aoe-test-2291-unsupported");
+                inst.tool = "settl".to_string();
+                inst.agent_session_id = Some("stored-unsupported-sid".to_string());
                 inst.resume_intent = ResumeIntent::Default;
 
                 let (sid, is_existing) = inst.acquire_session_id();
-                assert_eq!(sid.as_deref(), Some("stored-cursor-sid"));
+                assert_eq!(sid.as_deref(), Some("stored-unsupported-sid"));
                 assert!(is_existing);
-                assert_eq!(inst.agent_session_id.as_deref(), Some("stored-cursor-sid"));
+                assert_eq!(
+                    inst.agent_session_id.as_deref(),
+                    Some("stored-unsupported-sid")
+                );
             }
 
             // #2344: when several AoE Claude sessions share one cwd, the

@@ -50,7 +50,7 @@ Forking needs an agent that can branch a conversation:
 - **Terminal sessions**: claude, codex, and opencode.
 - **Structured (ACP) sessions**: the Claude adapter (`claude-agent-acp`).
 
-Resume-only agents (such as gemini, vibe, kiro, qwen, and copilot) and non-resuming agents (such as cursor and droid) cannot fork. For those, the Fork option is hidden or refused.
+Resume-only agents (such as gemini, vibe, kiro, qwen, copilot, cursor, droid, and antigravity) cannot fork. For those, the Fork option is hidden or refused.
 
 ## Fork vs. resume
 
