@@ -183,31 +183,29 @@ def _truncate_settings_payload(
         # Update title/badge count.
         row_count = _count_rows(longest_section)
         title = longest_section.get("title", "")
-        base = title.split(" (")[0] if " (" in title else title
+        base = title.rsplit(" (", 1)[0] if " (" in title else title
         longest_section["title"] = f"{base} ({row_count})"
         badge = longest_section.get("badges", [{}])[0]
         badge["text"] = str(row_count)
 
-    remaining = sum(
-        _count_rows(section)
-        for section in columns_block.get("children", [])
-        if section.get("kind") == "section"
-    )
-    if remaining < total_sessions:
-        blocks.append(
-            {
-                "kind": "note",
-                "tone": "warn",
-                "text": (
-                    f"Showing {remaining} of {total_sessions} sessions; "
-                    "reduce excluded columns or filter by repo to see more."
-                ),
-            }
+    def _remaining_rows() -> int:
+        return sum(
+            _count_rows(section)
+            for section in columns_block.get("children", [])
+            if section.get("kind") == "section"
         )
+
+    remaining = _remaining_rows()
+    if remaining < total_sessions:
+        warning_text = (
+            f"Showing {remaining} of {total_sessions} sessions; "
+            "reduce excluded columns or filter by repo to see more."
+        )
+        blocks.append({"kind": "note", "tone": "warn", "text": warning_text})
         payload["blocks"] = blocks
 
-    # Final safety pass: if the warning note pushed us back over the limit,
-    # drop columns from the end until we fit.
+    # Final safety pass: if the warning note pushed us back over the limit, or
+    # if trimming rows alone wasn't enough, drop whole columns from the end.
     while True:
         encoded = json.dumps(payload, separators=(",", ":")).encode("utf-8")
         if len(encoded) <= max_bytes:
@@ -216,6 +214,20 @@ def _truncate_settings_payload(
         if len(children) <= 1:
             break
         children.pop()
+
+    # Recalculate after dropping columns and refresh the warning count.
+    remaining = _remaining_rows()
+    if remaining < total_sessions:
+        warning_text = (
+            f"Showing {remaining} of {total_sessions} sessions; "
+            "reduce excluded columns or filter by repo to see more."
+        )
+        existing = [b for b in blocks if b.get("kind") == "note" and "Showing" in b.get("text", "")]
+        if existing:
+            existing[-1]["text"] = warning_text
+        else:
+            blocks.append({"kind": "note", "tone": "warn", "text": warning_text})
+        payload["blocks"] = blocks
 
     return payload
 

@@ -70,6 +70,14 @@ def group_by_repo(sessions: list[Session], max_columns: int = 12) -> list[Column
     # Reserve one column for Scratch so total columns never exceed max_columns.
     repo_capacity = max_columns - 1 if scratch else max_columns
 
+    if scratch and repo_capacity <= 0:
+        # Only one column is allowed; combine Scratch and all repositories.
+        combined = list(scratch)
+        for repo in sorted_repos:
+            combined.extend(groups[repo])
+        columns.append(make_column("Sessions", combined))
+        return columns
+
     if scratch:
         columns.append(make_column("Scratch / no repo", scratch))
 

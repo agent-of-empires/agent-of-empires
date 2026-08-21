@@ -77,6 +77,18 @@ def test_group_by_repo_scratch_counts_toward_max_columns():
     assert columns[-1].title.startswith("More repos")
 
 
+def test_group_by_repo_single_column_combines_scratch_and_repos():
+    sessions = [
+        _session("1", "A", "Running", "/work/repo-a"),
+        _session("2", "B", "Idle", "/work/repo-b"),
+        _session("3", "C", "Waiting", None),
+    ]
+    columns = group_by_repo(sessions, max_columns=1)
+    assert len(columns) == 1
+    assert columns[0].title == "Sessions"
+    assert len(columns[0].sessions) == 3
+
+
 def test_parse_excluded_statuses():
     assert parse_excluded_statuses("stopped, unknown") == {"stopped", "unknown"}
     assert parse_excluded_statuses("") == set()
