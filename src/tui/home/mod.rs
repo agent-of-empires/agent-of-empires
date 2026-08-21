@@ -31,6 +31,22 @@ use crate::session::{
 use crate::tmux::AvailableTools;
 
 use super::creation_poller::{CreatedWorktreeInfo, CreationPoller, CreationRequest};
+use super::deletion_poller::DeletionPoller;
+#[cfg(feature = "serve")]
+use super::dialogs::ServeView;
+use super::dialogs::{
+    AttachProjectDialog, ChangelogDialog, CommandPaletteDialog, ConfirmDialog, ContextMenuDialog,
+    GroupDeleteOptionsDialog, GroupPickerDialog, HooksInstallDialog, InfoDialog, IntroDialog,
+    NewSessionData, NewSessionDialog, NoAgentsDialog, ProfilePickerDialog,
+    ProjectSessionPickerDialog, ProjectsDialog, RenameDialog, RepoTrustDialog, RestartDialog,
+    SnoozeDurationDialog, SortPickerDialog, UnifiedDeleteDialog, UpdateConfirmDialog,
+    WorktreeNameDialog,
+};
+use super::diff::DiffView;
+use super::restart_poller::RestartPoller;
+use super::settings::SettingsView;
+use super::status_poller::{StatusPoller, StatusUpdate};
+use super::stop_poller::StopPoller;
 
 fn cleanup_creation_resources(
     instance: &Instance,
@@ -55,22 +71,6 @@ enum CreationCommit {
     Inserted,
     Duplicate(Box<Instance>),
 }
-use super::deletion_poller::DeletionPoller;
-#[cfg(feature = "serve")]
-use super::dialogs::ServeView;
-use super::dialogs::{
-    AttachProjectDialog, ChangelogDialog, CommandPaletteDialog, ConfirmDialog, ContextMenuDialog,
-    GroupDeleteOptionsDialog, GroupPickerDialog, HooksInstallDialog, InfoDialog, IntroDialog,
-    NewSessionData, NewSessionDialog, NoAgentsDialog, ProfilePickerDialog,
-    ProjectSessionPickerDialog, ProjectsDialog, RenameDialog, RepoTrustDialog, RestartDialog,
-    SnoozeDurationDialog, SortPickerDialog, UnifiedDeleteDialog, UpdateConfirmDialog,
-    WorktreeNameDialog,
-};
-use super::diff::DiffView;
-use super::restart_poller::RestartPoller;
-use super::settings::SettingsView;
-use super::status_poller::{StatusPoller, StatusUpdate};
-use super::stop_poller::StopPoller;
 
 /// The GroupTree identity key for a session in project mode. Worktree sessions
 /// key on `main_repo_path` (so all branches of a repo group together); other
