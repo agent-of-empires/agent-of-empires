@@ -393,6 +393,29 @@ pub(crate) fn claude_poll_fn(
     }
 }
 
+/// The `sh` snippet shipped to `docker exec` to list candidate transcripts.
+///
+/// All three checks dereference: `[ -f ]` for type, `find -L` for freshness,
+/// `ls -tL` for ordering. A symlink's own mtime is frozen at creation, so a
+/// link left undereferenced ages out of the five-minute gate while its target
+/// is still being appended. The host scan reads through links for the same
+/// reason (#3454), and the two have to agree for
+/// `claude_host_transcript_confirmed_absent` to mean anything.
+fn claude_container_list_snippet(dir_name: &str) -> String {
+    format!(
+        r#"
+CLAUDE_HOME="${{CLAUDE_CONFIG_DIR:-$HOME/.claude}}"
+DIR="$CLAUDE_HOME/projects/{dir_name}"
+[ -d "$DIR" ] || exit 0
+for f in $(ls -tL "$DIR"/*.jsonl 2>/dev/null); do
+  [ -f "$f" ] || continue
+  [ -n "$(find -L "$f" -mmin -5 2>/dev/null)" ] || continue
+  basename "$f" .jsonl
+done
+"#
+    )
+}
+
 /// Capture Claude Code session ID inside a Docker container.
 ///
 /// Lists every fresh (≤ 5 min mtime) UUID-named jsonl in
@@ -406,19 +429,7 @@ pub(crate) fn capture_claude_session_id_in_container(
     exclusion: &HashSet<String>,
     known_session_id: Option<&str>,
 ) -> Result<String> {
-    let dir_name = encode_claude_project_path(container_cwd);
-
-    let snippet = format!(
-        r#"
-CLAUDE_HOME="${{CLAUDE_CONFIG_DIR:-$HOME/.claude}}"
-DIR="$CLAUDE_HOME/projects/{dir_name}"
-[ -d "$DIR" ] || exit 0
-for f in $(ls -t "$DIR"/*.jsonl 2>/dev/null); do
-  [ -n "$(find "$f" -mmin -5 2>/dev/null)" ] || continue
-  basename "$f" .jsonl
-done
-"#
-    );
+    let snippet = claude_container_list_snippet(&encode_claude_project_path(container_cwd));
 
     let mut cmd = std::process::Command::new("docker");
     cmd.args(["exec", container_name, "sh", "-c", &snippet]);
@@ -3542,6 +3553,82 @@ mod tests {
             None,
         );
         assert!(result.is_err());
+    }
+
+    /// Runs the production snippet under `sh` against a real directory, so the
+    /// guard is exercised without Docker. `CLAUDE_CONFIG_DIR` goes to the child
+    /// only, so this needs no `EnvGuard` and no serial key.
+    #[cfg(unix)]
+    #[test]
+    fn test_container_list_snippet_lists_only_regular_files() {
+        let sid = "11111111-1111-4111-8111-111111111111";
+        // `listed` is what the snippet should emit for each shape. The glob
+        // does match a directory, but `ls -tL` on one lists its contents
+        // rather than itself, so that entry never reaches `[ -f ]`; the row
+        // pins the listing step, not the guard.
+        let cases = [
+            ("regular", true),
+            ("symlink-to-transcript", true),
+            ("directory", false),
+            ("dangling-link", false),
+            ("symlink-cycle", false),
+            ("fifo", false),
+        ];
+        for (kind, listed) in cases {
+            let home = tempfile::tempdir().unwrap();
+            let project_path = format!("/tmp/container-scan-probe-{kind}");
+            let dir = home
+                .path()
+                .join("projects")
+                .join(encode_claude_project_path(&project_path));
+            std::fs::create_dir_all(&dir).unwrap();
+            let entry = dir.join(format!("{sid}.jsonl"));
+            match kind {
+                "regular" => std::fs::write(&entry, "{}\n").unwrap(),
+                "symlink-to-transcript" => {
+                    let target = dir.join("target.data");
+                    std::fs::write(&target, "{}\n").unwrap();
+                    std::os::unix::fs::symlink(&target, &entry).unwrap();
+                    // Age the link past the five-minute gate while its target
+                    // stays fresh. Without this the row passes on a link too
+                    // young to distinguish lstat from stat, which is the case
+                    // that actually breaks.
+                    let _ = std::process::Command::new("touch")
+                        .args(["-h", "-d", "10 minutes ago"])
+                        .arg(&entry)
+                        .status();
+                }
+                "directory" => std::fs::create_dir(&entry).unwrap(),
+                "dangling-link" => {
+                    std::os::unix::fs::symlink(dir.join("gone.jsonl"), &entry).unwrap()
+                }
+                "symlink-cycle" => std::os::unix::fs::symlink(&entry, &entry).unwrap(),
+                "fifo" => {
+                    // Skipped rather than failed where `mkfifo` is unavailable;
+                    // the other rows still gate the guard.
+                    match std::process::Command::new("mkfifo").arg(&entry).status() {
+                        Ok(s) if s.success() => {}
+                        _ => continue,
+                    }
+                }
+                _ => continue,
+            }
+
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(claude_container_list_snippet(&encode_claude_project_path(
+                    &project_path,
+                )))
+                .env("CLAUDE_CONFIG_DIR", home.path())
+                .output()
+                .expect("snippet invocation failed");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert_eq!(
+                stdout.lines().any(|l| l.trim() == sid),
+                listed,
+                "{kind}: unexpected listing, stdout {stdout:?}",
+            );
+        }
     }
 
     #[test]
