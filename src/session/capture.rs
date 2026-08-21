@@ -3592,11 +3592,17 @@ mod tests {
                     // Age the link past the five-minute gate while its target
                     // stays fresh. Without this the row passes on a link too
                     // young to distinguish lstat from stat, which is the case
-                    // that actually breaks.
-                    let _ = std::process::Command::new("touch")
+                    // that actually breaks. BSD `touch` rejects this date
+                    // form, so skip the row where it is unavailable rather
+                    // than let it pass without testing anything.
+                    let aged = std::process::Command::new("touch")
                         .args(["-h", "-d", "10 minutes ago"])
                         .arg(&entry)
-                        .status();
+                        .status()
+                        .is_ok_and(|s| s.success());
+                    if !aged {
+                        continue;
+                    }
                 }
                 "directory" => std::fs::create_dir(&entry).unwrap(),
                 "dangling-link" => {
