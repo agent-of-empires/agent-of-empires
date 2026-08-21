@@ -2244,7 +2244,7 @@ impl Instance {
     /// attention sort short-circuits the row to its bottom tier.
     ///
     /// Cleared by `unarchive`, by `touch_last_accessed`, and by `favorite`
-    /// and `pin` through the mutual exclusion below; not by `snooze`.
+    /// and `pin`; not by `snooze`.
     /// `merge_user_action_diff` mirrors those onto disk, and #3465 tracks a
     /// status transition reaching that mirror without a user gesture.
     ///
