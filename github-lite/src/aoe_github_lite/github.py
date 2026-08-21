@@ -64,44 +64,69 @@ def parse_overrides(raw: str) -> dict[str, str]:
     return result
 
 
-def _make_request(url: str, token: str) -> Any:
+def _make_request(url: str) -> Any:
     req = urllib.request.Request(
         url,
         headers={"Accept": "application/vnd.github+json", "X-GitHub-Api-Version": "2022-11-28"},
     )
-    if token:
-        req.add_header("Authorization", f"Bearer {token}")
     with urllib.request.urlopen(req, timeout=15) as resp:
-        return json.loads(resp.read().decode("utf-8"))
+        return json.loads(resp.read().decode("utf-8")), dict(resp.headers)
 
 
-def list_open_prs(slug: str, token: str) -> list[PullRequest]:
-    """List open PRs for an owner/repo slug."""
-    url = f"https://api.github.com/repos/{slug}/pulls?state=open&per_page=50"
-    try:
-        data = _make_request(url, token)
-    except urllib.error.HTTPError as exc:
-        raise RuntimeError(f"GitHub API error for {slug}: {exc.code} {exc.reason}") from exc
-    except urllib.error.URLError as exc:
-        raise RuntimeError(f"GitHub API unreachable for {slug}: {exc.reason}") from exc
-
-    if not isinstance(data, list):
-        raise RuntimeError(f"unexpected GitHub response for {slug}: not a list")
-
-    prs: list[PullRequest] = []
-    for item in data:
-        if not isinstance(item, dict):
+def _next_page_url(headers: dict[str, str]) -> str | None:
+    """Extract the next page URL from a GitHub Link header."""
+    link = headers.get("Link", "")
+    if not link:
+        return None
+    for part in link.split(","):
+        try:
+            url, rel = part.split(";", 1)
+        except ValueError:
             continue
-        user = item.get("user") or {}
-        prs.append(
-            PullRequest(
-                number=int(item.get("number", 0)),
-                title=str(item.get("title", "")),
-                state=str(item.get("state", "")),
-                author=str(user.get("login", "")) if isinstance(user, dict) else "",
-                html_url=str(item.get("html_url", "")),
-                draft=bool(item.get("draft", False)),
-                created_at=str(item.get("created_at", "")),
-            )
-        )
+        if 'rel="next"' in rel:
+            return url.strip().strip("<>").strip()
+    return None
+
+
+def _item_to_pr(item: Any) -> PullRequest | None:
+    if not isinstance(item, dict):
+        return None
+    user = item.get("user") or {}
+    return PullRequest(
+        number=int(item.get("number", 0)),
+        title=str(item.get("title", "")),
+        state=str(item.get("state", "")),
+        author=str(user.get("login", "")) if isinstance(user, dict) else "",
+        html_url=str(item.get("html_url", "")),
+        draft=bool(item.get("draft", False)),
+        created_at=str(item.get("created_at", "")),
+    )
+
+
+def list_open_prs(slug: str) -> list[PullRequest]:
+    """List open PRs for an owner/repo slug, following GitHub pagination."""
+    url: str | None = f"https://api.github.com/repos/{slug}/pulls?state=open&per_page=100"
+    prs: list[PullRequest] = []
+    seen: set[int] = set()
+
+    while url:
+        try:
+            data, headers = _make_request(url)
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(f"GitHub API error for {slug}: {exc.code} {exc.reason}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"GitHub API unreachable for {slug}: {exc.reason}") from exc
+
+        if not isinstance(data, list):
+            raise RuntimeError(f"unexpected GitHub response for {slug}: not a list")
+
+        for item in data:
+            pr = _item_to_pr(item)
+            if pr is None or pr.number in seen:
+                continue
+            seen.add(pr.number)
+            prs.append(pr)
+
+        url = _next_page_url(headers)
+
     return prs

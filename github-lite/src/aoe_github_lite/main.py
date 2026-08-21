@@ -15,7 +15,6 @@ from .session_model import Session, session_from_json
 DEFAULT_SETTINGS: dict[str, Any] = {
     "default_owner": "",
     "repo_overrides": "",
-    "github_token": "",
     "refresh_secs": 60,
 }
 
@@ -165,6 +164,10 @@ class GitHubLiteWorker:
                 print(f"[github-lite] spurious response: {msg}", file=sys.stderr)
 
     def _refresh(self) -> None:
+        # Cache is scoped to a single refresh so new/closed PRs appear on the
+        # next cycle while still avoiding duplicate API calls within one refresh.
+        self._pr_cache.clear()
+
         result = self._request(
             "sessions.list",
             {"exclude": ["archived", "snoozed", "trashed"]},
@@ -176,13 +179,12 @@ class GitHubLiteWorker:
         overrides = parse_overrides(
             str(self.settings.get("repo_overrides", DEFAULT_SETTINGS["repo_overrides"]))
         )
-        token = str(self.settings.get("github_token", DEFAULT_SETTINGS["github_token"]))
 
         visible_session_ids: set[str] = set()
         for session in sessions:
             visible_session_ids.add(session.id)
             slug = parse_repo_slug(session.project_path, default_owner, overrides)
-            prs = self._fetch_prs(slug, token)
+            prs = self._fetch_prs(slug)
             write_message(
                 self.out_stream,
                 ui_state_set(session.id, build_pane_payload(session, slug, prs)),
@@ -193,13 +195,13 @@ class GitHubLiteWorker:
 
         self.pushed_session_ids = visible_session_ids
 
-    def _fetch_prs(self, slug: str | None, token: str) -> list:
+    def _fetch_prs(self, slug: str | None) -> list:
         if slug is None:
             return []
         if slug in self._pr_cache:
             return self._pr_cache[slug]
         try:
-            prs = list_open_prs(slug, token)
+            prs = list_open_prs(slug)
         except Exception as exc:
             print(f"[github-lite] failed to fetch PRs for {slug}: {exc}", file=sys.stderr)
             prs = []

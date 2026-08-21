@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import select
 import subprocess
 import time
 from pathlib import Path
@@ -15,7 +16,6 @@ WORKER = ROOT / ".aoe-build" / "venv" / "bin" / "aoe-github-lite-worker"
 CONFIG_VALUES = {
     "default_owner": "",
     "repo_overrides": "",
-    "github_token": "",
     "refresh_secs": 60,
 }
 
@@ -41,9 +41,14 @@ def worker_path() -> Path:
 
 
 def _read_line(proc: subprocess.Popen, deadline: float = 5.0) -> dict | None:
-    end = time.time() + deadline
-    while time.time() < end:
-        # Use a small non-blocking poll so closing stdin triggers EOF promptly.
+    end = time.monotonic() + deadline
+    while True:
+        remaining = end - time.monotonic()
+        if remaining <= 0:
+            break
+        ready, _, _ = select.select([proc.stdout], [], [], min(remaining, 0.01))
+        if not ready:
+            continue
         line = proc.stdout.readline()
         if line:
             line = line.strip()
@@ -51,7 +56,6 @@ def _read_line(proc: subprocess.Popen, deadline: float = 5.0) -> dict | None:
                 return json.loads(line)
         elif line == "":
             return None
-        time.sleep(0.01)
     raise TimeoutError(f"no worker output within {deadline}s")
 
 

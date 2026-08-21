@@ -2,3 +2,6 @@
 __pycache__/
 *.egg-info/
 .pytest_cache/
+.agent-of-empires/
+.env
+.mcp.json

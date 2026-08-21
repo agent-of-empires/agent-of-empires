@@ -24,20 +24,12 @@ default = ""
 advanced = true
 
 [[settings]]
-key = "github_token"
-label = "GitHub personal access token"
-description = "Optional token for private repositories and higher rate limits."
-type = "string"
-default = ""
-advanced = true
-
-[[settings]]
 key = "refresh_secs"
 label = "Refresh interval (seconds)"
 description = "How often the worker refreshes pull-request data."
 type = "integer"
 default = 60
-min = 0
+min = 1
 max = 3600
 advanced = true
 
