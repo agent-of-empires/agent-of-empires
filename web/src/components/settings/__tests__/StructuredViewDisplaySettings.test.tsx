@@ -82,6 +82,22 @@ describe("StructuredViewDisplaySettings localStorage contract", () => {
     expect((getByTestId("structured-desktop-font-size-select") as HTMLInputElement).value).toBe("10");
   });
 
+  it("associates the limit label with both controls for screen readers", () => {
+    const { getByTestId } = render(<StructuredViewDisplaySettings />);
+    fireEvent.click(getByTestId("persistent-structured-views-toggle"));
+
+    const labelId = "max-persistent-structured-views-label";
+    const label = document.getElementById(labelId);
+    expect(label).not.toBeNull();
+    expect(label?.textContent).toBe("Loaded session limit");
+    expect((getByTestId("max-persistent-structured-views") as HTMLInputElement).getAttribute("aria-labelledby")).toBe(
+      labelId,
+    );
+    // The range input is not test-id tagged; locate it by type within the same container.
+    const range = label?.nextElementSibling?.querySelector('input[type="range"]') as HTMLInputElement | null;
+    expect(range?.getAttribute("aria-labelledby")).toBe(labelId);
+  });
+
   it("defaults persistent structured views off and hides the limit input", () => {
     const { getByTestId, queryByTestId } = render(<StructuredViewDisplaySettings />);
     expect((getByTestId("persistent-structured-views-toggle") as HTMLInputElement).checked).toBe(false);

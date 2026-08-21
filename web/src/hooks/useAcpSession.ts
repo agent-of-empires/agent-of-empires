@@ -1143,6 +1143,22 @@ export function useAcpSession(
     connectRef.current?.();
   };
 
+  // Cancel any pending reconnect backoff when this session becomes inactive,
+  // and trigger one reconnect when it becomes active again so the user doesn't
+  // stare at a stale disconnected warm session.
+  const wasActiveRef = useRef(active);
+  useEffect(() => {
+    // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
+    if (active && !wasActiveRef.current) {
+      tryAutoReconnectRef.current();
+    }
+    // eslint-disable-next-line react-you-might-not-need-an-effect/no-event-handler
+    if (!active) {
+      clearRetryTimers();
+    }
+    wasActiveRef.current = active;
+  }, [active, clearRetryTimers]);
+
   // Liveness watchdog: a foreground-visible idle tab fires neither
   // visibilitychange nor online, so a zombie socket would otherwise sit
   // forever. Poll while the socket reports OPEN and let
@@ -1457,6 +1473,7 @@ export function useAcpSession(
 
     const scheduleReconnect = () => {
       if (cancelled) return;
+      if (!activeRef.current) return;
       if (retryCountRef.current >= ACP_MAX_RETRIES) {
         setReconnectingRef.current(false);
         setRetryCountRef.current(retryCountRef.current);
@@ -1480,6 +1497,7 @@ export function useAcpSession(
           clearInterval(countdownTimerRef.current);
           countdownTimerRef.current = null;
         }
+        if (!activeRef.current) return;
         connectRef.current?.();
       }, delayMs);
     };

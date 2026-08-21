@@ -42,19 +42,19 @@ export function StructuredViewStack({
         setRecentIds([]);
         return;
       }
-      if (!activeSessionId) {
-        setRecentIds((ids) => ids.filter((id) => sessionsById.has(id)));
-        return;
-      }
-      const activeSession = sessionsById.get(activeSessionId);
-      if (!activeSession || activeSession.view !== "structured") {
-        // Active session is not structured; keep recent structured sessions warm
-        // but do not add the active id.
-        setRecentIds((ids) => ids.filter((id) => id !== activeSessionId && sessionsById.has(id)).slice(0, limit));
-        return;
-      }
       setRecentIds((ids) => {
-        const inactive = ids.filter((id) => id !== activeSessionId && sessionsById.has(id));
+        // Drop sessions whose view is no longer structured and remove duplicates.
+        const structuredIds = ids.filter((id) => sessionsById.get(id)?.view === "structured");
+        if (!activeSessionId) {
+          return structuredIds;
+        }
+        const activeSession = sessionsById.get(activeSessionId);
+        if (!activeSession || activeSession.view !== "structured") {
+          // Active session is not structured; keep recent structured sessions warm
+          // but do not add the active id.
+          return structuredIds.filter((id) => id !== activeSessionId).slice(0, limit);
+        }
+        const inactive = structuredIds.filter((id) => id !== activeSessionId);
         const next = [activeSessionId, ...inactive].slice(0, limit);
         return next.join("\0") === ids.join("\0") ? ids : next;
       });
@@ -64,13 +64,19 @@ export function StructuredViewStack({
     };
   }, [activeSessionId, limit, persistent, sessionsById]);
 
-  if (!persistent && !activeSessionId) return null;
+  const activeStructuredId =
+    activeSessionId && sessionsById.get(activeSessionId)?.view === "structured" ? activeSessionId : null;
 
-  const visibleIds = persistent
-    ? recentIds.filter((id) => sessionsById.has(id))
-    : activeSessionId && sessionsById.get(activeSessionId)?.view === "structured"
-      ? [activeSessionId]
-      : [];
+  const visibleIds = useMemo(() => {
+    const retained = recentIds.filter((id) => {
+      const session = sessionsById.get(id);
+      return session && session.view === "structured" && id !== activeStructuredId;
+    });
+    if (!persistent) {
+      return activeStructuredId ? [activeStructuredId] : [];
+    }
+    return activeStructuredId ? [activeStructuredId, ...retained].slice(0, limit) : retained.slice(0, limit);
+  }, [activeStructuredId, limit, persistent, recentIds, sessionsById]);
 
   if (visibleIds.length === 0) return null;
 

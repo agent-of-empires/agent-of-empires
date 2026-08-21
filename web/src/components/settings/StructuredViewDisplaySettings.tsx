@@ -61,10 +61,13 @@ export function StructuredViewDisplaySettings() {
 
           {settings.persistentStructuredViews && (
             <div>
-              <label className="block text-[13px] text-text-secondary mb-2">Loaded session limit</label>
+              <span id="max-persistent-structured-views-label" className="block text-[13px] text-text-secondary mb-2">
+                Loaded session limit
+              </span>
               <div className="flex items-center gap-3">
                 <input
                   type="range"
+                  aria-labelledby="max-persistent-structured-views-label"
                   min={MIN_PERSISTENT_STRUCTURED_VIEWS}
                   max={MAX_PERSISTENT_STRUCTURED_VIEWS}
                   step={1}
@@ -78,6 +81,7 @@ export function StructuredViewDisplaySettings() {
                 />
                 <input
                   type="number"
+                  aria-labelledby="max-persistent-structured-views-label"
                   min={MIN_PERSISTENT_STRUCTURED_VIEWS}
                   max={MAX_PERSISTENT_STRUCTURED_VIEWS}
                   step={1}

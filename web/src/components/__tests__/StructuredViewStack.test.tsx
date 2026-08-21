@@ -175,6 +175,51 @@ describe("StructuredViewStack", () => {
     });
   });
 
+  it("shows the newly active structured session immediately on switch", async () => {
+    const sessions = [makeSession("s1"), makeSession("s2")];
+    const { rerender } = render(
+      <StructuredViewStack activeSessionId="s1" sessions={sessions} persistent={true} visible={true} />,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("structured-s1")).toBeDefined();
+    });
+
+    rerender(<StructuredViewStack activeSessionId="s2" sessions={sessions} persistent={true} visible={true} />);
+
+    // The active session must be visible synchronously on the render that changes
+    // it, before the queued microtask updates recentIds.
+    expect(screen.getByTestId("structured-s2").dataset.active).toBe("true");
+    expect(screen.getByTestId("structured-s1").dataset.active).toBe("false");
+  });
+
+  it("prunes a warm session from the recent list when its view becomes terminal", async () => {
+    const sessions = [makeSession("s1"), makeSession("s2")];
+    const { rerender } = render(
+      <StructuredViewStack activeSessionId="s1" sessions={sessions} persistent={true} visible={true} />,
+    );
+    await waitFor(() => {
+      expect(screen.getByTestId("structured-s1")).toBeDefined();
+    });
+
+    rerender(<StructuredViewStack activeSessionId="s2" sessions={sessions} persistent={true} visible={true} />);
+    await waitFor(() => {
+      expect(screen.getByTestId("structured-s1")).toBeDefined();
+    });
+
+    // Now s2 flips to terminal; it must drop out of the stack promptly.
+    rerender(
+      <StructuredViewStack
+        activeSessionId="s1"
+        sessions={[makeSession("s1"), makeSession("s2", "terminal")]}
+        persistent={true}
+        visible={true}
+      />,
+    );
+    await waitFor(() => {
+      expect(screen.queryByTestId("structured-s2")).toBeNull();
+    });
+  });
+
   it("counts the configured limit as the total mounted structured view count", async () => {
     const sessions = [makeSession("s1"), makeSession("s2"), makeSession("s3")];
     const { rerender } = render(

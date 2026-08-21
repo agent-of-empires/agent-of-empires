@@ -57,7 +57,12 @@ export function useMobileKeyboard(enabled = true) {
   const fullHeightRef = useRef(0);
 
   useEffect(() => {
-    if (!enabled) return;
+    if (!enabled) {
+      // Reset stored keyboard metrics when tracking is disabled so an inactive
+      // session can't leave stale open/height values behind for the next render.
+      store.update({ keyboardOpen: false, keyboardHeight: 0 });
+      return;
+    }
     if (typeof window === "undefined" || !window.matchMedia) return;
     const mql = window.matchMedia("(pointer: coarse)");
     const onChange = () => {

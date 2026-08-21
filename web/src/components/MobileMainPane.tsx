@@ -118,18 +118,20 @@ export function MobileMainPane({
       )}
       <div className="relative flex-1 flex flex-col min-h-0 overflow-hidden">
         <div className={layerClass(view === "agent")} inert={view !== "agent"}>
-          <Suspense fallback={null}>
-            <StructuredViewStack
-              activeSessionId={activeSessionId}
-              sessions={sessions}
-              persistent={webSettings.persistentStructuredViews}
-              maxPersistentStructuredViews={webSettings.maxPersistentStructuredViews}
-              visible={view === "agent"}
-              onOpenFileRef={onOpenFileRef}
-              onOpenAgentsPane={onOpenAgentsPane}
-              onRestoreSession={onRestoreSession}
-            />
-          </Suspense>
+          {(activeSession?.view === "structured" || webSettings.persistentStructuredViews) && (
+            <Suspense fallback={null}>
+              <StructuredViewStack
+                activeSessionId={activeSessionId}
+                sessions={sessions}
+                persistent={webSettings.persistentStructuredViews}
+                maxPersistentStructuredViews={webSettings.maxPersistentStructuredViews}
+                visible={view === "agent"}
+                onOpenFileRef={onOpenFileRef}
+                onOpenAgentsPane={onOpenAgentsPane}
+                onRestoreSession={onRestoreSession}
+              />
+            </Suspense>
+          )}
           {activeSession?.view !== "structured" && (
             // Reserve the bottom home-indicator inset on this wrapper (the App
             // root no longer does; see index.css .safe-area-inset) so the last

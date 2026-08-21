@@ -451,7 +451,7 @@ export function Composer({
   // already physically occludes, leaving a visible gap between the
   // composer and the top of the keyboard. Cancel that reservation and
   // drop our own bottom padding while the keyboard is open. See #1143.
-  const { keyboardOpen } = useMobileKeyboard();
+  const { keyboardOpen } = useMobileKeyboard(active);
 
   // On an installed iOS PWA the keyboard's accessory bar (predictive / AutoFill
   // strip) floats over the bottom of the page and covers Send, because the

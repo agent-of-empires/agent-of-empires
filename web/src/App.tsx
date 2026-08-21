@@ -1877,21 +1877,25 @@ function AppContent({
             left={
               <div className="flex-1 flex flex-col min-h-0 overflow-hidden relative">
                 <div className={selectedFilePath ? "hidden" : "relative flex-1 flex flex-col min-h-0 overflow-hidden"}>
-                  <Suspense fallback={<AcpLoadingFallback />}>
-                    <StructuredViewStack
-                      activeSessionId={activeSessionId}
-                      sessions={sessions}
-                      persistent={webSettings.persistentStructuredViews}
-                      maxPersistentStructuredViews={webSettings.maxPersistentStructuredViews}
-                      visible={activeSession?.view === "structured"}
-                      onOpenFileRef={handleOpenFileRef}
-                      onOpenAgentsPane={openAgentsPane}
-                      onRestoreSession={async (sessionId) => {
-                        const restored = await handleRestoreSession(trashedWorkspaceRestoreIds(workspaces, sessionId));
-                        return restored;
-                      }}
-                    />
-                  </Suspense>
+                  {(activeSession?.view === "structured" || webSettings.persistentStructuredViews) && (
+                    <Suspense fallback={<AcpLoadingFallback />}>
+                      <StructuredViewStack
+                        activeSessionId={activeSessionId}
+                        sessions={sessions}
+                        persistent={webSettings.persistentStructuredViews}
+                        maxPersistentStructuredViews={webSettings.maxPersistentStructuredViews}
+                        visible={activeSession?.view === "structured"}
+                        onOpenFileRef={handleOpenFileRef}
+                        onOpenAgentsPane={openAgentsPane}
+                        onRestoreSession={async (sessionId) => {
+                          const restored = await handleRestoreSession(
+                            trashedWorkspaceRestoreIds(workspaces, sessionId),
+                          );
+                          return restored;
+                        }}
+                      />
+                    </Suspense>
+                  )}
                   {activeSession?.view !== "structured" && (
                     <TerminalSessionStack
                       activeSessionId={activeSessionId!}

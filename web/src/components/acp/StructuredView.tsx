@@ -430,7 +430,7 @@ function AcpChrome({
   const [atBottom, setAtBottom] = useState(true);
   // Soft-keyboard state, so we can hold the bottom pin across the keyboard
   // open/close animation (see the effect below).
-  const { keyboardOpen } = useMobileKeyboard();
+  const { keyboardOpen } = useMobileKeyboard(active);
   const scrollToBottom = useCallback(() => {
     const vp = viewportRef.current;
     if (!vp) return;
