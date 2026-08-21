@@ -903,7 +903,7 @@ impl HomeView {
                     "Cannot move group while session {id} is being created"
                 );
                 anyhow::ensure!(
-                    instance.lifecycle_reservation.is_none(),
+                    !instance.has_fresh_lifecycle_reservation(chrono::Utc::now()),
                     "Cannot move group while session {id} has a lifecycle operation in progress"
                 );
             }
@@ -921,7 +921,7 @@ impl HomeView {
                     "Cannot move group while session {id} is being created"
                 );
                 anyhow::ensure!(
-                    authoritative.lifecycle_reservation.is_none(),
+                    !authoritative.has_fresh_lifecycle_reservation(chrono::Utc::now()),
                     "Cannot move group while session {id} has a lifecycle operation in progress"
                 );
                 anyhow::ensure!(

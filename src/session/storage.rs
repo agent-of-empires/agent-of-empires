@@ -88,15 +88,12 @@
 //! mutation timeout and container commands use the runtime timeout. The effect
 //! must not re-enter storage.
 //!
-//! Residual window (medium, never data loss): `before_commit` can move the
-//! worktree directory before the target/source rows are written. A later
-//! write/fsync failure may retain both source and target rows with the same
-//! global session id, or retain only the source row pointing at the old leaf.
-//! There is no safe automatic winner for every historical duplicate. The TUI
-//! therefore excludes ambiguous duplicate ids from its in-memory map instead of
-//! picking one by profile iteration order; a dedicated migration must inspect
-//! and repair the durable copies (#3459). Effect-first ordering still makes the common
-//! failure, the worktree move itself failing, a clean abort that touches no row.
+//! Residual window: `before_commit` can move the worktree before profile rows
+//! are written. A later write or sync failure may retain source and target rows
+//! with the same global session id, or retain only the source row pointing at
+//! the old leaf. The TUI excludes ambiguous ids instead of selecting a profile
+//! by iteration order. Effect-first ordering still makes a failed worktree move
+//! a clean abort that changes no profile row.
 //!
 //! `update_workspace_ordering` and `Storage::update` must NOT be called from
 //! inside each other's closures. They use distinct lock files but acquiring
@@ -474,6 +471,7 @@ fn sync_parent_directory(path: &Path) -> Result<()> {
     sync_resolved_parent_directory(&resolved)
 }
 
+#[cfg(unix)]
 fn sync_resolved_parent_directory(path: &Path) -> Result<()> {
     let parent = path
         .parent()
@@ -482,6 +480,16 @@ fn sync_resolved_parent_directory(path: &Path) -> Result<()> {
         .with_context(|| format!("opening profile directory {}", parent.display()))?
         .sync_all()
         .with_context(|| format!("syncing profile directory {}", parent.display()))
+}
+
+#[cfg(not(unix))]
+fn sync_resolved_parent_directory(path: &Path) -> Result<()> {
+    path.parent()
+        .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
+    // Rust exposes no portable directory flush outside Unix. The file content
+    // was already synced before rename; do not turn every profile move into a
+    // post-publication error on platforms that cannot open directories as files.
+    Ok(())
 }
 
 fn atomic_write_verified(path: &Path, content: &[u8]) -> Result<()> {
@@ -1019,10 +1027,10 @@ impl Storage {
     }
 
     /// Move a batch between profiles as one dual-locked transaction.
-    ///
-    /// Target groups and rows are written and the target directory is synced
-    /// before source metadata or rows are removed. Runtime source-write
-    /// failures restore both profiles when the source state is unambiguous.
+    /// Target groups and rows are written before source metadata is removed.
+    /// File contents are synced on every platform; Unix also verifies the
+    /// target parent-directory rename before removing source rows. Runtime
+    /// source-write failures restore both profiles when the source is clear.
     pub(crate) fn move_instances_to<F>(
         &self,
         target: &Storage,
@@ -1225,11 +1233,10 @@ impl Storage {
                 return Err(target_error);
             }
         };
-        // Double fsync of the target parent is deliberate. `atomic_write` inside
-        // `atomic_write_verified_resolved` already fsyncs the directory
-        // best-effort so the rename survives power loss; this second fsync is the
-        // verified durability barrier whose failure aborts the transaction before
-        // any source row is removed. Keep the verified one.
+        // `atomic_write` already syncs file content and attempts a directory
+        // sync. Unix performs this verified parent-directory barrier before
+        // source removal. Other platforms use the file sync as their portable
+        // durability boundary.
         if let Some(path) = resolved_target_groups_path.as_deref() {
             sync_target_parent(path)?;
         }
@@ -3025,7 +3032,7 @@ mod tests {
     }
 
     #[test]
-    fn profile_batch_move_is_all_or_nothing_and_merges_fresh_source() -> Result<()> {
+    fn profile_batch_move_rejects_collision_and_merges_fresh_source() -> Result<()> {
         let temp = tempdir()?;
         let source_dir = temp.path().join("source");
         let target_dir = temp.path().join("target");

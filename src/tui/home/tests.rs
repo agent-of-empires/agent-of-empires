@@ -7398,7 +7398,7 @@ fn test_group_profile_move_is_all_or_nothing() {
 
 #[test]
 #[serial]
-fn group_profile_move_preflights_every_creating_member_before_mutation() {
+fn group_profile_move_preflights_creating_and_expired_reservations() {
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
     let source = Storage::new_unwatched("alpha").unwrap();
@@ -7439,6 +7439,37 @@ fn group_profile_move_preflights_every_creating_member_before_mutation() {
         .iter()
         .all(|instance| instance.group_path == "work"));
     assert!(target.load().unwrap().is_empty());
+
+    let stale = LifecycleReservation {
+        op: LifecycleOperation::Launch,
+        generation: 1,
+        at: chrono::Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1),
+    };
+    view.mutate_instance(&second.id, |instance| {
+        instance.status = Status::Idle;
+        instance.lifecycle_generation = 1;
+        instance.lifecycle_reservation = Some(stale.clone());
+    });
+    source
+        .update(|instances, _groups| {
+            let instance = instances
+                .iter_mut()
+                .find(|instance| instance.id == second.id)
+                .unwrap();
+            instance.lifecycle_generation = 1;
+            instance.lifecycle_reservation = Some(stale);
+            Ok(())
+        })
+        .unwrap();
+    view.group_rename_context = Some(super::GroupRenameContext {
+        old_path: "work".to_string(),
+        old_profile: "alpha".to_string(),
+    });
+
+    view.rename_selected_group(Some("moved"), Some("beta"))
+        .expect("expired reservation must not block the group move");
+    assert!(source.load().unwrap().is_empty());
+    assert_eq!(target.load().unwrap().len(), 2);
 }
 
 #[test]
