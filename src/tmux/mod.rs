@@ -37,7 +37,7 @@ pub mod test_support {
 
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Output, Stdio};
 use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -252,6 +252,25 @@ struct SessionCache {
     data: Option<HashMap<String, i64>>,
     time: Option<Instant>,
 }
+const TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn run_tmux_command_with_timeout_inner(
+    cmd: &mut Command,
+    timeout: Duration,
+) -> std::io::Result<Output> {
+    cmd.stdin(Stdio::null());
+    match crate::process::run_with_timeout(cmd, timeout)? {
+        Some(output) => Ok(output),
+        None => Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!("tmux command timed out after {}s", timeout.as_secs_f64()),
+        )),
+    }
+}
+
+pub(crate) fn run_tmux_command_with_timeout(cmd: &mut Command) -> std::io::Result<Output> {
+    run_tmux_command_with_timeout_inner(cmd, TMUX_COMMAND_TIMEOUT)
+}
 
 /// Result of the authoritative `list-sessions` scan performed by
 /// [`refresh_session_cache`]. The shared cache intentionally keeps both
@@ -306,10 +325,9 @@ fn tmux_no_server_running(stderr: &[u8]) -> bool {
 
 pub fn refresh_session_cache() -> SessionCacheRefresh {
     let start = Instant::now();
-    let output = tmux_query_command()
-        .args(["list-sessions", "-F", "#{session_name}|#{session_activity}"])
-        .output();
-
+    let mut command = tmux_query_command();
+    command.args(["list-sessions", "-F", "#{session_name}|#{session_activity}"]);
+    let output = run_tmux_command_with_timeout(&mut command);
     let (new_data, outcome) = match output {
         Ok(out) if out.status.success() => {
             let stdout = String::from_utf8_lossy(&out.stdout);
@@ -1320,6 +1338,16 @@ mod tests {
         assert_eq!(args.first().map(|a| a.to_str().unwrap()), Some("-S"));
         assert!(args.get(1).is_some(), "socket path arg present");
         assert_eq!(cmd.get_program().to_str(), Some("tmux"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tmux_command_timeout_kills_a_stalled_client() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "sleep 5"]);
+        let error = run_tmux_command_with_timeout_inner(&mut command, Duration::from_millis(10))
+            .expect_err("stalled client must time out");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
     }
 
     #[test]

@@ -401,26 +401,16 @@ pub(crate) fn acquire_storage_flock(dir: &Path, name: &str) -> Result<StorageFlo
 /// writes, and any in-memory cache publication. See the module lock order.
 ///
 /// Held across slow external effects. The tied worktree rename path
-/// (`session::worktree_edit::edit_worktree_workdir`) runs `git branch -m` and
-/// `git worktree move`, and the callers refresh tmux state, all while this
-/// cross-process `flock` is held so duplicate validation and durable commit
-/// are one transaction with no TOCTOU window. Those git effects are therefore
-/// bounded (`WORKTREE_MUTATION_TIMEOUT` in `git::worktree`): a stalled
-/// filesystem turns into a surfaced error instead of pinning the lock, and
-/// thus every peer `aoe` process, indefinitely. The `flock` itself is released
-/// by the kernel on process exit, so a crashed holder cannot wedge peers
-/// either.
+/// (`session::worktree_edit::edit_worktree_workdir`) may run `git branch -m`
+/// and `git worktree move` while this lock is held. Both mutations are bounded
+/// by `WORKTREE_MUTATION_TIMEOUT`, so a stalled filesystem returns an error
+/// instead of blocking every identity writer indefinitely. Title writers
+/// release this lock after the durable commit and retain their per-session
+/// title and lifecycle locks through the bounded tmux rekey.
 ///
-/// Scope deliberately left OUTSIDE this lock, so `(title, project_path)`
-/// uniqueness is NOT a global invariant:
-///   - `session::smart_rename` rewrites a structured session's title from a
-///     detached one-shot without taking this lock (it only ever touches the
-///     title, never the worktree directory), so it can land a title that
-///     collides with another row.
-///   - Session-creation surfaces other than the guarded `aoe add` / rename
-///     paths (imports, restores, ACP-driven creation) do not serialize through
-///     here. The lock guarantees the add/rename endpoints cannot *introduce* a
-///     duplicate; it does not retroactively dedup rows created elsewhere.
+/// Imports, restores, and other creation surfaces that do not use guarded add
+/// or rename paths remain outside this lock. The lock prevents participating
+/// writers from introducing a duplicate; it does not repair existing rows.
 pub(crate) fn acquire_session_identity_lock() -> Result<StorageFlock> {
     acquire_storage_flock(&get_app_dir()?, SESSION_IDENTITY_LOCK_FILENAME)
 }

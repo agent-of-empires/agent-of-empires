@@ -929,6 +929,7 @@ fn apply_terminal_title(
 ) -> anyhow::Result<()> {
     let id = id.to_string();
     let new_title = new_title.map(str::to_string);
+    let identity_lock = crate::session::acquire_session_identity_lock()?;
     let _session_title_lock = crate::session::storage::acquire_session_title_lock(&id)?;
     let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(&id)?;
     let rekey = storage.update(|instances, _groups| {
@@ -962,6 +963,7 @@ fn apply_terminal_title(
         }
         Ok(rekey)
     })?;
+    drop(identity_lock);
     if let Some((old_title, new_title)) = rekey {
         if let Err(error) = crate::tmux::rekey_session(&id, &old_title, &new_title) {
             tracing::warn!(target: "smart_rename", session = %id, "tmux rename failed: {error}");
@@ -1392,19 +1394,13 @@ mod serve {
         apply_auto_title(&state, &session_id, &profile, &new_title).await;
     }
 
-    /// Apply an automatically-generated title to a session, persisting to
-    /// storage and mirroring the in-memory instance list so connected clients
-    /// see it without a reload. The write happens only while the current title
-    /// is still a default civ name or still equals the last auto title we wrote
-    /// (`title_is_auto_overwritable`), so a manual rename is never clobbered.
-    /// Serializes against manual renames / worktree edits on this session via
-    /// both the process-local instance lock and the cross-process per-session
-    /// title lock. The latter is retained from the authoritative storage commit
-    /// through the AppState mirror so an external title writer cannot land in
-    /// the gap and then be overwritten in memory. The mirror changes only when
-    /// the storage write actually happened. Two further cases skip the write
-    /// silently: the generated title already equals the current one, and another
-    /// session in this profile already owns the (title, path) pair.
+    /// Persist an automatically generated title and mirror it into AppState.
+    /// The title changes only while it remains auto-overwritable. The
+    /// process-local instance lock, global identity lock, and per-session title
+    /// lock serialize the write with manual renames. Identity covers duplicate
+    /// validation through the durable write. The title lock remains held
+    /// through the AppState mirror so a later writer cannot be overwritten in
+    /// memory. Unchanged and duplicate titles are skipped.
     pub(crate) async fn apply_auto_title(
         state: &Arc<AppState>,
         id: &str,
@@ -1429,6 +1425,7 @@ mod serve {
         let id_owned = id.to_string();
         let title_owned = new_title.to_string();
         let persisted = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let identity_lock = crate::session::acquire_session_identity_lock()?;
             let session_title_lock =
                 crate::session::storage::acquire_session_title_lock(&id_owned)?;
             let wrote = storage.update(|instances, _groups| {
@@ -1464,6 +1461,7 @@ mod serve {
                     Ok(false)
                 }
             })?;
+            drop(identity_lock);
             Ok((wrote, session_title_lock))
         })
         .await;
@@ -2733,18 +2731,16 @@ claude = "repo-wrapper"
 
     #[test]
     #[serial_test::serial]
-    fn title_mutation_lock_validates_id_and_serializes_writers() {
+    fn title_mutation_locks_validate_and_serialize_writers() {
         use crate::session::instance::Instance;
+        use crate::session::storage::Storage;
         let home = tempfile::tempdir().expect("tempdir HOME");
         let _home_guard = crate::session::test_support::isolate_home(home.path());
 
-        // The lock is keyed only by validated session id at the app root, so a
-        // path-traversal id is rejected before any file is touched.
         assert!(crate::session::storage::acquire_session_title_lock("../unsafe").is_err());
 
-        // A second writer cannot enter while the first holds the lock between
-        // commit and rekey, regardless of which profile Storage it would use.
-        let id = Instance::new("Vikings", "/tmp/x").id;
+        let instance = Instance::new("Vikings", "/tmp/x");
+        let id = instance.id.clone();
         let first_title_lock = crate::session::storage::acquire_session_title_lock(&id).unwrap();
         let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
         let competing_id = id.clone();
@@ -2756,13 +2752,45 @@ claude = "repo-wrapper"
             acquired_rx
                 .recv_timeout(std::time::Duration::from_millis(150))
                 .is_err(),
-            "a competing title writer entered before the current writer released the lock"
+            "a competing title writer entered before release"
         );
         drop(first_title_lock);
         acquired_rx
             .recv_timeout(std::time::Duration::from_secs(2))
             .expect("competing writer should enter after release");
         competing_writer.join().unwrap();
+
+        let storage = Storage::new_unwatched("identity-lock").unwrap();
+        storage
+            .update(|instances, _groups| {
+                instances.push(instance);
+                Ok(())
+            })
+            .unwrap();
+        let identity_lock = crate::session::acquire_session_identity_lock().unwrap();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let writer_id = id.clone();
+        let identity_writer = std::thread::spawn(move || {
+            let storage = Storage::new_unwatched("identity-lock").unwrap();
+            apply_terminal_title(&storage, &writer_id, Some("Shared title")).unwrap();
+            finished_tx.send(()).unwrap();
+        });
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_millis(150))
+                .is_err(),
+            "smart rename bypassed the identity transaction"
+        );
+        drop(identity_lock);
+        finished_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("smart rename should finish after identity release");
+        identity_writer.join().unwrap();
+        assert_eq!(
+            storage.load().unwrap()[0].title,
+            "Shared title",
+            "smart rename should commit after entering the transaction"
+        );
     }
 
     #[test]
