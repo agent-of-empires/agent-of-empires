@@ -1,0 +1,58 @@
+id = "dev.karl.github-lite"
+name = "GitHub Lite"
+version = "0.1.0"
+api_version = 12
+aoe_version = ">=1.14.0, <2.0.0"
+description = "Per-session GitHub pull-request pane."
+icon = "github"
+
+capabilities = ["runtime.worker", "session.read", "net"]
+
+[[settings]]
+key = "default_owner"
+label = "Default GitHub owner"
+description = "Owner or organization used when a session's project path does not match a repo override."
+type = "string"
+default = ""
+
+[[settings]]
+key = "repo_overrides"
+label = "Repo overrides"
+description = "Optional comma-separated path-to-slug mappings, e.g. 'work/app=acme/app,work/lib=acme/lib'."
+type = "string"
+default = ""
+advanced = true
+
+[[settings]]
+key = "github_token"
+label = "GitHub personal access token"
+description = "Optional token for private repositories and higher rate limits."
+type = "string"
+default = ""
+advanced = true
+
+[[settings]]
+key = "refresh_secs"
+label = "Refresh interval (seconds)"
+description = "How often the worker refreshes pull-request data."
+type = "integer"
+default = 60
+min = 0
+max = 3600
+advanced = true
+
+[[ui]]
+slot = "pane"
+id = "github_prs"
+
+[runtime]
+kind = "command"
+command = [".aoe-build/venv/bin/aoe-github-lite-worker"]
+
+[[runtime.build]]
+command = ["python3", "-m", "venv", "--copies", ".aoe-build/venv"]
+platforms = ["linux", "macos"]
+
+[[runtime.build]]
+command = [".aoe-build/venv/bin/pip", "install", "."]
+platforms = ["linux", "macos"]

@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aoe-github-lite"
+version = "0.1.0"
+description = "Agent of Empires plugin that shows GitHub pull requests in a per-session pane."
+requires-python = ">=3.10"
+dependencies = []
+
+[project.scripts]
+aoe-github-lite-worker = "aoe_github_lite.main:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]

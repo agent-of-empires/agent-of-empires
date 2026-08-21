@@ -1,0 +1,1 @@
+"""GitHub Lite AOE plugin."""
