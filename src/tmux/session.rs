@@ -620,9 +620,9 @@ impl Session {
             return Ok(());
         }
 
-        let output = crate::tmux::tmux_command()
-            .args(["rename-session", "-t", &self.name, new_name])
-            .output()?;
+        let mut command = crate::tmux::tmux_command();
+        command.args(["rename-session", "-t", &self.name, new_name]);
+        let output = crate::tmux::run_tmux_command_with_timeout(&mut command)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
