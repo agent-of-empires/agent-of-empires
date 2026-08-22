@@ -229,6 +229,18 @@ struct AgentDoctorEntry {
     name: String,
     command_present: bool,
     description: String,
+    /// Set when the copy aoe would spawn misses the adapter's minimum
+    /// version (#3267); the listing must not read `[OK]` then.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version_issue: Option<AgentVersionIssue>,
+}
+
+/// A version-gate finding for one configured agent: the remediation is
+/// the same `install_command` the startup error carries.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+struct AgentVersionIssue {
+    reason: String,
+    install_command: String,
 }
 
 #[cfg(feature = "serve")]
@@ -292,6 +304,57 @@ fn doctor_fix_action(
 #[cfg(feature = "serve")]
 fn skip_gate_check(binary: &str, on_path: bool) -> bool {
     !on_path && crate::acp::adapters::is_bundled(binary)
+}
+
+/// Version-gate finding for one configured agent, the listing-side twin
+/// of `doctor_fix_action`: same verdicts, plus the one distinction the
+/// plain listing needs that `--fix` does not. A pinned bundled copy
+/// satisfies the floor even when the PATH copy is stale or absent,
+/// because the spawn resolver switches to it below-floor (see #1017).
+/// Absence with nothing installed stays the presence check's report;
+/// probing cannot sharpen it.
+#[cfg(feature = "serve")]
+fn doctor_version_issue(
+    gate: &crate::acp::agent_compat::VersionGate,
+    probe: &crate::acp::version_probe::ProbeStatus,
+    bundle_installed: bool,
+) -> Option<AgentVersionIssue> {
+    use crate::acp::version_probe::ProbeStatus;
+    if matches!(probe, ProbeStatus::Missing) {
+        return None;
+    }
+    match doctor_fix_action(Some(*gate), probe) {
+        DoctorFixAction::Skip => None,
+        DoctorFixAction::PrintHint { reason } => {
+            if bundle_installed {
+                return None;
+            }
+            Some(AgentVersionIssue {
+                reason,
+                install_command: gate.install_command.to_string(),
+            })
+        }
+    }
+}
+
+/// Resolve whether `gate`'s adapter would miss its version floor at
+/// spawn time: probe the PATH copy (the one `--fix`'s gate loop checks)
+/// and account for a bundled copy that backs it. Skips the probe
+/// subprocess entirely when nothing usable is installed; the presence
+/// branch already reports that.
+#[cfg(feature = "serve")]
+async fn run_doctor_version_issue(
+    gate: &crate::acp::agent_compat::VersionGate,
+) -> Option<AgentVersionIssue> {
+    let on_path = find_in_path(gate.binary).is_some();
+    let bundle_installed = crate::session::get_app_dir().is_ok_and(|app_dir| {
+        crate::acp::adapters::bundled_adapter_bin(&app_dir, gate.binary).is_some()
+    });
+    if !on_path && !bundle_installed {
+        return None;
+    }
+    let probe = crate::acp::version_probe::probe_binary_version(gate.binary).await;
+    doctor_version_issue(gate, &probe, bundle_installed)
 }
 
 #[cfg(feature = "serve")]
@@ -434,25 +497,48 @@ async fn doctor(json: bool, fix: bool, adapter: Vec<String>, all_adapters: bool)
     let registry = AgentRegistry::with_defaults();
 
     let node_status = check_node();
-    let agent_entries: Vec<AgentDoctorEntry> = registry
-        .list()
-        .into_iter()
-        .map(|(name, spec)| AgentDoctorEntry {
+    let mut gate_issues: Vec<(&'static str, Option<AgentVersionIssue>)> = Vec::new();
+    let mut agent_entries: Vec<AgentDoctorEntry> = Vec::new();
+    for (name, spec) in registry.list() {
+        let command_present = command_present(&spec.command);
+        #[cfg(feature = "serve")]
+        let version_issue = if command_present {
+            let expected = crate::acp::agent_compat::ExpectedAgent::from_command(&spec.command);
+            match crate::acp::agent_compat::version_gate_for(expected) {
+                None => None,
+                Some(gate) => {
+                    // Aliases share a binary (claude / claude-code);
+                    // probe each gated binary once.
+                    match gate_issues
+                        .iter()
+                        .find(|(binary, _)| *binary == gate.binary)
+                    {
+                        Some((_, cached)) => cached.clone(),
+                        None => {
+                            let issue = run_doctor_version_issue(&gate).await;
+                            gate_issues.push((gate.binary, issue.clone()));
+                            issue
+                        }
+                    }
+                }
+            }
+        } else {
+            None
+        };
+        #[cfg(not(feature = "serve"))]
+        let version_issue = None;
+        agent_entries.push(AgentDoctorEntry {
             name: name.clone(),
-            command_present: command_present(&spec.command),
+            command_present,
             description: spec.description.clone(),
-        })
-        .collect();
+            version_issue,
+        });
+    }
 
     let any_agent_ok = agent_entries.iter().any(|e| e.command_present);
+    let any_agent_stale = agent_entries.iter().any(|e| e.version_issue.is_some());
     let node_ok = node_status.meets_minimum.unwrap_or(false);
-    let overall = if node_ok && any_agent_ok {
-        "ok"
-    } else if node_ok || any_agent_ok {
-        "partial"
-    } else {
-        "fail"
-    };
+    let overall = overall_status(node_ok, any_agent_ok, any_agent_stale);
     let report = DoctorReport {
         node: node_status,
         agents: agent_entries,
@@ -490,11 +576,7 @@ async fn doctor(json: bool, fix: bool, adapter: Vec<String>, all_adapters: bool)
     println!("Configured agents:");
     let registry_for_hints = AgentRegistry::with_defaults();
     for entry in &report.agents {
-        let mark = if entry.command_present {
-            "[OK]"
-        } else {
-            "[!! ]"
-        };
+        let mark = agent_mark(entry);
         println!("{} {}  ({})", mark, entry.name, entry.description);
         if !entry.command_present {
             // Look up the binary name via the registry so we can
@@ -506,6 +588,9 @@ async fn doctor(json: bool, fix: bool, adapter: Vec<String>, all_adapters: bool)
                     println!("    install: {hint}");
                 }
             }
+        } else if let Some(issue) = &entry.version_issue {
+            println!("    {}", issue.reason);
+            println!("    install: {}", issue.install_command);
         }
     }
     println!();
@@ -515,6 +600,29 @@ async fn doctor(json: bool, fix: bool, adapter: Vec<String>, all_adapters: bool)
         std::process::exit(if overall == "partial" { 2 } else { 1 });
     }
     Ok(())
+}
+
+/// `[OK]` only when the binary exists AND the version gate is satisfied;
+/// presence alone is not compatibility (#3267).
+fn agent_mark(entry: &AgentDoctorEntry) -> &'static str {
+    if entry.command_present && entry.version_issue.is_none() {
+        "[OK]"
+    } else {
+        "[!! ]"
+    }
+}
+
+/// Overall verdict. A version issue means configured sessions die at
+/// startup even though the binary exists, so it caps the verdict at
+/// partial exactly like a missing prerequisite (#3267).
+fn overall_status(node_ok: bool, any_agent_ok: bool, any_agent_stale: bool) -> &'static str {
+    if node_ok && any_agent_ok && !any_agent_stale {
+        "ok"
+    } else if node_ok || any_agent_ok {
+        "partial"
+    } else {
+        "fail"
+    }
 }
 
 fn check_node() -> NodeStatus {
@@ -1150,6 +1258,139 @@ mod tests {
             ),
             DoctorFixAction::PrintHint { .. }
         ));
+    }
+
+    /// Gate fixture for the doctor version-issue tests.
+    #[cfg(feature = "serve")]
+    fn claude_gate() -> crate::acp::agent_compat::VersionGate {
+        crate::acp::agent_compat::version_gate_for(
+            crate::acp::agent_compat::ExpectedAgent::ClaudeAgentAcp,
+        )
+        .expect("claude-agent-acp must carry a version gate")
+    }
+
+    /// #3267: the plain doctor listing applies the runtime's version
+    /// gate, not mere binary presence. The exact repro from the issue:
+    /// global adapter at 0.37.0 against the 0.55.0 floor, on PATH,
+    /// nothing bundled, sessions dying at initialize.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn doctor_flags_stale_gated_adapter_with_remediation() {
+        let gate = claude_gate();
+        let stale = crate::acp::version_probe::ProbeStatus::Version {
+            raw: "0.37.0".to_string(),
+            parsed: semver::Version::parse("0.37.0").unwrap(),
+        };
+        let issue = doctor_version_issue(&gate, &stale, false)
+            .expect("a below-floor adapter must produce a version issue");
+        assert!(issue.reason.contains("0.37.0"), "{}", issue.reason);
+        assert!(
+            issue.reason.contains(gate.min_version),
+            "reason must name the required floor: {}",
+            issue.reason
+        );
+        assert_eq!(issue.install_command, gate.install_command);
+    }
+
+    /// The listing borrows `--fix`'s verdicts verbatim and adds only the
+    /// bundle-awareness the spawn resolver acts on: a pinned bundled
+    /// copy satisfies the floor even when the PATH copy is stale or
+    /// absent, and absence with nothing installed stays the presence
+    /// check's report instead of a second complaint.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn doctor_version_issue_verdicts() {
+        use crate::acp::version_probe::ProbeStatus;
+        let gate = claude_gate();
+        let ver = |v: &str| ProbeStatus::Version {
+            raw: v.to_string(),
+            parsed: semver::Version::parse(v).unwrap(),
+        };
+        // (label, probe, bundle_installed, expect_issue)
+        let cases: Vec<(&str, ProbeStatus, bool, bool)> = vec![
+            // At-floor and above satisfy the gate; no false positive.
+            (
+                "at_floor",
+                ver(crate::acp::agent_compat::CLAUDE_AGENT_ACP_MIN_VERSION),
+                false,
+                false,
+            ),
+            ("above_floor", ver("1.0.0"), false, false),
+            // A pinned bundled copy backs the spawn below the floor
+            // (resolve_agent_command switches to it), so nothing to
+            // report.
+            ("stale_but_bundled", ver("0.37.0"), true, false),
+            // Absence is reported by the presence branch either way.
+            ("missing_but_bundled", ProbeStatus::Missing, true, false),
+            ("absent_unbundled", ProbeStatus::Missing, false, false),
+            // Unprobeable copies cannot prove compatibility.
+            (
+                "unparseable",
+                ProbeStatus::Unparseable {
+                    raw: "junk".to_string(),
+                },
+                false,
+                true,
+            ),
+            (
+                "failed",
+                ProbeStatus::Failed {
+                    message: "boom".to_string(),
+                },
+                false,
+                true,
+            ),
+            ("timed_out", ProbeStatus::TimedOut, false, true),
+        ];
+        for (label, probe, bundled, expect_issue) in cases {
+            let issue = doctor_version_issue(&gate, &probe, bundled);
+            assert_eq!(issue.is_some(), expect_issue, "{label}: {issue:?}");
+        }
+        // Non-npm gated adapter: remediation is its own hint.
+        let opencode = crate::acp::agent_compat::version_gate_for(
+            crate::acp::agent_compat::ExpectedAgent::OpenCode,
+        )
+        .expect("opencode must carry a version gate");
+        let issue = doctor_version_issue(&opencode, &ver("1.15.0"), false)
+            .expect("stale opencode must produce a version issue");
+        assert_eq!(issue.install_command, opencode.install_command);
+    }
+
+    /// The `[!! ]` mark and the overall verdict must react to version
+    /// issues, not only to missing binaries (#3267).
+    #[test]
+    fn doctor_mark_and_overall_demote_on_version_issue() {
+        let entry = |present: bool, issue: Option<AgentVersionIssue>| AgentDoctorEntry {
+            name: "claude".to_string(),
+            command_present: present,
+            description: String::new(),
+            version_issue: issue,
+        };
+        let stale_issue = AgentVersionIssue {
+            reason: "installed 0.37.0; requires >=0.55.0".to_string(),
+            install_command: "npm install -g @x/y@latest".to_string(),
+        };
+        let marks = [
+            (entry(true, None), "[OK]"),
+            (entry(true, Some(stale_issue.clone())), "[!! ]"),
+            (entry(false, None), "[!! ]"),
+        ];
+        for (e, mark) in &marks {
+            assert_eq!(&agent_mark(e), mark);
+        }
+        // (node_ok, any_agent_ok, any_agent_stale, expected)
+        let overall = [
+            (true, true, false, "ok"),
+            // The #3267 regression row: everything installed but stale
+            // must not read as fully green.
+            (true, true, true, "partial"),
+            (true, false, false, "partial"),
+            (false, true, false, "partial"),
+            (false, false, false, "fail"),
+        ];
+        for (node_ok, agents_ok, stale, expected) in overall {
+            assert_eq!(overall_status(node_ok, agents_ok, stale), expected);
+        }
     }
 
     /// #1858: `aoe acp cancel` must explain the conditional
