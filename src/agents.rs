@@ -1233,6 +1233,34 @@ pub const AGENTS: &[AgentDef] = &[
             deny: &[KeyToken::Named("Down"), KeyToken::Named("Enter")],
         }),
     },
+    AgentDef {
+        name: "prime-agent",
+        oneshot_flag: Some("-p"),
+        binary: "prime-agent",
+        launch_subcommand: None,
+        aliases: &[],
+        detection: DetectionMethod::Which("prime-agent"),
+        // Prime Agent executes model-generated Python and project commands
+        // with the user's permissions and has no built-in approval gate
+        // (upstream ships permission gating only as an example extension),
+        // so like its pi ancestor it runs YOLO by default and no flag is
+        // needed.
+        yolo: Some(YoloMode::AlwaysYolo),
+        instruction_flag: Some("--append-system-prompt {}"),
+        set_default_command: false,
+        detect_status: status_detection::detect_prime_agent_status,
+        container_env: &[("PRIME_AGENT_CODING_AGENT_DIR", "/root/.prime/agent")],
+        hook_config: None,
+        sidecar_hooks: None,
+        resume_strategy: ResumeStrategy::Flag("--resume"),
+        fork_strategy: ForkStrategy::Flag("--fork"),
+        host_only: false,
+        send_keys_enter_delay_ms: 0,
+        ready_marker: None,
+        install_hint:
+            "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh",
+        permission_response: None,
+    },
 ];
 
 /// Look up an agent by canonical name.
@@ -1277,7 +1305,7 @@ impl AgentDef {
     /// ignored rather than mis-injected (fail-closed).
     pub fn oneshot_model_flag(&self) -> Option<&'static str> {
         match self.name {
-            "claude" | "copilot" | "omp" => Some("--model"),
+            "claude" | "copilot" | "omp" | "prime-agent" => Some("--model"),
             "codex" | "gemini" | "opencode" | "kimi" => Some("-m"),
             _ => None,
         }
@@ -1308,12 +1336,15 @@ impl AgentDef {
     /// `-p`/`--prompt` value-binding flags (copilot, gemini, kimi) consume the
     /// next token as the prompt, so model args must follow the prompt (in the
     /// trailing region); placing them before it would make the flag swallow the
-    /// model selector. Positional-prompt one-shots (claude and omp's boolean
-    /// `-p`, codex `exec`, opencode `run`) take the model args before the prompt.
+    /// model selector. Positional-prompt one-shots (claude's, omp's, and
+    /// prime-agent's boolean `-p`, codex `exec`, opencode `run`) take the
+    /// model args before the prompt.
     ///
     /// Verified 2026-07-21 against each CLI: gemini `-p` is yargs
     /// `type: string, nargs: 1`; kimi `-p` is a `typer.Option(str)`; copilot
-    /// `-p <text>` takes a value; claude `-p`/`--print` is boolean.
+    /// `-p <text>` takes a value; claude `-p`/`--print` is boolean. Verified
+    /// 2026-08-23 for prime-agent from `packages/coding-agent/src/cli/args.ts`:
+    /// its `-p` sets boolean print mode and the prompt stays positional.
     pub fn oneshot_flag_binds_prompt(&self) -> bool {
         matches!(self.name, "copilot" | "gemini" | "kimi")
     }
@@ -1569,22 +1600,24 @@ pub fn agent_names() -> Vec<&'static str> {
 
 /// Given a command string (e.g. `"claude --resume xyz"` or `"open-code"`),
 /// return the canonical agent name if one is recognised.
+///
+/// When several tokens match, the LONGEST one wins regardless of registry
+/// order: `prime-agent` contains cursor's `"agent"` alias, and a naive
+/// first-match scan would resolve every prime-agent command to cursor.
 pub fn resolve_tool_name(cmd: &str) -> Option<&'static str> {
     let cmd_lower = cmd.to_lowercase();
     if cmd_lower.is_empty() {
         return Some("claude");
     }
+    let mut best: Option<(usize, &'static str)> = None;
     for agent in AGENTS {
-        if cmd_lower.contains(agent.name) {
-            return Some(agent.name);
-        }
-        for alias in agent.aliases {
-            if cmd_lower.contains(alias) {
-                return Some(agent.name);
+        for token in std::iter::once(agent.name).chain(agent.aliases.iter().copied()) {
+            if cmd_lower.contains(token) && best.is_none_or(|(len, _)| token.len() > len) {
+                best = Some((token.len(), agent.name));
             }
         }
     }
-    None
+    best.map(|(_, name)| name)
 }
 
 /// Return the install hint for an agent, looked up by canonical name.
@@ -1719,7 +1752,7 @@ mod tests {
         // flag to emit it.
         for agent in AGENTS {
             let expected = match agent.name {
-                "claude" | "copilot" | "omp" => Some("--model"),
+                "claude" | "copilot" | "omp" | "prime-agent" => Some("--model"),
                 "codex" | "gemini" | "opencode" | "kimi" => Some("-m"),
                 _ => None,
             };
@@ -1789,10 +1822,12 @@ mod tests {
                     agent.name
                 );
             }
-            // Semi-independent oracle (not a copy of the impl's name list): the
-            // `-p` is value-binding except for claude and omp, where it is the
-            // boolean `--print` flag.
-            if agent.oneshot_flag == Some("-p") && !matches!(agent.name, "claude" | "omp") {
+            // Semi-independent oracle (not a copy of the impl's name list):
+            // `-p` is value-binding except for claude, omp, and prime-agent,
+            // where it is the boolean `--print` flag.
+            if agent.oneshot_flag == Some("-p")
+                && !matches!(agent.name, "claude" | "omp" | "prime-agent")
+            {
                 assert!(
                     agent.oneshot_flag_binds_prompt(),
                     "agent '{}' has a `-p` one-shot flag but is not classified value-binding",
@@ -1820,6 +1855,7 @@ mod tests {
         assert_eq!(get_agent("antigravity").unwrap().binary, "agy");
         assert_eq!(get_agent("kimi").unwrap().binary, "kimi");
         assert_eq!(get_agent("omp").unwrap().binary, "omp");
+        assert_eq!(get_agent("prime-agent").unwrap().binary, "prime-agent");
     }
 
     #[test]
@@ -1984,7 +2020,8 @@ mod tests {
                 "qwen",
                 "antigravity",
                 "kimi",
-                "omp"
+                "omp",
+                "prime-agent"
             ]
         );
     }
@@ -2014,8 +2051,15 @@ mod tests {
         assert_eq!(resolve_tool_name("kimi"), Some("kimi"));
         assert_eq!(resolve_tool_name("kimi-code"), Some("kimi"));
         assert_eq!(resolve_tool_name("omp"), Some("omp"));
+        assert_eq!(resolve_tool_name("prime-agent"), Some("prime-agent"));
         assert_eq!(resolve_tool_name(""), Some("claude"));
         assert_eq!(resolve_tool_name("agent"), Some("cursor"));
+        // Longest token wins: prime-agent contains cursor's "agent" alias.
+        assert_eq!(resolve_tool_name("prime-agent"), Some("prime-agent"));
+        assert_eq!(
+            resolve_tool_name("prime-agent --mode acp"),
+            Some("prime-agent")
+        );
         assert_eq!(resolve_tool_name("unknown-tool"), None);
     }
 
@@ -2035,6 +2079,7 @@ mod tests {
         assert_eq!(settings_index_from_name(Some("antigravity")), 14);
         assert_eq!(settings_index_from_name(Some("kimi")), 15);
         assert_eq!(settings_index_from_name(Some("omp")), 16);
+        assert_eq!(settings_index_from_name(Some("prime-agent")), 17);
 
         assert_eq!(name_from_settings_index(0), None);
         assert_eq!(name_from_settings_index(1), Some("claude"));
@@ -2050,6 +2095,7 @@ mod tests {
         assert_eq!(name_from_settings_index(14), Some("antigravity"));
         assert_eq!(name_from_settings_index(15), Some("kimi"));
         assert_eq!(name_from_settings_index(16), Some("omp"));
+        assert_eq!(name_from_settings_index(17), Some("prime-agent"));
         assert_eq!(name_from_settings_index(99), None);
     }
 
@@ -2228,6 +2274,7 @@ mod tests {
         assert_eq!(send_keys_enter_delay("opencode"), 0);
         assert_eq!(send_keys_enter_delay("hermes"), 0);
         assert_eq!(send_keys_enter_delay("kiro"), 0);
+        assert_eq!(send_keys_enter_delay("prime-agent"), 0);
         assert_eq!(send_keys_enter_delay("antigravity"), 0);
         assert_eq!(send_keys_enter_delay("unknown_agent"), 0);
     }
@@ -2278,12 +2325,16 @@ mod tests {
             Some("curl -fsSL https://antigravity.google/cli/install.sh | bash")
         );
         assert_eq!(
+            install_hint("omp"),
+            Some("curl -fsSL https://omp.sh/install | sh")
+        );
+        assert_eq!(
             install_hint("kimi"),
             Some("curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash")
         );
         assert_eq!(
-            install_hint("omp"),
-            Some("curl -fsSL https://omp.sh/install | sh")
+            install_hint("prime-agent"),
+            Some("curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh")
         );
         assert!(install_hint("unknown").is_none());
     }
@@ -2357,9 +2408,9 @@ mod tests {
 
     #[test]
     fn test_fork_strategy_is_set_for_fork_capable_agents() {
-        // Only claude, codex, and opencode can fork; every other agent is
-        // Unsupported. Iterating the full AGENTS slice makes a new agent with a
-        // stray fork_strategy fail loudly here.
+        // Only claude, codex, opencode, and prime-agent can fork; every other
+        // agent is Unsupported. Iterating the full AGENTS slice makes a new
+        // agent with a stray fork_strategy fail loudly here.
         assert!(matches!(
             get_agent("claude").unwrap().fork_strategy,
             ForkStrategy::ClaudeFork
@@ -2372,8 +2423,13 @@ mod tests {
             get_agent("opencode").unwrap().fork_strategy,
             ForkStrategy::Flag("--fork")
         ));
+        assert!(matches!(
+            get_agent("prime-agent").unwrap().fork_strategy,
+            ForkStrategy::Flag("--fork")
+        ));
         for agent in AGENTS {
-            let fork_capable = matches!(agent.name, "claude" | "codex" | "opencode");
+            let fork_capable =
+                matches!(agent.name, "claude" | "codex" | "opencode" | "prime-agent");
             assert_eq!(
                 matches!(agent.fork_strategy, ForkStrategy::Unsupported),
                 !fork_capable,
@@ -2396,5 +2452,39 @@ mod tests {
                 agent.name
             );
         }
+    }
+
+    #[test]
+    fn test_prime_agent_definition() {
+        let prime = get_agent("prime-agent").unwrap();
+        assert_eq!(prime.binary, "prime-agent");
+        assert!(matches!(
+            &prime.detection,
+            DetectionMethod::Which("prime-agent")
+        ));
+        // No built-in approval gate upstream, so like pi it is AlwaysYolo.
+        assert!(matches!(&prime.yolo, Some(YoloMode::AlwaysYolo)));
+        assert!(matches!(
+            &prime.resume_strategy,
+            ResumeStrategy::Flag("--resume")
+        ));
+        assert!(matches!(&prime.fork_strategy, ForkStrategy::Flag("--fork")));
+        // `-p` is boolean print mode; the prompt stays positional (args.ts).
+        assert_eq!(prime.oneshot_flag, Some("-p"));
+        assert_eq!(prime.oneshot_model_flag(), Some("--model"));
+        assert!(!prime.oneshot_flag_binds_prompt());
+        assert!(!prime.host_only);
+        assert_eq!(prime.send_keys_enter_delay_ms, 0);
+        assert_eq!(prime.launch_subcommand, None);
+        assert!(prime.hook_config.is_none());
+        assert!(prime.sidecar_hooks.is_none());
+        assert_eq!(
+            prime.container_env,
+            &[("PRIME_AGENT_CODING_AGENT_DIR", "/root/.prime/agent")]
+        );
+        assert_eq!(
+            prime.install_hint,
+            "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh"
+        );
     }
 }
