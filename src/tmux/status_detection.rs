@@ -1837,7 +1837,7 @@ const PI_FOOTER_WINDOW: usize = 6;
 /// How deep the interrupt-hint scan reaches. pi derivatives with taller
 /// footers (omo, #3475) stack up to two tip lines, the input box, a usage
 /// line, and a harness status line under their busy line, pushing it to
-/// non-empty position 7-8; ten covers that plus footer variants. Safe to
+/// non-empty position 7-8; ten adds slack above that measured bound. Safe to
 /// widen only for this signal: the hint renders on the live busy line and
 /// vanishes when the turn ends, unlike spinners and activity words, which
 /// linger in scrollback.
@@ -5134,7 +5134,7 @@ You can monitor progress with aoe session logs.\n\
     /// taller footer than plain pi: two tip lines, the input box (rule,
     /// prompt, rule), a usage line, and a persistent harness status line.
     /// Its busy line (`• Running eval ... esc to interrupt`) lands around
-    /// position 8 above the bottom, outside pi's classic footer window.
+    /// position 8 above the bottom, outside `PI_FOOTER_WINDOW`.
     /// Captured shape from #3475's live pane, ANSI stripped, with one
     /// neutral transcript line of scrollback above it.
     const OMO_DEEP_FOOTER_BUSY_PANE: &str = "\
@@ -5182,7 +5182,7 @@ Tip: Set thinkingBudgets in settings.json to choose which models think.\n\
     #[test]
     fn test_detect_pi_status_deep_footer_interrupt_hint() {
         // #3475: a pi derivative's busy line carries `esc to interrupt`
-        // beyond the classic footer window; the parked row is the same pane
+        // beyond `PI_FOOTER_WINDOW`; the parked row is the same pane
         // without that line, its scrollback prose carrying an activity word
         // inside the widened window, and must stay Idle.
         let cases = [
