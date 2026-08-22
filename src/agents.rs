@@ -2051,7 +2051,6 @@ mod tests {
         assert_eq!(resolve_tool_name("kimi"), Some("kimi"));
         assert_eq!(resolve_tool_name("kimi-code"), Some("kimi"));
         assert_eq!(resolve_tool_name("omp"), Some("omp"));
-        assert_eq!(resolve_tool_name("prime-agent"), Some("prime-agent"));
         assert_eq!(resolve_tool_name(""), Some("claude"));
         assert_eq!(resolve_tool_name("agent"), Some("cursor"));
         // Longest token wins: prime-agent contains cursor's "agent" alias.
