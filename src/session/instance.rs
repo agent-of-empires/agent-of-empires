@@ -6722,12 +6722,14 @@ impl Instance {
     /// Update status using pre-fetched pane metadata to avoid per-instance
     /// subprocess spawns. Falls back to subprocess calls if metadata is missing.
     ///
-    /// Restamps `idle_entered_at`/`last_accessed_at` only when the detected
-    /// status differs from [`Self::live_status_baseline`]. The baseline
-    /// invariant lives on the field itself; this method's job is the
-    /// guard shape (baseline vs. newly detected). Every call re-seeds the
-    /// baseline at exit, so the next call compares against a value this
-    /// method itself wrote.
+    /// Restamps `idle_entered_at` only when the detected status differs from
+    /// [`Self::live_status_baseline`]. `last_accessed_at` is deliberately not
+    /// written here (#3465): it is a user-gesture signal, and a poller stamp
+    /// that advanced it on disk let `merge_user_action_diff`'s touched arm
+    /// erase a concurrently archived row. The baseline invariant lives on the
+    /// field itself; this method's job is the guard shape (baseline vs. newly
+    /// detected). Every call re-seeds the baseline at exit, so the next call
+    /// compares against a value this method itself wrote.
     pub fn update_status_with_metadata(
         &mut self,
         metadata: Option<&tmux::PaneMetadata>,
@@ -6738,8 +6740,12 @@ impl Instance {
         if let Some(prev) = baseline {
             if prev != self.status {
                 self.log_status_transition(prev);
+                // last_accessed_at is deliberately NOT restamped here
+                // (#3465): a passive advance reaches disk through
+                // PassiveStatusPatch, and merge_user_action_diff's touched
+                // arm reads any advance as a peer touch, wiping concurrent
+                // archive/snooze/dormancy writes.
                 let now = Utc::now();
-                self.last_accessed_at = Some(now);
                 self.idle_entered_at = if self.status == Status::Idle {
                     Some(now)
                 } else {
@@ -9415,53 +9421,50 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_merge_diff_passive_transition_stamp_does_not_wipe_concurrent_archive() {
-        // #3465: a passive status transition restamps last_accessed_at on
-        // disk (update_status_with_metadata writes Some(now) on every
-        // detected transition, with no user gesture behind it), and the
-        // stamp reaches disk through PassiveStatusPatch while an archive
-        // is landing concurrently. The writer's pre snapshot is then
-        // stale, so the deliberate `touched` arm below reads the stamp's
-        // advance as a peer touch and wipes sink state the user just set.
-        // That arm is correct for real gestures (pinned by
-        // test_merge_diff_peer_touch_clears_tui_archive, the
-        // messaging-unarchives rule); a poller stamp is not a gesture and
-        // must not dethrone a concurrent triage action.
+        // #3465: a passive status transition restamped last_accessed_at
+        // (update_status_with_metadata wrote Some(now) on every detected
+        // transition, with no user gesture behind it), and the stamp
+        // reached disk through PassiveStatusPatch while a user action was
+        // in flight. The writer's stale pre snapshot then made the
+        // deliberate touched arm read the advance as a peer touch and wipe
+        // sink state the user had just set. That arm is correct for real
+        // gestures (pinned by test_merge_diff_peer_touch_clears_tui_archive,
+        // the messaging-unarchives rule); the poller stamp was the lie.
         //
-        // The stamp is modeled as the raw field write
-        // update_status_with_metadata performs rather than via
-        // touch_last_accessed(), because the latter would be a genuine
-        // gesture, which this suite deliberately lets win.
-        let cases: &[(&str, fn(&mut Instance), fn(&Instance) -> bool)] = &[
+        // Driven through the real transition path: the
+        // update_status_with_metadata call below detects a genuine
+        // Idle -> Error flip (session forced Absent, see #2936), which on
+        // the pre-fix tree restamped last_accessed_at between the pre
+        // snapshot and the merge.
+        type SinkCase = (&'static str, fn(&mut Instance), fn(&Instance) -> bool);
+        let cases: &[SinkCase] = &[
             // The issue's headline victim: a concurrent archive.
             ("archived_at", |i| i.archive(), |i| i.archived_at.is_some()),
-            // Same touched arm, same wipe, for the other two sinks.
+            // Same touched arm, same wipe, for a concurrent snooze.
             (
                 "snoozed_until",
                 |i| i.snooze(15),
                 |i| i.snoozed_until.is_some(),
             ),
-            (
-                "idle_dormant_since",
-                |i| i.idle_dormant_since = Some(Utc::now()),
-                |i| i.idle_dormant_since.is_some(),
-            ),
         ];
-        let stale_pre_stamp = Utc::now() - chrono::Duration::seconds(60);
-        let passive_stamp = Utc::now();
+        let user_touch = Utc::now() - chrono::Duration::seconds(60);
         for (field, seed_sink, sink_present) in cases {
-            // Snapshot the archiving writer held before the poller tick.
+            // Snapshot the acting writer held before the poller tick.
             let mut pre = Instance::new("s", "/tmp/x");
-            pre.status = Status::Running;
-            pre.last_accessed_at = Some(stale_pre_stamp);
+            pre.live_status_baseline = Some(Status::Idle);
+            pre.status = Status::Idle;
+            pre.last_accessed_at = Some(user_touch);
 
-            // Passive poller observes Running -> Idle and restamps disk,
-            // mirroring update_status_with_metadata's transition block
-            // (idle_entered_at plus last_accessed_at = Some(now)).
+            // One passive poller tick observes Idle -> Error. On the
+            // pre-fix tree this restamped last_accessed_at on the row that
+            // lands on disk; post-fix it leaves the user-gesture stamp
+            // alone and only updates idle_entered_at bookkeeping.
             let mut disk = pre.clone();
-            disk.status = Status::Idle;
-            disk.idle_entered_at = Some(passive_stamp);
-            disk.last_accessed_at = Some(passive_stamp);
+            let _cache = force_session_absent();
+            disk.update_status_with_metadata(None, None);
+            assert_eq!(disk.status, Status::Error);
 
             // The concurrent user action seeds the sink on the writer's
             // post snapshot.
@@ -9472,7 +9475,7 @@ mod tests {
 
             assert!(
                 sink_present(&disk),
-                "passive transition stamp must not wipe concurrent {field} (#3465)"
+                "passive transition must not wipe concurrent {field} (#3465)"
             );
         }
     }
@@ -9498,6 +9501,37 @@ mod tests {
         assert!(
             disk.snoozed_until.is_none(),
             "archive() invariant must clear a concurrent TUI snooze"
+        );
+    }
+    #[test]
+    #[serial_test::serial]
+    fn test_merge_diff_passive_transition_stamp_does_not_wake_dormant_row() {
+        // Dormancy is the third field the touched arm wipes (#3465), with
+        // one structural difference from the archive/snooze cases: it is
+        // never spliced from post, so the wipe only hits a value already
+        // on the row. Seed it on the base instance, drive one passive
+        // poller tick through the real transition path (session forced
+        // Absent, see #2936), and confirm an unrelated user action does
+        // not wake the row just because the pre-fix tree restamped
+        // last_accessed_at in between.
+        let mut pre = Instance::new("s", "/tmp/x");
+        pre.live_status_baseline = Some(Status::Idle);
+        pre.status = Status::Idle;
+        pre.last_accessed_at = Some(Utc::now() - chrono::Duration::seconds(60));
+        pre.idle_dormant_since = Some(Utc::now() - chrono::Duration::hours(5));
+
+        let mut disk = pre.clone();
+        let _cache = force_session_absent();
+        disk.update_status_with_metadata(None, None);
+        assert_eq!(disk.status, Status::Error);
+
+        let mut post = pre.clone();
+        post.favorite();
+        disk.merge_user_action_diff(&pre, &post);
+
+        assert!(
+            disk.idle_dormant_since.is_some(),
+            "a passive transition must not wake a dormant row (#3465)"
         );
     }
 
@@ -10244,29 +10278,33 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_update_status_with_metadata_restamps_on_genuine_transition() {
+    fn test_update_status_with_metadata_keeps_last_accessed_at_on_transition() {
         // Once a live baseline is established, a real status change still
-        // restamps normally (no regression from the #2690 fix).
+        // re-anchors idle_entered_at bookkeeping, but must NOT restamp
+        // last_accessed_at (#3465): the field is a user-gesture signal, and
+        // passive stamps reaching disk let merge_user_action_diff's touched
+        // arm wipe concurrently archived rows.
         let mut inst = Instance::new("test", "/tmp/test");
         inst.live_status_baseline = Some(Status::Idle);
         inst.status = Status::Idle;
         inst.idle_entered_at = Some(Utc::now() - chrono::Duration::hours(2));
-        inst.last_accessed_at = Some(Utc::now() - chrono::Duration::hours(2));
+        let user_touch = Some(Utc::now() - chrono::Duration::hours(2));
+        inst.last_accessed_at = user_touch;
 
         // Force detection to resolve to `Absent` -> Error deterministically
         // (see #2936; without this the outcome is schedule-dependent).
         let _cache = force_session_absent();
 
-        let before = Utc::now();
         inst.update_status_with_metadata(None, None);
-        let after = Utc::now();
 
         // Detection confirms the session Absent, resolving to Error: a
         // genuine transition away from the established Idle baseline.
         assert_eq!(inst.status, Status::Error);
         assert_eq!(inst.idle_entered_at, None);
-        let last_accessed = inst.last_accessed_at.expect("must be restamped");
-        assert!(last_accessed >= before && last_accessed <= after);
+        assert_eq!(
+            inst.last_accessed_at, user_touch,
+            "a passive transition must not fabricate a user-gesture stamp"
+        );
         assert_eq!(inst.live_status_baseline, Some(Status::Error));
     }
 
@@ -10313,10 +10351,11 @@ mod tests {
     }
 
     #[test]
-    fn test_update_status_with_metadata_twice_different_statuses_both_restamp() {
-        // Two back-to-back genuine transitions must both restamp, and the
-        // baseline must update between calls so the second comparison is
-        // against the first call's result, not the original value.
+    fn test_update_status_with_metadata_transitions_never_stamp_last_accessed_at() {
+        // Two back-to-back genuine transitions update the idle_entered_at
+        // bookkeeping and re-seed the baseline between calls, but neither
+        // may touch last_accessed_at (#3465): passive stamps wiped
+        // concurrent archives through merge_user_action_diff's touched arm.
         //
         // Archiving short-circuits update_status_with_metadata_inner before
         // it touches `status` (see the `is_archived()` guard), which lets
@@ -10326,35 +10365,27 @@ mod tests {
         inst.archive();
         inst.live_status_baseline = Some(Status::Idle);
         inst.status = Status::Running;
+        let user_touch = Some(Utc::now() - chrono::Duration::hours(2));
+        inst.last_accessed_at = user_touch;
 
-        let before1 = Utc::now();
         inst.update_status_with_metadata(None, None);
-        let after1 = Utc::now();
         assert_eq!(
             inst.status,
             Status::Running,
             "archived guard preserves status"
         );
         assert_eq!(inst.idle_entered_at, None, "non-idle transition clears it");
-        let first_stamp = inst
-            .last_accessed_at
-            .expect("first transition must restamp");
-        assert!(first_stamp >= before1 && first_stamp <= after1);
+        assert_eq!(inst.last_accessed_at, user_touch);
         assert_eq!(inst.live_status_baseline, Some(Status::Running));
 
         inst.status = Status::Idle;
-        let before2 = Utc::now();
         inst.update_status_with_metadata(None, None);
-        let after2 = Utc::now();
         assert_eq!(inst.status, Status::Idle);
-        let second_idle = inst
-            .idle_entered_at
-            .expect("second transition must restamp");
-        assert!(second_idle >= before2 && second_idle <= after2);
         assert!(
-            second_idle >= first_stamp,
-            "second restamp must not be older than the first"
+            inst.idle_entered_at.is_some(),
+            "entering Idle re-anchors idle_entered_at"
         );
+        assert_eq!(inst.last_accessed_at, user_touch);
         assert_eq!(inst.live_status_baseline, Some(Status::Idle));
     }
 
