@@ -1829,18 +1829,20 @@ pub fn detect_copilot_status(raw_content: &str) -> Status {
 }
 
 /// How many of the last non-empty pane lines count as plain pi's footer for
-/// the spinner and activity-word running signals. Sized for pi itself, whose
-/// busy line sits ~5 non-empty lines above the bottom; anything deeper is
-/// finished-turn prose where both signals falsely fire.
+/// the spinner and activity-word running signals; the sizing rationale
+/// (measured busy-line depth, prose exclusion) lives at the call site in
+/// `detect_pi_status`.
 const PI_FOOTER_WINDOW: usize = 6;
 
 /// How deep the interrupt-hint scan reaches. pi derivatives with taller
 /// footers (omo, #3475) stack up to two tip lines, the input box, a usage
 /// line, and a harness status line under their busy line, pushing it to
 /// non-empty position 7-8; ten adds slack above that measured bound. Safe to
-/// widen only for this signal: the hint renders on the live busy line and
+/// widen only for this signal: rendered on the live busy line, the hint
 /// vanishes when the turn ends, unlike spinners and activity words, which
-/// linger in scrollback.
+/// linger in scrollback. Residual exposure: prose quoting the hint verbatim
+/// within ten lines of a parked pane still reads Running until newer output
+/// ages it out of the window.
 const PI_INTERRUPT_HINT_WINDOW: usize = 10;
 
 /// Pi coding agent status detection via tmux pane parsing.
