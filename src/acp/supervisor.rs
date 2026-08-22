@@ -652,6 +652,77 @@ pub(crate) fn apply_agent_command_override(
     Ok(())
 }
 
+/// Warn when this launch resolves an `agent_detect_as` wrapper to its
+/// base adapter instead of running the wrapper itself (#3422).
+///
+/// Three spawn shapes substitute silently, all funnelling through the same
+/// warn site: `pick_agent_for_tool` resolved the wrapper to its base key
+/// before the spawn (`agent` is the base, `tool` stays the wrapper); a
+/// caller passed the wrapper key directly (the attach respawn path), so
+/// `agent == tool` and `resolve_agent_spec` substitutes; and an explicit
+/// request-level agent override at create (or a persisted one on respawn)
+/// names a different wrapper than the session tool, whose own inheritance
+/// then applies. In every shape the wrapper never runs, so account,
+/// gateway, or env overrides it sets do not apply. `spec_from_registry`
+/// keeps a custom `agent_acp_cmd` spec, which does execute the wrapper's
+/// own command, silent.
+///
+/// A built-in running its own adapter is not a substitution even when a
+/// mapping keys on it: the direct registry lookup won, so that pair is
+/// skipped up front. The warning stays one line per launch rather than
+/// threading provenance through every spawn site; an operator who chose
+/// the substitute deliberately still gets an accurate statement.
+/// The map is the spawn's own resolved config snapshot; a config edit
+/// landing between the pick-time resolve and this one can miss the warning
+/// for that single launch, and the next launch warns normally.
+/// The fresh defaults registry matches what resolution consulted because
+/// the supervisor registry is never mutated after construction.
+fn warn_if_wrapper_resolves_to_base(
+    session_id: &str,
+    tool: &str,
+    agent: &str,
+    spec_from_registry: bool,
+    agent_detect_as: &HashMap<String, String>,
+) {
+    if !spec_from_registry || agent_detect_as.is_empty() {
+        return;
+    }
+    let registry = AgentRegistry::with_defaults();
+    let inherited = |name: &str| crate::acp::inherited_acp_base(name, agent_detect_as);
+    // Which key's adapter runs instead of its own binary, and that key's
+    // base. The pick path substitutes the session tool (agent became the
+    // base), the attach path passes the wrapper key as both tool and agent,
+    // and an explicit request-level override can name a different wrapper
+    // than the tool, whose own inheritance then applies.
+    let tool_base = inherited(tool);
+    let substituted = if agent == tool {
+        // A built-in executing itself is never a substitution, even when a
+        // mapping keys on it: the direct registry lookup already won.
+        (registry.get(tool).is_none()).then_some((tool, tool_base))
+    } else if tool_base.as_deref().is_some_and(|base| base == agent) && registry.get(tool).is_none()
+    {
+        Some((tool, tool_base))
+    } else if registry.get(agent).is_none() {
+        let agent_base = inherited(agent);
+        agent_base.is_some().then_some((agent, agent_base))
+    } else {
+        None
+    };
+    // An inner None is a wrapper mapped to a terminal-only base: resolution
+    // never substitutes it, so there is nothing to warn about.
+    let Some((wrapper, Some(base))) = substituted else {
+        return;
+    };
+    warn!(
+        target: "acp.supervisor",
+        session = %session_id,
+        tool = %tool,
+        wrapper = %wrapper,
+        base = %base,
+        "agent_detect_as resolved this wrapper to its base for structured view; the wrapper binary will not be executed, so account, gateway, or env overrides it sets do not apply; set [session.agent_acp_cmd] to run the wrapper itself"
+    );
+}
+
 impl<S: BroadcastSink> Supervisor<S> {
     /// Constructor with no concurrency cap. Used in tests; production
     /// callers should use [`Supervisor::with_capacity`] so the
@@ -1585,6 +1656,16 @@ impl<S: BroadcastSink> Supervisor<S> {
         if let Some(ref ovr) = agent_command_override {
             apply_agent_command_override(&agent, spec_from_registry, ovr, &mut spec)?;
         }
+        // #3422: say so when an agent_detect_as wrapper's base adapter is
+        // about to run in the wrapper's place; the wrapper's account,
+        // gateway, or env overrides would otherwise silently not apply.
+        warn_if_wrapper_resolves_to_base(
+            &session_id,
+            &tool,
+            &agent,
+            spec_from_registry,
+            &resolved_cfg.session.agent_detect_as,
+        );
         // Apply ${aoe_data_dir} placeholder substitution against the
         // appropriate path; if the placeholder is not consumed it stays
         // as-is and the spawn will fail with a clear error.
@@ -3625,6 +3706,7 @@ impl BroadcastSink for ChannelSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing_test::traced_test;
 
     // #3152: the worker's captured reset dies with the worker, and a
     // rate-limited session's worker is dropped, so a retry inherits the
@@ -3861,6 +3943,212 @@ mod tests {
                 ),
             }
         }
+    }
+    /// #3422: a wrapper mapped to its base via `agent_detect_as` starts a
+    /// structured view session happily, but the base adapter binary runs, so
+    /// account, gateway, or env overrides the wrapper sets silently do not
+    /// apply. The spawn must say so instead of substituting silently. Every
+    /// substitution shape must produce its own log line, so a regression in
+    /// one arm cannot hide behind another's.
+    #[traced_test]
+    #[test]
+    fn spawn_warns_when_a_detect_as_wrapper_runs_its_base_adapter() {
+        tracing::callsite::rebuild_interest_cache();
+        // Distinct wrapper/base pairs per row so the field-value assertions
+        // below discriminate a mislabeled shape instead of matching another
+        // row's line.
+        let detect_as = [
+            ("claude-personal".to_string(), "claude".to_string()),
+            ("codex-personal".to_string(), "codex".to_string()),
+            ("kimi-personal".to_string(), "kimi".to_string()),
+        ]
+        .into();
+        // (session id, tool, agent, expected wrapper, expected base).
+        let cases: [(&str, &str, &str, &str, &str); 3] = [
+            (
+                "s-pick",
+                "claude-personal",
+                "claude",
+                "claude-personal",
+                "claude",
+            ),
+            // Attach respawn path: the caller passes the wrapper key
+            // directly and resolve_agent_spec performs the substitution.
+            (
+                "s-attach",
+                "codex-personal",
+                "codex-personal",
+                "codex-personal",
+                "codex",
+            ),
+            // Explicit request-level agent override naming a different
+            // wrapper than an unmapped tool: the named wrapper's own
+            // inheritance applies inside resolve_agent_spec.
+            (
+                "s-override",
+                "plain-tool",
+                "kimi-personal",
+                "kimi-personal",
+                "kimi",
+            ),
+        ];
+        for (session_id, tool, agent, wrapper, base) in cases {
+            super::warn_if_wrapper_resolves_to_base(session_id, tool, agent, true, &detect_as);
+            assert!(
+                logs_contain(session_id),
+                "{session_id}: expected a warning naming this shape"
+            );
+            assert!(
+                logs_contain(&format!("wrapper={wrapper}"))
+                    && logs_contain(&format!("base={base}")),
+                "{session_id}: warning must attribute wrapper {wrapper} to base {base}"
+            );
+        }
+        assert!(
+            logs_contain("will not be executed"),
+            "expected the substitution warning text"
+        );
+    }
+
+    /// Shapes where nothing was substituted must stay silent: a built-in
+    /// running its own adapter (mapped or not), a wrapper mapped to a
+    /// terminal-only base, an explicit switch to an unrelated agent, a
+    /// custom `agent_acp_cmd` spec that executes the wrapper itself, and
+    /// spawns with no `agent_detect_as` involvement.
+    #[traced_test]
+    #[test]
+    fn spawn_stays_silent_when_no_detect_as_substitution_happened() {
+        tracing::callsite::rebuild_interest_cache();
+        let detect_as = [("claude-personal".to_string(), "claude".to_string())].into();
+        let mapped_builtin = [("claude".to_string(), "codex".to_string())].into();
+        let self_map = [("claude".to_string(), "claude".to_string())].into();
+        let codex_map = [("codex".to_string(), "claude".to_string())].into();
+        let cursor_map = [("claude-personal".to_string(), "cursor".to_string())].into();
+        // (session id, tool, agent, from registry, detect_as map).
+        let cases: [(&str, &str, &str, bool, &HashMap<String, String>); 9] = [
+            // Built-in tool on its own registry spec.
+            ("s-builtin", "claude", "claude", true, &detect_as),
+            // A mapping whose key is itself a built-in changes nothing: the
+            // direct registry lookup already won, so its own adapter runs.
+            (
+                "s-mapped-builtin",
+                "claude",
+                "claude",
+                true,
+                &mapped_builtin,
+            ),
+            // Degenerate self-aliasing mapping: the key executes itself.
+            ("s-self-map", "claude", "claude", true, &self_map),
+            // Built-in tool explicitly overridden onto its mapped base: the
+            // named built-in still runs its own registry spec.
+            (
+                "s-mapped-builtin-target",
+                "claude",
+                "codex",
+                true,
+                &mapped_builtin,
+            ),
+            // Unmapped tool overridden onto a mapped built-in: the built-in
+            // executes itself regardless of any mapping keyed on it.
+            ("s-builtin-target", "plain-tool", "codex", true, &codex_map),
+            // Wrapper mapped to a terminal-only base: resolution never
+            // substitutes it, so the inner-None destructure stays silent.
+            (
+                "s-terminal-base",
+                "claude-personal",
+                "claude-personal",
+                true,
+                &cursor_map,
+            ),
+            // Switched to an unrelated built-in; nothing inherited ran.
+            ("s-unrelated", "claude-personal", "codex", true, &detect_as),
+            // Custom agent_acp_cmd spec: the wrapper's own command executes.
+            (
+                "s-acp-cmd",
+                "claude-personal",
+                "claude-personal",
+                false,
+                &detect_as,
+            ),
+            // No agent_detect_as mapping anywhere.
+            ("s-no-map", "plain-tool", "aoe-agent", true, &HashMap::new()),
+        ];
+        for (session_id, tool, agent, spec_from_registry, detect_as) in cases {
+            super::warn_if_wrapper_resolves_to_base(
+                session_id,
+                tool,
+                agent,
+                spec_from_registry,
+                detect_as,
+            );
+            assert!(
+                !logs_contain(session_id),
+                "{session_id}: expected silence, got a warning"
+            );
+        }
+        assert!(
+            !logs_contain("will not be executed"),
+            "no shape above substitutes a base adapter; all must stay silent"
+        );
+    }
+
+    /// The warn site must be wired into the real spawn path: the two tests
+    /// above call the helper directly, so deleting or miswiring its call in
+    /// `spawn_inner` would leave them green. Here a full `Supervisor::spawn`
+    /// runs a detect_as wrapper against the real claude adapter with an
+    /// unwritable working directory: the warning is emitted before any
+    /// subprocess work, then the exec fails fast and deterministically.
+    /// Needs HOME isolation for the config resolve.
+    #[traced_test]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn spawn_path_emits_the_wrapper_warning() {
+        let tmp = tempfile::TempDir::with_prefix_in("aoe-warn-wiring-", "/tmp").unwrap();
+        let _guard = crate::session::test_support::isolate_home(tmp.path());
+        tracing::callsite::rebuild_interest_cache();
+
+        let sup = Supervisor::new(VecSink::new());
+        let cfg_path = crate::session::get_app_dir().unwrap().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            "\n[session.agent_detect_as]\nclaude-personal = \"claude\"\n",
+        )
+        .unwrap();
+
+        let result = sup
+            .spawn(SpawnRequest {
+                session_id: "s-wire".into(),
+                // Attach shape: the caller passes the wrapper key as both
+                // agent and tool, so resolve_agent_spec performs the
+                // substitution against the real claude adapter.
+                agent: "claude-personal".into(),
+                tool: "claude-personal".into(),
+                // An unwritable working directory makes the agent exec fail
+                // right after the warn site, deterministically, whether or
+                // not the adapter binary exists on this machine.
+                cwd: tmp.path().join("does-not-exist"),
+                additional_dirs: vec![],
+                provider_env: vec![],
+                model: None,
+                effort: None,
+                stored_acp_session_id: None,
+                fork_from: None,
+                seed_history_replay: false,
+                sandbox_info: None,
+                source_profile: None,
+                yolo_mode: false,
+                acp_mode_id: None,
+                agent_command_override: None,
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "launch into a missing working directory must fail"
+        );
+        assert!(
+            logs_contain("s-wire") && logs_contain("will not be executed"),
+            "spawn path must emit the wrapper warning before the launch fails"
+        );
     }
 
     #[tokio::test]
