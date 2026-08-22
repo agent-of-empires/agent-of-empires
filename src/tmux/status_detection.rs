@@ -3019,14 +3019,6 @@ enter to select · esc to cancel";
    2. No, exit
 ";
 
-    #[test]
-    fn claude_folder_trust_prompt_narrow_is_waiting() {
-        assert_eq!(
-            detect_claude_status(CLAUDE_FOLDER_TRUST_PROMPT_NARROW),
-            Status::Waiting
-        );
-    }
-
     /// The label match is anchored to the choice block, not the whole window.
     /// Window-wide collapsing found the label in ordinary prose, and because a
     /// blocking rule outranks the running signal these all reported `Waiting`
@@ -3119,19 +3111,15 @@ enter to select · esc to cancel";
     }
 
     #[test]
-    fn claude_folder_trust_prompt_wrapped_is_waiting() {
-        assert_eq!(
-            detect_claude_status(CLAUDE_FOLDER_TRUST_PROMPT_WRAPPED),
-            Status::Waiting
-        );
-    }
-
-    #[test]
     fn claude_folder_trust_prompt_is_waiting() {
-        assert_eq!(
-            detect_claude_status(CLAUDE_FOLDER_TRUST_PROMPT),
-            Status::Waiting
-        );
+        let cases = [
+            ("default", CLAUDE_FOLDER_TRUST_PROMPT),
+            ("wrapped", CLAUDE_FOLDER_TRUST_PROMPT_WRAPPED),
+            ("narrow", CLAUDE_FOLDER_TRUST_PROMPT_NARROW),
+        ];
+        for (name, fixture) in cases {
+            assert_eq!(detect_claude_status(fixture), Status::Waiting, "{name}");
+        }
     }
 
     /// The shapes the label anchor admits: an unprefixed verbatim menu row, a
