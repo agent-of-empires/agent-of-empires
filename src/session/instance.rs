@@ -9415,6 +9415,69 @@ mod tests {
     }
 
     #[test]
+    fn test_merge_diff_passive_transition_stamp_does_not_wipe_concurrent_archive() {
+        // #3465: a passive status transition restamps last_accessed_at on
+        // disk (update_status_with_metadata writes Some(now) on every
+        // detected transition, with no user gesture behind it), and the
+        // stamp reaches disk through PassiveStatusPatch while an archive
+        // is landing concurrently. The writer's pre snapshot is then
+        // stale, so the deliberate `touched` arm below reads the stamp's
+        // advance as a peer touch and wipes sink state the user just set.
+        // That arm is correct for real gestures (pinned by
+        // test_merge_diff_peer_touch_clears_tui_archive, the
+        // messaging-unarchives rule); a poller stamp is not a gesture and
+        // must not dethrone a concurrent triage action.
+        //
+        // The stamp is modeled as the raw field write
+        // update_status_with_metadata performs rather than via
+        // touch_last_accessed(), because the latter would be a genuine
+        // gesture, which this suite deliberately lets win.
+        let cases: &[(&str, fn(&mut Instance), fn(&Instance) -> bool)] = &[
+            // The issue's headline victim: a concurrent archive.
+            ("archived_at", |i| i.archive(), |i| i.archived_at.is_some()),
+            // Same touched arm, same wipe, for the other two sinks.
+            (
+                "snoozed_until",
+                |i| i.snooze(15),
+                |i| i.snoozed_until.is_some(),
+            ),
+            (
+                "idle_dormant_since",
+                |i| i.idle_dormant_since = Some(Utc::now()),
+                |i| i.idle_dormant_since.is_some(),
+            ),
+        ];
+        let stale_pre_stamp = Utc::now() - chrono::Duration::seconds(60);
+        let passive_stamp = Utc::now();
+        for (field, seed_sink, sink_present) in cases {
+            // Snapshot the archiving writer held before the poller tick.
+            let mut pre = Instance::new("s", "/tmp/x");
+            pre.status = Status::Running;
+            pre.last_accessed_at = Some(stale_pre_stamp);
+
+            // Passive poller observes Running -> Idle and restamps disk,
+            // mirroring update_status_with_metadata's transition block
+            // (idle_entered_at plus last_accessed_at = Some(now)).
+            let mut disk = pre.clone();
+            disk.status = Status::Idle;
+            disk.idle_entered_at = Some(passive_stamp);
+            disk.last_accessed_at = Some(passive_stamp);
+
+            // The concurrent user action seeds the sink on the writer's
+            // post snapshot.
+            let mut post = pre.clone();
+            seed_sink(&mut post);
+
+            disk.merge_user_action_diff(&pre, &post);
+
+            assert!(
+                sink_present(&disk),
+                "passive transition stamp must not wipe concurrent {field} (#3465)"
+            );
+        }
+    }
+
+    #[test]
     fn test_merge_diff_peer_archive_clears_concurrent_tui_snooze() {
         // The web/TUI/CLI contract treats pinned/archived/snoozed as
         // mutually exclusive (the sidebar tier comparator assumes a
