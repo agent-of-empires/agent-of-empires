@@ -83,8 +83,9 @@ impl AgentRegistry {
     ///   gemini   → `gemini --acp`       (native, Google)
     ///   codex    → codex-acp            (ACP adapter, OpenAI Codex CLI)
     ///   vibe     → vibe-acp             (native, Mistral)
-    ///   pi       → pi-acp               (adapter, Pi coding agent)
     ///   omp      → `omp acp`            (native, Oh My Pi)
+    ///   kimi     → `kimi acp`            (native, Kimi Code)
+    ///   prime-agent → `prime-agent --mode acp` (native, PrimeIntellect)
     ///
     /// We deliberately don't use `npx -y` for these. First-run
     /// downloads can hang for tens of seconds with no output, which
@@ -181,6 +182,16 @@ impl AgentRegistry {
                 args: vec!["acp".into()],
                 description: "Kimi Code (Moonshot AI), native ACP via `kimi acp`".into(),
                 env_allowlist: default_env_allowlist("kimi"),
+            },
+        );
+        reg.agents.insert(
+            "prime-agent".into(),
+            AgentSpec {
+                command: "prime-agent".into(),
+                args: vec!["--mode".into(), "acp".into()],
+                description: "PrimeIntellect Prime Agent, native ACP via `prime-agent --mode acp`"
+                    .into(),
+                env_allowlist: default_env_allowlist("prime-agent"),
             },
         );
         reg.agents.insert(
@@ -373,7 +384,7 @@ mod tests {
 
         // Deferred adapters stay None until each adapter's env reads are
         // verified from its own source.
-        for name in ["pi", "omp", "kimi", "vibe"] {
+        for name in ["pi", "omp", "kimi", "vibe", "prime-agent"] {
             assert!(
                 al(name).is_none(),
                 "{name} must have None env_allowlist until source-verified"

@@ -257,6 +257,25 @@ pub const OMP: AgentProfile = AgentProfile {
     yolo_mode_id: None,
 };
 
+/// PrimeIntellect Prime Agent via native `prime-agent --mode acp`. One ACP
+/// session per process is an upstream limit; a second `session/new` is
+/// refused rather than silently sharing state. Extensions (subagents,
+/// goals, gates) travel in a reverse-domain `_meta` envelope
+/// (`ai.primeintellect.prime-agent`), but only session-info envelopes are
+/// documented; tool-call parent linkage is not, so indentation stays off.
+/// `/new` exists as a TUI command, but its ACP-side clear semantics are
+/// unobserved, so clear aliases stay empty until then.
+pub const PRIME_AGENT: AgentProfile = AgentProfile {
+    key: "prime-agent",
+    parent_meta_namespaces: &[],
+    clear_aliases: &[],
+    clear_requires_driven_reset: false,
+    supports_exit_plan_mode: false,
+    supports_wakeup_tools: false,
+    emits_heartbeat_keepalives: false,
+    yolo_mode_id: None,
+};
+
 /// Kimi Code (Moonshot AI) via native `kimi acp`. Verified against the
 /// binary's `acp-adapter/src/modes.ts`: it advertises the canonical
 /// four-mode taxonomy (`default`, `plan`, `auto`, `yolo`), so `yolo` is
@@ -317,6 +336,7 @@ pub fn resolve(key: &str) -> &'static AgentProfile {
         "pi" => &PI,
         "omp" => &OMP,
         "kimi" => &KIMI,
+        "prime-agent" => &PRIME_AGENT,
         "aoe-agent" => &AOE_AGENT,
         _ => &DEFAULT,
     }
@@ -353,6 +373,7 @@ mod tests {
         assert_eq!(resolve("pi").key, "pi");
         assert_eq!(resolve("omp").key, "omp");
         assert_eq!(resolve("kimi").key, "kimi");
+        assert_eq!(resolve("prime-agent").key, "prime-agent");
         assert_eq!(resolve("aoe-agent").key, "aoe-agent");
     }
 
@@ -409,6 +430,7 @@ mod tests {
         assert_eq!(resolve("vibe").yolo_mode_id, None);
         assert_eq!(resolve("pi").yolo_mode_id, None);
         assert_eq!(resolve("omp").yolo_mode_id, None);
+        assert_eq!(resolve("prime-agent").yolo_mode_id, None);
         assert_eq!(resolve("unknown-agent").yolo_mode_id, None);
     }
 
@@ -452,7 +474,15 @@ mod tests {
             assert!(profile.clear_requires_driven_reset, "{}", profile.key);
         }
         for profile in [
-            &AOE_AGENT, &OPENCODE, &GEMINI, &VIBE, &PI, &OMP, &KIMI, &DEFAULT,
+            &AOE_AGENT,
+            &OPENCODE,
+            &GEMINI,
+            &VIBE,
+            &PI,
+            &OMP,
+            &KIMI,
+            &PRIME_AGENT,
+            &DEFAULT,
         ] {
             assert!(!profile.clear_requires_driven_reset, "{}", profile.key);
         }
@@ -523,7 +553,15 @@ mod tests {
             assert!(profile.supports_wakeup_tools);
         }
         for profile in [
-            &CODEX, &OPENCODE, &GEMINI, &VIBE, &PI, &OMP, &KIMI, &DEFAULT,
+            &CODEX,
+            &OPENCODE,
+            &GEMINI,
+            &VIBE,
+            &PI,
+            &OMP,
+            &KIMI,
+            &PRIME_AGENT,
+            &DEFAULT,
         ] {
             assert!(!profile.supports_exit_plan_mode, "{}", profile.key);
             assert!(!profile.supports_wakeup_tools, "{}", profile.key);

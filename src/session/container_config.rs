@@ -303,6 +303,21 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         preserve_files: &[],
         clean_files: &[],
     },
+    AgentConfigMount {
+        tool_name: "prime-agent",
+        host_rel: ".prime/agent",
+        container_suffix: ".prime/agent",
+        // Skip AoE's sandbox staging dir, the per-instance session
+        // transcripts, and the bootstrapped IPython kernel venv
+        // (machine-specific, and the container rebuilds it on first run).
+        skip_entries: &["sandbox", "sessions", "kernel-venv"],
+        seed_files: &[],
+        copy_dirs: &[],
+        keychain_credential: None,
+        home_seed_files: &[],
+        preserve_files: &[],
+        clean_files: &[],
+    },
 ];
 
 /// Sync host agent config into the shared sandbox directory. Copies top-level files

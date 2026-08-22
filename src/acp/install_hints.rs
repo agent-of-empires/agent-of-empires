@@ -27,6 +27,12 @@ pub fn install_hint_for(binary: &str) -> Option<&'static str> {
         }
         "kimi" => "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash  (then `kimi acp`)",
         "omp" => "curl -fsSL https://omp.sh/install | sh",
+        // The official installer wraps a checksum-verified `npm install -g`
+        // of a release tarball, so the curl script is the supported path;
+        // the package is not on the npm registry.
+        "prime-agent" => {
+            "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh  (then `/login` once)"
+        }
         _ => return None,
     })
 }
@@ -163,6 +169,7 @@ mod tests {
             "pi-acp",
             "kimi",
             "omp",
+            "prime-agent",
         ] {
             assert!(
                 install_hint_for(binary).is_some(),

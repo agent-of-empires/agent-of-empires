@@ -28,6 +28,7 @@ aoe ships an ACP registry entry for each tool whose ACP server we've verified. F
 | `pi` | `pi-acp` (adapter) | `npm install -g pi-acp` (plus `@earendil-works/pi-coding-agent`) | `pi-acp --terminal-login`, or provider env |
 | `omp` | `omp acp` (native) | `curl -fsSL https://omp.sh/install \| sh` | provider environment or OMP login |
 | `kimi` | `kimi acp` (native) | `curl -fsSL https://code.kimi.com/kimi-code/install.sh \| bash` | `kimi login`, or provider env |
+| `prime-agent` | `prime-agent --mode acp` (native) | `curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh \| sh` | `/login` once, or provider env |
 | `aoe-agent` | bundled (Vercel AI SDK 6) | ships with `aoe` | provider env vars |
 
 The `npm install -g` commands above are optional: `aoe acp doctor --fix` installs the `claude` / `codex` / `pi` adapters into the data dir for you, one adapter at a time (see [Requirements](#requirements)). Run it, or install them globally yourself.
