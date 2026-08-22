@@ -2350,7 +2350,7 @@ mod tests {
         let mut new_plain = Instance::new("new_plain", "/tmp/np");
         new_plain.created_at = chrono::Utc::now();
 
-        let instances = vec![old_fav, new_plain];
+        let instances = [old_fav, new_plain];
 
         // Feature off: plain newest-first, unchanged behavior.
         let mut refs: Vec<&Instance> = instances.iter().collect();
@@ -2375,7 +2375,7 @@ mod tests {
         fav_new.favorite();
         let plain = Instance::new("plain", "/tmp/p");
 
-        let instances = vec![fav_old, fav_new, plain];
+        let instances = [fav_old, fav_new, plain];
         let mut refs: Vec<&Instance> = instances.iter().collect();
         sort_sessions_inner(&mut refs, SortOrder::Newest, true);
 
@@ -2391,7 +2391,7 @@ mod tests {
         z_fav.favorite();
         let a_plain = Instance::new("apple", "/tmp/a");
 
-        let instances = vec![z_fav, a_plain];
+        let instances = [z_fav, a_plain];
 
         let mut refs: Vec<&Instance> = instances.iter().collect();
         sort_sessions_inner(&mut refs, SortOrder::AZ, true);
@@ -2412,7 +2412,7 @@ mod tests {
         let mut new_plain = Instance::new("new_plain", "/tmp/np");
         new_plain.created_at = chrono::Utc::now();
 
-        let instances = vec![snoozed_fav, new_plain];
+        let instances = [snoozed_fav, new_plain];
         let mut refs: Vec<&Instance> = instances.iter().collect();
         sort_sessions_inner(&mut refs, SortOrder::Newest, true);
 
@@ -2566,7 +2566,7 @@ mod tests {
         let mut plain_waiting = Instance::new("plain_waiting", "/tmp/pw");
         plain_waiting.status = crate::session::Status::Waiting;
 
-        let instances = vec![fav_idle, plain_waiting];
+        let instances = [fav_idle, plain_waiting];
 
         let mut on: Vec<&Instance> = instances.iter().collect();
         sort_sessions_inner(&mut on, SortOrder::Attention, true);
