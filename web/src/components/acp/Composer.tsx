@@ -729,18 +729,20 @@ export function Composer({
       }
       if (operation.kind === "set-text") {
         composerRuntime.setText(operation.text);
-        requestAnimationFrame(() => {
-          const el = taRef.current;
-          if (!el) return;
-          focusTextArea();
-          el.style.height = "auto";
-          el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
-        });
+        if (active) {
+          requestAnimationFrame(() => {
+            const el = taRef.current;
+            if (!el) return;
+            focusTextArea();
+            el.style.height = "auto";
+            el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
+          });
+        }
         return;
       }
-      insertRawTextAtCaret(ta, operation.text, operation.kind === "replace-selection");
+      insertRawTextAtCaret(ta, operation.text, operation.kind === "replace-selection", active);
     },
-    [composerRuntime, focusTextArea],
+    [active, composerRuntime, focusTextArea],
   );
   const pluginUiEntries = usePluginUiEntries();
   const pluginComposerEntries = useMemo(
@@ -1393,10 +1395,17 @@ export function insertSlashCommand(ref: React.RefObject<HTMLTextAreaElement | nu
  *  the text, and assigning `value` parks the caret at the end, so
  *  dispatching first hands the popover a cursor pointing past the text
  *  it is about to detect against. */
-function writeComposerValue(ta: HTMLTextAreaElement, next: string, caret: number, inputType: string, data?: string) {
+function writeComposerValue(
+  ta: HTMLTextAreaElement,
+  next: string,
+  caret: number,
+  inputType: string,
+  data?: string,
+  focus = true,
+) {
   const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, "value")?.set;
   setter?.call(ta, next);
-  ta.focus();
+  if (focus) ta.focus();
   ta.setSelectionRange(caret, caret);
   ta.dispatchEvent(new InputEvent("input", { bubbles: true, inputType, ...(data === undefined ? {} : { data }) }));
 }
@@ -1443,11 +1452,11 @@ export function insertAtCaret(ref: React.RefObject<HTMLTextAreaElement | null>, 
   writeComposerValue(ta, next, before.length + needsSpace.length + text.length, "insertText", text);
 }
 
-function insertRawTextAtCaret(ta: HTMLTextAreaElement, text: string, replaceSelection: boolean) {
+function insertRawTextAtCaret(ta: HTMLTextAreaElement, text: string, replaceSelection: boolean, focus = true) {
   const start = ta.selectionStart ?? ta.value.length;
   const end = replaceSelection ? (ta.selectionEnd ?? start) : start;
   const next = ta.value.slice(0, start) + text + ta.value.slice(end);
-  writeComposerValue(ta, next, start + text.length, "insertText", text);
+  writeComposerValue(ta, next, start + text.length, "insertText", text, focus);
   ta.style.height = "auto";
   ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`;
 }
