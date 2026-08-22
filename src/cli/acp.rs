@@ -308,11 +308,12 @@ fn skip_gate_check(binary: &str, on_path: bool) -> bool {
 
 /// Version-gate finding for one configured agent, the listing-side twin
 /// of `doctor_fix_action`: same verdicts, plus the one distinction the
-/// plain listing needs that `--fix` does not. A pinned bundled copy
-/// satisfies the floor even when the PATH copy is stale or absent,
-/// because the spawn resolver switches to it below-floor (see #1017).
-/// Absence with nothing installed stays the presence check's report;
-/// probing cannot sharpen it.
+/// plain listing needs that `--fix` does not. Only a PATH copy whose
+/// version parses below the floor is backed by a pinned bundled copy,
+/// because that is the only case `path_copy_below_floor` proves at spawn
+/// (see #1017); an unparseable or failed probe keeps the PATH copy at
+/// spawn, so it stays flagged here. Absence with nothing installed stays
+/// the presence check's report; probing cannot sharpen it.
 #[cfg(feature = "serve")]
 fn doctor_version_issue(
     gate: &crate::acp::agent_compat::VersionGate,
@@ -326,7 +327,7 @@ fn doctor_version_issue(
     match doctor_fix_action(Some(*gate), probe) {
         DoctorFixAction::Skip => None,
         DoctorFixAction::PrintHint { reason } => {
-            if bundle_installed {
+            if bundle_installed && matches!(probe, ProbeStatus::Version { .. }) {
                 return None;
             }
             Some(AgentVersionIssue {
@@ -335,6 +336,16 @@ fn doctor_version_issue(
             })
         }
     }
+}
+
+/// True when aoe's pinned bundled copy of `binary` is actually installed
+/// in the app data dir, not merely bundleable. Shared by the `--fix`
+/// reporter and the plain listing so the #1017 fallback semantics have
+/// one definition.
+#[cfg(feature = "serve")]
+fn bundled_copy_installed(binary: &str) -> bool {
+    crate::session::get_app_dir()
+        .is_ok_and(|app_dir| crate::acp::adapters::bundled_adapter_bin(&app_dir, binary).is_some())
 }
 
 /// Resolve whether `gate`'s adapter would miss its version floor at
@@ -347,9 +358,7 @@ async fn run_doctor_version_issue(
     gate: &crate::acp::agent_compat::VersionGate,
 ) -> Option<AgentVersionIssue> {
     let on_path = find_in_path(gate.binary).is_some();
-    let bundle_installed = crate::session::get_app_dir().is_ok_and(|app_dir| {
-        crate::acp::adapters::bundled_adapter_bin(&app_dir, gate.binary).is_some()
-    });
+    let bundle_installed = bundled_copy_installed(gate.binary);
     if !on_path && !bundle_installed {
         return None;
     }
@@ -370,9 +379,7 @@ async fn run_doctor_fix_action(binary: &str) {
             // actually installed. Since #1017, resolution prefers the pinned
             // bundle whenever it can prove the PATH copy is below the floor, so
             // with a bundle present the shadowing advice is simply false.
-            let bundle_installed = crate::session::get_app_dir().is_ok_and(|app_dir| {
-                crate::acp::adapters::bundled_adapter_bin(&app_dir, binary).is_some()
-            });
+            let bundle_installed = bundled_copy_installed(binary);
             if crate::acp::adapters::is_bundled(binary) && !bundle_installed {
                 println!(
                     "{binary}: {reason}. That copy is on your PATH and no bundled copy is \
@@ -1323,13 +1330,24 @@ mod tests {
             // Absence is reported by the presence branch either way.
             ("missing_but_bundled", ProbeStatus::Missing, true, false),
             ("absent_unbundled", ProbeStatus::Missing, false, false),
-            // Unprobeable copies cannot prove compatibility.
+            // Unprobeable copies cannot prove compatibility, with or
+            // without a bundle: path_copy_below_floor only rescues a
+            // parsed below-floor version, so spawn keeps the PATH copy
+            // and the listing must flag it.
             (
                 "unparseable",
                 ProbeStatus::Unparseable {
                     raw: "junk".to_string(),
                 },
                 false,
+                true,
+            ),
+            (
+                "unparseable_but_bundled",
+                ProbeStatus::Unparseable {
+                    raw: "junk".to_string(),
+                },
+                true,
                 true,
             ),
             (
@@ -1340,7 +1358,16 @@ mod tests {
                 false,
                 true,
             ),
+            (
+                "failed_but_bundled",
+                ProbeStatus::Failed {
+                    message: "boom".to_string(),
+                },
+                true,
+                true,
+            ),
             ("timed_out", ProbeStatus::TimedOut, false, true),
+            ("timed_out_but_bundled", ProbeStatus::TimedOut, true, true),
         ];
         for (label, probe, bundled, expect_issue) in cases {
             let issue = doctor_version_issue(&gate, &probe, bundled);
