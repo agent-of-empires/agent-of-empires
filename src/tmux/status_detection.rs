@@ -5113,6 +5113,40 @@ You can monitor progress with aoe session logs.\n\
 /Users/nbrake/scm/otari-workspace/otari-worktrees/orchestrator\n\
 ↑45k ↓11k $0.009 9.6%/500k (auto)                    gpt-5.5 • medium\n";
 
+    /// omo (a pi derivative aliased via `agent_detect_as = pi`) renders a
+    /// taller footer than plain pi: two tip lines, the input box (rule,
+    /// prompt, rule), a usage line, and a persistent harness status line.
+    /// Its busy line (`• Running eval ... esc to interrupt`) lands around
+    /// position 8 above the bottom, outside pi's classic footer window.
+    /// Captured shape from #3475's live pane, ANSI stripped, with one
+    /// neutral transcript line of scrollback above it.
+    const OMO_DEEP_FOOTER_BUSY_PANE: &str = "\
+Eval suite streaming results to the report.\n\
+• Running eval (3m 19s • esc to interrupt)\n\
+Tip: Set thinkingBudgets in settings.json to choose which models think.\n\
+↳ Want the full story on any tip? Ask about it in chat.\n\
+────────────────────────────────────────\n\
+❯\n\
+────────────────────────────────────────\n\
+~ • CH93.4% • $2.870 • 115K/1M (11.5%) (auto)      claude-opus-4-6:xhigh\n\
+(😺 OmO Native) Pursuing goal (1m) mem:12k/200k\n";
+
+    /// The same omo frame after the turn ends: the busy line is removed and
+    /// nothing else on the pane carries a running signal. The scrollback
+    /// prose deliberately contains an activity word at position 8, inside
+    /// the widened hint window, so a future move of the activity-word scan
+    /// to that window would fail this row instead of silently pinning idle
+    /// derivative sessions on Running.
+    const OMO_DEEP_FOOTER_PARKED_PANE: &str = "\
+The agent is now working on #443, extending the gate.\n\
+Tip: Set thinkingBudgets in settings.json to choose which models think.\n\
+↳ Want the full story on any tip? Ask about it in chat.\n\
+────────────────────────────────────────\n\
+❯\n\
+────────────────────────────────────────\n\
+~ • CH93.4% • $2.870 • 115K/1M (11.5%) (auto)      claude-opus-4-6:xhigh\n\
+(😺 OmO Native) Pursuing goal (1m) mem:12k/200k\n";
+
     #[test]
     fn test_detect_pi_status_running_spinner_footer() {
         assert_eq!(detect_pi_status(PI_RUNNING_PANE), Status::Running);
@@ -5126,6 +5160,29 @@ You can monitor progress with aoe session logs.\n\
             detect_pi_status(PI_FINISHED_PANE_WITH_ACTIVITY_PROSE),
             Status::Idle
         );
+    }
+
+    #[test]
+    fn test_detect_pi_status_deep_footer_interrupt_hint() {
+        // #3475: a pi derivative's busy line carries `esc to interrupt`
+        // beyond the classic footer window; the parked row is the same pane
+        // without that line, its scrollback prose carrying an activity word
+        // inside the widened window, and must stay Idle.
+        let cases = [
+            (
+                "busy frame, hint at position 8",
+                OMO_DEEP_FOOTER_BUSY_PANE,
+                Status::Running,
+            ),
+            (
+                "parked frame without the busy line",
+                OMO_DEEP_FOOTER_PARKED_PANE,
+                Status::Idle,
+            ),
+        ];
+        for (desc, pane, expected) in cases {
+            assert_eq!(detect_pi_status(pane), expected, "{desc}");
+        }
     }
 
     #[test]
