@@ -296,7 +296,8 @@ mod tests {
     /// #3238: verified adapters (`claude`, `codex`, `opencode`, `gemini`,
     /// `aoe-agent`)
     /// forward the operator's provider-auth env; adapters whose real env
-    /// vars couldn't be source-verified (pi, omp, kimi, vibe) stay `None`.
+    /// vars couldn't be source-verified (pi, omp, kimi, vibe, prime-agent)
+    /// stay `None`.
     /// One row asserts a specific negative for `aoe-agent`: it must NOT
     /// receive `GEMINI_API_KEY` (that's the CLI-native name; the bundled
     /// AI-SDK agent reads `GOOGLE_GENERATIVE_AI_API_KEY` instead). The
