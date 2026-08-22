@@ -106,6 +106,44 @@ describe("activityToThreadMessages; tool-call grouping (#1057)", () => {
     expect(toolParts[0]!.toolName).toBe(TOOL_GROUP_NAME);
   });
 
+  it("chunks long runs into bounded groups (#3477)", () => {
+    const runOf = (n: number): ActivityRow[] => [
+      userRow("go"),
+      ...Array.from({ length: n }, (_, i) => toolStart(`t${i}`)),
+    ];
+    const groupsIn = (n: number) => {
+      const messages = activityToThreadMessages(runOf(n), false);
+      const assistant = messages.find((m) => m.role === "assistant")!;
+      const parts = assistant.content as Array<{
+        type: string;
+        toolName?: string;
+        argsText?: string;
+      }>;
+      return {
+        groups: parts.filter((p) => p.type === "tool-call" && p.toolName === TOOL_GROUP_NAME),
+        inline: parts.filter((p) => p.type === "tool-call" && p.toolName !== TOOL_GROUP_NAME),
+      };
+    };
+
+    // At the max chunk size, still one group.
+    const ten = groupsIn(10);
+    expect(ten.groups).toHaveLength(1);
+    expect(ten.inline).toHaveLength(0);
+    expect(JSON.parse(ten.groups[0]!.argsText!).children).toHaveLength(10);
+
+    // Just over the max: first chunk groups, tail is too short to group.
+    const eleven = groupsIn(11);
+    expect(eleven.groups).toHaveLength(1);
+    expect(eleven.inline).toHaveLength(1);
+
+    // Long enough to fill multiple chunks.
+    const twentyFive = groupsIn(25);
+    expect(twentyFive.groups).toHaveLength(3);
+    expect(twentyFive.inline).toHaveLength(0);
+    const grouped = twentyFive.groups.reduce((sum, g) => sum + JSON.parse(g.argsText!).children.length, 0);
+    expect(grouped).toBe(25);
+  });
+
   it("does not group runs of 1 or 2 tool calls", () => {
     const messages = activityToThreadMessages([userRow("go"), toolStart("t1"), toolStart("t2")], false);
     const assistant = messages.find((m) => m.role === "assistant")!;

@@ -14,7 +14,7 @@
 // AcpRuntime.tsx. We never let assistant-ui own the chat state; it
 // only renders what we feed it and surfaces user actions back.
 
-import { Fragment, useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
+import { Fragment, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import { MessagePrimitive, ThreadPrimitive, useAuiState } from "@assistant-ui/react";
 import {
   AlertTriangle,
@@ -1294,12 +1294,12 @@ function groupChildToItem(c: GroupChild): {
 }
 
 function AssistantToolGroup({ argsText }: { argsText?: string }) {
-  const items = parseGroupChildren(argsText).map(groupChildToItem);
+  const items = useMemo(() => parseGroupChildren(argsText).map(groupChildToItem), [argsText]);
   return <ToolGroupCard items={items} />;
 }
 
 function AssistantTodoGroup({ argsText }: { argsText?: string }) {
-  const items = parseGroupChildren(argsText).map(groupChildToItem);
+  const items = useMemo(() => parseGroupChildren(argsText).map(groupChildToItem), [argsText]);
   return <TodoGroupCard items={items} />;
 }
 

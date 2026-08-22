@@ -881,6 +881,12 @@ function collapseSubagents(parts: DraftPart[], profile: AgentProfile): DraftPart
  *  block (#1057). */
 const TOOL_GROUP_MIN_RUN = 3;
 
+/** Maximum run length that stays in a single group card. Longer runs are
+ *  chunked so one agent turn (e.g. Kimi streaming many tool calls in a
+ *  single batch) doesn't collapse the whole turn into one enormous,
+ *  slow-loading card. See #3477. */
+const TOOL_GROUP_MAX_RUN = 10;
+
 /** Synthetic toolName used for the folded group card. Namespaced with
  *  the `_aoe_` prefix so it can't collide with a real ACP tool kind. */
 export const TOOL_GROUP_NAME = "_aoe_tool_group";
@@ -929,10 +935,12 @@ function buildGroupChildren(run: DraftPart[]): {
 
 /** Walk an assistant message's parts and collapse runs of consecutive
  *  tool-call parts (regardless of kind) into one synthetic group part
- *  when the run is ≥ TOOL_GROUP_MIN_RUN long. The grouping boundary is
- *  ANY non-tool-call part (text, callout, etc.); matching the "what
+ *  when the run is ≥ TOOL_GROUP_MIN_RUN long. Runs longer than
+ *  TOOL_GROUP_MAX_RUN are chunked into multiple bounded groups so one
+ *  agent turn can't swallow the whole timeline. The grouping boundary
+ *  is ANY non-tool-call part (text, callout, etc.); matching the "what
  *  did the agent do silently before its next sentence?" UX shape. The
- *  underlying tool-call data is preserved verbatim inside the group's
+ *  underlying tool-call data is preserved verbatim inside each group's
  *  argsText payload so the renderer can expand back to the original
  *  per-tool cards on click. */
 function collapseToolRuns(parts: DraftPart[], todosEnabled: boolean): DraftPart[] {
@@ -985,16 +993,26 @@ function collapseToolRuns(parts: DraftPart[], todosEnabled: boolean): DraftPart[
         run = [];
         return;
       }
-      const { childIds, children } = buildGroupChildren(run);
-      out.push({
-        type: "tool-call",
-        // Anchor the group's React identity to the first child (see the
-        // TodoGroup note above and #2802): the full-join key changed on
-        // every append, remounting the card and re-collapsing it.
-        toolCallId: `group-${childIds[0]}`,
-        toolName: TOOL_GROUP_NAME,
-        argsText: JSON.stringify({ children }),
-      });
+      // Chunk long generic runs so one turn can't produce a single
+      // monolithic "N actions" card. The last chunk falls back to inline
+      // cards if it's too short to group on its own. See #3477.
+      for (let i = 0; i < run.length; i += TOOL_GROUP_MAX_RUN) {
+        const chunk = run.slice(i, i + TOOL_GROUP_MAX_RUN);
+        if (chunk.length < TOOL_GROUP_MIN_RUN) {
+          for (const p of chunk) out.push(p);
+          continue;
+        }
+        const { childIds, children } = buildGroupChildren(chunk);
+        out.push({
+          type: "tool-call",
+          // Anchor the group's React identity to the first child (see the
+          // TodoGroup note above and #2802): the full-join key changed on
+          // every append, remounting the card and re-collapsing it.
+          toolCallId: `group-${childIds[0]}`,
+          toolName: TOOL_GROUP_NAME,
+          argsText: JSON.stringify({ children }),
+        });
+      }
     }
     run = [];
   };
