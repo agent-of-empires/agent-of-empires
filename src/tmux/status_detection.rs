@@ -1828,6 +1828,21 @@ pub fn detect_copilot_status(raw_content: &str) -> Status {
     Status::Idle
 }
 
+/// How many of the last non-empty pane lines count as plain pi's footer for
+/// the spinner and activity-word running signals. Sized for pi itself, whose
+/// busy line sits ~5 non-empty lines above the bottom; anything deeper is
+/// finished-turn prose where both signals falsely fire.
+const PI_FOOTER_WINDOW: usize = 6;
+
+/// How deep the interrupt-hint scan reaches. pi derivatives with taller
+/// footers (omo, #3475) stack up to two tip lines, the input box, a usage
+/// line, and a harness status line under their busy line, pushing it to
+/// non-empty position 7-8; ten covers that plus footer variants. Safe to
+/// widen only for this signal: the hint renders on the live busy line and
+/// vanishes when the turn ends, unlike spinners and activity words, which
+/// linger in scrollback.
+const PI_INTERRUPT_HINT_WINDOW: usize = 10;
+
 /// Pi coding agent status detection via tmux pane parsing.
 ///
 /// Pi has no status hooks (`hook_config: None`), so this pane detector is the
@@ -1841,13 +1856,16 @@ pub fn detect_copilot_status(raw_content: &str) -> Status {
 /// `>` prompt at rest, so the pane's only difference from the running frame is
 /// the absent spinner line.
 ///
-/// That is why the Running signal is scoped to the footer (the last few
-/// non-empty lines) rather than the whole capture: a finished turn's response
-/// prose routinely contains activity words ("now working on #443", "reading
-/// the file") and a scrollback frame can still hold a spinner glyph, so
-/// scanning the last 30 lines for those substrings pinned the session on
-/// Running forever. This mirrors the footer-only approach already used by
-/// `detect_omp_status` and `detect_copilot_status`.
+/// That is why the spinner and activity-word signals are scoped to pi's own
+/// footer (`PI_FOOTER_WINDOW`) rather than the whole capture: a finished
+/// turn's response prose routinely contains activity words ("now working on
+/// #443", "reading the file") and a scrollback frame can still hold a
+/// spinner glyph, so scanning the last 30 lines for those substrings pinned
+/// the session on Running forever. The `esc to interrupt` hint is specific
+/// to the live busy line, so it alone scans deeper
+/// (`PI_INTERRUPT_HINT_WINDOW`), reaching the taller footers of derivatives
+/// aliased via `agent_detect_as = pi` (#3475). This mirrors the footer-only
+/// approach already used by `detect_omp_status` and `detect_copilot_status`.
 pub fn detect_pi_status(raw_content: &str) -> Status {
     let clean = strip_ansi(raw_content);
     let non_empty_lines: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
@@ -1856,22 +1874,21 @@ pub fn detect_pi_status(raw_content: &str) -> Status {
     // (above the input box's two rules, the cwd line, and the status line), so
     // the footer window must reach it while staying tight enough to exclude the
     // bulk of a finished turn's response prose.
-    let footer: Vec<&str> = non_empty_lines
-        .iter()
-        .rev()
-        .take(6)
-        .rev()
-        .copied()
-        .collect();
-    let footer_lower = footer.join("\n").to_lowercase();
+    let footer = tail_lines(&non_empty_lines, PI_FOOTER_WINDOW);
 
     // A spinner glyph in the footer is pi's primary running signal; prose never
     // contains braille spinner chars, so this is the reliable positive marker.
-    if has_any_spinner(&footer) {
+    if has_any_spinner(footer) {
         return Status::Running;
     }
 
-    if footer_lower.contains("esc to interrupt") || footer_lower.contains("ctrl+c to interrupt") {
+    // The hint renders on the live busy line and vanishes with it, so unlike
+    // the signals above it can scan a deeper window without reopening the
+    // pinned-on-Running false positives (#3475).
+    let hint_lower = tail_lines(&non_empty_lines, PI_INTERRUPT_HINT_WINDOW)
+        .join("\n")
+        .to_lowercase();
+    if hint_lower.contains("esc to interrupt") || hint_lower.contains("ctrl+c to interrupt") {
         return Status::Running;
     }
 
