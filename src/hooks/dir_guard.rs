@@ -527,9 +527,9 @@ pub(crate) fn unlink_session_id_via_guard(instance_id: &str) -> Result<()> {
 }
 
 /// Ensure the per-instance hook directory exists with `dir_guard` discipline
-/// and return its host path. Used by callers that hand the path to an
-/// external resolver (Docker bind-mount source, sidecar config writer)
-/// rather than performing in-process I/O directly.
+/// and return its host path, canonically resolved. Used by callers that hand
+/// the path to an external resolver (Docker/Podman bind-mount source, sidecar
+/// config writer) rather than performing in-process I/O directly.
 ///
 /// The function calls `open_instance_dir` to verify-and-create with
 /// `*at`+`O_NOFOLLOW`+`fstat-on-fd`, then drops the fd and returns the
@@ -539,12 +539,31 @@ pub(crate) fn unlink_session_id_via_guard(instance_id: &str) -> Result<()> {
 /// would reject) and the multi-tenant pre-squat + symlink-swap race
 /// against Docker's bind-mount resolution.
 ///
+/// Issue #3240: VM-backed runtimes resolve mount sources inside their VM,
+/// against a fixed share set keyed by real paths (podman machine shares
+/// `/private`, never `/tmp`). The lexical base (`/tmp/aoe-hooks-<euid>`) is
+/// therefore canonicalized before it leaves the process; on macOS that turns
+/// `/tmp/...` into the shared `/private/tmp/...` spelling. If resolution
+/// fails (directory removed mid-flight), fall back to the lexical path with
+/// a warning rather than blocking session boot.
+///
 /// Caller policy on `Err`: skip the bind-mount push, surface a
 /// `tracing::warn!` and let the agent boot without status hooks
 /// (pane-detection fallback).
 pub(crate) fn ensure_instance_dir_path(instance_id: &str) -> Result<PathBuf> {
     let _fd = open_instance_dir(instance_id)?;
-    Ok(hook_base_path().join(instance_id))
+    let lexical = hook_base_path().join(instance_id);
+    match std::fs::canonicalize(&lexical) {
+        Ok(resolved) => Ok(resolved),
+        Err(e) => {
+            tracing::warn!(target: "hooks.guard",
+                "could not resolve {} to its real path ({e:#}); passing it \
+                 unresolved, VM-backed runtimes may reject it if it crosses a \
+                 symlinked share boundary",
+                lexical.display());
+            Ok(lexical)
+        }
+    }
 }
 
 // Cleanup.

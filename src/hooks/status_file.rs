@@ -249,6 +249,42 @@ mod tests {
 
     #[test]
     #[serial_test::serial(hook_base)]
+    fn test_ensure_instance_dir_path_resolves_symlinked_prefix() {
+        // Issue #3240: podman machine shares host paths under their real
+        // paths (/private, not /tmp) inside the VM, so the bind-mount source
+        // handed to the runtime must be canonically resolved.
+        use tempfile::TempDir;
+        let cases = [
+            ("symlinked base prefix resolves to the real path", true),
+            (
+                "already-real base prefix is passed through unchanged",
+                false,
+            ),
+        ];
+        for (label, symlinked) in cases {
+            let tmp = TempDir::new().unwrap();
+            let real_parent = tmp.path().join("real-parent");
+            std::fs::create_dir(&real_parent).unwrap();
+            let base = if symlinked {
+                let link_parent = tmp.path().join("via-symlink");
+                std::os::unix::fs::symlink(&real_parent, &link_parent).unwrap();
+                link_parent.join("aoe-hooks")
+            } else {
+                real_parent.join("aoe-hooks")
+            };
+            dir_guard::override_base_for_test(base.clone());
+            dir_guard::reset_for_test();
+            let got = crate::hooks::ensure_instance_dir_path("pathres")
+                .expect("instance dir must verify-and-create");
+            dir_guard::clear_base_override_for_test();
+            dir_guard::reset_for_test();
+            let want = std::fs::canonicalize(&base).unwrap().join("pathres");
+            assert_eq!(got, want, "{label}");
+        }
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
     fn test_cleanup_nonexistent_dir() {
         let (_g, _, _tmp) = BaseGuard::ready();
         cleanup_hook_status_dir("nonexistent_cleanup_test");
