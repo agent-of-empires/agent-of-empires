@@ -5150,12 +5150,12 @@ Tip: Set thinkingBudgets in settings.json to choose which models think.\n\
 
     /// The same omo frame after the turn ends: the busy line is removed and
     /// nothing else on the pane carries a running signal. The scrollback
-    /// prose deliberately contains an activity word at position 8, inside
-    /// the widened hint window, so a future move of the activity-word scan
-    /// to that window would fail this row instead of silently pinning idle
+    /// prose deliberately STARTS with an activity word at position 8, so it
+    /// would fire if the activity-word scan ever moved to the widened hint
+    /// window; the row fails then instead of silently pinning idle
     /// derivative sessions on Running.
     const OMO_DEEP_FOOTER_PARKED_PANE: &str = "\
-The agent is now working on #443, extending the gate.\n\
+Working through the eval matrix, results streaming to the report.\n\
 Tip: Set thinkingBudgets in settings.json to choose which models think.\n\
 ↳ Want the full story on any tip? Ask about it in chat.\n\
 ────────────────────────────────────────\n\
