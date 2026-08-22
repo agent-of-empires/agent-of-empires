@@ -83,8 +83,9 @@ impl AgentRegistry {
     ///   gemini   → `gemini --acp`       (native, Google)
     ///   codex    → codex-acp            (ACP adapter, OpenAI Codex CLI)
     ///   vibe     → vibe-acp             (native, Mistral)
+    ///   pi       → pi-acp               (adapter, Pi coding agent)
     ///   omp      → `omp acp`            (native, Oh My Pi)
-    ///   kimi     → `kimi acp`            (native, Kimi Code)
+    ///   kimi     → `kimi acp`           (native, Kimi Code)
     ///   prime-agent → `prime-agent --mode acp` (native, PrimeIntellect)
     ///
     /// We deliberately don't use `npx -y` for these. First-run
