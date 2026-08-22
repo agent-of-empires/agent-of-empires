@@ -272,12 +272,9 @@ mod tests {
             } else {
                 real_parent.join("aoe-hooks")
             };
-            dir_guard::override_base_for_test(base.clone());
-            dir_guard::reset_for_test();
+            let _g = BaseGuard::with_base(base.clone());
             let got = crate::hooks::ensure_instance_dir_path("pathres")
                 .expect("instance dir must verify-and-create");
-            dir_guard::clear_base_override_for_test();
-            dir_guard::reset_for_test();
             let want = std::fs::canonicalize(&base).unwrap().join("pathres");
             assert_eq!(got, want, "{label}");
         }

@@ -35,6 +35,17 @@ impl BaseGuard {
         make_correct_base(&base);
         (g, base, tmp)
     }
+
+    /// As [`Self::fresh`] but with an explicit base path instead of the
+    /// default tempdir layout. Use for fixtures whose base must sit under a
+    /// specific parent (symlink chains, shared roots); the caller owns
+    /// creating `base` itself. The override is cleared on drop like the
+    /// other constructors.
+    pub(crate) fn with_base(base: PathBuf) -> Self {
+        super::dir_guard::override_base_for_test(base);
+        super::dir_guard::reset_for_test();
+        Self
+    }
 }
 
 impl Drop for BaseGuard {

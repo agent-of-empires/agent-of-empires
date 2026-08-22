@@ -3953,6 +3953,9 @@ volume_ignores = ["node_modules"]
 
         let hook_dir =
             crate::hooks::hook_status_dir(instance_id).expect("test id must be allowlist-safe");
+        // Canonicalize for comparison (handles /var -> /private/var on macOS);
+        // the mount source is the resolved real path since #3240.
+        let hook_dir = hook_dir.canonicalize().unwrap();
         let expected_container_path = format!(
             "{}/{instance_id}",
             crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER
@@ -4334,6 +4337,9 @@ trust_level = "trusted"
 
             let hook_dir = crate::hooks::hook_status_dir(&instance_id)
                 .expect("test id must be allowlist-safe");
+            // Canonicalize for comparison (handles /var -> /private/var on
+            // macOS); the mount source is the resolved real path since #3240.
+            let hook_dir = hook_dir.canonicalize().unwrap();
             assert!(
                 config
                     .volumes
@@ -4575,6 +4581,8 @@ trust_level = "trusted"
 
         let hook_dir =
             crate::hooks::hook_status_dir(instance_id).expect("test id must be allowlist-safe");
+        // Lexical is correct here: hooks are disabled, the instance dir is
+        // never created, so canonicalize would fail and no mount can match.
         assert!(
             !config
                 .volumes
@@ -4652,6 +4660,9 @@ agent_detect_as = { "wrapped-codex" = "codex" }
 
         let hook_dir =
             crate::hooks::hook_status_dir(instance_id).expect("test id must be allowlist-safe");
+        // Canonicalize for comparison (handles /var -> /private/var on macOS);
+        // the mount source is the resolved real path since #3240.
+        let hook_dir = hook_dir.canonicalize().unwrap();
         assert!(
             config
                 .volumes
