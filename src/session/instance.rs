@@ -9503,6 +9503,7 @@ mod tests {
             "archive() invariant must clear a concurrent TUI snooze"
         );
     }
+
     #[test]
     #[serial_test::serial]
     fn test_merge_diff_passive_transition_stamp_does_not_wake_dormant_row() {
