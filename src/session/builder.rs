@@ -763,8 +763,7 @@ pub fn build_instance(
     {
         // Non-blocking: deprecated agents still launch; every support path
         // is unchanged. The warning only informs.
-        tracing::warn!(target: "session.builder",
-            "spawning deprecated agent '{}': {notice}", params.tool);
+        tracing::warn!(target: "session.builder", "agent '{}' is {notice}", params.tool);
     }
     instance.worktree_info = worktree_info;
     instance.workspace_info = workspace_info;

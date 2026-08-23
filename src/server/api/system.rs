@@ -197,6 +197,7 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
                     host_only: a.host_only,
                     installed: available.iter().any(|s| s == a.name),
                     install_hint: a.install_hint.to_string(),
+                    oneshot_capable: a.oneshot_flag.is_some(),
                     lifecycle: a.lifecycle,
                     acp_capable: acp_registry.get(a.name).is_some(),
                     acp_installed: acp_command

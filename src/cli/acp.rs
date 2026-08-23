@@ -450,7 +450,7 @@ async fn doctor(json: bool, fix: bool, adapter: Vec<String>, all_adapters: bool)
         .list()
         .into_iter()
         .map(|(name, spec)| AgentDoctorEntry {
-            lifecycle: registry_lifecycle(&name),
+            lifecycle: registry_lifecycle(name),
             name: name.clone(),
             command_present: command_present(&spec.command),
             description: spec.description.clone(),
@@ -603,8 +603,9 @@ fn agents() -> Result<()> {
         let present = command_present(&spec.command);
         let mark = if present { "[OK]" } else { "[!! ]" };
         println!("{} {:<14}  {}", mark, name, spec.description);
-        if let crate::agents::AgentLifecycle::Deprecated { .. } = registry_lifecycle(&name) {
-            println!("        ⚠ {}", registry_lifecycle(&name));
+        let lifecycle = registry_lifecycle(name);
+        if let crate::agents::AgentLifecycle::Deprecated { .. } = lifecycle {
+            println!("        ⚠ {lifecycle}");
         }
         let args = if spec.args.is_empty() {
             String::new()
