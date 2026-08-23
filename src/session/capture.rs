@@ -7128,7 +7128,10 @@ mod tests {
             capture_prime_agent_session_id(&proj_path, &HashSet::new(), None).unwrap(),
             "id-override"
         );
+        // An ambient PRIME_AGENT_SESSION_DIR from the developer's own shell
+        // must not shadow the legacy alias under test.
         drop(_primary);
+        let _unset_primary = EnvGuard::unset(&["PRIME_AGENT_SESSION_DIR"]);
 
         // Legacy alias applies when the primary override is unset.
         let legacy = tmp.path().join("legacy");
