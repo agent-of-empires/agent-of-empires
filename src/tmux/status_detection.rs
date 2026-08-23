@@ -5151,14 +5151,14 @@ Tip: Set thinkingBudgets in settings.json to choose which models think.\n\
 
     /// The same omo frame after the turn ends: the busy line is removed and
     /// nothing else on the pane carries a running signal. The scrollback
-    /// prose deliberately carries, at position 8, a leading spinner glyph
+    /// prose deliberately carries, at position 8, an embedded spinner glyph
     /// and an activity-verb start, arming three traps: the row fails if the
     /// spinner scan or the activity-word scan moves to the widened hint
     /// window, and it fails just the same if `PI_FOOTER_WINDOW` widens far
     /// enough to reach the prose, instead of silently pinning idle
     /// derivative sessions on Running.
     const OMO_DEEP_FOOTER_PARKED_PANE: &str = "\
-⠋ Working through the eval matrix, results streaming to the report.\n\
+Working through the eval matrix, results streaming to the report ⠋\n\
 Tip: Set thinkingBudgets in settings.json to choose which models think.\n\
 ↳ Want the full story on any tip? Ask about it in chat.\n\
 ────────────────────────────────────────\n\
