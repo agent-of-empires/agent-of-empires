@@ -44,6 +44,18 @@ describe("Row cursor placement with CJK (wide) characters", () => {
     }
   });
 
+
+  it("keeps trailing combining marks inside the boxed cursor cell", () => {
+    // A fixed run IS one cluster; splitting the base from its marks would
+    // strand them in a zero-width sibling and browsers draw dotted circles.
+    const text = "\u6F22\u0301"; // CJK base + combining acute
+    const { container } = render(<Row segs={[seg(text)]} cursorCol={0} />);
+    const cell = cursorCell(container);
+    expect(cell!.textContent).toBe(text);
+    expect(cell!.style.width).toBe(`calc(var(--term-cell, 1em) * ${cellWidth("\u6F22")})`);
+    // No sibling spans: the whole row lives in the cursor cell.
+    expect(container.querySelectorAll("span")).toHaveLength(1);
+  });
   it("boxes the correct character in a mixed ASCII+CJK line", () => {
     // "hello " is 6 cells; then CJK chars are 2 cells each: 한(6-8) 글(8-10)
     // 정(10-12) 렬(12-14). Column 8 must land on "글", not "정".

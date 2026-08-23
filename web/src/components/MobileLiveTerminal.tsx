@@ -396,6 +396,11 @@ export const Row = memo(function Row({
       if (idx != null) {
         placed = true;
         const chars = [...run.text];
+        // A fixed run is exactly one cluster (base plus its own trailing
+        // zero-width marks): box the WHOLE cluster as the cursor cell, or
+        // the marks would land in a zero-width sibling where they can no
+        // longer shape with their base and browsers draw a dotted circle.
+        const curEnd = run.fixed ? chars.length : idx + 1;
         if (idx > 0) {
           const pre = chars.slice(0, idx).join("");
           out.push(
@@ -409,13 +414,16 @@ export const Row = memo(function Row({
             key={key++}
             data-live-cursor
             className={focused ? "animate-term-cursor-blink" : undefined}
-            style={{ ...fixedBoxStyle(cellWidth(chars[idx]!), base), ...cursorStyle }}
+            style={{
+              ...fixedBoxStyle(run.fixed ? run.cells : cellWidth(chars[idx]!), base),
+              ...cursorStyle,
+            }}
           >
-            {chars[idx]}
+            {chars.slice(idx, curEnd).join("")}
           </span>,
         );
-        if (idx + 1 < chars.length) {
-          const post = chars.slice(idx + 1).join("");
+        if (curEnd < chars.length) {
+          const post = chars.slice(curEnd).join("");
           out.push(
             <span key={key++} style={run.fixed ? fixedBoxStyle(textWidth(post), base) : base}>
               {post}
