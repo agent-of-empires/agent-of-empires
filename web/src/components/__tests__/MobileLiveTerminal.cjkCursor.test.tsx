@@ -52,8 +52,9 @@ describe("Row cursor placement with CJK (wide) characters", () => {
   });
 
   it("keeps trailing combining marks inside the boxed cursor cell", () => {
-    // A fixed run IS one cluster; splitting the base from its marks would
-    // strand them in a zero-width sibling and browsers draw dotted circles.
+    // clusterSpanAt must take the WHOLE cluster (base plus marks): slicing
+    // the base alone would strand its marks in a zero-width sibling and
+    // browsers draw dotted circles.
     const text = "\u6F22\u0301"; // CJK base + combining acute
     const { container } = render(<Row segs={[seg(text)]} cursorCol={0} />);
     const cell = cursorCell(container);
