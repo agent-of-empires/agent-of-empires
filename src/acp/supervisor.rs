@@ -652,8 +652,10 @@ pub(crate) fn apply_agent_command_override(
     Ok(())
 }
 
-/// Warn when this launch resolves an `agent_detect_as` wrapper to its
-/// base adapter instead of running the wrapper itself (#3422).
+/// Which `(wrapper, base)` pair this launch substitutes, when an
+/// `agent_detect_as` wrapper resolves to its base adapter instead of
+/// running the wrapper itself (#3422). `None` when the wrapper's own
+/// command runs.
 ///
 /// Three spawn shapes substitute silently, all funnelling through the same
 /// warn site: `pick_agent_for_tool` resolved the wrapper to its base key
@@ -667,27 +669,23 @@ pub(crate) fn apply_agent_command_override(
 /// keeps a custom `agent_acp_cmd` spec, which does execute the wrapper's
 /// own command, silent.
 ///
-/// A built-in running its own adapter is not a substitution even when a
-/// mapping keys on it: the direct registry lookup won, so that pair is
-/// skipped up front. The warning stays one line per launch rather than
-/// threading provenance through every spawn site; an operator who chose
-/// the substitute deliberately still gets an accurate statement.
-/// The map is the spawn's own resolved config snapshot; a config edit
-/// landing between the pick-time resolve and this one can miss the warning
-/// for that single launch, and the next launch warns normally.
-/// The fresh defaults registry matches what resolution consulted because
-/// the supervisor registry is never mutated after construction.
-fn warn_if_wrapper_resolves_to_base(
-    session_id: &str,
+/// `registry` is the supervisor's live registry, so a key added at runtime
+/// behaves exactly as `resolve_agent_spec` treated it. A built-in running
+/// its own adapter is not a substitution even when a mapping keys on it:
+/// the direct registry lookup won, so that pair is skipped up front. The
+/// map is the spawn's own resolved config snapshot; a config edit landing
+/// between the pick-time resolve and this one can miss the warning for
+/// that single launch, and the next launch warns normally.
+fn wrapper_substitution_for(
+    registry: &AgentRegistry,
     tool: &str,
     agent: &str,
     spec_from_registry: bool,
     agent_detect_as: &HashMap<String, String>,
-) {
+) -> Option<(String, String)> {
     if !spec_from_registry || agent_detect_as.is_empty() {
-        return;
+        return None;
     }
-    let registry = AgentRegistry::with_defaults();
     let inherited = |name: &str| crate::acp::inherited_acp_base(name, agent_detect_as);
     // Which key's adapter runs instead of its own binary, and that key's
     // base. The pick path substitutes the session tool (agent became the
@@ -711,8 +709,15 @@ fn warn_if_wrapper_resolves_to_base(
     // An inner None is a wrapper mapped to a terminal-only base: resolution
     // never substitutes it, so there is nothing to warn about.
     let Some((wrapper, Some(base))) = substituted else {
-        return;
+        return None;
     };
+    Some((wrapper.to_string(), base))
+}
+
+/// Emit the #3422 substitution warning. Shared by the initial spawn site
+/// and the watchdog respawn path, which re-emits the pair stored in
+/// `SpawnConfig::wrapper_substitution`.
+fn log_wrapper_substitution(session_id: &str, tool: &str, wrapper: &str, base: &str) {
     warn!(
         target: "acp.supervisor",
         session = %session_id,
@@ -1659,13 +1664,21 @@ impl<S: BroadcastSink> Supervisor<S> {
         // #3422: say so when an agent_detect_as wrapper's base adapter is
         // about to run in the wrapper's place; the wrapper's account,
         // gateway, or env overrides would otherwise silently not apply.
-        warn_if_wrapper_resolves_to_base(
-            &session_id,
-            &tool,
-            &agent,
-            spec_from_registry,
-            &resolved_cfg.session.agent_detect_as,
-        );
+        // The pair rides SpawnConfig so watchdog respawns, which relaunch a
+        // clone of this config without re-resolving, re-emit it.
+        let wrapper_substitution = {
+            let registry = self.registry.lock().await;
+            wrapper_substitution_for(
+                &registry,
+                &tool,
+                &agent,
+                spec_from_registry,
+                &resolved_cfg.session.agent_detect_as,
+            )
+        };
+        if let Some((wrapper, base)) = &wrapper_substitution {
+            log_wrapper_substitution(&session_id, &tool, wrapper, base);
+        }
         // Apply ${aoe_data_dir} placeholder substitution against the
         // appropriate path; if the placeholder is not consumed it stays
         // as-is and the spawn will fail with a clear error.
@@ -1824,6 +1837,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             mcp_servers,
             seed_history_replay,
             artifact_dir: crate::session::artifacts::session_artifact_dir(&session_id).ok(),
+            wrapper_substitution,
         };
 
         debug!(
@@ -2392,6 +2406,13 @@ impl<S: BroadcastSink> Supervisor<S> {
                     }
 
                     let acp_session_id = AcpSessionId(session_id.clone());
+                    // The respawn relaunches a clone of the original
+                    // SpawnConfig, so whatever substitution it recorded at
+                    // initial spawn still describes this launch exactly.
+                    if let Some((wrapper, base)) = &respawn_config.wrapper_substitution {
+                        log_wrapper_substitution(&session_id, &respawn_config.tool, wrapper, base);
+                    }
+
                     let mut new_client =
                         match AcpClient::spawn(respawn_config.clone(), acp_session_id).await {
                             Ok(c) => c,
@@ -3944,38 +3965,34 @@ mod tests {
             }
         }
     }
+
     /// #3422: a wrapper mapped to its base via `agent_detect_as` starts a
     /// structured view session happily, but the base adapter binary runs, so
     /// account, gateway, or env overrides the wrapper sets silently do not
     /// apply. The spawn must say so instead of substituting silently. Every
-    /// substitution shape must produce its own log line, so a regression in
-    /// one arm cannot hide behind another's.
-    #[traced_test]
+    /// substitution shape must produce its own pair, so a regression in one
+    /// arm cannot hide behind another's.
     #[test]
     fn spawn_warns_when_a_detect_as_wrapper_runs_its_base_adapter() {
-        tracing::callsite::rebuild_interest_cache();
-        // Distinct wrapper/base pairs per row so the field-value assertions
-        // below discriminate a mislabeled shape instead of matching another
-        // row's line.
+        let registry = AgentRegistry::with_defaults();
+        // Distinct wrapper/base pairs per row so the returned substitution
+        // discriminates a mislabeled shape instead of matching another row's.
         let detect_as = [
             ("claude-personal".to_string(), "claude".to_string()),
             ("codex-personal".to_string(), "codex".to_string()),
             ("kimi-personal".to_string(), "kimi".to_string()),
         ]
         .into();
-        // (session id, tool, agent, expected wrapper, expected base).
-        let cases: [(&str, &str, &str, &str, &str); 3] = [
-            (
-                "s-pick",
-                "claude-personal",
-                "claude",
-                "claude-personal",
-                "claude",
-            ),
+        // (tool, agent, expected wrapper, expected base), one row per shape.
+        let cases: [(&str, &str, &str, &str); 3] = [
+            // Normal create path: pick_agent_for_tool swapped the base key
+            // in before spawn, so agent is "claude" while the tool stays
+            // the wrapper.
+            ("claude-personal", "claude", "claude-personal", "claude"),
             // Attach respawn path: the caller passes the wrapper key
-            // directly and resolve_agent_spec performs the substitution.
+            // directly and resolve_agent_spec performs the substitution,
+            // so agent and tool are both the wrapper key.
             (
-                "s-attach",
                 "codex-personal",
                 "codex-personal",
                 "codex-personal",
@@ -3984,30 +4001,16 @@ mod tests {
             // Explicit request-level agent override naming a different
             // wrapper than an unmapped tool: the named wrapper's own
             // inheritance applies inside resolve_agent_spec.
-            (
-                "s-override",
-                "plain-tool",
-                "kimi-personal",
-                "kimi-personal",
-                "kimi",
-            ),
+            ("plain-tool", "kimi-personal", "kimi-personal", "kimi"),
         ];
-        for (session_id, tool, agent, wrapper, base) in cases {
-            super::warn_if_wrapper_resolves_to_base(session_id, tool, agent, true, &detect_as);
-            assert!(
-                logs_contain(session_id),
-                "{session_id}: expected a warning naming this shape"
-            );
-            assert!(
-                logs_contain(&format!("wrapper={wrapper}"))
-                    && logs_contain(&format!("base={base}")),
-                "{session_id}: warning must attribute wrapper {wrapper} to base {base}"
+        for (tool, agent, wrapper, base) in cases {
+            let got = super::wrapper_substitution_for(&registry, tool, agent, true, &detect_as);
+            assert_eq!(
+                got.as_ref().map(|(w, b)| (w.as_str(), b.as_str())),
+                Some((wrapper, base)),
+                "{tool:?} -> {agent:?}: wrong substitution pair"
             );
         }
-        assert!(
-            logs_contain("will not be executed"),
-            "expected the substitution warning text"
-        );
     }
 
     /// Shapes where nothing was substituted must stay silent: a built-in
@@ -4015,16 +4018,15 @@ mod tests {
     /// terminal-only base, an explicit switch to an unrelated agent, a
     /// custom `agent_acp_cmd` spec that executes the wrapper itself, and
     /// spawns with no `agent_detect_as` involvement.
-    #[traced_test]
     #[test]
     fn spawn_stays_silent_when_no_detect_as_substitution_happened() {
-        tracing::callsite::rebuild_interest_cache();
+        let registry = AgentRegistry::with_defaults();
         let detect_as = [("claude-personal".to_string(), "claude".to_string())].into();
         let mapped_builtin = [("claude".to_string(), "codex".to_string())].into();
         let self_map = [("claude".to_string(), "claude".to_string())].into();
         let codex_map = [("codex".to_string(), "claude".to_string())].into();
         let cursor_map = [("claude-personal".to_string(), "cursor".to_string())].into();
-        // (session id, tool, agent, from registry, detect_as map).
+        // (tool, agent, from registry, detect_as map), one row per guard.
         let cases: [(&str, &str, &str, bool, &HashMap<String, String>); 9] = [
             // Built-in tool on its own registry spec.
             ("s-builtin", "claude", "claude", true, &detect_as),
@@ -4073,27 +4075,17 @@ mod tests {
             // No agent_detect_as mapping anywhere.
             ("s-no-map", "plain-tool", "aoe-agent", true, &HashMap::new()),
         ];
-        for (session_id, tool, agent, spec_from_registry, detect_as) in cases {
-            super::warn_if_wrapper_resolves_to_base(
-                session_id,
+        for (label, tool, agent, spec_from_registry, detect_as) in cases {
+            let got = super::wrapper_substitution_for(
+                &registry,
                 tool,
                 agent,
                 spec_from_registry,
                 detect_as,
             );
-            assert!(
-                !logs_contain(session_id),
-                "{session_id}: expected silence, got a warning"
-            );
+            assert_eq!(got, None, "{label}: expected silence");
         }
-        assert!(
-            !logs_contain("will not be executed"),
-            "no shape above substitutes a base adapter; all must stay silent"
-        );
     }
-
-    /// The warn site must be wired into the real spawn path: the two tests
-    /// above call the helper directly, so deleting or miswiring its call in
     /// `spawn_inner` would leave them green. Here a full `Supervisor::spawn`
     /// runs a detect_as wrapper against the real claude adapter with an
     /// unwritable working directory: the warning is emitted before any
@@ -4636,6 +4628,7 @@ cursor-acp-bridge = "agent acp"
         };
         let socket_path = tmp.path().join("budget.sock");
         let dummy_config = SpawnConfig {
+            wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
             spec: dummy_spec,
@@ -4733,6 +4726,7 @@ cursor-acp-bridge = "agent acp"
             env_allowlist: None,
         };
         let dummy_config = SpawnConfig {
+            wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
             spec: dummy_spec,
@@ -4850,6 +4844,7 @@ cursor-acp-bridge = "agent acp"
             env_allowlist: None,
         };
         let dummy_config = SpawnConfig {
+            wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
             spec: dummy_spec,
@@ -4930,6 +4925,7 @@ cursor-acp-bridge = "agent acp"
             env_allowlist: None,
         };
         let dummy_config = SpawnConfig {
+            wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
             spec: dummy_spec,
@@ -5064,6 +5060,7 @@ cursor-acp-bridge = "agent acp"
             env_allowlist: None,
         };
         let dummy_config = SpawnConfig {
+            wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
             spec: dummy_spec,
