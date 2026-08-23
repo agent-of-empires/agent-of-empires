@@ -30,8 +30,10 @@ const ATTENTION_FILE_READ_CAP: usize = 16 * 1024;
 /// `/tmp/aoe-hooks-<euid>` resolved by `dir_guard::hook_base_path()`.
 /// `Err` if `instance_id` fails `validate_instance_id`.
 ///
-/// The path is informational (used by the sandbox bind-mount source string and
-/// by debug logs); production I/O goes through `dir_guard` and never path-joins.
+/// The path is informational (tests and debug logs); production I/O goes
+/// through `dir_guard` and never path-joins. The sandbox bind-mount source is
+/// `dir_guard::ensure_instance_dir_path`, canonically resolved since #3240,
+/// so on symlinked prefixes it spells differently from this lexical value.
 pub fn hook_status_dir(instance_id: &str) -> Result<PathBuf> {
     crate::session::validate_instance_id(instance_id)?;
     Ok(dir_guard::hook_base_path().join(instance_id))
