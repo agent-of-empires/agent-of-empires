@@ -2173,6 +2173,7 @@ fn test_cli_session_show_json_reports_archived_and_precedence() {
 /// present but below-floor reads `[!! ]` with remediation instead of
 /// `[OK]`. Deleting the probe call from the listing loop fails here even
 /// though every unit-level decision test stays green.
+#[cfg(feature = "serve")]
 #[test]
 #[parallel]
 fn test_cli_acp_doctor_flags_below_floor_adapter() {

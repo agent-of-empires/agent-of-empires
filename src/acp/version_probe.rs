@@ -13,9 +13,20 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeStatus {
     Missing,
-    Version { raw: String, parsed: Version },
-    Unparseable { raw: String },
-    Failed { message: String },
+    Version {
+        raw: String,
+        parsed: Version,
+        /// stdout only, what the spawn-side tokenizer sees; stderr is
+        /// folded into `raw`. Bundle-backed suppression must judge
+        /// spawn's stream view, not this probe's lenient fold.
+        stdout_raw: String,
+    },
+    Unparseable {
+        raw: String,
+    },
+    Failed {
+        message: String,
+    },
     TimedOut,
 }
 
@@ -110,13 +121,10 @@ pub async fn probe_binary_version(binary: &str) -> ProbeStatus {
     };
     match tokio::time::timeout(PROBE_TIMEOUT, child.wait_with_output()).await {
         Ok(Ok(output)) => {
-            let raw = format!(
-                "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            )
-            .trim()
-            .to_string();
+            let stdout_raw = String::from_utf8_lossy(&output.stdout).to_string();
+            let raw = format!("{}{}", stdout_raw, String::from_utf8_lossy(&output.stderr),)
+                .trim()
+                .to_string();
             if !output.status.success() {
                 return ProbeStatus::Failed {
                     message: if raw.is_empty() {
@@ -127,7 +135,11 @@ pub async fn probe_binary_version(binary: &str) -> ProbeStatus {
                 };
             }
             match extract_semver(&raw) {
-                Some(parsed) => ProbeStatus::Version { raw, parsed },
+                Some(parsed) => ProbeStatus::Version {
+                    raw,
+                    parsed,
+                    stdout_raw,
+                },
                 None => ProbeStatus::Unparseable { raw },
             }
         }
@@ -301,6 +313,7 @@ mod tests {
                 &ProbeStatus::Version {
                     raw: "0.0.1".to_string(),
                     parsed: Version::parse("0.0.1").unwrap(),
+                    stdout_raw: "0.0.1".to_string(),
                 },
             )
             .unwrap()
@@ -312,6 +325,7 @@ mod tests {
             &ProbeStatus::Version {
                 raw: CLAUDE_AGENT_ACP_MIN_VERSION.to_string(),
                 parsed: Version::parse(CLAUDE_AGENT_ACP_MIN_VERSION).unwrap(),
+                stdout_raw: CLAUDE_AGENT_ACP_MIN_VERSION.to_string(),
             },
         )
         .is_none());
@@ -320,6 +334,7 @@ mod tests {
             &ProbeStatus::Version {
                 raw: "999.0.0".to_string(),
                 parsed: Version::parse("999.0.0").unwrap(),
+                stdout_raw: "999.0.0".to_string(),
             },
         )
         .is_none());

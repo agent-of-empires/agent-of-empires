@@ -336,10 +336,10 @@ fn doctor_version_issue(
             // like `version=0.37.0` parses here but not at spawn. When
             // spawn would keep the PATH copy, keep the flag.
             let bundle_backs_spawn = match probe {
-                ProbeStatus::Version { raw, .. } => {
+                ProbeStatus::Version { stdout_raw, .. } => {
                     let min = semver::Version::parse(gate.min_version)
                         .expect("gate min_version must be valid semver");
-                    crate::acp::version_probe::whitespace_token_below_floor(raw, min)
+                    crate::acp::version_probe::whitespace_token_below_floor(stdout_raw, min)
                 }
                 // Without a parseable version spawn cannot prove
                 // below-floor either, so it keeps the PATH copy.
@@ -522,6 +522,7 @@ async fn doctor(json: bool, fix: bool, adapter: Vec<String>, all_adapters: bool)
     let registry = AgentRegistry::with_defaults();
 
     let node_status = check_node();
+    #[cfg(feature = "serve")]
     let mut gate_issues: Vec<(&'static str, Option<AgentVersionIssue>)> = Vec::new();
     let mut agent_entries: Vec<AgentDoctorEntry> = Vec::new();
     for (name, spec) in registry.list() {
@@ -1204,6 +1205,7 @@ mod tests {
                 &crate::acp::version_probe::ProbeStatus::Version {
                     raw: "0.0.1".to_string(),
                     parsed: semver::Version::parse("0.0.1").unwrap(),
+                    stdout_raw: "0.0.1".to_string(),
                 },
             ),
             DoctorFixAction::PrintHint { .. }
@@ -1225,6 +1227,7 @@ mod tests {
                         crate::acp::agent_compat::CLAUDE_AGENT_ACP_MIN_VERSION,
                     )
                     .unwrap(),
+                    stdout_raw: crate::acp::agent_compat::CLAUDE_AGENT_ACP_MIN_VERSION.to_string(),
                 },
             ),
             DoctorFixAction::Skip,
@@ -1279,6 +1282,7 @@ mod tests {
                 &crate::acp::version_probe::ProbeStatus::Version {
                     raw: "1.15.0".to_string(),
                     parsed: semver::Version::parse("1.15.0").unwrap(),
+                    stdout_raw: "1.15.0".to_string(),
                 },
             ),
             DoctorFixAction::PrintHint { .. }
@@ -1305,6 +1309,7 @@ mod tests {
         let stale = crate::acp::version_probe::ProbeStatus::Version {
             raw: "0.37.0".to_string(),
             parsed: semver::Version::parse("0.37.0").unwrap(),
+            stdout_raw: "0.37.0".to_string(),
         };
         let issue = doctor_version_issue(&gate, &stale, false)
             .expect("a below-floor adapter must produce a version issue");
@@ -1330,6 +1335,7 @@ mod tests {
         let ver = |v: &str| ProbeStatus::Version {
             raw: v.to_string(),
             parsed: semver::Version::parse(v).unwrap(),
+            stdout_raw: v.to_string(),
         };
         // (label, probe, bundle_installed, expect_issue)
         let cases: Vec<(&str, ProbeStatus, bool, bool)> = vec![
@@ -1355,6 +1361,20 @@ mod tests {
                 ProbeStatus::Version {
                     raw: "version=0.37.0".to_string(),
                     parsed: semver::Version::parse("0.37.0").unwrap(),
+                    stdout_raw: "version=0.37.0".to_string(),
+                },
+                true,
+                true,
+            ),
+            // Spawn's probe reads stdout only (stderr is nulled), so a
+            // version printed solely to stderr is invisible to it even
+            // though this probe folded it into `raw`: keep flagging.
+            (
+                "stderr_only_but_bundled",
+                ProbeStatus::Version {
+                    raw: "0.37.0".to_string(),
+                    parsed: semver::Version::parse("0.37.0").unwrap(),
+                    stdout_raw: String::new(),
                 },
                 true,
                 true,
