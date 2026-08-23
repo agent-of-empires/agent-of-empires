@@ -134,18 +134,31 @@ export function splitUrls(text: string): UrlPart[] {
   return parts;
 }
 
-// Terminal cell widths, wcwidth-style: combining marks and zero-width
-// joiners take no cell; East Asian Wide/Fullwidth and emoji take two.
-// tmux wraps by cells, so wrapping (and the cursor math built on it)
-// must count the same way, not in UTF-16 code units.
+// Terminal cell widths, wcwidth-style: combining marks, zero-width
+// joiners, variation selectors and emoji modifiers take no cell; East
+// Asian Wide/Fullwidth and emoji take two. tmux wraps by cells, so
+// wrapping (and the cursor math built on it) must count the same way,
+// not in UTF-16 code units.
 const ZERO_WIDTH = /[\u200B-\u200D\uFEFF]|\p{M}/u;
+// Emoji composition tails: they modify the preceding pictographic glyph
+// and occupy no column of their own (skin-tone swatches, text/color
+// variation selectors).
+const EMOJI_TAIL = /[\uFE0E\uFE0F\u{1F3FB}-\u{1F3FF}]/u;
+// Regional indicator pairs compose flag glyphs; a lone RI is one cell.
+const REGIONAL_INDICATOR = /[\u{1F1E6}-\u{1F1FF}]/u;
 const WIDE =
   /[\u1100-\u115F\u2E80-\u303E\u3041-\u33FF\u3400-\u4DBF\u4E00-\u9FFF\uA000-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\uFFE0-\uFFE6\u{1F300}-\u{1FAFF}]|\p{Emoji_Presentation}/u;
 const ASCII_PRINTABLE_ONLY = /^[\x20-\x7E]*$/;
 
 export function cellWidth(codePoint: string): number {
-  if (ZERO_WIDTH.test(codePoint)) return 0;
+  if (ZERO_WIDTH.test(codePoint) || EMOJI_TAIL.test(codePoint)) return 0;
   return WIDE.test(codePoint) ? 2 : 1;
+}
+
+/** Last code point of a string, surrogate-pair aware (`slice(-1)` would
+ *  return a lone low surrogate for astral glyphs like flags). */
+function lastCodePoint(s: string): string {
+  return [...s].slice(-1)[0] ?? "";
 }
 
 export function textWidth(text: string): number {
@@ -178,12 +191,16 @@ export function findCursorCharIndex(text: string, col: number): number | null {
 
 /** One renderable piece of a row. Consecutive printable ASCII flows
  *  naturally (`fixed: false`, the configured monospace font is trusted for
- *  the only range where every plausible fallback agrees), everything else
- *  becomes its own explicitly sized box: CJK, braille, powerline PUA, emoji,
- *  box drawing, combining clusters. A glyph missing from the configured font
- *  falls back to a font whose advance is not 1 cell, and without the box
- *  every later column on the row shifts (#3342); with it, a row of N cells
- *  lays out N x cellWidth regardless of which font supplied each glyph. */
+ *  the only range where every plausible fallback agrees); each contiguous
+ *  stretch of everything else (CJK, braille, powerline PUA, emoji, box
+ *  drawing, RTL or joining scripts) becomes ONE explicitly sized box of
+ *  `cells x cellWidth`. A glyph missing from the configured font falls
+ *  back to a font whose advance is not 1 cell; the box pins every
+ *  flow/fixed boundary to its exact column (#3342), so a row of N cells
+ *  lays out N x cellWidth regardless of which font supplied each glyph.
+ *  Whole stretches stay in a single text node because atomic inline
+ *  boundaries would otherwise break Unicode bidi reordering, complex
+ *  script shaping and emoji composition inside the stretch. */
 export interface CellRun {
   text: string;
   /** Terminal cells this run occupies (zero-width marks add none). */
@@ -193,17 +210,26 @@ export interface CellRun {
 }
 
 /** Split one line's text into runs of like rendering risk. Zero-width
- *  characters glue onto the preceding run (marks must stay with their base
- *  or browsers draw a dotted-circle placeholder); a run opening the line
- *  holds them until a base arrives. Each non-ASCII cluster is isolated so
- *  exactly one box absorbs any fallback-advance error. */
+ *  characters and emoji tails glue onto the preceding run (marks must
+ *  shape with their base or browsers draw dotted-circle placeholders);
+ *  leading marks with no base open their own zero-cell flow run. A fixed
+ *  stretch absorbs clusters while they continue the current grapheme:
+ *  trailing marks and tails, a ZWJ plus whatever it joins, or a second
+ *  regional indicator completing one flag. */
 export function splitCellRuns(text: string): CellRun[] {
   const runs: CellRun[] = [];
   let flow = "";
+  let fixedStretch = "";
   const flushFlow = () => {
     if (flow) {
       runs.push({ text: flow, cells: textWidth(flow), fixed: false });
       flow = "";
+    }
+  };
+  const flushFixed = () => {
+    if (fixedStretch) {
+      runs.push({ text: fixedStretch, cells: textWidth(fixedStretch), fixed: true });
+      fixedStretch = "";
     }
   };
   const chars = [...text];
@@ -211,22 +237,73 @@ export function splitCellRuns(text: string): CellRun[] {
   while (i < chars.length) {
     const ch = chars[i]!;
     if (ASCII_PRINTABLE_ONLY.test(ch)) {
+      flushFixed();
       flow += ch;
     } else if (ZERO_WIDTH.test(ch)) {
-      const last = runs[runs.length - 1];
-      if (last && !flow) last.text += ch;
+      // Glue backward: onto the pending fixed stretch, else onto the flow
+      // run (a line opening with a mark opens a zero-width flow run).
+      if (fixedStretch) fixedStretch += ch;
+      else flow += ch;
+    } else if (
+      EMOJI_TAIL.test(ch) ||
+      (REGIONAL_INDICATOR.test(ch) && REGIONAL_INDICATOR.test(lastCodePoint(fixedStretch)))
+    ) {
+      // Composition tail of the previous glyph, or the second half of a
+      // flag pair: no new box, no new cells beyond what textWidth counts.
+      if (fixedStretch) fixedStretch += ch;
       else flow += ch;
     } else {
       flushFlow();
-      // Base glyph plus its own trailing zero-width marks form one cluster.
-      let cluster = ch;
-      while (i + 1 < chars.length && ZERO_WIDTH.test(chars[i + 1]!)) cluster += chars[++i]!;
-      runs.push({ text: cluster, cells: cellWidth(ch), fixed: true });
+      fixedStretch += ch;
+      // Absorb what continues this grapheme: trailing marks and tails, a
+      // second regional indicator completing exactly one flag pair, then
+      // whatever non-ASCII glyph a ZWJ joins into the same glyph.
+      let ris = REGIONAL_INDICATOR.test(ch) ? 1 : 0;
+      let joiner = false;
+      for (;;) {
+        const next = chars[i + 1];
+        if (next === undefined) break;
+        const joins = joiner
+          ? !ASCII_PRINTABLE_ONLY.test(next)
+          : ZERO_WIDTH.test(next) || EMOJI_TAIL.test(next) || (ris === 1 && REGIONAL_INDICATOR.test(next));
+        if (!joins) break;
+        fixedStretch += next;
+        i++;
+        if (REGIONAL_INDICATOR.test(next)) ris = Math.min(ris + 1, 2);
+        joiner = next === "\u200D";
+      }
     }
     i++;
   }
   flushFlow();
+  flushFixed();
   return runs;
+}
+
+/** Code-point range `[start, end)` of the grapheme cluster containing
+ *  `charIndex`: its base plus trailing zero-width marks and emoji tails,
+ *  extended over a completing regional-indicator pair and across a ZWJ
+ *  join, mirroring splitCellRuns' absorption rules so the cursor cell can
+ *  slice a coalesced fixed stretch without stranding a composition tail
+ *  outside the highlight. */
+export function clusterSpanAt(text: string, charIndex: number): [number, number] {
+  const chars = [...text];
+  let start = charIndex;
+  let end = charIndex + 1;
+  const glueAt = (k: number) =>
+    k >= 0 && k < chars.length && (ZERO_WIDTH.test(chars[k]!) || EMOJI_TAIL.test(chars[k]!));
+  while (glueAt(end)) end++;
+  if (REGIONAL_INDICATOR.test(chars[start] ?? "") && REGIONAL_INDICATOR.test(chars[start + 1] ?? "")) {
+    end = Math.max(end, start + 2);
+  } else if (REGIONAL_INDICATOR.test(chars[start] ?? "") && REGIONAL_INDICATOR.test(chars[start - 1] ?? "")) {
+    start--;
+    end = Math.max(end, start + 2);
+  }
+  while (chars[end - 1] === "\u200D") {
+    end++;
+    while (glueAt(end)) end++;
+  }
+  return [Math.max(start, 0), Math.min(end, chars.length)];
 }
 
 /** Hard-wrap one styled line at `cols` terminal cells, preserving

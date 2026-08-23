@@ -3,6 +3,7 @@ import { describe, expect, it } from "vitest";
 import {
   LineParseCache,
   ansiToLines,
+  clusterSpanAt,
   findCursorCharIndex,
   lineText,
   splitCellRuns,
@@ -239,20 +240,50 @@ describe("LineParseCache", () => {
 });
 
 describe("splitCellRuns", () => {
-  it("keeps printable ASCII as flowing runs and isolates risky glyphs as fixed boxes", () => {
+  it("keeps printable ASCII as flow and coalesces non-ASCII stretches", () => {
     // The #3342 fixture: ASCII prompt, CJK, braille spinner, powerline PUA.
     const runs = splitCellRuns("$ ok 한글 ⠋⠙ \u{E0B0}");
-    expect(runs.map((r) => r.fixed)).toEqual([false, true, true, false, true, true, false, true]);
-    expect(runs.filter((r) => r.fixed).map((r) => r.text)).toEqual(["한", "글", "⠋", "⠙", "\u{E0B0}"]);
-    expect(runs.filter((r) => r.fixed).map((r) => r.cells)).toEqual([2, 2, 1, 1, 1]);
+    expect(runs.map((r) => r.fixed)).toEqual([false, true, false, true, false, true]);
+    expect(runs.filter((r) => r.fixed).map((r) => r.text)).toEqual(["한글", "⠋⠙", "\u{E0B0}"]);
+    // Contiguous CJK coalesces into one box whose cells sum.
+    expect(runs.filter((r) => r.fixed).map((r) => r.cells)).toEqual([4, 2, 1]);
   });
 
   it("returns a single flowing run for pure-ASCII text", () => {
     expect(splitCellRuns("$ ls --color")).toEqual([{ text: "$ ls --color", cells: 12, fixed: false }]);
   });
 
+  it("coalesces a whole script stretch so bidi and shaping survive", () => {
+    // Per-character boxes would reverse RTL order and cut complex-script
+    // shaping; one box per stretch keeps the text node whole while its
+    // edges stay cell-exact.
+    expect(splitCellRuns("سلام")).toEqual([{ text: "سلام", cells: 4, fixed: true }]);
+  });
+
+  it("keeps composed emoji sequences whole at their terminal width", () => {
+    // Flag pair, skin-tone tail, ZWJ join: each stays one fixed run.
+    // Widths follow the file's own wcwidth convention: regional
+    // indicators and pictographs are Emoji_Presentation, so a flag is
+    // 2 x 2 cells and a three-person ZWJ chain is 3 x 2.
+    expect(splitCellRuns("\u{1F1FA}\u{1F1F8}")).toEqual([{ text: "\u{1F1FA}\u{1F1F8}", cells: 4, fixed: true }]);
+    expect(splitCellRuns("\u{1F44D}\u{1F3FB}")).toEqual([{ text: "\u{1F44D}\u{1F3FB}", cells: 2, fixed: true }]);
+    expect(splitCellRuns("\u{1F9D1}\u200D\u{1F4BB}")).toEqual([
+      { text: "\u{1F9D1}\u200D\u{1F4BB}", cells: 4, fixed: true },
+    ]);
+  });
+
   it("preserves the row invariant sum(cells) == textWidth on mixed lines", () => {
-    const cases = ["$ ready", "가각ᅟ⠋⠙", "\u{E0B0}\u{E0B2} powerline", "e\u0301glue", "emoji \u{1F600} done"];
+    const cases = [
+      "$ ready",
+      "가각ᅟ⠋⠙",
+      "\u{E0B0}\u{E0B2} powerline",
+      "e\u0301glue",
+      "emoji \u{1F600} done",
+      "\u{1F1FA}\u{1F1F8} flag",
+      "tone \u{1F44D}\u{1F3FB}",
+      "dev \u{1F9D1}\u200D\u{1F4BB} ops",
+      "arabic \u6F22\u0301 glue",
+    ];
     for (const line of cases) {
       const runs = splitCellRuns(line);
       expect(runs.reduce((n, r) => n + r.cells, 0)).toBe(textWidth(line), line);
@@ -260,13 +291,38 @@ describe("splitCellRuns", () => {
     }
   });
 
-  it("glues zero-width marks onto the preceding cluster, not into new boxes", () => {
-    // Combining acute on 'e' stays in the flow run; a ZWJ after a wide char
-    // widens no cell.
+  it("glues zero-width marks onto the preceding run, not into new boxes", () => {
+    // Combining acute on 'e' stays in the flow run; a ZWJ after a wide
+    // char joins that char's stretch and widens no cell.
     expect(splitCellRuns("cafe\u0301")).toEqual([{ text: "cafe\u0301", cells: 4, fixed: false }]);
     expect(splitCellRuns("한\u200dB")).toEqual([
       { text: "한\u200d", cells: 2, fixed: true },
       { text: "B", cells: 1, fixed: false },
     ]);
+  });
+
+  it("counts emoji tails as zero-width cells", () => {
+    expect(textWidth("\uFE0F")).toBe(0);
+    expect(textWidth("\u{1F3FB}")).toBe(0);
+    expect(textWidth("\u{1F44D}\u{1F3FB}")).toBe(2);
+  });
+});
+
+describe("clusterSpanAt", () => {
+  it("covers one CJK glyph per column", () => {
+    expect(clusterSpanAt("한글", 0)).toEqual([0, 1]);
+    expect(clusterSpanAt("한글", 1)).toEqual([1, 2]);
+  });
+
+  it("spans both regional indicators from either half of a flag", () => {
+    expect(clusterSpanAt("\u{1F1FA}\u{1F1F8}", 0)).toEqual([0, 2]);
+    expect(clusterSpanAt("\u{1F1FA}\u{1F1F8}", 1)).toEqual([0, 2]);
+  });
+
+  it("keeps tone tails and ZWJ chains inside the span", () => {
+    expect(clusterSpanAt("\u{1F44D}\u{1F3FB}", 0)).toEqual([0, 2]);
+    // a=0, man=1, ZWJ=2, woman=3, ZWJ=4, boy=5, b=6.
+    expect(clusterSpanAt("a\u{1F468}\u200D\u{1F469}\u200D\u{1F466}b", 1)).toEqual([1, 6]);
+    expect(clusterSpanAt("a\u{1F468}\u200D\u{1F469}\u200D\u{1F466}b", 6)).toEqual([6, 7]);
   });
 });

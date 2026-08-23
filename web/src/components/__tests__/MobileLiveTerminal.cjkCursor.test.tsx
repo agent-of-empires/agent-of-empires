@@ -28,22 +28,28 @@ describe("Row cursor placement with CJK (wide) characters", () => {
     const { container } = render(<Row segs={[seg(text)]} cursorCol={17} />);
     const cell = cursorCell(container);
     expect(cell).not.toBeNull();
-    // Per-cell runs (#3342): each CJK glyph gets its own fixed box, the
-    // ASCII digits flow together. No pad span of spaces may appear before
-    // the cursor; drift shows up as exactly that.
+    // The CJK stretch coalesces into ONE fixed box (#3342 follow-up):
+    // atomic-inline boundaries inside the stretch would break bidi,
+    // complex-script shaping and emoji composition. The box pins the
+    // flow/fixed boundary at exactly 14 cells; no pad span of spaces may
+    // appear before the cursor.
     const spans = [...container.querySelectorAll("span")];
-    expect(spans.map((s) => s.textContent)).toEqual([..."한글정렬테스트", "123", " "]);
+    expect(spans.map((s) => s.textContent)).toEqual(["한글정렬테스트", "123", " "]);
+    expect(spans[0].style.width).toBe("calc(var(--term-cell, 1em) * 14)");
     expect(cell!.previousSibling!.textContent).toBe("123");
     expect(cell!.textContent).toBe(" ");
-    // Fixed boxes carry explicit widths; the cursor cell (a space) is one
-    // of them. Each Hangul glyph is one code point in a two-cell box.
-    const fixed = spans.filter((s) => s.style.display === "inline-block");
-    expect(fixed).toHaveLength(8);
-    for (const box of fixed) {
-      expect(box.style.width).toBe(`calc(var(--term-cell, 1em) * ${cellWidth([...box.textContent!][0]!)})`);
-    }
+    expect(cell!.style.width).toBe("calc(var(--term-cell, 1em) * 1)");
   });
 
+  it("slices a coalesced stretch at cluster boundaries under the cursor", () => {
+    // Cursor on the second glyph of a CJK word: pre and cursor pieces are
+    // separately boxed at their exact cell widths, nothing drifts.
+    const { container } = render(<Row segs={[seg("한글")]} cursorCol={2} />);
+    const spans = [...container.querySelectorAll("span")];
+    expect(spans.map((s) => s.textContent)).toEqual(["한", "글"]);
+    expect(spans[0].style.width).toBe("calc(var(--term-cell, 1em) * 2)");
+    expect(cursorCell(container)!.textContent).toBe("글");
+  });
 
   it("keeps trailing combining marks inside the boxed cursor cell", () => {
     // A fixed run IS one cluster; splitting the base from its marks would

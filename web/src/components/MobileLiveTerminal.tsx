@@ -4,6 +4,7 @@ import type { AnsiSegment, AnsiStyle } from "../lib/ansi";
 import {
   LineParseCache,
   cellWidth,
+  clusterSpanAt,
   findCursorCharIndex,
   splitCellRuns,
   splitUrls,
@@ -396,34 +397,36 @@ export const Row = memo(function Row({
       if (idx != null) {
         placed = true;
         const chars = [...run.text];
-        // A fixed run is exactly one cluster (base plus its own trailing
-        // zero-width marks): box the WHOLE cluster as the cursor cell, or
-        // the marks would land in a zero-width sibling where they can no
-        // longer shape with their base and browsers draw a dotted circle.
-        const curEnd = run.fixed ? chars.length : idx + 1;
-        if (idx > 0) {
-          const pre = chars.slice(0, idx).join("");
+        // Slice at cluster boundaries: a fixed run is a coalesced stretch
+        // of whole graphemes, and the cursor cell must take exactly the
+        // cluster under the cursor (base plus its marks/tails, a flag pair,
+        // or whatever a ZWJ joins) so no composition tail is stranded in a
+        // zero-width sibling where browsers draw dotted circles.
+        const [clusterStart, clusterEnd] = run.fixed ? clusterSpanAt(run.text, idx) : [idx, idx + 1];
+        if (clusterStart > 0) {
+          const pre = chars.slice(0, clusterStart).join("");
           out.push(
             <span key={key++} style={run.fixed ? fixedBoxStyle(textWidth(pre), base) : base}>
               {pre}
             </span>,
           );
         }
+        const cursorText = chars.slice(clusterStart, clusterEnd).join("");
         out.push(
           <span
             key={key++}
             data-live-cursor
             className={focused ? "animate-term-cursor-blink" : undefined}
             style={{
-              ...fixedBoxStyle(run.fixed ? run.cells : cellWidth(chars[idx]!), base),
+              ...fixedBoxStyle(run.fixed ? textWidth(cursorText) : cellWidth(cursorText), base),
               ...cursorStyle,
             }}
           >
-            {chars.slice(idx, curEnd).join("")}
+            {cursorText}
           </span>,
         );
-        if (curEnd < chars.length) {
-          const post = chars.slice(curEnd).join("");
+        if (clusterEnd < chars.length) {
+          const post = chars.slice(clusterEnd).join("");
           out.push(
             <span key={key++} style={run.fixed ? fixedBoxStyle(textWidth(post), base) : base}>
               {post}
