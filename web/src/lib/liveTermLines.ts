@@ -100,8 +100,8 @@ export function lineText(line: AnsiSegment[]): string {
 // xterm here). A URL split across wrapped visual rows linkifies only its
 // first part; upgrade to reflow-aware matching only if that proves painful.
 // Bounded to printable ASCII: a URL glued to CJK text must not claim the
-// glued glyphs into its href, and per-cell runs (#3342) end the flow run at
-// the first non-ASCII code point, so the anchor must stop there too.
+// glued glyphs into its href, and cell runs (#3342) start a fixed stretch
+// at the first non-ASCII code point, so the anchor must stop there too.
 const URL_RE = /https?:\/\/[!-~]+/g;
 // Trailing punctuation that is usually sentence/wrapping syntax, not the URL
 // (e.g. `see https://x.com/a).`). Stripped from the match; re-emitted as text.

@@ -160,7 +160,7 @@ describe("splitUrls", () => {
   });
 
   it("stops the href at a non-ASCII glyph glued to the URL", () => {
-    // Per-cell runs (#3342) end the flow run at the first non-ASCII code
+    // Cell runs (#3342) start a fixed stretch at the first non-ASCII code
     // point; the anchor must claim no more than the ASCII prefix.
     expect(splitUrls("https://github.com/o/r를 확인")).toEqual([
       { text: "https://github.com/o/r", url: "https://github.com/o/r" },
