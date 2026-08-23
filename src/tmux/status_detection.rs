@@ -1866,8 +1866,8 @@ const PI_INTERRUPT_HINT_WINDOW: usize = 10;
 /// the session on Running forever. The `esc to interrupt` hint is specific
 /// to the live busy line, so it alone scans deeper
 /// (`PI_INTERRUPT_HINT_WINDOW`), reaching the taller footers of derivatives
-/// aliased via `agent_detect_as = pi` (#3475). This mirrors the footer-only
-/// approach already used by `detect_omp_status` and `detect_copilot_status`.
+/// aliased via `agent_detect_as = pi` (#3475). The footer scoping mirrors
+/// the approach already used by `detect_omp_status` and `detect_copilot_status`.
 pub fn detect_pi_status(raw_content: &str) -> Status {
     let clean = strip_ansi(raw_content);
     let non_empty_lines: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
