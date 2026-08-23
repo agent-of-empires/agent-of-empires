@@ -1899,19 +1899,22 @@ pub fn detect_pi_status(raw_content: &str) -> Status {
 
 /// Oh My Pi status detection via its live pane output.
 ///
-/// OMP keeps a bordered prompt visible both while running and while idle.
+/// OMP keeps a bordered composer visible both while running and while idle.
 /// Status is decided by the lowest pane signal, where position 1 is the
 /// bottom non-empty line: the live loader (`Working… ⟦esc⟧`), the retry
 /// countdown (`Retrying (N/M) in Ns…`), the pinned error banner (matched by
 /// its anchor line "Dismissed when you send your next message."), the
 /// terminal retry lines (`Error: Retry budget exhausted` / `Error: Retry
 /// failed after`), sub-agent retry labels (`retrying N/M …`, the rule-repair
-/// `Attempt N/M ·`), the approval prompt (`Allow tool: …`), and the
-/// `╭── π`/`╰─` prompt box. Each signal has a freshness window; beyond it the
-/// signal is ignored, so a completed turn's loader or a dismissed banner in
-/// scrollback cannot pin the session. The heuristic cannot see structured
-/// turn events; the structured error/retry path (herdr-style extension) is
-/// tracked in #3380.
+/// `Attempt N/M ·`), and the approval prompt (`Allow tool: …`). Each signal
+/// has a freshness window; beyond it the signal is ignored, so a completed
+/// turn's loader or a dismissed banner in scrollback cannot pin the session.
+/// When no signal matched, the frame reads as healthy idle rather than
+/// Waiting. In practice it is parked on the always-visible `╭── π`/`╰─`
+/// composer box, though the fallback itself does not require the box to be
+/// present.
+/// The heuristic cannot see structured turn events; the structured
+/// error/retry path (herdr-style extension) is tracked in #3380.
 pub fn detect_omp_status(raw_content: &str) -> Status {
     let clean = strip_ansi(raw_content);
     let non_empty_lines: Vec<&str> = clean
@@ -2031,17 +2034,9 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
         };
     }
 
-    // Fallback: parked at the prompt.
-    let has_header = footer
-        .iter()
-        .any(|line| line.trim_start().starts_with("╭── π"));
-    let has_input = footer
-        .iter()
-        .any(|line| line.trim_start().starts_with("╰─"));
-    if has_header && has_input {
-        return Status::Waiting;
-    }
-
+    // No live signal matched. omp parks every healthy frame on its
+    // always-visible composer box, so an unsignaled frame is idle at the
+    // composer, not waiting for the user.
     Status::Idle
 }
 
@@ -5149,31 +5144,69 @@ You can monitor progress with aoe session logs.\n\
     }
 
     #[test]
-    fn test_detect_omp_status_waiting() {
-        let pane = "OK\n\
-                    ╭── π  > GPT-5.6 Sol ─╮\n\
-                    ╰─                   ─╯";
-        assert_eq!(detect_omp_status(pane), Status::Waiting);
+    fn test_detect_omp_status_waiting_on_approval_prompt() {
+        // A live `Allow tool:` prompt is the only user-attention state at
+        // rest; the composer box alone must not read as Waiting.
+        // Case-insensitive on entry: the gate lowercases the window before
+        // matching, so an all-caps render still reads as a live approval.
+        assert_eq!(
+            detect_omp_status("ALLOW TOOL: BASH\nAPPROVE\nDENY"),
+            Status::Waiting
+        );
         assert_eq!(
             detect_omp_status("Allow tool: bash\nApprove\nDeny"),
             Status::Waiting
         );
     }
 
+    /// The two-line composer box omp renders at rest, shared by the
+    /// fixture-based tests below.
+    const MINIMAL_COMPOSER_BOX: &str = "╭── π  > GPT-5.6 Sol ─╮\n╰─                   ─╯";
+
+    /// Archived repro for the "idle omp sessions render yellow forever"
+    /// bug: tail of a live pane captured after returning to the session
+    /// panel. omp parks every healthy frame on its always-visible composer
+    /// box, so box-only frames are the at-rest shape, not a Waiting signal.
+    const OMP_PARKED_AT_COMPOSER_REPRO: &str = "\
+ ※ recap: Goal was a simple probe: replied OK and ran echo, which returned rca-probe-42 successfully.
+
+╭── π  > ⬢ Ox Alpha · ◉ max > 🗑 …of-empires-dev/scratch/4d9eb39378df4f4e ▶───2%───────────────────┃──────────1M─◀ Reply with OK ──╮
+╰─                                                                                                                                                                                      ─╯";
+
     #[test]
-    fn test_detect_omp_status_ignores_stale_loader() {
-        let pane = "⠋ Working… ⟦esc⟧\n\
-                    Completed response.\n\
-                    Additional output.\n\
-                    OK\n\
-                    ╭── π  > GPT-5.6 Sol ─╮\n\
-                    ╰─                   ─╯";
-        assert_eq!(detect_omp_status(pane), Status::Waiting);
+    fn test_detect_omp_status_idle_at_composer_box() {
+        let cases = [
+            ("bare box", MINIMAL_COMPOSER_BOX.to_string()),
+            // Completed turn above the box (the pre-fix contract said
+            // Waiting here, which painted every idle omp session yellow).
+            ("turn finished", format!("OK\n{MINIMAL_COMPOSER_BOX}")),
+            // Stale loader from the previous turn buried in scrollback.
+            (
+                "stale loader ignored",
+                format!("⠋ Working… ⟦esc⟧\nCompleted response.\nAdditional output.\nOK\n{MINIMAL_COMPOSER_BOX}"),
+            ),
+            // Live loader pushed one line past the 3-line footer window:
+            // the miss now reads Idle where pre-fix it read Waiting.
+            (
+                "loader pushed past footer",
+                format!("⠋ Working… ⟦esc⟧\nOK\n{MINIMAL_COMPOSER_BOX}"),
+            ),
+            // Full archived repro snapshot (see the const doc).
+            ("repro snapshot", OMP_PARKED_AT_COMPOSER_REPRO.to_string()),
+        ];
+        for (name, pane) in &cases {
+            assert_eq!(detect_omp_status(pane), Status::Idle, "case: {name}");
+        }
     }
 
     #[test]
     fn test_detect_omp_status_idle_without_prompt() {
-        assert_eq!(detect_omp_status("plain command output"), Status::Idle);
+        // Empty and whitespace-only panes must stay Idle without panicking:
+        // every window is empty and the unsignaled fallback applies.
+        let panes = ["plain command output", "", " \n\t\n"];
+        for pane in panes {
+            assert_eq!(detect_omp_status(pane), Status::Idle, "case: {pane:?}");
+        }
     }
 
     #[test]
@@ -5183,7 +5216,7 @@ You can monitor progress with aoe session logs.\n\
         // its dismissal footer) or the terminal retry lines; retries read
         // Running via the countdown and the sub-agent labels. Positions are
         // 1-based from the bottom; the lowest signal wins.
-        let prompt_box = "╭── π  > GPT-5.6 Sol ─╮\n╰─                   ─╯";
+        let prompt_box = MINIMAL_COMPOSER_BOX;
         let br = "─".repeat(24);
         let banner = |msg: &str| {
             format!(
@@ -5266,7 +5299,7 @@ You can monitor progress with aoe session logs.\n\
                 Status::Error,
             ),
             // Anchor at the window bound (pos 6) -> Error; past it (pos 7)
-            // the fallback prompt box wins.
+            // only the parked-composer fallback remains, which reads Idle.
             (
                 "anchor pos 6 bound",
                 format!(
@@ -5279,7 +5312,17 @@ You can monitor progress with aoe session logs.\n\
                 format!(
                     " Dismissed when you send your next message.\n l1\n l2\n l3\n l4\n{prompt_box}"
                 ),
+                Status::Idle,
+            ),
+            (
+                "approval pos 8 bound",
+                format!("Allow tool: bash\nApprove\nDeny\n l1\n l2\n l3\n{prompt_box}"),
                 Status::Waiting,
+            ),
+            (
+                "approval pos 9 out",
+                format!("Allow tool: bash\nApprove\nDeny\n l1\n l2\n l3\n l4\n{prompt_box}"),
+                Status::Idle,
             ),
             // US2: retry in progress -> Running.
             (
@@ -5411,71 +5454,73 @@ You can monitor progress with aoe session logs.\n\
                 ),
                 Status::Error,
             ),
-            // US3: ordinary tool output never pins a healthy session.
+            // US3: ordinary tool output never pins a healthy session. These
+            // rows pre-fix expected Waiting only because the composer-box
+            // fallback returned Waiting; they are pure Idle cases.
             (
                 "curl timed out",
                 format!(
                     "curl: (28) Operation timed out after 30000 milliseconds\n{prompt_box}"
                 ),
-                Status::Waiting,
+                Status::Idle,
             ),
             (
                 "ssh refused",
                 format!(
                     "ssh: connect to host 10.0.0.1 port 22: Connection refused\n{prompt_box}"
                 ),
-                Status::Waiting,
+                Status::Idle,
             ),
             (
                 "terminated by user",
                 format!("The agent was terminated by the user.\n{prompt_box}"),
-                Status::Waiting,
+                Status::Idle,
             ),
             (
                 "retry-after header",
                 format!("Retry-After: 30\n{prompt_box}"),
-                Status::Waiting,
+                Status::Idle,
             ),
             (
                 "attempt prose",
                 format!("I will attempt 2/3 of the cases\n{prompt_box}"),
-                Status::Waiting,
+                Status::Idle,
             ),
             (
                 "retrying prose",
                 format!(
                     "The tool kept retrying 2/3 of the files before giving up.\n{prompt_box}"
                 ),
-                Status::Waiting,
+                Status::Idle,
             ),
             (
                 "retrying next batch",
                 format!("I will be retrying 2/3 in the next batch\n{prompt_box}"),
-                Status::Waiting,
+                Status::Idle,
             ),
             (
                 "stop retrying intervals",
                 format!("Stop retrying (2/3) in 5s intervals!\n{prompt_box}"),
-                Status::Waiting,
+                Status::Idle,
             ),
             (
                 "retry failed no prefix",
                 format!(
                     "The tool reported retry failed after 3 attempts\n{prompt_box}"
                 ),
-                Status::Waiting,
+                Status::Idle,
             ),
             (
                 "retrying my tests",
                 format!("I keep retrying 2/3 in my tests: still failing\n{prompt_box}"),
-                Status::Waiting,
+                Status::Idle,
             ),
             (
                 "sub agent gave up",
                 format!(
                     "auto-retry gave up after 3 attempts: 429 Too Many Requests (rate limited).\n{prompt_box}"
                 ),
-                Status::Waiting,
+                Status::Idle,
             ),
             // Accepted: prose indistinguishable from the real label render
             // (family R3, bounded) reads Running by design.
@@ -5483,6 +5528,20 @@ You can monitor progress with aoe session logs.\n\
                 "label prose accepted",
                 format!("I'm retrying 2/3 now: the API timed out.\n{prompt_box}"),
                 Status::Running,
+            ),
+            (
+                "label pos 12 bound",
+                format!(
+                    "retrying 2/3 now: 429 Too Many Requests (rate limited).\n f1\n f2\n f3\n f4\n f5\n f6\n f7\n f8\n f9\n{prompt_box}"
+                ),
+                Status::Running,
+            ),
+            (
+                "label pos 13 out",
+                format!(
+                    "retrying 2/3 now: 429 Too Many Requests (rate limited).\n f1\n f2\n f3\n f4\n f5\n f6\n f7\n f8\n f9\n f10\n{prompt_box}"
+                ),
+                Status::Idle,
             ),
             // Precedences: the lowest signal wins.
             (
@@ -5555,7 +5614,7 @@ You can monitor progress with aoe session logs.\n\
                 format!(
                     " Error: Retry failed after 10 attempts: …\n OK\n Done.\n Next\n Final\n{prompt_box}"
                 ),
-                Status::Waiting,
+                Status::Idle,
             ),
         ];
         for (name, pane, expected) in cases {
