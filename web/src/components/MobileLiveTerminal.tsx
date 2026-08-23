@@ -201,8 +201,8 @@ function fixedBoxStyle(cells: number, base: CSSProperties | undefined): CSSPrope
 
 /** One styled run of a row: flowing text renders bare; fixed clusters get
  *  the explicit box while remaining ordinary selectable/copyable spans.
- *  Linkification applies per run (#2685); URLs are ASCII, so they live in
- *  flow runs and keep their exact href and text. */
+ *  Linkification applies per run (#2685); the URL regex is bounded to
+ *  printable ASCII, so an anchor never crosses into a fixed run. */
 function cellRunSpan(run: CellRun, style: AnsiStyle, key: string): ReactNode {
   const base = segStyle(style);
   return (

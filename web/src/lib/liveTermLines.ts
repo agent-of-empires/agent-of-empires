@@ -99,7 +99,10 @@ export function lineText(line: AnsiSegment[]): string {
 // ponytail: plain per-line regex, no OSC 8 / reflow tracking (there is no
 // xterm here). A URL split across wrapped visual rows linkifies only its
 // first part; upgrade to reflow-aware matching only if that proves painful.
-const URL_RE = /https?:\/\/\S+/g;
+// Bounded to printable ASCII: a URL glued to CJK text must not claim the
+// glued glyphs into its href, and per-cell runs (#3342) end the flow run at
+// the first non-ASCII code point, so the anchor must stop there too.
+const URL_RE = /https?:\/\/[!-~]+/g;
 // Trailing punctuation that is usually sentence/wrapping syntax, not the URL
 // (e.g. `see https://x.com/a).`). Stripped from the match; re-emitted as text.
 const URL_TRAILING = /[.,;:!?)\]}'">]+$/;
@@ -189,8 +192,6 @@ export interface CellRun {
   fixed: boolean;
 }
 
-const ASCII_CHAR = /^[\x20-\x7E]$/;
-
 /** Split one line's text into runs of like rendering risk. Zero-width
  *  characters glue onto the preceding run (marks must stay with their base
  *  or browsers draw a dotted-circle placeholder); a run opening the line
@@ -209,7 +210,7 @@ export function splitCellRuns(text: string): CellRun[] {
   let i = 0;
   while (i < chars.length) {
     const ch = chars[i]!;
-    if (ASCII_CHAR.test(ch)) {
+    if (ASCII_PRINTABLE_ONLY.test(ch)) {
       flow += ch;
     } else if (ZERO_WIDTH.test(ch)) {
       const last = runs[runs.length - 1];

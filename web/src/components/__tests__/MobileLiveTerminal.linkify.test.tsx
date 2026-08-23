@@ -34,4 +34,14 @@ describe("Row URL linkification", () => {
     const { container } = render(<Row segs={[seg("https://example.com")]} cursorCol={0} />);
     expect(container.querySelector("a")).toBeNull();
   });
+
+  it("keeps the anchor out of a CJK glyph glued to the URL", () => {
+    // The flow run ends at the first non-ASCII code point (#3342); the
+    // href and anchor text must stop there instead of swallowing the glue.
+    const { container } = render(<Row segs={[seg("voir https://github.com/o/r를 suite")]} cursorCol={null} />);
+    const a = container.querySelector("a");
+    expect(a!.getAttribute("href")).toBe("https://github.com/o/r");
+    expect(a!.textContent).toBe("https://github.com/o/r");
+    expect(container.textContent).toBe("voir https://github.com/o/r를 suite");
+  });
 });

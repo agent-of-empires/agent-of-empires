@@ -158,6 +158,15 @@ describe("splitUrls", () => {
     ]);
   });
 
+  it("stops the href at a non-ASCII glyph glued to the URL", () => {
+    // Per-cell runs (#3342) end the flow run at the first non-ASCII code
+    // point; the anchor must claim no more than the ASCII prefix.
+    expect(splitUrls("https://github.com/o/r를 확인")).toEqual([
+      { text: "https://github.com/o/r", url: "https://github.com/o/r" },
+      { text: "를 확인", url: null },
+    ]);
+  });
+
   it("handles multiple URLs on one line", () => {
     const parts = splitUrls("https://a.com and https://b.com");
     expect(parts.filter((p) => p.url).map((p) => p.url)).toEqual(["https://a.com", "https://b.com"]);
