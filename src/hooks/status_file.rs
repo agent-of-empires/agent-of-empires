@@ -252,7 +252,7 @@ mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
     fn test_ensure_instance_dir_path_resolves_symlinked_prefix() {
-        // Issue #3240: podman machine shares host paths under their real
+        // #3240: podman machine shares host paths under their real
         // paths (/private, not /tmp) inside the VM, so the bind-mount source
         // handed to the runtime must be canonically resolved.
         use tempfile::TempDir;

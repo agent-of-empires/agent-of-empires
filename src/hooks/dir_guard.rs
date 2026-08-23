@@ -539,7 +539,7 @@ pub(crate) fn unlink_session_id_via_guard(instance_id: &str) -> Result<()> {
 /// would reject) and the multi-tenant pre-squat + symlink-swap race
 /// against Docker's bind-mount resolution.
 ///
-/// Issue #3240: VM-backed runtimes resolve mount sources inside their VM,
+/// #3240: VM-backed runtimes resolve mount sources inside their VM,
 /// against a fixed share set keyed by real paths (podman machine shares
 /// `/private`, never `/tmp`). The lexical base (`/tmp/aoe-hooks-<euid>`) is
 /// therefore canonicalized before it leaves the process; on macOS that turns
