@@ -336,11 +336,14 @@ fn doctor_version_issue(
             // like `version=0.37.0` parses here but not at spawn. When
             // spawn would keep the PATH copy, keep the flag.
             let bundle_backs_spawn = match probe {
-                ProbeStatus::Version { stdout_raw, .. } => {
-                    let min = semver::Version::parse(gate.min_version)
-                        .expect("gate min_version must be valid semver");
-                    crate::acp::version_probe::whitespace_token_below_floor(stdout_raw, min)
-                }
+                ProbeStatus::Version { stdout_raw, .. } => semver::Version::parse(gate.min_version)
+                    // Like the sibling consumers of the floor (spawn's
+                    // path_copy_below_floor, doctor_fix_action), an
+                    // unparseable floor degrades to conservative: no
+                    // bundle credit, flag stays.
+                    .is_ok_and(|min| {
+                        crate::acp::version_probe::whitespace_token_below_floor(stdout_raw, min)
+                    }),
                 // Without a parseable version spawn cannot prove
                 // below-floor either, so it keeps the PATH copy.
                 _ => false,
@@ -551,8 +554,6 @@ async fn doctor(json: bool, fix: bool, adapter: Vec<String>, all_adapters: bool)
         } else {
             None
         };
-        #[cfg(not(feature = "serve"))]
-        let version_issue = None;
         agent_entries.push(AgentDoctorEntry {
             name: name.clone(),
             command_present,
