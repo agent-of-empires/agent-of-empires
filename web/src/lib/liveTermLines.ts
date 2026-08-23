@@ -144,7 +144,9 @@ const ZERO_WIDTH = /[\u200B-\u200D\uFEFF]|\p{M}/u;
 // and occupy no column of their own (skin-tone swatches, text/color
 // variation selectors).
 const EMOJI_TAIL = /[\uFE0E\uFE0F\u{1F3FB}-\u{1F3FF}]/u;
-// Regional indicator pairs compose flag glyphs; a lone RI is one cell.
+// Regional indicator pairs compose flag glyphs. Each RI carries
+// Emoji_Presentation, so the wide classifier counts two cells per RI and
+// a flag renders as four cells in this grid's convention.
 const REGIONAL_INDICATOR = /[\u{1F1E6}-\u{1F1FF}]/u;
 const WIDE =
   /[\u1100-\u115F\u2E80-\u303E\u3041-\u33FF\u3400-\u4DBF\u4E00-\u9FFF\uA000-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\uFFE0-\uFFE6\u{1F300}-\u{1FAFF}]|\p{Emoji_Presentation}/u;
@@ -213,9 +215,9 @@ export interface CellRun {
  *  characters and emoji tails glue onto the preceding run (marks must
  *  shape with their base or browsers draw dotted-circle placeholders);
  *  leading marks with no base open their own zero-cell flow run. A fixed
- *  stretch absorbs clusters while they continue the current grapheme:
- *  trailing marks and tails, a ZWJ plus whatever it joins, or a second
- *  regional indicator completing one flag. */
+ *  stretch swallows every contiguous non-ASCII code point, so composed
+ *  glyphs (flag pairs, skin tones, ZWJ chains) and script shaping stay
+ *  whole inside one text node. */
 export function splitCellRuns(text: string): CellRun[] {
   const runs: CellRun[] = [];
   let flow = "";
@@ -254,24 +256,10 @@ export function splitCellRuns(text: string): CellRun[] {
       else flow += ch;
     } else {
       flushFlow();
+      // Contiguous non-ASCII coalesces: every following code point that is
+      // not printable ASCII lands here too (marks, tails, joined glyphs),
+      // keeping the whole stretch in one text node.
       fixedStretch += ch;
-      // Absorb what continues this grapheme: trailing marks and tails, a
-      // second regional indicator completing exactly one flag pair, then
-      // whatever non-ASCII glyph a ZWJ joins into the same glyph.
-      let ris = REGIONAL_INDICATOR.test(ch) ? 1 : 0;
-      let joiner = false;
-      for (;;) {
-        const next = chars[i + 1];
-        if (next === undefined) break;
-        const joins = joiner
-          ? !ASCII_PRINTABLE_ONLY.test(next)
-          : ZERO_WIDTH.test(next) || EMOJI_TAIL.test(next) || (ris === 1 && REGIONAL_INDICATOR.test(next));
-        if (!joins) break;
-        fixedStretch += next;
-        i++;
-        if (REGIONAL_INDICATOR.test(next)) ris = Math.min(ris + 1, 2);
-        joiner = next === "\u200D";
-      }
     }
     i++;
   }
@@ -293,11 +281,18 @@ export function clusterSpanAt(text: string, charIndex: number): [number, number]
   const glueAt = (k: number) =>
     k >= 0 && k < chars.length && (ZERO_WIDTH.test(chars[k]!) || EMOJI_TAIL.test(chars[k]!));
   while (glueAt(end)) end++;
-  if (REGIONAL_INDICATOR.test(chars[start] ?? "") && REGIONAL_INDICATOR.test(chars[start + 1] ?? "")) {
-    end = Math.max(end, start + 2);
-  } else if (REGIONAL_INDICATOR.test(chars[start] ?? "") && REGIONAL_INDICATOR.test(chars[start - 1] ?? "")) {
-    start--;
-    end = Math.max(end, start + 2);
+  const extendRi =
+    (REGIONAL_INDICATOR.test(chars[start] ?? "") && REGIONAL_INDICATOR.test(chars[start + 1] ?? "")) ||
+    (REGIONAL_INDICATOR.test(chars[start] ?? "") && REGIONAL_INDICATOR.test(chars[start - 1] ?? ""));
+  if (extendRi) {
+    if (!REGIONAL_INDICATOR.test(chars[start - 1] ?? "")) {
+      end = Math.max(end, start + 2);
+    } else {
+      start--;
+      end = Math.max(end, start + 2);
+    }
+    // The pair may itself be followed by composition tails.
+    while (glueAt(end)) end++;
   }
   while (chars[end - 1] === "\u200D") {
     end++;

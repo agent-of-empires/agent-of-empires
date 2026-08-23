@@ -317,6 +317,10 @@ describe("clusterSpanAt", () => {
   it("spans both regional indicators from either half of a flag", () => {
     expect(clusterSpanAt("\u{1F1FA}\u{1F1F8}", 0)).toEqual([0, 2]);
     expect(clusterSpanAt("\u{1F1FA}\u{1F1F8}", 1)).toEqual([0, 2]);
+    // A tone tail glued behind the completed pair stays inside the span
+    // from either RI half; stranding it outside would detach the swatch.
+    expect(clusterSpanAt("\u{1F1E9}\u{1F1EA}\u{1F3FB}", 0)).toEqual([0, 3]);
+    expect(clusterSpanAt("\u{1F1E9}\u{1F1EA}\u{1F3FB}", 1)).toEqual([0, 3]);
   });
 
   it("keeps tone tails and ZWJ chains inside the span", () => {
