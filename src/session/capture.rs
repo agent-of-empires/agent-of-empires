@@ -2729,13 +2729,19 @@ pub(crate) fn kimi_poll_fn(
     }
 }
 
-// ─── Prime Agent session capture ─────────────────────────────────────────────
+// ─── Prime Agent session capture ──────────────────────────────────────────────
 
 /// Slack (ms) applied to the launch-time floor, mirroring
 /// [`KIMI_MTIME_FLOOR_SLACK_MS`]: session files can carry second-granularity
 /// mtimes that land below the millisecond launch timestamp and must still
 /// count as "touched after launch".
 const PRIME_AGENT_MTIME_FLOOR_SLACK_MS: f64 = 2000.0;
+
+/// Byte cap on the first-line header read, mirroring
+/// [`PI_HEADER_SCAN_BYTES`]: `BufRead::read_line` otherwise allocates
+/// without bound for one hostile or corrupt line. A header longer than this
+/// fails to parse and the file is skipped until the next poll.
+const PRIME_AGENT_HEADER_SCAN_BYTES: u64 = 64 * 1024;
 
 /// One Prime Agent session, parsed from the first line of a
 /// `~/.prime/agent/sessions/<uuid>.jsonl` file. The header carries both the
@@ -2761,7 +2767,9 @@ fn scan_prime_agent_sessions(sessions_dir: &Path) -> Vec<PrimeAgentSession> {
             continue;
         };
         let mut first_line = String::new();
-        if std::io::BufReader::new(file)
+        let mut reader = std::io::BufReader::new(file);
+        if (&mut reader)
+            .take(PRIME_AGENT_HEADER_SCAN_BYTES)
             .read_line(&mut first_line)
             .is_err()
         {

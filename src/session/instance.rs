@@ -11552,6 +11552,54 @@ mod tests {
     }
 
     #[test]
+    fn sandboxed_host_only_capture_agents_drop_pinned_sid_at_emission() {
+        // The apply_session_flags gate exists so a pinned or host-captured
+        // resume id is never launched inside a container whose own sessions
+        // store starts empty (copilot | kimi | prime-agent). Pin the
+        // prime-agent arm: deleting it from the matches! must fail here.
+        let sid = "11111111-2222-3333-4444-555555555555";
+        for tool in ["copilot", "kimi", "prime-agent"] {
+            let mut inst = Instance::new("test", "/tmp/test");
+            inst.tool = tool.to_string();
+            inst.agent_session_id = Some(sid.to_string());
+            inst.resume_intent = ResumeIntent::Use(sid.to_string());
+            inst.sandbox_info = Some(SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "test-image".to_string(),
+                container_name: "test".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: None,
+            });
+            let mut cmd = tool.to_string();
+            let resumed = inst.apply_session_flags(&mut cmd, "test");
+            assert_eq!(
+                cmd, tool,
+                "{tool}: sandboxed launch must not emit resume flags"
+            );
+            // The sid stays pinned in agent_session_id; only its emission
+            // into the container command is suppressed, so the method reports
+            // "no resume flags applied" (is_existing && emitted == false).
+            assert!(!resumed, "{tool}");
+            assert_eq!(
+                inst.agent_session_id.as_deref(),
+                Some(sid),
+                "{tool}: suppression must not clear the stored sid"
+            );
+        }
+        // Host control: without a sandbox the same pinned sid IS emitted.
+        let mut host_inst = Instance::new("test", "/tmp/test");
+        host_inst.tool = "prime-agent".to_string();
+        host_inst.agent_session_id = Some(sid.to_string());
+        host_inst.resume_intent = ResumeIntent::Use(sid.to_string());
+        let mut cmd = "prime-agent".to_string();
+        assert!(host_inst.apply_session_flags(&mut cmd, "test"));
+        assert_eq!(cmd, format!("prime-agent --resume {sid}"));
+    }
+
+    #[test]
     fn fork_flags_for_codex_and_opencode() {
         // Codex: `fork <parent>` subcommand. child_id unused (codex mints its own).
         let codex = build_fork_flags("codex", "parent-id", "ignored-child");
