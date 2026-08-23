@@ -2665,12 +2665,24 @@ enter to select · esc to cancel";
 ❯\n\
 └─────\n\
   ⏵⏵ auto mode on";
+        // The synthetic rows put the ellipsis on the third word, like the
+        // captured pane: `claude_line_is_active_spinner` then rejects the
+        // line and the counter is the only running signal being pinned.
         let cases = [
             ("issue pane", long_turn_pane),
-            ("k suffix", "✶ Working… (53s · ↓ 7.0k tokens)"),
-            ("m suffix", "✶ Working… (4s · ↓ 1.2m tokens)"),
-            ("g suffix", "✶ Working… (4s · ↓ 3g tokens)"),
-            ("integer k, no decimal", "✶ Working… (4s · ↓ 512k tokens)"),
+            (
+                "k suffix",
+                "✶ Summarizing the findings… (53s · ↓ 7.0k tokens)",
+            ),
+            (
+                "m suffix",
+                "✶ Summarizing the findings… (4s · ↓ 1.2m tokens)",
+            ),
+            ("g suffix", "✶ Summarizing the findings… (4s · ↓ 3g tokens)"),
+            (
+                "integer k, no decimal",
+                "✶ Summarizing the findings… (4s · ↓ 512k tokens)",
+            ),
         ];
         for (name, pane) in cases {
             assert_eq!(detect_claude_status(pane), Status::Running, "{name}");
@@ -2699,6 +2711,9 @@ enter to select · esc to cancel";
             ("uppercase suffix", "(4s · ↓ 44.7K tokens)", false),
             ("non-digit count", "(4s · ↓ many tokens)", false),
             ("double dot", "(4s · ↓ 44..7k tokens)", false),
+            // A dot with no digit after it must not be eaten as a fraction,
+            // or `44.tokens)` would half-parse into a live counter.
+            ("no digit after dot", "(4s · ↓ 44.tokens)", false),
         ];
         for (name, content, expected) in cases {
             assert_eq!(has_claude_live_token_counter(content), expected, "{name}");
