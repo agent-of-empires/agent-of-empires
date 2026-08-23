@@ -11600,10 +11600,27 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn sandboxed_prime_agent_capture_and_poller_stay_host_only() {
         // Both host-only dispatch points must decline before doing any work:
         // retroactive capture would otherwise read the HOST sessions dir for
         // a container session, and the poller would adopt a host peer's sid.
+        // A matching host session is seeded so the capture assertion cannot
+        // pass vacuously: only the sandbox gate keeps it None.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir(&sessions_dir).unwrap();
+        std::fs::write(
+            sessions_dir.join("seed.jsonl"),
+            "{\"type\":\"session\",\"version\":3,\
+              \"id\":\"11111111-2222-3333-4444-555555555555\",\
+              \"timestamp\":\"2026-08-23T00:00:00.000Z\",\
+              \"cwd\":\"/tmp/test\",\"rlmDepth\":0}\n",
+        )
+        .unwrap();
+        let _env = EnvGuard::set(&[("PRIME_AGENT_CODING_AGENT_DIR", tmp.path())]);
+        let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
+
         let mut inst = Instance::new("test", "/tmp/test");
         inst.tool = "prime-agent".to_string();
         inst.sandbox_info = Some(SandboxInfo {
@@ -11619,6 +11636,14 @@ mod tests {
         assert_eq!(inst.try_retroactive_capture(), None);
         inst.maybe_start_poller_since(None);
         assert!(inst.session_id_poller.is_none());
+
+        // Host control: the same store yields the matching sid once the
+        // session is not sandboxed, proving the seed was loadable at all.
+        inst.sandbox_info = None;
+        assert_eq!(
+            inst.try_retroactive_capture().as_deref(),
+            Some("11111111-2222-3333-4444-555555555555")
+        );
     }
 
     #[test]

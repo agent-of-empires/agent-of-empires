@@ -310,9 +310,11 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         // Skip AoE's sandbox staging dir, the per-instance session
         // transcripts, and the bootstrapped IPython kernel venv
         // (machine-specific, and the container rebuilds it on first run).
+        // skills/ stays un-skipped and is copied below so user-authored
+        // host skills reach the container, like Kimi's mount.
         skip_entries: &["sandbox", "sessions", "kernel-venv"],
         seed_files: &[],
-        copy_dirs: &[],
+        copy_dirs: &["skills"],
         keychain_credential: None,
         home_seed_files: &[],
         preserve_files: &[],
