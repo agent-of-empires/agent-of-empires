@@ -543,27 +543,18 @@ pub(crate) fn unlink_session_id_via_guard(instance_id: &str) -> Result<()> {
 /// against a fixed share set keyed by real paths (podman machine shares
 /// `/private`, never `/tmp`). The lexical base (`/tmp/aoe-hooks-<euid>`) is
 /// therefore canonicalized before it leaves the process; on macOS that turns
-/// `/tmp/...` into the shared `/private/tmp/...` spelling. If resolution
-/// fails (directory removed mid-flight), fall back to the lexical path with
-/// a warning rather than blocking session boot.
+/// `/tmp/...` into the shared `/private/tmp/...` spelling.
 ///
-/// Caller policy on `Err`: skip the bind-mount push, surface a
-/// `tracing::warn!` and let the agent boot without status hooks
-/// (pane-detection fallback).
+/// Resolution errors propagate: a path that no longer resolves on the host
+/// would fail container creation with the same `statfs` error class this
+/// fixes, so callers apply their graceful `Err` policy instead. On
+/// `Err`: skip the bind-mount push, surface a `tracing::warn!` and let the
+/// agent boot without status hooks (pane-detection fallback).
 pub(crate) fn ensure_instance_dir_path(instance_id: &str) -> Result<PathBuf> {
     let _fd = open_instance_dir(instance_id)?;
     let lexical = hook_base_path().join(instance_id);
-    match std::fs::canonicalize(&lexical) {
-        Ok(resolved) => Ok(resolved),
-        Err(e) => {
-            tracing::warn!(target: "hooks.guard",
-                "could not resolve {} to its real path ({e:#}); passing it \
-                 unresolved, VM-backed runtimes may reject it if it crosses a \
-                 symlinked share boundary",
-                lexical.display());
-            Ok(lexical)
-        }
-    }
+    std::fs::canonicalize(&lexical)
+        .with_context(|| format!("canonicalize hook dir {}", lexical.display()))
 }
 
 // Cleanup.

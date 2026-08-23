@@ -47,8 +47,8 @@ macro_rules! aoe_hook_marker {
 /// Fixed base path used inside the sandbox image, where the multi-tenant
 /// threat does not apply (per-container, single-tenant). The host bind-mounts
 /// `dir_guard::hook_base_path()/<id>`, canonically resolved since #3240, to
-/// this fixed path inside the container so the sandbox shell can bake a single
-/// canonical string regardless of the host's effective uid.
+/// this fixed path inside the container so the sandbox shell can bake a
+/// single fixed string regardless of the host's effective uid.
 pub(crate) const HOOK_STATUS_BASE_IN_CONTAINER: &str = concat!("/tmp/", aoe_hook_marker!());
 
 /// Marker token embedded by every AoE-emitted hook command in two structurally

@@ -3903,7 +3903,15 @@ volume_ignores = ["node_modules"]
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_installs_codex_hooks_files() {
-        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        // Symlinked base prefix: keeps a mount-source assertion sensitive to
+        // the #3240 canonicalization even on Linux, where /tmp is already
+        // real and lexical comparison alone would survive a regression.
+        let tmp_base = TempDir::new().unwrap();
+        let real_parent = tmp_base.path().join("real-parent");
+        std::fs::create_dir(&real_parent).unwrap();
+        let link_parent = tmp_base.path().join("via-symlink");
+        std::os::unix::fs::symlink(&real_parent, &link_parent).unwrap();
+        let _hg = BaseGuard::with_base(link_parent.join("aoe-hooks"));
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
