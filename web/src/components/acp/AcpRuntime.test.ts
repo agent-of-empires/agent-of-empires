@@ -129,19 +129,40 @@ describe("activityToThreadMessages; tool-call grouping (#1057)", () => {
     const ten = groupsIn(10);
     expect(ten.groups).toHaveLength(1);
     expect(ten.inline).toHaveLength(0);
-    expect(JSON.parse(ten.groups[0]!.argsText!).children).toHaveLength(10);
+    const tenChildren = JSON.parse(ten.groups[0]!.argsText!).children as Array<{ toolCallId: string }>;
+    expect(tenChildren.map((c) => c.toolCallId)).toEqual(["t0", "t1", "t2", "t3", "t4", "t5", "t6", "t7", "t8", "t9"]);
 
     // Just over the max: first chunk groups, tail is too short to group.
     const eleven = groupsIn(11);
     expect(eleven.groups).toHaveLength(1);
     expect(eleven.inline).toHaveLength(1);
+    const elevenChildren = JSON.parse(eleven.groups[0]!.argsText!).children as Array<{ toolCallId: string }>;
+    expect(elevenChildren.map((c) => c.toolCallId)).toEqual([
+      "t0",
+      "t1",
+      "t2",
+      "t3",
+      "t4",
+      "t5",
+      "t6",
+      "t7",
+      "t8",
+      "t9",
+    ]);
+    expect((eleven.inline[0] as { toolCallId?: string }).toolCallId).toBe("t10");
 
     // Long enough to fill multiple chunks.
     const twentyFive = groupsIn(25);
     expect(twentyFive.groups).toHaveLength(3);
     expect(twentyFive.inline).toHaveLength(0);
-    const grouped = twentyFive.groups.reduce((sum, g) => sum + JSON.parse(g.argsText!).children.length, 0);
-    expect(grouped).toBe(25);
+    const chunkSizes = twentyFive.groups.map(
+      (g) => (JSON.parse(g.argsText!).children as Array<{ toolCallId: string }>).length,
+    );
+    expect(chunkSizes).toEqual([10, 10, 5]);
+    const allIds = twentyFive.groups.flatMap((g) =>
+      (JSON.parse(g.argsText!).children as Array<{ toolCallId: string }>).map((c) => c.toolCallId),
+    );
+    expect(allIds).toEqual(Array.from({ length: 25 }, (_, i) => `t${i}`));
   });
 
   it("does not group runs of 1 or 2 tool calls", () => {
