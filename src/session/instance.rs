@@ -3563,13 +3563,14 @@ impl Instance {
             return false;
         }
         let (mut session_id, is_existing) = self.acquire_session_id();
-        // Sandboxed Copilot and Kimi start fresh: their session stores live
-        // inside the container (Copilot's SQLite db, Kimi's
-        // `~/.kimi-code/session_index.jsonl`), so a host-captured or manually
-        // pinned sid would launch `--session[-id] <id>` against an id that does
+        // Sandboxed Copilot, Kimi, and Prime Agent start fresh: their session
+        // stores live inside the container (Copilot's SQLite db, Kimi's
+        // `~/.kimi-code/session_index.jsonl`, Prime Agent's
+        // `~/.prime/agent/sessions/*.jsonl`), so a host-captured or manually
+        // pinned sid would launch `--resume <id>` against an id that does
         // not resolve there. Capture is already host-only above; drop the sid
         // to gate emission too.
-        if matches!(self.tool.as_str(), "copilot" | "kimi") && self.is_sandboxed() {
+        if matches!(self.tool.as_str(), "copilot" | "kimi" | "prime-agent") && self.is_sandboxed() {
             session_id = None;
         }
         let emitted =

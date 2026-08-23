@@ -398,7 +398,15 @@ mod tests {
         }
         // Adapters whose default/mode approval behavior is unverified fail
         // closed to unattended, and unknown keys never count as reviewed.
-        for key in ["opencode", "vibe", "pi", "omp", "unknown-agent", ""] {
+        for key in [
+            "opencode",
+            "vibe",
+            "pi",
+            "omp",
+            "prime-agent",
+            "unknown-agent",
+            "",
+        ] {
             assert!(!is_reviewed(key), "{key} should not be reviewed");
         }
     }
