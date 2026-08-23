@@ -57,4 +57,14 @@ describe("Row cursor fill state", () => {
     expect(cell!.style.outline).toBe("");
     expect(cell!.className).toContain("animate-term-cursor-blink");
   });
+
+  it("boxes the cursor on a completely empty row (no segments)", () => {
+    // A blank live-input line carries no segments; the pad + blank-cell
+    // path must still run or the cursor vanishes from an empty prompt.
+    const { container } = render(<Row segs={[]} cursorCol={3} />);
+    const cell = cursorCell(container);
+    expect(cell).not.toBeNull();
+    expect(cell!.textContent).toBe(" ");
+    expect(cell!.previousSibling!.textContent).toBe("   ");
+  });
 });

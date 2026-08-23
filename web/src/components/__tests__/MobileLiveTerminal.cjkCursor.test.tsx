@@ -7,6 +7,7 @@
 // under-counts and the boxed cell drifts right of the actual cursor.
 
 import { describe, expect, it } from "vitest";
+import { cellWidth } from "../../lib/liveTermLines";
 import { render } from "@testing-library/react";
 import { Row } from "../MobileLiveTerminal";
 import type { AnsiSegment } from "../../lib/ansi";
@@ -27,11 +28,20 @@ describe("Row cursor placement with CJK (wide) characters", () => {
     const { container } = render(<Row segs={[seg(text)]} cursorCol={17} />);
     const cell = cursorCell(container);
     expect(cell).not.toBeNull();
-    // The row is [text span, cursor span]. No pad span should be inserted
-    // between them; drift shows up as a pad span full of spaces.
-    expect(container.querySelectorAll("span")).toHaveLength(2);
-    expect(cell!.previousSibling!.textContent).toBe(text);
+    // Per-cell runs (#3342): each CJK glyph gets its own fixed box, the
+    // ASCII digits flow together. No pad span of spaces may appear before
+    // the cursor; drift shows up as exactly that.
+    const spans = [...container.querySelectorAll("span")];
+    expect(spans.map((s) => s.textContent)).toEqual([..."한글정렬테스트", "123", " "]);
+    expect(cell!.previousSibling!.textContent).toBe("123");
     expect(cell!.textContent).toBe(" ");
+    // Fixed boxes carry explicit widths; the cursor cell (a space) is one
+    // of them. Each Hangul glyph is one code point in a two-cell box.
+    const fixed = spans.filter((s) => s.style.display === "inline-block");
+    expect(fixed).toHaveLength(8);
+    for (const box of fixed) {
+      expect(box.style.width).toBe(`calc(var(--term-cell, 1em) * ${cellWidth([...box.textContent!][0]!)})`);
+    }
   });
 
   it("boxes the correct character in a mixed ASCII+CJK line", () => {

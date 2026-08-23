@@ -170,6 +170,13 @@
       "components": ["web/src/components/MobileLiveTerminal.tsx"]
     },
     {
+      "id": "terminal.live-glyph-cell-width",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/live-glyph-columns.spec.ts", "src/lib/liveTermLines.test.ts"],
+      "components": ["web/src/components/MobileLiveTerminal.tsx"]
+    },
+    {
       "id": "terminal.live-cursor-focus-fill",
       "kind": "vitest",
       "risk": "medium",
