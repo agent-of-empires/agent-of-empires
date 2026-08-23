@@ -9422,7 +9422,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_merge_diff_passive_transition_stamp_does_not_wipe_concurrent_archive() {
+    fn test_merge_diff_passive_transition_stamp_does_not_wipe_concurrent_sink_state() {
         // #3465: a passive status transition restamped last_accessed_at
         // (update_status_with_metadata wrote Some(now) on every detected
         // transition, with no user gesture behind it), and the stamp
