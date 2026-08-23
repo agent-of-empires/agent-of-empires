@@ -1253,7 +1253,13 @@ pub const AGENTS: &[AgentDef] = &[
         hook_config: None,
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Flag("--resume"),
-        fork_strategy: ForkStrategy::Flag("--fork"),
+        // Upstream `--fork <path|id>` requires the parent id as its value,
+        // but build_fork_flags' Flag arm appends the fork flag bare after
+        // `<resume> <parent_id>`, which prime-agent's parser silently drops
+        // (an unknown valueless flag), so a fork would quietly not fork.
+        // Unsupported keeps terminal_agent_can_fork fail-closed until a
+        // value-carrying fork variant exists.
+        fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
         ready_marker: None,
@@ -2407,9 +2413,9 @@ mod tests {
 
     #[test]
     fn test_fork_strategy_is_set_for_fork_capable_agents() {
-        // Only claude, codex, opencode, and prime-agent can fork; every other
-        // agent is Unsupported. Iterating the full AGENTS slice makes a new
-        // agent with a stray fork_strategy fail loudly here.
+        // Only claude, codex, and opencode can fork; every other agent is
+        // Unsupported. Iterating the full AGENTS slice makes a new agent with a
+        // stray fork_strategy fail loudly here.
         assert!(matches!(
             get_agent("claude").unwrap().fork_strategy,
             ForkStrategy::ClaudeFork
@@ -2422,13 +2428,15 @@ mod tests {
             get_agent("opencode").unwrap().fork_strategy,
             ForkStrategy::Flag("--fork")
         ));
+        // prime-agent documents `--fork <path|id>`, but the flag needs the
+        // parent id as its value and build_fork_flags' Flag arm appends the
+        // fork flag bare, so it stays Unsupported (see its AgentDef comment).
         assert!(matches!(
             get_agent("prime-agent").unwrap().fork_strategy,
-            ForkStrategy::Flag("--fork")
+            ForkStrategy::Unsupported
         ));
         for agent in AGENTS {
-            let fork_capable =
-                matches!(agent.name, "claude" | "codex" | "opencode" | "prime-agent");
+            let fork_capable = matches!(agent.name, "claude" | "codex" | "opencode");
             assert_eq!(
                 matches!(agent.fork_strategy, ForkStrategy::Unsupported),
                 !fork_capable,
@@ -2467,7 +2475,9 @@ mod tests {
             &prime.resume_strategy,
             ResumeStrategy::Flag("--resume")
         ));
-        assert!(matches!(&prime.fork_strategy, ForkStrategy::Flag("--fork")));
+        // Fork stays Unsupported: upstream `--fork` needs the parent id as
+        // its value, which build_fork_flags does not emit (see AGENTS entry).
+        assert!(matches!(&prime.fork_strategy, ForkStrategy::Unsupported));
         // `-p` is boolean print mode; the prompt stays positional (args.ts).
         assert_eq!(prime.oneshot_flag, Some("-p"));
         assert_eq!(prime.oneshot_model_flag(), Some("--model"));

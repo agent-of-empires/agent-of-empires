@@ -46,6 +46,7 @@ Each built-in adapter receives only the provider variables it is known to read f
 | `aoe-agent` | `ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENAI_BASE_URL`, `GOOGLE_GENERATIVE_AI_API_KEY` |
 
 `vibe`, `pi`, `omp`, `kimi`, and `prime-agent` have no ambient provider allowlist yet. Custom adapters also receive no ambient provider credentials. Until their variables are verified, give them auth through the per-session `extra_env` field or `environment` in your config, or set `session.inherit_host_environment = true` to forward your whole `aoe serve` environment to non-sandboxed agents. In a sandboxed session the per-adapter provider keys above still cross the container boundary (forwarded as `docker exec -e` flags), but `inherit_host_environment` does not; give a sandboxed not-yet-verified adapter its auth through `sandbox.environment`. Three ambient allowlist entries are host-only and never cross: `CLAUDE_CONFIG_DIR`, `CODEX_HOME`, and `GOOGLE_APPLICATION_CREDENTIALS` name paths on your machine that do not exist inside the container, and each agent's config dir is already bind-mounted at its canonical container location. Values explicitly supplied through `provider_env` are not part of that ambient filtering.
+
 ### Feature matrix
 
 Each feature fires for any ACP agent, only when the agent's profile opts in, or claude-only.

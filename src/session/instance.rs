@@ -23,12 +23,13 @@ use crate::session::capture::{
     capture_claude_session_id, capture_claude_session_id_in_container, capture_codex_session_id,
     capture_copilot_session_id, capture_gemini_session_id, capture_hermes_session_id,
     capture_kimi_session_id, capture_omp_session_id, capture_pi_session_id,
-    capture_vibe_session_id, claude_poll_fn, claude_poll_fn_sandboxed, codex_poll_fn,
-    codex_poll_fn_sandboxed, copilot_poll_fn, gemini_poll_fn, gemini_poll_fn_sandboxed,
-    generate_claude_session_id, hermes_poll_fn, hermes_poll_fn_sandboxed, is_valid_session_id,
-    kimi_poll_fn, omp_host_routing_environment, omp_poll_fn, omp_poll_fn_sandboxed,
-    omp_sandbox_launch_marker, opencode_poll_fn, opencode_poll_fn_sandboxed, pi_poll_fn,
-    pi_poll_fn_sandboxed, reject_omp_secret_args, resolve_omp_store_layout,
+    capture_prime_agent_session_id, capture_vibe_session_id, claude_poll_fn,
+    claude_poll_fn_sandboxed, codex_poll_fn, codex_poll_fn_sandboxed, copilot_poll_fn,
+    gemini_poll_fn, gemini_poll_fn_sandboxed, generate_claude_session_id, hermes_poll_fn,
+    hermes_poll_fn_sandboxed, is_valid_session_id, kimi_poll_fn, omp_host_routing_environment,
+    omp_poll_fn, omp_poll_fn_sandboxed, omp_sandbox_launch_marker, opencode_poll_fn,
+    opencode_poll_fn_sandboxed, pi_poll_fn, pi_poll_fn_sandboxed, prime_agent_poll_fn,
+    reject_omp_secret_args, resolve_omp_store_layout,
     resolve_omp_store_layout_in_container_with_environment,
     resolve_omp_store_layout_with_environment, try_capture_codex_session_id_in_container,
     try_capture_gemini_session_id_in_container, try_capture_hermes_session_id_in_container,
@@ -3302,6 +3303,22 @@ impl Instance {
                     capture_kimi_session_id(&self.project_path, &exclusion, None).ok()
                 }
             }
+            "prime-agent" => {
+                // Prime Agent writes one JSONL per session under
+                // `~/.prime/agent/sessions`, header line keyed by cwd. Host
+                // capture reads it directly; sandbox resume is a follow-up
+                // (the container's sessions dir is not read over `docker
+                // exec`), so a sandboxed Prime Agent session starts fresh on
+                // restart, mirroring Copilot and Kimi.
+                if self.is_sandboxed() {
+                    None
+                } else {
+                    let exclusion = self.retroactive_capture_exclusion_set();
+                    // Retroactive recovery is unrestricted (no launch floor):
+                    // resuming an older session on restart is the goal here.
+                    capture_prime_agent_session_id(&self.project_path, &exclusion, None).ok()
+                }
+            }
             _ => None,
         };
         result.and_then(validated_session_id)
@@ -5814,6 +5831,22 @@ impl Instance {
                 }
                 let launch_time_ms = crate::util::now_ms() as f64;
                 Box::new(kimi_poll_fn(
+                    self.project_path.clone(),
+                    self.id.clone(),
+                    launch_time_ms,
+                    extra_excludes,
+                ))
+            }
+            "prime-agent" => {
+                // Host-only, mirroring Copilot and Kimi: the Prime Agent
+                // sessions directory is read from the host `~/.prime/agent`.
+                // Sandboxed sessions have no poller and start fresh on
+                // restart (sandbox resume is a follow-up).
+                if self.is_sandboxed() {
+                    return;
+                }
+                let launch_time_ms = crate::util::now_ms() as f64;
+                Box::new(prime_agent_poll_fn(
                     self.project_path.clone(),
                     self.id.clone(),
                     launch_time_ms,
