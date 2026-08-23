@@ -2686,7 +2686,7 @@ enter to select · esc to cancel";
             ("plain integer", "(4s · ↓ 88 tokens)", true),
             ("multi-digit", "(12s · ↓ 1234 tokens)", true),
             ("decimal with k", "(53s · ↓ 7.0k tokens)", true),
-            ("decimal without suffix", "(4s · ↓ 44.7 tokens)", true),
+            ("plain decimal", "(4s · ↓ 44.7 tokens)", true),
             ("integer with k", "(4s · ↓ 512k tokens)", true),
             ("decimal with m", "(4s · ↓ 1.2m tokens)", true),
             ("integer with g", "(4s · ↓ 3g tokens)", true),
