@@ -229,8 +229,10 @@ struct AgentDoctorEntry {
     name: String,
     command_present: bool,
     description: String,
-    /// Set when the copy aoe would spawn misses the adapter's minimum
-    /// version (#3267); the listing must not read `[OK]` then.
+    /// Set when the copy aoe would spawn is not proven compatible with
+    /// the adapter's minimum version (#3267): below-floor, or unprobeable
+    /// so compatibility cannot be proven. The listing must not read
+    /// `[OK]` then.
     #[serde(skip_serializing_if = "Option::is_none")]
     version_issue: Option<AgentVersionIssue>,
 }
@@ -1383,10 +1385,10 @@ mod tests {
         assert_eq!(issue.install_command, opencode.install_command);
     }
 
-    /// The `[!! ]` mark and the overall verdict must react to version
-    /// issues, not only to missing binaries (#3267).
+    /// The `[!! ]` mark must react to version issues, not only to
+    /// missing binaries (#3267).
     #[test]
-    fn doctor_mark_and_overall_demote_on_version_issue() {
+    fn agent_mark_demotes_on_version_issue() {
         let entry = |present: bool, issue: Option<AgentVersionIssue>| AgentDoctorEntry {
             name: "claude".to_string(),
             command_present: present,
@@ -1399,14 +1401,20 @@ mod tests {
         };
         let marks = [
             (entry(true, None), "[OK]"),
-            (entry(true, Some(stale_issue.clone())), "[!! ]"),
+            (entry(true, Some(stale_issue)), "[!! ]"),
             (entry(false, None), "[!! ]"),
         ];
         for (e, mark) in &marks {
             assert_eq!(&agent_mark(e), mark);
         }
+    }
+
+    /// The overall verdict must cap at partial when a configured adapter
+    /// fails its version gate even though its binary exists (#3267).
+    #[test]
+    fn overall_status_caps_at_partial_on_version_issue() {
         // (node_ok, any_agent_ok, any_agent_stale, expected)
-        let overall = [
+        let cases = [
             (true, true, false, "ok"),
             // The #3267 regression row: everything installed but stale
             // must not read as fully green.
@@ -1415,7 +1423,7 @@ mod tests {
             (false, true, false, "partial"),
             (false, false, false, "fail"),
         ];
-        for (node_ok, agents_ok, stale, expected) in overall {
+        for (node_ok, agents_ok, stale, expected) in cases {
             assert_eq!(overall_status(node_ok, agents_ok, stale), expected);
         }
     }
