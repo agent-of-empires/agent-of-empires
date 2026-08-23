@@ -1901,19 +1901,36 @@ pub fn detect_pi_status(raw_content: &str) -> Status {
 ///
 /// OMP keeps a bordered composer visible both while running and while idle.
 /// Status is decided by the lowest pane signal, where position 1 is the
-/// bottom non-empty line: the live loader (`Working… ⟦esc⟧`), the retry
-/// countdown (`Retrying (N/M) in Ns…`), the pinned error banner (matched by
-/// its anchor line "Dismissed when you send your next message."), the
-/// terminal retry lines (`Error: Retry budget exhausted` / `Error: Retry
-/// failed after`), sub-agent retry labels (`retrying N/M …`, the rule-repair
-/// `Attempt N/M ·`), and the approval prompt (`Allow tool: …`). Each signal
-/// has a freshness window; beyond it the signal is ignored, so a completed
-/// turn's loader or a dismissed banner in scrollback cannot pin the session.
-/// Below all signals sits the always-visible `╭── π`/`╰─` composer box:
-/// when no signal matched, the frame is read as parked on it. Because the
-/// box renders in every healthy frame, an unsignaled frame means healthy
-/// idle rather than Waiting.
-/// The heuristic cannot see structured turn events; the structured
+/// bottom non-empty line: the live loader row, the retry countdown
+/// (`Retrying (N/M) in Ns…`), the pinned error banner (matched by its anchor
+/// line "Dismissed when you send your next message."), the terminal retry
+/// lines (`Error: Retry budget exhausted` / `Error: Retry failed after`),
+/// sub-agent retry labels (`retrying N/M …`, the rule-repair
+/// `Attempt N/M ·`), the tool-approval prompt, and the Plan Review overlay.
+/// Each signal has a freshness window; beyond it the signal is ignored, so a
+/// completed turn's loader or a dismissed banner in scrollback cannot pin
+/// the session.
+///
+/// A footer row counts as a live loader when it carries a braille activity
+/// frame plus the classic markers ("Working", the unicode `⟦esc⟧` hint), or
+/// when it ends on an esc-interrupt hint in any symbol preset's glyphs
+/// (unicode `⟦esc⟧`, nerd `⟨esc⟩`, ascii `[esc]`), or when it carries the
+/// maintenance-loader marker "(esc to cancel)": intent messages replace any
+/// "Working" text and non-unicode presets change both frames and glyphs.
+///
+/// The tool-approval select replaces the composer with an overlay panel;
+/// two arms catch it. The title arm needs `Allow tool:` inside window 8
+/// (synthetic or short panels). The panel arm anchors on the option-list
+/// help row (`up/down navigate … enter select`), whose distance from the
+/// pane bottom is fixed regardless of how far the detail rows wrap, gated on
+/// the Approve/Deny pair so generic selectors stay out. The Plan Review
+/// overlay pins Waiting through its `Approve and execute` / `Refine plan`
+/// option rows on distinct lines.
+///
+/// Below all signals sits the always-visible composer box: when no signal
+/// matched, the frame is read as parked on it. Because the box renders in
+/// every healthy frame, an unsignaled frame means healthy idle rather than
+/// Waiting. The heuristic cannot see structured turn events; the structured
 /// error/retry path (herdr-style extension) is tracked in #3380.
 pub fn detect_omp_status(raw_content: &str) -> Status {
     let clean = strip_ansi(raw_content);
@@ -1933,16 +1950,26 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
         }
     };
 
-    // Spinner: live loader, footer (last 3 non-empty lines) only.
+    // Live loader rows, footer (last 3 non-empty lines) only. A row is live
+    // when it carries a braille activity frame plus the classic markers, or
+    // when it ends on an esc-interrupt hint: the frame set and the bracket
+    // glyphs follow omp's symbol preset (unicode ⟦esc⟧, nerd ⟨esc⟧, ascii
+    // [esc]), intent messages replace any "Working" text, and maintenance
+    // loaders render "(esc to cancel)" instead of an esc-bracket hint.
     let footer = tail_lines(&non_empty_lines, 3);
-    let footer_lower = footer.join("\n").to_lowercase();
-    if has_any_spinner(footer)
-        && (footer_lower.contains("working") || footer_lower.contains("⟦esc⟧"))
-    {
+    let is_live_loader = |line: &str| -> bool {
+        let l = line.trim().to_lowercase();
+        has_any_spinner(&[line]) && (l.contains("working") || l.contains("⟦esc⟧"))
+            || l.ends_with("⟦esc⟧")
+            || l.ends_with("⟨esc⟩")
+            || l.ends_with("[esc]")
+            || l.contains("(esc to cancel)")
+    };
+    if footer.iter().any(|line| is_live_loader(line)) {
         let pos = footer
             .iter()
             .rev()
-            .position(|line| has_any_spinner(&[*line]))
+            .position(|line| is_live_loader(line))
             .map_or(1, |i| i + 1);
         consider(pos, OmpSignal::Spinner);
     }
@@ -1997,8 +2024,9 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
         consider(pos, OmpSignal::TerminalLines);
     }
 
-    // Approval prompt: window 8, all three substrings present.
+    // Approval prompt, title arm: window 8, all three substrings present.
     let window8 = tail_lines(&non_empty_lines, 8);
+    let window12 = tail_lines(&non_empty_lines, 12);
     let approval_footer = window8.join("\n").to_lowercase();
     if approval_footer.contains("allow tool:")
         && approval_footer.contains("approve")
@@ -2017,8 +2045,37 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
         }
     }
 
+    // Approval prompt, panel arm. The live select replaces the composer in
+    // an overlay panel whose blank padding rows carry border glyphs, so the
+    // title row sits ~10 non-empty rows above the pane bottom and can fall
+    // outside every window that still sees the options. The option-list help
+    // row stays two rows above the panel's bottom border regardless of how
+    // far the details wrap; requiring the Approve/Deny pair keeps generic
+    // selectors (model menu, session picker) from pinning Waiting.
+    if approval_footer.contains("approve") && approval_footer.contains("deny") {
+        if let Some(pos) = lowest_matching_line(window8, |l| {
+            let l = l.to_lowercase();
+            l.contains("up/down navigate") && l.contains("enter select")
+        }) {
+            consider(pos, OmpSignal::Approval);
+        }
+    }
+
+    // Plan Review overlay: while the operator deliberates, its option list
+    // replaces the pane bottom and the turn is blocked. The two unambiguous
+    // options must appear on distinct rows so a single prose line naming
+    // both phrases cannot pin Waiting.
+    let approve_pos = lowest_matching_line(window12, |l| {
+        l.to_lowercase().contains("approve and execute")
+    });
+    let refine_pos = lowest_matching_line(window12, |l| l.to_lowercase().contains("refine plan"));
+    if let (Some(a), Some(r)) = (approve_pos, refine_pos) {
+        if a != r {
+            consider(a.min(r), OmpSignal::Approval);
+        }
+    }
+
     // Sub-agent retry labels and rule-repair progress: window 12.
-    let window12 = tail_lines(&non_empty_lines, 12);
     if let Some(pos) = lowest_matching_line(window12, |l| {
         let l = l.to_lowercase();
         label_re().is_match(&l) || attempt_re().is_match(&l)
@@ -5578,6 +5635,91 @@ You can monitor progress with aoe session logs.\n\
         ];
         for (name, pane, expected) in cases {
             assert_eq!(detect_omp_status(pane), *expected, "case: {name}");
+        }
+    }
+
+    /// Verbatim tail of a live approval prompt (omp 18.0.3): the select panel
+    /// replaces the composer and its blank padding rows carry `│` glyphs, so
+    /// every row counts as non-empty and the `Allow tool:` title sits 10 rows
+    /// above the pane bottom, outside any window that still sees Approve/Deny.
+    const OMP_LIVE_APPROVAL_PANEL: &str = "\
+⠸ Working… ⟦esc⟧
+╭─ Allow tool: bash ───────────────────────────────────────╮
+│                                                          │
+│ Command: echo appr-probe-19                              │
+│                                                          │
+│  ❯ Approve                                               │
+│    Deny                                                  │
+│                                                          │
+│ up/down navigate  enter select  esc cancel               │
+│                                                          │
+╰──────────────────────────────────────────────────────────╯";
+
+    #[test]
+    fn test_detect_omp_status_waiting_on_real_approval_panel() {
+        // The rendered panel pushes the title past the gate window; the
+        // prompt is live either way and must read Waiting.
+        assert_eq!(detect_omp_status(OMP_LIVE_APPROVAL_PANEL), Status::Waiting);
+    }
+
+    #[test]
+    fn test_detect_omp_status_running_ascii_preset_loader() {
+        // symbolPreset ascii renders `[esc]` hints and `- \ | /` frames;
+        // intent messages replace the "Working…" text entirely (live capture).
+        let pane = "\
+/ Running requested echo probe [esc]
++-- pi  > [M] Ox Alpha - [max] > [T] scratch/84d437 ---+
++-                                                    -+";
+        assert_eq!(detect_omp_status(pane), Status::Running);
+    }
+
+    #[test]
+    fn test_detect_omp_status_running_maintenance_loaders() {
+        // Maintenance loaders swap into statusContainer with the working
+        // loader disposed, and their labels carry neither "Working" nor an
+        // esc-bracket glyph (command-controller.ts, event-controller.ts).
+        let box_ = "╭── π ─╮\n╰─ ─╯";
+        let cases = [
+            "⠼ Compacting context... (esc to cancel)",
+            "⠼ Auto-compacting context... (esc to cancel)",
+            "⠋ Context overflow detected, Auto context-full maintenance… (esc to cancel)",
+            "⠋ Response incomplete, Auto-handoff… (esc to cancel)",
+        ];
+        for line in &cases {
+            let pane = format!("{line}\n{box_}");
+            assert_eq!(detect_omp_status(&pane), Status::Running, "case: {line}");
+        }
+    }
+
+    #[test]
+    fn test_detect_omp_status_waiting_on_plan_review_overlay() {
+        // Verbatim bottom rows of a live Plan Review overlay: the option
+        // list replaces the pane bottom while the turn is blocked on it.
+        let pane = "\
+| Plan mode - next step                                                        |
+| > Approve and execute                                                        |
+|   Approve and compact context                                                |
+|   Approve and keep context (~28k / 1m)                                       |
+|   Refine plan                                                                |
+|   Save and quit                                                              |
++------------------------------------------------------------------------------+
+| ↑↓ select · ⏎ confirm · c copy · tab regions · Ctrl+G editor · esc cancel    |
++------------------------------------------------------------------------------+";
+        assert_eq!(detect_omp_status(pane), Status::Waiting);
+    }
+
+    #[test]
+    fn test_detect_omp_status_selector_hint_without_approval() {
+        // The panel help row alone must not pin Waiting: generic selectors
+        // render it without Approve/Deny options, and prose naming the plan
+        // options must not trip the overlay arm either.
+        let box_ = "╭── π ─╮\n╰─ ─╯";
+        let cases = [
+            format!("│ up/down navigate  enter select  esc cancel │\n{box_}"),
+            format!("I would approve and execute refine plan steps\n{box_}"),
+        ];
+        for pane in &cases {
+            assert_eq!(detect_omp_status(pane), Status::Idle, "case: {pane:?}");
         }
     }
 
