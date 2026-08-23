@@ -55,7 +55,7 @@ use serde::Deserialize;
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{UnixListener, UnixStream};
 use tokio::process::{Child, Command};
-use tokio::sync::Mutex;
+use tokio::sync::{mpsc, watch, Mutex};
 use tracing::{debug, info, warn};
 
 use super::worker_registry::{self, WorkerRecord};
@@ -360,7 +360,7 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
     let control_shared = Arc::clone(&shared);
     let control_session = args.session_id.clone();
     let control_stdin = Arc::clone(&agent_stdin);
-    let control_accept_task = tokio::spawn(async move {
+    let mut control_accept_task = tokio::spawn(async move {
         loop {
             match control_listener.accept().await {
                 Ok((stream, _addr)) => {
@@ -369,13 +369,16 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
                         session = %control_session,
                         "daemon connected (control channel)"
                     );
-                    handle_control_connection(
+                    if handle_control_connection(
                         stream,
                         Arc::clone(&control_shared),
                         Arc::clone(&control_stdin),
                         control_session.clone(),
                     )
-                    .await;
+                    .await
+                    {
+                        return;
+                    }
                     info!(
                         target: "acp.runner",
                         session = %control_session,
@@ -517,6 +520,21 @@ pub async fn run(args: AcpRunnerArgs) -> Result<()> {
         }
         _ = accept_loop => {
             warn!(target: "acp.runner", session = %session_id, "accept loop exited unexpectedly");
+        }
+        result = &mut control_accept_task => {
+            match result {
+                Ok(()) => {
+                    // The daemon owns path cleanup after cancelling an
+                    // incomplete handshake and may already have spawned a
+                    // replacement. Never unlink that replacement here.
+                    preserve_registry = true;
+                }
+                Err(error) => {
+                    warn!(target: "acp.runner", session = %session_id, "control accept task failed: {error}");
+                }
+            }
+            let _ = agent_child.start_kill();
+            let _ = agent_child.wait().await;
         }
     }
 
@@ -1704,6 +1722,27 @@ async fn handle_connection(
     shared.clear_outbound().await;
 }
 
+enum ControlRead {
+    Frame(ControlBody),
+    Closed,
+    Failed(String),
+}
+
+async fn await_handshake_or_control_loss<T>(
+    control_closed: &mut watch::Receiver<bool>,
+    handshake: impl std::future::Future<Output = T>,
+) -> Option<T> {
+    if *control_closed.borrow() {
+        return None;
+    }
+    tokio::pin!(handshake);
+    tokio::select! {
+        biased;
+        _ = control_closed.changed() => None,
+        result = &mut handshake => Some(result),
+    }
+}
+
 /// Handle one control-channel connection (#2976 Phase B). Greets with
 /// `Hello`, installs the persistent write half (draining any completion
 /// buffered across a no-daemon gap), then drives the runner-owned protocol:
@@ -1724,7 +1763,7 @@ async fn handle_control_connection(
     shared: Arc<RunnerShared>,
     agent_stdin: Arc<Mutex<tokio::process::ChildStdin>>,
     session_id: String,
-) {
+) -> bool {
     let (mut read_half, write_half) = stream.into_split();
     let mut write_half = Some(write_half);
     if !shared
@@ -1732,25 +1771,60 @@ async fn handle_control_connection(
         .await
     {
         shared.clear_control_outbound().await;
-        return;
+        return false;
     }
-    loop {
-        let body = match control_protocol::read_frame(&mut read_half).await {
-            Ok(Some(body)) => body,
-            Ok(None) => break, // clean EOF: daemon closed the control socket.
-            Err(e) => {
-                warn!(
-                    target: "acp.runner",
-                    session = %session_id,
-                    "control read error: {e}"
-                );
-                break;
+
+    let (frame_tx, mut frame_rx) = mpsc::channel(8);
+    let (control_closed_tx, mut control_closed_rx) = watch::channel(false);
+    let reader_session = session_id.clone();
+    let frame_reader = tokio::spawn(async move {
+        loop {
+            match control_protocol::read_frame(&mut read_half).await {
+                Ok(Some(frame)) => match frame_tx.try_send(ControlRead::Frame(frame)) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Closed(_)) => return,
+                    Err(mpsc::error::TrySendError::Full(_)) => {
+                        warn!(target: "acp.runner", session = %reader_session, "control command queue exceeded capacity");
+                        let _ = control_closed_tx.send(true);
+                        return;
+                    }
+                },
+                Ok(None) => {
+                    let _ = frame_tx.try_send(ControlRead::Closed);
+                    let _ = control_closed_tx.send(true);
+                    return;
+                }
+                Err(error) => {
+                    let _ = frame_tx.try_send(ControlRead::Failed(error.to_string()));
+                    let _ = control_closed_tx.send(true);
+                    return;
+                }
+            }
+        }
+    });
+
+    let mut handshake_complete = shared.acp_session_id().await.is_some();
+    let terminate_runner = 'connection: loop {
+        let body = match frame_rx.recv().await {
+            Some(ControlRead::Frame(frame)) => frame,
+            Some(ControlRead::Closed) | None => break 'connection !handshake_complete,
+            Some(ControlRead::Failed(error)) => {
+                warn!(target: "acp.runner", session = %session_id, "control read error: {error}");
+                break 'connection !handshake_complete;
             }
         };
         match body {
             ControlBody::Attach { .. } => {}
             ControlBody::Initialize { request } => {
-                let frame = match shared.run_or_replay_initialize(&agent_stdin, request).await {
+                let Some(result) = await_handshake_or_control_loss(
+                    &mut control_closed_rx,
+                    shared.run_or_replay_initialize(&agent_stdin, request),
+                )
+                .await
+                else {
+                    break 'connection true;
+                };
+                let frame = match result {
                     Ok(result) => ControlBody::Initialized { result },
                     Err(error) => {
                         warn!(target: "acp.runner", session = %session_id, "initialize failed: {error}");
@@ -1760,14 +1834,22 @@ async fn handle_control_connection(
                 shared.emit_control(frame).await;
             }
             ControlBody::EstablishSession { method, request } => {
-                let frame = match shared
-                    .run_or_replay_session(&agent_stdin, &method, request)
-                    .await
-                {
-                    Ok((acp_session_id, result)) => ControlBody::SessionReady {
-                        acp_session_id,
-                        result,
-                    },
+                let Some(result) = await_handshake_or_control_loss(
+                    &mut control_closed_rx,
+                    shared.run_or_replay_session(&agent_stdin, &method, request),
+                )
+                .await
+                else {
+                    break 'connection true;
+                };
+                let frame = match result {
+                    Ok((acp_session_id, result)) => {
+                        handshake_complete = true;
+                        ControlBody::SessionReady {
+                            acp_session_id,
+                            result,
+                        }
+                    }
                     Err(error) => {
                         warn!(target: "acp.runner", session = %session_id, "{method} failed: {error}");
                         ControlBody::HandshakeFailed { error }
@@ -1792,8 +1874,10 @@ async fn handle_control_connection(
             // Runner -> daemon frames should never arrive here; ignore.
             _ => {}
         }
-    }
+    };
+    frame_reader.abort();
     shared.clear_control_outbound().await;
+    terminate_runner
 }
 
 fn spawn_agent(
