@@ -2254,8 +2254,8 @@ impl Instance {
     ///
     /// Cleared by `unarchive`, by `touch_last_accessed`, and by `favorite`
     /// and `pin`; not by `snooze`.
-    /// `merge_user_action_diff` mirrors those onto disk, and #3465 tracks a
-    /// status transition reaching that mirror without a user gesture.
+    /// `merge_user_action_diff` mirrors those onto disk; #3465 was a status
+    /// transition reaching that mirror without a user gesture.
     ///
     /// Mutual exclusion with `favorite`, `snooze`, and `pin`: archiving
     /// clears `favorited_at`, `snoozed_until`, and `pinned_at`. Archive
