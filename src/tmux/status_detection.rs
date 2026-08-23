@@ -286,15 +286,22 @@ fn has_claude_live_token_counter(content: &str) -> bool {
             }
             let tail = after[count_end..].trim_start();
             if let Some(after_tokens) = tail.strip_prefix("tokens") {
-                // The live counter ends the spinner line, so only
-                // whitespace may follow the closing paren. Quoted literals
+                // The live counter ends the spinner line, so its closing
+                // paren must close a whitespace-only line. Quoted literals
                 // (this repo's own test rows, docs) carry punctuation or
-                // quotes right after it; rejecting those keeps an echoed
-                // row from pinning a parked pane on Running.
+                // prose right after it, and a following physical line
+                // starting with `)` cannot complete an echoed anchor tail;
+                // rejecting both keeps them from pinning a parked pane on
+                // Running. A newline itself is fine: narrow panes wrap the
+                // counter across lines.
                 let accepted = after_tokens
                     .trim_start()
                     .strip_prefix(')')
-                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace));
+                    .is_some_and(|rest| {
+                        rest.lines()
+                            .next()
+                            .is_none_or(|line| line.trim().is_empty())
+                    });
                 if accepted {
                     return true;
                 }
@@ -2746,6 +2753,23 @@ enter to select · esc to cancel";
             // The anchor needs the duration's `s`; a bare arrow in prose is
             // not a counter.
             ("bare arrow in prose", "watch the ↓ 88 tokens) chart", false),
+            // Text after the closing paren on its own line means the shape
+            // is quoted prose, not a live counter.
+            ("prose after paren", "(4s · ↓ 88 tokens) renders", false),
+            // A following physical line starting with `)` must not supply
+            // the paren to a prose line ending in the anchor tail.
+            (
+                "next line completes shape",
+                "● The helper reads s · ↓ 42 tokens\n) -> Status {",
+                false,
+            ),
+            // Relaxing the anchor to a bare middle-dot arrow would let
+            // ordinary prose through; the duration's `s` is load-bearing.
+            (
+                "middle dot arrow without duration",
+                "chart · ↓ 88 tokens)",
+                false,
+            ),
             // Unobserved magnitude units stay out of the alphabet.
             ("b suffix", "(4s · ↓ 512b tokens)", false),
         ];
