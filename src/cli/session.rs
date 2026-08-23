@@ -3153,6 +3153,7 @@ mod show_json_tests {
         assert!(!serialized.contains("archived_at"), "{serialized}");
         assert!(serialized.contains("\"state\":\"live\""), "{serialized}");
     }
+
     /// #3415: same four-timestamp mirror as `aoe list --json`, gated the
     /// same way: the snooze key surfaces only while `is_snoozed()` holds,
     /// the pin key whenever set, neither appears on a plain row, and

@@ -443,6 +443,7 @@ mod tests {
         assert!(!serialized.contains("archived_at"));
         assert!(serialized.contains("\"state\":\"live\""));
     }
+
     /// #3415: snooze and pin complete the four-timestamp state set the API
     /// has exposed since #1581. The table pins the whole contract: the
     /// snooze key follows the API's `is_snoozed()` gate (surfaced while
