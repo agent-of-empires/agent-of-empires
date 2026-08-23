@@ -1538,9 +1538,9 @@ fn tmux_env_session_name_for_instance_id(instance_id: &str) -> Option<String> {
 ///   poller from tmux pane state or ACP overlay, not by an explicit user
 ///   action.
 /// - **passive status patch**: a minimal `PassiveStatusPatch` carrying
-///   the fields a passive-status writer touches (`status`,
-///   `idle_entered_at`, `last_accessed_at`), applied on disk via
-///   [`Instance::merge_passive_status_patch`].
+///   the `status` / `idle_entered_at` writes plus the monotone
+///   `last_accessed_at` carry-through (user-gesture-only since #3465),
+///   applied on disk via [`Instance::merge_passive_status_patch`].
 /// - **live status baseline**: the last `Status` a caller has actually
 ///   observed live for an in-memory `Instance`. Held on
 ///   `Instance::live_status_baseline` (`#[serde(skip)]`). `None` means
