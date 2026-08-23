@@ -329,7 +329,23 @@ fn doctor_version_issue(
     match doctor_fix_action(Some(*gate), probe) {
         DoctorFixAction::Skip => None,
         DoctorFixAction::PrintHint { reason } => {
-            if bundle_installed && matches!(probe, ProbeStatus::Version { .. }) {
+            // The bundle only backs the PATH copy when the SPAWN-side
+            // tokenizer agrees the version parses below the floor: it
+            // splits on whitespace and parses strictly, while this
+            // probe folds stderr in and splits on punctuation, so a raw
+            // like `version=0.37.0` parses here but not at spawn. When
+            // spawn would keep the PATH copy, keep the flag.
+            let bundle_backs_spawn = match probe {
+                ProbeStatus::Version { raw, .. } => {
+                    let min = semver::Version::parse(gate.min_version)
+                        .expect("gate min_version must be valid semver");
+                    crate::acp::version_probe::whitespace_token_below_floor(raw, min)
+                }
+                // Without a parseable version spawn cannot prove
+                // below-floor either, so it keeps the PATH copy.
+                _ => false,
+            };
+            if bundle_installed && bundle_backs_spawn {
                 return None;
             }
             Some(AgentVersionIssue {
@@ -545,9 +561,9 @@ async fn doctor(json: bool, fix: bool, adapter: Vec<String>, all_adapters: bool)
     }
 
     let any_agent_ok = agent_entries.iter().any(|e| e.command_present);
-    let any_agent_stale = agent_entries.iter().any(|e| e.version_issue.is_some());
+    let any_version_issue = agent_entries.iter().any(|e| e.version_issue.is_some());
     let node_ok = node_status.meets_minimum.unwrap_or(false);
-    let overall = overall_status(node_ok, any_agent_ok, any_agent_stale);
+    let overall = overall_status(node_ok, any_agent_ok, any_version_issue);
     let report = DoctorReport {
         node: node_status,
         agents: agent_entries,
@@ -624,8 +640,8 @@ fn agent_mark(entry: &AgentDoctorEntry) -> &'static str {
 /// Overall verdict. A version issue means configured sessions die at
 /// startup even though the binary exists, so it caps the verdict at
 /// partial exactly like a missing prerequisite (#3267).
-fn overall_status(node_ok: bool, any_agent_ok: bool, any_agent_stale: bool) -> &'static str {
-    if node_ok && any_agent_ok && !any_agent_stale {
+fn overall_status(node_ok: bool, any_agent_ok: bool, any_version_issue: bool) -> &'static str {
+    if node_ok && any_agent_ok && !any_version_issue {
         "ok"
     } else if node_ok || any_agent_ok {
         "partial"
@@ -1326,9 +1342,23 @@ mod tests {
             ),
             ("above_floor", ver("1.0.0"), false, false),
             // A pinned bundled copy backs the spawn below the floor
-            // (resolve_agent_command switches to it), so nothing to
-            // report.
+            // only when the SPAWN-side tokenizer can parse the raw
+            // below-floor too (resolve_agent_command switches on its
+            // own strict parse), so nothing to report.
             ("stale_but_bundled", ver("0.37.0"), true, false),
+            // The doctor parser is more lenient than spawn's: it splits
+            // `version=0.37.0` on punctuation while spawn needs a
+            // whitespace token. Spawn keeps the PATH copy, so the
+            // listing must keep flagging despite the bundle.
+            (
+                "lenient_raw_but_bundled",
+                ProbeStatus::Version {
+                    raw: "version=0.37.0".to_string(),
+                    parsed: semver::Version::parse("0.37.0").unwrap(),
+                },
+                true,
+                true,
+            ),
             // Absence is reported by the presence branch either way.
             ("missing_but_bundled", ProbeStatus::Missing, true, false),
             ("absent_unbundled", ProbeStatus::Missing, false, false),
@@ -1413,7 +1443,7 @@ mod tests {
     /// fails its version gate even though its binary exists (#3267).
     #[test]
     fn overall_status_caps_at_partial_on_version_issue() {
-        // (node_ok, any_agent_ok, any_agent_stale, expected)
+        // (node_ok, any_agent_ok, any_version_issue, expected)
         let cases = [
             (true, true, false, "ok"),
             // The #3267 regression row: everything installed but stale

@@ -2167,3 +2167,35 @@ fn test_cli_session_show_json_reports_archived_and_precedence() {
     assert!(both["trashed_at"].is_string());
     assert!(both["archived_at"].is_string());
 }
+
+/// #3267 regression guard at the wiring level: `aoe acp doctor` must run
+/// its version-gate probe on configured agents, so an adapter that is
+/// present but below-floor reads `[!! ]` with remediation instead of
+/// `[OK]`. Deleting the probe call from the listing loop fails here even
+/// though every unit-level decision test stays green.
+#[test]
+#[parallel]
+fn test_cli_acp_doctor_flags_below_floor_adapter() {
+    let mut h = TuiTestHarness::new("cli_acp_doctor_below_floor");
+    let bin = h.home_path().join("fixture-bin");
+    std::fs::create_dir_all(&bin).expect("create fixture bin dir");
+    let script = bin.join("claude-agent-acp");
+    std::fs::write(&script, "#!/bin/sh\necho 0.37.0\n").expect("write fixture script");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755))
+            .expect("make fixture executable");
+    }
+    h.add_path_dir(&bin);
+
+    let out = h.run_cli(&["acp", "doctor"]);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("[!! ] claude"), "{stdout}");
+    assert!(stdout.contains("installed 0.37.0; requires >="), "{stdout}");
+    assert!(
+        stdout.contains("npm install -g @agentclientprotocol/claude-agent-acp@latest"),
+        "{stdout}"
+    );
+    assert!(!stdout.contains("[OK] claude"), "{stdout}");
+}

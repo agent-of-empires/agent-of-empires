@@ -76,6 +76,19 @@ pub fn extract_semver(raw: &str) -> Option<Version> {
         .next()
 }
 
+/// The spawn side's tokenizer (`path_copy_below_floor`): the first
+/// whitespace-delimited token that parses as strict semver once a
+/// leading `v` is stripped. The doctor's probe parser is more lenient
+/// (stderr folded in, punctuation-split tokens), so code that predicts
+/// what spawn will do must ask this exact predicate instead of reusing
+/// the lenient parse.
+pub fn whitespace_token_below_floor(raw: &str, min: Version) -> bool {
+    raw.split_whitespace()
+        .filter_map(|tok| Version::parse(tok.trim_start_matches('v')).ok())
+        .next()
+        .is_some_and(|found| found < min)
+}
+
 pub async fn probe_binary_version(binary: &str) -> ProbeStatus {
     let Ok(path) = which::which(binary) else {
         return ProbeStatus::Missing;
@@ -249,6 +262,36 @@ mod tests {
         assert!(extract_semver("not-semver").is_none());
     }
 
+    /// This predicate IS the spawn-side decision, so its table pins the
+    /// strict tokenizer: whitespace-delimited, `v`-stripped, first
+    /// parseable token wins. Formats the lenient doctor parser accepts
+    /// (like `version=0.37.0`, split on punctuation) must read as
+    /// unproven here.
+    #[test]
+    fn whitespace_token_below_floor_mirrors_spawn_parsing() {
+        let min = Version::parse(CLAUDE_AGENT_ACP_MIN_VERSION).unwrap();
+        // (raw, below_floor)
+        let cases = [
+            ("0.37.0", true),
+            ("claude-agent-acp 0.37.0", true),
+            ("v0.37.0", true),
+            ("0.55.0", false),
+            ("0.56.0", false),
+            // Punctuation-joined output has no whitespace token that
+            // parses strictly: spawn keeps the PATH copy.
+            ("version=0.37.0", false),
+            ("0.37.0-beta.1", true),
+            ("junk", false),
+            ("", false),
+        ];
+        for (raw, below) in cases {
+            assert_eq!(
+                whitespace_token_below_floor(raw, min.clone()),
+                below,
+                "{raw:?}"
+            );
+        }
+    }
     #[test]
     fn warning_for_probe_flags_only_unusable_versions() {
         let gate = claude_gate();
