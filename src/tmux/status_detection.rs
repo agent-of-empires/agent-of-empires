@@ -5182,6 +5182,13 @@ Tip: Set thinkingBudgets in settings.json to choose which models think.\n\
         );
     }
 
+    /// A synthetic pane holding `line` at non-empty position `depth`, with
+    /// neutral filler lines below it.
+    fn pane_with_line_at_depth(line: &str, depth: usize) -> String {
+        let filler = "Footer filler line.\n".repeat(depth - 1);
+        format!("{line}\n{filler}")
+    }
+
     #[test]
     fn test_detect_pi_status_deep_footer_interrupt_hint() {
         // #3475: a pi derivative's busy line carries `esc to interrupt`
@@ -5190,10 +5197,7 @@ Tip: Set thinkingBudgets in settings.json to choose which models think.\n\
         // 10, the last line the window reaches, Idle at 11. The parked row
         // drops the busy line; its prose starts with an activity word
         // inside the widened hint window, arming the traps listed on the fixture.
-        let busy_at_depth = |depth: usize| {
-            let filler = "Footer filler line.\n".repeat(depth - 1);
-            format!("• Running eval (3m 19s • esc to interrupt)\n{filler}")
-        };
+        let busy_line = "• Running eval (3m 19s • esc to interrupt)";
         let cases = [
             (
                 "busy frame, hint at position 8",
@@ -5202,12 +5206,12 @@ Tip: Set thinkingBudgets in settings.json to choose which models think.\n\
             ),
             (
                 "busy frame aged to position 10",
-                busy_at_depth(10),
+                pane_with_line_at_depth(busy_line, 10),
                 Status::Running,
             ),
             (
                 "busy frame aged to position 11",
-                busy_at_depth(11),
+                pane_with_line_at_depth(busy_line, 11),
                 Status::Idle,
             ),
             (
@@ -5227,19 +5231,15 @@ Tip: Set thinkingBudgets in settings.json to choose which models think.\n\
         // window rows above: a spinner at position 6 still reads Running,
         // while activity prose starting at position 7 stays Idle, so a
         // silent drift of the constant to 5 or to 7 fails a row.
-        let signal_at_depth = |line: &str, depth: usize| {
-            let filler = "Footer filler line.\n".repeat(depth - 1);
-            format!("{line}\n{filler}")
-        };
         let cases = [
             (
                 "spinner at position 6, the last line the footer reaches",
-                signal_at_depth("⠋ Working...", 6),
+                pane_with_line_at_depth("⠋ Working...", 6),
                 Status::Running,
             ),
             (
                 "activity prose at position 7, past the footer",
-                signal_at_depth("Working through the eval matrix.", 7),
+                pane_with_line_at_depth("Working through the eval matrix.", 7),
                 Status::Idle,
             ),
         ];
