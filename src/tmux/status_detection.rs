@@ -5187,7 +5187,7 @@ Tip: Set thinkingBudgets in settings.json to choose which models think.\n\
         // the depth rows pin the window width itself, Running at position
         // 10, the last line the window reaches, Idle at 11. The parked row
         // drops the busy line; its prose starts with an activity word
-        // inside the widened band, arming the traps listed on the fixture.
+        // inside the widened hint window, arming the traps listed on the fixture.
         let busy_at_depth = |depth: usize| {
             let filler = "Footer filler line.\n".repeat(depth - 1);
             format!("• Running eval (3m 19s • esc to interrupt)\n{filler}")
