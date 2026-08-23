@@ -1,4 +1,5 @@
 import type { AgentInfo } from "../../../lib/types";
+import { resolveAgentLifecycle, type AgentLifecycleInfo } from "../../../lib/agentProfiles";
 
 interface WizardData {
   tool: string;
@@ -11,11 +12,27 @@ interface Props {
   agents: AgentInfo[];
 }
 
+/** One-line deprecation warning for a selected deprecated agent. Server
+ *  lifecycle wins when present; falls back to the static profile mirror so
+ *  the notice still renders against older daemons. */
+function lifecycleWarningText(name: string, lifecycle: AgentLifecycleInfo): string {
+  const replacement = lifecycle.replacement ? `; consider switching to ${lifecycle.replacement}` : "";
+  return `${name} is deprecated (since ${lifecycle.since ?? "unknown"}): ${lifecycle.note ?? ""}${replacement}`;
+}
+
 /** Always-visible essentials of the agent section: just the agent picker
  *  grid. The structured-view choice lives in `AgentOptions` under the More
  *  options fold (#2210). */
 export function AgentPickerEssentials({ data, onChange, agents }: Props) {
   const selectableAgents = agents.filter((agent) => agent.kind === "custom" || agent.installed);
+  // The daemon's /api/agents lifecycle wins; the static profile mirror
+  // covers older daemons and keys the server does not list.
+  const selected = agents.find((agent) => agent.name === data.tool);
+  const selectedLifecycle = selected?.lifecycle ?? resolveAgentLifecycle(selected?.name);
+  const selectedDeprecated =
+    selected && selectedLifecycle.state === "deprecated"
+      ? lifecycleWarningText(selected.name, selectedLifecycle)
+      : null;
 
   return (
     <div>
@@ -57,10 +74,25 @@ export function AgentPickerEssentials({ data, onChange, agents }: Props) {
                   Custom
                 </span>
               )}
+              {(agent.lifecycle ?? resolveAgentLifecycle(agent.name)).state === "deprecated" && (
+                <span
+                  className="rounded px-1.5 py-px text-[10px] font-mono uppercase tracking-wide bg-status-warning/15 text-status-warning"
+                  data-testid={`wizard-agent-deprecated-badge-${agent.name}`}
+                >
+                  Deprecated
+                </span>
+              )}
             </div>
           </button>
         ))}
       </div>
+
+      {/* Selected agent is deprecated: non-blocking notice under the grid. */}
+      {selectedDeprecated && (
+        <p className="mt-2 text-xs text-status-warning" data-testid="wizard-agent-deprecated-warning">
+          {selectedDeprecated}
+        </p>
+      )}
     </div>
   );
 }

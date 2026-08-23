@@ -1,4 +1,5 @@
 import type { RepoColor } from "./repoAppearance";
+import type { AgentLifecycleInfo } from "./agentProfiles";
 
 /** Session data returned by the API */
 export interface SessionResponse {
@@ -445,6 +446,11 @@ export interface AgentInfo {
   /** Registry args appended to `acp_command` (e.g. `["acp"]` for
    *  opencode, `["--acp"]` for gemini). Absent or empty when none. */
   acp_args?: string[];
+  /** Registry lifecycle state from /api/agents. Omitted for Active agents
+   *  (the common case), so fixtures and older servers read as active.
+   *  Mirrors `AgentLifecycle` in src/agents.rs; the static frontend mirror
+   *  lives in agentProfiles.ts (`resolveAgentLifecycle`). */
+  lifecycle?: AgentLifecycleInfo;
 }
 
 /** Profile info returned by /api/profiles */

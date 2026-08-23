@@ -14,7 +14,7 @@
 //   - the manual trigger swaps the copy and drops the codex preference.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { SwitchAgentModal } from "./SwitchAgentModal";
 
@@ -40,6 +40,7 @@ beforeEach(() => {
     },
     { name: "codex", description: "OpenAI Codex", command: "codex-acp" },
     { name: "opencode", description: "OpenCode", command: "opencode-acp" },
+    { name: "gemini", description: "Gemini CLI", command: "gemini" },
   ]);
   mockSwitch.mockResolvedValue({
     session_id: "s-1",
@@ -201,6 +202,14 @@ describe("SwitchAgentModal (rate_limit)", () => {
       /Continue in/.test(b.textContent ?? ""),
     );
     expect(confirm?.disabled).toBe(true);
+  });
+  it("marks deprecated registry targets next to their name", async () => {
+    // gemini is deprecated in the static profile mirror; the modal labels
+    // it so a rate-limit handoff does not silently steer into it.
+    const { findByTestId } = mount();
+    expect(await findByTestId("switch-agent-deprecated-gemini")).not.toBeNull();
+    expect(screen.queryByTestId("switch-agent-deprecated-claude")).toBeNull();
+    expect(screen.queryByTestId("switch-agent-deprecated-codex")).toBeNull();
   });
 });
 
