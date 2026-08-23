@@ -6960,6 +6960,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_capture_prime_agent_session_id_selects_newest_matching_cwd() {
         let tmp = tempfile::TempDir::new().unwrap();
         let sessions_dir = tmp.path().join("sessions");
@@ -6989,6 +6990,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn test_capture_prime_agent_session_id_launch_floor_excludes_stale_sessions() {
         let tmp = tempfile::TempDir::new().unwrap();
         let sessions_dir = tmp.path().join("sessions");
