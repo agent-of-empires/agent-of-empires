@@ -81,12 +81,19 @@ RUN npm install -g @qwen-code/qwen-code
 RUN curl -fsSL https://code.kimi.com/kimi-code/install.sh \
     | KIMI_INSTALL_DIR=/usr/local KIMI_NO_MODIFY_PATH=1 bash
 
-# Install Prime Agent (PrimeIntellect). The official installer detects the
-# missing TTY in docker build and proceeds without its interactive
-# confirmations; it needs npm (installed above) and lands the binary in
-# npm's global bin directory, which the /root/.prime/agent config mount
-# below does not shadow.
-RUN curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh
+# Install Prime Agent (PrimeIntellect). The installer is downloaded to a
+# file first so a failed fetch fails the build instead of piping an empty
+# script into sh, and `command -v` fails the build if no binary landed. The
+# installer itself SHA-256-verifies the release tarball it installs. It
+# detects the missing TTY in docker build and proceeds without its
+# interactive confirmations; it needs npm (installed above) and lands the
+# binary in npm's global bin directory, which the /root/.prime/agent config
+# mount below does not shadow.
+RUN curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh \
+        -o /tmp/install-prime-agent.sh \
+    && sh /tmp/install-prime-agent.sh \
+    && command -v prime-agent \
+    && rm /tmp/install-prime-agent.sh
 
 # Install ACP adapters used by `aoe`'s structured view mode when the session is
 # sandboxed. The structured view runner `docker exec`s these by their bare binary

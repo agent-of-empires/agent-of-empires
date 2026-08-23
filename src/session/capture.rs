@@ -2758,14 +2758,34 @@ struct PrimeAgentSession {
 /// whose `type` is not `session`, and headers missing `id`/`cwd` are skipped:
 /// a read-only poll races writers and must tolerate partial files.
 fn scan_prime_agent_sessions(sessions_dir: &Path) -> Vec<PrimeAgentSession> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
     let Ok(entries) = resilient_read_dir(sessions_dir) else {
         return Vec::new();
     };
     let mut sessions = Vec::new();
     for entry in entries.filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl")) {
-        let Ok(file) = std::fs::File::open(entry.path()) else {
+        // Guarded open, mirroring extract_pi_header_fields: O_NONBLOCK keeps
+        // a misnamed FIFO from blocking the poll on open, O_NOFOLLOW refuses
+        // symlinked entries, and only regular files are scanned.
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        #[cfg(not(unix))]
+        if std::fs::symlink_metadata(entry.path())
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let Ok(file) = options.open(entry.path()) else {
             continue;
         };
+        if !file.metadata().map(|m| m.is_file()).unwrap_or(false) {
+            continue;
+        }
         let mut first_line = String::new();
         let mut reader = std::io::BufReader::new(file);
         if (&mut reader)
@@ -2832,10 +2852,29 @@ fn select_prime_agent_session(
         .ok_or_else(|| anyhow::anyhow!("No Prime Agent session found matching project path"))
 }
 
+/// Resolve Prime Agent's session directory with the CLI's own env
+/// precedence: `PRIME_AGENT_SESSION_DIR`, then its legacy alias
+/// `PRIME_AGENT_CODING_AGENT_SESSION_DIR`, then `<coding agent
+/// home>/sessions`. The `--session-dir` flag and `settings.json.sessionDir`
+/// are invisible to this host-side scan (they are tracked separately).
+fn prime_agent_sessions_dir(coding_agent_home: &Path) -> PathBuf {
+    for var in [
+        "PRIME_AGENT_SESSION_DIR",
+        "PRIME_AGENT_CODING_AGENT_SESSION_DIR",
+    ] {
+        if let Ok(dir) = std::env::var(var) {
+            return PathBuf::from(dir);
+        }
+    }
+    coding_agent_home.join("sessions")
+}
+
 /// Capture a Prime Agent session ID for `project_path`.
 ///
-/// Reads the first line of every `<home>/sessions/*.jsonl` (the home resolves
-/// from `PRIME_AGENT_CODING_AGENT_DIR`, default `~/.prime/agent`) and returns
+/// Reads the first line of every JSONL file in Prime Agent's resolved
+/// session directory (`PRIME_AGENT_SESSION_DIR`, then the legacy alias,
+/// else `<home>/sessions` where the home resolves from
+/// `PRIME_AGENT_CODING_AGENT_DIR`, default `~/.prime/agent`) and returns
 /// the id of the newest session whose header `cwd` matches `project_path`,
 /// skipping any ids in `exclusion`. `launch_time_ms` gates live polling to
 /// sessions touched after this run started (`None` for retroactive recovery).
@@ -2846,7 +2885,7 @@ pub(crate) fn capture_prime_agent_session_id(
     launch_time_ms: Option<f64>,
 ) -> Result<String> {
     let home = resolve_agent_home(Some("PRIME_AGENT_CODING_AGENT_DIR"), ".prime/agent")?;
-    let sessions = scan_prime_agent_sessions(&home.join("sessions"));
+    let sessions = scan_prime_agent_sessions(&prime_agent_sessions_dir(&home));
     select_prime_agent_session(sessions, project_path, exclusion, launch_time_ms)
 }
 
@@ -6985,6 +7024,29 @@ mod tests {
         assert!(scan_prime_agent_sessions(&sessions_dir).is_empty());
     }
 
+    /// Unix-only: a FIFO named `*.jsonl` must be skipped without blocking
+    /// the scan, and a symlinked entry must not be followed. If this test
+    /// ever hangs, the guarded open regressed to plain `File::open`.
+    #[test]
+    #[cfg(unix)]
+    fn test_scan_prime_agent_sessions_skips_fifo_and_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir(&sessions_dir).unwrap();
+        let fifo = sessions_dir.join("fifo.jsonl");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        symlink(
+            tmp.path().join("elsewhere.jsonl"),
+            sessions_dir.join("link.jsonl"),
+        )
+        .unwrap();
+
+        assert!(scan_prime_agent_sessions(&sessions_dir).is_empty());
+    }
+
     #[test]
     #[serial]
     fn test_capture_prime_agent_session_id_selects_newest_matching_cwd() {
@@ -7035,6 +7097,50 @@ mod tests {
         assert_eq!(
             capture_prime_agent_session_id(&proj_path, &HashSet::new(), None).unwrap(),
             "id-stale"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_prime_agent_session_id_honors_session_dir_overrides() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // The default location holds a decoy that must be ignored whenever an
+        // override points elsewhere.
+        let default_sessions = tmp.path().join("sessions");
+        std::fs::create_dir(&default_sessions).unwrap();
+        write_prime_session(
+            &default_sessions,
+            "default.jsonl",
+            "id-default",
+            "/tmp/test",
+        );
+
+        let proj_path = "/tmp/test".to_string();
+        // Primary override wins over the default location.
+        let redirected = tmp.path().join("redirected");
+        std::fs::create_dir(&redirected).unwrap();
+        write_prime_session(&redirected, "seed.jsonl", "id-override", &proj_path);
+        let _primary = EnvGuard::set(&[
+            ("PRIME_AGENT_CODING_AGENT_DIR", tmp.path()),
+            ("PRIME_AGENT_SESSION_DIR", redirected.as_path()),
+        ]);
+        assert_eq!(
+            capture_prime_agent_session_id(&proj_path, &HashSet::new(), None).unwrap(),
+            "id-override"
+        );
+        drop(_primary);
+
+        // Legacy alias applies when the primary override is unset.
+        let legacy = tmp.path().join("legacy");
+        std::fs::create_dir(&legacy).unwrap();
+        write_prime_session(&legacy, "seed.jsonl", "id-legacy", &proj_path);
+        let _legacy = EnvGuard::set(&[
+            ("PRIME_AGENT_CODING_AGENT_DIR", tmp.path()),
+            ("PRIME_AGENT_CODING_AGENT_SESSION_DIR", legacy.as_path()),
+        ]);
+        assert_eq!(
+            capture_prime_agent_session_id(&proj_path, &HashSet::new(), None).unwrap(),
+            "id-legacy"
         );
     }
 }
