@@ -1884,9 +1884,7 @@ pub fn detect_pi_status(raw_content: &str) -> Status {
         return Status::Running;
     }
 
-    // The hint renders on the live busy line and vanishes with it, so unlike
-    // the signals above it can scan a deeper window without reopening the
-    // pinned-on-Running false positives (#3475).
+    // Why only this signal scans deeper: see `PI_INTERRUPT_HINT_WINDOW`.
     let hint_lower = tail_lines(&non_empty_lines, PI_INTERRUPT_HINT_WINDOW)
         .join("\n")
         .to_lowercase();
@@ -5152,10 +5150,11 @@ Tip: Set thinkingBudgets in settings.json to choose which models think.\n\
 
     /// The same omo frame after the turn ends: the busy line is removed and
     /// nothing else on the pane carries a running signal. The scrollback
-    /// prose deliberately STARTS with an activity word at position 8, so it
-    /// would fire if the activity-word scan ever moved to the widened hint
-    /// window; the row fails then instead of silently pinning idle
-    /// derivative sessions on Running.
+    /// prose deliberately STARTS with an activity word at position 8, which
+    /// arms two traps: the row fails if the activity-word scan moves to the
+    /// widened hint window, and it fails just the same if `PI_FOOTER_WINDOW`
+    /// widens far enough to reach the prose, instead of silently pinning
+    /// idle derivative sessions on Running.
     const OMO_DEEP_FOOTER_PARKED_PANE: &str = "\
 Working through the eval matrix, results streaming to the report.\n\
 Tip: Set thinkingBudgets in settings.json to choose which models think.\n\
@@ -5184,23 +5183,39 @@ Tip: Set thinkingBudgets in settings.json to choose which models think.\n\
     #[test]
     fn test_detect_pi_status_deep_footer_interrupt_hint() {
         // #3475: a pi derivative's busy line carries `esc to interrupt`
-        // beyond `PI_FOOTER_WINDOW`; the parked row is the same pane
-        // without that line, its scrollback prose carrying an activity word
-        // inside the widened window, and must stay Idle.
+        // beyond `PI_FOOTER_WINDOW`. The captured rows fix the omo shape;
+        // the depth rows pin the window width itself, Running at position
+        // 10, the last line the window reaches, Idle at 11. The parked row
+        // drops the busy line; its prose starts with an activity word
+        // inside the widened band, arming the traps listed on the fixture.
+        let busy_at_depth = |depth: usize| {
+            let filler = "Footer filler line.\n".repeat(depth - 1);
+            format!("• Running eval (3m 19s • esc to interrupt)\n{filler}")
+        };
         let cases = [
             (
                 "busy frame, hint at position 8",
-                OMO_DEEP_FOOTER_BUSY_PANE,
+                OMO_DEEP_FOOTER_BUSY_PANE.to_string(),
                 Status::Running,
             ),
             (
+                "busy frame aged to position 10",
+                busy_at_depth(10),
+                Status::Running,
+            ),
+            (
+                "busy frame aged to position 11",
+                busy_at_depth(11),
+                Status::Idle,
+            ),
+            (
                 "parked frame without the busy line",
-                OMO_DEEP_FOOTER_PARKED_PANE,
+                OMO_DEEP_FOOTER_PARKED_PANE.to_string(),
                 Status::Idle,
             ),
         ];
-        for (desc, pane, expected) in cases {
-            assert_eq!(detect_pi_status(pane), expected, "{desc}");
+        for (desc, pane, expected) in &cases {
+            assert_eq!(detect_pi_status(pane), *expected, "{desc}");
         }
     }
 
