@@ -3460,6 +3460,9 @@ mod tests {
             ("gemini", Some("skills")),
             ("opencode", Some("skills")),
             ("kimi", Some("skills")),
+            // Prime Agent reads ~/.prime/agent/skills, under its .prime/agent
+            // mount.
+            ("prime-agent", Some("skills")),
             // Codex reads ~/.agents/skills, which is not under its .codex mount.
             ("codex", None),
         ];

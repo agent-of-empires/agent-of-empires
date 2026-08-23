@@ -96,6 +96,14 @@ const SKILL_ROOTS: &[SkillRoot] = &[
         primary_agent: "kimi",
         legacy: true,
     },
+    SkillRoot {
+        id: "prime-agent-user",
+        label: "Prime Agent",
+        relative_path: ".prime/agent/skills",
+        consumers: &["prime-agent"],
+        primary_agent: "prime-agent",
+        legacy: false,
+    },
 ];
 
 pub fn skill_roots() -> &'static [SkillRoot] {

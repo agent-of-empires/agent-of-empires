@@ -7014,9 +7014,9 @@ mod tests {
             capture_prime_agent_session_id(&proj_path, &HashSet::new(), Some(f64::MAX / 2.0))
                 .is_err()
         );
-        assert!(
-            capture_prime_agent_session_id(&proj_path, &HashSet::new(), None).unwrap()
-                == "id-stale"
+        assert_eq!(
+            capture_prime_agent_session_id(&proj_path, &HashSet::new(), None).unwrap(),
+            "id-stale"
         );
     }
 }

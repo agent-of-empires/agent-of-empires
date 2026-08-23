@@ -11600,6 +11600,28 @@ mod tests {
     }
 
     #[test]
+    fn sandboxed_prime_agent_capture_and_poller_stay_host_only() {
+        // Both host-only dispatch points must decline before doing any work:
+        // retroactive capture would otherwise read the HOST sessions dir for
+        // a container session, and the poller would adopt a host peer's sid.
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.tool = "prime-agent".to_string();
+        inst.sandbox_info = Some(SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test-image".to_string(),
+            container_name: "test".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        });
+        assert_eq!(inst.try_retroactive_capture(), None);
+        inst.maybe_start_poller_since(None);
+        assert!(inst.session_id_poller.is_none());
+    }
+
+    #[test]
     fn fork_flags_for_codex_and_opencode() {
         // Codex: `fork <parent>` subcommand. child_id unused (codex mints its own).
         let codex = build_fork_flags("codex", "parent-id", "ignored-child");

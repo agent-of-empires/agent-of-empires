@@ -421,6 +421,38 @@ mod tests {
     }
 
     #[test]
+    fn defaults_spawn_commands_match_expected() {
+        // The structured view runner executes each spec's command+args
+        // verbatim; a typo'd or reordered argv only breaks at handshake time,
+        // so pin every default adapter's exact spawn contract here.
+        let reg = AgentRegistry::with_defaults();
+        let expected: &[(&str, &str, &[&str])] = &[
+            ("claude", "claude-agent-acp", &[]),
+            ("claude-code", "claude-agent-acp", &[]),
+            ("opencode", "opencode", &["acp"]),
+            ("gemini", "gemini", &["--acp"]),
+            ("codex", "codex-acp", &[]),
+            ("vibe", "vibe-acp", &[]),
+            ("pi", "pi-acp", &[]),
+            ("omp", "omp", &["acp"]),
+            ("kimi", "kimi", &["acp"]),
+            ("prime-agent", "prime-agent", &["--mode", "acp"]),
+            (
+                "aoe-agent",
+                "${aoe_data_dir}/acp-worker/dist/aoe-agent",
+                &[],
+            ),
+        ];
+        for (name, command, args) in expected {
+            let spec = reg
+                .get(name)
+                .unwrap_or_else(|| panic!("missing adapter {name}"));
+            assert_eq!(spec.command, *command, "{name} command drifted");
+            assert_eq!(spec.args, *args, "{name} args drifted");
+        }
+    }
+
+    #[test]
     fn inherited_acp_base_resolves_only_registry_backed_bases() {
         let mut detect_as = HashMap::new();
         // Wrapper inheriting a base that has an ACP adapter → resolves to base.

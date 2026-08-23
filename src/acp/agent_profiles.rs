@@ -257,6 +257,23 @@ pub const OMP: AgentProfile = AgentProfile {
     yolo_mode_id: None,
 };
 
+/// Kimi Code (Moonshot AI) via native `kimi acp`. Verified against the
+/// binary's `acp-adapter/src/modes.ts`: it advertises the canonical
+/// four-mode taxonomy (`default`, `plan`, `auto`, `yolo`), so `yolo` is
+/// the bypass-all-permissions mode. Its parent/child subagent linkage
+/// convention over ACP is unobserved, so indentation stays off. `/new`
+/// starts a fresh conversation.
+pub const KIMI: AgentProfile = AgentProfile {
+    key: "kimi",
+    parent_meta_namespaces: &[],
+    clear_aliases: &["/new"],
+    clear_requires_driven_reset: false,
+    supports_exit_plan_mode: false,
+    supports_wakeup_tools: false,
+    emits_heartbeat_keepalives: false,
+    yolo_mode_id: Some("yolo"),
+};
+
 /// PrimeIntellect Prime Agent via native `prime-agent --mode acp`. One ACP
 /// session per process is an upstream limit; a second `session/new` is
 /// refused rather than silently sharing state. Extensions (subagents,
@@ -274,23 +291,6 @@ pub const PRIME_AGENT: AgentProfile = AgentProfile {
     supports_wakeup_tools: false,
     emits_heartbeat_keepalives: false,
     yolo_mode_id: None,
-};
-
-/// Kimi Code (Moonshot AI) via native `kimi acp`. Verified against the
-/// binary's `acp-adapter/src/modes.ts`: it advertises the canonical
-/// four-mode taxonomy (`default`, `plan`, `auto`, `yolo`), so `yolo` is
-/// the bypass-all-permissions mode. Its parent/child subagent linkage
-/// convention over ACP is unobserved, so indentation stays off. `/new`
-/// starts a fresh conversation.
-pub const KIMI: AgentProfile = AgentProfile {
-    key: "kimi",
-    parent_meta_namespaces: &[],
-    clear_aliases: &["/new"],
-    clear_requires_driven_reset: false,
-    supports_exit_plan_mode: false,
-    supports_wakeup_tools: false,
-    emits_heartbeat_keepalives: false,
-    yolo_mode_id: Some("yolo"),
 };
 
 /// aoe's bundled multi-provider agent. Treated as Claude-equivalent
