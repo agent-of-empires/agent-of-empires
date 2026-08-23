@@ -281,16 +281,16 @@ export function clusterSpanAt(text: string, charIndex: number): [number, number]
   const glueAt = (k: number) =>
     k >= 0 && k < chars.length && (ZERO_WIDTH.test(chars[k]!) || EMOJI_TAIL.test(chars[k]!));
   while (glueAt(end)) end++;
-  const extendRi =
-    (REGIONAL_INDICATOR.test(chars[start] ?? "") && REGIONAL_INDICATOR.test(chars[start + 1] ?? "")) ||
-    (REGIONAL_INDICATOR.test(chars[start] ?? "") && REGIONAL_INDICATOR.test(chars[start - 1] ?? ""));
-  if (extendRi) {
-    if (!REGIONAL_INDICATOR.test(chars[start - 1] ?? "")) {
-      end = Math.max(end, start + 2);
-    } else {
-      start--;
-      end = Math.max(end, start + 2);
-    }
+  // Regional indicators pair on parity within their maximal run, so a
+  // cursor between two adjacent flags pairs with its own flag's half
+  // instead of straddling the boundary.
+  let runStart = start;
+  while (runStart > 0 && REGIONAL_INDICATOR.test(chars[runStart - 1] ?? "")) runStart--;
+  const onRi = REGIONAL_INDICATOR.test(chars[start] ?? "");
+  const oddInRun = (start - runStart) % 2 === 1;
+  if (onRi && (oddInRun || REGIONAL_INDICATOR.test(chars[start + 1] ?? ""))) {
+    if (oddInRun) start--;
+    end = Math.max(end, start + 2);
     // The pair may itself be followed by composition tails.
     while (glueAt(end)) end++;
   }

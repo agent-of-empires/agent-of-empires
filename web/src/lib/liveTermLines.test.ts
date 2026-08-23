@@ -326,7 +326,18 @@ describe("clusterSpanAt", () => {
   it("keeps tone tails and ZWJ chains inside the span", () => {
     expect(clusterSpanAt("\u{1F44D}\u{1F3FB}", 0)).toEqual([0, 2]);
     // a=0, man=1, ZWJ=2, woman=3, ZWJ=4, boy=5, b=6.
+
     expect(clusterSpanAt("a\u{1F468}\u200D\u{1F469}\u200D\u{1F466}b", 1)).toEqual([1, 6]);
     expect(clusterSpanAt("a\u{1F468}\u200D\u{1F469}\u200D\u{1F466}b", 6)).toEqual([6, 7]);
+  });
+
+  it("pairs adjacent flags on parity without crossing the boundary", () => {
+    // US DE: cursor on the leading half of the second flag must pair
+    // forward within its own flag, not backward across the pair boundary.
+    const twoFlags = "\u{1F1FA}\u{1F1F8}\u{1F1E9}\u{1F1EA}";
+    expect(clusterSpanAt(twoFlags, 0)).toEqual([0, 2]);
+    expect(clusterSpanAt(twoFlags, 1)).toEqual([0, 2]);
+    expect(clusterSpanAt(twoFlags, 2)).toEqual([2, 4]);
+    expect(clusterSpanAt(twoFlags, 3)).toEqual([2, 4]);
   });
 });
