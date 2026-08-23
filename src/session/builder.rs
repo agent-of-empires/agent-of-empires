@@ -758,6 +758,14 @@ pub fn build_instance(
         .filter(|a| a.set_default_command)
         .map(|a| a.binary.to_string())
         .unwrap_or_default();
+    if let Some(notice) =
+        crate::agents::get_agent(&params.tool).and_then(crate::agents::AgentDef::lifecycle_notice)
+    {
+        // Non-blocking: deprecated agents still launch; every support path
+        // is unchanged. The warning only informs.
+        tracing::warn!(target: "session.builder",
+            "spawning deprecated agent '{}': {notice}", params.tool);
+    }
     instance.worktree_info = worktree_info;
     instance.workspace_info = workspace_info;
     instance.yolo_mode = params.yolo_mode;
