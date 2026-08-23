@@ -1841,8 +1841,9 @@ const PI_FOOTER_WINDOW: usize = 6;
 /// widen only for this signal: rendered on the live busy line, the hint
 /// vanishes when the turn ends, unlike spinners and activity words, which
 /// linger in scrollback. Residual exposure: prose quoting the hint verbatim
-/// within ten lines of a parked pane still reads Running until newer output
-/// ages it out of the window.
+/// within ten non-empty lines of a parked pane still reads Running; live
+/// output eventually ages the quote out of the window, but a pane at rest
+/// holds it until its next turn starts.
 const PI_INTERRUPT_HINT_WINDOW: usize = 10;
 
 /// Pi coding agent status detection via tmux pane parsing.
