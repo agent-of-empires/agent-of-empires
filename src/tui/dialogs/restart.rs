@@ -17,7 +17,7 @@ use crate::session::profile_config::resolve_config_or_warn;
 use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::components::{
     handle_tool_config_key, profile_cycler_spans, render_tool_config_overlay,
-    tool_config_suffix_spans, tool_cycler_spans, ToolConfigOutcome,
+    tool_config_suffix_spans, tool_cycler_spans, tool_lifecycle_spans, ToolConfigOutcome,
 };
 use crate::tui::styles::Theme;
 
@@ -523,6 +523,7 @@ impl RestartDialog {
             self.is_tool_field(),
             theme,
         ));
+        spans.extend(tool_lifecycle_spans(value, theme));
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
