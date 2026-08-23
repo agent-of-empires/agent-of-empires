@@ -138,6 +138,11 @@ Nothing. Sessions are tmux sessions running in the background. Open and close `a
 
 Claude Code, OpenCode, Mistral Vibe, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi.dev, Oh My Pi (OMP), Factory Droid, Hermes, Kiro CLI, Qwen Code, and Kimi Code. AoE auto-detects which are installed on your system.
 
+Agents carry a lifecycle state in AoE's registry. When an upstream vendor
+deprecates a CLI, AoE keeps supporting it but marks it everywhere it appears
+(`aoe agents`, `aoe acp doctor`, session creation, the picker, and the web
+dashboard), so you always know before you launch one.
+
 ### Can I use AoE over SSH?
 
 Yes. AoE runs in your terminal and sessions persist across disconnects. If your mobile SSH client drops the connection, reconnect and `aoe` finds every session still running. See [mobile SSH clients](#using-aoe-with-mobile-ssh-clients-termius-blink-etc) for the one extra step needed on mobile.
