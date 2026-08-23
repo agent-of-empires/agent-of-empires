@@ -2286,6 +2286,12 @@ fn test_cli_acp_doctor_bundle_only_judged_by_pinned_copy() {
     let cases = [("0.65.0", "[OK] claude"), ("0.44.0", "[!! ] claude")];
     for (bundle_version, expected_mark) in cases {
         let mut h = TuiTestHarness::new("cli_acp_doctor_bundle_only");
+        // The host PATH must not decide this cell: a global adapter
+        // would route the listing through the PATH-present branch.
+        // Scrubbing it leaves only the pinned copy visible, which is
+        // exactly the bundle-only state under test; every invocation
+        // here uses absolute paths, so nothing else needs PATH.
+        h.set_env("PATH", "");
         seed_bundled_fixture(&h, bundle_version);
 
         let out = h.run_cli(&["acp", "doctor"]);
