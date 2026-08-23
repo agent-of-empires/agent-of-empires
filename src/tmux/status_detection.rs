@@ -286,7 +286,16 @@ fn has_claude_live_token_counter(content: &str) -> bool {
             }
             let tail = after[count_end..].trim_start();
             if let Some(after_tokens) = tail.strip_prefix("tokens") {
-                if after_tokens.trim_start().starts_with(')') {
+                // The live counter ends the spinner line, so only
+                // whitespace may follow the closing paren. Quoted literals
+                // (this repo's own test rows, docs) carry punctuation or
+                // quotes right after it; rejecting those keeps an echoed
+                // row from pinning a parked pane on Running.
+                let accepted = after_tokens
+                    .trim_start()
+                    .strip_prefix(')')
+                    .is_some_and(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace));
+                if accepted {
                     return true;
                 }
             }
@@ -2702,6 +2711,14 @@ enter to select · esc to cancel";
             ("integer with k", "(4s · ↓ 512k tokens)", true),
             ("decimal with m", "(4s · ↓ 1.2m tokens)", true),
             ("integer with g", "(4s · ↓ 3g tokens)", true),
+            ("two-digit fraction", "(4s · ↓ 1.23m tokens)", true),
+            // A narrow pane wraps the counter across lines; the scan hops
+            // the newline before `tokens`.
+            (
+                "wrapped across lines",
+                "✶ Summarizing the findings… (22m 8s · ↓ 44.7k\ntokens)",
+                true,
+            ),
             // The frozen strip's counters end the line without a closing
             // paren; that is what keeps them excluded.
             ("strip integer, no paren", "19s · ↓ 728 tokens", false),
@@ -2714,6 +2731,23 @@ enter to select · esc to cancel";
             // A dot with no digit after it must not be eaten as a fraction,
             // or `44.tokens)` would half-parse into a live counter.
             ("no digit after dot", "(4s · ↓ 44.tokens)", false),
+            // Only whitespace may follow the closing paren: a quoted
+            // literal row carries punctuation there and must stay
+            // rejected, echo or not.
+            ("punctuation after paren", "(4s · ↓ 7.0k tokens),", false),
+            ("quote after paren", "(4s · ↓ 88 tokens)\",", false),
+            // A decoy anchor inside footer text must not stop the scan
+            // from finding the real counter later in the window.
+            (
+                "decoy anchor then real counter",
+                "  ⏵⏵ bypass permissions on · ← for agents · ↓ to manage\n(4s · ↓ 88 tokens)",
+                true,
+            ),
+            // The anchor needs the duration's `s`; a bare arrow in prose is
+            // not a counter.
+            ("bare arrow in prose", "watch the ↓ 88 tokens) chart", false),
+            // Unobserved magnitude units stay out of the alphabet.
+            ("b suffix", "(4s · ↓ 512b tokens)", false),
         ];
         for (name, content, expected) in cases {
             assert_eq!(has_claude_live_token_counter(content), expected, "{name}");
