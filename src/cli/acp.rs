@@ -386,9 +386,54 @@ async fn run_doctor_version_issue(
     if !on_path && !bundle_installed {
         return None;
     }
+
+    // Bundle-only installs are invisible to a PATH probe: which::which
+    // cannot see the data dir, so the pinned copy itself decides. A
+    // floor bump can strand an older pin there, and spawn would run it
+    // unconditionally while validate() rejects its handshake (#3267).
+    if !on_path {
+        let strict = bundled_copy_strict_version(gate.binary).await;
+        let min = semver::Version::parse(gate.min_version);
+        if strict
+            .as_ref()
+            .is_some_and(|found| min.as_ref().is_ok_and(|min| found >= min))
+        {
+            return None;
+        }
+        let reason = match (strict, min) {
+            (Some(found), Ok(min)) => {
+                format!("installed {found} (aoe's pinned copy); requires >={min}")
+            }
+            (_, _) => {
+                format!(
+                    "the bundled copy did not report a usable version; requires >={}",
+                    gate.min_version
+                )
+            }
+        };
+        return Some(AgentVersionIssue {
+            reason,
+            install_command: gate.install_command.to_string(),
+        });
+    }
+
     let probe = crate::acp::version_probe::probe_binary_version(gate.binary).await;
     let bundle_ok = bundle_installed && bundled_copy_meets_floor(gate).await;
     doctor_version_issue(gate, &probe, bundle_ok)
+}
+
+/// Strict stdout semver of the installed pinned copy, probed at its
+/// resolved data-dir path (`which::which` cannot see it there).
+#[cfg(feature = "serve")]
+async fn bundled_copy_strict_version(binary: &str) -> Option<semver::Version> {
+    let app_dir = crate::session::get_app_dir().ok()?;
+    let path = crate::acp::adapters::bundled_adapter_bin(&app_dir, binary)?;
+    match crate::acp::version_probe::probe_path_version(&path).await {
+        crate::acp::version_probe::ProbeStatus::Version { stdout_raw, .. } => {
+            crate::acp::version_probe::whitespace_token_semver(&stdout_raw)
+        }
+        _ => None,
+    }
 }
 
 /// True when the installed pinned copy's own `--version` parses, on the
@@ -1352,10 +1397,11 @@ mod tests {
     }
 
     /// The listing borrows `--fix`'s verdicts verbatim and adds only the
-    /// bundle-awareness the spawn resolver acts on: a pinned bundled
-    /// copy satisfies the floor even when the PATH copy is stale or
-    /// absent, and absence with nothing installed stays the presence
-    /// check's report instead of a second complaint.
+    /// bundle-awareness the spawn resolver acts on: a floor-COMPLIANT
+    /// pinned bundled copy satisfies the gate even when the PATH copy is
+    /// stale, and absence stays the presence check's report instead of a
+    /// second complaint. Bundle-only installs never reach this function:
+    /// the runner judges them from the pinned copy itself.
     #[cfg(feature = "serve")]
     #[test]
     fn doctor_version_issue_verdicts() {
@@ -1409,7 +1455,9 @@ mod tests {
                 true,
                 true,
             ),
-            // Absence is reported by the presence branch either way.
+            // Absence is reported by the presence branch either way;
+            // with a compliant bundle the runner's bundle-only branch
+            // owns that cell, so Missing itself never flags here.
             ("missing_but_bundled", ProbeStatus::Missing, true, false),
             ("absent_unbundled", ProbeStatus::Missing, false, false),
             // Unprobeable copies cannot prove compatibility, with or

@@ -2273,3 +2273,23 @@ fn test_cli_acp_doctor_stale_bundle_keeps_flagging() {
     assert!(stdout.contains("[!! ] claude"), "{stdout}");
     assert!(!stdout.contains("[OK] claude"), "{stdout}");
 }
+
+/// Bundle-ONLY installs (nothing on PATH) are invisible to the PATH
+/// probe, so the pinned copy itself decides the verdict: compliant
+/// reads `[OK]`, stale reads `[!! ]` naming the bundled version. This
+/// is the stranded-pin cell after a floor bump.
+#[cfg(feature = "serve")]
+#[test]
+#[parallel]
+fn test_cli_acp_doctor_bundle_only_judged_by_pinned_copy() {
+    // (bundled fixture version, expected mark)
+    let cases = [("0.65.0", "[OK] claude"), ("0.44.0", "[!! ] claude")];
+    for (bundle_version, expected_mark) in cases {
+        let mut h = TuiTestHarness::new("cli_acp_doctor_bundle_only");
+        seed_bundled_fixture(&h, bundle_version);
+
+        let out = h.run_cli(&["acp", "doctor"]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(stdout.contains(expected_mark), "{bundle_version}: {stdout}");
+    }
+}
