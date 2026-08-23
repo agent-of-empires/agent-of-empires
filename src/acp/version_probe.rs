@@ -94,17 +94,31 @@ pub fn extract_semver(raw: &str) -> Option<Version> {
 /// what spawn will do must ask this exact predicate instead of reusing
 /// the lenient parse.
 pub fn whitespace_token_below_floor(raw: &str, min: Version) -> bool {
+    whitespace_token_semver(raw).is_some_and(|found| found < min)
+}
+
+/// The strict token itself, for callers that need to compare against a
+/// floor in either direction (spawn keeps the PATH copy when this is
+/// `None`, and a pinned bundle only counts as backing when its own
+/// stdout parses at or above the floor).
+pub fn whitespace_token_semver(raw: &str) -> Option<Version> {
     raw.split_whitespace()
         .filter_map(|tok| Version::parse(tok.trim_start_matches('v')).ok())
         .next()
-        .is_some_and(|found| found < min)
 }
 
 pub async fn probe_binary_version(binary: &str) -> ProbeStatus {
-    let Ok(path) = which::which(binary) else {
-        return ProbeStatus::Missing;
-    };
-    let child = tokio::process::Command::new(&path)
+    match which::which(binary) {
+        Ok(path) => probe_path_version(&path).await,
+        Err(_) => ProbeStatus::Missing,
+    }
+}
+
+/// Probe an explicit executable path. Same budget and stream handling
+/// as [`probe_binary_version`], for callers that resolved the binary
+/// themselves (the pinned bundled copies never sit on PATH).
+pub async fn probe_path_version(path: &std::path::Path) -> ProbeStatus {
+    let child = tokio::process::Command::new(path)
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())

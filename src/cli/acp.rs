@@ -239,7 +239,7 @@ struct AgentDoctorEntry {
 
 /// A version-gate finding for one configured agent: the remediation is
 /// the same `install_command` the startup error carries.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize)]
 struct AgentVersionIssue {
     reason: String,
     install_command: String,
@@ -310,17 +310,20 @@ fn skip_gate_check(binary: &str, on_path: bool) -> bool {
 
 /// Version-gate finding for one configured agent, the listing-side twin
 /// of `doctor_fix_action`: same verdicts, plus the one distinction the
-/// plain listing needs that `--fix` does not. Only a PATH copy whose
-/// version parses below the floor is backed by a pinned bundled copy,
-/// because that is the only case `path_copy_below_floor` proves at spawn
-/// (see #1017); an unparseable or failed probe keeps the PATH copy at
-/// spawn, so it stays flagged here. Absence with nothing installed stays
-/// the presence check's report; probing cannot sharpen it.
+/// plain listing needs that `--fix` does not. The `bundle_ok` flag
+/// means a pinned bundled copy exists AND provably satisfies the floor
+/// (existence alone is not compliance: a floor bump can strand an older
+/// pin in the data dir). Only a PATH copy whose version parses below
+/// the floor is backed by such a bundle, because that is the only case
+/// `path_copy_below_floor` proves at spawn (see #1017); an unparseable
+/// or failed probe keeps the PATH copy at spawn, so it stays flagged
+/// here. Absence with nothing installed stays the presence check's
+/// report; probing cannot sharpen it.
 #[cfg(feature = "serve")]
 fn doctor_version_issue(
     gate: &crate::acp::agent_compat::VersionGate,
     probe: &crate::acp::version_probe::ProbeStatus,
-    bundle_installed: bool,
+    bundle_ok: bool,
 ) -> Option<AgentVersionIssue> {
     use crate::acp::version_probe::ProbeStatus;
     if matches!(probe, ProbeStatus::Missing) {
@@ -348,7 +351,7 @@ fn doctor_version_issue(
                 // below-floor either, so it keeps the PATH copy.
                 _ => false,
             };
-            if bundle_installed && bundle_backs_spawn {
+            if bundle_ok && bundle_backs_spawn {
                 return None;
             }
             Some(AgentVersionIssue {
@@ -371,9 +374,9 @@ fn bundled_copy_installed(binary: &str) -> bool {
 
 /// Resolve whether `gate`'s adapter would miss its version floor at
 /// spawn time: probe the PATH copy (the one `--fix`'s gate loop checks)
-/// and account for a bundled copy that backs it. Skips the probe
-/// subprocess entirely when nothing usable is installed; the presence
-/// branch already reports that.
+/// and credit the pinned bundle only when its own copy provably meets
+/// the floor. Skips the probe subprocess entirely when nothing usable
+/// is installed; the presence branch already reports that.
 #[cfg(feature = "serve")]
 async fn run_doctor_version_issue(
     gate: &crate::acp::agent_compat::VersionGate,
@@ -384,7 +387,32 @@ async fn run_doctor_version_issue(
         return None;
     }
     let probe = crate::acp::version_probe::probe_binary_version(gate.binary).await;
-    doctor_version_issue(gate, &probe, bundle_installed)
+    let bundle_ok = bundle_installed && bundled_copy_meets_floor(gate).await;
+    doctor_version_issue(gate, &probe, bundle_ok)
+}
+
+/// True when the installed pinned copy's own `--version` parses, on the
+/// strict stdout stream, at or above the floor. A floor bump can strand
+/// an older pin in the data dir; crediting it would reproduce #3267
+/// behind a green doctor, since spawn prefers it whenever the PATH copy
+/// looks stale and validate() then rejects the handshake.
+#[cfg(feature = "serve")]
+async fn bundled_copy_meets_floor(gate: &crate::acp::agent_compat::VersionGate) -> bool {
+    let Some(path) = crate::session::get_app_dir()
+        .ok()
+        .and_then(|app_dir| crate::acp::adapters::bundled_adapter_bin(&app_dir, gate.binary))
+    else {
+        return false;
+    };
+    match crate::acp::version_probe::probe_path_version(&path).await {
+        crate::acp::version_probe::ProbeStatus::Version { stdout_raw, .. } => {
+            semver::Version::parse(gate.min_version).is_ok_and(|min| {
+                crate::acp::version_probe::whitespace_token_semver(stdout_raw.as_str())
+                    .is_some_and(|found| found >= min)
+            })
+        }
+        _ => false,
+    }
 }
 
 #[cfg(feature = "serve")]
@@ -1338,7 +1366,8 @@ mod tests {
             parsed: semver::Version::parse(v).unwrap(),
             stdout_raw: v.to_string(),
         };
-        // (label, probe, bundle_installed, expect_issue)
+        // (label, probe, bundle_ok: a pinned copy exists AND provably
+        // meets the floor, expect_issue)
         let cases: Vec<(&str, ProbeStatus, bool, bool)> = vec![
             // At-floor and above satisfy the gate; no false positive.
             (
