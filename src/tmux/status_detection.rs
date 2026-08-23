@@ -252,23 +252,39 @@ fn claude_pane_has_running_signal(
 /// counters (`1m 14s · ↓ 40.4k tokens`) and stays on screen, frozen at its
 /// final values, after the agent completes and the session is fully idle.
 /// Matching it would pin a parked session on Running (the bug #2909 fixed),
-/// so two structural requirements exclude it: the count must be a plain
-/// integer (no `40.4k` decimal/suffix forms) and `tokens` must be followed by
-/// the counter's closing paren, which strip rows never have.
+/// so the count must be numeric and `tokens` must be followed by the
+/// counter's closing paren, which strip rows never have. The paren is the
+/// requirement that excludes the strip, so the count itself may take
+/// Claude's abbreviated forms (`44.7k`, `1.2m`); the earlier plain-integer
+/// rule rejected those and left long turns reading Idle (#3440).
 fn has_claude_live_token_counter(content: &str) -> bool {
     let mut search = content;
     while let Some(pos) = search.find("s · ↓") {
         let after = search[pos + "s · ↓".len()..].trim_start();
-        let mut digits_end = 0;
-        for (i, c) in after.char_indices() {
-            if c.is_ascii_digit() {
-                digits_end = i + c.len_utf8();
-            } else {
-                break;
+        let bytes = after.as_bytes();
+        let mut count_end = bytes
+            .iter()
+            .position(|b| !b.is_ascii_digit())
+            .unwrap_or(bytes.len());
+        if count_end > 0 {
+            // Optional single fractional part (`44.7`), consumed only when a
+            // digit follows the dot so `44.tokens` does not half-parse.
+            if bytes.get(count_end) == Some(&b'.')
+                && bytes.get(count_end + 1).is_some_and(|b| b.is_ascii_digit())
+            {
+                count_end += 1;
+                count_end += bytes[count_end..]
+                    .iter()
+                    .position(|b| !b.is_ascii_digit())
+                    .unwrap_or(bytes.len() - count_end);
             }
-        }
-        if digits_end > 0 {
-            let tail = after[digits_end..].trim_start();
+            // Optional magnitude suffix (`512k`, `1.2m`, `3g`), lowercase
+            // only: every captured rendering is lowercase, and prose echoes
+            // more readily carry an uppercase unit.
+            if matches!(bytes.get(count_end), Some(b'k' | b'm' | b'g')) {
+                count_end += 1;
+            }
+            let tail = after[count_end..].trim_start();
             if let Some(after_tokens) = tail.strip_prefix("tokens") {
                 if after_tokens.trim_start().starts_with(')') {
                     return true;
@@ -2633,6 +2649,59 @@ enter to select · esc to cancel";
             detect_claude_status("● Cooking… (12s · ↓ 1234 tokens)"),
             Status::Running
         );
+    }
+
+    #[test]
+    fn test_detect_claude_status_running_on_abbreviated_token_counter() {
+        // Claude abbreviates the live count once a turn runs long
+        // (`↓ 44.7k tokens`); the spinner line's ellipsis can sit past the
+        // second word, so the counter is that pane's only running signal.
+        // Captured from #3440.
+        let long_turn_pane = "\
+● Clippy clean on both; waiting on the base-commit control.\n\
+  Ran 2 shell commands\n\
+✻ Judging #3413 feedback… (22m 8s · ↓ 44.7k tokens)\n\
+┌─────\n\
+❯\n\
+└─────\n\
+  ⏵⏵ auto mode on";
+        let cases = [
+            ("issue pane", long_turn_pane),
+            ("k suffix", "✶ Working… (53s · ↓ 7.0k tokens)"),
+            ("m suffix", "✶ Working… (4s · ↓ 1.2m tokens)"),
+            ("g suffix", "✶ Working… (4s · ↓ 3g tokens)"),
+            ("integer k, no decimal", "✶ Working… (4s · ↓ 512k tokens)"),
+        ];
+        for (name, pane) in cases {
+            assert_eq!(detect_claude_status(pane), Status::Running, "{name}");
+        }
+    }
+
+    #[test]
+    fn test_has_claude_live_token_counter_variants() {
+        // Accepts every count form Claude renders inside the parenthesized
+        // live counter; rejects the unparenthesized frozen agents-strip
+        // counters (#2909) and malformed echoes.
+        let cases = [
+            ("plain integer", "(4s · ↓ 88 tokens)", true),
+            ("multi-digit", "(12s · ↓ 1234 tokens)", true),
+            ("decimal with k", "(53s · ↓ 7.0k tokens)", true),
+            ("integer with k", "(4s · ↓ 512k tokens)", true),
+            ("decimal with m", "(4s · ↓ 1.2m tokens)", true),
+            ("integer with g", "(4s · ↓ 3g tokens)", true),
+            // The frozen strip's counters end the line without a closing
+            // paren; that is what keeps them excluded.
+            ("strip integer, no paren", "19s · ↓ 728 tokens", false),
+            ("strip k, no paren", "1m 14s · ↓ 40.4k tokens", false),
+            ("no count", "(4s · ↓ tokens)", false),
+            ("comma separator", "(4s · ↓ 12,345 tokens)", false),
+            ("uppercase suffix", "(4s · ↓ 44.7K tokens)", false),
+            ("non-digit count", "(4s · ↓ many tokens)", false),
+            ("double dot", "(4s · ↓ 44..7k tokens)", false),
+        ];
+        for (name, content, expected) in cases {
+            assert_eq!(has_claude_live_token_counter(content), expected, "{name}");
+        }
     }
 
     #[test]
