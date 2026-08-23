@@ -443,21 +443,8 @@ async fn bundled_copy_strict_version(binary: &str) -> Option<semver::Version> {
 /// looks stale and validate() then rejects the handshake.
 #[cfg(feature = "serve")]
 async fn bundled_copy_meets_floor(gate: &crate::acp::agent_compat::VersionGate) -> bool {
-    let Some(path) = crate::session::get_app_dir()
-        .ok()
-        .and_then(|app_dir| crate::acp::adapters::bundled_adapter_bin(&app_dir, gate.binary))
-    else {
-        return false;
-    };
-    match crate::acp::version_probe::probe_path_version(&path).await {
-        crate::acp::version_probe::ProbeStatus::Version { stdout_raw, .. } => {
-            semver::Version::parse(gate.min_version).is_ok_and(|min| {
-                crate::acp::version_probe::whitespace_token_semver(stdout_raw.as_str())
-                    .is_some_and(|found| found >= min)
-            })
-        }
-        _ => false,
-    }
+    let found = bundled_copy_strict_version(gate.binary).await;
+    semver::Version::parse(gate.min_version).is_ok_and(|min| found.is_some_and(|v| v >= min))
 }
 
 #[cfg(feature = "serve")]
