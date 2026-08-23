@@ -466,10 +466,17 @@ mod tests {
         let mut pinned = Instance::new("z", "/repo");
         pinned.pinned_at = Some(now);
 
+        // pin() and snooze() clear each other's marker, but peer store
+        // writes bypass the mutators, so a row can carry both at once
+        // and neither key may suppress the other.
+        let mut both = Instance::new("z", "/repo");
+        both.pinned_at = Some(now);
+        both.snoozed_until = Some(future);
+
         // archive() clears a concurrent snooze through the mutators, but
-        // the store can still hold both (restore from trash preserves the
-        // sibling timestamps, older rows carry stale deadlines): the keys
-        // must stay independent of the bucket tag.
+        // snooze() leaves archived_at alone, so archiving a row and then
+        // snoozing it persists the pair through ordinary CLI commands:
+        // the keys must stay independent of the bucket tag.
         let mut sunk = Instance::new("z", "/repo");
         sunk.archived_at = Some(now);
         sunk.snoozed_until = Some(future);
@@ -482,6 +489,7 @@ mod tests {
             ("pinned", &pinned, false, true, "live"),
             ("plain row", &plain, false, false, "live"),
             ("snoozed and archived", &sunk, true, false, "archived"),
+            ("pinned and snoozed", &both, true, true, "live"),
         ];
         for (label, inst, want_snooze, want_pin, want_state) in cases {
             let value = serde_json::to_value(session_json(inst, "p")).unwrap();
