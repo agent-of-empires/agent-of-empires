@@ -1528,6 +1528,9 @@ fn resolve_tool_for_add(args: &AddArgs, config: &crate::session::Config) -> Resu
                             agent_def.install_hint
                         );
                     }
+                    if let Some(notice) = agent_def.lifecycle_notice() {
+                        eprintln!("Warning: {tool_name} is {notice}");
+                    }
                 }
             }
         }
@@ -1640,6 +1643,9 @@ fn resolve_named_tool(tool: &str, config: &crate::session::Config) -> Result<Nam
                     agent_def.binary,
                     agent_def.install_hint
                 );
+            }
+            if let Some(notice) = agent_def.lifecycle_notice() {
+                eprintln!("Warning: {tool_name} is {notice}");
             }
         }
         return Ok(NamedToolSelection::BuiltIn(tool_name.to_string()));

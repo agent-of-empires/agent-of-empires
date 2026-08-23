@@ -229,6 +229,18 @@ struct AgentDoctorEntry {
     name: String,
     command_present: bool,
     description: String,
+    /// Registry lifecycle state; omitted while Active so existing JSON
+    /// consumers see no change for supported agents.
+    #[serde(skip_serializing_if = "crate::agents::AgentLifecycle::is_active")]
+    lifecycle: crate::agents::AgentLifecycle,
+}
+
+/// Registry lifecycle state for an ACP registry key. Falls back to Active
+/// for registry entries with no `AGENTS` counterpart.
+fn registry_lifecycle(name: &str) -> crate::agents::AgentLifecycle {
+    crate::agents::get_agent(name)
+        .map(|def| def.lifecycle)
+        .unwrap_or(crate::agents::AgentLifecycle::Active)
 }
 
 #[cfg(feature = "serve")]
@@ -438,6 +450,7 @@ async fn doctor(json: bool, fix: bool, adapter: Vec<String>, all_adapters: bool)
         .list()
         .into_iter()
         .map(|(name, spec)| AgentDoctorEntry {
+            lifecycle: registry_lifecycle(&name),
             name: name.clone(),
             command_present: command_present(&spec.command),
             description: spec.description.clone(),
@@ -496,6 +509,9 @@ async fn doctor(json: bool, fix: bool, adapter: Vec<String>, all_adapters: bool)
             "[!! ]"
         };
         println!("{} {}  ({})", mark, entry.name, entry.description);
+        if let crate::agents::AgentLifecycle::Deprecated { .. } = entry.lifecycle {
+            println!("    ⚠ {}", entry.lifecycle);
+        }
         if !entry.command_present {
             // Look up the binary name via the registry so we can
             // print a tailored install hint instead of generic
@@ -587,6 +603,9 @@ fn agents() -> Result<()> {
         let present = command_present(&spec.command);
         let mark = if present { "[OK]" } else { "[!! ]" };
         println!("{} {:<14}  {}", mark, name, spec.description);
+        if let crate::agents::AgentLifecycle::Deprecated { .. } = registry_lifecycle(&name) {
+            println!("        ⚠ {}", registry_lifecycle(&name));
+        }
         let args = if spec.args.is_empty() {
             String::new()
         } else {
@@ -1053,6 +1072,44 @@ mod tests {
         assert_eq!(parse_node_major("v20.0.0"), Some(20));
         assert_eq!(parse_node_major("18.17.1"), Some(18));
         assert_eq!(parse_node_major("not a version"), None);
+    }
+
+    #[test]
+    fn registry_lifecycle_mirrors_agents_registry() {
+        // (registry key, expected active). gemini is the only deprecated
+        // entry; keys with no AGENTS counterpart fall back to Active.
+        let cases = [
+            ("gemini", false),
+            ("claude", true),
+            ("codex", true),
+            ("opencode", true),
+            ("no-such-adapter", true),
+        ];
+        for (key, active) in cases {
+            assert_eq!(registry_lifecycle(key).is_active(), active, "{key}");
+        }
+    }
+
+    #[test]
+    fn doctor_entry_json_omits_active_lifecycle() {
+        let active = AgentDoctorEntry {
+            name: "claude".to_string(),
+            command_present: true,
+            description: "claude adapter".to_string(),
+            lifecycle: registry_lifecycle("claude"),
+        };
+        let value = serde_json::to_value(&active).unwrap();
+        assert!(value.get("lifecycle").is_none(), "{value}");
+
+        let deprecated = AgentDoctorEntry {
+            name: "gemini".to_string(),
+            command_present: false,
+            description: "gemini adapter".to_string(),
+            lifecycle: registry_lifecycle("gemini"),
+        };
+        let value = serde_json::to_value(&deprecated).unwrap();
+        assert_eq!(value["lifecycle"]["replacement"], "antigravity", "{value}");
+        assert_eq!(value["lifecycle"]["since"], "2026-06-18", "{value}");
     }
 
     #[cfg(feature = "serve")]

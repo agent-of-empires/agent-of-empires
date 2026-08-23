@@ -22,6 +22,9 @@ pub fn run() -> Result<()> {
                 agent.name, agent.install_hint
             );
         }
+        if let Some(notice) = agent.lifecycle_notice() {
+            println!("      \x1b[33m⚠ {}\x1b[0m", notice);
+        }
     }
 
     let installed_count = crate::agents::AGENTS
