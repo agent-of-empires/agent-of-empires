@@ -173,6 +173,61 @@ export function findCursorCharIndex(text: string, col: number): number | null {
   return null;
 }
 
+/** One renderable piece of a row. Consecutive printable ASCII flows
+ *  naturally (`fixed: false`, the configured monospace font is trusted for
+ *  the only range where every plausible fallback agrees), everything else
+ *  becomes its own explicitly sized box: CJK, braille, powerline PUA, emoji,
+ *  box drawing, combining clusters. A glyph missing from the configured font
+ *  falls back to a font whose advance is not 1 cell, and without the box
+ *  every later column on the row shifts (#3342); with it, a row of N cells
+ *  lays out N x cellWidth regardless of which font supplied each glyph. */
+export interface CellRun {
+  text: string;
+  /** Terminal cells this run occupies (zero-width marks add none). */
+  cells: number;
+  /** Render inside an explicit `cells x cellWidth` box. */
+  fixed: boolean;
+}
+
+const ASCII_CHAR = /^[\x20-\x7E]$/;
+
+/** Split one line's text into runs of like rendering risk. Zero-width
+ *  characters glue onto the preceding run (marks must stay with their base
+ *  or browsers draw a dotted-circle placeholder); a run opening the line
+ *  holds them until a base arrives. Each non-ASCII cluster is isolated so
+ *  exactly one box absorbs any fallback-advance error. */
+export function splitCellRuns(text: string): CellRun[] {
+  const runs: CellRun[] = [];
+  let flow = "";
+  const flushFlow = () => {
+    if (flow) {
+      runs.push({ text: flow, cells: textWidth(flow), fixed: false });
+      flow = "";
+    }
+  };
+  const chars = [...text];
+  let i = 0;
+  while (i < chars.length) {
+    const ch = chars[i]!;
+    if (ASCII_CHAR.test(ch)) {
+      flow += ch;
+    } else if (ZERO_WIDTH.test(ch)) {
+      const last = runs[runs.length - 1];
+      if (last && !flow) last.text += ch;
+      else flow += ch;
+    } else {
+      flushFlow();
+      // Base glyph plus its own trailing zero-width marks form one cluster.
+      let cluster = ch;
+      while (i + 1 < chars.length && ZERO_WIDTH.test(chars[i + 1]!)) cluster += chars[++i]!;
+      runs.push({ text: cluster, cells: cellWidth(ch), fixed: true });
+    }
+    i++;
+  }
+  flushFlow();
+  return runs;
+}
+
 /** Hard-wrap one styled line at `cols` terminal cells, preserving
  *  segment styles across the breaks. Lines at or under the limit return
  *  a single visual row (the normal case: the pane is sized to the

@@ -1,6 +1,15 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
-import { LineParseCache, ansiToLines, findCursorCharIndex, lineText, splitUrls, wrapLine } from "./liveTermLines";
+import {
+  LineParseCache,
+  ansiToLines,
+  findCursorCharIndex,
+  lineText,
+  splitCellRuns,
+  splitUrls,
+  textWidth,
+  wrapLine,
+} from "./liveTermLines";
 
 describe("ansiToLines", () => {
   it("splits plain text into lines and drops the capture trailing terminator", () => {
@@ -217,5 +226,38 @@ describe("LineParseCache", () => {
     // Re-parsed after eviction: equal content, fresh identity.
     expect(b[0]).toEqual(a[0]);
     expect(b[0]).not.toBe(a[0]);
+  });
+});
+
+describe("splitCellRuns", () => {
+  it("keeps printable ASCII as flowing runs and isolates risky glyphs as fixed boxes", () => {
+    // The #3342 fixture: ASCII prompt, CJK, braille spinner, powerline PUA.
+    const runs = splitCellRuns("$ ok 한글 ⠋⠙ \u{E0B0}");
+    expect(runs.map((r) => r.fixed)).toEqual([false, true, true, false, true, true, false, true]);
+    expect(runs.filter((r) => r.fixed).map((r) => r.text)).toEqual(["한", "글", "⠋", "⠙", "\u{E0B0}"]);
+    expect(runs.filter((r) => r.fixed).map((r) => r.cells)).toEqual([2, 2, 1, 1, 1]);
+  });
+
+  it("returns a single flowing run for pure-ASCII text", () => {
+    expect(splitCellRuns("$ ls --color")).toEqual([{ text: "$ ls --color", cells: 12, fixed: false }]);
+  });
+
+  it("preserves the row invariant sum(cells) == textWidth on mixed lines", () => {
+    const cases = ["$ ready", "가각ᅟ⠋⠙", "\u{E0B0}\u{E0B2} powerline", "e\u0301glue", "emoji \u{1F600} done"];
+    for (const line of cases) {
+      const runs = splitCellRuns(line);
+      expect(runs.reduce((n, r) => n + r.cells, 0)).toBe(textWidth(line), line);
+      expect(runs.map((r) => r.text).join("")).toBe(line);
+    }
+  });
+
+  it("glues zero-width marks onto the preceding cluster, not into new boxes", () => {
+    // Combining acute on 'e' stays in the flow run; a ZWJ after a wide char
+    // widens no cell.
+    expect(splitCellRuns("cafe\u0301")).toEqual([{ text: "cafe\u0301", cells: 4, fixed: false }]);
+    expect(splitCellRuns("한\u200dB")).toEqual([
+      { text: "한\u200d", cells: 2, fixed: true },
+      { text: "B", cells: 1, fixed: false },
+    ]);
   });
 });
