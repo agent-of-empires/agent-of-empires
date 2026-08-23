@@ -5222,6 +5222,33 @@ Tip: Set thinkingBudgets in settings.json to choose which models think.\n\
     }
 
     #[test]
+    fn test_detect_pi_status_footer_window_bounds() {
+        // Pins `PI_FOOTER_WINDOW` at one line of granularity, like the hint
+        // window rows above: a spinner at position 6 still reads Running,
+        // while activity prose starting at position 7 stays Idle, so a
+        // silent drift of the constant to 5 or to 7 fails a row.
+        let signal_at_depth = |line: &str, depth: usize| {
+            let filler = "Footer filler line.\n".repeat(depth - 1);
+            format!("{line}\n{filler}")
+        };
+        let cases = [
+            (
+                "spinner at position 6, the last line the footer reaches",
+                signal_at_depth("⠋ Working...", 6),
+                Status::Running,
+            ),
+            (
+                "activity prose at position 7, past the footer",
+                signal_at_depth("Working through the eval matrix.", 7),
+                Status::Idle,
+            ),
+        ];
+        for (desc, pane, expected) in &cases {
+            assert_eq!(detect_pi_status(pane), *expected, "{desc}");
+        }
+    }
+
+    #[test]
     fn test_detect_omp_status_running() {
         let pane = "Reply with OK only.\n\
                     ⠋ Working… ⟦esc⟧\n\
