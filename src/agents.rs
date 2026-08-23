@@ -1250,6 +1250,9 @@ pub const AGENTS: &[AgentDef] = &[
         set_default_command: false,
         detect_status: status_detection::detect_prime_agent_status,
         container_env: &[("PRIME_AGENT_CODING_AGENT_DIR", "/root/.prime/agent")],
+        // Level 3 (hooks) is skipped by design: upstream has no hook system
+        // at all (no Claude/Codex/Kiro-style config file to write), so status
+        // stays on the stub below.
         hook_config: None,
         sidecar_hooks: None,
         resume_strategy: ResumeStrategy::Flag("--resume"),

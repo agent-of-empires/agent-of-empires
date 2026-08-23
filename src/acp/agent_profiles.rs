@@ -555,6 +555,21 @@ mod tests {
     }
 
     #[test]
+    fn deferred_profiles_keep_parent_linkage_disabled() {
+        // These adapters' tool-call parent linkage is undocumented; pin the
+        // conservative empty namespace so a future edit cannot silently
+        // start claiming hierarchy (prime-agent's _meta envelope is
+        // session-info only today).
+        for profile in [&VIBE, &PI, &OMP, &KIMI, &PRIME_AGENT] {
+            assert!(
+                profile.parent_meta_namespaces.is_empty(),
+                "{}: parent linkage must stay off until observed",
+                profile.key
+            );
+        }
+    }
+
+    #[test]
     fn capability_flags_only_set_for_claude_family() {
         for profile in [&CLAUDE, &CLAUDE_CODE, &AOE_AGENT] {
             assert!(profile.supports_exit_plan_mode);

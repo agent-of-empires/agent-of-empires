@@ -3093,6 +3093,21 @@ mod tests {
         assert!(!sandbox.join("subdir").exists());
     }
 
+    // Regression pin for the prime-agent sandbox mount: without "skills" in
+    // copy_dirs, user-authored host skills never reach the container even
+    // though the SkillRoot row advertises ~/.prime/agent/skills.
+    #[test]
+    fn test_prime_agent_mount_copies_user_skills() {
+        let prime_mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|m| m.tool_name == "prime-agent")
+            .expect("prime-agent mount must exist");
+        assert!(
+            prime_mount.copy_dirs.contains(&"skills"),
+            "prime-agent copy_dirs must include 'skills' so host-authored skills land in-container"
+        );
+    }
+
     // Regression for #3014: settings.json (a top-level file) referenced a hook
     // script under ~/.claude/hooks/, but `hooks` was absent from Claude's
     // copy_dirs, so the config was carried into the sandbox without the script

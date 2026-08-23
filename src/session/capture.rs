@@ -6968,6 +6968,24 @@ mod tests {
     }
 
     #[test]
+    fn test_scan_prime_agent_sessions_skips_oversized_header() {
+        // A first line longer than PRIME_AGENT_HEADER_SCAN_BYTES is read
+        // truncated, fails JSON parsing, and the file is skipped instead of
+        // allocating without bound (mirror of the pi oversized-line pin).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir(&sessions_dir).unwrap();
+        let mut oversized = String::from(
+            "{\"type\":\"session\",\"id\":\"id-big\",\"cwd\":\"/tmp/proj\",\"pad\":\"",
+        );
+        oversized.push_str(&"x".repeat(96 * 1024));
+        oversized.push_str("\"}\n");
+        std::fs::write(sessions_dir.join("big.jsonl"), &oversized).unwrap();
+
+        assert!(scan_prime_agent_sessions(&sessions_dir).is_empty());
+    }
+
+    #[test]
     #[serial]
     fn test_capture_prime_agent_session_id_selects_newest_matching_cwd() {
         let tmp = tempfile::TempDir::new().unwrap();
