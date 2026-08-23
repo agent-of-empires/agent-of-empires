@@ -3188,6 +3188,24 @@ mod show_json_tests {
         sunk.archived_at = Some(now);
         sunk.snoozed_until = Some(future);
 
+        // snoozed then trashed through ordinary commands: trash()
+        // preserves the sibling timestamps, so a triaged row must still
+        // report its deadline from the trash.
+        let mut trashed_snoozed = Instance::new("z", "/repo");
+        trashed_snoozed.snooze(30);
+        trashed_snoozed.trash();
+
+        // pinned for the web sidebar, then trashed the same way.
+        let mut trashed_pinned = Instance::new("z", "/repo");
+        trashed_pinned.pin();
+        trashed_pinned.trash();
+
+        // pin() clears archived_at through the mutators, but peer store
+        // writes bypass them: an archived row can still carry a pin.
+        let mut archived_pinned = Instance::new("z", "/repo");
+        archived_pinned.archived_at = Some(now);
+        archived_pinned.pinned_at = Some(now);
+
         let plain = Instance::new("z", "/repo");
 
         let cases = [
@@ -3197,6 +3215,27 @@ mod show_json_tests {
             ("plain row", &plain, false, false, "live"),
             ("snoozed and archived", &sunk, true, false, "archived"),
             ("pinned and snoozed", &both, true, true, "live"),
+            (
+                "trashed and snoozed",
+                &trashed_snoozed,
+                true,
+                false,
+                "trashed",
+            ),
+            (
+                "trashed and pinned",
+                &trashed_pinned,
+                false,
+                true,
+                "trashed",
+            ),
+            (
+                "pinned and archived",
+                &archived_pinned,
+                false,
+                true,
+                "archived",
+            ),
         ];
         for (label, inst, want_snooze, want_pin, want_state) in cases {
             let value = serde_json::to_value(session_details(inst, "p")).unwrap();
