@@ -273,6 +273,15 @@ fn has_claude_live_token_counter(content: &str) -> bool {
             // else rejects this occurrence and the scan moves on to the
             // next one. The digit itself may sit across the wrapping
             // newline (`22m 8` + newline + `s · ↓`).
+            //
+            // Wrapping is covered only where these two anchors reach: a
+            // break before the duration's last digit, one splitting that
+            // digit from its `s`, or one right after the `s`. A break
+            // inside `· ↓` matches neither anchor, and a split `8s` is
+            // walked only when the continuation starts flush, because the
+            // hop below crosses newlines but not the indentation a boxed
+            // pane puts after one. Both read Idle until the next capture,
+            // the harmless direction.
             let mut j = pos;
             while j > 0 && matches!(bytes[j - 1], b'\n') {
                 j -= 1;
