@@ -159,12 +159,12 @@ describe("splitUrls", () => {
     ]);
   });
 
-  it("stops the href at a non-ASCII glyph glued to the URL", () => {
-    // Cell runs (#3342) start a fixed stretch at the first non-ASCII code
-    // point; the anchor must claim no more than the ASCII prefix.
+  it("claims glued non-ASCII glyphs into the URL part", () => {
+    // The regex owns part boundaries; Row anchors whole parts, so the
+    // href follows the match including glued glyphs.
     expect(splitUrls("https://github.com/o/r를 확인")).toEqual([
-      { text: "https://github.com/o/r", url: "https://github.com/o/r" },
-      { text: "를 확인", url: null },
+      { text: "https://github.com/o/r를", url: "https://github.com/o/r를" },
+      { text: " 확인", url: null },
     ]);
   });
 
@@ -260,15 +260,39 @@ describe("splitCellRuns", () => {
     expect(splitCellRuns("سلام")).toEqual([{ text: "سلام", cells: 4, fixed: true }]);
   });
 
+  it("matches tmux cell widths per grapheme cluster", () => {
+    // Measured against real tmux 3.6a cursor_x deltas (round 5 probe):
+    // VS16-forced emoji = 2, flag pair = 2, ZWJ chain = 2, lone RI = 1,
+    // skin-tone tail adds nothing to its wide base.
+    const cases: Array<[string, number]> = [
+      ["\u26A0\uFE0F", 2],
+      ["\u2714\uFE0F", 2],
+      ["\u2139\uFE0F", 2],
+      ["\u270F\uFE0F", 2],
+      ["\u2764\uFE0F", 2],
+      ["\u{1F1FA}\u{1F1F8}", 2],
+      ["\u{1F468}\u200D\u{1F469}\u200D\u{1F467}", 2],
+      ["\u{1F468}\u200D\u{1F469}\u200D\u{1F466}", 2],
+      ["\u{1F44D}\u{1F3FB}", 2],
+      ["\u{1F600}", 2],
+      ["\u{1F1EB}", 1],
+      ["\uD55C", 2],
+      ["\u280B", 1],
+      ["\u{E0B0}", 1],
+      ["e\u0301", 1],
+    ];
+    for (const [input, expected] of cases) {
+      expect(textWidth(input)).toBe(expected, input);
+    }
+  });
+
   it("keeps composed emoji sequences whole at their terminal width", () => {
-    // Flag pair, skin-tone tail, ZWJ join: each stays one fixed run.
-    // Widths follow the file's own wcwidth convention: regional
-    // indicators and pictographs are Emoji_Presentation, so a flag is
-    // 2 x 2 cells and a three-person ZWJ chain is 3 x 2.
-    expect(splitCellRuns("\u{1F1FA}\u{1F1F8}")).toEqual([{ text: "\u{1F1FA}\u{1F1F8}", cells: 4, fixed: true }]);
+    // Flag pair, skin-tone tail, ZWJ join: one fixed run at the tmux
+    // cluster width.
+    expect(splitCellRuns("\u{1F1FA}\u{1F1F8}")).toEqual([{ text: "\u{1F1FA}\u{1F1F8}", cells: 2, fixed: true }]);
     expect(splitCellRuns("\u{1F44D}\u{1F3FB}")).toEqual([{ text: "\u{1F44D}\u{1F3FB}", cells: 2, fixed: true }]);
     expect(splitCellRuns("\u{1F9D1}\u200D\u{1F4BB}")).toEqual([
-      { text: "\u{1F9D1}\u200D\u{1F4BB}", cells: 4, fixed: true },
+      { text: "\u{1F9D1}\u200D\u{1F4BB}", cells: 2, fixed: true },
     ]);
   });
 
@@ -283,6 +307,7 @@ describe("splitCellRuns", () => {
       "tone \u{1F44D}\u{1F3FB}",
       "dev \u{1F9D1}\u200D\u{1F4BB} ops",
       "arabic \u6F22\u0301 glue",
+      "warn \u26A0\uFE0F end",
     ];
     for (const line of cases) {
       const runs = splitCellRuns(line);
@@ -291,14 +316,28 @@ describe("splitCellRuns", () => {
     }
   });
 
-  it("glues zero-width marks onto the preceding run, not into new boxes", () => {
-    // Combining acute on 'e' stays in the flow run; a ZWJ after a wide
-    // char joins that char's stretch and widens no cell.
-    expect(splitCellRuns("cafe\u0301")).toEqual([{ text: "cafe\u0301", cells: 4, fixed: false }]);
-    expect(splitCellRuns("한\u200dB")).toEqual([
-      { text: "한\u200d", cells: 2, fixed: true },
-      { text: "B", cells: 1, fixed: false },
-    ]);
+  it("resolves cursor columns onto whole tmux clusters", () => {
+    // Flag occupies columns 0-1: both land on its single code point span;
+    // column 2 is past it. ZWJ chain spans columns 0-1 likewise.
+    expect(findCursorCharIndex("\u{1F1FA}\u{1F1F8}", 0)).toBe(0);
+    expect(findCursorCharIndex("\u{1F1FA}\u{1F1F8}", 1)).toBe(0);
+    expect(findCursorCharIndex("\u{1F1FA}\u{1F1F8}", 2)).toBeNull();
+    expect(findCursorCharIndex("\u{1F468}\u200D\u{1F469}\u200D\u{1F467}", 0)).toBe(0);
+    expect(findCursorCharIndex("\u{1F468}\u200D\u{1F469}\u200D\u{1F467}", 1)).toBe(0);
+    expect(findCursorCharIndex("\u{1F468}\u200D\u{1F469}\u200D\u{1F467}", 2)).toBeNull();
+  });
+
+  it("never splits a cluster when wrapping", () => {
+    const line = [{ text: "\u{1F9D1}\u200D\u{1F4BB}\u{1F44D}", style: {} }];
+    for (const cols of [2, 3, 4]) {
+      const rows = wrapLine(line, cols);
+      expect(
+        rows
+          .flat()
+          .map((s) => s.text)
+          .join(""),
+      ).toBe("\u{1F9D1}\u200D\u{1F4BB}\u{1F44D}");
+    }
   });
 
   it("counts emoji tails as zero-width cells", () => {

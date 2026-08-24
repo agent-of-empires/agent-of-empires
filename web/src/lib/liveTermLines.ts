@@ -99,10 +99,9 @@ export function lineText(line: AnsiSegment[]): string {
 // ponytail: plain per-line regex, no OSC 8 / reflow tracking (there is no
 // xterm here). A URL split across wrapped visual rows linkifies only its
 // first part; upgrade to reflow-aware matching only if that proves painful.
-// Bounded to printable ASCII: a URL glued to CJK text must not claim the
-// glued glyphs into its href, and cell runs (#3342) start a fixed stretch
-// at the first non-ASCII code point, so the anchor must stop there too.
-const URL_RE = /https?:\/\/[!-~]+/g;
+// The match may run into glued non-ASCII glyphs; Row anchors whole parts,
+// so the href follows whatever this regex claims.
+const URL_RE = /https?:\/\/\S+/g;
 // Trailing punctuation that is usually sentence/wrapping syntax, not the URL
 // (e.g. `see https://x.com/a).`). Stripped from the match; re-emitted as text.
 const URL_TRAILING = /[.,;:!?)\]}'">]+$/;
@@ -134,23 +133,23 @@ export function splitUrls(text: string): UrlPart[] {
   return parts;
 }
 
-// Terminal cell widths, wcwidth-style: combining marks, zero-width
-// joiners, variation selectors and emoji modifiers take no cell; East
-// Asian Wide/Fullwidth and emoji take two. tmux wraps by cells, so
-// wrapping (and the cursor math built on it) must count the same way,
-// not in UTF-16 code units.
+// Terminal cell widths, tmux-aligned and counted PER GRAPHEME CLUSTER,
+// not per code point (measured against tmux 3.6a cursor_x deltas):
+// combining marks, zero-width joiners, variation selectors and emoji
+// modifiers take no column of their own; a VS16-forced emoji, a flag
+// pair and a ZWJ chain each take exactly two columns; a lone regional
+// indicator takes one; East Asian Wide/Fullwidth and emoji take two.
 const ZERO_WIDTH = /[\u200B-\u200D\uFEFF]|\p{M}/u;
 // Emoji composition tails: they modify the preceding pictographic glyph
 // and occupy no column of their own (skin-tone swatches, text/color
 // variation selectors).
 const EMOJI_TAIL = /^(?:[\uFE0E\uFE0F]|[\u{1F3FB}-\u{1F3FF}])$/u;
-// Regional indicator pairs compose flag glyphs. Each RI carries
-// Emoji_Presentation, so the wide classifier counts two cells per RI and
-// a flag renders as four cells in this grid's convention.
+// Regional indicator pairs compose flag glyphs.
 const REGIONAL_INDICATOR = /[\u{1F1E6}-\u{1F1FF}]/u;
 const WIDE =
   /[\u1100-\u115F\u2E80-\u303E\u3041-\u33FF\u3400-\u4DBF\u4E00-\u9FFF\uA000-\uA4CF\uAC00-\uD7A3\uF900-\uFAFF\uFE30-\uFE4F\uFF00-\uFF60\uFFE0-\uFFE6\u{1F300}-\u{1FAFF}]|\p{Emoji_Presentation}/u;
 const ASCII_PRINTABLE_ONLY = /^[\x20-\x7E]*$/;
+const ZWJ = "\u200D";
 
 export function cellWidth(codePoint: string): number {
   if (ZERO_WIDTH.test(codePoint) || EMOJI_TAIL.test(codePoint)) return 0;
@@ -163,30 +162,83 @@ function lastCodePoint(s: string): string {
   return [...s].slice(-1)[0] ?? "";
 }
 
-export function textWidth(text: string): number {
-  if (ASCII_PRINTABLE_ONLY.test(text)) return text.length;
-  let width = 0;
-  for (const ch of text) width += cellWidth(ch);
-  return width;
+/** Split text into extended grapheme clusters: a base glyph plus its
+ *  zero-width marks and emoji tails; consecutive regional indicators
+ *  pair up on parity into flags; a ZWJ joins the next non-ASCII glyph
+ *  into the same cluster. Mirrors clusterSpanAt's absorption rules. */
+export function splitGraphemes(text: string): string[] {
+  const clusters: string[] = [];
+  const chars = [...text];
+  let i = 0;
+  while (i < chars.length) {
+    let cluster = chars[i]!;
+    if (REGIONAL_INDICATOR.test(cluster)) {
+      // Pair on parity within the maximal RI run.
+      let runStart = i;
+      while (runStart > 0 && REGIONAL_INDICATOR.test(chars[runStart - 1]!)) runStart--;
+      if ((i - runStart) % 2 === 0 && REGIONAL_INDICATOR.test(chars[i + 1] ?? "")) {
+        cluster += chars[++i]!;
+      }
+    } else if (!ASCII_PRINTABLE_ONLY.test(cluster)) {
+      // Non-ASCII base: absorb trailing marks, emoji tails and whatever
+      // non-ASCII glyph a ZWJ joins into the same cluster.
+      for (;;) {
+        const next = chars[i + 1];
+        if (next === undefined) break;
+        if (next === ZWJ) {
+          cluster += next;
+          i++;
+          const joined = chars[i + 1];
+          if (joined === undefined || ASCII_PRINTABLE_ONLY.test(joined)) break;
+          cluster += joined;
+          i++;
+          continue;
+        }
+        if (ZERO_WIDTH.test(next) || EMOJI_TAIL.test(next)) {
+          cluster += next;
+          i++;
+          continue;
+        }
+        break;
+      }
+    }
+    clusters.push(cluster);
+    i++;
+  }
+  return clusters;
 }
 
-/** Find the code point in `text` whose terminal cell range contains `col`
- *  (cell units from the start of `text`), or null if `col` falls at or
- *  past the end. Iterates code points (an emoji's surrogate pair never
- *  splits) and counts cells the same way `textWidth`/`wrapLine` do, so a
- *  cursor column from tmux (already cell-based) lands on the right glyph
- *  even when wide CJK or zero-width characters precede it. */
+/** Terminal cells occupied by one grapheme cluster (see splitGraphemes). */
+export function graphemeWidth(cluster: string): number {
+  const cps = [...cluster];
+  const riCount = cps.filter((c) => REGIONAL_INDICATOR.test(c)).length;
+  if (riCount >= 2) return 2;
+  if (riCount === 1 && cps.length === 1) return 1;
+  if (cps.some((c) => c === ZWJ)) return 2;
+  if (cps.length > 1 && cps[cps.length - 1] === "\uFE0F") return 2;
+  return cellWidth(cps[0]!);
+}
+
+/** Terminal cells occupied by a whole line: the sum of its grapheme
+ *  clusters' widths, matching how tmux counts columns. */
+export function textWidth(text: string): number {
+  if (ASCII_PRINTABLE_ONLY.test(text)) return text.length;
+  return splitGraphemes(text).reduce((n, c) => n + graphemeWidth(c), 0);
+}
+
+/** Find the code point that starts the grapheme cluster whose terminal
+ *  cell range contains `col`, or null if `col` falls at or past the end.
+ *  Counts cells per cluster (a flag, ZWJ chain or VS16-forced emoji is
+ *  one stop of width 2), so a cursor column from tmux lands on the right
+ *  glyph even when wide CJK or zero-width characters precede it. */
 export function findCursorCharIndex(text: string, col: number): number | null {
-  if (ASCII_PRINTABLE_ONLY.test(text)) {
-    return col >= 0 && col < text.length ? col : null;
-  }
   let c = 0;
-  let i = 0;
-  for (const ch of text) {
-    const w = cellWidth(ch);
-    if (col >= c && col < c + w) return i;
+  let pos = 0;
+  for (const cluster of splitGraphemes(text)) {
+    const w = graphemeWidth(cluster);
+    if (col >= c && col < c + w) return pos;
     c += w;
-    i++;
+    pos += [...cluster].length;
   }
   return null;
 }
@@ -310,8 +362,8 @@ export function clusterSpanAt(text: string, charIndex: number): [number, number]
  *  viewer's grid, so this is the identity). Wider lines appear when
  *  another writer resized the tmux window out from under the viewer;
  *  wrapping keeps them readable until the server re-asserts the grid.
- *  Iterates code points (an emoji's surrogate pair never splits) and
- *  counts cells, so CJK and emoji wrap where tmux would wrap them. */
+ *  Iterates grapheme clusters and counts cells, so CJK, flags, ZWJ
+ *  chains and emoji wrap where tmux would wrap them. */
 export function wrapLine(line: AnsiSegment[], cols: number): AnsiSegment[][] {
   if (!Number.isFinite(cols) || cols <= 0) return [line];
   const total = line.reduce((n, s) => n + textWidth(s.text), 0);
@@ -327,17 +379,17 @@ export function wrapLine(line: AnsiSegment[], cols: number): AnsiSegment[][] {
         chunk = "";
       }
     };
-    for (const ch of seg.text) {
-      const w = cellWidth(ch);
-      // A wide char that doesn't fit wraps whole (terminals leave the
-      // last cell empty); zero-width marks stay with their base char.
+    for (const cluster of splitGraphemes(seg.text)) {
+      const w = graphemeWidth(cluster);
+      // A cluster that doesn't fit wraps whole (terminals leave the last
+      // cell empty); zero-width members never separate from their base.
       if (used + w > cols && used > 0) {
         flushChunk();
         rows.push(current);
         current = [];
         used = 0;
       }
-      chunk += ch;
+      chunk += cluster;
       used += w;
     }
     flushChunk();

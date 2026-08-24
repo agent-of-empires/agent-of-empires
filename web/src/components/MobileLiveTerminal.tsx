@@ -201,13 +201,14 @@ function fixedBoxStyle(cells: number, base: CSSProperties | undefined): CSSPrope
 
 /** One styled run of a row: flowing text renders bare; fixed clusters get
  *  the explicit box while remaining ordinary selectable/copyable spans.
- *  Linkification applies per run (#2685); the URL regex is bounded to
- *  printable ASCII, so an anchor never crosses into a fixed run. */
+ *  Anchoring happens one level up, per URL part over the whole segment,
+ *  so a href keeps its glued non-ASCII glyphs even though the runs split
+ *  there (#3342). */
 function cellRunSpan(run: CellRun, style: AnsiStyle, key: string): ReactNode {
   const base = segStyle(style);
   return (
     <span key={key} style={run.fixed ? fixedBoxStyle(run.cells, base) : base}>
-      {linkify(run.text)}
+      {run.text}
     </span>
   );
 }
@@ -337,23 +338,6 @@ function specialKeySequence(e: TerminalKeyLike): string | null {
   }
 }
 
-// Wrap http(s) URLs in a segment's text as clickable anchors, so agent output
-// (PR links, localhost dev servers, docs) opens in one tap instead of a
-// manual select-copy-paste (#2685). Plain text returns as-is.
-function linkify(text: string): ReactNode {
-  const parts = splitUrls(text);
-  if (parts.length === 1 && parts[0]!.url == null) return text;
-  return parts.map((p, i) =>
-    p.url ? (
-      <a key={i} href={p.url} target="_blank" rel="noopener noreferrer" className="underline cursor-pointer">
-        {p.text}
-      </a>
-    ) : (
-      p.text
-    ),
-  );
-}
-
 export const Row = memo(function Row({
   segs,
   cursorCol,
@@ -368,7 +352,26 @@ export const Row = memo(function Row({
     if (segs.length === 0) return <div> </div>; // keep empty rows at full height
     return (
       <div>
-        {segs.map((seg, i) => splitCellRuns(seg.text).map((run, j) => cellRunSpan(run, seg.style, `${i}-${j}`)))}
+        {segs.map((seg, i) =>
+          splitUrls(seg.text).map((part, j) => {
+            const runs = splitCellRuns(part.text).map((run, k) => cellRunSpan(run, seg.style, `${i}-${j}-${k}`));
+            // Whole-part anchors: a URL that runs into glued non-ASCII
+            // keeps those glyphs in its href and inside the clickable
+            // span, with each run still boxed cell-exact.
+            if (!part.url) return <Fragment key={`${i}-${j}`}>{runs}</Fragment>;
+            return (
+              <a
+                key={`${i}-${j}`}
+                href={part.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="underline cursor-pointer"
+              >
+                {runs}
+              </a>
+            );
+          }),
+        )}
       </div>
     );
   }

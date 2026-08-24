@@ -35,13 +35,17 @@ describe("Row URL linkification", () => {
     expect(container.querySelector("a")).toBeNull();
   });
 
-  it("keeps the anchor out of a CJK glyph glued to the URL", () => {
-    // The flow run ends at the first non-ASCII code point (#3342); the
-    // href and anchor text must stop there instead of swallowing the glue.
+  it("anchors glued non-ASCII glyphs while keeping their cell boxes", () => {
+    // Whole-part anchoring (#3342): the href follows the URL match
+    // including the glued glyph, the glyph keeps its own fixed box inside
+    // the anchor, and the row text is unchanged.
     const { container } = render(<Row segs={[seg("voir https://github.com/o/r를 suite")]} cursorCol={null} />);
     const a = container.querySelector("a");
-    expect(a!.getAttribute("href")).toBe("https://github.com/o/r");
-    expect(a!.textContent).toBe("https://github.com/o/r");
+    expect(a).not.toBeNull();
+    expect(a!.getAttribute("href")).toBe("https://github.com/o/r를");
+    expect(a!.textContent).toBe("https://github.com/o/r를");
+    const boxed = a!.querySelector("span[style*='inline-block']");
+    expect(boxed!.textContent).toBe("를");
     expect(container.textContent).toBe("voir https://github.com/o/r를 suite");
   });
 });
