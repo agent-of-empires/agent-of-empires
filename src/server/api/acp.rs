@@ -1254,11 +1254,26 @@ async fn touch_on_prompt_and_wake_if_sunk(state: &Arc<AppState>, id: &str) -> bo
     woke_idle_dormant
 }
 
-/// Disk-side half of [`touch_on_prompt_and_wake_if_sunk`]. A waking prompt
-/// keeps touch semantics (lifts sink state); any other prompt advances
-/// recency monotonically and must NOT clear sinks, or #3465's wipe returns
-/// through this save path for archives a peer process wrote after this
-/// process's snapshot.
+/// Disk-side half of [`touch_on_prompt_and_wake_if_sunk`], mirroring onto disk
+/// whatever the memory side actually did. A waking prompt keeps touch semantics
+/// and lifts the sink; any other prompt advances recency monotonically and
+/// leaves sink state alone.
+///
+/// What the second tier buys, precisely: `wake` is computed from
+/// `state.instances`, so a daemon whose memory predates a peer's archive would
+/// otherwise clear a sink it has never observed. Tier 2 stops that, and only
+/// that.
+///
+/// It does NOT make this save path safe against #3465's wipe, and it was a
+/// mistake to claim otherwise. Advancing `last_accessed_at` on disk arms the
+/// very signal the wipe keys on: `merge_user_action_diff` computes
+/// `touched = self.last_accessed_at > pre.last_accessed_at`
+/// (`session/instance.rs`) and clears `archived_at` / `snoozed_until` /
+/// `idle_dormant_since` when it holds, so a writer whose `pre` snapshot
+/// predates this advance still loses its archive one hop later. That is the
+/// documented invariant rather than a bug (a prompt is a real user gesture, and
+/// a real touch is meant to dethrone a concurrent archive); what #3465 was
+/// about is a *passive* stamp reaching the same arm with no gesture behind it.
 fn apply_prompt_persist_to_disk(disk: &mut crate::session::Instance, wake: bool) {
     if wake {
         disk.touch_last_accessed();
@@ -3662,10 +3677,13 @@ mod tests {
     }
 
     #[test]
-    fn plain_prompt_recency_never_clears_a_peer_archive() {
-        // #3465 residual: prompting a live structured row persists
-        // recency monotonically and must not clear sink state a peer
-        // process wrote after this process's snapshot.
+    fn recency_only_persist_does_not_itself_clear_a_peer_sink() {
+        // Scope, deliberately narrow: this pins that the recency-only tier
+        // performs no clear of its own on a sink this daemon's memory has
+        // not observed. It does NOT claim the archive survives everything
+        // afterwards -- advancing last_accessed_at still arms
+        // merge_user_action_diff's `touched` arm for a later writer holding
+        // a pre-prompt snapshot. See apply_prompt_persist_to_disk's docs.
         let mut disk = crate::session::Instance::new("s", "/tmp/x");
         disk.view = crate::session::View::Structured;
         disk.last_accessed_at = Some(chrono::Utc::now() - chrono::Duration::seconds(60));
@@ -3675,7 +3693,7 @@ mod tests {
 
         assert!(
             disk.archived_at.is_some(),
-            "recency-only persist must not clear peer sink state"
+            "the recency-only tier must not clear peer sink state itself"
         );
         assert!(disk.last_accessed_at > disk.archived_at);
     }
