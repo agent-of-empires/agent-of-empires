@@ -145,7 +145,17 @@ function AgentDefaultsCard({
     <div className="rounded-md border border-surface-700 bg-surface-850 p-3 space-y-3">
       <div className="flex items-baseline justify-between">
         <h5 className="text-sm font-semibold text-text-primary">{agent.name}</h5>
-        {!agent.installed && <span className="text-[10px] uppercase text-text-dim">not installed</span>}
+        <span className="flex items-baseline gap-1.5">
+          {agent.lifecycle?.state === "deprecated" && (
+            <span
+              className="text-[10px] uppercase text-status-warning"
+              data-testid={`acp-defaults-deprecated-${agent.name}`}
+            >
+              deprecated
+            </span>
+          )}
+          {!agent.installed && <span className="text-[10px] uppercase text-text-dim">not installed</span>}
+        </span>
       </div>
       <p className="text-xs text-text-dim">{freshness(entry)}</p>
 
