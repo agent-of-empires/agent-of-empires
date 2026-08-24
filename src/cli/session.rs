@@ -3251,5 +3251,13 @@ mod show_json_tests {
             );
             assert_eq!(value["state"].as_str(), Some(want_state), "{label}");
         }
+
+        // Value fidelity on the one row whose exact deadline we set:
+        // presence alone would accept a regression emitting any instant.
+        let active = serde_json::to_value(session_details(&snoozed, "p")).unwrap();
+        assert_eq!(
+            active["snoozed_until"],
+            serde_json::to_value(future).unwrap()
+        );
     }
 }
