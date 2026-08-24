@@ -2074,7 +2074,10 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
         l.contains("approve and") || l.contains("refine plan") || l.contains("save and quit")
     };
     let cursor_pos = lowest_matching_line(window12, |l| has_cursor(l) && is_option(l));
-    let other_pos = lowest_matching_line(window12, is_option);
+    // Corroborate with an UNMARKED option row: when the selection rests on
+    // the bottom-most option, the marked row alone would equal itself here
+    // and suppress the signal.
+    let other_pos = lowest_matching_line(window12, |l| is_option(l) && !has_cursor(l));
     if let (Some(c), Some(o)) = (cursor_pos, other_pos) {
         if c != o {
             consider(c.min(o), OmpSignal::Approval);
@@ -5835,6 +5838,20 @@ You can monitor progress with aoe session logs.\n\
 | ↑↓ select · ⏎ confirm · c copy · tab regions · Ctrl+G editor · esc cancel    |
 +------------------------------------------------------------------------------+";
         assert_eq!(detect_omp_status(navigated), Status::Waiting);
+
+        // Selection moved to the bottom-most option: the cursor row must
+        // not be its own corroboration (regression guard for the C2 pass).
+        let bottom_most = "\
+| Plan mode - next step                                                        |
+|   Approve and execute                                                        |
+|   Approve and compact context                                                |
+|   Approve and keep context (~28k / 1m)                                       |
+|   Refine plan                                                                |
+| ❯ Save and quit                                                              |
++------------------------------------------------------------------------------+
+| ↑↓ select · ⏎ confirm · c copy · tab regions · Ctrl+G editor · esc cancel    |
++------------------------------------------------------------------------------+";
+        assert_eq!(detect_omp_status(bottom_most), Status::Waiting);
     }
 
     #[test]
