@@ -84,12 +84,14 @@ fn acp_doctor_text_emits_amber_lifecycle_notice() {
     let stub = stub_dir();
     let out = run_aoe(&home, &xdg, &stub, &["acp", "doctor"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    // The stub makes command_present true; the amber-wrapped notice must
-    // ride along on the same row block.
+    // The stub makes command_present true; the notice must ride along on
+    // the same row block. Captured output is piped, so it arrives as
+    // plain text: color is tty-only by contract.
     assert!(stdout.contains("[OK] gemini"), "{stdout}");
+    assert!(stdout.contains("⚠ deprecated since 2026-06-18"), "{stdout}");
     assert!(
-        stdout.contains("\x1b[33m⚠ deprecated since 2026-06-18"),
-        "{stdout}"
+        !stdout.contains("\x1b[33m"),
+        "piped output must be escape-free"
     );
 }
 

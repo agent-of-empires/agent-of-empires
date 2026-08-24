@@ -846,12 +846,8 @@
       "id": "wizard.agent-lifecycle",
       "kind": "vitest",
       "risk": "low",
-      "specs": [
-        "src/components/session-wizard/__tests__/AgentPickerEssentials.lifecycle.test.tsx"
-      ],
-      "components": [
-        "web/src/components/session-wizard/steps/AgentPickerEssentials.tsx"
-      ]
+      "specs": ["src/components/session-wizard/__tests__/AgentPickerEssentials.lifecycle.test.tsx"],
+      "components": ["web/src/components/session-wizard/steps/AgentPickerEssentials.tsx"]
     },
     {
       "id": "wizard.recent-projects",

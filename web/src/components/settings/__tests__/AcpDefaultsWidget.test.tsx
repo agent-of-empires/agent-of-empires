@@ -160,6 +160,14 @@ it("marks a server-deprecated agent on its card without hiding it", async () => 
   await waitFor(() => expect(screen.getAllByText("gemini").length).toBeGreaterThan(0));
 });
 
+it("falls back to the static mirror when the server omits lifecycle", async () => {
+  // Older daemons never send the field; gemini is still flagged because
+  // the static profile mirror knows it.
+  vi.mocked(api.fetchAgents).mockResolvedValue([agent("gemini")] as never);
+  render(<AcpDefaultsWidget descriptor={DESCRIPTOR} value={{}} save={vi.fn()} />);
+  expect(await screen.findByTestId("acp-defaults-deprecated-gemini")).toBeTruthy();
+});
+
 describe("no acp-capable agents", () => {
   it("shows an empty-state message", async () => {
     vi.mocked(api.fetchAgents).mockResolvedValue([agent("claude", false)] as never);

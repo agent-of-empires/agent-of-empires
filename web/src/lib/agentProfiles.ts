@@ -219,6 +219,16 @@ export function resolveAgentLifecycle(toolKey: string | null | undefined): Agent
   return PROFILES[toolKey]?.lifecycle ?? ACTIVE_LIFECYCLE;
 }
 
+/** Server-reported lifecycle wins; the static mirror fills the gap for
+ *  older daemons and keys the server does not list. Single definition of
+ *  that precedence so every surface resolves identically. */
+export function effectiveLifecycle(
+  source: { lifecycle?: AgentLifecycleInfo } | undefined,
+  name: string | null | undefined,
+): AgentLifecycleInfo {
+  return source?.lifecycle ?? resolveAgentLifecycle(name);
+}
+
 const VIBE: AgentProfile = {
   key: "vibe",
   subagentToolNames: [],

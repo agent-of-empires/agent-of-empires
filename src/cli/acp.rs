@@ -680,7 +680,7 @@ async fn doctor(json: bool, fix: bool, adapter: Vec<String>, all_adapters: bool)
         let mark = agent_mark(entry);
         println!("{} {}  ({})", mark, entry.name, entry.description);
         if let Some(notice) = entry.lifecycle.notice() {
-            println!("    \x1b[33m⚠ {notice}\x1b[0m");
+            println!("{}", crate::cli::lifecycle_notice_line("    ", &notice));
         }
         if !entry.command_present {
             // Look up the binary name via the registry so we can
@@ -800,7 +800,7 @@ fn agents() -> Result<()> {
         let mark = if present { "[OK]" } else { "[!! ]" };
         println!("{} {:<14}  {}", mark, name, spec.description);
         if let Some(notice) = registry_lifecycle(name).notice() {
-            println!("        \x1b[33m⚠ {notice}\x1b[0m");
+            println!("{}", crate::cli::lifecycle_notice_line("        ", &notice));
         }
         let args = if spec.args.is_empty() {
             String::new()

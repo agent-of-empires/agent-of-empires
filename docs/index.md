@@ -37,8 +37,9 @@ Claude Code, OpenCode, Mistral Vibe, Codex CLI, Gemini CLI, Antigravity CLI, Cur
 
 Agents carry a lifecycle state in AoE's registry. When an upstream vendor
 deprecates a CLI, AoE keeps supporting it but marks it everywhere it appears
-(`aoe agents`, `aoe acp doctor`, session creation, the picker, and the web
-dashboard), so you always know before you launch one.
+(`aoe agents`, `aoe acp doctor`, session creation, the new-session and restart
+pickers, the web wizard, and the switch-agent modal), so you always know before
+you launch one.
 
 <div class="cta-box">
 <p><strong>Ready to get started?</strong></p>

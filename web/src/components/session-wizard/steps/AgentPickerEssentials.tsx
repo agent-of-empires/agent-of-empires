@@ -1,5 +1,5 @@
 import type { AgentInfo } from "../../../lib/types";
-import { resolveAgentLifecycle, type AgentLifecycleInfo } from "../../../lib/agentProfiles";
+import { effectiveLifecycle, type AgentLifecycleInfo } from "../../../lib/agentProfiles";
 
 interface WizardData {
   tool: string;
@@ -28,7 +28,7 @@ export function AgentPickerEssentials({ data, onChange, agents }: Props) {
   // The daemon's /api/agents lifecycle wins; the static profile mirror
   // covers older daemons and keys the server does not list.
   const selected = agents.find((agent) => agent.name === data.tool);
-  const selectedLifecycle = selected?.lifecycle ?? resolveAgentLifecycle(selected?.name);
+  const selectedLifecycle = effectiveLifecycle(selected, selected?.name);
   const selectedDeprecated =
     selected && selectedLifecycle.state === "deprecated"
       ? lifecycleWarningText(selected.name, selectedLifecycle)
@@ -74,7 +74,7 @@ export function AgentPickerEssentials({ data, onChange, agents }: Props) {
                   Custom
                 </span>
               )}
-              {(agent.lifecycle ?? resolveAgentLifecycle(agent.name)).state === "deprecated" && (
+              {effectiveLifecycle(agent, agent.name).state === "deprecated" && (
                 <span
                   className="rounded px-1.5 py-px text-[10px] font-mono uppercase tracking-wide bg-status-warning/15 text-status-warning"
                   data-testid={`wizard-agent-deprecated-badge-${agent.name}`}

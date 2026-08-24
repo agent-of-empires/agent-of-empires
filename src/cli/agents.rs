@@ -23,7 +23,7 @@ pub fn run() -> Result<()> {
             );
         }
         if let Some(notice) = agent.lifecycle_notice() {
-            println!("      \x1b[33m⚠ {}\x1b[0m", notice);
+            println!("{}", crate::cli::lifecycle_notice_line("      ", &notice));
         }
     }
 
