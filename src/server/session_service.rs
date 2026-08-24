@@ -83,11 +83,22 @@ struct MirroredFields {
     queued_prompts: Vec<crate::acp::state::QueuedPromptEntry>,
     queued_prompt_next_seq: u64,
     idle_dormant_since: Option<chrono::DateTime<chrono::Utc>>,
-    /// Mirrored monotonically, not copied: disk can legitimately be ahead of
-    /// this daemon's memory when a peer process touched the row, and the field
-    /// is documented monotone non-decreasing. `enqueue_prompt` is the only
-    /// caller that advances it; the other queue mutations re-assert whatever
-    /// memory already held, which the max turns into a no-op.
+    /// Mirrored as `disk = max(disk, memory)`, not copied, because the field is
+    /// documented monotone non-decreasing and disk can legitimately lead memory
+    /// when a peer process touched the row.
+    ///
+    /// Note what that means for the callers that do not advance it themselves
+    /// (edit / remove / clear / the dormancy clear): the max is NOT a no-op for
+    /// them. It runs against the disk row, so whenever memory leads disk those
+    /// mutations flush memory's value too. That is intended. Since #3465 and
+    /// #3481 removed the passive stamps, a leading memory value can only have
+    /// come from a real user gesture that has not reached disk yet, so
+    /// persisting it opportunistically is correct rather than fabricated.
+    ///
+    /// It is also safe in the direction #3465 cares about: a max advances
+    /// recency but never clears `archived_at` / `snoozed_until` /
+    /// `idle_dormant_since`, so no queue mutation can lift a sink. Writing this
+    /// as `touch_last_accessed()` would.
     last_accessed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
