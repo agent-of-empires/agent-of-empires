@@ -239,6 +239,8 @@ describe("LineParseCache", () => {
   });
 });
 
+const ZWJ = "\u200D";
+
 describe("splitCellRuns", () => {
   it("keeps printable ASCII as flow and coalesces non-ASCII stretches", () => {
     // The #3342 fixture: ASCII prompt, CJK, braille spinner, powerline PUA.
@@ -263,7 +265,7 @@ describe("splitCellRuns", () => {
   it("matches tmux cell widths per grapheme cluster", () => {
     // Measured against real tmux 3.6a cursor_x deltas (round 5 probe):
     // VS16-forced emoji = 2, flag pair = 2, ZWJ chain = 2, lone RI = 1,
-    // skin-tone tail adds nothing to its wide base.
+    // skin-tone tail adds nothing to a base that takes a modifier.
     const cases: Array<[string, number]> = [
       ["\u26A0\uFE0F", 2],
       ["\u2714\uFE0F", 2],
@@ -280,6 +282,21 @@ describe("splitCellRuns", () => {
       ["\u280B", 1],
       ["\u{E0B0}", 1],
       ["e\u0301", 1],
+      // A skin-tone swatch folds in only behind a base that takes a
+      // modifier. U+1F600 does not, so tmux gives the swatch its own two
+      // columns, as it does after CJK or after nothing at all.
+      ["\u{1F600}\u{1F3FB}", 4],
+      ["\u6F22\u{1F3FB}", 4],
+      ["\u280B\u{1F3FB}", 3],
+      ["a\u{1F3FB}", 3],
+      ["\u{1F3FB}", 2],
+      // An orphan ZWJ or enclosing keycap has no base to modify, so it is
+      // an ordinary zero-width mark rather than the two-cell composition
+      // its presence inside a cluster would imply.
+      [ZWJ, 0],
+      [`a${ZWJ}b`, 2],
+      ["\u20E3", 0],
+      ["1\u20E3", 1],
     ];
     for (const [input, expected] of cases) {
       expect(textWidth(input)).toBe(expected, input);
@@ -357,8 +374,10 @@ describe("splitCellRuns", () => {
 
   it("counts emoji tails as zero-width cells", () => {
     expect(textWidth("\uFE0F")).toBe(0);
-    expect(textWidth("\u{1F3FB}")).toBe(0);
+    // A swatch behind a modifier base folds in; standing alone it keeps
+    // its own two columns, matching tmux.
     expect(textWidth("\u{1F44D}\u{1F3FB}")).toBe(2);
+    expect(textWidth("\u{1F3FB}")).toBe(2);
   });
 });
 
@@ -371,10 +390,11 @@ describe("clusterSpanAt", () => {
   it("spans both regional indicators from either half of a flag", () => {
     expect(clusterSpanAt("\u{1F1FA}\u{1F1F8}", 0)).toEqual([0, 2]);
     expect(clusterSpanAt("\u{1F1FA}\u{1F1F8}", 1)).toEqual([0, 2]);
-    // A tone tail glued behind the completed pair stays inside the span
-    // from either RI half; stranding it outside would detach the swatch.
-    expect(clusterSpanAt("\u{1F1E9}\u{1F1EA}\u{1F3FB}", 0)).toEqual([0, 3]);
-    expect(clusterSpanAt("\u{1F1E9}\u{1F1EA}\u{1F3FB}", 1)).toEqual([0, 3]);
+    // A regional indicator takes no skin-tone modifier, so a swatch after
+    // a completed pair is its own cell (tmux measures flag + tone at 4
+    // columns) and the span stops at the pair.
+    expect(clusterSpanAt("\u{1F1E9}\u{1F1EA}\u{1F3FB}", 0)).toEqual([0, 2]);
+    expect(clusterSpanAt("\u{1F1E9}\u{1F1EA}\u{1F3FB}", 1)).toEqual([0, 2]);
   });
 
   it("keeps tone tails and ZWJ chains inside the span", () => {

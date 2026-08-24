@@ -135,15 +135,27 @@ export function splitUrls(text: string): UrlPart[] {
 
 // Terminal cell widths, tmux-aligned and counted PER GRAPHEME CLUSTER,
 // not per code point (measured against tmux 3.6a cursor_x deltas):
-// combining marks, zero-width joiners, variation selectors and emoji
-// modifiers take no column of their own; a VS16-forced emoji, a flag
-// pair and a ZWJ chain each take exactly two columns; a lone regional
-// indicator takes one; East Asian Wide/Fullwidth and emoji take two.
+// combining marks, zero-width joiners and variation selectors take no
+// column of their own, and neither does a skin-tone swatch that has a
+// modifier base in front of it; a VS16-forced emoji, a flag pair and a
+// ZWJ chain each take exactly two columns; a lone regional indicator
+// takes one; East Asian Wide/Fullwidth and emoji take two. An orphan
+// mark with no base to attach to keeps whatever width it has on its own.
 const ZERO_WIDTH = /[\u200B-\u200D\uFEFF]|\p{M}/u;
 // Emoji composition tails: they modify the preceding pictographic glyph
-// and occupy no column of their own (skin-tone swatches, text/color
-// variation selectors).
-const EMOJI_TAIL = /^(?:[\uFE0E\uFE0F]|[\u{1F3FB}-\u{1F3FF}])$/u;
+// and occupy no column of their own (text/color variation selectors).
+const EMOJI_TAIL = /^[\uFE0E\uFE0F]$/u;
+// Skin-tone swatches fold into the preceding glyph only when that glyph
+// takes a modifier; after anything else the swatch keeps its own two
+// columns (measured: thumbs-up + tone = 2 cells, grinning face + tone =
+// 4, since U+1F600 takes no modifier). tmux 3.6a decides this from a
+// hand-maintained list of ~70 base code points in utf8_should_combine()
+// rather than from Unicode's Emoji_Modifier_Base property, so a base in
+// the property but missing from that list (U+270B, U+1F91D, U+1F3C3)
+// still measures 2 here against tmux's 4. The property is the closest
+// stable approximation and errs only on that gap.
+const SKIN_TONE = /^[\u{1F3FB}-\u{1F3FF}]$/u;
+const MODIFIER_BASE = /\p{Emoji_Modifier_Base}/u;
 // Regional indicator pairs compose flag glyphs.
 const REGIONAL_INDICATOR = /[\u{1F1E6}-\u{1F1FF}]/u;
 const WIDE =
@@ -156,22 +168,26 @@ export function cellWidth(codePoint: string): number {
   return WIDE.test(codePoint) ? 2 : 1;
 }
 
-/** Last code point of a string, surrogate-pair aware (`slice(-1)` would
- *  return a lone low surrogate for astral glyphs like flags). */
-function lastCodePoint(s: string): string {
-  return [...s].slice(-1)[0] ?? "";
+/** True when `next` composes onto a cluster based on `base` instead of
+ *  opening a column of its own. Shared by splitGraphemes (which decides
+ *  cluster widths) and clusterSpanAt (which decides how much text the
+ *  boxed cursor cell takes), so the two cannot drift apart. */
+function composesOnto(base: string, next: string): boolean {
+  if (SKIN_TONE.test(next)) return MODIFIER_BASE.test(base);
+  return ZERO_WIDTH.test(next) || EMOJI_TAIL.test(next);
 }
 
 /** Split text into extended grapheme clusters: a base glyph plus its
  *  zero-width marks and emoji tails; consecutive regional indicators
  *  pair up on parity into flags; a ZWJ joins the next non-ASCII glyph
  *  into the same cluster. Mirrors clusterSpanAt's absorption rules. */
-export function splitGraphemes(text: string): string[] {
+function splitGraphemes(text: string): string[] {
   const clusters: string[] = [];
   const chars = [...text];
   let i = 0;
   while (i < chars.length) {
-    let cluster = chars[i]!;
+    const base = chars[i]!;
+    let cluster = base;
     if (chars[i + 1] === "\uFE0F" && chars[i + 2] === "\u20E3") {
       // Keycap sequence (base + VS16 + enclosing keycap): one two-cell
       // cluster even when the base is printable ASCII like #, * or a
@@ -200,7 +216,7 @@ export function splitGraphemes(text: string): string[] {
           i++;
           continue;
         }
-        if (ZERO_WIDTH.test(next) || EMOJI_TAIL.test(next)) {
+        if (composesOnto(base, next)) {
           cluster += next;
           i++;
           continue;
@@ -214,13 +230,16 @@ export function splitGraphemes(text: string): string[] {
   return clusters;
 }
 
-export function graphemeWidth(cluster: string): number {
+function graphemeWidth(cluster: string): number {
   const cps = [...cluster];
   const riCount = cps.filter((c) => REGIONAL_INDICATOR.test(c)).length;
-  if (cps.some((c) => c === "\u20E3")) return 2;
+  // The keycap and ZWJ rules need a base to apply to: an orphan U+20E3 or
+  // U+200D with nothing in front of it is an ordinary zero-width mark, so
+  // both guards require more than one code point in the cluster.
+  if (cps.length > 1 && cps.some((c) => c === "\u20E3")) return 2;
   if (riCount >= 2) return 2;
   if (riCount === 1 && cps.length === 1) return 1;
-  if (cps.some((c) => c === ZWJ)) return 2;
+  if (cps.length > 1 && cps.some((c) => c === ZWJ)) return 2;
   if (cps.length > 1 && cps[cps.length - 1] === "\uFE0F") return 2;
   return cellWidth(cps[0]!);
 }
@@ -307,12 +326,9 @@ export function splitCellRuns(text: string): CellRun[] {
       // run (a line opening with a mark opens a zero-width flow run).
       if (fixedStretch) fixedStretch += ch;
       else flow += ch;
-    } else if (
-      EMOJI_TAIL.test(ch) ||
-      (REGIONAL_INDICATOR.test(ch) && REGIONAL_INDICATOR.test(lastCodePoint(fixedStretch)))
-    ) {
-      // Composition tail of the previous glyph, or the second half of a
-      // flag pair: no new box, no new cells beyond what textWidth counts.
+    } else if (EMOJI_TAIL.test(ch)) {
+      // Composition tail of the previous glyph: no new box, no new cells
+      // beyond what textWidth counts.
       if (fixedStretch) fixedStretch += ch;
       else flow += ch;
     } else {
@@ -339,8 +355,7 @@ export function clusterSpanAt(text: string, charIndex: number): [number, number]
   const chars = [...text];
   let start = charIndex;
   let end = charIndex + 1;
-  const glueAt = (k: number) =>
-    k >= 0 && k < chars.length && (ZERO_WIDTH.test(chars[k]!) || EMOJI_TAIL.test(chars[k]!));
+  const glueAt = (k: number) => k >= 0 && k < chars.length && composesOnto(chars[start] ?? "", chars[k]!);
   while (glueAt(end)) end++;
   // Regional indicators pair on parity within their maximal run, so a
   // cursor between two adjacent flags pairs with its own flag's half
