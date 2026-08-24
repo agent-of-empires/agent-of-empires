@@ -1913,19 +1913,19 @@ pub fn detect_pi_status(raw_content: &str) -> Status {
 ///
 /// A footer row counts as a live loader when it carries a braille activity
 /// frame plus the classic markers ("Working", the unicode `⟦esc⟧` hint), or
-/// when it ends on an esc-interrupt hint in any symbol preset's glyphs
+/// when it ends on an esc hint glyph in any symbol preset's glyphs
 /// (unicode `⟦esc⟧`, nerd `⟨esc⟩`, ascii `[esc]`), or when it carries the
 /// maintenance-loader marker "(esc to cancel)": intent messages replace any
 /// "Working" text and non-unicode presets change both frames and glyphs.
 ///
 /// The tool-approval select replaces the composer with an overlay panel;
-/// two arms catch it. The title arm needs `Allow tool:` inside window 8
-/// (synthetic or short panels). The panel arm anchors on the option-list
-/// help row (`up/down navigate … enter select`), whose distance from the
-/// pane bottom is fixed regardless of how far the detail rows wrap, gated on
-/// the Approve/Deny pair so generic selectors stay out. The Plan Review
-/// overlay pins Waiting through its `Approve and execute` / `Refine plan`
-/// option rows on distinct lines.
+/// two arms catch it. The title arm needs `Allow tool:` plus the
+/// Approve/Deny pair inside window 8 (synthetic or short panels). The panel
+/// arm anchors on the option-list help row (`up/down navigate … enter
+/// select`), whose distance from the pane bottom is fixed regardless of how
+/// far the detail rows wrap, gated on the same pair so generic selectors
+/// stay out. The Plan Review overlay pins Waiting through its
+/// `Approve and execute` / `Refine plan` option rows on distinct lines.
 ///
 /// When no signal matched, the frame reads as healthy idle rather than
 /// Waiting. In practice it is parked on the always-visible `╭── π`/`╰─`
@@ -1952,10 +1952,10 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
 
     // Live loader rows, footer (last 3 non-empty lines) only. A row is live
     // when it carries a braille activity frame plus the classic markers, or
-    // when it ends on an esc-interrupt hint: the frame set and the bracket
+    // when it ends on an esc hint glyph: the frame set and the bracket
     // glyphs follow omp's symbol preset (unicode ⟦esc⟧, nerd ⟨esc⟧, ascii
     // [esc]), intent messages replace any "Working" text, and maintenance
-    // loaders render "(esc to cancel)" instead of an esc-bracket hint.
+    // loaders render "(esc to cancel)" instead of an esc hint glyph.
     let footer = tail_lines(&non_empty_lines, 3);
     let is_live_loader = |line: &str| -> bool {
         let l = line.trim().to_lowercase();
@@ -1965,13 +1965,8 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
             || l.ends_with("[esc]")
             || l.contains("(esc to cancel)")
     };
-    if footer.iter().any(|line| is_live_loader(line)) {
-        let pos = footer
-            .iter()
-            .rev()
-            .position(|line| is_live_loader(line))
-            .map_or(1, |i| i + 1);
-        consider(pos, OmpSignal::Spinner);
+    if let Some(pos) = footer.iter().rev().position(|line| is_live_loader(line)) {
+        consider(pos + 1, OmpSignal::Spinner);
     }
 
     // Retry countdown: fixed live region above the prompt (window 6). (a)
@@ -5705,21 +5700,42 @@ You can monitor progress with aoe session logs.\n\
     }
 
     #[test]
-    fn test_detect_omp_status_running_ascii_preset_loader() {
-        // symbolPreset ascii renders `[esc]` hints and `- \ | /` frames;
-        // intent messages replace the "Working…" text entirely (live capture).
-        let pane = "\
+    fn test_detect_omp_status_running_preset_loaders() {
+        // Each symbol preset renders its own esc hint glyph, and intent
+        // messages replace the "Working…" text entirely (live captures for
+        // ascii; unicode/nerd rows derived from the same loader templates).
+        let box_unicode = "╭── π ─╮\n╰─ ─╯";
+        let cases = [
+            // unicode: braille frame plus the ⟦esc⟧ hint on an intent line.
+            (
+                "unicode intent",
+                format!("⠴ Set permissions on audit bait path ⟦esc⟧\n{box_unicode}"),
+            ),
+            // nerd: ⟨esc⟩ glyphs; the frame is still braille but neither
+            // "Working" nor the unicode glyph appears on an intent line.
+            (
+                "nerd intent",
+                format!("⠹ Reading audit fixtures ⟨esc⟩\n{box_unicode}"),
+            ),
+            (
+                "ascii intent",
+                "\
 / Running requested echo probe [esc]
 +-- pi  > [M] Ox Alpha - [max] > [T] scratch/84d437 ---+
-+-                                                    -+";
-        assert_eq!(detect_omp_status(pane), Status::Running);
++-                                                    -+"
+                    .to_string(),
+            ),
+        ];
+        for (name, pane) in &cases {
+            assert_eq!(detect_omp_status(pane), Status::Running, "case: {name}");
+        }
     }
 
     #[test]
     fn test_detect_omp_status_running_maintenance_loaders() {
         // Maintenance loaders swap into statusContainer with the working
         // loader disposed, and their labels carry neither "Working" nor an
-        // esc-bracket glyph (command-controller.ts, event-controller.ts).
+        // esc hint glyph (command-controller.ts, event-controller.ts).
         let box_ = "╭── π ─╮\n╰─ ─╯";
         let cases = [
             "⠼ Compacting context... (esc to cancel)",
