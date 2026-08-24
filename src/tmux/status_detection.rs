@@ -1907,7 +1907,9 @@ pub fn detect_pi_status(raw_content: &str) -> Status {
 /// lines (`Error: Retry budget exhausted` / `Error: Retry failed after`),
 /// sub-agent retry labels (`retrying N/M …`, the rule-repair
 /// `Attempt N/M ·`), the tool-approval prompt, the Plan Review overlay, and
-/// the ask tool's option dialog. Each signal
+/// the ask tool's option dialog. Each signal has a freshness window; beyond
+/// it the signal is ignored, so a completed turn's loader or a dismissed
+/// banner in scrollback cannot pin the session.
 ///
 /// A footer row counts as a live loader when it carries a braille activity
 /// frame plus the classic markers ("Working", the unicode `⟦esc⟧` hint), or
