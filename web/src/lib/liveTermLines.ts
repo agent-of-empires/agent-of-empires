@@ -172,7 +172,13 @@ export function splitGraphemes(text: string): string[] {
   let i = 0;
   while (i < chars.length) {
     let cluster = chars[i]!;
-    if (REGIONAL_INDICATOR.test(cluster)) {
+    if (chars[i + 1] === "\uFE0F" && chars[i + 2] === "\u20E3") {
+      // Keycap sequence (base + VS16 + enclosing keycap): one two-cell
+      // cluster even when the base is printable ASCII like #, * or a
+      // digit.
+      cluster += chars[++i]!;
+      cluster += chars[++i]!;
+    } else if (REGIONAL_INDICATOR.test(cluster)) {
       // Pair on parity within the maximal RI run.
       let runStart = i;
       while (runStart > 0 && REGIONAL_INDICATOR.test(chars[runStart - 1]!)) runStart--;
@@ -208,10 +214,10 @@ export function splitGraphemes(text: string): string[] {
   return clusters;
 }
 
-/** Terminal cells occupied by one grapheme cluster (see splitGraphemes). */
 export function graphemeWidth(cluster: string): number {
   const cps = [...cluster];
   const riCount = cps.filter((c) => REGIONAL_INDICATOR.test(c)).length;
+  if (cps.some((c) => c === "\u20E3")) return 2;
   if (riCount >= 2) return 2;
   if (riCount === 1 && cps.length === 1) return 1;
   if (cps.some((c) => c === ZWJ)) return 2;

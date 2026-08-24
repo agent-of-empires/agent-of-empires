@@ -340,6 +340,21 @@ describe("splitCellRuns", () => {
     }
   });
 
+  it("counts keycap sequences as two-cell clusters", () => {
+    // tmux-measured: base + VS16 + U+20E3 advances cursor_x by exactly 2
+    // even when the base is printable ASCII; rendering keeps the whole
+    // sequence in one flow node so the font composes it.
+    const cases: Array<[string, number]> = [
+      ["#\uFE0F\u20E3", 2],
+      ["1\uFE0F\u20E3", 2],
+      ["*\uFE0F\u20E3", 2],
+    ];
+    for (const [input, expected] of cases) {
+      expect(textWidth(input)).toBe(expected, input);
+    }
+    expect(splitCellRuns("#\uFE0F\u20E3")).toEqual([{ text: "#\uFE0F\u20E3", cells: 2, fixed: false }]);
+  });
+
   it("counts emoji tails as zero-width cells", () => {
     expect(textWidth("\uFE0F")).toBe(0);
     expect(textWidth("\u{1F3FB}")).toBe(0);
