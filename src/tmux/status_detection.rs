@@ -1927,10 +1927,10 @@ pub fn detect_pi_status(raw_content: &str) -> Status {
 /// overlay pins Waiting through its `Approve and execute` / `Refine plan`
 /// option rows on distinct lines.
 ///
-/// Below all signals sits the always-visible composer box: when no signal
-/// matched, the frame is read as parked on it. Because the box renders in
-/// every healthy frame, an unsignaled frame means healthy idle rather than
-/// Waiting. The heuristic cannot see structured turn events; the structured
+/// When no signal matched, the frame reads as healthy idle rather than
+/// Waiting. In practice it is parked on the always-visible `╭── π`/`╰─`
+/// composer box, though the fallback itself does not require the box to be
+/// present. The heuristic cannot see structured turn events; the structured
 /// error/retry path (herdr-style extension) is tracked in #3380.
 pub fn detect_omp_status(raw_content: &str) -> Status {
     let clean = strip_ansi(raw_content);
@@ -5204,6 +5204,12 @@ You can monitor progress with aoe session logs.\n\
     fn test_detect_omp_status_waiting_on_approval_prompt() {
         // A live `Allow tool:` prompt is the only user-attention state at
         // rest; the composer box alone must not read as Waiting.
+        // Case-insensitive on entry: the gate lowercases the window before
+        // matching, so an all-caps render still reads as a live approval.
+        assert_eq!(
+            detect_omp_status("ALLOW TOOL: BASH\nAPPROVE\nDENY"),
+            Status::Waiting
+        );
         assert_eq!(
             detect_omp_status("Allow tool: bash\nApprove\nDeny"),
             Status::Waiting
@@ -5236,6 +5242,13 @@ You can monitor progress with aoe session logs.\n\
                 "stale loader ignored",
                 format!("⠋ Working… ⟦esc⟧\nCompleted response.\nAdditional output.\nOK\n{MINIMAL_COMPOSER_BOX}"),
             ),
+            // Live loader pushed one line past the 3-line footer window:
+            // the miss reads Idle, the same bounded flapping other agents
+            // accept between polls.
+            (
+                "loader pushed past footer",
+                format!("⠋ Working… ⟦esc⟧\nOK\n{MINIMAL_COMPOSER_BOX}"),
+            ),
             // Full archived repro snapshot (see the const doc).
             ("repro snapshot", OMP_PARKED_AT_COMPOSER_REPRO.to_string()),
         ];
@@ -5246,7 +5259,12 @@ You can monitor progress with aoe session logs.\n\
 
     #[test]
     fn test_detect_omp_status_idle_without_prompt() {
-        assert_eq!(detect_omp_status("plain command output"), Status::Idle);
+        // Empty and whitespace-only panes must stay Idle without panicking:
+        // every window is empty and the unsignaled fallback applies.
+        let panes = ["plain command output", "", " \n\t\n"];
+        for pane in panes {
+            assert_eq!(detect_omp_status(pane), Status::Idle, "case: {pane:?}");
+        }
     }
 
     #[test]
@@ -5352,6 +5370,16 @@ You can monitor progress with aoe session logs.\n\
                 format!(
                     " Dismissed when you send your next message.\n l1\n l2\n l3\n l4\n{prompt_box}"
                 ),
+                Status::Idle,
+            ),
+            (
+                "approval pos 8 bound",
+                format!("Allow tool: bash\nApprove\nDeny\n l1\n l2\n l3\n{prompt_box}"),
+                Status::Waiting,
+            ),
+            (
+                "approval pos 9 out",
+                format!("Allow tool: bash\nApprove\nDeny\n l1\n l2\n l3\n l4\n{prompt_box}"),
                 Status::Idle,
             ),
             // US2: retry in progress -> Running.
@@ -5558,6 +5586,20 @@ You can monitor progress with aoe session logs.\n\
                 "label prose accepted",
                 format!("I'm retrying 2/3 now: the API timed out.\n{prompt_box}"),
                 Status::Running,
+            ),
+            (
+                "label pos 12 bound",
+                format!(
+                    "retrying 2/3 now: 429 Too Many Requests (rate limited).\n f1\n f2\n f3\n f4\n f5\n f6\n f7\n f8\n f9\n{prompt_box}"
+                ),
+                Status::Running,
+            ),
+            (
+                "label pos 13 out",
+                format!(
+                    "retrying 2/3 now: 429 Too Many Requests (rate limited).\n f1\n f2\n f3\n f4\n f5\n f6\n f7\n f8\n f9\n f10\n{prompt_box}"
+                ),
+                Status::Idle,
             ),
             // Precedences: the lowest signal wins.
             (
