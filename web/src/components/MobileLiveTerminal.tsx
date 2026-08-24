@@ -3,7 +3,6 @@ import type { CSSProperties, ReactNode, RefObject } from "react";
 import type { AnsiSegment, AnsiStyle } from "../lib/ansi";
 import {
   LineParseCache,
-  cellWidth,
   clusterSpanAt,
   findCursorCharIndex,
   splitCellRuns,
@@ -397,12 +396,13 @@ export const Row = memo(function Row({
       if (idx != null) {
         placed = true;
         const chars = [...run.text];
-        // Slice at cluster boundaries: a fixed run is a coalesced stretch
-        // of whole graphemes, and the cursor cell must take exactly the
-        // cluster under the cursor (base plus its marks/tails, a flag pair,
-        // or whatever a ZWJ joins) so no composition tail is stranded in a
-        // zero-width sibling where browsers draw dotted circles.
-        const [clusterStart, clusterEnd] = run.fixed ? clusterSpanAt(run.text, idx) : [idx, idx + 1];
+        // Slice at cluster boundaries for BOTH run kinds: a fixed run is a
+        // coalesced stretch of whole graphemes, and flow runs can carry
+        // glued marks too (NFD input). The cursor cell must take exactly
+        // the cluster under the cursor (base plus its marks/tails, a flag
+        // pair, or whatever a ZWJ joins) so no composition tail is
+        // stranded in a zero-width sibling where browsers draw circles.
+        const [clusterStart, clusterEnd] = clusterSpanAt(run.text, idx);
         if (clusterStart > 0) {
           const pre = chars.slice(0, clusterStart).join("");
           out.push(
@@ -418,7 +418,7 @@ export const Row = memo(function Row({
             data-live-cursor
             className={focused ? "animate-term-cursor-blink" : undefined}
             style={{
-              ...fixedBoxStyle(run.fixed ? textWidth(cursorText) : cellWidth(cursorText), base),
+              ...fixedBoxStyle(textWidth(cursorText), base),
               ...cursorStyle,
             }}
           >

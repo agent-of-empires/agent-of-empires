@@ -200,6 +200,9 @@ export function findCursorCharIndex(text: string, col: number): number | null {
  *  back to a font whose advance is not 1 cell; the box pins every
  *  flow/fixed boundary to its exact column (#3342), so a row of N cells
  *  lays out N x cellWidth regardless of which font supplied each glyph.
+ *  cellWidth is measured at regular weight; on systems where the
+ *  configured font has no true bold face, synthesized bold can advance
+ *  slightly wider and bold runs may drift inside their boxes.
  *  Whole stretches stay in a single text node because atomic inline
  *  boundaries would otherwise break Unicode bidi reordering, complex
  *  script shaping and emoji composition inside the stretch. */
