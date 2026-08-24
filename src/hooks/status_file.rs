@@ -8,7 +8,6 @@
 
 use std::os::fd::AsFd;
 use std::path::PathBuf;
-use std::time::Duration;
 
 use anyhow::Result;
 use uuid::Uuid;
@@ -16,9 +15,6 @@ use uuid::Uuid;
 use crate::session::Status;
 
 use super::dir_guard;
-
-/// Maximum age before a sidecar `session_id` file is considered stale.
-pub(crate) const SESSION_ID_SIDECAR_MAX_AGE: Duration = Duration::from_secs(5 * 60);
 
 /// Cap used when reading a status file. The legitimate values are short
 /// tokens; an attacker-planted larger payload is irrelevant either way.
@@ -81,15 +77,17 @@ fn parse_status(bytes: &[u8]) -> Option<Status> {
 
 /// Read a Claude session UUID from the hook-written `session_id` sidecar.
 ///
-/// Returns `None` when the file is absent, malformed (non-UUID), or older
-/// than `SESSION_ID_SIDECAR_MAX_AGE`.
+/// Returns `None` when the file is absent or malformed (non-UUID).
+///
+/// Deliberately not age-gated. The sidecar is per-instance and is rewritten by
+/// this pane's own `SessionStart` / `UserPromptSubmit` hooks, so it names the
+/// conversation Claude last ran here; going idle does not make it wrong. The
+/// only alternative on expiry is the mtime scan over a project directory shared
+/// by every pane on the same cwd, which cannot attribute a transcript to a pane
+/// at all. A reboot expires every sidecar at once, so age-gating turned mass
+/// recovery into panes resuming each other's conversations.
 pub fn read_hook_session_id(instance_id: &str) -> Option<String> {
     let dir = dir_guard::open_instance_dir_read_only(instance_id).ok()??;
-    let meta = dir_guard::metadata_at(dir.as_fd(), "session_id").ok()??;
-    let mtime = meta.modified().ok()?;
-    if mtime.elapsed().ok()? > SESSION_ID_SIDECAR_MAX_AGE {
-        return None;
-    }
     let bytes =
         dir_guard::read_file_at(dir.as_fd(), "session_id", SESSION_ID_FILE_READ_CAP).ok()??;
     let id = std::str::from_utf8(&bytes).ok()?.trim().to_string();
@@ -388,7 +386,7 @@ mod tests {
 
     #[test]
     #[serial_test::serial(hook_base)]
-    fn test_read_hook_session_id_rejects_stale_file() {
+    fn test_read_hook_session_id_keeps_stale_file() {
         let (_g, base, _tmp) = BaseGuard::ready();
         let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         write_session_id_sidecar("session_id_stale", uuid);
@@ -399,7 +397,13 @@ mod tests {
             .unwrap()
             .set_times(std::fs::FileTimes::new().set_modified(stale))
             .unwrap();
-        assert_eq!(read_hook_session_id("session_id_stale"), None);
+        // Age is not evidence of wrongness: the sidecar still names the
+        // conversation this pane last ran, and the mtime-scan alternative
+        // cannot attribute a transcript to a pane at all.
+        assert_eq!(
+            read_hook_session_id("session_id_stale").as_deref(),
+            Some(uuid)
+        );
     }
 
     #[test]

@@ -144,10 +144,28 @@ pub(crate) fn capture_claude_session_id(
     if let Some((id, modified)) =
         scan_claude_project_dir(&claude_home, &canonical, known_session_id, exclusion)?
     {
+        // The anchor is this pane's own conversation, so its age says nothing
+        // about whether it is the right target: an idle session is still ours.
+        // The freshness gate belongs to the anchorless guess below, which is
+        // only a guess.
+        if known_session_id == Some(id.as_str()) {
+            return Ok(id);
+        }
         let age = modified.elapsed().unwrap_or(Duration::from_secs(u64::MAX));
         if age <= Duration::from_secs(5 * 60) {
             return Ok(id);
         }
+    }
+
+    // `lastSessionId` is per-project, not per-pane: whichever Claude ran last in
+    // this cwd owns it. A pane that already has a session of its own must not
+    // consult it, or it adopts a peer's conversation the moment its own
+    // transcript is missing (a pinned `--session-id` before the first prompt).
+    if known_session_id.is_some() {
+        anyhow::bail!(
+            "No transcript yet for the session anchored to {}",
+            project_path
+        );
     }
 
     let claude_json_path = claude_json_path(&claude_home, host_env);
@@ -232,12 +250,16 @@ pub(crate) fn claude_host_transcript_confirmed_absent(
 /// Scan `~/.claude/projects/{encoded-path}/` and pick this poller's session.
 ///
 /// Tie-break:
-/// 1. anchor stale or absent → return `best` (most-recent unexcluded jsonl).
-/// 2. `best` exists, fresh, and strictly newer than the anchor → return
-///    `best`. The caller promotes `last_known` so the poller adopts the new
-///    UUID after `/clear` / `/new` / `--fork-session` mints a new jsonl.
-/// 3. otherwise → return the anchor (covers steady-state and the case where
-///    a sibling's most-recent write was filtered out by `exclusion`).
+/// 1. the anchor's transcript exists → return the anchor, whatever its age and
+///    however much newer a sibling is.
+/// 2. an anchor was asked for but is missing or excluded → return `None`.
+/// 3. no anchor asked for → return `best` (most-recent unexcluded jsonl), the
+///    only thing this scan can offer a pane that has no session yet.
+///
+/// mtime cannot attribute a transcript to a pane: one cwd is one directory, so
+/// "most recently written" usually means "a peer is busy". Promotion after
+/// `/clear`, `/new` or `--fork-session` is delivered by the per-instance hook
+/// sidecar instead, which is attributable.
 fn scan_claude_project_dir(
     claude_home: &Path,
     project_path: &Path,
@@ -295,24 +317,16 @@ fn scan_claude_project_dir(
         }
     }
 
-    if let Some((kid, kmt)) = known_hit {
-        let known_fresh = kmt
-            .elapsed()
-            .map(|age| age <= Duration::from_secs(5 * 60))
-            .unwrap_or(false);
-        if !known_fresh {
-            return Ok(best);
-        }
-        if let Some((_, bmt)) = best.as_ref() {
-            let best_fresh = bmt
-                .elapsed()
-                .map(|age| age <= Duration::from_secs(5 * 60))
-                .unwrap_or(false);
-            if best_fresh && *bmt > kmt {
-                return Ok(best);
-            }
-        }
-        return Ok(Some((kid, kmt)));
+    if let Some(hit) = known_hit {
+        return Ok(Some(hit));
+    }
+
+    // Anchored callers get their own transcript or nothing. Reaching here means
+    // the anchor is missing (a pinned `--session-id` before its first prompt) or
+    // excluded (claimed by a peer); `best` is then just whichever peer wrote
+    // last, which is never a safe substitute for a session this pane owns.
+    if known.is_some() {
+        return Ok(None);
     }
 
     Ok(best)
@@ -1001,6 +1015,35 @@ pub(crate) fn compose_exclusion(
 /// effective profile. A stopped peer in a different profile against the same
 /// host `$HOME` will not be excluded; the residual gap is narrower than #2355's
 /// trigger and is left for a follow-up.
+/// Whether another AoE session in `profile` runs Claude out of the same
+/// directory as this one.
+///
+/// `<config>/projects/<encoded-cwd>/` is keyed by cwd alone, so co-located
+/// sessions all append into one directory and "most recently written" stops
+/// identifying a pane — during a mass recovery every pane sees the same newest
+/// transcript, and the peer-exclusion sets cannot help because no peer has
+/// claimed anything yet. Callers use this to refuse an mtime guess that would
+/// retarget a session already holding a conversation of its own.
+pub(crate) fn claude_project_dir_is_shared(
+    current_instance_id: &str,
+    current_project_path: &str,
+    profile: &str,
+) -> bool {
+    let Ok(storage) = crate::session::storage::Storage::new_unwatched(profile) else {
+        return false;
+    };
+    let Ok(instances) = storage.load() else {
+        return false;
+    };
+    let canonical_current = canonicalize_or_raw(current_project_path);
+    instances.iter().any(|inst| {
+        inst.id != current_instance_id
+            && inst.tool == "claude"
+            && !inst.is_trashed()
+            && canonicalize_or_raw(&inst.project_path) == canonical_current
+    })
+}
+
 pub(crate) fn compose_exclusion_with_persisted_peers(
     current_instance_id: &str,
     current_project_path: &str,
@@ -3477,10 +3520,12 @@ mod tests {
             uuid_b
         );
 
+        // Anchored: the newer sibling is a peer's write, so the anchor holds
+        // whether or not the sibling is also excluded.
         assert_eq!(
             capture_claude_session_id("/tmp/myproject", Some(uuid_a), &HashSet::new(), &[])
                 .unwrap(),
-            uuid_b
+            uuid_a
         );
 
         let exclusion: HashSet<String> = std::iter::once(uuid_b.to_string()).collect();
@@ -3495,11 +3540,13 @@ mod tests {
             uuid_b
         );
 
+        // An anchor with no transcript yet is a pinned `--session-id` before its
+        // first prompt. Handing it a peer's conversation is exactly the mix-up
+        // this scan must not make, so it reports nothing instead.
         let absent = "99999999-9999-9999-9999-999999999999";
-        assert_eq!(
+        assert!(
             capture_claude_session_id("/tmp/myproject", Some(absent), &HashSet::new(), &[])
-                .unwrap(),
-            uuid_b
+                .is_err()
         );
 
         match old_val {
@@ -3510,9 +3557,9 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_capture_claude_session_known_but_stale_falls_back() {
-        // If our own session's file went stale (>5min), adopt the fresh
-        // most-recent rather than clinging to a dead anchor.
+    fn test_capture_claude_session_keeps_stale_anchor() {
+        // Our own session going quiet for >5min does not make a sibling's
+        // transcript ours. The anchor is held.
         let tmp = tempfile::tempdir().unwrap();
         let project_dir = tmp.path().join("projects").join("-tmp-myproject");
         std::fs::create_dir_all(&project_dir).unwrap();
@@ -3535,7 +3582,7 @@ mod tests {
         assert_eq!(
             capture_claude_session_id("/tmp/myproject", Some(uuid_known), &HashSet::new(), &[])
                 .unwrap(),
-            uuid_fresh
+            uuid_known
         );
 
         match old_val {
@@ -3546,7 +3593,58 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_claude_poll_fn_promotes_last_known_across_polls() {
+    fn test_capture_claude_session_mass_recovery_keeps_panes_apart() {
+        // Reproduces the recovery storm: several panes share one cwd, every
+        // sidecar has expired, and each resume touches a transcript so the
+        // "newest jsonl" keeps flipping between peers. Every pane must still get
+        // its own conversation back.
+        let tmp = tempfile::tempdir().unwrap();
+        let project_dir = tmp.path().join("projects").join("-tmp-myproject");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let anchors = [
+            "aaaaaaaa-1111-1111-1111-111111111111",
+            "bbbbbbbb-2222-2222-2222-222222222222",
+            "cccccccc-3333-3333-3333-333333333333",
+        ];
+        for (i, uuid) in anchors.iter().enumerate() {
+            let path = project_dir.join(format!("{uuid}.jsonl"));
+            std::fs::write(&path, "t\n").unwrap();
+            let when = std::time::SystemTime::now() - Duration::from_secs(600 + i as u64 * 60);
+            std::fs::File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_times(std::fs::FileTimes::new().set_modified(when))
+                .unwrap();
+        }
+        // One peer is written during recovery; it must not become everyone's.
+        std::fs::write(project_dir.join(format!("{}.jsonl", anchors[2])), "t\nt\n").unwrap();
+
+        let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
+        std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
+
+        let captured: Vec<String> = anchors
+            .iter()
+            .map(|a| {
+                capture_claude_session_id("/tmp/myproject", Some(a), &HashSet::new(), &[]).unwrap()
+            })
+            .collect();
+
+        assert_eq!(
+            captured.iter().map(String::as_str).collect::<Vec<_>>(),
+            anchors.to_vec()
+        );
+
+        match old_val {
+            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
+            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_claude_poll_fn_holds_anchor_across_polls() {
         let tmp = tempfile::tempdir().unwrap();
         let project_dir = tmp.path().join("projects").join("-tmp-myproject");
         std::fs::create_dir_all(&project_dir).unwrap();
@@ -3577,11 +3675,12 @@ mod tests {
             Vec::new(),
         );
 
-        assert_eq!(poll().as_deref(), Some(uuid_post_fork));
+        // A newer sibling jsonl is a peer writing, not this pane forking.
+        assert_eq!(poll().as_deref(), Some(uuid_startup));
 
         std::fs::write(project_dir.join(format!("{uuid_sibling}.jsonl")), "x\n").unwrap();
 
-        assert_eq!(poll().as_deref(), Some(uuid_post_fork));
+        assert_eq!(poll().as_deref(), Some(uuid_startup));
 
         match old_val {
             Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
@@ -6729,7 +6828,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_claude_poll_fn_skips_stale_sidecar_falls_through_to_disk() {
+    fn test_claude_poll_fn_uses_sidecar_regardless_of_age() {
         use std::os::unix::fs::PermissionsExt;
         let hook_tmp = tempfile::tempdir().unwrap();
         let hook_base = hook_tmp.path().join("aoe-hooks");
@@ -6777,7 +6876,10 @@ mod tests {
             HashSet::new(),
             Vec::new(),
         );
-        assert_eq!(poll().as_deref(), Some(disk_uuid));
+        // The sidecar is this instance's own hook output; a newer sibling
+        // transcript on disk does not outrank it.
+        let _ = disk_uuid;
+        assert_eq!(poll().as_deref(), Some(stale_uuid));
 
         match old_val {
             Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
@@ -6787,7 +6889,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_capture_claude_session_active_newer_wins_over_anchor() {
+    fn test_capture_claude_session_anchor_wins_over_newer_sibling() {
         let tmp = tempfile::tempdir().unwrap();
         let project_dir = tmp.path().join("projects").join("-tmp-myproject");
         std::fs::create_dir_all(&project_dir).unwrap();
@@ -6811,7 +6913,7 @@ mod tests {
         assert_eq!(
             capture_claude_session_id("/tmp/myproject", Some(uuid_anchor), &HashSet::new(), &[])
                 .unwrap(),
-            uuid_active
+            uuid_anchor
         );
 
         match old_val {

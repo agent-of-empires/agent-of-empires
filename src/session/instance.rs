@@ -3049,7 +3049,23 @@ impl Instance {
             // through the same empty-thread downgrade as the stored id below.
             // The SessionStart hook fires before Claude writes any content, so
             // the sidecar can legitimately name a thread with no transcript.
-            let stored = match self.capture_freshest_session_id() {
+            //
+            // Which observation is admissible depends on the directory. Claude's
+            // non-hook capture is an mtime scan of
+            // `<config>/projects/<encoded-cwd>/`: with one session per cwd that
+            // scan is sound, and it is what re-targets a stored id after
+            // `/clear` (#2291). With several sessions on one cwd it is a
+            // lottery, because they share the directory — on a mass recovery
+            // every pane sees the same "newest" transcript and resumes it,
+            // swapping conversations between panes and leaving one conversation
+            // open in two. Where the directory is shared, only the per-instance
+            // hook sidecar may retarget an id we already hold.
+            let observed = if self.tool == "claude" && self.claude_project_dir_is_shared() {
+                self.capture_authoritative_session_id()
+            } else {
+                self.capture_freshest_session_id()
+            };
+            let stored = match observed {
                 Some(fresh) => {
                     tracing::info!(
                         target: "session.store",
@@ -3168,6 +3184,16 @@ impl Instance {
     /// Full set of session IDs capture must skip for this instance: live tmux
     /// ownership, cascade-cleared ids, and conversations same-project peers
     /// parked while running another tool.
+    /// Whether another AoE session shares this one's Claude project directory,
+    /// which makes transcript mtime useless for attributing a conversation.
+    fn claude_project_dir_is_shared(&self) -> bool {
+        super::capture::claude_project_dir_is_shared(
+            &self.id,
+            &self.project_path,
+            &self.effective_profile(),
+        )
+    }
+
     fn retroactive_capture_exclusion_set(&self) -> HashSet<String> {
         super::capture::compose_exclusion_with_persisted_peers(
             &self.id,
@@ -3569,6 +3595,19 @@ impl Instance {
 
         let live = self.try_retroactive_capture()?;
         override_if_distinct(self.agent_session_id.as_deref(), live)
+    }
+
+    /// The per-instance hook sidecar only: the one Claude session observation
+    /// that is attributable to *this* pane.
+    ///
+    /// Used where an id is being *retargeted* rather than established, which the
+    /// mtime fallback in [`Self::capture_freshest_session_id`] must never do.
+    pub(crate) fn capture_authoritative_session_id(&self) -> Option<String> {
+        let authoritative = crate::hooks::read_hook_session_id(&self.id)?;
+        if self.retroactive_capture_excludes.contains(&authoritative) {
+            return None;
+        }
+        override_if_distinct(self.agent_session_id.as_deref(), authoritative)
     }
 
     fn apply_session_flags(&mut self, cmd: &mut String, context: &str) -> bool {
@@ -14290,6 +14329,56 @@ mod tests {
                 let (sid, _is_existing) = inst.acquire_session_id();
                 assert_eq!(sid.as_deref(), Some(fresh));
                 assert_eq!(inst.agent_session_id.as_deref(), Some(fresh));
+            }
+
+            // The recovery storm: several AoE sessions share one cwd, so they
+            // share one `<config>/projects/<encoded-cwd>/`. Every sidecar has
+            // expired and the stored ids are themselves already wrong, so the
+            // freshest transcript is claimed by nobody and no exclusion set can
+            // filter it out. mtime must not retarget this session.
+            #[test]
+            #[serial]
+            fn mtime_fallback_declines_when_project_dir_is_shared() {
+                let temp = tempdir().unwrap();
+                let _guard = claude_home_guard(&temp);
+
+                let project_path = "/tmp/aoe-test-shared-project-dir";
+                let claude_dir = temp
+                    .path()
+                    .join(".claude")
+                    .join("projects")
+                    .join(encode_claude_project_path(project_path));
+                fs::create_dir_all(&claude_dir).unwrap();
+
+                let mine = "11111111-1111-4111-8111-111111111111";
+                let unclaimed = "33333333-3333-4333-8333-333333333333";
+                let now = SystemTime::now();
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{mine}.jsonl")),
+                    now - Duration::from_secs(120),
+                );
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{unclaimed}.jsonl")),
+                    now - Duration::from_secs(5),
+                );
+
+                let profile = "verify-shared-project-dir";
+                let mut peer_inst = Instance::new("shared-peer-id", project_path);
+                peer_inst.source_profile = profile.to_string();
+                peer_inst.tool = "claude".to_string();
+                peer_inst.agent_session_id =
+                    Some("22222222-2222-4222-8222-222222222222".to_string());
+                super::seed_disk_for_sidecar_test(profile, &peer_inst);
+
+                let mut inst = Instance::new("verify-shared", project_path);
+                inst.source_profile = profile.to_string();
+                inst.tool = "claude".to_string();
+                inst.agent_session_id = Some(mine.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, _is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some(mine));
+                assert_eq!(inst.agent_session_id.as_deref(), Some(mine));
             }
 
             // #2355: when a co-located stopped peer leaves a fresher jsonl in
