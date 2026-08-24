@@ -1512,16 +1512,16 @@ fn override_if_distinct(stored: Option<&str>, fresh: String) -> Option<String> {
     }
 }
 
+/// Reads the shared session-name cache rather than forking its own
+/// `list-sessions`. [`Instance::has_live_tmux_pane`] sits on top of this and is
+/// called once per instance by several passes (the peer-exclusion scan walks
+/// every stored session sharing the project path, trashed ones included), so a
+/// fork here is multiplied by the size of the whole session store. Every
+/// lifecycle operation that can change tmux session existence already calls
+/// `refresh_session_cache`, so the snapshot is stale only within its TTL.
 fn tmux_env_session_name_for_instance_id(instance_id: &str) -> Option<String> {
-    let output = crate::tmux::tmux_command()
-        .args(["list-sessions", "-F", "#{session_name}"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    crate::tmux::live_any_kind_name_for_id(stdout.lines(), instance_id)
+    let names = crate::tmux::cached_session_names();
+    crate::tmux::live_any_kind_name_for_id(names.iter().map(String::as_str), instance_id)
 }
 
 /// A passively-detected status transition, queued for a batched disk write.
@@ -16125,6 +16125,13 @@ mod tests {
                     .status()
                     .expect("failed to spawn tmux");
                 assert!(status.success(), "tmux new-session failed for {}", name);
+                // Production creation refreshes the shared session cache (see
+                // `Session::create_with_size_env_inner` and
+                // `PairedTerminal::create_with_size`); liveness reads that
+                // cache, so a helper that spawns tmux directly has to do the
+                // same or the session stays invisible for the snapshot's TTL.
+                // Mirrors the same helper in `tui/home/tests.rs`.
+                crate::tmux::refresh_session_cache();
                 Self(name)
             }
 
@@ -16138,6 +16145,7 @@ mod tests {
                 let _ = crate::tmux::tmux_command()
                     .args(["kill-session", "-t", &self.0])
                     .output();
+                crate::tmux::refresh_session_cache();
             }
         }
 

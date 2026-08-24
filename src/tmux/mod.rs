@@ -997,6 +997,47 @@ impl Drop for SessionCacheGuard {
 /// force a fresh `refresh_session_cache()` call.
 const CACHE_TTL: Duration = Duration::from_secs(2);
 
+/// Live tmux session names from the shared [`SESSION_CACHE`], refreshing the
+/// snapshot only when it is older than [`CACHE_TTL`].
+///
+/// Any caller that needs the name list *per instance* must use this rather than
+/// its own `list-sessions`. A store with N sessions turns one such caller into N
+/// forks per pass, and a fork+exec round-trip is ~5ms on macOS, so a few hundred
+/// sessions is enough to keep a thread blocked for a large fraction of every
+/// second — including the thread serving keystrokes.
+///
+/// An empty list is returned both for "no sessions" and for "the last refresh
+/// could not reach the server". That matches what the per-caller
+/// `list-sessions` did on failure, and deliberately does not re-probe: during a
+/// real outage the retry fails the same way and just burns a fork per lookup.
+pub fn cached_session_names() -> Vec<String> {
+    if let Some(names) = session_names_from_cache() {
+        return names;
+    }
+    refresh_session_cache();
+    session_names_from_cache().unwrap_or_default()
+}
+
+/// Names from the current snapshot, or `None` when it is stale (older than
+/// [`CACHE_TTL`]) or the lock is poisoned, meaning the caller must refresh.
+fn session_names_from_cache() -> Option<Vec<String>> {
+    let cache = SESSION_CACHE.read().ok()?;
+    let fresh = cache
+        .time
+        .map(|t| t.elapsed() <= CACHE_TTL)
+        .unwrap_or(false);
+    if !fresh {
+        return None;
+    }
+    Some(
+        cache
+            .data
+            .as_ref()
+            .map(|m| m.keys().cloned().collect())
+            .unwrap_or_default(),
+    )
+}
+
 pub fn session_exists_from_cache(name: &str) -> Option<bool> {
     let cache = SESSION_CACHE.read().ok()?;
 
@@ -1408,6 +1449,32 @@ mod tests {
         // confirmed this session is not in its list.
         guard.force_present(&[&format!("{P}some_other_session")]);
         assert_eq!(probe_session_existence(&name), SessionExistence::Absent);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cached_session_names_serves_a_fresh_snapshot() {
+        let guard = SessionCacheGuard::capture();
+        let a = format!("{P}cached_names_one_abc12345");
+        let b = format!("{P}cached_names_two_abc12345");
+        guard.force_present(&[&a, &b]);
+        let mut got = cached_session_names();
+        got.sort();
+        let mut want = vec![a, b];
+        want.sort();
+        assert_eq!(got, want);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn cached_session_names_is_empty_when_server_unreachable() {
+        let guard = SessionCacheGuard::capture();
+        // Fresh snapshot, no data: the last `list-sessions` failed. Callers
+        // treated that as "no live sessions" when they forked it themselves, so
+        // it stays that way — and must not re-probe, which during an outage
+        // would burn one fork per lookup.
+        guard.force_unreachable();
+        assert!(cached_session_names().is_empty());
     }
 
     #[test]
