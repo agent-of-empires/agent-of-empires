@@ -3181,9 +3181,6 @@ impl Instance {
         !self.has_command_override() && self.profile_host_environment().is_empty()
     }
 
-    /// Full set of session IDs capture must skip for this instance: live tmux
-    /// ownership, cascade-cleared ids, and conversations same-project peers
-    /// parked while running another tool.
     /// Whether another AoE session shares this one's Claude project directory,
     /// which makes transcript mtime useless for attributing a conversation.
     fn claude_project_dir_is_shared(&self) -> bool {
@@ -3194,6 +3191,9 @@ impl Instance {
         )
     }
 
+    /// Full set of session IDs capture must skip for this instance: live tmux
+    /// ownership, cascade-cleared ids, and conversations same-project peers
+    /// parked while running another tool.
     fn retroactive_capture_exclusion_set(&self) -> HashSet<String> {
         super::capture::compose_exclusion_with_persisted_peers(
             &self.id,
