@@ -105,8 +105,27 @@ test("a native contextmenu after the long-press does not dismiss the row menu", 
   await cdp.send("Input.dispatchTouchEvent", { type: "touchEnd", touchPoints: [] });
 
   // The guard is a window, not a latch: once it lapses a tap outside still
-  // dismisses the menu.
+  // dismisses the menu. A tap rather than a mouse click, since touch is the
+  // path the bug lived on. The point is derived from the menu box and clears
+  // it HORIZONTALLY on purpose: the menu is capped at `100dvh - 16px` and on
+  // a phone it is nearly full height, so there is no reliable gap above or
+  // below it, and Chromium's touch adjustment snaps a near-miss back onto the
+  // menu. The side margin is the only dependable outside.
   await page.waitForTimeout(LONG_PRESS_MS + 100);
-  await page.mouse.click(5, 5);
+  const outside = await menu.evaluate((el) => {
+    const r = el.getBoundingClientRect();
+    const gapLeft = r.left;
+    const gapRight = window.innerWidth - r.right;
+    if (Math.max(gapLeft, gapRight) < 12) throw new Error("no horizontal gap beside the menu");
+    return {
+      x: Math.round(gapLeft >= gapRight ? gapLeft / 2 : (r.right + window.innerWidth) / 2),
+      y: Math.round(r.top + r.height / 2),
+    };
+  });
+  const urlBefore = page.url();
+  await page.touchscreen.tap(outside.x, outside.y);
   await expect(menu).toBeHidden();
+  // The dismissal has to come from the document listener, not from the tap
+  // landing on a row and navigating away, which would hide the menu too.
+  expect(page.url()).toBe(urlBefore);
 });

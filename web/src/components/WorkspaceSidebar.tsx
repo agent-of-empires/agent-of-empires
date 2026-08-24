@@ -1307,9 +1307,14 @@ export const SessionRow = memo(function SessionRow({
   useEffect(() => {
     if (!contextMenu) return;
     const close = () => setContextMenu(null);
-    // One handler for both dismissers, so the click and contextmenu paths
-    // cannot drift apart again. An unguarded contextmenu listener here made
-    // Android's long-press menu open and instantly vanish (#3460).
+    // One handler for both of this row's dismissers, so the click and
+    // contextmenu paths cannot drift apart again. An unguarded contextmenu
+    // listener here made Android's long-press menu open and instantly
+    // vanish (#3460). SidebarGroupHeader, ProjectsSection and
+    // CopyPathContextMenu still carry the two-listener shape; none of them
+    // has a long-press timer, so their menu is only ever opened by a
+    // contextmenu whose dispatch the requestAnimationFrame below defers
+    // past, and this sequence is unreachable there.
     const dismissIfOutside = (e: MouseEvent) => {
       // Events inside the menu should be handled by item onClick handlers,
       // not by this dismiss listener. The menu is a portal placed at the
