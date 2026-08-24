@@ -1924,12 +1924,13 @@ pub fn detect_pi_status(raw_content: &str) -> Status {
 /// arm anchors on the option-list help row (`up/down navigate … enter
 /// select`), whose distance from the pane bottom is fixed regardless of how
 /// far the detail rows wrap, gated on the same pair so generic selectors
-/// stay out. The Plan Review overlay pins Waiting through its
-/// `Approve and execute` / `Refine plan` option rows on distinct lines.
+/// stay out. The Plan Review overlay pins Waiting through its cursor-marked
+/// option rows (`Approve and execute`, `Refine plan`, `Save and quit`).
 ///
 /// The ask tool's option dialog swaps into the composer slot the same way;
 /// its footer hint rows (`Enter select · n note`, `Space toggle · Enter …`,
-/// `Enter submit · ↑/↓ scroll`) pin Waiting while answers are pending.
+/// `Enter submit · ↑/↓ scroll`, and the input-guard form
+/// `…current prompt to answer`) pin Waiting while answers are pending.
 ///
 /// When no signal matched, the frame reads as healthy idle rather than
 /// Waiting. In practice it is parked on the always-visible `╭── π`/`╰─`
@@ -2083,15 +2084,18 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
             consider(c.min(o), OmpSignal::Approval);
         }
     }
+
     // Ask dialog: the built-in ask tool swaps an option dialog into the
     // composer slot and blocks the turn on the operator's answers. Its
-    // footer hint row is fixed relative to the pane bottom; the three verb
-    // patterns cover single-select, multi-select and the submit tab.
+    // footer hint row is fixed relative to the pane bottom; four variants
+    // cover single-select, multi-select, the submit tab, and the
+    // input-guard form shown while a composer draft exists.
     if let Some(pos) = lowest_matching_line(window8, |l| {
         let l = l.to_lowercase();
         l.contains("enter select · n note")
             || l.contains("space toggle · enter ")
             || l.contains("enter submit · ↑/↓ scroll")
+            || l.contains("current prompt to answer")
     }) {
         consider(pos, OmpSignal::Approval);
     }
@@ -5793,13 +5797,13 @@ You can monitor progress with aoe session logs.\n\
 │ Enter select · n note · ↑/↓ move · Esc       │
 │                                              │
 ╰──────────────────────────────────────────────╯",
-            // Multi-select footer (Enter advances to the next question).
-            "\
-│ Space toggle · Enter next · ↑/↓ move · Esc   │
-╰──────────────────────────────────────────────╯",
             // Submit tab footer.
             "\
 │ Enter submit · ↑/↓ scroll · Esc              │
+╰──────────────────────────────────────────────╯",
+            // Input-guard footer: shown while a composer draft exists.
+            "\
+│ Finish or clear the current prompt to answer · Esc cancel │
 ╰──────────────────────────────────────────────╯",
         ];
         for (i, pane) in cases.iter().enumerate() {
