@@ -1167,12 +1167,11 @@ pub async fn switch_acp_agent(
     .into_response()
 }
 
-/// Auto-wake an archived, snoozed, or idle-dormant session before a
-/// prompt is forwarded, matching the tmux send path
-/// (`/api/sessions/{id}/send`). `touch_last_accessed` clears
-/// `archived_at`, `snoozed_until`, and `idle_dormant_since` so the
-/// structured view reconciler stops skipping the session on its next ~2s tick and
-/// respawns the worker; the frontend's queue drains as soon as the fresh
+/// Touches the row's `last_accessed_at` on every prompt (a prompt is a
+/// user gesture, and structured rows have no other per-prompt recency
+/// writer since the intent stamp was dropped for #3465), then wakes a
+/// sunk row: archived_at/snoozed_until are cleared and an idle-dormant
+/// worker respawns; the frontend's queue drains as soon as the fresh
 /// `AcpSessionAssigned` lands. The idle_dormant clear is the wake path for
 /// auto-stopped idle workers (#1689); a worker reaped for inactivity
 /// respawns on the next prompt. See #1581.
@@ -1190,33 +1189,33 @@ pub async fn switch_acp_agent(
 /// Returns whether the wake cleared an idle-dormant marker, so the caller
 /// can synchronously kick a background respawn (the reconciler's ~2s tick
 /// is too slow for the prompt that triggered the wake; see #1748).
-async fn touch_and_wake_if_sunk(state: &Arc<AppState>, id: &str) -> bool {
+async fn touch_on_prompt_and_wake_if_sunk(state: &Arc<AppState>, id: &str) -> bool {
     let inst_lock = state.instance_lock(id).await;
     let _guard = inst_lock.lock().await;
-    let (triage_changed, woke_idle_dormant) = {
+    let (found, wake, woke_idle_dormant) = {
         let mut instances = state.instances.write().await;
         if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
             let was_idle_dormant = inst.is_idle_dormant();
-            let was_sunk = inst.is_archived() || inst.is_snoozed() || was_idle_dormant;
-            if was_sunk {
-                inst.touch_last_accessed();
-                if was_idle_dormant {
-                    // Pairs with the "auto-stopped idle structured view worker"
-                    // info log in the reconciler's reap pass (#1689) so the
-                    // stop/resume cycle is traceable in the daemon log.
-                    tracing::info!(
-                        target: "acp.supervisor",
-                        session = %id,
-                        "waking idle-dormant structured view session on prompt; spawning a fresh worker"
-                    );
-                }
+            let wake = inst.is_archived() || inst.is_snoozed() || was_idle_dormant;
+            // Memory side: a prompt is a user gesture, so refresh recency
+            // and lift sinks unconditionally.
+            inst.touch_last_accessed();
+            if was_idle_dormant {
+                // Pairs with the "auto-stopped idle structured view worker"
+                // info log in the reconciler's reap pass (#1689) so the
+                // stop/resume cycle is traceable in the daemon log.
+                tracing::info!(
+                    target: "acp.supervisor",
+                    session = %id,
+                    "waking idle-dormant structured view session on prompt; spawning a fresh worker"
+                );
             }
-            (was_sunk, was_idle_dormant)
+            (true, wake, was_idle_dormant)
         } else {
-            (false, false)
+            (false, false, false)
         }
     };
-    if triage_changed {
+    if found {
         let profile = {
             let instances = state.instances.read().await;
             instances
@@ -1231,7 +1230,7 @@ async fn touch_and_wake_if_sunk(state: &Arc<AppState>, id: &str) -> bool {
             match tokio::task::spawn_blocking(move || {
                 storage.update(|instances, _groups| {
                     if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
-                        inst.touch_last_accessed();
+                        apply_prompt_persist_to_disk(inst, wake);
                     }
                     Ok(())
                 })
@@ -1242,17 +1241,31 @@ async fn touch_and_wake_if_sunk(state: &Arc<AppState>, id: &str) -> bool {
                 Ok(Err(e)) => tracing::warn!(
                     target: "http.api.acp",
                     session = %session_id_for_log,
-                    "failed to save after triage auto-wake: {e}"
+                    "failed to save after prompt touch and wake: {e}"
                 ),
                 Err(join_err) => tracing::warn!(
                     target: "http.api.acp",
                     session = %session_id_for_log,
-                    "spawn_blocking join error during triage auto-wake save: {join_err}"
+                    "spawn_blocking join error during prompt touch save: {join_err}"
                 ),
             }
         }
     }
     woke_idle_dormant
+}
+
+/// Disk-side half of [`touch_on_prompt_and_wake_if_sunk`]. A waking prompt
+/// keeps touch semantics (lifts sink state); any other prompt advances
+/// recency monotonically and must NOT clear sinks, or #3465's wipe returns
+/// through this save path for archives a peer process wrote after this
+/// process's snapshot.
+fn apply_prompt_persist_to_disk(disk: &mut crate::session::Instance, wake: bool) {
+    if wake {
+        disk.touch_last_accessed();
+    } else {
+        let now = chrono::Utc::now();
+        disk.last_accessed_at = disk.last_accessed_at.max(Some(now));
+    }
 }
 
 /// `POST /api/sessions/{id}/acp/prompt` success body.
@@ -1284,7 +1297,7 @@ pub async fn acp_prompt(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
-    let woke_idle_dormant = touch_and_wake_if_sunk(&state, &id).await;
+    let woke_idle_dormant = touch_on_prompt_and_wake_if_sunk(&state, &id).await;
     {
         let instances = state.instances.read().await;
         if !instances.iter().any(|i| i.id == id) {
@@ -1329,7 +1342,7 @@ pub async fn acp_prompt(
         let control = crate::server::acp_ws::fold_control_state(&state, &id).await;
         let liveness = crate::acp::dispatch::WorkerLiveness {
             running: state.acp_supervisor.is_running(&id).await,
-            // `touch_and_wake_if_sunk` above already cleared the marker for a
+            // `touch_on_prompt_and_wake_if_sunk` above already cleared the marker for a
             // dormant session, so read the pre-clear answer it returned rather
             // than the instance, which now says "awake".
             idle_dormant: woke_idle_dormant,
@@ -1446,7 +1459,7 @@ pub async fn acp_prompt_diff_comments(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
-    let woke_idle_dormant = touch_and_wake_if_sunk(&state, &id).await;
+    let woke_idle_dormant = touch_on_prompt_and_wake_if_sunk(&state, &id).await;
     {
         let instances = state.instances.read().await;
         if !instances.iter().any(|i| i.id == id) {
@@ -3646,5 +3659,39 @@ mod tests {
         let (files, truncated) = list_files(dir.path(), 3).unwrap();
         assert!(truncated);
         assert_eq!(files, vec!["f0.rs", "f1.rs", "f2.rs"]);
+    }
+
+    #[test]
+    fn plain_prompt_recency_never_clears_a_peer_archive() {
+        // #3465 residual: prompting a live structured row persists
+        // recency monotonically and must not clear sink state a peer
+        // process wrote after this process's snapshot.
+        let mut disk = crate::session::Instance::new("s", "/tmp/x");
+        disk.view = crate::session::View::Structured;
+        disk.last_accessed_at = Some(chrono::Utc::now() - chrono::Duration::seconds(60));
+        disk.archived_at = Some(chrono::Utc::now() - chrono::Duration::seconds(30));
+
+        apply_prompt_persist_to_disk(&mut disk, false);
+
+        assert!(
+            disk.archived_at.is_some(),
+            "recency-only persist must not clear peer sink state"
+        );
+        assert!(disk.last_accessed_at > disk.archived_at);
+    }
+
+    #[test]
+    fn wake_persist_keeps_touch_semantics_for_sunk_rows() {
+        let mut disk = crate::session::Instance::new("s", "/tmp/x");
+        disk.view = crate::session::View::Structured;
+        disk.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::minutes(10));
+
+        apply_prompt_persist_to_disk(&mut disk, true);
+
+        assert!(
+            disk.snoozed_until.is_none(),
+            "wake persist lifts the sunk row (messaging-unarchives)"
+        );
+        assert!(disk.last_accessed_at.is_some());
     }
 }
