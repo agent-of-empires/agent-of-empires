@@ -2036,6 +2036,18 @@ impl Instance {
                 .insert(self.tool.clone(), outgoing);
         }
         self.tool = new_tool.to_string();
+        // The alias is resolved per-tool, so the outgoing tool's answer cannot
+        // survive: kept, it points `resolved_agent` at the wrong built-in
+        // outright (a `codex-personal` -> `claude-personal` swap would keep
+        // detecting as codex); cleared, the row lands in the same
+        // empty-`detect_as` state a session built before its tool joined
+        // `[session.agent_detect_as]` does. Re-resolve against the same
+        // process-global registry `effective_detect_as` reads, so this stays a
+        // lookup rather than a config load, and the row ends up exactly as if
+        // it had been built on the new tool.
+        self.detect_as =
+            tmux::status_rules::effective_detect_as(&self.source_profile, new_tool, "")
+                .into_owned();
         // Consumed, not copied: the row owns exactly one live conversation per
         // agent, and leaving the entry behind would let a later swap restore an
         // id this session has since replaced.
@@ -2609,6 +2621,32 @@ impl Instance {
     /// when `source_profile` was never populated (e.g. legacy callers).
     pub fn effective_profile(&self) -> String {
         super::config::effective_profile(&self.source_profile)
+    }
+
+    /// The `agent_detect_as` alias that actually applies to this session.
+    ///
+    /// `detect_as` is resolved once at session build and persisted, so it is
+    /// empty on a row created before its tool gained an
+    /// `[session.agent_detect_as]` entry. Treat the stored field as a cache
+    /// and let [`tmux::status_rules::effective_detect_as`] consult the live
+    /// registry when it is empty, the same way the pane detector, hook
+    /// reconciliation, and the status-change log line already do (#3398).
+    fn effective_detect_as(&self) -> std::borrow::Cow<'_, str> {
+        tmux::status_rules::effective_detect_as(&self.source_profile, &self.tool, &self.detect_as)
+    }
+
+    /// The built-in agent backing this session: its own tool when that names
+    /// one, else the agent its `agent_detect_as` alias points at.
+    ///
+    /// Every launch-time consumer resolves through here rather than reading
+    /// `detect_as` raw, because a miss is silent and permanent. `None` drops
+    /// the `AOE_PROFILE`/`AOE_INSTANCE_ID` prefix from the launch line
+    /// ([`status_hook_env_prefix`]) and skips hook install, so every hook the
+    /// agent does have bails on `[ -n "$AOE_INSTANCE_ID" ]` and the session
+    /// reports Idle forever with nothing logged.
+    fn resolved_agent(&self) -> Option<&'static crate::agents::AgentDef> {
+        crate::agents::get_agent(&self.tool)
+            .or_else(|| crate::agents::get_agent(&self.effective_detect_as()))
     }
 
     /// Resolve the effective `environment` list for this session's profile,
@@ -3750,9 +3788,10 @@ impl Instance {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("sandbox_info missing for sandboxed session"))?;
 
+        let detect_as = self.effective_detect_as().into_owned();
         let managed_codex_home = container_config::managed_codex_home(
             &self.tool,
-            Some(&self.detect_as),
+            Some(detect_as.as_str()),
             &self.source_profile,
             &self.id,
         )?;
@@ -4321,8 +4360,7 @@ impl Instance {
         if self.tool == "omp" && !self.has_command_override() {
             reject_omp_secret_args(&super::config::quote_model_value_in_args(&self.extra_args))?;
         }
-        let agent = crate::agents::get_agent(&self.tool)
-            .or_else(|| crate::agents::get_agent(&self.detect_as));
+        let agent = self.resolved_agent();
         self.install_agent_status_hooks(agent);
         self.propagate_managed_skills();
 
@@ -4381,8 +4419,8 @@ impl Instance {
         if self.tool == "omp" && !self.has_command_override() {
             reject_omp_secret_args(&super::config::quote_model_value_in_args(&self.extra_args))?;
         }
-        let agent = crate::agents::get_agent(&self.tool)
-            .or_else(|| crate::agents::get_agent(&self.detect_as));
+        let agent = self.resolved_agent();
+        let detect_as = self.effective_detect_as().into_owned();
 
         let (cmd, is_existing, omp_capture_plan, launch_env) = if self.is_sandboxed() {
             let image = self
@@ -4453,7 +4491,7 @@ impl Instance {
                 .ok_or_else(|| anyhow::anyhow!("sandbox_info missing for sandboxed instance"))?;
             let managed_codex_home = container_config::managed_codex_home(
                 &self.tool,
-                Some(&self.detect_as),
+                Some(detect_as.as_str()),
                 &self.source_profile,
                 &self.id,
             )?;
@@ -5308,6 +5346,7 @@ impl Instance {
     }
 
     pub fn get_container_for_instance(&mut self) -> Result<containers::DockerContainer> {
+        let detect_as = self.effective_detect_as().into_owned();
         let image = self
             .sandbox_info
             .as_ref()
@@ -5329,13 +5368,13 @@ impl Instance {
                 &self.effective_profile(),
                 &self.id,
                 &self.tool,
-                Some(&self.detect_as),
+                Some(detect_as.as_str()),
             );
             self.backfill_container_workdir(&container);
             if self.is_yolo_mode() {
                 container_config::ensure_yolo_trust_config_for_active_agent(
                     &self.tool,
-                    Some(&self.detect_as),
+                    Some(detect_as.as_str()),
                     &self.source_profile,
                     &self.id,
                     &self.container_workdir(),
@@ -5352,14 +5391,14 @@ impl Instance {
                 &self.effective_profile(),
                 &self.id,
                 &self.tool,
-                Some(&self.detect_as),
+                Some(detect_as.as_str()),
             );
             container.start()?;
             self.backfill_container_workdir(&container);
             if self.is_yolo_mode() {
                 container_config::ensure_yolo_trust_config_for_active_agent(
                     &self.tool,
-                    Some(&self.detect_as),
+                    Some(detect_as.as_str()),
                     &self.source_profile,
                     &self.id,
                     &self.container_workdir(),
@@ -5442,6 +5481,7 @@ impl Instance {
     }
 
     fn build_container_config(&self) -> Result<crate::containers::ContainerConfig> {
+        let detect_as = self.effective_detect_as();
         let sandbox = self
             .sandbox_info
             .as_ref()
@@ -5458,8 +5498,7 @@ impl Instance {
             // Mirror the host path's agent resolution (a custom wrapper detected
             // as kiro carries kiro's sidecar via detect_as), and the sandbox's
             // own `resolve_active_agent`, which also falls back to detect_as.
-            crate::agents::get_agent(&self.tool)
-                .or_else(|| crate::agents::get_agent(&self.detect_as))
+            self.resolved_agent()
                 .and_then(|a| a.sidecar_hooks.as_ref())
                 .and_then(|s| s.selected_agent_hooks.as_ref())
                 .and_then(|sel| {
@@ -5471,7 +5510,7 @@ impl Instance {
         container_config::build_container_config(
             &self.project_path,
             sandbox,
-            container_config::ContainerAgentSelection::new(&self.tool, Some(&self.detect_as))
+            container_config::ContainerAgentSelection::new(&self.tool, Some(&detect_as))
                 .with_selected_agent(selected_agent.as_deref()),
             self.is_yolo_mode(),
             &self.id,
@@ -11781,6 +11820,81 @@ mod tests {
             status_hook_env_prefix("work", "abc123", crate::agents::get_agent("kimi")),
             "AOE_PROFILE='work' AOE_INSTANCE_ID='abc123' "
         );
+    }
+
+    /// Seed the process-global `agent_detect_as` registry for one profile.
+    /// The registry is profile-keyed and `install_from_config` only replaces
+    /// the named profile's entries, so a test-only profile name keeps these
+    /// hermetic without serializing against every other registry writer.
+    fn install_aliases(profile: &str, aliases: &[(&str, &str)]) {
+        let mut config = crate::session::Config::default();
+        for (agent, target) in aliases {
+            config
+                .session
+                .agent_detect_as
+                .insert(agent.to_string(), target.to_string());
+        }
+        crate::tmux::status_rules::install_from_config(profile, &config);
+    }
+
+    /// A custom-agent row whose stored `detect_as` is empty must still resolve
+    /// its built-in agent at launch. Without it `status_hook_env_prefix` drops
+    /// `AOE_INSTANCE_ID`, every hook in the agent's settings file bails on
+    /// `[ -n "$AOE_INSTANCE_ID" ]`, and the session reports Idle forever with
+    /// nothing logged. #3398 taught the read sites to consult the live
+    /// registry; this is the launch site.
+    #[test]
+    fn empty_detect_as_still_resolves_the_launch_agent() {
+        const PROFILE: &str = "detect-as-launch-path-test";
+        install_aliases(PROFILE, &[("claude-personal", "claude")]);
+
+        let mut inst = Instance::new("orch", "/tmp/x");
+        inst.source_profile = PROFILE.to_string();
+        inst.tool = "claude-personal".to_string();
+        inst.command = "claude-personal".to_string();
+        inst.detect_as = String::new();
+
+        assert_eq!(
+            inst.resolved_agent().map(|a| a.name),
+            Some("claude"),
+            "empty detect_as must fall back to the live agent_detect_as registry"
+        );
+        assert_eq!(
+            status_hook_env_prefix(&inst.effective_profile(), "abc123", inst.resolved_agent()),
+            format!("AOE_PROFILE='{PROFILE}' AOE_INSTANCE_ID='abc123' "),
+        );
+    }
+
+    /// `swap_tool` re-resolves the alias for the incoming tool. The alias is
+    /// per-tool, so carrying the outgoing tool's value forward aims every
+    /// launch-time reader at the wrong built-in.
+    #[test]
+    fn swap_tool_reresolves_detect_as() {
+        const PROFILE: &str = "detect-as-swap-test";
+        install_aliases(
+            PROFILE,
+            &[("claude-personal", "claude"), ("codex-personal", "codex")],
+        );
+
+        // (starting tool, stored alias, tool swapped to, expected alias)
+        let cases = [
+            // The reported row: created on a built-in (no alias to store),
+            // then swapped onto a custom agent.
+            ("claude", "", "claude-personal", "claude"),
+            // Custom to custom: the outgoing alias is actively wrong, not
+            // merely stale, so it cannot survive.
+            ("codex-personal", "codex", "claude-personal", "claude"),
+            // Custom back to a built-in: nothing to pin.
+            ("claude-personal", "claude", "codex", ""),
+        ];
+        for (tool, detect_as, new_tool, expected) in cases {
+            let mut inst = Instance::new("t", "/tmp/x");
+            inst.source_profile = PROFILE.to_string();
+            inst.tool = tool.to_string();
+            inst.detect_as = detect_as.to_string();
+            inst.swap_tool(new_tool);
+            assert_eq!(inst.detect_as, expected, "{tool} -> {new_tool}");
+        }
     }
 
     #[test]
