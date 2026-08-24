@@ -249,7 +249,7 @@ serve = [
 cap-std = ["dep:cap-std"]
 
 [dev-dependencies]
-serial_test = "3.4"
+serial_test = "4.0"
 # Test-only tracing capture (#2756, I4): asserts the equal-timestamp guard's
 # drop branch logged. Its target `session.store` is rejected by the default
 # `agent_of_empires=trace` env filter, so `no-env-filter` is required; the
