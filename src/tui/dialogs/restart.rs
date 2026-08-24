@@ -966,4 +966,38 @@ mod tests {
             _ => panic!("Expected Submit"),
         }
     }
+
+    #[test]
+    fn deprecated_tool_badge_renders_on_restart_tool_row() {
+        // Alternate render path parity with the New dialog: the cycler
+        // affordances differ, the lifecycle suffix must not. Paired with an
+        // Active tool so a blanket suffix would also fail.
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let cases = [("gemini", true), ("claude", false)];
+        for (tool, deprecated) in cases {
+            let mut dialog = RestartDialog::new(
+                "fix bug",
+                "default",
+                tool,
+                "",
+                "",
+                vec!["default".to_string()],
+                vec![tool.to_string()],
+            );
+            let mut terminal = Terminal::new(TestBackend::new(100, 40)).expect("terminal");
+            let theme = crate::tui::styles::Theme::default();
+            terminal
+                .draw(|frame| dialog.render(frame, frame.area(), &theme))
+                .expect("render");
+            let content = terminal
+                .backend()
+                .buffer()
+                .content()
+                .iter()
+                .map(|cell| cell.symbol())
+                .collect::<String>();
+            assert_eq!(content.contains("⚠ deprecated"), deprecated, "{tool}");
+        }
+    }
 }

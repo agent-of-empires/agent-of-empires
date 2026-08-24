@@ -178,7 +178,7 @@ mod tests {
             let spans = tool_lifecycle_spans(tool, &theme);
             assert_eq!(contents(&spans), expected, "{tool}");
             if !spans.is_empty() {
-                assert_eq!(spans[0].style.fg, Some(theme.waiting.into()), "{tool}");
+                assert_eq!(spans[0].style.fg, Some(theme.waiting), "{tool}");
             }
         }
     }
