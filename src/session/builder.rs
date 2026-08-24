@@ -2192,6 +2192,10 @@ mod tests {
         )
         .unwrap();
         let project = tempfile::tempdir().unwrap();
+        // resolve_config inside build_instance installs this config's
+        // agent_detect_as into the process-global registry; restore the
+        // prior entries afterwards.
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
 
         let result = build_instance(
             custom_agent_params(project.path(), "remote-claude"),
@@ -2222,6 +2226,7 @@ mod tests {
         )
         .unwrap();
         let project = tempfile::tempdir().unwrap();
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
 
         let result = build_instance(
             custom_agent_params(project.path(), "remote-opencode"),

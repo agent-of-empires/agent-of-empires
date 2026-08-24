@@ -11933,7 +11933,7 @@ mod tests {
         profile: &str,
         aliases: &[(&str, &str)],
     ) -> crate::tmux::status_rules::ProfileRegistryGuard {
-        let restore = crate::tmux::status_rules::ProfileRegistryGuard::take(profile);
+        let guard = crate::tmux::status_rules::ProfileRegistryGuard::take(profile);
         let mut config = crate::session::Config::default();
         for (agent, target) in aliases {
             config
@@ -11942,7 +11942,7 @@ mod tests {
                 .insert(agent.to_string(), target.to_string());
         }
         crate::tmux::status_rules::install_from_config(profile, &config);
-        restore
+        guard
     }
 
     /// A custom-agent row whose stored `detect_as` is empty must still resolve

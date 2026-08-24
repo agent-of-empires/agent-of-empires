@@ -266,7 +266,11 @@ pub(crate) struct ProfileRegistryGuard {
 #[cfg(test)]
 impl ProfileRegistryGuard {
     /// Capture `profile`'s current entries. Take the snapshot BEFORE the
-    /// first mutation, or the restore replays the test's own writes.
+    /// first mutation, or the restore replays the test's own writes. Pass
+    /// the same literal profile the guarded section will install under: an
+    /// empty name resolves against config state at call time, and a later
+    /// resolve would normalize to whatever is configured then, not to this
+    /// snapshot's frozen key.
     pub(crate) fn take(profile: &str) -> Self {
         let profile = crate::session::config::effective_profile(profile);
         let aliases = aliases()
@@ -312,6 +316,7 @@ impl Drop for ProfileRegistryGuard {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serial_test::serial;
     use std::sync::Mutex;
 
     /// The registry is process-global; serialize the tests that write to it
@@ -348,6 +353,7 @@ mod tests {
         config
     }
 
+    #[serial]
     #[test]
     fn no_rules_returns_none() {
         let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
@@ -357,6 +363,7 @@ mod tests {
         assert!(!has_rules("default", "anything"));
     }
 
+    #[serial]
     #[test]
     fn first_match_wins_and_no_match_is_idle() {
         let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
@@ -383,6 +390,7 @@ mod tests {
         assert_eq!(detect("default", "rules-agent", "$ "), Some(Status::Idle));
     }
 
+    #[serial]
     #[test]
     fn contains_is_case_insensitive_and_regex_is_as_written() {
         let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
@@ -416,6 +424,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn malformed_rules_are_skipped_and_all_skipped_means_no_entry() {
         let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
@@ -457,6 +466,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn install_replaces_previous_rules() {
         let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
@@ -473,6 +483,7 @@ mod tests {
         assert!(!has_rules("default", "rules-agent"));
     }
 
+    #[serial]
     #[test]
     fn install_is_scoped_to_its_profile() {
         let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
@@ -514,6 +525,7 @@ mod tests {
         assert!(!has_rules("p1", "gjc"));
     }
 
+    #[serial]
     #[test]
     fn detection_tool_prefers_own_rules_over_detect_as() {
         let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
@@ -539,6 +551,7 @@ mod tests {
     /// persists an empty alias, which used to strand it on the `Status::Idle`
     /// fallback forever. The stored value is a cache, so an empty one defers to
     /// the config the resolve installed.
+    #[serial]
     #[test]
     fn effective_detect_as_falls_back_to_installed_config() {
         let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
@@ -582,6 +595,7 @@ mod tests {
     /// Own rules outrank the alias whether the alias came from the stored field
     /// or from the config fallback, so the fallback cannot silently take over an
     /// agent the user wrote rules for.
+    #[serial]
     #[test]
     fn own_rules_outrank_the_config_fallback() {
         let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
@@ -598,6 +612,7 @@ mod tests {
         assert_eq!(detection_tool("default", "rules-agent", ""), "rules-agent");
     }
 
+    #[serial]
     #[test]
     fn rules_dispatch_through_detect_status_from_content_in() {
         let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
@@ -627,6 +642,7 @@ mod tests {
         );
     }
 
+    #[serial]
     #[test]
     fn rules_override_builtin_detector() {
         let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
@@ -662,6 +678,7 @@ mod tests {
     /// The guard must hand back exactly the snapshotted entries: prior
     /// aliases and rules clobbered by a guarded install come back, and a
     /// profile that had nothing keeps nothing.
+    #[serial]
     #[test]
     fn profile_registry_guard_restores_the_snapshotted_entries_on_drop() {
         let _lock = test_lock().lock().unwrap_or_else(|p| p.into_inner());
