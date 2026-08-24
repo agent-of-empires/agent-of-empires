@@ -1997,6 +1997,22 @@ mod tests {
     }
 
     #[test]
+    fn test_lifecycle_notice_without_replacement() {
+        // Boundary: a Deprecated state with no suggested replacement must
+        // still render its full notice, minus the "consider switching"
+        // clause (Display's None arm).
+        let lifecycle = AgentLifecycle::Deprecated {
+            since: "2026-01-01",
+            note: "upstream shut down",
+            replacement: None,
+        };
+        let notice = lifecycle.to_string();
+        assert_eq!(notice, "deprecated since 2026-01-01: upstream shut down");
+        assert!(!notice.contains("consider switching"), "{notice}");
+        assert_eq!(lifecycle.notice().as_deref(), Some(notice.as_str()));
+    }
+
+    #[test]
     fn test_lifecycle_serialization_shape() {
         // Wire contract consumed by the dashboard (`web/src/lib/types.ts`
         // AgentLifecycleInfo). Active agents are omitted by callers via
