@@ -289,11 +289,11 @@ fn has_claude_live_token_counter(content: &str) -> bool {
                 // The live counter ends the spinner line, so its closing
                 // paren must close a whitespace-only line. Quoted literals
                 // (this repo's own test rows, docs) carry punctuation or
-                // prose right after it, and a following physical line
-                // starting with `)` cannot complete an echoed anchor tail;
-                // rejecting both keeps them from pinning a parked pane on
-                // Running. A newline itself is fine: narrow panes wrap the
-                // counter across lines.
+                // prose right after it; rejecting those keeps them from
+                // pinning a parked pane on Running. A newline itself is
+                // fine: narrow panes wrap the counter across lines, and a
+                // bare `)` opening the next line still completes the shape
+                // (pinned by the wrapped-before-paren row below).
                 let accepted = after_tokens
                     .trim_start()
                     .strip_prefix(')')
@@ -2708,8 +2708,10 @@ enter to select · esc to cancel";
     #[test]
     fn test_has_claude_live_token_counter_variants() {
         // Accepts every count form Claude renders inside the parenthesized
-        // live counter; rejects the unparenthesized frozen agents-strip
-        // counters (#2909) and malformed echoes.
+        // live counter plus the regular extensions of that shape (m, g and
+        // bare decimals are extrapolations, not captures); rejects the
+        // unparenthesized frozen agents-strip counters (#2909) and
+        // malformed echoes.
         let cases = [
             ("plain integer", "(4s · ↓ 88 tokens)", true),
             ("multi-digit", "(12s · ↓ 1234 tokens)", true),
@@ -2719,6 +2721,14 @@ enter to select · esc to cancel";
             ("decimal with m", "(4s · ↓ 1.2m tokens)", true),
             ("integer with g", "(4s · ↓ 3g tokens)", true),
             ("two-digit fraction", "(4s · ↓ 1.23m tokens)", true),
+            // A bare `)` opening the next line still completes a wrapped
+            // counter; pinning it so a future tightening knows what it
+            // changes.
+            (
+                "wrapped before paren",
+                "✻ Judging #3413 feedback… (4s · ↓ 88 tokens\n)",
+                true,
+            ),
             // A narrow pane wraps the counter across lines; the scan hops
             // the newline before `tokens`.
             (
