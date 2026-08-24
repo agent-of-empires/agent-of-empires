@@ -33,7 +33,7 @@ The canonical glossary lives on `PassiveStatusPatch` in [`src/session/instance.r
 
 Authority rule:
 
-- **Plain tmux sessions**: the poller is authoritative on `status` / `idle_entered_at` / `last_accessed_at`. `Instance::update_status_with_metadata` reads pane metadata + tmux state, compares against `live_status_baseline`, and mutates in place. `merge_passive_status_patch` on disk applies the same fields per patch.
+- **Plain tmux sessions**: the poller is authoritative on `status` / `idle_entered_at`. `last_accessed_at` is user-gesture-only since #3465: passive patches carry it through unchanged and the monotone guard turns that into a disk no-op. `Instance::update_status_with_metadata` reads pane metadata + tmux state, compares against `live_status_baseline`, and mutates in place. `merge_passive_status_patch` on disk applies the patch's `status` and `idle_entered_at` writes, the monotone `last_accessed_at` carry-through, and the lifecycle generation.
 - **Structured / ACP sessions**: `apply_acp_overlay_inplace` in `src/server/mod.rs` is the sole authority. `decide_passive_transition` returns `patch: None` for `is_structured()` rows, so the passive-status writers deliberately skip them. Post-daemon-restart the row's `idle_entered_at` resets to the last durable value (either creation-time, or the last explicit user action); ACP event handlers re-emit as they observe new state.
 
 Writer shapes:

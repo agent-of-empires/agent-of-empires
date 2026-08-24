@@ -24,6 +24,7 @@ fn spawn_config(
     default_effort: Option<String>,
 ) -> SpawnConfig {
     SpawnConfig {
+        wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {

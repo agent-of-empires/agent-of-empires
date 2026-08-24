@@ -4561,7 +4561,7 @@ async fn status_poll_loop(state: Arc<AppState>) {
         // that finds disk out of sync with live reality (the common case,
         // since nothing persists a passive transition until the patch below
         // lands) misreads that mismatch as a brand new transition and
-        // restamps idle_entered_at/last_accessed_at. See #2690.
+        // restamps idle_entered_at. See #2690.
         let prev_for_poll = prev.clone();
         // Invariant 8: read before `load_all_instances()` below. The tmux
         // scrape that follows it can block for seconds when the tmux server is

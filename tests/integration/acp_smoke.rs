@@ -28,6 +28,7 @@ async fn shim_agent_round_trips_prompt() {
 
     let cwd = std::env::temp_dir();
     let config = SpawnConfig {
+        wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
@@ -156,6 +157,7 @@ async fn shim_agent_round_trips_approval_allow() {
 
     let cwd = std::env::temp_dir();
     let config = SpawnConfig {
+        wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
@@ -260,6 +262,7 @@ async fn shim_agent_round_trips_fs() {
     let temp = tempfile::tempdir().expect("tempdir");
     let cwd = temp.path().to_path_buf();
     let config = SpawnConfig {
+        wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
@@ -338,6 +341,7 @@ async fn shim_agent_round_trips_terminal() {
     let temp = tempfile::tempdir().expect("tempdir");
     let cwd = temp.path().to_path_buf();
     let config = SpawnConfig {
+        wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
@@ -428,6 +432,7 @@ async fn shim_agent_set_mode_emits_current_mode_changed() {
 
     let cwd = std::env::temp_dir();
     let config = SpawnConfig {
+        wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {
@@ -502,6 +507,7 @@ async fn shim_agent_emits_rate_limit_event() {
 
     let cwd = std::env::temp_dir();
     let config = SpawnConfig {
+        wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {

@@ -22,6 +22,7 @@ use crate::common::{shim_path, shim_ready};
 fn base_config(cwd: std::path::PathBuf, record_path: &std::path::Path) -> SpawnConfig {
     let shim = shim_path();
     SpawnConfig {
+        wrapper_substitution: None,
         agent_key: "claude".into(),
         tool: "claude".into(),
         spec: AgentSpec {

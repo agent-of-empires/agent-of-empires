@@ -1307,6 +1307,13 @@
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {
+      "id": "sidebar.longpress-menu-persists",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/sidebar-longpress-menu-persists.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
       "id": "sidebar.longpress-slop",
       "kind": "vitest",
       "risk": "high",
