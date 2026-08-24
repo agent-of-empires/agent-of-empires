@@ -617,8 +617,18 @@ impl HomeView {
         };
         let id_owned = id.to_string();
         let new_tool = new_tool.to_string();
+        let row_profile = profile.clone();
         if let Err(e) = storage.update(|instances, _groups| {
             if let Some(disk) = instances.iter_mut().find(|i| i.id == id_owned) {
+                // `source_profile` is `skip_serializing`, so a storage-loaded
+                // row always comes back blank and would resolve the incoming
+                // tool's `agent_detect_as` alias against the default profile.
+                // A tool name aliased differently per profile would then be
+                // pinned to the wrong built-in on disk, and `detect_as` is not
+                // in `reconcile_from_disk`'s carry set, so the next launch
+                // reads that value rather than the in-memory one. Restore it
+                // the same way `reconcile_from_disk` does before the swap.
+                disk.source_profile = row_profile.clone();
                 disk.swap_tool(&new_tool);
             }
             Ok(())
@@ -890,6 +900,9 @@ impl HomeView {
             .filter(|instance| is_member(instance))
             .map(|instance| instance.id.clone())
             .collect();
+        if profile_changed {
+            affected_ids.sort();
+        }
 
         if profile_changed {
             // Refuse every transient member before taking any guard or
@@ -1035,6 +1048,7 @@ impl HomeView {
                 instance.group_path = new_group_path;
             })?;
         }
+
         let path_changed = new_path != ctx.old_path;
 
         // Capture old_path and its descendants from the pre-rebuild tree:

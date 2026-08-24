@@ -1307,28 +1307,39 @@ export const SessionRow = memo(function SessionRow({
   useEffect(() => {
     if (!contextMenu) return;
     const close = () => setContextMenu(null);
-    const onDocClick = (e: MouseEvent) => {
-      // Clicks inside the menu should be handled by item onClick
-      // handlers, not by this dismiss listener.
+    // One handler for both of this row's dismissers, so the click and
+    // contextmenu paths cannot drift apart again. An unguarded contextmenu
+    // listener here made Android's long-press menu open and instantly
+    // vanish (#3460). SidebarGroupHeader, ProjectsSection and
+    // CopyPathContextMenu still carry the two-listener shape; none of them
+    // has a long-press timer, so their menu is only ever opened by a
+    // contextmenu whose dispatch the requestAnimationFrame below defers
+    // past, and this sequence is unreachable there.
+    const dismissIfOutside = (e: MouseEvent) => {
+      // Events inside the menu should be handled by item onClick handlers,
+      // not by this dismiss listener. The menu is a portal placed at the
+      // touch point, so on Android it is the topmost element under the
+      // finger when the native contextmenu lands.
       if (menuRef.current?.contains(e.target as Node)) return;
-      // On mobile, lifting the finger after a long-press dispatches a
-      // synthetic click even when touchend called preventDefault().
-      // Ignore clicks that arrive shortly after a touch-triggered open.
+      // Android's long-press emits a synthetic click even when touchend
+      // called preventDefault(), plus a native contextmenu, both after our
+      // timer already opened the menu. Ignore either one when it arrives
+      // shortly after a touch-triggered open.
       if (Date.now() - touchOpenedAt.current < 500) return;
       close();
     };
     // Defer so the event that opened the menu finishes bubbling first
     const id = requestAnimationFrame(() => {
-      document.addEventListener("click", onDocClick);
-      document.addEventListener("contextmenu", close);
+      document.addEventListener("click", dismissIfOutside);
+      document.addEventListener("contextmenu", dismissIfOutside);
     });
     // Listen for the "close" broadcast from any sibling SessionRow
     // that is opening its own menu.
     menuBus.addEventListener("close", close);
     return () => {
       cancelAnimationFrame(id);
-      document.removeEventListener("click", onDocClick);
-      document.removeEventListener("contextmenu", close);
+      document.removeEventListener("click", dismissIfOutside);
+      document.removeEventListener("contextmenu", dismissIfOutside);
       menuBus.removeEventListener("close", close);
     };
   }, [contextMenu]);

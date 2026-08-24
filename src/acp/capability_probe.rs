@@ -64,6 +64,7 @@ pub async fn probe_agent(agent: &str) -> anyhow::Result<bool> {
     let tmp = tempfile::tempdir()?;
 
     let config = SpawnConfig {
+        wrapper_substitution: None,
         agent_key: agent.to_string(),
         tool: agent.to_string(),
         spec,

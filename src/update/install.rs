@@ -117,9 +117,9 @@ fn probe_brew_aoe_path_with_timeout(timeout: std::time::Duration) -> Option<Path
     let mut cmd = Command::new("brew");
     cmd.args(["list", "aoe"]);
 
-    // run_with_timeout kills brew at the deadline and bounds the output
-    // drain by it too, so neither a hung brew nor a grandchild holding the
-    // pipe can block the probe.
+    // run_with_timeout kills brew at the deadline and captures output in a
+    // temporary regular file, so neither a hung brew nor a grandchild that
+    // inherits the handle can block the probe.
     let output = crate::process::run_with_timeout(&mut cmd, timeout)
         .ok()
         .flatten()?;

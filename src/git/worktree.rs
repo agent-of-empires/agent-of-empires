@@ -389,8 +389,8 @@ impl GitWorktree {
         let timeout = std::time::Duration::from_secs(10);
         let start = std::time::Instant::now();
 
-        // run_with_timeout drains stderr with a deadline-bounded read, so a
-        // grandchild holding the pipe (credential helper) cannot block this
+        // run_with_timeout captures stderr in a temporary regular file, so a
+        // grandchild that inherits the handle cannot block this
         // past the timeout.
         match crate::process::run_with_timeout(&mut cmd, timeout) {
             Ok(Some(output)) => {
@@ -973,7 +973,7 @@ impl GitWorktree {
         let path_str = path
             .to_str()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "Invalid path"))?;
-        let output = super::command::run_git(
+        let Some(output) = super::command::run_git_with_timeout(
             &self.repo_path,
             [
                 "worktree",
@@ -982,7 +982,14 @@ impl GitWorktree {
                 WORKTREE_LOCK_REASON,
                 path_str,
             ],
-        )?;
+            WORKTREE_MUTATION_TIMEOUT,
+        )?
+        else {
+            return Err(GitError::WorktreeCommandFailed(format!(
+                "`git worktree lock` timed out after {}s",
+                WORKTREE_MUTATION_TIMEOUT.as_secs()
+            )));
+        };
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
             return Err(GitError::WorktreeCommandFailed(stderr));
@@ -998,13 +1005,23 @@ impl GitWorktree {
     /// still clears the lock when the checkout directory is already gone, and a
     /// non-zero exit (already unlocked, or no such worktree) is a harmless
     /// no-op rather than an error. That classification is why the call goes
-    /// through `run_git_quiet`: the routine non-zero exit belongs at DEBUG,
+    /// through the quiet helper: the routine non-zero exit belongs at DEBUG,
     /// not in the WARN stream.
+    ///
+    /// Bounded like the mutations it precedes. `move_worktree` calls this
+    /// immediately before its own bounded `git worktree move`, and both touch
+    /// the same `.git/worktrees/<name>/` metadata, so leaving this one
+    /// unbounded would let a stalled filesystem pin every caller's locks
+    /// through the call that runs first.
     pub fn unlock_worktree(&self, path: &Path) {
         let Some(path_str) = path.to_str() else {
             return;
         };
-        let _ = super::command::run_git_quiet(&self.repo_path, ["worktree", "unlock", path_str]);
+        let _ = super::command::run_git_quiet_with_timeout(
+            &self.repo_path,
+            ["worktree", "unlock", path_str],
+            WORKTREE_MUTATION_TIMEOUT,
+        );
     }
 
     /// Convert a worktree's .git file from absolute to relative path.
@@ -1389,12 +1406,22 @@ impl GitWorktree {
         // all subprocess-driven for consistent stderr / exit-code
         // semantics. The subprocess is why `Err(_)` is a real possibility
         // here even though the repo is already open.
-        let output = super::command::run_git(
+        let output = super::command::run_git_with_timeout(
             &self.repo_path,
             ["show-ref", "--verify", "--quiet", &refname],
+            MUTATION_OBSERVATION_TIMEOUT,
         )
         .map_err(|e| {
             GitError::WorktreeCommandFailed(format!("git show-ref --verify {refname}: {e}"))
+        })?
+        .ok_or_else(|| {
+            // Tri-state contract: a timeout is "could not determine", which
+            // must surface as Err so the caller fails closed rather than
+            // treating an unknown ref as absent.
+            GitError::WorktreeCommandFailed(format!(
+                "git show-ref --verify {refname} timed out after {}s",
+                MUTATION_OBSERVATION_TIMEOUT.as_secs()
+            ))
         })?;
         match output.status.code() {
             Some(0) => Ok(true),
@@ -1860,6 +1887,56 @@ mod tests {
             classify_worktree_move_listing(&completed_listing, &observed_from, &observed_to),
             Some(TimedMutationOutcome::Applied),
         );
+    }
+
+    /// Every git subprocess reachable from `move_worktree` /
+    /// `edit_worktree_workdir` is bounded. The profile-move transaction runs
+    /// them while holding the app-global identity flock, both per-session
+    /// locks, and both profile storage flocks, so one unbounded call pins every
+    /// peer `aoe` process. Pins the whole set rather than one call: the gap
+    /// this closes was `unlock_worktree` sitting one line above an already
+    /// bounded `git worktree move`.
+    ///
+    /// Source-level rather than behavioural because making git itself block on
+    /// `.git` metadata is not reproducible in a unit test; the failure mode is
+    /// a future caller reaching for the unbounded helper, which this catches.
+    #[test]
+    fn every_worktree_mutation_subprocess_is_bounded() {
+        // Whitespace-normalised so rustfmt's line wrapping cannot change the
+        // result: the point is which helper is called, not how it is laid out.
+        let source = include_str!("worktree.rs");
+        let region = source
+            .split_once("impl GitWorktree {")
+            .expect("GitWorktree impl block")
+            .1
+            .split_once("\n#[cfg(test)]")
+            .expect("test module terminates the scanned region")
+            .0;
+        let flat = region.split_whitespace().collect::<Vec<_>>().join(" ");
+        let cases = [
+            ("\"worktree\", \"lock\"", "git worktree lock"),
+            ("\"worktree\", \"unlock\"", "git worktree unlock"),
+            ("\"show-ref\", \"--verify\"", "git show-ref --verify"),
+            ("\"worktree\", \"move\"", "git worktree move"),
+            ("\"branch\", \"-m\"", "git branch -m"),
+        ];
+        for (needle, label) in cases {
+            let at = flat
+                .find(needle)
+                .unwrap_or_else(|| panic!("{label} should still be issued from this module"));
+            // The helper name precedes its argument list, so scan back to the
+            // nearest `run_git*` and require one of the timed variants.
+            let call = flat[..at]
+                .rfind("run_git")
+                .map(|i| &flat[i..])
+                .unwrap_or_default();
+            assert!(
+                call.starts_with("run_git_with_timeout")
+                    || call.starts_with("run_git_quiet_with_timeout"),
+                "{label} must go through a bounded helper, found `{}`",
+                call.split('(').next().unwrap_or(call)
+            );
+        }
     }
 
     fn run_git(path: &Path, args: &[&str]) {
