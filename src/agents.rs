@@ -2016,6 +2016,32 @@ mod tests {
     }
 
     #[test]
+    fn test_lifecycle_facts_stay_synced_with_ts_mirror() {
+        // The dashboard keeps a static fallback mirror of the gemini facts
+        // (web/src/lib/agentProfiles.ts). Each side has its own pinning
+        // tests, so a coordinated update of one side alone would ship a
+        // silent desync; this cross-checks the literal strings instead.
+        let mirror_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/src/lib/agentProfiles.ts");
+        let mirror = std::fs::read_to_string(&mirror_path)
+            .expect("web/src/lib/agentProfiles.ts must exist next to the crate");
+        let AgentLifecycle::Deprecated {
+            since,
+            note,
+            replacement: Some(replacement),
+        } = get_agent("gemini").unwrap().lifecycle
+        else {
+            panic!("gemini must stay Deprecated with a replacement");
+        };
+        for fact in [since, note, replacement] {
+            assert!(
+                mirror.contains(fact),
+                "TS mirror is missing {fact:?}; update web/src/lib/agentProfiles.ts in the same change"
+            );
+        }
+    }
+
+    #[test]
     fn test_omp_agent_definition() {
         let omp = get_agent("omp").unwrap();
         assert!(matches!(&omp.detection, DetectionMethod::Which("omp")));
