@@ -49,6 +49,31 @@ fn test_esc_cancels() {
 }
 
 #[test]
+fn test_deprecated_tool_badge_renders_on_single_tool_read_only_row() {
+    // Alternate render path: one available tool drops the cycler affordances
+    // (total <= 1 early return), but the lifecycle suffix must still reach
+    // the row through the unconditional extend at the call site.
+    let mut dialog = NewSessionDialog::new_with_tools(vec!["gemini"], TEST_PATH.to_string());
+    let mut terminal =
+        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).expect("terminal");
+    let theme = crate::tui::styles::Theme::default();
+    terminal
+        .draw(|frame| dialog.render(frame, frame.area(), &theme))
+        .expect("render");
+    let content = terminal
+        .backend()
+        .buffer()
+        .content()
+        .iter()
+        .map(|cell| cell.symbol())
+        .collect::<String>();
+    assert!(
+        content.contains("⚠ deprecated"),
+        "single-tool gemini row must carry the deprecation suffix; got: {content}"
+    );
+}
+
+#[test]
 fn test_enter_submits_with_empty_title_for_builder() {
     let mut dialog = single_tool_dialog();
     let result = dialog.handle_key(key(KeyCode::Enter));
