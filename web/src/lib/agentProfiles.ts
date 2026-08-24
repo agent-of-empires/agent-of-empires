@@ -198,10 +198,9 @@ const GEMINI: AgentProfile = {
   },
 };
 
-/** Wire shape of the server's agent lifecycle (see
- *  `web/src/lib/types.ts`). Duplicated here rather than imported from
- *  types.ts to keep this module dependency-free: it must stay importable
- *  from the lightest surfaces. */
+/** Canonical wire shape of the server's agent lifecycle; `types.ts`
+ *  imports it from here so this module stays the dependency-free source
+ *  every surface can import. Mirrors `AgentLifecycle` in src/agents.rs. */
 export interface AgentLifecycleInfo {
   state: "active" | "deprecated";
   since?: string | null;

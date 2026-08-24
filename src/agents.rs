@@ -95,6 +95,12 @@ pub enum ForkStrategy {
 /// gates spawning, resume, hook installs, or any other support path; every
 /// surface that lists or launches an agent renders the state alongside it
 /// (CLI listings, doctor, spawn warnings, TUI picker badge, dashboard).
+///
+/// Wire mirror: `web/src/lib/types.ts` (`AgentLifecycleInfo`, served by
+/// `/api/agents` and `/api/acp/agents`) and the static fallback mirror in
+/// `web/src/lib/agentProfiles.ts`. When adding a variant, update both TS
+/// files in the same change: the closed `"state"` union there is the one
+/// place a new variant does not fail compilation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum AgentLifecycle {
@@ -119,6 +125,18 @@ impl AgentLifecycle {
     /// keeps its wire shape.
     pub fn is_active(&self) -> bool {
         matches!(self, AgentLifecycle::Active)
+    }
+
+    /// Full one-line notice for any non-active state; `None` while Active.
+    /// The single rendering entry point for CLI listings and spawn
+    /// warnings, so a future variant automatically surfaces its Display
+    /// everywhere without per-site match updates.
+    pub fn notice(&self) -> Option<String> {
+        if self.is_active() {
+            None
+        } else {
+            Some(self.to_string())
+        }
     }
 }
 
@@ -1323,10 +1341,7 @@ impl AgentDef {
     /// Full one-line lifecycle notice for CLI listings and spawn warnings;
     /// `None` while Active.
     pub fn lifecycle_notice(&self) -> Option<String> {
-        match self.lifecycle {
-            AgentLifecycle::Active => None,
-            _ => Some(self.lifecycle.to_string()),
-        }
+        self.lifecycle.notice()
     }
 
     /// Extra argv tokens inserted between the one-shot flag and the prompt for a
@@ -1974,6 +1989,10 @@ mod tests {
                 }
                 _ => panic!("{name}: label and notice must agree"),
             }
+            // The enum-level entry point (used by the acp surfaces) must
+            // agree with the AgentDef helper for every variant, including
+            // future ones: any non-active state surfaces its Display.
+            assert_eq!(def.lifecycle.notice(), def.lifecycle_notice(), "{name}");
         }
     }
 

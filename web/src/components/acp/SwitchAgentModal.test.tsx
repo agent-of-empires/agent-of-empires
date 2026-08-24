@@ -41,6 +41,14 @@ beforeEach(() => {
     { name: "codex", description: "OpenAI Codex", command: "codex-acp" },
     { name: "opencode", description: "OpenCode", command: "opencode-acp" },
     { name: "gemini", description: "Gemini CLI", command: "gemini" },
+    {
+      name: "legacy",
+      description: "Legacy backend",
+      command: "legacy-acp",
+      // Deprecated server-side only: absent from the static profile
+      // mirror, so the label must come from the endpoint field.
+      lifecycle: { state: "deprecated", since: "2026-01-01", note: "upstream shut down", replacement: null },
+    },
   ]);
   mockSwitch.mockResolvedValue({
     session_id: "s-1",
@@ -204,12 +212,16 @@ describe("SwitchAgentModal (rate_limit)", () => {
     expect(confirm?.disabled).toBe(true);
   });
   it("marks deprecated registry targets next to their name", async () => {
-    // gemini is deprecated in the static profile mirror; the modal labels
-    // it so a rate-limit handoff does not silently steer into it.
+    // gemini is deprecated in the static profile mirror; "legacy" is
+    // deprecated only through the endpoint's lifecycle field. Both get
+    // the label so a rate-limit handoff never silently steers into a
+    // deprecated backend.
     const { findByTestId } = mount();
     expect(await findByTestId("switch-agent-deprecated-gemini")).not.toBeNull();
+    expect(await findByTestId("switch-agent-deprecated-legacy")).not.toBeNull();
     expect(screen.queryByTestId("switch-agent-deprecated-claude")).toBeNull();
     expect(screen.queryByTestId("switch-agent-deprecated-codex")).toBeNull();
+    expect(screen.queryByTestId("switch-agent-deprecated-opencode")).toBeNull();
   });
 });
 

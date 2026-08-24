@@ -236,8 +236,9 @@ struct AgentDoctorEntry {
 }
 
 /// Registry lifecycle state for an ACP registry key. Falls back to Active
-/// for registry entries with no `AGENTS` counterpart.
-fn registry_lifecycle(name: &str) -> crate::agents::AgentLifecycle {
+/// for registry entries with no `AGENTS` counterpart. Shared by the doctor
+/// and `/api/acp/agents` surfaces.
+pub(crate) fn registry_lifecycle(name: &str) -> crate::agents::AgentLifecycle {
     crate::agents::get_agent(name)
         .map(|def| def.lifecycle)
         .unwrap_or(crate::agents::AgentLifecycle::Active)
@@ -509,8 +510,8 @@ async fn doctor(json: bool, fix: bool, adapter: Vec<String>, all_adapters: bool)
             "[!! ]"
         };
         println!("{} {}  ({})", mark, entry.name, entry.description);
-        if let crate::agents::AgentLifecycle::Deprecated { .. } = entry.lifecycle {
-            println!("    ⚠ {}", entry.lifecycle);
+        if let Some(notice) = entry.lifecycle.notice() {
+            println!("    ⚠ {notice}");
         }
         if !entry.command_present {
             // Look up the binary name via the registry so we can
@@ -603,9 +604,8 @@ fn agents() -> Result<()> {
         let present = command_present(&spec.command);
         let mark = if present { "[OK]" } else { "[!! ]" };
         println!("{} {:<14}  {}", mark, name, spec.description);
-        let lifecycle = registry_lifecycle(name);
-        if let crate::agents::AgentLifecycle::Deprecated { .. } = lifecycle {
-            println!("        ⚠ {lifecycle}");
+        if let Some(notice) = registry_lifecycle(name).notice() {
+            println!("        ⚠ {notice}");
         }
         let args = if spec.args.is_empty() {
             String::new()
