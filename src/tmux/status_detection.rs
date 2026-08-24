@@ -260,73 +260,102 @@ fn claude_pane_has_running_signal(
 /// rule rejected those and left long turns reading Idle (#3440).
 fn has_claude_live_token_counter(content: &str) -> bool {
     let bytes = content.as_bytes();
-    for (pos, _) in content.match_indices("s · ↓") {
-        // The anchor tail alone would match prose like `summary: 4s · ↓ 88
-        // tokens)`; the live counter always opens with `(` right before the
-        // duration. Walk back over that duration (`22m 8`) and require the
-        // opening paren; anything else (punctuation, prose letters, a
-        // closing paren, start of content) rejects this anchor occurrence,
-        // and the scan moves on to the next one.
-        let mut i = pos;
-        while i > 0 {
-            let c = bytes[i - 1];
-            if c == b'(' {
-                break;
+    // Two anchor shapes: the full `s · ↓` tail, and `s` + newline + `↓`
+    // when a narrow pane wraps right after the duration group
+    // (`(22m 8s` + newline + `↓ 44.7k tokens)`).
+    for pattern in ["s · ↓", "s\n↓"] {
+        for (pos, _) in content.match_indices(pattern) {
+            // The live counter always opens with `(` right before its
+            // duration, and that duration ends in a digit: `(22m 8s`,
+            // never `(s · ↓` or `(22m s · ↓`. Walk back over the duration
+            // (newlines included: narrow panes wrap mid-token, splitting
+            // `8s` across lines) and require the opening paren; anything
+            // else rejects this occurrence and the scan moves on to the
+            // next one. The digit itself may sit across the wrapping
+            // newline (`22m 8` + newline + `s · ↓`).
+            let mut j = pos;
+            while j > 0 && matches!(bytes[j - 1], b'\n') {
+                j -= 1;
             }
-            if !(c.is_ascii_digit() || matches!(c, b'm' | b's' | b'h' | b' ' | b'\t')) {
-                break;
+            if j == 0 || !bytes[j - 1].is_ascii_digit() {
+                continue;
             }
-            i -= 1;
-        }
-        if i == 0 || bytes[i - 1] != b'(' {
-            continue;
-        }
-        let after = content[pos + "s · ↓".len()..].trim_start();
-        let count_bytes = after.as_bytes();
-        let mut count_end = count_bytes
-            .iter()
-            .position(|b| !b.is_ascii_digit())
-            .unwrap_or(count_bytes.len());
-        if count_end > 0 {
-            // Optional single fractional part (`44.7`), consumed only when a
-            // digit follows the dot so `44.tokens` does not half-parse.
-            if count_bytes.get(count_end) == Some(&b'.')
-                && count_bytes
-                    .get(count_end + 1)
-                    .is_some_and(|b| b.is_ascii_digit())
-            {
-                count_end += 1;
-                count_end += count_bytes[count_end..]
-                    .iter()
-                    .position(|b| !b.is_ascii_digit())
-                    .unwrap_or(count_bytes.len() - count_end);
+            let mut i = pos;
+            while i > 0 {
+                let c = bytes[i - 1];
+                if c == b'(' {
+                    break;
+                }
+                if !(c.is_ascii_digit() || matches!(c, b'm' | b's' | b'h' | b' ' | b'\t' | b'\n')) {
+                    break;
+                }
+                i -= 1;
             }
-            // Optional magnitude suffix (`512k`, `1.2m`, `3g`), lowercase
-            // only: every captured rendering is lowercase, and prose echoes
-            // more readily carry an uppercase unit.
-            if matches!(count_bytes.get(count_end), Some(b'k' | b'm' | b'g')) {
-                count_end += 1;
+            if i == 0 || bytes[i - 1] != b'(' {
+                continue;
             }
-            let tail = after[count_end..].trim_start();
-            if let Some(after_tokens) = tail.strip_prefix("tokens") {
-                // The live counter ends the spinner line, so its closing
-                // paren must close a whitespace-only line. Quoted literals
-                // (this repo's own test rows, docs) carry punctuation or
-                // prose right after it; rejecting those keeps them from
-                // pinning a parked pane on Running. A newline itself is
-                // fine: narrow panes wrap the counter across lines, and a
-                // bare `)` opening the next line still completes the shape
-                // (pinned by the wrapped-before-paren row below).
-                let accepted = after_tokens
-                    .trim_start()
-                    .strip_prefix(')')
-                    .is_some_and(|rest| {
-                        rest.lines()
-                            .next()
-                            .is_none_or(|line| line.trim().is_empty())
-                    });
-                if accepted {
-                    return true;
+            let mut i = pos;
+            while i > 0 {
+                let c = bytes[i - 1];
+                if c == b'(' {
+                    break;
+                }
+                if !(c.is_ascii_digit() || matches!(c, b'm' | b's' | b'h' | b' ' | b'\t' | b'\n')) {
+                    break;
+                }
+                i -= 1;
+            }
+            if i == 0 || bytes[i - 1] != b'(' {
+                continue;
+            }
+            let after = content[pos + pattern.len()..].trim_start();
+            let count_bytes = after.as_bytes();
+            let mut count_end = count_bytes
+                .iter()
+                .position(|b| !b.is_ascii_digit())
+                .unwrap_or(count_bytes.len());
+            if count_end > 0 {
+                // Optional single fractional part (`44.7`), consumed only when a
+                // digit follows the dot so `44.tokens` does not half-parse.
+                if count_bytes.get(count_end) == Some(&b'.')
+                    && count_bytes
+                        .get(count_end + 1)
+                        .is_some_and(|b| b.is_ascii_digit())
+                {
+                    count_end += 1;
+                    count_end += count_bytes[count_end..]
+                        .iter()
+                        .position(|b| !b.is_ascii_digit())
+                        .unwrap_or(count_bytes.len() - count_end);
+                }
+                // Optional magnitude suffix (`512k`, `1.2m`, `3g`), lowercase
+                // only: every captured rendering is lowercase, and prose echoes
+                // more readily carry an uppercase unit.
+                if matches!(count_bytes.get(count_end), Some(b'k' | b'm' | b'g')) {
+                    count_end += 1;
+                }
+                let tail = after[count_end..].trim_start();
+                if let Some(after_tokens) = tail.strip_prefix("tokens") {
+                    // The live counter ends the spinner line, so its closing
+                    // paren must close a whitespace-only line. Quoted literals
+                    // (this repo's own test rows, docs) carry punctuation or
+                    // prose right after it; rejecting those keeps them from
+                    // pinning a parked pane on Running. A newline itself is
+                    // fine: narrow panes wrap the counter across lines, and a
+                    // bare `)` opening the next line still completes the shape
+                    // (pinned by the wrapped-before-paren row below).
+                    let accepted =
+                        after_tokens
+                            .trim_start()
+                            .strip_prefix(')')
+                            .is_some_and(|rest| {
+                                rest.lines()
+                                    .next()
+                                    .is_none_or(|line| line.trim().is_empty())
+                            });
+                    if accepted {
+                        return true;
+                    }
                 }
             }
         }
@@ -2720,6 +2749,13 @@ enter to select · esc to cancel";
                 "integer k, no decimal",
                 "✶ Summarizing the findings… (4s · ↓ 512k tokens)",
             ),
+            (
+                "wrap between duration and arrow",
+                "(22m 8s\n↓ 44.7k tokens)",
+            ),
+            // Narrow panes wrap mid-token: the joined capture carries the
+            // newline inside what was `8s`.
+            ("wrap inside seconds", "(22m 8\ns · ↓ 44.7k tokens)"),
         ];
         for (name, pane) in cases {
             assert_eq!(detect_claude_status(pane), Status::Running, "{name}");
@@ -2750,17 +2786,22 @@ enter to select · esc to cancel";
                 "✻ Judging #3413 feedback… (4s · ↓ 88 tokens\n)",
                 true,
             ),
-            // A narrow pane wraps the counter across lines; the scan hops
-            // the newline before `tokens`.
+            // Transcript prose may follow on the next physical line; only
+            // the paren's own line must stay blank.
+            (
+                "prose on the following line",
+                "(4s · ↓ 88 tokens)\nRan 2 shell commands",
+                true,
+            ),
             (
                 "wrapped across lines",
                 "✶ Summarizing the findings… (22m 8s · ↓ 44.7k\ntokens)",
                 true,
             ),
-            // The frozen strip's counters end the line without a closing
-            // paren; that is what keeps them excluded.
-            ("strip integer, no paren", "19s · ↓ 728 tokens", false),
-            ("strip k, no paren", "1m 14s · ↓ 40.4k tokens", false),
+            // Duration segments without their own digits are malformed
+            // pane text, not a counter.
+            ("empty duration", "(s · ↓ 88 tokens)", false),
+            ("unit without own digits", "(22m s · ↓ 88 tokens)", false),
             ("no count", "(4s · ↓ tokens)", false),
             ("comma separator", "(4s · ↓ 12,345 tokens)", false),
             ("uppercase suffix", "(4s · ↓ 44.7K tokens)", false),
