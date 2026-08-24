@@ -1923,11 +1923,12 @@ pub fn detect_pi_status(raw_content: &str) -> Status {
 /// Approve/Deny pair inside window 8 (synthetic or short panels). The panel
 /// arm anchors on the option-list help row (`up/down navigate … enter
 /// select`), whose distance from the pane bottom is fixed regardless of how
-/// far the detail rows wrap; its Approve/Deny pair is read from window 12
-/// so wrapped details cannot starve the gate, which still keeps generic
-/// selectors out. The Plan Review overlay pins Waiting through its
-/// cursor-marked option rows (any `Approve …` variant, `Refine plan`,
-/// `Save and quit`) corroborated by an unmarked option phrase.
+/// far the detail rows wrap; the Approve/Deny pair shares that fixed
+/// distance, so the window-8 gate cannot be starved by wrapped details and
+/// still keeps generic selectors out. The Plan Review overlay pins Waiting
+/// through its cursor-marked option rows (any `Approve …` variant,
+/// `Refine plan`, `Save and quit`) corroborated by an unmarked option
+/// phrase.
 ///
 /// The ask tool's option dialog swaps into the composer slot the same way;
 /// its footer hint rows (`Enter select · n note`, `Space toggle · Enter …`,
@@ -5729,10 +5730,10 @@ You can monitor progress with aoe session logs.\n\
         // The rendered panel pushes the title past the gate window; the
         // prompt is live either way and must read Waiting.
         assert_eq!(detect_omp_status(OMP_LIVE_APPROVAL_PANEL), Status::Waiting);
-
-        // A tall panel: wrapped detail rows push Approve/Deny past window 8
-        // while the help row stays at the bottom; the widened gate must keep
-        // this live approval on Waiting.
+        // The panel's geometry pins Approve/Deny a fixed few rows above the
+        // pane bottom (only help row, padding and border lie below them), so
+        // wrapped details extend the panel upward without moving the pair:
+        // the window-8 gate holds for any detail length.
         let tall = "\
 ╭─ Allow tool: bash ───────────────────────────────────────╮
 │                                                          │
