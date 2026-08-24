@@ -2333,6 +2333,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&provisioned);
     }
 
+    #[serial_test::serial]
     #[test]
     fn build_instance_applies_terminal_fork_seed() {
         use crate::session::ForkSeed;
@@ -2376,6 +2377,7 @@ mod tests {
     }
 
     #[cfg(feature = "serve")]
+    #[serial_test::serial]
     #[test]
     fn build_instance_applies_structured_fork_seed() {
         use crate::session::ForkSeed;

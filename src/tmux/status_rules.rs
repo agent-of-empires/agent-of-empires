@@ -317,14 +317,6 @@ impl Drop for ProfileRegistryGuard {
 mod tests {
     use super::*;
     use serial_test::serial;
-    use std::sync::Mutex;
-
-    /// The registry is process-global; serialize the tests that write to it
-    /// so parallel test threads can't clobber each other's installs.
-    fn test_lock() -> &'static Mutex<()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     fn rule(status: HookStatus, contains: Option<&str>, regex: Option<&str>) -> StatusRule {
         StatusRule {
@@ -356,7 +348,6 @@ mod tests {
     #[serial]
     #[test]
     fn no_rules_returns_none() {
-        let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
         let _registry = ProfileRegistryGuard::take("default");
         install_from_config("default", &crate::session::Config::default());
         assert_eq!(detect("default", "anything", "some pane text"), None);
@@ -366,7 +357,6 @@ mod tests {
     #[serial]
     #[test]
     fn first_match_wins_and_no_match_is_idle() {
-        let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
         let _registry = ProfileRegistryGuard::take("default");
         install_from_config(
             "default",
@@ -393,7 +383,6 @@ mod tests {
     #[serial]
     #[test]
     fn contains_is_case_insensitive_and_regex_is_as_written() {
-        let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
         let _registry = ProfileRegistryGuard::take("default");
         install_from_config(
             "default",
@@ -427,7 +416,6 @@ mod tests {
     #[serial]
     #[test]
     fn malformed_rules_are_skipped_and_all_skipped_means_no_entry() {
-        let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
         let _registry = ProfileRegistryGuard::take("default");
         install_from_config(
             "default",
@@ -469,7 +457,6 @@ mod tests {
     #[serial]
     #[test]
     fn install_replaces_previous_rules() {
-        let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
         let _registry = ProfileRegistryGuard::take("default");
         install_from_config(
             "default",
@@ -486,7 +473,6 @@ mod tests {
     #[serial]
     #[test]
     fn install_is_scoped_to_its_profile() {
-        let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
         let _registry_p1 = ProfileRegistryGuard::take("p1");
         let _registry_p2 = ProfileRegistryGuard::take("p2");
         // p1's `gjc` maps a marker to Running; p2's `gjc` maps the same marker
@@ -528,7 +514,6 @@ mod tests {
     #[serial]
     #[test]
     fn detection_tool_prefers_own_rules_over_detect_as() {
-        let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
         let _registry = ProfileRegistryGuard::take("default");
         install_from_config(
             "default",
@@ -554,7 +539,6 @@ mod tests {
     #[serial]
     #[test]
     fn effective_detect_as_falls_back_to_installed_config() {
-        let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
         let _registry = ProfileRegistryGuard::take("default");
         install_from_config("default", &config_with_alias("claude-personal", "claude"));
 
@@ -598,7 +582,6 @@ mod tests {
     #[serial]
     #[test]
     fn own_rules_outrank_the_config_fallback() {
-        let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
         let _registry = ProfileRegistryGuard::take("default");
         let mut config = config_with_alias("rules-agent", "claude");
         config
@@ -615,7 +598,6 @@ mod tests {
     #[serial]
     #[test]
     fn rules_dispatch_through_detect_status_from_content_in() {
-        let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
         let _registry = ProfileRegistryGuard::take("default");
         install_from_config(
             "default",
@@ -645,7 +627,6 @@ mod tests {
     #[serial]
     #[test]
     fn rules_override_builtin_detector() {
-        let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
         let _registry = ProfileRegistryGuard::take("default");
         // "claude" has a built-in pane detector; configured rules outrank it.
         install_from_config(
@@ -681,8 +662,6 @@ mod tests {
     #[serial]
     #[test]
     fn profile_registry_guard_restores_the_snapshotted_entries_on_drop() {
-        let _lock = test_lock().lock().unwrap_or_else(|p| p.into_inner());
-
         // (case label, prior config under the case's profile, alias the
         // sentinel resolves to afterwards, rules present afterwards)
         let cases = [

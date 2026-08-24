@@ -10255,8 +10255,8 @@ fn restart_selected_session_tool_swap_resolves_detect_as_for_the_row_profile() {
     // The registries are process-globals and every config resolve in this
     // test (env boot included) rewrites the touched profiles' entries, so
     // snapshot before anything runs and restore on the way out.
-    let _restore_test = crate::tmux::status_rules::ProfileRegistryGuard::take("test");
-    let _restore_other = crate::tmux::status_rules::ProfileRegistryGuard::take("other");
+    let _registry_test = crate::tmux::status_rules::ProfileRegistryGuard::take("test");
+    let _registry_other = crate::tmux::status_rules::ProfileRegistryGuard::take("other");
 
     let mut env = create_test_env_with_sessions(1);
     let id = env.view.instance_at(0).id.clone();
@@ -10306,8 +10306,8 @@ fn tool_swap_test_restores_the_detect_as_registry() {
     ];
     // The probe's own seeds must not leak either: restore the pre-probe
     // entries once the assertion below has run.
-    let _restore_test = crate::tmux::status_rules::ProfileRegistryGuard::take("test");
-    let _restore_other = crate::tmux::status_rules::ProfileRegistryGuard::take("other");
+    let _registry_test = crate::tmux::status_rules::ProfileRegistryGuard::take("test");
+    let _registry_other = crate::tmux::status_rules::ProfileRegistryGuard::take("other");
     for (profile, agent, target) in sentinels {
         let mut seeded = crate::session::Config::default();
         seeded
