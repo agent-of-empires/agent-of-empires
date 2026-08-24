@@ -252,36 +252,59 @@ fn claude_pane_has_running_signal(
 /// counters (`1m 14s · ↓ 40.4k tokens`) and stays on screen, frozen at its
 /// final values, after the agent completes and the session is fully idle.
 /// Matching it would pin a parked session on Running (the bug #2909 fixed),
-/// so the count must be numeric and `tokens` must be followed by the
-/// counter's closing paren, which strip rows never have. The paren is the
-/// requirement that excludes the strip, so the count itself may take
+/// so three structural requirements hold: an opening paren right before the
+/// duration (`(22m 8s · ↓`), a numeric count, and `tokens` followed by the
+/// counter's closing paren, which strip rows never have. The closing paren
+/// is the requirement that excludes the strip, so the count itself may take
 /// Claude's abbreviated forms (`44.7k`, `1.2m`); the earlier plain-integer
 /// rule rejected those and left long turns reading Idle (#3440).
 fn has_claude_live_token_counter(content: &str) -> bool {
-    let mut search = content;
-    while let Some(pos) = search.find("s · ↓") {
-        let after = search[pos + "s · ↓".len()..].trim_start();
-        let bytes = after.as_bytes();
-        let mut count_end = bytes
+    let bytes = content.as_bytes();
+    for (pos, _) in content.match_indices("s · ↓") {
+        // The anchor tail alone would match prose like `summary: 4s · ↓ 88
+        // tokens)`; the live counter always opens with `(` right before the
+        // duration. Walk back over that duration (`22m 8`) and require the
+        // opening paren; anything else (punctuation, prose letters, a
+        // closing paren, start of content) rejects this anchor occurrence,
+        // and the scan moves on to the next one.
+        let mut i = pos;
+        while i > 0 {
+            let c = bytes[i - 1];
+            if c == b'(' {
+                break;
+            }
+            if !(c.is_ascii_digit() || matches!(c, b'm' | b's' | b'h' | b' ' | b'\t')) {
+                break;
+            }
+            i -= 1;
+        }
+        if i == 0 || bytes[i - 1] != b'(' {
+            continue;
+        }
+        let after = content[pos + "s · ↓".len()..].trim_start();
+        let count_bytes = after.as_bytes();
+        let mut count_end = count_bytes
             .iter()
             .position(|b| !b.is_ascii_digit())
-            .unwrap_or(bytes.len());
+            .unwrap_or(count_bytes.len());
         if count_end > 0 {
             // Optional single fractional part (`44.7`), consumed only when a
             // digit follows the dot so `44.tokens` does not half-parse.
-            if bytes.get(count_end) == Some(&b'.')
-                && bytes.get(count_end + 1).is_some_and(|b| b.is_ascii_digit())
+            if count_bytes.get(count_end) == Some(&b'.')
+                && count_bytes
+                    .get(count_end + 1)
+                    .is_some_and(|b| b.is_ascii_digit())
             {
                 count_end += 1;
-                count_end += bytes[count_end..]
+                count_end += count_bytes[count_end..]
                     .iter()
                     .position(|b| !b.is_ascii_digit())
-                    .unwrap_or(bytes.len() - count_end);
+                    .unwrap_or(count_bytes.len() - count_end);
             }
             // Optional magnitude suffix (`512k`, `1.2m`, `3g`), lowercase
             // only: every captured rendering is lowercase, and prose echoes
             // more readily carry an uppercase unit.
-            if matches!(bytes.get(count_end), Some(b'k' | b'm' | b'g')) {
+            if matches!(count_bytes.get(count_end), Some(b'k' | b'm' | b'g')) {
                 count_end += 1;
             }
             let tail = after[count_end..].trim_start();
@@ -307,8 +330,6 @@ fn has_claude_live_token_counter(content: &str) -> bool {
                 }
             }
         }
-        // Advance past this match so we don't loop on the same position.
-        search = &search[pos + "s · ↓".len()..];
     }
     false
 }
@@ -2744,6 +2765,15 @@ enter to select · esc to cancel";
             ("comma separator", "(4s · ↓ 12,345 tokens)", false),
             ("uppercase suffix", "(4s · ↓ 44.7K tokens)", false),
             ("non-digit count", "(4s · ↓ many tokens)", false),
+            // The duration must sit inside an opening paren; an anchor tail
+            // loose in prose is not a live counter (review finding on
+            // #3488).
+            ("no opening paren", "summary: 4s · ↓ 88 tokens)", false),
+            (
+                "prose before the duration",
+                "see issue s · ↓ 88 tokens)",
+                false,
+            ),
             ("double dot", "(4s · ↓ 44..7k tokens)", false),
             // A dot with no digit after it must not be eaten as a fraction,
             // or `44.tokens)` would half-parse into a live counter.
