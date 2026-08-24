@@ -2063,25 +2063,23 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
     // Plan Review overlay: while the operator deliberates, its option list
     // replaces the pane bottom and the turn is blocked. The anchor is the
     // SELECTED row, which carries the preset's nav cursor (unicode ❯,
-    // nerd \u{f054}, ascii >) directly before the phrase; a wrapped or
-    // pasted composer draft naming both options never carries that cursor.
-    // `Refine plan` on any other distinct row confirms the overlay context.
-    let approve_pos = lowest_matching_line(window12, |l| {
+    // nerd \u{f054}, ascii >) before one of the option phrases; wherever
+    // the operator moves the selection, some known option keeps the cursor.
+    // A second distinct option phrase confirms overlay context, so wrapped
+    // composer drafts (no cursor) and single-line prose stay Idle. Residual:
+    // pasted text quoting a cursor-prefixed option line verbatim.
+    let has_cursor = |l: &str| l.contains("❯ ") || l.contains("\u{f054} ") || l.contains("> ");
+    let is_option = |l: &str| {
         let l = l.to_lowercase();
-        l.contains("❯ approve and execute")
-            || l.contains("\u{f054} approve and execute")
-            || l.contains("> approve and execute")
-    });
-    let refine_pos = lowest_matching_line(window12, |l| {
-        let l = l.to_lowercase();
-        l.contains("refine plan") && !l.contains("approve and execute")
-    });
-    if let (Some(a), Some(r)) = (approve_pos, refine_pos) {
-        if a != r {
-            consider(a.min(r), OmpSignal::Approval);
+        l.contains("approve and") || l.contains("refine plan") || l.contains("save and quit")
+    };
+    let cursor_pos = lowest_matching_line(window12, |l| has_cursor(l) && is_option(l));
+    let other_pos = lowest_matching_line(window12, is_option);
+    if let (Some(c), Some(o)) = (cursor_pos, other_pos) {
+        if c != o {
+            consider(c.min(o), OmpSignal::Approval);
         }
     }
-
     // Ask dialog: the built-in ask tool swaps an option dialog into the
     // composer slot and blocks the turn on the operator's answers. Its
     // footer hint row is fixed relative to the pane bottom; the three verb
@@ -5808,9 +5806,11 @@ You can monitor progress with aoe session logs.\n\
 
     #[test]
     fn test_detect_omp_status_waiting_on_plan_review_overlay() {
-        // Verbatim bottom rows of a live Plan Review overlay: the option
-        // list replaces the pane bottom while the turn is blocked on it.
-        let pane = "\
+        // Verbatim bottom rows of a live Plan Review overlay (ascii preset):
+        // the option list replaces the pane bottom while the turn is blocked
+        // on it. The selection is operator-navigable, so both a cursor on
+        // Approve and execute and on Refine plan must read Waiting.
+        let rows = "\
 | Plan mode - next step                                                        |
 | > Approve and execute                                                        |
 |   Approve and compact context                                                |
@@ -5820,7 +5820,21 @@ You can monitor progress with aoe session logs.\n\
 +------------------------------------------------------------------------------+
 | ↑↓ select · ⏎ confirm · c copy · tab regions · Ctrl+G editor · esc cancel    |
 +------------------------------------------------------------------------------+";
-        assert_eq!(detect_omp_status(pane), Status::Waiting);
+        assert_eq!(detect_omp_status(rows), Status::Waiting);
+
+        // Selection moved off the first option during deliberation: the
+        // cursor now marks Refine plan, Approve and execute is unmarked.
+        let navigated = "\
+| Plan mode - next step                                                        |
+|   Approve and execute                                                        |
+|   Approve and compact context                                                |
+|   Approve and keep context (~28k / 1m)                                       |
+| ❯ Refine plan                                                                |
+|   Save and quit                                                              |
++------------------------------------------------------------------------------+
+| ↑↓ select · ⏎ confirm · c copy · tab regions · Ctrl+G editor · esc cancel    |
++------------------------------------------------------------------------------+";
+        assert_eq!(detect_omp_status(navigated), Status::Waiting);
     }
 
     #[test]
