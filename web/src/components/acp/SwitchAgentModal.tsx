@@ -234,6 +234,7 @@ export function SwitchAgentModal({ open, sessionId, currentAgent, onClose, onPre
                           {a.name}
                           {isCurrent && <span className="ml-2 font-sans text-xs text-text-muted">(current)</span>}
                         </span>
+                        <span className="block text-xs text-text-muted">{a.description}</span>
                         {(a.lifecycle ?? resolveAgentLifecycle(a.name)).state === "deprecated" && (
                           <span
                             className="ml-2 font-sans text-xs text-status-warning"

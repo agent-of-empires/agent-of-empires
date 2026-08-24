@@ -222,6 +222,11 @@ describe("SwitchAgentModal (rate_limit)", () => {
     expect(screen.queryByTestId("switch-agent-deprecated-claude")).toBeNull();
     expect(screen.queryByTestId("switch-agent-deprecated-codex")).toBeNull();
     expect(screen.queryByTestId("switch-agent-deprecated-opencode")).toBeNull();
+    // The deprecation label is additive: every row keeps its description.
+    const descriptions = ["Claude (Sonnet)", "OpenAI Codex", "OpenCode", "Gemini CLI", "Legacy backend"];
+    for (const text of descriptions) {
+      expect(screen.getByText(text)).not.toBeNull();
+    }
   });
 });
 
