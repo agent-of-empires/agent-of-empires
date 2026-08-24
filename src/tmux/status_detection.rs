@@ -1923,9 +1923,11 @@ pub fn detect_pi_status(raw_content: &str) -> Status {
 /// Approve/Deny pair inside window 8 (synthetic or short panels). The panel
 /// arm anchors on the option-list help row (`up/down navigate … enter
 /// select`), whose distance from the pane bottom is fixed regardless of how
-/// far the detail rows wrap, gated on the same pair so generic selectors
-/// stay out. The Plan Review overlay pins Waiting through its cursor-marked
-/// option rows (`Approve and execute`, `Refine plan`, `Save and quit`).
+/// far the detail rows wrap; its Approve/Deny pair is read from window 12
+/// so wrapped details cannot starve the gate, which still keeps generic
+/// selectors out. The Plan Review overlay pins Waiting through its
+/// cursor-marked option rows (any `Approve …` variant, `Refine plan`,
+/// `Save and quit`) corroborated by an unmarked option phrase.
 ///
 /// The ask tool's option dialog swaps into the composer slot the same way;
 /// its footer hint rows (`Enter select · n note`, `Space toggle · Enter …`,
@@ -2050,9 +2052,11 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
     // title row sits ~10 non-empty rows above the pane bottom and can fall
     // outside every window that still sees the options. The option-list help
     // row stays two rows above the panel's bottom border regardless of how
-    // far the details wrap; requiring the Approve/Deny pair keeps generic
-    // selectors (model menu, session picker) from pinning Waiting.
-    if approval_footer.contains("approve") && approval_footer.contains("deny") {
+    // far the details wrap; the gate reads its Approve/Deny pair from
+    // window 12 so wrapped detail rows cannot starve it, while still keeping
+    // generic selectors (model menu, session picker) from pinning Waiting.
+    let panel_gate = window12.join("\n").to_lowercase();
+    if panel_gate.contains("approve") && panel_gate.contains("deny") {
         if let Some(pos) = lowest_matching_line(window8, |l| {
             let l = l.to_lowercase();
             l.contains("up/down navigate") && l.contains("enter select")
@@ -2069,20 +2073,18 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
     // A second distinct option phrase confirms overlay context, so wrapped
     // composer drafts (no cursor) and single-line prose stay Idle. Residual:
     // pasted text quoting a cursor-prefixed option line verbatim.
-    let has_cursor = |l: &str| l.contains("❯ ") || l.contains("\u{f054} ") || l.contains("> ");
     let is_option = |l: &str| {
         let l = l.to_lowercase();
         l.contains("approve and") || l.contains("refine plan") || l.contains("save and quit")
     };
+    let has_cursor = |l: &str| l.contains("❯ ") || l.contains("\u{f054} ") || l.contains("> ");
     let cursor_pos = lowest_matching_line(window12, |l| has_cursor(l) && is_option(l));
-    // Corroborate with an UNMARKED option row: when the selection rests on
-    // the bottom-most option, the marked row alone would equal itself here
-    // and suppress the signal.
+    // Corroborate with an UNMARKED option row: the !has_cursor half of the
+    // predicate guarantees the corroborating line differs from the marked
+    // anchor, wherever the selection rests.
     let other_pos = lowest_matching_line(window12, |l| is_option(l) && !has_cursor(l));
     if let (Some(c), Some(o)) = (cursor_pos, other_pos) {
-        if c != o {
-            consider(c.min(o), OmpSignal::Approval);
-        }
+        consider(c.min(o), OmpSignal::Approval);
     }
 
     // Ask dialog: the built-in ask tool swaps an option dialog into the
@@ -5727,6 +5729,24 @@ You can monitor progress with aoe session logs.\n\
         // The rendered panel pushes the title past the gate window; the
         // prompt is live either way and must read Waiting.
         assert_eq!(detect_omp_status(OMP_LIVE_APPROVAL_PANEL), Status::Waiting);
+
+        // A tall panel: wrapped detail rows push Approve/Deny past window 8
+        // while the help row stays at the bottom; the widened gate must keep
+        // this live approval on Waiting.
+        let tall = "\
+╭─ Allow tool: bash ───────────────────────────────────────╮
+│                                                          │
+│ Command: for f in $(find . -type f | head -400); do      │
+│   echo $f; grep -R audit --include=*.rs $f; done         │
+│   echo done-with-scan                                    │
+│                                                          │
+│  ❯ Approve                                               │
+│    Deny                                                  │
+│                                                          │
+│ up/down navigate  enter select  esc cancel               │
+│                                                          │
+╰──────────────────────────────────────────────────────────╯";
+        assert_eq!(detect_omp_status(tall), Status::Waiting);
     }
 
     #[test]
