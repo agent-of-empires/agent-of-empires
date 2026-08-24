@@ -265,12 +265,19 @@ pub(crate) struct ProfileRegistryGuard {
 
 #[cfg(test)]
 impl ProfileRegistryGuard {
-    /// Capture `profile`'s current entries. Take the snapshot BEFORE the
+    /// Snapshot `profile`'s current entries. Take the snapshot BEFORE the
     /// first mutation, or the restore replays the test's own writes. Pass
     /// the same literal profile the guarded section will install under: an
     /// empty name resolves against config state at call time, and a later
     /// resolve would normalize to whatever is configured then, not to this
     /// snapshot's frozen key.
+    ///
+    /// The aliases and rules phases each lock their own map, so a writer
+    /// touching the same profile between the phases would see or leave a
+    /// half-swapped pair; every same-profile writer therefore sits in the
+    /// default serial group, which excludes them for the whole guard. The
+    /// guard covers exactly these two registries: a future process-global
+    /// needs its own restore mechanism.
     pub(crate) fn take(profile: &str) -> Self {
         let profile = crate::session::config::effective_profile(profile);
         let aliases = aliases()
