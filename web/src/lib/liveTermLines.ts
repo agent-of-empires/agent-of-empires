@@ -143,7 +143,7 @@ const ZERO_WIDTH = /[\u200B-\u200D\uFEFF]|\p{M}/u;
 // Emoji composition tails: they modify the preceding pictographic glyph
 // and occupy no column of their own (skin-tone swatches, text/color
 // variation selectors).
-const EMOJI_TAIL = /[\uFE0E\uFE0F\u{1F3FB}-\u{1F3FF}]/u;
+const EMOJI_TAIL = /^(?:[\uFE0E\uFE0F]|[\u{1F3FB}-\u{1F3FF}])$/u;
 // Regional indicator pairs compose flag glyphs. Each RI carries
 // Emoji_Presentation, so the wide classifier counts two cells per RI and
 // a flag renders as four cells in this grid's convention.
