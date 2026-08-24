@@ -1965,8 +1965,8 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
             || l.ends_with("[esc]")
             || l.contains("(esc to cancel)")
     };
-    if let Some(pos) = footer.iter().rev().position(|line| is_live_loader(line)) {
-        consider(pos + 1, OmpSignal::Spinner);
+    if let Some(pos) = lowest_matching_line(footer, |line| is_live_loader(line)) {
+        consider(pos, OmpSignal::Spinner);
     }
 
     // Retry countdown: fixed live region above the prompt (window 6). (a)
