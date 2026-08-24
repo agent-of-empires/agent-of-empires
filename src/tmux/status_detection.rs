@@ -2050,13 +2050,13 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
     // Approval prompt, panel arm. The live select replaces the composer in
     // an overlay panel whose blank padding rows carry border glyphs, so the
     // title row sits ~10 non-empty rows above the pane bottom and can fall
-    // outside every window that still sees the options. The option-list help
-    // row stays two rows above the panel's bottom border regardless of how
-    // far the details wrap; the gate reads its Approve/Deny pair from
-    // window 12 so wrapped detail rows cannot starve it, while still keeping
-    // generic selectors (model menu, session picker) from pinning Waiting.
-    let panel_gate = window12.join("\n").to_lowercase();
-    if panel_gate.contains("approve") && panel_gate.contains("deny") {
+    // outside every window that still sees the options. The option rows
+    // themselves keep a fixed distance from the pane bottom: only the help
+    // row, padding and border lie below them, so wrapping details extend
+    // the panel upward without moving the pair. The Approve/Deny gate reads
+    // from window 8 and keeps generic selectors (model menu, session
+    // picker) from pinning Waiting.
+    if approval_footer.contains("approve") && approval_footer.contains("deny") {
         if let Some(pos) = lowest_matching_line(window8, |l| {
             let l = l.to_lowercase();
             l.contains("up/down navigate") && l.contains("enter select")
@@ -5839,8 +5839,8 @@ You can monitor progress with aoe session logs.\n\
     fn test_detect_omp_status_waiting_on_plan_review_overlay() {
         // Verbatim bottom rows of a live Plan Review overlay (ascii preset):
         // the option list replaces the pane bottom while the turn is blocked
-        // on it. The selection is operator-navigable, so both a cursor on
-        // Approve and execute and on Refine plan must read Waiting.
+        // on it. The selection is operator-navigable, so a cursor on any of
+        // the three deliberation-relevant options must read Waiting.
         let rows = "\
 | Plan mode - next step                                                        |
 | > Approve and execute                                                        |
