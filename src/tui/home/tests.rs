@@ -10252,6 +10252,12 @@ fn restart_selected_session_tool_swap_clears_old_agent_session_state() {
 #[test]
 #[serial]
 fn restart_selected_session_tool_swap_resolves_detect_as_for_the_row_profile() {
+    // The registries are process-globals and every config resolve in this
+    // test (env boot included) rewrites the touched profiles' entries, so
+    // snapshot before anything runs and restore on the way out.
+    let _restore_test = crate::tmux::status_rules::ProfileRegistryGuard::take("test");
+    let _restore_other = crate::tmux::status_rules::ProfileRegistryGuard::take("other");
+
     let mut env = create_test_env_with_sessions(1);
     let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
@@ -10281,6 +10287,49 @@ fn restart_selected_session_tool_swap_resolves_detect_as_for_the_row_profile() {
     assert_eq!(
         row.detect_as, "claude",
         "the swap must read profile 'test' aliases, not the default profile's"
+    );
+}
+
+/// Repro for the open CodeRabbit thread on #3509: the tool-swap test above
+/// mutates the process-global `agent_detect_as` registry through
+/// `install_from_config` without restoring prior entries, and the registry
+/// outlives the test, so any later reader of those profiles observes state
+/// its config never contained. Sentinel aliases stand in for entries an
+/// earlier test installed; both must survive the swap test unchanged.
+#[test]
+#[serial]
+fn tool_swap_test_restores_the_detect_as_registry() {
+    // (profile, sentinel agent, target)
+    let sentinels = [
+        ("test", "zz-sentinel-test", "codex"),
+        ("other", "zz-sentinel-other", "claude"),
+    ];
+    // The probe's own seeds must not leak either: restore the pre-probe
+    // entries once the assertion below has run.
+    let _restore_test = crate::tmux::status_rules::ProfileRegistryGuard::take("test");
+    let _restore_other = crate::tmux::status_rules::ProfileRegistryGuard::take("other");
+    for (profile, agent, target) in sentinels {
+        let mut seeded = crate::session::Config::default();
+        seeded
+            .session
+            .agent_detect_as
+            .insert(agent.to_string(), target.to_string());
+        crate::tmux::status_rules::install_from_config(profile, &seeded);
+    }
+
+    restart_selected_session_tool_swap_resolves_detect_as_for_the_row_profile();
+
+    for (profile, agent, target) in sentinels {
+        assert_eq!(
+            crate::tmux::status_rules::effective_detect_as(profile, agent, ""),
+            target,
+            "the tool-swap test clobbered pre-existing alias {agent} in profile '{profile}'"
+        );
+    }
+    assert_eq!(
+        crate::tmux::status_rules::effective_detect_as("test", "gjc", ""),
+        "",
+        "the tool-swap test leaked `gjc -> claude` into profile 'test'"
     );
 }
 
