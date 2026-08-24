@@ -657,20 +657,32 @@ mod tests {
     }
 
     /// The guard must hand back exactly the snapshotted entries: prior
-    /// aliases and rules clobbered by a guarded install come back, and a
-    /// profile that had nothing keeps nothing.
+    /// aliases and rules clobbered by a guarded install come back with
+    /// their original matchers, a rules-only or alias-only prior is
+    /// restored on its own, and a profile that had nothing keeps nothing.
+    /// The outer guard returns each case's profile to the pre-test state
+    /// so the seeded priors themselves do not leak.
     #[serial]
     #[test]
     fn profile_registry_guard_restores_the_snapshotted_entries_on_drop() {
         // (case label, prior config under the case's profile, alias the
-        // sentinel resolves to afterwards, rules present afterwards)
+        // sentinel resolves to afterwards, "spin" detected afterwards)
         let cases = [
-            ("empty", None, "", false),
+            ("empty", None, "", None),
             (
                 "seeded",
                 Some(config_with_alias("sentinel-agent", "codex")),
                 "codex",
-                false,
+                None,
+            ),
+            (
+                "rules-only",
+                Some(config_with_rules(
+                    "rules-agent",
+                    vec![rule(HookStatus::Running, Some("spin"), None)],
+                )),
+                "",
+                Some(Status::Running),
             ),
             (
                 "seeded-with-rules",
@@ -684,11 +696,12 @@ mod tests {
                     config
                 }),
                 "codex",
-                true,
+                Some(Status::Running),
             ),
         ];
-        for (label, prior, want_alias, want_rules) in cases {
+        for (label, prior, want_alias, want_spin) in cases {
             let profile = format!("guard-{label}");
+            let _pre_test = ProfileRegistryGuard::take(&profile);
             if let Some(prior) = prior.as_ref() {
                 install_from_config(&profile, prior);
             }
@@ -710,9 +723,9 @@ mod tests {
                 "{label}: prior alias entry must be restored"
             );
             assert_eq!(
-                has_rules(&profile, "rules-agent"),
-                want_rules,
-                "{label}: prior rules entry must be restored"
+                detect(&profile, "rules-agent", "spin"),
+                want_spin,
+                "{label}: prior rule must be restored with its original matcher"
             );
         }
     }
