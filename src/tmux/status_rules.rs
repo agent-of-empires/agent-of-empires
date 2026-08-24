@@ -34,11 +34,13 @@ use crate::session::Status;
 
 /// A rule compiled for the poll loop: the matcher is pre-lowered /
 /// pre-compiled so per-tick evaluation is substring or regex work only.
+#[derive(Clone)]
 struct CompiledRule {
     status: Status,
     matcher: Matcher,
 }
 
+#[derive(Clone)]
 enum Matcher {
     /// Case-insensitive substring: stored lowercased, tested against the
     /// lowercased pane text.
@@ -247,6 +249,66 @@ pub fn detection_tool<'a>(profile: &str, tool: &'a str, detect_as: &'a str) -> C
     }
 }
 
+/// Test-only restoration guard over one profile's entries in both
+/// registries. `install_from_config` replaces the whole profile's state and
+/// the registries are process-globals that outlive any single test, so a
+/// test that installs must hand the prior entries back: [`Self::take`]
+/// snapshots what `profile` currently has, and dropping the guard removes
+/// everything the test installed (and reinstates anything it clobbered),
+/// including through an unwinding assertion.
+#[cfg(test)]
+pub(crate) struct ProfileRegistryGuard {
+    profile: String,
+    aliases: Vec<((String, String), String)>,
+    rules: Vec<((String, String), Vec<CompiledRule>)>,
+}
+
+#[cfg(test)]
+impl ProfileRegistryGuard {
+    /// Capture `profile`'s current entries. Take the snapshot BEFORE the
+    /// first mutation, or the restore replays the test's own writes.
+    pub(crate) fn take(profile: &str) -> Self {
+        let profile = crate::session::config::effective_profile(profile);
+        let aliases = aliases()
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|((p, _), _)| *p == profile)
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        let rules = registry()
+            .read()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .filter(|((p, _), _)| *p == profile)
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect();
+        Self {
+            profile,
+            aliases,
+            rules,
+        }
+    }
+
+    /// Drop this profile's current entries and reinstall the snapshot.
+    fn restore(&mut self) {
+        let mut map = aliases().write().unwrap_or_else(|p| p.into_inner());
+        map.retain(|(p, _), _| p != &self.profile);
+        map.extend(self.aliases.drain(..));
+        drop(map);
+        let mut reg = registry().write().unwrap_or_else(|p| p.into_inner());
+        reg.retain(|(p, _), _| p != &self.profile);
+        reg.extend(self.rules.drain(..));
+    }
+}
+
+#[cfg(test)]
+impl Drop for ProfileRegistryGuard {
+    fn drop(&mut self) {
+        self.restore();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -289,6 +351,7 @@ mod tests {
     #[test]
     fn no_rules_returns_none() {
         let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _registry = ProfileRegistryGuard::take("default");
         install_from_config("default", &crate::session::Config::default());
         assert_eq!(detect("default", "anything", "some pane text"), None);
         assert!(!has_rules("default", "anything"));
@@ -297,6 +360,7 @@ mod tests {
     #[test]
     fn first_match_wins_and_no_match_is_idle() {
         let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _registry = ProfileRegistryGuard::take("default");
         install_from_config(
             "default",
             &config_with_rules(
@@ -317,12 +381,12 @@ mod tests {
             Some(Status::Running)
         );
         assert_eq!(detect("default", "rules-agent", "$ "), Some(Status::Idle));
-        install_from_config("default", &crate::session::Config::default());
     }
 
     #[test]
     fn contains_is_case_insensitive_and_regex_is_as_written() {
         let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _registry = ProfileRegistryGuard::take("default");
         install_from_config(
             "default",
             &config_with_rules(
@@ -350,12 +414,12 @@ mod tests {
             detect("default", "rules-agent", "WAITING FOR 2 APPROVALS"),
             Some(Status::Idle)
         );
-        install_from_config("default", &crate::session::Config::default());
     }
 
     #[test]
     fn malformed_rules_are_skipped_and_all_skipped_means_no_entry() {
         let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _registry = ProfileRegistryGuard::take("default");
         install_from_config(
             "default",
             &config_with_rules(
@@ -391,12 +455,12 @@ mod tests {
             ),
             Some(Status::Error)
         );
-        install_from_config("default", &crate::session::Config::default());
     }
 
     #[test]
     fn install_replaces_previous_rules() {
         let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _registry = ProfileRegistryGuard::take("default");
         install_from_config(
             "default",
             &config_with_rules(
@@ -412,6 +476,8 @@ mod tests {
     #[test]
     fn install_is_scoped_to_its_profile() {
         let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _registry_p1 = ProfileRegistryGuard::take("p1");
+        let _registry_p2 = ProfileRegistryGuard::take("p2");
         // p1's `gjc` maps a marker to Running; p2's `gjc` maps the same marker
         // to Error. Distinct keys, so neither install touches the other.
         install_from_config(
@@ -451,6 +517,7 @@ mod tests {
     #[test]
     fn detection_tool_prefers_own_rules_over_detect_as() {
         let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _registry = ProfileRegistryGuard::take("default");
         install_from_config(
             "default",
             &config_with_rules(
@@ -466,7 +533,6 @@ mod tests {
         // No rules: alias applies, and no alias means the tool itself.
         assert_eq!(detection_tool("default", "other-agent", "claude"), "claude");
         assert_eq!(detection_tool("default", "other-agent", ""), "other-agent");
-        install_from_config("default", &crate::session::Config::default());
     }
 
     /// A session built before its tool was added to `[session.agent_detect_as]`
@@ -476,6 +542,7 @@ mod tests {
     #[test]
     fn effective_detect_as_falls_back_to_installed_config() {
         let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _registry = ProfileRegistryGuard::take("default");
         install_from_config("default", &config_with_alias("claude-personal", "claude"));
 
         // (tool, stored detect_as, expected alias, expected detection tool)
@@ -518,6 +585,7 @@ mod tests {
     #[test]
     fn own_rules_outrank_the_config_fallback() {
         let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _registry = ProfileRegistryGuard::take("default");
         let mut config = config_with_alias("rules-agent", "claude");
         config
             .agents
@@ -528,13 +596,12 @@ mod tests {
 
         assert_eq!(effective_detect_as("default", "rules-agent", ""), "claude");
         assert_eq!(detection_tool("default", "rules-agent", ""), "rules-agent");
-
-        install_from_config("default", &crate::session::Config::default());
     }
 
     #[test]
     fn rules_dispatch_through_detect_status_from_content_in() {
         let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _registry = ProfileRegistryGuard::take("default");
         install_from_config(
             "default",
             &config_with_rules(
@@ -558,12 +625,12 @@ mod tests {
             ),
             Status::Idle
         );
-        install_from_config("default", &crate::session::Config::default());
     }
 
     #[test]
     fn rules_override_builtin_detector() {
         let _guard = test_lock().lock().unwrap_or_else(|p| p.into_inner());
+        let _registry = ProfileRegistryGuard::take("default");
         // "claude" has a built-in pane detector; configured rules outrank it.
         install_from_config(
             "default",
@@ -590,5 +657,67 @@ mod tests {
             ),
             Status::Idle
         );
+    }
+
+    /// The guard must hand back exactly the snapshotted entries: prior
+    /// aliases and rules clobbered by a guarded install come back, and a
+    /// profile that had nothing keeps nothing.
+    #[test]
+    fn profile_registry_guard_restores_the_snapshotted_entries_on_drop() {
+        let _lock = test_lock().lock().unwrap_or_else(|p| p.into_inner());
+
+        // (case label, prior config under the case's profile, alias the
+        // sentinel resolves to afterwards, rules present afterwards)
+        let cases = [
+            ("empty", None, "", false),
+            (
+                "seeded",
+                Some(config_with_alias("sentinel-agent", "codex")),
+                "codex",
+                false,
+            ),
+            (
+                "seeded-with-rules",
+                Some({
+                    let mut config = config_with_alias("sentinel-agent", "codex");
+                    config
+                        .agents
+                        .entry("rules-agent".to_string())
+                        .or_default()
+                        .status_rules = vec![rule(HookStatus::Running, Some("spin"), None)];
+                    config
+                }),
+                "codex",
+                true,
+            ),
+        ];
+        for (label, prior, want_alias, want_rules) in cases {
+            let profile = format!("guard-{label}");
+            if let Some(prior) = prior.as_ref() {
+                install_from_config(&profile, prior);
+            }
+
+            {
+                let _restore = ProfileRegistryGuard::take(&profile);
+                let mut clobber = config_with_alias("sentinel-agent", "claude");
+                clobber
+                    .agents
+                    .entry("rules-agent".to_string())
+                    .or_default()
+                    .status_rules = vec![rule(HookStatus::Error, Some("boom"), None)];
+                install_from_config(&profile, &clobber);
+            }
+
+            assert_eq!(
+                effective_detect_as(&profile, "sentinel-agent", ""),
+                want_alias,
+                "{label}: prior alias entry must be restored"
+            );
+            assert_eq!(
+                has_rules(&profile, "rules-agent"),
+                want_rules,
+                "{label}: prior rules entry must be restored"
+            );
+        }
     }
 }
