@@ -1969,7 +1969,7 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
             || l.ends_with("[esc]")
             || l.contains("(esc to cancel)")
     };
-    if let Some(pos) = lowest_matching_line(footer, |line| is_live_loader(line)) {
+    if let Some(pos) = lowest_matching_line(footer, is_live_loader) {
         consider(pos, OmpSignal::Spinner);
     }
 
