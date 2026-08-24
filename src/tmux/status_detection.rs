@@ -1927,6 +1927,10 @@ pub fn detect_pi_status(raw_content: &str) -> Status {
 /// stay out. The Plan Review overlay pins Waiting through its
 /// `Approve and execute` / `Refine plan` option rows on distinct lines.
 ///
+/// The ask tool's option dialog swaps into the composer slot the same way;
+/// its footer hint rows (`Enter select · n note`, `Space toggle · Enter …`,
+/// `Enter submit · ↑/↓ scroll`) pin Waiting while answers are pending.
+///
 /// When no signal matched, the frame reads as healthy idle rather than
 /// Waiting. In practice it is parked on the always-visible `╭── π`/`╰─`
 /// composer box, though the fallback itself does not require the box to be
@@ -2068,6 +2072,19 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
         if a != r {
             consider(a.min(r), OmpSignal::Approval);
         }
+    }
+
+    // Ask dialog: the built-in ask tool swaps an option dialog into the
+    // composer slot and blocks the turn on the operator's answers. Its
+    // footer hint row is fixed relative to the pane bottom; the three verb
+    // patterns cover single-select, multi-select and the submit tab.
+    if let Some(pos) = lowest_matching_line(window8, |l| {
+        let l = l.to_lowercase();
+        l.contains("enter select · n note")
+            || l.contains("space toggle · enter ")
+            || l.contains("enter submit · ↑/↓ scroll")
+    }) {
+        consider(pos, OmpSignal::Approval);
     }
 
     // Sub-agent retry labels and rule-repair progress: window 12.
@@ -5750,6 +5767,38 @@ You can monitor progress with aoe session logs.\n\
     }
 
     #[test]
+    fn test_detect_omp_status_waiting_on_ask_dialog() {
+        // The built-in ask tool swaps its dialog into the composer slot and
+        // blocks the turn; the footer hint rows are the stable anchor.
+        let cases = [
+            // Single-select footer.
+            "\
+╭─ Ask ────────────────────────────────────────╮
+│                                              │
+│ Which database for the new service?          │
+│                                              │
+│  ❯ PostgreSQL                                │
+│    SQLite                                    │
+│    Other (type your own)                     │
+│                                              │
+│ Enter select · n note · ↑/↓ move · Esc       │
+│                                              │
+╰──────────────────────────────────────────────╯",
+            // Multi-select footer (Enter advances to the next question).
+            "\
+│ Space toggle · Enter next · ↑/↓ move · Esc   │
+╰──────────────────────────────────────────────╯",
+            // Submit tab footer.
+            "\
+│ Enter submit · ↑/↓ scroll · Esc              │
+╰──────────────────────────────────────────────╯",
+        ];
+        for (i, pane) in cases.iter().enumerate() {
+            assert_eq!(detect_omp_status(pane), Status::Waiting, "case {i}");
+        }
+    }
+
+    #[test]
     fn test_detect_omp_status_waiting_on_plan_review_overlay() {
         // Verbatim bottom rows of a live Plan Review overlay: the option
         // list replaces the pane bottom while the turn is blocked on it.
@@ -5775,6 +5824,8 @@ You can monitor progress with aoe session logs.\n\
         let cases = [
             format!("│ up/down navigate  enter select  esc cancel │\n{box_}"),
             format!("I would approve and execute refine plan steps\n{box_}"),
+            // Ask-arm verbs without the dialog's exact footer phrasing.
+            format!("press enter to select an option\n{box_}"),
         ];
         for pane in &cases {
             assert_eq!(detect_omp_status(pane), Status::Idle, "case: {pane:?}");
