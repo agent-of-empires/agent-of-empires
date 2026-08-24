@@ -294,20 +294,6 @@ fn has_claude_live_token_counter(content: &str) -> bool {
             if i == 0 || bytes[i - 1] != b'(' {
                 continue;
             }
-            let mut i = pos;
-            while i > 0 {
-                let c = bytes[i - 1];
-                if c == b'(' {
-                    break;
-                }
-                if !(c.is_ascii_digit() || matches!(c, b'm' | b's' | b'h' | b' ' | b'\t' | b'\n')) {
-                    break;
-                }
-                i -= 1;
-            }
-            if i == 0 || bytes[i - 1] != b'(' {
-                continue;
-            }
             let after = content[pos + pattern.len()..].trim_start();
             let count_bytes = after.as_bytes();
             let mut count_end = count_bytes
