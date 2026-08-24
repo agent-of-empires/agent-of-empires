@@ -2061,13 +2061,21 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
     }
 
     // Plan Review overlay: while the operator deliberates, its option list
-    // replaces the pane bottom and the turn is blocked. The two unambiguous
-    // options must appear on distinct rows so a single prose line naming
-    // both phrases cannot pin Waiting.
+    // replaces the pane bottom and the turn is blocked. The anchor is the
+    // SELECTED row, which carries the preset's nav cursor (unicode ❯,
+    // nerd \u{f054}, ascii >) directly before the phrase; a wrapped or
+    // pasted composer draft naming both options never carries that cursor.
+    // `Refine plan` on any other distinct row confirms the overlay context.
     let approve_pos = lowest_matching_line(window12, |l| {
-        l.to_lowercase().contains("approve and execute")
+        let l = l.to_lowercase();
+        l.contains("❯ approve and execute")
+            || l.contains("\u{f054} approve and execute")
+            || l.contains("> approve and execute")
     });
-    let refine_pos = lowest_matching_line(window12, |l| l.to_lowercase().contains("refine plan"));
+    let refine_pos = lowest_matching_line(window12, |l| {
+        let l = l.to_lowercase();
+        l.contains("refine plan") && !l.contains("approve and execute")
+    });
     if let (Some(a), Some(r)) = (approve_pos, refine_pos) {
         if a != r {
             consider(a.min(r), OmpSignal::Approval);
@@ -5826,6 +5834,9 @@ You can monitor progress with aoe session logs.\n\
             format!("I would approve and execute refine plan steps\n{box_}"),
             // Ask-arm verbs without the dialog's exact footer phrasing.
             format!("press enter to select an option\n{box_}"),
+            // Wrapped draft naming both plan options without the overlay's
+            // selected-row cursor: prose, not the overlay.
+            format!("I approve and execute\nthen refine plan things\n{box_}"),
         ];
         for pane in &cases {
             assert_eq!(detect_omp_status(pane), Status::Idle, "case: {pane:?}");
