@@ -5797,6 +5797,10 @@ You can monitor progress with aoe session logs.\n\
 │ Enter select · n note · ↑/↓ move · Esc       │
 │                                              │
 ╰──────────────────────────────────────────────╯",
+            // Multi-select footer (Enter advances to the next question).
+            "\
+│ Space toggle · Enter next · ↑/↓ move · Esc   │
+╰──────────────────────────────────────────────╯",
             // Submit tab footer.
             "\
 │ Enter submit · ↑/↓ scroll · Esc              │
