@@ -47,7 +47,6 @@
 //! all, is enough.
 
 use std::collections::HashSet;
-use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
 use anyhow::Context as _;
@@ -58,10 +57,7 @@ use serde_json::{json, Value};
 use crate::events::{self, Order, Schema, SeqBound};
 use crate::plugin::protocol::codes;
 use crate::plugin::ui_state::{Tone, UiError, UiSnapshot, UiStore};
-use crate::session::mcp_model::{self, McpProvenance};
-use crate::session::mcp_state::{self, ConflictWinner, ResolveStatus};
-use crate::session::settings_schema::{self, Scope, WebWritePolicy};
-use crate::session::{mcp_overrides, update_config, Storage};
+use crate::session::Storage;
 
 /// Capability required by each host method. Reused from the manifest taxonomy
 /// (`aoe_plugin_api::KNOWN_CAPABILITIES`); no new capability is introduced.
@@ -229,30 +225,6 @@ impl PluginRpcContext {
             })
         }
     }
-
-    /// Refuse the call unless the plugin holds at least one of `capabilities`.
-    /// Used where either of two grants suffices (e.g. `skills.list` accepts
-    /// `fs.read` OR `config.read`).
-    fn require_any(&self, capabilities: &[&str]) -> Result<(), DispatchError> {
-        if capabilities
-            .iter()
-            .any(|cap| self.granted_capabilities.iter().any(|c| c == cap))
-        {
-            Ok(())
-        } else {
-            Err(DispatchError {
-                code: codes::FORBIDDEN,
-                message: format!(
-                    "plugin {} holds none of the required capabilities {capabilities:?}",
-                    self.plugin_id
-                ),
-                data: Some(serde_json::json!({
-                    "kind": "capability_missing",
-                    "required_capabilities": capabilities,
-                })),
-            })
-        }
-    }
 }
 
 /// A failed dispatch, carrying the JSON-RPC error code, diagnostic message,
@@ -276,13 +248,6 @@ impl DispatchError {
     pub(crate) fn internal(msg: impl Into<String>) -> Self {
         Self {
             code: codes::INTERNAL_ERROR,
-            message: msg.into(),
-            data: None,
-        }
-    }
-    fn forbidden(msg: impl Into<String>) -> Self {
-        Self {
-            code: codes::FORBIDDEN,
             message: msg.into(),
             data: None,
         }
@@ -1259,8 +1224,35 @@ mod tests {
     fn unknown_method_is_method_not_found() {
         let tmp = tempfile::tempdir().unwrap();
         let state = state(tmp.path());
-        let err = dispatch(&state, &ctx(&[CAP_WORKER]), "no.such", &json!({})).unwrap_err();
-        assert_eq!(err.code, codes::METHOD_NOT_FOUND);
+        // The `config.read`/`write`, `mcp.*`, `fs.*` and `skills.*` methods were
+        // dispatchable until the MCP/Skills-plugin approach was abandoned
+        // (#3054). A worker still calling one must get METHOD_NOT_FOUND rather
+        // than a capability error, which would imply the method still exists.
+        for method in [
+            "no.such",
+            "config.read",
+            "config.write",
+            "mcp.list",
+            "mcp.resolve",
+            "mcp.add",
+            "mcp.edit",
+            "mcp.delete",
+            "mcp.keep",
+            "mcp.drop",
+            "mcp.resolve-conflict",
+            "fs.read",
+            "fs.write",
+            "skills.list",
+            "skills.read",
+            "skills.create",
+            "skills.edit",
+            "skills.delete",
+            "skills.adopt",
+            "skills.propagate",
+        ] {
+            let err = dispatch(&state, &ctx(&[CAP_WORKER]), method, &json!({})).unwrap_err();
+            assert_eq!(err.code, codes::METHOD_NOT_FOUND, "{method}");
+        }
     }
 
     #[test]

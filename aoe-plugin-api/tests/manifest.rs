@@ -661,21 +661,28 @@ slot = "status-bar"
 fn unknown_ui_slot_is_a_parse_error() {
     // `slot` is a typed enum (closed set), so a slot this host does not render
     // is rejected at parse time, not carried forward like an unknown capability.
-    let toml = r#"
+    // `settings-page` and `tool-card-badge` were real slots until the
+    // MCP/Skills-plugin approach was abandoned (#3054); a manifest still
+    // declaring one must fail rather than load with the slot silently inert.
+    for slot in ["sidebar", "settings-page", "tool-card-badge"] {
+        let toml = format!(
+            r#"
 id = "acme.thing"
 name = "Thing"
 version = "0.1.0"
-api_version = 2
+api_version = 13
 
 [[ui]]
-slot = "sidebar"
+slot = "{slot}"
 id = "panel"
-"#;
-    let err = PluginManifest::from_toml_str(toml).unwrap_err();
-    assert!(
-        matches!(err, ManifestError::Parse(_)),
-        "expected Parse, got {err:?}"
-    );
+"#
+        );
+        let err = PluginManifest::from_toml_str(&toml).unwrap_err();
+        assert!(
+            matches!(err, ManifestError::Parse(_)),
+            "expected Parse for {slot:?}, got {err:?}"
+        );
+    }
 }
 
 #[test]
