@@ -34,13 +34,13 @@ use crate::session::Status;
 
 /// A rule compiled for the poll loop: the matcher is pre-lowered /
 /// pre-compiled so per-tick evaluation is substring or regex work only.
-#[derive(Clone)]
+#[cfg_attr(test, derive(Clone))]
 struct CompiledRule {
     status: Status,
     matcher: Matcher,
 }
 
-#[derive(Clone)]
+#[cfg_attr(test, derive(Clone))]
 enum Matcher {
     /// Case-insensitive substring: stored lowercased, tested against the
     /// lowercased pane text.
