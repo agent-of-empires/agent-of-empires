@@ -407,6 +407,23 @@ struct RowSeed {
     modifier: ratatui::style::Modifier,
 }
 
+/// How a view mode resolves a sunk row (archived / trashed / snoozed).
+enum SunkRow {
+    /// Structured: the agent's own resting glyph. Error and Deleting punch
+    /// through the sink mask here, because they are live delete-op states this
+    /// TUI set rather than stale pane statuses, and the seed carries
+    /// `ICON_ERROR` + `theme.error` for them. Swallowing that left a failed
+    /// Empty Trash indistinguishable from a healthy trash row.
+    /// [`agent_row_icon`] applies the same exception to the glyph.
+    AgentStatus(&'static str),
+    /// Terminal / Tool: one muted glyph, unconditionally. These seeds describe
+    /// pane liveness and carry no error affordance, so letting a delete-op
+    /// status punch through would paint a bright animated "the terminal is
+    /// alive" row inside a shelf whose whole premise is that the row is put
+    /// away, while signalling nothing about the failure.
+    Pane,
+}
+
 /// The archive/trash, snooze, urgent, and favorite overlays every view mode
 /// paints on top of its [`RowSeed`], plus the title prefix that goes with them.
 ///
@@ -416,15 +433,13 @@ struct RowSeed {
 /// archived or snoozed session in Tool view kept painting its running glyph
 /// with no `z ` / `! ` prefix.
 ///
-/// `sunk_icon` is the glyph a sunk row (archived / trashed / snoozed) falls
-/// back to: [`agent_row_icon`] for Structured, [`ICON_STOPPED`] for the pane
-/// views, which have no richer resting state to show.
+/// `sunk` says how this view resolves a sunk row; see [`SunkRow`].
 fn decorate_row(
     inst: &crate::session::Instance,
     in_attention: bool,
     show_favorite: bool,
     seed: RowSeed,
-    sunk_icon: &'static str,
+    sunk: SunkRow,
     theme: &Theme,
 ) -> (&'static str, std::borrow::Cow<'static, str>, Style) {
     use ratatui::style::Modifier;
@@ -433,13 +448,14 @@ fn decorate_row(
     let mut icon = seed.icon;
     let mut style = Style::default().fg(seed.color).add_modifier(seed.modifier);
 
-    // Error and Deleting are live delete-op states this TUI set (a failed or
-    // in-flight permanent delete), not stale persisted pane statuses, so they
-    // punch through the sunk-row mask; swallowing them left a failed Empty
-    // Trash indistinguishable from a healthy trash row. `agent_row_icon`
-    // applies the same exception to the glyph.
-    let live_delete_op = matches!(inst.status, Status::Error | Status::Deleting);
-    if (inst.is_archived() || inst.is_trashed()) && !live_delete_op {
+    let (sunk_icon, punches_through) = match sunk {
+        SunkRow::AgentStatus(resting) => (
+            resting,
+            matches!(inst.status, Status::Error | Status::Deleting),
+        ),
+        SunkRow::Pane => (ICON_STOPPED, false),
+    };
+    if (inst.is_archived() || inst.is_trashed()) && !punches_through {
         // Archived and trashed rows render with one uniform muted glyph
         // regardless of underlying pane status. The pane is dead, so painting
         // the persisted status would be misleading. The Archived section
@@ -1580,7 +1596,7 @@ impl HomeView {
                     // and color for its own backing pane; every overlay on top
                     // of that (archive/trash, snooze, urgent, favorite) is
                     // mode-independent and belongs to `decorate_row`.
-                    let (seed, sunk_icon) = match self.view_mode {
+                    let (seed, sunk) = match self.view_mode {
                         ViewMode::Structured => {
                             // For Idle sessions, decay color from `fresh_idle`
                             // toward `idle` over `idle_decay_window`. A slow
@@ -1671,7 +1687,7 @@ impl HomeView {
                                     color,
                                     modifier,
                                 },
-                                agent_row_icon(inst),
+                                SunkRow::AgentStatus(agent_row_icon(inst)),
                             )
                         }
                         ViewMode::Terminal => {
@@ -1707,7 +1723,7 @@ impl HomeView {
                                     color,
                                     modifier: ratatui::style::Modifier::empty(),
                                 },
-                                ICON_STOPPED,
+                                SunkRow::Pane,
                             )
                         }
                         ViewMode::Tool(ref tool_name) => {
@@ -1729,11 +1745,11 @@ impl HomeView {
                                     color,
                                     modifier: ratatui::style::Modifier::empty(),
                                 },
-                                ICON_STOPPED,
+                                SunkRow::Pane,
                             )
                         }
                     };
-                    decorate_row(inst, in_attention, show_favorite, seed, sunk_icon, theme)
+                    decorate_row(inst, in_attention, show_favorite, seed, sunk, theme)
                 } else {
                     (
                         "?",

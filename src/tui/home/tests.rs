@@ -20385,5 +20385,27 @@ fn every_view_mode_paints_the_same_sunk_row_decoration() {
                 "{mode:?}/{label}: wrong title decoration"
             );
         }
+
+        // Error and Deleting punch through the sink mask in Structured only.
+        // There the seed carries ICON_ERROR + theme.error, so a failed Empty
+        // Trash stays distinguishable from a healthy trash row. The pane views
+        // seed from terminal liveness and have no error affordance, so
+        // punching through would paint a bright animated "still alive" row
+        // inside the Archived shelf while signalling nothing about the failure.
+        for status in [Status::Error, Status::Deleting] {
+            seed_panes_live();
+            env.view.mutate_instance(&id, |inst| {
+                inst.status = status;
+                inst.archived_at = Some(chrono::Utc::now());
+                inst.snoozed_until = None;
+            });
+            let line = env.view.render_item_line(&item, false, false, &theme, 120);
+            let sunk = line.spans[1].style.fg == Some(theme.dimmed);
+            assert_eq!(
+                sunk,
+                !matches!(mode, ViewMode::Structured),
+                "{mode:?}/archived+{status:?}: only Structured may punch through the sink mask"
+            );
+        }
     }
 }
