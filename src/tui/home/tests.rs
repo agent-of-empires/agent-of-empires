@@ -20490,3 +20490,43 @@ fn paint_never_forks_tmux_even_with_empty_absent_or_expired_caches() {
         }
     }
 }
+
+/// Regression: a frozen (scrolled-back) preview must still be able to GROW
+/// its capture. Only worker frames write the cache now, so the reading-depth
+/// budget has to reach the worker while frozen and an adequate frame has to
+//  be applied; otherwise scrollback reads hit a hard wall at the live-edge
+/// window (~CAPTURE_BUFFER rows past the viewport). An inadequate frame is
+/// skipped rather than applied: it would clamp the held offset against too
+/// few lines and snap the view toward the live edge.
+#[test]
+#[serial]
+fn frozen_preview_grows_only_on_coverage_extending_frames() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+    env.view
+        .sync_preview_capture_worker(Some("aoe_test_frozen_read".to_string()));
+    env.view.preview_scroll_offset = 40; // non-zero offset freezes the preview
+
+    // A frame that does not cover viewport + offset is skipped while frozen.
+    if let Some(worker) = env.view.preview_capture_worker.as_ref() {
+        worker.inject_frame_for_test(100, &"line\n".repeat(30));
+    }
+    env.view.refresh_preview_cache_if_needed(80, 24);
+    assert_eq!(
+        env.view.preview_cache.content.lines().count(),
+        0,
+        "an inadequate frame must not shift the held content under the reader"
+    );
+
+    // A coverage-extending frame grows the cache even though frozen.
+    if let Some(worker) = env.view.preview_capture_worker.as_ref() {
+        worker.inject_frame_for_test(200, &"line\n".repeat(120));
+    }
+    env.view.refresh_preview_cache_if_needed(80, 24);
+    assert_eq!(
+        env.view.preview_cache.content.lines().count(),
+        120,
+        "the frozen read must be able to grow its capture off-thread"
+    );
+}

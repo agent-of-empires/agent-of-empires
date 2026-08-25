@@ -1400,7 +1400,13 @@ pub fn spawn_snapshot_poller() {
             refresh_session_cache();
             refresh_pane_meta_cache();
             execute_passive_resizes();
-            std::thread::sleep(CACHE_TTL);
+            // Half the TTL, not the TTL: the refresh work itself takes time
+            // and the timestamps are stamped when each query lands, so a
+            // full-TTL period would guarantee an expired-snapshot window
+            // every cycle (cache-only display answers would flicker to
+            // "absent" inside it). Half keeps the snapshot fresh across the
+            // whole cycle at one extra bounded fork pair per 2s.
+            std::thread::sleep(CACHE_TTL / 2);
         });
 }
 

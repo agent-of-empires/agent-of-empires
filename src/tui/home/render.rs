@@ -2036,17 +2036,15 @@ impl HomeView {
                 *cache = super::PreviewCache::default();
             }
         }
-        // Frozen (reading scrollback, or a selection is in flight): don't apply
-        // the worker's live frames. The held snapshot stays in place and the
-        // idle poll is gated on `!frozen`, so nothing shifts under the user.
-        if self.preview_is_frozen() {
-            return false;
-        }
         let scroll_offset = self.preview_scroll_offset;
+        let frozen = self.preview_is_frozen();
         let capture_lines = capture_lines_for(height, scroll_offset);
         let Some(worker) = self.preview_capture_worker.as_ref() else {
             return false;
         };
+        // Publish the budget BEFORE the frozen gate: the reading-depth branch
+        // of `capture_lines_for` exists precisely for frozen scrollback reads,
+        // so the worker must see it even though no frame applies yet.
         worker.set_capture_lines(capture_lines);
         let Some(frame) = worker.take_latest() else {
             return false;
@@ -2056,6 +2054,19 @@ impl HomeView {
         // the consumer side).
         if !worker.frame_is_current(&frame) {
             return false;
+        }
+        if frozen {
+            let incoming_lines = frame.content.lines().count();
+            let covers_read = !scroll_exceeds_cache(incoming_lines, height, scroll_offset);
+            // A frame captured at the FULL requested budget that still falls
+            // short means the pane simply ends there (an alternate-screen
+            // agent with no scrollback): apply it. A shorter-budget frame is
+            // just stale (the budget bump has not reached the worker yet):
+            // wait for the republish instead of clamping against it.
+            let pane_exhausted = frame.budget >= capture_lines && incoming_lines > 0;
+            if !covers_read && !pane_exhausted {
+                return false;
+            }
         }
         let captured_lines = select(self).store_capture(frame.content.clone(), id, (width, height));
         // An EMPTY frame always applies: terminal / container panes forward
