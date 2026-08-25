@@ -19927,30 +19927,6 @@ mod daemon_status_apply_tests {
 
     #[test]
     #[serial]
-    fn daemon_status_does_not_mark_a_structured_turn_end_unread() {
-        // #3181: the daemon writes that mark itself, durably, from the live ACP
-        // turn-end event (`should_mark_acp_unread`). Marking here as well would
-        // make the TUI a second writer of the same boolean, and the exemption
-        // that would have justified keeping it (`!is_live_target`) is inert on a
-        // structured row anyway, since live-send needs a tmux pane. The row
-        // still picks the mark up: it arrives through the daemon's disk write.
-        crate::session::set_unread_enabled(true);
-        let mut env = create_test_env_empty();
-        let id = structured_row(&mut env, Status::Running);
-
-        env.view
-            .apply_daemon_status_update(update(&id, Status::Idle));
-
-        let inst = env.view.get_instance(&id).expect("row still present");
-        assert_eq!(inst.status, Status::Idle, "the turn-end still applies");
-        assert!(
-            !inst.is_unread(),
-            "the structured turn-end mark is the daemon's to write"
-        );
-    }
-
-    #[test]
-    #[serial]
     fn daemon_status_ignores_a_terminal_row() {
         // The tmux poller owns terminal rows. Letting the daemon's copy through
         // would give them two producers fighting on alternating cycles.
@@ -20154,16 +20130,35 @@ mod daemon_status_apply_tests {
         );
     }
 
-    /// #3201, the deliberately-ungated half: the status patch is skipped
-    /// for a structured row, but the unread mark still lands, mirroring the
-    /// daemon (`decide_passive_transition` gates only `patch` on
-    /// `is_structured()`; its `mark_unread` is ungated and
-    /// `flush_passive_transition_writes` persists it). A future refactor that
-    /// gates unread the same way it gates status would strand structured rows
-    /// as read across a restart; this locks against it.
+    /// A structured row's turn-end is the daemon's to record, both halves of
+    /// it, so the TUI writes neither field.
+    ///
+    /// The status half is #3201: it is a daemon-side overlay with no durable
+    /// owner, and persisting it here strands a row at `Running` with nothing
+    /// left to heal it once the daemon is gone.
+    ///
+    /// The unread half is #3181. This test previously asserted the opposite,
+    /// on the rationale that `decide_passive_transition`'s `mark_unread` was
+    /// ungated so the daemon persisted the mark too and the TUI was merely
+    /// mirroring it. That rationale was already false when it was written:
+    /// since #3162 a structured row compares equal to `prev`, so
+    /// `observed_transitions` never reports one and the poll loop never
+    /// reached that predicate. The TUI was the only writer, which is why the
+    /// mark was missing for anyone not running a TUI home view. The daemon now
+    /// writes it durably from the live ACP turn-end event
+    /// (`should_mark_acp_unread`), so mirroring here would make the TUI a
+    /// second writer of one boolean.
+    ///
+    /// The restart-stranding fear the old rationale named is handled, and by
+    /// the correct owner: `apply_daemon_status_update` is fed only by
+    /// `DaemonStatusPoller`, so reaching this code at all proves a daemon is
+    /// live, and that same daemon produced this `Running -> Idle` reading and
+    /// persisted the mark alongside it. The TUI picks the mark up from disk on
+    /// its next reload; `merge_from_tui` has no `unread` arm, so its own saves
+    /// cannot clobber it.
     #[test]
     #[serial]
-    fn daemon_status_persists_the_unread_mark_but_not_the_status_for_structured() {
+    fn tui_persists_neither_status_nor_unread_for_a_structured_turn_end() {
         crate::session::set_unread_enabled(true);
         let mut env = create_test_env_empty();
         let id = structured_row(&mut env, Status::Running);
@@ -20171,9 +20166,16 @@ mod daemon_status_apply_tests {
             .save()
             .expect("seed the structured row on disk as read/Running");
 
-        // A finished turn (Running -> Idle) marks the row unread.
+        // A finished turn (Running -> Idle).
         env.view
             .apply_daemon_status_update(update(&id, Status::Idle));
+
+        let inst = env.view.get_instance(&id).expect("row still present");
+        assert_eq!(inst.status, Status::Idle, "the turn-end still applies");
+        assert!(
+            !inst.is_unread(),
+            "the structured turn-end mark is the daemon's to write, not ours"
+        );
 
         let rows = env.view.storages.get("test").unwrap().load().unwrap();
         let disk = rows.iter().find(|i| i.id == id).expect("disk row present");
@@ -20183,8 +20185,8 @@ mod daemon_status_apply_tests {
             "structured status must not be passively persisted (#3201)"
         );
         assert!(
-            disk.is_unread(),
-            "the unread mark must still persist for a structured row, mirroring the daemon (#3201)"
+            !disk.is_unread(),
+            "structured unread must not be passively persisted either (#3181)"
         );
     }
 
