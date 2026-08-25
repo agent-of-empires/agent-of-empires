@@ -476,3 +476,187 @@ fn edit_workdir_rejects_invalid_cases_without_partial_changes() {
     assert!(matches!(err, WorktreeEditError::NotManaged));
     assert!(old_path.exists());
 }
+
+// --- Reconciling a stale project_path (#2002) ---
+
+use agent_of_empires::session::worktree_reconcile::{
+    reconcile_and_persist, resolve_worktree_path, WorktreePathResolution,
+};
+
+/// Run a git subcommand in `repo` the way a user in another shell would,
+/// bypassing aoe entirely.
+fn git_in(repo: &std::path::Path, args: &[&str]) {
+    let out = std::process::Command::new("git")
+        .current_dir(repo)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// An external `git worktree move` is discovered from git's own listing, and
+/// the recorded path is repaired in storage so the rename that would otherwise
+/// fail with `SourceMissing` proceeds against the relocated directory.
+///
+/// `#[serial]` because `Storage` resolves its app dir from the process-global
+/// `HOME`.
+#[test]
+#[serial]
+fn reconcile_heals_a_worktree_moved_outside_aoe() {
+    let (repo_dir, _repo, _config_dir) = setup_test_environment();
+    let temp_home = TempDir::new().unwrap();
+    std::env::set_var("HOME", temp_home.path());
+    let git_wt = GitWorktree::new(repo_dir.path().to_path_buf()).unwrap();
+
+    let created = repo_dir.path().join("recorded-name");
+    git_wt
+        .create_worktree("recorded-name", &created, true, None)
+        .unwrap();
+    let info = managed_info("recorded-name", repo_dir.path());
+
+    let mut instance = Instance::new("Moved Session", created.to_str().unwrap());
+    instance.worktree_info = Some(info.clone());
+    let storage = Storage::new_unwatched("worktree-reconcile-profile").unwrap();
+    let seeded = vec![instance.clone()];
+    storage
+        .update(|i, g| {
+            *i = seeded.to_vec();
+            *g = GroupTree::new_with_groups(&seeded, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    // aoe locks every worktree it creates, so a user relocating one from
+    // another shell has to unlock it first; `git worktree move` refuses a
+    // locked tree.
+    let relocated = repo_dir.path().join("moved-by-hand");
+    git_in(
+        repo_dir.path(),
+        &["worktree", "unlock", created.to_str().unwrap()],
+    );
+    git_in(
+        repo_dir.path(),
+        &[
+            "worktree",
+            "move",
+            created.to_str().unwrap(),
+            relocated.to_str().unwrap(),
+        ],
+    );
+    assert!(!created.exists());
+    assert!(relocated.exists());
+
+    // The pre-reconcile behavior, pinned: `edit_worktree_workdir` is untouched
+    // by the reconcile work, so calling it with the recorded path is exactly
+    // what every surface did before and it still refuses.
+    let before = edit_worktree_workdir(WorktreeEditRequest {
+        worktree_info: &info,
+        current_path: &created,
+        new_name: "settled-name",
+        rename_branch: false,
+    })
+    .unwrap_err();
+    assert!(matches!(before, WorktreeEditError::SourceMissing(_)));
+
+    let mut stale = instance.clone();
+    assert_eq!(
+        reconcile_and_persist(&storage, &mut stale).unwrap(),
+        WorktreePathResolution::Moved(relocated.canonicalize().unwrap())
+    );
+    assert_eq!(
+        std::path::PathBuf::from(&stale.project_path),
+        relocated.canonicalize().unwrap()
+    );
+    // The repair is durable, not just in the caller's copy.
+    let reloaded = storage.load().unwrap();
+    assert_eq!(
+        std::path::PathBuf::from(&reloaded[0].project_path),
+        relocated.canonicalize().unwrap()
+    );
+
+    // The rename that returned SourceMissing before the reconcile now lands,
+    // renaming within the directory's real parent.
+    let outcome = edit_worktree_workdir(WorktreeEditRequest {
+        worktree_info: &info,
+        current_path: std::path::Path::new(&stale.project_path),
+        new_name: "settled-name",
+        rename_branch: false,
+    })
+    .unwrap();
+    assert_eq!(
+        outcome.new_path,
+        relocated
+            .parent()
+            .unwrap()
+            .canonicalize()
+            .unwrap()
+            .join("settled-name")
+    );
+    assert!(outcome.new_path.exists());
+
+    // Reconciling again is a no-op: the recorded path is present, so git is
+    // never consulted.
+    let mut settled = stale.clone();
+    settled.project_path = outcome.new_path.to_string_lossy().into_owned();
+    assert_eq!(
+        reconcile_and_persist(&storage, &mut settled).unwrap(),
+        WorktreePathResolution::Current
+    );
+}
+
+/// What git can and cannot tell us. A bare `mv` leaves git's record naming the
+/// old path, so the new location is not discoverable until the user runs
+/// `git worktree repair`; a deleted checkout is never discoverable. Both leave
+/// the recorded path alone rather than guessing.
+#[test]
+fn resolve_reports_missing_when_git_cannot_place_the_branch() {
+    let (repo_dir, _repo, _config_dir) = setup_test_environment();
+    let git_wt = GitWorktree::new(repo_dir.path().to_path_buf()).unwrap();
+
+    let created = repo_dir.path().join("hand-moved");
+    git_wt
+        .create_worktree("hand-moved", &created, true, None)
+        .unwrap();
+    let info = managed_info("hand-moved", repo_dir.path());
+
+    // A bare `mv`: the directory is at its new location but git still points
+    // at the old one, which is indistinguishable from a deletion.
+    let elsewhere = repo_dir.path().join("elsewhere");
+    std::fs::rename(&created, &elsewhere).unwrap();
+    assert_eq!(
+        resolve_worktree_path(&git_wt, &created, &info).unwrap(),
+        WorktreePathResolution::Missing
+    );
+
+    // `git worktree repair` is git's own remedy: once its record catches up,
+    // the same lookup finds the checkout.
+    git_in(
+        repo_dir.path(),
+        &["worktree", "repair", elsewhere.to_str().unwrap()],
+    );
+    assert_eq!(
+        resolve_worktree_path(&git_wt, &created, &info).unwrap(),
+        WorktreePathResolution::Moved(elsewhere.canonicalize().unwrap())
+    );
+
+    // A checkout that is gone for good stays Missing.
+    std::fs::remove_dir_all(&elsewhere).unwrap();
+    assert_eq!(
+        resolve_worktree_path(&git_wt, &created, &info).unwrap(),
+        WorktreePathResolution::Missing
+    );
+
+    // An unmanaged worktree is out of scope and never consults git.
+    let unmanaged = WorktreeInfo {
+        managed_by_aoe: false,
+        ..info.clone()
+    };
+    assert_eq!(
+        resolve_worktree_path(&git_wt, &created, &unmanaged).unwrap(),
+        WorktreePathResolution::Current
+    );
+}
