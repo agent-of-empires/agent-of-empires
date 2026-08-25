@@ -16,13 +16,11 @@
   </p>
 </p>
 
-> [!NOTE]
-> ### 📅 Weekly Office Hours with the maintainers
-> Every week on Discord, no agenda, no slides. Ask us anything about AoE, talk
-> through what you are building, meet the rest of the community, or find out how
-> to contribute (we are looking for new maintainers).
->
-> **[→ RSVP to the next one](https://discord.com/events/1089876418936180786/1541803604036419725)** or [join the Discord](https://discord.gg/5N3QKX3f6s).
+<p align="center">
+  <a href="https://discord.com/events/1089876418936180786/1541803604036419725"><img src="assets/office-hours.png" alt="Office Hours: every week on Discord. Ask us anything, meet the community, learn how to contribute." width="900"></a>
+  <br>
+  <sub><a href="https://discord.com/events/1089876418936180786/1541803604036419725">RSVP to the next one</a> or <a href="https://discord.gg/5N3QKX3f6s">join the Discord</a>. We are looking for new maintainers.</sub>
+</p>
 
 A session manager for AI coding agents on Linux and macOS, driven from the terminal (TUI) or any browser ([web dashboard](https://www.agent-of-empires.com/guides/web-dashboard/)). Run many agents in parallel across different branches, each in its own isolated session with optional Docker sandboxing. Keeping track of which agent is stuck, which is waiting on input, and which just made a mess of your working tree becomes a part-time job; AoE makes it a glance: one dashboard, one status column, git worktrees and sandboxes set up for you, and sessions that outlive your terminal, reachable from your laptop, phone, or tablet.
 

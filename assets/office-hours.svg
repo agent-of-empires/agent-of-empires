@@ -1,0 +1,85 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="300" viewBox="0 0 1200 300">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0f172a"/>
+      <stop offset="100%" stop-color="#020617"/>
+    </linearGradient>
+    <linearGradient id="win-back" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#78350f"/>
+      <stop offset="100%" stop-color="#451a03"/>
+    </linearGradient>
+    <linearGradient id="win-mid" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#92400e"/>
+      <stop offset="100%" stop-color="#78350f"/>
+    </linearGradient>
+    <linearGradient id="win-front" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#f59e0b"/>
+      <stop offset="100%" stop-color="#d97706"/>
+    </linearGradient>
+    <linearGradient id="titlebar" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#fbbf24"/>
+      <stop offset="100%" stop-color="#f59e0b"/>
+    </linearGradient>
+    <linearGradient id="cta" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%" stop-color="#fbbf24"/>
+      <stop offset="100%" stop-color="#d97706"/>
+    </linearGradient>
+    <linearGradient id="accent-line" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#d97706"/>
+      <stop offset="50%" stop-color="#0d9488"/>
+      <stop offset="100%" stop-color="#0d9488" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <rect width="1200" height="300" fill="url(#bg)"/>
+
+  <!-- Subtle grid, same rhythm as the social preview -->
+  <g stroke="#334155" stroke-width="0.5" opacity="0.12">
+    <line x1="0" y1="100" x2="1200" y2="100"/>
+    <line x1="0" y1="200" x2="1200" y2="200"/>
+    <line x1="300" y1="0" x2="300" y2="300"/>
+    <line x1="600" y1="0" x2="600" y2="300"/>
+    <line x1="900" y1="0" x2="900" y2="300"/>
+  </g>
+
+  <!-- Decorative session stacks, weighted right so the copy stays left-aligned -->
+  <g transform="translate(1080, 32) scale(0.9)" opacity="0.07">
+    <rect x="10" y="38" width="76" height="60" rx="6" fill="#94a3b8"/>
+    <rect x="20" y="28" width="76" height="60" rx="6" fill="#94a3b8"/>
+    <rect x="32" y="18" width="82" height="66" rx="6" fill="#94a3b8"/>
+  </g>
+  <g transform="translate(1010, 176) scale(0.75)" opacity="0.05">
+    <rect x="10" y="38" width="76" height="60" rx="6" fill="#94a3b8"/>
+    <rect x="20" y="28" width="76" height="60" rx="6" fill="#94a3b8"/>
+    <rect x="32" y="18" width="82" height="66" rx="6" fill="#94a3b8"/>
+  </g>
+
+  <!-- Mark -->
+  <g transform="translate(64, 96) scale(0.92)">
+    <rect x="10" y="38" width="76" height="60" rx="6" fill="url(#win-back)" opacity="0.6"/>
+    <rect x="20" y="28" width="76" height="60" rx="6" fill="url(#win-mid)" opacity="0.7"/>
+    <rect x="32" y="18" width="82" height="66" rx="6" fill="url(#win-front)"/>
+    <rect x="32" y="18" width="82" height="18" rx="6" fill="url(#titlebar)"/>
+    <rect x="32" y="30" width="82" height="6" fill="url(#titlebar)"/>
+    <circle cx="46" cy="28" r="2.8" fill="#b45309" opacity="0.55"/>
+    <circle cx="55" cy="28" r="2.8" fill="#b45309" opacity="0.55"/>
+    <circle cx="64" cy="28" r="2.8" fill="#b45309" opacity="0.55"/>
+    <rect x="36" y="39" width="74" height="41" rx="3" fill="#b45309" opacity="0.22"/>
+    <text x="45" y="65" font-family="'JetBrains Mono', 'Courier New', monospace" font-size="20" font-weight="bold" fill="#fef3c7" opacity="0.85">$</text>
+    <rect x="64" y="51" width="9" height="17" rx="2" fill="#fef3c7" opacity="0.75"/>
+  </g>
+
+  <text x="212" y="98" font-family="'JetBrains Mono', 'SF Mono', monospace" font-size="13" fill="#d97706" letter-spacing="0.2em">EVERY WEEK ON DISCORD</text>
+
+  <text x="212" y="158" font-family="'Satoshi', 'DM Sans', 'Inter', system-ui, sans-serif" font-size="52" font-weight="900" fill="#f8fafc" letter-spacing="-0.01em">Office Hours</text>
+
+  <text x="212" y="196" font-family="'DM Sans', 'Inter', system-ui, sans-serif" font-size="19" fill="#94a3b8">Ask us anything, meet the community, learn how to contribute.</text>
+
+  <g transform="translate(212, 220)">
+    <rect width="196" height="44" rx="22" fill="url(#cta)"/>
+    <text x="98" y="28" text-anchor="middle" font-family="'DM Sans', 'Inter', system-ui, sans-serif" font-size="16" font-weight="600" fill="#451a03">RSVP on Discord</text>
+  </g>
+  <text x="428" y="248" font-family="'DM Sans', 'Inter', system-ui, sans-serif" font-size="15" fill="#64748b">No agenda, no slides, just the maintainers.</text>
+
+  <rect x="0" y="296" width="1200" height="4" fill="url(#accent-line)"/>
+</svg>
