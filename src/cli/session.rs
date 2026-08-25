@@ -2148,6 +2148,17 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
         .iter()
         .find(|instance| instance.id == id)
         .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
+    // The recorded path can be stale: someone may have `git worktree move`d the
+    // directory outside aoe. Heal it from git before anything below derives a
+    // target path or a container gate from it, so those decisions are made
+    // against the live parent. Best-effort; a lookup failure just leaves the
+    // stale path, which `edit_worktree_workdir` then rejects as before (#2002).
+    let mut inst = inst.clone();
+    if let Err(error) =
+        crate::session::worktree_reconcile::reconcile_and_persist(&storage, &mut inst)
+    {
+        tracing::warn!(target: "cli.session", session = %id, "worktree path reconciliation skipped: {error}");
+    }
     let current_path = inst.project_path.clone();
     let Some(worktree_info) = inst.worktree_info.clone() else {
         bail!("Session does not use a worktree");
