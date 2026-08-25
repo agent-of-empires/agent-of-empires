@@ -2039,6 +2039,13 @@ impl HomeView {
         let scroll_offset = self.preview_scroll_offset;
         let frozen = self.preview_is_frozen();
         let capture_lines = capture_lines_for(height, scroll_offset);
+        // Whether the HELD snapshot covers the current read. Computed before
+        // the worker borrow so the cache stays reachable through `select`.
+        let visible_rows = self.preview_visible_rows;
+        let held_covers = {
+            let cache = select(self);
+            visible_rows.saturating_add(scroll_offset as usize) <= cache.captured_lines
+        };
         let Some(worker) = self.preview_capture_worker.as_ref() else {
             return false;
         };
@@ -2056,15 +2063,21 @@ impl HomeView {
             return false;
         }
         if frozen {
+            // While frozen, a routine fresh frame would shift the held
+            // content out from under the reader, so apply ONLY when the HELD
+            // snapshot cannot cover the read (the removed synchronous path's
+            // single-grow-on-read-begin trigger) AND this frame actually
+            // extends coverage, or was captured at the full requested budget
+            // yet still falls short (the pane simply ends there). Anything
+            // else goes back into the mailbox: the worker's content dedup
+            // would never republish it, and once unfrozen it is exactly what
+            // the preview must show.
             let incoming_lines = frame.content.lines().count();
-            let covers_read = !scroll_exceeds_cache(incoming_lines, height, scroll_offset);
-            // A frame captured at the FULL requested budget that still falls
-            // short means the pane simply ends there (an alternate-screen
-            // agent with no scrollback): apply it. A shorter-budget frame is
-            // just stale (the budget bump has not reached the worker yet):
-            // wait for the republish instead of clamping against it.
-            let pane_exhausted = frame.budget >= capture_lines && incoming_lines > 0;
-            if !covers_read && !pane_exhausted {
+            let grows = !held_covers
+                && (!scroll_exceeds_cache(incoming_lines, height, scroll_offset)
+                    || (frame.budget >= capture_lines && incoming_lines > 0));
+            if !grows {
+                worker.restore_latest(frame);
                 return false;
             }
         }

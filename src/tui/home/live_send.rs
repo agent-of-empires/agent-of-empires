@@ -1043,6 +1043,11 @@ impl LiveCaptureWorker {
         std::thread::spawn(move || {
             let mut last_target = String::new();
             let mut last_captured: Option<String> = None;
+            // Budget the currently-held capture was published at. A budget
+            // change alone (scroll depth, viewport resize over a quiet pane)
+            // must republish even when the bytes are identical, or consumers
+            // waiting for a wider/deeper capture stall forever.
+            let mut last_published_budget: usize = 0;
             // When the frame that is currently in the mailbox (or the last
             // one consumed) was published, for the inter-publish floor.
             let mut last_published_at: Option<std::time::Instant> = None;
@@ -1122,6 +1127,7 @@ impl LiveCaptureWorker {
                 if name != last_target {
                     last_target = name.clone();
                     last_captured = None;
+                    last_published_budget = 0;
                     // The new pane's first frame must not inherit the old
                     // pane's floor or debounce hold.
                     last_published_at = None;
@@ -1330,7 +1336,13 @@ impl LiveCaptureWorker {
                                 }
                                 wake.notify_one();
                             }
-                            if (forward_empty || !content.is_empty()) && changed {
+                            // A budget change alone (deeper scroll, viewport
+                            // resize over a quiet pane) must republish even
+                            // when the bytes are identical, or consumers
+                            // waiting for a wider/deeper capture stall.
+                            if (forward_empty || !content.is_empty())
+                                && (changed || lines != last_published_budget)
+                            {
                                 let since =
                                     last_published_at.map(|t| t.elapsed().as_millis() as u64);
                                 let floor = publish_floor_wait_ms(since);
@@ -1361,6 +1373,7 @@ impl LiveCaptureWorker {
                                         }));
                                     }
                                     last_captured = Some(content);
+                                    last_published_budget = lines;
                                     last_published_at = Some(std::time::Instant::now());
                                     pending_since = None;
                                     wake.notify_one();
@@ -1575,6 +1588,18 @@ impl LiveCaptureWorker {
             .store(lines, std::sync::atomic::Ordering::Relaxed);
     }
 
+    /// Put a frame a consumer rejected back into the mailbox so it survives
+    /// until one can apply it. The worker's dedup is content-based, so a
+    /// consumed-and-dropped frame (e.g. a terminal-clear empty frame landing
+    /// while the preview is frozen) would otherwise never be republished.
+    /// Never overwrites a newer frame.
+    pub(in crate::tui) fn restore_latest(&self, frame: std::sync::Arc<CaptureFrame>) {
+        if let Ok(mut guard) = self.latest.lock() {
+            if guard.is_none() {
+                *guard = Some(frame);
+            }
+        }
+    }
     /// Take the newest frame the worker has produced since the last call,
     /// if any. Returns `None` when nothing new has arrived (the render loop
     /// then keeps the current preview).

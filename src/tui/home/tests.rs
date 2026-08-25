@@ -20518,6 +20518,16 @@ fn frozen_preview_grows_only_on_coverage_extending_frames() {
         0,
         "an inadequate frame must not shift the held content under the reader"
     );
+    // The skipped frame must be back in the mailbox: the worker's content
+    // dedup would otherwise never republish it.
+    assert!(
+        env.view
+            .preview_capture_worker
+            .as_ref()
+            .map(|w| w.take_latest().is_some())
+            .unwrap_or(false),
+        "a frame rejected while frozen must be restored for later consumption"
+    );
 
     // A coverage-extending frame grows the cache even though frozen.
     if let Some(worker) = env.view.preview_capture_worker.as_ref() {
