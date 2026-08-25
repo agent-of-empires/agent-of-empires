@@ -2299,3 +2299,52 @@ fn test_cli_acp_doctor_bundle_only_judged_by_pinned_copy() {
         assert!(stdout.contains(expected_mark), "{bundle_version}: {stdout}");
     }
 }
+
+/// #3415: the snooze half of the four-timestamp set. `aoe session snooze`
+/// is the only CLI producer of the marker, so this exercises the real path:
+/// a live row omits both new keys, and after a snooze both surfaces carry
+/// `snoozed_until` while staying `state: "live"` with no `pinned_at` (pin
+/// has no CLI producer, it is set from the web sidebar).
+#[test]
+#[parallel]
+fn test_cli_snoozed_row_exposes_snoozed_until() {
+    let h = TuiTestHarness::new("cli_show_snoozed");
+    let project = h.project_path();
+
+    let add = h.run_cli(&["add", project.to_str().unwrap(), "-t", "Snooze Probe"]);
+    assert!(
+        add.status.success(),
+        "aoe add failed: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+
+    let live: serde_json::Value = serde_json::from_slice(
+        &h.run_cli(&["session", "show", "Snooze Probe", "--json"])
+            .stdout,
+    )
+    .expect("session show --json must emit JSON");
+    assert!(live.get("snoozed_until").is_none());
+    assert!(live.get("pinned_at").is_none());
+
+    let snooze = h.run_cli(&["session", "snooze", "Snooze Probe", "--minutes", "5"]);
+    assert!(
+        snooze.status.success(),
+        "aoe session snooze failed: {}",
+        String::from_utf8_lossy(&snooze.stderr)
+    );
+
+    let listed: serde_json::Value = serde_json::from_slice(&h.run_cli(&["list", "--json"]).stdout)
+        .expect("list --json must emit JSON");
+    assert_eq!(listed[0]["state"], "live");
+    assert!(listed[0]["snoozed_until"].is_string());
+    assert!(listed[0].get("pinned_at").is_none());
+
+    let shown: serde_json::Value = serde_json::from_slice(
+        &h.run_cli(&["session", "show", "Snooze Probe", "--json"])
+            .stdout,
+    )
+    .expect("session show --json must emit JSON for a snoozed row");
+    assert_eq!(shown["state"], "live");
+    assert!(shown["snoozed_until"].is_string());
+    assert!(shown.get("pinned_at").is_none());
+}

@@ -89,16 +89,17 @@ test.describe("Wizard extra repos picker (#1219)", () => {
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
     await openProjectStepWithPath(page);
-    // Scope to the wizard: the same registered projects also render in the
-    // sidebar Projects section now (#2212), so page-wide button locators are
+    // Scope to the picker itself: the same registered projects also render in
+    // the sidebar Projects section (#2212) and in the step's own Saved
+    // projects list (#3461), so page-wide or wizard-wide button locators are
     // ambiguous.
-    const wizard = page.getByTestId("session-wizard");
-    await expect(wizard.getByText("Registered projects")).toBeVisible();
+    const picker = page.getByTestId("extra-repos-picker");
+    await expect(picker.getByText("Registered projects")).toBeVisible();
     // The primary entry (matching /tmp/example) is hidden from the picker
     // so users can't accidentally duplicate it.
-    await expect(wizard.getByRole("button").filter({ hasText: /^primary$/ })).toHaveCount(0);
-    await expect(wizard.getByRole("button").filter({ hasText: /^shared-lib/ })).toBeVisible();
-    await expect(wizard.getByRole("button").filter({ hasText: /^docs/ })).toBeVisible();
+    await expect(picker.getByRole("button").filter({ hasText: /^primary/ })).toHaveCount(0);
+    await expect(picker.getByRole("button").filter({ hasText: /^shared-lib/ })).toBeVisible();
+    await expect(picker.getByRole("button").filter({ hasText: /^docs/ })).toBeVisible();
   });
 
   test("clicking a registered project chip toggles selection", async ({ page }) => {
@@ -106,9 +107,10 @@ test.describe("Wizard extra repos picker (#1219)", () => {
     await page.setViewportSize({ width: 1280, height: 900 });
     await page.goto("/");
     await openProjectStepWithPath(page);
-    // Scope to the wizard; the sidebar Projects section also lists shared-lib.
+    // Scope to the picker; the sidebar Projects section and the step's own
+    // Saved projects list also render a shared-lib row.
     const sharedLib = page
-      .getByTestId("session-wizard")
+      .getByTestId("extra-repos-picker")
       .getByRole("button")
       .filter({ hasText: /^shared-lib/ })
       .first();

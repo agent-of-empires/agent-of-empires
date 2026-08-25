@@ -3903,7 +3903,15 @@ volume_ignores = ["node_modules"]
     #[test]
     #[serial_test::serial]
     fn test_build_container_config_installs_codex_hooks_files() {
-        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        // Symlinked base prefix: keeps a mount-source assertion sensitive to
+        // the #3240 canonicalization even on Linux, where /tmp is already
+        // real and lexical comparison alone would survive a regression.
+        let tmp_base = TempDir::new().unwrap();
+        let real_parent = tmp_base.path().join("real-parent");
+        std::fs::create_dir(&real_parent).unwrap();
+        let link_parent = tmp_base.path().join("via-symlink");
+        std::os::unix::fs::symlink(&real_parent, &link_parent).unwrap();
+        let _hg = BaseGuard::with_base(link_parent.join("aoe-hooks"));
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -3953,6 +3961,9 @@ volume_ignores = ["node_modules"]
 
         let hook_dir =
             crate::hooks::hook_status_dir(instance_id).expect("test id must be allowlist-safe");
+        // Canonicalize for comparison (handles /var -> /private/var on macOS);
+        // the mount source is the resolved real path since #3240.
+        let hook_dir = hook_dir.canonicalize().unwrap();
         let expected_container_path = format!(
             "{}/{instance_id}",
             crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER
@@ -4334,6 +4345,9 @@ trust_level = "trusted"
 
             let hook_dir = crate::hooks::hook_status_dir(&instance_id)
                 .expect("test id must be allowlist-safe");
+            // Canonicalize for comparison (handles /var -> /private/var on
+            // macOS); the mount source is the resolved real path since #3240.
+            let hook_dir = hook_dir.canonicalize().unwrap();
             assert!(
                 config
                     .volumes
@@ -4575,6 +4589,8 @@ trust_level = "trusted"
 
         let hook_dir =
             crate::hooks::hook_status_dir(instance_id).expect("test id must be allowlist-safe");
+        // Lexical is correct here: hooks are disabled, the instance dir is
+        // never created, so canonicalize would fail and no mount can match.
         assert!(
             !config
                 .volumes
@@ -4652,6 +4668,9 @@ agent_detect_as = { "wrapped-codex" = "codex" }
 
         let hook_dir =
             crate::hooks::hook_status_dir(instance_id).expect("test id must be allowlist-safe");
+        // Canonicalize for comparison (handles /var -> /private/var on macOS);
+        // the mount source is the resolved real path since #3240.
+        let hook_dir = hook_dir.canonicalize().unwrap();
         assert!(
             config
                 .volumes
