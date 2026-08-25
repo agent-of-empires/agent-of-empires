@@ -20265,3 +20265,86 @@ mod daemon_status_apply_tests {
         }
     }
 }
+
+#[test]
+#[serial]
+fn every_view_mode_paints_the_same_sunk_row_decoration() {
+    // `render_item_line`'s three view arms each carried their own copy of the
+    // archive / snooze / favorite block (Structured and Terminal had
+    // byte-identical title blocks), and the Tool arm had none at all: an
+    // archived or snoozed session in Tool view kept painting its live glyph
+    // with no `z ` prefix. `decorate_row` owns the overlay for every mode now,
+    // so the three must agree.
+    use super::{ViewMode, ICON_STOPPED};
+    use crate::session::Status;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = match env.view.flat_items.first() {
+        Some(Item::Session { id, .. }) => id.clone(),
+        _ => panic!("expected the fixture to seed a single Session item"),
+    };
+    // Snooze decoration is Attention-gated; archive is universal.
+    env.view.sort_order = crate::session::config::SortOrder::Attention;
+    let theme = crate::tui::styles::Theme::default();
+    let item = Item::Session {
+        id: id.clone(),
+        depth: 0,
+    };
+
+    // (label, archived, snoozed, expected title prefix)
+    let cases = [
+        ("archived", true, false, ""),
+        ("snoozed", false, true, "z "),
+    ];
+
+    for mode in [
+        ViewMode::Structured,
+        ViewMode::Terminal,
+        ViewMode::Tool("lazygit".to_string()),
+    ] {
+        env.view.view_mode = mode.clone();
+        for (label, archived, snoozed, prefix) in cases {
+            // Status stays Running so the live-glyph branch would fire in
+            // every mode if the sink override were missing.
+            env.view.mutate_instance(&id, |inst| {
+                inst.status = Status::Running;
+                inst.archived_at = archived.then(chrono::Utc::now);
+                inst.snoozed_until =
+                    snoozed.then(|| chrono::Utc::now() + chrono::Duration::minutes(15));
+            });
+
+            let line = env.view.render_item_line(&item, false, false, &theme, 120);
+            let icon = line.spans[1].content.trim().to_string();
+            let title = line.spans[2].content.to_string();
+
+            assert_eq!(
+                icon, ICON_STOPPED,
+                "{mode:?}/{label}: sunk row must drop its live glyph"
+            );
+            assert_eq!(
+                line.spans[1].style.fg,
+                Some(theme.dimmed),
+                "{mode:?}/{label}: sunk row must paint dimmed"
+            );
+            assert!(
+                title.starts_with(prefix) && title.contains("session0"),
+                "{mode:?}/{label}: expected {prefix:?} prefix, got {title:?}"
+            );
+        }
+    }
+
+    // Sanity: a live row in every mode must NOT collapse to the sunk glyph,
+    // or the assertions above would pass on a renderer that always sinks.
+    env.view.mutate_instance(&id, |inst| {
+        inst.status = Status::Running;
+        inst.archived_at = None;
+        inst.snoozed_until = None;
+    });
+    env.view.view_mode = ViewMode::Structured;
+    let line = env.view.render_item_line(&item, false, false, &theme, 120);
+    assert_ne!(
+        line.spans[1].content.trim(),
+        ICON_STOPPED,
+        "a live Structured row must keep its spinner"
+    );
+}
