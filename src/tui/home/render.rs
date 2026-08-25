@@ -2962,22 +2962,25 @@ impl HomeView {
 
                     // Now borrow instance for rendering
                     if let Some(inst) = self.get_instance(&id) {
+                        // Snapshot-backed like the list rows: this runs on
+                        // every frame, and the preview capture above is already
+                        // worker-driven, so a per-name `has-session` here would
+                        // be the only fork left in a steady-state frame.
                         let (terminal_running, preview_text) = match terminal_mode {
                             TerminalMode::Container => {
-                                let running = inst
-                                    .container_terminal_tmux_session()
-                                    .map(|s| s.exists())
-                                    .unwrap_or(false);
+                                let running =
+                                    inst.container_terminal_tmux_session().is_ok_and(|s| {
+                                        crate::tmux::session_exists_for_display(s.name())
+                                    });
                                 (
                                     running,
                                     self.container_terminal_preview_cache.parsed_text.as_ref(),
                                 )
                             }
                             TerminalMode::Host => {
-                                let running = inst
-                                    .terminal_tmux_session()
-                                    .map(|s| s.exists())
-                                    .unwrap_or(false);
+                                let running = inst.terminal_tmux_session().is_ok_and(|s| {
+                                    crate::tmux::session_exists_for_display(s.name())
+                                });
                                 (running, self.terminal_preview_cache.parsed_text.as_ref())
                             }
                         };
@@ -3040,7 +3043,12 @@ impl HomeView {
                     if let Some(inst) = self.get_instance(&id) {
                         let tool_session =
                             crate::tmux::ToolSession::new(&inst.id, &inst.title, &tool_name);
-                        let tool_running = tool_session.exists() && !tool_session.is_pane_dead();
+                        // Snapshot-backed for the same reason as the rows:
+                        // this pair used to be the two remaining per-frame
+                        // forks on the render thread in Tool view.
+                        let tool_running =
+                            crate::tmux::session_exists_for_display(tool_session.session_name())
+                                && !crate::tmux::pane_dead_for_display(tool_session.session_name());
 
                         Preview::render_terminal_preview(
                             frame,

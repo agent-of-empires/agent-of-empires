@@ -1006,6 +1006,45 @@ impl Drop for SessionCacheGuard {
     }
 }
 
+/// [`SessionCacheGuard`] for [`PANE_META_CACHE`]: captures the prior snapshot
+/// and restores it on `Drop` so a mid-test panic cannot leak a forced state
+/// into a later test. Pair with `#[serial_test::serial]`.
+#[cfg(test)]
+pub(crate) struct PaneMetaCacheGuard {
+    prev_data: Option<HashMap<String, PaneMetadata>>,
+    prev_time: Option<Instant>,
+}
+
+#[cfg(test)]
+impl PaneMetaCacheGuard {
+    pub(crate) fn capture() -> Self {
+        let cache = PANE_META_CACHE.read().expect("pane meta cache lock");
+        Self {
+            prev_data: cache.data.clone(),
+            prev_time: cache.time,
+        }
+    }
+
+    /// Force a fresh snapshot that carries no data: what `refresh_pane_meta_cache`
+    /// writes when `batch_pane_metadata` fails.
+    pub(crate) fn force_failed_refresh(&self) {
+        if let Ok(mut cache) = PANE_META_CACHE.write() {
+            cache.data = None;
+            cache.time = Some(Instant::now());
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for PaneMetaCacheGuard {
+    fn drop(&mut self) {
+        if let Ok(mut cache) = PANE_META_CACHE.write() {
+            cache.data = self.prev_data.take();
+            cache.time = self.prev_time;
+        }
+    }
+}
+
 /// How long a [`SESSION_CACHE`] snapshot is trusted before a lookup must
 /// force a fresh `refresh_session_cache()` call.
 const CACHE_TTL: Duration = Duration::from_secs(2);
@@ -1128,7 +1167,7 @@ pub fn session_exists(name: &str) -> bool {
 /// rows read `Instance.status` straight from the poller's batched snapshot.
 ///
 /// The trade is that a session created since the last scan reads as absent for
-/// up to [`CACHE_TTL`]. Call sites that start or kill a pane already force a
+/// up to `CACHE_TTL`. Call sites that start or kill a pane already force a
 /// [`refresh_session_cache`], so the glyph flips immediately there; the TTL
 /// only covers panes created behind this process's back.
 ///
@@ -1140,9 +1179,9 @@ pub fn session_exists_for_display(name: &str) -> bool {
 }
 
 /// Pane-dead state for a **render path**, from a shared `list-panes -a`
-/// snapshot refreshed at most once per [`CACHE_TTL`].
+/// snapshot refreshed at most once per `CACHE_TTL`.
 ///
-/// The per-name [`utils::is_pane_dead`] forks a `display-message` on every
+/// The per-name `utils::is_pane_dead` forks a `display-message` on every
 /// call, so the Tool view paid two forks per row per frame (this plus
 /// existence). See [`session_exists_for_display`] for the measurement and the
 /// staleness trade.
@@ -1983,6 +2022,30 @@ mod tests {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_failed_pane_snapshot_is_an_answer_so_rows_do_not_re_fork() {
+        // `refresh_pane_meta_cache` stamps `time` even when `batch_pane_metadata`
+        // fails, and `pane_dead_from_cache` gates on `time` alone. That pairing is
+        // what bounds a tmux outage to one fork per CACHE_TTL instead of one per
+        // row per frame: if a fresh-but-empty snapshot resolved to `None`, every
+        // Tool row would drive another doomed refresh, which is the per-row fork
+        // this whole change removes.
+        let guard = PaneMetaCacheGuard::capture();
+        guard.force_failed_refresh();
+
+        assert_eq!(
+            pane_dead_from_cache("aoe_tool_absent_00000000"),
+            Some(false),
+            "a fresh snapshot with no data must answer \"can't tell, not dead\", \
+             not report itself stale"
+        );
+        assert!(
+            !pane_dead_for_display("aoe_tool_absent_00000000"),
+            "and the display helper must not claim a pane it cannot see is dead"
+        );
     }
 
     #[test]

@@ -20275,14 +20275,29 @@ fn every_view_mode_paints_the_same_sunk_row_decoration() {
     // archived or snoozed session in Tool view kept painting its live glyph
     // with no `z ` prefix. `decorate_row` owns the overlay for every mode now,
     // so the three must agree.
+    //
+    // The pane views are seeded live on purpose. `ICON_IDLE` and `ICON_STOPPED`
+    // are the same glyph and an unseeded pane row is already dimmed, so a row
+    // whose terminal is NOT running renders identically with and without the
+    // sink override, and every assertion below would pass on a renderer that
+    // dropped `decorate_row` entirely. Injecting the pane names into the shared
+    // tmux snapshot makes the seed a bright animated spinner, which is what
+    // gives the override something to actually override.
     use super::{ViewMode, ICON_STOPPED};
     use crate::session::Status;
+    use ratatui::style::Modifier;
 
     let mut env = create_test_env_with_sessions(1);
     let id = match env.view.flat_items.first() {
         Some(Item::Session { id, .. }) => id.clone(),
         _ => panic!("expected the fixture to seed a single Session item"),
     };
+    let title = env
+        .view
+        .get_instance(&id)
+        .expect("session present")
+        .title
+        .clone();
     // Snooze decoration is Attention-gated; archive is universal.
     env.view.sort_order = crate::session::config::SortOrder::Attention;
     let theme = crate::tui::styles::Theme::default();
@@ -20291,10 +20306,25 @@ fn every_view_mode_paints_the_same_sunk_row_decoration() {
         depth: 0,
     };
 
-    // (label, archived, snoozed, expected title prefix)
+    let seed_panes_live = || {
+        crate::tmux::test_inject_session_into_cache(&crate::tmux::TerminalSession::generate_name(
+            &id, &title,
+        ));
+        crate::tmux::test_inject_session_into_cache(&crate::tmux::ToolSession::generate_name(
+            &id, &title, "lazygit",
+        ));
+    };
+
+    // (label, archived, snoozed, expected title prefix, extra modifiers)
     let cases = [
-        ("archived", true, false, ""),
-        ("snoozed", false, true, "z "),
+        ("archived", true, false, "", Modifier::empty()),
+        (
+            "snoozed",
+            false,
+            true,
+            "z ",
+            Modifier::ITALIC | Modifier::DIM,
+        ),
     ];
 
     for mode in [
@@ -20303,7 +20333,25 @@ fn every_view_mode_paints_the_same_sunk_row_decoration() {
         ViewMode::Tool("lazygit".to_string()),
     ] {
         env.view.view_mode = mode.clone();
-        for (label, archived, snoozed, prefix) in cases {
+
+        // Anti-vacuity: a live, unsunk row must NOT already look sunk, or the
+        // sink assertions below prove nothing about this mode.
+        seed_panes_live();
+        env.view.mutate_instance(&id, |inst| {
+            inst.status = Status::Running;
+            inst.archived_at = None;
+            inst.snoozed_until = None;
+        });
+        let live = env.view.render_item_line(&item, false, false, &theme, 120);
+        assert_ne!(
+            live.spans[1].style.fg,
+            Some(theme.dimmed),
+            "{mode:?}: a live row must not already paint dimmed; \
+             the sink assertions below would be vacuous"
+        );
+
+        for (label, archived, snoozed, prefix, extra) in cases {
+            seed_panes_live();
             // Status stays Running so the live-glyph branch would fire in
             // every mode if the sink override were missing.
             env.view.mutate_instance(&id, |inst| {
@@ -20315,7 +20363,7 @@ fn every_view_mode_paints_the_same_sunk_row_decoration() {
 
             let line = env.view.render_item_line(&item, false, false, &theme, 120);
             let icon = line.spans[1].content.trim().to_string();
-            let title = line.spans[2].content.to_string();
+            let rendered = line.spans[2].content.to_string();
 
             assert_eq!(
                 icon, ICON_STOPPED,
@@ -20327,24 +20375,15 @@ fn every_view_mode_paints_the_same_sunk_row_decoration() {
                 "{mode:?}/{label}: sunk row must paint dimmed"
             );
             assert!(
-                title.starts_with(prefix) && title.contains("session0"),
-                "{mode:?}/{label}: expected {prefix:?} prefix, got {title:?}"
+                line.spans[1].style.add_modifier.contains(extra),
+                "{mode:?}/{label}: expected {extra:?}, got {:?}",
+                line.spans[1].style.add_modifier
+            );
+            assert_eq!(
+                rendered,
+                format!("{prefix}{title}"),
+                "{mode:?}/{label}: wrong title decoration"
             );
         }
     }
-
-    // Sanity: a live row in every mode must NOT collapse to the sunk glyph,
-    // or the assertions above would pass on a renderer that always sinks.
-    env.view.mutate_instance(&id, |inst| {
-        inst.status = Status::Running;
-        inst.archived_at = None;
-        inst.snoozed_until = None;
-    });
-    env.view.view_mode = ViewMode::Structured;
-    let line = env.view.render_item_line(&item, false, false, &theme, 120);
-    assert_ne!(
-        line.spans[1].content.trim(),
-        ICON_STOPPED,
-        "a live Structured row must keep its spinner"
-    );
 }
