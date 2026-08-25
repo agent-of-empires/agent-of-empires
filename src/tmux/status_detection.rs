@@ -5255,7 +5255,7 @@ Final prose line.\n";
     /// A synthetic pane holding `line` at non-empty position `depth`, with
     /// neutral filler lines below it.
     fn pane_with_line_at_depth(line: &str, depth: usize) -> String {
-        let filler = "Footer filler line.\n".repeat(depth - 1);
+        let filler = "Footer filler line.\n".repeat(depth.saturating_sub(1));
         format!("{line}\n{filler}")
     }
 
@@ -5263,7 +5263,7 @@ Final prose line.\n";
     /// rules, cwd line, status line) instead of bare fillers.
     fn boxed_pane_with_line_at_depth(line: &str, depth: usize) -> String {
         let mut lines = vec![line.to_string()];
-        for _ in 0..(depth - 5) {
+        for _ in 0..depth.saturating_sub(5) {
             lines.push("Footer filler line.".to_string());
         }
         lines.push("────────────────────────────────────────".to_string());
@@ -5275,13 +5275,20 @@ Final prose line.\n";
 
     #[test]
     fn test_detect_pi_status_window_bounds() {
-        // Both window knobs at one line of granularity. Footer rows pin
+        // Both scan knobs at one line of granularity; each row names its own
+        // scope in `desc`, so a drift in either direction fails a row rather
+        // than silently widening the Running signal. Footer rows pin
         // `PI_FOOTER_WINDOW`: a spinner at position 6 still reads Running,
         // activity prose at position 7 stays Idle, so drift to 5 or to 7
         // fails a row. Hint rows pin the input-box anchor (#3475): the omo
-        // busy line three lines above the box's topmost rule reads Running,
+        // busy line three lines above the box's rule anchor reads Running,
         // while a finished response quoting the hint past that band stays
-        // Idle, so moving the anchor fails a row either way.
+        // Idle. The position 7 row is the known-bad residual and is asserted
+        // as Running on purpose: in a finished frame the busy line is gone,
+        // so positions 5 through 7 are all prose, and narrowing the band to
+        // close it drops the omo busy line. That is one line of prose
+        // exposure against main's two, and the row is here so the tradeoff
+        // is visible where the bounds are read.
         let quote_line = "You can press esc to interrupt at any time.";
         let cases = [
             (
@@ -5318,6 +5325,11 @@ Final prose line.\n";
                 "hint: quoted hint at position 11, past the anchored band",
                 boxed_pane_with_line_at_depth(quote_line, 11),
                 Status::Idle,
+            ),
+            (
+                "hint: quoted hint at position 7 is the accepted residual",
+                boxed_pane_with_line_at_depth(quote_line, 7),
+                Status::Running,
             ),
             (
                 "hint: prose rules with the box off-capture stay bounded",
