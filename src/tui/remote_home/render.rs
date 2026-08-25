@@ -399,6 +399,11 @@ mod tests {
                "session_id": session_id, "payload": {"text": text}})
     }
 
+    fn row_badge(session_id: &str, payload: serde_json::Value) -> serde_json::Value {
+        json!({"plugin_id": "gh", "slot": "row-badge", "id": "pr",
+               "session_id": session_id, "payload": payload})
+    }
+
     /// Screen column where `needle` starts on the first row carrying it. Indexes
     /// the per-cell strings from `rows`, one character per painted cell, so it is
     /// a real column: a byte offset would be skewed by the multi-byte `▸ `
@@ -546,6 +551,85 @@ mod tests {
         let (cells, width) = row_column_cells(&state, "s1", PLUGIN_REGION_MAX_WIDTH);
         assert_eq!(cells.len(), 1);
         assert_eq!(width, PLUGIN_REGION_MAX_WIDTH);
+    }
+
+    #[test]
+    fn row_shows_the_plugin_row_badge_text_before_the_column() {
+        let state = state_with(
+            &["s1"],
+            json!([
+                row_column("s1", "CI failing"),
+                row_badge("s1", json!({"text": "draft", "tone": "warn"}))
+            ]),
+        );
+        let painted = rows(&state);
+        assert!(painted.iter().any(|l| l.contains("draft")), "{painted:?}");
+        // Badges sit left of the column, matching the web's row line.
+        assert!(column_of(&painted, "draft") < column_of(&painted, "CI failing"));
+    }
+
+    #[test]
+    fn badges_share_the_plugin_region_instead_of_widening_it() {
+        // A badge plus a column wordy enough to have filled the region alone.
+        let long = "x".repeat(PLUGIN_REGION_MAX_WIDTH + 10);
+        let state = state_with(
+            &["s1"],
+            json!([
+                row_badge("s1", json!({"text": "draft"})),
+                row_column("s1", &long)
+            ]),
+        );
+        let painted = rows(&state);
+        assert!(painted.iter().any(|l| l.contains("draft")), "{painted:?}");
+        // The 41-cell prefix, the whole region, and the gap before the path:
+        // the badge took its cells from the column, not from the path, which
+        // starts exactly where a badge-free capped column leaves it.
+        assert_eq!(
+            column_of(&painted, "/tmp/s1"),
+            41 + PLUGIN_REGION_MAX_WIDTH + 2
+        );
+    }
+
+    #[test]
+    fn badge_free_rows_leave_the_whole_region_to_the_column() {
+        let long = "x".repeat(PLUGIN_REGION_MAX_WIDTH + 10);
+        let state = state_with(&["s1"], json!([row_column("s1", &long)]));
+        let (_, width) = row_column_cells(&state, "s1", PLUGIN_REGION_MAX_WIDTH);
+        assert_eq!(width, PLUGIN_REGION_MAX_WIDTH);
+    }
+
+    #[test]
+    fn badge_column_pads_so_the_path_stays_aligned() {
+        // s2 has no badge; both rows must start the path at the same column.
+        let state = state_with(
+            &["s1", "s2"],
+            json!([row_badge("s1", json!({"text": "changes requested"}))]),
+        );
+        let painted = rows(&state);
+        assert_eq!(
+            column_of(&painted, "/tmp/s1"),
+            column_of(&painted, "/tmp/s2")
+        );
+    }
+
+    #[test]
+    fn cleared_and_icon_only_badges_reserve_no_width() {
+        // Both render nothing, so the path sits where it does with no entries.
+        for payload in [json!({"items": []}), json!({"icon": "git-pull-request"})] {
+            let state = state_with(&["s1"], json!([row_badge("s1", payload.clone())]));
+            assert_eq!(column_of(&rows(&state), "/tmp/s1"), 41, "{payload}");
+        }
+    }
+
+    #[test]
+    fn long_badge_text_is_capped_to_the_badge_budget() {
+        let long = "b".repeat(ROW_BADGE_MAX_WIDTH + 20);
+        let state = state_with(&["s1"], json!([row_badge("s1", json!({"text": long}))]));
+        let (cells, width) = row_badge_cells(&state, "s1");
+        assert_eq!(width, ROW_BADGE_MAX_WIDTH);
+        assert!(cells[0].0.ends_with('\u{2026}'));
+        let painted = rows(&state);
+        assert!(painted.iter().any(|l| l.contains("/tmp/s1")), "{painted:?}");
     }
 
     #[test]

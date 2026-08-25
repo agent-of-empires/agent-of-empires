@@ -963,6 +963,79 @@ mod tests {
     }
 
     #[test]
+    fn row_badge_cells_read_both_payload_forms() {
+        // One badge payload and the cells it must yield. Covers the single
+        // badge form, the `items` list, and every shape that renders nothing.
+        let cases: [(serde_json::Value, &[(&str, Option<Tone>)]); 9] = [
+            // Single badge: text and tone kept, the web-only fields dropped.
+            (
+                json!({"text": "open", "tone": "success", "icon": "git-pull-request",
+                       "href": "https://example.test/1", "tooltip": "dropped"}),
+                &[("open", Some(Tone::Success))],
+            ),
+            // Items keep snapshot order and carry their own tones.
+            (
+                json!({"items": [{"text": "draft"}, {"text": "2 checks", "tone": "warn"}]}),
+                &[("draft", None), ("2 checks", Some(Tone::Warn))],
+            ),
+            // The documented "clear the row" form.
+            (json!({"items": []}), &[]),
+            // `items` present selects the list form, so the entry's own text
+            // is not a fallback: a plugin clearing the row means it.
+            (json!({"text": "stale", "items": []}), &[]),
+            (
+                json!({"text": "outer", "items": [{"text": "inner"}]}),
+                &[("inner", None)],
+            ),
+            // Malformed `items` clears the row rather than quietly rendering
+            // the other form.
+            (json!({"text": "stale", "items": 7}), &[]),
+            // A lucide name has no terminal glyph, so an icon-only badge
+            // yields nothing; its text-carrying neighbours still render.
+            (json!({"icon": "git-pull-request"}), &[]),
+            (
+                json!({"items": [{"icon": "check"}, {"text": "kept"}, {"text": "  "}, {"text": 7}]}),
+                &[("kept", None)],
+            ),
+            // An unreadable tone degrades to neutral rather than dropping text.
+            (
+                json!({"text": "kept", "tone": "chartreuse"}),
+                &[("kept", None)],
+            ),
+        ];
+        for (payload, expected) in cases {
+            let snap = pane_snapshot(json!([
+                {"plugin_id": "gh", "slot": "row-badge", "id": "pr",
+                 "session_id": "s1", "payload": payload}
+            ]));
+            let expected: Vec<(String, Option<Tone>)> = expected
+                .iter()
+                .map(|(t, tone)| ((*t).to_string(), *tone))
+                .collect();
+            assert_eq!(row_badge_cells(&snap, "s1"), expected);
+        }
+    }
+
+    #[test]
+    fn row_badge_cells_read_this_session_and_slot_only() {
+        let snap = pane_snapshot(json!([
+            {"plugin_id": "gh", "slot": "row-badge", "id": "pr", "session_id": "s1",
+             "payload": {"text": "mine"}},
+            {"plugin_id": "gh", "slot": "row-badge", "id": "pr", "session_id": "s2",
+             "payload": {"text": "theirs"}},
+            {"plugin_id": "gh", "slot": "row-badge", "id": "pr",
+             "payload": {"text": "global"}},
+            {"plugin_id": "gh", "slot": "row-column", "id": "col", "session_id": "s1",
+             "payload": {"text": "column"}}
+        ]));
+        assert_eq!(
+            row_badge_cells(&snap, "s1"),
+            vec![("mine".to_string(), None)]
+        );
+        assert!(row_badge_cells(&snap, "s3").is_empty());
+    }
+
+    #[test]
     fn row_column_cells_ignore_other_slots() {
         let snap = pane_snapshot(json!([
             {"plugin_id": "a", "slot": "row-badge", "id": "b", "session_id": "s1",
