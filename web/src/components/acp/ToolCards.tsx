@@ -60,8 +60,6 @@ import { marked } from "marked";
 import { reclassifyBash } from "../../lib/toolReclassify";
 import { useAgentProfile } from "../../lib/agentProfileContext";
 import { useAcpFileRef } from "./AcpFileRefContext";
-import { useAcpSessionId } from "../../lib/acpSessionContext";
-import { PluginToolCardBadges } from "../plugin/PluginSlots";
 import { useBackgroundAgentFor, useOpenBackgroundAgentsPane } from "./backgroundAgentsContext";
 import { relativeDisplayPath } from "../../lib/fileRef";
 import { useToolDisplayMode, type ToolDensity } from "./ToolDisplayMode";
@@ -1361,7 +1359,6 @@ interface SkillProps extends Props {
 
 function SkillToolCard({ tool, result, skillName }: SkillProps) {
   const status = statusFor(result);
-  const sessionId = useAcpSessionId();
   const [open, setOpen] = useToolCardExpansion(status);
   // Memo on the raw string so downstream memos see a stable args reference
   // and don't recompute every render.
@@ -1394,12 +1391,7 @@ function SkillToolCard({ tool, result, skillName }: SkillProps) {
       icon={<Sparkles className="h-3.5 w-3.5" />}
       label="skill"
       primary={skillName}
-      meta={
-        <>
-          {skillSource && <ProvenanceBadge label={badgeLabel(skillSource)} tone={badgeTone(skillSource)} />}
-          {sessionId && <PluginToolCardBadges sessionId={sessionId} kind="skill" target={skillName} />}
-        </>
-      }
+      meta={skillSource && <ProvenanceBadge label={badgeLabel(skillSource)} tone={badgeTone(skillSource)} />}
       expanded={open}
       onToggle={status === "err" || hasBody ? () => setOpen((v) => !v) : undefined}
       startedAt={tool.started_at}
@@ -1713,7 +1705,6 @@ interface McpProps extends Props {
 
 function McpToolCard({ tool, result, server, verb }: McpProps) {
   const status = statusFor(result);
-  const sessionId = useAcpSessionId();
   const [open, setOpen] = useToolCardExpansion(status);
   // Memo on the raw string so downstream memos see a stable args reference
   // and don't recompute every render.
@@ -1763,7 +1754,6 @@ function McpToolCard({ tool, result, server, verb }: McpProps) {
           {argPreview && <span className="ml-2 text-text-dim">· {argPreview}</span>}
         </>
       }
-      meta={sessionId && <PluginToolCardBadges sessionId={sessionId} kind="mcp" target={server} />}
       expanded={open}
       onToggle={status === "err" || hasBody ? () => setOpen((v) => !v) : undefined}
       body={

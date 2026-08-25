@@ -66,7 +66,6 @@ import {
 // hatch for a likely missed-Stopped wedge. See #1100, #1112.
 const FORCE_END_TURN_THRESHOLD_SECS = 30;
 import { AgentProfileProvider, useClearAliases } from "../../lib/agentProfileContext";
-import { AcpSessionContext } from "../../lib/acpSessionContext";
 import { isClearAlias } from "../../lib/agentProfiles";
 import { AttentionChime } from "./AttentionChime";
 import { useRespawnSession, type RespawnState } from "../../hooks/useRespawnSession";
@@ -184,41 +183,39 @@ export function StructuredView(props: Props) {
   const [toolDensity, toggleToolDensity] = useToolDensityPref();
   return (
     <AcpFileRefContext.Provider value={{ onOpenFileRef, fileRefSession }}>
-      <AcpSessionContext.Provider value={sessionId}>
-        <AgentProfileProvider toolKey={tool} clearAliases={clearAliases}>
-          <ToolDisplayModeProvider density={toolDensity}>
-            <AcpRuntime
-              sessionId={sessionId}
-              acpWorkerState={acpWorkerState}
-              archivedAt={archivedAt}
-              snoozedUntil={snoozedUntil}
-              showClearedTurns={showClearedTurns}
-            >
-              {(ctx) => (
-                <BackgroundAgentsContext.Provider
-                  value={{ agents: ctx.state.backgroundAgents, openPane: onOpenAgentsPane }}
-                >
-                  <AcpChrome
-                    sessionId={sessionId}
-                    acpWorkerState={acpWorkerState}
-                    acpAgent={acpAgent}
-                    showClearedTurns={showClearedTurns}
-                    onToggleClearedTurns={() => setShowClearedTurns((v) => !v)}
-                    toolDensity={toolDensity}
-                    onToggleToolDensity={toggleToolDensity}
-                    archivedAt={archivedAt}
-                    snoozedUntil={snoozedUntil}
-                    trashedAt={trashedAt}
-                    onRestore={onRestore}
-                    isSandboxed={isSandboxed}
-                    {...ctx}
-                  />
-                </BackgroundAgentsContext.Provider>
-              )}
-            </AcpRuntime>
-          </ToolDisplayModeProvider>
-        </AgentProfileProvider>
-      </AcpSessionContext.Provider>
+      <AgentProfileProvider toolKey={tool} clearAliases={clearAliases}>
+        <ToolDisplayModeProvider density={toolDensity}>
+          <AcpRuntime
+            sessionId={sessionId}
+            acpWorkerState={acpWorkerState}
+            archivedAt={archivedAt}
+            snoozedUntil={snoozedUntil}
+            showClearedTurns={showClearedTurns}
+          >
+            {(ctx) => (
+              <BackgroundAgentsContext.Provider
+                value={{ agents: ctx.state.backgroundAgents, openPane: onOpenAgentsPane }}
+              >
+                <AcpChrome
+                  sessionId={sessionId}
+                  acpWorkerState={acpWorkerState}
+                  acpAgent={acpAgent}
+                  showClearedTurns={showClearedTurns}
+                  onToggleClearedTurns={() => setShowClearedTurns((v) => !v)}
+                  toolDensity={toolDensity}
+                  onToggleToolDensity={toggleToolDensity}
+                  archivedAt={archivedAt}
+                  snoozedUntil={snoozedUntil}
+                  trashedAt={trashedAt}
+                  onRestore={onRestore}
+                  isSandboxed={isSandboxed}
+                  {...ctx}
+                />
+              </BackgroundAgentsContext.Provider>
+            )}
+          </AcpRuntime>
+        </ToolDisplayModeProvider>
+      </AgentProfileProvider>
     </AcpFileRefContext.Provider>
   );
 }
