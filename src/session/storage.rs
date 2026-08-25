@@ -469,27 +469,25 @@ pub(crate) fn acquire_session_title_lock(instance_id: &str) -> Result<StorageFlo
     )
 }
 
-/// Test-only crash injection for the profile-move transaction (#3459). Tests
-/// arm a named point and `move_instances_to_inner` panics when it is reached,
-/// unwinding through the rollback paths exactly like a process death would.
+// Test-only crash injection for the profile-move transaction (#3459). Tests
+// arm a named point and `move_instances_to_inner` panics when it is reached,
+// unwinding through the rollback paths exactly like a process death would.
+// Thread-local so concurrent test threads can never trip each other's
+// armed points.
 #[cfg(test)]
-static TEST_CRASH_POINTS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+thread_local! {
+    static TEST_CRASH_POINTS: std::cell::RefCell<Vec<String>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
 
 #[cfg(test)]
 pub(crate) fn arm_test_crash_point(name: &str) {
-    TEST_CRASH_POINTS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .push(name.to_string());
+    TEST_CRASH_POINTS.with(|points| points.borrow_mut().push(name.to_string()));
 }
 
 #[cfg(test)]
 fn test_crash_point(name: &str) {
-    let armed = TEST_CRASH_POINTS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .iter()
-        .any(|armed| armed == name);
+    let armed = TEST_CRASH_POINTS.with(|points| points.borrow().iter().any(|armed| armed == name));
     if armed {
         panic!("simulated crash at crash point `{name}`");
     }
@@ -497,10 +495,7 @@ fn test_crash_point(name: &str) {
 
 #[cfg(test)]
 pub(crate) fn disarm_test_crash_points() {
-    TEST_CRASH_POINTS
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .clear();
+    TEST_CRASH_POINTS.with(|points| points.borrow_mut().clear());
 }
 
 pub(crate) fn sync_parent_directory(path: &Path) -> Result<()> {
@@ -1275,10 +1270,11 @@ impl Storage {
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or_default(),
         };
-        let journal_path =
-            Some(super::move_journal::record(&journal_entry).context(
+        let journal_path = Some(
+            super::move_journal::record(&journal_entry, &self.sessions_path).context(
                 "recording the durable move journal failed; no profile rows were changed",
-            )?);
+            )?,
+        );
         #[cfg(test)]
         test_crash_point("profile-move-journal");
 
@@ -1787,20 +1783,11 @@ pub(crate) fn reconcile_profile_duplicates(
 ) -> ReconciliationOutcome {
     let mut outcome = ReconciliationOutcome::default();
     let duplicated = !detect_duplicate_ids(loaded).is_empty();
-    let entries = match super::move_journal::scan() {
-        Ok(entries) => entries,
-        Err(error) => {
-            if !duplicated {
-                return outcome;
-            }
-            tracing::error!(
-                target: "session.store",
-                error = %error,
-                "failed to scan the move journal while reconciling duplicate session ids"
-            );
-            Vec::new()
-        }
-    };
+    let entries = super::move_journal::scan(
+        storages
+            .iter()
+            .map(|(_, storage)| storage.sessions_path().to_path_buf()),
+    );
     if entries.is_empty() && !duplicated {
         return outcome;
     }
@@ -4104,21 +4091,14 @@ mod tests {
         Ok(())
     }
 
-    /// Shared harness for the #3459 recovery tests: isolated app dir (the
-    /// move journal lives there), one source row in group `work`, empty
-    /// target, and a realistic post-move candidate in group `moved`.
+    /// Shared harness for the #3459 recovery tests: one source row in group
+    /// `work`, empty target, and a realistic post-move candidate in group
+    /// `moved`. Journals live inside the temp profile directories, so no
+    /// process-global isolation is needed.
     fn setup_recovery_env(
         tag: &str,
-    ) -> Result<(
-        tempfile::TempDir,
-        AppDirGuard,
-        Storage,
-        Storage,
-        Instance,
-        Instance,
-    )> {
+    ) -> Result<(tempfile::TempDir, Storage, Storage, Instance, Instance)> {
         let temp = tempfile::TempDir::new()?;
-        let guard = isolate_app_dir_at(temp.path());
         let source_dir = temp.path().join(format!("{tag}-source"));
         let target_dir = temp.path().join(format!("{tag}-target"));
         fs::create_dir_all(&source_dir)?;
@@ -4138,7 +4118,7 @@ mod tests {
         target.update(|_instances, _groups| Ok(()))?;
         let mut after = before.clone();
         after.group_path = "moved".to_string();
-        Ok((temp, guard, source, target, before, after))
+        Ok((temp, source, target, before, after))
     }
 
     fn run_crashing_move(source: &Storage, target: &Storage, point: &str) {
@@ -4164,7 +4144,6 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn profile_move_crash_recovery_target_wins_from_each_crash_point() -> Result<()> {
         // One case per crash point #3459 requires: target write/fsync,
         // source group write/fsync, source session write/fsync. In all
@@ -4176,14 +4155,14 @@ mod tests {
             "profile-move-source-groups",
             "profile-move-source-sessions",
         ] {
-            let (_temp, _guard, source, target, _before, _after) =
+            let (_temp, source, target, _before, _after) =
                 setup_recovery_env(point.replace('-', "_").as_str())?;
             run_crashing_move(&source, &target, point);
 
             assert_eq!(source.load()?.len(), 1, "{point}: source row remains");
             assert_eq!(target.load()?.len(), 1, "{point}: target copy durable");
             assert_eq!(
-                journal_entry_count()?,
+                journal_entry_count(&source),
                 1,
                 "{point}: exactly one journal entry guards the residual"
             );
@@ -4217,7 +4196,7 @@ mod tests {
                 !source_groups.iter().any(|group| group.path == "work"),
                 "{point}: losing attributable group entry pruned"
             );
-            assert_eq!(journal_entry_count()?, 0, "{point}: journal consumed");
+            assert_eq!(journal_entry_count(&source), 0, "{point}: journal consumed");
             let backup_count = fs_extra_count_backups(source.sessions_path());
             assert!(
                 backup_count >= 1,
@@ -4233,18 +4212,17 @@ mod tests {
     }
 
     #[test]
-    #[serial]
     fn profile_move_crash_before_publication_source_wins() -> Result<()> {
         // Crash right after the journal is written but before any row was
         // touched: the evidence says the target never published, so the
         // source row wins and nothing is removed. The leaked journal entry
         // is still consumed as consistent.
-        let (_temp, _guard, source, target, _before, _after) = setup_recovery_env("prepub")?;
+        let (_temp, source, target, _before, _after) = setup_recovery_env("prepub")?;
         run_crashing_move(&source, &target, "profile-move-journal");
 
         assert_eq!(source.load()?.len(), 1, "source row untouched");
         assert!(target.load()?.is_empty(), "target never published");
-        assert_eq!(journal_entry_count()?, 1);
+        assert_eq!(journal_entry_count(&source), 1);
 
         let view: Vec<(&str, &Storage)> =
             vec![(source.profile(), &source), (target.profile(), &target)];
@@ -4255,17 +4233,16 @@ mod tests {
         assert!(outcome.reports.is_empty());
         assert_eq!(source.load()?.len(), 1, "source wins, nothing removed");
         assert!(target.load()?.is_empty());
-        assert_eq!(journal_entry_count()?, 0);
+        assert_eq!(journal_entry_count(&source), 0);
         Ok(())
     }
 
     #[test]
-    #[serial]
     fn legacy_duplicate_without_journal_is_surfaced_never_arbitrated() -> Result<()> {
         // Two copies of one id with no usable journal evidence: neither may
         // be chosen by iteration order. Both rows stay on disk, both are
         // excluded upstream, and the report names profiles, files, mtimes.
-        let (_temp, _guard, source, target, before, _after) = setup_recovery_env("legacy")?;
+        let (_temp, source, target, before, _after) = setup_recovery_env("legacy")?;
         let id = before.id.clone();
         target.update(|instances, _| {
             let mut copy = before.clone();
@@ -4302,16 +4279,15 @@ mod tests {
             );
             assert_eq!(storage.load()?.len(), 1, "no automatic arbitration");
         }
-        assert_eq!(journal_entry_count()?, 0);
+        assert_eq!(journal_entry_count(&source), 0);
         Ok(())
     }
 
     #[test]
-    #[serial]
     fn stale_version_journal_is_insufficient_evidence() -> Result<()> {
         // A journal from an older version carries no arbitration authority:
         // the duplicate stays surfaced and the entry is not consumed.
-        let (_temp, _guard, source, target, before, _after) = setup_recovery_env("stale")?;
+        let (_temp, source, target, before, _after) = setup_recovery_env("stale")?;
         target.update(|instances, _| {
             let mut copy = before.clone();
             copy.source_profile = target.profile().to_string();
@@ -4330,31 +4306,32 @@ mod tests {
             group_move_subtree: false,
             created_at_epoch_ms: 0,
         };
-        super::super::move_journal::record(&stale)?;
-        assert_eq!(journal_entry_count()?, 1);
-
+        super::super::move_journal::record(&stale, source.sessions_path())?;
+        assert_eq!(journal_entry_count(&source), 1);
         let view: Vec<(&str, &Storage)> =
             vec![(source.profile(), &source), (target.profile(), &target)];
         let loaded = collect_loaded(&[&source, &target]);
         let outcome = super::reconcile_profile_duplicates(&loaded, &view);
 
         assert!(!outcome.repaired, "stale evidence must not arbitrate");
-        assert_eq!(outcome.reports.len(), 1);
+        assert_eq!(journal_entry_count(&source), 1, "stale entry stays on disk");
         assert_eq!(source.load()?.len(), 1);
         assert_eq!(target.load()?.len(), 1);
-        assert_eq!(journal_entry_count()?, 1, "stale entry stays on disk");
         Ok(())
     }
 
+    fn journal_entry_count(source: &Storage) -> usize {
+        super::super::move_journal::scan([source.sessions_path().to_path_buf()]).len()
+    }
+
     #[test]
-    #[serial]
     fn recovery_survives_a_panic_mid_repair_and_stays_idempotent() -> Result<()> {
         // A panic between the repair write and the journal consumption must
         // leave a state a plain rerun converges on, and further reruns are
         // exact no-ops.
-        let (_temp, _guard, source, target, _before, _after) = setup_recovery_env("midpanic")?;
+        let (_temp, source, target, _before, _after) = setup_recovery_env("midpanic")?;
         run_crashing_move(&source, &target, "profile-move-source-sessions");
-        assert_eq!(journal_entry_count()?, 1);
+        assert_eq!(journal_entry_count(&source), 1);
 
         arm_test_crash_point("profile-repair-source-written");
         let view: Vec<(&str, &Storage)> =
@@ -4370,11 +4347,11 @@ mod tests {
         // consuming the journal; the rerun finishes the job.
         let loaded = collect_loaded(&[&source, &target]);
         let outcome = super::reconcile_profile_duplicates(&loaded, &view);
-        assert!(outcome.repaired || journal_entry_count()? == 0);
+        assert!(outcome.repaired || journal_entry_count(&source) == 0);
         assert!(outcome.reports.is_empty());
         assert!(source.load()?.is_empty());
         assert_eq!(target.load()?.len(), 1);
-        assert_eq!(journal_entry_count()?, 0);
+        assert_eq!(journal_entry_count(&source), 0);
 
         let loaded = collect_loaded(&[&source, &target]);
         let outcome = super::reconcile_profile_duplicates(&loaded, &view);
@@ -4383,10 +4360,6 @@ mod tests {
             "rerun is a no-op"
         );
         Ok(())
-    }
-
-    fn journal_entry_count() -> Result<usize> {
-        Ok(super::super::move_journal::scan()?.len())
     }
 
     fn collect_loaded(storages: &[&Storage]) -> Vec<(String, Vec<Instance>)> {

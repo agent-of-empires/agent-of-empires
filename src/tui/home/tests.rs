@@ -20913,18 +20913,21 @@ mod profile_duplicate_reconciliation {
         })
         .unwrap();
         if with_journal {
-            crate::session::record_move_journal(&crate::session::MoveJournalEntry {
-                version: 1,
-                ids: vec![id.clone()],
-                source_profile: "alpha".to_string(),
-                target_profile: "beta".to_string(),
-                source_sessions_path: alpha.sessions_path().to_path_buf(),
-                target_sessions_path: beta.sessions_path().to_path_buf(),
-                group_move_source_path: "work".to_string(),
-                group_move_target_path: "moved".to_string(),
-                group_move_subtree: false,
-                created_at_epoch_ms: 0,
-            })
+            crate::session::record_move_journal(
+                &crate::session::MoveJournalEntry {
+                    version: 1,
+                    ids: vec![id.clone()],
+                    source_profile: "alpha".to_string(),
+                    target_profile: "beta".to_string(),
+                    source_sessions_path: alpha.sessions_path().to_path_buf(),
+                    target_sessions_path: beta.sessions_path().to_path_buf(),
+                    group_move_source_path: "work".to_string(),
+                    group_move_target_path: "moved".to_string(),
+                    group_move_subtree: false,
+                    created_at_epoch_ms: 0,
+                },
+                alpha.sessions_path(),
+            )
             .unwrap();
         }
         (temp, guard, id)
