@@ -1141,7 +1141,7 @@ impl HomeView {
     fn render_list(&mut self, frame: &mut Frame, area: Rect, theme: &Theme, layout: PaneLayout) {
         self.list_area = area;
         let profile = self.active_profile_display();
-        let title = match &self.view_mode {
+        let mut title = match &self.view_mode {
             ViewMode::Structured => {
                 compose_list_title("aoe", profile, self.group_by, self.sort_order)
             }
@@ -1155,6 +1155,13 @@ impl HomeView {
                 self.sort_order,
             ),
         };
+        if !self.legacy_duplicate_reports.is_empty() {
+            // Fail-closed surface (#3459): ambiguous copies are hidden from
+            // the list, so without this marker the loss is silent.
+            let count = self.legacy_duplicate_reports.len();
+            let plural = if count == 1 { "" } else { "s" };
+            title.push_str(&format!("  \u{26a0} {count} ambiguous session{plural}"));
+        }
         let (border_color, title_color) = match self.view_mode {
             ViewMode::Structured => (theme.border, theme.title),
             ViewMode::Terminal | ViewMode::Tool(_) => {
