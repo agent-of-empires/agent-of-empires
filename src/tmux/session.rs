@@ -324,6 +324,14 @@ impl Session {
         crate::tmux::live_agent_session_name(id, &Self::generate_name(id, title))
     }
 
+    /// [`Self::resolve_name`] for **render paths**: answered from the shared
+    /// snapshot only, never refreshing. A stale snapshot yields the derived
+    /// name until the background snapshot poller refreshes it; paint must
+    /// never wait on tmux.
+    pub(crate) fn resolve_name_for_display(id: &str, title: &str) -> String {
+        crate::tmux::display_agent_session_name(id, &Self::generate_name(id, title))
+    }
+
     /// Purely derive the tmux session name from a session id and title, with no
     /// reference to what is live. Callers that want the session's CURRENT name
     /// want [`Self::resolve_name`].

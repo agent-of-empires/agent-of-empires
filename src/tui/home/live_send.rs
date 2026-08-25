@@ -735,6 +735,22 @@ impl LiveCaptureWake {
     }
 }
 
+/// One atomic capture frame: content, the pane cursor probed in the same
+/// cycle, the line budget it was captured under, and the target generation
+/// it belongs to. Published as a single unit so a consumer can never see a
+/// frame torn across a retarget or a budget change.
+#[derive(Debug, Clone)]
+pub(in crate::tui) struct CaptureFrame {
+    /// Target generation at capture time; compared against the worker's
+    /// current generation so a frame captured before a retarget is dropped
+    /// instead of landing under the new view.
+    pub(in crate::tui) generation: u64,
+    /// The `capture_lines` budget this capture was produced under.
+    pub(in crate::tui) budget: usize,
+    pub(in crate::tui) content: String,
+    pub(in crate::tui) cursor: Option<crate::tmux::PaneCursor>,
+}
+
 /// Off-thread preview capture. One long-lived thread forks `tmux
 /// capture-pane` and publishes fresh pane content into a single-slot
 /// mailbox the render loop drains, so the render loop applies the latest
@@ -762,11 +778,16 @@ pub(in crate::tui) struct LiveCaptureWorker {
     /// long-lived thread serves every view without per-switch respawns.
     /// Empty string means "idle, capture nothing" (no selection).
     target: std::sync::Arc<std::sync::Mutex<String>>,
-    /// Single-slot mailbox holding the newest capture not yet consumed by
-    /// the render loop. A new capture overwrites an unconsumed one (the
-    /// render only ever wants the latest), so this can't grow unbounded if
-    /// the render thread stalls.
-    latest: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    /// Single-slot mailbox holding the newest [`CaptureFrame`] not yet
+    /// consumed by the render loop. A new frame overwrites an unconsumed one
+    /// (the render only ever wants the latest), so this can't grow unbounded
+    /// if the render thread stalls.
+    latest: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<CaptureFrame>>>>,
+    /// Bumped on every `set_target` change. Published frames carry the value
+    /// read at capture time; a consumer drops frames whose generation no
+    /// longer matches, so stale bytes can never land under a new view even if
+    /// they were captured mid-switch.
+    generation: std::sync::Arc<std::sync::atomic::AtomicU64>,
     /// Sleep between captures, in ms. Adaptive: fast under live-send, idle
     /// otherwise. Read by the worker thread each cycle.
     interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
@@ -989,13 +1010,14 @@ impl LiveCaptureWorker {
         use std::sync::{Arc, Condvar, Mutex};
         let capture_lines = Arc::new(AtomicUsize::new(0));
         let target: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-        let latest: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let latest: Arc<Mutex<Option<std::sync::Arc<CaptureFrame>>>> = Arc::new(Mutex::new(None));
         let interval_ms = Arc::new(AtomicU64::new(LIVE_CAPTURE_INTERVAL_IDLE_MS));
         let forward_empty = Arc::new(AtomicBool::new(false));
         let nudge: Arc<(Mutex<()>, Condvar)> = Arc::new((Mutex::new(()), Condvar::new()));
         let stop = Arc::new(AtomicBool::new(false));
         let cursor: Arc<Mutex<Option<crate::tmux::PaneCursor>>> = Arc::new(Mutex::new(None));
         let clipboard: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let generation = Arc::new(AtomicU64::new(0));
         // Spawned enabled; the render reconcile pushes the real
         // `[tmux] vt_live` value right after spawn (and on every config
         // refresh), so the worker itself never touches the config file.
@@ -1013,6 +1035,7 @@ impl LiveCaptureWorker {
         let stop_flag = stop.clone();
         let cursor_cell = cursor.clone();
         let clipboard_cell = clipboard.clone();
+        let generation_cell = generation.clone();
         #[cfg(unix)]
         let vt_enabled_cell = vt_enabled.clone();
         #[cfg(unix)]
@@ -1088,6 +1111,11 @@ impl LiveCaptureWorker {
                 // goes out as soon as its blockers reopen; `None` means nothing
                 // was deferred.
                 let mut defer_wait_ms: Option<u64> = None;
+                // The generation this cycle's frames belong to. Read once per
+                // cycle so a mid-fork retarget is caught by the still_current
+                // recheck below, and a frame that slips past it still carries
+                // the old generation for the consumer to drop.
+                let generation_now = generation_cell.load(Ordering::Relaxed);
                 // A retarget resets the dedup so the new pane's first frame
                 // always publishes, even if its bytes happen to match the
                 // previous pane's last capture.
@@ -1325,7 +1353,12 @@ impl LiveCaptureWorker {
                                 };
                                 if floor == 0 && debounce == 0 {
                                     if let Ok(mut guard) = slot.lock() {
-                                        *guard = Some(content.clone());
+                                        *guard = Some(std::sync::Arc::new(CaptureFrame {
+                                            generation: generation_now,
+                                            budget: lines,
+                                            content: content.clone(),
+                                            cursor: cursor_now,
+                                        }));
                                     }
                                     last_captured = Some(content);
                                     last_published_at = Some(std::time::Instant::now());
@@ -1403,6 +1436,7 @@ impl LiveCaptureWorker {
             capture_lines,
             target,
             latest,
+            generation,
             interval_ms,
             forward_empty,
             nudge,
@@ -1477,6 +1511,12 @@ impl LiveCaptureWorker {
         let changed = if let Ok(mut guard) = self.target.lock() {
             if *guard != name {
                 *guard = name;
+                // Invalidate every frame the in-flight cycle might publish:
+                // it tagged its frames with the old generation, so even a
+                // frame that slips past the mailbox clear is dropped by
+                // `frame_is_current`.
+                self.generation
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 if let Ok(mut latest) = self.latest.lock() {
                     *latest = None;
                 }
@@ -1535,11 +1575,18 @@ impl LiveCaptureWorker {
             .store(lines, std::sync::atomic::Ordering::Relaxed);
     }
 
-    /// Take the newest capture the worker has produced since the last
-    /// call, if any. Returns `None` when nothing new has arrived (the
-    /// render loop then keeps the current preview).
-    pub(in crate::tui) fn take_latest(&self) -> Option<String> {
+    /// Take the newest frame the worker has produced since the last call,
+    /// if any. Returns `None` when nothing new has arrived (the render loop
+    /// then keeps the current preview).
+    pub(in crate::tui) fn take_latest(&self) -> Option<std::sync::Arc<CaptureFrame>> {
         self.latest.lock().ok().and_then(|mut guard| guard.take())
+    }
+
+    /// Whether `frame` belongs to the worker's CURRENT target generation.
+    /// A frame captured before the last `set_target` must be dropped, never
+    /// applied under the new view.
+    pub(in crate::tui) fn frame_is_current(&self, frame: &CaptureFrame) -> bool {
+        self.generation.load(std::sync::atomic::Ordering::Relaxed) == frame.generation
     }
 
     /// The newest cursor for the worker's CURRENT target pane, or `None`
@@ -1550,7 +1597,15 @@ impl LiveCaptureWorker {
     /// not taken, so the cursor persists across frames until the next live
     /// cycle refreshes it.
     pub(in crate::tui) fn current_cursor(&self) -> Option<crate::tmux::PaneCursor> {
-        self.cursor.lock().ok().and_then(|guard| *guard)
+        if let Some(cursor) = self.cursor.lock().ok().and_then(|guard| *guard) {
+            return Some(cursor);
+        }
+        // Mirror cleared (retarget) but an unconsumed frame from the new
+        // target may already carry its cursor: prefer that over nothing.
+        self.latest
+            .lock()
+            .ok()
+            .and_then(|guard| guard.as_ref().and_then(|frame| frame.cursor))
     }
 
     /// Take the newest OSC 52 clipboard write the displayed pane's agent has
@@ -1570,6 +1625,27 @@ impl LiveCaptureWorker {
     pub(in crate::tui) fn set_cursor_for_test(&self, cursor: Option<crate::tmux::PaneCursor>) {
         if let Ok(mut guard) = self.cursor.lock() {
             *guard = cursor;
+        }
+    }
+
+    /// Current target generation for tests that hand-build frames.
+    #[cfg(test)]
+    pub(in crate::tui) fn current_generation_for_test(&self) -> u64 {
+        self.generation.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Hand-publish a frame into the mailbox for tests that exercise the
+    /// consumer side (`apply_worker_capture`) without standing up a real
+    /// pane.
+    #[cfg(test)]
+    pub(in crate::tui) fn inject_frame_for_test(&self, budget: usize, content: &str) {
+        if let Ok(mut latest) = self.latest.lock() {
+            *latest = Some(std::sync::Arc::new(CaptureFrame {
+                generation: self.current_generation_for_test(),
+                budget,
+                content: content.to_string(),
+                cursor: None,
+            }));
         }
     }
 }
@@ -2261,7 +2337,7 @@ mod tests {
         let deadline = std::time::Instant::now() + timeout;
         loop {
             if let Some(value) = worker.take_latest() {
-                return Some(value);
+                return Some(value.content.clone());
             }
             if std::time::Instant::now() >= deadline {
                 return None;
@@ -2998,7 +3074,12 @@ mod tests {
         let worker = LiveCaptureWorker::spawn(std::sync::Arc::new(tokio::sync::Notify::new()));
         worker.set_capture_lines(40);
         if let Ok(mut latest) = worker.latest.lock() {
-            *latest = Some("stale previous-pane content".to_string());
+            *latest = Some(std::sync::Arc::new(CaptureFrame {
+                generation: 0,
+                budget: 40,
+                content: "stale previous-pane content".to_string(),
+                cursor: None,
+            }));
         }
         worker.set_target("aoe_test_capture_new_target".into());
         assert!(

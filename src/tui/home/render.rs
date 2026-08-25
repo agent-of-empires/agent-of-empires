@@ -205,59 +205,9 @@ fn scroll_exceeds_cache(cache_captured_lines: usize, height: u16, scroll_offset:
 /// could not grow it. `capture_lines_for` asks for `height + CAPTURE_BUFFER`
 /// (plus the reading depth when scrolled); a result shorter than that has hit
 /// the end of the pane's content and can never satisfy the BUFFER headroom.
-///
-/// This is the live-view counterpart of the frozen top-of-history fix
-/// (`capture_window_stale`): an alternate-screen agent (Claude Code, and any
-/// full-screen TUI) keeps no scrollback, so `tmux capture-pane` returns exactly
-/// the visible `height` and is always "short" of the headroom. Without this
-/// guard `scroll_exceeds_cache` stayed true on every frame, which both re-forked
-/// `capture-pane` on the render thread each tick and made `apply_worker_capture`
-/// reject every off-thread frame, so the whole capture worker was bypassed for
-/// full-screen agents (#1824's offload never applied to them).
-///
-/// A zero-line result is the cold-cache case (nothing captured yet), not an
-/// exhausted pane, so it is deliberately not treated as exhausted.
 fn capture_is_exhausted(cache_captured_lines: usize, requested_lines: usize) -> bool {
     cache_captured_lines > 0 && cache_captured_lines < requested_lines
 }
-
-/// Whether the cache must be re-captured this frame.
-///
-/// Live-follow (`!frozen`) keeps `scroll_exceeds_cache`'s `CAPTURE_BUFFER`
-/// headroom so a few notches of scroll pre-fetch instead of re-capturing each
-/// tick. While frozen we already hold a full-scrollback snapshot, so the
-/// headroom is dropped and the test is exact: only a viewport that genuinely
-/// runs past the captured content (`visible_rows + offset`) forces a refresh.
-/// Keeping the headroom while frozen re-forks `capture-pane` every frame at the
-/// physical top of history, where the offset is clamped to
-/// `captured_lines - visible_rows` and the extra buffer lines can never exist.
-/// `visible_rows` (the rendered body height) is what the offset is clamped
-/// against, so it, not the raw pane `height`, is the correct coverage bound.
-///
-/// Live-follow applies the same "the pane has no more lines" escape via
-/// [`capture_is_exhausted`]: an alternate-screen agent's capture is always
-/// exactly `height` (no scrollback), so the BUFFER headroom can never be met and
-/// demanding it re-forked every frame. A capture shorter than what we asked for
-/// is treated as covered, so only a genuinely undersized-but-growable window (in
-/// practice a cold cache) forces the refresh.
-fn capture_window_stale(
-    frozen: bool,
-    cache_captured_lines: usize,
-    height: u16,
-    visible_rows: usize,
-    scroll_offset: u16,
-) -> bool {
-    if frozen {
-        visible_rows.saturating_add(scroll_offset as usize) > cache_captured_lines
-    } else {
-        scroll_exceeds_cache(cache_captured_lines, height, scroll_offset)
-            && !capture_is_exhausted(
-                cache_captured_lines,
-                capture_lines_for(height, scroll_offset),
-            )
-    }
-}
-
 /// What the passive (non-live) preview sync should do this refresh for the
 /// wanted `(session_id, cols, rows)` geometry.
 #[derive(Debug, PartialEq, Eq)]
@@ -1596,159 +1546,166 @@ impl HomeView {
                     // and color for its own backing pane; every overlay on top
                     // of that (archive/trash, snooze, urgent, favorite) is
                     // mode-independent and belongs to `decorate_row`.
-                    let (seed, sunk) = match self.view_mode {
-                        ViewMode::Structured => {
-                            // For Idle sessions, decay color from `fresh_idle`
-                            // toward `idle` over `idle_decay_window`. A slow
-                            // `breathe` rattle replaces the static braille
-                            // glyph while we're inside the window, matching
-                            // the animated visual language of the other
-                            // attention-worthy states (Running, Waiting,
-                            // Starting). Also serves as a redundant cue for
-                            // colorblind users / monochrome terminals.
-                            let idle_age = inst.idle_age();
-                            let is_fresh_idle =
-                                matches!(idle_age, Some(age) if age < self.idle_decay_window);
-                            // Dormant (idle-reaped, resumable) structured
-                            // workers get their own glyph + dim amber, taking
-                            // precedence over the raw status. Unread still
-                            // wins over dormancy below (an unseen finished turn
-                            // is the more actionable signal, matching the web
-                            // sidebar's unread-dot precedence). See #2250.
-                            let is_shown_dormant = inst.is_shown_dormant();
-                            let mut icon = if is_shown_dormant {
-                                ICON_DORMANT
-                            } else {
-                                match inst.status {
-                                    Status::Running => spinner_running(&inst.created_at),
-                                    Status::Waiting => spinner_waiting(&inst.created_at),
-                                    Status::Idle if is_fresh_idle => {
-                                        spinner_idle_fresh(&inst.created_at, inst.idle_entered_at)
+                    let (seed, sunk) =
+                        match self.view_mode {
+                            ViewMode::Structured => {
+                                // For Idle sessions, decay color from `fresh_idle`
+                                // toward `idle` over `idle_decay_window`. A slow
+                                // `breathe` rattle replaces the static braille
+                                // glyph while we're inside the window, matching
+                                // the animated visual language of the other
+                                // attention-worthy states (Running, Waiting,
+                                // Starting). Also serves as a redundant cue for
+                                // colorblind users / monochrome terminals.
+                                let idle_age = inst.idle_age();
+                                let is_fresh_idle =
+                                    matches!(idle_age, Some(age) if age < self.idle_decay_window);
+                                // Dormant (idle-reaped, resumable) structured
+                                // workers get their own glyph + dim amber, taking
+                                // precedence over the raw status. Unread still
+                                // wins over dormancy below (an unseen finished turn
+                                // is the more actionable signal, matching the web
+                                // sidebar's unread-dot precedence). See #2250.
+                                let is_shown_dormant = inst.is_shown_dormant();
+                                let mut icon = if is_shown_dormant {
+                                    ICON_DORMANT
+                                } else {
+                                    match inst.status {
+                                        Status::Running => spinner_running(&inst.created_at),
+                                        Status::Waiting => spinner_waiting(&inst.created_at),
+                                        Status::Idle if is_fresh_idle => spinner_idle_fresh(
+                                            &inst.created_at,
+                                            inst.idle_entered_at,
+                                        ),
+                                        Status::Idle => ICON_IDLE,
+                                        Status::Unknown => ICON_UNKNOWN,
+                                        Status::Stopped => ICON_STOPPED,
+                                        Status::Error => ICON_ERROR,
+                                        Status::Starting => spinner_starting(&inst.created_at),
+                                        Status::Deleting => ICON_DELETING,
+                                        Status::Creating => spinner_starting(&inst.created_at),
                                     }
-                                    Status::Idle => ICON_IDLE,
-                                    Status::Unknown => ICON_UNKNOWN,
-                                    Status::Stopped => ICON_STOPPED,
-                                    Status::Error => ICON_ERROR,
-                                    Status::Starting => spinner_starting(&inst.created_at),
-                                    Status::Deleting => ICON_DELETING,
-                                    Status::Creating => spinner_starting(&inst.created_at),
-                                }
-                            };
-                            // Unread paints only on resting rows
-                            // (Idle/Unknown): a live status (Running/Waiting/
-                            // Starting/...) supersedes it and keeps its own
-                            // color AND spinner. Auto-unread only ever lands
-                            // on Idle; a manual flag on a live row defers to
-                            // the live state. Sunk rows (archived/snoozed)
-                            // never paint unread: the user dismissed the row,
-                            // so surfacing it as unread contradicts that. The
-                            // flag stays on disk, so unarchiving/unsnoozing
-                            // restores it. Snooze is checked in every sort
-                            // mode here (unlike the Attention-only snooze
-                            // decoration in `decorate_row`), so a snoozed
-                            // unread row outside Attention sort still drops
-                            // the dot (#2571).
-                            let unread_resting = crate::session::unread_enabled()
-                                && inst.is_unread()
-                                && !inst.is_archived()
-                                && !inst.is_snoozed()
-                                && matches!(inst.status, Status::Idle | Status::Unknown);
-                            let color = if is_shown_dormant && !unread_resting {
-                                theme.dormant()
-                            } else {
-                                match inst.status {
-                                    Status::Running => theme.running,
-                                    Status::Waiting => theme.waiting,
-                                    Status::Idle if unread_resting => theme.unread,
-                                    Status::Idle => {
-                                        theme.idle_color_at_age(idle_age, self.idle_decay_window)
+                                };
+                                // Unread paints only on resting rows
+                                // (Idle/Unknown): a live status (Running/Waiting/
+                                // Starting/...) supersedes it and keeps its own
+                                // color AND spinner. Auto-unread only ever lands
+                                // on Idle; a manual flag on a live row defers to
+                                // the live state. Sunk rows (archived/snoozed)
+                                // never paint unread: the user dismissed the row,
+                                // so surfacing it as unread contradicts that. The
+                                // flag stays on disk, so unarchiving/unsnoozing
+                                // restores it. Snooze is checked in every sort
+                                // mode here (unlike the Attention-only snooze
+                                // decoration in `decorate_row`), so a snoozed
+                                // unread row outside Attention sort still drops
+                                // the dot (#2571).
+                                let unread_resting = crate::session::unread_enabled()
+                                    && inst.is_unread()
+                                    && !inst.is_archived()
+                                    && !inst.is_snoozed()
+                                    && matches!(inst.status, Status::Idle | Status::Unknown);
+                                let color = if is_shown_dormant && !unread_resting {
+                                    theme.dormant()
+                                } else {
+                                    match inst.status {
+                                        Status::Running => theme.running,
+                                        Status::Waiting => theme.waiting,
+                                        Status::Idle if unread_resting => theme.unread,
+                                        Status::Idle => theme
+                                            .idle_color_at_age(idle_age, self.idle_decay_window),
+                                        Status::Unknown if unread_resting => theme.unread,
+                                        Status::Unknown => theme.waiting,
+                                        Status::Stopped => theme.dimmed,
+                                        Status::Error => theme.error,
+                                        Status::Starting => theme.dimmed,
+                                        Status::Deleting => theme.waiting,
+                                        Status::Creating => theme.accent,
                                     }
-                                    Status::Unknown if unread_resting => theme.unread,
-                                    Status::Unknown => theme.waiting,
-                                    Status::Stopped => theme.dimmed,
-                                    Status::Error => theme.error,
-                                    Status::Starting => theme.dimmed,
-                                    Status::Deleting => theme.waiting,
-                                    Status::Creating => theme.accent,
+                                };
+                                let mut modifier = ratatui::style::Modifier::empty();
+                                if unread_resting {
+                                    // Make unread unmistakable: a solid dot glyph
+                                    // plus bold, on top of the `theme.unread`
+                                    // color set above. A plain color swap read as
+                                    // too subtle (#2088 review).
+                                    icon = ICON_UNREAD;
+                                    modifier = ratatui::style::Modifier::BOLD;
                                 }
-                            };
-                            let mut modifier = ratatui::style::Modifier::empty();
-                            if unread_resting {
-                                // Make unread unmistakable: a solid dot glyph
-                                // plus bold, on top of the `theme.unread`
-                                // color set above. A plain color swap read as
-                                // too subtle (#2088 review).
-                                icon = ICON_UNREAD;
-                                modifier = ratatui::style::Modifier::BOLD;
+                                (
+                                    RowSeed {
+                                        icon,
+                                        color,
+                                        modifier,
+                                    },
+                                    SunkRow::AgentStatus(agent_row_icon(inst)),
+                                )
                             }
-                            (
-                                RowSeed {
-                                    icon,
-                                    color,
-                                    modifier,
-                                },
-                                SunkRow::AgentStatus(agent_row_icon(inst)),
-                            )
-                        }
-                        ViewMode::Terminal => {
-                            // For sandboxed sessions, check the appropriate terminal based on mode
-                            let terminal_mode = if inst.is_sandboxed() {
-                                self.get_terminal_mode(id)
-                            } else {
-                                TerminalMode::Host
-                            };
-                            let terminal_running = match terminal_mode {
-                                TerminalMode::Container => {
-                                    inst.container_terminal_tmux_session().is_ok_and(|s| {
-                                        crate::tmux::session_exists_for_display(s.name())
-                                    })
-                                }
-                                TerminalMode::Host => inst.terminal_tmux_session().is_ok_and(|s| {
-                                    crate::tmux::session_exists_for_display(s.name())
-                                }),
-                            };
-                            // Unread is an Agent-view concept: it means the agent
-                            // produced output the user hasn't looked at. The
-                            // paired terminal has no such notion, so Terminal
-                            // view never paints the unread dot; the row just
-                            // tracks whether its terminal pane is live.
-                            let (icon, color) = if terminal_running {
-                                (spinner_running(&inst.created_at), theme.terminal_active)
-                            } else {
-                                (ICON_IDLE, theme.dimmed)
-                            };
-                            (
-                                RowSeed {
-                                    icon,
-                                    color,
-                                    modifier: ratatui::style::Modifier::empty(),
-                                },
-                                SunkRow::Pane,
-                            )
-                        }
-                        ViewMode::Tool(ref tool_name) => {
-                            let tool_session =
-                                crate::tmux::ToolSession::new(&inst.id, &inst.title, tool_name);
-                            let tool_running = crate::tmux::session_exists_for_display(
-                                tool_session.session_name(),
-                            ) && !crate::tmux::pane_dead_for_display(
-                                tool_session.session_name(),
-                            );
-                            let (icon, color) = if tool_running {
-                                (spinner_running(&inst.created_at), theme.terminal_active)
-                            } else {
-                                (ICON_IDLE, theme.dimmed)
-                            };
-                            (
-                                RowSeed {
-                                    icon,
-                                    color,
-                                    modifier: ratatui::style::Modifier::empty(),
-                                },
-                                SunkRow::Pane,
-                            )
-                        }
-                    };
+                            ViewMode::Terminal => {
+                                // For sandboxed sessions, check the appropriate terminal based on mode
+                                let terminal_mode = if inst.is_sandboxed() {
+                                    self.get_terminal_mode(id)
+                                } else {
+                                    TerminalMode::Host
+                                };
+                                let terminal_running =
+                                    match terminal_mode {
+                                        TerminalMode::Container => {
+                                            let name = crate::tmux::ContainerTerminalSession::
+                                        resolve_name_for_display(&inst.id, &inst.title);
+                                            crate::tmux::session_exists_for_display(&name)
+                                        }
+                                        TerminalMode::Host => {
+                                            let name = crate::tmux::TerminalSession::
+                                        resolve_name_for_display(&inst.id, &inst.title);
+                                            crate::tmux::session_exists_for_display(&name)
+                                        }
+                                    };
+                                // Unread is an Agent-view concept: it means the agent
+                                // produced output the user hasn't looked at. The
+                                // paired terminal has no such notion, so Terminal
+                                // view never paints the unread dot; the row just
+                                // tracks whether its terminal pane is live.
+                                let (icon, color) = if terminal_running {
+                                    (spinner_running(&inst.created_at), theme.terminal_active)
+                                } else {
+                                    (ICON_IDLE, theme.dimmed)
+                                };
+                                (
+                                    RowSeed {
+                                        icon,
+                                        color,
+                                        modifier: ratatui::style::Modifier::empty(),
+                                    },
+                                    SunkRow::Pane,
+                                )
+                            }
+                            ViewMode::Tool(ref tool_name) => {
+                                let tool_session = crate::tmux::ToolSession::for_display(
+                                    &inst.id,
+                                    &inst.title,
+                                    tool_name,
+                                );
+                                let tool_running = crate::tmux::session_exists_for_display(
+                                    tool_session.session_name(),
+                                ) && !crate::tmux::pane_dead_for_display(
+                                    tool_session.session_name(),
+                                );
+                                let (icon, color) = if tool_running {
+                                    (spinner_running(&inst.created_at), theme.terminal_active)
+                                } else {
+                                    (ICON_IDLE, theme.dimmed)
+                                };
+                                (
+                                    RowSeed {
+                                        icon,
+                                        color,
+                                        modifier: ratatui::style::Modifier::empty(),
+                                    },
+                                    SunkRow::Pane,
+                                )
+                            }
+                        };
                     decorate_row(inst, in_attention, show_favorite, seed, sunk, theme)
                 } else {
                     (
@@ -1953,66 +1910,6 @@ impl HomeView {
         }
     }
 
-    /// Shared core for the four `refresh_*_preview_cache_if_needed` methods.
-    /// They all run the same needs-refresh gate (session id / dimensions /
-    /// scroll-exceeds / 250ms timer) and the same capture, cache-update, and
-    /// scroll-clamp body; they differ only in which cache field they target,
-    /// where the capture comes from, and whether live-send forces a refresh.
-    ///
-    /// `select` is called twice: once for the gate, once to write the result.
-    /// `capture` runs between those two borrows so it can take a shared `&self`
-    /// to reach `get_instance`. It returns `None` to leave the cache untouched:
-    /// the agent uses that for its live-send preserve-last-good kill switch
-    /// (#1501); the terminal/tool wrappers use it when the instance has gone
-    /// away, matching the original "only write inside `if let Some(inst)`".
-    ///
-    /// `force` bypasses the idle throttle; the agent passes `in_live` here so
-    /// every render refreshes the preview in live-send mode (see the throttle
-    /// note in `refresh_preview_cache_if_needed`), the others pass `false`.
-    fn refresh_preview_cache_core(
-        &mut self,
-        width: u16,
-        height: u16,
-        force: bool,
-        select: fn(&mut Self) -> &mut super::PreviewCache,
-        capture: impl FnOnce(&Self, &str, usize) -> Option<String>,
-    ) {
-        const PREVIEW_REFRESH_MS: u128 = 250;
-        let Some(id) = self.selected_session.clone() else {
-            return;
-        };
-        let scroll_offset = self.preview_scroll_offset;
-        let frozen = self.preview_is_frozen();
-        let visible_rows = self.preview_visible_rows;
-
-        let cache = select(self);
-        let needs_refresh = force
-            || cache.session_id.as_ref() != Some(&id)
-            || cache.dimensions != (width, height)
-            || capture_window_stale(frozen, cache.captured_lines, height, visible_rows, scroll_offset)
-            // While frozen (reading scrollback or holding a selection) the idle
-            // poll must not re-capture: a fresh bottom-anchored snapshot would
-            // shift the held content out from under the reader or the drag.
-            // Session change, resize, and the reading grow still refresh.
-            || (!frozen && cache.last_refresh.elapsed().as_millis() > PREVIEW_REFRESH_MS);
-        if !needs_refresh {
-            return;
-        }
-
-        let capture_lines = capture_lines_for(height, scroll_offset);
-        let Some(content) = capture(self, id.as_str(), capture_lines) else {
-            return;
-        };
-
-        let captured_lines = select(self).store_capture(content, id, (width, height));
-
-        self.preview_scroll_offset = clamp_scroll_to_capture(
-            self.preview_scroll_offset,
-            captured_lines,
-            self.preview_visible_rows,
-        );
-    }
-
     /// tmux session name backing the pane the preview currently shows, as a
     /// function of the selected session and view mode (and, for Terminal,
     /// the host/container sub-mode). `None` when nothing is selected. Drives
@@ -2021,7 +1918,9 @@ impl HomeView {
         let id = self.selected_session.as_ref()?;
         let inst = self.get_instance(id)?;
         let name = match &self.view_mode {
-            ViewMode::Structured => crate::tmux::Session::resolve_name(&inst.id, &inst.title),
+            ViewMode::Structured => {
+                crate::tmux::Session::resolve_name_for_display(&inst.id, &inst.title)
+            }
             ViewMode::Terminal => {
                 let mode = if inst.is_sandboxed() {
                     self.get_terminal_mode(id)
@@ -2029,17 +1928,23 @@ impl HomeView {
                     TerminalMode::Host
                 };
                 match mode {
-                    TerminalMode::Host => {
-                        crate::tmux::TerminalSession::resolve_name(&inst.id, &inst.title)
-                    }
+                    TerminalMode::Host => crate::tmux::TerminalSession::resolve_name_for_display(
+                        &inst.id,
+                        &inst.title,
+                    ),
                     TerminalMode::Container => {
-                        crate::tmux::ContainerTerminalSession::resolve_name(&inst.id, &inst.title)
+                        crate::tmux::ContainerTerminalSession::resolve_name_for_display(
+                            &inst.id,
+                            &inst.title,
+                        )
                     }
                 }
             }
-            ViewMode::Tool(tool) => crate::tmux::ToolSession::new(&inst.id, &inst.title, tool)
-                .session_name()
-                .to_string(),
+            ViewMode::Tool(tool) => {
+                crate::tmux::ToolSession::for_display(&inst.id, &inst.title, tool)
+                    .session_name()
+                    .to_string()
+            }
         };
         Some(name)
     }
@@ -2101,20 +2006,15 @@ impl HomeView {
         }
     }
 
-    /// If the capture worker has fresh content, store it into `select`'s
-    /// cache and report `true` so the caller skips the synchronous fork.
-    /// Returns `false` when the worker has nothing new (cold start, or an
-    /// idle/unchanged pane), leaving the caller's `refresh_preview_cache_core`
-    /// to populate the cache once via the fork gate. Steady state across
-    /// every view goes through here, so `tmux capture-pane` stays off the
-    /// render thread.
-    /// Whether the preview holds its captured snapshot instead of following
-    /// live output. Decision lives in the pure [`preview_frozen`] helper so it
-    /// is unit-tested away from a live `HomeView`.
-    fn preview_is_frozen(&self) -> bool {
-        preview_frozen(self.preview_scroll_offset, self.preview_selection.is_some())
-    }
-
+    /// Apply the capture worker's newest frame to `select`'s cache. The
+    /// worker is the ONLY capture source: when it has nothing new (cold
+    /// start, retarget, unchanged pane), the cache keeps its last-good
+    /// content and this returns without writing, so paint never forks a
+    /// capture.
+    ///
+    /// The frame is consumed atomically: content, cursor, line budget, and
+    /// target generation travel together, so a frame can never be split
+    /// across a retarget or budget change.
     fn apply_worker_capture(
         &mut self,
         width: u16,
@@ -2125,9 +2025,8 @@ impl HomeView {
             return false;
         };
         // Frozen (reading scrollback, or a selection is in flight): don't apply
-        // the worker's live frames. Falling through leaves the held snapshot in
-        // place; `refresh_preview_cache_core` won't re-capture it either (its
-        // idle poll is gated on `!frozen`), so nothing shifts under the user.
+        // the worker's live frames. The held snapshot stays in place and the
+        // idle poll is gated on `!frozen`, so nothing shifts under the user.
         if self.preview_is_frozen() {
             return false;
         }
@@ -2137,30 +2036,48 @@ impl HomeView {
             return false;
         };
         worker.set_capture_lines(capture_lines);
-        let Some(content) = worker.take_latest() else {
+        let Some(frame) = worker.take_latest() else {
             return false;
         };
-        let captured_lines = select(self).store_capture(content, id, (width, height));
-        // `set_capture_lines` is async, so this frame may carry a capture
-        // produced under a smaller line budget (the user just scrolled back
-        // or the pane grew). If it doesn't cover the requested window, fall
-        // through so `refresh_preview_cache_core` does a one-off synchronous
-        // catch-up instead of clamping the offset against an undersized
-        // capture and snapping the preview toward the live edge.
+        // A frame captured before the last retarget must never land under the
+        // new view (the worker re-checks too; this closes the same race from
+        // the consumer side).
+        if !worker.frame_is_current(&frame) {
+            return false;
+        }
+        let captured_lines = select(self).store_capture(frame.content.clone(), id, (width, height));
+        // An EMPTY frame always applies: terminal / container panes forward
+        // empties precisely so a cleared shell drops its stale text (#1501's
+        // counterpart outside the agent kill switch), and there is nothing to
+        // clamp an offset against anyway.
+        //
+        // Otherwise: `set_capture_lines` is async, so this frame may carry a
+        // capture produced under a smaller line budget (the user just
+        // scrolled back or the pane grew). If it doesn't cover the requested
+        // window, skip clamping against the undersized capture (it would snap
+        // the preview toward the live edge); the worker republishes at the
+        // new budget and the next adequate frame clamps properly. There is NO
+        // synchronous catch-up anymore.
         //
         // An *exhausted* capture (fewer lines than requested because the pane
         // simply has no more, e.g. an alternate-screen agent with no scrollback)
-        // is not undersized: forwarding it to the synchronous catch-up would fork
-        // `capture-pane` on the render thread every frame and never do better, so
-        // apply it and keep the worker's off-thread capture in play.
-        if scroll_exceeds_cache(captured_lines, height, scroll_offset)
-            && !capture_is_exhausted(captured_lines, capture_lines)
+        // is not undersized: apply it so scroll state tracks the real pane.
+        if !frame.content.is_empty()
+            && scroll_exceeds_cache(captured_lines, height, scroll_offset)
+            && !capture_is_exhausted(captured_lines, frame.budget)
         {
-            return false;
+            return true;
         }
         self.preview_scroll_offset =
             clamp_scroll_to_capture(scroll_offset, captured_lines, self.preview_visible_rows);
         true
+    }
+
+    /// Whether the preview holds its captured snapshot instead of following
+    /// live output. Decision lives in the pure [`preview_frozen`] helper so it
+    /// is unit-tested away from a live `HomeView`.
+    fn preview_is_frozen(&self) -> bool {
+        preview_frozen(self.preview_scroll_offset, self.preview_selection.is_some())
     }
 
     pub(super) fn refresh_preview_cache_if_needed(&mut self, width: u16, height: u16) {
@@ -2197,6 +2114,15 @@ impl HomeView {
         // While in live-send mode, keep the agent's tmux pane sized to the
         // preview's visible output area so it renders directly into view.
         self.resize_live_pane_if_target(live_send::LiveSendTarget::Agent, width, height);
+        // Adopt resizes the snapshot poller completed since the last frame, so
+        // the dedup records only geometry the poller actually set.
+        for done in crate::tmux::take_passive_resize_dones() {
+            self.preview_pane_synced = Some((done.session_id.clone(), done.cols, done.rows));
+            if self.preview_pane_pending.as_ref() == Some(&(done.session_id, done.cols, done.rows))
+            {
+                self.preview_pane_pending = None;
+            }
+        }
 
         // Outside live-send nothing keeps the agent's pane sized to the
         // preview's output area. A full-screen agent is sized to whatever
@@ -2230,110 +2156,33 @@ impl HomeView {
                         self.preview_wake.notify_one();
                     }
                     PassiveResizeStep::Fire => {
-                        // Only record the dedup once the pane actually exists and was
-                        // resized. If a Stopped session we're viewing is started later
-                        // without an attach in this instance to clear the dedup (e.g.
-                        // a peer or the web structured view launches it), marking it synced now
-                        // would pin the preview to the pre-start size and keep clipping
-                        // until the next geometry change. Leaving it unset (and the
-                        // pending slot armed) retries on the next refresh; `exists()`
-                        // is cache-backed, so the retry is cheap.
-                        if let Some(session) = self
-                            .get_instance(&want.0)
-                            .and_then(|inst| inst.tmux_session().ok())
-                            .filter(|s| s.exists())
-                        {
-                            // Defer to anything actually driving this session's
-                            // size: a real tmux client (this TUI's own
-                            // `switch-client` attach registers no size owner, so
-                            // without the `is_attached` check the passive resize
-                            // shrank the window the user just attached to back to
-                            // the preview dimensions, #3071), or an active size
-                            // owner (a phone/desktop live client, or this TUI's
-                            // own live-send below). The detached preview is a
-                            // passive display, so it only sizes a session nobody
-                            // else is driving and never claims the lock itself;
-                            // leaving the dedup unset retries once the client
-                            // detaches or the owner disconnects.
-                            //
-                            // `is_attached` is checked first: it is one tmux call
-                            // against `has_active_size_owner`'s two, and being
-                            // attached is the sticky state here (the skip leaves
-                            // the pending slot armed, so this block re-runs every
-                            // poll for as long as the user stays attached).
-                            if !session.is_attached() && !session.has_active_size_owner() {
-                                session.resize_window(width, height);
-                                self.preview_pane_synced = Some(want);
-                                self.preview_pane_pending = None;
-                            }
+                        // The tmux work runs on the snapshot poller, never
+                        // paint: it re-runs the exact authoritative chain this
+                        // arm used to run inline (#3071 attach deference, size
+                        // owners, exists gate) before resizing. The pending
+                        // slot stays armed until the poller's completion above
+                        // adopts the dedup, so a session that does not exist
+                        // yet retries once started (by a peer or the web
+                        // structured view) instead of pinning a stale synced
+                        // geometry.
+                        if let Some(inst) = self.get_instance(&want.0) {
+                            crate::tmux::queue_passive_resize(crate::tmux::PassiveResizeIntent {
+                                session_id: want.0.clone(),
+                                title: inst.title.clone(),
+                                cols: want.1,
+                                rows: want.2,
+                            });
                         }
                     }
                 }
             }
         }
 
-        // Apply the worker's latest capture if it has fresh content; that's
-        // the steady-state path and never forks. Only a cold start (worker
-        // just retargeted) or an idle/unchanged pane falls through to the
-        // synchronous fork below.
-        if self.apply_worker_capture(width, height, |s| &mut s.preview_cache) {
-            return;
-        }
-
-        // Cold-start / fallback capture via the fork-based path
-        // (`Session::capture_pane` via the instance helper). The
-        // 250ms gate in `refresh_preview_cache_core` keeps this from forking
-        // every frame; in steady state the worker above satisfies the render.
-        //
-        // Live vs. non-live failure semantics differ. In live mode an empty
-        // capture (which is what `Session::capture_pane` returns when
-        // the session is gone OR tmux had a transient hiccup) preserves the
-        // last-known-good capture so the preview doesn't flash blank (the
-        // kill-switch behavior introduced in #1501). The capture closure
-        // returns `None` for that case so the core leaves every cache field
-        // alone, including `session_id` and `dimensions`, which document
-        // "what's in `content`" and would lie if updated past a stale snapshot.
-        // Outside live mode the empty content surfaces as "No output
-        // available", the intended signal that the underlying session is gone.
-        self.refresh_preview_cache_core(
-            width,
-            height,
-            false,
-            |s| &mut s.preview_cache,
-            |s, id, capture_lines| {
-                let in_live = s
-                    .live_send
-                    .as_ref()
-                    .is_some_and(|st| st.target == live_send::LiveSendTarget::Agent);
-                // Only treat an empty fork capture as "preserve the existing
-                // cache" when the cache is FOR THIS SAME SESSION. If the user
-                // just switched live-send from session A to session B and B's
-                // first capture comes back empty, holding the kill-switch would
-                // leave A's content on screen under B's header. Cross-session we
-                // always overwrite, falling back to an empty body (the same
-                // "session looks gone" signal the non-live path uses).
-                let same_session = s.preview_cache.session_id.as_deref() == Some(id);
-                // Composited in BOTH modes, matching what the worker publishes.
-                // This fallback also runs on every idle refresh (the worker
-                // dedups unchanged frames, so it has nothing to hand over), so a
-                // pane-0-only capture here would clobber the worker's composite
-                // a beat after each keystroke and leave the split visible for
-                // only one frame at a time. On an unsplit window this returns
-                // the pane bytes verbatim, so nothing changes there.
-                let fork_capture = s
-                    .get_instance(id)
-                    .and_then(|inst| inst.capture_output_composited(capture_lines).ok());
-                if in_live {
-                    match fork_capture {
-                        Some(content) if !content.is_empty() => Some(content),
-                        _ if same_session => None,
-                        _ => Some(String::new()),
-                    }
-                } else {
-                    Some(fork_capture.unwrap_or_default())
-                }
-            },
-        );
+        // The capture worker is the ONLY capture source. Apply its newest
+        // frame; when it has nothing yet (cold start, retarget, unchanged
+        // pane), the cache keeps its last-good content and the frame shows
+        // that or the empty state. Paint never forks a capture fallback.
+        self.apply_worker_capture(width, height, |s| &mut s.preview_cache);
     }
 
     /// Refresh terminal preview cache if needed (for host terminals)
@@ -2343,25 +2192,9 @@ impl HomeView {
         // the visible output area so a window resize or info-header toggle
         // reflows the shell instead of waiting for a live-mode re-enter.
         self.resize_live_pane_if_target(live_send::LiveSendTarget::Terminal, width, height);
-        // Worker (retargeted to this pane in `render_preview`) drives the
-        // steady-state refresh fork-free; the core below is the cold-start /
-        // empty-worker fallback.
-        if self.apply_worker_capture(width, height, |s| &mut s.terminal_preview_cache) {
-            return;
-        }
-        self.refresh_preview_cache_core(
-            width,
-            height,
-            false,
-            |s| &mut s.terminal_preview_cache,
-            |s, id, capture_lines| {
-                s.get_instance(id).map(|inst| {
-                    inst.terminal_tmux_session()
-                        .and_then(|sess| sess.capture_window_composited(capture_lines))
-                        .unwrap_or_default()
-                })
-            },
-        );
+        // Worker-only: no synchronous fallback. A cold or unchanged worker
+        // leaves the last-good cache content on screen.
+        self.apply_worker_capture(width, height, |s| &mut s.terminal_preview_cache);
     }
 
     /// Refresh container terminal preview cache if needed
@@ -2375,22 +2208,7 @@ impl HomeView {
             width,
             height,
         );
-        if self.apply_worker_capture(width, height, |s| &mut s.container_terminal_preview_cache) {
-            return;
-        }
-        self.refresh_preview_cache_core(
-            width,
-            height,
-            false,
-            |s| &mut s.container_terminal_preview_cache,
-            |s, id, capture_lines| {
-                s.get_instance(id).map(|inst| {
-                    inst.container_terminal_tmux_session()
-                        .and_then(|sess| sess.capture_window_composited(capture_lines))
-                        .unwrap_or_default()
-                })
-            },
-        );
+        self.apply_worker_capture(width, height, |s| &mut s.container_terminal_preview_cache);
     }
 
     pub(super) fn refresh_tool_preview_cache_if_needed(
@@ -2409,22 +2227,7 @@ impl HomeView {
             width,
             height,
         );
-        if self.apply_worker_capture(width, height, |s| &mut s.tool_preview_cache) {
-            return;
-        }
-        self.refresh_preview_cache_core(
-            width,
-            height,
-            false,
-            |s| &mut s.tool_preview_cache,
-            |s, id, capture_lines| {
-                s.get_instance(id).map(|inst| {
-                    crate::tmux::ToolSession::new(&inst.id, &inst.title, tool_name)
-                        .capture_window_composited(capture_lines)
-                        .unwrap_or_default()
-                })
-            },
-        );
+        self.apply_worker_capture(width, height, |s| &mut s.tool_preview_cache);
     }
 
     /// `captured_lines` from whichever preview cache is currently on screen.
@@ -2982,24 +2785,28 @@ impl HomeView {
                         // every frame, and the preview capture above is already
                         // worker-driven, so a per-name `has-session` here would
                         // be the only fork left in a steady-state frame.
-                        let (terminal_running, preview_text) = match terminal_mode {
-                            TerminalMode::Container => {
-                                let running =
-                                    inst.container_terminal_tmux_session().is_ok_and(|s| {
-                                        crate::tmux::session_exists_for_display(s.name())
-                                    });
-                                (
-                                    running,
-                                    self.container_terminal_preview_cache.parsed_text.as_ref(),
-                                )
-                            }
-                            TerminalMode::Host => {
-                                let running = inst.terminal_tmux_session().is_ok_and(|s| {
-                                    crate::tmux::session_exists_for_display(s.name())
-                                });
-                                (running, self.terminal_preview_cache.parsed_text.as_ref())
-                            }
-                        };
+                        let (terminal_running, preview_text) =
+                            match terminal_mode {
+                                TerminalMode::Container => {
+                                    let name = crate::tmux::ContainerTerminalSession::
+                                    resolve_name_for_display(&inst.id, &inst.title);
+                                    (
+                                        crate::tmux::session_exists_for_display(&name),
+                                        self.container_terminal_preview_cache.parsed_text.as_ref(),
+                                    )
+                                }
+                                TerminalMode::Host => {
+                                    let name =
+                                        crate::tmux::TerminalSession::resolve_name_for_display(
+                                            &inst.id,
+                                            &inst.title,
+                                        );
+                                    (
+                                        crate::tmux::session_exists_for_display(&name),
+                                        self.terminal_preview_cache.parsed_text.as_ref(),
+                                    )
+                                }
+                            };
 
                         Preview::render_terminal_preview(
                             frame,
@@ -3057,8 +2864,11 @@ impl HomeView {
                     self.set_preview_text_view(pane_area, total_lines);
 
                     if let Some(inst) = self.get_instance(&id) {
-                        let tool_session =
-                            crate::tmux::ToolSession::new(&inst.id, &inst.title, &tool_name);
+                        let tool_session = crate::tmux::ToolSession::for_display(
+                            &inst.id,
+                            &inst.title,
+                            &tool_name,
+                        );
                         // Snapshot-backed for the same reason as the rows:
                         // this pair used to be the two remaining per-frame
                         // forks on the render thread in Tool view.
@@ -4545,30 +4355,6 @@ mod tests {
             capture_lines_for(u16::MAX, u16::MAX),
             u16::MAX as usize * 2 + CAPTURE_BUFFER as usize
         );
-    }
-
-    #[test]
-    fn capture_window_stale_breaks_the_fork_loop_at_history_top() {
-        // Frozen: exact coverage test, no CAPTURE_BUFFER headroom. At the top
-        // the offset is clamped to captured - visible_rows, so the viewport is
-        // exactly covered and no re-capture fires (the per-frame capture-pane
-        // fork loop). Uses visible_rows, not the raw pane height.
-        assert!(!capture_window_stale(true, 100, /*height*/ 999, 20, 80));
-        // A viewport that genuinely runs past the captured content still
-        // refreshes so a deeper read can grow the window.
-        assert!(capture_window_stale(true, 100, 999, 20, 90));
-        // Not frozen (the live edge, scroll 0): a cold cache still forces the
-        // first capture, but a warm one is covered even when it is shorter than
-        // height + CAPTURE_BUFFER, because an exhausted pane has no more lines to
-        // give. This is the live-view counterpart of the frozen fix above.
-        let height = 30u16; // capture_lines_for(30, 0) = 50
-                            // Cold cache: nothing captured yet, so the first capture must fire.
-        assert!(capture_window_stale(false, 0, height, 20, 0));
-        // Alternate-screen agent: capture is exactly `height` (no scrollback),
-        // always short of the 50-line request. Must read as covered, not stale.
-        assert!(!capture_window_stale(false, height as usize, height, 20, 0));
-        // Main-screen pane with scrollback: full height + BUFFER, covered.
-        assert!(!capture_window_stale(false, 50, height, 20, 0));
     }
 
     #[test]

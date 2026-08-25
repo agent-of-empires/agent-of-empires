@@ -16678,13 +16678,11 @@ mod live_send_mode {
     #[serial]
     fn refresh_terminal_cache_overwrites_on_empty_capture() {
         // Counterpart to `refresh_preserves_cache_when_live_capture_fails`:
-        // the agent cache and the host-terminal cache now share
-        // `refresh_preview_cache_core`, but only the agent wrapper carries the
-        // live-send kill switch. The terminal path must keep its old semantics
-        // (overwrite to empty so the preview surfaces "session looks gone")
-        // even when the unit fixture's backing tmux session does not exist and
-        // the capture comes back empty. Guards against the kill switch leaking
-        // into the shared core for the non-agent wrappers.
+        // only the agent path carries the live-send kill switch. The terminal
+        // path must overwrite to empty so the preview surfaces "session looks
+        // gone". With the worker as the ONLY capture source, the empty frame
+        // arrives through the mailbox (the worker forwards empties for
+        // terminal panes); paint applies it without any synchronous fork.
         let mut env = create_test_env_with_sessions(1);
         let id = env
             .view
@@ -16700,6 +16698,12 @@ mod live_send_mode {
         env.view.terminal_preview_cache.captured_lines = 1;
         env.view.terminal_preview_cache.dimensions = (10, 10);
         env.view.terminal_preview_cache.session_id = Some(id.clone());
+
+        env.view
+            .sync_preview_capture_worker(Some("aoe_test_missing_terminal".to_string()));
+        if let Some(worker) = env.view.preview_capture_worker.as_ref() {
+            worker.inject_frame_for_test(40, "");
+        }
 
         env.view.refresh_terminal_preview_cache_if_needed(80, 24);
 

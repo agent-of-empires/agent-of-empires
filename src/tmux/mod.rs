@@ -38,7 +38,7 @@ pub mod test_support {
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
-use std::sync::{OnceLock, RwLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
 /// Environment variable that overrides the tmux socket path. Set by the e2e
@@ -173,6 +173,8 @@ fn socket_from_config_name(name: Option<String>) -> Option<TmuxSocket> {
 /// `Command::new("tmux")` would fall back to the default socket and split state
 /// across two servers.
 pub(crate) fn tmux_command() -> Command {
+    #[cfg(test)]
+    fork_probe::record();
     let mut cmd = Command::new("tmux");
     match tmux_socket() {
         Some(TmuxSocket::Path(path)) => {
@@ -695,6 +697,22 @@ pub(crate) fn live_session_name(derived: &str, shape: &NameShape) -> String {
     session_name_from_cache(derived, shape).unwrap_or_else(|| derived.to_string())
 }
 
+/// [`live_session_name`] for **render paths**: answered from the current
+/// snapshot only, never refreshing. A stale or missing snapshot resolves to
+/// the derived name; the background [`spawn_snapshot_poller`] refreshes the
+/// snapshot and the next frame self-corrects onto a renamed session. Paint
+/// must never wait on tmux, so unlike [`live_session_name`] there is no
+/// synchronous fallback.
+pub(crate) fn display_session_name(derived: &str, shape: &NameShape) -> String {
+    session_name_from_cache(derived, shape).unwrap_or_else(|| derived.to_string())
+}
+
+/// `display_session_name` for the agent pane.
+pub(crate) fn display_agent_session_name(session_id: &str, derived: &str) -> String {
+    let suffix = id_suffix(session_id);
+    display_session_name(derived, &NameShape::agent(&suffix))
+}
+
 /// `live_session_name` for the agent pane.
 pub fn live_agent_session_name(session_id: &str, derived: &str) -> String {
     let suffix = id_suffix(session_id);
@@ -955,6 +973,50 @@ pub fn test_inject_session_into_cache(name: &str) {
         cache.time = Some(Instant::now());
     }
 }
+/// Test-only instrumentation at the process's single tmux entry point.
+///
+/// `tmux_command()` records one hit per invocation on the *current* thread
+/// while that thread is armed, so a paint-path regression test can assert
+/// zero forks from the render thread while worker threads (capture, live
+/// send) fork freely. Never compiled outside `cfg(test)`.
+#[cfg(test)]
+pub(crate) mod fork_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static ARMED: Cell<bool> = const { Cell::new(false) };
+        static COUNT: Cell<u64> = const { Cell::new(0) };
+    }
+
+    /// Arms fork counting for the calling thread until the guard drops.
+    pub(crate) struct Guard;
+
+    pub(crate) fn arm() -> Guard {
+        ARMED.with(|a| a.set(true));
+        Guard
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            ARMED.with(|a| a.set(false));
+        }
+    }
+
+    pub(crate) fn record() {
+        if ARMED.with(Cell::get) {
+            COUNT.with(|c| c.set(c.get() + 1));
+        }
+    }
+
+    /// Returns the armed thread's fork count since the last call.
+    pub(crate) fn take() -> u64 {
+        COUNT.with(|c| {
+            let n = c.get();
+            c.set(0);
+            n
+        })
+    }
+}
 
 /// Test-only RAII guard for tests that force [`SESSION_CACHE`] into a known
 /// state (e.g. simulating a server-unreachable snapshot for
@@ -992,6 +1054,15 @@ impl SessionCacheGuard {
         if let Ok(mut cache) = SESSION_CACHE.write() {
             cache.data = Some(names.iter().map(|n| (n.to_string(), 0)).collect());
             cache.time = Some(Instant::now());
+        }
+    }
+
+    /// Force an EXPIRED snapshot with data intact: what the shared cache
+    /// looks like just past [`CACHE_TTL`] after a successful refresh. Paint
+    /// must answer from it anyway instead of re-forking.
+    pub(crate) fn force_stale(&self) {
+        if let Ok(mut cache) = SESSION_CACHE.write() {
+            cache.time = Some(Instant::now() - CACHE_TTL - Duration::from_secs(1));
         }
     }
 }
@@ -1033,8 +1104,14 @@ impl PaneMetaCacheGuard {
             cache.time = Some(Instant::now());
         }
     }
+    /// Force an EXPIRED snapshot: the past-`CACHE_TTL` state that paint must
+    /// answer from without re-forking once display helpers are cache-only.
+    pub(crate) fn force_stale(&self) {
+        if let Ok(mut cache) = PANE_META_CACHE.write() {
+            cache.time = Some(Instant::now() - CACHE_TTL - Duration::from_secs(1));
+        }
+    }
 }
-
 #[cfg(test)]
 impl Drop for PaneMetaCacheGuard {
     fn drop(&mut self) {
@@ -1157,7 +1234,7 @@ pub fn session_exists(name: &str) -> bool {
 }
 
 /// Session liveness for a **render path**, answered from the shared snapshot
-/// and never from a per-name probe.
+/// only: never a per-name probe, never a synchronous refresh.
 ///
 /// [`session_exists`] falls through to a live `has-session` on a cache miss so
 /// teardown and drift decisions can't act on a cached false negative. A row
@@ -1167,15 +1244,13 @@ pub fn session_exists(name: &str) -> bool {
 /// rows read `Instance.status` straight from the poller's batched snapshot.
 ///
 /// The trade is that a session created since the last scan reads as absent for
-/// up to `CACHE_TTL`. Call sites that start or kill a pane already force a
-/// [`refresh_session_cache`], so the glyph flips immediately there; the TTL
-/// only covers panes created behind this process's back.
-///
-/// An unreachable tmux server resolves to `false` (nothing to draw as live)
-/// without re-forking per row, because [`probe_session_existence`] treats a
-/// fresh "server did not answer" snapshot as an answer.
+/// up to `CACHE_TTL`, and an expired snapshot reads as absent until the
+/// background [`spawn_snapshot_poller`] refreshes it. Call sites that start or
+/// kill a pane already force a [`refresh_session_cache`], so the glyph flips
+/// immediately there; the poller covers panes created behind this process's
+/// back. Paint must never wait on tmux, so there is no synchronous fallback.
 pub fn session_exists_for_display(name: &str) -> bool {
-    matches!(probe_session_existence(name), SessionExistence::Present)
+    session_existence_from_cache(name) == Some(SessionExistence::Present)
 }
 
 /// Pane-dead state for a **render path**, from a shared `list-panes -a`
@@ -1192,10 +1267,6 @@ pub fn session_exists_for_display(name: &str) -> bool {
 /// than "everything is dead". Callers gate on existence first, so a missing
 /// key is an absent session rather than a live pane.
 pub fn pane_dead_for_display(name: &str) -> bool {
-    if let Some(dead) = pane_dead_from_cache(name) {
-        return dead;
-    }
-    refresh_pane_meta_cache();
     pane_dead_from_cache(name).unwrap_or(false)
 }
 
@@ -1227,6 +1298,113 @@ fn refresh_pane_meta_cache() {
         cache.data = data;
         cache.time = Some(Instant::now());
     }
+}
+
+/// One queued passive preview resize, pushed by the render thread when its
+/// debounce fires and executed here on the snapshot poller's thread.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PassiveResizeIntent {
+    pub session_id: String,
+    pub title: String,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+/// A passive resize the poller completed. The render thread consumes these to
+/// adopt the (session, cols, rows) dedup exactly as the old in-paint path did
+/// on success.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PassiveResizeDone {
+    pub session_id: String,
+    pub cols: u16,
+    pub rows: u16,
+}
+
+static PASSIVE_RESIZE_INTENTS: Mutex<Vec<PassiveResizeIntent>> = Mutex::new(Vec::new());
+static PASSIVE_RESIZE_DONES: Mutex<Vec<PassiveResizeDone>> = Mutex::new(Vec::new());
+
+/// Queue a passive preview resize for the poller. Non-blocking by contract:
+/// this is called from paint.
+pub(crate) fn queue_passive_resize(intent: PassiveResizeIntent) {
+    if let Ok(mut queue) = PASSIVE_RESIZE_INTENTS.lock() {
+        queue.push(intent);
+    }
+}
+
+/// Drain the completions the poller published since the last call. Called
+/// from paint each frame.
+pub(crate) fn take_passive_resize_dones() -> Vec<PassiveResizeDone> {
+    PASSIVE_RESIZE_DONES
+        .lock()
+        .map(|mut guard| std::mem::take(&mut *guard))
+        .unwrap_or_default()
+}
+
+/// Execute one queued passive resize with EXACTLY the authoritative checks the
+/// in-paint path used before it moved off the render thread (#3071): skip a
+/// session that no longer exists (leaving the intent unconsumed so a later
+/// start retries), defer to an attached client or an active size owner, and
+/// only then `resize-window`. Publishes a completion on success so the render
+/// thread can record the dedup.
+fn execute_passive_resizes() {
+    let intents = PASSIVE_RESIZE_INTENTS
+        .lock()
+        .map(|mut guard| std::mem::take(&mut *guard))
+        .unwrap_or_default();
+    // Same intent re-queued every frame while pending: keep one.
+    let mut unique: Vec<PassiveResizeIntent> = Vec::new();
+    for intent in intents {
+        if unique
+            .last()
+            .is_none_or(|prev| prev.session_id != intent.session_id)
+        {
+            unique.retain(|prev| prev.session_id != intent.session_id);
+            unique.push(intent);
+        }
+    }
+    for intent in unique {
+        let Some(session) = Session::new(&intent.session_id, &intent.title)
+            .ok()
+            .filter(|s| s.exists())
+        else {
+            continue;
+        };
+        if session.is_attached() || session.has_active_size_owner() {
+            continue;
+        }
+        session.resize_window(intent.cols, intent.rows);
+        if let Ok(mut dones) = PASSIVE_RESIZE_DONES.lock() {
+            dones.push(PassiveResizeDone {
+                session_id: intent.session_id,
+                cols: intent.cols,
+                rows: intent.rows,
+            });
+        }
+    }
+}
+
+/// Background poller that keeps [`SESSION_CACHE`] and [`PANE_META_CACHE`]
+/// fresh so every `_for_display` helper and cache-only name resolution can
+/// answer from the snapshot without ever forking from the paint thread, and
+/// that executes queued passive preview resizes off paint. Commands run under
+/// the shared timeout; a tmux outage costs two bounded forks per cycle, never
+/// per row or per frame.
+///
+/// Idempotent: later calls are no-ops. The daemon thread dies with the
+/// process.
+pub fn spawn_snapshot_poller() {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let _ = std::thread::Builder::new()
+        .name("aoe-display-snapshot".to_string())
+        .spawn(|| loop {
+            refresh_session_cache();
+            refresh_pane_meta_cache();
+            execute_passive_resizes();
+            std::thread::sleep(CACHE_TTL);
+        });
 }
 
 pub fn get_current_session_name() -> Option<String> {

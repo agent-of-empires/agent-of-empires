@@ -135,16 +135,35 @@ impl PairedTerminal {
     /// spawn a fresh shell under the new name and orphan the pane the user was
     /// working in, exactly as the agent pane did before #3157.
     fn resolve_name(kind: TerminalKind, id: &str, title: &str, index: u32) -> String {
+        Self::resolve_name_inner(kind, id, title, index, false)
+    }
+
+    /// [`Self::resolve_name`] restricted to the current snapshot: no refresh,
+    /// so a stale snapshot yields the derived name until the background
+    /// snapshot poller refreshes it. Render paths only.
+    fn resolve_name_for_display(kind: TerminalKind, id: &str, title: &str, index: u32) -> String {
+        Self::resolve_name_inner(kind, id, title, index, true)
+    }
+
+    fn resolve_name_inner(
+        kind: TerminalKind,
+        id: &str,
+        title: &str,
+        index: u32,
+        display_only: bool,
+    ) -> String {
         let derived = Self::generate_name(kind, id, title, index);
         let suffix = Self::name_suffix(id, index);
-        crate::tmux::live_session_name(
-            &derived,
-            &crate::tmux::NameShape {
-                prefix: kind.prefix(),
-                suffix: &suffix,
-                excluded_prefixes: &[],
-            },
-        )
+        let shape = crate::tmux::NameShape {
+            prefix: kind.prefix(),
+            suffix: &suffix,
+            excluded_prefixes: &[],
+        };
+        if display_only {
+            crate::tmux::display_session_name(&derived, &shape)
+        } else {
+            crate::tmux::live_session_name(&derived, &shape)
+        }
     }
 
     fn new(kind: TerminalKind, id: &str, title: &str, index: u32) -> Self {
@@ -340,6 +359,12 @@ impl TerminalSession {
         PairedTerminal::resolve_name(TerminalKind::Host, id, title, index)
     }
 
+    /// [`Self::resolve_name`] for render paths: snapshot-only, never
+    /// refreshing. See [`PairedTerminal::resolve_name_for_display`].
+    pub fn resolve_name_for_display(id: &str, title: &str) -> String {
+        PairedTerminal::resolve_name_for_display(TerminalKind::Host, id, title, 0)
+    }
+
     pub fn generate_name(id: &str, title: &str) -> String {
         Self::generate_name_indexed(id, title, 0)
     }
@@ -419,6 +444,12 @@ impl ContainerTerminalSession {
     /// [`Self::resolve_name`] for the web dashboard's additional terminal tabs.
     pub fn resolve_name_indexed(id: &str, title: &str, index: u32) -> String {
         PairedTerminal::resolve_name(TerminalKind::Container, id, title, index)
+    }
+
+    /// [`Self::resolve_name`] for render paths: snapshot-only, never
+    /// refreshing. See [`PairedTerminal::resolve_name_for_display`].
+    pub fn resolve_name_for_display(id: &str, title: &str) -> String {
+        PairedTerminal::resolve_name_for_display(TerminalKind::Container, id, title, 0)
     }
 
     pub fn generate_name(id: &str, title: &str) -> String {
