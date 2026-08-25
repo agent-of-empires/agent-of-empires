@@ -99,8 +99,9 @@ pub enum ForkStrategy {
 /// Wire mirror: `web/src/lib/types.ts` (`AgentLifecycleInfo`, served by
 /// `/api/agents` and `/api/acp/agents`) and the static fallback mirror in
 /// `web/src/lib/agentProfiles.ts`. When adding a variant, update both TS
-/// files in the same change: the closed `"state"` union there is the one
-/// place a new variant does not fail compilation.
+/// files and give the variant an arm in [`AgentDef::lifecycle_label`] in
+/// the same change: the closed `"state"` union on the TS side and that
+/// match arm are the two places a new variant does not fail compilation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum AgentLifecycle {
@@ -1440,6 +1441,17 @@ impl AgentDef {
 
 pub fn get_agent(name: &str) -> Option<&'static AgentDef> {
     AGENTS.iter().find(|a| a.name == name)
+}
+
+/// Registry lifecycle state for an ACP-registry key. Falls back to Active
+/// for registry entries with no `AGENTS` counterpart (bundled or alias-only
+/// keys). Shared by the doctor, `/api/acp/agents`, and `aoe acp agents`
+/// surfaces; every consumer is serve-gated, so the helper is too.
+#[cfg(feature = "serve")]
+pub(crate) fn registry_lifecycle(name: &str) -> AgentLifecycle {
+    get_agent(name)
+        .map(|def| def.lifecycle)
+        .unwrap_or(AgentLifecycle::Active)
 }
 
 /// Whether switching a structured-view session back to a terminal can hand

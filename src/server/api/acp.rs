@@ -890,7 +890,7 @@ fn acp_agent_entries(
             name: name.clone(),
             description: spec.description.clone(),
             command: spec.command.clone(),
-            lifecycle: crate::cli::acp::registry_lifecycle(name),
+            lifecycle: crate::agents::registry_lifecycle(name),
         })
         .collect();
     entries.sort_by(|a, b| a.name.cmp(&b.name));

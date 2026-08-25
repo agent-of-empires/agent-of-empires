@@ -200,13 +200,17 @@ const GEMINI: AgentProfile = {
 
 /** Canonical wire shape of the server's agent lifecycle; `types.ts`
  *  imports it from here so this module stays the dependency-free source
- *  every surface can import. Mirrors `AgentLifecycle` in src/agents.rs. */
-export interface AgentLifecycleInfo {
-  state: "active" | "deprecated";
-  since?: string | null;
-  note?: string | null;
-  replacement?: string | null;
-}
+ *  every surface can import. Mirrors `AgentLifecycle` in src/agents.rs:
+ *  the deprecated arm carries since/note as required strings (the server
+ *  always serializes them) with replacement nullable. */
+export type AgentLifecycleInfo =
+  | { state: "active" }
+  | {
+      state: "deprecated";
+      since: string;
+      note: string;
+      replacement: string | null;
+    };
 
 /** Lifecycle fallback for profiles without one (and unknown keys): plain
  *  Active, matching the server omitting the field entirely. */

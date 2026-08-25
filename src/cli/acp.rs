@@ -11,6 +11,7 @@ use clap::Subcommand;
 use crate::acp::agent_registry::AgentRegistry;
 use crate::acp::install_hints::install_hint_for;
 use crate::acp::node;
+use crate::agents::registry_lifecycle;
 
 #[derive(Subcommand)]
 pub enum AcpCommands {
@@ -239,15 +240,6 @@ struct AgentDoctorEntry {
     /// `[OK]` then.
     #[serde(skip_serializing_if = "Option::is_none")]
     version_issue: Option<AgentVersionIssue>,
-}
-
-/// Registry lifecycle state for an ACP registry key. Falls back to Active
-/// for registry entries with no `AGENTS` counterpart. Shared by the doctor
-/// and `/api/acp/agents` surfaces.
-pub(crate) fn registry_lifecycle(name: &str) -> crate::agents::AgentLifecycle {
-    crate::agents::get_agent(name)
-        .map(|def| def.lifecycle)
-        .unwrap_or(crate::agents::AgentLifecycle::Active)
 }
 
 /// A version-gate finding for one configured agent: the remediation is

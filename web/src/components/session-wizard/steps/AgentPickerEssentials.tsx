@@ -14,10 +14,11 @@ interface Props {
 
 /** One-line deprecation warning for a selected deprecated agent. Server
  *  lifecycle wins when present; falls back to the static profile mirror so
- *  the notice still renders against older daemons. */
-function lifecycleWarningText(name: string, lifecycle: AgentLifecycleInfo): string {
+ *  the notice still renders against older daemons. Only ever called with
+ *  the deprecated arm, where since/note are required strings. */
+function lifecycleWarningText(name: string, lifecycle: Extract<AgentLifecycleInfo, { state: "deprecated" }>): string {
   const replacement = lifecycle.replacement ? `; consider switching to ${lifecycle.replacement}` : "";
-  return `${name} is deprecated (since ${lifecycle.since ?? "unknown"}): ${lifecycle.note ?? ""}${replacement}`;
+  return `${name} is deprecated (since ${lifecycle.since}): ${lifecycle.note}${replacement}`;
 }
 
 /** Always-visible essentials of the agent section: just the agent picker
