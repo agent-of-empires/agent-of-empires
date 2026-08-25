@@ -12,7 +12,7 @@ use ratatui::widgets::*;
 use tui_input::backend::crossterm::EventHandler;
 use tui_input::Input;
 
-use super::render_text_field;
+use super::{cycler::tool_lifecycle_spans, render_text_field};
 use crate::tui::styles::Theme;
 
 /// Tool-config overlay fields: command override, then extra args.
@@ -20,12 +20,28 @@ pub const TOOL_CONFIG_CMD: usize = 0;
 pub const TOOL_CONFIG_ARGS: usize = 1;
 const TOOL_CONFIG_FIELD_COUNT: usize = 2;
 
-/// Trailing spans appended to the Tool row: a dimmed (configured) marker
-/// when an override is set, plus the Ctrl+P hint while the row is focused.
-/// has_config is true when either the command override or extra args is
-/// non-empty. compact shortens the focused configured hint so a higher-
-/// priority status badge can share the fixed-width row without clipping.
-pub fn tool_config_suffix_spans(
+/// Trailing lifecycle and configuration spans appended to the Tool row.
+/// Lifecycle status comes first so lower-priority configuration metadata cannot
+/// clip it. The focused configuration hint is compact when a status is present.
+pub fn tool_row_suffix_spans(
+    tool: &str,
+    has_config: bool,
+    focused: bool,
+    theme: &Theme,
+) -> Vec<Span<'static>> {
+    let mut spans = tool_lifecycle_spans(tool, theme);
+    let compact_config = !spans.is_empty();
+    spans.extend(tool_config_suffix_spans(
+        has_config,
+        focused,
+        compact_config,
+        theme,
+    ));
+    spans
+}
+
+/// Configuration spans appended after higher-priority Tool row status.
+fn tool_config_suffix_spans(
     has_config: bool,
     focused: bool,
     compact: bool,

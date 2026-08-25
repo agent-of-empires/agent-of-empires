@@ -14,7 +14,7 @@ mod text;
 mod text_input;
 mod tool_config;
 
-pub use cycler::{profile_cycler_spans, tool_cycler_spans, tool_lifecycle_spans};
+pub use cycler::{profile_cycler_spans, tool_cycler_spans};
 pub use dir_picker::{DirPicker, DirPickerResult};
 pub use help::HelpOverlay;
 pub use list_picker::{ListPicker, ListPickerResult};
@@ -26,5 +26,5 @@ pub use text_input::{
     set_input_cursor_position, set_prefixed_input_cursor_position, GroupGhostCompletion,
 };
 pub use tool_config::{
-    handle_tool_config_key, render_tool_config_overlay, tool_config_suffix_spans, ToolConfigOutcome,
+    handle_tool_config_key, render_tool_config_overlay, tool_row_suffix_spans, ToolConfigOutcome,
 };

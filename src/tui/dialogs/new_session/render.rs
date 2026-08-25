@@ -10,7 +10,7 @@ use super::{NewSessionDialog, FIELD_HELP, HELP_DIALOG_WIDTH};
 use crate::tui::components::{
     focused_input_spans, input_scroll, profile_cycler_spans, render_text_field,
     render_text_field_with_ghost, render_tool_config_overlay, set_prefixed_input_cursor_position,
-    tool_config_suffix_spans, tool_cycler_spans, tool_lifecycle_spans, visible_slice,
+    tool_cycler_spans, tool_row_suffix_spans, visible_slice,
 };
 use crate::tui::styles::Theme;
 
@@ -218,14 +218,14 @@ impl NewSessionDialog {
         self.focusable_rects.push((title_field, area));
         ci += 1;
 
-        // Tool (always shown, interactive or read-only). The cycler itself is
-        // shared with the Restart dialog via `tool_cycler_spans`; the New
-        // dialog appends its own config summary and Ctrl+P hint afterwards.
+        // Tool (always shown, interactive or read-only). The cycler and suffix
+        // ordering are shared with the Restart dialog.
         let tool_field = base + 2;
         let is_tool_focused = has_tool_selection && self.focused_field == tool_field;
+        let selected_tool = self.available_tools[self.tool_index].as_str();
         let mut tool_spans = tool_cycler_spans(
             "Tool:",
-            self.available_tools[self.tool_index].as_str(),
+            selected_tool,
             self.tool_index,
             self.available_tools.len(),
             is_tool_focused,
@@ -233,14 +233,10 @@ impl NewSessionDialog {
         );
         let has_config =
             !self.extra_args.value().is_empty() || !self.command_override.value().is_empty();
-        tool_spans.extend(tool_config_suffix_spans(
+        tool_spans.extend(tool_row_suffix_spans(
+            selected_tool,
             has_config,
             is_tool_focused,
-            false,
-            theme,
-        ));
-        tool_spans.extend(tool_lifecycle_spans(
-            self.available_tools[self.tool_index].as_str(),
             theme,
         ));
         let area = chunks[ci];

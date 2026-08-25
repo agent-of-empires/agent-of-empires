@@ -49,28 +49,50 @@ fn test_esc_cancels() {
 }
 
 #[test]
-fn test_deprecated_tool_badge_renders_on_single_tool_read_only_row() {
-    // Alternate render path: one available tool drops the cycler affordances
-    // (total <= 1 early return), but the lifecycle suffix must still reach
-    // the row through the unconditional extend at the call site.
-    let mut dialog = NewSessionDialog::new_with_tools(vec!["gemini"], TEST_PATH.to_string());
-    let mut terminal =
-        ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 40)).expect("terminal");
+fn test_deprecated_tool_badge_remains_visible_on_tool_rows() {
+    use ratatui::{backend::TestBackend, Terminal};
+
+    let mut cases = [
+        (
+            "single-tool read-only",
+            NewSessionDialog::new_with_tools(vec!["gemini"], TEST_PATH.to_string()),
+            100,
+        ),
+        (
+            "constrained configured",
+            NewSessionDialog::new_with_tools(
+                vec!["claude", "codex", "gemini"],
+                TEST_PATH.to_string(),
+            ),
+            64,
+        ),
+    ];
+    cases[1].1.tool_index = 2;
+    cases[1].1.focused_field = 2;
+    cases[1].1.command_override = Input::new("custom-wrapper".to_string());
+    cases[1].1.extra_args = Input::new("--model long --verbose".to_string());
+
     let theme = crate::tui::styles::Theme::default();
-    terminal
-        .draw(|frame| dialog.render(frame, frame.area(), &theme))
-        .expect("render");
-    let content = terminal
-        .backend()
-        .buffer()
-        .content()
-        .iter()
-        .map(|cell| cell.symbol())
-        .collect::<String>();
-    assert!(
-        content.contains("⚠ deprecated"),
-        "single-tool gemini row must carry the deprecation suffix; got: {content}"
-    );
+    for (name, dialog, width) in &mut cases {
+        let mut terminal = Terminal::new(TestBackend::new(*width, 40)).expect("terminal");
+        terminal
+            .draw(|frame| dialog.render(frame, frame.area(), &theme))
+            .expect("render");
+        let content = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            content.contains("⚠ deprecated"),
+            "{name} gemini row must carry the deprecation suffix; got: {content}"
+        );
+        if *name == "constrained configured" {
+            assert!(content.contains("(configured) Ctrl+P"), "{content}");
+        }
+    }
 }
 
 #[test]
