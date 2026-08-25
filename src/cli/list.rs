@@ -76,6 +76,20 @@ pub(super) fn state_tag(inst: &Instance) -> &'static str {
     }
 }
 
+/// Mirrors the API's snooze surfacing rule (`SessionResponse::from_instance`,
+/// `src/server/api/sessions.rs`): expose `snoozed_until` only while
+/// [`Instance::is_snoozed`] holds. An expired deadline stays persisted until
+/// the next mutation rewrites it, so without this gate a woken row would keep
+/// advertising a snooze that already ended. Shared by `session show --json`
+/// so both CLI projections gate identically.
+pub(super) fn active_snoozed_until(inst: &Instance) -> Option<chrono::DateTime<chrono::Utc>> {
+    if inst.is_snoozed() {
+        inst.snoozed_until
+    } else {
+        None
+    }
+}
+
 #[derive(Serialize)]
 struct SessionJson {
     id: String,
@@ -101,6 +115,17 @@ struct SessionJson {
     /// reports `trashed` in that case.
     #[serde(skip_serializing_if = "Option::is_none")]
     archived_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Set while a snooze deadline is in the future, gated on
+    /// [`Instance::is_snoozed`] exactly like the API: an expired deadline
+    /// lingers on disk but the row has woken, so the key disappears instead
+    /// of advertising a stale snooze. Orthogonal to `state`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snoozed_until: Option<chrono::DateTime<chrono::Utc>>,
+    /// Set iff the session is currently pinned for the web sidebar.
+    /// Independent of `state`; the client derives the boolean as
+    /// `pinned_at != null`, matching the API field from #1581.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pinned_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Empty for single-repo sessions; populated with one entry per repo
     /// (including the primary) for sessions created with `--repo`/`--project`.
     workspace_repos: Vec<WorkspaceRepoJson>,
@@ -146,6 +171,8 @@ fn session_json(inst: &Instance, profile: &str) -> SessionJson {
         created_at: inst.created_at,
         trashed_at: inst.trashed_at,
         archived_at: inst.archived_at,
+        snoozed_until: active_snoozed_until(inst),
+        pinned_at: inst.pinned_at,
         workspace_repos: workspace_repos_for(inst),
         worktree: worktree_for(inst),
     }
@@ -415,6 +442,116 @@ mod tests {
         assert!(!serialized.contains("trashed_at"));
         assert!(!serialized.contains("archived_at"));
         assert!(serialized.contains("\"state\":\"live\""));
+    }
+
+    /// #3415: snooze and pin complete the four-timestamp state set the API
+    /// has exposed since #1581. The table pins the whole contract: the
+    /// snooze key follows the API's `is_snoozed()` gate (surfaced while
+    /// active, dropped once expired even though the stale timestamp stays
+    /// on disk), the pin key is a plain presence mirror, a plain row
+    /// carries neither key, and neither key bends `state`, which stays the
+    /// bucket tag.
+    #[test]
+    fn session_json_mirrors_the_api_snooze_and_pin_keys() {
+        let now = chrono::Utc::now();
+        let future = now + chrono::Duration::minutes(15);
+        let past = now - chrono::Duration::minutes(15);
+
+        let mut snoozed = Instance::new("z", "/repo");
+        snoozed.snoozed_until = Some(future);
+
+        let mut expired = Instance::new("z", "/repo");
+        expired.snoozed_until = Some(past);
+
+        let mut pinned = Instance::new("z", "/repo");
+        pinned.pinned_at = Some(now);
+
+        // pin() and snooze() clear each other's marker, but peer store
+        // writes bypass the mutators, so a row can carry both at once
+        // and neither key may suppress the other.
+        let mut both = Instance::new("z", "/repo");
+        both.pinned_at = Some(now);
+        both.snoozed_until = Some(future);
+
+        // archive() clears a concurrent snooze through the mutators, but
+        // snooze() leaves archived_at alone, so archiving a row and then
+        // snoozing it persists the pair through ordinary CLI commands:
+        // the keys must stay independent of the bucket tag.
+        let mut sunk = Instance::new("z", "/repo");
+        sunk.archived_at = Some(now);
+        sunk.snoozed_until = Some(future);
+
+        // snoozed then trashed through ordinary commands: trash()
+        // preserves the sibling timestamps, so a triaged row must still
+        // report its deadline from the trash.
+        let mut trashed_snoozed = Instance::new("z", "/repo");
+        trashed_snoozed.snooze(30);
+        trashed_snoozed.trash();
+
+        // pinned for the web sidebar, then trashed the same way.
+        let mut trashed_pinned = Instance::new("z", "/repo");
+        trashed_pinned.pin();
+        trashed_pinned.trash();
+
+        // pin() clears archived_at through the mutators, but peer store
+        // writes bypass them: an archived row can still carry a pin.
+        let mut archived_pinned = Instance::new("z", "/repo");
+        archived_pinned.archived_at = Some(now);
+        archived_pinned.pinned_at = Some(now);
+
+        let plain = Instance::new("z", "/repo");
+
+        let cases = [
+            ("active snooze", &snoozed, true, false, "live"),
+            ("expired snooze", &expired, false, false, "live"),
+            ("pinned", &pinned, false, true, "live"),
+            ("plain row", &plain, false, false, "live"),
+            ("snoozed and archived", &sunk, true, false, "archived"),
+            ("pinned and snoozed", &both, true, true, "live"),
+            (
+                "trashed and snoozed",
+                &trashed_snoozed,
+                true,
+                false,
+                "trashed",
+            ),
+            (
+                "trashed and pinned",
+                &trashed_pinned,
+                false,
+                true,
+                "trashed",
+            ),
+            (
+                "pinned and archived",
+                &archived_pinned,
+                false,
+                true,
+                "archived",
+            ),
+        ];
+        for (label, inst, want_snooze, want_pin, want_state) in cases {
+            let value = serde_json::to_value(session_json(inst, "p")).unwrap();
+            assert_eq!(
+                value.get("snoozed_until").is_some(),
+                want_snooze,
+                "{label}: {value}"
+            );
+            assert_eq!(
+                value.get("pinned_at").is_some(),
+                want_pin,
+                "{label}: {value}"
+            );
+            assert_eq!(value["state"].as_str(), Some(want_state), "{label}");
+        }
+
+        // Value fidelity on the one row whose exact deadline we set:
+        // presence alone would accept a regression emitting any instant.
+        let active = serde_json::to_value(session_json(&snoozed, "p")).unwrap();
+        assert_eq!(
+            active["snoozed_until"],
+            serde_json::to_value(future).unwrap()
+        );
     }
 
     /// Backward-compat: `aoe list` (no `--state`) shows what it always

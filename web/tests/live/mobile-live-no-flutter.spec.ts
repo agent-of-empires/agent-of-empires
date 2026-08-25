@@ -82,16 +82,19 @@ done
     // still catches it; a slow CI reflow settles within the cap. A plain loop
     // (not expect.poll) avoids recording a spurious assertion failure on the
     // regression path.
-    const settled = async () => {
-      const a = await headerTop();
-      await page.waitForTimeout(80);
-      const b = await headerTop();
-      return a != null && a === b;
-    };
+    // A single equal pair was too weak a settle signal. The spinner toggles
+    // every 120ms, so two samples can coincide while the bottom-align is still
+    // converging; sampling then started mid-move and read a ~2 row jitter.
+    // Require a run of consecutive equal samples instead.
+    const STABLE_RUN = 4;
     const settleDeadline = 5_000;
-    for (let waited = 0; waited < settleDeadline; waited += 180) {
-      if (await settled()) break;
-      await page.waitForTimeout(100);
+    let last = await headerTop();
+    let run = 1;
+    for (let waited = 0; waited < settleDeadline && run < STABLE_RUN; waited += 90) {
+      await page.waitForTimeout(90);
+      const y = await headerTop();
+      run = y != null && y === last ? run + 1 : 1;
+      last = y;
     }
 
     const ys: number[] = [];

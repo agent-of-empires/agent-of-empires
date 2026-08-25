@@ -175,15 +175,17 @@ describe("ProjectStep saved-projects render (#2140)", () => {
     expect(queryByText("Recent", asHeader)).toBeNull();
   });
 
-  it("narrows the Saved projects section to entries matching the path filter", async () => {
+  it("narrows the Saved projects section to entries matching the search query", async () => {
     vi.mocked(fetchProjects).mockResolvedValue([
       savedProject({ name: "alpha", path: "/repo/alpha" }),
       savedProject({ name: "zeta", path: "/repo/zeta" }),
     ]);
     vi.mocked(fetchSessions).mockResolvedValue({ sessions: [], workspace_ordering: [] });
 
-    // data.path acts as the filter query against both sections.
-    const { findByText, queryByText } = renderStep("zeta");
+    // The search box drives the filter over both sections (#3461); before it
+    // existed the query came from the already-selected data.path.
+    const { findByLabelText, findByText, queryByText } = renderStep();
+    fireEvent.change(await findByLabelText("Search projects"), { target: { value: "zeta" } });
     expect(await findByText("/repo/zeta")).toBeTruthy();
     expect(queryByText("/repo/alpha")).toBeNull();
   });

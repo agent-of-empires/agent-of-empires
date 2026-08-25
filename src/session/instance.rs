@@ -3045,17 +3045,24 @@ impl Instance {
         }
 
         if let Some(stored) = self.agent_session_id.clone() {
-            if let Some(fresh) = self.capture_freshest_session_id() {
-                tracing::info!(
-                    target: "session.store",
-                    stale = %stored,
-                    fresh = %fresh,
-                    tool = %self.tool,
-                    "Replacing stored session id with fresher live observation"
-                );
-                self.agent_session_id = Some(fresh.clone());
-                return (Some(fresh), true);
-            }
+            // Rebinding rather than returning early runs the observation
+            // through the same empty-thread downgrade as the stored id below.
+            // The SessionStart hook fires before Claude writes any content, so
+            // the sidecar can legitimately name a thread with no transcript.
+            let stored = match self.capture_freshest_session_id() {
+                Some(fresh) => {
+                    tracing::info!(
+                        target: "session.store",
+                        stale = %stored,
+                        fresh = %fresh,
+                        tool = %self.tool,
+                        "Replacing stored session id with fresher live observation"
+                    );
+                    self.agent_session_id = Some(fresh.clone());
+                    fresh
+                }
+                None => stored,
+            };
             // A stored Claude sid with no transcript on disk is not resumable:
             // Claude minted the UUID at first launch but nothing was ever
             // written (an empty thread killed before the first prompt), so
@@ -13909,6 +13916,50 @@ mod tests {
                 assert_eq!(sid.as_deref(), Some(live));
                 assert!(is_existing);
                 assert_eq!(inst.agent_session_id.as_deref(), Some(live));
+            }
+
+            /// The empty-thread downgrade must cover an id that arrived as a
+            /// live observation, not just one loaded from storage: SessionStart
+            /// fires before Claude writes any content, so the sidecar can name
+            /// a thread with no transcript, and `--resume` on it is a dead pane
+            /// on every restart.
+            #[test]
+            #[serial]
+            fn observed_sid_without_transcript_downgrades_to_fresh() {
+                let temp = tempdir().unwrap();
+                let _guard = claude_home_guard(&temp);
+
+                let project_path = "/tmp/aoe-test-observed-no-transcript";
+                let claude_dir = temp
+                    .path()
+                    .join(".claude")
+                    .join("projects")
+                    .join(encode_claude_project_path(project_path));
+                fs::create_dir_all(&claude_dir).unwrap();
+
+                let stored = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+                let empty_thread = "11111111-2222-3333-4444-555555555555";
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{stored}.jsonl")),
+                    SystemTime::now() - Duration::from_secs(120),
+                );
+                // No .jsonl for `empty_thread`.
+
+                let mut inst = Instance::new("verify-observed-no-transcript", project_path);
+                inst.tool = "claude".to_string();
+                inst.agent_session_id = Some(stored.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let dir = super::write_sidecar(&inst.id, empty_thread);
+                let (sid, is_existing) = inst.acquire_session_id();
+                std::fs::remove_dir_all(&dir).ok();
+
+                assert_eq!(sid.as_deref(), Some(empty_thread));
+                assert!(
+                    !is_existing,
+                    "an observed sid with no transcript must launch as \
+                     --session-id, never --resume"
+                );
             }
 
             // An empty Claude thread killed before its first prompt has a

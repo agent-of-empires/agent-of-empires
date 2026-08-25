@@ -2256,7 +2256,14 @@ export function AddProjectModal({
   // letting Escape close the modal mid-request would throw away the result,
   // the warnings, and the "the agent did not restart" notice this component
   // exists to surface.
-  useEffect(() => {
+  //
+  // The subscription closes over `busy`, so it has to be re-established in a
+  // layout effect, not a passive one. A keydown on `document` never reaches
+  // React's root listener, so nothing flushes pending passive effects before
+  // this handler runs. As a passive effect it left a window right after the
+  // response landed where the DOM already showed the result but the listener
+  // still held `busy === true`, and Escape was silently swallowed.
+  useLayoutEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key === "Escape" && !busy) onCancel();
     };

@@ -57,4 +57,30 @@ describe("Row cursor fill state", () => {
     expect(cell!.style.outline).toBe("");
     expect(cell!.className).toContain("animate-term-cursor-blink");
   });
+
+  it("keeps a glued mark inside the cursor cell on a flow run (NFD input)", () => {
+    // Flow runs can carry zero-width marks too (NFD text typed into the
+    // live input); slicing must stay cluster-aware so the mark is not
+    // stranded outside the highlight.
+    const { container } = render(<Row segs={[seg("cafe\u0301")]} cursorCol={3} />);
+    const cell = cursorCell(container);
+    expect(cell!.textContent).toBe("e\u0301");
+    expect(cell!.style.width).toBe("calc(var(--term-cell, 1em) * 1)");
+    expect(cell!.previousSibling!.textContent).toBe("caf");
+  });
+
+  it("boxes the cursor on a completely empty row (no segments)", () => {
+    // A blank live-input line carries no segments; the pad + blank-cell
+    // path must still run or the cursor vanishes from an empty prompt.
+    // The pad is an explicit box so a fallback font's space advance
+    // cannot push the cursor off its column either.
+    const { container } = render(<Row segs={[]} cursorCol={3} />);
+    const cell = cursorCell(container);
+    expect(cell).not.toBeNull();
+    expect(cell!.textContent).toBe(" ");
+    expect(cell!.style.width).toBe("calc(var(--term-cell, 1em) * 1)");
+    const pad = cell!.previousSibling!;
+    expect(pad.textContent).toBe("   ");
+    expect((pad as HTMLElement).style.width).toBe("calc(var(--term-cell, 1em) * 3)");
+  });
 });

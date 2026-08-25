@@ -1,6 +1,16 @@
 // @vitest-environment jsdom
 import { describe, expect, it } from "vitest";
-import { LineParseCache, ansiToLines, findCursorCharIndex, lineText, splitUrls, wrapLine } from "./liveTermLines";
+import {
+  LineParseCache,
+  ansiToLines,
+  clusterSpanAt,
+  findCursorCharIndex,
+  lineText,
+  splitCellRuns,
+  splitUrls,
+  textWidth,
+  wrapLine,
+} from "./liveTermLines";
 
 describe("ansiToLines", () => {
   it("splits plain text into lines and drops the capture trailing terminator", () => {
@@ -149,6 +159,15 @@ describe("splitUrls", () => {
     ]);
   });
 
+  it("claims glued non-ASCII glyphs into the URL part", () => {
+    // The regex owns part boundaries; Row anchors whole parts, so the
+    // href follows the match including glued glyphs.
+    expect(splitUrls("https://github.com/o/r를 확인")).toEqual([
+      { text: "https://github.com/o/r를", url: "https://github.com/o/r를" },
+      { text: " 확인", url: null },
+    ]);
+  });
+
   it("handles multiple URLs on one line", () => {
     const parts = splitUrls("https://a.com and https://b.com");
     expect(parts.filter((p) => p.url).map((p) => p.url)).toEqual(["https://a.com", "https://b.com"]);
@@ -217,5 +236,182 @@ describe("LineParseCache", () => {
     // Re-parsed after eviction: equal content, fresh identity.
     expect(b[0]).toEqual(a[0]);
     expect(b[0]).not.toBe(a[0]);
+  });
+});
+
+const ZWJ = "\u200D";
+
+describe("splitCellRuns", () => {
+  it("keeps printable ASCII as flow and coalesces non-ASCII stretches", () => {
+    // The #3342 fixture: ASCII prompt, CJK, braille spinner, powerline PUA.
+    const runs = splitCellRuns("$ ok 한글 ⠋⠙ \u{E0B0}");
+    expect(runs.map((r) => r.fixed)).toEqual([false, true, false, true, false, true]);
+    expect(runs.filter((r) => r.fixed).map((r) => r.text)).toEqual(["한글", "⠋⠙", "\u{E0B0}"]);
+    // Contiguous CJK coalesces into one box whose cells sum.
+    expect(runs.filter((r) => r.fixed).map((r) => r.cells)).toEqual([4, 2, 1]);
+  });
+
+  it("returns a single flowing run for pure-ASCII text", () => {
+    expect(splitCellRuns("$ ls --color")).toEqual([{ text: "$ ls --color", cells: 12, fixed: false }]);
+  });
+
+  it("coalesces a whole script stretch so bidi and shaping survive", () => {
+    // Per-character boxes would reverse RTL order and cut complex-script
+    // shaping; one box per stretch keeps the text node whole while its
+    // edges stay cell-exact.
+    expect(splitCellRuns("سلام")).toEqual([{ text: "سلام", cells: 4, fixed: true }]);
+  });
+
+  it("matches tmux cell widths per grapheme cluster", () => {
+    // Measured against real tmux 3.6a cursor_x deltas (round 5 probe):
+    // VS16-forced emoji = 2, flag pair = 2, ZWJ chain = 2, lone RI = 1,
+    // skin-tone tail adds nothing to a base that takes a modifier.
+    const cases: Array<[string, number]> = [
+      ["\u26A0\uFE0F", 2],
+      ["\u2714\uFE0F", 2],
+      ["\u2139\uFE0F", 2],
+      ["\u270F\uFE0F", 2],
+      ["\u2764\uFE0F", 2],
+      ["\u{1F1FA}\u{1F1F8}", 2],
+      ["\u{1F468}\u200D\u{1F469}\u200D\u{1F467}", 2],
+      ["\u{1F468}\u200D\u{1F469}\u200D\u{1F466}", 2],
+      ["\u{1F44D}\u{1F3FB}", 2],
+      ["\u{1F600}", 2],
+      ["\u{1F1EB}", 1],
+      ["\uD55C", 2],
+      ["\u280B", 1],
+      ["\u{E0B0}", 1],
+      ["e\u0301", 1],
+      // A skin-tone swatch folds in only behind a base that takes a
+      // modifier. U+1F600 does not, so tmux gives the swatch its own two
+      // columns, as it does after CJK or after nothing at all.
+      ["\u{1F600}\u{1F3FB}", 4],
+      ["\u6F22\u{1F3FB}", 4],
+      ["\u280B\u{1F3FB}", 3],
+      ["a\u{1F3FB}", 3],
+      ["\u{1F3FB}", 2],
+      // An orphan ZWJ or enclosing keycap has no base to modify, so it is
+      // an ordinary zero-width mark rather than the two-cell composition
+      // its presence inside a cluster would imply.
+      [ZWJ, 0],
+      [`a${ZWJ}b`, 2],
+      ["\u20E3", 0],
+      ["1\u20E3", 1],
+    ];
+    for (const [input, expected] of cases) {
+      expect(textWidth(input)).toBe(expected, input);
+    }
+  });
+
+  it("keeps composed emoji sequences whole at their terminal width", () => {
+    // Flag pair, skin-tone tail, ZWJ join: one fixed run at the tmux
+    // cluster width.
+    expect(splitCellRuns("\u{1F1FA}\u{1F1F8}")).toEqual([{ text: "\u{1F1FA}\u{1F1F8}", cells: 2, fixed: true }]);
+    expect(splitCellRuns("\u{1F44D}\u{1F3FB}")).toEqual([{ text: "\u{1F44D}\u{1F3FB}", cells: 2, fixed: true }]);
+    expect(splitCellRuns("\u{1F9D1}\u200D\u{1F4BB}")).toEqual([
+      { text: "\u{1F9D1}\u200D\u{1F4BB}", cells: 2, fixed: true },
+    ]);
+  });
+
+  it("preserves the row invariant sum(cells) == textWidth on mixed lines", () => {
+    const cases = [
+      "$ ready",
+      "가각ᅟ⠋⠙",
+      "\u{E0B0}\u{E0B2} powerline",
+      "e\u0301glue",
+      "emoji \u{1F600} done",
+      "\u{1F1FA}\u{1F1F8} flag",
+      "tone \u{1F44D}\u{1F3FB}",
+      "dev \u{1F9D1}\u200D\u{1F4BB} ops",
+      "arabic \u6F22\u0301 glue",
+      "warn \u26A0\uFE0F end",
+    ];
+    for (const line of cases) {
+      const runs = splitCellRuns(line);
+      expect(runs.reduce((n, r) => n + r.cells, 0)).toBe(textWidth(line), line);
+      expect(runs.map((r) => r.text).join("")).toBe(line);
+    }
+  });
+
+  it("resolves cursor columns onto whole tmux clusters", () => {
+    // Flag occupies columns 0-1: both land on its single code point span;
+    // column 2 is past it. ZWJ chain spans columns 0-1 likewise.
+    expect(findCursorCharIndex("\u{1F1FA}\u{1F1F8}", 0)).toBe(0);
+    expect(findCursorCharIndex("\u{1F1FA}\u{1F1F8}", 1)).toBe(0);
+    expect(findCursorCharIndex("\u{1F1FA}\u{1F1F8}", 2)).toBeNull();
+    expect(findCursorCharIndex("\u{1F468}\u200D\u{1F469}\u200D\u{1F467}", 0)).toBe(0);
+    expect(findCursorCharIndex("\u{1F468}\u200D\u{1F469}\u200D\u{1F467}", 1)).toBe(0);
+    expect(findCursorCharIndex("\u{1F468}\u200D\u{1F469}\u200D\u{1F467}", 2)).toBeNull();
+  });
+
+  it("never splits a cluster when wrapping", () => {
+    const line = [{ text: "\u{1F9D1}\u200D\u{1F4BB}\u{1F44D}", style: {} }];
+    for (const cols of [2, 3, 4]) {
+      const rows = wrapLine(line, cols);
+      expect(
+        rows
+          .flat()
+          .map((s) => s.text)
+          .join(""),
+      ).toBe("\u{1F9D1}\u200D\u{1F4BB}\u{1F44D}");
+    }
+  });
+
+  it("counts keycap sequences as two-cell clusters", () => {
+    // tmux-measured: base + VS16 + U+20E3 advances cursor_x by exactly 2
+    // even when the base is printable ASCII; rendering keeps the whole
+    // sequence in one flow node so the font composes it.
+    const cases: Array<[string, number]> = [
+      ["#\uFE0F\u20E3", 2],
+      ["1\uFE0F\u20E3", 2],
+      ["*\uFE0F\u20E3", 2],
+    ];
+    for (const [input, expected] of cases) {
+      expect(textWidth(input)).toBe(expected, input);
+    }
+    expect(splitCellRuns("#\uFE0F\u20E3")).toEqual([{ text: "#\uFE0F\u20E3", cells: 2, fixed: false }]);
+  });
+
+  it("counts emoji tails as zero-width cells", () => {
+    expect(textWidth("\uFE0F")).toBe(0);
+    // A swatch behind a modifier base folds in; standing alone it keeps
+    // its own two columns, matching tmux.
+    expect(textWidth("\u{1F44D}\u{1F3FB}")).toBe(2);
+    expect(textWidth("\u{1F3FB}")).toBe(2);
+  });
+});
+
+describe("clusterSpanAt", () => {
+  it("covers one CJK glyph per column", () => {
+    expect(clusterSpanAt("한글", 0)).toEqual([0, 1]);
+    expect(clusterSpanAt("한글", 1)).toEqual([1, 2]);
+  });
+
+  it("spans both regional indicators from either half of a flag", () => {
+    expect(clusterSpanAt("\u{1F1FA}\u{1F1F8}", 0)).toEqual([0, 2]);
+    expect(clusterSpanAt("\u{1F1FA}\u{1F1F8}", 1)).toEqual([0, 2]);
+    // A regional indicator takes no skin-tone modifier, so a swatch after
+    // a completed pair is its own cell (tmux measures flag + tone at 4
+    // columns) and the span stops at the pair.
+    expect(clusterSpanAt("\u{1F1E9}\u{1F1EA}\u{1F3FB}", 0)).toEqual([0, 2]);
+    expect(clusterSpanAt("\u{1F1E9}\u{1F1EA}\u{1F3FB}", 1)).toEqual([0, 2]);
+  });
+
+  it("keeps tone tails and ZWJ chains inside the span", () => {
+    expect(clusterSpanAt("\u{1F44D}\u{1F3FB}", 0)).toEqual([0, 2]);
+    // a=0, man=1, ZWJ=2, woman=3, ZWJ=4, boy=5, b=6.
+
+    expect(clusterSpanAt("a\u{1F468}\u200D\u{1F469}\u200D\u{1F466}b", 1)).toEqual([1, 6]);
+    expect(clusterSpanAt("a\u{1F468}\u200D\u{1F469}\u200D\u{1F466}b", 6)).toEqual([6, 7]);
+  });
+
+  it("pairs adjacent flags on parity without crossing the boundary", () => {
+    // US DE: cursor on the leading half of the second flag must pair
+    // forward within its own flag, not backward across the pair boundary.
+    const twoFlags = "\u{1F1FA}\u{1F1F8}\u{1F1E9}\u{1F1EA}";
+    expect(clusterSpanAt(twoFlags, 0)).toEqual([0, 2]);
+    expect(clusterSpanAt(twoFlags, 1)).toEqual([0, 2]);
+    expect(clusterSpanAt(twoFlags, 2)).toEqual([2, 4]);
+    expect(clusterSpanAt(twoFlags, 3)).toEqual([2, 4]);
   });
 });

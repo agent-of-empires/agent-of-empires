@@ -5774,7 +5774,11 @@ pub(crate) fn apply_status_intent(
     let prev = inst.status;
     inst.status = target;
     let now = chrono::Utc::now();
-    inst.last_accessed_at = Some(now);
+    // last_accessed_at is deliberately NOT stamped here (#3465 residual):
+    // the value relays through DaemonStatusPoller into TUI memory, and
+    // save()'s merge_from_tui monotone max persists it ungated, so the
+    // touched arm of merge_user_action_diff wiped concurrent archives.
+    // Structured rows take real touches from user prompts instead.
     inst.idle_entered_at = if target == Status::Idle {
         Some(now)
     } else {
@@ -9442,6 +9446,73 @@ mod tests {
         inst.status = Status::Error;
         apply(&mut inst, StatusIntent::HealError);
         assert_eq!(inst.status, Status::Idle);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn status_intent_transitions_preserve_last_accessed_at() {
+        // #3465 residual: the intent applier used to restamp
+        // last_accessed_at on every transition. The value relays through
+        // DaemonStatusPoller into TUI memory and save()'s merge_from_tui
+        // monotone max persists it, so a phantom stamp here wiped
+        // concurrent archives through merge_user_action_diff's touched
+        // arm. Structured rows take real touches from user prompts
+        // (touch_on_prompt_and_wake_if_sunk), so the field stays gesture-only.
+        let mut inst = stopped_structured_instance();
+        inst.status = Status::Idle;
+        let user_touch = chrono::Utc::now() - chrono::Duration::seconds(60);
+        inst.last_accessed_at = Some(user_touch);
+
+        apply(&mut inst, StatusIntent::Set(Status::Running));
+        assert_eq!(inst.status, Status::Running);
+        assert_eq!(inst.idle_entered_at, None);
+        assert_eq!(
+            inst.last_accessed_at,
+            Some(user_touch),
+            "a worker-event transition must not fabricate a user-gesture stamp"
+        );
+
+        apply(&mut inst, StatusIntent::Set(Status::Idle));
+        assert_eq!(inst.status, Status::Idle);
+        assert!(inst.idle_entered_at.is_some());
+        assert_eq!(
+            inst.last_accessed_at,
+            Some(user_touch),
+            "entering Idle re-anchors idle bookkeeping, not the gesture stamp"
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn relayed_intent_stamp_wipes_concurrent_archive() {
+        // Full #3465 residual chain on structured rows:
+        // apply_status_intent stamps daemon memory, save()'s
+        // merge_from_tui folds that memory into disk with an ungated
+        // monotone max, and a writer holding a pre snapshot from before
+        // the stamp loses its archive to merge_user_action_diff's
+        // touched arm. Dropping the intent stamp breaks this chain.
+        let user_touch = chrono::Utc::now() - chrono::Duration::seconds(60);
+
+        let mut daemon_row = stopped_structured_instance();
+        daemon_row.status = Status::Idle;
+        daemon_row.last_accessed_at = Some(user_touch);
+        apply(&mut daemon_row, StatusIntent::Set(Status::Running));
+
+        let mut disk = stopped_structured_instance();
+        disk.status = Status::Idle;
+        disk.last_accessed_at = Some(user_touch);
+        let pre = disk.clone();
+
+        disk.merge_from_tui(&daemon_row);
+
+        let mut post = pre.clone();
+        post.archive();
+        disk.merge_user_action_diff(&pre, &post);
+
+        assert!(
+            disk.archived_at.is_some(),
+            "relayed intent stamp must not wipe a concurrent archive (#3465)"
+        );
     }
 
     #[cfg(feature = "serve")]
