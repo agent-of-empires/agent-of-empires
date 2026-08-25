@@ -2056,11 +2056,14 @@ pub fn detect_pi_status(raw_content: &str) -> Status {
 /// it the signal is ignored, so a completed turn's loader or a dismissed
 /// banner in scrollback cannot pin the session.
 ///
-/// A live loader has a preset activity frame (braille for unicode/nerd,
-/// `- \ | /` for ascii) plus its marker on the same row, or on the next row
-/// after a narrow-pane wrap. The markers are `Working`, an esc hint glyph
-/// (`⟦esc⟧`, `⟨esc⟩`, `[esc]`), and the maintenance hint
-/// `(esc to cancel)`.
+/// A live loader has a built-in or configured symbolic frame, or an ASCII
+/// preset frame (`- \ | /`), plus its marker on the same row or on the next
+/// row after a narrow-pane wrap. Known braille frames retain the historical
+/// `Working` marker; other symbolic and ASCII frames require an esc hint
+/// (`⟦esc⟧`, `⟨esc⟩`, `[esc]`, or `(esc to cancel)`). OMP intents are arbitrary,
+/// so hint-bearing ASCII prose can be textually identical to a live loader.
+/// The bottom-three-line window intentionally favors the active direction for
+/// that irreducible case, avoiding a false Idle while a turn runs.
 ///
 /// A tool approval replaces the composer with a selector panel. Exact
 /// bordered `Approve`/`Deny` option rows corroborate its navigation footer;
@@ -2097,10 +2100,11 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
         }
     };
 
-    // Live loader rows sit directly above the composer. Braille frames keep
-    // the historical Working/hint markers; ASCII frames additionally require
-    // their esc hint so Markdown bullets such as "- Working …" stay prose.
-    // A wrapped hint is accepted only beside the preceding activity frame.
+    // Live loader rows sit directly above the composer. Known braille frames
+    // keep the historical Working/hint markers. Configured symbolic frames
+    // require an esc hint, the invariant OMP appends to its live loader. ASCII
+    // frames require the same hint because their glyphs are ordinary prose
+    // prefixes. A wrapped hint is accepted only beside the preceding frame.
     let loader_window = tail_lines(&non_empty_lines, 4);
     let starts_with_braille_frame = |line: &str| {
         let line = line.trim_start();
@@ -2116,6 +2120,24 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
                 .is_some_and(|rest| rest.starts_with(' '))
         })
     };
+    let starts_with_symbolic_frame = |line: &str| {
+        let Some((frame, _)) = line.trim_start().split_once(' ') else {
+            return false;
+        };
+        const RESERVED_PREFIXES: &[&str] = &["•", "※", "❯", "\u{f054}", "│", "┃", "▎"];
+        if frame.is_empty() || RESERVED_PREFIXES.contains(&frame) {
+            return false;
+        }
+        let mut has_non_ascii = false;
+        for ch in frame.chars() {
+            if ch.is_alphanumeric() {
+                return false;
+            }
+            has_non_ascii |= !ch.is_ascii();
+        }
+        has_non_ascii
+    };
+
     let has_hint_marker = |line: &str| {
         let line = line.trim().to_lowercase();
         line.ends_with("⟦esc⟧")
@@ -2125,16 +2147,18 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
     };
     let has_loader_marker =
         |line: &str| line.to_lowercase().contains("working") || has_hint_marker(line);
+    let starts_with_hint_gated_frame =
+        |line: &str| starts_with_ascii_frame(line) || starts_with_symbolic_frame(line);
     let loader_pos = (0..loader_window.len()).rev().find_map(|i| {
         let pos = loader_window.len() - i;
         let line = loader_window[i];
         let direct = pos <= 3
             && ((starts_with_braille_frame(line) && has_loader_marker(line))
-                || (starts_with_ascii_frame(line) && has_hint_marker(line)));
+                || (starts_with_hint_gated_frame(line) && has_hint_marker(line)));
         let wrapped = pos <= 3
             && i > 0
             && (starts_with_braille_frame(loader_window[i - 1])
-                || starts_with_ascii_frame(loader_window[i - 1]))
+                || starts_with_hint_gated_frame(loader_window[i - 1]))
             && has_hint_marker(line);
         (direct || wrapped).then_some(pos)
     });
@@ -6073,6 +6097,21 @@ Final prose line.\n";
                 format!("- Working tree status is clean.\n{prompt_box}"),
                 Status::Idle,
             ),
+            (
+                "unicode markdown bullet",
+                format!("• The interrupt key is [esc]\n{prompt_box}"),
+                Status::Idle,
+            ),
+            (
+                "idle recap prefix",
+                format!("※ Working… ⟦esc⟧\n{prompt_box}"),
+                Status::Idle,
+            ),
+            (
+                "symbolic prose without hint",
+                format!("◐ Working through the explanation\n{prompt_box}"),
+                Status::Idle,
+            ),
             // Precedences: the lowest live signal wins. Approval fixtures
             // use omp's real bordered selector rather than synthetic text.
             (
@@ -6196,8 +6235,8 @@ Final prose line.\n";
 
     #[test]
     fn test_detect_omp_status_running_loaders() {
-        // Same behavior and setup: every live loader has a preset frame and
-        // marker on one row, or on an adjacent row after a narrow-pane wrap.
+        // Same behavior and setup: every live loader has a built-in or configured
+        // frame and marker on one row, or on an adjacent row after a narrow wrap.
         let box_unicode = "╭── π ─╮\n╰─ ─╯";
         let box_ascii = "+-- pi ---+\n+- -------+";
         let answered_panel = "\
@@ -6214,12 +6253,24 @@ Final prose line.\n";
         let cases = [
             ("unicode default", format!("⠋ Working… ⟦esc⟧\n{box_unicode}")),
             (
+                "unicode status frame",
+                format!("⣾ Working… ⟦esc⟧\n{box_unicode}"),
+            ),
+            (
+                "nerd status frame",
+                format!("󱑖 Working… ⟨esc⟩\n{box_unicode}"),
+            ),
+            (
                 "unicode intent",
                 format!("⠴ Set permissions on audit bait path ⟦esc⟧\n{box_unicode}"),
             ),
             (
                 "nerd intent",
                 format!("⠹ Reading audit fixtures ⟨esc⟩\n{box_unicode}"),
+            ),
+            (
+                "custom symbolic frame",
+                format!("◐ Working… ⟦esc⟧\n{box_unicode}"),
             ),
             (
                 "ascii intent",
@@ -6244,6 +6295,10 @@ Final prose line.\n";
             (
                 "wrapped unicode intent",
                 format!("⠹ Locating audit config files in parent tree\n ⟦esc⟧\n{box_unicode}"),
+            ),
+            (
+                "wrapped custom symbolic frame",
+                format!("◐ Locating audit config files in parent tree\n ⟦esc⟧\n{box_unicode}"),
             ),
             (
                 "wrapped ascii intent",
