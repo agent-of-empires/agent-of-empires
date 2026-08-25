@@ -233,7 +233,12 @@ impl NewSessionDialog {
         );
         let has_config =
             !self.extra_args.value().is_empty() || !self.command_override.value().is_empty();
-        tool_spans.extend(tool_config_suffix_spans(has_config, is_tool_focused, theme));
+        tool_spans.extend(tool_config_suffix_spans(
+            has_config,
+            is_tool_focused,
+            false,
+            theme,
+        ));
         tool_spans.extend(tool_lifecycle_spans(
             self.available_tools[self.tool_index].as_str(),
             theme,

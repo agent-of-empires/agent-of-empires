@@ -16,11 +16,7 @@ import { cleanup, render, screen } from "@testing-library/react";
 
 import { AgentPickerEssentials } from "../steps/AgentPickerEssentials";
 import { initialData } from "../wizardReducer";
-import type { AgentInfo } from "../../../../lib/types";
-
-vi.mock("../../../../lib/api", () => ({
-  fetchSettings: vi.fn().mockResolvedValue({}),
-}));
+import type { AgentInfo } from "../../../lib/types";
 
 afterEach(() => {
   cleanup();

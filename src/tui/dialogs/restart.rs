@@ -518,12 +518,18 @@ impl RestartDialog {
         );
         let has_config =
             !self.extra_args.value().is_empty() || !self.command_override.value().is_empty();
+        // Lifecycle is the load-bearing status: append it before the config
+        // metadata. The compact configured hint keeps (configured) Ctrl+P
+        // visible in the dialog's real 60-column inner width.
+        let lifecycle_spans = tool_lifecycle_spans(value, theme);
+        let compact_config = !lifecycle_spans.is_empty();
+        spans.extend(lifecycle_spans);
         spans.extend(tool_config_suffix_spans(
             has_config,
             self.is_tool_field(),
+            compact_config,
             theme,
         ));
-        spans.extend(tool_lifecycle_spans(value, theme));
         frame.render_widget(Paragraph::new(Line::from(spans)), area);
     }
 
@@ -968,10 +974,10 @@ mod tests {
     }
 
     #[test]
-    fn deprecated_tool_badge_renders_on_restart_tool_row() {
-        // Alternate render path parity with the New dialog: the cycler
-        // affordances differ, the lifecycle suffix must not. Paired with an
-        // Active tool so a blanket suffix would also fail.
+    fn deprecated_tool_badge_renders_on_constrained_configured_restart_row() {
+        // Real dialog geometry: 64 columns leaves a 60-column inner row. With
+        // three tools, a configured command, and extra args, this fails if the
+        // lifecycle suffix moves behind the trailing configuration metadata.
         use ratatui::{backend::TestBackend, Terminal};
 
         let cases = [("gemini", true), ("claude", false)];
@@ -980,12 +986,17 @@ mod tests {
                 "fix bug",
                 "default",
                 tool,
-                "",
-                "",
+                "custom-wrapper",
+                "--model long --verbose",
                 vec!["default".to_string()],
-                vec![tool.to_string()],
+                vec![
+                    "claude".to_string(),
+                    "codex".to_string(),
+                    "gemini".to_string(),
+                ],
             );
-            let mut terminal = Terminal::new(TestBackend::new(100, 40)).expect("terminal");
+            dialog.focused_field = 1;
+            let mut terminal = Terminal::new(TestBackend::new(64, 14)).expect("terminal");
             let theme = crate::tui::styles::Theme::default();
             terminal
                 .draw(|frame| dialog.render(frame, frame.area(), &theme))
@@ -997,7 +1008,16 @@ mod tests {
                 .iter()
                 .map(|cell| cell.symbol())
                 .collect::<String>();
-            assert_eq!(content.contains("⚠ deprecated"), deprecated, "{tool}");
+            assert_eq!(
+                content.contains("⚠ deprecated"),
+                deprecated,
+                "{tool}: {content}"
+            );
+            assert!(content.contains("(configured)"), "{tool}: {content}");
+            assert!(content.contains("Ctrl+P"), "{tool}: {content}");
+            if deprecated {
+                assert!(content.contains("(configured) Ctrl+P"), "{content}");
+            }
         }
     }
 }

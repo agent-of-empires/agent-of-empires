@@ -5,9 +5,9 @@
 //! isolated HOME:
 //!
 //! - `aoe agents` lists the deprecation notice under gemini;
-//! - `aoe acp doctor` (serve build) emits the amber notice line in text mode;
-//! - `aoe add --tool gemini` warns on stderr and still creates the session,
-//!   pinning the non-blocking contract end to end.
+//! - `aoe acp doctor` (serve build) emits the notice line in text mode;
+//! - `aoe add` emits exactly one non-blocking warning after every built-in
+//!   resolution path, including default tools and command overrides.
 //!
 //! These pin the rendering sites themselves (`cli/agents.rs`, `cli/acp.rs`,
 //! `cli/add.rs`); the shared notice producer is pinned separately in
@@ -17,21 +17,20 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-/// Directory holding an executable `gemini` stub so PATH-based detection
-/// reports it installed. The TempDir must stay alive for the run; dropping
-/// it removes the stub (tests clean up after themselves).
-fn stub_dir() -> (tempfile::TempDir, PathBuf) {
+/// Directory holding executable stubs so PATH-based detection reports them
+/// installed. The TempDir must stay alive for the run; dropping it removes
+/// the stubs (tests clean up after themselves).
+fn stub_dir(names: &[&str]) -> (tempfile::TempDir, PathBuf) {
     let dir = tempfile::tempdir_in(std::env::temp_dir()).expect("stub tempdir");
-    let mut gemini = std::fs::File::create(dir.path().join("gemini")).expect("create stub");
-    writeln!(gemini, "#!/bin/sh").unwrap();
-    writeln!(gemini, "echo 0.14.0").unwrap();
-    drop(gemini);
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(
-        dir.path().join("gemini"),
-        std::fs::Permissions::from_mode(0o755),
-    )
-    .expect("chmod stub");
+    for name in names {
+        let path = dir.path().join(name);
+        let mut stub = std::fs::File::create(&path).expect("create stub");
+        writeln!(stub, "#!/bin/sh").unwrap();
+        writeln!(stub, "echo 0.14.0").unwrap();
+        drop(stub);
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755)).expect("chmod stub");
+    }
     let path = dir.path().to_path_buf();
     (dir, path)
 }
@@ -43,6 +42,33 @@ fn isolated_dirs() -> (tempfile::TempDir, PathBuf, PathBuf) {
     std::fs::create_dir_all(&home).unwrap();
     std::fs::create_dir_all(&xdg).unwrap();
     (tmp, home, xdg)
+}
+
+fn write_config(xdg: &Path, session_toml: &str) {
+    if session_toml.is_empty() {
+        return;
+    }
+    let app = xdg.join(if cfg!(debug_assertions) {
+        "agent-of-empires-dev"
+    } else {
+        "agent-of-empires"
+    });
+    std::fs::create_dir_all(&app).expect("create app dir");
+    let config = format!(
+        r#"[updates]
+update_check_mode = "off"
+
+[app_state]
+has_seen_welcome = true
+last_seen_version = "{}"
+
+[session]
+{}
+"#,
+        env!("CARGO_PKG_VERSION"),
+        session_toml
+    );
+    std::fs::write(app.join("config.toml"), config).expect("write config");
 }
 
 fn run_aoe(home: &Path, xdg: &Path, stub: &Path, args: &[&str]) -> std::process::Output {
@@ -65,7 +91,7 @@ fn run_aoe(home: &Path, xdg: &Path, stub: &Path, args: &[&str]) -> std::process:
 #[test]
 fn aoe_agents_lists_deprecated_notice() {
     let (_tmp, home, xdg) = isolated_dirs();
-    let (_stub_tmp, stub) = stub_dir();
+    let (_stub_tmp, stub) = stub_dir(&["gemini"]);
     let out = run_aoe(&home, &xdg, &stub, &["agents"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     // The ✓ mark carries its own color resets between glyph and name, so
@@ -83,7 +109,7 @@ fn aoe_agents_lists_deprecated_notice() {
 #[test]
 fn acp_doctor_text_emits_amber_lifecycle_notice() {
     let (_tmp, home, xdg) = isolated_dirs();
-    let (_stub_tmp, stub) = stub_dir();
+    let (_stub_tmp, stub) = stub_dir(&["gemini"]);
     let out = run_aoe(&home, &xdg, &stub, &["acp", "doctor"]);
     let stdout = String::from_utf8_lossy(&out.stdout);
     // The stub makes command_present true; the notice must ride along on
@@ -98,30 +124,77 @@ fn acp_doctor_text_emits_amber_lifecycle_notice() {
 }
 
 #[test]
-fn aoe_add_warns_but_still_creates_session() {
-    let (tmp, home, xdg) = isolated_dirs();
-    let (_stub_tmp, stub) = stub_dir();
-    let repo = tmp.path().join("repo");
-    std::fs::create_dir_all(&repo).unwrap();
-    Command::new("git")
-        .args(["init", "-q"])
-        .current_dir(&repo)
-        .output()
-        .expect("git init");
-    let out = run_aoe(
-        &home,
-        &xdg,
-        &stub,
-        &["add", repo.to_str().unwrap(), "--tool", "gemini"],
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stderr.contains("Warning: gemini is deprecated since 2026-06-18"),
-        "stderr: {stderr}"
-    );
-    assert!(
-        stdout.contains("✓ Added session"),
-        "warning must stay non-blocking; stdout: {stdout}"
-    );
+fn aoe_add_lifecycle_warning_covers_all_resolution_paths() {
+    struct Case {
+        name: &'static str,
+        args: &'static [&'static str],
+        config: &'static str,
+        stubs: &'static [&'static str],
+        expected_warnings: usize,
+    }
+
+    let cases = [
+        Case {
+            name: "explicit tool",
+            args: &["--tool", "gemini"],
+            config: "",
+            stubs: &["gemini"],
+            expected_warnings: 1,
+        },
+        Case {
+            name: "configured default tool",
+            args: &[],
+            config: "default_tool = \"gemini\"",
+            stubs: &["gemini"],
+            expected_warnings: 1,
+        },
+        Case {
+            name: "command with configured override",
+            args: &["--cmd", "gemini"],
+            config: "agent_command_override = { gemini = \"gemini-wrapper\" }",
+            stubs: &["gemini-wrapper"],
+            expected_warnings: 1,
+        },
+        Case {
+            name: "configured custom agent",
+            args: &["--tool", "custom"],
+            config: "custom_agents = { custom = \"bash -lc true\" }",
+            stubs: &[],
+            expected_warnings: 0,
+        },
+        Case {
+            name: "command without override warns once",
+            args: &["--cmd", "gemini"],
+            config: "",
+            stubs: &["gemini"],
+            expected_warnings: 1,
+        },
+    ];
+
+    for case in cases {
+        let (tmp, home, xdg) = isolated_dirs();
+        let (_stub_tmp, stub) = stub_dir(case.stubs);
+        write_config(&xdg, case.config);
+        let repo = tmp.path().join("repo");
+        std::fs::create_dir_all(&repo).unwrap();
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(&repo)
+            .output()
+            .expect("git init");
+        let mut args = vec!["add", repo.to_str().unwrap()];
+        args.extend_from_slice(case.args);
+        let out = run_aoe(&home, &xdg, &stub, &args);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let warnings = stderr
+            .matches("Warning: gemini is deprecated since 2026-06-18")
+            .count();
+        assert_eq!(warnings, case.expected_warnings, "{}: {stderr}", case.name);
+        assert!(
+            stdout.contains("✓ Added session"),
+            "{}: warning must stay non-blocking; stdout: {stdout}; stderr: {stderr}",
+            case.name
+        );
+    }
 }

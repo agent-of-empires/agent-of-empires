@@ -77,7 +77,7 @@ export function AgentPickerEssentials({ data, onChange, agents }: Props) {
               )}
               {effectiveLifecycle(agent, agent.name).state === "deprecated" && (
                 <span
-                  className="rounded px-1.5 py-px text-[10px] font-mono uppercase tracking-wide bg-status-warning/15 text-status-warning"
+                  className="rounded-full px-1.5 py-px text-[10px] uppercase tracking-wide bg-status-warning/15 text-status-warning"
                   data-testid={`wizard-agent-deprecated-badge-${agent.name}`}
                 >
                   Deprecated

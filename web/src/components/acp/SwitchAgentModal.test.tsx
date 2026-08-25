@@ -217,7 +217,9 @@ describe("SwitchAgentModal (rate_limit)", () => {
     // the label so a rate-limit handoff never silently steers into a
     // deprecated backend.
     const { findByTestId } = mount();
-    expect(await findByTestId("switch-agent-deprecated-gemini")).not.toBeNull();
+    const geminiBadge = await findByTestId("switch-agent-deprecated-gemini");
+    expect(geminiBadge.parentElement?.textContent).toContain("gemini");
+    expect(geminiBadge.parentElement?.nextElementSibling?.textContent).toBe("Gemini CLI");
     expect(await findByTestId("switch-agent-deprecated-legacy")).not.toBeNull();
     expect(screen.queryByTestId("switch-agent-deprecated-claude")).toBeNull();
     expect(screen.queryByTestId("switch-agent-deprecated-codex")).toBeNull();

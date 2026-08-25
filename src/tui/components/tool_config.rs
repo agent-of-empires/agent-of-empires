@@ -20,13 +20,15 @@ pub const TOOL_CONFIG_CMD: usize = 0;
 pub const TOOL_CONFIG_ARGS: usize = 1;
 const TOOL_CONFIG_FIELD_COUNT: usize = 2;
 
-/// Trailing spans appended to the Tool row: a dimmed `(configured)` marker
-/// when an override is set, plus the `Ctrl+P` hint while the row is focused.
-/// `has_config` is true when either the command override or extra args is
-/// non-empty.
+/// Trailing spans appended to the Tool row: a dimmed (configured) marker
+/// when an override is set, plus the Ctrl+P hint while the row is focused.
+/// has_config is true when either the command override or extra args is
+/// non-empty. compact shortens the focused configured hint so a higher-
+/// priority status badge can share the fixed-width row without clipping.
 pub fn tool_config_suffix_spans(
     has_config: bool,
     focused: bool,
+    compact: bool,
     theme: &Theme,
 ) -> Vec<Span<'static>> {
     let mut spans = Vec::new();
@@ -38,10 +40,10 @@ pub fn tool_config_suffix_spans(
     }
     if focused {
         spans.push(Span::styled(
-            if has_config {
-                "  Ctrl+P: edit"
-            } else {
-                "  (Ctrl+P to configure)"
+            match (has_config, compact) {
+                (true, true) => " Ctrl+P",
+                (true, false) => "  Ctrl+P: edit",
+                (false, _) => "  (Ctrl+P to configure)",
             },
             Style::default().fg(theme.dimmed),
         ));
@@ -196,27 +198,29 @@ mod tests {
     #[test]
     fn suffix_empty_when_unconfigured_and_unfocused() {
         let theme = Theme::default();
-        assert!(tool_config_suffix_spans(false, false, &theme).is_empty());
+        assert!(tool_config_suffix_spans(false, false, false, &theme).is_empty());
     }
 
     #[test]
     fn suffix_shows_configure_hint_when_focused_unconfigured() {
         let theme = Theme::default();
-        let spans = tool_config_suffix_spans(false, true, &theme);
+        let spans = tool_config_suffix_spans(false, true, false, &theme);
         assert_eq!(contents(&spans), ["  (Ctrl+P to configure)"]);
     }
 
     #[test]
     fn suffix_shows_configured_and_edit_when_focused_configured() {
         let theme = Theme::default();
-        let spans = tool_config_suffix_spans(true, true, &theme);
+        let spans = tool_config_suffix_spans(true, true, false, &theme);
         assert_eq!(contents(&spans), ["  (configured)", "  Ctrl+P: edit"]);
+        let compact = tool_config_suffix_spans(true, true, true, &theme);
+        assert_eq!(contents(&compact), ["  (configured)", " Ctrl+P"]);
     }
 
     #[test]
     fn suffix_shows_configured_only_when_unfocused_configured() {
         let theme = Theme::default();
-        let spans = tool_config_suffix_spans(true, false, &theme);
+        let spans = tool_config_suffix_spans(true, false, false, &theme);
         assert_eq!(contents(&spans), ["  (configured)"]);
     }
 

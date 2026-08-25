@@ -2051,8 +2051,16 @@ mod tests {
         // silent desync; this cross-checks the literal strings instead.
         let mirror_path =
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/src/lib/agentProfiles.ts");
-        let mirror = std::fs::read_to_string(&mirror_path)
-            .expect("web/src/lib/agentProfiles.ts must exist next to the crate");
+        let Ok(mirror) = std::fs::read_to_string(&mirror_path) else {
+            // Nix-filtered cargo-test sources omit web/. The TS suite still
+            // pins the mirror there; cross-check it whenever the monorepo
+            // source is available instead of failing a filtered package.
+            eprintln!(
+                "skipping TS lifecycle mirror check: {} is absent",
+                mirror_path.display()
+            );
+            return;
+        };
         let AgentLifecycle::Deprecated {
             since,
             note,
