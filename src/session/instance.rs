@@ -3179,6 +3179,17 @@ impl Instance {
         )
     }
 
+    /// Whether another AoE session shares this one's Kimi store namespace,
+    /// which makes the session index useless for attributing a conversation
+    /// to a pane.
+    fn kimi_store_is_shared(&self) -> bool {
+        super::capture::kimi_store_is_shared(
+            &self.id,
+            &self.project_path,
+            &self.effective_profile(),
+        )
+    }
+
     pub(crate) fn try_retroactive_capture(&self) -> Option<String> {
         let result: Option<String> = match self.tool.as_str() {
             "claude" => {
@@ -3565,6 +3576,15 @@ impl Instance {
                 }
                 return override_if_distinct(self.agent_session_id.as_deref(), authoritative);
             }
+        }
+        // A shared Kimi index names no pane: its newest same-workDir record is
+        // as likely to be a co-located peer's conversation as this one's, so an
+        // anchored sid is kept rather than swapped for the scan result (#3516).
+        // Sole-owner stores skip this and keep the mtime retarget, which stays
+        // the new-conversation promotion path (#2291); sandboxed Kimi never
+        // captures (its arm in try_retroactive_capture returns None).
+        if self.tool == "kimi" && !self.is_sandboxed() && self.kimi_store_is_shared() {
+            return None;
         }
 
         let live = self.try_retroactive_capture()?;
@@ -14936,6 +14956,179 @@ mod tests {
                 assert_eq!(sid.as_deref(), Some(stored));
                 assert!(is_existing);
                 assert_eq!(inst.agent_session_id.as_deref(), Some(stored));
+            }
+            // ── Kimi shared-index anchor (#3516) ─────────────────────────────
+            //
+            // The per-tool bascule tests above run one instance against its
+            // store. Kimi's store is a single append-only
+            // `session_index.jsonl` keyed by workDir with no per-instance
+            // signal, so when two AoE sessions share one cwd the MRU pick can
+            // name either pane's conversation. These fixtures stage the mass
+            // recovery from #3516: every pane holds a stored sid, no peer has
+            // a live tmux pane yet, and the freshest record belongs to a
+            // sibling.
+
+            /// Stage two Kimi index records for one `workDir`, the "fresh"
+            /// one newer than the "stored" one. The recorded `sessionDir`
+            /// paths are regular files rather than directories so their
+            /// mtimes are deterministic through `File::set_times`; the
+            /// selector only stats whatever path the index records.
+            fn seed_kimi_index(home: &std::path::Path, project: &str, stored: &str, fresh: &str) {
+                let now = SystemTime::now();
+                let stored_dir = home.join("sessions").join("stored");
+                let fresh_dir = home.join("sessions").join("fresh");
+                fs::create_dir_all(stored_dir.parent().unwrap()).unwrap();
+                write_with_mtime(&stored_dir, "", now - Duration::from_secs(120));
+                write_with_mtime(&fresh_dir, "", now - Duration::from_secs(5));
+                fs::write(
+                    home.join("session_index.jsonl"),
+                    format!(
+                        "{{\"sessionId\":\"{stored}\",\"sessionDir\":\"{}\",\"workDir\":\"{project}\"}}\n\
+                         {{\"sessionId\":\"{fresh}\",\"sessionDir\":\"{}\",\"workDir\":\"{project}\"}}\n",
+                        stored_dir.display(),
+                        fresh_dir.display(),
+                    ),
+                )
+                .unwrap();
+            }
+
+            #[test]
+            #[serial]
+            fn acquire_kimi_keeps_anchor_when_session_index_is_shared() {
+                let temp = tempdir().unwrap();
+                let _home = isolate_app_dir_at(temp.path());
+                let project = temp.path().join("storm-project");
+                fs::create_dir_all(&project).unwrap();
+                let project = project.to_string_lossy().to_string();
+                let kimi_home = temp.path().join("kimi-home");
+                fs::create_dir_all(&kimi_home).unwrap();
+                let _kimi = EnvGuard::set(&[("KIMI_CODE_HOME", kimi_home.to_str().unwrap())]);
+                seed_kimi_index(&kimi_home, &project, "kimi-stored", "kimi-peer-fresh");
+
+                // The peer shares the cwd and owns the fresher record. It is
+                // persisted but pane-less: exactly the state of every session
+                // in a recovery storm before any pane has come up, when the
+                // live-tmux exclusion scan still sees nothing.
+                let profile = "kimi-shared-anchor";
+                let mut peer = Instance::new("storm-peer", &project);
+                peer.source_profile = profile.to_string();
+                peer.tool = "kimi".to_string();
+                peer.agent_session_id = Some("kimi-peer-fresh".to_string());
+                super::seed_disk_for_sidecar_test(profile, &peer);
+
+                let mut inst = Instance::new("storm-caller", &project);
+                inst.source_profile = profile.to_string();
+                inst.tool = "kimi".to_string();
+                inst.agent_session_id = Some("kimi-stored".to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                // The newest record names the peer's conversation, not this
+                // pane's; acquire must keep the anchored sid instead of
+                // swapping it for the MRU guess.
+                let (sid, is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some("kimi-stored"));
+                assert!(is_existing);
+                assert_eq!(inst.agent_session_id.as_deref(), Some("kimi-stored"));
+            }
+
+            #[test]
+            #[serial]
+            fn acquire_kimi_retarget_stays_when_sole_owner_of_cwd() {
+                // Same fixture without the persisted peer: the index cannot
+                // name another pane's conversation, so the #2291-style MRU
+                // retarget stays intact and remains the post-/clear promotion
+                // path for single-session cwds.
+                let temp = tempdir().unwrap();
+                let _home = isolate_app_dir_at(temp.path());
+                let project = temp.path().join("solo-project");
+                fs::create_dir_all(&project).unwrap();
+                let project = project.to_string_lossy().to_string();
+                let kimi_home = temp.path().join("kimi-home");
+                fs::create_dir_all(&kimi_home).unwrap();
+                let _kimi = EnvGuard::set(&[("KIMI_CODE_HOME", kimi_home.to_str().unwrap())]);
+                seed_kimi_index(&kimi_home, &project, "kimi-stored", "kimi-fresh");
+
+                let mut inst = Instance::new("solo-caller", &project);
+                inst.tool = "kimi".to_string();
+                inst.agent_session_id = Some("kimi-stored".to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some("kimi-fresh"));
+                assert!(is_existing);
+                assert_eq!(inst.agent_session_id.as_deref(), Some("kimi-fresh"));
+            }
+
+            #[test]
+            #[serial]
+            fn kimi_shared_detection_walks_across_profiles() {
+                // The session-index namespace is keyed by the resolved Kimi
+                // home plus the canonical cwd, not by the AoE profile: a peer
+                // recovered under a different profile must still block the
+                // MRU retarget (the gap class flagged as P1 on #3507).
+                let temp = tempdir().unwrap();
+                let _home = isolate_app_dir_at(temp.path());
+                let project = temp.path().join("cross-project");
+                fs::create_dir_all(&project).unwrap();
+                let project = project.to_string_lossy().to_string();
+                let kimi_home = temp.path().join("kimi-home");
+                fs::create_dir_all(&kimi_home).unwrap();
+                let _kimi = EnvGuard::set(&[("KIMI_CODE_HOME", kimi_home.to_str().unwrap())]);
+                seed_kimi_index(&kimi_home, &project, "kimi-stored", "kimi-peer-fresh");
+
+                let mut peer = Instance::new("cross-peer", &project);
+                peer.source_profile = "kimi-cross-peer-profile".to_string();
+                peer.tool = "kimi".to_string();
+                peer.agent_session_id = Some("kimi-peer-fresh".to_string());
+                super::seed_disk_for_sidecar_test("kimi-cross-peer-profile", &peer);
+
+                let mut inst = Instance::new("cross-caller", &project);
+                inst.source_profile = "kimi-cross-caller-profile".to_string();
+                inst.tool = "kimi".to_string();
+                inst.agent_session_id = Some("kimi-stored".to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, _is_existing) = inst.acquire_session_id();
+                assert_eq!(
+                    sid.as_deref(),
+                    Some("kimi-stored"),
+                    "a peer in another profile sharing the resolved home and cwd must still count as shared"
+                );
+            }
+
+            #[test]
+            #[serial]
+            fn kimi_peer_on_different_cwd_does_not_block_retarget() {
+                // Sharing is judged on the pair (resolved home, canonical
+                // cwd): a peer on another project leaves this pane the sole
+                // owner of its own workDir slice of the index.
+                let temp = tempdir().unwrap();
+                let _home = isolate_app_dir_at(temp.path());
+                let project = temp.path().join("mine-project");
+                let other_project = temp.path().join("other-project");
+                fs::create_dir_all(&project).unwrap();
+                fs::create_dir_all(&other_project).unwrap();
+                let project = project.to_string_lossy().to_string();
+                let other_project = other_project.to_string_lossy().to_string();
+                let kimi_home = temp.path().join("kimi-home");
+                fs::create_dir_all(&kimi_home).unwrap();
+                let _kimi = EnvGuard::set(&[("KIMI_CODE_HOME", kimi_home.to_str().unwrap())]);
+                seed_kimi_index(&kimi_home, &project, "kimi-stored", "kimi-fresh");
+
+                let profile = "kimi-different-cwd";
+                let mut peer = Instance::new("cwd-peer", &other_project);
+                peer.source_profile = profile.to_string();
+                peer.tool = "kimi".to_string();
+                super::seed_disk_for_sidecar_test(profile, &peer);
+
+                let mut inst = Instance::new("mine-caller", &project);
+                inst.source_profile = profile.to_string();
+                inst.tool = "kimi".to_string();
+                inst.agent_session_id = Some("kimi-stored".to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, _is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some("kimi-fresh"));
             }
         }
 

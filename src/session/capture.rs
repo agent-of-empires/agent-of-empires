@@ -2749,6 +2749,83 @@ pub(crate) fn kimi_poll_fn(
     }
 }
 
+/// Effective Kimi home for one profile's host environment: `KIMI_CODE_HOME`
+/// from that environment when set, else the same ambient default resolution
+/// [`capture_kimi_session_id`] performs. `None` when even the default cannot
+/// be resolved; the sharing predicate fails closed on `None`.
+fn kimi_home_for_environment(environment: &[String]) -> Option<PathBuf> {
+    for entry in environment {
+        if let Some((key, value)) = entry.split_once('=') {
+            if key == "KIMI_CODE_HOME" && !value.is_empty() {
+                return Some(PathBuf::from(value));
+            }
+        }
+    }
+    resolve_agent_home(Some("KIMI_CODE_HOME"), ".kimi-code").ok()
+}
+
+/// Whether another live-tracked AoE session shares this one's Kimi store
+/// namespace: the same resolved `$KIMI_CODE_HOME` (or default `~/.kimi-code`)
+/// and the same canonicalized project path. When true, the newest matching
+/// record in `session_index.jsonl` cannot be attributed to this pane, so
+/// acquire must not retarget an anchored session id from it (#3516).
+///
+/// The walk covers every AoE profile because the index is keyed by resolved
+/// home plus cwd, not by profile: two profiles resolving to one home share
+/// one store. It fails closed: an unreadable profile list, an unreadable
+/// per-profile store, or an unresolvable Kimi home all report shared,
+/// because ownership that cannot be proven must not license an MRU
+/// retarget. Trashed and archived peers are skipped: they need explicit user
+/// action or are skipped by startup recovery, so they cannot take part in a
+/// concurrent start. Stopped and pane-less peers deliberately count as
+/// sharing; pane liveness is exactly what races during a mass recovery, so
+/// filtering on it re-opens the storm window (same reasoning as #3507's
+/// Claude predicate).
+pub(crate) fn kimi_store_is_shared(
+    current_instance_id: &str,
+    current_project_path: &str,
+    profile: &str,
+) -> bool {
+    let canonical_current = canonicalize_or_raw(current_project_path);
+    let Some(own_home) = kimi_home_for_environment(
+        &super::profile_config::resolve_config_or_warn(profile).environment,
+    ) else {
+        return true;
+    };
+    let own_home = canonicalize_or_raw(own_home.to_string_lossy().as_ref());
+    let Ok(profiles) = crate::session::list_profiles() else {
+        return true;
+    };
+    for peer_profile in profiles {
+        let Ok(storage) = crate::session::storage::Storage::new_unwatched(&peer_profile) else {
+            return true;
+        };
+        let Ok(instances) = storage.load() else {
+            return true;
+        };
+        let Some(peer_home) = kimi_home_for_environment(
+            &super::profile_config::resolve_config_or_warn(&peer_profile).environment,
+        ) else {
+            return true;
+        };
+        if canonicalize_or_raw(peer_home.to_string_lossy().as_ref()) != own_home {
+            continue;
+        }
+        for inst in instances {
+            if inst.id == current_instance_id || inst.tool != "kimi" || inst.is_sandboxed() {
+                continue;
+            }
+            if inst.is_trashed() || inst.is_archived() {
+                continue;
+            }
+            if canonicalize_or_raw(&inst.project_path) == canonical_current {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 // ─── Hermes session capture ───────────────────────────────────────────────────
 
 const HERMES_COMMAND_TIMEOUT_SECS: u64 = 5;
