@@ -348,6 +348,15 @@ struct SessionDetails {
     trashed_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     archived_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Gated on [`Instance::is_snoozed`] exactly like `aoe list --json` and
+    /// the API: surfaced only while the deadline is in the future, so a row
+    /// whose snooze expired omits the key instead of advertising it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snoozed_until: Option<chrono::DateTime<chrono::Utc>>,
+    /// Set iff the session is currently pinned for the web sidebar.
+    /// Independent of `state`, matching the API field from #1581.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pinned_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -367,6 +376,8 @@ fn session_details(inst: &Instance, profile: &str) -> SessionDetails {
         state: super::list::state_tag(inst),
         trashed_at: inst.trashed_at,
         archived_at: inst.archived_at,
+        snoozed_until: super::list::active_snoozed_until(inst),
+        pinned_at: inst.pinned_at,
         agent_session_id: inst.agent_session_id.clone(),
         parent_session_id: inst.parent_session_id.clone(),
         profile: profile.to_string(),
@@ -3141,5 +3152,112 @@ mod show_json_tests {
         assert!(!serialized.contains("trashed_at"), "{serialized}");
         assert!(!serialized.contains("archived_at"), "{serialized}");
         assert!(serialized.contains("\"state\":\"live\""), "{serialized}");
+    }
+
+    /// #3415: same four-timestamp mirror as `aoe list --json`, gated the
+    /// same way: the snooze key surfaces only while `is_snoozed()` holds,
+    /// the pin key whenever set, neither appears on a plain row, and
+    /// `state` stays the untouched bucket tag throughout.
+    #[test]
+    fn show_json_mirrors_the_api_snooze_and_pin_keys() {
+        let now = chrono::Utc::now();
+        let future = now + chrono::Duration::minutes(15);
+        let past = now - chrono::Duration::minutes(15);
+
+        let mut snoozed = Instance::new("z", "/repo");
+        snoozed.snoozed_until = Some(future);
+
+        let mut expired = Instance::new("z", "/repo");
+        expired.snoozed_until = Some(past);
+
+        let mut pinned = Instance::new("z", "/repo");
+        pinned.pinned_at = Some(now);
+
+        // pin() and snooze() clear each other's marker, but peer store
+        // writes bypass the mutators, so a row can carry both at once
+        // and neither key may suppress the other.
+        let mut both = Instance::new("z", "/repo");
+        both.pinned_at = Some(now);
+        both.snoozed_until = Some(future);
+
+        // archive() clears a concurrent snooze through the mutators, but
+        // snooze() leaves archived_at alone, so archiving a row and then
+        // snoozing it persists the pair through ordinary CLI commands:
+        // the keys must stay independent of the bucket tag.
+        let mut sunk = Instance::new("z", "/repo");
+        sunk.archived_at = Some(now);
+        sunk.snoozed_until = Some(future);
+
+        // snoozed then trashed through ordinary commands: trash()
+        // preserves the sibling timestamps, so a triaged row must still
+        // report its deadline from the trash.
+        let mut trashed_snoozed = Instance::new("z", "/repo");
+        trashed_snoozed.snooze(30);
+        trashed_snoozed.trash();
+
+        // pinned for the web sidebar, then trashed the same way.
+        let mut trashed_pinned = Instance::new("z", "/repo");
+        trashed_pinned.pin();
+        trashed_pinned.trash();
+
+        // pin() clears archived_at through the mutators, but peer store
+        // writes bypass them: an archived row can still carry a pin.
+        let mut archived_pinned = Instance::new("z", "/repo");
+        archived_pinned.archived_at = Some(now);
+        archived_pinned.pinned_at = Some(now);
+
+        let plain = Instance::new("z", "/repo");
+
+        let cases = [
+            ("active snooze", &snoozed, true, false, "live"),
+            ("expired snooze", &expired, false, false, "live"),
+            ("pinned", &pinned, false, true, "live"),
+            ("plain row", &plain, false, false, "live"),
+            ("snoozed and archived", &sunk, true, false, "archived"),
+            ("pinned and snoozed", &both, true, true, "live"),
+            (
+                "trashed and snoozed",
+                &trashed_snoozed,
+                true,
+                false,
+                "trashed",
+            ),
+            (
+                "trashed and pinned",
+                &trashed_pinned,
+                false,
+                true,
+                "trashed",
+            ),
+            (
+                "pinned and archived",
+                &archived_pinned,
+                false,
+                true,
+                "archived",
+            ),
+        ];
+        for (label, inst, want_snooze, want_pin, want_state) in cases {
+            let value = serde_json::to_value(session_details(inst, "p")).unwrap();
+            assert_eq!(
+                value.get("snoozed_until").is_some(),
+                want_snooze,
+                "{label}: {value}"
+            );
+            assert_eq!(
+                value.get("pinned_at").is_some(),
+                want_pin,
+                "{label}: {value}"
+            );
+            assert_eq!(value["state"].as_str(), Some(want_state), "{label}");
+        }
+
+        // Value fidelity on the one row whose exact deadline we set:
+        // presence alone would accept a regression emitting any instant.
+        let active = serde_json::to_value(session_details(&snoozed, "p")).unwrap();
+        assert_eq!(
+            active["snoozed_until"],
+            serde_json::to_value(future).unwrap()
+        );
     }
 }

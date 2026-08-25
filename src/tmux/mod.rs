@@ -252,6 +252,19 @@ struct SessionCache {
     data: Option<HashMap<String, i64>>,
     time: Option<Instant>,
 }
+
+/// Shared `tmux list-panes -a` snapshot behind [`pane_dead_for_display`],
+/// mirroring [`SESSION_CACHE`]'s TTL and its `data: None` "the server could
+/// not answer" state.
+static PANE_META_CACHE: RwLock<PaneMetaCache> = RwLock::new(PaneMetaCache {
+    data: None,
+    time: None,
+});
+
+struct PaneMetaCache {
+    data: Option<HashMap<String, PaneMetadata>>,
+    time: Option<Instant>,
+}
 const TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 fn run_tmux_command_with_timeout_inner(
@@ -993,6 +1006,45 @@ impl Drop for SessionCacheGuard {
     }
 }
 
+/// [`SessionCacheGuard`] for [`PANE_META_CACHE`]: captures the prior snapshot
+/// and restores it on `Drop` so a mid-test panic cannot leak a forced state
+/// into a later test. Pair with `#[serial_test::serial]`.
+#[cfg(test)]
+pub(crate) struct PaneMetaCacheGuard {
+    prev_data: Option<HashMap<String, PaneMetadata>>,
+    prev_time: Option<Instant>,
+}
+
+#[cfg(test)]
+impl PaneMetaCacheGuard {
+    pub(crate) fn capture() -> Self {
+        let cache = PANE_META_CACHE.read().expect("pane meta cache lock");
+        Self {
+            prev_data: cache.data.clone(),
+            prev_time: cache.time,
+        }
+    }
+
+    /// Force a fresh snapshot that carries no data: what `refresh_pane_meta_cache`
+    /// writes when `batch_pane_metadata` fails.
+    pub(crate) fn force_failed_refresh(&self) {
+        if let Ok(mut cache) = PANE_META_CACHE.write() {
+            cache.data = None;
+            cache.time = Some(Instant::now());
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for PaneMetaCacheGuard {
+    fn drop(&mut self) {
+        if let Ok(mut cache) = PANE_META_CACHE.write() {
+            cache.data = self.prev_data.take();
+            cache.time = self.prev_time;
+        }
+    }
+}
+
 /// How long a [`SESSION_CACHE`] snapshot is trusted before a lookup must
 /// force a fresh `refresh_session_cache()` call.
 const CACHE_TTL: Duration = Duration::from_secs(2);
@@ -1102,6 +1154,79 @@ pub fn session_exists(name: &str) -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Session liveness for a **render path**, answered from the shared snapshot
+/// and never from a per-name probe.
+///
+/// [`session_exists`] falls through to a live `has-session` on a cache miss so
+/// teardown and drift decisions can't act on a cached false negative. A row
+/// glyph is neither of those, and that fallback costs one fork per call: the
+/// Terminal-view list called it once per visible row per frame, which measured
+/// 52ms/frame at 30 rows (1.7ms/row) against 47us for the agent view, whose
+/// rows read `Instance.status` straight from the poller's batched snapshot.
+///
+/// The trade is that a session created since the last scan reads as absent for
+/// up to `CACHE_TTL`. Call sites that start or kill a pane already force a
+/// [`refresh_session_cache`], so the glyph flips immediately there; the TTL
+/// only covers panes created behind this process's back.
+///
+/// An unreachable tmux server resolves to `false` (nothing to draw as live)
+/// without re-forking per row, because [`probe_session_existence`] treats a
+/// fresh "server did not answer" snapshot as an answer.
+pub fn session_exists_for_display(name: &str) -> bool {
+    matches!(probe_session_existence(name), SessionExistence::Present)
+}
+
+/// Pane-dead state for a **render path**, from a shared `list-panes -a`
+/// snapshot refreshed at most once per `CACHE_TTL`.
+///
+/// The per-name `utils::is_pane_dead` forks a `display-message` on every
+/// call, so the Tool view paid two forks per row per frame (this plus
+/// existence). See [`session_exists_for_display`] for the measurement and the
+/// staleness trade.
+///
+/// Returns `false` ("not known to be dead") for a session missing from the
+/// snapshot and whenever the snapshot could not be produced, matching
+/// [`batch_pane_metadata`]'s contract that an `Err` means "don't know" rather
+/// than "everything is dead". Callers gate on existence first, so a missing
+/// key is an absent session rather than a live pane.
+pub fn pane_dead_for_display(name: &str) -> bool {
+    if let Some(dead) = pane_dead_from_cache(name) {
+        return dead;
+    }
+    refresh_pane_meta_cache();
+    pane_dead_from_cache(name).unwrap_or(false)
+}
+
+/// Resolve from the current pane snapshot without spawning. `None` only when
+/// the snapshot is stale or the lock is poisoned, so the caller knows a
+/// refresh could still change the answer. A fresh snapshot with no data is an
+/// answer (`Some(false)`, "can't tell, don't claim dead"), not a stale one, or
+/// every row would re-refresh into the same failure.
+fn pane_dead_from_cache(name: &str) -> Option<bool> {
+    let cache = PANE_META_CACHE.read().ok()?;
+    if cache.time.map(|t| t.elapsed() > CACHE_TTL).unwrap_or(true) {
+        return None;
+    }
+    Some(
+        cache
+            .data
+            .as_ref()
+            .and_then(|map| map.get(name))
+            .is_some_and(|meta| meta.pane_dead),
+    )
+}
+
+/// Repopulate [`PANE_META_CACHE`]. The timestamp is stamped even when the
+/// query fails, so a tmux outage costs one fork per [`CACHE_TTL`] instead of
+/// one per row per frame.
+fn refresh_pane_meta_cache() {
+    let data = batch_pane_metadata().ok();
+    if let Ok(mut cache) = PANE_META_CACHE.write() {
+        cache.data = data;
+        cache.time = Some(Instant::now());
+    }
 }
 
 pub fn get_current_session_name() -> Option<String> {
@@ -1897,6 +2022,71 @@ mod tests {
             .output()
             .map(|o| o.status.success())
             .unwrap_or(false)
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_failed_pane_snapshot_is_an_answer_so_rows_do_not_re_fork() {
+        // `refresh_pane_meta_cache` stamps `time` even when `batch_pane_metadata`
+        // fails, and `pane_dead_from_cache` gates on `time` alone. That pairing is
+        // what bounds a tmux outage to one fork per CACHE_TTL instead of one per
+        // row per frame: if a fresh-but-empty snapshot resolved to `None`, every
+        // Tool row would drive another doomed refresh, which is the per-row fork
+        // this whole change removes.
+        let guard = PaneMetaCacheGuard::capture();
+        guard.force_failed_refresh();
+
+        assert_eq!(
+            pane_dead_from_cache("aoe_tool_absent_00000000"),
+            Some(false),
+            "a fresh snapshot with no data must answer \"can't tell, not dead\", \
+             not report itself stale"
+        );
+        assert!(
+            !pane_dead_for_display("aoe_tool_absent_00000000"),
+            "and the display helper must not claim a pane it cannot see is dead"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn display_liveness_answers_from_the_snapshot_instead_of_probing_per_name() {
+        // The render path's contract: `session_exists_for_display` reads the
+        // shared snapshot, where `session_exists` falls through to a live
+        // `has-session` on a miss. Only a snapshot that DISAGREES with tmux
+        // separates them, so force one that says "server reachable, zero
+        // sessions" while a real pane is live. Getting this wrong costs one
+        // fork per row per frame (~1.7ms each), which is what stalled the
+        // Terminal-view list at ~19fps.
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+        let guard = SessionCacheGuard::capture();
+        let session = test_helpers::TmuxTestSession::new(&format!("{SESSION_PREFIX}display_probe"));
+        let created = tmux_command()
+            .args(["new-session", "-d", "-s", session.name(), "sleep 60"])
+            .output()
+            .expect("tmux new-session");
+        assert!(created.status.success());
+
+        // No fork between forcing the snapshot and reading it, so the TTL
+        // cannot expire out from under the assertions.
+        guard.force_present(&[]);
+        assert!(
+            !session_exists_for_display(session.name()),
+            "display path must answer from the snapshot, not probe tmux"
+        );
+        assert!(
+            session_exists(session.name()),
+            "the probing path must see the live pane the snapshot missed; \
+             without this the test would pass on a broken snapshot too"
+        );
+
+        // And a snapshot that lists the session resolves live without tmux
+        // being consulted at all.
+        guard.force_present(&[session.name()]);
+        assert!(session_exists_for_display(session.name()));
     }
 
     #[test]

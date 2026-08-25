@@ -817,7 +817,7 @@ export interface AcpState {
    *  meaning the reconciler reaped the worker for inactivity
    *  (`acp.auto_stop_idle_secs`) and marked the session dormant. Unlike
    *  `workerStopped`, this is recoverable without any explicit reconnect:
-   *  the next prompt POST wakes it (the server's `touch_and_wake_if_sunk`
+   *  the next prompt POST wakes it (the server's `touch_on_prompt_and_wake_if_sunk`
    *  clears dormancy, the reconciler respawns, and `send_prompt`'s
    *  `wait_for_worker` holds the request until the fresh worker is ready).
    *  `sendPrompt` and the drain effect read this so a dormant worker does

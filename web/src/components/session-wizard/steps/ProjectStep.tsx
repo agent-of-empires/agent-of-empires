@@ -54,6 +54,10 @@ function Toggle({
 
 type Tab = "recent" | "browse" | "clone" | "import";
 
+/** How many recents render when the search box is empty. The search itself is
+ *  not capped; see the filteredRecent memo. */
+const RECENT_CAP = 6;
+
 interface Props {
   data: WizardData;
   onChange: (field: string, value: unknown) => void;
@@ -169,6 +173,7 @@ export function ProjectStep({ data, onChange, initialTab, agents = [] }: Props) 
   const [saved, setSaved] = useState<ProjectInfo[]>([]);
   const [loading, setLoading] = useState(true);
   const [activeTab, setActiveTab] = useState<Tab>(initialTab ?? "recent");
+  const [query, setQuery] = useState("");
 
   // Clone state
   const [cloneUrl, setCloneUrl] = useState("");
@@ -183,7 +188,7 @@ export function ProjectStep({ data, onChange, initialTab, agents = [] }: Props) 
     Promise.all([fetchSessions(), fetchRecentProjects(), fetchProjects()]).then(
       ([envelope, recentEnvelope, savedProjects]) => {
         const sessionDerived = envelope ? collectRecentProjects(envelope.sessions) : [];
-        const merged = mergeRecentProjects(sessionDerived, recentEnvelope?.projects ?? []).slice(0, 6);
+        const merged = mergeRecentProjects(sessionDerived, recentEnvelope?.projects ?? []);
         const split = splitSavedAndRecent(savedProjects, merged);
         setSaved(split.saved);
         setRecent(split.recent);
@@ -198,17 +203,20 @@ export function ProjectStep({ data, onChange, initialTab, agents = [] }: Props) 
     );
   }, [initialTab]);
 
+  // #3461: with no query, recents stay capped so the tab reads as a short
+  // "jump back in" list. A query searches the whole merged list instead, so a
+  // project sitting below the cap is still reachable by typing.
   const filteredRecent = useMemo(() => {
-    if (!data.path) return recent;
-    const q = data.path.toLowerCase();
+    const q = query.trim().toLowerCase();
+    if (!q) return recent.slice(0, RECENT_CAP);
     return recent.filter((r) => r.path.toLowerCase().includes(q) || r.displayName.toLowerCase().includes(q));
-  }, [recent, data.path]);
+  }, [recent, query]);
 
   const filteredSaved = useMemo(() => {
-    if (!data.path) return saved;
-    const q = data.path.toLowerCase();
+    const q = query.trim().toLowerCase();
+    if (!q) return saved;
     return saved.filter((s) => s.path.toLowerCase().includes(q) || s.name.toLowerCase().includes(q));
-  }, [saved, data.path]);
+  }, [saved, query]);
 
   const hasPicks = recent.length > 0 || saved.length > 0;
 
@@ -355,6 +363,22 @@ export function ProjectStep({ data, onChange, initialTab, agents = [] }: Props) 
               session-derived and persisted recents below. */}
           {!loading && activeTab === "recent" && hasPicks && (
             <div className="flex flex-col gap-4">
+              {/* #3461: type-to-filter over the whole saved + recent list, so
+                  a project below RECENT_CAP is reachable without falling back
+                  to Browse. */}
+              <input
+                type="text"
+                value={query}
+                onChange={(e) => setQuery(e.target.value)}
+                placeholder="Search projects by name or path"
+                aria-label="Search projects"
+                className="w-full px-3 py-2.5 text-sm bg-surface-900 border border-surface-700/40 rounded-md text-text-primary placeholder:text-text-dim focus:outline-none focus:border-brand-600"
+              />
+
+              {filteredSaved.length === 0 && filteredRecent.length === 0 && (
+                <p className="text-sm text-text-dim">No projects match that search. Try the Browse tab.</p>
+              )}
+
               {filteredSaved.length > 0 && (
                 <div className="flex flex-col gap-1.5">
                   <p className="text-[10px] font-mono uppercase tracking-wider text-text-dim">Saved projects</p>

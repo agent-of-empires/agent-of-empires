@@ -10244,6 +10244,46 @@ fn restart_selected_session_tool_swap_clears_old_agent_session_state() {
     assert_eq!(parked.acp_session_id.as_deref(), Some("acp-sess-1"));
 }
 
+/// The disk row a tool swap writes must resolve `agent_detect_as` against the
+/// session's own profile. `source_profile` is `skip_serializing`, so a
+/// storage-loaded row comes back blank and would key the default profile's
+/// aliases instead; `detect_as` is not in `reconcile_from_disk`'s carry set,
+/// so that wrong value is what the next launch reads.
+#[test]
+#[serial]
+fn restart_selected_session_tool_swap_resolves_detect_as_for_the_row_profile() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+
+    // Pin the resolved default profile to something other than the row's own
+    // profile, so a blank `source_profile` is observably the wrong key.
+    let app_dir = crate::session::get_app_dir().expect("app dir");
+    std::fs::create_dir_all(app_dir.join("profiles").join("other")).expect("other profile");
+    std::fs::write(app_dir.join("config.toml"), "default_profile = \"other\"\n")
+        .expect("global config");
+
+    let mut config = crate::session::Config::default();
+    config
+        .session
+        .agent_detect_as
+        .insert("gjc".to_string(), "claude".to_string());
+    crate::tmux::status_rules::install_from_config("test", &config);
+    crate::tmux::status_rules::install_from_config("other", &crate::session::Config::default());
+
+    env.view
+        .restart_selected_session(None, Some("gjc"), None, None)
+        .unwrap();
+
+    let disk = Storage::new_unwatched("test").unwrap().load().unwrap();
+    let row = disk.iter().find(|i| i.id == id).unwrap();
+    assert_eq!(row.tool, "gjc");
+    assert_eq!(
+        row.detect_as, "claude",
+        "the swap must read profile 'test' aliases, not the default profile's"
+    );
+}
+
 #[test]
 #[serial]
 fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
@@ -20221,6 +20261,150 @@ mod daemon_status_apply_tests {
                 env.view.get_instance(&id).map(|i| i.status),
                 Some(Status::Idle),
                 "a {label} row is sunk; the daemon overlay must not drive its status (#3201)"
+            );
+        }
+    }
+}
+
+#[test]
+#[serial]
+fn every_view_mode_paints_the_same_sunk_row_decoration() {
+    // `render_item_line`'s three view arms each carried their own copy of the
+    // archive / snooze / favorite block (Structured and Terminal had
+    // byte-identical title blocks), and the Tool arm had none at all: an
+    // archived or snoozed session in Tool view kept painting its live glyph
+    // with no `z ` prefix. `decorate_row` owns the overlay for every mode now,
+    // so the three must agree.
+    //
+    // The pane views are seeded live on purpose. `ICON_IDLE` and `ICON_STOPPED`
+    // are the same glyph and an unseeded pane row is already dimmed, so a row
+    // whose terminal is NOT running renders identically with and without the
+    // sink override, and every assertion below would pass on a renderer that
+    // dropped `decorate_row` entirely. Injecting the pane names into the shared
+    // tmux snapshot makes the seed a bright animated spinner, which is what
+    // gives the override something to actually override.
+    use super::{ViewMode, ICON_STOPPED};
+    use crate::session::Status;
+    use ratatui::style::Modifier;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = match env.view.flat_items.first() {
+        Some(Item::Session { id, .. }) => id.clone(),
+        _ => panic!("expected the fixture to seed a single Session item"),
+    };
+    let title = env
+        .view
+        .get_instance(&id)
+        .expect("session present")
+        .title
+        .clone();
+    // Snooze decoration is Attention-gated; archive is universal.
+    env.view.sort_order = crate::session::config::SortOrder::Attention;
+    let theme = crate::tui::styles::Theme::default();
+    let item = Item::Session {
+        id: id.clone(),
+        depth: 0,
+    };
+
+    let seed_panes_live = || {
+        crate::tmux::test_inject_session_into_cache(&crate::tmux::TerminalSession::generate_name(
+            &id, &title,
+        ));
+        crate::tmux::test_inject_session_into_cache(&crate::tmux::ToolSession::generate_name(
+            &id, &title, "lazygit",
+        ));
+    };
+
+    // (label, archived, snoozed, expected title prefix, extra modifiers)
+    let cases = [
+        ("archived", true, false, "", Modifier::empty()),
+        (
+            "snoozed",
+            false,
+            true,
+            "z ",
+            Modifier::ITALIC | Modifier::DIM,
+        ),
+    ];
+
+    for mode in [
+        ViewMode::Structured,
+        ViewMode::Terminal,
+        ViewMode::Tool("lazygit".to_string()),
+    ] {
+        env.view.view_mode = mode.clone();
+
+        // Anti-vacuity: a live, unsunk row must NOT already look sunk, or the
+        // sink assertions below prove nothing about this mode.
+        seed_panes_live();
+        env.view.mutate_instance(&id, |inst| {
+            inst.status = Status::Running;
+            inst.archived_at = None;
+            inst.snoozed_until = None;
+        });
+        let live = env.view.render_item_line(&item, false, false, &theme, 120);
+        assert_ne!(
+            live.spans[1].style.fg,
+            Some(theme.dimmed),
+            "{mode:?}: a live row must not already paint dimmed; \
+             the sink assertions below would be vacuous"
+        );
+
+        for (label, archived, snoozed, prefix, extra) in cases {
+            seed_panes_live();
+            // Status stays Running so the live-glyph branch would fire in
+            // every mode if the sink override were missing.
+            env.view.mutate_instance(&id, |inst| {
+                inst.status = Status::Running;
+                inst.archived_at = archived.then(chrono::Utc::now);
+                inst.snoozed_until =
+                    snoozed.then(|| chrono::Utc::now() + chrono::Duration::minutes(15));
+            });
+
+            let line = env.view.render_item_line(&item, false, false, &theme, 120);
+            let icon = line.spans[1].content.trim().to_string();
+            let rendered = line.spans[2].content.to_string();
+
+            assert_eq!(
+                icon, ICON_STOPPED,
+                "{mode:?}/{label}: sunk row must drop its live glyph"
+            );
+            assert_eq!(
+                line.spans[1].style.fg,
+                Some(theme.dimmed),
+                "{mode:?}/{label}: sunk row must paint dimmed"
+            );
+            assert!(
+                line.spans[1].style.add_modifier.contains(extra),
+                "{mode:?}/{label}: expected {extra:?}, got {:?}",
+                line.spans[1].style.add_modifier
+            );
+            assert_eq!(
+                rendered,
+                format!("{prefix}{title}"),
+                "{mode:?}/{label}: wrong title decoration"
+            );
+        }
+
+        // Error and Deleting punch through the sink mask in Structured only.
+        // There the seed carries ICON_ERROR + theme.error, so a failed Empty
+        // Trash stays distinguishable from a healthy trash row. The pane views
+        // seed from terminal liveness and have no error affordance, so
+        // punching through would paint a bright animated "still alive" row
+        // inside the Archived shelf while signalling nothing about the failure.
+        for status in [Status::Error, Status::Deleting] {
+            seed_panes_live();
+            env.view.mutate_instance(&id, |inst| {
+                inst.status = status;
+                inst.archived_at = Some(chrono::Utc::now());
+                inst.snoozed_until = None;
+            });
+            let line = env.view.render_item_line(&item, false, false, &theme, 120);
+            let sunk = line.spans[1].style.fg == Some(theme.dimmed);
+            assert_eq!(
+                sunk,
+                !matches!(mode, ViewMode::Structured),
+                "{mode:?}/archived+{status:?}: only Structured may punch through the sink mask"
             );
         }
     }

@@ -396,6 +396,116 @@ pub(crate) fn agent_row_icon(inst: &crate::session::Instance) -> &'static str {
     }
 }
 
+/// A view mode's contribution to a session row: the glyph, color, and any
+/// modifier describing the state of *its own* backing pane. Structured seeds
+/// from the poller-maintained `Instance.status`, Terminal from the paired
+/// terminal's liveness, Tool from the tool pane's. Everything layered on top
+/// is mode-independent and lives in [`decorate_row`].
+struct RowSeed {
+    icon: &'static str,
+    color: Color,
+    modifier: ratatui::style::Modifier,
+}
+
+/// How a view mode resolves a sunk row (archived / trashed / snoozed).
+enum SunkRow {
+    /// Structured: the agent's own resting glyph. Error and Deleting punch
+    /// through the sink mask here, because they are live delete-op states this
+    /// TUI set rather than stale pane statuses, and the seed carries
+    /// `ICON_ERROR` + `theme.error` for them. Swallowing that left a failed
+    /// Empty Trash indistinguishable from a healthy trash row.
+    /// [`agent_row_icon`] applies the same exception to the glyph.
+    AgentStatus(&'static str),
+    /// Terminal / Tool: one muted glyph, unconditionally. These seeds describe
+    /// pane liveness and carry no error affordance, so letting a delete-op
+    /// status punch through would paint a bright animated "the terminal is
+    /// alive" row inside a shelf whose whole premise is that the row is put
+    /// away, while signalling nothing about the failure.
+    Pane,
+}
+
+/// The archive/trash, snooze, urgent, and favorite overlays every view mode
+/// paints on top of its [`RowSeed`], plus the title prefix that goes with them.
+///
+/// This was three copies: the Structured and Terminal arms of
+/// `render_item_line` carried byte-identical title blocks and near-identical
+/// style blocks, and the Tool arm had silently dropped all of it, so an
+/// archived or snoozed session in Tool view kept painting its running glyph
+/// with no `z ` / `! ` prefix.
+///
+/// `sunk` says how this view resolves a sunk row; see [`SunkRow`].
+fn decorate_row(
+    inst: &crate::session::Instance,
+    in_attention: bool,
+    show_favorite: bool,
+    seed: RowSeed,
+    sunk: SunkRow,
+    theme: &Theme,
+) -> (&'static str, std::borrow::Cow<'static, str>, Style) {
+    use ratatui::style::Modifier;
+    use std::borrow::Cow;
+
+    let mut icon = seed.icon;
+    let mut style = Style::default().fg(seed.color).add_modifier(seed.modifier);
+
+    let (sunk_icon, punches_through) = match sunk {
+        SunkRow::AgentStatus(resting) => (
+            resting,
+            matches!(inst.status, Status::Error | Status::Deleting),
+        ),
+        SunkRow::Pane => (ICON_STOPPED, false),
+    };
+    if (inst.is_archived() || inst.is_trashed()) && !punches_through {
+        // Archived and trashed rows render with one uniform muted glyph
+        // regardless of underlying pane status. The pane is dead, so painting
+        // the persisted status would be misleading. The Archived section
+        // header is the sole textual cue, so no italic/dim modifier here; just
+        // a dim color.
+        icon = sunk_icon;
+        style = Style::default().fg(theme.dimmed);
+    } else if in_attention && inst.is_snoozed() {
+        // Snooze decoration is Attention-only. Outside Attention the row
+        // paints its real state (the timer keeps running; the visual
+        // treatment just doesn't surface).
+        icon = sunk_icon;
+        style = Style::default()
+            .fg(theme.dimmed)
+            .add_modifier(Modifier::ITALIC)
+            .add_modifier(Modifier::DIM);
+    } else if in_attention && inst.is_urgent() {
+        // Urgent decoration is Attention-only. The flag still persists in
+        // non-Attention modes, but the cross-tier promoter visual only makes
+        // sense when tier ordering is in effect.
+        style = Style::default()
+            .fg(theme.error)
+            .add_modifier(Modifier::BOLD)
+            .add_modifier(Modifier::RAPID_BLINK);
+    } else if show_favorite && crate::session::is_live_favorite(inst) {
+        style = style
+            .add_modifier(Modifier::BOLD)
+            .add_modifier(Modifier::UNDERLINED);
+    }
+
+    // Prefix priority: archive (no prefix) wins over snooze (`z `) wins over
+    // urgent (`! `) wins over favorite (`* `). Snooze and urgent are
+    // Attention-mode-only so users in Newest / AZ / etc. don't see decoration
+    // for state they didn't opt into managing; the favorite star also shows
+    // elsewhere, because favorites-first pins the row there too.
+    let title_text = if inst.is_archived() || inst.is_trashed() {
+        Cow::Owned(inst.title.clone())
+    } else if in_attention && inst.is_snoozed() {
+        Cow::Owned(format!("z {}", inst.title))
+    } else if in_attention && inst.is_urgent() {
+        Cow::Owned(format!("! {}", inst.title))
+    } else if show_favorite && crate::session::is_live_favorite(inst) {
+        Cow::Owned(format!("* {}", inst.title))
+    } else {
+        Cow::Owned(inst.title.clone())
+    };
+
+    (icon, title_text, style)
+}
+
 /// Append the selected row's `last_error` (in red) to a shelf placeholder's
 /// lines when the row sits in `Status::Error`. A failed permanent delete
 /// parks a trashed/archived row exactly here (`apply_deletion_results`);
@@ -1482,7 +1592,11 @@ impl HomeView {
             }
             Item::Session { id, .. } => {
                 if let Some(inst) = self.get_instance(id) {
-                    match self.view_mode {
+                    // Each view mode contributes only the live-state glyph
+                    // and color for its own backing pane; every overlay on top
+                    // of that (archive/trash, snooze, urgent, favorite) is
+                    // mode-independent and belongs to `decorate_row`.
+                    let (seed, sunk) = match self.view_mode {
                         ViewMode::Structured => {
                             // For Idle sessions, decay color from `fresh_idle`
                             // toward `idle` over `idle_decay_window`. A slow
@@ -1492,11 +1606,6 @@ impl HomeView {
                             // attention-worthy states (Running, Waiting,
                             // Starting). Also serves as a redundant cue for
                             // colorblind users / monochrome terminals.
-                            //
-                            // Archive/snooze then overrides the live spinner.
-                            // A shelved session's underlying status is noise;
-                            // an animated row reads as "still alive" and pulls
-                            // the eye away from real attention items.
                             let idle_age = inst.idle_age();
                             let is_fresh_idle =
                                 matches!(idle_age, Some(age) if age < self.idle_decay_window);
@@ -1530,16 +1639,15 @@ impl HomeView {
                             // Starting/...) supersedes it and keeps its own
                             // color AND spinner. Auto-unread only ever lands
                             // on Idle; a manual flag on a live row defers to
-                            // the live state. Archived/snoozed/urgent below
-                            // still override on top.
-                            // Sunk rows (archived/snoozed) never paint unread:
-                            // the user dismissed the row, so surfacing it as
-                            // unread contradicts that. The flag stays on disk,
-                            // so unarchiving/unsnoozing restores it. Snooze is
-                            // checked in every sort mode here (unlike the
-                            // Attention-only snooze decoration below), so a
-                            // snoozed unread row outside Attention sort still
-                            // drops the dot (#2571).
+                            // the live state. Sunk rows (archived/snoozed)
+                            // never paint unread: the user dismissed the row,
+                            // so surfacing it as unread contradicts that. The
+                            // flag stays on disk, so unarchiving/unsnoozing
+                            // restores it. Snooze is checked in every sort
+                            // mode here (unlike the Attention-only snooze
+                            // decoration in `decorate_row`), so a snoozed
+                            // unread row outside Attention sort still drops
+                            // the dot (#2571).
                             let unread_resting = crate::session::unread_enabled()
                                 && inst.is_unread()
                                 && !inst.is_archived()
@@ -1564,78 +1672,23 @@ impl HomeView {
                                     Status::Creating => theme.accent,
                                 }
                             };
-                            let mut style = Style::default().fg(color);
+                            let mut modifier = ratatui::style::Modifier::empty();
                             if unread_resting {
                                 // Make unread unmistakable: a solid dot glyph
                                 // plus bold, on top of the `theme.unread`
                                 // color set above. A plain color swap read as
-                                // too subtle (#2088 review). Sink/urgent
-                                // states below still override icon + style.
+                                // too subtle (#2088 review).
                                 icon = ICON_UNREAD;
-                                style = style.add_modifier(ratatui::style::Modifier::BOLD);
+                                modifier = ratatui::style::Modifier::BOLD;
                             }
-                            if (inst.is_archived() || inst.is_trashed())
-                                && !matches!(inst.status, Status::Error | Status::Deleting)
-                            {
-                                // Archived and trashed rows render with one
-                                // uniform muted glyph regardless of underlying
-                                // pane status. The pane is dead, so painting
-                                // the persisted Running/Waiting status
-                                // would be misleading. The Archived
-                                // section header is the sole textual
-                                // cue, so no italic/dim modifier is
-                                // applied here; just a dim color. Error and
-                                // Deleting are live delete-operation states,
-                                // not pane statuses, so they keep their real
-                                // glyph and color (see `agent_row_icon`).
-                                icon = agent_row_icon(inst);
-                                style = Style::default().fg(theme.dimmed);
-                            } else if in_attention && inst.is_snoozed() {
-                                // Snooze decoration is Attention-only.
-                                // Outside Attention the row paints its
-                                // real status (the timer keeps running;
-                                // the visual treatment just doesn't
-                                // surface).
-                                icon = agent_row_icon(inst);
-                                style = Style::default()
-                                    .fg(theme.dimmed)
-                                    .add_modifier(ratatui::style::Modifier::ITALIC)
-                                    .add_modifier(ratatui::style::Modifier::DIM);
-                            } else if in_attention && inst.is_urgent() {
-                                // Urgent decoration is Attention-only.
-                                // The flag still persists in non-
-                                // Attention modes, but the cross-tier
-                                // promoter visual only makes sense when
-                                // tier ordering is in effect.
-                                style = Style::default()
-                                    .fg(theme.error)
-                                    .add_modifier(ratatui::style::Modifier::BOLD)
-                                    .add_modifier(ratatui::style::Modifier::RAPID_BLINK);
-                            } else if show_favorite && crate::session::is_live_favorite(inst) {
-                                style = style
-                                    .add_modifier(ratatui::style::Modifier::BOLD)
-                                    .add_modifier(ratatui::style::Modifier::UNDERLINED);
-                            }
-                            // Prefix priority: archive (no prefix) wins
-                            // over snooze (`z `) wins over urgent (`! `)
-                            // wins over favorite (`* `). Snooze and urgent
-                            // are Attention-mode-only so users in Newest /
-                            // AZ / etc. don't see decoration for state they
-                            // didn't opt into managing; the favorite star
-                            // also shows elsewhere, because favorites-first
-                            // pins the row there too.
-                            let title_text = if inst.is_archived() || inst.is_trashed() {
-                                Cow::Owned(inst.title.clone())
-                            } else if in_attention && inst.is_snoozed() {
-                                Cow::Owned(format!("z {}", inst.title))
-                            } else if in_attention && inst.is_urgent() {
-                                Cow::Owned(format!("! {}", inst.title))
-                            } else if show_favorite && crate::session::is_live_favorite(inst) {
-                                Cow::Owned(format!("* {}", inst.title))
-                            } else {
-                                Cow::Owned(inst.title.clone())
-                            };
-                            (icon, title_text, style)
+                            (
+                                RowSeed {
+                                    icon,
+                                    color,
+                                    modifier,
+                                },
+                                SunkRow::AgentStatus(agent_row_icon(inst)),
+                            )
                         }
                         ViewMode::Terminal => {
                             // For sandboxed sessions, check the appropriate terminal based on mode
@@ -1645,85 +1698,58 @@ impl HomeView {
                                 TerminalMode::Host
                             };
                             let terminal_running = match terminal_mode {
-                                TerminalMode::Container => inst
-                                    .container_terminal_tmux_session()
-                                    .map(|s| s.exists())
-                                    .unwrap_or(false),
-                                TerminalMode::Host => inst
-                                    .terminal_tmux_session()
-                                    .map(|s| s.exists())
-                                    .unwrap_or(false),
+                                TerminalMode::Container => {
+                                    inst.container_terminal_tmux_session().is_ok_and(|s| {
+                                        crate::tmux::session_exists_for_display(s.name())
+                                    })
+                                }
+                                TerminalMode::Host => inst.terminal_tmux_session().is_ok_and(|s| {
+                                    crate::tmux::session_exists_for_display(s.name())
+                                }),
                             };
                             // Unread is an Agent-view concept: it means the agent
                             // produced output the user hasn't looked at. The
                             // paired terminal has no such notion, so Terminal
                             // view never paints the unread dot; the row just
                             // tracks whether its terminal pane is live.
-                            let (mut icon, color) = if terminal_running {
+                            let (icon, color) = if terminal_running {
                                 (spinner_running(&inst.created_at), theme.terminal_active)
                             } else {
                                 (ICON_IDLE, theme.dimmed)
                             };
-                            let mut style = Style::default().fg(color);
-                            if inst.is_archived() || inst.is_trashed() {
-                                // Archive/trash lifecycle override mirrors the
-                                // Agent-view path: dim color, stopped
-                                // icon, no italic/dim modifier; the
-                                // Archived section header is the cue.
-                                icon = ICON_STOPPED;
-                                style = Style::default().fg(theme.dimmed);
-                            } else if in_attention && inst.is_snoozed() {
-                                icon = ICON_STOPPED;
-                                style = Style::default()
-                                    .fg(theme.dimmed)
-                                    .add_modifier(ratatui::style::Modifier::ITALIC)
-                                    .add_modifier(ratatui::style::Modifier::DIM);
-                            } else if in_attention && inst.is_urgent() {
-                                style = Style::default()
-                                    .fg(theme.error)
-                                    .add_modifier(ratatui::style::Modifier::BOLD)
-                                    .add_modifier(ratatui::style::Modifier::RAPID_BLINK);
-                            } else if show_favorite && crate::session::is_live_favorite(inst) {
-                                style = style
-                                    .add_modifier(ratatui::style::Modifier::BOLD)
-                                    .add_modifier(ratatui::style::Modifier::UNDERLINED);
-                            }
-                            let title_text = if inst.is_archived() || inst.is_trashed() {
-                                Cow::Owned(inst.title.clone())
-                            } else if in_attention && inst.is_snoozed() {
-                                Cow::Owned(format!("z {}", inst.title))
-                            } else if in_attention && inst.is_urgent() {
-                                Cow::Owned(format!("! {}", inst.title))
-                            } else if show_favorite && crate::session::is_live_favorite(inst) {
-                                Cow::Owned(format!("* {}", inst.title))
-                            } else {
-                                Cow::Owned(inst.title.clone())
-                            };
-                            (icon, title_text, style)
+                            (
+                                RowSeed {
+                                    icon,
+                                    color,
+                                    modifier: ratatui::style::Modifier::empty(),
+                                },
+                                SunkRow::Pane,
+                            )
                         }
                         ViewMode::Tool(ref tool_name) => {
                             let tool_session =
                                 crate::tmux::ToolSession::new(&inst.id, &inst.title, tool_name);
-                            let tool_running =
-                                tool_session.exists() && !tool_session.is_pane_dead();
+                            let tool_running = crate::tmux::session_exists_for_display(
+                                tool_session.session_name(),
+                            ) && !crate::tmux::pane_dead_for_display(
+                                tool_session.session_name(),
+                            );
                             let (icon, color) = if tool_running {
                                 (spinner_running(&inst.created_at), theme.terminal_active)
                             } else {
                                 (ICON_IDLE, theme.dimmed)
                             };
-                            let mut style = Style::default().fg(color);
-                            let title_text =
-                                if show_favorite && crate::session::is_live_favorite(inst) {
-                                    style = style
-                                        .add_modifier(ratatui::style::Modifier::BOLD)
-                                        .add_modifier(ratatui::style::Modifier::UNDERLINED);
-                                    Cow::Owned(format!("* {}", inst.title))
-                                } else {
-                                    Cow::Owned(inst.title.clone())
-                                };
-                            (icon, title_text, style)
+                            (
+                                RowSeed {
+                                    icon,
+                                    color,
+                                    modifier: ratatui::style::Modifier::empty(),
+                                },
+                                SunkRow::Pane,
+                            )
                         }
-                    }
+                    };
+                    decorate_row(inst, in_attention, show_favorite, seed, sunk, theme)
                 } else {
                     (
                         "?",
@@ -2952,22 +2978,25 @@ impl HomeView {
 
                     // Now borrow instance for rendering
                     if let Some(inst) = self.get_instance(&id) {
+                        // Snapshot-backed like the list rows: this runs on
+                        // every frame, and the preview capture above is already
+                        // worker-driven, so a per-name `has-session` here would
+                        // be the only fork left in a steady-state frame.
                         let (terminal_running, preview_text) = match terminal_mode {
                             TerminalMode::Container => {
-                                let running = inst
-                                    .container_terminal_tmux_session()
-                                    .map(|s| s.exists())
-                                    .unwrap_or(false);
+                                let running =
+                                    inst.container_terminal_tmux_session().is_ok_and(|s| {
+                                        crate::tmux::session_exists_for_display(s.name())
+                                    });
                                 (
                                     running,
                                     self.container_terminal_preview_cache.parsed_text.as_ref(),
                                 )
                             }
                             TerminalMode::Host => {
-                                let running = inst
-                                    .terminal_tmux_session()
-                                    .map(|s| s.exists())
-                                    .unwrap_or(false);
+                                let running = inst.terminal_tmux_session().is_ok_and(|s| {
+                                    crate::tmux::session_exists_for_display(s.name())
+                                });
                                 (running, self.terminal_preview_cache.parsed_text.as_ref())
                             }
                         };
@@ -3030,7 +3059,12 @@ impl HomeView {
                     if let Some(inst) = self.get_instance(&id) {
                         let tool_session =
                             crate::tmux::ToolSession::new(&inst.id, &inst.title, &tool_name);
-                        let tool_running = tool_session.exists() && !tool_session.is_pane_dead();
+                        // Snapshot-backed for the same reason as the rows:
+                        // this pair used to be the two remaining per-frame
+                        // forks on the render thread in Tool view.
+                        let tool_running =
+                            crate::tmux::session_exists_for_display(tool_session.session_name())
+                                && !crate::tmux::pane_dead_for_display(tool_session.session_name());
 
                         Preview::render_terminal_preview(
                             frame,
