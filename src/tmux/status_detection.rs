@@ -1967,7 +1967,7 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
     let footer = tail_lines(&non_empty_lines, 3);
     let is_live_loader = |line: &str| -> bool {
         let l = line.trim().to_lowercase();
-        has_any_spinner(&[line]) && (l.contains("working") || l.contains("⟦esc⟧"))
+        (has_any_spinner(&[line]) && (l.contains("working") || l.contains("⟦esc⟧")))
             || l.ends_with("⟦esc⟧")
             || l.ends_with("⟨esc⟩")
             || l.ends_with("[esc]")
