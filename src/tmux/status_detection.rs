@@ -1911,24 +1911,18 @@ pub fn detect_pi_status(raw_content: &str) -> Status {
 /// it the signal is ignored, so a completed turn's loader or a dismissed
 /// banner in scrollback cannot pin the session.
 ///
-/// A footer row counts as a live loader when it carries a braille activity
-/// frame plus the classic markers ("Working", the unicode `⟦esc⟧` hint), or
-/// when it ends on an esc hint glyph in any symbol preset's glyphs
-/// (unicode `⟦esc⟧`, nerd `⟨esc⟩`, ascii `[esc]`), or when it carries the
-/// maintenance-loader marker "(esc to cancel)": intent messages replace any
-/// "Working" text and non-unicode presets change both frames and glyphs.
+/// A live loader has a preset activity frame (braille for unicode/nerd,
+/// `- \ | /` for ascii) plus its marker on the same row, or on the next row
+/// after a narrow-pane wrap. The markers are `Working`, an esc hint glyph
+/// (`⟦esc⟧`, `⟨esc⟩`, `[esc]`), and the maintenance hint
+/// `(esc to cancel)`.
 ///
-/// The tool-approval select replaces the composer with an overlay panel;
-/// two arms catch it. The title arm needs `Allow tool:` plus the
-/// Approve/Deny pair inside window 8 (synthetic or short panels). The panel
-/// arm anchors on the option-list help row (`up/down navigate … enter
-/// select`), whose distance from the pane bottom is fixed regardless of how
-/// far the detail rows wrap; the Approve/Deny pair shares that fixed
-/// distance, so the window-8 gate cannot be starved by wrapped details and
-/// still keeps generic selectors out. The Plan Review overlay pins Waiting
-/// through its cursor-marked option rows (any `Approve …` variant,
-/// `Refine plan`, `Save and quit`) corroborated by an unmarked option
-/// phrase.
+/// A tool approval replaces the composer with a selector panel. Exact
+/// bordered `Approve`/`Deny` option rows corroborate its navigation footer;
+/// the title text is not used because real detail rows can push it outside
+/// the freshness window. Plan Review is likewise corroborated by its stable
+/// option labels and the live overlay footer (`tab regions`, `esc cancel`),
+/// which disappears as soon as the selection is submitted.
 ///
 /// The ask tool's option dialog swaps into the composer slot the same way;
 /// its footer hint rows (`Enter select · n note`, `Space toggle · Enter …`,
@@ -1958,22 +1952,36 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
         }
     };
 
-    // Live loader rows, footer (last 3 non-empty lines) only. A row is live
-    // when it carries a braille activity frame plus the classic markers, or
-    // when it ends on an esc hint glyph: the frame set and the bracket
-    // glyphs follow omp's symbol preset (unicode ⟦esc⟧, nerd ⟨esc⟧, ascii
-    // [esc]), intent messages replace any "Working" text, and maintenance
-    // loaders render "(esc to cancel)" instead of an esc hint glyph.
-    let footer = tail_lines(&non_empty_lines, 3);
-    let is_live_loader = |line: &str| -> bool {
-        let l = line.trim().to_lowercase();
-        (has_any_spinner(&[line]) && (l.contains("working") || l.contains("⟦esc⟧")))
-            || l.ends_with("⟦esc⟧")
-            || l.ends_with("⟨esc⟩")
-            || l.ends_with("[esc]")
-            || l.contains("(esc to cancel)")
+    // Live loader rows sit directly above the composer. The frame and marker
+    // must belong to the same rendered loader, either on one row or on two
+    // adjacent rows after a narrow-pane wrap.
+    let loader_window = tail_lines(&non_empty_lines, 4);
+    let starts_with_activity_frame = |line: &str| {
+        let line = line.trim_start();
+        SPINNER_CHARS.iter().any(|frame| {
+            line.strip_prefix(*frame)
+                .is_some_and(|rest| rest.starts_with(' '))
+        }) || ["-", "\\", "|", "/"].iter().any(|frame| {
+            line.strip_prefix(frame)
+                .is_some_and(|rest| rest.starts_with(' '))
+        })
     };
-    if let Some(pos) = lowest_matching_line(footer, is_live_loader) {
+    let has_loader_marker = |line: &str| {
+        let line = line.trim().to_lowercase();
+        line.contains("working")
+            || line.ends_with("⟦esc⟧")
+            || line.ends_with("⟨esc⟩")
+            || line.ends_with("[esc]")
+            || line.contains("(esc to cancel)")
+    };
+    let loader_pos = (0..loader_window.len()).rev().find_map(|i| {
+        let pos = loader_window.len() - i;
+        let marker = has_loader_marker(loader_window[i]);
+        let direct = pos <= 3 && starts_with_activity_frame(loader_window[i]);
+        let wrapped = pos <= 3 && i > 0 && starts_with_activity_frame(loader_window[i - 1]);
+        (marker && (direct || wrapped)).then_some(pos)
+    });
+    if let Some(pos) = loader_pos {
         consider(pos, OmpSignal::Spinner);
     }
 
@@ -2027,65 +2035,63 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
         consider(pos, OmpSignal::TerminalLines);
     }
 
-    // Approval prompt, title arm: window 8, all three substrings present.
     let window8 = tail_lines(&non_empty_lines, 8);
     let window12 = tail_lines(&non_empty_lines, 12);
-    let approval_footer = window8.join("\n").to_lowercase();
-    if approval_footer.contains("allow tool:")
-        && approval_footer.contains("approve")
-        && approval_footer.contains("deny")
-    {
-        // Position on `allow tool:` alone. `approve` / `deny` gate the
-        // prompt's presence but are too weak to place it: `approve` is a
-        // substring of omp's own "Plan approved." render and of any prose or
-        // composer draft the user types, and the composer line is position 1,
-        // so positioning on them let a granted approval outrank a live loader
-        // three lines above it.
-        if let Some(pos) =
-            lowest_matching_line(window8, |l| l.to_lowercase().contains("allow tool:"))
-        {
-            consider(pos, OmpSignal::Approval);
-        }
-    }
 
-    // Approval prompt, panel arm. The live select replaces the composer in
-    // an overlay panel whose blank padding rows carry border glyphs, so the
-    // title row sits ~10 non-empty rows above the pane bottom and can fall
-    // outside every window that still sees the options. The option rows
-    // themselves keep a fixed distance from the pane bottom: only the help
-    // row, padding and border lie below them, so wrapping details extend
-    // the panel upward without moving the pair. The Approve/Deny gate reads
-    // from window 8 and keeps generic selectors (model menu, session
-    // picker) from pinning Waiting.
-    if approval_footer.contains("approve") && approval_footer.contains("deny") {
-        if let Some(pos) = lowest_matching_line(window8, |l| {
-            let l = l.to_lowercase();
-            l.contains("up/down navigate") && l.contains("enter select")
+    // Tool approval: the selector always renders bordered Approve/Deny rows
+    // plus its navigation footer, even when the tool supplies no detail row.
+    // Exact option labels keep surrounding prose from satisfying the gate.
+    let is_panel_row = |line: &str| {
+        let line = line.trim();
+        (line.starts_with('│') && line.ends_with('│'))
+            || (line.starts_with('|') && line.ends_with('|'))
+    };
+    let is_panel_option = |line: &str, expected: &str| {
+        let line = line.trim();
+        let inner = line
+            .strip_prefix('│')
+            .and_then(|line| line.strip_suffix('│'))
+            .or_else(|| {
+                line.strip_prefix('|')
+                    .and_then(|line| line.strip_suffix('|'))
+            });
+        let Some(inner) = inner else { return false };
+        let inner = inner.trim();
+        let inner = inner
+            .strip_prefix("❯ ")
+            .or_else(|| inner.strip_prefix("\u{f054} "))
+            .or_else(|| inner.strip_prefix("> "))
+            .unwrap_or(inner);
+        inner.trim().eq_ignore_ascii_case(expected)
+    };
+    let has_approve = window8.iter().any(|line| is_panel_option(line, "approve"));
+    let has_deny = window8.iter().any(|line| is_panel_option(line, "deny"));
+    if has_approve && has_deny {
+        if let Some(pos) = lowest_matching_line(window8, |line| {
+            let lower = line.to_lowercase();
+            is_panel_row(line)
+                && lower.contains("up/down navigate")
+                && lower.contains("enter select")
+                && lower.contains("esc cancel")
         }) {
             consider(pos, OmpSignal::Approval);
         }
     }
 
-    // Plan Review overlay: while the operator deliberates, its option list
-    // replaces the pane bottom and the turn is blocked. The anchor is the
-    // SELECTED row, which carries the preset's nav cursor (unicode ❯,
-    // nerd \u{f054}, ascii >) before one of the option phrases; wherever
-    // the operator moves the selection, some known option keeps the cursor.
-    // A second distinct option phrase confirms overlay context, so wrapped
-    // composer drafts (no cursor) and single-line prose stay Idle. Residual:
-    // pasted text quoting a cursor-prefixed option line verbatim.
-    let is_option = |l: &str| {
-        let l = l.to_lowercase();
-        l.contains("approve and") || l.contains("refine plan") || l.contains("save and quit")
-    };
-    let has_cursor = |l: &str| l.contains("❯ ") || l.contains("\u{f054} ") || l.contains("> ");
-    let cursor_pos = lowest_matching_line(window12, |l| has_cursor(l) && is_option(l));
-    // Corroborate with an UNMARKED option row: the !has_cursor half of the
-    // predicate guarantees the corroborating line differs from the marked
-    // anchor, wherever the selection rests.
-    let other_pos = lowest_matching_line(window12, |l| is_option(l) && !has_cursor(l));
-    if let (Some(c), Some(o)) = (cursor_pos, other_pos) {
-        consider(c.min(o), OmpSignal::Approval);
+    // Plan Review: option prose is not unique, but every live overlay keeps
+    // three stable option labels and a footer shared by all focus regions.
+    // The footer disappears as soon as the selection is submitted.
+    let plan_text = window12.join("\n").to_lowercase();
+    if plan_text.contains("approve and execute")
+        && plan_text.contains("refine plan")
+        && plan_text.contains("save and quit")
+    {
+        if let Some(pos) = lowest_matching_line(window12, |line| {
+            let lower = line.to_lowercase();
+            lower.contains("tab regions") && lower.contains("esc cancel")
+        }) {
+            consider(pos, OmpSignal::Approval);
+        }
     }
 
     // Ask dialog: the built-in ask tool swaps an option dialog into the
@@ -5208,42 +5214,6 @@ You can monitor progress with aoe session logs.\n\
         );
     }
 
-    #[test]
-    fn test_detect_omp_status_running() {
-        let pane = "Reply with OK only.\n\
-                    ⠋ Working… ⟦esc⟧\n\
-                    ╭── π  > GPT-5.6 Sol ─╮\n\
-                    ╰─                   ─╯";
-        assert_eq!(detect_omp_status(pane), Status::Running);
-    }
-
-    #[test]
-    fn test_detect_omp_status_running_over_stale_approval() {
-        let pane = "Allow tool: bash\n\
-                    Approve\n\
-                    Deny\n\
-                    ⠋ Working… ⟦esc⟧\n\
-                    ╭── π  > GPT-5.6 Sol ─╮\n\
-                    ╰─                   ─╯";
-        assert_eq!(detect_omp_status(pane), Status::Running);
-    }
-
-    #[test]
-    fn test_detect_omp_status_waiting_on_approval_prompt() {
-        // A live `Allow tool:` prompt is the only user-attention state at
-        // rest; the composer box alone must not read as Waiting.
-        // Case-insensitive on entry: the gate lowercases the window before
-        // matching, so an all-caps render still reads as a live approval.
-        assert_eq!(
-            detect_omp_status("ALLOW TOOL: BASH\nAPPROVE\nDENY"),
-            Status::Waiting
-        );
-        assert_eq!(
-            detect_omp_status("Allow tool: bash\nApprove\nDeny"),
-            Status::Waiting
-        );
-    }
-
     /// The two-line composer box omp renders at rest, shared by the
     /// fixture-based tests below.
     const MINIMAL_COMPOSER_BOX: &str = "╭── π  > GPT-5.6 Sol ─╮\n╰─                   ─╯";
@@ -5309,6 +5279,17 @@ You can monitor progress with aoe session logs.\n\
                 "{br}\n ✖ {msg}\n Dismissed when you send your next message.\n{br}\n{prompt_box}"
             )
         };
+        let approval_panel = "\
+╭─ Allow tool: bash ───────────────────────────────────────╮
+│                                                          │
+│ Command: echo approval-probe                             │
+│                                                          │
+│  ❯ Approve                                               │
+│    Deny                                                  │
+│                                                          │
+│ up/down navigate  enter select  esc cancel               │
+│                                                          │
+╰──────────────────────────────────────────────────────────╯";
         let cases: &[(&str, String, Status)] = &[
             // US1: rate limit / provider errors -> Error (banner anchor).
             (
@@ -5398,16 +5379,6 @@ You can monitor progress with aoe session logs.\n\
                 format!(
                     " Dismissed when you send your next message.\n l1\n l2\n l3\n l4\n{prompt_box}"
                 ),
-                Status::Idle,
-            ),
-            (
-                "approval pos 8 bound",
-                format!("Allow tool: bash\nApprove\nDeny\n l1\n l2\n l3\n{prompt_box}"),
-                Status::Waiting,
-            ),
-            (
-                "approval pos 9 out",
-                format!("Allow tool: bash\nApprove\nDeny\n l1\n l2\n l3\n l4\n{prompt_box}"),
                 Status::Idle,
             ),
             // US2: retry in progress -> Running.
@@ -5629,56 +5600,59 @@ You can monitor progress with aoe session logs.\n\
                 ),
                 Status::Idle,
             ),
-            // Precedences: the lowest signal wins.
+            // Esc hints quoted in prose without a live activity frame must
+            // not pin Running.
             (
-                "stale approval over fresh banner",
+                "ascii esc prose",
+                format!("The keymap binds cancel to [esc]\n{prompt_box}"),
+                Status::Idle,
+            ),
+            (
+                "maintenance esc prose",
+                format!("Docs say: press esc (esc to cancel) during compaction\n{prompt_box}"),
+                Status::Idle,
+            ),
+            // Precedences: the lowest live signal wins. Approval fixtures
+            // use omp's real bordered selector rather than synthetic text.
+            (
+                "answered approval above fresh banner",
                 format!(
-                    "Allow tool: bash\nApprove\nDeny\n ✖ 429 Too Many Requests (rate limited). Retry after 30s.\n Dismissed when you send your next message.\n{prompt_box}"
+                    "{approval_panel}\n ✖ 429 Too Many Requests (rate limited).\n Dismissed when you send your next message.\n{prompt_box}"
                 ),
                 Status::Error,
             ),
             (
-                "approval out of window",
+                "answered approval past filler above fresh banner",
                 format!(
-                    "Allow tool: bash\nApprove\nDeny\n l1\n l2\n ✖ 429 Too Many Requests (rate limited). Retry after 30s.\n Dismissed when you send your next message.\n{prompt_box}"
+                    "{approval_panel}\n l1\n l2\n ✖ 429 Too Many Requests (rate limited).\n Dismissed when you send your next message.\n{prompt_box}"
                 ),
                 Status::Error,
             ),
             (
-                "terminal lines below approval",
-                format!(
-                    " Error: Retry budget exhausted after 10 retries: …\nAllow tool: bash\nApprove\nDeny\n{prompt_box}"
-                ),
+                "live approval below terminal line",
+                format!(" Error: Retry budget exhausted after 10 retries: …\n{approval_panel}"),
                 Status::Waiting,
             ),
             (
-                "approval in window over banner",
+                "answered approval above banner border",
                 format!(
-                    "Allow tool: bash\nApprove\nDeny\n ✖ 429 Too Many Requests (rate limited). Retry after 30s.\n Dismissed when you send your next message.\n{br}\n{prompt_box}"
+                    "{approval_panel}\n ✖ 429 Too Many Requests (rate limited).\n Dismissed when you send your next message.\n{br}\n{prompt_box}"
                 ),
                 Status::Error,
             ),
             (
-                "live countdown over approval",
-                format!(
-                    "Allow tool: bash\nApprove\nDeny\n⠋ Retrying (2/3) in 30s… (esc to cancel)\n{prompt_box}"
-                ),
+                "live countdown below answered approval",
+                format!("{approval_panel}\n⠋ Retrying (2/3) in 30s… (esc to cancel)\n{prompt_box}"),
                 Status::Running,
             ),
             (
-                "stale countdown under approval",
-                format!(
-                    "⠋ Retrying (2/3) in 30s… (esc to cancel)\nAllow tool: bash\nApprove\nDeny\n{prompt_box}"
-                ),
+                "live approval below stale countdown",
+                format!("⠋ Retrying (2/3) in 30s… (esc to cancel)\n{approval_panel}"),
                 Status::Waiting,
             ),
-            // A granted approval still in window 8 must not outrank the live
-            // loader just because the composer draft below it contains
-            // "approve"/"deny" (`test_detect_omp_status_running_over_stale
-            // _approval` guards only the empty-composer form).
             (
-                "live loader over granted approval, composer draft",
-                "Allow tool: bash\nApprove\nDeny\n⠋ Working… ⟦esc⟧\n╭── π  > GPT-5.6 Sol ─╮\n╰─ deny that         ─╯".to_string(),
+                "live loader below answered approval",
+                format!("{approval_panel}\n⠋ Working… ⟦esc⟧\n╭── π  > GPT-5.6 Sol ─╮\n╰─ deny that         ─╯"),
                 Status::Running,
             ),
             (
@@ -5689,10 +5663,8 @@ You can monitor progress with aoe session logs.\n\
                 Status::Error,
             ),
             (
-                "approval over label",
-                format!(
-                    "retrying 2/3 now: 429…\nAllow tool: bash\nApprove\nDeny\n{prompt_box}"
-                ),
+                "live approval below label",
+                format!("retrying 2/3 now: 429…\n{approval_panel}"),
                 Status::Waiting,
             ),
             (
@@ -5727,14 +5699,11 @@ You can monitor progress with aoe session logs.\n\
 
     #[test]
     fn test_detect_omp_status_waiting_on_real_approval_panel() {
-        // The rendered panel pushes the title past the gate window; the
-        // prompt is live either way and must read Waiting.
-        assert_eq!(detect_omp_status(OMP_LIVE_APPROVAL_PANEL), Status::Waiting);
-        // The panel's geometry pins Approve/Deny a fixed few rows above the
-        // pane bottom (only help row, padding and border lie below them), so
-        // wrapped details extend the panel upward without moving the pair:
-        // the window-8 gate holds for any detail length.
-        let tall = "\
+        // Same selector structure with normal, wrapped, or absent tool
+        // details: option rows and the footer stay fixed near the bottom.
+        let cases = [
+            OMP_LIVE_APPROVAL_PANEL,
+            "\
 ╭─ Allow tool: bash ───────────────────────────────────────╮
 │                                                          │
 │ Command: for f in $(find . -type f | head -400); do      │
@@ -5746,57 +5715,86 @@ You can monitor progress with aoe session logs.\n\
 │                                                          │
 │ up/down navigate  enter select  esc cancel               │
 │                                                          │
-╰──────────────────────────────────────────────────────────╯";
-        assert_eq!(detect_omp_status(tall), Status::Waiting);
+╰──────────────────────────────────────────────────────────╯",
+            // Custom tools may omit detail rows; the same real selector
+            // furniture remains, so title text is not a separate signal.
+            "\
+╭─ Allow tool: custom_tool ────────────────────────────────╮
+│                                                          │
+│  ❯ Approve                                               │
+│    Deny                                                  │
+│                                                          │
+│ up/down navigate  enter select  esc cancel               │
+│                                                          │
+╰──────────────────────────────────────────────────────────╯",
+        ];
+        for (i, pane) in cases.iter().enumerate() {
+            assert_eq!(detect_omp_status(pane), Status::Waiting, "case {i}");
+        }
     }
 
     #[test]
-    fn test_detect_omp_status_running_preset_loaders() {
-        // Each symbol preset renders its own esc hint glyph, and intent
-        // messages replace the "Working…" text entirely (live captures for
-        // ascii; unicode/nerd rows derived from the same loader templates).
+    fn test_detect_omp_status_running_loaders() {
+        // Same behavior and setup: every live loader has a preset frame and
+        // marker on one row, or on an adjacent row after a narrow-pane wrap.
         let box_unicode = "╭── π ─╮\n╰─ ─╯";
+        let box_ascii = "+-- pi ---+\n+- -------+";
+        let answered_panel = "\
+╭─ Allow tool: bash ───────────────────────────────────────╮
+│                                                          │
+│ Command: echo approval-probe                             │
+│                                                          │
+│  ❯ Approve                                               │
+│    Deny                                                  │
+│                                                          │
+│ up/down navigate  enter select  esc cancel               │
+│                                                          │
+╰──────────────────────────────────────────────────────────╯";
         let cases = [
-            // unicode: braille frame plus the ⟦esc⟧ hint on an intent line.
+            ("unicode default", format!("⠋ Working… ⟦esc⟧\n{box_unicode}")),
             (
                 "unicode intent",
                 format!("⠴ Set permissions on audit bait path ⟦esc⟧\n{box_unicode}"),
             ),
-            // nerd: ⟨esc⟩ glyphs; the frame is still braille but neither
-            // "Working" nor the unicode glyph appears on an intent line.
             (
                 "nerd intent",
                 format!("⠹ Reading audit fixtures ⟨esc⟩\n{box_unicode}"),
             ),
             (
                 "ascii intent",
-                "\
-/ Running requested echo probe [esc]
-+-- pi  > [M] Ox Alpha - [max] > [T] scratch/84d437 ---+
-+-                                                    -+"
-                    .to_string(),
+                format!("/ Running requested echo probe [esc]\n{box_ascii}"),
+            ),
+            (
+                "manual compaction",
+                format!("⠼ Compacting context... (esc to cancel)\n{box_unicode}"),
+            ),
+            (
+                "auto compaction",
+                format!("⠼ Auto-compacting context... (esc to cancel)\n{box_unicode}"),
+            ),
+            (
+                "context maintenance",
+                format!("⠋ Context overflow detected, Auto context-full maintenance… (esc to cancel)\n{box_unicode}"),
+            ),
+            (
+                "auto handoff",
+                format!("⠋ Response incomplete, Auto-handoff… (esc to cancel)\n{box_unicode}"),
+            ),
+            (
+                "wrapped unicode intent",
+                format!("⠹ Locating audit config files in parent tree\n ⟦esc⟧\n{box_unicode}"),
+            ),
+            (
+                "wrapped ascii intent",
+                format!("/ Locating audit config files in parent tree\n [esc]\n{box_ascii}"),
+            ),
+            (
+                "fresh loader below answered approval",
+                format!("{answered_panel}\n⠋ Working… ⟦esc⟧\n{box_unicode}"),
             ),
         ];
         for (name, pane) in &cases {
             assert_eq!(detect_omp_status(pane), Status::Running, "case: {name}");
-        }
-    }
-
-    #[test]
-    fn test_detect_omp_status_running_maintenance_loaders() {
-        // Maintenance loaders swap into statusContainer with the working
-        // loader disposed, and their labels carry neither "Working" nor an
-        // esc hint glyph (command-controller.ts, event-controller.ts).
-        let box_ = "╭── π ─╮\n╰─ ─╯";
-        let cases = [
-            "⠼ Compacting context... (esc to cancel)",
-            "⠼ Auto-compacting context... (esc to cancel)",
-            "⠋ Context overflow detected, Auto context-full maintenance… (esc to cancel)",
-            "⠋ Response incomplete, Auto-handoff… (esc to cancel)",
-        ];
-        for line in &cases {
-            let pane = format!("{line}\n{box_}");
-            assert_eq!(detect_omp_status(&pane), Status::Running, "case: {line}");
         }
     }
 
@@ -5838,11 +5836,12 @@ You can monitor progress with aoe session logs.\n\
 
     #[test]
     fn test_detect_omp_status_waiting_on_plan_review_overlay() {
-        // Verbatim bottom rows of a live Plan Review overlay (ascii preset):
-        // the option list replaces the pane bottom while the turn is blocked
-        // on it. The selection is operator-navigable, so a cursor on any of
-        // the three deliberation-relevant options must read Waiting.
-        let rows = "\
+        // Same overlay contract under each focus region: stable option labels
+        // plus the live footer (tab regions, esc cancel).
+        let cases = [
+            (
+                "actions focus",
+                "\
 | Plan mode - next step                                                        |
 | > Approve and execute                                                        |
 |   Approve and compact context                                                |
@@ -5851,36 +5850,38 @@ You can monitor progress with aoe session logs.\n\
 |   Save and quit                                                              |
 +------------------------------------------------------------------------------+
 | ↑↓ select · ⏎ confirm · c copy · tab regions · Ctrl+G editor · esc cancel    |
-+------------------------------------------------------------------------------+";
-        assert_eq!(detect_omp_status(rows), Status::Waiting);
-
-        // Selection moved off the first option during deliberation: the
-        // cursor now marks Refine plan, Approve and execute is unmarked.
-        let navigated = "\
-| Plan mode - next step                                                        |
-|   Approve and execute                                                        |
-|   Approve and compact context                                                |
-|   Approve and keep context (~28k / 1m)                                       |
-| ❯ Refine plan                                                                |
-|   Save and quit                                                              |
-+------------------------------------------------------------------------------+
-| ↑↓ select · ⏎ confirm · c copy · tab regions · Ctrl+G editor · esc cancel    |
-+------------------------------------------------------------------------------+";
-        assert_eq!(detect_omp_status(navigated), Status::Waiting);
-
-        // Selection moved to the bottom-most option: the cursor row must
-        // not be its own corroboration (regression guard for the C2 pass).
-        let bottom_most = "\
-| Plan mode - next step                                                        |
-|   Approve and execute                                                        |
-|   Approve and compact context                                                |
-|   Approve and keep context (~28k / 1m)                                       |
-|   Refine plan                                                                |
-| ❯ Save and quit                                                              |
-+------------------------------------------------------------------------------+
-| ↑↓ select · ⏎ confirm · c copy · tab regions · Ctrl+G editor · esc cancel    |
-+------------------------------------------------------------------------------+";
-        assert_eq!(detect_omp_status(bottom_most), Status::Waiting);
++------------------------------------------------------------------------------+",
+            ),
+            (
+                "toc focus",
+                "\
+│ Plan mode - next step                                                        │
+│   Approve and execute                                                        │
+│   Approve and compact context                                                │
+│   Approve and keep context (~28k / 1m)                                       │
+│ ❯ Refine plan                                                                │
+│   Save and quit                                                              │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ ↑↓ section · ⏎ open · a annotate · d delete · u undo · tab regions · esc cancel │
+╰──────────────────────────────────────────────────────────────────────────────╯",
+            ),
+            (
+                "body focus",
+                "\
+│ Plan mode - next step                                                        │
+│   Approve and execute                                                        │
+│   Approve and compact context                                                │
+│   Approve and keep context (~28k / 1m)                                       │
+│   Refine plan                                                                │
+│ ❯ Save and quit                                                              │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ ↑↓ scroll · ⇧ faster · pgup/pgdn · g/G ends · tab regions · esc cancel      │
+╰──────────────────────────────────────────────────────────────────────────────╯",
+            ),
+        ];
+        for (name, pane) in cases {
+            assert_eq!(detect_omp_status(pane), Status::Waiting, "case: {name}");
+        }
     }
 
     #[test]
@@ -5890,13 +5891,22 @@ You can monitor progress with aoe session logs.\n\
         // options must not trip the overlay arm either.
         let box_ = "╭── π ─╮\n╰─ ─╯";
         let cases = [
+            // Real composer top row carries a > status separator: it must not
+            // become a Plan Review cursor when the draft names an option.
+            "╭── π  > approve and execute the migration ─╮\n│ then refine plan wording                    │\n╰─                                           ─╯".to_string(),
+            // Markdown blockquote with option prose is not a live overlay.
+            format!("Options were:\n> Approve and execute\nor Refine plan\n{box_}"),
+            // Answered overlay rows retained in scrollback have no live
+            // overlay footer and must not pin Waiting over recent output.
+            format!("| > Approve and execute |\n|   Refine plan |\n|   Save and quit |\nPlan approved.\nrunning step 1\ndone\n{box_}"),
+            // Wrapped draft naming both plan options without overlay proof.
+            format!("I approve and execute\nthen refine plan things\n{box_}"),
             format!("│ up/down navigate  enter select  esc cancel │\n{box_}"),
+            // Panel help plus approval prose is not a real approval panel.
+            format!("│ up/down navigate  enter select  esc cancel │\nI will approve or deny later\n{box_}"),
             format!("I would approve and execute refine plan steps\n{box_}"),
             // Ask-arm verbs without the dialog's exact footer phrasing.
             format!("press enter to select an option\n{box_}"),
-            // Wrapped draft naming both plan options without the overlay's
-            // selected-row cursor: prose, not the overlay.
-            format!("I approve and execute\nthen refine plan things\n{box_}"),
         ];
         for pane in &cases {
             assert_eq!(detect_omp_status(pane), Status::Idle, "case: {pane:?}");
