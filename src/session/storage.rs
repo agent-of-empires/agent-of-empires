@@ -498,6 +498,26 @@ pub(crate) fn disarm_test_crash_points() {
     TEST_CRASH_POINTS.with(|points| points.borrow_mut().clear());
 }
 
+/// RAII wrapper so a failing assertion between arm and disarm can never leave
+/// an armed point panicking an unrelated test scheduled on the same thread.
+#[cfg(test)]
+pub(crate) struct ArmedCrashPoint;
+
+#[cfg(test)]
+impl ArmedCrashPoint {
+    pub(crate) fn arm(name: &'static str) -> Self {
+        arm_test_crash_point(name);
+        Self
+    }
+}
+
+#[cfg(test)]
+impl Drop for ArmedCrashPoint {
+    fn drop(&mut self) {
+        disarm_test_crash_points();
+    }
+}
+
 pub(crate) fn sync_parent_directory(path: &Path) -> Result<()> {
     let resolved = resolve_symlink_chain(path)?;
     sync_resolved_parent_directory(&resolved)
@@ -1270,11 +1290,8 @@ impl Storage {
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or_default(),
         };
-        let journal_path = Some(
-            super::move_journal::record(&journal_entry, &self.sessions_path).context(
-                "recording the durable move journal failed; no profile rows were changed",
-            )?,
-        );
+        let journal_path = super::move_journal::record(&journal_entry, &self.sessions_path)
+            .context("recording the durable move journal failed; no profile rows were changed")?;
         #[cfg(test)]
         test_crash_point("profile-move-journal");
 
@@ -1498,10 +1515,15 @@ impl Storage {
             ));
         }
         // Every write and directory barrier above has passed: the move is
-        // complete, so the journal that guarded it can be dropped.
-        if let Some(path) = journal_path.as_ref() {
-            super::move_journal::consume(path)
-                .context("consuming the completed move journal failed")?;
+        // complete. A failed cleanup must not turn a committed move into a
+        // reported failure (a retry would then hit "already exists in
+        // target"); the leftover entry self-heals at the next reconcile pass.
+        if let Err(error) = super::move_journal::consume(&journal_path) {
+            tracing::warn!(
+                target: "session.store",
+                error = %error,
+                "completed profile move could not consume its journal; recovery will discard it"
+            );
         }
         if source_groups_changed {
             self.file_watch.notify_local_change(&source_groups_path);
@@ -1772,6 +1794,35 @@ pub(crate) fn detect_duplicate_ids(loaded: &[(String, Vec<Instance>)]) -> Vec<St
     duplicates
 }
 
+/// Journal evidence older than this is insufficient for arbitration (#3459):
+/// an entry that outlived its move (leaked by a consume failure, a crash
+/// before the TUI ever reloaded, CLI-only usage) must never delete a copy the
+/// user created or edited afterwards. Expired entries degrade to the surfaced
+/// legacy path. Generous by design: live residuals are consumed within one
+/// reload of the crash.
+const MOVE_JOURNAL_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+
+/// Paths already reported as unusable this process lifetime, so a permanently
+/// broken entry cannot produce ERROR spam and lock churn on every reload tick.
+static UNUSABLE_JOURNAL_ENTRIES: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+fn mark_unusable_journal_entry(path: &Path) {
+    let mut seen = UNUSABLE_JOURNAL_ENTRIES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if !seen.iter().any(|seen| seen == path) {
+        seen.push(path.to_path_buf());
+    }
+}
+
+fn entry_age(entry: &super::move_journal::MoveJournalEntry) -> std::time::Duration {
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or_default();
+    std::time::Duration::from_millis(now_ms.saturating_sub(entry.created_at_epoch_ms))
+}
+
 /// Detect duplicates across the loaded profiles, run journal-guided repair
 /// for the cases with durable evidence, and return reports for whatever
 /// remains ambiguous. Repairs happen under the app-global identity lock, the
@@ -1792,41 +1843,74 @@ pub(crate) fn reconcile_profile_duplicates(
         return outcome;
     }
     for (path, parsed) in entries {
-        match parsed {
-            Ok(entry) => match repair_journal_entry(&entry, storages, &path) {
-                Ok(true) => {
-                    outcome.repaired = true;
-                    tracing::info!(
-                        target: "session.store",
-                        ids = %entry.ids.join(","),
-                        "reconciled interrupted profile move from its journal"
-                    );
-                }
-                Ok(false) => {
-                    tracing::warn!(
-                        target: "session.store",
-                        path = %path.display(),
-                        "move journal entry references stores that are missing or moved; leaving it for manual inspection"
-                    );
-                }
-                Err(error) => {
-                    tracing::error!(
-                        target: "session.store",
-                        path = %path.display(),
-                        error = %error,
-                        "move-journal-guided repair failed; the duplicate stays excluded"
-                    );
-                }
-            },
+        // Unusable entries stay on disk by design; without this guard every
+        // 5-10s reload would re-log and re-attempt them forever.
+        if UNUSABLE_JOURNAL_ENTRIES
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .iter()
+            .any(|unusable| unusable == &path)
+        {
+            continue;
+        }
+        let entry = match parsed {
+            Ok(entry) => entry,
             Err(reason) => {
+                mark_unusable_journal_entry(&path);
                 tracing::error!(
                     target: "session.store",
                     path = %path.display(),
                     reason = %reason,
                     "unreadable move journal entry cannot arbitrate a duplicate session id"
                 );
+                continue;
+            }
+        };
+        // Expired evidence arbitrates nothing: a journal that outlived its
+        // move must never delete a copy the user created or edited later.
+        // It degrades to the same surfaced-legacy path as having no journal.
+        if entry_age(&entry) > MOVE_JOURNAL_MAX_AGE {
+            mark_unusable_journal_entry(&path);
+            tracing::error!(
+                target: "session.store",
+                path = %path.display(),
+                ids = %entry.ids.join(","),
+                "expired move journal entry is insufficient evidence for arbitration; duplicates stay surfaced"
+            );
+            continue;
+        }
+        match repair_journal_entry(&entry, storages, &path) {
+            Ok(true) => {
+                outcome.repaired = true;
+                tracing::info!(
+                    target: "session.store",
+                    ids = %entry.ids.join(","),
+                    "reconciled interrupted profile move from its journal"
+                );
+            }
+            Ok(false) => {
+                mark_unusable_journal_entry(&path);
+                tracing::warn!(
+                    target: "session.store",
+                    path = %path.display(),
+                    "journal-guided repair skipped: entry references stores that are missing or moved; leaving it for manual inspection"
+                );
+            }
+            Err(error) => {
+                tracing::error!(
+                    target: "session.store",
+                    path = %path.display(),
+                    error = %error,
+                    "journal-guided repair failed; the duplicate stays excluded"
+                );
             }
         }
+    }
+    if !outcome.repaired {
+        // Nothing changed on disk: build reports from the caller's fresh
+        // load instead of re-reading every profile again.
+        outcome.reports = duplicate_reports(loaded, storages);
+        return outcome;
     }
     // Recompute from fresh disk state so reports reflect post-repair reality.
     let mut reloaded: Vec<(String, Vec<Instance>)> = storages
@@ -1834,9 +1918,20 @@ pub(crate) fn reconcile_profile_duplicates(
         .map(|(_, storage)| (storage.profile.clone(), storage.load().unwrap_or_default()))
         .collect();
     reloaded.sort_by(|left, right| left.0.cmp(&right.0));
+    outcome.reports = duplicate_reports(&reloaded, storages);
+    outcome
+}
+
+/// Build one report per duplicated id with per-copy profile, store path, and
+/// mtime. `loaded` must be sorted deterministically or first-seen order is
+/// used as-is; reports follow `detect_duplicate_ids` order.
+fn duplicate_reports(
+    loaded: &[(String, Vec<Instance>)],
+    storages: &[(&str, &Storage)],
+) -> Vec<DuplicateIdReport> {
     let mut reports: Vec<DuplicateIdReport> = Vec::new();
-    for id in detect_duplicate_ids(&reloaded) {
-        let copies = reloaded
+    for id in detect_duplicate_ids(loaded) {
+        let copies = loaded
             .iter()
             .filter(|(_, instances)| instances.iter().any(|instance| instance.id == id))
             .filter_map(|(profile, _)| {
@@ -1853,8 +1948,7 @@ pub(crate) fn reconcile_profile_duplicates(
             .collect();
         reports.push(DuplicateIdReport { id, copies });
     }
-    outcome.reports = reports;
-    outcome
+    reports
 }
 
 /// True when `candidate` equals or contains `path` as an ancestor segment.
@@ -1929,9 +2023,11 @@ fn repair_journal_entry(
         target_path: entry.group_move_target_path.clone(),
         move_subtree: entry.group_move_subtree,
     };
-    backup_before_repair(source_storage.sessions_path())?;
-    backup_before_repair(&source_storage.sessions_path().with_file_name("groups.json"))?;
     source_storage.update(|instances, groups| {
+        // Backups run inside the closure so the snapshot is taken under the
+        // save_lock and storage flock it protects, not before them.
+        backup_before_repair(source_storage.sessions_path())?;
+        backup_before_repair(&source_storage.sessions_path().with_file_name("groups.json"))?;
         instances.retain(|row| !source_losers.contains(&row.id));
         let winners: Vec<crate::session::Instance> = instances
             .iter()
@@ -1993,11 +2089,13 @@ fn backup_before_repair(path: &Path) -> Result<()> {
         .context(format!("backup {} was not made durable", backup.display()))
 }
 
-/// Keep the losing profile's groups sidecar consistent with the winning rows:
-/// drop explicit group rows attributable to the move that no longer have any
-/// member, and materialize any group row a winning row references but that a
-/// partially-applied transaction never wrote. Rows unrelated to the move are
-/// untouched.
+/// Keep the repaired profile's groups sidecar consistent with what an
+/// uninterrupted `apply_group_move` would have left on disk: explicit group
+/// rows attributable to the move lose their members when the losing rows go,
+/// winning rows' groups are materialized, and the sidecar is re-treeed
+/// exactly like `apply_group_move` does so ancestor rows and metadata match.
+/// Attributable follows `apply_group_move`'s own matching: the moved path
+/// itself always, descendants only for a subtree move.
 fn reconcile_groups_after_repair(
     instances: &[Instance],
     groups: &mut Vec<Group>,
@@ -2005,14 +2103,14 @@ fn reconcile_groups_after_repair(
     plan: &crate::session::GroupMovePlan,
 ) {
     let source_prefix = format!("{}/", plan.source_path);
+    let target_prefix = format!("{}/", plan.target_path);
     let attributable = |path: &str| {
         (!plan.source_path.is_empty()
-            && (group_path_covers(&plan.source_path, path)
+            && (path == plan.source_path
                 || (plan.move_subtree && path.starts_with(&source_prefix))))
-            || (!plan.target_path.is_empty() && group_path_covers(&plan.target_path, path))
-            || (plan.move_subtree
-                && !plan.target_path.is_empty()
-                && path.starts_with(&format!("{}/", plan.target_path)))
+            || (!plan.target_path.is_empty()
+                && (path == plan.target_path
+                    || (plan.move_subtree && path.starts_with(&target_prefix))))
     };
     let has_member = |path: &str| {
         instances
@@ -2033,6 +2131,9 @@ fn reconcile_groups_after_repair(
             groups.push(Group::new(leaf, &winner.group_path));
         }
     }
+    // Same final re-tree `apply_group_move` performs, so the durable sidecar
+    // carries the full explicit ancestor chain with preserved metadata.
+    *groups = super::GroupTree::new_with_groups(instances, groups).get_all_groups();
 }
 
 #[cfg(test)]
@@ -4121,8 +4222,8 @@ mod tests {
         Ok((temp, source, target, before, after))
     }
 
-    fn run_crashing_move(source: &Storage, target: &Storage, point: &str) {
-        arm_test_crash_point(point);
+    fn run_crashing_move(source: &Storage, target: &Storage, point: &'static str) {
+        let _crash = ArmedCrashPoint::arm(point);
         // Panic output for the simulated crash is expected noise.
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let mut after = source.load().unwrap().remove(0);
@@ -4140,7 +4241,6 @@ mod tests {
                 sync_resolved_parent_directory,
             );
         }));
-        disarm_test_crash_points();
     }
 
     #[test]
@@ -4325,6 +4425,119 @@ mod tests {
     }
 
     #[test]
+    fn expired_journal_is_insufficient_evidence() -> Result<()> {
+        // A journal that outlived its move must never arbitrate: if the user
+        // later duplicates the id by hand, months-old evidence would delete
+        // the newer copy. Expired entries degrade to the surfaced legacy path.
+        let (_temp, source, target, before, _after) = setup_recovery_env("expired")?;
+        target.update(|instances, _| {
+            let mut copy = before.clone();
+            copy.source_profile = target.profile().to_string();
+            instances.push(copy);
+            Ok(())
+        })?;
+        let week_ago_ms = (std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis() as u64)
+            - 8 * 24 * 3600 * 1000;
+        let expired = super::super::move_journal::MoveJournalEntry {
+            created_at_epoch_ms: week_ago_ms,
+            ..fresh_journal_entry(&source, &target, &before.id)
+        };
+        super::super::move_journal::record(&expired, source.sessions_path())?;
+        assert_eq!(journal_entry_count(&source), 1);
+
+        let view: Vec<(&str, &Storage)> =
+            vec![(source.profile(), &source), (target.profile(), &target)];
+        let loaded = collect_loaded(&[&source, &target]);
+        let outcome = super::reconcile_profile_duplicates(&loaded, &view);
+
+        assert!(!outcome.repaired, "expired evidence must not arbitrate");
+        assert_eq!(outcome.reports.len(), 1);
+        assert_eq!(source.load()?.len(), 1);
+        assert_eq!(target.load()?.len(), 1);
+        assert_eq!(journal_entry_count(&source), 1, "expired entry stays");
+        Ok(())
+    }
+
+    #[test]
+    fn group_repair_scope_matches_apply_group_move() -> Result<()> {
+        // Table over subtree mode: an explicit memberless child under the
+        // moved path survives a single-group repair (apply_group_move's
+        // non-subtree branch preserves explicit descendants) and is pruned
+        // for a subtree move. Either way the losing path itself is pruned.
+        let cases = [
+            ("gscope-single", false, true),
+            ("gscope-subtree", true, false),
+        ];
+        for (tag, move_subtree, child_survives) in cases {
+            let (_temp, source, target, before, _after) = setup_recovery_env(tag)?;
+            source.update(|_instances, groups| {
+                let mut child = Group::new("archive", "work/archive");
+                child.collapsed = true;
+                groups.push(child);
+                Ok(())
+            })?;
+            target.update(|instances, _| {
+                let mut copy = before.clone();
+                copy.source_profile = target.profile().to_string();
+                instances.push(copy);
+                Ok(())
+            })?;
+            let entry = super::super::move_journal::MoveJournalEntry {
+                group_move_subtree: move_subtree,
+                ..fresh_journal_entry(&source, &target, &before.id)
+            };
+            super::super::move_journal::record(&entry, source.sessions_path())?;
+
+            let view: Vec<(&str, &Storage)> =
+                vec![(source.profile(), &source), (target.profile(), &target)];
+            let loaded = collect_loaded(&[&source, &target]);
+            let outcome = super::reconcile_profile_duplicates(&loaded, &view);
+
+            assert!(outcome.repaired, "{tag}");
+            assert!(outcome.reports.is_empty(), "{tag}");
+            assert!(source.load()?.is_empty(), "{tag}: loser emptied");
+            let source_groups = source.load_with_groups()?.1;
+            assert!(
+                !source_groups.iter().any(|group| group.path == "work"),
+                "{tag}: moved path pruned"
+            );
+            assert_eq!(
+                source_groups
+                    .iter()
+                    .any(|group| group.path == "work/archive"),
+                child_survives,
+                "{tag}: explicit descendant handling must mirror apply_group_move"
+            );
+            assert_eq!(journal_entry_count(&source), 0, "{tag}");
+        }
+        Ok(())
+    }
+
+    fn fresh_journal_entry(
+        source: &Storage,
+        target: &Storage,
+        id: &str,
+    ) -> super::super::move_journal::MoveJournalEntry {
+        super::super::move_journal::MoveJournalEntry {
+            version: super::super::move_journal::MOVE_JOURNAL_VERSION,
+            ids: vec![id.to_string()],
+            source_profile: source.profile().to_string(),
+            target_profile: target.profile().to_string(),
+            source_sessions_path: source.sessions_path().to_path_buf(),
+            target_sessions_path: target.sessions_path().to_path_buf(),
+            group_move_source_path: "work".to_string(),
+            group_move_target_path: "moved".to_string(),
+            group_move_subtree: false,
+            created_at_epoch_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or_default(),
+        }
+    }
+
+    #[test]
     fn recovery_survives_a_panic_mid_repair_and_stays_idempotent() -> Result<()> {
         // A panic between the repair write and the journal consumption must
         // leave a state a plain rerun converges on, and further reruns are
@@ -4333,16 +4546,17 @@ mod tests {
         run_crashing_move(&source, &target, "profile-move-source-sessions");
         assert_eq!(journal_entry_count(&source), 1);
 
-        arm_test_crash_point("profile-repair-source-written");
         let view: Vec<(&str, &Storage)> =
             vec![(source.profile(), &source), (target.profile(), &target)];
         {
+            // Guard scoped to the interrupted pass only, so its Drop runs
+            // before the converging rerun below.
+            let _crash = ArmedCrashPoint::arm("profile-repair-source-written");
             let loaded = collect_loaded(&[&source, &target]);
             let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 super::reconcile_profile_duplicates(&loaded, &view);
             }));
         }
-        disarm_test_crash_points();
         // The interrupted pass wrote the repaired source but died before
         // consuming the journal; the rerun finishes the job.
         let loaded = collect_loaded(&[&source, &target]);

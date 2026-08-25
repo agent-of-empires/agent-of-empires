@@ -20924,7 +20924,10 @@ mod profile_duplicate_reconciliation {
                     group_move_source_path: "work".to_string(),
                     group_move_target_path: "moved".to_string(),
                     group_move_subtree: false,
-                    created_at_epoch_ms: 0,
+                    created_at_epoch_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or_default(),
                 },
                 alpha.sessions_path(),
             )
