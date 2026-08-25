@@ -69,7 +69,7 @@
     <rect x="64" y="51" width="9" height="17" rx="2" fill="#fef3c7" opacity="0.75"/>
   </g>
 
-  <text x="212" y="98" font-family="'JetBrains Mono', 'SF Mono', monospace" font-size="13" fill="#d97706" letter-spacing="0.2em">EVERY TUESDAY  ·  14:00 EUROPE/PARIS</text>
+  <text x="212" y="98" font-family="'JetBrains Mono', 'SF Mono', monospace" font-size="13" fill="#d97706" letter-spacing="0.2em">EVERY TUESDAY  ·  14:00 PARIS  ·  08:00 ET  ·  05:00 PT</text>
 
   <text x="212" y="158" font-family="'Satoshi', 'DM Sans', 'Inter', system-ui, sans-serif" font-size="52" font-weight="900" fill="#f8fafc" letter-spacing="-0.01em">Office Hours</text>
 
