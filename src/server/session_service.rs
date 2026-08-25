@@ -83,6 +83,23 @@ struct MirroredFields {
     queued_prompts: Vec<crate::acp::state::QueuedPromptEntry>,
     queued_prompt_next_seq: u64,
     idle_dormant_since: Option<chrono::DateTime<chrono::Utc>>,
+    /// Mirrored as `disk = max(disk, memory)`, not copied, because the field is
+    /// documented monotone non-decreasing and disk can legitimately lead memory
+    /// when a peer process touched the row.
+    ///
+    /// Note what that means for the callers that do not advance it themselves
+    /// (edit / remove / clear / the dormancy clear): the max is NOT a no-op for
+    /// them. It runs against the disk row, so whenever memory leads disk those
+    /// mutations flush memory's value too. That is intended. Since #3465 and
+    /// #3481 removed the passive stamps, a leading memory value can only have
+    /// come from a real user gesture that has not reached disk yet, so
+    /// persisting it opportunistically is correct rather than fabricated.
+    ///
+    /// It is also safe in the direction #3465 cares about: a max advances
+    /// recency but never clears `archived_at` / `snoozed_until` /
+    /// `idle_dormant_since`, so no queue mutation can lift a sink. Writing this
+    /// as `touch_last_accessed()` would.
+    last_accessed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Result of `SessionService::edit_queued_prompt`.
@@ -845,6 +862,7 @@ impl SessionService {
                     queued_prompts: inst.queued_prompts.clone(),
                     queued_prompt_next_seq: inst.queued_prompt_next_seq,
                     idle_dormant_since: inst.idle_dormant_since,
+                    last_accessed_at: inst.last_accessed_at,
                 },
             )
         };
@@ -857,6 +875,13 @@ impl SessionService {
                             inst.queued_prompts = mirrored.queued_prompts;
                             inst.queued_prompt_next_seq = mirrored.queued_prompt_next_seq;
                             inst.idle_dormant_since = mirrored.idle_dormant_since;
+                            // Monotone max, never `touch_last_accessed()`: a
+                            // queued prompt is a recency gesture, not a wake,
+                            // so it must not clear `archived_at` /
+                            // `snoozed_until` / `idle_dormant_since` a peer
+                            // wrote after this daemon's snapshot (#3465).
+                            inst.last_accessed_at =
+                                inst.last_accessed_at.max(mirrored.last_accessed_at);
                         }
                         Ok(())
                     })
@@ -877,6 +902,21 @@ impl SessionService {
     /// stored entry (with its assigned `seq`). Idempotent on `prompt_id`:
     /// re-enqueuing an existing id updates its text/attachments in place instead
     /// of adding a duplicate, so an optimistic client retry cannot double-queue.
+    ///
+    /// Queueing is a user gesture, so it advances `last_accessed_at`. Both
+    /// enqueue routes land here (`POST /queue` from the web composer, and
+    /// `/acp/prompt`'s Tier 3 `Queued` disposition, which the TUI takes because
+    /// it always posts the prompt endpoint), so the two clients stay symmetric
+    /// without either endpoint plumbing recency itself. It is only a recency
+    /// advance, never a wake: the respawn kick a real wake needs lives on the
+    /// prompt endpoint, and a client queues behind a live turn, so there is no
+    /// sunk row to lift here.
+    ///
+    /// Until #3465 this was invisible. `apply_status_intent` restamped the
+    /// field on every worker-event transition, so a queued turn's Running/Idle
+    /// edges kept recency fresh by accident; dropping that stamp is what made
+    /// the missing gesture-side write observable in the attention sort and the
+    /// TUI activity column.
     #[cfg(feature = "serve")]
     pub(crate) async fn enqueue_prompt(
         self: &Arc<Self>,
@@ -888,6 +928,7 @@ impl SessionService {
         created_at: String,
     ) -> Option<crate::acp::state::QueuedPromptEntry> {
         self.mutate_instance_persisted(id, move |inst| {
+            inst.last_accessed_at = inst.last_accessed_at.max(Some(chrono::Utc::now()));
             if let Some(existing) = inst.queued_prompts.iter_mut().find(|q| q.id == prompt_id) {
                 existing.text = text.clone();
                 existing.attachments = attachments.clone();
@@ -1739,6 +1780,92 @@ mod tests {
                 .map(|q| q.id.clone())
                 .collect::<Vec<_>>(),
             ["next"]
+        );
+    }
+
+    /// Queueing a follow-up is a user gesture, so it must advance
+    /// `last_accessed_at` in memory and on disk, and it must do so WITHOUT
+    /// clearing a sink a peer wrote after this daemon's snapshot.
+    ///
+    /// Before #3465 the recency half was supplied by accident:
+    /// `apply_status_intent` restamped the field on every worker-event
+    /// transition, so the queued turn's Running/Idle edges kept it fresh.
+    /// Dropping that stamp left the web composer's `POST /queue` path (the one
+    /// it takes for a follow-up typed behind a live turn) advancing nothing, so
+    /// an actively-queued session aged into the top of the attention sort as
+    /// the most neglected one (`groups.rs::attention_session_key` sorts
+    /// `last_accessed_at` ASC) and the TUI activity column showed a stale age.
+    ///
+    /// The sink assertion is the other half: mirroring this field with
+    /// `touch_last_accessed()` instead of a monotone max would pass the recency
+    /// checks and reintroduce #3465's wipe.
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn enqueueing_a_prompt_advances_recency_without_clearing_a_peer_sink() {
+        use crate::session::test_support::isolate_app_dir;
+        let _tmp = isolate_app_dir();
+        let profile = "default";
+
+        let stale = chrono::Utc::now() - chrono::Duration::seconds(600);
+        let mut inst = Instance::new("queue", "/tmp/aoe-queue-recency");
+        inst.id = "sess-recency".to_string();
+        inst.view = crate::session::View::Structured;
+        inst.source_profile = profile.to_string();
+        inst.last_accessed_at = Some(stale);
+
+        // Disk carries a sink this daemon's memory has not observed, which is
+        // exactly the shape #3465's wipe needs.
+        let mut seed = inst.clone();
+        seed.archive();
+        let peer_archived_at = seed.archived_at;
+        assert!(peer_archived_at.is_some());
+        seed.last_accessed_at = Some(stale);
+        crate::session::Storage::new_unwatched(profile)
+            .unwrap()
+            .update(|instances, _groups| {
+                instances.push(seed);
+                Ok(())
+            })
+            .unwrap();
+
+        let service = crate::server::test_support::build_test_app_state(vec![inst])
+            .session_service
+            .clone();
+        service
+            .enqueue_prompt(
+                "sess-recency",
+                "q1".into(),
+                "follow-up behind a live turn".into(),
+                vec![],
+                None,
+                "t0".into(),
+            )
+            .await
+            .expect("session exists");
+
+        let in_memory = service.instances.read().await[0].last_accessed_at;
+        assert!(
+            in_memory > Some(stale),
+            "queueing is a user gesture; daemon memory must advance recency"
+        );
+
+        let on_disk = crate::session::Storage::new_unwatched(profile)
+            .unwrap()
+            .load()
+            .unwrap();
+        let row = on_disk
+            .iter()
+            .find(|i| i.id == "sess-recency")
+            .expect("session on disk");
+        assert!(
+            row.last_accessed_at > Some(stale),
+            "the gesture must survive a daemon restart, not just live in memory"
+        );
+        assert_eq!(
+            row.archived_at, peer_archived_at,
+            "a queued prompt is a recency advance, not a wake: it must not clear \
+             a peer archive (#3465)"
         );
     }
 

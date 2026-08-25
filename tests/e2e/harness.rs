@@ -417,6 +417,12 @@ last_seen_version = "{}"
         self.extra_env.push((key.to_string(), value.to_string()));
     }
 
+    /// Prepend `dir` to the PATH of every spawned process so a
+    /// test-specific fixture binary shadows anything on the system.
+    pub fn add_path_dir(&mut self, dir: &Path) {
+        self.extra_path_dirs.push(dir.to_path_buf());
+    }
+
     /// Make the fake ACP agent reject `session/fork` (for fork-failure tests).
     /// Must be called BEFORE `install_acp_shim` so the knob is baked into the
     /// shim: the daemon strips arbitrary env before spawning the worker, so a

@@ -252,31 +252,108 @@ fn claude_pane_has_running_signal(
 /// counters (`1m 14s · ↓ 40.4k tokens`) and stays on screen, frozen at its
 /// final values, after the agent completes and the session is fully idle.
 /// Matching it would pin a parked session on Running (the bug #2909 fixed),
-/// so two structural requirements exclude it: the count must be a plain
-/// integer (no `40.4k` decimal/suffix forms) and `tokens` must be followed by
-/// the counter's closing paren, which strip rows never have.
+/// so three structural requirements hold: an opening paren right before the
+/// duration (`(22m 8s · ↓`), a numeric count, and `tokens` followed by the
+/// counter's closing paren, which strip rows never have. The closing paren
+/// is the requirement that excludes the strip, so the count itself may take
+/// Claude's abbreviated forms (`44.7k`, `1.2m`); the earlier plain-integer
+/// rule rejected those and left long turns reading Idle (#3440).
 fn has_claude_live_token_counter(content: &str) -> bool {
-    let mut search = content;
-    while let Some(pos) = search.find("s · ↓") {
-        let after = search[pos + "s · ↓".len()..].trim_start();
-        let mut digits_end = 0;
-        for (i, c) in after.char_indices() {
-            if c.is_ascii_digit() {
-                digits_end = i + c.len_utf8();
-            } else {
-                break;
+    let bytes = content.as_bytes();
+    // Two anchor shapes: the full `s · ↓` tail, and `s` + newline + `↓`
+    // when a narrow pane wraps right after the duration group
+    // (`(22m 8s` + newline + `↓ 44.7k tokens)`).
+    for pattern in ["s · ↓", "s\n↓"] {
+        for (pos, _) in content.match_indices(pattern) {
+            // The live counter always opens with `(` right before its
+            // duration, and that duration ends in a digit: `(22m 8s`,
+            // never `(s · ↓` or `(22m s · ↓`. Walk back over the duration
+            // (newlines included: narrow panes wrap mid-token, splitting
+            // `8s` across lines) and require the opening paren; anything
+            // else rejects this occurrence and the scan moves on to the
+            // next one. The digit itself may sit across the wrapping
+            // newline (`22m 8` + newline + `s · ↓`).
+            //
+            // Wrapping is covered only where these two anchors reach: a
+            // break before the duration's last digit, one splitting that
+            // digit from its `s`, or one right after the `s`. A break
+            // inside `· ↓` matches neither anchor, and a split `8s` is
+            // walked only when the continuation starts flush, because the
+            // hop below crosses newlines but not the indentation a boxed
+            // pane puts after one. Both read Idle until the next capture,
+            // the harmless direction.
+            let mut j = pos;
+            while j > 0 && matches!(bytes[j - 1], b'\n') {
+                j -= 1;
             }
-        }
-        if digits_end > 0 {
-            let tail = after[digits_end..].trim_start();
-            if let Some(after_tokens) = tail.strip_prefix("tokens") {
-                if after_tokens.trim_start().starts_with(')') {
-                    return true;
+            if j == 0 || !bytes[j - 1].is_ascii_digit() {
+                continue;
+            }
+            let mut i = pos;
+            while i > 0 {
+                let c = bytes[i - 1];
+                if c == b'(' {
+                    break;
+                }
+                if !(c.is_ascii_digit() || matches!(c, b'm' | b's' | b'h' | b' ' | b'\t' | b'\n')) {
+                    break;
+                }
+                i -= 1;
+            }
+            if i == 0 || bytes[i - 1] != b'(' {
+                continue;
+            }
+            let after = content[pos + pattern.len()..].trim_start();
+            let count_bytes = after.as_bytes();
+            let mut count_end = count_bytes
+                .iter()
+                .position(|b| !b.is_ascii_digit())
+                .unwrap_or(count_bytes.len());
+            if count_end > 0 {
+                // Optional single fractional part (`44.7`), consumed only when a
+                // digit follows the dot so `44.tokens` does not half-parse.
+                if count_bytes.get(count_end) == Some(&b'.')
+                    && count_bytes
+                        .get(count_end + 1)
+                        .is_some_and(|b| b.is_ascii_digit())
+                {
+                    count_end += 1;
+                    count_end += count_bytes[count_end..]
+                        .iter()
+                        .position(|b| !b.is_ascii_digit())
+                        .unwrap_or(count_bytes.len() - count_end);
+                }
+                // Optional magnitude suffix (`512k`, `1.2m`, `3g`), lowercase
+                // only: every captured rendering is lowercase, and prose echoes
+                // more readily carry an uppercase unit.
+                if matches!(count_bytes.get(count_end), Some(b'k' | b'm' | b'g')) {
+                    count_end += 1;
+                }
+                let tail = after[count_end..].trim_start();
+                if let Some(after_tokens) = tail.strip_prefix("tokens") {
+                    // The live counter ends the spinner line, so its closing
+                    // paren must close a whitespace-only line. Quoted literals
+                    // (this repo's own test rows, docs) carry punctuation or
+                    // prose right after it; rejecting those keeps them from
+                    // pinning a parked pane on Running. A newline itself is
+                    // fine: narrow panes wrap the counter across lines, and a
+                    // bare `)` opening the next line still completes the shape
+                    // (pinned by the wrapped-before-paren row below).
+                    let accepted =
+                        after_tokens
+                            .trim_start()
+                            .strip_prefix(')')
+                            .is_some_and(|rest| {
+                                rest.lines()
+                                    .next()
+                                    .is_none_or(|line| line.trim().is_empty())
+                            });
+                    if accepted {
+                        return true;
+                    }
                 }
             }
         }
-        // Advance past this match so we don't loop on the same position.
-        search = &search[pos + "s · ↓".len()..];
     }
     false
 }
@@ -2643,6 +2720,148 @@ enter to select · esc to cancel";
     }
 
     #[test]
+    fn test_detect_claude_status_running_on_abbreviated_token_counter() {
+        // Claude abbreviates the live count once a turn runs long
+        // (`↓ 44.7k tokens`); the spinner line's ellipsis can sit past the
+        // second word, so the counter is that pane's only running signal.
+        // Captured from #3440.
+        let long_turn_pane = "\
+● Clippy clean on both; waiting on the base-commit control.\n\
+  Ran 2 shell commands\n\
+✻ Judging #3413 feedback… (22m 8s · ↓ 44.7k tokens)\n\
+┌─────\n\
+❯\n\
+└─────\n\
+  ⏵⏵ auto mode on";
+        // The synthetic rows put the ellipsis on the third word, like the
+        // captured pane: `claude_line_is_active_spinner` then rejects the
+        // line and the counter is the only running signal being pinned.
+        let cases = [
+            ("issue pane", long_turn_pane),
+            (
+                "k suffix",
+                "✶ Summarizing the findings… (53s · ↓ 7.0k tokens)",
+            ),
+            (
+                "m suffix",
+                "✶ Summarizing the findings… (4s · ↓ 1.2m tokens)",
+            ),
+            ("g suffix", "✶ Summarizing the findings… (4s · ↓ 3g tokens)"),
+            (
+                "integer k, no decimal",
+                "✶ Summarizing the findings… (4s · ↓ 512k tokens)",
+            ),
+            (
+                "wrap between duration and arrow",
+                "(22m 8s\n↓ 44.7k tokens)",
+            ),
+            // Narrow panes wrap mid-token: the joined capture carries the
+            // newline inside what was `8s`.
+            ("wrap inside seconds", "(22m 8\ns · ↓ 44.7k tokens)"),
+        ];
+        for (name, pane) in cases {
+            assert_eq!(detect_claude_status(pane), Status::Running, "{name}");
+        }
+    }
+
+    #[test]
+    fn test_has_claude_live_token_counter_variants() {
+        // Accepts every count form Claude renders inside the parenthesized
+        // live counter plus the regular extensions of that shape (m, g and
+        // bare decimals are extrapolations, not captures); rejects the
+        // unparenthesized frozen agents-strip counters (#2909) and
+        // malformed echoes.
+        let cases = [
+            ("plain integer", "(4s · ↓ 88 tokens)", true),
+            ("multi-digit", "(12s · ↓ 1234 tokens)", true),
+            ("decimal with k", "(53s · ↓ 7.0k tokens)", true),
+            ("plain decimal", "(4s · ↓ 44.7 tokens)", true),
+            ("integer with k", "(4s · ↓ 512k tokens)", true),
+            ("decimal with m", "(4s · ↓ 1.2m tokens)", true),
+            ("integer with g", "(4s · ↓ 3g tokens)", true),
+            ("two-digit fraction", "(4s · ↓ 1.23m tokens)", true),
+            // A bare `)` opening the next line still completes a wrapped
+            // counter; pinning it so a future tightening knows what it
+            // changes.
+            (
+                "wrapped before paren",
+                "✻ Judging #3413 feedback… (4s · ↓ 88 tokens\n)",
+                true,
+            ),
+            // Transcript prose may follow on the next physical line; only
+            // the paren's own line must stay blank.
+            (
+                "prose on the following line",
+                "(4s · ↓ 88 tokens)\nRan 2 shell commands",
+                true,
+            ),
+            (
+                "wrapped across lines",
+                "✶ Summarizing the findings… (22m 8s · ↓ 44.7k\ntokens)",
+                true,
+            ),
+            // Duration segments without their own digits are malformed
+            // pane text, not a counter.
+            ("empty duration", "(s · ↓ 88 tokens)", false),
+            ("unit without own digits", "(22m s · ↓ 88 tokens)", false),
+            ("no count", "(4s · ↓ tokens)", false),
+            ("comma separator", "(4s · ↓ 12,345 tokens)", false),
+            ("uppercase suffix", "(4s · ↓ 44.7K tokens)", false),
+            ("non-digit count", "(4s · ↓ many tokens)", false),
+            // The duration must sit inside an opening paren; an anchor tail
+            // loose in prose is not a live counter (review finding on
+            // #3488).
+            ("no opening paren", "summary: 4s · ↓ 88 tokens)", false),
+            (
+                "prose before the duration",
+                "see issue s · ↓ 88 tokens)",
+                false,
+            ),
+            ("double dot", "(4s · ↓ 44..7k tokens)", false),
+            // A dot with no digit after it must not be eaten as a fraction,
+            // or `44.tokens)` would half-parse into a live counter.
+            ("no digit after dot", "(4s · ↓ 44.tokens)", false),
+            // Only whitespace may follow the closing paren: a quoted
+            // literal row carries punctuation there and must stay
+            // rejected, echo or not.
+            ("punctuation after paren", "(4s · ↓ 7.0k tokens),", false),
+            ("quote after paren", "(4s · ↓ 88 tokens)\",", false),
+            // A decoy anchor inside footer text must not stop the scan
+            // from finding the real counter later in the window.
+            (
+                "decoy anchor then real counter",
+                "  ⏵⏵ bypass permissions on · ← for agents · ↓ to manage\n(4s · ↓ 88 tokens)",
+                true,
+            ),
+            // The anchor needs the duration's `s`; a bare arrow in prose is
+            // not a counter.
+            ("bare arrow in prose", "watch the ↓ 88 tokens) chart", false),
+            // Text after the closing paren on its own line means the shape
+            // is quoted prose, not a live counter.
+            ("prose after paren", "(4s · ↓ 88 tokens) renders", false),
+            // A following physical line starting with `)` must not supply
+            // the paren to a prose line ending in the anchor tail.
+            (
+                "next line completes shape",
+                "● The helper reads s · ↓ 42 tokens\n) -> Status {",
+                false,
+            ),
+            // Relaxing the anchor to a bare middle-dot arrow would let
+            // ordinary prose through; the duration's `s` is load-bearing.
+            (
+                "middle dot arrow without duration",
+                "chart · ↓ 88 tokens)",
+                false,
+            ),
+            // Unobserved magnitude units stay out of the alphabet.
+            ("b suffix", "(4s · ↓ 512b tokens)", false),
+        ];
+        for (name, content, expected) in cases {
+            assert_eq!(has_claude_live_token_counter(content), expected, "{name}");
+        }
+    }
+
+    #[test]
     fn test_detect_claude_status_running_on_spinner_verb_shape() {
         // <frame> <Verb…> is the live spinner line.
         assert_eq!(detect_claude_status("✶ Working…"), Status::Running);
@@ -3026,14 +3245,6 @@ enter to select · esc to cancel";
    2. No, exit
 ";
 
-    #[test]
-    fn claude_folder_trust_prompt_narrow_is_waiting() {
-        assert_eq!(
-            detect_claude_status(CLAUDE_FOLDER_TRUST_PROMPT_NARROW),
-            Status::Waiting
-        );
-    }
-
     /// The label match is anchored to the choice block, not the whole window.
     /// Window-wide collapsing found the label in ordinary prose, and because a
     /// blocking rule outranks the running signal these all reported `Waiting`
@@ -3126,19 +3337,15 @@ enter to select · esc to cancel";
     }
 
     #[test]
-    fn claude_folder_trust_prompt_wrapped_is_waiting() {
-        assert_eq!(
-            detect_claude_status(CLAUDE_FOLDER_TRUST_PROMPT_WRAPPED),
-            Status::Waiting
-        );
-    }
-
-    #[test]
     fn claude_folder_trust_prompt_is_waiting() {
-        assert_eq!(
-            detect_claude_status(CLAUDE_FOLDER_TRUST_PROMPT),
-            Status::Waiting
-        );
+        let cases = [
+            ("default", CLAUDE_FOLDER_TRUST_PROMPT),
+            ("wrapped", CLAUDE_FOLDER_TRUST_PROMPT_WRAPPED),
+            ("narrow", CLAUDE_FOLDER_TRUST_PROMPT_NARROW),
+        ];
+        for (name, fixture) in cases {
+            assert_eq!(detect_claude_status(fixture), Status::Waiting, "{name}");
+        }
     }
 
     /// The shapes the label anchor admits: an unprefixed verbatim menu row, a

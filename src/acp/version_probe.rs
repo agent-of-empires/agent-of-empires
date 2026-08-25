@@ -13,9 +13,20 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProbeStatus {
     Missing,
-    Version { raw: String, parsed: Version },
-    Unparseable { raw: String },
-    Failed { message: String },
+    Version {
+        raw: String,
+        parsed: Version,
+        /// stdout only, what the spawn-side tokenizer sees; stderr is
+        /// folded into `raw`. Bundle-backed suppression must judge
+        /// spawn's stream view, not this probe's lenient fold.
+        stdout_raw: String,
+    },
+    Unparseable {
+        raw: String,
+    },
+    Failed {
+        message: String,
+    },
     TimedOut,
 }
 
@@ -76,11 +87,38 @@ pub fn extract_semver(raw: &str) -> Option<Version> {
         .next()
 }
 
+/// The spawn side's tokenizer (`path_copy_below_floor`): the first
+/// whitespace-delimited token that parses as strict semver once a
+/// leading `v` is stripped. The doctor's probe parser is more lenient
+/// (stderr folded in, punctuation-split tokens), so code that predicts
+/// what spawn will do must ask this exact predicate instead of reusing
+/// the lenient parse.
+pub fn whitespace_token_below_floor(raw: &str, min: Version) -> bool {
+    whitespace_token_semver(raw).is_some_and(|found| found < min)
+}
+
+/// The strict token itself, for callers that need to compare against a
+/// floor in either direction (spawn keeps the PATH copy when this is
+/// `None`, and a pinned bundle only counts as backing when its own
+/// stdout parses at or above the floor).
+pub fn whitespace_token_semver(raw: &str) -> Option<Version> {
+    raw.split_whitespace()
+        .filter_map(|tok| Version::parse(tok.trim_start_matches('v')).ok())
+        .next()
+}
+
 pub async fn probe_binary_version(binary: &str) -> ProbeStatus {
-    let Ok(path) = which::which(binary) else {
-        return ProbeStatus::Missing;
-    };
-    let child = tokio::process::Command::new(&path)
+    match which::which(binary) {
+        Ok(path) => probe_path_version(&path).await,
+        Err(_) => ProbeStatus::Missing,
+    }
+}
+
+/// Probe an explicit executable path. Same budget and stream handling
+/// as [`probe_binary_version`], for callers that resolved the binary
+/// themselves (the pinned bundled copies never sit on PATH).
+pub async fn probe_path_version(path: &std::path::Path) -> ProbeStatus {
+    let child = tokio::process::Command::new(path)
         .arg("--version")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -97,13 +135,10 @@ pub async fn probe_binary_version(binary: &str) -> ProbeStatus {
     };
     match tokio::time::timeout(PROBE_TIMEOUT, child.wait_with_output()).await {
         Ok(Ok(output)) => {
-            let raw = format!(
-                "{}{}",
-                String::from_utf8_lossy(&output.stdout),
-                String::from_utf8_lossy(&output.stderr),
-            )
-            .trim()
-            .to_string();
+            let stdout_raw = String::from_utf8_lossy(&output.stdout).to_string();
+            let raw = format!("{}{}", stdout_raw, String::from_utf8_lossy(&output.stderr),)
+                .trim()
+                .to_string();
             if !output.status.success() {
                 return ProbeStatus::Failed {
                     message: if raw.is_empty() {
@@ -114,7 +149,11 @@ pub async fn probe_binary_version(binary: &str) -> ProbeStatus {
                 };
             }
             match extract_semver(&raw) {
-                Some(parsed) => ProbeStatus::Version { raw, parsed },
+                Some(parsed) => ProbeStatus::Version {
+                    raw,
+                    parsed,
+                    stdout_raw,
+                },
                 None => ProbeStatus::Unparseable { raw },
             }
         }
@@ -249,6 +288,36 @@ mod tests {
         assert!(extract_semver("not-semver").is_none());
     }
 
+    /// This predicate IS the spawn-side decision, so its table pins the
+    /// strict tokenizer: whitespace-delimited, `v`-stripped, first
+    /// parseable token wins. Formats the lenient doctor parser accepts
+    /// (like `version=0.37.0`, split on punctuation) must read as
+    /// unproven here.
+    #[test]
+    fn whitespace_token_below_floor_mirrors_spawn_parsing() {
+        let min = Version::parse(CLAUDE_AGENT_ACP_MIN_VERSION).unwrap();
+        // (raw, below_floor)
+        let cases = [
+            ("0.37.0", true),
+            ("claude-agent-acp 0.37.0", true),
+            ("v0.37.0", true),
+            ("0.55.0", false),
+            ("0.56.0", false),
+            // Punctuation-joined output has no whitespace token that
+            // parses strictly: spawn keeps the PATH copy.
+            ("version=0.37.0", false),
+            ("0.37.0-beta.1", true),
+            ("junk", false),
+            ("", false),
+        ];
+        for (raw, below) in cases {
+            assert_eq!(
+                whitespace_token_below_floor(raw, min.clone()),
+                below,
+                "{raw:?}"
+            );
+        }
+    }
     #[test]
     fn warning_for_probe_flags_only_unusable_versions() {
         let gate = claude_gate();
@@ -258,6 +327,7 @@ mod tests {
                 &ProbeStatus::Version {
                     raw: "0.0.1".to_string(),
                     parsed: Version::parse("0.0.1").unwrap(),
+                    stdout_raw: "0.0.1".to_string(),
                 },
             )
             .unwrap()
@@ -269,6 +339,7 @@ mod tests {
             &ProbeStatus::Version {
                 raw: CLAUDE_AGENT_ACP_MIN_VERSION.to_string(),
                 parsed: Version::parse(CLAUDE_AGENT_ACP_MIN_VERSION).unwrap(),
+                stdout_raw: CLAUDE_AGENT_ACP_MIN_VERSION.to_string(),
             },
         )
         .is_none());
@@ -277,6 +348,7 @@ mod tests {
             &ProbeStatus::Version {
                 raw: "999.0.0".to_string(),
                 parsed: Version::parse("999.0.0").unwrap(),
+                stdout_raw: "999.0.0".to_string(),
             },
         )
         .is_none());

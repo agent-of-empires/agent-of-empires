@@ -625,8 +625,18 @@ impl HomeView {
         };
         let id_owned = id.to_string();
         let new_tool = new_tool.to_string();
+        let row_profile = profile.clone();
         if let Err(e) = storage.update(|instances, _groups| {
             if let Some(disk) = instances.iter_mut().find(|i| i.id == id_owned) {
+                // `source_profile` is `skip_serializing`, so a storage-loaded
+                // row always comes back blank and would resolve the incoming
+                // tool's `agent_detect_as` alias against the default profile.
+                // A tool name aliased differently per profile would then be
+                // pinned to the wrong built-in on disk, and `detect_as` is not
+                // in `reconcile_from_disk`'s carry set, so the next launch
+                // reads that value rather than the in-memory one. Restore it
+                // the same way `reconcile_from_disk` does before the swap.
+                disk.source_profile = row_profile.clone();
                 disk.swap_tool(&new_tool);
             }
             Ok(())

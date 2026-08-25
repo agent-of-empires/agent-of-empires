@@ -170,6 +170,13 @@
       "components": ["web/src/components/MobileLiveTerminal.tsx"]
     },
     {
+      "id": "terminal.live-glyph-cell-width",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/live-glyph-columns.spec.ts", "src/lib/liveTermLines.test.ts"],
+      "components": ["web/src/components/MobileLiveTerminal.tsx"]
+    },
+    {
       "id": "terminal.live-cursor-focus-fill",
       "kind": "vitest",
       "risk": "medium",
@@ -1304,6 +1311,13 @@
       "kind": "mocked-playwright",
       "risk": "medium",
       "specs": ["tests/ios-callout-suppression.spec.ts"],
+      "components": ["web/src/components/WorkspaceSidebar.tsx"]
+    },
+    {
+      "id": "sidebar.longpress-menu-persists",
+      "kind": "mocked-playwright",
+      "risk": "high",
+      "specs": ["tests/sidebar-longpress-menu-persists.spec.ts"],
       "components": ["web/src/components/WorkspaceSidebar.tsx"]
     },
     {

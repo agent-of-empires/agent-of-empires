@@ -10244,6 +10244,46 @@ fn restart_selected_session_tool_swap_clears_old_agent_session_state() {
     assert_eq!(parked.acp_session_id.as_deref(), Some("acp-sess-1"));
 }
 
+/// The disk row a tool swap writes must resolve `agent_detect_as` against the
+/// session's own profile. `source_profile` is `skip_serializing`, so a
+/// storage-loaded row comes back blank and would key the default profile's
+/// aliases instead; `detect_as` is not in `reconcile_from_disk`'s carry set,
+/// so that wrong value is what the next launch reads.
+#[test]
+#[serial]
+fn restart_selected_session_tool_swap_resolves_detect_as_for_the_row_profile() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+
+    // Pin the resolved default profile to something other than the row's own
+    // profile, so a blank `source_profile` is observably the wrong key.
+    let app_dir = crate::session::get_app_dir().expect("app dir");
+    std::fs::create_dir_all(app_dir.join("profiles").join("other")).expect("other profile");
+    std::fs::write(app_dir.join("config.toml"), "default_profile = \"other\"\n")
+        .expect("global config");
+
+    let mut config = crate::session::Config::default();
+    config
+        .session
+        .agent_detect_as
+        .insert("gjc".to_string(), "claude".to_string());
+    crate::tmux::status_rules::install_from_config("test", &config);
+    crate::tmux::status_rules::install_from_config("other", &crate::session::Config::default());
+
+    env.view
+        .restart_selected_session(None, Some("gjc"), None, None)
+        .unwrap();
+
+    let disk = Storage::new_unwatched("test").unwrap().load().unwrap();
+    let row = disk.iter().find(|i| i.id == id).unwrap();
+    assert_eq!(row.tool, "gjc");
+    assert_eq!(
+        row.detect_as, "claude",
+        "the swap must read profile 'test' aliases, not the default profile's"
+    );
+}
+
 #[test]
 #[serial]
 fn restart_selected_session_surfaces_resume_failed_after_async_restart() {

@@ -1,7 +1,16 @@
 import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { CSSProperties, ReactNode, RefObject } from "react";
 import type { AnsiSegment, AnsiStyle } from "../lib/ansi";
-import { LineParseCache, findCursorCharIndex, splitUrls, textWidth, wrapLine } from "../lib/liveTermLines";
+import {
+  LineParseCache,
+  clusterSpanAt,
+  findCursorCharIndex,
+  splitCellRuns,
+  splitUrls,
+  textWidth,
+  wrapLine,
+  type CellRun,
+} from "../lib/liveTermLines";
 import { wheelNotches } from "../lib/liveMouse";
 import { registerMobileKeyboardProxyReceiver, type MobileKeyboardProxyInput } from "../lib/mobileKeyboardProxy";
 import { writeClipboard } from "../lib/clipboard";
@@ -181,6 +190,28 @@ function segStyle(style: AnsiStyle): CSSProperties | undefined {
   if (style.underline) css.textDecoration = "underline";
   return Object.keys(css).length ? css : undefined;
 }
+// Explicit-width box for one isolated run (#3342): an inline-block of
+// exactly `cells` cells, sized by the term-cell CSS variable set on the
+// scroller, absorbs any fallback font's advance error so a glyph missing
+// from the configured font shifts nothing after it. The 1em fallback in
+// the calc only covers standalone renders (unit tests) with no scroller.
+function fixedBoxStyle(cells: number, base: CSSProperties | undefined): CSSProperties {
+  return { ...base, display: "inline-block", width: `calc(var(--term-cell, 1em) * ${cells})` };
+}
+
+/** One styled run of a row: flowing text renders bare; fixed clusters get
+ *  the explicit box while remaining ordinary selectable/copyable spans.
+ *  Anchoring happens one level up, per URL part over the whole segment,
+ *  so a href keeps its glued non-ASCII glyphs even though the runs split
+ *  there (#3342). */
+function cellRunSpan(run: CellRun, style: AnsiStyle, key: string): ReactNode {
+  const base = segStyle(style);
+  return (
+    <span key={key} style={run.fixed ? fixedBoxStyle(run.cells, base) : base}>
+      {run.text}
+    </span>
+  );
+}
 
 // Diagnostic overlay for cursor-alignment field reports: open the dashboard
 // with `?livedebug=1` and the live view shows the geometry the overlay math
@@ -307,23 +338,6 @@ function specialKeySequence(e: TerminalKeyLike): string | null {
   }
 }
 
-// Wrap http(s) URLs in a segment's text as clickable anchors, so agent output
-// (PR links, localhost dev servers, docs) opens in one tap instead of a
-// manual select-copy-paste (#2685). Plain text returns as-is.
-function linkify(text: string): ReactNode {
-  const parts = splitUrls(text);
-  if (parts.length === 1 && parts[0]!.url == null) return text;
-  return parts.map((p, i) =>
-    p.url ? (
-      <a key={i} href={p.url} target="_blank" rel="noopener noreferrer" className="underline cursor-pointer">
-        {p.text}
-      </a>
-    ) : (
-      p.text
-    ),
-  );
-}
-
 export const Row = memo(function Row({
   segs,
   cursorCol,
@@ -338,73 +352,117 @@ export const Row = memo(function Row({
     if (segs.length === 0) return <div> </div>; // keep empty rows at full height
     return (
       <div>
-        {segs.map((seg, i) => (
-          <span key={i} style={segStyle(seg.style)}>
-            {linkify(seg.text)}
-          </span>
-        ))}
+        {segs.map((seg, i) =>
+          splitUrls(seg.text).map((part, j) => {
+            const runs = splitCellRuns(part.text).map((run, k) => cellRunSpan(run, seg.style, `${i}-${j}-${k}`));
+            // Whole-part anchors: a URL that runs into glued non-ASCII
+            // keeps those glyphs in its href and inside the clickable
+            // span, with each run still boxed cell-exact.
+            if (!part.url) return <Fragment key={`${i}-${j}`}>{runs}</Fragment>;
+            return (
+              <a
+                key={`${i}-${j}`}
+                href={part.url}
+                target="_blank"
+                rel="noopener noreferrer"
+                className="underline cursor-pointer"
+              >
+                {runs}
+              </a>
+            );
+          }),
+        )}
       </div>
     );
   }
   // The cursor row (live input line) keeps the delicate cell-split logic below
   // and is not linkified; agent-output URLs live in the cursorCol == null rows.
-  // Render the row with the single cell at `cursorCol` boxed. Walk segments by
-  // terminal cell width, not UTF-16 code units, since `cursorCol` is a real
-  // cell count from tmux and CJK/wide glyphs take two cells but one code
-  // unit (#2665); split the segment that straddles the cursor.
+  // Walk the row by terminal cell width, not UTF-16 code units, since
+  // `cursorCol` is a real cell count from tmux and CJK/wide glyphs take two
+  // cells but one code unit (#2665). Runs from splitCellRuns carry explicit
+  // widths (#3342), so splitting the run that straddles the cursor re-derives
+  // each piece's box and the boxed cell lands exactly on its column even when
+  // earlier glyphs fell back to another font.
   const out: ReactNode[] = [];
   let col = 0;
   let placed = false;
   let key = 0;
   for (const seg of segs) {
-    const t = seg.text;
-    const idx = placed ? null : findCursorCharIndex(t, cursorCol - col);
-    if (idx != null) {
-      const chars = [...t];
-      if (idx > 0) {
+    for (const run of splitCellRuns(seg.text)) {
+      const end = col + run.cells;
+      const base = segStyle(seg.style);
+      const idx = placed
+        ? null
+        : cursorCol >= col && cursorCol < end
+          ? findCursorCharIndex(run.text, cursorCol - col)
+          : null;
+      if (idx != null) {
+        placed = true;
+        const chars = [...run.text];
+        // Slice at cluster boundaries for BOTH run kinds: a fixed run is a
+        // coalesced stretch of whole graphemes, and flow runs can carry
+        // glued marks too (NFD input). The cursor cell must take exactly
+        // the cluster under the cursor (base plus its marks/tails, a flag
+        // pair, or whatever a ZWJ joins) so no composition tail is
+        // stranded in a zero-width sibling where browsers draw circles.
+        const [clusterStart, clusterEnd] = clusterSpanAt(run.text, idx);
+        if (clusterStart > 0) {
+          const pre = chars.slice(0, clusterStart).join("");
+          out.push(
+            <span key={key++} style={run.fixed ? fixedBoxStyle(textWidth(pre), base) : base}>
+              {pre}
+            </span>,
+          );
+        }
+        const cursorText = chars.slice(clusterStart, clusterEnd).join("");
         out.push(
-          <span key={key++} style={segStyle(seg.style)}>
-            {chars.slice(0, idx).join("")}
+          <span
+            key={key++}
+            data-live-cursor
+            className={focused ? "animate-term-cursor-blink" : undefined}
+            style={{
+              ...fixedBoxStyle(textWidth(cursorText), base),
+              ...cursorStyle,
+            }}
+          >
+            {cursorText}
+          </span>,
+        );
+        if (clusterEnd < chars.length) {
+          const post = chars.slice(clusterEnd).join("");
+          out.push(
+            <span key={key++} style={run.fixed ? fixedBoxStyle(textWidth(post), base) : base}>
+              {post}
+            </span>,
+          );
+        }
+      } else {
+        out.push(
+          <span key={key++} style={run.fixed ? fixedBoxStyle(run.cells, base) : base}>
+            {run.text}
           </span>,
         );
       }
-      out.push(
-        <span
-          key={key++}
-          data-live-cursor
-          className={focused ? "animate-term-cursor-blink" : undefined}
-          style={{ ...segStyle(seg.style), ...cursorStyle }}
-        >
-          {chars[idx]}
-        </span>,
-      );
-      if (idx + 1 < chars.length) {
-        out.push(
-          <span key={key++} style={segStyle(seg.style)}>
-            {chars.slice(idx + 1).join("")}
-          </span>,
-        );
-      }
-      placed = true;
-    } else {
-      out.push(
-        <span key={key++} style={segStyle(seg.style)}>
-          {t}
-        </span>,
-      );
+      col = end;
     }
-    col += textWidth(t);
   }
   if (!placed) {
     // Cursor sits past the row's text (blank input cell): pad to the column
-    // and box a space.
-    if (cursorCol > col) out.push(<span key="pad">{" ".repeat(cursorCol - col)}</span>);
+    // and box a space. The pad is an explicit box too; a fallback font's
+    // space advance must not move the cursor either.
+    if (cursorCol > col) {
+      out.push(
+        <span key="pad" style={fixedBoxStyle(cursorCol - col, undefined)}>
+          {" ".repeat(cursorCol - col)}
+        </span>,
+      );
+    }
     out.push(
       <span
         key="cursor"
         data-live-cursor
         className={focused ? "animate-term-cursor-blink" : undefined}
-        style={cursorStyle}
+        style={{ ...fixedBoxStyle(1, undefined), ...cursorStyle }}
       >
         {" "}
       </span>,
@@ -1756,44 +1814,51 @@ export function MobileLiveTerminal({
         className={`absolute inset-x-0 top-0 bottom-[8px] font-mono flex flex-col ${
           forwardMode ? "overflow-hidden" : "overflow-y-auto overflow-x-clip"
         }`}
-        style={{
-          fontSize: `${fontSize}px`,
-          // Undefined leaves the `font-mono` class to supply the default family.
-          fontFamily,
-          lineHeight: `${lineH}px`,
-          background: "var(--term-bg, #1c1c1f)",
-          color: "var(--term-fg, #e4e4e7)",
-          // A terminal is a fixed grid: never ligate or substitute contextual
-          // glyphs (e.g. `->`, `!=`, `==`), which would merge cells and read as
-          // fuzz. Inherited by the row spans below.
-          fontVariantLigatures: "none",
-          fontFeatureSettings: '"liga" 0, "calt" 0',
-          overscrollBehavior: "contain",
-          // Forward mode has no native scrolling (overflow hidden): a drag
-          // becomes forwarded wheel notches in onTouchMove. Suppressing the
-          // browser's own pan must happen HERE, declaratively: React
-          // registers its delegated touchstart/touchmove/wheel listeners as
-          // passive, so a preventDefault inside onTouchMove never reaches
-          // the browser. Without this the pan falls through the
-          // non-scrollable terminal to the page, and whenever the layout
-          // viewport is taller than the visual one (soft keyboard open,
-          // Safari URL bar) iOS pans the whole page while the forwarded
-          // wheel scrolls the app, the double-scroll clunk. touch-action:
-          // none stops the browser from starting any pan or zoom for
-          // touches on the terminal; JS still receives every touch event.
-          touchAction: forwardMode ? "none" : undefined,
-          // Do NOT set `-webkit-overflow-scrolling: touch` here. It promotes
-          // this opaque scroll region to a composited layer that macOS/iOS
-          // Safari rasterizes at 1x, making the DOM terminal text look
-          // pixelated/low-res. It is deprecated and a no-op on iOS 13+
-          // (momentum scrolling is always on), so omitting it costs nothing.
-          // The spacer model keeps above-viewport pixels invariant by
-          // construction, so a preserved scrollTop is always correct.
-          // The browser's own scroll anchoring doesn't know that: when
-          // the full-history frame replaces the spacer it re-anchors and
-          // teleports scrollTop. Ours is the only anchoring allowed.
-          overflowAnchor: "none",
-        }}
+        style={
+          {
+            fontSize: `${fontSize}px`,
+            // Undefined leaves the `font-mono` class to supply the default family.
+            fontFamily,
+            lineHeight: `${lineH}px`,
+            // The measured cell advance the row boxes multiply (#3342). A CSS
+            // variable rather than per-span pixel widths so a re-measure (webfont
+            // load, font-size change) restyles every mounted row without
+            // re-rendering them.
+            "--term-cell": `${charW}px`,
+            background: "var(--term-bg, #1c1c1f)",
+            color: "var(--term-fg, #e4e4e7)",
+            // A terminal is a fixed grid: never ligate or substitute contextual
+            // glyphs (e.g. `->`, `!=`, `==`), which would merge cells and read as
+            // fuzz. Inherited by the row spans below.
+            fontVariantLigatures: "none",
+            fontFeatureSettings: '"liga" 0, "calt" 0',
+            overscrollBehavior: "contain",
+            // Forward mode has no native scrolling (overflow hidden): a drag
+            // becomes forwarded wheel notches in onTouchMove. Suppressing the
+            // browser's own pan must happen HERE, declaratively: React
+            // registers its delegated touchstart/touchmove/wheel listeners as
+            // passive, so a preventDefault inside onTouchMove never reaches
+            // the browser. Without this the pan falls through the
+            // non-scrollable terminal to the page, and whenever the layout
+            // viewport is taller than the visual one (soft keyboard open,
+            // Safari URL bar) iOS pans the whole page while the forwarded
+            // wheel scrolls the app, the double-scroll clunk. touch-action:
+            // none stops the browser from starting any pan or zoom for
+            // touches on the terminal; JS still receives every touch event.
+            touchAction: forwardMode ? "none" : undefined,
+            // Do NOT set `-webkit-overflow-scrolling: touch` here. It promotes
+            // this opaque scroll region to a composited layer that macOS/iOS
+            // Safari rasterizes at 1x, making the DOM terminal text look
+            // pixelated/low-res. It is deprecated and a no-op on iOS 13+
+            // (momentum scrolling is always on), so omitting it costs nothing.
+            // The spacer model keeps above-viewport pixels invariant by
+            // construction, so a preserved scrollTop is always correct.
+            // The browser's own scroll anchoring doesn't know that: when
+            // the full-history frame replaces the spacer it re-anchors and
+            // teleports scrollTop. Ours is the only anchoring allowed.
+            overflowAnchor: "none",
+          } as CSSProperties
+        }
       >
         <span
           ref={measureRef}

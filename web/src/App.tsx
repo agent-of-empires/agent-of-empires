@@ -775,7 +775,7 @@ function AppContent({
   const diffComments = useDiffComments(activeSessionId);
   const commentsEnabled = activeSession?.view === "structured";
   // Sending does not require a live worker: the diff-comments handler runs the
-  // same auto-wake as a plain composer prompt (touch_and_wake_if_sunk +
+  // same auto-wake as a plain composer prompt (touch_on_prompt_and_wake_if_sunk +
   // trigger_resume_background, #1748), so an archived / snoozed / idle-dormant
   // session respawns its worker on send instead of sinking the prompt. A
   // trashed session is the one exception: the reconciler never resumes it, so

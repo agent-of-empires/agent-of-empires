@@ -1539,9 +1539,9 @@ fn tmux_env_session_name_for_instance_id(instance_id: &str) -> Option<String> {
 ///   poller from tmux pane state or ACP overlay, not by an explicit user
 ///   action.
 /// - **passive status patch**: a minimal `PassiveStatusPatch` carrying
-///   the fields a passive-status writer touches (`status`,
-///   `idle_entered_at`, `last_accessed_at`), applied on disk via
-///   [`Instance::merge_passive_status_patch`].
+///   the `status` / `idle_entered_at` writes plus the monotone
+///   `last_accessed_at` carry-through (user-gesture-only since #3465),
+///   applied on disk via [`Instance::merge_passive_status_patch`].
 /// - **live status baseline**: the last `Status` a caller has actually
 ///   observed live for an in-memory `Instance`. Held on
 ///   `Instance::live_status_baseline` (`#[serde(skip)]`). `None` means
@@ -2037,6 +2037,18 @@ impl Instance {
                 .insert(self.tool.clone(), outgoing);
         }
         self.tool = new_tool.to_string();
+        // The alias is resolved per-tool, so the outgoing tool's answer cannot
+        // survive: kept, it points `resolved_agent` at the wrong built-in
+        // outright (a `codex-personal` -> `claude-personal` swap would keep
+        // detecting as codex); cleared, the row lands in the same
+        // empty-`detect_as` state a session built before its tool joined
+        // `[session.agent_detect_as]` does. Re-resolve against the same
+        // process-global registry `effective_detect_as` reads, so this stays a
+        // lookup rather than a config load, and the row ends up exactly as if
+        // it had been built on the new tool.
+        self.detect_as =
+            tmux::status_rules::effective_detect_as(&self.source_profile, new_tool, "")
+                .into_owned();
         // Consumed, not copied: the row owns exactly one live conversation per
         // agent, and leaving the entry behind would let a later swap restore an
         // id this session has since replaced.
@@ -2255,8 +2267,8 @@ impl Instance {
     ///
     /// Cleared by `unarchive`, by `touch_last_accessed`, and by `favorite`
     /// and `pin`; not by `snooze`.
-    /// `merge_user_action_diff` mirrors those onto disk, and #3465 tracks a
-    /// status transition reaching that mirror without a user gesture.
+    /// `merge_user_action_diff` mirrors those onto disk; #3465 was a status
+    /// transition reaching that mirror without a user gesture.
     ///
     /// Mutual exclusion with `favorite`, `snooze`, and `pin`: archiving
     /// clears `favorited_at`, `snoozed_until`, and `pinned_at`. Archive
@@ -2610,6 +2622,32 @@ impl Instance {
     /// when `source_profile` was never populated (e.g. legacy callers).
     pub fn effective_profile(&self) -> String {
         super::config::effective_profile(&self.source_profile)
+    }
+
+    /// The `agent_detect_as` alias that actually applies to this session.
+    ///
+    /// `detect_as` is resolved once at session build and persisted, so it is
+    /// empty on a row created before its tool gained an
+    /// `[session.agent_detect_as]` entry. Treat the stored field as a cache
+    /// and let [`tmux::status_rules::effective_detect_as`] consult the live
+    /// registry when it is empty, the same way the pane detector, hook
+    /// reconciliation, and the status-change log line already do (#3398).
+    fn effective_detect_as(&self) -> std::borrow::Cow<'_, str> {
+        tmux::status_rules::effective_detect_as(&self.source_profile, &self.tool, &self.detect_as)
+    }
+
+    /// The built-in agent backing this session: its own tool when that names
+    /// one, else the agent its `agent_detect_as` alias points at.
+    ///
+    /// Every launch-time consumer resolves through here rather than reading
+    /// `detect_as` raw, because a miss is silent and permanent. `None` drops
+    /// the `AOE_PROFILE`/`AOE_INSTANCE_ID` prefix from the launch line
+    /// ([`status_hook_env_prefix`]) and skips hook install, so every hook the
+    /// agent does have bails on `[ -n "$AOE_INSTANCE_ID" ]` and the session
+    /// reports Idle forever with nothing logged.
+    fn resolved_agent(&self) -> Option<&'static crate::agents::AgentDef> {
+        crate::agents::get_agent(&self.tool)
+            .or_else(|| crate::agents::get_agent(&self.effective_detect_as()))
     }
 
     /// Resolve the effective `environment` list for this session's profile,
@@ -3008,17 +3046,24 @@ impl Instance {
         }
 
         if let Some(stored) = self.agent_session_id.clone() {
-            if let Some(fresh) = self.capture_freshest_session_id() {
-                tracing::info!(
-                    target: "session.store",
-                    stale = %stored,
-                    fresh = %fresh,
-                    tool = %self.tool,
-                    "Replacing stored session id with fresher live observation"
-                );
-                self.agent_session_id = Some(fresh.clone());
-                return (Some(fresh), true);
-            }
+            // Rebinding rather than returning early runs the observation
+            // through the same empty-thread downgrade as the stored id below.
+            // The SessionStart hook fires before Claude writes any content, so
+            // the sidecar can legitimately name a thread with no transcript.
+            let stored = match self.capture_freshest_session_id() {
+                Some(fresh) => {
+                    tracing::info!(
+                        target: "session.store",
+                        stale = %stored,
+                        fresh = %fresh,
+                        tool = %self.tool,
+                        "Replacing stored session id with fresher live observation"
+                    );
+                    self.agent_session_id = Some(fresh.clone());
+                    fresh
+                }
+                None => stored,
+            };
             // A stored Claude sid with no transcript on disk is not resumable:
             // Claude minted the UUID at first launch but nothing was ever
             // written (an empty thread killed before the first prompt), so
@@ -3768,9 +3813,10 @@ impl Instance {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("sandbox_info missing for sandboxed session"))?;
 
+        let detect_as = self.effective_detect_as().into_owned();
         let managed_codex_home = container_config::managed_codex_home(
             &self.tool,
-            Some(&self.detect_as),
+            Some(detect_as.as_str()),
             &self.source_profile,
             &self.id,
         )?;
@@ -4339,8 +4385,7 @@ impl Instance {
         if self.tool == "omp" && !self.has_command_override() {
             reject_omp_secret_args(&super::config::quote_model_value_in_args(&self.extra_args))?;
         }
-        let agent = crate::agents::get_agent(&self.tool)
-            .or_else(|| crate::agents::get_agent(&self.detect_as));
+        let agent = self.resolved_agent();
         self.install_agent_status_hooks(agent);
         self.propagate_managed_skills();
 
@@ -4399,8 +4444,8 @@ impl Instance {
         if self.tool == "omp" && !self.has_command_override() {
             reject_omp_secret_args(&super::config::quote_model_value_in_args(&self.extra_args))?;
         }
-        let agent = crate::agents::get_agent(&self.tool)
-            .or_else(|| crate::agents::get_agent(&self.detect_as));
+        let agent = self.resolved_agent();
+        let detect_as = self.effective_detect_as().into_owned();
 
         let (cmd, is_existing, omp_capture_plan, launch_env) = if self.is_sandboxed() {
             let image = self
@@ -4471,7 +4516,7 @@ impl Instance {
                 .ok_or_else(|| anyhow::anyhow!("sandbox_info missing for sandboxed instance"))?;
             let managed_codex_home = container_config::managed_codex_home(
                 &self.tool,
-                Some(&self.detect_as),
+                Some(detect_as.as_str()),
                 &self.source_profile,
                 &self.id,
             )?;
@@ -5326,6 +5371,7 @@ impl Instance {
     }
 
     pub fn get_container_for_instance(&mut self) -> Result<containers::DockerContainer> {
+        let detect_as = self.effective_detect_as().into_owned();
         let image = self
             .sandbox_info
             .as_ref()
@@ -5347,13 +5393,13 @@ impl Instance {
                 &self.effective_profile(),
                 &self.id,
                 &self.tool,
-                Some(&self.detect_as),
+                Some(detect_as.as_str()),
             );
             self.backfill_container_workdir(&container);
             if self.is_yolo_mode() {
                 container_config::ensure_yolo_trust_config_for_active_agent(
                     &self.tool,
-                    Some(&self.detect_as),
+                    Some(detect_as.as_str()),
                     &self.source_profile,
                     &self.id,
                     &self.container_workdir(),
@@ -5370,14 +5416,14 @@ impl Instance {
                 &self.effective_profile(),
                 &self.id,
                 &self.tool,
-                Some(&self.detect_as),
+                Some(detect_as.as_str()),
             );
             container.start()?;
             self.backfill_container_workdir(&container);
             if self.is_yolo_mode() {
                 container_config::ensure_yolo_trust_config_for_active_agent(
                     &self.tool,
-                    Some(&self.detect_as),
+                    Some(detect_as.as_str()),
                     &self.source_profile,
                     &self.id,
                     &self.container_workdir(),
@@ -5460,6 +5506,7 @@ impl Instance {
     }
 
     fn build_container_config(&self) -> Result<crate::containers::ContainerConfig> {
+        let detect_as = self.effective_detect_as();
         let sandbox = self
             .sandbox_info
             .as_ref()
@@ -5476,8 +5523,7 @@ impl Instance {
             // Mirror the host path's agent resolution (a custom wrapper detected
             // as kiro carries kiro's sidecar via detect_as), and the sandbox's
             // own `resolve_active_agent`, which also falls back to detect_as.
-            crate::agents::get_agent(&self.tool)
-                .or_else(|| crate::agents::get_agent(&self.detect_as))
+            self.resolved_agent()
                 .and_then(|a| a.sidecar_hooks.as_ref())
                 .and_then(|s| s.selected_agent_hooks.as_ref())
                 .and_then(|sel| {
@@ -5489,7 +5535,7 @@ impl Instance {
         container_config::build_container_config(
             &self.project_path,
             sandbox,
-            container_config::ContainerAgentSelection::new(&self.tool, Some(&self.detect_as))
+            container_config::ContainerAgentSelection::new(&self.tool, Some(&detect_as))
                 .with_selected_agent(selected_agent.as_deref()),
             self.is_yolo_mode(),
             &self.id,
@@ -6756,12 +6802,14 @@ impl Instance {
     /// Update status using pre-fetched pane metadata to avoid per-instance
     /// subprocess spawns. Falls back to subprocess calls if metadata is missing.
     ///
-    /// Restamps `idle_entered_at`/`last_accessed_at` only when the detected
-    /// status differs from [`Self::live_status_baseline`]. The baseline
-    /// invariant lives on the field itself; this method's job is the
-    /// guard shape (baseline vs. newly detected). Every call re-seeds the
-    /// baseline at exit, so the next call compares against a value this
-    /// method itself wrote.
+    /// Restamps `idle_entered_at` only when the detected status differs from
+    /// [`Self::live_status_baseline`]. `last_accessed_at` is deliberately not
+    /// written here (#3465): it is a user-gesture signal, and a poller stamp
+    /// that advanced it on disk let `merge_user_action_diff`'s touched arm
+    /// erase a concurrently archived row. The baseline invariant lives on the
+    /// field itself; this method's job is the guard shape (baseline vs. newly
+    /// detected). Every call re-seeds the baseline at exit, so the next call
+    /// compares against a value this method itself wrote.
     pub fn update_status_with_metadata(
         &mut self,
         metadata: Option<&tmux::PaneMetadata>,
@@ -6772,8 +6820,12 @@ impl Instance {
         if let Some(prev) = baseline {
             if prev != self.status {
                 self.log_status_transition(prev);
+                // last_accessed_at is deliberately NOT restamped here
+                // (#3465): a passive advance reaches disk through
+                // PassiveStatusPatch, and merge_user_action_diff's touched
+                // arm reads any advance as a peer touch, wiping concurrent
+                // archive/snooze/dormancy writes.
                 let now = Utc::now();
-                self.last_accessed_at = Some(now);
                 self.idle_entered_at = if self.status == Status::Idle {
                     Some(now)
                 } else {
@@ -9449,6 +9501,66 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
+    fn test_merge_diff_passive_transition_stamp_does_not_wipe_concurrent_sink_state() {
+        // #3465: a passive status transition restamped last_accessed_at
+        // (update_status_with_metadata wrote Some(now) on every detected
+        // transition, with no user gesture behind it), and the stamp
+        // reached disk through PassiveStatusPatch while a user action was
+        // in flight. The writer's stale pre snapshot then made the
+        // deliberate touched arm read the advance as a peer touch and wipe
+        // sink state the user had just set. That arm is correct for real
+        // gestures (pinned by test_merge_diff_peer_touch_clears_tui_archive,
+        // the messaging-unarchives rule); the poller stamp was the lie.
+        //
+        // Driven through the real transition path: the
+        // update_status_with_metadata call below detects a genuine
+        // Idle -> Error flip (session forced Absent, see #2936), which on
+        // the pre-fix tree restamped last_accessed_at between the pre
+        // snapshot and the merge.
+        type SinkCase = (&'static str, fn(&mut Instance), fn(&Instance) -> bool);
+        let cases: &[SinkCase] = &[
+            // The issue's headline victim: a concurrent archive.
+            ("archived_at", |i| i.archive(), |i| i.archived_at.is_some()),
+            // Same touched arm, same wipe, for a concurrent snooze.
+            (
+                "snoozed_until",
+                |i| i.snooze(15),
+                |i| i.snoozed_until.is_some(),
+            ),
+        ];
+        let user_touch = Utc::now() - chrono::Duration::seconds(60);
+        for (field, seed_sink, sink_present) in cases {
+            // Snapshot the acting writer held before the poller tick.
+            let mut pre = Instance::new("s", "/tmp/x");
+            pre.live_status_baseline = Some(Status::Idle);
+            pre.status = Status::Idle;
+            pre.last_accessed_at = Some(user_touch);
+
+            // One passive poller tick observes Idle -> Error. On the
+            // pre-fix tree this restamped last_accessed_at on the row that
+            // lands on disk; post-fix it leaves the user-gesture stamp
+            // alone and only updates idle_entered_at bookkeeping.
+            let mut disk = pre.clone();
+            let _cache = force_session_absent();
+            disk.update_status_with_metadata(None, None);
+            assert_eq!(disk.status, Status::Error);
+
+            // The concurrent user action seeds the sink on the writer's
+            // post snapshot.
+            let mut post = pre.clone();
+            seed_sink(&mut post);
+
+            disk.merge_user_action_diff(&pre, &post);
+
+            assert!(
+                sink_present(&disk),
+                "passive transition must not wipe concurrent {field} (#3465)"
+            );
+        }
+    }
+
+    #[test]
     fn test_merge_diff_peer_archive_clears_concurrent_tui_snooze() {
         // The web/TUI/CLI contract treats pinned/archived/snoozed as
         // mutually exclusive (the sidebar tier comparator assumes a
@@ -9469,6 +9581,38 @@ mod tests {
         assert!(
             disk.snoozed_until.is_none(),
             "archive() invariant must clear a concurrent TUI snooze"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn test_merge_diff_passive_transition_stamp_does_not_wake_dormant_row() {
+        // Dormancy is the third field the touched arm wipes (#3465), with
+        // one structural difference from the archive/snooze cases: it is
+        // never spliced from post, so the wipe only hits a value already
+        // on the row. Seed it on the base instance, drive one passive
+        // poller tick through the real transition path (session forced
+        // Absent, see #2936), and confirm an unrelated user action does
+        // not wake the row just because the pre-fix tree restamped
+        // last_accessed_at in between.
+        let mut pre = Instance::new("s", "/tmp/x");
+        pre.live_status_baseline = Some(Status::Idle);
+        pre.status = Status::Idle;
+        pre.last_accessed_at = Some(Utc::now() - chrono::Duration::seconds(60));
+        pre.idle_dormant_since = Some(Utc::now() - chrono::Duration::hours(5));
+
+        let mut disk = pre.clone();
+        let _cache = force_session_absent();
+        disk.update_status_with_metadata(None, None);
+        assert_eq!(disk.status, Status::Error);
+
+        let mut post = pre.clone();
+        post.favorite();
+        disk.merge_user_action_diff(&pre, &post);
+
+        assert!(
+            disk.idle_dormant_since.is_some(),
+            "a passive transition must not wake a dormant row (#3465)"
         );
     }
 
@@ -10215,29 +10359,33 @@ mod tests {
 
     #[test]
     #[serial_test::serial]
-    fn test_update_status_with_metadata_restamps_on_genuine_transition() {
+    fn test_update_status_with_metadata_keeps_last_accessed_at_on_transition() {
         // Once a live baseline is established, a real status change still
-        // restamps normally (no regression from the #2690 fix).
+        // re-anchors idle_entered_at bookkeeping, but must NOT restamp
+        // last_accessed_at (#3465): the field is a user-gesture signal, and
+        // passive stamps reaching disk let merge_user_action_diff's touched
+        // arm wipe concurrently archived rows.
         let mut inst = Instance::new("test", "/tmp/test");
         inst.live_status_baseline = Some(Status::Idle);
         inst.status = Status::Idle;
         inst.idle_entered_at = Some(Utc::now() - chrono::Duration::hours(2));
-        inst.last_accessed_at = Some(Utc::now() - chrono::Duration::hours(2));
+        let user_touch = Some(Utc::now() - chrono::Duration::hours(2));
+        inst.last_accessed_at = user_touch;
 
         // Force detection to resolve to `Absent` -> Error deterministically
         // (see #2936; without this the outcome is schedule-dependent).
         let _cache = force_session_absent();
 
-        let before = Utc::now();
         inst.update_status_with_metadata(None, None);
-        let after = Utc::now();
 
         // Detection confirms the session Absent, resolving to Error: a
         // genuine transition away from the established Idle baseline.
         assert_eq!(inst.status, Status::Error);
         assert_eq!(inst.idle_entered_at, None);
-        let last_accessed = inst.last_accessed_at.expect("must be restamped");
-        assert!(last_accessed >= before && last_accessed <= after);
+        assert_eq!(
+            inst.last_accessed_at, user_touch,
+            "a passive transition must not fabricate a user-gesture stamp"
+        );
         assert_eq!(inst.live_status_baseline, Some(Status::Error));
     }
 
@@ -10284,10 +10432,11 @@ mod tests {
     }
 
     #[test]
-    fn test_update_status_with_metadata_twice_different_statuses_both_restamp() {
-        // Two back-to-back genuine transitions must both restamp, and the
-        // baseline must update between calls so the second comparison is
-        // against the first call's result, not the original value.
+    fn test_update_status_with_metadata_transitions_never_stamp_last_accessed_at() {
+        // Two back-to-back genuine transitions update the idle_entered_at
+        // bookkeeping and re-seed the baseline between calls, but neither
+        // may touch last_accessed_at (#3465): passive stamps wiped
+        // concurrent archives through merge_user_action_diff's touched arm.
         //
         // Archiving short-circuits update_status_with_metadata_inner before
         // it touches `status` (see the `is_archived()` guard), which lets
@@ -10297,35 +10446,27 @@ mod tests {
         inst.archive();
         inst.live_status_baseline = Some(Status::Idle);
         inst.status = Status::Running;
+        let user_touch = Some(Utc::now() - chrono::Duration::hours(2));
+        inst.last_accessed_at = user_touch;
 
-        let before1 = Utc::now();
         inst.update_status_with_metadata(None, None);
-        let after1 = Utc::now();
         assert_eq!(
             inst.status,
             Status::Running,
             "archived guard preserves status"
         );
         assert_eq!(inst.idle_entered_at, None, "non-idle transition clears it");
-        let first_stamp = inst
-            .last_accessed_at
-            .expect("first transition must restamp");
-        assert!(first_stamp >= before1 && first_stamp <= after1);
+        assert_eq!(inst.last_accessed_at, user_touch);
         assert_eq!(inst.live_status_baseline, Some(Status::Running));
 
         inst.status = Status::Idle;
-        let before2 = Utc::now();
         inst.update_status_with_metadata(None, None);
-        let after2 = Utc::now();
         assert_eq!(inst.status, Status::Idle);
-        let second_idle = inst
-            .idle_entered_at
-            .expect("second transition must restamp");
-        assert!(second_idle >= before2 && second_idle <= after2);
         assert!(
-            second_idle >= first_stamp,
-            "second restamp must not be older than the first"
+            inst.idle_entered_at.is_some(),
+            "entering Idle re-anchors idle_entered_at"
         );
+        assert_eq!(inst.last_accessed_at, user_touch);
         assert_eq!(inst.live_status_baseline, Some(Status::Idle));
     }
 
@@ -11910,6 +12051,81 @@ mod tests {
             status_hook_env_prefix("work", "abc123", crate::agents::get_agent("kimi")),
             "AOE_PROFILE='work' AOE_INSTANCE_ID='abc123' "
         );
+    }
+
+    /// Seed the process-global `agent_detect_as` registry for one profile.
+    /// The registry is profile-keyed and `install_from_config` only replaces
+    /// the named profile's entries, so a test-only profile name keeps these
+    /// hermetic without serializing against every other registry writer.
+    fn install_aliases(profile: &str, aliases: &[(&str, &str)]) {
+        let mut config = crate::session::Config::default();
+        for (agent, target) in aliases {
+            config
+                .session
+                .agent_detect_as
+                .insert(agent.to_string(), target.to_string());
+        }
+        crate::tmux::status_rules::install_from_config(profile, &config);
+    }
+
+    /// A custom-agent row whose stored `detect_as` is empty must still resolve
+    /// its built-in agent at launch. Without it `status_hook_env_prefix` drops
+    /// `AOE_INSTANCE_ID`, every hook in the agent's settings file bails on
+    /// `[ -n "$AOE_INSTANCE_ID" ]`, and the session reports Idle forever with
+    /// nothing logged. #3398 taught the read sites to consult the live
+    /// registry; this is the launch site.
+    #[test]
+    fn empty_detect_as_still_resolves_the_launch_agent() {
+        const PROFILE: &str = "detect-as-launch-path-test";
+        install_aliases(PROFILE, &[("claude-personal", "claude")]);
+
+        let mut inst = Instance::new("orch", "/tmp/x");
+        inst.source_profile = PROFILE.to_string();
+        inst.tool = "claude-personal".to_string();
+        inst.command = "claude-personal".to_string();
+        inst.detect_as = String::new();
+
+        assert_eq!(
+            inst.resolved_agent().map(|a| a.name),
+            Some("claude"),
+            "empty detect_as must fall back to the live agent_detect_as registry"
+        );
+        assert_eq!(
+            status_hook_env_prefix(&inst.effective_profile(), "abc123", inst.resolved_agent()),
+            format!("AOE_PROFILE='{PROFILE}' AOE_INSTANCE_ID='abc123' "),
+        );
+    }
+
+    /// `swap_tool` re-resolves the alias for the incoming tool. The alias is
+    /// per-tool, so carrying the outgoing tool's value forward aims every
+    /// launch-time reader at the wrong built-in.
+    #[test]
+    fn swap_tool_reresolves_detect_as() {
+        const PROFILE: &str = "detect-as-swap-test";
+        install_aliases(
+            PROFILE,
+            &[("claude-personal", "claude"), ("codex-personal", "codex")],
+        );
+
+        // (starting tool, stored alias, tool swapped to, expected alias)
+        let cases = [
+            // The reported row: created on a built-in (no alias to store),
+            // then swapped onto a custom agent.
+            ("claude", "", "claude-personal", "claude"),
+            // Custom to custom: the outgoing alias is actively wrong, not
+            // merely stale, so it cannot survive.
+            ("codex-personal", "codex", "claude-personal", "claude"),
+            // Custom back to a built-in: nothing to pin.
+            ("claude-personal", "claude", "codex", ""),
+        ];
+        for (tool, detect_as, new_tool, expected) in cases {
+            let mut inst = Instance::new("t", "/tmp/x");
+            inst.source_profile = PROFILE.to_string();
+            inst.tool = tool.to_string();
+            inst.detect_as = detect_as.to_string();
+            inst.swap_tool(new_tool);
+            assert_eq!(inst.detect_as, expected, "{tool} -> {new_tool}");
+        }
     }
 
     #[test]
@@ -13829,6 +14045,50 @@ mod tests {
                 assert_eq!(sid.as_deref(), Some(live));
                 assert!(is_existing);
                 assert_eq!(inst.agent_session_id.as_deref(), Some(live));
+            }
+
+            /// The empty-thread downgrade must cover an id that arrived as a
+            /// live observation, not just one loaded from storage: SessionStart
+            /// fires before Claude writes any content, so the sidecar can name
+            /// a thread with no transcript, and `--resume` on it is a dead pane
+            /// on every restart.
+            #[test]
+            #[serial]
+            fn observed_sid_without_transcript_downgrades_to_fresh() {
+                let temp = tempdir().unwrap();
+                let _guard = claude_home_guard(&temp);
+
+                let project_path = "/tmp/aoe-test-observed-no-transcript";
+                let claude_dir = temp
+                    .path()
+                    .join(".claude")
+                    .join("projects")
+                    .join(encode_claude_project_path(project_path));
+                fs::create_dir_all(&claude_dir).unwrap();
+
+                let stored = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+                let empty_thread = "11111111-2222-3333-4444-555555555555";
+                write_jsonl_with_mtime(
+                    &claude_dir.join(format!("{stored}.jsonl")),
+                    SystemTime::now() - Duration::from_secs(120),
+                );
+                // No .jsonl for `empty_thread`.
+
+                let mut inst = Instance::new("verify-observed-no-transcript", project_path);
+                inst.tool = "claude".to_string();
+                inst.agent_session_id = Some(stored.to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let dir = super::write_sidecar(&inst.id, empty_thread);
+                let (sid, is_existing) = inst.acquire_session_id();
+                std::fs::remove_dir_all(&dir).ok();
+
+                assert_eq!(sid.as_deref(), Some(empty_thread));
+                assert!(
+                    !is_existing,
+                    "an observed sid with no transcript must launch as \
+                     --session-id, never --resume"
+                );
             }
 
             // An empty Claude thread killed before its first prompt has a
