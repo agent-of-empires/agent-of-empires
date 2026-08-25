@@ -46,6 +46,7 @@ pub(crate) mod sync;
 pub(crate) mod test_support;
 pub mod trash;
 pub mod worktree_edit;
+pub mod worktree_reconcile;
 
 pub use crate::sound::SoundConfig;
 pub use crate::status_hooks::StatusHookConfig;
