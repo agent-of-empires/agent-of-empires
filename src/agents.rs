@@ -1956,19 +1956,6 @@ mod tests {
     }
 
     #[test]
-    fn test_gemini_deprecated_fields() {
-        let gemini = get_agent("gemini").unwrap();
-        assert_eq!(
-            gemini.lifecycle,
-            AgentLifecycle::Deprecated {
-                since: "2026-06-18",
-                note: "consumer accounts cut off by Google; enterprise/API-key remain valid",
-                replacement: Some("antigravity"),
-            }
-        );
-    }
-
-    #[test]
     fn test_lifecycle_notice_and_label() {
         // (agent, label, notice fragment or None). Active agents surface
         // nothing; the deprecated one carries date, reason, and replacement.

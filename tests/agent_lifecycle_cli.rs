@@ -71,6 +71,26 @@ last_seen_version = "{}"
     std::fs::write(app.join("config.toml"), config).expect("write config");
 }
 
+fn init_repo_isolated(repo: &Path, home: &Path, xdg: &Path) {
+    let empty_global = home.join("empty-gitconfig");
+    std::fs::write(&empty_global, "").expect("write empty gitconfig");
+    let output = Command::new("git")
+        .args(["init", "-q"])
+        .current_dir(repo)
+        .env("HOME", home)
+        .env("XDG_CONFIG_HOME", xdg)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", &empty_global)
+        .env("GIT_TEMPLATE_DIR", "")
+        .output()
+        .expect("git init");
+    assert!(
+        output.status.success(),
+        "isolated git init failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn run_aoe(home: &Path, xdg: &Path, stub: &Path, args: &[&str]) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_aoe"))
         .args(args)
@@ -101,6 +121,10 @@ fn aoe_agents_lists_deprecated_notice() {
     assert!(
         stdout.contains("consider switching to antigravity"),
         "{stdout}"
+    );
+    assert!(
+        !stdout.contains("\x1b["),
+        "piped agents output must be escape-free"
     );
     assert_eq!(stdout.matches("deprecated since").count(), 1, "{stdout}");
 }
@@ -177,11 +201,20 @@ fn aoe_add_lifecycle_warning_covers_all_resolution_paths() {
         write_config(&xdg, case.config);
         let repo = tmp.path().join("repo");
         std::fs::create_dir_all(&repo).unwrap();
-        Command::new("git")
-            .args(["init", "-q"])
-            .current_dir(&repo)
-            .output()
-            .expect("git init");
+        let hostile_template = tmp.path().join("hostile-template");
+        std::fs::create_dir_all(&hostile_template).unwrap();
+        std::fs::write(hostile_template.join("USER_TEMPLATE_LEAK"), "hostile").unwrap();
+        std::fs::write(
+            home.join(".gitconfig"),
+            format!("[init]\n\ttemplateDir = {}\n", hostile_template.display()),
+        )
+        .unwrap();
+        init_repo_isolated(&repo, &home, &xdg);
+        assert!(
+            !repo.join(".git/USER_TEMPLATE_LEAK").exists(),
+            "{}: git init inherited the hostile user template",
+            case.name
+        );
         let mut args = vec!["add", repo.to_str().unwrap()];
         args.extend_from_slice(case.args);
         let out = run_aoe(&home, &xdg, &stub, &args);

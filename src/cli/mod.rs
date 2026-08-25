@@ -41,15 +41,17 @@ pub mod worktree;
 
 pub use definition::{command_name, Cli, Commands, CLI_COMMAND_NAMES};
 
-/// One rendered lifecycle-notice line for CLI listings. Amber when stdout
-/// is a terminal and `NO_COLOR` is unset-or-empty (the NO_COLOR convention:
-/// only a non-empty value disables color); plain text otherwise, so pipes
-/// and CI logs stay escape-free.
-pub(crate) fn lifecycle_notice_line(indent: &str, notice: &str) -> String {
+/// Whether CLI stdout should contain ANSI color. Color is terminal-only and
+/// follows the NO_COLOR convention (only a non-empty value disables it).
+pub(crate) fn color_enabled() -> bool {
     use std::io::IsTerminal;
-    let colorize = std::io::stdout().is_terminal()
-        && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty());
-    if colorize {
+    std::io::stdout().is_terminal() && std::env::var_os("NO_COLOR").is_none_or(|v| v.is_empty())
+}
+
+/// One rendered lifecycle-notice line for CLI listings. Amber on a color-
+/// capable terminal; plain text otherwise, so pipes and CI logs stay clean.
+pub(crate) fn lifecycle_notice_line(indent: &str, notice: &str) -> String {
+    if color_enabled() {
         format!("{indent}\x1b[33m⚠ {notice}\x1b[0m")
     } else {
         format!("{indent}⚠ {notice}")
