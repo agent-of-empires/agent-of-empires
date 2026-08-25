@@ -5176,17 +5176,29 @@ impl HomeView {
     }
 
     /// Build the id-keyed `IndexMap` from a `Vec<Instance>` (the storage-load
-    /// shape). Logs a warning on a duplicate id so a corrupt disk state
-    /// surfaces in logs rather than silently keeping only the last row.
+    /// shape). Duplicate ids across profiles are ambiguous after an interrupted
+    /// profile move: selecting either row by iteration order can route lifecycle
+    /// work to the wrong profile. Exclude every copy and fail closed until the
+    /// durable state is reconciled.
     fn build_instances_map(all_instances: Vec<Instance>) -> indexmap::IndexMap<String, Instance> {
-        let mut map = indexmap::IndexMap::with_capacity(all_instances.len());
+        let mut map: indexmap::IndexMap<String, Instance> =
+            indexmap::IndexMap::with_capacity(all_instances.len());
+        let mut duplicate_ids = std::collections::HashSet::new();
         for inst in all_instances {
-            if let Some(prev) = map.insert(inst.id.clone(), inst) {
-                tracing::warn!(
+            if duplicate_ids.contains(&inst.id) {
+                continue;
+            }
+            if let Some(previous) = map.shift_remove(&inst.id) {
+                duplicate_ids.insert(inst.id.clone());
+                tracing::error!(
                     target: "tui.home",
-                    id = %prev.id,
-                    "duplicate session id in loaded rows; keeping later entry"
+                    id = %inst.id,
+                    first_profile = %previous.source_profile,
+                    second_profile = %inst.source_profile,
+                    "duplicate session id across profiles; excluding every copy until durable reconciliation"
                 );
+            } else {
+                map.insert(inst.id.clone(), inst);
             }
         }
         map
@@ -6542,41 +6554,6 @@ impl HomeView {
         }
     }
 
-    /// Drop `group_path` from `profile`'s tree when no remaining session in
-    /// that profile sits at the path or anywhere underneath it AND the path
-    /// carries no user-anchored descendant group. Used after a session moves
-    /// to a different profile: without this, the source profile keeps an
-    /// empty group header that renders alongside the target profile's new
-    /// copy of the same group, reading as a duplicate. Delegates to
-    /// `delete_group_in_profile` so the deletion is tombstoned for `save()`
-    /// and survives the next reload.
-    pub(super) fn prune_empty_group(&mut self, profile: &str, group_path: &str) {
-        if group_path.is_empty() {
-            return;
-        }
-        let prefix = format!("{}/", group_path);
-        let still_used = self.instances.values().any(|i| {
-            i.source_profile == profile
-                && (i.group_path == group_path || i.group_path.starts_with(&prefix))
-        });
-        if still_used {
-            return;
-        }
-        // Preserve hand-built structure: if the tree carries a descendant
-        // group (e.g. user-anchored `work/anchor`) under this path, leave
-        // the parent alone. The duplicate-header in unified view is the
-        // lesser evil compared to nuking the user's hierarchy.
-        let has_descendant_group = self.group_trees.get(profile).is_some_and(|tree| {
-            tree.get_all_groups()
-                .iter()
-                .any(|g| g.path.starts_with(&prefix))
-        });
-        if has_descendant_group {
-            return;
-        }
-        self.delete_group_in_profile(profile, group_path);
-    }
-
     /// Determine which profile the item at the given cursor position belongs to.
     pub(super) fn profile_for_cursor(&self, cursor: usize) -> Option<String> {
         if let Some(profile) = &self.active_profile {
@@ -6775,35 +6752,54 @@ impl HomeView {
             _lifecycle: lifecycle,
         })
     }
-
-    /// Cross-profile move: structurally distinct from `mutate_instance`
-    /// because the row must be tombstoned in the old profile's disk file
-    /// AND marked as TUI-new for the target profile. Without this, save()'s
-    /// per-profile loop misclassifies the row as peer-deleted in the new
-    /// profile and leaves the old profile's disk row, which next reload
-    /// resurrects under the original profile.
-    ///
-    /// Callers that need cross-process title/lifecycle serialization retain
-    /// [`SessionMutationGuards`] around this mutation and its durable save.
+    /// Move a row between profiles as one dual-locked storage transaction,
+    /// then publish the committed row in memory.
     pub(super) fn move_to_profile(
         &mut self,
         id: &str,
         target: &str,
-        new_group_path: String,
+        requested: Instance,
+        baseline: Option<&Instance>,
     ) -> anyhow::Result<()> {
-        let now = chrono::Utc::now();
-        let Some((old_profile, lifecycle_reserved)) = self.instances.get(id).map(|instance| {
-            (
-                instance.source_profile.clone(),
-                instance.has_fresh_lifecycle_reservation(now),
-            )
-        }) else {
+        self.move_to_profile_with_effect(id, target, requested, baseline, |_| Ok(()))
+    }
+
+    /// Cross-profile move: structurally distinct from `mutate_instance`
+    /// because the source row and group metadata must be removed in the same
+    /// transaction that durably publishes the target row and metadata.
+    ///
+    /// `before_commit` runs after authoritative target validation while both
+    /// profile storage locks are held. It may perform only bounded
+    /// worktree/container effects; it must not re-enter storage or rekey tmux.
+    /// Callers retain [`SessionMutationGuards`] around the transaction and any
+    /// post-persist tmux rekey.
+    pub(super) fn move_to_profile_with_effect<B>(
+        &mut self,
+        id: &str,
+        target: &str,
+        mut requested: Instance,
+        baseline: Option<&Instance>,
+        before_commit: B,
+    ) -> anyhow::Result<()>
+    where
+        B: FnOnce(&Instance) -> anyhow::Result<()>,
+    {
+        let Some(current) = self.instances.get(id).cloned() else {
             return Ok(());
         };
+        let lifecycle_reserved = current.has_fresh_lifecycle_reservation(chrono::Utc::now());
+        let before = baseline.cloned().unwrap_or_else(|| current.clone());
+        let old_profile = before.source_profile.clone();
+        requested.source_profile = old_profile.clone();
         if old_profile == target {
-            self.mutate_instance(id, |inst| inst.group_path = new_group_path);
+            requested.source_profile = target.to_string();
+            self.instances.insert(id.to_string(), requested);
             return Ok(());
         }
+        anyhow::ensure!(
+            current.status != crate::session::Status::Creating,
+            "Cannot move session {id} between profiles while it is being created"
+        );
         anyhow::ensure!(
             !lifecycle_reserved,
             "Cannot move session {id} between profiles while a lifecycle operation is in progress"
@@ -6815,22 +6811,57 @@ impl HomeView {
                 Storage::open(target, self.file_watch.clone())?,
             );
         }
+        let source = self
+            .storages
+            .get(&old_profile)
+            .ok_or_else(|| anyhow::anyhow!("Source profile storage is not loaded"))?;
+        let target_storage = self
+            .storages
+            .get(target)
+            .ok_or_else(|| anyhow::anyhow!("Target profile storage is not loaded"))?;
+        let mut moved = source.move_instance_to_with_effect(
+            target_storage,
+            &before,
+            &requested,
+            |instances, candidate| {
+                if crate::session::is_duplicate_session(
+                    instances.iter(),
+                    &candidate.title,
+                    &candidate.project_path,
+                    None,
+                ) {
+                    return Err(crate::session::duplicate_session_error(&candidate.title));
+                }
+                Ok(())
+            },
+            before_commit,
+        )?;
+        moved.merge_runtime_for_profile_move(&current);
+        moved.source_profile = target.to_string();
+        self.instances.insert(id.to_string(), moved);
+        Ok(())
+    }
 
-        self.pending_deletions
-            .entry(old_profile.clone())
-            .or_default()
-            .insert(id.to_string());
-        if let Some(set) = self.pending_added.get_mut(&old_profile) {
-            set.remove(id);
-        }
-        self.pending_added
-            .entry(target.to_string())
-            .or_default()
-            .insert(id.to_string());
-
-        if let Some(inst) = self.instances.get_mut(id) {
-            inst.group_path = new_group_path;
-            inst.source_profile = target.to_string();
+    /// Reload storage after a profile move without dropping runtime-only state
+    /// from the rows the transaction just published.
+    pub(super) fn reload_preserving_profile_move_runtime(
+        &mut self,
+        ids: &[String],
+    ) -> anyhow::Result<()> {
+        let previous: Vec<(String, Instance)> = ids
+            .iter()
+            .filter_map(|id| {
+                self.instances
+                    .get(id)
+                    .cloned()
+                    .map(|instance| (id.clone(), instance))
+            })
+            .collect();
+        self.reload()?;
+        for (id, prior) in previous {
+            if let Some(reloaded) = self.instances.get_mut(&id) {
+                reloaded.merge_runtime_for_profile_move(&prior);
+            }
         }
         Ok(())
     }

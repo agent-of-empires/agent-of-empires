@@ -81,6 +81,12 @@ export interface AgentProfile {
      *  (ToolSearch / Monitor / TaskStop). See #2139. */
     harnessNames: string[];
   };
+  /** Registry lifecycle state, mirrored from `src/agents.rs`
+   *  (`AgentDef.lifecycle` / `/api/agents` `lifecycle`). Absent for Active
+   *  agents. Consumed by the switch-agent modal and the wizard picker so
+   *  deprecated agents are labelled everywhere they appear without a
+   *  second fetch. */
+  lifecycle?: AgentLifecycleInfo;
 }
 
 const CLAUDE: AgentProfile = {
@@ -181,7 +187,51 @@ const GEMINI: AgentProfile = {
     fetch: ["web_fetch"],
   },
   specialTitles: { skillNames: [], scheduleNames: [], harnessNames: [] },
+  // Mirrors AgentLifecycle::Deprecated in src/agents.rs: consumer accounts
+  // cut off by Google (gemini-cli discussions #28017, #27274); enterprise
+  // and API-key installs remain valid. Support is unchanged.
+  lifecycle: {
+    state: "deprecated",
+    since: "2026-06-18",
+    note: "consumer accounts cut off by Google; enterprise/API-key remain valid",
+    replacement: "antigravity",
+  },
 };
+
+/** Canonical wire shape of the server's agent lifecycle; `types.ts`
+ *  imports it from here so this module stays the dependency-free source
+ *  every surface can import. Mirrors `AgentLifecycle` in src/agents.rs:
+ *  the deprecated arm carries since/note as required strings (the server
+ *  always serializes them) with replacement nullable. */
+export type AgentLifecycleInfo =
+  | { state: "active" }
+  | {
+      state: "deprecated";
+      since: string;
+      note: string;
+      replacement: string | null;
+    };
+
+/** Lifecycle fallback for profiles without one (and unknown keys): plain
+ *  Active, matching the server omitting the field entirely. */
+export const ACTIVE_LIFECYCLE: AgentLifecycleInfo = { state: "active" };
+
+/** Resolve an agent's lifecycle from its registry key. Unknown keys and
+ *  `null` / `undefined` resolve to Active, mirroring `resolveAgentProfile`. */
+export function resolveAgentLifecycle(toolKey: string | null | undefined): AgentLifecycleInfo {
+  if (!toolKey) return ACTIVE_LIFECYCLE;
+  return PROFILES[toolKey]?.lifecycle ?? ACTIVE_LIFECYCLE;
+}
+
+/** Server-reported lifecycle wins; the static mirror fills the gap for
+ *  older daemons and keys the server does not list. Single definition of
+ *  that precedence so every surface resolves identically. */
+export function effectiveLifecycle(
+  source: { lifecycle?: AgentLifecycleInfo } | undefined,
+  name: string | null | undefined,
+): AgentLifecycleInfo {
+  return source?.lifecycle ?? resolveAgentLifecycle(name);
+}
 
 const VIBE: AgentProfile = {
   key: "vibe",

@@ -1975,6 +1975,26 @@ impl Instance {
         self.session_id_poller = previous.session_id_poller.clone();
         self.retroactive_capture_excludes = previous.retroactive_capture_excludes.clone();
     }
+    /// Carry every in-process field from a pre-move live row onto the
+    /// committed disk-derived candidate published by `HomeView`.
+    /// Adding a new `#[serde(skip)]` field requires deciding whether
+    /// `merge_runtime_from_reload`, this function, and
+    /// `server::merge_runtime_fields` must carry it.
+    pub(crate) fn merge_runtime_for_profile_move(&mut self, previous: &Self) {
+        self.merge_runtime_from_reload(previous);
+        self.live_status_baseline = previous.live_status_baseline;
+        self.ever_confirmed_present = previous.ever_confirmed_present;
+        self.unknown_since = previous.unknown_since;
+        self.pane_dead_observed = previous.pane_dead_observed;
+        self.force_fresh_next_launch = previous.force_fresh_next_launch;
+        self.pending_host_env = previous.pending_host_env.clone();
+        self.file_watch = previous.file_watch.clone();
+        if let (Some(reloaded_sandbox), Some(runtime_sandbox)) =
+            (self.sandbox_info.as_mut(), previous.sandbox_info.as_ref())
+        {
+            reloaded_sandbox.before_start_env = runtime_sandbox.before_start_env.clone();
+        }
+    }
 
     /// Splice TUI-mirrored, persisted fields from `src` onto `self`. Used by
     /// `HomeView::save` for fields the TUI is the canonical disk writer of
@@ -2140,11 +2160,33 @@ impl Instance {
         self.last_accessed_at = Some(incoming);
     }
 
+    /// Merge the complete user-requested delta for a cross-profile move while
+    /// preserving unrelated fields refreshed by a peer after `pre` was read.
+    /// A tool change is one atomic state transition: the tool name and every
+    /// conversation field staged by `swap_tool` must travel together.
+    pub(crate) fn merge_profile_move_diff(&mut self, pre: &Self, post: &Self) {
+        self.merge_user_action_diff(pre, post);
+        if pre.tool != post.tool {
+            // Apply the requested transition to the freshly locked disk row.
+            // The TUI post snapshot can carry parked session ids captured
+            // before a poller or peer refreshed the durable conversation state.
+            self.swap_tool(&post.tool);
+        }
+        if pre.command != post.command {
+            self.command = post.command.clone();
+        }
+        if pre.extra_args != post.extra_args {
+            self.extra_args = post.extra_args.clone();
+        }
+    }
+
     /// Per-field-conditional splice: copy `post.X` onto `self.X` only when
     /// `pre.X != post.X`. Peer writes to fields the mutation did not touch
     /// survive even when the field is in the user-action set.
     /// `last_accessed_at` is monotone-max (no diff guard).
-    /// `source_profile` is excluded; cross-profile moves bypass this path.
+    /// `source_profile` is excluded from this splice. Same-profile actions call
+    /// this directly; cross-profile moves call it through
+    /// `merge_profile_move_diff` and assign `source_profile` separately.
     /// Post-splice rules enforce the same cross-field invariants the
     /// per-mutation methods enforce (archive XOR favorite, touch unarchives)
     /// so concurrent peer writes cannot violate them.
@@ -2201,9 +2243,9 @@ impl Instance {
         // user-action diff, so the value on disk is already authoritative here.
         // Assigning `post`'s copy would let a stale TUI snapshot clobber a
         // conversion a peer landed between the `pre` snapshot and this merge.
-        if pre.status != post.status {
-            self.status = post.status;
-        }
+        // `status` deliberately has no arm. It is runtime state, not user
+        // intent; copying it from a stale TUI snapshot could overwrite a
+        // lifecycle transition loaded under the storage lock.
         // Lifecycle ownership is intentionally never spliced from a TUI
         // snapshot. Only transition code holding the per-instance flock may
         // mutate the durable reservation and generation.
@@ -9653,21 +9695,28 @@ mod tests {
     }
 
     #[test]
-    fn test_merge_diff_uses_self_not_post_for_touch_detection() {
+    fn test_merge_diff_preserves_runtime_state_and_peer_touch() {
         let mut pre = Instance::new("s", "/tmp/x");
         pre.last_accessed_at = Some(Utc::now() - chrono::Duration::seconds(60));
         pre.archived_at = Some(Utc::now() - chrono::Duration::seconds(120));
 
         let mut post = pre.clone();
         post.title = "renamed".into();
+        post.status = Status::Running;
 
         let mut disk = pre.clone();
         disk.touch_last_accessed();
+        disk.status = Status::Waiting;
 
         disk.merge_user_action_diff(&pre, &post);
 
         assert_eq!(disk.title, "renamed");
         assert!(disk.archived_at.is_none());
+        assert_eq!(
+            disk.status,
+            Status::Waiting,
+            "runtime status must remain authoritative"
+        );
     }
 
     #[test]
@@ -12053,11 +12102,16 @@ mod tests {
         );
     }
 
-    /// Seed the process-global `agent_detect_as` registry for one profile.
-    /// The registry is profile-keyed and `install_from_config` only replaces
-    /// the named profile's entries, so a test-only profile name keeps these
-    /// hermetic without serializing against every other registry writer.
-    fn install_aliases(profile: &str, aliases: &[(&str, &str)]) {
+    /// Seed the process-global `agent_detect_as` registry for one profile
+    /// and return a guard that restores the profile's prior entries on drop:
+    /// `install_from_config` replaces the whole profile's state and the
+    /// registry outlives every test, so the caller must keep the returned
+    /// guard alive for the duration of its reads.
+    fn install_aliases(
+        profile: &str,
+        aliases: &[(&str, &str)],
+    ) -> crate::tmux::status_rules::ProfileRegistryGuard {
+        let guard = crate::tmux::status_rules::ProfileRegistryGuard::take(profile);
         let mut config = crate::session::Config::default();
         for (agent, target) in aliases {
             config
@@ -12066,6 +12120,7 @@ mod tests {
                 .insert(agent.to_string(), target.to_string());
         }
         crate::tmux::status_rules::install_from_config(profile, &config);
+        guard
     }
 
     /// A custom-agent row whose stored `detect_as` is empty must still resolve
@@ -12077,7 +12132,7 @@ mod tests {
     #[test]
     fn empty_detect_as_still_resolves_the_launch_agent() {
         const PROFILE: &str = "detect-as-launch-path-test";
-        install_aliases(PROFILE, &[("claude-personal", "claude")]);
+        let _registry = install_aliases(PROFILE, &[("claude-personal", "claude")]);
 
         let mut inst = Instance::new("orch", "/tmp/x");
         inst.source_profile = PROFILE.to_string();
@@ -12102,7 +12157,7 @@ mod tests {
     #[test]
     fn swap_tool_reresolves_detect_as() {
         const PROFILE: &str = "detect-as-swap-test";
-        install_aliases(
+        let _registry = install_aliases(
             PROFILE,
             &[("claude-personal", "claude"), ("codex-personal", "codex")],
         );

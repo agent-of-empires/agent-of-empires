@@ -11,6 +11,7 @@ use clap::Subcommand;
 use crate::acp::agent_registry::AgentRegistry;
 use crate::acp::install_hints::install_hint_for;
 use crate::acp::node;
+use crate::agents::registry_lifecycle;
 
 #[derive(Subcommand)]
 pub enum AcpCommands {
@@ -229,6 +230,10 @@ struct AgentDoctorEntry {
     name: String,
     command_present: bool,
     description: String,
+    /// Registry lifecycle state; omitted while Active so existing JSON
+    /// consumers see no change for supported agents.
+    #[serde(skip_serializing_if = "crate::agents::AgentLifecycle::is_active")]
+    lifecycle: crate::agents::AgentLifecycle,
     /// Set when the copy aoe would spawn is not proven compatible with
     /// the adapter's minimum version (#3267): below-floor, or unprobeable
     /// so compatibility cannot be proven. The listing must not read
@@ -615,6 +620,7 @@ async fn doctor(json: bool, fix: bool, adapter: Vec<String>, all_adapters: bool)
             None
         };
         agent_entries.push(AgentDoctorEntry {
+            lifecycle: registry_lifecycle(name),
             name: name.clone(),
             command_present,
             description: spec.description.clone(),
@@ -665,6 +671,9 @@ async fn doctor(json: bool, fix: bool, adapter: Vec<String>, all_adapters: bool)
     for entry in &report.agents {
         let mark = agent_mark(entry);
         println!("{} {}  ({})", mark, entry.name, entry.description);
+        if let Some(notice) = entry.lifecycle.notice() {
+            println!("{}", crate::cli::lifecycle_notice_line("    ", &notice));
+        }
         if !entry.command_present {
             // Look up the binary name via the registry so we can
             // print a tailored install hint instead of generic
@@ -782,6 +791,9 @@ fn agents() -> Result<()> {
         let present = command_present(&spec.command);
         let mark = if present { "[OK]" } else { "[!! ]" };
         println!("{} {:<14}  {}", mark, name, spec.description);
+        if let Some(notice) = registry_lifecycle(name).notice() {
+            println!("{}", crate::cli::lifecycle_notice_line("        ", &notice));
+        }
         let args = if spec.args.is_empty() {
             String::new()
         } else {
@@ -1250,6 +1262,46 @@ mod tests {
         assert_eq!(parse_node_major("not a version"), None);
     }
 
+    #[test]
+    fn registry_lifecycle_mirrors_agents_registry() {
+        // (registry key, expected active). gemini is the only deprecated
+        // entry; keys with no AGENTS counterpart fall back to Active.
+        let cases = [
+            ("gemini", false),
+            ("claude", true),
+            ("codex", true),
+            ("opencode", true),
+            ("no-such-adapter", true),
+        ];
+        for (key, active) in cases {
+            assert_eq!(registry_lifecycle(key).is_active(), active, "{key}");
+        }
+    }
+
+    #[test]
+    fn doctor_entry_json_omits_active_lifecycle() {
+        let active = AgentDoctorEntry {
+            name: "claude".to_string(),
+            command_present: true,
+            description: "claude adapter".to_string(),
+            lifecycle: registry_lifecycle("claude"),
+            version_issue: None,
+        };
+        let value = serde_json::to_value(&active).unwrap();
+        assert!(value.get("lifecycle").is_none(), "{value}");
+
+        let deprecated = AgentDoctorEntry {
+            name: "gemini".to_string(),
+            command_present: false,
+            description: "gemini adapter".to_string(),
+            lifecycle: registry_lifecycle("gemini"),
+            version_issue: None,
+        };
+        let value = serde_json::to_value(&deprecated).unwrap();
+        assert_eq!(value["lifecycle"]["replacement"], "antigravity", "{value}");
+        assert_eq!(value["lifecycle"]["since"], "2026-06-18", "{value}");
+    }
+
     #[cfg(feature = "serve")]
     #[test]
     fn doctor_fix_hints_missing_and_stale_gated_agents() {
@@ -1508,6 +1560,7 @@ mod tests {
             name: "claude".to_string(),
             command_present: present,
             description: String::new(),
+            lifecycle: registry_lifecycle("claude"),
             version_issue: issue,
         };
         let stale_issue = AgentVersionIssue {

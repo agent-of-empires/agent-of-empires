@@ -98,6 +98,12 @@ pub struct AgentInfo {
     /// or for custom agents.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub acp_args: Vec<String>,
+    /// Registry lifecycle state. Omitted while Active so the common wire
+    /// shape is unchanged; the dashboard mirrors the shape in
+    /// `web/src/lib/types.ts` (`AgentLifecycleInfo`) and renders a
+    /// deprecated badge in the wizard picker and switch-agent modal.
+    #[serde(skip_serializing_if = "crate::agents::AgentLifecycle::is_active")]
+    pub lifecycle: crate::agents::AgentLifecycle,
 }
 
 /// Resolve the acp launch command + args for a built-in agent from
@@ -138,6 +144,7 @@ fn build_custom_agent_infos(
                 && crate::agents::get_agent(name).is_none()
         })
         .map(|(name, _command)| AgentInfo {
+            lifecycle: crate::agents::AgentLifecycle::Active,
             kind: "custom".to_string(),
             name: name.clone(),
             binary: name.clone(),
@@ -191,6 +198,7 @@ pub async fn list_agents(State(state): State<Arc<AppState>>) -> Json<Vec<AgentIn
                     installed: available.iter().any(|s| s == a.name),
                     install_hint: a.install_hint.to_string(),
                     oneshot_capable: a.oneshot_flag.is_some(),
+                    lifecycle: a.lifecycle,
                     acp_capable: acp_registry.get(a.name).is_some(),
                     acp_installed: acp_command
                         .as_deref()
@@ -2311,6 +2319,37 @@ mod tests {
         assert!(!serialized.contains("ssh -t prod.example claude"));
         assert!(!serialized.contains("prod.example"));
         assert!(!serialized.contains("agent_detect_as"));
+    }
+
+    #[test]
+    fn agent_info_lifecycle_wire_shape() {
+        // The /api/agents contract: lifecycle omitted for Active agents,
+        // full metadata for deprecated ones. Mirrored by
+        // web/src/lib/types.ts (AgentLifecycleInfo).
+        let mk = |name: &str| {
+            let def = crate::agents::get_agent(name).unwrap();
+            AgentInfo {
+                kind: "builtin".to_string(),
+                name: def.name.to_string(),
+                binary: def.binary.to_string(),
+                host_only: def.host_only,
+                installed: true,
+                install_hint: def.install_hint.to_string(),
+                oneshot_capable: def.oneshot_flag.is_some(),
+                acp_capable: false,
+                acp_installed: false,
+                acp_allowed: true,
+                acp_command: None,
+                acp_args: Vec::new(),
+                lifecycle: def.lifecycle,
+            }
+        };
+        let claude = serde_json::to_value(mk("claude")).unwrap();
+        assert!(claude.get("lifecycle").is_none(), "{claude}");
+        let gemini = serde_json::to_value(mk("gemini")).unwrap();
+        assert_eq!(gemini["lifecycle"]["state"], "deprecated", "{gemini}");
+        assert_eq!(gemini["lifecycle"]["since"], "2026-06-18");
+        assert_eq!(gemini["lifecycle"]["replacement"], "antigravity");
     }
 
     #[test]

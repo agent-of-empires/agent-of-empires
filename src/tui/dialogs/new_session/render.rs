@@ -10,7 +10,7 @@ use super::{NewSessionDialog, FIELD_HELP, HELP_DIALOG_WIDTH};
 use crate::tui::components::{
     focused_input_spans, input_scroll, profile_cycler_spans, render_text_field,
     render_text_field_with_ghost, render_tool_config_overlay, set_prefixed_input_cursor_position,
-    tool_config_suffix_spans, tool_cycler_spans, visible_slice,
+    tool_config_suffix_spans, tool_cycler_spans, tool_lifecycle_spans, visible_slice,
 };
 use crate::tui::styles::Theme;
 
@@ -233,7 +233,16 @@ impl NewSessionDialog {
         );
         let has_config =
             !self.extra_args.value().is_empty() || !self.command_override.value().is_empty();
-        tool_spans.extend(tool_config_suffix_spans(has_config, is_tool_focused, theme));
+        tool_spans.extend(tool_config_suffix_spans(
+            has_config,
+            is_tool_focused,
+            false,
+            theme,
+        ));
+        tool_spans.extend(tool_lifecycle_spans(
+            self.available_tools[self.tool_index].as_str(),
+            theme,
+        ));
         let area = chunks[ci];
         frame.render_widget(Paragraph::new(Line::from(tool_spans)), area);
         // Push the tool rect only when interactive (multiple tools).

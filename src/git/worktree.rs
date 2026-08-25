@@ -1863,6 +1863,32 @@ mod tests {
         }
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn worktree_move_observation_canonicalizes_symlinked_parents() {
+        let dir = tempfile::tempdir().unwrap();
+        let real_parent = dir.path().join("real");
+        std::fs::create_dir(&real_parent).unwrap();
+        let linked_parent = dir.path().join("linked");
+        std::os::unix::fs::symlink(&real_parent, &linked_parent).unwrap();
+        let from = linked_parent.join("old");
+        std::fs::create_dir(&from).unwrap();
+        let to = linked_parent.join("new");
+
+        let observed_from = canonicalize_move_endpoint(&from);
+        let observed_to = canonicalize_move_endpoint(&to);
+        assert_eq!(observed_from, real_parent.join("old"));
+        assert_eq!(observed_to, real_parent.join("new"));
+
+        let mut completed_listing = b"worktree ".to_vec();
+        completed_listing.extend_from_slice(observed_to.as_os_str().as_encoded_bytes());
+        completed_listing.extend_from_slice(b"\0HEAD abc\0branch refs/heads/topic\0\0");
+        assert_eq!(
+            classify_worktree_move_listing(&completed_listing, &observed_from, &observed_to),
+            Some(TimedMutationOutcome::Applied),
+        );
+    }
+
     /// Every git subprocess reachable from `move_worktree` /
     /// `edit_worktree_workdir` is bounded. The profile-move transaction runs
     /// them while holding the app-global identity flock, both per-session
@@ -1911,32 +1937,6 @@ mod tests {
                 call.split('(').next().unwrap_or(call)
             );
         }
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn worktree_move_observation_canonicalizes_symlinked_parents() {
-        let dir = tempfile::tempdir().unwrap();
-        let real_parent = dir.path().join("real");
-        std::fs::create_dir(&real_parent).unwrap();
-        let linked_parent = dir.path().join("linked");
-        std::os::unix::fs::symlink(&real_parent, &linked_parent).unwrap();
-        let from = linked_parent.join("old");
-        std::fs::create_dir(&from).unwrap();
-        let to = linked_parent.join("new");
-
-        let observed_from = canonicalize_move_endpoint(&from);
-        let observed_to = canonicalize_move_endpoint(&to);
-        assert_eq!(observed_from, real_parent.join("old"));
-        assert_eq!(observed_to, real_parent.join("new"));
-
-        let mut completed_listing = b"worktree ".to_vec();
-        completed_listing.extend_from_slice(observed_to.as_os_str().as_encoded_bytes());
-        completed_listing.extend_from_slice(b"\0HEAD abc\0branch refs/heads/topic\0\0");
-        assert_eq!(
-            classify_worktree_move_listing(&completed_listing, &observed_from, &observed_to),
-            Some(TimedMutationOutcome::Applied),
-        );
     }
 
     fn run_git(path: &Path, args: &[&str]) {

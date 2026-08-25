@@ -16,6 +16,12 @@
   </p>
 </p>
 
+<p align="center">
+  <a href="https://discord.com/events/1089876418936180786/1541803604036419725"><img src="assets/office-hours.png" alt="Office Hours: every Tuesday at 9:00 AM ET, live on Discord. Ask us anything, meet the community, learn how to contribute." width="900"></a>
+  <br>
+  <sub>Tuesdays at 9:00am ET (New York). <a href="https://discord.com/events/1089876418936180786/1541803604036419725">RSVP to the next one</a> and Discord will show it in your own timezone, or <a href="https://discord.gg/5N3QKX3f6s">join the Discord</a> first.</sub>
+</p>
+
 A session manager for AI coding agents on Linux and macOS, driven from the terminal (TUI) or any browser ([web dashboard](https://www.agent-of-empires.com/guides/web-dashboard/)). Run many agents in parallel across different branches, each in its own isolated session with optional Docker sandboxing. Keeping track of which agent is stuck, which is waiting on input, and which just made a mess of your working tree becomes a part-time job; AoE makes it a glance: one dashboard, one status column, git worktrees and sandboxes set up for you, and sessions that outlive your terminal, reachable from your laptop, phone, or tablet.
 
 <p align="center">
@@ -137,6 +143,12 @@ Nothing. Sessions are tmux sessions running in the background. Open and close `a
 ### Which AI tools are supported?
 
 Claude Code, OpenCode, Mistral Vibe, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi.dev, Oh My Pi (OMP), Factory Droid, Hermes, Kiro CLI, Qwen Code, Kimi Code, and Prime Agent. AoE auto-detects which are installed on your system.
+
+Agents carry a lifecycle state in AoE's registry. When an upstream vendor
+deprecates a CLI, AoE keeps supporting it but marks it everywhere it appears
+(`aoe agents`, `aoe acp doctor`, session creation, the new-session and restart
+pickers, the web wizard, and the switch-agent modal), so you always know before
+you launch one.
 
 ### Can I use AoE over SSH?
 

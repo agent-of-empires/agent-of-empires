@@ -366,6 +366,7 @@ mod tests {
     /// silently produced a plain new session. Assert the seed is forwarded and
     /// applied (child id pinned, one-shot Fork intent set).
     #[test]
+    #[serial_test::serial]
     fn create_instance_forwards_fork_seed() {
         let request = CreationRequest {
             data: fork_data(ForkSeed::Terminal {

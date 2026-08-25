@@ -614,18 +614,21 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_simple_dialog_focuses_no_button() {
         let dialog = simple_dialog();
         assert_eq!(dialog.focus, FocusElement::NoButton);
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_full_dialog_focuses_first_checkbox() {
         let dialog = full_dialog();
         assert_eq!(dialog.focus, FocusElement::WorktreeCheckbox);
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_full_dialog_respects_config_defaults() {
         let dialog = full_dialog();
         assert!(
@@ -643,6 +646,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_tab_cycles_through_elements() {
         let mut dialog = full_dialog();
         assert_eq!(dialog.focus, FocusElement::WorktreeCheckbox);
@@ -667,6 +671,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_branch_checkbox_toggle() {
         let mut dialog = full_dialog();
         dialog.focus = FocusElement::BranchCheckbox;
@@ -680,6 +685,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_space_toggles_checkbox() {
         let mut dialog = full_dialog();
         let initial = dialog.options.delete_worktree;
@@ -692,6 +698,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_esc_cancels() {
         let mut dialog = full_dialog();
         let result = dialog.handle_key(key(KeyCode::Esc));
@@ -699,6 +706,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_n_cancels() {
         let mut dialog = full_dialog();
         let result = dialog.handle_key(key(KeyCode::Char('n')));
@@ -706,6 +714,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_y_confirms() {
         let mut dialog = full_dialog();
         let result = dialog.handle_key(key(KeyCode::Char('y')));
@@ -713,6 +722,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_enter_on_no_cancels() {
         let mut dialog = simple_dialog();
         let result = dialog.handle_key(key(KeyCode::Enter));
@@ -720,6 +730,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_enter_on_yes_submits() {
         let mut dialog = simple_dialog();
         dialog.focus = FocusElement::YesButton;
@@ -728,6 +739,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_left_focuses_yes() {
         let mut dialog = simple_dialog();
         dialog.handle_key(key(KeyCode::Left));
@@ -735,6 +747,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_right_focuses_no() {
         let mut dialog = simple_dialog();
         dialog.focus = FocusElement::YesButton;
@@ -743,6 +756,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_click_before_render_is_noop() {
         // Both button rects default to Rect::default() (zero-sized) so
         // the contains() check returns false until the dialog has been
@@ -752,6 +766,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_click_on_yes_button_submits() {
         let mut dialog = simple_dialog();
         // Stage the button rects manually since the real coordinates
@@ -764,6 +779,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_click_on_no_button_cancels() {
         let mut dialog = simple_dialog();
         dialog.yes_button_area = Rect::new(10, 8, 5, 1);
@@ -774,6 +790,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_click_between_buttons_misses() {
         let mut dialog = simple_dialog();
         dialog.yes_button_area = Rect::new(10, 8, 5, 1);
@@ -783,6 +800,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_scratch_dialog_focuses_keep_scratch_checkbox() {
         let dialog = scratch_dialog();
         assert_eq!(dialog.focus, FocusElement::KeepScratchCheckbox);
@@ -790,6 +808,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_scratch_dialog_toggles_keep_scratch_on_space() {
         let mut dialog = scratch_dialog();
         dialog.handle_key(key(KeyCode::Char(' ')));
@@ -799,6 +818,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_submit_returns_options() {
         let mut dialog = full_dialog();
         dialog.options.delete_worktree = true;
@@ -848,6 +868,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn hover_highlights_button_without_changing_focus() {
         // Hover drives the visual highlight only; it must leave focus
         // alone, otherwise mouse drift between reading the dialog and
@@ -879,6 +900,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn hover_on_checkbox_row_highlights_without_stealing_focus() {
         let mut dialog = full_dialog();
         stage_rects_for_full(&mut dialog);
@@ -894,6 +916,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn click_on_checkbox_toggles_and_focuses() {
         let mut dialog = full_dialog();
         stage_rects_for_full(&mut dialog);
@@ -907,6 +930,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn click_on_worktree_checkbox_toggles_and_rebuilds_focusables() {
         let mut dialog = full_dialog();
         // Force a known starting state so the test doesn't depend on

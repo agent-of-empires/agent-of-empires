@@ -1,0 +1,11 @@
+# `axum::response::Response` is exactly 128 bytes, which is exactly clippy's
+# default `large-error-threshold`, so every helper using the standard axum
+# idiom `Result<T, Response>` (return an early HTTP error the caller can `?`)
+# trips `result_large_err` on the nose. Boxing the response at each of those
+# helpers would churn every construction and every `?` site to satisfy a lint
+# that is measuring an idiom, not a problem. 192 clears `Response` with
+# headroom while still flagging an error type that is genuinely large.
+#
+# This surfaced only once CI started linting the `serve` feature set; the
+# affected helpers live in src/server/api/ and were never in a clippy run.
+large-error-threshold = 192
