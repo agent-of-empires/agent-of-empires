@@ -2169,10 +2169,12 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
         let wrapped = if pos <= 3 && i > 0 {
             let (frame_line_index, frame_line) = loader_window[i - 1];
             let continuation_is_indented = line.len() > line.trim_start().len();
-            let frame_is_unfinished = !matches!(
-                frame_line.trim_end().chars().next_back(),
-                Some('.' | '!' | '?' | ':' | ';')
-            );
+            let frame_text = frame_line.trim_end();
+            let frame_is_unfinished = frame_text.ends_with("...")
+                || !matches!(
+                    frame_text.chars().next_back(),
+                    Some('.' | '!' | '?' | ':' | ';')
+                );
             frame_line_index + 1 == line_index
                 && continuation_is_indented
                 && frame_is_unfinished
@@ -6319,6 +6321,10 @@ Final prose line.\n";
             (
                 "manual compaction",
                 format!("⠼ Compacting context... (esc to cancel)\n{box_unicode}"),
+            ),
+            (
+                "wrapped ascii ellipsis maintenance",
+                format!("⠼ Compacting context...\n (esc to cancel)\n{box_unicode}"),
             ),
             (
                 "auto compaction",
