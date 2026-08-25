@@ -25,9 +25,11 @@
 //!   `{"cols":..,"rows":..,"left":..,"top":..}`, pane 0's rectangle within
 //!   the window grid. The cursor is translated onto that grid before it is
 //!   sent, and clients map pointer cells back by subtracting
-//!   `(left, top)` (#3515). Absent on single-pane frames; older clients
-//!   that ignore `left`/`top` render correctly whenever pane 0 sits at the
-//!   window origin.
+//!   `(left, top)` (#3515). Absent on single-pane frames. Clients that
+//!   ignore `left`/`top` still paint the cursor correctly at any origin,
+//!   because the translation already happened here; their mouse forwarding
+//!   is what degrades, back to the one-row shift of #3515 whenever the
+//!   origin is not `(0, 0)`.
 //!   `{"type":"size_owner","is_owner":bool}`: whether this client holds
 //!     the session's size-owner lock. Only the owner resizes the shared
 //!     tmux window and may type; a non-owner renders best-effort at the
@@ -1167,7 +1169,7 @@ mod tests {
             // Composited with pane-border-status top: the wire cursor moves
             // onto the window grid by pane 0's origin (#3515).
             (
-                Some(crate::tmux::Pane0Rect {
+                Some(crate::tmux::PaneGeom {
                     left: 2,
                     top: 1,
                     width: 37,

@@ -961,12 +961,7 @@ fn capture_composited_over_grid(
     // A composite carries no scrollback (panes have independent histories), so
     // the preview must not advertise any to scroll into.
     cursor.history_size = 0;
-    cursor.composite_pane0 = Some(crate::tmux::Pane0Rect {
-        left: first.left,
-        top: first.top,
-        width: first.width,
-        height: first.height,
-    });
+    cursor.composite_pane0 = Some(first);
     (
         Some(layout.composite_with_first_pane_rows(&rows)),
         Some(cursor),

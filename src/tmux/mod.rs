@@ -14,9 +14,8 @@ pub(crate) mod utils;
 #[cfg(unix)]
 pub(crate) mod vt;
 
-pub use session::{
-    Pane0Rect, PaneCursor, PaneEnvMutation, Session, SIZE_OWNER_HEARTBEAT, SIZE_OWNER_TTL,
-};
+pub use composite::PaneGeom;
+pub use session::{PaneCursor, PaneEnvMutation, Session, SIZE_OWNER_HEARTBEAT, SIZE_OWNER_TTL};
 pub use status_bar::{get_session_info_for_current, get_status_for_current_session};
 pub(crate) use status_detection::{
     claude_pane_is_ambiguous_typed_prompt, claude_pane_marker_fingerprint,

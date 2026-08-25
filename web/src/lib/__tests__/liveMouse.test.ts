@@ -104,15 +104,22 @@ describe("pointerPaneCell", () => {
       col: 10,
       row: 5,
     });
-    // Cells past pane 0's right edge (a neighbouring pane's columns) clamp
-    // into it; the web surface clamps rather than drops forwarded events.
+    // A right-hand neighbour's columns (pane 0 spans composite 1-based
+    // cols 166..329 here) clamp into pane 0; the web surface clamps rather
+    // than drops forwarded events.
+    expect(pointerPaneCell(340, 5, { cols: 164, rows: 71, left: 165, top: 1 })).toEqual({
+      col: 164,
+      row: 5,
+    });
+    // Inside the neighbour-adjacent pane itself the origin subtraction lands
+    // on the app's own column.
     expect(pointerPaneCell(170, 5, { cols: 164, rows: 71, left: 165, top: 1 })).toEqual({
       col: 5,
       row: 5,
     });
   });
 
-  it("clamps to pane 0's extent", () => {
+  it("clamps to pane 0's rectangle", () => {
     expect(pointerPaneCell(500, 100, { cols: 164, rows: 71, left: 0, top: 1 })).toEqual({
       col: 164,
       row: 71,
@@ -123,7 +130,7 @@ describe("pointerPaneCell", () => {
     });
   });
 
-  it("treats a missing extent as a 1x1 pane", () => {
+  it("treats a missing rectangle as a 1x1 pane", () => {
     expect(pointerPaneCell(7, 9, null)).toEqual({ col: 1, row: 1 });
   });
 });

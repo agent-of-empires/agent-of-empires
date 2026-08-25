@@ -79,17 +79,6 @@ pub const SIZE_OWNER_TTL: Duration = Duration::from_secs(4);
 /// the lock only frees on disconnect/crash (TTL expiry) or explicit take-over.
 pub const SIZE_OWNER_HEARTBEAT: Duration = Duration::from_millis(1500);
 
-/// One pane's rectangle within its window. Pane 0's copy rides on
-/// [`PaneCursor::composite_pane0`] so composited frames can translate
-/// between pane coordinates and the window grid (#3515).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Pane0Rect {
-    pub left: u16,
-    pub top: u16,
-    pub width: u16,
-    pub height: u16,
-}
-
 /// The active pane's cursor, queried alongside a `capture-pane` so the
 /// live-send preview can paint a real cursor (`capture-pane` returns cell
 /// text only; tmux's own client draws the cursor from these pane fields).
@@ -157,7 +146,7 @@ pub struct PaneCursor {
     /// carries the full rectangle, not just the extent: consumers translate
     /// `x`/`y` onto the composite by adding `(left, top)`, and map pointer
     /// cells back by subtracting it, clamping to `(width, height)`.
-    pub composite_pane0: Option<Pane0Rect>,
+    pub composite_pane0: Option<PaneGeom>,
 }
 
 /// tmux format line every cursor probe requests, parsed by
@@ -1046,12 +1035,7 @@ impl Session {
             // Rebasing the frame onto the window is what the renderer needs, but
             // it also erases where pane 0 sits in it, which cursor painting and
             // mouse forwarding both need. Carry pane 0's rectangle alongside.
-            c.composite_pane0 = layout.first_pane().map(|p| Pane0Rect {
-                left: p.left,
-                top: p.top,
-                width: p.width,
-                height: p.height,
-            });
+            c.composite_pane0 = layout.first_pane();
             c
         });
         let content = pane0_rows.as_deref().map_or_else(

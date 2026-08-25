@@ -7117,7 +7117,7 @@ mod tests {
         let pane = Rect::new(0, 0, 80, 24);
         let mut split = cursor_for(true, true, true);
         split.mouse_all = true;
-        split.composite_pane0 = Some(crate::tmux::Pane0Rect {
+        split.composite_pane0 = Some(crate::tmux::PaneGeom {
             left: 0,
             top: 0,
             width: 40,
@@ -7140,7 +7140,7 @@ mod tests {
         // A no-mouse full-screen agent gets no page key from a wheel aimed at
         // the neighbour either, but keeps it over pane 0.
         let mut no_mouse = cursor_for(true, false, false);
-        no_mouse.composite_pane0 = Some(crate::tmux::Pane0Rect {
+        no_mouse.composite_pane0 = Some(crate::tmux::PaneGeom {
             left: 0,
             top: 0,
             width: 40,
@@ -7178,7 +7178,7 @@ mod tests {
         use ratatui::layout::Rect;
         let pane = Rect::new(2, 3, 20, 10);
         let mut cursor = cursor_for(true, true, true);
-        cursor.composite_pane0 = Some(crate::tmux::Pane0Rect {
+        cursor.composite_pane0 = Some(crate::tmux::PaneGeom {
             left: 0,
             top: 0,
             width: 999,

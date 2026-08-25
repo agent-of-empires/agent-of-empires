@@ -131,6 +131,13 @@ const READING_CAPTURE_LINES: u16 = 2000;
 /// resize), using the bare `visible_rows` here would paint the cursor a row
 /// BELOW the text the user typed (#2742); clamping to `line_count` keeps them
 /// aligned. A hidden cursor, or one that maps outside `output`, yields `None`.
+///
+/// Residual #3515 (TUI side, never reproduced): `y` is pane relative, while
+/// on a COMPOSITED preview the painted grid is the whole window and a
+/// `pane-border-status` row shifts pane 0 down. Indexing that grid with the
+/// untranslated `y` would paint one row high; consumers of
+/// [`crate::tmux::PaneCursor::composite_pane0`] are supposed to translate by
+/// `(left, top)`. This path does not yet.
 fn map_live_preview_cursor(
     output: Rect,
     visible_rows: usize,

@@ -107,9 +107,9 @@ export function cursorLineIndex(lineCount: number, screenRows: number, cursorY: 
  * `compositeCol` is 1-based, `compositeRow` is the 0-based composite row
  * under the pointer. Pane 0 may sit away from the window origin (a
  * `pane-border-status` row pushes every pane down one), so subtract the
- * origin the frame reports and clamp to the pane extent (#3515). A missing
- * origin means pane 0 at the corner, which keeps unsplit and pre-fix frames
- * unchanged.
+ * origin the frame reports and clamp to the pane rectangle (#3515). A
+ * missing rectangle means pane 0 at the corner, which keeps unsplit and
+ * pre-fix frames unchanged.
  */
 export function pointerPaneCell(
   compositeCol: number,

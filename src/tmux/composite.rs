@@ -18,9 +18,12 @@
 //! `window_height` and rebasing every consumer, so the rule stays.
 
 /// One pane's rectangle within its window, from
-/// `#{pane_left} #{pane_top} #{pane_width} #{pane_height}`.
+/// `#{pane_left} #{pane_top} #{pane_width} #{pane_height}`. Pub because
+/// pane 0's copy rides on the public [`crate::tmux::PaneCursor::
+/// composite_pane0`] so composited frames can translate between pane
+/// coordinates and the window grid (#3515).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct PaneGeom {
+pub struct PaneGeom {
     pub left: u16,
     pub top: u16,
     pub width: u16,
