@@ -2056,14 +2056,16 @@ pub fn detect_pi_status(raw_content: &str) -> Status {
 /// it the signal is ignored, so a completed turn's loader or a dismissed
 /// banner in scrollback cannot pin the session.
 ///
-/// A live loader has a built-in or configured symbolic frame, or an ASCII
-/// preset frame (`- \ | /`), plus its marker on the same row or on the next
-/// row after a narrow-pane wrap. Known braille frames retain the historical
-/// `Working` marker; other symbolic and ASCII frames require an esc hint
-/// (`⟦esc⟧`, `⟨esc⟩`, `[esc]`, or `(esc to cancel)`). OMP intents are arbitrary,
-/// so hint-bearing ASCII prose can be textually identical to a live loader.
-/// The bottom-three-line window intentionally favors the active direction for
-/// that irreducible case, avoiding a false Idle while a turn runs.
+/// A live loader has a built-in activity frame or configured symbolic frame,
+/// or an ASCII preset frame (`- \ | /`), plus its marker on the same row. A
+/// wrapped marker must be indented beneath an unfinished frame row, matching
+/// OMP's text layout rather than an adjacent prose sentence. Known braille
+/// frames retain the historical `Working` marker; other symbolic and ASCII
+/// frames require an esc hint (`⟦esc⟧`, `⟨esc⟩`, `[esc]`, or `(esc to cancel)`).
+/// OMP intents are arbitrary, so hint-bearing ASCII or symbolic prose can be
+/// textually identical to a direct loader row. The bottom-three-line window
+/// favors the active direction for that irreducible case, avoiding a false
+/// Idle while a turn runs.
 ///
 /// A tool approval replaces the composer with a selector panel. Exact
 /// bordered `Approve`/`Deny` option rows corroborate its navigation footer;
@@ -2101,10 +2103,9 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
     };
 
     // Live loader rows sit directly above the composer. Known braille frames
-    // keep the historical Working/hint markers. Configured symbolic frames
-    // require an esc hint, the invariant OMP appends to its live loader. ASCII
-    // frames require the same hint because their glyphs are ordinary prose
-    // prefixes. A wrapped hint is accepted only beside the preceding frame.
+    // keep the historical Working/hint markers. Configured symbolic and ASCII
+    // frames require an esc hint because their glyphs can prefix ordinary prose.
+    // A wrapped hint must be an indented continuation of an unfinished frame row.
     let loader_window = tail_lines(&non_empty_lines, 4);
     let starts_with_braille_frame = |line: &str| {
         let line = line.trim_start();
@@ -2124,7 +2125,8 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
         let Some((frame, _)) = line.trim_start().split_once(' ') else {
             return false;
         };
-        const RESERVED_PREFIXES: &[&str] = &["•", "※", "❯", "\u{f054}", "│", "┃", "▎"];
+        const RESERVED_PREFIXES: &[&str] =
+            &["•", "\u{f111}", "※", "❯", "\u{f054}", "│", "┃", "▏", "▎"];
         if frame.is_empty() || RESERVED_PREFIXES.contains(&frame) {
             return false;
         }
@@ -2155,11 +2157,22 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
         let direct = pos <= 3
             && ((starts_with_braille_frame(line) && has_loader_marker(line))
                 || (starts_with_hint_gated_frame(line) && has_hint_marker(line)));
-        let wrapped = pos <= 3
-            && i > 0
-            && (starts_with_braille_frame(loader_window[i - 1])
-                || starts_with_hint_gated_frame(loader_window[i - 1]))
-            && has_hint_marker(line);
+        let wrapped = if pos <= 3 && i > 0 {
+            let frame_line = loader_window[i - 1];
+            let continuation_is_indented = line.len() > line.trim_start().len();
+            let frame_is_unfinished = !matches!(
+                frame_line.trim_end().chars().next_back(),
+                Some('.' | '!' | '?' | ':' | ';')
+            );
+            continuation_is_indented
+                && frame_is_unfinished
+                && !has_hint_marker(frame_line)
+                && (starts_with_braille_frame(frame_line)
+                    || starts_with_hint_gated_frame(frame_line))
+                && has_hint_marker(line)
+        } else {
+            false
+        };
         (direct || wrapped).then_some(pos)
     });
     if let Some(pos) = loader_pos {
@@ -6112,6 +6125,31 @@ Final prose line.\n";
                 format!("◐ Working through the explanation\n{prompt_box}"),
                 Status::Idle,
             ),
+            (
+                "unindented symbolic prose pair",
+                format!("✓ Done with step 3\nSee docs: press [esc]\n{prompt_box}"),
+                Status::Idle,
+            ),
+            (
+                "symbolic prose pair across blank row",
+                format!("→ Some heading\n\nThe cancel key is [esc]\n{prompt_box}"),
+                Status::Idle,
+            ),
+            (
+                "indented prose after completed sentence",
+                format!("✓ Done with step 3.\n See docs: press [esc]\n{prompt_box}"),
+                Status::Idle,
+            ),
+            (
+                "unicode quote border",
+                format!("▏ quoted: press [esc]\n{prompt_box}"),
+                Status::Idle,
+            ),
+            (
+                "nerd markdown bullet",
+                format!("\u{f111} The interrupt key is [esc]\n{prompt_box}"),
+                Status::Idle,
+            ),
             // Precedences: the lowest live signal wins. Approval fixtures
             // use omp's real bordered selector rather than synthetic text.
             (
@@ -6235,8 +6273,8 @@ Final prose line.\n";
 
     #[test]
     fn test_detect_omp_status_running_loaders() {
-        // Same behavior and setup: every live loader has a built-in or configured
-        // frame and marker on one row, or on an adjacent row after a narrow wrap.
+        // Same behavior and setup: every live loader has a preset activity or
+        // configured frame plus a direct marker or indented wrapped continuation.
         let box_unicode = "╭── π ─╮\n╰─ ─╯";
         let box_ascii = "+-- pi ---+\n+- -------+";
         let answered_panel = "\
@@ -6252,14 +6290,6 @@ Final prose line.\n";
 ╰──────────────────────────────────────────────────────────╯";
         let cases = [
             ("unicode default", format!("⠋ Working… ⟦esc⟧\n{box_unicode}")),
-            (
-                "unicode status frame",
-                format!("⣾ Working… ⟦esc⟧\n{box_unicode}"),
-            ),
-            (
-                "nerd status frame",
-                format!("󱑖 Working… ⟨esc⟩\n{box_unicode}"),
-            ),
             (
                 "unicode intent",
                 format!("⠴ Set permissions on audit bait path ⟦esc⟧\n{box_unicode}"),
