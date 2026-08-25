@@ -3,7 +3,7 @@
 use crate::session::Status;
 
 use regex::Regex;
-use std::sync::OnceLock;
+use std::{collections::VecDeque, sync::OnceLock};
 
 use super::utils::strip_ansi;
 
@@ -2058,9 +2058,10 @@ pub fn detect_pi_status(raw_content: &str) -> Status {
 ///
 /// A live loader has a built-in activity frame or configured symbolic frame,
 /// or an ASCII preset frame (`- \ | /`), plus its marker on the same row. A
-/// wrapped marker must be indented beneath an unfinished frame row, matching
-/// OMP's text layout rather than an adjacent prose sentence. Known braille
-/// frames retain the historical `Working` marker; other symbolic and ASCII
+/// wrapped marker must be physically adjacent and indented beneath an
+/// unfinished frame row. This matches OMP's text layout and rejects prose
+/// separated by blank output. Known braille frames retain the historical
+/// `Working` marker; other symbolic and ASCII
 /// frames require an esc hint (`⟦esc⟧`, `⟨esc⟩`, `[esc]`, or `(esc to cancel)`).
 /// OMP intents are arbitrary, so hint-bearing ASCII or symbolic prose can be
 /// textually identical to a direct loader row. The bottom-three-line window
@@ -2086,10 +2087,18 @@ pub fn detect_pi_status(raw_content: &str) -> Status {
 /// error/retry path (herdr-style extension) is tracked in #3380.
 pub fn detect_omp_status(raw_content: &str) -> Status {
     let clean = strip_ansi(raw_content);
-    let non_empty_lines: Vec<&str> = clean
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .collect();
+    let mut non_empty_lines = Vec::new();
+    let mut loader_window = VecDeque::with_capacity(4);
+    for (line_index, line) in clean.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        non_empty_lines.push(line);
+        if loader_window.len() == 4 {
+            loader_window.pop_front();
+        }
+        loader_window.push_back((line_index, line));
+    }
 
     // Each signal registers the position of its lowest matching line (1 =
     // bottom, within its freshness window); the lowest position wins, ties
@@ -2105,8 +2114,8 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
     // Live loader rows sit directly above the composer. Known braille frames
     // keep the historical Working/hint markers. Configured symbolic and ASCII
     // frames require an esc hint because their glyphs can prefix ordinary prose.
-    // A wrapped hint must be an indented continuation of an unfinished frame row.
-    let loader_window = tail_lines(&non_empty_lines, 4);
+    // A wrapped hint must be physically adjacent and indented beneath an
+    // unfinished frame row.
     let starts_with_braille_frame = |line: &str| {
         let line = line.trim_start();
         SPINNER_CHARS.iter().any(|frame| {
@@ -2153,18 +2162,19 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
         |line: &str| starts_with_ascii_frame(line) || starts_with_symbolic_frame(line);
     let loader_pos = (0..loader_window.len()).rev().find_map(|i| {
         let pos = loader_window.len() - i;
-        let line = loader_window[i];
+        let (line_index, line) = loader_window[i];
         let direct = pos <= 3
             && ((starts_with_braille_frame(line) && has_loader_marker(line))
                 || (starts_with_hint_gated_frame(line) && has_hint_marker(line)));
         let wrapped = if pos <= 3 && i > 0 {
-            let frame_line = loader_window[i - 1];
+            let (frame_line_index, frame_line) = loader_window[i - 1];
             let continuation_is_indented = line.len() > line.trim_start().len();
             let frame_is_unfinished = !matches!(
                 frame_line.trim_end().chars().next_back(),
                 Some('.' | '!' | '?' | ':' | ';')
             );
-            continuation_is_indented
+            frame_line_index + 1 == line_index
+                && continuation_is_indented
                 && frame_is_unfinished
                 && !has_hint_marker(frame_line)
                 && (starts_with_braille_frame(frame_line)
@@ -6132,7 +6142,7 @@ Final prose line.\n";
             ),
             (
                 "symbolic prose pair across blank row",
-                format!("→ Some heading\n\nThe cancel key is [esc]\n{prompt_box}"),
+                format!("→ Some heading\n\n The cancel key is [esc]\n{prompt_box}"),
                 Status::Idle,
             ),
             (
