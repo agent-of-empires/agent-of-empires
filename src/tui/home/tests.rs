@@ -19927,6 +19927,30 @@ mod daemon_status_apply_tests {
 
     #[test]
     #[serial]
+    fn daemon_status_does_not_mark_a_structured_turn_end_unread() {
+        // #3181: the daemon writes that mark itself, durably, from the live ACP
+        // turn-end event (`should_mark_acp_unread`). Marking here as well would
+        // make the TUI a second writer of the same boolean, and the exemption
+        // that would have justified keeping it (`!is_live_target`) is inert on a
+        // structured row anyway, since live-send needs a tmux pane. The row
+        // still picks the mark up: it arrives through the daemon's disk write.
+        crate::session::set_unread_enabled(true);
+        let mut env = create_test_env_empty();
+        let id = structured_row(&mut env, Status::Running);
+
+        env.view
+            .apply_daemon_status_update(update(&id, Status::Idle));
+
+        let inst = env.view.get_instance(&id).expect("row still present");
+        assert_eq!(inst.status, Status::Idle, "the turn-end still applies");
+        assert!(
+            !inst.is_unread(),
+            "the structured turn-end mark is the daemon's to write"
+        );
+    }
+
+    #[test]
+    #[serial]
     fn daemon_status_ignores_a_terminal_row() {
         // The tmux poller owns terminal rows. Letting the daemon's copy through
         // would give them two producers fighting on alternating cycles.
