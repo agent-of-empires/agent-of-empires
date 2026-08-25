@@ -1976,6 +1976,9 @@ impl Instance {
     }
     /// Carry every in-process field from a pre-move live row onto the
     /// committed disk-derived candidate published by `HomeView`.
+    /// Adding a new `#[serde(skip)]` field requires deciding whether
+    /// `merge_runtime_from_reload`, this function, and
+    /// `server::merge_runtime_fields` must carry it.
     pub(crate) fn merge_runtime_for_profile_move(&mut self, previous: &Self) {
         self.merge_runtime_from_reload(previous);
         self.live_status_baseline = previous.live_status_baseline;

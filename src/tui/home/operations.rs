@@ -916,6 +916,10 @@ impl HomeView {
                     "Cannot move group while session {id} is being created"
                 );
                 anyhow::ensure!(
+                    instance.status != Status::Deleting,
+                    "Cannot move group while session {id} is being deleted"
+                );
+                anyhow::ensure!(
                     !instance.has_fresh_lifecycle_reservation(chrono::Utc::now()),
                     "Cannot move group while session {id} has a lifecycle operation in progress"
                 );
@@ -932,6 +936,10 @@ impl HomeView {
                 anyhow::ensure!(
                     authoritative.status != Status::Creating,
                     "Cannot move group while session {id} is being created"
+                );
+                anyhow::ensure!(
+                    authoritative.status != Status::Deleting,
+                    "Cannot move group while session {id} is being deleted"
                 );
                 anyhow::ensure!(
                     !authoritative.has_fresh_lifecycle_reservation(chrono::Utc::now()),

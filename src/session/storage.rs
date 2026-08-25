@@ -337,6 +337,9 @@ fn same_filesystem_identity(left: &fs::Metadata, right: &fs::Metadata) -> bool {
 
 #[cfg(not(unix))]
 fn same_filesystem_identity(_left: &fs::Metadata, _right: &fs::Metadata) -> bool {
+    // Portable metadata exposes no stable file identity. Canonical path equality
+    // still catches direct aliases, but junctions or reparse points may bypass
+    // these guards on non-Unix platforms.
     false
 }
 
@@ -1177,8 +1180,8 @@ impl Storage {
             }
         }
         validate_target(&target_instances, &moved)?;
-        // Effect-first ordering: this moves the worktree directory / renames tmux
-        // before any row is written, so the common failure (the move itself
+        // Effect-first ordering may run a bounded worktree or container effect
+        // before any row is written, so the common failure (the effect itself
         // failing) aborts cleanly with every row untouched. The tradeoff is the
         // documented residual window if a later write fails, see the module docs.
         before_commit(&moved)?;

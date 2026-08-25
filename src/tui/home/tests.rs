@@ -7440,6 +7440,20 @@ fn group_profile_move_preflights_creating_and_expired_reservations() {
         .all(|instance| instance.group_path == "work"));
     assert!(target.load().unwrap().is_empty());
 
+    view.mutate_instance(&second.id, |instance| {
+        instance.status = Status::Deleting;
+    });
+    view.group_rename_context = Some(super::GroupRenameContext {
+        old_path: "work".to_string(),
+        old_profile: "alpha".to_string(),
+    });
+    let error = view
+        .rename_selected_group(Some("moved"), Some("beta"))
+        .expect_err("a deleting member must reject the complete group move");
+    assert!(error.to_string().contains("being deleted"));
+    assert_eq!(source.load().unwrap().len(), 2);
+    assert!(target.load().unwrap().is_empty());
+
     let stale = LifecycleReservation {
         op: LifecycleOperation::Launch,
         generation: 1,
