@@ -3187,7 +3187,7 @@ impl Instance {
         super::capture::claude_project_dir_is_shared(
             &self.id,
             &self.project_path,
-            &self.effective_profile(),
+            &self.resolved_host_environment(),
         )
     }
 

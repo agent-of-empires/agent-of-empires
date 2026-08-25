@@ -435,13 +435,22 @@ pub(crate) fn claude_poll_fn(
 /// is still being appended. The host scan reads through links for the same
 /// reason (#3454), and the two have to agree for
 /// `claude_host_transcript_confirmed_absent` to mean anything.
-fn claude_container_list_snippet(dir_name: &str) -> String {
+fn claude_container_list_snippet(dir_name: &str, anchor: Option<&str>) -> String {
+    // The anchor is emitted whatever its mtime: this pane going quiet for five
+    // minutes does not make a co-located peer's transcript the better resume
+    // target, and the freshness gate is what removed it from the candidate list
+    // entirely. Interpolated only after parsing as a UUID, so it cannot carry
+    // shell metacharacters into the snippet.
+    let anchor_line = anchor
+        .filter(|a| Uuid::parse_str(a).is_ok())
+        .map(|a| format!("[ -f \"$DIR/{a}.jsonl\" ] && printf '%s\\n' '{a}'\n"))
+        .unwrap_or_default();
     format!(
         r#"
 CLAUDE_HOME="${{CLAUDE_CONFIG_DIR:-$HOME/.claude}}"
 DIR="$CLAUDE_HOME/projects/{dir_name}"
 [ -d "$DIR" ] || exit 0
-for f in $(ls -tL "$DIR"/*.jsonl 2>/dev/null); do
+{anchor_line}for f in $(ls -tL "$DIR"/*.jsonl 2>/dev/null); do
   [ -f "$f" ] || continue
   [ -n "$(find -L "$f" -mmin -5 2>/dev/null)" ] || continue
   basename "$f" .jsonl
@@ -463,7 +472,8 @@ pub(crate) fn capture_claude_session_id_in_container(
     exclusion: &HashSet<String>,
     known_session_id: Option<&str>,
 ) -> Result<String> {
-    let snippet = claude_container_list_snippet(&encode_claude_project_path(container_cwd));
+    let snippet =
+        claude_container_list_snippet(&encode_claude_project_path(container_cwd), known_session_id);
 
     let mut cmd = std::process::Command::new("docker");
     cmd.args(["exec", container_name, "sh", "-c", &snippet]);
@@ -482,12 +492,16 @@ pub(crate) fn capture_claude_session_id_in_container(
 /// Pick the active Claude session UUID from the container shell snippet's
 /// stdout.
 ///
-/// Stdout is UUID basenames in newest-first order. Tie-break (mirrors
-/// [`scan_claude_project_dir`]):
-/// 1. anchor absent → return first unexcluded.
-/// 2. anchor present, an unexcluded candidate appears before it → return
-///    that candidate (active newer wins).
-/// 3. otherwise → return the anchor.
+/// Stdout is UUID basenames in newest-first order, with this pane's anchor
+/// emitted regardless of age. Tie-break (mirrors [`scan_claude_project_dir`]):
+/// 1. the anchor is present and unexcluded → return it, however much newer a
+///    sibling is. Co-located sandboxed panes share one `.claude/sandbox` store,
+///    so a newer sibling is normally a peer writing, not this pane switching
+///    conversations; `/clear` promotion arrives on the per-instance sidecar,
+///    which `claude_poll_fn_sandboxed` reads first.
+/// 2. an anchor was asked for but is absent or excluded → `Err`: an anchored
+///    pane gets its own transcript or nothing.
+/// 3. no anchor asked for → return the first unexcluded candidate.
 fn select_claude_session_in_container(
     stdout_bytes: &[u8],
     exclusion: &HashSet<String>,
@@ -514,22 +528,29 @@ fn select_claude_session_in_container(
     });
     let best_pos = candidates.iter().position(|c| !exclusion.contains(c));
 
-    match (known_pos, best_pos) {
-        (None, None) => {
-            anyhow::bail!("All Claude session candidates in container are excluded")
-        }
-        (None, Some(p)) => Ok(candidates[p].clone()),
-        (Some(kp), Some(bp)) if bp < kp => Ok(candidates[bp].clone()),
-        (Some(kp), _) => Ok(candidates[kp].clone()),
+    if let Some(kp) = known_pos {
+        return Ok(candidates[kp].clone());
+    }
+    if known.is_some() {
+        anyhow::bail!("Anchored Claude session has no candidate in container");
+    }
+    match best_pos {
+        Some(p) => Ok(candidates[p].clone()),
+        None => anyhow::bail!("All Claude session candidates in container are excluded"),
     }
 }
 
 /// Polling closure for sandboxed (Docker) Claude Code session tracking.
 ///
-/// Mirrors [`claude_poll_fn`] but does not read the host hook sidecar (the
-/// in-container hook would write to the container's `/tmp/aoe-hooks/`,
-/// which the host poller cannot see without bind-mounting). Sandboxed
-/// `/clear` adoption therefore takes ≤ 1 poll tick.
+/// Mirrors [`claude_poll_fn`], sidecar first. The per-instance hook directory
+/// is bind-mounted into the container (see the hook mount in
+/// `session::container_config`), so the in-container hook's `session_id` lands
+/// in this instance's host-side hook dir and is readable here. That matters
+/// because sandboxed Claude sessions share one `$HOME/.claude/sandbox` store:
+/// `sandbox_dir_for` gives only Codex an instance-suffixed directory, so
+/// co-located sandboxed panes write into one transcript namespace and the
+/// mtime ordering cannot attribute a transcript to a pane any better than it
+/// can on the host.
 pub(crate) fn claude_poll_fn_sandboxed(
     container_name: String,
     container_cwd: String,
@@ -539,6 +560,17 @@ pub(crate) fn claude_poll_fn_sandboxed(
 ) -> impl Fn() -> Option<String> + Send + 'static {
     let last_known = std::sync::Mutex::new(known_session_id);
     move || {
+        if let Some(id) = crate::hooks::read_hook_session_id(&instance_id) {
+            if !extra_excludes.contains(&id) {
+                if let Some(validated) = validated_session_id(id) {
+                    if let Ok(mut guard) = last_known.lock() {
+                        *guard = Some(validated.clone());
+                    }
+                    return Some(validated);
+                }
+            }
+        }
+
         let current_known = last_known.lock().ok().and_then(|g| g.clone());
         let exclusion = compose_exclusion(&instance_id, &extra_excludes);
         let captured = capture_claude_session_id_in_container(
@@ -1015,33 +1047,57 @@ pub(crate) fn compose_exclusion(
 /// effective profile. A stopped peer in a different profile against the same
 /// host `$HOME` will not be excluded; the residual gap is narrower than #2355's
 /// trigger and is left for a follow-up.
-/// Whether another AoE session in `profile` runs Claude out of the same
-/// directory as this one.
+/// Whether another AoE session shares this one's Claude transcript directory.
 ///
-/// `<config>/projects/<encoded-cwd>/` is keyed by cwd alone, so co-located
-/// sessions all append into one directory and "most recently written" stops
-/// identifying a pane — during a mass recovery every pane sees the same newest
-/// transcript, and the peer-exclusion sets cannot help because no peer has
-/// claimed anything yet. Callers use this to refuse an mtime guess that would
-/// retarget a session already holding a conversation of its own.
+/// `<config>/projects/<encoded-cwd>/` is keyed by the effective Claude home and
+/// the cwd, so co-located sessions all append into one directory and "most
+/// recently written" stops identifying a pane — during a mass recovery every
+/// pane sees the same newest transcript, and the peer-exclusion sets cannot help
+/// because no peer has claimed anything yet. Callers use this to refuse an mtime
+/// guess that would retarget a session already holding a conversation of its own.
+///
+/// The namespace is **not** an AoE profile: two profiles resolving to the same
+/// Claude home and cwd write into one directory, so every profile is walked and
+/// each peer is compared on its own resolved home. Anything that leaves
+/// ownership unestablished — an unreadable profile list or store, a home that
+/// will not resolve — returns `true`, because "cannot prove sole ownership" must
+/// not license an mtime retarget.
 pub(crate) fn claude_project_dir_is_shared(
     current_instance_id: &str,
     current_project_path: &str,
-    profile: &str,
+    current_host_env: &[String],
 ) -> bool {
-    let Ok(storage) = crate::session::storage::Storage::new_unwatched(profile) else {
-        return false;
-    };
-    let Ok(instances) = storage.load() else {
-        return false;
+    let Ok(current_home) = claude_home_for_host_environment(current_host_env) else {
+        return true;
     };
     let canonical_current = canonicalize_or_raw(current_project_path);
-    instances.iter().any(|inst| {
-        inst.id != current_instance_id
-            && inst.tool == "claude"
-            && !inst.is_trashed()
-            && canonicalize_or_raw(&inst.project_path) == canonical_current
-    })
+    let Ok(profiles) = crate::session::list_profiles() else {
+        return true;
+    };
+    for profile in profiles {
+        let Ok(storage) = crate::session::storage::Storage::new_unwatched(&profile) else {
+            return true;
+        };
+        let Ok(instances) = storage.load() else {
+            return true;
+        };
+        for inst in instances {
+            if inst.id == current_instance_id || inst.tool != "claude" || inst.is_trashed() {
+                continue;
+            }
+            if canonicalize_or_raw(&inst.project_path) != canonical_current {
+                continue;
+            }
+            let Ok(peer_home) = claude_home_for_host_environment(&inst.resolved_host_environment())
+            else {
+                return true;
+            };
+            if peer_home == current_home {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 pub(crate) fn compose_exclusion_with_persisted_peers(
@@ -3849,9 +3905,10 @@ mod tests {
 
             let out = std::process::Command::new("sh")
                 .arg("-c")
-                .arg(claude_container_list_snippet(&encode_claude_project_path(
-                    &project_path,
-                )))
+                .arg(claude_container_list_snippet(
+                    &encode_claude_project_path(&project_path),
+                    None,
+                ))
                 .env("CLAUDE_CONFIG_DIR", home.path())
                 .output()
                 .expect("snippet invocation failed");
@@ -6717,7 +6774,9 @@ mod tests {
     }
 
     #[test]
-    fn test_select_claude_session_in_container_active_newer_wins_over_anchor() {
+    fn test_select_claude_session_in_container_anchor_wins_over_newer_sibling() {
+        // Co-located sandboxed panes share one `.claude/sandbox` store, so a
+        // newer sibling is normally a peer writing, not this pane switching.
         let uuid_anchor = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
         let uuid_newer = "11111111-2222-3333-4444-555555555555";
         let stdout = format!("{uuid_newer}\n{uuid_anchor}\n");
@@ -6727,7 +6786,56 @@ mod tests {
             Some(uuid_anchor),
         )
         .unwrap();
-        assert_eq!(id, uuid_newer);
+        assert_eq!(id, uuid_anchor);
+    }
+
+    /// Two sandboxed Claude instances sharing one cwd, hence one
+    /// `$HOME/.claude/sandbox/projects/<encoded-cwd>/`: whichever pane wrote
+    /// last, each must still resolve to its own conversation.
+    #[test]
+    fn test_select_claude_session_in_container_keeps_co_located_panes_apart() {
+        let pane_a = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+        let pane_b = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+        // Pane B wrote most recently, so it heads the newest-first listing.
+        let stdout = format!("{pane_b}\n{pane_a}\n");
+        assert_eq!(
+            select_claude_session_in_container(stdout.as_bytes(), &HashSet::new(), Some(pane_a))
+                .unwrap(),
+            pane_a
+        );
+        assert_eq!(
+            select_claude_session_in_container(stdout.as_bytes(), &HashSet::new(), Some(pane_b))
+                .unwrap(),
+            pane_b
+        );
+    }
+
+    #[test]
+    fn test_select_claude_session_in_container_anchored_without_candidate_errors() {
+        // A pinned session before its first transcript: handing it a peer's
+        // conversation is the mix-up this must not make.
+        let absent = "99999999-9999-4999-8999-999999999999";
+        let sibling = "11111111-2222-4333-8444-555555555555";
+        let stdout = format!("{sibling}\n");
+        assert!(select_claude_session_in_container(
+            stdout.as_bytes(),
+            &HashSet::new(),
+            Some(absent)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn test_claude_container_list_snippet_emits_the_anchor_unconditionally() {
+        let anchor = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+        let snippet = claude_container_list_snippet("-tmp-proj", Some(anchor));
+        assert!(
+            snippet.contains(&format!("$DIR/{anchor}.jsonl")),
+            "anchor must be listed regardless of its mtime: {snippet}"
+        );
+        // A non-UUID anchor is never interpolated into the shell snippet.
+        let hostile = claude_container_list_snippet("-tmp-proj", Some("x'; rm -rf /"));
+        assert!(!hostile.contains("rm -rf"), "{hostile}");
     }
 
     #[test]
