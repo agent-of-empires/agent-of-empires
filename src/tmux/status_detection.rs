@@ -2065,14 +2065,14 @@ pub fn detect_pi_status(raw_content: &str) -> Status {
 /// A tool approval replaces the composer with a selector panel. Exact
 /// bordered `Approve`/`Deny` option rows corroborate its navigation footer;
 /// the title text is not used because real detail rows can push it outside
-/// the freshness window. Plan Review is likewise corroborated by its stable
-/// option labels and the live overlay footer (`tab regions`, `esc cancel`),
-/// which disappears as soon as the selection is submitted.
+/// the freshness window. Plan Review additionally requires a cursor-marked
+/// option in a bordered row, exact bordered option labels, and its live
+/// bordered footer (`tab regions`, `esc cancel`), which disappears after
+/// submission.
 ///
 /// The ask tool's option dialog swaps into the composer slot the same way;
-/// its footer hint rows (`Enter select · n note`, `Space toggle · Enter …`,
-/// `Enter submit · ↑/↓ scroll`, and the input-guard form
-/// `…current prompt to answer`) pin Waiting while answers are pending.
+/// its footer phrases (`Enter select · n note`, `Space toggle · Enter …`,
+/// `Enter submit · ↑/↓ scroll`, input guard) count only on bordered rows.
 ///
 /// When no signal matched, the frame reads as healthy idle rather than
 /// Waiting. In practice it is parked on the always-visible `╭── π`/`╰─`
@@ -2235,33 +2235,51 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
         }
     }
 
-    // Plan Review: option prose is not unique, but every live overlay keeps
-    // three stable option labels and a footer shared by all focus regions.
-    // The footer disappears as soon as the selection is submitted.
-    let plan_text = window12.join("\n").to_lowercase();
-    if plan_text.contains("approve and execute")
-        && plan_text.contains("refine plan")
-        && plan_text.contains("save and quit")
-    {
+    // Plan Review: stable bordered option rows, a selected option cursor,
+    // and the live bordered footer prove that the overlay is still active.
+    let has_panel_cursor = |line: &str| {
+        let line = line.trim();
+        let inner = line
+            .strip_prefix('│')
+            .and_then(|line| line.strip_suffix('│'))
+            .or_else(|| {
+                line.strip_prefix('|')
+                    .and_then(|line| line.strip_suffix('|'))
+            });
+        let Some(inner) = inner else { return false };
+        let inner = inner.trim();
+        inner.starts_with("❯ ") || inner.starts_with("\u{f054} ") || inner.starts_with("> ")
+    };
+    let is_plan_option = |line: &str| {
+        is_panel_option(line, "approve and execute")
+            || is_panel_option(line, "approve and compact context")
+            || is_panel_option(line, "refine plan")
+            || is_panel_option(line, "save and quit")
+            || (is_panel_row(line) && line.to_lowercase().contains("approve and keep context"))
+    };
+    let has_selected_option = window12
+        .iter()
+        .any(|line| has_panel_cursor(line) && is_plan_option(line));
+    let has_plan_options = ["approve and execute", "refine plan", "save and quit"]
+        .iter()
+        .all(|expected| window12.iter().any(|line| is_panel_option(line, expected)));
+    if has_selected_option && has_plan_options {
         if let Some(pos) = lowest_matching_line(window12, |line| {
             let lower = line.to_lowercase();
-            lower.contains("tab regions") && lower.contains("esc cancel")
+            is_panel_row(line) && lower.contains("tab regions") && lower.contains("esc cancel")
         }) {
             consider(pos, OmpSignal::Approval);
         }
     }
 
-    // Ask dialog: the built-in ask tool swaps an option dialog into the
-    // composer slot and blocks the turn on the operator's answers. Its
-    // footer hint row is fixed relative to the pane bottom; four variants
-    // cover single-select, multi-select, the submit tab, and the
-    // input-guard form shown while a composer draft exists.
-    if let Some(pos) = lowest_matching_line(window8, |l| {
-        let l = l.to_lowercase();
-        l.contains("enter select · n note")
-            || l.contains("space toggle · enter ")
-            || l.contains("enter submit · ↑/↓ scroll")
-            || l.contains("current prompt to answer")
+    // Ask dialog footer phrases count only on a bordered dialog row.
+    if let Some(pos) = lowest_matching_line(window8, |line| {
+        let lower = line.to_lowercase();
+        is_panel_row(line)
+            && (lower.contains("enter select · n note")
+                || lower.contains("space toggle · enter ")
+                || lower.contains("enter submit · ↑/↓ scroll")
+                || lower.contains("current prompt to answer"))
     }) {
         consider(pos, OmpSignal::Approval);
     }
@@ -6259,11 +6277,11 @@ Final prose line.\n";
 │ Enter select · n note · ↑/↓ move · Esc       │
 │                                              │
 ╰──────────────────────────────────────────────╯",
-            // Multi-select footer (Enter advances to the next question).
+            // ASCII dialog footer.
             "\
-│ Space toggle · Enter next · ↑/↓ move · Esc   │
-╰──────────────────────────────────────────────╯",
-            // Submit tab footer.
+| Space toggle · Enter next · ↑/↓ move · Esc   |
++----------------------------------------------+",
+            // Nerd uses the same unicode box border as the unicode preset.
             "\
 │ Enter submit · ↑/↓ scroll · Esc              │
 ╰──────────────────────────────────────────────╯",
@@ -6283,7 +6301,7 @@ Final prose line.\n";
         // plus the live footer (tab regions, esc cancel).
         let cases = [
             (
-                "actions focus",
+                "actions focus (ascii)",
                 "\
 | Plan mode - next step                                                        |
 | > Approve and execute                                                        |
@@ -6296,7 +6314,7 @@ Final prose line.\n";
 +------------------------------------------------------------------------------+",
             ),
             (
-                "toc focus",
+                "toc focus (unicode)",
                 "\
 │ Plan mode - next step                                                        │
 │   Approve and execute                                                        │
@@ -6309,14 +6327,14 @@ Final prose line.\n";
 ╰──────────────────────────────────────────────────────────────────────────────╯",
             ),
             (
-                "body focus",
+                "body focus (nerd)",
                 "\
 │ Plan mode - next step                                                        │
 │   Approve and execute                                                        │
 │   Approve and compact context                                                │
 │   Approve and keep context (~28k / 1m)                                       │
 │   Refine plan                                                                │
-│ ❯ Save and quit                                                              │
+│ \u{f054} Save and quit                                                      │
 ├──────────────────────────────────────────────────────────────────────────────┤
 │ ↑↓ scroll · ⇧ faster · pgup/pgdn · g/G ends · tab regions · esc cancel      │
 ╰──────────────────────────────────────────────────────────────────────────────╯",
@@ -6334,6 +6352,10 @@ Final prose line.\n";
         // options must not trip the overlay arm either.
         let box_ = "╭── π ─╮\n╰─ ─╯";
         let cases = [
+            // Quoted Plan Review labels/footer are not a live overlay.
+            format!("Quoted UI:\nApprove and execute\nRefine plan\nSave and quit\ntab regions · esc cancel\n{box_}"),
+            // Quoted ask instructions in an ordinary response are not a dialog.
+            format!("The instructions said: Enter select · n note\n{box_}"),
             // Real composer top row carries a > status separator: it must not
             // become a Plan Review cursor when the draft names an option.
             "╭── π  > approve and execute the migration ─╮\n│ then refine plan wording                    │\n╰─                                           ─╯".to_string(),
