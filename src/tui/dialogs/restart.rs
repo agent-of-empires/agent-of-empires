@@ -664,6 +664,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_right_cycles_profile_when_profile_focused() {
         let mut d = dialog("default", "claude");
         d.handle_key(key(KeyCode::Right));
@@ -691,6 +692,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_arrows_cycle_tool_when_tool_focused() {
         let mut d = dialog("default", "claude");
         d.focused_field = 1;
@@ -715,6 +717,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_tool_only_change_submits_tool_some_profile_none() {
         let mut d = dialog("default", "claude");
         d.focused_field = 1;
@@ -729,6 +732,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_tool_override_does_not_snap_profile() {
         let mut d = dialog("default", "claude");
         d.focused_field = 1;
@@ -914,6 +918,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_tool_round_trip_preserves_live_overrides() {
         // Session has custom overrides on its original tool. Cycling the tool
         // away and back must restore the live values (not config defaults),

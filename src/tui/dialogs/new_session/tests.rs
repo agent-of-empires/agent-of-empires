@@ -437,6 +437,7 @@ fn test_backspace_on_empty_field() {
 }
 
 #[test]
+#[serial_test::serial]
 fn test_tool_selection_left_right() {
     let mut dialog = multi_tool_dialog();
     dialog.focused_field = 2; // tool field (single profile: path=0, title=1, tool=2)
@@ -453,6 +454,7 @@ fn test_tool_selection_left_right() {
 }
 
 #[test]
+#[serial_test::serial]
 fn test_tool_selection_left_right_three_tools() {
     let mut dialog = NewSessionDialog::new_with_tools(
         vec!["claude", "opencode", "codex"],
@@ -477,6 +479,7 @@ fn test_tool_selection_left_right_three_tools() {
 }
 
 #[test]
+#[serial_test::serial]
 fn test_tool_selection_space() {
     let mut dialog = multi_tool_dialog();
     dialog.focused_field = 2; // tool field
@@ -507,6 +510,7 @@ fn test_tool_selection_ignored_single_tool() {
 }
 
 #[test]
+#[serial_test::serial]
 fn test_submit_with_selected_tool() {
     let mut dialog = multi_tool_dialog();
     dialog.focused_field = 2; // tool field
@@ -1097,6 +1101,7 @@ fn test_confirm_create_failure_shows_error() {
 // --- Profile picker tests ---
 
 #[test]
+#[serial_test::serial]
 fn test_profile_cycling() {
     let mut dialog = single_tool_dialog();
     dialog.available_profiles = vec![
@@ -1366,6 +1371,7 @@ fn test_env_list_edit_submits_session_override() {
 // --- Sandbox config mode tests ---
 
 #[test]
+#[serial_test::serial]
 fn test_ctrl_p_on_sandbox_enters_config_mode() {
     let mut dialog = multi_tool_dialog();
     dialog.docker_available = true;
@@ -1569,6 +1575,7 @@ fn click_on_path_field_just_moves_focus() {
 }
 
 #[test]
+#[serial_test::serial]
 fn click_on_tool_cycles_when_multi_tool() {
     let mut dialog = multi_tool_dialog();
     // Multi-tool, no-profile layout: path=0, title=1, tool=2.

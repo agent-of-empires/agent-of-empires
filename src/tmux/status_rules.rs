@@ -274,11 +274,13 @@ impl ProfileRegistryGuard {
     ///
     /// The aliases and rules phases each lock their own map, so the guard is
     /// rollback, not mutual exclusion: a concurrent writer for the same
-    /// profile can interleave and leave a half-swapped pair. Tests changed by
-    /// this PR are serialized or use disjoint profiles, but other pre-existing
-    /// config-resolving tests still write `default` outside that group. The
-    /// guard covers exactly these two registries and only its caller's writes;
-    /// a future process-global needs its own restore mechanism.
+    /// profile can interleave and leave a half-swapped pair. The test cohort
+    /// that resolves or installs `default` shares serial_test's default key;
+    /// writers on dedicated profiles may run concurrently because their map
+    /// keys are disjoint. This caller-side exclusion is what makes the two-map
+    /// snapshot coherent. The guard covers exactly these two registries and
+    /// only its caller's writes; a future process-global needs its own restore
+    /// mechanism.
     pub(crate) fn take(profile: &str) -> Self {
         let profile = crate::session::config::effective_profile(profile);
         let aliases = aliases()
