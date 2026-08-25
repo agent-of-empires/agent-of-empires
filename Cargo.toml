@@ -159,7 +159,7 @@ base64 = "0.23"
 p256 = { version = "0.13", features = ["pem", "pkcs8", "ecdsa", "ecdh"], optional = true }
 hkdf = { version = "0.13", optional = true }
 aes-gcm = { version = "0.11", optional = true }
-jsonwebtoken = { version = "10.4", features = ["aws_lc_rs"], optional = true }
+jsonwebtoken = { version = "11.0", features = ["aws_lc_rs"], optional = true }
 getrandom = { version = "0.4", optional = true }
 
 # Agent Client Protocol — drives the structured view surface bundled with `serve`.
