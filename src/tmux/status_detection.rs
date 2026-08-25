@@ -1831,7 +1831,9 @@ pub fn detect_copilot_status(raw_content: &str) -> Status {
 /// How many of the last non-empty pane lines count as plain pi's footer for
 /// the spinner and activity-word running signals; the sizing rationale
 /// (measured busy-line depth, prose exclusion) lives at the call site in
-/// `detect_pi_status`.
+/// `detect_pi_status`. It doubles as the ceiling on the input box rule
+/// anchor: the box is footer furniture (plain pi anchors at 4, omo at 5), so
+/// a deeper rule pair is transcript content, not the box.
 const PI_FOOTER_WINDOW: usize = 6;
 
 /// Non-empty position (1 = bottom) of the input box's topmost rule, or
@@ -1878,10 +1880,13 @@ fn input_box_topmost_rule_depth(non_empty_lines: &[&str]) -> Option<usize> {
 /// spinner glyph, so scanning the last 30 lines for those substrings pinned
 /// the session on Running forever. The `esc to interrupt` hint is bound to
 /// the input box instead of a line count: the scan covers the three
-/// non-empty lines above the box's topmost rule, where plain pi puts its
+/// non-empty lines above the box's rule anchor, where plain pi puts its
 /// busy line (directly above the rule) and where derivatives aliased via
 /// `agent_detect_as = pi` stack theirs behind up to two tip lines (#3475),
-/// so response prose above the box top stays out of reach. The footer
+/// so response prose above the box top stays out of reach. An anchor deeper
+/// than the footer is treated as transcript content and falls back to the
+/// footer window, so a response drawing its own rules with the input box
+/// off-capture cannot float the band to unbounded depth. The footer
 /// scoping mirrors the approach already used by `detect_omp_status` and
 /// `detect_copilot_status`.
 pub fn detect_pi_status(raw_content: &str) -> Status {
@@ -1901,12 +1906,18 @@ pub fn detect_pi_status(raw_content: &str) -> Status {
     }
 
     // The hint region is the three non-empty lines above the input box's
-    // topmost rule: plain pi puts its busy line directly above the box and
+    // rule anchor: plain pi puts its busy line directly above the box and
     // derivatives stack up to two tip lines between busy line and box
-    // (#3475), while response prose always sits above that band. Panes
-    // without a rule pair (odd wrappers, synthetic captures) keep the
-    // pre-#3475 footer-only hint check.
-    let hint_region = match input_box_topmost_rule_depth(&non_empty_lines) {
+    // (#3475), while response prose always sits above that band. An anchor
+    // deeper than the footer is rejected: the box is footer furniture, so a
+    // deeper rule pair is transcript prose drawing the same glyph run (pi
+    // renders a markdown `---` that way), and without the ceiling the band
+    // floats to unbounded depth. Panes without a usable rule pair (odd
+    // wrappers, synthetic captures, an off-capture box) keep the pre-#3475
+    // footer-only hint check.
+    let hint_region = match input_box_topmost_rule_depth(&non_empty_lines)
+        .filter(|depth| *depth <= PI_FOOTER_WINDOW)
+    {
         Some(rule_depth) => {
             let above_box = &non_empty_lines[..non_empty_lines.len() - rule_depth];
             tail_lines(above_box, 3).to_vec()
@@ -5193,6 +5204,25 @@ Tip: Set thinkingBudgets in settings.json to choose which models think.\n\
 ~ • CH93.4% • $2.870 • 115K/1M (11.5%) (auto)      claude-opus-4-6:xhigh\n\
 (😺 OmO Native) Pursuing goal (1m) mem:12k/200k\n";
 
+    /// A finished turn whose response renders two markdown horizontal rules
+    /// (pi draws them with the same `────` glyph run as its input box) while
+    /// the input box itself is off-capture: startup, a full-screen pager, or
+    /// a derivative that hides the box while streaming. The rule anchor then
+    /// lands on prose at position 7, so without the shallow-anchor guard the
+    /// hint band floats up to positions 8 through 10 and the quoted hint at
+    /// position 8 pins the session on Running with no depth cap.
+    const PI_PROSE_RULES_WITHOUT_BOX_PANE: &str = "\
+Two horizontal rules in this response, and the input box is off-capture.\n\
+Here is the first section of the answer.\n\
+You can press esc to interrupt at any time.\n\
+────────────────────────────────────────\n\
+Second section of the answer.\n\
+More prose in the second section.\n\
+Still more prose in the second section.\n\
+────────────────────────────────────────\n\
+Closing prose line.\n\
+Final prose line.\n";
+
     #[test]
     fn test_detect_pi_status_running_spinner_footer() {
         assert_eq!(detect_pi_status(PI_RUNNING_PANE), Status::Running);
@@ -5273,6 +5303,11 @@ Tip: Set thinkingBudgets in settings.json to choose which models think.\n\
             (
                 "hint: quoted hint at position 11, past the anchored band",
                 boxed_pane_with_line_at_depth(quote_line, 11),
+                Status::Idle,
+            ),
+            (
+                "hint: prose rules with the box off-capture stay bounded",
+                PI_PROSE_RULES_WITHOUT_BOX_PANE.to_string(),
                 Status::Idle,
             ),
             (
