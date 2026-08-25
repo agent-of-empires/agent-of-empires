@@ -6,11 +6,8 @@
 //! blocks in a toggleable overlay (#2467); the remote-home picker shows
 //! `RowColumn` text per session row
 //! (#2948). Icons, tooltips, hrefs, and the
-//! `Card`/`RowBadge`/`SortKey`/`FilterFacet`/`SettingsPage`/
-//! `ToolCardBadge` slots have no TUI surface here and are ignored (a terminal
-//! cannot render a routed full page). `ToolCardBadge` renders on the web
-//! tool-call cards only; the TUI would need MCP/skill target classification it
-//! does not carry today, tracked as a follow-up.
+//! `Card`/`RowBadge`/`SortKey`/`FilterFacet` slots have no TUI surface here and
+//! are ignored.
 //!
 //! Kept side-effect-free so the render layer can borrow the snapshot and so the
 //! filtering / tone-mapping logic is unit-testable without a daemon.
