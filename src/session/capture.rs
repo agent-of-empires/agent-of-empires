@@ -1022,6 +1022,13 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
     // silently drops them from this exclusion even though they share the
     // directory — re-opening the #2355 steal for exactly those peers (#2858).
     let canonical_current = canonicalize_or_raw(current_project_path);
+    // One observation for the whole walk. This loop visits every stored session
+    // sharing the project path, trashed ones included, so a per-instance
+    // liveness probe costs a fork each; a store of a few hundred sessions made
+    // that the dominant cost of the pass. `names() == None` (server
+    // unreachable) reads as "no live pane", which is what the per-item probe
+    // already did when its `list-sessions` failed.
+    let live = crate::tmux::LiveSessionSnapshot::take();
     for inst in instances {
         if inst.id == current_instance_id {
             continue;
@@ -1046,7 +1053,7 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
         }
         let should_exclude = matches!(inst.status, crate::session::Status::Stopped)
             || inst.is_archived()
-            || !inst.has_live_tmux_pane();
+            || !inst.has_live_tmux_pane_in(&live);
         if !should_exclude {
             continue;
         }
