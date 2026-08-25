@@ -1163,9 +1163,25 @@ mod tests {
     #[test]
     fn frame_json_includes_geometry_and_cursor() {
         let cases = [
-            // Unsplit (or pane 0 at the window origin): the translation is
-            // the identity and `pane0` is absent.
+            // Unsplit: `pane0` is absent and the cursor is untouched.
             (None, (3, 7), serde_json::Value::Null),
+            // Composited with pane 0 at the corner (a borderless split):
+            // identity translation, but `pane0` rides with zero origin.
+            (
+                Some(crate::tmux::PaneGeom {
+                    left: 0,
+                    top: 0,
+                    width: 37,
+                    height: 46,
+                }),
+                (3, 7),
+                serde_json::json!({
+                    "cols": 37,
+                    "rows": 46,
+                    "left": 0,
+                    "top": 0,
+                }),
+            ),
             // Composited with pane-border-status top: the wire cursor moves
             // onto the window grid by pane 0's origin (#3515).
             (

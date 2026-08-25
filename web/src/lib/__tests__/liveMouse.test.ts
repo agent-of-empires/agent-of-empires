@@ -86,6 +86,12 @@ describe("cursorLineIndex", () => {
     expect(cursorLineIndex(120, 72, 0)).toBe(48);
     expect(cursorLineIndex(120, 72, 63)).toBe(111);
   });
+
+  it("clamps the live edge at zero when the viewport is taller than the capture", () => {
+    // A short capture in a tall viewport must index from the top, not go
+    // negative (which the renderer reads as "no cursor").
+    expect(cursorLineIndex(5, 72, 3)).toBe(3);
+  });
 });
 
 describe("pointerPaneCell", () => {

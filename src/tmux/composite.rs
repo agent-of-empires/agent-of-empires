@@ -366,9 +366,10 @@ mod tests {
 
     #[test]
     fn first_pane_is_the_one_at_the_window_origin() {
-        // tmux orders pane indices by layout, so index 0 is the top-left pane.
-        // The live path relies on this to paint pane 0's cursor onto the
-        // composite without translating its coordinates.
+        // tmux orders pane indices by layout, so index 0 is the top-left
+        // pane. Consumers no longer assume that corner paints untranslated:
+        // they translate the cursor by the origin carried on
+        // `composite_pane0` (#3515).
         let l = layout(
             9,
             1,

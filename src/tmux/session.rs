@@ -869,11 +869,12 @@ impl Session {
     /// [`capture_window_composited`](Self::capture_window_composited) plus pane
     /// 0's cursor, for the live preview.
     ///
-    /// Pane 0 owns the cursor because it is the pane that receives input, and
-    /// tmux puts it at the window origin, so its coordinates index the
-    /// composite untranslated. The probe targets `^.0` explicitly rather than
-    /// the window, whose format fields would resolve against whichever pane the
-    /// user happens to have selected.
+    /// Pane 0 owns the cursor because it is the pane that receives input; its
+    /// coordinates are pane relative, and the composite they index is the
+    /// whole window, so consumers translate them by pane 0's origin carried
+    /// on [`PaneCursor::composite_pane0`] (#3515). The probe targets `^.0`
+    /// explicitly rather than the window, whose format fields would resolve
+    /// against whichever pane the user happens to have selected.
     ///
     /// On a composite the cursor is rebased onto the window's dimensions: the
     /// renderer anchors it by `pane_height` against the painted line count,
@@ -3617,8 +3618,10 @@ mod tests {
     }
 
     /// The live path caches a layout and re-renders only pane 0 from its VT
-    /// grid, so the layout must come back with pane 0 first, at the window
-    /// origin, and with rectangles that tile the real window.
+    /// grid, so the layout must come back with pane 0 first and with
+    /// rectangles that tile the real window. This split sets no
+    /// border-status option, so pane 0 additionally sits at the window
+    /// origin here.
     #[test]
     #[serial_test::serial]
     fn captured_layout_puts_pane_zero_first_at_the_origin() {
@@ -3669,7 +3672,7 @@ mod tests {
         assert_eq!(
             (first.left, first.top),
             (0, 0),
-            "pane 0 must sit at the window origin for the cursor math to hold"
+            "pane 0 must sit at the origin in this split; a border-status row would shift it (#3515)"
         );
         // Pane 0 is the agent's, even though pane 1 is the active one.
         assert!(
