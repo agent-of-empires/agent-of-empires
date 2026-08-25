@@ -2461,11 +2461,16 @@ impl HomeView {
 
         // Batch-sync instance IDs and captured session IDs to tmux hidden env
         // so that build_exclusion_set() on other AoE instances can see them.
+        // One observation for both per-instance walks below. They visit every
+        // instance in the view, so a per-item `list-sessions` fork scales with
+        // the whole store — measured as the dominant tmux cost of this pass on
+        // a store of a few hundred sessions.
+        let live = crate::tmux::LiveSessionSnapshot::take();
         {
             let mut set_batch: Vec<(String, String, String)> = Vec::new();
             let mut unset_batch: Vec<(String, String)> = Vec::new();
             for inst in view.instances.values() {
-                let Some(tmux_name) = inst.tmux_env_session_name() else {
+                let Some(tmux_name) = inst.tmux_env_session_name_in(&live) else {
                     continue;
                 };
 
@@ -2509,7 +2514,7 @@ impl HomeView {
 
         // Recover session IDs for pre-existing sessions via pollers.
         for inst in view.instances.values_mut() {
-            let has_live_tmux = inst.has_live_tmux_pane();
+            let has_live_tmux = inst.has_live_tmux_pane_in(&live);
             if !has_live_tmux {
                 continue;
             }

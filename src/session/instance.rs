@@ -3776,6 +3776,15 @@ impl Instance {
         self.tmux_env_session_name().is_some()
     }
 
+    /// [`Self::tmux_env_session_name`] answered from a snapshot the caller
+    /// already took, for passes that ask once per stored session.
+    pub(crate) fn tmux_env_session_name_in(
+        &self,
+        snapshot: &crate::tmux::LiveSessionSnapshot,
+    ) -> Option<String> {
+        crate::tmux::live_any_kind_name_for_id_in(snapshot, &self.id)
+    }
+
     /// [`Self::has_live_tmux_pane`] answered from a snapshot the caller already
     /// took, for passes that ask once per stored session. Same decision and the
     /// same freshness — one live observation shared by the batch instead of a
@@ -3784,7 +3793,7 @@ impl Instance {
         &self,
         snapshot: &crate::tmux::LiveSessionSnapshot,
     ) -> bool {
-        crate::tmux::live_any_kind_name_for_id_in(snapshot, &self.id).is_some()
+        self.tmux_env_session_name_in(snapshot).is_some()
     }
 
     pub fn start_container_terminal_with_size(&mut self, size: Option<(u16, u16)>) -> Result<()> {
