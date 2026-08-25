@@ -3181,11 +3181,14 @@ impl Instance {
 
     /// Whether another AoE session shares this one's Kimi store, which makes
     /// the session index useless for attributing a conversation to a pane.
+    /// Both own homes are supplied so a hook-minted `KIMI_CODE_HOME` still
+    /// counts static-profile siblings as sharing.
     fn kimi_store_is_shared(&self) -> bool {
         super::capture::kimi_store_is_shared(
             &self.id,
             &self.project_path,
             &self.resolved_host_environment(),
+            &self.profile_host_environment(),
         )
     }
 
@@ -3343,18 +3346,35 @@ impl Instance {
                 }
             }
             "kimi" => {
-                // Kimi records sessions in `~/.kimi-code/session_index.jsonl`
-                // keyed by workDir. Host capture reads it directly; sandbox
-                // resume is a follow-up (the container's index is not read over
-                // `docker exec`), so a sandboxed Kimi session starts fresh on
-                // restart, mirroring Copilot.
+                // Kimi records sessions in `session_index.jsonl` under the
+                // resolved `KIMI_CODE_HOME`, keyed by workDir. Host capture
+                // reads it through the launched pane's environment; sandbox
+                // resume is a follow-up (the container's index is not read
+                // over `docker exec`), so a sandboxed Kimi session starts
+                // fresh on restart, mirroring Copilot.
                 if self.is_sandboxed() {
+                    None
+                } else if self.kimi_store_is_shared() {
+                    // A shared store names no pane: its newest same-workDir
+                    // record is as likely to be a co-located peer's
+                    // conversation as this one's, so the MRU scan is refused
+                    // entirely (#3516). An anchored sid keeps its value on
+                    // the freshest path; an id-less session starts fresh
+                    // rather than adopt a peer conversation. Sole-owner
+                    // stores keep the MRU retarget, which stays the
+                    // new-conversation promotion path (#2291).
                     None
                 } else {
                     let exclusion = self.retroactive_capture_exclusion_set();
                     // Retroactive recovery is unrestricted (no launch floor):
                     // resuming an older session on restart is the goal here.
-                    capture_kimi_session_id(&self.project_path, &exclusion, None).ok()
+                    capture_kimi_session_id(
+                        &self.project_path,
+                        &exclusion,
+                        None,
+                        &self.resolved_host_environment(),
+                    )
+                    .ok()
                 }
             }
             _ => None,
@@ -3576,16 +3596,9 @@ impl Instance {
                 return override_if_distinct(self.agent_session_id.as_deref(), authoritative);
             }
         }
-        // A shared Kimi store names no pane: the newest same-workDir record
-        // in its session index is as likely to be a co-located peer's
-        // conversation as this one's, so an anchored sid is kept rather than
-        // swapped for the scan result (#3516). Sole-owner stores skip this and
-        // keep the MRU retarget, which stays the new-conversation promotion
-        // path (#2291); sandboxed Kimi never captures (its arm in
-        // try_retroactive_capture returns None).
-        if self.tool == "kimi" && !self.is_sandboxed() && self.kimi_store_is_shared() {
-            return None;
-        }
+        // Kimi: a shared store refuses the MRU scan entirely inside
+        // try_retroactive_capture, so reaching this line means the store is
+        // sole-owned and a fresher observation is attributable.
 
         let live = self.try_retroactive_capture()?;
         override_if_distinct(self.agent_session_id.as_deref(), live)
@@ -5871,9 +5884,10 @@ impl Instance {
                 ))
             }
             "kimi" => {
-                // Host-only, mirroring Copilot: the Kimi session index is read
-                // from the host `~/.kimi-code`. Sandboxed sessions have no
-                // poller and start fresh on restart (sandbox resume is a
+                // Host-only, mirroring Copilot: the Kimi session index is
+                // read from the host store under the launched pane's
+                // resolved environment. Sandboxed sessions have no poller
+                // and start fresh on restart (sandbox resume is a
                 // follow-up).
                 if self.is_sandboxed() {
                     return;
@@ -5884,6 +5898,7 @@ impl Instance {
                     self.id.clone(),
                     launch_time_ms,
                     extra_excludes,
+                    self.resolved_host_environment(),
                 ))
             }
             _ => return,
@@ -15239,6 +15254,85 @@ mod tests {
                     sid.as_deref(),
                     Some("kimi-stored"),
                     "a $VAR-spelled peer home resolving to the same store must count as shared"
+                );
+            }
+            #[test]
+            #[serial]
+            fn kimi_shared_store_refuses_id_less_retroactive_fill() {
+                // The shared-store refusal lives in try_retroactive_capture,
+                // so it also covers the id-less doors (recovery of a session
+                // that never captured, read-command self-heal): the scan is
+                // refused entirely, yielding a fresh start instead of an
+                // unattributable adoption, while a sole-owner store keeps
+                // filling from the index.
+                for (label, peer_present, expected) in
+                    [("shared", true, None), ("solo", false, Some("kimi-fresh"))]
+                {
+                    let temp = tempdir().unwrap();
+                    let _home = isolate_app_dir_at(temp.path());
+                    let project = temp.path().join(format!("idless-project-{label}"));
+                    fs::create_dir_all(&project).unwrap();
+                    let project = project.to_string_lossy().to_string();
+                    let kimi_home = temp.path().join("kimi-home");
+                    fs::create_dir_all(&kimi_home).unwrap();
+                    let _kimi = EnvGuard::set(&[("KIMI_CODE_HOME", kimi_home.to_str().unwrap())]);
+                    seed_kimi_index(&kimi_home, &project, "kimi-stored", "kimi-fresh");
+
+                    if peer_present {
+                        let profile = format!("kimi-idless-{label}");
+                        let mut peer = Instance::new("idless-peer", &project);
+                        peer.source_profile = profile.clone();
+                        peer.tool = "kimi".to_string();
+                        super::seed_disk_for_sidecar_test(&profile, &peer);
+                    }
+
+                    let mut inst = Instance::new("idless-caller", &project);
+                    inst.tool = "kimi".to_string();
+
+                    assert_eq!(
+                        inst.try_retroactive_capture(),
+                        expected.map(str::to_string),
+                        "{label} store"
+                    );
+                }
+            }
+
+            #[test]
+            #[serial]
+            fn kimi_anchor_kept_when_profile_list_unreadable() {
+                // Fail-closed branch: an erroring profile walk must report
+                // shared, keeping the anchored sid rather than licensing the
+                // MRU retarget. Driven through the existing list_profiles
+                // injection seam.
+                let temp = tempdir().unwrap();
+                let _home = isolate_app_dir_at(temp.path());
+                let project = temp.path().join("failclosed-project");
+                fs::create_dir_all(&project).unwrap();
+                let project = project.to_string_lossy().to_string();
+                let kimi_home = temp.path().join("kimi-home");
+                fs::create_dir_all(&kimi_home).unwrap();
+                let _kimi = EnvGuard::set(&[("KIMI_CODE_HOME", kimi_home.to_str().unwrap())]);
+                seed_kimi_index(&kimi_home, &project, "kimi-stored", "kimi-peer-fresh");
+
+                let profile = "kimi-failclosed";
+                let mut peer = Instance::new("failclosed-peer", &project);
+                peer.source_profile = profile.to_string();
+                peer.tool = "kimi".to_string();
+                peer.agent_session_id = Some("kimi-peer-fresh".to_string());
+                super::seed_disk_for_sidecar_test(profile, &peer);
+
+                let mut inst = Instance::new("failclosed-caller", &project);
+                inst.source_profile = profile.to_string();
+                inst.tool = "kimi".to_string();
+                inst.agent_session_id = Some("kimi-stored".to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let _failure = crate::session::FailNextListProfilesGuard::new();
+                let (sid, _is_existing) = inst.acquire_session_id();
+                assert_eq!(
+                    sid.as_deref(),
+                    Some("kimi-stored"),
+                    "an unreadable profile list must count as shared"
                 );
             }
         }

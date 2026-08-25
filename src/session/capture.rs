@@ -2714,100 +2714,123 @@ fn select_kimi_session(
 
 /// Capture a Kimi Code session ID for `project_path`.
 ///
-/// Reads `~/.kimi-code/session_index.jsonl` (or
-/// `$KIMI_CODE_HOME/session_index.jsonl`) and returns the id of the most
-/// recently created session whose recorded `workDir` matches `project_path`,
-/// skipping any ids in `exclusion`. `launch_time_ms` gates live polling to
-/// sessions created after this run started (`None` for retroactive recovery).
-/// Kimi resumes the returned id with `kimi --session <id>`.
+/// Reads `session_index.jsonl` under the Kimi home resolved from
+/// `environment` and returns the id of the most recently created session
+/// whose recorded `workDir` matches `project_path`, skipping any ids in
+/// `exclusion`. `environment` must be the launched pane's host environment so
+/// the scan reads the same physical store Kimi writes (`KIMI_CODE_HOME`
+/// honored through launch's `$VAR` / bare-key grammar). `launch_time_ms`
+/// gates live polling to sessions created after this run started (`None` for
+/// retroactive recovery). Kimi resumes the returned id with `kimi --session
+/// <id>`.
 pub(crate) fn capture_kimi_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
     launch_time_ms: Option<f64>,
+    environment: &[String],
 ) -> Result<String> {
-    let home = resolve_agent_home(Some("KIMI_CODE_HOME"), ".kimi-code")?;
+    let home = kimi_home_for_environment(environment)
+        .ok_or_else(|| anyhow::anyhow!("could not resolve the Kimi home"))?;
     let sessions = read_kimi_session_index(&home.join("session_index.jsonl"))?;
     select_kimi_session(&sessions, project_path, exclusion, launch_time_ms)
 }
 
 /// Polling closure for Kimi Code session tracking. `launch_time_ms` floors the
 /// live poll so it never claims a conversation that predates this launch.
+/// `environment` is snapshotted from the instance at poller construction so
+/// every tick reads the store the launched pane writes.
 pub(crate) fn kimi_poll_fn(
     project_path: String,
     instance_id: String,
     launch_time_ms: f64,
     extra_excludes: HashSet<String>,
+    environment: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
         let exclusion = compose_exclusion(&instance_id, &extra_excludes);
-        capture_kimi_session_id(&project_path, &exclusion, Some(launch_time_ms))
-            .map_err(
-                |e| tracing::debug!(target: "session.capture", "Kimi poll capture failed: {}", e),
-            )
-            .ok()
-            .and_then(validated_session_id)
+        capture_kimi_session_id(
+            &project_path,
+            &exclusion,
+            Some(launch_time_ms),
+            &environment,
+        )
+        .map_err(|e| tracing::debug!(target: "session.capture", "Kimi poll capture failed: {}", e))
+        .ok()
+        .and_then(validated_session_id)
     }
 }
 
 /// Effective Kimi home for one environment list: `KIMI_CODE_HOME` resolved
 /// through the same `$VAR` / bare-key grammar launch applies
 /// ([`crate::session::environment::resolve_host_environment_value`]), else the
-/// ambient default resolution [`capture_kimi_session_id`] performs. `None`
-/// when even the default cannot be resolved; the sharing predicate fails
-/// closed on `None`.
+/// ambient default resolution. An empty resolved value counts as unset; `None`
+/// when even the default cannot be resolved (the sharing predicate fails
+/// closed on `None`).
 fn kimi_home_for_environment(environment: &[String]) -> Option<PathBuf> {
     crate::session::environment::resolve_host_environment_value(environment, "KIMI_CODE_HOME")
         .map(PathBuf::from)
+        .filter(|home| !home.as_os_str().is_empty())
         .or_else(|| resolve_agent_home(Some("KIMI_CODE_HOME"), ".kimi-code").ok())
 }
 
-/// Whether another live-tracked AoE session shares this one's Kimi store: the
-/// same resolved `$KIMI_CODE_HOME` (or default `~/.kimi-code`) plus the same
-/// canonicalized project path. When true, the newest matching record in the
-/// session index cannot be attributed to this pane, so acquire must not make
-/// the MRU retarget from it (#3516).
+/// Whether another live-tracked AoE session shares this one's Kimi store: a
+/// resolvable own home plus the same canonicalized project path. When true,
+/// the newest matching record in the session index cannot be attributed to
+/// this pane, so the acquire-time MRU scan behind
+/// [`capture_kimi_session_id`] must not run (#3516). The live poller still
+/// runs that scan on shared stores, bounded by its launch-time floor and the
+/// exclusion sets.
 ///
-/// `own_environment` must be the caller's [`Instance::resolved_host_environment`]
-/// so the own side judges sharing on exactly what the launched pane sees,
-/// including `before_session`-minted values. Peers are judged on their
-/// profile's static list because minted pairs are runtime state that is
-/// deliberately not persisted; a profile whose hook mints `KIMI_CODE_HOME`
-/// is therefore judged on its static spelling for the peer side only.
+/// `own_resolved_environment` is the caller's
+/// [`Instance::resolved_host_environment`] and `own_profile_environment` its
+/// static profile list; the own side matches peers against either home so a
+/// hook that deterministically mints a different `KIMI_CODE_HOME` still
+/// counts its profile siblings as sharing. Peers are judged on their static
+/// profile list because minted pairs are runtime state that is deliberately
+/// not persisted.
+///
 /// The walk covers every AoE profile because the store is keyed by resolved
 /// home plus cwd, not by profile: two profiles resolving to one home share
 /// one store. It fails closed: an unreadable profile list, an unreadable
-/// per-profile store, or an unresolvable Kimi home all report shared,
-/// because ownership that cannot be proven must not license an MRU
-/// retarget. Trashed and archived peers are skipped: they need explicit user
-/// action or are skipped by startup recovery, so they cannot take part in a
-/// concurrent start. Stopped and pane-less peers deliberately count as
-/// sharing; pane liveness is exactly what races during a mass recovery, so
-/// filtering on it re-opens the storm window (same reasoning as #3507's
-/// Claude predicate).
+/// per-profile store, or no resolvable own home all report shared, because
+/// ownership that cannot be proven must not license an MRU retarget.
+/// Trashed and archived peers are skipped: they need explicit user action or
+/// are skipped by startup recovery, so they cannot take part in a concurrent
+/// start. Stopped and pane-less peers deliberately count as sharing; pane
+/// liveness is exactly what races during a mass recovery, so filtering on it
+/// re-opens the storm window (same reasoning as #3507's Claude predicate).
 pub(crate) fn kimi_store_is_shared(
     current_instance_id: &str,
     current_project_path: &str,
-    own_environment: &[String],
+    own_resolved_environment: &[String],
+    own_profile_environment: &[String],
 ) -> bool {
     let canonical_current = canonicalize_or_raw(current_project_path);
-    let Some(own_home) = kimi_home_for_environment(own_environment)
+    let mut own_homes = [own_resolved_environment, own_profile_environment]
+        .iter()
+        .filter_map(|env| kimi_home_for_environment(env))
         .map(|home| canonicalize_or_raw(home.to_string_lossy().as_ref()))
-    else {
+        .collect::<Vec<_>>();
+    own_homes.dedup();
+    if own_homes.is_empty() {
         return true;
-    };
+    }
     let Ok(profiles) = crate::session::list_profiles() else {
         return true;
     };
     for peer_profile in profiles {
         // Judge the namespace before paying for the store read: a peer whose
         // resolved home differs cannot share this store however many rows its
-        // sessions.json holds.
+        // sessions.json holds. The per-launch cost of one config read per
+        // profile is accepted; the status-rule install it triggers is
+        // idempotent.
         let Some(peer_home) = kimi_home_for_environment(
             &super::profile_config::resolve_config_or_warn(&peer_profile).environment,
         ) else {
             return true;
         };
-        if canonicalize_or_raw(peer_home.to_string_lossy().as_ref()) != own_home {
+        let peer_home = canonicalize_or_raw(peer_home.to_string_lossy().as_ref());
+        if !own_homes.contains(&peer_home) {
             continue;
         }
         let Ok(storage) = crate::session::storage::Storage::new_unwatched(&peer_profile) else {
