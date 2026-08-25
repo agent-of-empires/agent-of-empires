@@ -1351,16 +1351,13 @@ fn execute_passive_resizes() {
         .lock()
         .map(|mut guard| std::mem::take(&mut *guard))
         .unwrap_or_default();
-    // Same intent re-queued every frame while pending: keep one.
+    // Keep only the NEWEST intent per session: geometry can change again
+    // within one poll cycle, and executing a stale size first would
+    // SIGWINCH the agent twice.
     let mut unique: Vec<PassiveResizeIntent> = Vec::new();
     for intent in intents {
-        if unique
-            .last()
-            .is_none_or(|prev| prev.session_id != intent.session_id)
-        {
-            unique.retain(|prev| prev.session_id != intent.session_id);
-            unique.push(intent);
-        }
+        unique.retain(|prev| prev.session_id != intent.session_id);
+        unique.push(intent);
     }
     for intent in unique {
         let Some(session) = Session::new(&intent.session_id, &intent.title)

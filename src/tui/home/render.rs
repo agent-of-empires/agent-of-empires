@@ -2024,6 +2024,18 @@ impl HomeView {
         let Some(id) = self.selected_session.clone() else {
             return false;
         };
+        // Drop a cache that documents a DIFFERENT pane than the one now
+        // displayed. Without this a quiet or dead new target would keep
+        // painting the previous instance's bytes forever: only worker frames
+        // write the cache now, and a target that never produces one has no
+        // correction. The removed synchronous gate overwrote within one
+        // frame on a session change, frozen or not, so this mirrors it.
+        {
+            let cache = select(self);
+            if cache.session_id.as_deref() != Some(id.as_str()) && !cache.content.is_empty() {
+                *cache = super::PreviewCache::default();
+            }
+        }
         // Frozen (reading scrollback, or a selection is in flight): don't apply
         // the worker's live frames. The held snapshot stays in place and the
         // idle poll is gated on `!frozen`, so nothing shifts under the user.

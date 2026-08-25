@@ -1600,12 +1600,20 @@ impl LiveCaptureWorker {
         if let Some(cursor) = self.cursor.lock().ok().and_then(|guard| *guard) {
             return Some(cursor);
         }
-        // Mirror cleared (retarget) but an unconsumed frame from the new
+        // Mirror cleared (retarget) but an unconsumed frame from the NEW
         // target may already carry its cursor: prefer that over nothing.
+        // Old-generation frames are skipped: they belong to the previous
+        // pane, the exact bytes `set_target`'s mirror clear exists to hide.
         self.latest
             .lock()
             .ok()
-            .and_then(|guard| guard.as_ref().and_then(|frame| frame.cursor))
+            .and_then(|guard| {
+                guard
+                    .as_ref()
+                    .filter(|frame| self.frame_is_current(frame))
+                    .map(|frame| frame.cursor)
+            })
+            .flatten()
     }
 
     /// Take the newest OSC 52 clipboard write the displayed pane's agent has
