@@ -63,16 +63,17 @@ pub enum WorktreePathResolution {
 /// Pick the live worktree that owns `branch`, if there is exactly one.
 ///
 /// Split out from the git call so the selection rules are testable without a
-/// repo. Candidates are canonicalized before they are counted, because
+/// repo. Never returns [`WorktreePathResolution::Current`]: the callers
+/// short-circuit on a present recorded path before there is anything to select
+/// between.
+///
+/// Canonicalizing doubles as the liveness filter, since it fails for a path
+/// that is not there, and as the de-duplicator. Both matter:
 /// `list_worktrees` canonicalizes linked worktrees but leaves the main
-/// worktree's path as configured; on macOS, where `/var` is a symlink to
-/// `/private/var`, comparing those two spellings of one checkout would
+/// worktree's path as configured, so on macOS, where `/var` is a symlink to
+/// `/private/var`, one checkout can arrive under two spellings and would
 /// otherwise read as [`WorktreePathResolution::Ambiguous`].
-fn select_live_worktree(
-    entries: &[WorktreeEntry],
-    branch: &str,
-    recorded: &Path,
-) -> WorktreePathResolution {
+fn select_live_worktree(entries: &[WorktreeEntry], branch: &str) -> WorktreePathResolution {
     let mut candidates: Vec<PathBuf> = entries
         .iter()
         .filter(|entry| !entry.is_detached && entry.branch.as_deref() == Some(branch))
@@ -83,17 +84,7 @@ fn select_live_worktree(
 
     match candidates.len() {
         0 => WorktreePathResolution::Missing,
-        1 => {
-            let found = candidates.remove(0);
-            // A recorded path that canonicalizes to the candidate is already
-            // correct even though the raw strings differ (symlinked parents,
-            // a trailing component spelled differently).
-            if recorded.canonicalize().is_ok_and(|r| r == found) {
-                WorktreePathResolution::Current
-            } else {
-                WorktreePathResolution::Moved(found)
-            }
-        }
+        1 => WorktreePathResolution::Moved(candidates.remove(0)),
         _ => WorktreePathResolution::Ambiguous(candidates),
     }
 }
@@ -112,11 +103,7 @@ pub fn resolve_worktree_path(
     if !info.managed_by_aoe || recorded.exists() {
         return Ok(WorktreePathResolution::Current);
     }
-    Ok(select_live_worktree(
-        &git.list_worktrees()?,
-        &info.branch,
-        recorded,
-    ))
+    Ok(select_live_worktree(&git.list_worktrees()?, &info.branch))
 }
 
 /// Reconcile one session: on [`WorktreePathResolution::Moved`], rewrite
@@ -145,14 +132,33 @@ pub fn reconcile_and_persist(
     match &resolution {
         WorktreePathResolution::Moved(found) => {
             let id = inst.id.clone();
+            let stale = inst.project_path.clone();
             let found_str = found.to_string_lossy().into_owned();
-            storage.update(|instances, _groups| {
-                if let Some(stored) = instances.iter_mut().find(|c| c.id == id) {
-                    stored.project_path = found_str.clone();
-                }
-                Ok(())
+            // Compare and set. The git lookup runs without holding the storage
+            // lock, so a peer process could have renamed or trashed this
+            // session in the meantime; its path is fresher than ours and must
+            // not be clobbered with a location we resolved from the old one.
+            let applied = storage.update(|instances, _groups| {
+                Ok(instances
+                    .iter_mut()
+                    .find(|c| c.id == id)
+                    .is_some_and(|stored| {
+                        let fresh = stored.project_path == stale;
+                        if fresh {
+                            stored.project_path = found_str.clone();
+                        }
+                        fresh
+                    }))
             })?;
-            inst.project_path = found_str;
+            if !applied {
+                tracing::info!(
+                    target: "session.worktree",
+                    session = %inst.id,
+                    "worktree path changed under the reconcile; keeping the newer record"
+                );
+                return Ok(WorktreePathResolution::Current);
+            }
+            inst.project_path = found.to_string_lossy().into_owned();
             tracing::info!(
                 target: "session.worktree",
                 session = %inst.id,
@@ -203,7 +209,7 @@ mod tests {
         std::fs::create_dir(&other).unwrap();
         let canon_live = live.canonicalize().unwrap();
 
-        let cases: Vec<(&str, Vec<WorktreeEntry>, WorktreePathResolution)> = vec![
+        let cases = [
             (
                 "the one live checkout of the branch is the new location",
                 vec![entry(&live, Some("feat"))],
@@ -258,32 +264,8 @@ mod tests {
             ),
         ];
 
-        // `recorded` is the stale path the session carries: absent, hence the
-        // reconcile.
-        let recorded = dir.path().join("stale");
         for (name, entries, expected) in cases {
-            assert_eq!(
-                select_live_worktree(&entries, "feat", &recorded),
-                expected,
-                "{name}"
-            );
+            assert_eq!(select_live_worktree(&entries, "feat"), expected, "{name}");
         }
-    }
-
-    #[test]
-    fn select_live_worktree_keeps_a_path_that_only_looks_different() {
-        let dir = tempfile::tempdir().unwrap();
-        let live = dir.path().join("live");
-        std::fs::create_dir(&live).unwrap();
-        // The row points at the checkout git named, spelled through the
-        // tempdir's symlinked parent. Nothing moved, so nothing is rewritten.
-        assert_eq!(
-            select_live_worktree(
-                &[entry(&live.canonicalize().unwrap(), Some("feat"))],
-                "feat",
-                &live
-            ),
-            WorktreePathResolution::Current
-        );
     }
 }
