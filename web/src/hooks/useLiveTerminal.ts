@@ -30,6 +30,13 @@ export interface LiveCursor {
 export interface LivePaneExtent {
   cols: number;
   rows: number;
+  /** Pane 0's offset within the composited window grid. A
+   *  `pane-border-status` row pushes every pane down, so the cursor and
+   *  pointer cells the client sees are window-relative while the app speaks
+   *  pane-relative coordinates (#3515). Absent means the origin (pre-fix
+   *  servers, unsplit windows). */
+  left?: number;
+  top?: number;
 }
 
 export interface LiveFrame {

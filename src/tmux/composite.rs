@@ -10,6 +10,12 @@
 //!
 //! Compositing is read-only and changes nothing about input routing, which
 //! stays pinned to `^.0` (#435, #488).
+//!
+//! Known residual: a window row covered by NO pane (a `pane-border-status
+//! top` status line, which tmux draws itself and no capture sees) is filled
+//! with a full-width border rule. Translating the cursor (#3515) does not
+//! remove that row; dropping it would mean rendering a grid shorter than
+//! `window_height` and rebasing every consumer, so the rule stays.
 
 /// One pane's rectangle within its window, from
 /// `#{pane_left} #{pane_top} #{pane_width} #{pane_height}`.
@@ -87,11 +93,16 @@ impl WindowLayout {
         composite_window(self.window_width, self.window_height, &self.panes)
     }
 
-    /// The first pane's rectangle, which tmux guarantees sits at the window
-    /// origin: pane indices follow layout order, so index 0 is the top-left
-    /// pane, and closing it renumbers whichever pane takes that corner. That
-    /// is what lets a VT grid's cursor be painted onto the composite with no
-    /// coordinate translation.
+    /// The first pane's rectangle. Pane indices follow layout order, so
+    /// index 0 is the top-left pane and closing it renumbers whichever pane
+    /// takes that corner; the composite therefore paints pane 0's rows at
+    /// `geom.top` and its columns at `geom.left`, which is `(0, 0)` for the
+    /// common layouts but NOT always: a window option like
+    /// `pane-border-status top` reserves a border row above every pane,
+    /// shifting pane 0 down to `top == 1` (#3515). Consumers of the cursor
+    /// must translate by the origin carried on
+    /// [`crate::tmux::PaneCursor::composite_pane0`] rather than assuming the
+    /// window origin.
     pub(crate) fn first_pane(&self) -> Option<PaneGeom> {
         self.panes.first().map(|p| p.geom)
     }
