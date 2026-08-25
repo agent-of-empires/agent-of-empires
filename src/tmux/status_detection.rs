@@ -2097,34 +2097,46 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
         }
     };
 
-    // Live loader rows sit directly above the composer. The frame and marker
-    // must belong to the same rendered loader, either on one row or on two
-    // adjacent rows after a narrow-pane wrap.
+    // Live loader rows sit directly above the composer. Braille frames keep
+    // the historical Working/hint markers; ASCII frames additionally require
+    // their esc hint so Markdown bullets such as "- Working …" stay prose.
+    // A wrapped hint is accepted only beside the preceding activity frame.
     let loader_window = tail_lines(&non_empty_lines, 4);
-    let starts_with_activity_frame = |line: &str| {
+    let starts_with_braille_frame = |line: &str| {
         let line = line.trim_start();
         SPINNER_CHARS.iter().any(|frame| {
             line.strip_prefix(*frame)
                 .is_some_and(|rest| rest.starts_with(' '))
-        }) || ["-", "\\", "|", "/"].iter().any(|frame| {
+        })
+    };
+    let starts_with_ascii_frame = |line: &str| {
+        let line = line.trim_start();
+        ["-", "\\", "|", "/"].iter().any(|frame| {
             line.strip_prefix(frame)
                 .is_some_and(|rest| rest.starts_with(' '))
         })
     };
-    let has_loader_marker = |line: &str| {
+    let has_hint_marker = |line: &str| {
         let line = line.trim().to_lowercase();
-        line.contains("working")
-            || line.ends_with("⟦esc⟧")
+        line.ends_with("⟦esc⟧")
             || line.ends_with("⟨esc⟩")
             || line.ends_with("[esc]")
             || line.contains("(esc to cancel)")
     };
+    let has_loader_marker =
+        |line: &str| line.to_lowercase().contains("working") || has_hint_marker(line);
     let loader_pos = (0..loader_window.len()).rev().find_map(|i| {
         let pos = loader_window.len() - i;
-        let marker = has_loader_marker(loader_window[i]);
-        let direct = pos <= 3 && starts_with_activity_frame(loader_window[i]);
-        let wrapped = pos <= 3 && i > 0 && starts_with_activity_frame(loader_window[i - 1]);
-        (marker && (direct || wrapped)).then_some(pos)
+        let line = loader_window[i];
+        let direct = pos <= 3
+            && ((starts_with_braille_frame(line) && has_loader_marker(line))
+                || (starts_with_ascii_frame(line) && has_hint_marker(line)));
+        let wrapped = pos <= 3
+            && i > 0
+            && (starts_with_braille_frame(loader_window[i - 1])
+                || starts_with_ascii_frame(loader_window[i - 1]))
+            && has_hint_marker(line);
+        (direct || wrapped).then_some(pos)
     });
     if let Some(pos) = loader_pos {
         consider(pos, OmpSignal::Spinner);
@@ -6036,6 +6048,11 @@ Final prose line.\n";
             (
                 "maintenance esc prose",
                 format!("Docs say: press esc (esc to cancel) during compaction\n{prompt_box}"),
+                Status::Idle,
+            ),
+            (
+                "markdown working bullet",
+                format!("- Working tree status is clean.\n{prompt_box}"),
                 Status::Idle,
             ),
             // Precedences: the lowest live signal wins. Approval fixtures
