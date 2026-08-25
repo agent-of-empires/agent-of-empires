@@ -2337,6 +2337,7 @@ mod tests {
     #[serial_test::serial]
     fn build_instance_applies_terminal_fork_seed() {
         use crate::session::ForkSeed;
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
         let params = InstanceParams {
             title: "Forked".into(),
             path: "/tmp".into(),
@@ -2381,6 +2382,7 @@ mod tests {
     #[serial_test::serial]
     fn build_instance_applies_structured_fork_seed() {
         use crate::session::ForkSeed;
+        let _registry = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
         let params = InstanceParams {
             title: "Forked".into(),
             path: "/tmp".into(),
@@ -2421,6 +2423,50 @@ mod tests {
             inst.resume_intent,
             crate::session::instance::ResumeIntent::Fork { .. }
         ));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn fork_seed_tests_restore_default_profile_registry() {
+        const ALIAS_AGENT: &str = "fork-seed-registry-alias";
+        const RULE_AGENT: &str = "fork-seed-registry-rule";
+        let cases: &[(&str, fn())] = &[
+            ("terminal", build_instance_applies_terminal_fork_seed),
+            #[cfg(feature = "serve")]
+            ("structured", build_instance_applies_structured_fork_seed),
+        ];
+
+        // serial_test 4's default-key lock is reentrant: the wrapper must call
+        // each serialized test directly to inspect state after its guard drops.
+        for (label, run) in cases {
+            let _cleanup = crate::tmux::status_rules::ProfileRegistryGuard::take("default");
+            let mut sentinels = crate::session::Config::default();
+            sentinels
+                .session
+                .agent_detect_as
+                .insert(ALIAS_AGENT.to_string(), "codex".to_string());
+            sentinels
+                .agents
+                .entry(RULE_AGENT.to_string())
+                .or_default()
+                .status_rules = vec![crate::session::config::StatusRule {
+                status: crate::agents::HookStatus::Running,
+                contains: Some("fork-seed-working".to_string()),
+                regex: None,
+            }];
+            crate::tmux::status_rules::install_from_config("default", &sentinels);
+
+            run();
+
+            let alias = crate::tmux::status_rules::effective_detect_as("default", ALIAS_AGENT, "");
+            let rule =
+                crate::tmux::status_rules::detect("default", RULE_AGENT, "fork-seed-working");
+            assert_eq!(
+                (alias.as_ref(), rule),
+                ("codex", Some(crate::session::Status::Running)),
+                "{label}: fork-seed build must restore the prior alias and compiled rule"
+            );
+        }
     }
 
     #[test]

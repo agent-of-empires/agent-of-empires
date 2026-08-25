@@ -10317,6 +10317,8 @@ fn tool_swap_test_restores_the_detect_as_registry() {
         crate::tmux::status_rules::install_from_config(profile, &seeded);
     }
 
+    // serial_test 4's default-key lock is reentrant, so this serialized test
+    // can be called directly and observed after its nested guards have dropped.
     restart_selected_session_tool_swap_resolves_detect_as_for_the_row_profile();
 
     for (profile, agent, target) in sentinels {
