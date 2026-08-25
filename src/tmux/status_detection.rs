@@ -1836,13 +1836,26 @@ pub fn detect_copilot_status(raw_content: &str) -> Status {
 /// a deeper rule pair is transcript content, not the box.
 const PI_FOOTER_WINDOW: usize = 6;
 
-/// Non-empty position (1 = bottom) of the input box's topmost rule, or
-/// `None` when the pane shows no rule pair. Pi stacks two `────` rules
-/// around its input area and derivatives keep that furniture (omo separates
-/// them with the prompt line), so the second rule counting from the bottom
-/// is the stable anchor; rule lines drawn by transcript content sit higher
-/// and are never reached.
-fn input_box_topmost_rule_depth(non_empty_lines: &[&str]) -> Option<usize> {
+/// How many non-empty lines above the input box's rule anchor the
+/// `esc to interrupt` hint scan covers. Plain pi puts its busy line directly
+/// above the box (anchor + 1); the omo frame in #3475 stacks it behind two
+/// tip lines (anchor + 3). The value is tuned to those captures rather than
+/// derived: sweeping the tip-line count shows the busy line drops out of the
+/// band at three tips, so a derivative carrying one more line of furniture
+/// between its busy line and its box reopens #3475 and widens this by one.
+/// The failure is bounded and degrades to Idle, unlike a window over the
+/// whole tail.
+const PI_HINT_BAND_ABOVE_BOX: usize = 3;
+
+/// Non-empty position (1 = bottom) of the second rule counting from the
+/// bottom, or `None` when the pane shows fewer than two rules. Pi stacks two
+/// `────` rules around its input area and derivatives keep that furniture
+/// (omo separates them with the prompt line), so with the box in the capture
+/// this is the box's topmost rule and rule lines drawn by transcript content
+/// sit higher and are never reached. With the box off-capture it can return a
+/// prose line instead, since pi renders a markdown `---` as the same glyph
+/// run, which is why callers reject an anchor deeper than the footer.
+fn input_box_rule_anchor_depth(non_empty_lines: &[&str]) -> Option<usize> {
     let is_rule = |line: &str| {
         let trimmed = line.trim();
         trimmed.chars().count() >= 3 && trimmed.chars().all(|c| c == '─')
@@ -1879,11 +1892,12 @@ fn input_box_topmost_rule_depth(non_empty_lines: &[&str]) -> Option<usize> {
 /// #443", "reading the file") and a scrollback frame can still hold a
 /// spinner glyph, so scanning the last 30 lines for those substrings pinned
 /// the session on Running forever. The `esc to interrupt` hint is bound to
-/// the input box instead of a line count: the scan covers the three
-/// non-empty lines above the box's rule anchor, where plain pi puts its
-/// busy line (directly above the rule) and where derivatives aliased via
-/// `agent_detect_as = pi` stack theirs behind up to two tip lines (#3475),
-/// so response prose above the box top stays out of reach. An anchor deeper
+/// the input box instead of a line count: the scan covers the
+/// `PI_HINT_BAND_ABOVE_BOX` non-empty lines above the box's rule anchor,
+/// where plain pi puts its busy line (directly above the rule) and where
+/// derivatives aliased via `agent_detect_as = pi` stack theirs behind up to
+/// two tip lines (#3475), so response prose above the box top stays out of
+/// reach. An anchor deeper
 /// than the footer is treated as transcript content and falls back to the
 /// footer window, so a response drawing its own rules with the input box
 /// off-capture cannot float the band to unbounded depth. The footer
@@ -1905,22 +1919,22 @@ pub fn detect_pi_status(raw_content: &str) -> Status {
         return Status::Running;
     }
 
-    // The hint region is the three non-empty lines above the input box's
-    // rule anchor: plain pi puts its busy line directly above the box and
-    // derivatives stack up to two tip lines between busy line and box
-    // (#3475), while response prose always sits above that band. An anchor
+    // The hint region is the `PI_HINT_BAND_ABOVE_BOX` non-empty lines above
+    // the input box's rule anchor: plain pi puts its busy line directly above
+    // the box and derivatives stack up to two tip lines between busy line and
+    // box (#3475), while response prose always sits above that band. An anchor
     // deeper than the footer is rejected: the box is footer furniture, so a
     // deeper rule pair is transcript prose drawing the same glyph run (pi
     // renders a markdown `---` that way), and without the ceiling the band
     // floats to unbounded depth. Panes without a usable rule pair (odd
     // wrappers, synthetic captures, an off-capture box) keep the pre-#3475
     // footer-only hint check.
-    let hint_region = match input_box_topmost_rule_depth(&non_empty_lines)
+    let hint_region = match input_box_rule_anchor_depth(&non_empty_lines)
         .filter(|depth| *depth <= PI_FOOTER_WINDOW)
     {
         Some(rule_depth) => {
             let above_box = &non_empty_lines[..non_empty_lines.len() - rule_depth];
-            tail_lines(above_box, 3).to_vec()
+            tail_lines(above_box, PI_HINT_BAND_ABOVE_BOX).to_vec()
         }
         None => tail_lines(&non_empty_lines, PI_FOOTER_WINDOW).to_vec(),
     };
