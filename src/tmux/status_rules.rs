@@ -272,13 +272,18 @@ impl ProfileRegistryGuard {
     /// resolve would normalize to whatever is configured then, not to this
     /// snapshot's frozen key.
     ///
-    /// The aliases and rules phases each lock their own map, so the guard is
-    /// rollback, not mutual exclusion: a concurrent writer for the same
-    /// profile can interleave and leave a half-swapped pair. The test cohort
-    /// that resolves or installs `default` shares serial_test's default key;
-    /// writers on dedicated profiles may run concurrently because their map
-    /// keys are disjoint. This caller-side exclusion is what makes the two-map
-    /// snapshot coherent. The guard covers exactly these two registries and
+    /// The aliases and rules phases each lock their own map, so this guard is
+    /// rollback, not mutual exclusion: a writer touching the same profile
+    /// between the phases can leave a half-swapped pair standing. Guarding a
+    /// profile nothing else writes therefore needs nothing more, since the
+    /// keys never overlap; guarding a profile other tests write needs those
+    /// writers held off, and a config resolve counts as a write. One known
+    /// case that is not held off: the serve-gated `#[tokio::test]` functions
+    /// in `src/acp/acp_client.rs` reach this registry through
+    /// `resolved_acp_config` and write `default` outside serial_test's default
+    /// key, so a `take("default")` can be raced under `--features serve`.
+    /// Audit the writers of the profile you guard rather than assuming a group
+    /// already covers them. The guard covers exactly these two registries and
     /// only its caller's writes; a future process-global needs its own restore
     /// mechanism.
     pub(crate) fn take(profile: &str) -> Self {
