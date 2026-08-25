@@ -4299,6 +4299,9 @@ struct PassiveTransitionDecision {
     /// intra-doc link that would degrade to literal text under
     /// `cargo doc`).
     patch: Option<crate::session::PassiveStatusPatch>,
+    /// Always `false` for structured / ACP sessions: `should_mark_acp_unread`,
+    /// driven off the live ACP turn-end event, is the sole producer of their
+    /// automatic mark. See the gate in `decide_passive_transition`.
     mark_unread: bool,
 }
 
@@ -4306,9 +4309,9 @@ struct PassiveTransitionDecision {
 /// `status` differs from the tick's `prev` snapshot. The full
 /// contract lives on the return type at [`PassiveTransitionDecision`]:
 /// `patch: None` for structured / ACP sessions (the ACP overlay is the
-/// sole authority), and `mark_unread: true` only on genuine
-/// Running -> Idle when unread is enabled and the row is not already
-/// unread.
+/// sole authority), and `mark_unread: true` only on a genuine
+/// Running -> Idle for a *terminal* session when unread is enabled and the
+/// row is not already unread.
 fn decide_passive_transition(
     inst: &Instance,
     old_status: Status,
@@ -4316,7 +4319,14 @@ fn decide_passive_transition(
 ) -> PassiveTransitionDecision {
     let patch =
         (!inst.is_structured()).then(|| crate::session::PassiveStatusPatch::from_instance(inst));
+    // Structured rows are excluded for the same reason as the patch: the poll
+    // loop has no authority over a paneless row, and since #3162 one never
+    // reaches here anyway (it compares equal to `prev`, so `observed_transitions`
+    // does not report it). `should_mark_acp_unread`, driven off the live ACP
+    // `Stopped` event, is the sole producer for them; the gate is what stops a
+    // later change to this loop from quietly re-marking from two daemon paths.
     let mark_unread = unread_enabled
+        && !inst.is_structured()
         && old_status == Status::Running
         && inst.status == Status::Idle
         && !inst.unread;
@@ -5621,7 +5631,7 @@ async fn acp_event_listener(state: Arc<AppState>) {
 
         // Acquire `instances` once for both branches. Releases before
         // the (potentially blocking) sessions.json save.
-        let profile_to_save = {
+        let (profile_to_save, unread_profile) = {
             let mut instances = state.instances.write().await;
             let Some(inst) = instances.iter_mut().find(|i| i.id == frame.session_id) else {
                 continue;
@@ -5630,9 +5640,74 @@ async fn acp_event_listener(state: Arc<AppState>) {
                 continue;
             }
 
+            // Snapshotting around the call is exactly "the transition
+            // `apply_status_intent` actually applied": it assigns `status` in
+            // one place and every rejected or no-op path (the trashed /
+            // Deleting / Creating guard, the Stopped guard, the ineligible
+            // HealError guard, `status == target`) leaves it untouched. We hold
+            // the write lock across both reads, so nothing else can move it in
+            // between. A future refactor that makes `apply_status_intent`
+            // assign `status` more than once has to revisit this.
+            let old_status = inst.status;
             apply_status_intent(inst, status_intent, &state.status_tx);
-            apply_acp_session_change(inst, &frame.session_id, acp_change.as_ref())
+            let unread_profile =
+                should_mark_acp_unread(inst, old_status, crate::session::unread_enabled())
+                    .then(|| inst.source_profile.clone());
+
+            (
+                apply_acp_session_change(inst, &frame.session_id, acp_change.as_ref()),
+                unread_profile,
+            )
         };
+
+        // The turn just finished, so the row takes the automatic unread mark.
+        // This is the sole producer of it for a structured row. The tmux poll
+        // loop has no authority over a paneless one, which is why #3162 stopped
+        // it reporting phantom transitions for them and so left this gap; the
+        // TUI's passive path is gated off them to keep the boolean single-writer.
+        //
+        // The write has to be durable. `reload_state_instances_from_disk` rebases
+        // every row on the disk row on each 2s tick and `merge_runtime_fields`
+        // does not carry `unread`, so an in-memory-only mark is gone within two
+        // seconds. Memory is mirrored only after the write lands, the same
+        // ordering `flush_passive_transition_writes` uses (#2755) and for the
+        // same reason: a mark that exists only in daemon memory is served over
+        // `/api/sessions`, mirrored into the TUI, and then silently dropped by
+        // the next reload.
+        //
+        // Deliberately not folded into the `profile_to_save` save below:
+        // `derive_acp_session_change` yields nothing for `Event::Stopped`, so an
+        // identity change and a turn-end can never arrive on the same event and
+        // there is no atomicity to win.
+        //
+        // No per-instance lock. A concurrent `PATCH /api/sessions/:id/unread`
+        // clear cannot be lost to this write: `should_mark_acp_unread` requires
+        // the row to be read at decision time, and until the mirror below runs
+        // it still reads as read everywhere, so the reactive clears (the
+        // dashboard's active-session effect, the TUI's unread dwell) cannot have
+        // fired yet. A clear racing this window is therefore a no-op on an
+        // already-read row, and marking after it is the chronologically correct
+        // outcome: the turn did finish afterwards.
+        if let Some(profile) = unread_profile {
+            let persist_id = frame.session_id.clone();
+            let persisted = api::persist_session_update(
+                profile,
+                "acp turn-end unread",
+                state.file_watch.clone(),
+                move |instances| {
+                    if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                        inst.mark_unread();
+                    }
+                },
+            )
+            .await;
+            if persisted.is_ok() {
+                let mut instances = state.instances.write().await;
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == frame.session_id) {
+                    inst.mark_unread();
+                }
+            }
+        }
 
         // Persist `acp_session_id` to disk if the field changed.
         // Sync FS (file copy + JSON write) goes through spawn_blocking
@@ -5791,6 +5866,32 @@ pub(crate) fn apply_status_intent(
         new: target,
         at: now,
     });
+}
+
+/// Whether a structured row whose ACP status just moved should take the
+/// automatic unread mark, i.e. whether its turn just finished.
+///
+/// `inst` is the row *after* [`apply_status_intent`] ran and `old_status` is
+/// the snapshot taken before it. The predicate is deliberately byte-identical
+/// to the one in [`decide_passive_transition`] and in the TUI's
+/// `apply_status_update`, so "a turn just finished" means the same thing on
+/// every surface.
+///
+/// `Running -> Idle` is the whole edge. An approval or elicitation excursion
+/// comes back through `Set(Running)` (`ApprovalResolved` /
+/// `ElicitationResolved`) before the turn's `Stopped`, so an answered-then-
+/// completed turn still ends on this edge and needs no case of its own. A
+/// direct `Waiting -> Idle` means the turn stopped while still blocked on the
+/// user, who is by construction present for it. Every `Stopped` reason maps to
+/// `Idle`, so a rate-limit park marks unread too; that is the same policy
+/// terminal sessions get, and a parked session does want attention.
+#[cfg(feature = "serve")]
+fn should_mark_acp_unread(inst: &Instance, old_status: Status, unread_enabled: bool) -> bool {
+    unread_enabled
+        && inst.is_structured()
+        && old_status == Status::Running
+        && inst.status == Status::Idle
+        && !inst.unread
 }
 
 /// Fold a derived `AcpSessionChange` into an `Instance`. Returns the
@@ -7888,6 +7989,127 @@ mod tests {
             !decision.mark_unread,
             "already-unread sessions must not re-mark"
         );
+
+        // #3181: a structured row's turn-end mark belongs to the live ACP
+        // listener (`should_mark_acp_unread`), so the poll loop must not also
+        // produce it. Paired with
+        // `tick_reports_no_transition_for_a_structured_phantom` above, which
+        // covers the other half: the tick never even reports such a row, so a
+        // read structured session cannot be re-marked seconds after the user
+        // read it (the #3162 defect).
+        let mut structured = Instance::new("acp-session", "/tmp/test");
+        structured.view = crate::session::View::Structured;
+        structured.status = Status::Idle;
+        let decision = decide_passive_transition(&structured, Status::Running, true);
+        assert!(
+            !decision.mark_unread,
+            "structured turn-end unread is owned by the acp event listener"
+        );
+    }
+
+    /// #3181: the automatic mark's predicate for a structured row, driven off
+    /// the live ACP turn-end event. One table rather than a test per case, per
+    /// the repo's compile-cost rule.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn should_mark_acp_unread_only_on_a_structured_running_to_idle_turn_end() {
+        // (name, structured, old_status, new_status, unread_enabled, already_unread, expected)
+        let cases = [
+            (
+                "turn finished",
+                true,
+                Status::Running,
+                Status::Idle,
+                true,
+                false,
+                true,
+            ),
+            // The turn stopped while still blocked on the user, who is by
+            // construction present for it; an answered approval comes back
+            // through Running first, so this is not the answered-then-completed
+            // path.
+            (
+                "still blocked on the user",
+                true,
+                Status::Waiting,
+                Status::Idle,
+                true,
+                false,
+                false,
+            ),
+            (
+                "crashed, not finished",
+                true,
+                Status::Running,
+                Status::Error,
+                true,
+                false,
+                false,
+            ),
+            (
+                "turn starting",
+                true,
+                Status::Idle,
+                Status::Running,
+                true,
+                false,
+                false,
+            ),
+            (
+                "no transition applied",
+                true,
+                Status::Running,
+                Status::Running,
+                true,
+                false,
+                false,
+            ),
+            (
+                "feature off",
+                true,
+                Status::Running,
+                Status::Idle,
+                false,
+                false,
+                false,
+            ),
+            // Re-marking would churn the flock once per turn, and would undo a
+            // read the user has not been given a new turn to earn.
+            (
+                "already unread",
+                true,
+                Status::Running,
+                Status::Idle,
+                true,
+                true,
+                false,
+            ),
+            // Terminal rows stay with the tmux poll loop's
+            // `decide_passive_transition`.
+            (
+                "terminal row, owned elsewhere",
+                false,
+                Status::Running,
+                Status::Idle,
+                true,
+                false,
+                false,
+            ),
+        ];
+        for (name, structured, old, new, enabled, already_unread, expected) in cases {
+            let mut inst = Instance::new(name, "/tmp/test");
+            if structured {
+                inst.view = crate::session::View::Structured;
+            }
+            // The helper reads the row *after* `apply_status_intent` ran.
+            inst.status = new;
+            inst.unread = already_unread;
+            assert_eq!(
+                should_mark_acp_unread(&inst, old, enabled),
+                expected,
+                "{name}"
+            );
+        }
     }
 
     // #2755 (follow-up to #2729): the poller must not strand an in-memory
