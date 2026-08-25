@@ -20413,3 +20413,80 @@ fn every_view_mode_paints_the_same_sunk_row_decoration() {
         }
     }
 }
+
+/// Regression: the TUI paint path must never fork tmux, no matter how cold
+/// the shared snapshots are. Every tmux question a frame needs is answered
+/// from `SESSION_CACHE` / `PANE_META_CACHE` by a background poller and from
+/// `LiveCaptureWorker` frames; this walks Structured / Terminal / Tool view
+/// modes across an empty cache, a fresh-but-absent snapshot, and an expired
+/// one (the states that used to trigger synchronous refreshes from render)
+/// and counts forks on the paint thread via the probe at
+/// `tmux_command()`. Worker threads are NOT armed, so their legitimate
+/// captures don't count.
+#[test]
+#[serial]
+fn paint_never_forks_tmux_even_with_empty_absent_or_expired_caches() {
+    use crate::tui::styles::load_theme;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+    let theme = load_theme("empire");
+
+    let session_guard = crate::tmux::SessionCacheGuard::capture();
+    let pane_guard = crate::tmux::PaneMetaCacheGuard::capture();
+
+    let modes = [
+        ViewMode::Structured,
+        ViewMode::Terminal,
+        ViewMode::Tool("lazygit".to_string()),
+    ];
+    for mode in modes {
+        env.view.view_mode = mode.clone();
+        // Cache states: (session snapshot, pane snapshot). "Cold boot" is the
+        // never-refreshed state; "absent" is fresh but without our session;
+        // "expired" is populated but past CACHE_TTL. All three used to make
+        // paint refresh synchronously.
+        let states = [("cold-boot", 0), ("fresh-absent", 1), ("expired", 2)];
+        for (label, state) in states {
+            match state {
+                0 => {
+                    session_guard.force_unreachable();
+                    session_guard.force_stale();
+                    pane_guard.force_failed_refresh();
+                    pane_guard.force_stale();
+                }
+                1 => {
+                    session_guard.force_present(&["aoe_someone_elses_session"]);
+                    pane_guard.force_failed_refresh();
+                }
+                _ => {
+                    session_guard.force_present(&["aoe_someone_elses_session"]);
+                    session_guard.force_stale();
+                    pane_guard.force_failed_refresh();
+                    pane_guard.force_stale();
+                }
+            }
+
+            crate::tmux::fork_probe::take();
+            let _armed = crate::tmux::fork_probe::arm();
+            // Two frames: the first exercises cold paths (worker empty,
+            // debounces arming), the second steady state.
+            for _frame in 0..2 {
+                let backend = TestBackend::new(120, 40);
+                let mut terminal = Terminal::new(backend).unwrap();
+                terminal
+                    .draw(|f| env.view.render(f, f.area(), &theme, None, None, None))
+                    .unwrap();
+            }
+            let forks = crate::tmux::fork_probe::take();
+            assert_eq!(
+                forks, 0,
+                "{mode:?} with {label} caches: paint forked tmux {forks}x; \
+                 display answers must come from poller-refreshed snapshots"
+            );
+        }
+    }
+}
