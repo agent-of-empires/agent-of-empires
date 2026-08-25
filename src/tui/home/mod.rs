@@ -2519,7 +2519,7 @@ impl HomeView {
                 continue;
             }
 
-            inst.repair_session_id_poller_if_needed();
+            inst.repair_session_id_poller_if_needed(&live);
         }
 
         // Startup auto-recovery: kick off a worker pool to restart any
@@ -3648,8 +3648,14 @@ impl HomeView {
     /// [`Self::apply_session_id_updates`], which runs on every input/render
     /// wake while live views are open.
     pub fn repair_session_id_pollers(&mut self) {
+        // One observation for the whole walk. This runs on the `App::run` tick
+        // over every instance, so a per-item `list-sessions` fork scales with
+        // the store and lands on the thread that also serves keystrokes —
+        // profiling a store of a few hundred sessions put this path at the top
+        // of the main thread.
+        let live = crate::tmux::LiveSessionSnapshot::take();
         for instance in self.instances.values_mut() {
-            instance.repair_session_id_poller_if_needed();
+            instance.repair_session_id_poller_if_needed(&live);
         }
     }
 
