@@ -4476,6 +4476,14 @@ pub(crate) async fn reconcile_worktree_paths(state: &Arc<AppState>) {
         // reapplied under the write lock.
         let reconciled = match tokio::task::spawn_blocking(move || {
             let mut instance = snapshot;
+            // An empty profile resolves to the *default* profile rather than
+            // failing, which would aim the persist at another profile's
+            // sessions.json. The compare-and-set inside the reconcile makes
+            // that a no-op, but refuse outright rather than lean on it.
+            anyhow::ensure!(
+                !instance.source_profile.is_empty(),
+                "session has no source profile; refusing worktree path reconciliation"
+            );
             let storage = crate::session::Storage::open_unwatched(&instance.source_profile)?;
             let resolution =
                 crate::session::worktree_reconcile::reconcile_and_persist(&storage, &mut instance)?;

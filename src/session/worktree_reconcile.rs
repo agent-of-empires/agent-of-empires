@@ -113,8 +113,9 @@ pub fn resolve_worktree_path(
 /// Best-effort by design. Every non-`Moved` outcome, including a git failure,
 /// leaves the row exactly as it was and logs why, mirroring
 /// [`crate::session::trash::reconcile_trashed_location`]. Takes the `Storage`
-/// rather than deriving one from `inst.source_profile`, which only the TUI
-/// populates.
+/// rather than deriving one from `inst.source_profile`: `Storage::load` does
+/// not set that field, so on the CLI it is empty, and an empty profile resolves
+/// to the *default* profile rather than failing.
 pub fn reconcile_and_persist(
     storage: &Storage,
     inst: &mut Instance,
@@ -122,6 +123,14 @@ pub fn reconcile_and_persist(
     let Some(info) = inst.worktree_info.clone() else {
         return Ok(WorktreePathResolution::Current);
     };
+    // A trashed session's directory belongs to [`crate::session::trash`], which
+    // relocates the checkout into a holding dir and back and keeps its own
+    // pre-trash marker alongside `project_path`. Both surfaces that run this
+    // pass run the trash reconcile first, and repointing a row it owns (or one
+    // whose relocation it just failed to complete) would fight it.
+    if inst.is_trashed() {
+        return Ok(WorktreePathResolution::Current);
+    }
     let recorded = PathBuf::from(&inst.project_path);
     if !info.managed_by_aoe || recorded.exists() {
         return Ok(WorktreePathResolution::Current);
@@ -133,22 +142,20 @@ pub fn reconcile_and_persist(
         WorktreePathResolution::Moved(found) => {
             let id = inst.id.clone();
             let stale = inst.project_path.clone();
-            let found_str = found.to_string_lossy().into_owned();
+            let new_path = found.to_string_lossy().into_owned();
             // Compare and set. The git lookup runs without holding the storage
             // lock, so a peer process could have renamed or trashed this
             // session in the meantime; its path is fresher than ours and must
             // not be clobbered with a location we resolved from the old one.
             let applied = storage.update(|instances, _groups| {
-                Ok(instances
-                    .iter_mut()
-                    .find(|c| c.id == id)
-                    .is_some_and(|stored| {
-                        let fresh = stored.project_path == stale;
-                        if fresh {
-                            stored.project_path = found_str.clone();
-                        }
-                        fresh
-                    }))
+                let Some(stored) = instances.iter_mut().find(|c| c.id == id) else {
+                    return Ok(false);
+                };
+                if stored.project_path != stale {
+                    return Ok(false);
+                }
+                stored.project_path = new_path.clone();
+                Ok(true)
             })?;
             if !applied {
                 tracing::info!(
