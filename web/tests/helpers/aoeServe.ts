@@ -186,6 +186,31 @@ export async function listSessions(
 }
 
 /**
+ * Poll `GET /api/sessions` until at least one session is present, and
+ * return the snapshot the poll settled on. The list is a cache the
+ * daemon reconciles on a 2s tick (see `waitForView` below), so a fresh
+ * `listSessions()` issued right after a poll that already saw the
+ * session can come back empty; reading the array from inside the poll
+ * removes that second, racy fetch.
+ */
+export async function waitForSessions(
+  baseUrl: string,
+  timeout = 15_000,
+): Promise<Awaited<ReturnType<typeof listSessions>>> {
+  let settled: Awaited<ReturnType<typeof listSessions>> = [];
+  await expect
+    .poll(
+      async () => {
+        settled = await listSessions(baseUrl);
+        return settled.length;
+      },
+      { timeout },
+    )
+    .toBeGreaterThan(0);
+  return settled;
+}
+
+/**
  * Poll `GET /api/sessions` until the given session's `view` reaches
  * `expected`. The sessions list is a cache the daemon reconciles on a
  * 2s tick, so a disk snapshot taken just before an endpoint's write

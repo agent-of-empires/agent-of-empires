@@ -4,7 +4,7 @@
 
 import { basename, dirname } from "node:path";
 import { test as base, expect } from "@playwright/test";
-import { listSessions, spawnAoeServe } from "../helpers/aoeServe";
+import { spawnAoeServe, waitForSessions } from "../helpers/aoeServe";
 
 base("scratch happy path: launch creates a scratch-dir session", async ({ page }, testInfo) => {
   const serve = await spawnAoeServe({
@@ -30,13 +30,7 @@ base("scratch happy path: launch creates a scratch-dir session", async ({ page }
     // whose parent directory basename is "scratch" (the harness isolates
     // the app dir under a per-worker temp tree, so we assert structure
     // rather than absolute location).
-    await expect
-      .poll(async () => (await listSessions(serve.baseUrl)).length, {
-        timeout: 15_000,
-      })
-      .toBeGreaterThan(0);
-
-    const sessions = await listSessions(serve.baseUrl);
+    const sessions = await waitForSessions(serve.baseUrl);
     expect(sessions).toHaveLength(1);
     const session = sessions[0]!;
     expect(session.scratch).toBe(true);

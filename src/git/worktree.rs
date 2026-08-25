@@ -1871,6 +1871,9 @@ mod tests {
         std::fs::create_dir(&real_parent).unwrap();
         let linked_parent = dir.path().join("linked");
         std::os::unix::fs::symlink(&real_parent, &linked_parent).unwrap();
+        // macOS hands out temp dirs under `/var`, itself a symlink to
+        // `/private/var`, so the expectation has to be canonical too.
+        let real_parent = real_parent.canonicalize().unwrap();
         let from = linked_parent.join("old");
         std::fs::create_dir(&from).unwrap();
         let to = linked_parent.join("new");
