@@ -7110,6 +7110,8 @@ mod tests {
     /// goes to pane 0 alone, so a pointer over a neighbouring pane must not be
     /// mapped against the full rect: that reported a column past pane 0's right
     /// edge to the agent as though its own pane were window-wide.
+    /// It also round-trips a painted composite cursor cell through mouse mapping,
+    /// pinning the bottom-follow clipping semantics.
     #[test]
     fn composited_preview_maps_the_mouse_into_pane_zero_only() {
         use ratatui::layout::Rect;
