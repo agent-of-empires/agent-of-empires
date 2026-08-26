@@ -254,6 +254,16 @@ pub(super) struct GroupRenameContext {
     pub(super) old_profile: String,
 }
 
+/// Destination for a response from the shared permission dialog.
+pub(super) enum PermissionResponseTarget {
+    Terminal(String),
+    #[cfg(feature = "serve")]
+    Structured {
+        session_id: String,
+        nonce: String,
+    },
+}
+
 /// View mode for the home screen
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum ViewMode {
@@ -567,9 +577,8 @@ pub struct HomeView {
     pub(super) tips_badge_hovered: bool,
     pub(super) send_message_dialog: Option<super::dialogs::SendMessageDialog>,
     pub(super) permission_response_dialog: Option<super::dialogs::PermissionResponseDialog>,
-    /// Session to receive the permission-response keystrokes once the
-    /// dialog resolves.
-    pub(super) pending_permission_response_session: Option<String>,
+    /// Destination for the response once the dialog resolves.
+    pub(super) pending_permission_response: Option<PermissionResponseTarget>,
     /// Session to receive the message from the send dialog
     pub(super) pending_send_session: Option<String>,
     /// Which pane the pending send-message dialog will target. Set
@@ -727,11 +736,16 @@ pub struct HomeView {
     pub(super) pending_status_refresh: bool,
 
     // Structured (ACP) rows: the tmux poller above bails on them, so their
-    // status comes from the daemon instead. See `daemon_status_poller`.
+    // status and pending approval nonces come from the daemon instead. See
+    // `daemon_status_poller`.
     #[cfg(feature = "serve")]
     pub(super) daemon_status_poller: super::daemon_status_poller::DaemonStatusPoller,
     #[cfg(feature = "serve")]
     pub(super) pending_daemon_status_refresh: bool,
+    #[cfg(feature = "serve")]
+    pub(super) structured_pending_approvals: HashMap<String, Vec<String>>,
+    #[cfg(feature = "serve")]
+    pub(super) structured_approval_poller: super::approval_poller::StructuredApprovalPoller,
 
     // Performance: background deletion
     pub(super) deletion_poller: DeletionPoller,
@@ -2194,7 +2208,7 @@ impl HomeView {
             tips_badge_hovered: false,
             send_message_dialog: None,
             permission_response_dialog: None,
-            pending_permission_response_session: None,
+            pending_permission_response: None,
             pending_send_session: None,
             pending_send_target: live_send::LiveSendTarget::Agent,
             pending_live_send_target: live_send::LiveSendTarget::Agent,
@@ -2243,6 +2257,10 @@ impl HomeView {
             daemon_status_poller: super::daemon_status_poller::DaemonStatusPoller::new(),
             #[cfg(feature = "serve")]
             pending_daemon_status_refresh: false,
+            #[cfg(feature = "serve")]
+            structured_pending_approvals: HashMap::new(),
+            #[cfg(feature = "serve")]
+            structured_approval_poller: super::approval_poller::StructuredApprovalPoller::new(),
             deletion_poller: DeletionPoller::new(),
             stop_poller: StopPoller::new(),
             trash_poller: crate::tui::trash_poller::TrashPoller::new(),
@@ -2938,15 +2956,23 @@ impl HomeView {
     ) {
         use crate::session::Status;
         use crate::tui::status_poller::IdleIntent;
-
-        // One lookup feeds both guards below and the Stopped-lift check.
-        let Some(inst) = self.get_instance(&update.id) else {
-            return;
+        let (is_structured, applies, was_stopped) = match self.get_instance(&update.id) {
+            Some(inst) => (
+                inst.is_structured(),
+                self.daemon_status_applies_to(inst),
+                inst.status == Status::Stopped,
+            ),
+            None => return,
         };
-        if !inst.is_structured() || !self.daemon_status_applies_to(inst) {
+        if !is_structured || !applies {
             return;
         }
-        let was_stopped = inst.status == Status::Stopped;
+        if update.pending_approval_nonces.is_empty() {
+            self.structured_pending_approvals.remove(&update.id);
+        } else {
+            self.structured_pending_approvals
+                .insert(update.id.clone(), update.pending_approval_nonces.clone());
+        }
         // Lift a locally-`Stopped` row before the shared apply path sees it.
         // `apply_status_update`'s guard drops every update whose row is
         // `Stopped`, which is right for tmux rows (nothing but an explicit
@@ -2980,14 +3006,101 @@ impl HomeView {
                     None => IdleIntent::Clear,
                 },
                 last_accessed_at: update.last_accessed_at,
-                // Structured rows have no pane, so the Attention sort's
-                // dead-pane tier never applies to them.
                 pane_dead: false,
                 live_status_baseline: Some(update.status),
             },
             true,
             true,
         );
+    }
+    /// Queue a structured approval response without blocking input handling.
+    #[cfg(feature = "serve")]
+    pub(super) fn resolve_structured_approval(
+        &mut self,
+        session_id: String,
+        nonce: String,
+        choice: crate::tui::dialogs::PermissionResponseChoice,
+    ) {
+        use crate::acp::protocol::ApprovalDecisionWire;
+
+        let decision = match choice {
+            crate::tui::dialogs::PermissionResponseChoice::Allow => ApprovalDecisionWire::Allow,
+            crate::tui::dialogs::PermissionResponseChoice::AllowAlways => {
+                ApprovalDecisionWire::AllowAlways
+            }
+            crate::tui::dialogs::PermissionResponseChoice::Deny => ApprovalDecisionWire::Deny,
+        };
+        self.remove_structured_pending_approval(&session_id, &nonce);
+        self.structured_approval_poller
+            .request_resolve(super::approval_poller::ApprovalRequest {
+                session_id,
+                nonce,
+                decision,
+            });
+    }
+
+    /// Apply completed structured approval requests without blocking the TUI.
+    #[cfg(feature = "serve")]
+    pub fn apply_structured_approval_results(&mut self) -> bool {
+        use super::approval_poller::StructuredApprovalPoller;
+        use std::sync::mpsc::TryRecvError;
+
+        let mut changed = false;
+        loop {
+            match self.structured_approval_poller.try_recv_result() {
+                Ok(result) => {
+                    changed = true;
+                    self.apply_structured_approval_result(result);
+                }
+                Err(TryRecvError::Empty) => return changed,
+                Err(TryRecvError::Disconnected) => {
+                    tracing::error!(
+                        target: "tui.home",
+                        "structured approval worker gone; respawning a fresh worker",
+                    );
+                    self.structured_approval_poller = StructuredApprovalPoller::new();
+                    self.pending_daemon_status_refresh = false;
+                    return true;
+                }
+            }
+        }
+    }
+    #[cfg(feature = "serve")]
+    fn remove_structured_pending_approval(&mut self, session_id: &str, nonce: &str) {
+        let remove_empty = self
+            .structured_pending_approvals
+            .get_mut(session_id)
+            .is_some_and(|nonces| {
+                nonces.retain(|pending| pending != nonce);
+                nonces.is_empty()
+            });
+        if remove_empty {
+            self.structured_pending_approvals.remove(session_id);
+        }
+    }
+
+    #[cfg(feature = "serve")]
+    fn apply_structured_approval_result(&mut self, result: super::approval_poller::ApprovalResult) {
+        use super::approval_poller::ApprovalResolution;
+
+        match result.resolution {
+            ApprovalResolution::Resolved | ApprovalResolution::Gone => {
+                self.remove_structured_pending_approval(&result.session_id, &result.nonce);
+            }
+            ApprovalResolution::Failed(error) => {
+                let nonces = self
+                    .structured_pending_approvals
+                    .entry(result.session_id)
+                    .or_default();
+                if !nonces.contains(&result.nonce) {
+                    nonces.insert(0, result.nonce);
+                }
+                self.info_dialog = Some(InfoDialog::new(
+                    "Respond Failed",
+                    &format!("Failed to resolve approval: {error}"),
+                ));
+            }
+        }
     }
 
     /// Apply a single status update from the poller. Extracted from the

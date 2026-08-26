@@ -58,7 +58,16 @@ impl PermissionResponseDialog {
         session_title: &str,
         allow_always: Option<&'static [crate::agents::KeyToken]>,
     ) -> Self {
-        let supports_allow_always = allow_always.is_some();
+        Self::with_allow_always(session_title, allow_always.is_some())
+    }
+
+    /// Construct the shared dialog for an ACP approval, which always supports
+    /// the protocol's AllowAlways decision.
+    pub fn structured(session_title: &str) -> Self {
+        Self::with_allow_always(session_title, true)
+    }
+
+    fn with_allow_always(session_title: &str, supports_allow_always: bool) -> Self {
         let choices = ALL_CHOICES
             .into_iter()
             .filter(|(_, choice)| {

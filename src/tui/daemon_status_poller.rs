@@ -32,6 +32,7 @@ pub(super) struct DaemonStatusUpdate {
     pub last_error: Option<String>,
     pub last_accessed_at: Option<chrono::DateTime<chrono::Utc>>,
     pub idle_entered_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub pending_approval_nonces: Vec<String>,
 }
 
 /// Subset of `/api/sessions`'s `SessionResponse` this poller reads.
@@ -57,6 +58,8 @@ struct DaemonSessionRow {
     #[serde(default)]
     idle_entered_at: Option<String>,
     #[serde(default)]
+    pending_approval_nonces: Vec<String>,
+    #[serde(default)]
     view: View,
 }
 
@@ -79,6 +82,7 @@ fn structured_updates(rows: Vec<DaemonSessionRow>) -> Vec<DaemonStatusUpdate> {
                 last_error: row.last_error,
                 last_accessed_at: parse_ts(row.last_accessed_at.as_deref()),
                 idle_entered_at: parse_ts(row.idle_entered_at.as_deref()),
+                pending_approval_nonces: row.pending_approval_nonces,
             })
         })
         .collect()
@@ -193,6 +197,7 @@ mod tests {
             last_error: None,
             last_accessed_at: None,
             idle_entered_at: None,
+            pending_approval_nonces: Vec::new(),
             view,
         }
     }
@@ -247,6 +252,7 @@ mod tests {
             last_error: Some("agent failed to start".into()),
             last_accessed_at: Some("2026-07-30T12:00:00Z".into()),
             idle_entered_at: None,
+            pending_approval_nonces: vec!["nonce-1".into()],
             view: View::Structured,
         }]);
         assert_eq!(updates[0].status, Status::Error);
@@ -256,6 +262,7 @@ mod tests {
         );
         assert!(updates[0].last_accessed_at.is_some());
         assert_eq!(updates[0].idle_entered_at, None);
+        assert_eq!(updates[0].pending_approval_nonces, ["nonce-1"]);
     }
 
     #[test]

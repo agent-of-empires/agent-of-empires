@@ -1,6 +1,8 @@
 //! Terminal User Interface module
 
 mod app;
+#[cfg(feature = "serve")]
+mod approval_poller;
 mod attach_project_poller;
 mod attached_status_hooks;
 pub(crate) mod clipboard;

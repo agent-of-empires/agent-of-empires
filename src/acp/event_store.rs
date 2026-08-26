@@ -1317,7 +1317,8 @@ impl EventStore {
                    FROM acp_events
                    WHERE session_id = ?1
                      AND json_extract(event_json, '$.ApprovalResolved') IS NOT NULL
-               )",
+               )
+             ORDER BY seq ASC",
         ) {
             Ok(s) => s,
             Err(e) => {

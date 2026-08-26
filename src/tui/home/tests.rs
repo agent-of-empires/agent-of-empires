@@ -18216,6 +18216,10 @@ mod stacked_single_seam {
 mod permission_response_dialog {
     use super::*;
     use crate::session::Status;
+    #[cfg(feature = "serve")]
+    use crate::tui::approval_poller::{ApprovalResolution, ApprovalResult};
+    #[cfg(feature = "serve")]
+    use crate::tui::home::PermissionResponseTarget;
 
     fn add_session_with_tool(view: &mut HomeView, title: &str, tool: &str) -> String {
         let mut inst = Instance::new(title, "/tmp/test");
@@ -18282,22 +18286,51 @@ mod permission_response_dialog {
         );
     }
 
+    #[cfg(feature = "serve")]
     #[test]
     #[serial]
-    fn structured_session_is_a_no_op() {
+    fn structured_session_reuses_the_permission_dialog() {
         let mut env = create_test_env_empty();
         let id = add_session_with_tool(&mut env.view, "session-one", "claude");
         env.view
             .mutate_instance(&id, |inst| inst.view = crate::session::View::Structured);
-        env.view.selected_session = Some(id);
+        env.view
+            .structured_pending_approvals
+            .insert(id.clone(), vec!["approval-1".to_string()]);
+        env.view.selected_session = Some(id.clone());
+
         let _ = env.view.handle_key(key(KeyCode::Char('a')), None);
+
         assert!(
-            env.view.permission_response_dialog.is_none(),
-            "structured (ACP) session must not open the tmux-keystroke dialog"
+            env.view.permission_response_dialog.is_some(),
+            "structured sessions must use the existing permission dialog"
         );
+        assert!(matches!(
+            env.view.pending_permission_response,
+            Some(PermissionResponseTarget::Structured { session_id, nonce })
+                if session_id == id && nonce == "approval-1"
+        ));
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    #[serial]
+    fn resolved_structured_approval_clears_a_nonce_reintroduced_by_polling() {
+        let mut env = create_test_env_empty();
+        let id = add_session_with_tool(&mut env.view, "session-one", "claude");
+        env.view
+            .structured_pending_approvals
+            .insert(id.clone(), vec!["approval-1".to_string()]);
+
+        env.view.apply_structured_approval_result(ApprovalResult {
+            session_id: id.clone(),
+            nonce: "approval-1".to_string(),
+            resolution: ApprovalResolution::Resolved,
+        });
+
         assert!(
-            env.view.info_dialog.is_none(),
-            "structured session no-op must be silent, not surface an info dialog"
+            !env.view.structured_pending_approvals.contains_key(&id),
+            "a completed resolution must clear a nonce reintroduced by polling"
         );
     }
 }
@@ -18438,6 +18471,7 @@ mod daemon_status_apply_tests {
             last_error: None,
             last_accessed_at: None,
             idle_entered_at: None,
+            pending_approval_nonces: Vec::new(),
         }
     }
 
@@ -18454,6 +18488,13 @@ mod daemon_status_apply_tests {
             env.view.get_instance(&id).map(|i| i.status),
             Some(Status::Running),
             "a Running turn on the daemon must move the TUI's pill"
+        );
+        assert_eq!(
+            env.view
+                .get_instance(&id)
+                .and_then(|inst| inst.live_status_baseline),
+            Some(Status::Running),
+            "daemon status updates must carry the structured status baseline"
         );
     }
 

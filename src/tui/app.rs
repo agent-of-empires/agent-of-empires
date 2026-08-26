@@ -1785,6 +1785,10 @@ impl App {
                     refresh_needed = true;
                     needs_full_refresh = true;
                 }
+                if self.home.apply_structured_approval_results() {
+                    refresh_needed = true;
+                    needs_full_refresh = true;
+                }
             }
 
             if self.home.apply_deletion_results() {

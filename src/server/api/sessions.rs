@@ -179,6 +179,12 @@ pub struct SessionResponse {
     /// structured view. See #1088.
     #[cfg(feature = "serve")]
     pub acp_worker_state: crate::acp::supervisor::AcpWorkerState,
+    /// Unresolved structured approval nonces in request order. The TUI uses
+    /// these only to route the existing permission-response dialog through the
+    /// ACP resolver; no dashboard surface renders them.
+    #[cfg(feature = "serve")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub pending_approval_nonces: Vec<String>,
     /// True when this session's agent can run in structured view: a built-in
     /// with an ACP adapter, or a custom agent whose profile config
     /// declares a valid `agent_acp_cmd`. The web terminal view reads
@@ -411,6 +417,8 @@ impl SessionResponse {
             view: inst.view,
             #[cfg(feature = "serve")]
             acp_worker_state,
+            #[cfg(feature = "serve")]
+            pending_approval_nonces: Vec::new(),
             // Built-in ACP capability is resolved here from a process-wide
             // registry (cheap, no IO). Custom agents depend on profile
             // config; the list and create handlers overlay that without a
@@ -668,7 +676,7 @@ pub async fn list_sessions(
                 .get(&inst.id)
                 .copied()
                 .unwrap_or(crate::acp::supervisor::AcpWorkerState::Absent);
-            SessionResponse::from_instance_with_plan(
+            let mut session = SessionResponse::from_instance_with_plan(
                 inst,
                 claude_fullscreen,
                 plan_summary,
@@ -677,7 +685,17 @@ pub async fn list_sessions(
                 next_wakeup_at,
                 next_wakeup_reason,
                 active_monitor,
-            )
+            );
+            #[cfg(feature = "serve")]
+            if structured_live {
+                session.pending_approval_nonces = state
+                    .acp_event_store
+                    .unresolved_approval_nonces(&inst.id)
+                    .into_iter()
+                    .map(|nonce| nonce.0)
+                    .collect();
+            }
+            session
         })
         .collect();
 
@@ -7736,6 +7754,42 @@ mod tests {
         .await;
         assert_eq!(ids(&explicit_all).len(), 3);
     }
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn list_sessions_includes_pending_structured_approval_nonces() {
+        use crate::acp::permissions::build_approval;
+        use crate::acp::state::ToolCall;
+        use crate::acp::Event;
+
+        let mut inst = Instance::new("pending-approval", "/tmp/pending-approval");
+        inst.id = "pending-approval".to_string();
+        inst.view = crate::session::View::Structured;
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+        let approval = build_approval(ToolCall {
+            id: "tool-1".to_string(),
+            name: "shell".to_string(),
+            kind: "execute".to_string(),
+            args_preview: "echo hello".to_string(),
+            started_at: chrono::Utc::now(),
+            parent_tool_call_id: None,
+            memory_recall: None,
+            diffs: Vec::new(),
+        });
+        let nonce = approval.nonce.0.clone();
+        state
+            .acp_event_store
+            .record(&id, 1, &Event::ApprovalRequested { approval })
+            .expect("record pending approval");
+
+        let response = list_sessions(
+            axum::extract::State(state),
+            axum::extract::Query(ListSessionsQuery { state: None }),
+        )
+        .await;
+
+        assert_eq!(response.sessions[0].pending_approval_nonces, [nonce]);
+    }
 
     #[cfg(feature = "serve")]
     #[tokio::test]
@@ -10328,6 +10382,8 @@ mod workspace_ordering_tests {
             view: crate::session::View::Terminal,
             #[cfg(feature = "serve")]
             acp_worker_state: crate::acp::supervisor::AcpWorkerState::Absent,
+            #[cfg(feature = "serve")]
+            pending_approval_nonces: Vec::new(),
             #[cfg(feature = "serve")]
             acp_capable: false,
             #[cfg(feature = "serve")]
