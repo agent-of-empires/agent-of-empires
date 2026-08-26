@@ -2461,11 +2461,21 @@ impl HomeView {
 
         // Batch-sync instance IDs and captured session IDs to tmux hidden env
         // so that build_exclusion_set() on other AoE instances can see them.
+        // One observation for both per-instance walks below. They visit every
+        // instance in the view, so a per-item `list-sessions` fork scales with
+        // the whole store, measured as the dominant tmux cost of this pass on
+        // a store of a few hundred sessions.
+        let live = crate::tmux::LiveSessionSnapshot::new();
         {
             let mut set_batch: Vec<(String, String, String)> = Vec::new();
             let mut unset_batch: Vec<(String, String)> = Vec::new();
             for inst in view.instances.values() {
-                let Some(tmux_name) = inst.tmux_env_session_name() else {
+                // This publication is one-shot: no reload re-runs it and a
+                // poller does not re-emit an unchanged sid, so a row dropped
+                // here stays unpublished until an unrelated sid change or a
+                // relaunch. A snapshot that could not reach the server is
+                // therefore probed per row rather than read as "no live pane".
+                let Some(tmux_name) = inst.tmux_env_session_name_in_or_probe(&live) else {
                     continue;
                 };
 
@@ -2509,12 +2519,12 @@ impl HomeView {
 
         // Recover session IDs for pre-existing sessions via pollers.
         for inst in view.instances.values_mut() {
-            let has_live_tmux = inst.has_live_tmux_pane();
+            let has_live_tmux = inst.has_live_tmux_pane_in(&live);
             if !has_live_tmux {
                 continue;
             }
 
-            inst.repair_session_id_poller_if_needed();
+            inst.repair_session_id_poller_if_needed(&live);
         }
 
         // Startup auto-recovery: kick off a worker pool to restart any
@@ -3129,13 +3139,13 @@ impl HomeView {
     }
 
     /// Fold one daemon-sourced structured status into the shared apply path,
-    /// so sounds, status hooks, and unread marking behave exactly as they do
-    /// for a tmux-derived transition. The `sessions.json` status patch is the
-    /// one deliberate exception: this path only handles structured rows, and
-    /// `persist_passive_status_transition` skips the passive status patch for
-    /// `is_structured()` (only the unread mark persists there), since a
-    /// structured row's status is a daemon-side overlay with no durable owner.
-    /// See #3201.
+    /// so sounds and status hooks fire exactly as they do for a tmux-derived
+    /// transition. Persistence is the deliberate exception: this path only
+    /// handles structured rows, and nothing about one is the TUI's to write, so
+    /// `persist_passive_status_transition` returns early for `is_structured()`.
+    /// The status is a daemon-side overlay with no durable owner (#3201), and
+    /// the automatic unread mark is the daemon's too, written from the live ACP
+    /// turn-end event (#3181).
     ///
     /// The row is re-checked against `is_structured()` here rather than
     /// trusted from the wire: the daemon's `view` and the local row's could
@@ -3302,9 +3312,26 @@ impl HomeView {
                     // Skip when already unread (the mark is a no-op) so a
                     // re-finishing session doesn't churn the flock once
                     // per turn.
-                    let already_unread =
-                        self.get_instance(&update.id).is_some_and(|i| i.is_unread());
+                    let (already_unread, structured) = self
+                        .get_instance(&update.id)
+                        .map(|i| (i.is_unread(), i.is_structured()))
+                        .unwrap_or((false, false));
+                    // Structured rows are the daemon's: `should_mark_acp_unread`
+                    // marks them off the live ACP turn-end event and persists it
+                    // there (#3181). Marking here too would be a second writer of
+                    // the same boolean for no gain, and `is_live_target` cannot
+                    // even earn its keep on one: `start_live_send` returns `None`
+                    // outright for `is_structured()` (`home/input.rs`, matched by
+                    // the guard in `app.rs`), so the exemption is always inert for
+                    // them. Note it is that explicit guard which makes it inert,
+                    // not the absence of a pane: a structured row can own paired
+                    // terminal and tool panes, so `LiveSendTarget` alone would not
+                    // rule live-send out. What clears the mark for a structured
+                    // row the user is actually reading is `tick_unread_dwell`,
+                    // which re-checks `is_unread()` every tick and so picks up a
+                    // daemon-written mark on the row under the cursor.
                     let should_mark_unread = crate::session::unread_enabled()
+                        && !structured
                         && old == Status::Running
                         && new_status == Status::Idle
                         && !is_live_target
@@ -3643,8 +3670,14 @@ impl HomeView {
     /// [`Self::apply_session_id_updates`], which runs on every input/render
     /// wake while live views are open.
     pub fn repair_session_id_pollers(&mut self) {
+        // One observation for the whole walk. This runs on the `App::run` tick
+        // over every instance, so a per-item `list-sessions` fork scales with
+        // the store and lands on the thread that also serves keystrokes.
+        // Profiling a store of a few hundred sessions put this path at the top
+        // of the main thread.
+        let live = crate::tmux::LiveSessionSnapshot::new();
         for instance in self.instances.values_mut() {
-            instance.repair_session_id_poller_if_needed();
+            instance.repair_session_id_poller_if_needed(&live);
         }
     }
 
@@ -3957,11 +3990,11 @@ impl HomeView {
         };
 
         let mut candidates: Vec<crate::session::Instance> = Vec::new();
-        // Single fallible tmux probe instead of per-instance
-        // `inst.has_live_tmux_pane()` calls. On Err: skip recovery this
-        // launch (a transient tmux glitch must NOT collapse to "all panes
-        // dead" and trigger phantom cascades). Bonus: one subprocess call
-        // regardless of instance count (was 1-2 per instance).
+        // Single fallible tmux probe instead of a per-instance liveness
+        // lookup. On Err: skip recovery this launch (a transient tmux glitch
+        // must NOT collapse to "all panes dead" and trigger phantom
+        // cascades). Bonus: one subprocess call regardless of instance count
+        // (was 1-2 per instance).
         let pane_meta = match crate::tmux::batch_pane_metadata() {
             Ok(map) => map,
             Err(e) => {
@@ -6878,7 +6911,8 @@ impl HomeView {
     /// `mark_unread` folds the Running -> Idle unread mark into the same
     /// `Storage::update` call instead of a second flock round-trip on the
     /// same row in the same tick, matching the daemon's per-tick batching
-    /// shape in `status_poll_loop`.
+    /// shape in `status_poll_loop`. Terminal rows only; see the
+    /// `is_structured()` return below.
     pub(super) fn persist_passive_status_transition(&self, id: &str, mark_unread: bool) {
         let Some(inst) = self.instances.get(id) else {
             return;
@@ -6886,32 +6920,31 @@ impl HomeView {
         let Some(storage) = self.storages.get(&inst.source_profile) else {
             return;
         };
-        // Structured rows are not durable: their status is a daemon-side
-        // overlay rebuilt from live worker state (`apply_acp_overlay_inplace`)
-        // and re-derived at daemon boot by `seed_acp_statuses`. The daemon's
-        // own passive writer gates the status patch on exactly this predicate
+        // A structured row has nothing for the TUI to persist, so bail before
+        // taking the flock at all.
+        //
+        // Its status is not durable: that is a daemon-side overlay rebuilt from
+        // live worker state (`apply_acp_overlay_inplace`) and re-derived at
+        // daemon boot by `seed_acp_statuses`, and the daemon's own passive
+        // writer gates the patch on exactly this predicate
         // (`decide_passive_transition` returns `patch: None` for
-        // `is_structured()`, `server/mod.rs`). Persisting it here would strand
-        // a row at `Running` or `Error` with no producer left to heal it once
-        // the daemon is gone, since the tmux poller now bails on structured
-        // rows (`status_poller.rs`); this is the #3201 regression from #3170.
-        // The unread mark is deliberately NOT gated: the daemon marks a
-        // structured row unread on a Running -> Idle turn (its `mark_unread` is
-        // not gated on `is_structured`), so mirroring it here keeps the two
-        // producers symmetric.
-        let structured = inst.is_structured();
-        // Pure optimization, not a correctness gate: a structured row with
-        // nothing to mark unread has no patch and no unread write, so skip the
-        // empty-write flock round-trip entirely.
-        if structured && !mark_unread {
+        // `is_structured()`, `server/mod.rs`). Persisting it here would strand a
+        // row at `Running` or `Error` with no producer left to heal it once the
+        // daemon is gone, since the tmux poller now bails on structured rows
+        // (`status_poller.rs`); this is the #3201 regression from #3170.
+        //
+        // Its unread mark is not ours either, as of #3181: the daemon writes it
+        // from the live ACP turn-end event (`should_mark_acp_unread`), and the
+        // caller's predicate is gated on `!structured` to match. So `mark_unread`
+        // is only ever `false` here for a structured row and this return is
+        // total, not an optimization.
+        if inst.is_structured() {
             return;
         }
-        let patch = (!structured).then(|| crate::session::PassiveStatusPatch::from_instance(inst));
+        let patch = crate::session::PassiveStatusPatch::from_instance(inst);
         if let Err(e) = storage.update(|insts, _groups| {
             if let Some(disk) = insts.iter_mut().find(|i| i.id == id) {
-                if let Some(patch) = &patch {
-                    disk.merge_passive_status_patch(id, patch);
-                }
+                disk.merge_passive_status_patch(id, &patch);
                 if mark_unread {
                     disk.mark_unread();
                 }

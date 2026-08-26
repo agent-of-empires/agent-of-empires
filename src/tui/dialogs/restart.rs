@@ -16,8 +16,8 @@ use super::DialogResult;
 use crate::session::profile_config::resolve_config_or_warn;
 use crate::tui::components::hover::{paint_hover_bg, HoverState};
 use crate::tui::components::{
-    handle_tool_config_key, profile_cycler_spans, render_tool_config_overlay,
-    tool_config_suffix_spans, tool_cycler_spans, tool_lifecycle_spans, ToolConfigOutcome,
+    handle_tool_config_key, profile_cycler_spans, render_tool_config_overlay, tool_cycler_spans,
+    tool_row_suffix_spans, ToolConfigOutcome,
 };
 use crate::tui::styles::Theme;
 
@@ -518,16 +518,10 @@ impl RestartDialog {
         );
         let has_config =
             !self.extra_args.value().is_empty() || !self.command_override.value().is_empty();
-        // Lifecycle is the load-bearing status: append it before the config
-        // metadata. The compact configured hint keeps (configured) Ctrl+P
-        // visible in the dialog's real 60-column inner width.
-        let lifecycle_spans = tool_lifecycle_spans(value, theme);
-        let compact_config = !lifecycle_spans.is_empty();
-        spans.extend(lifecycle_spans);
-        spans.extend(tool_config_suffix_spans(
+        spans.extend(tool_row_suffix_spans(
+            value,
             has_config,
             self.is_tool_field(),
-            compact_config,
             theme,
         ));
         frame.render_widget(Paragraph::new(Line::from(spans)), area);

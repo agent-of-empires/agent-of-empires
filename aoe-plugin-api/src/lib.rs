@@ -40,8 +40,9 @@ pub use manifest::{
 /// actions; 9 when the host gained ACP-capability discovery, host-owned
 /// session creation / prompt delivery (with the `session.unattended` grant),
 /// plugin-private storage, and structured settings widgets (`object_list`,
-/// `dynamic_select`); 10 when the `settings-page` full-page slot and the
-/// `tool-card-badge` slot were added; 11 when `acp.capabilities.probe` let a
+/// `dynamic_select`); 10 is retired, its two UI slots (`settings-page`,
+/// `tool-card-badge`) having been removed once MCP and skills management
+/// moved into core; 11 when `acp.capabilities.probe` let a
 /// plugin trigger a handshake-only catalog probe and the capability response
 /// grew a `thinking` (thought-level) list; 12 when the pane block vocabulary
 /// gained the `callout`, `bar`, and `columns` kinds, clickable/badged `row`s,

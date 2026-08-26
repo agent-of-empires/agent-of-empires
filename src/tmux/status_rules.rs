@@ -277,11 +277,7 @@ impl ProfileRegistryGuard {
     /// between the phases can leave a half-swapped pair standing. Guarding a
     /// profile nothing else writes therefore needs nothing more, since the
     /// keys never overlap; guarding a profile other tests write needs those
-    /// writers held off, and a config resolve counts as a write. One known
-    /// case that is not held off: the serve-gated `#[tokio::test]` functions
-    /// in `src/acp/acp_client.rs` reach this registry through
-    /// `resolved_acp_config` and write `default` outside serial_test's default
-    /// key, so a `take("default")` can be raced under `--features serve`.
+    /// writers held off, and a config resolve counts as a write.
     /// Audit the writers of the profile you guard rather than assuming a group
     /// already covers them. The guard covers exactly these two registries and
     /// only its caller's writes; a future process-global needs its own restore

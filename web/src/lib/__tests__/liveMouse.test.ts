@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { buttonMouseBytes, wheelMouseBytes, wheelNotches } from "../liveMouse";
+import { cursorLineIndex, pointerPaneCell, buttonMouseBytes, wheelMouseBytes, wheelNotches } from "../liveMouse";
 
 const bytes = (...n: number[]) => new Uint8Array(n);
 const ascii = (s: string) => new Uint8Array([...s].map((c) => c.charCodeAt(0)));
@@ -72,5 +72,71 @@ describe("wheelNotches", () => {
 
   it("is a no-op for a zero threshold", () => {
     expect(wheelNotches(99, 0, 8)).toEqual({ notches: 0, remainder: 99 });
+  });
+});
+
+describe("cursorLineIndex", () => {
+  it("indexes the live edge when every line fits on screen", () => {
+    // 72-line composite fully visible: cursor row indexes directly.
+    expect(cursorLineIndex(72, 72, 63)).toBe(63);
+  });
+
+  it("keeps the mapping when scrolled back (screenRows < lines.length)", () => {
+    // The viewport shows the LAST screenRows lines of the capture.
+    expect(cursorLineIndex(120, 72, 0)).toBe(48);
+    expect(cursorLineIndex(120, 72, 63)).toBe(111);
+  });
+
+  it("clamps the live edge at zero when the viewport is taller than the capture", () => {
+    // A short capture in a tall viewport must index from the top, not go
+    // negative (which the renderer reads as "no cursor").
+    expect(cursorLineIndex(5, 72, 3)).toBe(3);
+  });
+});
+
+describe("pointerPaneCell", () => {
+  it("is the identity when pane 0 sits at the window origin", () => {
+    expect(pointerPaneCell(10, 5, { cols: 80, rows: 24 })).toEqual({ col: 10, row: 6 });
+    expect(pointerPaneCell(10, 5, { cols: 80, rows: 24, left: 0, top: 0 })).toEqual({
+      col: 10,
+      row: 6,
+    });
+  });
+
+  it("subtracts a non-zero origin (#3515: pane-border-status shifts pane 0 down)", () => {
+    // Composite cell (10, 5) over a pane starting one row down: the app
+    // hears its own row 5, not the border row above it.
+    expect(pointerPaneCell(10, 5, { cols: 164, rows: 71, left: 0, top: 1 })).toEqual({
+      col: 10,
+      row: 5,
+    });
+    // A right-hand neighbour's columns (pane 0 spans composite 1-based
+    // cols 166..329 here) clamp into pane 0; the web surface clamps rather
+    // than drops forwarded events.
+    expect(pointerPaneCell(340, 5, { cols: 164, rows: 71, left: 165, top: 1 })).toEqual({
+      col: 164,
+      row: 5,
+    });
+    // Inside the neighbour-adjacent pane itself the origin subtraction lands
+    // on the app's own column.
+    expect(pointerPaneCell(170, 5, { cols: 164, rows: 71, left: 165, top: 1 })).toEqual({
+      col: 5,
+      row: 5,
+    });
+  });
+
+  it("clamps to pane 0's rectangle", () => {
+    expect(pointerPaneCell(500, 100, { cols: 164, rows: 71, left: 0, top: 1 })).toEqual({
+      col: 164,
+      row: 71,
+    });
+    expect(pointerPaneCell(0, 0, { cols: 164, rows: 71, left: 0, top: 1 })).toEqual({
+      col: 1,
+      row: 1,
+    });
+  });
+
+  it("treats a missing rectangle as a 1x1 pane", () => {
+    expect(pointerPaneCell(7, 9, null)).toEqual({ col: 1, row: 1 });
   });
 });

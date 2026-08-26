@@ -20654,16 +20654,16 @@ mod daemon_status_apply_tests {
         );
     }
 
-    /// #3201, the deliberately-ungated half: the status patch is skipped
-    /// for a structured row, but the unread mark still lands, mirroring the
-    /// daemon (`decide_passive_transition` gates only `patch` on
-    /// `is_structured()`; its `mark_unread` is ungated and
-    /// `flush_passive_transition_writes` persists it). A future refactor that
-    /// gates unread the same way it gates status would strand structured rows
-    /// as read across a restart; this locks against it.
+    /// A structured row's turn-end is the daemon's to record, both halves of it,
+    /// so the TUI writes neither field: the status is a daemon-side overlay with
+    /// no durable owner (#3201), and the unread mark is written durably by the
+    /// live ACP turn-end path (`should_mark_acp_unread`, #3181).
+    ///
+    /// The mark still reaches this row, from disk on the next reload;
+    /// `merge_from_tui` has no `unread` arm, so a TUI save cannot clobber it.
     #[test]
     #[serial]
-    fn daemon_status_persists_the_unread_mark_but_not_the_status_for_structured() {
+    fn tui_persists_neither_status_nor_unread_for_a_structured_turn_end() {
         crate::session::set_unread_enabled(true);
         let mut env = create_test_env_empty();
         let id = structured_row(&mut env, Status::Running);
@@ -20671,9 +20671,16 @@ mod daemon_status_apply_tests {
             .save()
             .expect("seed the structured row on disk as read/Running");
 
-        // A finished turn (Running -> Idle) marks the row unread.
+        // A finished turn (Running -> Idle).
         env.view
             .apply_daemon_status_update(update(&id, Status::Idle));
+
+        let inst = env.view.get_instance(&id).expect("row still present");
+        assert_eq!(inst.status, Status::Idle, "the turn-end still applies");
+        assert!(
+            !inst.is_unread(),
+            "the structured turn-end mark is the daemon's to write, not ours"
+        );
 
         let rows = env.view.storages.get("test").unwrap().load().unwrap();
         let disk = rows.iter().find(|i| i.id == id).expect("disk row present");
@@ -20683,8 +20690,8 @@ mod daemon_status_apply_tests {
             "structured status must not be passively persisted (#3201)"
         );
         assert!(
-            disk.is_unread(),
-            "the unread mark must still persist for a structured row, mirroring the daemon (#3201)"
+            !disk.is_unread(),
+            "structured unread must not be passively persisted either (#3181)"
         );
     }
 

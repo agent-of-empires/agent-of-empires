@@ -745,8 +745,6 @@ export type PluginUiSlot =
   | "pane"
   | "composer-action"
   | "detail-badge"
-  | "settings-page"
-  | "tool-card-badge"
   | "home-pane"
   | "notification";
 

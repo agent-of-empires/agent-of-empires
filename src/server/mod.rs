@@ -398,14 +398,20 @@ pub struct AppState {
     /// transitions to `Status::Error` for up to 8 seconds while the agent
     /// is still settling. Periodically GC'd by a background task.
     pub recently_restarted: crate::session::recovery::RecentlyRestarted,
-    /// Bumped once per committed session removal, after the row is gone from
-    /// both `sessions.json` and `instances`. A reloader reads it before its
-    /// disk read and hands the value back to
+    /// Bumped once per committed membership change of the session set: a
+    /// removal, after the row is gone from both `sessions.json` and
+    /// `instances`, and a creation, after the row is in both. A reloader
+    /// reads it before its disk read and hands the value back to
     /// `reload_state_instances_from_disk`, which drops the reload when the
-    /// value moved: the disk snapshot it is carrying predates a delete, so
-    /// folding it in would resurrect the removed row. See invariant 8 on that
-    /// function.
-    pub delete_epoch: std::sync::atomic::AtomicU64,
+    /// value moved: the disk snapshot it is carrying predates the mutation,
+    /// so folding it in would resurrect a removed row or drop a created one.
+    /// See invariant 8 on that function.
+    ///
+    /// Membership only. A field edit on an existing row does not bump, because
+    /// the per-id merge already reconciles those; the epoch exists for the
+    /// two cases the merge cannot see, where the id itself is absent from one
+    /// side.
+    pub mutation_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Ids whose startup-recovery cascade is scheduled but not yet complete.
     /// Phase A seeds it; each Phase B worker drains its id on completion. The
     /// background refresher walks it to keep queued candidates' marks in
@@ -595,17 +601,7 @@ impl AppState {
     /// `RwLock` is only held long enough to insert/lookup the `Arc<Mutex>`;
     /// the caller awaits the inner mutex without holding the map lock.
     pub async fn instance_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
-        {
-            let guard = self.instance_locks.read().await;
-            if let Some(lock) = guard.get(id) {
-                return lock.clone();
-            }
-        }
-        let mut guard = self.instance_locks.write().await;
-        guard
-            .entry(id.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        instance_lock_in(&self.instance_locks, id).await
     }
 
     /// Get or create the per-idempotency-key serialization mutex. Same
@@ -911,12 +907,14 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     let instance_locks = Arc::new(RwLock::new(std::collections::HashMap::new()));
     let idempotency_locks = Arc::new(RwLock::new(std::collections::HashMap::new()));
     let telemetry_session_creates = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let mutation_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
     #[cfg(feature = "serve")]
     let session_service = Arc::new(session_service::SessionService::new(
         Arc::clone(&instances),
         Arc::clone(&instance_locks),
         Arc::clone(&file_watch),
         Arc::clone(&telemetry_session_creates),
+        Arc::clone(&mutation_epoch),
         acp_supervisor.clone(),
         acp_event_store.clone(),
     ));
@@ -926,6 +924,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         Arc::clone(&instance_locks),
         Arc::clone(&file_watch),
         Arc::clone(&telemetry_session_creates),
+        Arc::clone(&mutation_epoch),
     ));
 
     // the daemon serves fine without plugin workers.
@@ -1223,7 +1222,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             crate::session::conversation_summary::MAX_CONCURRENT,
         ),
         recently_restarted: crate::session::recovery::new_recently_restarted(),
-        delete_epoch: std::sync::atomic::AtomicU64::new(0),
+        mutation_epoch: Arc::clone(&mutation_epoch),
         recovery_pending: crate::session::recovery::new_recovery_pending(),
         cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
             // Seed with an already-stale timestamp so the first request
@@ -3296,19 +3295,23 @@ fn skip_tmux_decision_for_structured(inst: &mut Instance) -> bool {
 //    scrape can briefly carry the prior status; it self-corrects on
 //    the next 2s tick. Polling is canonical (invariant 6) so this is
 //    acceptable.
-// 8. Every caller must read `state.delete_epoch` BEFORE its disk read and
+// 8. Every caller must read `state.mutation_epoch` BEFORE its disk read and
 //    pass that value as `read_epoch`. `fresh` is a snapshot of
 //    `sessions.json`, and `*current = merged` below replaces
-//    `state.instances` wholesale, so a delete that commits between the
-//    read and this call would otherwise be undone: the deleted row is
-//    still in `fresh` and comes straight back. The epoch check drops such
-//    a reload rather than resurrecting the row. Dropping ids missing from
+//    `state.instances` wholesale, so a membership change that commits
+//    between the read and this call would otherwise be undone. It cuts both
+//    ways. A delete: the removed row is still in `fresh` and comes straight
+//    back. A create: the new row is absent from `fresh`, and since `merged`
+//    is built exclusively from `fresh`, the wholesale replace drops the row
+//    the create just put in `state.instances`, so `GET /api/sessions` loses
+//    it until the next tick re-reads disk. The epoch check drops such a
+//    reload rather than applying either. Dropping ids missing from
 //    `prior_by_id` is NOT an alternative; that is also how a session
 //    created by another process (the CLI, a peer daemon) legitimately
 //    enters `state.instances`. The comparison happens under the
-//    `state.instances` write lock, and the delete bumps under that same
-//    lock, so the two are ordered against each other; comparing before
-//    taking the lock reopens the race one lock acquisition later.
+//    `state.instances` write lock, and both the delete and the create bump
+//    under that same lock, so they are ordered against each other; comparing
+//    before taking the lock reopens the race one lock acquisition later.
 
 /// Reload `state.instances` by merging caller-supplied `fresh` against the
 /// prior in-memory snapshot per id, then reapplying the acp overlay.
@@ -3358,26 +3361,30 @@ pub(crate) async fn reload_state_instances_from_disk(
 
     let mut current = state.instances.write().await;
 
-    // Invariant 8: `fresh` predates a committed delete, so folding it in would
-    // put the removed row back. Drop the whole reload rather than filter it:
-    // the next poll tick re-reads disk 2s from now and converges, and a delete
-    // is rare enough that losing one tick of status updates costs nothing.
+    // Invariant 8: `fresh` predates a committed create or delete, so folding it
+    // in would put a removed row back, or drop a created one. Drop the whole
+    // reload rather than filter it: the next poll tick re-reads disk 2s from
+    // now and converges, and both mutations are rare enough (each one is a
+    // user action) that losing one tick of status updates costs nothing.
     //
     // Read under the `instances` write lock, and before `drain_from` empties
-    // `current`, so this is atomic against the delete. Checking before taking
-    // the lock leaves a hole: a reload could pass the check, park on the lock,
-    // let a delete take the lock, remove the row and bump, then wake and write
-    // its stale snapshot over the removal. The delete bumps inside the same
-    // lock scope for the same reason. No memory ordering closes that gap; it
+    // `current`, so this is atomic against the mutation. Checking before
+    // taking the lock leaves a hole: a reload could pass the check, park on
+    // the lock, let a delete take the lock, remove the row and bump, then wake
+    // and write its stale snapshot over the removal. Symmetrically for a
+    // create, whose row is missing from the stale snapshot entirely. Both
+    // mutations bump inside the same lock scope for the same reason. No memory ordering closes that gap; it
     // is a check-then-act race, so the check has to happen under the lock that
     // orders the two writers.
-    let current_epoch = state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst);
+    let current_epoch = state
+        .mutation_epoch
+        .load(std::sync::atomic::Ordering::SeqCst);
     if current_epoch != read_epoch {
         tracing::debug!(
             target: "server.file_watch",
             read_epoch,
             current_epoch,
-            "dropping a disk reload whose snapshot predates a session delete"
+            "dropping a disk reload whose snapshot predates a session create or delete"
         );
         return;
     }
@@ -3910,7 +3917,9 @@ async fn disk_watcher_consumer(state: Arc<AppState>) {
         let started = std::time::Instant::now();
         // Invariant 8: read before the disk read, so a delete committing
         // during it invalidates this snapshot.
-        let read_epoch = state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
         let file_watch_for_load = state.file_watch.clone();
         let loaded = match tokio::task::spawn_blocking(move || {
             load_all_instances(&file_watch_for_load)
@@ -4299,6 +4308,9 @@ struct PassiveTransitionDecision {
     /// intra-doc link that would degrade to literal text under
     /// `cargo doc`).
     patch: Option<crate::session::PassiveStatusPatch>,
+    /// Always `false` for structured / ACP sessions: `should_mark_acp_unread`,
+    /// driven off the live ACP turn-end event, is the sole producer of their
+    /// automatic mark. See the gate in `decide_passive_transition`.
     mark_unread: bool,
 }
 
@@ -4306,9 +4318,9 @@ struct PassiveTransitionDecision {
 /// `status` differs from the tick's `prev` snapshot. The full
 /// contract lives on the return type at [`PassiveTransitionDecision`]:
 /// `patch: None` for structured / ACP sessions (the ACP overlay is the
-/// sole authority), and `mark_unread: true` only on genuine
-/// Running -> Idle when unread is enabled and the row is not already
-/// unread.
+/// sole authority), and `mark_unread: true` only on a genuine
+/// Running -> Idle for a *terminal* session when unread is enabled and the
+/// row is not already unread.
 fn decide_passive_transition(
     inst: &Instance,
     old_status: Status,
@@ -4316,7 +4328,14 @@ fn decide_passive_transition(
 ) -> PassiveTransitionDecision {
     let patch =
         (!inst.is_structured()).then(|| crate::session::PassiveStatusPatch::from_instance(inst));
+    // Structured rows are excluded for the same reason as the patch: the poll
+    // loop has no authority over a paneless row, and since #3162 one never
+    // reaches here anyway (it compares equal to `prev`, so `observed_transitions`
+    // does not report it). `should_mark_acp_unread`, driven off the live ACP
+    // `Stopped` event, is the sole producer for them; the gate is what stops a
+    // later change to this loop from quietly re-marking from two daemon paths.
     let mark_unread = unread_enabled
+        && !inst.is_structured()
         && old_status == Status::Running
         && inst.status == Status::Idle
         && !inst.unread;
@@ -4567,7 +4586,9 @@ async fn status_poll_loop(state: Arc<AppState>) {
         // scrape that follows it can block for seconds when the tmux server is
         // unreachable, which is exactly when a concurrent delete has time to
         // land and this tick's snapshot goes stale.
-        let read_epoch = state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
         let updated = tokio::task::spawn_blocking(move || {
             let mut instances = load_all_instances(&file_watch_for_poll).unwrap_or_default();
             seed_unknown_tracking(&mut instances, &prev_unknown_tracking);
@@ -5333,12 +5354,34 @@ async fn acp_event_listener(state: Arc<AppState>) {
             // reconcile on the next event; a missed acp_session_id
             // means at most one restart loses context. Far better to
             // continue than to exit the listener entirely.
+            //
+            // The unread mark does NOT self-heal like status does: it is
+            // edge-triggered on `Running -> Idle`, so a dropped `Stopped` would
+            // lose it for good and no later event would reproduce it. The
+            // events are durable, recorded before broadcast, so replay the
+            // structured rows from the event log before continuing.
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                 tracing::warn!(
                     target: "acp.event_listener",
                     skipped,
                     "broadcast lagged; status and acp_session_id may briefly desync"
                 );
+                let recovered = recover_structured_unread_after_lag(
+                    &state.instances,
+                    &state.acp_event_store,
+                    &state.instance_locks,
+                    state.file_watch.clone(),
+                    &state.status_tx,
+                )
+                .await;
+                if recovered > 0 {
+                    tracing::info!(
+                        target: "acp.event_listener",
+                        skipped,
+                        recovered,
+                        "replayed turn-end unread marks missed by the lagged frames"
+                    );
+                }
                 continue;
             }
             // Closed: AppState dropped (shutdown). Exit cleanly.
@@ -5621,7 +5664,7 @@ async fn acp_event_listener(state: Arc<AppState>) {
 
         // Acquire `instances` once for both branches. Releases before
         // the (potentially blocking) sessions.json save.
-        let profile_to_save = {
+        let (profile_to_save, unread_profile) = {
             let mut instances = state.instances.write().await;
             let Some(inst) = instances.iter_mut().find(|i| i.id == frame.session_id) else {
                 continue;
@@ -5630,9 +5673,59 @@ async fn acp_event_listener(state: Arc<AppState>) {
                 continue;
             }
 
+            // Snapshotting around the call is exactly "the transition
+            // `apply_status_intent` actually applied": it assigns `status` in
+            // one place and every rejected or no-op path (the trashed /
+            // Deleting / Creating guard, the Stopped guard, the ineligible
+            // HealError guard, `status == target`) leaves it untouched. We hold
+            // the write lock across both reads, so nothing else can move it in
+            // between. A future refactor that makes `apply_status_intent`
+            // assign `status` more than once has to revisit this.
+            let old_status = inst.status;
             apply_status_intent(inst, status_intent, &state.status_tx);
-            apply_acp_session_change(inst, &frame.session_id, acp_change.as_ref())
+            let unread_profile =
+                should_mark_acp_unread(inst, old_status, crate::session::unread_enabled())
+                    .then(|| inst.source_profile.clone());
+
+            (
+                apply_acp_session_change(inst, &frame.session_id, acp_change.as_ref()),
+                unread_profile,
+            )
         };
+
+        // The turn just finished, so the row takes the automatic unread mark.
+        // This is the sole producer of it for a structured row. The tmux poll
+        // loop has no authority over a paneless one, which is why #3162 stopped
+        // it reporting phantom transitions for them and so left this gap; the
+        // TUI's passive path is gated off them to keep the boolean single-writer.
+        //
+        // The write has to be durable. `reload_state_instances_from_disk` rebases
+        // every row on the disk row on each 2s tick and `merge_runtime_fields`
+        // does not carry `unread`, so an in-memory-only mark is gone within two
+        // seconds. Memory is mirrored only after the write lands, the same
+        // ordering `flush_passive_transition_writes` uses (#2755) and for the
+        // same reason: a mark that exists only in daemon memory is served over
+        // `/api/sessions`, mirrored into the TUI, and then silently dropped by
+        // the next reload.
+        //
+        // Deliberately not folded into the `profile_to_save` save below:
+        // `derive_acp_session_change` yields nothing for `Event::Stopped`, so an
+        // identity change and a turn-end can never arrive on the same event and
+        // there is no atomicity to win.
+        //
+        // `persist_and_mirror_unread` owns the lock and commit-check ordering;
+        // see its docstring for why both are load-bearing.
+        if let Some(profile) = unread_profile {
+            let lock = state.instance_lock(&frame.session_id).await;
+            persist_and_mirror_unread(
+                &state.instances,
+                &lock,
+                state.file_watch.clone(),
+                &frame.session_id,
+                profile,
+            )
+            .await;
+        }
 
         // Persist `acp_session_id` to disk if the field changed.
         // Sync FS (file copy + JSON write) goes through spawn_blocking
@@ -5791,6 +5884,196 @@ pub(crate) fn apply_status_intent(
         new: target,
         at: now,
     });
+}
+
+/// Get or create the per-instance serialization mutex in `locks`. Free function
+/// rather than only an [`AppState`] method so the ACP turn-end unread writers
+/// can take the *same* lock a REST handler takes without needing an `AppState`
+/// (which has no test constructor). See [`AppState::instance_lock`].
+async fn instance_lock_in(
+    locks: &RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    id: &str,
+) -> Arc<tokio::sync::Mutex<()>> {
+    {
+        let guard = locks.read().await;
+        if let Some(lock) = guard.get(id) {
+            return lock.clone();
+        }
+    }
+    let mut guard = locks.write().await;
+    guard
+        .entry(id.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// Whether a structured row whose ACP status just moved should take the
+/// automatic unread mark, i.e. whether its turn just finished.
+///
+/// `inst` is the row *after* [`apply_status_intent`] ran and `old_status` is
+/// the snapshot taken before it. The predicate is deliberately byte-identical
+/// to the one in [`decide_passive_transition`] and in the TUI's
+/// `apply_status_update`, so "a turn just finished" means the same thing on
+/// every surface.
+///
+/// `Running -> Idle` is the whole edge. An approval or elicitation excursion
+/// comes back through `Set(Running)` (`ApprovalResolved` /
+/// `ElicitationResolved`) before the turn's `Stopped`, so an answered-then-
+/// completed turn still ends on this edge and needs no case of its own. A
+/// direct `Waiting -> Idle` means the turn stopped while still blocked on the
+/// user, who is by construction present for it. Every `Stopped` reason maps to
+/// `Idle`, so a rate-limit park marks unread too; that is the same policy
+/// terminal sessions get, and a parked session does want attention.
+#[cfg(feature = "serve")]
+fn should_mark_acp_unread(inst: &Instance, old_status: Status, unread_enabled: bool) -> bool {
+    unread_enabled
+        && inst.is_structured()
+        && old_status == Status::Running
+        && inst.status == Status::Idle
+        && !inst.unread
+}
+
+/// Write the automatic unread mark for `id` to its profile store, then mirror it
+/// into daemon memory. Returns whether the mark actually landed.
+///
+/// Takes primitives rather than [`AppState`] so it is reachable from tests
+/// (`AppState` has no test constructor).
+///
+/// Ordering rules, both of which cost correctness if dropped:
+///
+/// 1. **Under `instance_lock`.** The same mutex `PATCH /api/sessions/:id/unread`
+///    takes, held across both the write and the mirror. Without it a clear can
+///    land between them and leave disk read while memory says unread, and the
+///    user's explicit mark-read loses to a mark it happened after. Holding it
+///    makes the two orderings the only ones possible, and both are correct: a
+///    clear before this marks (the turn genuinely finished afterwards), a clear
+///    after this wins (the user read it afterwards).
+/// 2. **Only mirror a committed mutation.** `persist_session_update` reports
+///    `Ok` for a write whose closure matched no row, so `profile` going stale
+///    (a concurrent profile move) would otherwise mark memory off a successful
+///    no-op on the *old* profile, and the next reload would drop the
+///    notification. The flag reports whether the owning row was really mutated.
+///
+/// A stale-profile write is not retried. The row is left read rather than
+/// half-marked, the turn's mark is simply lost, and the move is rare enough that
+/// a re-resolve loop is not worth the added failure surface here.
+#[cfg(feature = "serve")]
+async fn persist_and_mirror_unread(
+    instances: &RwLock<Vec<Instance>>,
+    instance_lock: &tokio::sync::Mutex<()>,
+    file_watch: Arc<crate::file_watch::FileWatchService>,
+    id: &str,
+    profile: String,
+) -> bool {
+    let _guard = instance_lock.lock().await;
+    let marked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let marked_in_closure = marked.clone();
+    let persist_id = id.to_string();
+    let persisted = api::persist_session_update(
+        profile.clone(),
+        "acp turn-end unread",
+        file_watch,
+        move |instances| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                inst.mark_unread();
+                marked_in_closure.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        },
+    )
+    .await;
+    if persisted.is_err() {
+        return false;
+    }
+    if !marked.load(std::sync::atomic::Ordering::SeqCst) {
+        tracing::debug!(
+            target: "acp.event_listener",
+            session = %id,
+            profile = %profile,
+            "turn-end unread write found no row in that profile store (moved?); \
+             not mirroring so memory cannot disagree with disk"
+        );
+        return false;
+    }
+    let mut instances = instances.write().await;
+    if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+        inst.mark_unread();
+    }
+    true
+}
+
+/// Re-derive every structured row's status from the durable event log after the
+/// ACP broadcast dropped frames, marking any row whose turn ended while we were
+/// not listening. Returns the number of rows marked.
+///
+/// `acp_events_tx` is a `broadcast` of [`ACP_CHANNEL_CAPACITY`], and a lagged
+/// receiver is told only *how many* frames it missed, never which. Status
+/// tolerated that because it is level-triggered: any later event re-derives the
+/// right value. The unread mark is edge-triggered, so a dropped `Stopped` loses
+/// it permanently, and nothing else would ever produce it.
+///
+/// The events themselves are durable (recorded before broadcast), so the log is
+/// the recovery source. `latest_seed_status_event` is the same query
+/// `seed_acp_statuses` uses at boot, and for the same reason: it returns the
+/// most recent *lifecycle* event, which is exactly the frame whose loss matters.
+///
+/// This deliberately does NOT reuse `seed_acp_statuses`, despite the shared
+/// shape, because the two differ on both points that matter:
+///
+/// - **Boot must not mark.** Its replay re-reads history, so a `Stopped` from
+///   before the restart would re-mark a row the user has already read, on every
+///   restart. Here a `Stopped` under a still-`Running` memory status is evidence
+///   of a turn that ended during this daemon's life and was missed.
+/// - **Boot lifts a stale `Stopped`**, because a persisted `Stopped` from a
+///   daemon that died mid-turn would otherwise trap the dot grey. Mid-run a
+///   `Stopped` in memory is a deliberate stop, so `apply_status_intent`'s guard
+///   should keep it.
+#[cfg(feature = "serve")]
+async fn recover_structured_unread_after_lag(
+    instances: &RwLock<Vec<Instance>>,
+    event_store: &crate::acp::event_store::EventStore,
+    instance_locks: &RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    file_watch: Arc<crate::file_watch::FileWatchService>,
+    status_tx: &broadcast::Sender<StatusChange>,
+) -> usize {
+    let ids: Vec<String> = instances
+        .read()
+        .await
+        .iter()
+        .filter(|i| i.is_structured())
+        .map(|i| i.id.clone())
+        .collect();
+    let unread_enabled = crate::session::unread_enabled();
+    let mut marked = 0usize;
+    for id in ids {
+        let Some(event) = event_store.latest_seed_status_event(&id) else {
+            continue;
+        };
+        let Some(intent) = derive_acp_status(&event) else {
+            continue;
+        };
+        // Same snapshot-around-apply as the live path, so "the transition that
+        // was actually applied" means the same thing in both.
+        let unread_profile = {
+            let mut guard = instances.write().await;
+            let Some(inst) = guard.iter_mut().find(|i| i.id == id) else {
+                continue;
+            };
+            if !inst.is_structured() {
+                continue;
+            }
+            let old_status = inst.status;
+            apply_status_intent(inst, Some(intent), status_tx);
+            should_mark_acp_unread(inst, old_status, unread_enabled)
+                .then(|| inst.source_profile.clone())
+        };
+        if let Some(profile) = unread_profile {
+            let lock = instance_lock_in(instance_locks, &id).await;
+            if persist_and_mirror_unread(instances, &lock, file_watch.clone(), &id, profile).await {
+                marked += 1;
+            }
+        }
+    }
+    marked
 }
 
 /// Fold a derived `AcpSessionChange` into an `Instance`. Returns the
@@ -6041,10 +6324,14 @@ async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
         // just made durable.
         let outcome =
             crate::session::sync::drain_and_persist_session_ids(&mut snapshot, &file_watch);
+        // One observation for the whole repair walk, as on the TUI side: this
+        // visits every instance, so a per-item `list-sessions` fork scales with
+        // the store.
+        let live = crate::tmux::LiveSessionSnapshot::new();
         let repaired: std::collections::HashSet<String> = snapshot
             .iter_mut()
             .filter_map(|inst| {
-                inst.repair_session_id_poller_if_needed()
+                inst.repair_session_id_poller_if_needed(&live)
                     .then(|| inst.id.clone())
             })
             .collect();
@@ -6151,12 +6438,14 @@ pub mod test_support {
         let instance_locks = Arc::new(RwLock::new(HashMap::new()));
         let idempotency_locks = Arc::new(RwLock::new(HashMap::new()));
         let telemetry_session_creates = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mutation_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let file_watch = FileWatchService::noop();
         let session_service = Arc::new(session_service::SessionService::new(
             Arc::clone(&instances),
             Arc::clone(&instance_locks),
             Arc::clone(&file_watch),
             Arc::clone(&telemetry_session_creates),
+            Arc::clone(&mutation_epoch),
             supervisor.clone(),
             event_store.clone(),
         ));
@@ -6186,7 +6475,7 @@ pub mod test_support {
                 crate::session::conversation_summary::MAX_CONCURRENT,
             ),
             recently_restarted: crate::session::recovery::new_recently_restarted(),
-            delete_epoch: std::sync::atomic::AtomicU64::new(0),
+            mutation_epoch: Arc::clone(&mutation_epoch),
             recovery_pending: crate::session::recovery::new_recovery_pending(),
             cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
                 refreshed_at: std::time::Instant::now(),
@@ -6293,7 +6582,9 @@ pub mod test_support {
         fresh: Vec<Instance>,
         live_worker_records: Vec<(crate::process::worker_registry::WorkerRecord, String)>,
     ) {
-        let read_epoch = state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
         super::reload_state_instances_from_disk(
             state,
             fresh,
@@ -6309,7 +6600,9 @@ pub mod test_support {
         fresh: Vec<Instance>,
         live_worker_records: Vec<(crate::process::worker_registry::WorkerRecord, String)>,
     ) {
-        let read_epoch = state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
         super::reload_state_instances_from_disk(
             state,
             fresh,
@@ -7888,6 +8181,464 @@ mod tests {
             !decision.mark_unread,
             "already-unread sessions must not re-mark"
         );
+
+        // #3181: a structured row's turn-end mark belongs to the live ACP
+        // listener (`should_mark_acp_unread`), so the poll loop must not also
+        // produce it. Paired with
+        // `tick_reports_no_transition_for_a_structured_phantom` above, which
+        // covers the other half: the tick never even reports such a row, so a
+        // read structured session cannot be re-marked seconds after the user
+        // read it (the #3162 defect).
+        let mut structured = Instance::new("acp-session", "/tmp/test");
+        structured.view = crate::session::View::Structured;
+        structured.status = Status::Idle;
+        let decision = decide_passive_transition(&structured, Status::Running, true);
+        assert!(
+            !decision.mark_unread,
+            "structured turn-end unread is owned by the acp event listener"
+        );
+    }
+
+    /// #3181: the automatic mark's predicate for a structured row, driven off
+    /// the live ACP turn-end event. One table rather than a test per case, per
+    /// the repo's compile-cost rule.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn should_mark_acp_unread_only_on_a_structured_running_to_idle_turn_end() {
+        // (name, structured, old_status, new_status, unread_enabled, already_unread, expected)
+        let cases = [
+            (
+                "turn finished",
+                true,
+                Status::Running,
+                Status::Idle,
+                true,
+                false,
+                true,
+            ),
+            // The turn stopped while still blocked on the user, who is by
+            // construction present for it; an answered approval comes back
+            // through Running first, so this is not the answered-then-completed
+            // path.
+            (
+                "still blocked on the user",
+                true,
+                Status::Waiting,
+                Status::Idle,
+                true,
+                false,
+                false,
+            ),
+            (
+                "crashed, not finished",
+                true,
+                Status::Running,
+                Status::Error,
+                true,
+                false,
+                false,
+            ),
+            (
+                "turn starting",
+                true,
+                Status::Idle,
+                Status::Running,
+                true,
+                false,
+                false,
+            ),
+            (
+                "no transition applied",
+                true,
+                Status::Running,
+                Status::Running,
+                true,
+                false,
+                false,
+            ),
+            (
+                "feature off",
+                true,
+                Status::Running,
+                Status::Idle,
+                false,
+                false,
+                false,
+            ),
+            // Re-marking would churn the flock once per turn, and would undo a
+            // read the user has not been given a new turn to earn.
+            (
+                "already unread",
+                true,
+                Status::Running,
+                Status::Idle,
+                true,
+                true,
+                false,
+            ),
+            // Terminal rows stay with the tmux poll loop's
+            // `decide_passive_transition`.
+            (
+                "terminal row, owned elsewhere",
+                false,
+                Status::Running,
+                Status::Idle,
+                true,
+                false,
+                false,
+            ),
+        ];
+        for (name, structured, old, new, enabled, already_unread, expected) in cases {
+            let mut inst = Instance::new(name, "/tmp/test");
+            if structured {
+                inst.view = crate::session::View::Structured;
+            }
+            // The helper reads the row *after* `apply_status_intent` ran.
+            inst.status = new;
+            inst.unread = already_unread;
+            assert_eq!(
+                should_mark_acp_unread(&inst, old, enabled),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    /// Seed `profile`'s store with `rows`, so a persist closure has a matching
+    /// id to mark. Mirrors the shape used by the `flush_passive_transition_*`
+    /// tests above.
+    #[cfg(feature = "serve")]
+    fn seed_profile_store(profile: &str, rows: Vec<Instance>) {
+        crate::session::Storage::new_unwatched(profile)
+            .expect("storage")
+            .update(move |instances, _groups| {
+                *instances = rows;
+                Ok(())
+            })
+            .expect("seed write");
+    }
+
+    #[cfg(feature = "serve")]
+    fn load_profile_row(profile: &str, id: &str) -> Option<Instance> {
+        crate::session::Storage::new_unwatched(profile)
+            .expect("storage")
+            .load()
+            .expect("load")
+            .into_iter()
+            .find(|i| i.id == id)
+    }
+
+    /// The commit-check half of `persist_and_mirror_unread`: memory is mirrored
+    /// only when the write actually mutated the owning row.
+    ///
+    /// The second call is the profile-move case a reviewer raised on #3530.
+    /// `persist_session_update` reports `Ok` for a write whose closure matched
+    /// nothing, so mirroring on `is_ok()` alone would mark memory off a
+    /// successful no-op against a profile the row no longer lives in, and the
+    /// next disk reload would silently drop the notification.
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn persist_and_mirror_unread_mirrors_only_a_committed_mutation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+
+        let owning = "acp-unread-owner";
+        let mut inst = Instance::new("acp-session", "/tmp/acp");
+        inst.view = crate::session::View::Structured;
+        inst.source_profile = owning.to_string();
+        let id = inst.id.clone();
+        seed_profile_store(owning, vec![inst.clone()]);
+        // The profile the row is *not* in. Created empty, so the write there
+        // succeeds while matching nothing.
+        seed_profile_store("acp-unread-stale", Vec::new());
+
+        let instances = RwLock::new(vec![inst]);
+        let lock = tokio::sync::Mutex::new(());
+
+        // Stale profile: write succeeds, matches no row, so nothing is mirrored.
+        let landed = persist_and_mirror_unread(
+            &instances,
+            &lock,
+            crate::file_watch::FileWatchService::noop(),
+            &id,
+            "acp-unread-stale".to_string(),
+        )
+        .await;
+        assert!(!landed, "a no-op write must not report the mark as landed");
+        assert!(
+            !instances.read().await[0].unread,
+            "memory must not be marked off a write that matched no row"
+        );
+        assert!(
+            !load_profile_row(owning, &id).expect("row").unread,
+            "the owning profile's row must be untouched by a stale-profile write"
+        );
+
+        // Owning profile: the mark lands on disk first, then in memory.
+        let landed = persist_and_mirror_unread(
+            &instances,
+            &lock,
+            crate::file_watch::FileWatchService::noop(),
+            &id,
+            owning.to_string(),
+        )
+        .await;
+        assert!(landed);
+        assert!(
+            load_profile_row(owning, &id).expect("row").unread,
+            "the mark must be durable"
+        );
+        assert!(
+            instances.read().await[0].unread,
+            "memory must mirror the committed mark"
+        );
+    }
+
+    /// A failed write must not strand a memory-only mark, the #2755 rule that
+    /// `flush_passive_transition_defers_unread_until_persist_ok` locks for the
+    /// tmux poller. Separate test rather than a row in the one above because it
+    /// needs the store deliberately broken.
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn persist_and_mirror_unread_skips_the_mirror_on_a_failed_write() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+
+        let profile = "acp-unread-write-failure";
+        // Making `sessions.json` a directory makes the read-modify-write fail.
+        let dir = crate::session::get_profile_dir(profile).expect("profile dir");
+        std::fs::create_dir_all(dir.join("sessions.json")).expect("sessions.json dir");
+
+        let mut inst = Instance::new("acp-session", "/tmp/acp");
+        inst.view = crate::session::View::Structured;
+        inst.source_profile = profile.to_string();
+        let id = inst.id.clone();
+        let instances = RwLock::new(vec![inst]);
+        let lock = tokio::sync::Mutex::new(());
+
+        let landed = persist_and_mirror_unread(
+            &instances,
+            &lock,
+            crate::file_watch::FileWatchService::noop(),
+            &id,
+            profile.to_string(),
+        )
+        .await;
+
+        assert!(!landed);
+        assert!(
+            !instances.read().await[0].unread,
+            "a failed persist must not leave a phantom in-memory unread mark"
+        );
+    }
+
+    /// Lag replay, the other finding on #3530: the ACP broadcast tells a lagged
+    /// receiver only how many frames it missed, never which, so a dropped
+    /// `Stopped` would lose the turn-end mark permanently (unlike status, which
+    /// is level-triggered and re-derives from any later event). The events are
+    /// durable, so recovery reads the log.
+    ///
+    /// Three rows in one pass, all with a durable `Stopped` as their latest
+    /// lifecycle event, so the discriminator is the row rather than the event:
+    /// only the structured row still sitting at `Running` represents a turn that
+    /// ended unobserved.
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn recover_structured_unread_after_lag_marks_only_a_missed_turn_end() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+        crate::session::set_unread_enabled(true);
+
+        let profile = "acp-unread-lag-replay";
+
+        // The turn ended while the listener was lagged: memory still says
+        // Running, the log already has the Stopped we never saw.
+        let mut missed = Instance::new("acp-missed", "/tmp/acp");
+        missed.view = crate::session::View::Structured;
+        missed.source_profile = profile.to_string();
+        missed.status = Status::Running;
+
+        // Already reconciled: the Stopped was observed, so there is no
+        // transition left to apply and no second mark to make.
+        let mut already = Instance::new("acp-already-idle", "/tmp/acp");
+        already.view = crate::session::View::Structured;
+        already.source_profile = profile.to_string();
+        already.status = Status::Idle;
+
+        // A terminal row is not this producer's to touch at all.
+        let mut terminal = Instance::new("tmux-row", "/tmp/tmux");
+        terminal.source_profile = profile.to_string();
+        terminal.status = Status::Running;
+
+        let (missed_id, already_id, terminal_id) =
+            (missed.id.clone(), already.id.clone(), terminal.id.clone());
+        let rows = vec![missed.clone(), already.clone(), terminal.clone()];
+        seed_profile_store(profile, rows.clone());
+
+        let db = temp.path().join("acp-events.db");
+        let store = crate::acp::event_store::EventStore::open(&db, 1000).expect("event store");
+        for id in [&missed_id, &already_id, &terminal_id] {
+            store
+                .record(
+                    id,
+                    1,
+                    &crate::acp::Event::Stopped {
+                        reason: "prompt_complete".into(),
+                    },
+                )
+                .expect("record stopped");
+        }
+
+        let instances = RwLock::new(rows);
+        let locks = RwLock::new(std::collections::HashMap::new());
+        let (status_tx, _rx) = broadcast::channel(16);
+
+        let marked = recover_structured_unread_after_lag(
+            &instances,
+            &store,
+            &locks,
+            crate::file_watch::FileWatchService::noop(),
+            &status_tx,
+        )
+        .await;
+
+        assert_eq!(marked, 1, "only the missed turn-end is a fresh mark");
+
+        let guard = instances.read().await;
+        let row = |id: &str| guard.iter().find(|i| i.id == id).expect("row").clone();
+
+        let missed = row(&missed_id);
+        assert_eq!(
+            missed.status,
+            Status::Idle,
+            "replay applies the missed Stopped"
+        );
+        assert!(missed.unread, "and marks the turn that ended unobserved");
+        assert!(
+            load_profile_row(profile, &missed_id).expect("row").unread,
+            "the replayed mark must be durable, not memory-only"
+        );
+
+        assert!(
+            !row(&already_id).unread,
+            "an already-reconciled row has no transition left, so no second mark"
+        );
+        assert_eq!(
+            row(&terminal_id).status,
+            Status::Running,
+            "a terminal row is left entirely to the tmux poller"
+        );
+        assert!(!row(&terminal_id).unread);
+    }
+
+    /// End to end over `acp_event_listener` itself, the path that actually
+    /// closes #3181. The predicate table and the TUI ownership tests all pass
+    /// even if the snapshot is taken *after* `apply_status_intent`, the persist
+    /// is dropped, or the mirror is reordered, because none of them run the
+    /// listener. This one drives a real `Event::Stopped` frame through the
+    /// broadcast and asserts both halves of the write.
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn acp_event_listener_marks_a_finished_turn_unread_on_disk_and_in_memory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+        crate::session::set_unread_enabled(true);
+
+        let profile = "acp-listener-turn-end";
+        let mut inst = Instance::new("acp-session", "/tmp/acp");
+        inst.view = crate::session::View::Structured;
+        inst.source_profile = profile.to_string();
+        // Mid-turn, so the incoming Stopped is a real Running -> Idle edge.
+        inst.status = Status::Running;
+        let id = inst.id.clone();
+        seed_profile_store(profile, vec![inst.clone()]);
+
+        let state = test_support::build_test_app_state(vec![inst]);
+        let listener = tokio::spawn(acp_event_listener(state.clone()));
+
+        // A broadcast only reaches receivers that subscribed before the send,
+        // and the spawned listener subscribes as its first act. Wait for that
+        // rather than racing it; nothing else in this test subscribes, so the
+        // count reaching 1 is precisely "the listener is listening".
+        for _ in 0..500 {
+            if state.acp_events_tx.receiver_count() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(
+            state.acp_events_tx.receiver_count() > 0,
+            "listener never subscribed"
+        );
+
+        // The turn ends.
+        state
+            .acp_events_tx
+            .send(AcpBroadcastFrame {
+                session_id: id.clone(),
+                seq: 1,
+                event: Arc::new(crate::acp::Event::Stopped {
+                    reason: "prompt_complete".into(),
+                }),
+            })
+            .expect("listener is subscribed");
+
+        // The listener owns the write, so poll rather than sleeping a fixed
+        // interval: the persist is a real flock'd file write. Wait on the
+        // *mirror*, which is the last step, so this cannot abort the listener
+        // in between the disk write and the mirror and then blame the mirror.
+        let mut mirrored = false;
+        for _ in 0..500 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            if state
+                .instances
+                .read()
+                .await
+                .iter()
+                .any(|i| i.id == id && i.unread)
+            {
+                mirrored = true;
+                break;
+            }
+        }
+        listener.abort();
+
+        assert!(
+            mirrored,
+            "daemon memory must mirror the mark, so /api/sessions reports it"
+        );
+        assert!(
+            load_profile_row(profile, &id).is_some_and(|i| i.unread),
+            "and the mark must be durable, which is the #3181 fix; a memory-only \
+             mark is dropped by the next reload"
+        );
+        let instances = state.instances.read().await;
+        let row = instances.iter().find(|i| i.id == id).expect("row present");
+        assert_eq!(row.status, Status::Idle, "the Stopped applied");
     }
 
     // #2755 (follow-up to #2729): the poller must not strand an in-memory
@@ -8876,7 +9627,9 @@ mod tests {
 
         // Invariant 8: capture the epoch BEFORE the disk read, the order every
         // production caller uses.
-        let read_epoch = state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
         let file_watch = state.file_watch.clone();
         let fresh = tokio::task::spawn_blocking(move || load_all_instances(&file_watch))
             .await
@@ -8925,7 +9678,7 @@ mod tests {
         // The delete already committed: `doomed` is gone from memory, and the
         // epoch moved to say so.
         state
-            .delete_epoch
+            .mutation_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         reload_state_instances_from_disk(
@@ -8951,6 +9704,78 @@ mod tests {
         assert_eq!(titles, vec!["survivor".to_string()]);
     }
 
+    // The mirror image of the delete case, and the reason `mutation_epoch` is
+    // not named `delete_epoch`. `create_session` persists the new row to
+    // `sessions.json` and only then upserts it into `state.instances`
+    // (`upsert_instance`). A poll tick whose disk read STARTED before that
+    // persist carries a `fresh` without the new row, and since the merge
+    // rebuilds `state.instances` exclusively from `fresh`, the wholesale
+    // replace drops the session the create just inserted. `GET /api/sessions`
+    // then loses it until the next tick re-reads disk 2s later. Observed as a
+    // live Playwright failure: `wizard-scratch-launch` polled until the
+    // session appeared, and the very next `GET /api/sessions` returned `[]`.
+    #[tokio::test]
+    async fn a_reload_predating_a_create_does_not_drop_the_new_row() {
+        let existing = Instance::new("existing", "/tmp/existing");
+        let created = Instance::new("created", "/tmp/created");
+        // What a reloader read from disk before the create persisted.
+        let stale_snapshot = vec![existing.clone()];
+
+        // The create already committed: `created` is in memory (and on disk),
+        // and the epoch moved to say so.
+        let state = test_support::build_test_app_state(vec![existing.clone(), created.clone()]);
+        state
+            .mutation_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        reload_state_instances_from_disk(
+            &state,
+            stale_snapshot.clone(),
+            Vec::new(),
+            StatusSource::DiskOnly,
+            0,
+        )
+        .await;
+
+        let titles: Vec<String> = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .map(|i| i.title.clone())
+            .collect();
+        assert!(
+            titles.contains(&"created".to_string()),
+            "a created session must survive a pre-create snapshot: {titles:?}"
+        );
+
+        // And the converse, which is what the create path's bump buys: hand
+        // the same stale snapshot a matching epoch, as if the create had never
+        // bumped, and the row is gone. This is the pre-fix behaviour, pinned so
+        // the bump cannot be dropped as redundant.
+        let unbumped = test_support::build_test_app_state(vec![existing.clone(), created.clone()]);
+        reload_state_instances_from_disk(
+            &unbumped,
+            stale_snapshot,
+            Vec::new(),
+            StatusSource::DiskOnly,
+            0,
+        )
+        .await;
+        let titles: Vec<String> = unbumped
+            .instances
+            .read()
+            .await
+            .iter()
+            .map(|i| i.title.clone())
+            .collect();
+        assert_eq!(
+            titles,
+            vec!["existing".to_string()],
+            "without the epoch bump the reload drops the created row"
+        );
+    }
+
     // The epoch comparison has to be atomic against the delete, not merely
     // ordered by `SeqCst`. Comparing before taking the `instances` write lock
     // leaves a check-then-act race: a reload passes the check, parks on the
@@ -8969,7 +9794,9 @@ mod tests {
         let stale_snapshot = vec![doomed.clone(), survivor.clone()];
 
         let state = test_support::build_test_app_state(vec![survivor.clone()]);
-        let read_epoch = state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
 
         // Hold the lock the reload needs, so it cannot get past it.
         let guard = state.instances.write().await;
@@ -8992,7 +9819,7 @@ mod tests {
         // The delete commits while the reload is parked: row out, epoch up.
         // Both happen before the lock is released, mirroring the real purge.
         state
-            .delete_epoch
+            .mutation_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         drop(guard);
 
@@ -9020,7 +9847,9 @@ mod tests {
         let known = Instance::new("known", "/tmp/known");
         let created_elsewhere = Instance::new("created-elsewhere", "/tmp/elsewhere");
         let state = test_support::build_test_app_state(vec![known.clone()]);
-        let read_epoch = state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
 
         reload_state_instances_from_disk(
             &state,
@@ -9085,7 +9914,9 @@ mod tests {
 
         // Invariant 8: capture the epoch BEFORE the disk read, the order every
         // production caller uses.
-        let read_epoch = state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
         let file_watch = state.file_watch.clone();
         let fresh = tokio::task::spawn_blocking(move || load_all_instances(&file_watch))
             .await

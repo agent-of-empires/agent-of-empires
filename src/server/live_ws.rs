@@ -21,6 +21,15 @@
 //!   `#{mouse_sgr_flag}`: when the pane is a full-screen mouse app the
 //!   client forwards the wheel to it (as input bytes) instead of widening
 //!   the capture window, since the alternate screen has no scrollback.
+//!   On a composited (split) window the frame also carries `"pane0"`:
+//!   `{"cols":..,"rows":..,"left":..,"top":..}`, pane 0's rectangle within
+//!   the window grid. The cursor is translated onto that grid before it is
+//!   sent, and clients map pointer cells back by subtracting
+//!   `(left, top)` (#3515). Absent on single-pane frames. Clients that
+//!   ignore `left`/`top` still paint the cursor correctly at any origin,
+//!   because the translation already happened here; their mouse forwarding
+//!   is what degrades, back to the one-row shift of #3515 whenever the
+//!   origin is not `(0, 0)`.
 //!   `{"type":"size_owner","is_owner":bool}`: whether this client holds
 //!     the session's size-owner lock. Only the owner resizes the shared
 //!     tmux window and may type; a non-owner renders best-effort at the
@@ -1027,10 +1036,19 @@ async fn handle_live_ws(
 /// virtual scroll spacer off `history` and slices the live screen off
 /// the content's last `rows` lines, independent of cursor visibility.
 fn frame_json(content: &str, cursor: Option<&crate::tmux::PaneCursor>) -> String {
+    // On a composited frame the content grid is the whole WINDOW while
+    // `x`/`y` are pane 0 relative; the client paints the cursor by indexing
+    // that grid directly, so translate onto the composite here (#3515).
+    // `composite_pane0` is `None` (or at the origin) on every other frame,
+    // where this is the identity. The origin also rides on `pane0` so the
+    // client's inverse mapping, pointer cell -> pane coordinate, can
+    // subtract it again.
+    let pane0 = cursor.and_then(|c| c.composite_pane0);
+    let (origin_x, origin_y) = pane0.map_or((0, 0), |p| (p.left, p.top));
     let cursor_value = match cursor {
         Some(c) if c.visible => serde_json::json!({
-            "x": c.x,
-            "y": c.y,
+            "x": c.x.saturating_add(origin_x),
+            "y": c.y.saturating_add(origin_y),
         }),
         _ => serde_json::Value::Null,
     };
@@ -1046,8 +1064,13 @@ fn frame_json(content: &str, cursor: Option<&crate::tmux::PaneCursor>) -> String
         "altScreen": cursor.map(|c| c.alternate_on).unwrap_or(false),
         "mouse": cursor.map(|c| c.mouse_tracking).unwrap_or(false),
         "mouseSgr": cursor.map(|c| c.mouse_sgr).unwrap_or(false),
-        "pane0": cursor.and_then(|c| c.composite_pane0).map(|(cols, rows)| {
-            serde_json::json!({ "cols": cols, "rows": rows })
+        "pane0": pane0.map(|p| {
+            serde_json::json!({
+                "cols": p.width,
+                "rows": p.height,
+                "left": p.left,
+                "top": p.top,
+            })
         }),
     })
     .to_string()
@@ -1139,33 +1162,72 @@ mod tests {
 
     #[test]
     fn frame_json_includes_geometry_and_cursor() {
-        let cursor = crate::tmux::PaneCursor {
-            x: 3,
-            y: 7,
-            visible: true,
-            pane_height: 46,
-            history_size: 1200,
-            pane_width: 74,
-            alternate_on: false,
-            mouse_tracking: false,
-            mouse_sgr: false,
-            mouse_all: false,
-            position_reliable: true,
-            composite_pane0: Some((37, 46)),
-        };
-        let json = frame_json("hello\nworld", Some(&cursor));
-        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["type"], "frame");
-        assert_eq!(v["content"], "hello\nworld");
-        assert_eq!(v["rows"], 46);
-        assert_eq!(v["history"], 1200);
-        assert_eq!(v["cursor"]["x"], 3);
-        assert_eq!(v["cursor"]["y"], 7);
-        assert_eq!(v["altScreen"], false);
-        assert_eq!(v["mouse"], false);
-        assert_eq!(v["mouseSgr"], false);
-        assert_eq!(v["pane0"]["cols"], 37);
-        assert_eq!(v["pane0"]["rows"], 46);
+        let cases = [
+            // Unsplit: `pane0` is absent and the cursor is untouched.
+            (None, (3, 7), serde_json::Value::Null),
+            // Composited with pane 0 at the corner (a borderless split):
+            // identity translation, but `pane0` rides with zero origin.
+            (
+                Some(crate::tmux::PaneGeom {
+                    left: 0,
+                    top: 0,
+                    width: 37,
+                    height: 46,
+                }),
+                (3, 7),
+                serde_json::json!({
+                    "cols": 37,
+                    "rows": 46,
+                    "left": 0,
+                    "top": 0,
+                }),
+            ),
+            // Composited with pane-border-status top: the wire cursor moves
+            // onto the window grid by pane 0's origin (#3515).
+            (
+                Some(crate::tmux::PaneGeom {
+                    left: 2,
+                    top: 1,
+                    width: 37,
+                    height: 46,
+                }),
+                (5, 8),
+                serde_json::json!({
+                    "cols": 37,
+                    "rows": 46,
+                    "left": 2,
+                    "top": 1,
+                }),
+            ),
+        ];
+        for (pane0, want_cursor, want_pane0) in cases {
+            let cursor = crate::tmux::PaneCursor {
+                x: 3,
+                y: 7,
+                visible: true,
+                pane_height: 46,
+                history_size: 1200,
+                pane_width: 74,
+                alternate_on: false,
+                mouse_tracking: false,
+                mouse_sgr: false,
+                mouse_all: false,
+                position_reliable: true,
+                composite_pane0: pane0,
+            };
+            let json = frame_json("hello\nworld", Some(&cursor));
+            let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+            assert_eq!(v["type"], "frame");
+            assert_eq!(v["content"], "hello\nworld");
+            assert_eq!(v["rows"], 46);
+            assert_eq!(v["history"], 1200);
+            assert_eq!(v["cursor"]["x"], want_cursor.0, "{pane0:?}");
+            assert_eq!(v["cursor"]["y"], want_cursor.1, "{pane0:?}");
+            assert_eq!(v["altScreen"], false);
+            assert_eq!(v["mouse"], false);
+            assert_eq!(v["mouseSgr"], false);
+            assert_eq!(v["pane0"], want_pane0, "{pane0:?}");
+        }
     }
 
     #[test]

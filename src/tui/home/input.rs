@@ -202,8 +202,12 @@ fn split_bracketed_paste(text: &str) -> Vec<live_send::TmuxKey> {
 /// report at all, so it is dropped rather than clamped to the nearest edge,
 /// which would otherwise synthesise a click or hover on pane 0's border.
 ///
-/// Pane 0 sits at the window origin, so the sub-rectangle shares the preview's
-/// top-left corner and only its extent differs.
+/// Pane 0 usually sits at the window origin, so the sub-rectangle shares the
+/// preview's top-left corner and only its extent differs. A window option
+/// like `pane-border-status top` can shift it down (`pane_top == 1`, #3515);
+/// this mapping still assumes the shared corner, so a composited preview with
+/// a shifted pane 0 clamps against the wrong row. Known residual: the TUI
+/// side of #3515 was never reproduced there.
 fn mouse_target_rect(
     cursor: &crate::tmux::PaneCursor,
     pane: ratatui::layout::Rect,
@@ -236,11 +240,11 @@ fn mouse_pane_rect(
     pane: ratatui::layout::Rect,
 ) -> ratatui::layout::Rect {
     match cursor.composite_pane0 {
-        Some((width, height)) => ratatui::layout::Rect {
+        Some(rect) => ratatui::layout::Rect {
             x: pane.x,
             y: pane.y,
-            width: width.min(pane.width),
-            height: height.min(pane.height),
+            width: rect.width.min(pane.width),
+            height: rect.height.min(pane.height),
         },
         None => pane,
     }
@@ -7113,7 +7117,12 @@ mod tests {
         let pane = Rect::new(0, 0, 80, 24);
         let mut split = cursor_for(true, true, true);
         split.mouse_all = true;
-        split.composite_pane0 = Some((40, 24));
+        split.composite_pane0 = Some(crate::tmux::PaneGeom {
+            left: 0,
+            top: 0,
+            width: 40,
+            height: 24,
+        });
 
         // Inside pane 0: maps as before, 1-based.
         assert_eq!(
@@ -7131,7 +7140,12 @@ mod tests {
         // A no-mouse full-screen agent gets no page key from a wheel aimed at
         // the neighbour either, but keeps it over pane 0.
         let mut no_mouse = cursor_for(true, false, false);
-        no_mouse.composite_pane0 = Some((40, 24));
+        no_mouse.composite_pane0 = Some(crate::tmux::PaneGeom {
+            left: 0,
+            top: 0,
+            width: 40,
+            height: 24,
+        });
         assert_eq!(wheel_forward_key(&no_mouse, true, pane, 60, 5), None);
         assert!(wheel_forward_key(&no_mouse, true, pane, 10, 5).is_some());
 
@@ -7164,7 +7178,12 @@ mod tests {
         use ratatui::layout::Rect;
         let pane = Rect::new(2, 3, 20, 10);
         let mut cursor = cursor_for(true, true, true);
-        cursor.composite_pane0 = Some((999, 999));
+        cursor.composite_pane0 = Some(crate::tmux::PaneGeom {
+            left: 0,
+            top: 0,
+            width: 999,
+            height: 999,
+        });
         assert_eq!(mouse_pane_rect(&cursor, pane), pane);
         // And the origin is honoured: a cell above/left of the rect is outside.
         assert_eq!(mouse_target_rect(&cursor, pane, 1, 3), None);
