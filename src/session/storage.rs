@@ -1727,7 +1727,8 @@ pub(crate) struct DuplicateIdReport {
 
 impl DuplicateIdReport {
     /// Single-line, user-actionable summary naming every copy's profile,
-    /// store file, and mtime. Rendered by the TUI and written to the log.
+    /// store file, and mtime. Written to the log by the reconciliation
+    /// layer; the TUI surfaces a count marker derived from these reports.
     pub(crate) fn actionable_message(&self) -> String {
         let copies = self
             .copies
@@ -1761,29 +1762,29 @@ fn file_mtime_epoch_ms(path: &Path) -> Option<u64> {
         .map(|duration| duration.as_millis() as u64)
 }
 
-/// Ids present in more than one profile among `loaded` (per-profile instance
-/// lists), in deterministic first-seen order.
+/// Ids appearing more than once across `loaded` (within one profile or
+/// across profiles), in deterministic first-seen order.
 pub(crate) fn detect_duplicate_ids<'a>(
     loaded: impl IntoIterator<Item = (&'a str, &'a [Instance])>,
 ) -> Vec<String> {
-    let mut seen: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
-    let mut duplicates: Vec<String> = Vec::new();
-    for (profile, instances) in loaded {
+    // Counts occurrences across every profile; an id repeated even within
+    // one profile is ambiguous the same way (corrupt file or writer bug) and
+    // must surface, not silently fail closed.
+    let mut order: Vec<String> = Vec::new();
+    let mut counts: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+    for (_, instances) in loaded {
         for instance in instances {
-            match seen.get(instance.id.as_str()) {
-                Some(previous) if *previous == profile => {}
-                Some(_) => {
-                    if !duplicates.iter().any(|id| id == &instance.id) {
-                        duplicates.push(instance.id.clone());
-                    }
-                }
-                None => {
-                    seen.insert(&instance.id, profile);
-                }
-            }
+            let count = counts.entry(instance.id.as_str()).or_insert_with(|| {
+                order.push(instance.id.clone());
+                0
+            });
+            *count += 1;
         }
     }
-    duplicates
+    order
+        .into_iter()
+        .filter(|id| counts[id.as_str()] > 1)
+        .collect()
 }
 
 /// Journal evidence older than this is insufficient for arbitration (#3459):
@@ -1803,6 +1804,15 @@ const MOVE_JOURNAL_MTIME_SLACK_MS: u64 = 5 * 60 * 1000;
 /// Paths already reported as unusable this process lifetime, so a permanently
 /// broken entry cannot produce ERROR spam and lock churn on every reload tick.
 static UNUSABLE_JOURNAL_ENTRIES: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn unusable_journal_entries_contains(path: &Path) -> bool {
+    UNUSABLE_JOURNAL_ENTRIES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .iter()
+        .any(|seen| seen == path)
+}
 
 fn mark_unusable_journal_entry(path: &Path) {
     let mut seen = UNUSABLE_JOURNAL_ENTRIES
@@ -1831,7 +1841,11 @@ pub(crate) fn reconcile_profile_duplicates(
     storages: &[(&str, &Storage)],
 ) -> ReconciliationOutcome {
     let mut outcome = ReconciliationOutcome::default();
-    let duplicated = !detect_duplicate_ids(loaded.iter().copied()).is_empty();
+    // Normalize to a name-sorted view so report and copy ordering are
+    // deterministic regardless of how the caller iterates its storages.
+    let mut normalized: Vec<(&str, &[Instance])> = loaded.to_vec();
+    normalized.sort_by(|left, right| left.0.cmp(right.0));
+    let duplicated = !detect_duplicate_ids(normalized.iter().copied()).is_empty();
     let mut entries = super::move_journal::scan(
         storages
             .iter()
@@ -1919,7 +1933,7 @@ pub(crate) fn reconcile_profile_duplicates(
     if !outcome.repaired {
         // Nothing changed on disk: build reports from the caller's fresh
         // load instead of re-reading every profile again.
-        outcome.reports = duplicate_reports(loaded, storages);
+        outcome.reports = duplicate_reports(&normalized, storages);
         return outcome;
     }
     // Recompute from fresh disk state so reports reflect post-repair reality.
@@ -1998,11 +2012,15 @@ fn repair_journal_entry(
     for storage in [source_storage, target_storage] {
         let mtime = file_mtime_epoch_ms(storage.sessions_path()).unwrap_or_default();
         if mtime.saturating_sub(entry.created_at_epoch_ms) > MOVE_JOURNAL_MTIME_SLACK_MS {
+            // Permanent: mtimes only grow relative to created_at, so this
+            // entry can never become applicable again. Blacklist it like the
+            // other permanent insufficiency causes to avoid tick spam.
+            mark_unusable_journal_entry(journal_path);
             tracing::warn!(
                 target: "session.store",
                 path = %journal_path.display(),
                 ids = %entry.ids.join(","),
-                "store was modified after the move journal was written; degrading to surfaced legacy instead of arbitrating"
+                "store was modified after the move journal was written; entry is permanently insufficient evidence and stays surfaced"
             );
             return Ok(false);
         }
@@ -4646,6 +4664,18 @@ mod tests {
         assert_eq!(source.load()?.len(), 1);
         assert_eq!(target.load()?.len(), 1);
         assert_eq!(journal_entry_count(&source), 1);
+        // The degradation is permanent (mtimes only grow relative to the
+        // journal timestamp), so it lands in the log-once registry instead of
+        // re-warning on every reload tick.
+        let journal_path = super::super::move_journal::scan([source.sessions_path().to_path_buf()])
+            .into_iter()
+            .next()
+            .map(|(path, _)| path)
+            .expect("entry still on disk");
+        assert!(
+            super::unusable_journal_entries_contains(&journal_path),
+            "mtime-degraded entry is blacklisted like other permanent causes"
+        );
         Ok(())
     }
 
@@ -4666,6 +4696,29 @@ mod tests {
         )?);
         fs::remove_file(&path)?;
         assert!(!target_still_holds(&path, &[winner.id])?);
+        Ok(())
+    }
+
+    #[test]
+    fn same_profile_duplicate_id_is_surfaced() -> Result<()> {
+        // An id repeated inside ONE profile (corrupt file or writer bug) is
+        // ambiguous exactly like a cross-profile duplicate: it must surface,
+        // not silently fail closed without a report or title marker.
+        let (_temp, source, _target, before, _after) = setup_recovery_env("intraprofile")?;
+        source.update(|instances, _| {
+            instances.push(before.clone());
+            Ok(())
+        })?;
+
+        let view: Vec<(&str, &Storage)> = vec![(source.profile(), &source)];
+        let outcome = reconcile_loaded(&[&source], &view);
+
+        assert!(!outcome.repaired);
+        assert_eq!(outcome.reports.len(), 1, "the repeated id surfaces");
+        let report = &outcome.reports[0];
+        assert_eq!(report.id, before.id);
+        assert!(report.actionable_message().contains(&before.id));
+        assert_eq!(source.load()?.len(), 2, "nothing is deleted automatically");
         Ok(())
     }
 
