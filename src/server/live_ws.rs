@@ -1035,7 +1035,9 @@ async fn handle_live_ws(
 fn frame_json(content: &str, cursor: Option<&crate::tmux::PaneCursor>) -> String {
     // The cursor is pane relative while composited content uses the window
     // grid. Emit window-relative coordinates and carry the same origin for
-    // the client's inverse pointer mapping. No pane rectangle means identity.
+    // the client's inverse pointer mapping. Translating before emission also
+    // keeps cursor painting correct in older clients that ignore the origin;
+    // only their pointer mapping degrades. No pane rectangle means identity.
     let pane0 = cursor.and_then(|c| c.composite_pane0);
     let (origin_x, origin_y) = pane0.map_or((0, 0), |p| (p.left, p.top));
     let cursor_value = match cursor {

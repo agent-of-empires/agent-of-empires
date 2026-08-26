@@ -123,7 +123,7 @@ const READING_CAPTURE_LINES: u16 = 2000;
 /// cursor.y`; a short capture instead anchors at the top. This keeps the
 /// cursor on the same text row for both the status-row offset (#3515) and the
 /// shorter-pane case (#2742). A hidden or out-of-bounds cursor yields `None`.
-fn map_live_preview_cursor(
+pub(super) fn map_live_preview_cursor(
     output: Rect,
     visible_rows: usize,
     line_count: usize,

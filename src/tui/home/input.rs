@@ -7137,6 +7137,34 @@ mod tests {
         assert!(hover_forward_bytes(&split, pane, 39, 5).is_some());
         assert_eq!(hover_forward_bytes(&split, pane, 40, 5), None);
 
+        // In the bottom-follow layout, the composite's top border row is
+        // clipped before painting: `first_line == pane0.top == 1`. The cursor
+        // mapper adds `top` after its anchor delta, while the mouse rect stays
+        // at the visible output origin. A click on the painted cursor must
+        // round-trip to that cursor's 1-based app cell.
+        let mut bottom_follow = cursor_for(true, true, true);
+        bottom_follow.x = 10;
+        bottom_follow.y = 4;
+        bottom_follow.pane_height = 25;
+        bottom_follow.composite_pane0 = Some(crate::tmux::PaneGeom {
+            left: 0,
+            top: 1,
+            width: 40,
+            height: 24,
+        });
+        let painted = crate::tui::home::render::map_live_preview_cursor(
+            pane,
+            usize::from(pane.height),
+            25,
+            bottom_follow,
+        )
+        .expect("visible pane cursor");
+        assert_eq!(
+            map_pane_cell(mouse_pane_rect(&bottom_follow, pane), painted.x, painted.y,),
+            (bottom_follow.x + 1, bottom_follow.y + 1),
+            "clicking the painted cursor must report the same app cell"
+        );
+
         // A no-mouse full-screen agent gets no page key from a wheel aimed at
         // the neighbour either, but keeps it over pane 0.
         let mut no_mouse = cursor_for(true, false, false);
