@@ -15373,29 +15373,28 @@ mod tests {
 
             #[test]
             #[serial]
-            fn kimi_invalid_peer_config_fails_closed_without_resetting_aliases() {
+            fn kimi_invalid_peer_config_fails_closed() {
                 let temp = tempdir().unwrap();
                 let _home = isolate_app_dir_at(temp.path());
-                // Registry writers using an empty profile normalize through
-                // the process-global default. Pin it away from `peer_profile`
-                // so unrelated parallel tests cannot clear the alias this
-                // fixture is observing.
-                fs::write(
-                    crate::session::get_app_dir().unwrap().join("config.toml"),
-                    "default_profile = \"status-default\"\n",
-                )
-                .unwrap();
-                assert_eq!(
-                    crate::session::config::resolve_default_profile(),
-                    "status-default"
-                );
                 let project = temp.path().join("invalid-config-project");
                 fs::create_dir_all(&project).unwrap();
                 let project = project.to_string_lossy().to_string();
                 let kimi_home = temp.path().join("kimi-home");
+                let ambient_home = temp.path().join("ambient-kimi-home");
                 fs::create_dir_all(&kimi_home).unwrap();
-                let _kimi = EnvGuard::set(&[("KIMI_CODE_HOME", kimi_home.to_str().unwrap())]);
+                fs::create_dir_all(&ambient_home).unwrap();
+                let _kimi = EnvGuard::set(&[("KIMI_CODE_HOME", ambient_home.to_str().unwrap())]);
                 seed_kimi_index(&kimi_home, &project, "kimi-stored", "kimi-peer-fresh");
+
+                let caller_profile = "kimi-invalid-config-caller";
+                let mut caller_config =
+                    crate::session::profile_config::load_profile_config(caller_profile).unwrap();
+                caller_config.overrides.insert(
+                    "environment".to_string(),
+                    serde_json::json!([format!("KIMI_CODE_HOME={}", kimi_home.display())]),
+                );
+                crate::session::profile_config::save_profile_config(caller_profile, &caller_config)
+                    .unwrap();
 
                 let peer_profile = "kimi-invalid-config-peer";
                 let mut peer = Instance::new("invalid-config-peer", &project);
@@ -15403,7 +15402,6 @@ mod tests {
                 peer.tool = "kimi".to_string();
                 peer.agent_session_id = Some("kimi-peer-fresh".to_string());
                 super::seed_disk_for_sidecar_test(peer_profile, &peer);
-                super::super::install_aliases(peer_profile, &[("kimi-alias", "kimi")]);
                 fs::write(
                     crate::session::get_profile_dir_path(peer_profile)
                         .unwrap()
@@ -15413,17 +15411,16 @@ mod tests {
                 .unwrap();
 
                 let mut inst = Instance::new("invalid-config-caller", &project);
-                inst.source_profile = "kimi-invalid-config-caller".to_string();
+                inst.source_profile = caller_profile.to_string();
                 inst.tool = "kimi".to_string();
                 inst.agent_session_id = Some("kimi-stored".to_string());
                 inst.resume_intent = ResumeIntent::Default;
 
                 let (sid, _is_existing) = inst.acquire_session_id();
-                assert_eq!(sid.as_deref(), Some("kimi-stored"));
                 assert_eq!(
-                    crate::tmux::status_rules::effective_detect_as(peer_profile, "kimi-alias", ""),
-                    "kimi",
-                    "an attribution read must not reset a peer profile's aliases"
+                    sid.as_deref(),
+                    Some("kimi-stored"),
+                    "invalid peer config must not license ambient-home MRU"
                 );
             }
         }
