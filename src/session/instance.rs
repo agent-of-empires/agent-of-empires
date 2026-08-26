@@ -3166,14 +3166,16 @@ impl Instance {
     }
 
     /// Full set of session IDs capture must skip for this instance: live tmux
-    /// ownership, cascade-cleared ids, and conversations same-project peers
-    /// parked while running another tool.
+    /// ownership, cascade-cleared ids, conversations same-project peers parked
+    /// while running another tool, and inactive peers that still own records
+    /// in a shared host store.
     fn retroactive_capture_exclusion_set(&self) -> HashSet<String> {
         super::capture::compose_exclusion_with_persisted_peers(
             &self.id,
             &self.project_path,
             &self.tool,
-            self.tool == "claude" || (self.tool == "codex" && !self.is_sandboxed()),
+            self.tool == "claude"
+                || (matches!(self.tool.as_str(), "codex" | "kimi") && !self.is_sandboxed()),
             &self.effective_profile(),
             &self.retroactive_capture_excludes,
         )
@@ -15010,160 +15012,196 @@ mod tests {
 
             #[test]
             #[serial]
-            fn acquire_kimi_keeps_anchor_when_store_is_shared() {
-                let temp = tempdir().unwrap();
-                let _home = isolate_app_dir_at(temp.path());
-                let project = temp.path().join("storm-project");
-                fs::create_dir_all(&project).unwrap();
-                let project = project.to_string_lossy().to_string();
-                let kimi_home = temp.path().join("kimi-home");
-                fs::create_dir_all(&kimi_home).unwrap();
-                let _kimi = EnvGuard::set(&[("KIMI_CODE_HOME", kimi_home.to_str().unwrap())]);
-                seed_kimi_index(&kimi_home, &project, "kimi-stored", "kimi-peer-fresh");
+            fn acquire_kimi_respects_store_ownership() {
+                #[derive(Clone, Copy)]
+                enum PeerKind {
+                    None,
+                    CurrentKimi,
+                    ParkedKimi,
+                    ArchivedKimi,
+                    TrashedKimi,
+                    SandboxedKimi,
+                }
 
-                // The peer shares the cwd and owns the fresher record. It is
-                // persisted but pane-less: exactly the state of every session
-                // in a recovery storm before any pane has come up, when the
-                // live-tmux exclusion scan still sees nothing.
-                let profile = "kimi-shared-anchor";
-                let mut peer = Instance::new("storm-peer", &project);
-                peer.source_profile = profile.to_string();
-                peer.tool = "kimi".to_string();
-                peer.agent_session_id = Some("kimi-peer-fresh".to_string());
-                super::seed_disk_for_sidecar_test(profile, &peer);
+                struct Case {
+                    label: &'static str,
+                    peer: PeerKind,
+                    cross_profile: bool,
+                    same_cwd: bool,
+                    fresh_sid: &'static str,
+                    expected: &'static str,
+                }
 
-                let mut inst = Instance::new("storm-caller", &project);
-                inst.source_profile = profile.to_string();
-                inst.tool = "kimi".to_string();
-                inst.agent_session_id = Some("kimi-stored".to_string());
-                inst.resume_intent = ResumeIntent::Default;
-
-                // The newest record names the peer's conversation, not this
-                // pane's; acquire must keep the anchored sid instead of
-                // swapping it for the MRU guess.
-                let (sid, is_existing) = inst.acquire_session_id();
-                assert_eq!(sid.as_deref(), Some("kimi-stored"));
-                assert!(is_existing);
-                assert_eq!(inst.agent_session_id.as_deref(), Some("kimi-stored"));
-            }
-
-            #[test]
-            #[serial]
-            fn acquire_kimi_retarget_stays_when_sole_owner_of_cwd() {
-                // Same fixture without the persisted peer: the index cannot
-                // name another pane's conversation, so the #2291-style MRU
-                // retarget stays intact and remains the post-/clear promotion
-                // path for single-session cwds.
-                let temp = tempdir().unwrap();
-                let _home = isolate_app_dir_at(temp.path());
-                let project = temp.path().join("solo-project");
-                fs::create_dir_all(&project).unwrap();
-                let project = project.to_string_lossy().to_string();
-                let kimi_home = temp.path().join("kimi-home");
-                fs::create_dir_all(&kimi_home).unwrap();
-                let _kimi = EnvGuard::set(&[("KIMI_CODE_HOME", kimi_home.to_str().unwrap())]);
-                seed_kimi_index(&kimi_home, &project, "kimi-stored", "kimi-fresh");
-
-                let mut inst = Instance::new("solo-caller", &project);
-                inst.tool = "kimi".to_string();
-                inst.agent_session_id = Some("kimi-stored".to_string());
-                inst.resume_intent = ResumeIntent::Default;
-
-                let (sid, is_existing) = inst.acquire_session_id();
-                assert_eq!(sid.as_deref(), Some("kimi-fresh"));
-                assert!(is_existing);
-                assert_eq!(inst.agent_session_id.as_deref(), Some("kimi-fresh"));
-            }
-
-            #[test]
-            #[serial]
-            fn kimi_shared_detection_walks_across_profiles() {
-                // The session-index namespace is keyed by the resolved Kimi
-                // home plus the canonical cwd, not by the AoE profile: a peer
-                // recovered under a different profile must still block the
-                // MRU retarget (the gap class flagged as P1 on #3507).
-                let temp = tempdir().unwrap();
-                let _home = isolate_app_dir_at(temp.path());
-                let project = temp.path().join("cross-project");
-                fs::create_dir_all(&project).unwrap();
-                let project = project.to_string_lossy().to_string();
-                let kimi_home = temp.path().join("kimi-home");
-                fs::create_dir_all(&kimi_home).unwrap();
-                let _kimi = EnvGuard::set(&[("KIMI_CODE_HOME", kimi_home.to_str().unwrap())]);
-                seed_kimi_index(&kimi_home, &project, "kimi-stored", "kimi-peer-fresh");
-
-                let mut peer = Instance::new("cross-peer", &project);
-                peer.source_profile = "kimi-cross-peer-profile".to_string();
-                peer.tool = "kimi".to_string();
-                peer.agent_session_id = Some("kimi-peer-fresh".to_string());
-                super::seed_disk_for_sidecar_test("kimi-cross-peer-profile", &peer);
-
-                let mut inst = Instance::new("cross-caller", &project);
-                inst.source_profile = "kimi-cross-caller-profile".to_string();
-                inst.tool = "kimi".to_string();
-                inst.agent_session_id = Some("kimi-stored".to_string());
-                inst.resume_intent = ResumeIntent::Default;
-
-                let (sid, _is_existing) = inst.acquire_session_id();
-                assert_eq!(
-                    sid.as_deref(),
-                    Some("kimi-stored"),
-                    "a peer in another profile sharing the resolved home and cwd must still count as shared"
-                );
-            }
-
-            #[test]
-            #[serial]
-            fn kimi_peer_on_different_cwd_does_not_block_retarget() {
-                // Sharing is judged on the pair (resolved home, canonical
-                // cwd): a peer on another project leaves this pane the sole
-                // owner of its own workDir slice of the index.
-                let temp = tempdir().unwrap();
-                let _home = isolate_app_dir_at(temp.path());
-                let project = temp.path().join("mine-project");
-                let other_project = temp.path().join("other-project");
-                fs::create_dir_all(&project).unwrap();
-                fs::create_dir_all(&other_project).unwrap();
-                let project = project.to_string_lossy().to_string();
-                let other_project = other_project.to_string_lossy().to_string();
-                let kimi_home = temp.path().join("kimi-home");
-                fs::create_dir_all(&kimi_home).unwrap();
-                let _kimi = EnvGuard::set(&[("KIMI_CODE_HOME", kimi_home.to_str().unwrap())]);
-                seed_kimi_index(&kimi_home, &project, "kimi-stored", "kimi-fresh");
-
-                let profile = "kimi-different-cwd";
-                let mut peer = Instance::new("cwd-peer", &other_project);
-                peer.source_profile = profile.to_string();
-                peer.tool = "kimi".to_string();
-                super::seed_disk_for_sidecar_test(profile, &peer);
-
-                let mut inst = Instance::new("mine-caller", &project);
-                inst.source_profile = profile.to_string();
-                inst.tool = "kimi".to_string();
-                inst.agent_session_id = Some("kimi-stored".to_string());
-                inst.resume_intent = ResumeIntent::Default;
-
-                let (sid, _is_existing) = inst.acquire_session_id();
-                assert_eq!(sid.as_deref(), Some("kimi-fresh"));
-            }
-            #[test]
-            #[serial]
-            fn kimi_inactive_peers_do_not_block_retarget() {
-                // The skip filters are load-bearing in both directions: a
-                // trashed, archived, or sandboxed peer on the same cwd must
-                // NOT count as sharing, or one stale row would permanently
-                // disable the #2291 retarget through the fail-closed store.
-                // Table rows share the storm fixture; only the peer's state
-                // differs.
                 let cases = [
-                    ("trashed", "kimi-trashed-peer"),
-                    ("archived", "kimi-archived-peer"),
-                    ("sandboxed", "kimi-sandboxed-peer"),
+                    Case {
+                        label: "same-profile-current",
+                        peer: PeerKind::CurrentKimi,
+                        cross_profile: false,
+                        same_cwd: true,
+                        fresh_sid: "kimi-peer-fresh",
+                        expected: "kimi-stored",
+                    },
+                    Case {
+                        label: "sole-owner",
+                        peer: PeerKind::None,
+                        cross_profile: false,
+                        same_cwd: true,
+                        fresh_sid: "kimi-fresh",
+                        expected: "kimi-fresh",
+                    },
+                    Case {
+                        label: "cross-profile-current",
+                        peer: PeerKind::CurrentKimi,
+                        cross_profile: true,
+                        same_cwd: true,
+                        fresh_sid: "kimi-peer-fresh",
+                        expected: "kimi-stored",
+                    },
+                    Case {
+                        label: "different-cwd",
+                        peer: PeerKind::CurrentKimi,
+                        cross_profile: false,
+                        same_cwd: false,
+                        fresh_sid: "kimi-fresh",
+                        expected: "kimi-fresh",
+                    },
+                    Case {
+                        label: "cross-profile-parked",
+                        peer: PeerKind::ParkedKimi,
+                        cross_profile: true,
+                        same_cwd: true,
+                        fresh_sid: "kimi-parked-peer",
+                        expected: "kimi-stored",
+                    },
+                    Case {
+                        label: "cross-profile-archived",
+                        peer: PeerKind::ArchivedKimi,
+                        cross_profile: true,
+                        same_cwd: true,
+                        fresh_sid: "kimi-archived-peer",
+                        expected: "kimi-stored",
+                    },
+                    Case {
+                        label: "cross-profile-trashed",
+                        peer: PeerKind::TrashedKimi,
+                        cross_profile: true,
+                        same_cwd: true,
+                        fresh_sid: "kimi-trashed-peer",
+                        expected: "kimi-stored",
+                    },
+                    Case {
+                        label: "sandbox-private",
+                        peer: PeerKind::SandboxedKimi,
+                        cross_profile: false,
+                        same_cwd: true,
+                        fresh_sid: "kimi-unrelated-host-fresh",
+                        expected: "kimi-unrelated-host-fresh",
+                    },
                 ];
-                for (label, peer_sid) in cases {
+
+                for case in cases {
                     let temp = tempdir().unwrap();
                     let _home = isolate_app_dir_at(temp.path());
-                    let project = temp.path().join(format!("filter-project-{label}"));
+                    let project = temp.path().join(format!("project-{}", case.label));
+                    let other_project = temp.path().join(format!("other-{}", case.label));
+                    fs::create_dir_all(&project).unwrap();
+                    fs::create_dir_all(&other_project).unwrap();
+                    let project = project.to_string_lossy().to_string();
+                    let other_project = other_project.to_string_lossy().to_string();
+                    let kimi_home = temp.path().join("kimi-home");
+                    fs::create_dir_all(&kimi_home).unwrap();
+                    let _kimi = EnvGuard::set(&[("KIMI_CODE_HOME", kimi_home.to_str().unwrap())]);
+                    seed_kimi_index(&kimi_home, &project, "kimi-stored", case.fresh_sid);
+
+                    let caller_profile = format!("kimi-owner-{}-caller", case.label);
+                    if !matches!(case.peer, PeerKind::None) {
+                        let peer_profile = if case.cross_profile {
+                            format!("kimi-owner-{}-peer", case.label)
+                        } else {
+                            caller_profile.clone()
+                        };
+                        let peer_path = if case.same_cwd {
+                            project.as_str()
+                        } else {
+                            other_project.as_str()
+                        };
+                        let mut peer = Instance::new("ownership-peer", peer_path);
+                        peer.source_profile = peer_profile.clone();
+                        match case.peer {
+                            PeerKind::None => unreachable!(),
+                            PeerKind::CurrentKimi => {
+                                peer.tool = "kimi".to_string();
+                                peer.agent_session_id = Some(case.fresh_sid.to_string());
+                            }
+                            PeerKind::ParkedKimi => {
+                                peer.tool = "claude".to_string();
+                                peer.prior_tool_session_ids.insert(
+                                    "kimi".to_string(),
+                                    crate::session::instance::PriorToolSession {
+                                        agent_session_id: Some(case.fresh_sid.to_string()),
+                                        acp_session_id: None,
+                                    },
+                                );
+                            }
+                            PeerKind::ArchivedKimi => {
+                                peer.tool = "kimi".to_string();
+                                peer.agent_session_id = Some(case.fresh_sid.to_string());
+                                peer.archive();
+                            }
+                            PeerKind::TrashedKimi => {
+                                peer.tool = "kimi".to_string();
+                                peer.agent_session_id = Some(case.fresh_sid.to_string());
+                                peer.trash();
+                            }
+                            PeerKind::SandboxedKimi => {
+                                peer.tool = "kimi".to_string();
+                                peer.agent_session_id = Some("kimi-sandbox-only".to_string());
+                                peer.sandbox_info = Some(crate::session::SandboxInfo {
+                                    enabled: true,
+                                    container_id: None,
+                                    image: "test-image".to_string(),
+                                    container_name: format!("aoe-test-{}", case.label),
+                                    extra_env: None,
+                                    custom_instruction: None,
+                                    container_workdir: None,
+                                    before_start_env: Vec::new(),
+                                });
+                            }
+                        }
+                        super::seed_disk_for_sidecar_test(&peer_profile, &peer);
+                    }
+
+                    let mut inst = Instance::new("ownership-caller", &project);
+                    inst.source_profile = caller_profile;
+                    inst.tool = "kimi".to_string();
+                    inst.agent_session_id = Some("kimi-stored".to_string());
+                    inst.resume_intent = ResumeIntent::Default;
+
+                    let (sid, is_existing) = inst.acquire_session_id();
+                    assert_eq!(sid.as_deref(), Some(case.expected), "{}", case.label);
+                    assert!(is_existing, "{}", case.label);
+                    assert_eq!(
+                        inst.agent_session_id.as_deref(),
+                        Some(case.expected),
+                        "{}",
+                        case.label
+                    );
+                }
+            }
+            #[test]
+            #[serial]
+            fn kimi_inactive_same_profile_sids_are_excluded() {
+                // Restorable inactive rows retain their Kimi conversation.
+                // The same-profile exclusion feeds both acquire and the live
+                // poller snapshot, while the cross-profile table above proves
+                // the all-profile ownership predicate independently.
+                for (label, peer_sid) in [
+                    ("trashed", "kimi-trashed-peer"),
+                    ("archived", "kimi-archived-peer"),
+                ] {
+                    let temp = tempdir().unwrap();
+                    let _home = isolate_app_dir_at(temp.path());
+                    let project = temp.path().join(format!("inactive-project-{label}"));
                     fs::create_dir_all(&project).unwrap();
                     let project = project.to_string_lossy().to_string();
                     let kimi_home = temp.path().join("kimi-home");
@@ -15171,42 +15209,28 @@ mod tests {
                     let _kimi = EnvGuard::set(&[("KIMI_CODE_HOME", kimi_home.to_str().unwrap())]);
                     seed_kimi_index(&kimi_home, &project, "kimi-stored", peer_sid);
 
-                    let profile = format!("kimi-filter-{label}");
-                    let mut peer = Instance::new("filter-peer", &project);
+                    let profile = format!("kimi-inactive-{label}");
+                    let mut peer = Instance::new("inactive-peer", &project);
                     peer.source_profile = profile.clone();
                     peer.tool = "kimi".to_string();
                     peer.agent_session_id = Some(peer_sid.to_string());
                     match label {
                         "trashed" => peer.trash(),
                         "archived" => peer.archive(),
-                        "sandboxed" => {
-                            peer.sandbox_info = Some(crate::session::SandboxInfo {
-                                enabled: true,
-                                container_id: None,
-                                image: "test-image".to_string(),
-                                container_name: format!("aoe-test-{label}"),
-                                extra_env: None,
-                                custom_instruction: None,
-                                container_workdir: None,
-                                before_start_env: Vec::new(),
-                            });
-                        }
                         _ => unreachable!(),
                     }
                     super::seed_disk_for_sidecar_test(&profile, &peer);
 
-                    let mut inst = Instance::new("filter-caller", &project);
-                    inst.source_profile = profile.clone();
+                    let mut inst = Instance::new("inactive-caller", &project);
+                    inst.source_profile = profile;
                     inst.tool = "kimi".to_string();
                     inst.agent_session_id = Some("kimi-stored".to_string());
                     inst.resume_intent = ResumeIntent::Default;
 
+                    let exclusion = inst.retroactive_capture_exclusion_set();
+                    assert!(exclusion.contains(peer_sid), "{label} exclusion");
                     let (sid, _is_existing) = inst.acquire_session_id();
-                    assert_eq!(
-                        sid.as_deref(),
-                        Some(peer_sid),
-                        "{label} peer on the same cwd must not count as shared"
-                    );
+                    assert_eq!(sid.as_deref(), Some("kimi-stored"), "{label} anchor");
                 }
             }
 
@@ -15266,9 +15290,11 @@ mod tests {
                 // refused entirely, yielding a fresh start instead of an
                 // unattributable adoption, while a sole-owner store keeps
                 // filling from the index.
-                for (label, peer_present, expected) in
-                    [("shared", true, None), ("solo", false, Some("kimi-fresh"))]
-                {
+                for (label, peer_state, expected) in [
+                    ("shared-unattributed", Some("unattributed"), None),
+                    ("shared-stopped-known", Some("stopped-known"), None),
+                    ("solo", None, Some("kimi-fresh")),
+                ] {
                     let temp = tempdir().unwrap();
                     let _home = isolate_app_dir_at(temp.path());
                     let project = temp.path().join(format!("idless-project-{label}"));
@@ -15277,13 +15303,22 @@ mod tests {
                     let kimi_home = temp.path().join("kimi-home");
                     fs::create_dir_all(&kimi_home).unwrap();
                     let _kimi = EnvGuard::set(&[("KIMI_CODE_HOME", kimi_home.to_str().unwrap())]);
-                    seed_kimi_index(&kimi_home, &project, "kimi-stored", "kimi-fresh");
+                    let old_sid = if peer_state == Some("stopped-known") {
+                        "kimi-stale-peer"
+                    } else {
+                        "kimi-stored"
+                    };
+                    seed_kimi_index(&kimi_home, &project, old_sid, "kimi-fresh");
 
-                    if peer_present {
+                    if let Some(peer_state) = peer_state {
                         let profile = format!("kimi-idless-{label}");
                         let mut peer = Instance::new("idless-peer", &project);
                         peer.source_profile = profile.clone();
                         peer.tool = "kimi".to_string();
+                        if peer_state == "stopped-known" {
+                            peer.status = Status::Stopped;
+                            peer.agent_session_id = Some(old_sid.to_string());
+                        }
                         super::seed_disk_for_sidecar_test(&profile, &peer);
                     }
 
@@ -15334,6 +15369,49 @@ mod tests {
                     sid.as_deref(),
                     Some("kimi-stored"),
                     "an unreadable profile list must count as shared"
+                );
+            }
+
+            #[test]
+            #[serial]
+            fn kimi_invalid_peer_config_fails_closed_without_resetting_aliases() {
+                let temp = tempdir().unwrap();
+                let _home = isolate_app_dir_at(temp.path());
+                let project = temp.path().join("invalid-config-project");
+                fs::create_dir_all(&project).unwrap();
+                let project = project.to_string_lossy().to_string();
+                let kimi_home = temp.path().join("kimi-home");
+                fs::create_dir_all(&kimi_home).unwrap();
+                let _kimi = EnvGuard::set(&[("KIMI_CODE_HOME", kimi_home.to_str().unwrap())]);
+                seed_kimi_index(&kimi_home, &project, "kimi-stored", "kimi-peer-fresh");
+
+                let peer_profile = "kimi-invalid-config-peer";
+                let mut peer = Instance::new("invalid-config-peer", &project);
+                peer.source_profile = peer_profile.to_string();
+                peer.tool = "kimi".to_string();
+                peer.agent_session_id = Some("kimi-peer-fresh".to_string());
+                super::seed_disk_for_sidecar_test(peer_profile, &peer);
+                super::super::install_aliases(peer_profile, &[("kimi-alias", "kimi")]);
+                fs::write(
+                    crate::session::get_profile_dir_path(peer_profile)
+                        .unwrap()
+                        .join("config.toml"),
+                    "environment = [",
+                )
+                .unwrap();
+
+                let mut inst = Instance::new("invalid-config-caller", &project);
+                inst.source_profile = "kimi-invalid-config-caller".to_string();
+                inst.tool = "kimi".to_string();
+                inst.agent_session_id = Some("kimi-stored".to_string());
+                inst.resume_intent = ResumeIntent::Default;
+
+                let (sid, _is_existing) = inst.acquire_session_id();
+                assert_eq!(sid.as_deref(), Some("kimi-stored"));
+                assert_eq!(
+                    crate::tmux::status_rules::effective_detect_as(peer_profile, "kimi-alias", ""),
+                    "kimi",
+                    "an attribution read must not reset a peer profile's aliases"
                 );
             }
         }

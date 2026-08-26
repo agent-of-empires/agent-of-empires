@@ -991,16 +991,17 @@ pub(crate) fn compose_exclusion(
 /// starts. Parked conversations are no longer published in the peer's tmux
 /// environment, so [`build_exclusion_set`] cannot see them. Without this set,
 /// another session can capture the parked conversation before its owner swaps
-/// back. Claude and host Codex additionally need stopped peer protection
-/// because their mtime fallbacks can select a transcript after the owning tmux
-/// pane disappears (#2355). Sandboxed Codex sessions have instance-private
-/// `CODEX_HOME` directories and do not share a transcript store (#3317).
+/// back. Claude, host Codex, and host Kimi additionally need inactive
+/// same-tool protection because their shared-store MRU scans can select a
+/// conversation after the owning pane disappears. Sandboxed Codex and Kimi
+/// omit that protection because their stores are instance-private or are not
+/// captured from the host (#3317).
 ///
-/// Scope: the host transcript directories are keyed by `$HOME`, not by AoE
-/// profile, but this helper only inspects `sessions.json` for the caller's
-/// effective profile. A stopped peer in a different profile against the same
-/// host `$HOME` will not be excluded; the residual gap is narrower than #2355's
-/// trigger and is left for a follow-up.
+/// Scope: host stores are keyed by each agent's effective home, not by AoE
+/// profile, but this helper inspects only `sessions.json` for the caller's
+/// effective profile. A stopped peer in another profile against the same
+/// agent home will not be excluded; callers needing global ownership must
+/// compose their own cross-profile check.
 pub(crate) fn compose_exclusion_with_persisted_peers(
     current_instance_id: &str,
     current_project_path: &str,
@@ -2771,9 +2772,10 @@ fn kimi_home_for_environment(environment: &[String]) -> Option<PathBuf> {
         .map(PathBuf::from)
         .filter(|home| !home.as_os_str().is_empty())
         .or_else(|| resolve_agent_home(Some("KIMI_CODE_HOME"), ".kimi-code").ok())
+        .filter(|home| !home.as_os_str().is_empty())
 }
 
-/// Whether another live-tracked AoE session shares this one's Kimi store: a
+/// Whether another persisted host AoE session shares this one's Kimi store: a
 /// resolvable own home plus the same canonicalized project path. When true,
 /// the newest matching record in the session index cannot be attributed to
 /// this pane, so the acquire-time MRU scan behind
@@ -2789,22 +2791,15 @@ fn kimi_home_for_environment(environment: &[String]) -> Option<PathBuf> {
 /// profile list because minted pairs are runtime state that is deliberately
 /// not persisted.
 ///
-/// An unreadable peer profile config silently resolves that peer to the
-/// ambient default home rather than failing closed: the trigger needs a
-/// config readable at launch and unreadable during recovery, and the
-/// fallible-resolution fix would ripple through shared helpers, so the gap
-/// is accepted and stated here instead of hidden.
-///
 /// The walk covers every AoE profile because the store is keyed by resolved
 /// home plus cwd, not by profile: two profiles resolving to one home share
-/// one store. It fails closed: an unreadable profile list, an unreadable
-/// per-profile store, or no resolvable own home all report shared, because
-/// ownership that cannot be proven must not license an MRU retarget.
-/// Trashed and archived peers are skipped: they need explicit user action or
-/// are skipped by startup recovery, so they cannot take part in a concurrent
-/// start. Stopped and pane-less peers deliberately count as sharing; pane
-/// liveness is exactly what races during a mass recovery, so filtering on it
-/// re-opens the storm window (same reasoning as #3507's Claude predicate).
+/// one store. It fails closed: an unreadable profile list, config, or store,
+/// or no resolvable own home all report shared, because ownership that cannot
+/// be proven must not license an MRU retarget. Current Kimi peers and peers
+/// with a parked Kimi conversation count even when stopped, pane-less,
+/// archived, or trashed: the former race during recovery and the latter
+/// remain restorable owners. Sandboxed peers are skipped because their Kimi
+/// stores are container-private.
 pub(crate) fn kimi_store_is_shared(
     current_instance_id: &str,
     current_project_path: &str,
@@ -2812,12 +2807,11 @@ pub(crate) fn kimi_store_is_shared(
     own_profile_environment: &[String],
 ) -> bool {
     let canonical_current = canonicalize_or_raw(current_project_path);
-    let mut own_homes = [own_resolved_environment, own_profile_environment]
+    let own_homes = [own_resolved_environment, own_profile_environment]
         .iter()
         .filter_map(|env| kimi_home_for_environment(env))
         .map(|home| canonicalize_or_raw(home.to_string_lossy().as_ref()))
         .collect::<Vec<_>>();
-    own_homes.dedup();
     if own_homes.is_empty() {
         return true;
     }
@@ -2827,12 +2821,13 @@ pub(crate) fn kimi_store_is_shared(
     for peer_profile in profiles {
         // Judge the namespace before paying for the store read: a peer whose
         // resolved home differs cannot share this store however many rows its
-        // sessions.json holds. The per-launch cost of one config read per
-        // profile is accepted; the status-rule install it triggers is
-        // idempotent.
-        let Some(peer_home) = kimi_home_for_environment(
-            &super::profile_config::resolve_config_or_warn(&peer_profile).environment,
-        ) else {
+        // sessions.json holds. A successful resolve idempotently reinstalls
+        // that profile's status rules; a failed resolve returns shared without
+        // installing fallback rules or clearing the prior registry state.
+        let Ok(peer_config) = super::profile_config::resolve_config(&peer_profile) else {
+            return true;
+        };
+        let Some(peer_home) = kimi_home_for_environment(&peer_config.environment) else {
             return true;
         };
         let peer_home = canonicalize_or_raw(peer_home.to_string_lossy().as_ref());
@@ -2846,10 +2841,16 @@ pub(crate) fn kimi_store_is_shared(
             return true;
         };
         for inst in instances {
-            if inst.id == current_instance_id || inst.tool != "kimi" || inst.is_sandboxed() {
+            if inst.id == current_instance_id || inst.is_sandboxed() {
                 continue;
             }
-            if inst.is_trashed() || inst.is_archived() {
+            let owns_kimi = inst.tool == "kimi"
+                || inst
+                    .prior_tool_session_ids
+                    .get("kimi")
+                    .and_then(|prior| prior.agent_session_id.as_deref())
+                    .is_some_and(|sid| !sid.is_empty());
+            if !owns_kimi {
                 continue;
             }
             if canonicalize_or_raw(&inst.project_path) == canonical_current {
@@ -6245,6 +6246,16 @@ mod tests {
         let entries = vec![("a".to_string(), "/work/elsewhere".to_string())];
         let result = select_copilot_session(&entries, "/work/proj", &HashSet::new());
         assert!(result.is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn test_kimi_home_rejects_empty_ambient_fallback() {
+        let _env = EnvGuard::set(&[("KIMI_CODE_HOME", "")]);
+        assert!(
+            kimi_home_for_environment(&[]).is_none(),
+            "an explicitly empty ambient home must not become a relative store path"
+        );
     }
 
     #[test]
