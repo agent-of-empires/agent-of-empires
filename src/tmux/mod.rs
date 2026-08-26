@@ -193,19 +193,20 @@ pub(crate) fn tmux_command() -> Command {
     cmd
 }
 
-/// Like [`tmux_command`], but pins `LC_ALL=C` so tmux's connection-failure
+/// Like [`tmux_command`], but pins `LC_MESSAGES=C` so tmux's connection-failure
 /// messages on stderr stay stable English for callers that match them. tmux's
 /// `client.c` prints `error connecting to <socket> (strerror(errno))` for a
 /// non-`ECONNREFUSED` connect failure, and glibc localizes `strerror` by
 /// `LC_MESSAGES`, so on a non-English host the `(No such file or directory)`
-/// ENOENT marker for an absent socket (#3337) would not match. Used by the
-/// status-query callers (which classify via [`tmux_no_server_running`]) and by
-/// `kill_session_if_present`. NOT folded into [`tmux_command`]: the
-/// interactive attach/switch-client/capture-pane paths must keep the user's
-/// locale for UTF-8 and status-bar rendering.
+/// ENOENT marker for an absent socket (#3337) would not match. Keeping the
+/// caller's `LC_CTYPE` matters because `list-sessions` returns names later
+/// passed to locale-preserving tmux commands; `LC_ALL=C` substitutes wide
+/// characters with underscores in those names. Used by the status-query
+/// callers (which classify via [`tmux_no_server_running`]) and by
+/// `kill_session_if_present`.
 pub(crate) fn tmux_query_command() -> Command {
     let mut cmd = tmux_command();
-    cmd.env("LC_ALL", "C");
+    cmd.env("LC_MESSAGES", "C");
     cmd
 }
 
@@ -1463,6 +1464,22 @@ mod tests {
         assert_eq!(args.first().map(|a| a.to_str().unwrap()), Some("-S"));
         assert!(args.get(1).is_some(), "socket path arg present");
         assert_eq!(cmd.get_program().to_str(), Some("tmux"));
+    }
+
+    #[test]
+    fn tmux_query_command_preserves_ctype_for_session_names() {
+        let command = tmux_query_command();
+        let message_locale = command
+            .get_envs()
+            .find(|(key, _)| key.to_str() == Some("LC_MESSAGES"))
+            .and_then(|(_, value)| value.and_then(|value| value.to_str()));
+        assert_eq!(message_locale, Some("C"));
+        assert!(
+            command
+                .get_envs()
+                .all(|(key, _)| key.to_str() != Some("LC_ALL")),
+            "LC_ALL changes LC_CTYPE and corrupts non-ASCII tmux session names"
+        );
     }
 
     #[cfg(unix)]
