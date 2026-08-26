@@ -976,7 +976,22 @@ pub(crate) fn compose_exclusion(
     current_instance_id: &str,
     extra: &HashSet<String>,
 ) -> HashSet<String> {
-    let mut set = build_exclusion_set(current_instance_id);
+    compose_exclusion_in(
+        current_instance_id,
+        extra,
+        &crate::tmux::LiveSessionSnapshot::new(),
+    )
+}
+
+/// [`compose_exclusion`] against a snapshot the caller already holds, so a
+/// pass that also probes per-instance liveness observes tmux once instead of
+/// twice.
+fn compose_exclusion_in(
+    current_instance_id: &str,
+    extra: &HashSet<String>,
+    live: &crate::tmux::LiveSessionSnapshot,
+) -> HashSet<String> {
+    let mut set = build_exclusion_set(current_instance_id, live);
     set.extend(extra.iter().cloned());
     set
 }
@@ -1009,7 +1024,16 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
     profile: &str,
     retroactive_capture_excludes: &HashSet<String>,
 ) -> HashSet<String> {
-    let mut set = compose_exclusion(current_instance_id, retroactive_capture_excludes);
+    // One observation for the whole pass. Both halves consult tmux: the
+    // cross-instance scan needs the live session names, and the walk below
+    // visits every stored session sharing the project path, trashed ones
+    // included, so a per-instance liveness probe costs a fork each. A store of
+    // a few hundred sessions made that the dominant cost of the pass.
+    // `names() == None` (server unreachable) reads as "no live pane" here,
+    // which is what the per-item probe already did when its own
+    // `list-sessions` failed, and this pass re-runs.
+    let live = crate::tmux::LiveSessionSnapshot::new();
+    let mut set = compose_exclusion_in(current_instance_id, retroactive_capture_excludes, &live);
     let Ok(storage) = crate::session::storage::Storage::new_unwatched(profile) else {
         return set;
     };
@@ -1022,13 +1046,6 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
     // silently drops them from this exclusion even though they share the
     // directory — re-opening the #2355 steal for exactly those peers (#2858).
     let canonical_current = canonicalize_or_raw(current_project_path);
-    // One observation for the whole walk. This loop visits every stored session
-    // sharing the project path, trashed ones included, so a per-instance
-    // liveness probe costs a fork each; a store of a few hundred sessions made
-    // that the dominant cost of the pass. `names() == None` (server
-    // unreachable) reads as "no live pane", which is what the per-item probe
-    // already did when its `list-sessions` failed.
-    let live = crate::tmux::LiveSessionSnapshot::take();
     for inst in instances {
         if inst.id == current_instance_id {
             continue;
@@ -1076,18 +1093,17 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
 /// the resume-fallback cascade's just-crashed sid) should use
 /// [`compose_exclusion`] instead, which composes this function with the
 /// per-instance exclusion list.
-fn build_exclusion_set(current_instance_id: &str) -> HashSet<String> {
-    let output = match crate::tmux::tmux_command()
-        .args(["list-sessions", "-F", "#{session_name}"])
-        .output()
-    {
-        Ok(o) if o.status.success() => o,
-        _ => return HashSet::new(),
+fn build_exclusion_set(
+    current_instance_id: &str,
+    live: &crate::tmux::LiveSessionSnapshot,
+) -> HashSet<String> {
+    let Some(names) = live.names() else {
+        return HashSet::new();
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let aoe_sessions: Vec<&str> = stdout
-        .lines()
+    let aoe_sessions: Vec<&str> = names
+        .iter()
+        .map(String::as_str)
         .filter(|name| {
             name.starts_with(crate::tmux::SESSION_PREFIX)
                 && !name.starts_with(crate::tmux::TOOL_PREFIX)
@@ -4656,7 +4672,10 @@ mod tests {
 
     #[test]
     fn test_build_exclusion_set_empty() {
-        let result = build_exclusion_set("nonexistent-instance-id-12345");
+        let result = build_exclusion_set(
+            "nonexistent-instance-id-12345",
+            &crate::tmux::LiveSessionSnapshot::new(),
+        );
         // The exclusion set should never contain our own instance ID
         // (it collects OTHER instances' captured session IDs).
         // On a machine with active AoE tmux sessions, the set may be

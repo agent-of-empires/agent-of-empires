@@ -6044,7 +6044,7 @@ async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
         // One observation for the whole repair walk, as on the TUI side: this
         // visits every instance, so a per-item `list-sessions` fork scales with
         // the store.
-        let live = crate::tmux::LiveSessionSnapshot::take();
+        let live = crate::tmux::LiveSessionSnapshot::new();
         let repaired: std::collections::HashSet<String> = snapshot
             .iter_mut()
             .filter_map(|inst| {

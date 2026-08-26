@@ -569,46 +569,37 @@ pub fn agent_session_belongs_to(tmux_name: &str, session_id: &str) -> bool {
 /// A pass that asks "is this instance's pane live?" once per stored session
 /// otherwise pays a `list-sessions` fork per instance, plus a `pane_dead`
 /// fork per match. `compose_exclusion_with_persisted_peers` walks every
-/// session sharing the project path — trashed ones included — so on a store
-/// of a few hundred that is a few hundred `fork`+`exec` round-trips per pass,
-/// on the thread that also serves input.
+/// session sharing the project path, trashed ones included, so on a store of
+/// a few hundred that is a few hundred `fork`+`exec` round-trips per pass, on
+/// the thread that also serves input.
 ///
-/// This is a *fresh* observation taken once per pass, not a cached one: the
-/// session cache's answers are asymmetric (a hit proves existence, a miss only
-/// means "not seen at the last scan"), and liveness here decides both
-/// exclusion and env publication, where a false negative and a false positive
-/// are each harmful. Taking one live snapshot keeps the decision exactly as
-/// authoritative as the per-item probe it replaces.
+/// The observations are *fresh*, not cached: the session cache's answers are
+/// asymmetric (a hit proves existence, a miss only means "not seen at the last
+/// scan"), and liveness here decides both peer exclusion and env publication,
+/// where a false negative and a false positive are each harmful. One live
+/// observation per pass leaves the decision exactly as authoritative as the
+/// per-item probe it replaces.
 ///
-/// Server-unreachable is preserved rather than collapsed into "absent":
-/// [`Self::names`] returns `None`, so a caller that needs Unknown distinct
-/// from Absent can still tell them apart.
+/// Each observation is taken on first use, and only if used: a pass that ends
+/// up asking nothing, because no stored peer shares the project path or every
+/// row short-circuits before the liveness clause, forks nothing, and a caller
+/// that only needs session names never forks `list-panes`.
+///
+/// An unreachable server is preserved rather than collapsed into "absent":
+/// [`Self::names`] returns `None`, so a one-shot caller that cannot retry can
+/// tell Unknown from Absent and probe per row instead (see
+/// `Instance::tmux_env_session_name_in_or_probe`).
+#[derive(Default)]
 pub(crate) struct LiveSessionSnapshot {
-    names: Option<Vec<String>>,
-    panes: Option<HashMap<String, PaneMetadata>>,
+    names: OnceLock<Option<Vec<String>>>,
+    panes: OnceLock<Option<HashMap<String, PaneMetadata>>>,
 }
 
 impl LiveSessionSnapshot {
-    /// Take one fresh snapshot: a single `list-sessions` plus a single
-    /// `list-panes -a`, regardless of how many instances are then looked up.
-    pub(crate) fn take() -> Self {
-        let names = tmux_query_command()
-            .args(["list-sessions", "-F", "#{session_name}"])
-            .output()
-            .ok()
-            .filter(|out| out.status.success())
-            .map(|out| {
-                String::from_utf8_lossy(&out.stdout)
-                    .lines()
-                    .map(str::trim)
-                    .filter(|l| !l.is_empty())
-                    .map(String::from)
-                    .collect()
-            });
-        Self {
-            names,
-            panes: batch_pane_metadata().ok(),
-        }
+    /// A snapshot for one pass: at most one `list-sessions` and at most one
+    /// `list-panes -a`, however many instances are then looked up.
+    pub(crate) fn new() -> Self {
+        Self::default()
     }
 
     /// Build a snapshot from already-known parts, for tests that must not
@@ -618,19 +609,42 @@ impl LiveSessionSnapshot {
         names: Option<Vec<String>>,
         panes: Option<HashMap<String, PaneMetadata>>,
     ) -> Self {
-        Self { names, panes }
+        let snapshot = Self::new();
+        let _ = snapshot.names.set(names);
+        let _ = snapshot.panes.set(panes);
+        snapshot
     }
 
     /// Live session names, or `None` when the tmux server could not be reached.
     pub(crate) fn names(&self) -> Option<&[String]> {
-        self.names.as_deref()
+        self.names
+            .get_or_init(|| {
+                tmux_query_command()
+                    .args(["list-sessions", "-F", "#{session_name}"])
+                    .output()
+                    .ok()
+                    .filter(|out| out.status.success())
+                    .map(|out| {
+                        String::from_utf8_lossy(&out.stdout)
+                            .lines()
+                            .map(str::trim)
+                            .filter(|l| !l.is_empty())
+                            .map(String::from)
+                            .collect()
+                    })
+            })
+            .as_deref()
     }
 
     /// Whether `name`'s first pane is dead, mirroring `utils::is_pane_dead`
     /// but read from the batched metadata. An absent entry is reported alive,
     /// matching the per-item probe's `unwrap_or(false)` on a failed query.
+    ///
+    /// Only reachable once [`Self::names`] has produced a candidate, so an
+    /// unreachable server never pays for this observation.
     pub(crate) fn pane_dead(&self, name: &str) -> bool {
         self.panes
+            .get_or_init(|| batch_pane_metadata().ok())
             .as_ref()
             .and_then(|panes| panes.get(name))
             .map(|meta| meta.pane_dead)
@@ -1726,33 +1740,28 @@ mod tests {
     #[test]
     fn snapshot_lookup_matches_the_per_item_probe() {
         let agent = format!("{P}Refactor_{ID8}");
-        let snapshot = LiveSessionSnapshot::from_parts(
-            Some(vec![agent.clone()]),
-            Some(HashMap::from([(agent.clone(), dead_pane_meta(false))])),
-        );
-        assert_eq!(
-            live_any_kind_name_for_id_in(&snapshot, ID).as_deref(),
-            Some(agent.as_str())
-        );
-    }
-
-    #[test]
-    fn snapshot_lookup_skips_a_dead_pane() {
-        let agent = format!("{P}Refactor_{ID8}");
-        let snapshot = LiveSessionSnapshot::from_parts(
-            Some(vec![agent.clone()]),
-            Some(HashMap::from([(agent.clone(), dead_pane_meta(true))])),
-        );
-        assert_eq!(live_any_kind_name_for_id_in(&snapshot, ID), None);
+        let cases = [(false, Some(agent.as_str())), (true, None)];
+        for (pane_dead, expected) in cases {
+            let snapshot = LiveSessionSnapshot::from_parts(
+                Some(vec![agent.clone()]),
+                Some(HashMap::from([(agent.clone(), dead_pane_meta(pane_dead))])),
+            );
+            assert_eq!(
+                live_any_kind_name_for_id_in(&snapshot, ID).as_deref(),
+                expected,
+                "pane_dead = {pane_dead}"
+            );
+        }
     }
 
     #[test]
     fn snapshot_lookup_reports_not_live_when_server_unreachable() {
-        // `names() == None` is Unknown, preserved on the snapshot so a caller
-        // can distinguish it; the exclusion walk collapses it to "not live",
-        // which is what the per-item probe did when its `list-sessions` failed.
+        // Unknown collapses to "not live" for the exclusion walk, which is what
+        // the per-item probe did when its own `list-sessions` failed, and the
+        // walk re-runs. A one-shot caller must not collapse it; that rule is
+        // covered by
+        // `instance::tests::one_shot_name_probes_when_the_snapshot_missed_tmux`.
         let snapshot = LiveSessionSnapshot::from_parts(None, None);
-        assert!(snapshot.names().is_none());
         assert_eq!(live_any_kind_name_for_id_in(&snapshot, ID), None);
     }
 
