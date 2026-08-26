@@ -2248,6 +2248,15 @@ where
             target_path: entry.group_move_target_path.clone(),
             move_subtree: entry.group_move_subtree,
         };
+        // Automatic arbitration requires one valid row on each side. If
+        // either profile already contains repeated rows for this id, preserve
+        // every copy and the journal so duplicate surfacing stays in control.
+        if entry.ids.iter().any(|id| {
+            source_instances.iter().filter(|row| &row.id == id).count() > 1
+                || target_instances.iter().filter(|row| &row.id == id).count() > 1
+        }) {
+            return Ok(false);
+        }
         let source_losers: Vec<String> = entry
             .ids
             .iter()
@@ -2317,7 +2326,11 @@ fn target_still_holds(target_sessions_path: &Path, losers: &[String]) -> Result<
         .context("failed parsing target sessions during repair re-check")?;
     let held: Vec<String> = rows
         .iter()
-        .filter_map(|row| row.get("id").and_then(|id| id.as_str()).map(str::to_string))
+        .filter_map(|row| {
+            <Instance as serde::Deserialize>::deserialize(row)
+                .ok()
+                .map(|instance| instance.id)
+        })
         .collect();
     Ok(losers
         .iter()
@@ -5084,6 +5097,40 @@ mod tests {
         assert_eq!(outcome.reports.len(), 2);
         assert_eq!(a.load()?.len(), 2, "newer X+Y target remains intact");
         assert_eq!(b.load()?.len(), 2, "no stale journal deletes either copy");
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_target_rows_never_become_an_automatic_winner() -> Result<()> {
+        let (_temp, _guard, source, target, before, _after) = setup_recovery_env("target-dup")?;
+        target.update(|instances, _| {
+            for _ in 0..2 {
+                let mut copy = before.clone();
+                copy.source_profile = target.profile().to_string();
+                instances.push(copy);
+            }
+            Ok(())
+        })?;
+        let entry = fresh_journal_entry(&source, &target, &before.id);
+        super::super::move_journal::record(&entry, source.sessions_path())?;
+        let stores: Vec<(&str, &Storage)> =
+            vec![(source.profile(), &source), (target.profile(), &target)];
+
+        let outcome = reconcile_loaded(&[&source, &target], &stores);
+
+        assert!(!outcome.repaired);
+        assert_eq!(outcome.reports.len(), 1);
+        assert_eq!(source.load()?.len(), 1, "source copy is preserved");
+        assert_eq!(
+            target.load()?.len(),
+            2,
+            "ambiguous target copies remain surfaced"
+        );
+        assert_eq!(
+            journal_entry_count(&source),
+            1,
+            "evidence remains for manual resolution"
+        );
         Ok(())
     }
 
