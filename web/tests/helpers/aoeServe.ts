@@ -204,7 +204,11 @@ export async function waitForSessions(
         settled = await listSessions(baseUrl);
         return settled.length;
       },
-      { timeout },
+      {
+        timeout,
+        intervals: [100, 200, 400],
+        message: `at least one session should appear in GET /api/sessions within ${timeout}ms`,
+      },
     )
     .toBeGreaterThan(0);
   return settled;
