@@ -2020,9 +2020,9 @@ impl HomeView {
         width: u16,
         height: u16,
         select: fn(&mut Self) -> &mut super::PreviewCache,
-    ) -> bool {
+    ) {
         let Some(id) = self.selected_session.clone() else {
-            return false;
+            return;
         };
         // Drop a cache that documents a DIFFERENT pane than the one now
         // displayed. Without this a quiet or dead new target would keep
@@ -2047,20 +2047,20 @@ impl HomeView {
             visible_rows.saturating_add(scroll_offset as usize) <= cache.captured_lines
         };
         let Some(worker) = self.preview_capture_worker.as_ref() else {
-            return false;
+            return;
         };
         // Publish the budget BEFORE the frozen gate: the reading-depth branch
         // of `capture_lines_for` exists precisely for frozen scrollback reads,
         // so the worker must see it even though no frame applies yet.
         worker.set_capture_lines(capture_lines);
         let Some(frame) = worker.take_latest() else {
-            return false;
+            return;
         };
         // A frame captured before the last retarget must never land under the
         // new view (the worker re-checks too; this closes the same race from
         // the consumer side).
         if !worker.frame_is_current(&frame) {
-            return false;
+            return;
         }
         if frozen {
             // While frozen, a routine fresh frame would shift the held
@@ -2078,7 +2078,7 @@ impl HomeView {
                     || (frame.budget >= capture_lines && incoming_lines > 0));
             if !grows {
                 worker.restore_latest(frame);
-                return false;
+                return;
             }
         }
         let captured_lines = select(self).store_capture(frame.content.clone(), id, (width, height));
@@ -2102,11 +2102,10 @@ impl HomeView {
             && scroll_exceeds_cache(captured_lines, height, scroll_offset)
             && !capture_is_exhausted(captured_lines, frame.budget)
         {
-            return true;
+            return;
         }
         self.preview_scroll_offset =
             clamp_scroll_to_capture(scroll_offset, captured_lines, self.preview_visible_rows);
-        true
     }
 
     /// Whether the preview holds its captured snapshot instead of following

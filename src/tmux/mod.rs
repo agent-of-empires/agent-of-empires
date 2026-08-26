@@ -703,14 +703,14 @@ pub(crate) fn live_session_name(derived: &str, shape: &NameShape) -> String {
 /// snapshot and the next frame self-corrects onto a renamed session. Paint
 /// must never wait on tmux, so unlike [`live_session_name`] there is no
 /// synchronous fallback.
-pub(crate) fn display_session_name(derived: &str, shape: &NameShape) -> String {
+pub(crate) fn session_name_for_display(derived: &str, shape: &NameShape) -> String {
     session_name_from_cache(derived, shape).unwrap_or_else(|| derived.to_string())
 }
 
-/// `display_session_name` for the agent pane.
-pub(crate) fn display_agent_session_name(session_id: &str, derived: &str) -> String {
+/// `session_name_for_display` for the agent pane.
+pub(crate) fn agent_session_name_for_display(session_id: &str, derived: &str) -> String {
     let suffix = id_suffix(session_id);
-    display_session_name(derived, &NameShape::agent(&suffix))
+    session_name_for_display(derived, &NameShape::agent(&suffix))
 }
 
 /// `live_session_name` for the agent pane.
@@ -973,6 +973,7 @@ pub fn test_inject_session_into_cache(name: &str) {
         cache.time = Some(Instant::now());
     }
 }
+
 /// Test-only instrumentation at the process's single tmux entry point.
 ///
 /// `tmux_command()` records one hit per invocation on the *current* thread

@@ -20494,7 +20494,7 @@ fn paint_never_forks_tmux_even_with_empty_absent_or_expired_caches() {
 /// Regression: a frozen (scrolled-back) preview must still be able to GROW
 /// its capture. Only worker frames write the cache now, so the reading-depth
 /// budget has to reach the worker while frozen and an adequate frame has to
-//  be applied; otherwise scrollback reads hit a hard wall at the live-edge
+/// be applied; otherwise scrollback reads hit a hard wall at the live-edge
 /// window (~CAPTURE_BUFFER rows past the viewport). An inadequate frame is
 /// skipped rather than applied: it would clamp the held offset against too
 /// few lines and snap the view toward the live edge.

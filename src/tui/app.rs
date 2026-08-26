@@ -761,6 +761,15 @@ impl App {
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<()> {
+        // Keep the display snapshots (sessions, pane metadata) fresh off the
+        // paint thread: every `_for_display` helper and the passive preview
+        // resize executor answer from these snapshots and must never fork
+        // from render.
+        crate::tmux::spawn_snapshot_poller();
+        // One immediate refresh so even the FIRST frame paints from a warm
+        // snapshot instead of an empty one.
+        crate::tmux::refresh_session_cache();
+
         // Initial render
         crate::tui::clear_terminal(terminal)?;
         // Sync mouse capture before the first paint so any onboarding
@@ -769,14 +778,6 @@ impl App {
         // Otherwise the user would have to press a key first.
         self.sync_mouse_capture(terminal)?;
         self.draw(terminal)?;
-
-        // Keep the display snapshots (sessions, pane metadata) fresh off the
-        // paint thread: every `_for_display` helper and the passive preview
-        // resize executor answer from these snapshots and must never fork
-        // from render.
-        crate::tmux::spawn_snapshot_poller();
-        // One immediate refresh so the first frames already have a snapshot.
-        crate::tmux::refresh_session_cache();
 
         // Spawn async update check at startup. The periodic re-check below
         // covers long-running sessions (#1471). `last_update_check` stays

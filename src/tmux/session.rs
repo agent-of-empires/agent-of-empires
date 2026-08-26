@@ -329,7 +329,7 @@ impl Session {
     /// name until the background snapshot poller refreshes it; paint must
     /// never wait on tmux.
     pub(crate) fn resolve_name_for_display(id: &str, title: &str) -> String {
-        crate::tmux::display_agent_session_name(id, &Self::generate_name(id, title))
+        crate::tmux::agent_session_name_for_display(id, &Self::generate_name(id, title))
     }
 
     /// Purely derive the tmux session name from a session id and title, with no

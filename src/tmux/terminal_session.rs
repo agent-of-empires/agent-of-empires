@@ -160,7 +160,7 @@ impl PairedTerminal {
             excluded_prefixes: &[],
         };
         if display_only {
-            crate::tmux::display_session_name(&derived, &shape)
+            crate::tmux::session_name_for_display(&derived, &shape)
         } else {
             crate::tmux::live_session_name(&derived, &shape)
         }

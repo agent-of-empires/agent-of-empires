@@ -370,9 +370,9 @@ impl PreviewCache {
 
     /// Store a fresh capture, invalidating the parsed cache and stamping
     /// the session/dimensions/time the content belongs to. Returns the
-    /// captured line count so the caller can clamp scroll. Shared by the
-    /// synchronous fork path (`refresh_preview_cache_core`) and the
-    /// off-thread worker path so the two can't drift.
+    /// captured line count so the caller can clamp scroll. Written only by
+    /// `apply_worker_capture`'s worker frames; there is no other capture
+    /// source.
     pub(super) fn store_capture(
         &mut self,
         content: String,
