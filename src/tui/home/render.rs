@@ -2140,12 +2140,11 @@ impl HomeView {
         // The off-thread `LiveCaptureWorker` (retargeted to this pane by
         // `sync_preview_capture_worker` in `render_preview`) keeps fresh
         // content flowing on its own thread; `apply_worker_capture` below
-        // just applies the newest it has produced. The synchronous fork via
-        // `refresh_preview_cache_core` remains only as the cold-start /
-        // worker-empty fallback (its 250ms gate still applies there). This
-        // moves the per-frame capture cost (~8.5ms on macOS, ~90% of a
-        // frame; the `tui.render` `capture_us` trace measures it) off the
-        // render thread for every view, not just agent live-send.
+        // just applies the newest it has produced, and is the ONLY capture
+        // source: there is no synchronous fork fallback anymore. This moves
+        // the per-frame capture cost (~8.5ms on macOS, ~90% of a frame; the
+        // `tui.render` `capture_us` trace measures it) off the render thread
+        // for every view, not just agent live-send.
         let in_live = self.live_send.is_some();
         // While in live-send mode, keep the agent's tmux pane sized to the
         // preview's visible output area so it renders directly into view.
