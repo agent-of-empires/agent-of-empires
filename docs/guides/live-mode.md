@@ -15,8 +15,8 @@ you work.
 
 * **Enter:** press `Tab` on a runnable session, or set live mode as your
   default so that `Enter` (and clicking a row) drops you straight into
-  it. See **Default Attach Mode** and **New Session Attach Mode** in
-  Settings.
+  it. Use **New Session Mode** when new sessions should open in live mode
+  without changing the Enter behavior.
 * **Leave (fast exit):** press `Ctrl+Q`. This is a single press and is
   always available, independent of the leader below.
 

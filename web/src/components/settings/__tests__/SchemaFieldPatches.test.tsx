@@ -36,6 +36,12 @@ const TMUX_MODES = [
   { value: "disabled", label: "Disabled" },
 ];
 
+const NEW_SESSION_MODES = [
+  { value: "match_default", label: "Match default attach" },
+  { value: "tmux", label: "Tmux" },
+  { value: "live_send", label: "Live mode" },
+];
+
 const SCHEMA = [
   {
     section: "tmux",
@@ -87,6 +93,18 @@ const SCHEMA = [
     web_write: ALLOW,
     profile_overridable: true,
     validation: { rule: "range", min: 1, max: 43200 },
+    advanced: false,
+  },
+  {
+    section: "session",
+    field: "new_session_mode",
+    category: "Session",
+    label: "New Session Mode",
+    description: "How the TUI opens a terminal-mode session after it is created.",
+    widget: { kind: "select", options: NEW_SESSION_MODES },
+    web_write: ALLOW,
+    profile_overridable: true,
+    validation: NONE,
     advanced: false,
   },
   {
@@ -244,6 +262,21 @@ describe("schema-driven settings field PATCH payloads", () => {
     await waitFor(() =>
       expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
         session: { snooze_duration_minutes: 12 },
+      }),
+    );
+  });
+
+  it("session New Session Mode select emits { session: { new_session_mode } }", async () => {
+    const { container } = renderTab("session");
+    await screen.findByText("New Session Mode");
+
+    fireEvent.change(selectByLabel(container, "New Session Mode"), {
+      target: { value: "live_send" },
+    });
+
+    await waitFor(() =>
+      expect(vi.mocked(api.updateProfileSettings)).toHaveBeenCalledWith("main", {
+        session: { new_session_mode: "live_send" },
       }),
     );
   });

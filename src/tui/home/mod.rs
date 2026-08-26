@@ -7038,6 +7038,21 @@ impl HomeView {
             .map(|s| s.default_attach_mode)
     }
 
+    /// Resolve the attach mode for a newly-created terminal-mode session.
+    /// `MatchDefault` preserves the previous behavior by using the setting
+    /// that activates existing rows.
+    pub(super) fn new_session_attach_mode(
+        &self,
+        session_id: &str,
+    ) -> Option<crate::session::AttachMode> {
+        self.resolve_session_config_for(session_id)
+            .map(|s| match s.new_session_mode {
+                crate::session::NewSessionMode::MatchDefault => s.default_attach_mode,
+                crate::session::NewSessionMode::Tmux => crate::session::AttachMode::Tmux,
+                crate::session::NewSessionMode::LiveSend => crate::session::AttachMode::LiveSend,
+            })
+    }
+
     /// Resolve `live_send_on_view_switch` for an existing session row:
     /// whether switching into Terminal or Tool view should auto-start
     /// live-send instead of waiting for a separate Enter/Tab/click. See
