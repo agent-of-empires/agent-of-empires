@@ -1814,6 +1814,22 @@ pub(crate) fn unusable_journal_entries_contains(path: &Path) -> bool {
         .any(|seen| seen == path)
 }
 
+/// Paths whose repair failure has already been reported at ERROR level, so a
+/// persistently failing (retrying) repair logs once per process.
+static REPAIR_FAILURES_REPORTED: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+fn mark_repair_failure_logged(path: &Path) -> bool {
+    let mut seen = REPAIR_FAILURES_REPORTED
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if seen.iter().any(|seen| seen == path) {
+        false
+    } else {
+        seen.push(path.to_path_buf());
+        true
+    }
+}
+
 fn mark_unusable_journal_entry(path: &Path) {
     let mut seen = UNUSABLE_JOURNAL_ENTRIES
         .lock()
@@ -1921,12 +1937,24 @@ pub(crate) fn reconcile_profile_duplicates(
                 );
             }
             Err(error) => {
-                tracing::error!(
-                    target: "session.store",
-                    path = %path.display(),
-                    error = %error,
-                    "journal-guided repair failed; the duplicate stays excluded"
-                );
+                // Genuinely transient failures keep retrying on later passes;
+                // only their logging is once-per-path so a persistently
+                // failing repair cannot spam ERROR lines every reload tick.
+                if mark_repair_failure_logged(&path) {
+                    tracing::error!(
+                        target: "session.store",
+                        path = %path.display(),
+                        error = %error,
+                        "journal-guided repair failed; the duplicate stays excluded"
+                    );
+                } else {
+                    tracing::debug!(
+                        target: "session.store",
+                        path = %path.display(),
+                        error = %error,
+                        "journal-guided repair failed again"
+                    );
+                }
             }
         }
     }
@@ -2004,6 +2032,22 @@ fn repair_journal_entry(
             Some(storage) => storage,
             None => return Ok(false),
         };
+
+    // An id that fails validation can never pass the title/lifecycle lock
+    // acquisition below: permanently insufficient evidence, blacklisted.
+    for id in &entry.ids {
+        if let Err(error) = super::validate_instance_id(id) {
+            mark_unusable_journal_entry(journal_path);
+            tracing::error!(
+                target: "session.store",
+                path = %journal_path.display(),
+                id = %id,
+                error = %error,
+                "move journal entry carries an invalid session id; duplicates stay surfaced"
+            );
+            return Ok(false);
+        }
+    }
 
     // Freshness gate: a losing store modified well after the journal was
     // written means the user edited it since the crash; arbitrating on the
@@ -2106,20 +2150,23 @@ fn repair_journal_entry(
 /// and only narrows the race window; the identity/title/lifecycle locks held
 /// by the caller already exclude every lifecycle-mutating surface.
 fn target_still_holds(target_sessions_path: &Path, losers: &[String]) -> Result<bool> {
-    #[derive(serde::Deserialize)]
-    struct RowId {
-        id: String,
-    }
+    // Two-phase parse mirroring `Storage::load`: a single corrupt row is
+    // skipped, not a whole-file failure, so a quarantined-row file cannot
+    // wedge the repair into retrying forever.
     let content = match fs::read_to_string(target_sessions_path) {
         Ok(content) => content,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(error) => return Err(error).context("failed re-reading target sessions during repair"),
     };
-    let rows: Vec<RowId> = serde_json::from_str(&content)
+    let rows: Vec<serde_json::Value> = serde_json::from_str(&content)
         .context("failed parsing target sessions during repair re-check")?;
+    let held: Vec<String> = rows
+        .iter()
+        .filter_map(|row| row.get("id").and_then(|id| id.as_str()).map(str::to_string))
+        .collect();
     Ok(losers
         .iter()
-        .all(|loser| rows.iter().any(|row| row.id == *loser)))
+        .all(|loser| held.iter().any(|row_id| row_id == loser)))
 }
 
 /// Remove explicit group rows attributable to the move that no longer have
@@ -4680,6 +4727,43 @@ mod tests {
     }
 
     #[test]
+    fn invalid_id_entry_is_permanently_insufficient() -> Result<()> {
+        // An id that cannot pass validation would fail the title/lifecycle
+        // lock acquisition inside every repair attempt: permanently
+        // insufficient, so it blacklists like parse/version/expired causes.
+        let (_temp, source, target, before, _after) = setup_recovery_env("badid")?;
+        target.update(|instances, _| {
+            let mut copy = before.clone();
+            copy.source_profile = target.profile().to_string();
+            instances.push(copy);
+            Ok(())
+        })?;
+        let entry = super::super::move_journal::MoveJournalEntry {
+            ids: vec!["../escape".to_string()],
+            ..fresh_journal_entry(&source, &target, &before.id)
+        };
+        super::super::move_journal::record(&entry, source.sessions_path())?;
+        assert_eq!(journal_entry_count(&source), 1);
+
+        let view: Vec<(&str, &Storage)> =
+            vec![(source.profile(), &source), (target.profile(), &target)];
+        let outcome = reconcile_loaded(&[&source, &target], &view);
+
+        assert!(!outcome.repaired);
+        assert_eq!(journal_entry_count(&source), 1, "entry stays on disk");
+        let journal_path = super::super::move_journal::scan([source.sessions_path().to_path_buf()])
+            .into_iter()
+            .next()
+            .map(|(path, _)| path)
+            .expect("entry present");
+        assert!(
+            super::unusable_journal_entries_contains(&journal_path),
+            "invalid-id entry is blacklisted"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn target_still_holds_checks_every_loser_id() -> Result<()> {
         let temp = tempdir()?;
         let path = temp.path().join("sessions.json");
@@ -4694,6 +4778,19 @@ mod tests {
             &path,
             &[winner.id.clone(), "gone".to_string()]
         )?);
+
+        // A corrupt row is skipped the way Storage::load quarantines it: the
+        // surviving winner still holds instead of wedging the repair into
+        // retrying forever.
+        let mut corrupt_row = serde_json::Map::new();
+        corrupt_row.insert("id".to_string(), serde_json::Value::from(42));
+        let mixed = vec![
+            serde_json::Value::Object(corrupt_row),
+            serde_json::to_value(&winner)?,
+        ];
+        fs::write(&path, serde_json::to_vec_pretty(&mixed)?)?;
+        assert!(target_still_holds(&path, std::slice::from_ref(&winner.id))?);
+
         fs::remove_file(&path)?;
         assert!(!target_still_holds(&path, &[winner.id])?);
         Ok(())
