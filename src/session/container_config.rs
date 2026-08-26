@@ -3094,8 +3094,10 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_prime_agent_mount_copies_user_skills() {
         let home = TempDir::new().unwrap();
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(home.path());
         let skill_dir = home.path().join(".prime/agent/skills/reviewing");
         fs::create_dir_all(&skill_dir).unwrap();
         fs::write(skill_dir.join("SKILL.md"), "review instructions").unwrap();
