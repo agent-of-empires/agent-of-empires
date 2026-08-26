@@ -20915,7 +20915,7 @@ mod profile_duplicate_reconciliation {
         if with_journal {
             crate::session::record_move_journal(
                 &crate::session::MoveJournalEntry {
-                    version: 1,
+                    version: crate::session::MOVE_JOURNAL_VERSION,
                     ids: vec![id.clone()],
                     source_profile: "alpha".to_string(),
                     target_profile: "beta".to_string(),

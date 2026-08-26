@@ -86,7 +86,9 @@ pub use instance::{
     WorkspaceRepo, WorktreeInfo, SESSION_COLORS, TMUX_SESSION_GONE_ERROR,
 };
 #[cfg(test)]
-pub(crate) use move_journal::{record as record_move_journal, MoveJournalEntry};
+pub(crate) use move_journal::{
+    record as record_move_journal, MoveJournalEntry, MOVE_JOURNAL_VERSION,
+};
 pub(crate) use storage::acquire_session_identity_lock;
 pub(crate) use storage::{reconcile_profile_duplicates, DuplicateIdReport};
 

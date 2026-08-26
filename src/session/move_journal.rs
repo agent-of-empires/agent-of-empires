@@ -11,7 +11,9 @@
 //! The journal lives with the source store instead of a global app-dir folder
 //! so its lifetime is bounded by exactly the stores it arbitrates between,
 //! and tests driving `Storage` at arbitrary paths stay hermetic without
-//! process-global coordination.
+//! process-global coordination. Successfully completed or reconciled entries
+//! are consumed; permanently unusable entries intentionally remain for manual
+//! inspection and have no automatic GC.
 //!
 //! Winner policy: a valid, current-version journal entry is proof that a move
 //! was in flight between exactly the two recorded stores. Because the
@@ -70,8 +72,24 @@ fn journal_dir_for(sessions_path: &Path) -> PathBuf {
 /// its path. The write is atomic and fsynced (file content plus parent
 /// directory), so once [`record`] returns Ok the entry survives a power loss.
 pub(crate) fn record(entry: &MoveJournalEntry, source_sessions_path: &Path) -> Result<PathBuf> {
+    record_with_sync(entry, source_sessions_path, sync_parent_directory)
+}
+
+fn record_with_sync<S>(
+    entry: &MoveJournalEntry,
+    source_sessions_path: &Path,
+    mut sync: S,
+) -> Result<PathBuf>
+where
+    S: FnMut(&Path) -> Result<()>,
+{
     let dir = journal_dir_for(source_sessions_path);
     fs::create_dir_all(&dir).with_context(|| format!("failed to create {}", dir.display()))?;
+    // create_dir_all only makes the new journal directory itself visible.
+    // Sync its profile parent too so the .move-journal directory entry
+    // survives power loss before any profile mutation is allowed to run.
+    sync(&dir)
+        .with_context(|| format!("journal directory {} was not made durable", dir.display()))?;
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -80,13 +98,22 @@ pub(crate) fn record(entry: &MoveJournalEntry, source_sessions_path: &Path) -> R
     let bytes = serde_json::to_vec_pretty(entry)?;
     atomic_write_verified(&path, &bytes)
         .with_context(|| format!("failed to write move journal {}", path.display()))?;
-    sync_parent_directory(&path)
-        .with_context(|| format!("move journal {} was not made durable", path.display()))?;
+    sync(&path).with_context(|| format!("move journal {} was not made durable", path.display()))?;
     Ok(path)
 }
 
 /// Delete one consumed entry and sync its parent directory so the removal
 /// itself is durable. Idempotent: a missing file is already consumed.
+/// Nanosecond creation order encoded in record's filename. Used only as a
+/// durable tie-breaker when two entries share the millisecond JSON timestamp.
+pub(crate) fn file_created_at_nanos(path: &Path) -> Option<u128> {
+    path.file_stem()
+        .and_then(|name| name.to_str())
+        .and_then(|name| name.strip_prefix("move-"))
+        .and_then(|name| name.split_once('-').map(|(nanos, _)| nanos))
+        .and_then(|nanos| nanos.parse().ok())
+}
+
 pub(crate) fn consume(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => {}
@@ -99,14 +126,22 @@ pub(crate) fn consume(path: &Path) -> Result<()> {
         .with_context(|| format!("removal of {} was not made durable", path.display()))
 }
 
-/// Every entry under each given profile directory paired with its parse
-/// outcome. `Err` covers unreadable files, malformed JSON, and wrong-version
-/// entries: all of them are evidence that *something* happened but not enough
-/// to arbitrate automatically.
-pub(crate) fn scan(
-    sessions_paths: impl IntoIterator<Item = PathBuf>,
-) -> Vec<(PathBuf, std::result::Result<MoveJournalEntry, String>)> {
-    let mut out = Vec::new();
+/// Result of scanning every loaded profile's journal directory. Entry results
+/// always name journal files; directory-list failures stay transient and
+/// separate, so callers never blacklist a directory as bad journal evidence.
+pub(crate) struct ScanResult {
+    pub(crate) entries: Vec<(PathBuf, std::result::Result<MoveJournalEntry, String>)>,
+    pub(crate) unreadable_dirs: Vec<(PathBuf, String)>,
+}
+
+/// Every journal file under each given profile directory paired with its parse
+/// outcome. Err covers unreadable files, malformed JSON, and wrong-version
+/// entries. Directory-listing failures are retried on later scans.
+pub(crate) fn scan(sessions_paths: impl IntoIterator<Item = PathBuf>) -> ScanResult {
+    let mut result = ScanResult {
+        entries: Vec::new(),
+        unreadable_dirs: Vec::new(),
+    };
     let mut dirs: Vec<PathBuf> = sessions_paths
         .into_iter()
         .map(|sessions_path| journal_dir_for(&sessions_path))
@@ -118,9 +153,9 @@ pub(crate) fn scan(
             Ok(read_dir) => read_dir,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
-                out.push((
+                result.unreadable_dirs.push((
                     dir.clone(),
-                    Err(format!("failed to list {}: {error}", dir.display())),
+                    format!("failed to list {}: {error}", dir.display()),
                 ));
                 continue;
             }
@@ -148,8 +183,73 @@ pub(crate) fn scan(
                         ))
                     }
                 });
-            out.push((path, parsed));
+            result.entries.push((path, parsed));
         }
     }
-    out
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(source: &Path, target: &Path) -> MoveJournalEntry {
+        MoveJournalEntry {
+            version: MOVE_JOURNAL_VERSION,
+            ids: vec!["session-id".to_string()],
+            source_profile: "source".to_string(),
+            target_profile: "target".to_string(),
+            source_sessions_path: source.to_path_buf(),
+            target_sessions_path: target.to_path_buf(),
+            group_move_source_path: "work".to_string(),
+            group_move_target_path: "moved".to_string(),
+            group_move_subtree: false,
+            created_at_epoch_ms: 1,
+        }
+    }
+
+    #[test]
+    fn record_requires_profile_parent_barrier_before_writing_entry() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let source = temp.path().join("source/sessions.json");
+        let target = temp.path().join("target/sessions.json");
+        fs::create_dir_all(source.parent().unwrap())?;
+        fs::create_dir_all(target.parent().unwrap())?;
+        let expected_dir = journal_dir_for(&source);
+        let mut calls = Vec::new();
+
+        let error = record_with_sync(&entry(&source, &target), &source, |path| {
+            calls.push(path.to_path_buf());
+            Err(anyhow::anyhow!("forced profile-parent barrier failure"))
+        })
+        .expect_err("journal record must fail before an unverified directory can be used");
+
+        assert!(error.to_string().contains("journal directory"));
+        assert_eq!(calls, vec![expected_dir.clone()]);
+        assert!(
+            expected_dir.exists(),
+            "directory was created before its barrier"
+        );
+        assert!(
+            fs::read_dir(expected_dir)?.next().is_none(),
+            "no entry may be written before the parent barrier"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn scan_separates_directory_failures_from_entry_results() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let sessions = temp.path().join("profile/sessions.json");
+        fs::create_dir_all(sessions.parent().unwrap())?;
+        let journal_dir = journal_dir_for(&sessions);
+        fs::write(&journal_dir, b"not-a-directory")?;
+
+        let result = scan([sessions]);
+
+        assert!(result.entries.is_empty());
+        assert_eq!(result.unreadable_dirs.len(), 1);
+        assert_eq!(result.unreadable_dirs[0].0, journal_dir);
+        Ok(())
+    }
 }
