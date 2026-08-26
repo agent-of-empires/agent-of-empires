@@ -3597,9 +3597,10 @@ impl Instance {
             }
         }
         // Kimi: a shared store refuses the MRU scan entirely inside
-        // try_retroactive_capture, so reaching this line means the store is
-        // sole-owned and a fresher observation is attributable.
-
+        // try_retroactive_capture and surfaces here as None, so a Some from
+        // the call below implies the store was sole-owned and the fresher
+        // observation attributable. Execution reaches this line for every
+        // tool; the gating lives in the callee.
         let live = self.try_retroactive_capture()?;
         override_if_distinct(self.agent_session_id.as_deref(), live)
     }

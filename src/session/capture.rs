@@ -2789,6 +2789,12 @@ fn kimi_home_for_environment(environment: &[String]) -> Option<PathBuf> {
 /// profile list because minted pairs are runtime state that is deliberately
 /// not persisted.
 ///
+/// An unreadable peer profile config silently resolves that peer to the
+/// ambient default home rather than failing closed: the trigger needs a
+/// config readable at launch and unreadable during recovery, and the
+/// fallible-resolution fix would ripple through shared helpers, so the gap
+/// is accepted and stated here instead of hidden.
+///
 /// The walk covers every AoE profile because the store is keyed by resolved
 /// home plus cwd, not by profile: two profiles resolving to one home share
 /// one store. It fails closed: an unreadable profile list, an unreadable
