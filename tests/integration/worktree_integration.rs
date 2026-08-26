@@ -502,14 +502,16 @@ fn git_in(repo: &std::path::Path, args: &[&str]) {
 /// the recorded path is repaired in storage so the rename that would otherwise
 /// fail with `SourceMissing` proceeds against the relocated directory.
 ///
-/// `#[serial]` because `Storage` resolves its app dir from the process-global
-/// `HOME`.
+/// `#[serial]` because `setup_temp_home` mutates the process-global `HOME` and
+/// `XDG_CONFIG_HOME` that `Storage` resolves its app dir from. Setting `HOME`
+/// alone is not enough: on macOS the app dir is `$XDG_CONFIG_HOME/agent-of-empires`
+/// whenever that variable is set, so a bare `HOME` override would write a real
+/// profile dir on any machine that exports it.
 #[test]
 #[serial]
 fn reconcile_heals_a_worktree_moved_outside_aoe() {
     let (repo_dir, _repo, _config_dir) = setup_test_environment();
-    let temp_home = TempDir::new().unwrap();
-    std::env::set_var("HOME", temp_home.path());
+    let _temp_home = crate::common::setup_temp_home();
     let git_wt = GitWorktree::new(repo_dir.path().to_path_buf()).unwrap();
 
     let created = repo_dir.path().join("recorded-name");
@@ -612,7 +614,12 @@ fn reconcile_heals_a_worktree_moved_outside_aoe() {
 /// old path, so the new location is not discoverable until the user runs
 /// `git worktree repair`; a deleted checkout is never discoverable. Both leave
 /// the recorded path alone rather than guessing.
+///
+/// `#[serial]` even though this test sets no env var of its own: it shells out
+/// to `git`, which reads `$HOME/.gitconfig`, so it must not overlap a peer that
+/// has pointed `HOME` at a temp dir.
 #[test]
+#[serial]
 fn resolve_reports_missing_when_git_cannot_place_the_branch() {
     let (repo_dir, _repo, _config_dir) = setup_test_environment();
     let git_wt = GitWorktree::new(repo_dir.path().to_path_buf()).unwrap();
