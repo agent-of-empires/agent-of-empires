@@ -388,18 +388,21 @@ fn test_quit_during_creation_shows_confirm() {
 /// historical tmux default while opening newly-created sessions in live mode.
 /// No hooks; the sync create path applies.
 fn write_config_new_session_mode_live_send(h: &TuiTestHarness) {
-    let config_dir = app_dir_in(h.home_path());
-    std::fs::create_dir_all(&config_dir).expect("create config directory");
+    let config_path = app_dir_in(h.home_path()).join("config.toml");
+    let config_content = std::fs::read_to_string(&config_path).expect("read harness config");
     std::fs::write(
-        config_dir.join("state.toml"),
-        "has_acknowledged_agent_hooks = true\n",
+        app_dir_in(h.home_path()).join("state.toml"),
+        format!(
+            "has_seen_welcome = true\nhas_responded_to_telemetry = true\nlast_seen_version = \"{}\"\nhas_acknowledged_agent_hooks = true\n",
+            env!("CARGO_PKG_VERSION")
+        ),
     )
-    .expect("write state with hook acknowledgment");
-    let config_content = r#"[session]
-new_session_mode = "live_send"
-"#;
-    std::fs::write(config_dir.join("config.toml"), config_content)
-        .expect("write config with new session mode");
+    .expect("write state with harness flags and hook acknowledgment");
+    std::fs::write(
+        config_path,
+        format!("{config_content}\n[session]\nnew_session_mode = \"live_send\"\n"),
+    )
+    .expect("write config with new session mode");
 }
 
 /// New-session mode must remain independent from the setting that controls
@@ -415,8 +418,6 @@ fn test_new_session_enters_live_mode_when_configured() {
     h.spawn_tui();
 
     h.wait_for(" aoe ");
-    h.send_keys("Escape");
-    h.wait_for("No sessions yet");
 
     h.send_keys("n");
     h.wait_for("Title");

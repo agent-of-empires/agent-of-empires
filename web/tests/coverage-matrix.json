@@ -2415,7 +2415,7 @@
       "id": "story.settings-new-session-mode",
       "kind": "vitest",
       "risk": "medium",
-      "specs": ["src/components/settings/__tests__/SchemaFieldPatches.test.tsx"],
+      "specs": ["src/components/settings/__tests__/NewSessionModePatch.test.tsx"],
       "components": ["web/src/components/settings/SchemaSection.tsx", "web/src/components/settings/FormFields.tsx"]
     },
     {
