@@ -3181,14 +3181,10 @@ impl Instance {
         !self.has_command_override() && self.profile_host_environment().is_empty()
     }
 
-    /// Whether another AoE session shares this one's Claude project directory,
-    /// which makes transcript mtime useless for attributing a conversation.
+    /// Whether another AoE session writes into this one's Claude transcript
+    /// directory, which makes mtime useless for attributing a conversation.
     fn claude_project_dir_is_shared(&self) -> bool {
-        super::capture::claude_project_dir_is_shared(
-            &self.id,
-            &self.project_path,
-            &self.resolved_host_environment(),
-        )
+        super::capture::claude_project_dir_is_shared(self)
     }
 
     /// Full set of session IDs capture must skip for this instance: live tmux
@@ -3219,13 +3215,13 @@ impl Instance {
                         &container_name,
                         &self.container_workdir(),
                         &exclusion,
-                        None,
+                        crate::session::capture::ClaudeAnchor::None,
                     )
                     .ok()
                 } else {
                     capture_claude_session_id(
                         &self.project_path,
-                        None,
+                        crate::session::capture::ClaudeAnchor::None,
                         &exclusion,
                         &self.resolved_host_environment(),
                     )
@@ -5730,6 +5726,13 @@ impl Instance {
 
         let poll_fn: Box<dyn Fn() -> Option<String> + Send + 'static> = match tool {
             "claude" => {
+                // Resolved once here, not per tick: the predicate walks every
+                // profile's `sessions.json`, which is far too expensive for a
+                // poll loop. A peer created on this cwd after the poller starts
+                // therefore does not flip an already-running "sole writer"
+                // verdict; what covers that peer is the per-tick exclusion set,
+                // which drops its sid as soon as it publishes one to tmux env.
+                let project_dir_is_shared = self.claude_project_dir_is_shared();
                 if self.is_sandboxed() {
                     let container_name = match self.sandbox_info.as_ref() {
                         Some(s) => s.container_name.clone(),
@@ -5741,6 +5744,7 @@ impl Instance {
                         initial_known.clone(),
                         instance_id.clone(),
                         extra_excludes.clone(),
+                        project_dir_is_shared,
                     ))
                 } else {
                     Box::new(claude_poll_fn(
@@ -5749,6 +5753,7 @@ impl Instance {
                         instance_id.clone(),
                         extra_excludes.clone(),
                         self.resolved_host_environment(),
+                        project_dir_is_shared,
                     ))
                 }
             }
