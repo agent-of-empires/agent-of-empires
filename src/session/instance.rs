@@ -14975,7 +14975,6 @@ mod tests {
                 assert!(is_existing);
                 assert_eq!(inst.agent_session_id.as_deref(), Some(stored));
             }
-            // ── Kimi shared-index anchor (#3516) ─────────────────────────────
             //
             // The per-tool bascule tests above run one instance against its
             // store. Kimi's store is a single append-only
@@ -15377,6 +15376,19 @@ mod tests {
             fn kimi_invalid_peer_config_fails_closed_without_resetting_aliases() {
                 let temp = tempdir().unwrap();
                 let _home = isolate_app_dir_at(temp.path());
+                // Registry writers using an empty profile normalize through
+                // the process-global default. Pin it away from `peer_profile`
+                // so unrelated parallel tests cannot clear the alias this
+                // fixture is observing.
+                fs::write(
+                    crate::session::get_app_dir().unwrap().join("config.toml"),
+                    "default_profile = \"status-default\"\n",
+                )
+                .unwrap();
+                assert_eq!(
+                    crate::session::config::resolve_default_profile(),
+                    "status-default"
+                );
                 let project = temp.path().join("invalid-config-project");
                 fs::create_dir_all(&project).unwrap();
                 let project = project.to_string_lossy().to_string();
