@@ -642,7 +642,7 @@ describe("SkillToolCard (claude profile)", () => {
     expect(container.textContent).not.toContain("_aoe_title");
   });
 
-  it("renders the resolved skill's provenance badge alongside the plugin badges (#3052)", () => {
+  it("renders the resolved skill's provenance badge (#3052)", () => {
     skillIndexRef.current = buildSkillIndex({
       roots: [
         { id: "claude-user", label: "Claude", relativePath: ".claude/skills", consumers: ["claude"], legacy: false },

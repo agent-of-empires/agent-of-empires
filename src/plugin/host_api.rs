@@ -24,18 +24,6 @@
 //!   `cas { key, expected, value }` / `remove { key }` (`runtime.worker`):
 //!   a host-backed durable key/value store, namespaced by the calling
 //!   plugin's id (#2897). Survives daemon and worker restarts; quota-bounded.
-//! - `fs.read { root, path }` (`fs.read`) and `fs.write { root, path, content }`
-//!   (`fs.write`): a UTF-8 file under one of two AoE-owned roots, `plugin` (the
-//!   caller's private `<app_dir>/plugins/<id>/files`) or `skills` (the managed
-//!   `<app_dir>/skills` store). Confined to the root; no arbitrary host path.
-//! - `skills.list` / `skills.read { source, directory }` (`fs.read` OR
-//!   `config.read`): the discovered skill set, source-qualified by provenance.
-//! - `skills.create` / `skills.edit` / `skills.delete` (`fs.write`): mutate the
-//!   AoE-managed skills store in place. `skills.adopt` (`fs.write`) copies a
-//!   host-discovered skill INTO the managed store, leaving the original.
-//!   `skills.propagate` (`fs.write`) copies a managed skill OUT into a supported
-//!   agent's host skills dir. A host-discovered (read-only) skill target for a
-//!   create/edit/delete is refused with `FORBIDDEN`.
 //!
 //! Per-plugin namespace: session metadata is always read and written under the
 //! calling plugin's own `Instance.plugin_meta[<plugin-id>]` slot, and
@@ -78,9 +66,6 @@ const STORAGE_MAX_KEYS: usize = 64;
 const STORAGE_MAX_KEY_BYTES: usize = 256;
 const STORAGE_MAX_VALUE_BYTES: usize = 64 * 1024;
 
-/// The declared-but-previously-unwired filesystem capabilities (#2984). `fs.*`
-/// and the skills write RPCs gate on these; skills reads accept `fs.read` or
-/// `config.read` (declared above).
 /// Shared, host-owned state behind the API: the plugin event bus and the
 /// profile whose session storage the API reads and writes. One per running
 /// host; cloned cheaply via `Arc` by each worker's dispatch task.
