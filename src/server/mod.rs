@@ -6324,10 +6324,14 @@ async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
         // just made durable.
         let outcome =
             crate::session::sync::drain_and_persist_session_ids(&mut snapshot, &file_watch);
+        // One observation for the whole repair walk, as on the TUI side: this
+        // visits every instance, so a per-item `list-sessions` fork scales with
+        // the store.
+        let live = crate::tmux::LiveSessionSnapshot::new();
         let repaired: std::collections::HashSet<String> = snapshot
             .iter_mut()
             .filter_map(|inst| {
-                inst.repair_session_id_poller_if_needed()
+                inst.repair_session_id_poller_if_needed(&live)
                     .then(|| inst.id.clone())
             })
             .collect();

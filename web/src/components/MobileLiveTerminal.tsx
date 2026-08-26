@@ -11,7 +11,7 @@ import {
   wrapLine,
   type CellRun,
 } from "../lib/liveTermLines";
-import { wheelNotches } from "../lib/liveMouse";
+import { cursorLineIndex, pointerPaneCell, wheelNotches } from "../lib/liveMouse";
 import { registerMobileKeyboardProxyReceiver, type MobileKeyboardProxyInput } from "../lib/mobileKeyboardProxy";
 import { writeClipboard } from "../lib/clipboard";
 import type { LiveFrame } from "../hooks/useLiveTerminal";
@@ -859,7 +859,7 @@ export function MobileLiveTerminal({
   const live = useMemo(() => {
     const cursor = !reading ? (frame?.cursor ?? null) : null;
     if (!cursor) return { row: -1, col: -1, top: null as number | null };
-    const lineIdx = Math.max(0, lines.length - screenRows) + cursor.y;
+    const lineIdx = cursorLineIndex(lines.length, screenRows, cursor.y);
     if (lineIdx < 0 || lineIdx >= lines.length) return { row: -1, col: -1, top: null };
     const cols = renderCols > 0 ? renderCols : Number.POSITIVE_INFINITY;
     const baseRow = visual.lineStartRow[lineIdx] ?? -1;
@@ -978,14 +978,18 @@ export function MobileLiveTerminal({
       const r = el.getBoundingClientRect();
       const content = el.querySelector<HTMLElement>("[data-live-content]");
       const gridTop = content?.getBoundingClientRect().top ?? r.top;
-      const cols = frame?.pane0?.cols ?? (renderCols > 0 ? renderCols : 1);
-      const rows = frame?.pane0?.rows ?? Math.max(1, screenRows || rowsRef.current);
-      const col = Math.min(cols, Math.max(1, Math.floor((clientX - r.left) / charW) + 1));
+      const pane0 = frame?.pane0 ?? {
+        cols: renderCols > 0 ? renderCols : 1,
+        rows: Math.max(1, screenRows || rowsRef.current),
+      };
+      const compositeCol = Math.floor((clientX - r.left) / charW) + 1;
       const visualRow = Math.floor((clientY - gridTop) / lineH) - effectiveSpacerLines;
       const firstScreenLine = Math.max(0, lines.length - screenRows);
       const screenTopVisual = visual.lineStartRow[firstScreenLine] ?? 0;
-      const row = Math.min(rows, Math.max(1, visualRow - screenTopVisual + 1));
-      return { col, row };
+      // The hovered cell is on the window grid; the app receives pane 0
+      // coordinates, so the inverse projection subtracts pane 0's origin
+      // (#3515).
+      return pointerPaneCell(compositeCol, visualRow - screenTopVisual, pane0);
     },
     [charW, lineH, renderCols, screenRows, effectiveSpacerLines, lines.length, visual, frame?.pane0],
   );

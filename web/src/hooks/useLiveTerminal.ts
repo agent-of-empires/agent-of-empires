@@ -27,9 +27,16 @@ export interface LiveCursor {
   y: number;
 }
 
-export interface LivePaneExtent {
+export interface LivePaneRect {
   cols: number;
   rows: number;
+  /** Pane 0's offset within the composited window grid. A
+   *  `pane-border-status` row pushes every pane down, so the cursor and
+   *  pointer cells the client sees are window-relative while the app speaks
+   *  pane-relative coordinates (#3515). Absent means the origin (pre-fix
+   *  servers, unsplit windows). */
+  left?: number;
+  top?: number;
 }
 
 export interface LiveFrame {
@@ -52,8 +59,9 @@ export interface LiveFrame {
   /** App is in SGR (1006) mouse encoding; picks the forwarded wire format
    *  (SGR vs legacy X10). */
   mouseSgr: boolean;
-  /** Pane 0's input extent when the frame composites a split window. */
-  pane0?: LivePaneExtent | null;
+  /** Pane 0's rectangle within the composited window grid (a split
+   *  window). */
+  pane0?: LivePaneRect | null;
 }
 
 export interface LiveTerminalState {
@@ -264,7 +272,7 @@ export function useLiveTerminal(
           altScreen?: boolean;
           mouse?: boolean;
           mouseSgr?: boolean;
-          pane0?: LivePaneExtent | null;
+          pane0?: LivePaneRect | null;
         };
         try {
           msg = JSON.parse(text) as typeof msg;

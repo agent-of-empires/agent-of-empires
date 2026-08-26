@@ -3812,10 +3812,45 @@ impl Instance {
             .unwrap_or(false)
     }
 
-    /// `exists()` alone is insufficient: a pane can exist while its agent
-    /// has died. Used by recovery, status polling, and TUI reload.
-    pub fn has_live_tmux_pane(&self) -> bool {
-        self.tmux_env_session_name().is_some()
+    /// [`Self::tmux_env_session_name`] answered from a snapshot the caller
+    /// already holds, for passes that ask once per stored session.
+    pub(crate) fn tmux_env_session_name_in(
+        &self,
+        snapshot: &crate::tmux::LiveSessionSnapshot,
+    ) -> Option<String> {
+        crate::tmux::live_any_kind_name_for_id_in(snapshot, &self.id)
+    }
+
+    /// [`Self::tmux_env_session_name_in`] for a one-shot pass that cannot
+    /// retry: an unreachable tmux server is Unknown, not "no live pane", so
+    /// fall back to a fresh per-item probe rather than dropping the row.
+    ///
+    /// The startup hidden-env publication in `HomeView::new` is such a pass.
+    /// Nothing re-runs it on reload and a poller does not re-emit an unchanged
+    /// sid, so a row skipped there stays unpublished until an unrelated sid
+    /// change or a relaunch, weakening the ownership attribution
+    /// `build_exclusion_set` reads. Startup recovery treats the same
+    /// distinction the other way, skipping its whole pass on a failed probe
+    /// rather than reading it as "every pane is dead".
+    pub(crate) fn tmux_env_session_name_in_or_probe(
+        &self,
+        snapshot: &crate::tmux::LiveSessionSnapshot,
+    ) -> Option<String> {
+        match snapshot.names() {
+            Some(_) => self.tmux_env_session_name_in(snapshot),
+            None => self.tmux_env_session_name(),
+        }
+    }
+
+    /// Whether this instance has a live tmux pane, answered from a snapshot
+    /// the caller already holds. `exists()` alone is insufficient: a pane can
+    /// exist while its agent has died. Used by peer exclusion, poller repair,
+    /// and TUI reload.
+    pub(crate) fn has_live_tmux_pane_in(
+        &self,
+        snapshot: &crate::tmux::LiveSessionSnapshot,
+    ) -> bool {
+        self.tmux_env_session_name_in(snapshot).is_some()
     }
 
     pub fn start_container_terminal_with_size(&mut self, size: Option<(u16, u16)>) -> Result<()> {
@@ -5950,14 +5985,17 @@ impl Instance {
     ///
     /// OMP pollers reload pane metadata on every tick, so a replacement binds
     /// to the durable generation that won any concurrent restart race.
-    pub(crate) fn repair_session_id_poller_if_needed(&mut self) -> bool {
+    pub(crate) fn repair_session_id_poller_if_needed(
+        &mut self,
+        snapshot: &crate::tmux::LiveSessionSnapshot,
+    ) -> bool {
         // Structured sessions have ACP workers rather than tmux panes. Their
         // lifecycle is reconciled by the daemon, so probing tmux here can only
         // fail and is especially costly from the native TUI's refresh loop.
         if self.is_structured()
             || !self.supports_session_poller()
             || self.session_id_poller_is_running()
-            || !self.has_live_tmux_pane()
+            || !self.has_live_tmux_pane_in(snapshot)
         {
             return false;
         }
@@ -7877,6 +7915,54 @@ mod tests {
             !contended.contains(&("opencode".to_string(), canon)),
             "a dead id-less peer must not force the live session to abstain"
         );
+    }
+
+    /// A one-shot pass must not read an unreachable snapshot as "no live
+    /// pane". The startup hidden-env publication is batched behind one
+    /// `LiveSessionSnapshot`, and nothing re-runs it, so collapsing Unknown
+    /// into Absent there would leave every row's `AOE_INSTANCE_ID` and
+    /// `AOE_CAPTURED_SESSION_ID` unpublished until an unrelated sid change or
+    /// a relaunch, and peer exclusion reads exactly those variables.
+    #[test]
+    #[serial_test::serial]
+    #[cfg(unix)]
+    fn one_shot_name_probes_when_the_snapshot_missed_tmux() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let temp = tempfile::tempdir().unwrap();
+        let inst = Instance::new("Refactor billing", "/tmp/aoe-test-one-shot-probe");
+        let live_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
+
+        // A `tmux` that answers with one live session name, standing in for the
+        // probe that succeeds after the snapshot's own `list-sessions` failed.
+        // The pane-liveness check reads the same output and parses it as "not
+        // dead", which is what the real probe does for any answer but `1`.
+        let shim = temp.path().join("tmux");
+        std::fs::write(&shim, format!("#!/bin/sh\necho '{live_name}'\n")).unwrap();
+        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            temp.path().display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let _guard = EnvGuard::set(&[("PATH", path)]);
+
+        let missed = crate::tmux::LiveSessionSnapshot::from_parts(None, None);
+        assert_eq!(
+            inst.tmux_env_session_name_in(&missed),
+            None,
+            "the snapshot alone has nothing to answer an unreachable server with"
+        );
+        assert_eq!(
+            inst.tmux_env_session_name_in_or_probe(&missed).as_deref(),
+            Some(live_name.as_str()),
+            "a one-shot caller falls back to the per-item probe"
+        );
+
+        // A snapshot that did reach the server is authoritative: absent from
+        // its list means absent, with no probe behind it.
+        let observed = crate::tmux::LiveSessionSnapshot::from_parts(Some(Vec::new()), None);
+        assert_eq!(inst.tmux_env_session_name_in_or_probe(&observed), None);
     }
 
     /// Force the tmux session cache into a fresh "server reachable, but this
@@ -14597,7 +14683,7 @@ mod tests {
 
             // Companion to the above: same setup but the peer carries the
             // default `Status::Idle` and is not archived, exercising the
-            // `!inst.has_live_tmux_pane()` branch on its own. The peer has
+            // `!inst.has_live_tmux_pane_in()` branch on its own. The peer has
             // never spawned a tmux pane in the test, so it counts as
             // pane-less even though its Status field does not flag it.
             #[test]
@@ -14633,7 +14719,7 @@ mod tests {
                 peer_inst.agent_session_id = Some(peer.to_string());
                 assert!(!peer_inst.is_archived());
                 assert!(matches!(peer_inst.status, Status::Idle));
-                assert!(!peer_inst.has_live_tmux_pane());
+                assert!(!peer_inst.has_live_tmux_pane_in(&crate::tmux::LiveSessionSnapshot::new()));
 
                 super::seed_disk_for_sidecar_test(profile, &peer_inst);
 
