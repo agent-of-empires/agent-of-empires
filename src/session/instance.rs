@@ -7196,13 +7196,6 @@ impl Instance {
     pub fn update_status(&mut self) {
         self.update_status_with_metadata(None, None);
     }
-
-    /// Capture the session's window for the preview, with any panes the user
-    /// split off composited in. `capture-pane` has no size parameters: the
-    /// window is captured at its own dimensions.
-    pub fn capture_output_composited(&self, lines: usize) -> Result<String> {
-        self.tmux_session()?.capture_window_composited(lines)
-    }
 }
 
 fn generate_id() -> String {

@@ -616,8 +616,11 @@ async fn handle_live_ws(
                             let claimed = tokio::task::spawn_blocking(move || {
                                 let session = crate::tmux::Session::from_name(&name);
                                 if session.claim_size_owner(&who, SIZE_OWNER_TTL) {
-                                    session.resize_window(cols, rows);
-                                    true
+                                    let resized = session.resize_window(cols, rows);
+                                    if !resized {
+                                        session.release_size_owner(&who);
+                                    }
+                                    resized
                                 } else {
                                     false
                                 }
@@ -896,12 +899,17 @@ async fn handle_live_ws(
                                 let owned = tokio::task::spawn_blocking(move || {
                                     let session = crate::tmux::Session::from_name(&name);
                                     if session.claim_size_owner(&who, SIZE_OWNER_TTL) {
-                                        session.resize_window(cols, rows);
-                                        true
+                                        let resized = session.resize_window(cols, rows);
+                                        if !resized {
+                                            session.release_size_owner(&who);
+                                        }
+                                        resized
                                     } else {
                                         false
                                     }
+
                                 })
+
                                 .await
                                 .unwrap_or(false);
                                 settings.is_owner.store(owned, Ordering::Relaxed);
@@ -957,9 +965,14 @@ async fn handle_live_ws(
                                     let session = crate::tmux::Session::from_name(&name);
                                     if session.steal_size_owner(&who) {
                                         if cols > 0 && rows > 0 {
-                                            session.resize_window(cols, rows);
+                                            let resized = session.resize_window(cols, rows);
+                                            if !resized {
+                                                session.release_size_owner(&who);
+                                            }
+                                            resized
+                                        } else {
+                                            true
                                         }
-                                        true
                                     } else {
                                         false
                                     }

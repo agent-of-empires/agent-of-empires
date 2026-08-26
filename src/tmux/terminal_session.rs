@@ -321,13 +321,6 @@ impl PairedTerminal {
 
         Ok(())
     }
-
-    fn capture_window_composited(&self, lines: usize) -> Result<String> {
-        if !self.exists() {
-            return Ok(String::new());
-        }
-        super::Session::from_name(&self.name).capture_window_composited(lines)
-    }
 }
 
 pub struct TerminalSession {
@@ -360,7 +353,7 @@ impl TerminalSession {
     }
 
     /// [`Self::resolve_name`] for render paths: snapshot-only, never
-    /// refreshing. See [`PairedTerminal::resolve_name_for_display`].
+    /// refreshing.
     pub fn resolve_name_for_display(id: &str, title: &str) -> String {
         PairedTerminal::resolve_name_for_display(TerminalKind::Host, id, title, 0)
     }
@@ -407,12 +400,6 @@ impl TerminalSession {
     pub fn attach(&self) -> Result<()> {
         self.inner.attach()
     }
-
-    /// Preview capture with the window's other panes composited in; see
-    /// [`super::Session::capture_window_composited`].
-    pub fn capture_window_composited(&self, lines: usize) -> Result<String> {
-        self.inner.capture_window_composited(lines)
-    }
 }
 
 /// Container terminal session for sandboxed sessions.
@@ -447,7 +434,7 @@ impl ContainerTerminalSession {
     }
 
     /// [`Self::resolve_name`] for render paths: snapshot-only, never
-    /// refreshing. See [`PairedTerminal::resolve_name_for_display`].
+    /// refreshing.
     pub fn resolve_name_for_display(id: &str, title: &str) -> String {
         PairedTerminal::resolve_name_for_display(TerminalKind::Container, id, title, 0)
     }
@@ -493,12 +480,6 @@ impl ContainerTerminalSession {
 
     pub fn attach(&self) -> Result<()> {
         self.inner.attach()
-    }
-
-    /// Preview capture with the window's other panes composited in; see
-    /// [`super::Session::capture_window_composited`].
-    pub fn capture_window_composited(&self, lines: usize) -> Result<String> {
-        self.inner.capture_window_composited(lines)
     }
 }
 

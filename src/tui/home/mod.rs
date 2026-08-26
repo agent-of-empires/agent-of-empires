@@ -17,7 +17,6 @@ mod file_watch_tests;
 // go through the `super::live_send::LiveSendState` path.
 
 use std::collections::{HashMap, HashSet};
-use std::time::Instant;
 
 use ratatui::prelude::Rect;
 use tui_input::Input;
@@ -308,11 +307,11 @@ pub enum TerminalMode {
     Container,
 }
 
-/// Cached preview content to avoid subprocess calls on every frame
+/// Cached preview content received from the off-thread capture worker.
+#[derive(Default)]
 pub(super) struct PreviewCache {
     pub(super) session_id: Option<String>,
     pub(super) content: String,
-    pub(super) last_refresh: Instant,
     pub(super) dimensions: (u16, u16),
     /// Number of lines that were captured into `content`. Used together with
     /// the BUFFER reserve so consecutive wheel ticks don't trigger a fresh
@@ -332,19 +331,6 @@ pub(super) struct PreviewCache {
     /// wake-ups or unrelated key events. With it, the parse happens
     /// at most once per actual content change.
     pub(super) parsed_text: Option<ratatui::text::Text<'static>>,
-}
-
-impl Default for PreviewCache {
-    fn default() -> Self {
-        Self {
-            session_id: None,
-            content: String::new(),
-            last_refresh: Instant::now(),
-            dimensions: (0, 0),
-            captured_lines: 0,
-            parsed_text: None,
-        }
-    }
 }
 
 impl PreviewCache {
@@ -386,18 +372,17 @@ impl PreviewCache {
         self.parsed_text = None;
         self.session_id = Some(session_id);
         self.dimensions = dimensions;
-        self.last_refresh = Instant::now();
         self.captured_lines
     }
 }
 
-/// Per-frame durations for the preview pipeline's two fork/CPU phases.
-/// Lives on `HomeView`, reset each frame by `App::render`, and read back
-/// by the render sampler so a slow or live-send frame logs the breakdown
-/// instead of a single opaque `frame_ms`.
+/// Per-frame durations for the preview pipeline's paint-side apply/parse phases.
+/// Lives on HomeView, resets each frame in App::render, and feeds the render
+/// sampler so slow frames distinguish mailbox/cache application from ANSI
+/// parsing and widget construction. Actual tmux capture runs on the worker.
 #[derive(Default, Clone, Copy)]
 pub(super) struct PreviewTimings {
-    pub(super) capture: std::time::Duration,
+    pub(super) apply: std::time::Duration,
     pub(super) parse: std::time::Duration,
 }
 
@@ -849,17 +834,9 @@ pub struct HomeView {
     pub(super) container_terminal_preview_cache: PreviewCache,
     pub(super) tool_preview_cache: PreviewCache,
 
-    /// Per-frame timing of the preview pipeline's two latency-sensitive
-    /// phases, reset by `App::render` before each `render` and populated
-    /// at the agent-preview call site. `capture` is the `tmux
-    /// capture-pane` fork (sub-100us when the gate short-circuits, ~1-10ms
-    /// when it actually forks); `parse` is the `ansi-to-tui` pass (~0 on a
-    /// parsed-cache hit). The app loop's render sampler reads these to
-    /// break a live-send frame down into fork vs. parse vs. widget build.
+    /// Paint-side preview timings used to split mailbox/cache application,
+    /// ANSI parsing, and widget construction in slow-frame traces.
     pub(super) preview_timings: PreviewTimings,
-
-    /// Mouse wheel offset for the preview pane, in lines back from the bottom.
-    /// Reset to 0 whenever the selected session changes.
     pub(super) preview_scroll_offset: u16,
     pub(super) preview_area: Rect,
     /// Sub-rect of `preview_area` where the agent's captured pane content
@@ -6406,12 +6383,10 @@ impl HomeView {
         // one row shorter than the preview output area, desyncing the live
         // preview by a row (#2742).
         let session = crate::tmux::Session::from_name(&tmux_name);
-        // Only register the dedup if the session still exists (so the resize was
-        // actually attempted). If it died between our state install and now,
-        // leaving `live_send_last_resize` as None lets the next
-        // `refresh_preview_cache_if_needed` retry through the worker.
-        if session.exists() {
-            session.resize_window(pane.width, pane.height);
+        // Register the dedup only when the bounded authoritative resize
+        // actually succeeds; a vanished pane or timeout leaves it unset so
+        // the next preview refresh retries.
+        if session.resize_window(pane.width, pane.height) {
             self.live_send_last_resize = Some((pane.width, pane.height));
         }
         // Give the agent ~50ms to handle SIGWINCH and re-lay out

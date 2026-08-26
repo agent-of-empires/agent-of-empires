@@ -461,6 +461,9 @@ pub(in crate::tui) struct LiveSendWorker {
     /// and exits live mode; the worker itself never steals the lock back
     /// after entry, so a web "take over" wins instead of ping-ponging.
     lock_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Set by the worker when resize-window fails or times out. Paint consumes
+    /// the flag and clears its geometry dedup so the same size retries.
+    resize_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl LiveSendWorker {
@@ -473,6 +476,9 @@ impl LiveSendWorker {
         let (tx, rx) = channel::<WorkerMsg>();
         let lock_lost = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let thread_lock_lost = std::sync::Arc::clone(&lock_lost);
+        let resize_failed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let thread_resize_failed = std::sync::Arc::clone(&resize_failed);
+
         std::thread::spawn(move || {
             use std::sync::atomic::Ordering;
             use std::sync::mpsc::RecvTimeoutError;
@@ -572,11 +578,14 @@ impl LiveSendWorker {
                             batch.retain(|m| !matches!(m, WorkerMsg::Resize { .. }));
                         }
                         if !batch.is_empty() {
-                            dispatch_batch(&tmux_name, batch);
+                            if dispatch_batch(&tmux_name, batch) {
+                                thread_resize_failed.store(true, Ordering::Relaxed);
+                            }
                             if let Some(wake) = &capture_wake {
                                 wake.wake();
                             }
                         }
+
                         if last_owner_maintenance.elapsed() >= crate::tmux::SIZE_OWNER_HEARTBEAT
                             && maintain(owned)
                         {
@@ -597,7 +606,11 @@ impl LiveSendWorker {
             }
             session.release_size_owner(&owner_id);
         });
-        Self { tx, lock_lost }
+        Self {
+            tx,
+            lock_lost,
+            resize_failed,
+        }
     }
 
     /// True once the worker observed the size-owner lock held by another
@@ -605,6 +618,13 @@ impl LiveSendWorker {
     /// exits live mode.
     pub(super) fn lock_lost(&self) -> bool {
         self.lock_lost.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Consume the sticky resize failure so paint can clear its dedup and
+    /// retry the same geometry.
+    pub(super) fn take_resize_failed(&self) -> bool {
+        self.resize_failed
+            .swap(false, std::sync::atomic::Ordering::Relaxed)
     }
 
     #[cfg(test)]
@@ -749,6 +769,18 @@ pub(in crate::tui) struct CaptureFrame {
     pub(in crate::tui) budget: usize,
     pub(in crate::tui) content: String,
     pub(in crate::tui) cursor: Option<crate::tmux::PaneCursor>,
+}
+
+/// Whether the worker must reset target-scoped dedup and transport state.
+/// Generation is part of the identity: A -> B -> A can happen entirely
+/// between worker cycles, leaving the name unchanged but the mailbox cleared.
+fn capture_target_changed(
+    last_name: &str,
+    last_generation: u64,
+    name: &str,
+    generation: u64,
+) -> bool {
+    last_name != name || last_generation != generation
 }
 
 /// Off-thread preview capture. One long-lived thread forks `tmux
@@ -1049,6 +1081,8 @@ impl LiveCaptureWorker {
         let clipboard_capture_enabled_cell = clipboard_capture_enabled.clone();
         std::thread::spawn(move || {
             let mut last_target = String::new();
+            let mut last_generation = 0;
+
             let mut last_captured: Option<String> = None;
             // Budget the currently-held capture was published at. A budget
             // change alone (scroll depth, viewport resize over a quiet pane)
@@ -1128,13 +1162,16 @@ impl LiveCaptureWorker {
                 // recheck below, and a frame that slips past it still carries
                 // the old generation for the consumer to drop.
                 let generation_now = generation_cell.load(Ordering::Relaxed);
-                // A retarget resets the dedup so the new pane's first frame
-                // always publishes, even if its bytes happen to match the
-                // previous pane's last capture.
-                if name != last_target {
+                // A retarget resets the dedup so the new generation's first
+                // frame always publishes, even in an ABA switch A -> B -> A
+                // that happens entirely between worker cycles and leaves the
+                // name unchanged.
+                if capture_target_changed(&last_target, last_generation, &name, generation_now) {
                     last_target = name.clone();
+                    last_generation = generation_now;
                     last_captured = None;
                     last_published_budget = 0;
+
                     // The new pane's first frame must not inherit the old
                     // pane's floor or debounce hold.
                     last_published_at = None;
@@ -1733,27 +1770,25 @@ impl LiveCaptureWorker {
 /// named keys and resizes dispatch individually. Tests verify the
 /// coalescing ordering via `coalesce` directly without needing a real
 /// session.
-fn dispatch_batch(tmux_name: &str, batch: Vec<WorkerMsg>) {
+fn dispatch_batch(tmux_name: &str, batch: Vec<WorkerMsg>) -> bool {
     let actions = coalesce(batch);
-    // A `Paste` can only go through tmux (`paste-buffer -p` is what decides
-    // whether the pane gets bracketed-paste markers), so a batch holding one
-    // would otherwise split across two writers: the paste via tmux and its
-    // neighbouring keystrokes via the vt socket. The socket hands bytes to the
-    // `pipe-pane -I` forwarder, which writes to the pty independently, so the
-    // two can land out of order and scramble a type-then-paste sequence. Pin
-    // the whole batch to tmux instead, which serializes its own writes, and
-    // keep the single-writer invariant in `tmux::vt::input_mode` intact.
+    // A Paste can only go through tmux (paste-buffer -p decides whether the
+    // pane gets bracketed-paste markers), so pin the whole mixed batch to tmux
+    // and preserve one ordered writer for the pty.
     let force_tmux = actions.iter().any(|a| matches!(a, TmuxAction::Paste(_)));
+    let mut resize_failed = false;
     for action in actions {
         if let Err(err) = dispatch_via_fork(tmux_name, &action, force_tmux) {
+            resize_failed |= matches!(action, TmuxAction::Resize { .. });
             tracing::warn!(
                 target: "tui.live_send",
                 error = %err,
                 action = ?action,
-                "live-send fork dispatch failed; keystroke dropped",
+                "live-send fork dispatch failed; action dropped",
             );
         }
     }
+    resize_failed
 }
 
 /// Execute one `TmuxAction` as a one-shot `tmux` subprocess. Module-
@@ -1858,15 +1893,12 @@ fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction, force_tmux: bool) -> 
             return crate::tmux::Session::from_name(tmux_name).paste_text(text);
         }
         TmuxAction::Resize { cols, rows } => {
-            // Size the window through `Session::resize_window` so the pane lands
-            // at exactly `rows` after tmux's status-bar chrome, the same math the
-            // passive / serve preview sync uses (#2766). A raw `resize-window -y
-            // rows` leaves a `rows - chrome` pane whenever a client is attached
-            // (or a tmux that reserves the status row while detached), one row
-            // shorter than the preview output area the cursor overlay and the
-            // bottom-anchored capture assume, so the live preview desyncs by a
-            // row (#2742).
-            crate::tmux::Session::from_name(tmux_name).resize_window(*cols, *rows);
+            // Use the shared chrome-aware and timeout-bounded resize path. A
+            // failure is reported to the worker so paint clears its dedup and
+            // retries the same geometry on the next frame.
+            if !crate::tmux::Session::from_name(tmux_name).resize_window(*cols, *rows) {
+                anyhow::bail!("live-send resize-window failed or timed out");
+            }
             return Ok(());
         }
     }
@@ -3146,6 +3178,16 @@ mod tests {
     }
 
     #[test]
+    fn capture_target_change_detects_aba_generation() {
+        assert!(!capture_target_changed("a", 7, "a", 7));
+        assert!(capture_target_changed("a", 7, "b", 8));
+        assert!(
+            capture_target_changed("a", 7, "a", 9),
+            "A -> B -> A between worker cycles must still reset dedup"
+        );
+    }
+
+    #[test]
     fn live_capture_worker_retarget_drops_previous_capture() {
         // Swapping the target must clear any queued capture so the render
         // never applies the previous pane's bytes under the new view.
@@ -3357,6 +3399,33 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(25));
         }
         panic!("timed out waiting for {what}");
+    }
+
+    #[test]
+    fn live_send_worker_reports_failed_resize() {
+        let name = "aoe_test_missing_live_resize";
+        let action = TmuxAction::Resize { cols: 80, rows: 24 };
+        assert!(
+            dispatch_via_fork(name, &action, false).is_err(),
+            "the bounded resize path must expose failure"
+        );
+
+        let worker = LiveSendWorker::spawn(name.to_string(), None);
+        worker.resize(80, 24);
+        wait_until(
+            "live resize failure flag",
+            std::time::Duration::from_secs(5),
+            || {
+                worker
+                    .resize_failed
+                    .load(std::sync::atomic::Ordering::Relaxed)
+            },
+        );
+        assert!(
+            worker.take_resize_failed(),
+            "paint consumes the sticky failure"
+        );
+        assert!(!worker.take_resize_failed(), "consuming the flag clears it");
     }
 
     fn pane_width(name: &str) -> u16 {

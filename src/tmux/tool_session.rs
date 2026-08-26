@@ -224,12 +224,6 @@ impl ToolSession {
         super::Session::from_name(&self.name).capture_pane(lines)
     }
 
-    /// Passive-preview capture with the window's other panes composited in;
-    /// see [`super::Session::capture_window_composited`].
-    pub fn capture_window_composited(&self, lines: usize) -> Result<String> {
-        super::Session::from_name(&self.name).capture_window_composited(lines)
-    }
-
     fn get_pane_pid(&self) -> Option<u32> {
         process::get_pane_pid(&self.name)
     }

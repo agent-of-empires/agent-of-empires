@@ -802,14 +802,14 @@ pub fn stop_all_sessions() -> anyhow::Result<usize> {
 /// successful empty map is authoritative and means there are no panes.
 pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
     let start = Instant::now();
-    let output = tmux_query_command()
-        .args([
-            "list-panes",
-            "-a",
-            "-F",
-            "#{session_name}|#{pane_index}|#{pane_dead}|#{pane_current_command}|#{pane_start_command}",
-        ])
-        .output();
+    let mut command = tmux_query_command();
+    command.args([
+        "list-panes",
+        "-a",
+        "-F",
+        "#{session_name}|#{pane_index}|#{pane_dead}|#{pane_current_command}|#{pane_start_command}",
+    ]);
+    let output = run_tmux_command_with_timeout(&mut command);
 
     let result: anyhow::Result<HashMap<String, PaneMetadata>> = match output {
         Ok(out) if out.status.success() => {
@@ -1227,9 +1227,9 @@ pub fn session_exists(name: &str) -> bool {
         return true;
     }
 
-    tmux_command()
-        .args(["has-session", "-t", name])
-        .output()
+    let mut command = tmux_command();
+    command.args(["has-session", "-t", name]);
+    run_tmux_command_with_timeout(&mut command)
         .map(|o| o.status.success())
         .unwrap_or(false)
 }
@@ -1323,13 +1323,28 @@ pub(crate) struct PassiveResizeDone {
 
 static PASSIVE_RESIZE_INTENTS: Mutex<Vec<PassiveResizeIntent>> = Mutex::new(Vec::new());
 static PASSIVE_RESIZE_DONES: Mutex<Vec<PassiveResizeDone>> = Mutex::new(Vec::new());
+static PASSIVE_RESIZE_IN_FLIGHT: Mutex<Vec<PassiveResizeDone>> = Mutex::new(Vec::new());
 
 /// Replace any queued resize for the same session with the latest geometry.
-/// Paint can queue every frame while the pending slot stays armed; coalescing
-/// here bounds the queue by the number of sessions even if the poller is
-/// delayed or restarts after a panic.
-fn queue_latest_passive_resize(queue: &mut Vec<PassiveResizeIntent>, intent: PassiveResizeIntent) {
+/// Paint can queue every frame while the pending slot stays armed; an exact
+/// in-flight geometry is ignored until render consumes its completion. A
+/// different geometry supersedes the pending slot. This bounds the queue by
+/// the number of sessions even if the poller is delayed or restarts.
+fn queue_latest_passive_resize(
+    queue: &mut Vec<PassiveResizeIntent>,
+    in_flight: &[PassiveResizeDone],
+    intent: PassiveResizeIntent,
+) {
+    // Any newly wanted geometry supersedes the queued one for this session,
+    // even when it returns to the currently in-flight geometry.
     queue.retain(|prev| prev.session_id != intent.session_id);
+    if in_flight.iter().any(|active| {
+        active.session_id == intent.session_id
+            && active.cols == intent.cols
+            && active.rows == intent.rows
+    }) {
+        return;
+    }
     queue.push(intent);
 }
 
@@ -1339,16 +1354,56 @@ pub(crate) fn queue_passive_resize(intent: PassiveResizeIntent) {
     let mut queue = PASSIVE_RESIZE_INTENTS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    queue_latest_passive_resize(&mut queue, intent);
-}
-
-/// Drain the completions the poller published since the last call. Called
-/// from paint each frame.
-pub(crate) fn take_passive_resize_dones() -> Vec<PassiveResizeDone> {
-    let mut dones = PASSIVE_RESIZE_DONES
+    let in_flight = PASSIVE_RESIZE_IN_FLIGHT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    std::mem::take(&mut *dones)
+    queue_latest_passive_resize(&mut queue, &in_flight, intent);
+}
+
+fn remove_pending_passive_resize(queue: &mut Vec<PassiveResizeIntent>, session_id: &str) {
+    queue.retain(|intent| intent.session_id != session_id);
+}
+
+/// Cancel queued geometry once render observes that the completed geometry is
+/// already the one wanted. Any other pending size for this session is stale.
+pub(crate) fn cancel_pending_passive_resize(session_id: &str) {
+    let mut queue = PASSIVE_RESIZE_INTENTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    remove_pending_passive_resize(&mut queue, session_id);
+}
+
+/// Drain completions and release matching in-flight geometry only when render
+/// can adopt the dedup. A newer geometry for the same session remains active.
+pub(crate) fn take_passive_resize_dones() -> Vec<PassiveResizeDone> {
+    let dones = {
+        let mut slot = PASSIVE_RESIZE_DONES
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        std::mem::take(&mut *slot)
+    };
+    let mut in_flight = PASSIVE_RESIZE_IN_FLIGHT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    in_flight.retain(|active| {
+        !dones.iter().any(|done| {
+            active.session_id == done.session_id
+                && active.cols == done.cols
+                && active.rows == done.rows
+        })
+    });
+    dones
+}
+
+fn clear_passive_resize_in_flight(intent: &PassiveResizeIntent) {
+    let mut in_flight = PASSIVE_RESIZE_IN_FLIGHT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    in_flight.retain(|active| {
+        active.session_id != intent.session_id
+            || active.cols != intent.cols
+            || active.rows != intent.rows
+    });
 }
 
 /// Execute one queued passive resize with EXACTLY the authoritative checks the
@@ -1358,32 +1413,49 @@ pub(crate) fn take_passive_resize_dones() -> Vec<PassiveResizeDone> {
 /// completion adopts the dedup), defer to an attached client or an active
 /// size owner, and only then `resize-window`. Publishes a completion on
 /// success so the render thread can record the dedup.
+fn execute_passive_resize(intent: &PassiveResizeIntent) -> Option<PassiveResizeDone> {
+    let session = Session::new(&intent.session_id, &intent.title).ok()?;
+    if !session.exists() || session.is_attached() || session.has_active_size_owner() {
+        return None;
+    }
+    session
+        .resize_window(intent.cols, intent.rows)
+        .then(|| PassiveResizeDone {
+            session_id: intent.session_id.clone(),
+            cols: intent.cols,
+            rows: intent.rows,
+        })
+}
+
 fn execute_passive_resizes() {
     let intents = {
         let mut queue = PASSIVE_RESIZE_INTENTS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        std::mem::take(&mut *queue)
+        let intents = std::mem::take(&mut *queue);
+        let mut in_flight = PASSIVE_RESIZE_IN_FLIGHT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        for intent in &intents {
+            in_flight.retain(|active| active.session_id != intent.session_id);
+            in_flight.push(PassiveResizeDone {
+                session_id: intent.session_id.clone(),
+                cols: intent.cols,
+                rows: intent.rows,
+            });
+        }
+        intents
     };
+
     for intent in intents {
-        let Some(session) = Session::new(&intent.session_id, &intent.title)
-            .ok()
-            .filter(|s| s.exists())
-        else {
+        let Some(done) = execute_passive_resize(&intent) else {
+            clear_passive_resize_in_flight(&intent);
             continue;
         };
-        if session.is_attached() || session.has_active_size_owner() {
-            continue;
-        }
-        session.resize_window(intent.cols, intent.rows);
         let mut dones = PASSIVE_RESIZE_DONES
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        dones.push(PassiveResizeDone {
-            session_id: intent.session_id,
-            cols: intent.cols,
-            rows: intent.rows,
-        });
+        dones.push(done);
     }
 }
 
@@ -1665,13 +1737,61 @@ mod tests {
             rows,
         };
         let mut queue = Vec::new();
-        queue_latest_passive_resize(&mut queue, intent("a", 80, 24));
-        queue_latest_passive_resize(&mut queue, intent("b", 90, 30));
-        queue_latest_passive_resize(&mut queue, intent("a", 120, 40));
+        queue_latest_passive_resize(&mut queue, &[], intent("a", 80, 24));
+        queue_latest_passive_resize(&mut queue, &[], intent("b", 90, 30));
+        queue_latest_passive_resize(&mut queue, &[], intent("a", 120, 40));
 
         assert_eq!(queue.len(), 2, "one bounded slot per session");
         assert_eq!((queue[0].session_id.as_str(), queue[0].cols), ("b", 90));
         assert_eq!((queue[1].session_id.as_str(), queue[1].cols), ("a", 120));
+
+        let in_flight = vec![PassiveResizeDone {
+            session_id: "a".to_string(),
+            cols: 120,
+            rows: 40,
+        }];
+        let mut while_running = Vec::new();
+        queue_latest_passive_resize(&mut while_running, &in_flight, intent("a", 120, 40));
+        let mut completed_then_in_sync = vec![intent("a", 140, 50)];
+        remove_pending_passive_resize(&mut completed_then_in_sync, "a");
+        assert!(
+            completed_then_in_sync.is_empty(),
+            "adopting the in-sync completion cancels stale queued geometry"
+        );
+        assert!(
+            while_running.is_empty(),
+            "identical in-flight resize is suppressed"
+        );
+        queue_latest_passive_resize(&mut while_running, &in_flight, intent("a", 140, 50));
+        assert_eq!((while_running[0].cols, while_running[0].rows), (140, 50));
+        // If the desired geometry returns to the in-flight one before G2 is
+        // drained, the now-stale queued G2 must be removed as well.
+        queue_latest_passive_resize(&mut while_running, &in_flight, intent("a", 120, 40));
+        assert!(
+            while_running.is_empty(),
+            "returning to the in-flight geometry drops stale queued geometry"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn failed_passive_resize_does_not_publish_completion() {
+        const ID: &str = "resize_failure_id";
+        const TITLE: &str = "Missing resize target";
+        let name = Session::generate_name(ID, TITLE);
+        let cache = SessionCacheGuard::capture();
+        cache.force_present(&[&name]);
+        let intent = PassiveResizeIntent {
+            session_id: ID.to_string(),
+            title: TITLE.to_string(),
+            cols: 100,
+            rows: 30,
+        };
+
+        assert!(
+            execute_passive_resize(&intent).is_none(),
+            "a failed or timed-out resize must not publish a completion"
+        );
     }
 
     #[test]

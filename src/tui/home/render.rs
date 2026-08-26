@@ -1901,6 +1901,13 @@ impl HomeView {
         if !targets_this_pane || width == 0 || height == 0 {
             return;
         }
+        if self
+            .live_send_worker
+            .as_ref()
+            .is_some_and(live_send::LiveSendWorker::take_resize_failed)
+        {
+            self.live_send_last_resize = None;
+        }
         let next = (width, height);
         if self.live_send_last_resize != Some(next) {
             if let Some(worker) = &self.live_send_worker {
@@ -2153,14 +2160,10 @@ impl HomeView {
                 crate::tui::clipboard::copy_to_clipboard(&text);
             }
         }
-        // The off-thread `LiveCaptureWorker` (retargeted to this pane by
-        // `sync_preview_capture_worker` in `render_preview`) keeps fresh
-        // content flowing on its own thread; `apply_worker_capture` below
-        // just applies the newest it has produced, and is the ONLY capture
-        // source: there is no synchronous fork fallback anymore. This moves
-        // the per-frame capture cost (~8.5ms on macOS, ~90% of a frame; the
-        // `tui.render` `capture_us` trace measures it) off the render thread
-        // for every view, not just agent live-send.
+        // LiveCaptureWorker is the only capture source and runs off paint.
+        // apply_worker_capture below only moves the newest mailbox frame into
+        // the cache; tui.render preview_apply_us measures that paint-side work,
+        // not tmux capture latency.
         let in_live = self.live_send.is_some();
         // While in live-send mode, keep the agent's tmux pane sized to the
         // preview's visible output area so it renders directly into view.
@@ -2193,7 +2196,10 @@ impl HomeView {
                     self.preview_pane_synced.as_ref(),
                     self.preview_pane_pending.as_ref(),
                 ) {
-                    PassiveResizeStep::InSync => self.preview_pane_pending = None,
+                    PassiveResizeStep::InSync => {
+                        crate::tmux::cancel_pending_passive_resize(&want.0);
+                        self.preview_pane_pending = None;
+                    }
                     PassiveResizeStep::Arm => {
                         self.preview_pane_pending = Some(want);
                         // Nudge the event loop so the confirming refresh isn't
@@ -2725,7 +2731,7 @@ impl HomeView {
                     // coexist in the actual render call.
                     let cap_start = Instant::now();
                     self.refresh_preview_cache_if_needed(pane_area.width, pane_area.height);
-                    self.preview_timings.capture = cap_start.elapsed();
+                    self.preview_timings.apply = cap_start.elapsed();
                     let parse_start = Instant::now();
                     self.preview_cache.ensure_parsed();
                     self.preview_timings.parse = parse_start.elapsed();

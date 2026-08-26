@@ -872,12 +872,7 @@ impl Session {
     /// only. The preview's scroll offset clamps itself to the shorter capture,
     /// so this reads as "a split window doesn't scroll back" rather than
     /// misbehaving.
-    pub fn capture_window_composited(&self, lines: usize) -> Result<String> {
-        Ok(self.capture_window_composited_with_cursor(lines)?.0)
-    }
-
-    /// [`capture_window_composited`](Self::capture_window_composited) plus pane
-    /// 0's cursor, for the live preview.
+    /// Composite window capture plus pane 0's cursor, for the live preview.
     ///
     /// Pane 0 owns the cursor because it is the pane that receives input, and
     /// tmux puts it at the window origin, so its coordinates index the
@@ -1055,9 +1050,9 @@ impl Session {
         Ok((content, cursor))
     }
 
-    /// Second fork of [`capture_window_composited`](Self::capture_window_composited):
-    /// window dimensions plus geometry and visible capture for each of `count`
-    /// panes, chained into one `tmux` invocation.
+    /// Second fork of capture_window_composited_with_cursor: window dimensions
+    /// plus geometry and visible capture for each of count panes, chained into
+    /// one tmux invocation.
     ///
     /// Pane indices are contiguous from 0 within a window (tmux renumbers them
     /// as the layout changes, unlike window indices) and `pane-base-index` is
@@ -1144,6 +1139,13 @@ impl Session {
             window_height,
             panes,
         })
+    }
+
+    /// Test-only convenience wrapper: production callers consume the cursor
+    /// from capture_window_composited_with_cursor directly.
+    #[cfg(test)]
+    fn capture_window_composited(&self, lines: usize) -> Result<String> {
+        Ok(self.capture_window_composited_with_cursor(lines)?.0)
     }
 
     /// Capture the pane's full scrollback (from session start) with wrapped
@@ -1431,9 +1433,9 @@ impl Session {
         if !self.exists() {
             return;
         }
-        let _ = crate::tmux::tmux_command()
-            .args(["set-option", "-t", &self.name, "window-size", "latest"])
-            .output();
+        let mut command = crate::tmux::tmux_command();
+        command.args(["set-option", "-t", &self.name, "window-size", "latest"]);
+        let _ = crate::tmux::run_tmux_command_with_timeout(&mut command);
     }
 
     /// Resize the session's first window so its pane's visible content area
@@ -1460,11 +1462,11 @@ impl Session {
     /// to `manual`, so any later `attach-session` must call
     /// [`reset_size_to_latest_client`](Self::reset_size_to_latest_client) first
     /// or the window stays pinned at these preview dimensions.
-    pub fn resize_window(&self, cols: u16, rows: u16) {
+    pub fn resize_window(&self, cols: u16, rows: u16) -> bool {
         if cols == 0 || rows == 0 || !self.exists() {
-            return;
+            return false;
         }
-        // Query the same window/pane the capture streams (`:^.0`), so the
+        // Query the same window/pane the capture streams (:^.0), so the
         // measured chrome matches the pane whose height the owner loop checks.
         let pane_target = format!("{}:^.0", self.name);
         let window_rows = self
@@ -1472,34 +1474,36 @@ impl Session {
             .map(|chrome| rows.saturating_add(chrome))
             .unwrap_or(rows);
         let window_target = format!("{}:^", self.name);
-        let _ = crate::tmux::tmux_command()
-            .args([
-                "resize-window",
-                "-t",
-                &window_target,
-                "-x",
-                &cols.to_string(),
-                "-y",
-                &window_rows.to_string(),
-            ])
-            .output();
+        let mut command = crate::tmux::tmux_command();
+        command.args([
+            "resize-window",
+            "-t",
+            &window_target,
+            "-x",
+            &cols.to_string(),
+            "-y",
+            &window_rows.to_string(),
+        ]);
+        crate::tmux::run_tmux_command_with_timeout(&mut command)
+            .map(|output| output.status.success())
+            .unwrap_or(false)
     }
 
-    /// Read the live vertical chrome (status-bar rows) for `pane_target` from
-    /// tmux. `None` when the geometry can't be read; callers then size the
+    /// Read the live vertical chrome (status-bar rows) for pane_target from
+    /// tmux. None when the geometry cannot be read; callers then size the
     /// window with no chrome adjustment (the pre-#2766 behavior).
     fn pane_chrome_rows(&self, pane_target: &str) -> Option<u16> {
-        let output = crate::tmux::tmux_command()
-            .args([
-                "display-message",
-                "-p",
-                "-t",
-                pane_target,
-                "-F",
-                "#{window_height} #{pane_height}",
-            ])
-            .output()
-            .ok()?;
+        let mut command = crate::tmux::tmux_command();
+        command.args([
+            "display-message",
+            "-p",
+            "-t",
+            pane_target,
+            "-F",
+            "#{window_height} #{pane_height}",
+        ]);
+        let output = crate::tmux::run_tmux_command_with_timeout(&mut command).ok()?;
+
         if !output.status.success() {
             return None;
         }
@@ -1624,8 +1628,11 @@ impl Session {
     pub fn resize_window_if_owner(&self, owner_id: &str, cols: u16, rows: u16) -> bool {
         match self.size_owner() {
             Some((id, _)) if id == owner_id => {
-                self.resize_window(cols, rows);
-                true
+                let resized = self.resize_window(cols, rows);
+                if !resized {
+                    self.release_size_owner(owner_id);
+                }
+                resized
             }
             _ => false,
         }
@@ -1646,15 +1653,16 @@ impl Session {
     /// dedup unset when it skips, so a transient glitch costs one poll
     /// interval of a clipped preview rather than wedging the resize forever.
     pub fn is_attached(&self) -> bool {
-        let out = crate::tmux::tmux_command()
-            .args([
-                "display-message",
-                "-t",
-                &self.name,
-                "-p",
-                "#{session_attached}",
-            ])
-            .output();
+        let mut command = crate::tmux::tmux_command();
+        command.args([
+            "display-message",
+            "-t",
+            &self.name,
+            "-p",
+            "#{session_attached}",
+        ]);
+        let out = crate::tmux::run_tmux_command_with_timeout(&mut command);
+
         match out {
             Ok(o) if o.status.success() => {
                 let s = String::from_utf8_lossy(&o.stdout);
@@ -1694,10 +1702,9 @@ impl Session {
     }
 
     fn show_user_option(&self, opt: &str) -> Option<String> {
-        let out = crate::tmux::tmux_command()
-            .args(["show-options", "-v", "-t", &self.name, opt])
-            .output()
-            .ok()?;
+        let mut command = crate::tmux::tmux_command();
+        command.args(["show-options", "-v", "-t", &self.name, opt]);
+        let out = crate::tmux::run_tmux_command_with_timeout(&mut command).ok()?;
         if !out.status.success() {
             return None;
         }
@@ -1710,15 +1717,15 @@ impl Session {
     }
 
     fn set_user_option(&self, opt: &str, value: &str) {
-        let _ = crate::tmux::tmux_command()
-            .args(["set-option", "-t", &self.name, opt, value])
-            .output();
+        let mut command = crate::tmux::tmux_command();
+        command.args(["set-option", "-t", &self.name, opt, value]);
+        let _ = crate::tmux::run_tmux_command_with_timeout(&mut command);
     }
 
     fn unset_user_option(&self, opt: &str) {
-        let _ = crate::tmux::tmux_command()
-            .args(["set-option", "-u", "-t", &self.name, opt])
-            .output();
+        let mut command = crate::tmux::tmux_command();
+        command.args(["set-option", "-u", "-t", &self.name, opt]);
+        let _ = crate::tmux::run_tmux_command_with_timeout(&mut command);
     }
 
     /// Deliver `text` to `target` via tmux's load-buffer + paste-buffer.
@@ -2590,6 +2597,13 @@ mod tests {
             session.size_owner().map(|(id, _)| id),
             Some("d".to_string())
         );
+
+        // A verified owner whose authoritative resize fails must release the
+        // lock before the caller demotes itself. Zero width deterministically
+        // exercises the failure path without relying on tmux timing.
+        assert!(!session.resize_window_if_owner("d", 0, 24));
+        assert!(session.size_owner().is_none());
+        assert!(session.steal_size_owner("d"));
 
         // A non-owner release is a no-op; the owner's release clears the lock.
         session.release_size_owner("not-d");

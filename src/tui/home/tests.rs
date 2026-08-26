@@ -15930,7 +15930,6 @@ mod preview_drag_select {
         env.view.preview_cache.content = "alpha beta gamma\nsecond line\nthird line\n".to_string();
         env.view.preview_cache.dimensions = (80, 24);
         env.view.preview_cache.captured_lines = 3;
-        env.view.preview_cache.last_refresh = std::time::Instant::now();
         env.view.preview_cache.session_id = Some("fake-id".to_string());
 
         // First render seeds preview_text_view + paints content. We need

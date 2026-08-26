@@ -2,8 +2,8 @@
 //!
 //! `capture-pane` is per-pane and tmux has no command that returns a window
 //! with its panes composited, so the preview historically showed only the
-//! pinned `^.0` pane and a user's split was invisible (see
-//! [`crate::tmux::Session::capture_window_composited`] for the capture side).
+//! pinned `^.0` pane and a user split was invisible (see
+//! [`crate::tmux::Session::capture_window_composited_with_cursor`] for the capture side).
 //! This module is the pure half: given each pane's geometry and its captured
 //! rows, lay them back out on the window grid and draw tmux-style borders in
 //! the gaps between them.
