@@ -4874,6 +4874,39 @@ mod tests {
     }
 
     #[test]
+    fn post_repair_load_error_prevents_home_reload_and_keeps_report() -> Result<()> {
+        let (temp, _guard, source, target, before, _after) = setup_recovery_env("reload-fallback")?;
+        target.update(|instances, _| {
+            let mut copy = before.clone();
+            copy.source_profile = target.profile().to_string();
+            instances.push(copy);
+            Ok(())
+        })?;
+        let entry = fresh_journal_entry(&source, &target, &before.id);
+        super::super::move_journal::record(&entry, source.sessions_path())?;
+        let bad_dir = temp.path().join("bad");
+        fs::create_dir_all(&bad_dir)?;
+        let bad = Storage::new_for_test_path("bad", bad_dir.join("sessions.json"));
+        fs::write(bad.sessions_path(), b"not-json")?;
+        let stores: Vec<(&str, &Storage)> = vec![
+            (source.profile(), &source),
+            (target.profile(), &target),
+            (bad.profile(), &bad),
+        ];
+
+        let outcome = reconcile_loaded(&[&source, &target, &bad], &stores);
+
+        assert!(source.load()?.is_empty(), "repair reached disk");
+        assert_eq!(target.load()?.len(), 1);
+        assert!(
+            !outcome.repaired,
+            "Home must keep pre-repair loads instead of repeating the failed reload"
+        );
+        assert_eq!(outcome.reports.len(), 1, "ambiguity remains surfaced");
+        Ok(())
+    }
+
+    #[test]
     fn target_still_holds_checks_every_loser_id() -> Result<()> {
         let temp = tempdir()?;
         let path = temp.path().join("sessions.json");
