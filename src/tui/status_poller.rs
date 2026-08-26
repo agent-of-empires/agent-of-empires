@@ -143,7 +143,7 @@ pub(super) fn poll_statuses_once(
 
     let pane_metadata = if any_pollable {
         crate::tmux::refresh_session_cache();
-        match crate::tmux::batch_pane_metadata() {
+        match crate::tmux::refresh_pane_meta_cache() {
             Ok(metadata) => metadata,
             Err(error) => {
                 tracing::warn!(
@@ -155,7 +155,7 @@ pub(super) fn poll_statuses_once(
             }
         }
     } else {
-        HashMap::new()
+        std::sync::Arc::new(HashMap::new())
     };
 
     // Refresh container health if any sandboxed session exists and interval elapsed

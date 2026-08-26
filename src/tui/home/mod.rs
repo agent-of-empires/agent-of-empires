@@ -311,8 +311,13 @@ pub enum TerminalMode {
 #[derive(Default)]
 pub(super) struct PreviewCache {
     pub(super) session_id: Option<String>,
+    pub(super) capture_target: Option<String>,
+    pub(super) capture_generation: u64,
     pub(super) content: String,
     pub(super) dimensions: (u16, u16),
+    /// Cursor and terminal mode flags from the same accepted capture frame as
+    /// content. Paint and input routing must never read a newer worker sample.
+    pub(super) cursor: Option<crate::tmux::PaneCursor>,
     /// Number of lines that were captured into `content`. Used together with
     /// the BUFFER reserve so consecutive wheel ticks don't trigger a fresh
     /// `tmux capture-pane` subprocess while the cached window still covers
@@ -363,7 +368,10 @@ impl PreviewCache {
         &mut self,
         content: String,
         session_id: String,
+        capture_target: String,
+        capture_generation: u64,
         dimensions: (u16, u16),
+        cursor: Option<crate::tmux::PaneCursor>,
     ) -> usize {
         self.captured_lines = content.lines().count();
         self.content = content;
@@ -371,7 +379,10 @@ impl PreviewCache {
         // `ansi-to-tui`.
         self.parsed_text = None;
         self.session_id = Some(session_id);
+        self.capture_target = Some(capture_target);
+        self.capture_generation = capture_generation;
         self.dimensions = dimensions;
+        self.cursor = cursor;
         self.captured_lines
     }
 }

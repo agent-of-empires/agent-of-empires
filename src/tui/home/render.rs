@@ -1986,6 +1986,10 @@ impl HomeView {
             if let Some(worker) = self.preview_capture_worker.as_ref() {
                 worker.set_target(desired.clone().unwrap_or_default());
             }
+            self.preview_cache.cursor = None;
+            self.terminal_preview_cache.cursor = None;
+            self.container_terminal_preview_cache.cursor = None;
+            self.tool_preview_cache.cursor = None;
             self.preview_capture_target = desired;
             // New pane under the pointer: drop the hover dedup cell so a
             // stationary pointer still reports its cell to the new agent.
@@ -2104,7 +2108,14 @@ impl HomeView {
         let frame_budget = frame.budget;
         let content_is_empty = frame.content.is_empty();
         let frame = std::sync::Arc::unwrap_or_clone(frame);
-        let captured_lines = select(self).store_capture(frame.content, id, (width, height));
+        let captured_lines = select(self).store_capture(
+            frame.content,
+            id,
+            frame.target,
+            frame.generation,
+            (width, height),
+            frame.cursor,
+        );
 
         // An EMPTY frame always applies: terminal / container panes forward
         // empties precisely so a cleared shell drops its stale text (#1501's
@@ -2340,6 +2351,18 @@ impl HomeView {
         }
     }
 
+    pub(super) fn active_preview_cursor(&self) -> Option<crate::tmux::PaneCursor> {
+        let cache = self.active_preview_cache();
+        let target = cache.capture_target.as_deref()?;
+        if self.preview_capture_target.as_deref() != Some(target) {
+            return None;
+        }
+        let worker = self.preview_capture_worker.as_ref()?;
+        worker
+            .capture_identity_is_current(target, cache.capture_generation)
+            .then_some(cache.cursor)
+            .flatten()
+    }
     fn active_captured_lines(&self) -> usize {
         self.active_preview_cache().captured_lines
     }
@@ -2991,7 +3014,7 @@ impl HomeView {
         if self.live_send.is_none() || self.preview_scroll_offset != 0 {
             return None;
         }
-        let cursor = self.preview_capture_worker.as_ref()?.current_cursor()?;
+        let cursor = self.active_preview_cursor()?;
         if !cursor.position_reliable {
             return None;
         }

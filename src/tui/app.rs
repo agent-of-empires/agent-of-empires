@@ -765,10 +765,11 @@ impl App {
         // paint thread: every `_for_display` helper and the passive preview
         // resize executor answer from these snapshots and must never fork
         // from render.
-        crate::tmux::spawn_snapshot_poller();
-        // One immediate refresh so even the FIRST frame paints from a warm
-        // snapshot instead of an empty one.
+        // Warm the first session snapshot before starting the owner thread, so
+        // its first cycle observes fresh data instead of issuing a duplicate
+        // list-sessions command during startup.
         crate::tmux::refresh_session_cache();
+        crate::tmux::spawn_snapshot_poller();
 
         // Initial render
         crate::tui::clear_terminal(terminal)?;

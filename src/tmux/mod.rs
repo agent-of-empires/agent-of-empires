@@ -264,11 +264,42 @@ static PANE_META_CACHE: RwLock<PaneMetaCache> = RwLock::new(PaneMetaCache {
 });
 
 struct PaneMetaCache {
-    data: Option<HashMap<String, PaneMetadata>>,
+    data: Option<std::sync::Arc<HashMap<String, PaneMetadata>>>,
     time: Option<Instant>,
 }
 const TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
+/// One wall-clock budget shared by every tmux subprocess in a logical
+/// operation. Composite capture uses this so its layout fallback cannot turn
+/// one stalled preview sample into two consecutive full timeouts.
+pub(crate) struct TmuxCommandDeadline {
+    deadline: Instant,
+}
+
+impl TmuxCommandDeadline {
+    pub(crate) fn new() -> Self {
+        Self {
+            deadline: Instant::now() + TMUX_COMMAND_TIMEOUT,
+        }
+    }
+    #[cfg(test)]
+    fn with_timeout(timeout: Duration) -> Self {
+        Self {
+            deadline: Instant::now() + timeout,
+        }
+    }
+
+    pub(crate) fn run(&self, cmd: &mut Command) -> std::io::Result<Output> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "tmux operation deadline elapsed",
+            ));
+        }
+        run_tmux_command_with_timeout_inner(cmd, remaining)
+    }
+}
 fn run_tmux_command_with_timeout_inner(
     cmd: &mut Command,
     timeout: Duration,
@@ -284,7 +315,7 @@ fn run_tmux_command_with_timeout_inner(
 }
 
 pub(crate) fn run_tmux_command_with_timeout(cmd: &mut Command) -> std::io::Result<Output> {
-    run_tmux_command_with_timeout_inner(cmd, TMUX_COMMAND_TIMEOUT)
+    TmuxCommandDeadline::new().run(cmd)
 }
 
 /// Result of the authoritative `list-sessions` scan performed by
@@ -1083,7 +1114,7 @@ impl Drop for SessionCacheGuard {
 /// into a later test. Pair with `#[serial_test::serial]`.
 #[cfg(test)]
 pub(crate) struct PaneMetaCacheGuard {
-    prev_data: Option<HashMap<String, PaneMetadata>>,
+    prev_data: Option<std::sync::Arc<HashMap<String, PaneMetadata>>>,
     prev_time: Option<Instant>,
 }
 
@@ -1293,12 +1324,30 @@ fn pane_dead_from_cache(name: &str) -> Option<bool> {
 /// Repopulate [`PANE_META_CACHE`]. The timestamp is stamped even when the
 /// query fails, so a tmux outage costs one fork per [`CACHE_TTL`] instead of
 /// one per row per frame.
-fn refresh_pane_meta_cache() {
-    let data = batch_pane_metadata().ok();
+pub(crate) fn refresh_pane_meta_cache(
+) -> anyhow::Result<std::sync::Arc<HashMap<String, PaneMetadata>>> {
+    let result = batch_pane_metadata().map(std::sync::Arc::new);
     if let Ok(mut cache) = PANE_META_CACHE.write() {
-        cache.data = data;
+        cache.data = result.as_ref().ok().cloned();
         cache.time = Some(Instant::now());
     }
+    result
+}
+
+fn snapshot_refresh_due(last_refresh: Option<Instant>) -> bool {
+    last_refresh.is_none_or(|at| at.elapsed() >= CACHE_TTL / 2)
+}
+
+fn session_snapshot_refresh_due() -> bool {
+    SESSION_CACHE
+        .read()
+        .map_or(true, |cache| snapshot_refresh_due(cache.time))
+}
+
+fn pane_snapshot_refresh_due() -> bool {
+    PANE_META_CACHE
+        .read()
+        .map_or(true, |cache| snapshot_refresh_due(cache.time))
 }
 
 /// One queued passive preview resize, pushed by the render thread when its
@@ -1415,7 +1464,11 @@ fn clear_passive_resize_in_flight(intent: &PassiveResizeIntent) {
 /// success so the render thread can record the dedup.
 fn execute_passive_resize(intent: &PassiveResizeIntent) -> Option<PassiveResizeDone> {
     let session = Session::new(&intent.session_id, &intent.title).ok()?;
-    if !session.exists() || session.is_attached() || session.has_active_size_owner() {
+    if !passive_resize_authorized(
+        session.exists(),
+        session.is_attached(),
+        session.has_active_size_owner(),
+    ) {
         return None;
     }
     session
@@ -1425,6 +1478,14 @@ fn execute_passive_resize(intent: &PassiveResizeIntent) -> Option<PassiveResizeD
             cols: intent.cols,
             rows: intent.rows,
         })
+}
+
+fn passive_resize_authorized(
+    exists: bool,
+    attached: Option<bool>,
+    active_size_owner: Option<bool>,
+) -> bool {
+    exists && attached == Some(false) && active_size_owner == Some(false)
 }
 
 fn execute_passive_resizes() {
@@ -1477,8 +1538,12 @@ pub fn spawn_snapshot_poller() {
         .name("aoe-display-snapshot".to_string())
         .spawn(|| loop {
             let cycle = std::panic::catch_unwind(|| {
-                refresh_session_cache();
-                refresh_pane_meta_cache();
+                if session_snapshot_refresh_due() {
+                    refresh_session_cache();
+                }
+                if pane_snapshot_refresh_due() {
+                    let _ = refresh_pane_meta_cache();
+                }
                 execute_passive_resizes();
             });
             if cycle.is_err() {
@@ -1807,6 +1872,44 @@ mod tests {
         assert_eq!(cmd.get_program().to_str(), Some("tmux"));
     }
 
+    #[test]
+    fn passive_resize_fails_closed_on_unknown_authority() {
+        let cases = [
+            ("authoritative", true, Some(false), Some(false), true),
+            ("missing", false, Some(false), Some(false), false),
+            ("attached unknown", true, None, Some(false), false),
+            ("owner unknown", true, Some(false), None, false),
+            ("attached", true, Some(true), Some(false), false),
+            ("owned", true, Some(false), Some(true), false),
+        ];
+        for (name, exists, attached, owner, expected) in cases {
+            assert_eq!(
+                passive_resize_authorized(exists, attached, owner),
+                expected,
+                "{name}",
+            );
+        }
+    }
+
+    #[test]
+    fn shared_snapshot_refresh_skips_fresh_scans() {
+        assert!(snapshot_refresh_due(None));
+        assert!(!snapshot_refresh_due(Some(Instant::now())));
+        assert!(snapshot_refresh_due(Some(
+            Instant::now() - CACHE_TTL / 2 - Duration::from_millis(1)
+        )));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn tmux_operation_deadline_rejects_a_second_budget() {
+        let deadline = TmuxCommandDeadline::with_timeout(Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(5));
+        let mut command = Command::new("true");
+        let error = deadline
+            .run(&mut command)
+            .expect_err("an expired operation must not start another command budget");
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+    }
     #[cfg(unix)]
     #[test]
     fn tmux_command_timeout_kills_a_stalled_client() {

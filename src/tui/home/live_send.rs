@@ -560,7 +560,7 @@ impl LiveSendWorker {
                                 // and would never flag the loss.
                                 owned = session
                                     .claim_size_owner(&owner_id, crate::tmux::SIZE_OWNER_TTL);
-                                if !owned && session.has_active_size_owner() {
+                                if !owned && session.has_active_size_owner() == Some(true) {
                                     // Our own claim would have succeeded if the
                                     // live owner were us, so this is a takeover.
                                     thread_lock_lost.store(true, Ordering::Relaxed);
@@ -765,7 +765,9 @@ pub(in crate::tui) struct CaptureFrame {
     /// current generation so a frame captured before a retarget is dropped
     /// instead of landing under the new view.
     pub(in crate::tui) generation: u64,
-    /// The `capture_lines` budget this capture was produced under.
+    /// Exact tmux target identity captured in this frame.
+    pub(in crate::tui) target: String,
+    /// The capture_lines budget this capture was produced under.
     pub(in crate::tui) budget: usize,
     pub(in crate::tui) content: String,
     pub(in crate::tui) cursor: Option<crate::tmux::PaneCursor>,
@@ -783,6 +785,14 @@ fn capture_target_changed(
     last_name != name || last_generation != generation
 }
 
+fn frame_needs_publish(
+    content_changed: bool,
+    last_cursor: Option<crate::tmux::PaneCursor>,
+    cursor: Option<crate::tmux::PaneCursor>,
+    budget_changed: bool,
+) -> bool {
+    content_changed || last_cursor != cursor || budget_changed
+}
 /// Off-thread preview capture. One long-lived thread forks `tmux
 /// capture-pane` and publishes fresh pane content into a single-slot
 /// mailbox the render loop drains, so the render loop applies the latest
@@ -840,16 +850,6 @@ pub(in crate::tui) struct LiveCaptureWorker {
     /// would lag the first fast capture by ~250ms.
     nudge: std::sync::Arc<(std::sync::Mutex<()>, std::sync::Condvar)>,
     stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
-    /// Newest pane cursor, refreshed every capture cycle (even when the
-    /// captured text is unchanged, so a bare cursor move still updates).
-    /// Cleared on `set_target` (the previewed pane changed). Two consumers: the
-    /// render loop paints a real terminal cursor over the preview ONLY while
-    /// live-send is active (`live_preview_cursor_pos` gates on `live_send`),
-    /// and the wheel forward reads it in BOTH live-send and passive preview
-    /// to decide whether/how to scroll an alternate-screen agent. So the
-    /// cursor query (a one-line `display-message` folded into the capture
-    /// fork) runs every cycle, not just live ones.
-    cursor: std::sync::Arc<std::sync::Mutex<Option<crate::tmux::PaneCursor>>>,
     /// Newest OSC 52 clipboard write the displayed pane has emitted. A VT grid
     /// extracts it from the live byte stream; terminal capture uses a separate
     /// raw observer so rendered snapshots never need to carry the escape.
@@ -900,24 +900,24 @@ const PANE_COUNT_PROBE_MS: u64 = 1_000;
 /// overlap and the compositor's tiling assumption does not hold. Compositing
 /// there hides the zoomed pane behind border fill, so the single-pane transport
 /// is both cheaper and more correct.
-fn probe_pane_count(name: &str) -> u16 {
-    let out = crate::tmux::tmux_command()
-        .args([
-            "display-message",
-            "-p",
-            "-t",
-            &format!("{name}:^"),
-            "-F",
-            "#{window_panes} #{window_zoomed_flag}",
-        ])
-        .output()
+fn probe_pane_count(name: &str, deadline: &crate::tmux::TmuxCommandDeadline) -> u16 {
+    let mut command = crate::tmux::tmux_command();
+    command.args([
+        "display-message",
+        "-p",
+        "-t",
+        &format!("{name}:^"),
+        "-F",
+        "#{window_panes} #{window_zoomed_flag}",
+    ]);
+    let out = deadline
+        .run(&mut command)
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok());
     let Some(out) = out else { return 1 };
     let mut fields = out.split_whitespace();
     let count: u16 = fields.next().and_then(|f| f.parse().ok()).unwrap_or(1);
-    // Absent (older tmux, or a truncated line) reads as not zoomed.
     if fields.next().is_some_and(|z| z != "0") {
         return 1;
     }
@@ -936,15 +936,15 @@ fn capture_composited(
     name: &str,
     lines: usize,
     forward_empty: bool,
+    deadline: &crate::tmux::TmuxCommandDeadline,
 ) -> (Option<String>, Option<crate::tmux::PaneCursor>) {
     let session = crate::tmux::Session::from_name(name);
-    match session.capture_window_composited_with_cursor(lines) {
+    match session.capture_window_composited_with_cursor_with_deadline(lines, deadline) {
         Ok((content, cursor)) => (Some(content), cursor),
         Err(_) if forward_empty => (Some(String::new()), None),
         Err(_) => (None, None),
     }
 }
-
 /// How long a cached window layout serves the composite before the panes
 /// around pane 0 are re-captured.
 ///
@@ -970,41 +970,49 @@ const COMPOSITE_LAYOUT_MS: u64 = 300;
 /// and because the cache is only stamped on success the failing fork would be
 /// retried every frame while the preview kept compositing a ghost of the closed
 /// pane from the stale rectangles.
+struct CompositeCaptureState<'a> {
+    layout: &'a mut Option<(std::time::Instant, crate::tmux::composite::WindowLayout)>,
+    last_pane_probe: &'a mut Option<std::time::Instant>,
+}
 fn capture_composited_over_grid(
     name: &str,
     channel: &crate::tmux::vt::VtChannel,
-    cache: &mut Option<(std::time::Instant, crate::tmux::composite::WindowLayout)>,
-    last_pane_probe: &mut Option<std::time::Instant>,
+    state: CompositeCaptureState<'_>,
     pane_count: u16,
     lines: usize,
     forward_empty: bool,
+    deadline: &crate::tmux::TmuxCommandDeadline,
 ) -> (Option<String>, Option<crate::tmux::PaneCursor>) {
-    let stale = cache.as_ref().is_none_or(|(at, _)| {
+    let stale = state.layout.as_ref().is_none_or(|(at, _)| {
         at.elapsed() >= std::time::Duration::from_millis(COMPOSITE_LAYOUT_MS)
     });
     if stale {
-        match crate::tmux::Session::from_name(name).capture_window_layout(pane_count) {
-            Some(layout) => *cache = Some((std::time::Instant::now(), layout)),
+        match crate::tmux::Session::from_name(name)
+            .capture_window_layout_with_deadline(pane_count, deadline)
+        {
+            Some(layout) => *state.layout = Some((std::time::Instant::now(), layout)),
             // The window is no longer the one these rectangles describe. Drop
             // them rather than compositing a pane that is gone, force a count
             // re-probe on the next cycle, and let the fallback below carry this
             // frame: it probes `window_panes` in the same fork as its capture,
             // so it is correct no matter how stale the count had become.
             None => {
-                *cache = None;
-                *last_pane_probe = None;
+                *state.layout = None;
+                *state.last_pane_probe = None;
             }
         }
     }
 
-    let Some((_, layout)) = cache.as_ref() else {
-        return capture_composited(name, lines, forward_empty);
+    let Some((_, layout)) = state.layout.as_ref() else {
+        return capture_composited(name, lines, forward_empty, deadline);
     };
     let Some(first) = layout.first_pane() else {
-        return capture_composited(name, lines, forward_empty);
+        return capture_composited(name, lines, forward_empty, deadline);
     };
-    let Some((rows, mut cursor)) = channel.sample_rows_padded(first.width, first.height) else {
-        return capture_composited(name, lines, forward_empty);
+    let Some((rows, mut cursor)) =
+        channel.sample_rows_padded_with_deadline(first.width, first.height, deadline)
+    else {
+        return capture_composited(name, lines, forward_empty, deadline);
     };
 
     // The cursor is pane 0's, and tmux puts pane 0 at the window origin, so its
@@ -1032,15 +1040,41 @@ fn capture_via_tmux(
     name: &str,
     lines: usize,
     forward_empty: bool,
+    deadline: &crate::tmux::TmuxCommandDeadline,
 ) -> (Option<String>, Option<crate::tmux::PaneCursor>) {
     let session = crate::tmux::Session::from_name(name);
-    match session.capture_pane_with_cursor(lines) {
+    match session.capture_pane_with_cursor_with_deadline(lines, deadline) {
         Ok((content, cur)) => (Some(content), cur),
         Err(_) if forward_empty => (Some(String::new()), None),
         Err(_) => (None, None),
     }
 }
 
+#[cfg(unix)]
+fn shutdown_vt_source(
+    source: &mut Option<std::sync::Arc<crate::tmux::vt::VtChannel>>,
+    deadline: &crate::tmux::TmuxCommandDeadline,
+) {
+    let Some(source) = source.take() else {
+        return;
+    };
+    if let Ok(channel) = std::sync::Arc::try_unwrap(source) {
+        channel.shutdown_with_deadline(deadline);
+    }
+}
+
+#[cfg(unix)]
+fn shutdown_osc52_source(
+    source: &mut Option<std::sync::Arc<crate::tmux::vt::Osc52Channel>>,
+    deadline: &crate::tmux::TmuxCommandDeadline,
+) {
+    let Some(source) = source.take() else {
+        return;
+    };
+    if let Ok(channel) = std::sync::Arc::try_unwrap(source) {
+        channel.shutdown_with_deadline(deadline);
+    }
+}
 impl LiveCaptureWorker {
     pub(in crate::tui) fn spawn(wake: std::sync::Arc<tokio::sync::Notify>) -> Self {
         use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -1053,7 +1087,6 @@ impl LiveCaptureWorker {
         let forward_empty = Arc::new(AtomicBool::new(false));
         let nudge: Arc<(Mutex<()>, Condvar)> = Arc::new((Mutex::new(()), Condvar::new()));
         let stop = Arc::new(AtomicBool::new(false));
-        let cursor: Arc<Mutex<Option<crate::tmux::PaneCursor>>> = Arc::new(Mutex::new(None));
         let clipboard: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
         let generation = Arc::new(AtomicU64::new(0));
         // Spawned enabled; the render reconcile pushes the real
@@ -1072,7 +1105,6 @@ impl LiveCaptureWorker {
         let forward_empty_cell = forward_empty.clone();
         let nudge_thread = nudge.clone();
         let stop_flag = stop.clone();
-        let cursor_cell = cursor.clone();
         let clipboard_cell = clipboard.clone();
         let generation_cell = generation.clone();
         #[cfg(unix)]
@@ -1089,6 +1121,7 @@ impl LiveCaptureWorker {
             // must republish even when the bytes are identical, or consumers
             // waiting for a wider/deeper capture stall forever.
             let mut last_published_budget: usize = 0;
+            let mut last_published_cursor: Option<crate::tmux::PaneCursor> = None;
             // When the frame that is currently in the mailbox (or the last
             // one consumed) was published, for the inter-publish floor.
             let mut last_published_at: Option<std::time::Instant> = None;
@@ -1162,6 +1195,7 @@ impl LiveCaptureWorker {
                 // recheck below, and a frame that slips past it still carries
                 // the old generation for the consumer to drop.
                 let generation_now = generation_cell.load(Ordering::Relaxed);
+                let command_deadline = crate::tmux::TmuxCommandDeadline::new();
                 // A retarget resets the dedup so the new generation's first
                 // frame always publishes, even in an ABA switch A -> B -> A
                 // that happens entirely between worker cycles and leaves the
@@ -1171,6 +1205,7 @@ impl LiveCaptureWorker {
                     last_generation = generation_now;
                     last_captured = None;
                     last_published_budget = 0;
+                    last_published_cursor = None;
 
                     // The new pane's first frame must not inherit the old
                     // pane's floor or debounce hold.
@@ -1181,9 +1216,9 @@ impl LiveCaptureWorker {
                     // a fresh arm attempt for the new target.
                     #[cfg(unix)]
                     {
-                        vt_source = None;
+                        shutdown_vt_source(&mut vt_source, &command_deadline);
                         last_vt_arm = None;
-                        osc52_source = None;
+                        shutdown_osc52_source(&mut osc52_source, &command_deadline);
                         osc52_seen = 0;
                         last_osc52_arm = None;
                     }
@@ -1204,12 +1239,12 @@ impl LiveCaptureWorker {
                 // arm attempt), so re-enabling always arms on the next cycle.
                 #[cfg(unix)]
                 if !vt_enabled {
-                    vt_source = None;
+                    shutdown_vt_source(&mut vt_source, &command_deadline);
                     last_vt_arm = None;
                 }
                 #[cfg(unix)]
                 if !clipboard_capture_enabled {
-                    osc52_source = None;
+                    shutdown_osc52_source(&mut osc52_source, &command_deadline);
                     osc52_seen = 0;
                     last_osc52_arm = None;
                 }
@@ -1222,7 +1257,7 @@ impl LiveCaptureWorker {
                         t.elapsed() >= std::time::Duration::from_millis(PANE_COUNT_PROBE_MS)
                     }) {
                         last_pane_probe = Some(std::time::Instant::now());
-                        let seen = probe_pane_count(&name);
+                        let seen = probe_pane_count(&name, &command_deadline);
                         if seen != pane_count {
                             // Layout changed under us; the cached rectangles no
                             // longer describe this window.
@@ -1243,7 +1278,7 @@ impl LiveCaptureWorker {
                     let observe_osc52 = !vt_enabled && forward_empty && clipboard_capture_enabled;
                     #[cfg(unix)]
                     if !observe_osc52 {
-                        osc52_source = None;
+                        shutdown_osc52_source(&mut osc52_source, &command_deadline);
                         last_osc52_arm = None;
                     }
                     #[cfg(unix)]
@@ -1252,7 +1287,10 @@ impl LiveCaptureWorker {
                         && last_osc52_arm.is_none_or(|t| t.elapsed() >= VT_REARM_INTERVAL)
                     {
                         last_osc52_arm = Some(std::time::Instant::now());
-                        osc52_source = crate::tmux::vt::Osc52Channel::acquire(&name);
+                        osc52_source = crate::tmux::vt::Osc52Channel::acquire_with_deadline(
+                            &name,
+                            &command_deadline,
+                        );
                         if let Some(source) = osc52_source.as_ref() {
                             osc52_seen = source.clipboard_sequence();
                         }
@@ -1262,12 +1300,12 @@ impl LiveCaptureWorker {
                         .as_ref()
                         .is_some_and(|source| !source.is_alive())
                     {
-                        osc52_source = None;
+                        shutdown_osc52_source(&mut osc52_source, &command_deadline);
                         osc52_seen = 0;
                     }
                     #[cfg(unix)]
                     let mut clipboard_now = osc52_source.as_ref().and_then(|source| {
-                        source.refresh_owner_heartbeat();
+                        source.refresh_owner_heartbeat_with_deadline(&command_deadline);
                         source.clipboard_after(&mut osc52_seen)
                     });
                     #[cfg(not(unix))]
@@ -1291,7 +1329,10 @@ impl LiveCaptureWorker {
                             && last_vt_arm.is_none_or(|t| t.elapsed() >= VT_REARM_INTERVAL)
                         {
                             last_vt_arm = Some(std::time::Instant::now());
-                            vt_source = crate::tmux::vt::VtChannel::acquire(&name);
+                            vt_source = crate::tmux::vt::VtChannel::acquire_with_deadline(
+                                &name,
+                                &command_deadline,
+                            );
                             // Event-driven echo: the channel pokes our nudge
                             // condvar on every grid change, so the wait below
                             // ends the moment output lands instead of after
@@ -1307,7 +1348,7 @@ impl LiveCaptureWorker {
                         // the tmux name, so the pane usually comes back)
                         // without thrashing on a permanently broken pane.
                         if vt_source.as_ref().is_some_and(|v| !v.is_alive()) {
-                            vt_source = None;
+                            shutdown_vt_source(&mut vt_source, &command_deadline);
                         }
                         match vt_source.as_ref() {
                             Some(v) => {
@@ -1316,32 +1357,40 @@ impl LiveCaptureWorker {
                                     capture_composited_over_grid(
                                         &name,
                                         v,
-                                        &mut composite_layout,
-                                        &mut last_pane_probe,
+                                        CompositeCaptureState {
+                                            layout: &mut composite_layout,
+                                            last_pane_probe: &mut last_pane_probe,
+                                        },
                                         pane_count,
                                         lines,
                                         forward_empty,
+                                        &command_deadline,
                                     )
                                 } else {
-                                    let (content, cur) = v.sample(lines);
+                                    let (content, cur) =
+                                        v.sample_with_deadline(lines, &command_deadline);
                                     (Some(content), cur)
                                 }
                             }
                             // No grid for pane 0, so every pane comes from the
                             // fork instead.
-                            None if composite => capture_composited(&name, lines, forward_empty),
-                            None => capture_via_tmux(&name, lines, forward_empty),
+                            None if composite => {
+                                capture_composited(&name, lines, forward_empty, &command_deadline)
+                            }
+                            None => {
+                                capture_via_tmux(&name, lines, forward_empty, &command_deadline)
+                            }
                         }
                     } else if composite {
-                        capture_composited(&name, lines, forward_empty)
+                        capture_composited(&name, lines, forward_empty, &command_deadline)
                     } else {
-                        capture_via_tmux(&name, lines, forward_empty)
+                        capture_via_tmux(&name, lines, forward_empty, &command_deadline)
                     };
                     #[cfg(not(unix))]
                     let (capture, cursor_now) = if composite {
-                        capture_composited(&name, lines, forward_empty)
+                        capture_composited(&name, lines, forward_empty, &command_deadline)
                     } else {
-                        capture_via_tmux(&name, lines, forward_empty)
+                        capture_via_tmux(&name, lines, forward_empty, &command_deadline)
                     };
                     // Chunk-arrival timing for the repaint-quiescence debounce,
                     // only when sampling a live VT grid. `None` on the
@@ -1363,17 +1412,9 @@ impl LiveCaptureWorker {
                         // the old pane and must not land under the new view.
                         // `set_target` also clears the mailbox, but the fork may
                         // have started before that switch.
-                        let still_current =
-                            target_cell.lock().ok().map(|g| *g == name).unwrap_or(false);
+                        let still_current = target_cell.lock().ok().is_some_and(|g| *g == name)
+                            && generation_cell.load(Ordering::Relaxed) == generation_now;
                         if still_current {
-                            // Cursor refreshes every cycle, independent of the
-                            // content dedup: a bare cursor move leaves the
-                            // captured cells unchanged but must still update the
-                            // cursor (the render paints it only under live-send;
-                            // the wheel forward reads it in passive preview too).
-                            if let Ok(mut guard) = cursor_cell.lock() {
-                                *guard = cursor_now;
-                            }
                             // Publish an agent clipboard write and wake the
                             // render loop even if the frame itself dedups: a
                             // copy must reach the host clipboard promptly
@@ -1389,7 +1430,12 @@ impl LiveCaptureWorker {
                             // when the bytes are identical, or consumers
                             // waiting for a wider/deeper capture stall.
                             if (forward_empty || !content.is_empty())
-                                && (changed || lines != last_published_budget)
+                                && frame_needs_publish(
+                                    changed,
+                                    last_published_cursor,
+                                    cursor_now,
+                                    lines != last_published_budget,
+                                )
                             {
                                 let since =
                                     last_published_at.map(|t| t.elapsed().as_millis() as u64);
@@ -1415,6 +1461,7 @@ impl LiveCaptureWorker {
                                     if let Ok(mut guard) = slot.lock() {
                                         *guard = Some(std::sync::Arc::new(CaptureFrame {
                                             generation: generation_now,
+                                            target: name.clone(),
                                             budget: lines,
                                             content: content.clone(),
                                             cursor: cursor_now,
@@ -1422,6 +1469,7 @@ impl LiveCaptureWorker {
                                     }
                                     last_captured = Some(content);
                                     last_published_budget = lines;
+                                    last_published_cursor = cursor_now;
                                     last_published_at = Some(std::time::Instant::now());
                                     pending_since = None;
                                     wake.notify_one();
@@ -1492,6 +1540,12 @@ impl LiveCaptureWorker {
                         .wait_timeout(guard, std::time::Duration::from_millis(ms));
                 }
             }
+            #[cfg(unix)]
+            {
+                let deadline = crate::tmux::TmuxCommandDeadline::new();
+                shutdown_vt_source(&mut vt_source, &deadline);
+                shutdown_osc52_source(&mut osc52_source, &deadline);
+            }
         });
         Self {
             capture_lines,
@@ -1503,7 +1557,6 @@ impl LiveCaptureWorker {
             forward_empty,
             nudge,
             stop,
-            cursor,
             clipboard,
             vt_enabled,
             clipboard_capture_enabled,
@@ -1592,12 +1645,6 @@ impl LiveCaptureWorker {
                 if let Ok(mut latest) = self.latest.lock() {
                     *latest = None;
                 }
-                // Drop the old pane's cursor too, so it can't flash over the
-                // new pane's first frame before the next live capture lands.
-                if let Ok(mut cursor) = self.cursor.lock() {
-                    *cursor = None;
-                }
-                // And an unconsumed clipboard write: a copy from the old
                 // pane must not land on the host clipboard under the new
                 // view.
                 if let Ok(mut clipboard) = self.clipboard.lock() {
@@ -1669,26 +1716,40 @@ impl LiveCaptureWorker {
     }
 
     /// Whether `frame` belongs to the worker's CURRENT target generation.
-    /// A frame captured before the last `set_target` must be dropped, never
-    /// applied under the new view.
+    /// A frame captured before the last set_target must be dropped, never
+    /// applied or restored under the new target.
     pub(in crate::tui) fn frame_is_current(&self, frame: &CaptureFrame) -> bool {
-        self.generation.load(std::sync::atomic::Ordering::Relaxed) == frame.generation
+        self.capture_identity_is_current(&frame.target, frame.generation)
     }
 
-    /// Hand-publish a frame tagged with a PREVIOUS generation, so consumer
-    /// tests can prove the `frame_is_current` guard rejects it (the exact
-    /// bytes that would otherwise flash under the new view after a
-    /// retarget).
+    pub(in crate::tui) fn capture_identity_is_current(
+        &self,
+        target: &str,
+        generation: u64,
+    ) -> bool {
+        self.generation.load(std::sync::atomic::Ordering::Relaxed) == generation
+            && self
+                .target
+                .lock()
+                .ok()
+                .is_some_and(|current| *current == target)
+    }
     #[cfg(test)]
     pub(in crate::tui) fn inject_stale_generation_frame_for_test(
         &self,
         budget: usize,
         content: &str,
     ) {
-        let gen = self.current_generation_for_test();
+        let generation = self.current_generation_for_test();
         if let Ok(mut latest) = self.latest.lock() {
             *latest = Some(std::sync::Arc::new(CaptureFrame {
-                generation: gen.saturating_sub(1),
+                generation: generation.saturating_sub(1),
+                target: self
+                    .target
+                    .lock()
+                    .ok()
+                    .map(|value| value.clone())
+                    .unwrap_or_default(),
                 budget,
                 content: content.to_string(),
                 cursor: None,
@@ -1696,51 +1757,13 @@ impl LiveCaptureWorker {
         }
     }
 
-    /// The newest cursor for the worker's CURRENT target pane, or `None`
-    /// right after a retarget (`set_target` clears it so the old pane's
-    /// cursor can't paint over the new view) or when the last capture
-    /// couldn't probe one. Always the displayed pane's cursor; the render
-    /// loop additionally gates painting on live-send being active. Cloned,
-    /// not taken, so the cursor persists across frames until the next live
-    /// cycle refreshes it.
-    pub(in crate::tui) fn current_cursor(&self) -> Option<crate::tmux::PaneCursor> {
-        if let Some(cursor) = self.cursor.lock().ok().and_then(|guard| *guard) {
-            return Some(cursor);
-        }
-        // Mirror cleared (retarget) but an unconsumed frame from the NEW
-        // target may already carry its cursor: prefer that over nothing.
-        // Old-generation frames are skipped: they belong to the previous
-        // pane, the exact bytes `set_target`'s mirror clear exists to hide.
-        self.latest
-            .lock()
-            .ok()
-            .and_then(|guard| {
-                guard
-                    .as_ref()
-                    .filter(|frame| self.frame_is_current(frame))
-                    .map(|frame| frame.cursor)
-            })
-            .flatten()
-    }
-
     /// Take the newest OSC 52 clipboard write the displayed pane's agent has
-    /// emitted since the last call, if any. Consuming: the render loop drains
-    /// this each frame and forwards the text to the host clipboard (#2420).
+    /// emitted since the last call, if any.
     pub(in crate::tui) fn take_agent_clipboard(&self) -> Option<String> {
         self.clipboard
             .lock()
             .ok()
             .and_then(|mut guard| guard.take())
-    }
-
-    /// Inject a cursor without running a capture cycle, so scroll-routing
-    /// tests can exercise the alternate-screen / mouse-tracking branch
-    /// deterministically instead of standing up a real full-screen pane.
-    #[cfg(test)]
-    pub(in crate::tui) fn set_cursor_for_test(&self, cursor: Option<crate::tmux::PaneCursor>) {
-        if let Ok(mut guard) = self.cursor.lock() {
-            *guard = cursor;
-        }
     }
 
     /// Current target generation for tests that hand-build frames.
@@ -1749,22 +1772,35 @@ impl LiveCaptureWorker {
         self.generation.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Hand-publish a frame into the mailbox for tests that exercise the
-    /// consumer side (`apply_worker_capture`) without standing up a real
-    /// pane.
+    /// Hand-publish a frame into the mailbox for consumer-side tests.
     #[cfg(test)]
     pub(in crate::tui) fn inject_frame_for_test(&self, budget: usize, content: &str) {
+        self.inject_frame_with_cursor_for_test(budget, content, None);
+    }
+
+    #[cfg(test)]
+    pub(in crate::tui) fn inject_frame_with_cursor_for_test(
+        &self,
+        budget: usize,
+        content: &str,
+        cursor: Option<crate::tmux::PaneCursor>,
+    ) {
         if let Ok(mut latest) = self.latest.lock() {
             *latest = Some(std::sync::Arc::new(CaptureFrame {
                 generation: self.current_generation_for_test(),
+                target: self
+                    .target
+                    .lock()
+                    .ok()
+                    .map(|value| value.clone())
+                    .unwrap_or_default(),
                 budget,
                 content: content.to_string(),
-                cursor: None,
+                cursor,
             }));
         }
     }
 }
-
 /// Walk one drained batch and execute it as one-shot `tmux` subprocesses.
 /// `coalesce` merges literal-key runs into a single `send-keys -l` call;
 /// named keys and resizes dispatch individually. Tests verify the
@@ -3188,6 +3224,30 @@ mod tests {
     }
 
     #[test]
+    fn cursor_only_change_requires_atomic_frame_publish() {
+        let cursor = crate::tmux::PaneCursor {
+            x: 1,
+            y: 2,
+            visible: true,
+            pane_height: 24,
+            history_size: 0,
+            pane_width: 80,
+            alternate_on: false,
+            mouse_tracking: false,
+            mouse_sgr: false,
+            mouse_all: false,
+            position_reliable: true,
+            composite_pane0: None,
+        };
+        assert!(frame_needs_publish(false, None, Some(cursor), false));
+        assert!(!frame_needs_publish(
+            false,
+            Some(cursor),
+            Some(cursor),
+            false
+        ));
+    }
+    #[test]
     fn live_capture_worker_retarget_drops_previous_capture() {
         // Swapping the target must clear any queued capture so the render
         // never applies the previous pane's bytes under the new view.
@@ -3196,6 +3256,7 @@ mod tests {
         if let Ok(mut latest) = worker.latest.lock() {
             *latest = Some(std::sync::Arc::new(CaptureFrame {
                 generation: 0,
+                target: String::new(),
                 budget: 40,
                 content: "stale previous-pane content".to_string(),
                 cursor: None,

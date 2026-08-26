@@ -12949,15 +12949,16 @@ mod scroll_pane_isolation {
             leader: None,
         });
         env.view.live_send_worker = Some(LiveSendWorker::spawn("fake".to_string(), None));
-        // Spawn the capture worker, then inject the cursor (set_target
-        // clears it, so the injection must come after).
         env.view
             .sync_preview_capture_worker(Some("fake".to_string()));
-        env.view
+        env.view.preview_cache.cursor = Some(cursor);
+        env.view.preview_cache.capture_target = Some("fake".to_string());
+        env.view.preview_cache.capture_generation = env
+            .view
             .preview_capture_worker
             .as_ref()
-            .expect("capture worker spawned")
-            .set_cursor_for_test(Some(cursor));
+            .expect("capture worker")
+            .current_generation_for_test();
         env
     }
 
@@ -12977,11 +12978,14 @@ mod scroll_pane_isolation {
         env.view
             .sync_preview_capture_worker(Some("fake".to_string()));
         env.view.preview_capture_target = Some("fake".to_string());
-        env.view
+        env.view.preview_cache.cursor = Some(cursor);
+        env.view.preview_cache.capture_target = Some("fake".to_string());
+        env.view.preview_cache.capture_generation = env
+            .view
             .preview_capture_worker
             .as_ref()
-            .expect("capture worker spawned")
-            .set_cursor_for_test(Some(cursor));
+            .expect("capture worker")
+            .current_generation_for_test();
         env
     }
 
@@ -16587,6 +16591,55 @@ mod live_send_mode {
         assert_eq!(env.view.preview_cache.captured_lines, 1);
     }
 
+    #[test]
+    #[serial]
+    fn accepted_capture_keeps_content_and_cursor_in_one_cache_frame() {
+        let mut env = create_test_env_with_sessions(1);
+        let id = env.view.selected_session.clone().expect("selected session");
+        env.view
+            .sync_preview_capture_worker(Some("aoe_test_atomic_cursor".to_string()));
+        let first = crate::tmux::PaneCursor {
+            x: 1,
+            y: 2,
+            visible: true,
+            pane_height: 24,
+            history_size: 0,
+            pane_width: 80,
+            alternate_on: false,
+            mouse_tracking: false,
+            mouse_sgr: false,
+            mouse_all: false,
+            position_reliable: true,
+            composite_pane0: None,
+        };
+        env.view
+            .preview_capture_worker
+            .as_ref()
+            .expect("capture worker")
+            .inject_frame_with_cursor_for_test(40, "stable content", Some(first));
+        env.view.refresh_preview_cache_if_needed(80, 24);
+        assert_eq!(env.view.preview_cache.session_id, Some(id));
+        assert_eq!(env.view.preview_cache.content, "stable content");
+        assert_eq!(env.view.preview_cache.cursor, Some(first));
+
+        let second = crate::tmux::PaneCursor { x: 7, ..first };
+        env.view
+            .preview_capture_worker
+            .as_ref()
+            .expect("capture worker")
+            .inject_frame_with_cursor_for_test(40, "stable content", Some(second));
+        env.view.refresh_preview_cache_if_needed(80, 24);
+        assert_eq!(env.view.preview_cache.cursor, Some(second));
+        env.view
+            .sync_preview_capture_worker(Some("aoe_test_atomic_other".to_string()));
+        assert!(env.view.active_preview_cursor().is_none());
+        env.view
+            .sync_preview_capture_worker(Some("aoe_test_atomic_cursor".to_string()));
+        // Simulate an old cache surviving an A -> B -> A switch. Matching the
+        // target string is insufficient; the accepted generation must match.
+        env.view.preview_cache.cursor = Some(second);
+        assert!(env.view.active_preview_cursor().is_none());
+    }
     #[test]
     #[serial]
     fn warm_predicates_stay_cold_without_a_live_pane() {

@@ -4489,10 +4489,7 @@ impl HomeView {
     /// so it goes out as a one-shot fork to the previewed pane's tmux target.
     /// Returns true when the event was forwarded.
     fn forward_wheel_to_preview(&self, up: bool, col: u16, row: u16) -> bool {
-        let cursor = self
-            .preview_capture_worker
-            .as_ref()
-            .and_then(|w| w.current_cursor());
+        let cursor = self.active_preview_cursor();
         let Some(cursor) = cursor else { return false };
         let Some(key) = wheel_forward_key(&cursor, up, self.preview_text_view.pane, col, row)
         else {
@@ -4515,11 +4512,7 @@ impl HomeView {
     /// forward) direction; `col`/`row` is the held pointer cell, mapped into the
     /// pane for the mouse-byte encoding. Returns true when something was sent.
     fn forward_scroll_to_preview(&self, up: bool, col: u16, row: u16) -> bool {
-        let Some(cursor) = self
-            .preview_capture_worker
-            .as_ref()
-            .and_then(|w| w.current_cursor())
-        else {
+        let Some(cursor) = self.active_preview_cursor() else {
             return false;
         };
         let Some(key) = wheel_forward_key(&cursor, up, self.preview_text_view.pane, col, row)
@@ -4562,10 +4555,7 @@ impl HomeView {
     /// caller's escape hatch back to aoe-side selection / copy. Returns the
     /// cursor so the caller can read `mouse_sgr` for the encoding.
     fn preview_forwards_mouse(&self) -> Option<crate::tmux::PaneCursor> {
-        let cursor = self
-            .preview_capture_worker
-            .as_ref()
-            .and_then(|w| w.current_cursor())?;
+        let cursor = self.active_preview_cursor()?;
         (cursor.alternate_on && cursor.mouse_tracking).then_some(cursor)
     }
 
@@ -4664,11 +4654,7 @@ impl HomeView {
             self.hover_forward_cell = None;
             return false;
         }
-        let Some(cursor) = self
-            .preview_capture_worker
-            .as_ref()
-            .and_then(|w| w.current_cursor())
-        else {
+        let Some(cursor) = self.active_preview_cursor() else {
             return false;
         };
         let pane = self.preview_text_view.pane;
