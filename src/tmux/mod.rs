@@ -206,6 +206,7 @@ pub(crate) fn tmux_command() -> Command {
 /// `kill_session_if_present`.
 pub(crate) fn tmux_query_command() -> Command {
     let mut cmd = tmux_command();
+    cmd.env_remove("LC_ALL");
     cmd.env("LC_MESSAGES", "C");
     cmd
 }
@@ -1477,8 +1478,9 @@ mod tests {
         assert!(
             command
                 .get_envs()
-                .all(|(key, _)| key.to_str() != Some("LC_ALL")),
-            "LC_ALL changes LC_CTYPE and corrupts non-ASCII tmux session names"
+                .find(|(key, _)| key.to_str() == Some("LC_ALL"))
+                .is_some_and(|(_, value)| value.is_none()),
+            "LC_ALL must not override the caller's LC_CTYPE"
         );
     }
 
