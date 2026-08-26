@@ -1017,6 +1017,15 @@ impl Storage {
             )
         })?;
         let _flock = acquire_storage_flock(profile_dir, STORAGE_LOCK_FILENAME)?;
+        self.update_under_lock(f)
+    }
+
+    /// Apply one storage mutation while the caller already owns this profile's
+    /// in-process save lock and cross-process storage flock.
+    fn update_under_lock<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
         let (mut instances, mut groups) = self.load_with_groups()?;
         let groups_before = groups.clone();
         let result = f(&mut instances, &mut groups)?;
@@ -1037,11 +1046,6 @@ impl Storage {
         if let Some(buf) = groups_buf {
             let groups_path = self.sessions_path.with_file_name("groups.json");
             atomic_write(&groups_path, &buf)?;
-            // Surface the rename to in-process subscribers immediately;
-            // the kernel echo arrives ~ms later for the same rename and
-            // collapses into the same per-key debounce slot. Runs strictly
-            // AFTER atomic_write returns so any subscriber waking on the
-            // notify is guaranteed to read the post-rename file.
             self.file_watch.notify_local_change(&groups_path);
         }
         #[cfg(test)]
@@ -1867,105 +1871,115 @@ pub(crate) fn reconcile_profile_duplicates(
             .iter()
             .map(|(_, storage)| storage.sessions_path().to_path_buf()),
     );
+    let mut opaque_failure = !scan.unreadable_dirs.is_empty();
     for (dir, error) in scan.unreadable_dirs {
         tracing::warn!(
             target: "session.store",
             path = %dir.display(),
             error = %error,
-            "move journal directory could not be listed; retrying on the next reload"
+            "move journal directory could not be listed; all arbitration is deferred"
         );
     }
-    let mut entries = scan.entries;
-    // The newest entry is the only current intent after a reverse move. Apply
-    // it first; older evidence then degrades harmlessly to already-consistent.
-    // Unparseable entries sort last and can never consume anything.
-    entries.sort_by_key(|(path, parsed)| {
-        std::cmp::Reverse((
-            parsed
-                .as_ref()
-                .map(|entry| entry.created_at_epoch_ms)
-                .unwrap_or_default(),
-            super::move_journal::file_created_at_nanos(path).unwrap_or_default(),
-        ))
-    });
-    if entries.is_empty() && !duplicated {
-        return outcome;
-    }
-    for (path, parsed) in entries {
-        // Unusable entries stay on disk by design; without this guard every
-        // 5-10s reload would re-log and re-attempt them forever.
-        if UNUSABLE_JOURNAL_ENTRIES
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .iter()
-            .any(|unusable| unusable == &path)
-        {
-            continue;
-        }
-        let entry = match parsed {
-            Ok(entry) => entry,
+    let mut valid_entries = Vec::new();
+    for (path, parsed) in scan.entries {
+        match parsed {
+            Ok(entry) => valid_entries.push((path, entry)),
             Err(reason) => {
-                mark_unusable_journal_entry(&path);
-                tracing::error!(
-                    target: "session.store",
-                    path = %path.display(),
-                    reason = %reason,
-                    "move journal entry is insufficient evidence for arbitration; duplicates stay surfaced"
-                );
-                continue;
-            }
-        };
-        // Expired evidence arbitrates nothing: a journal that outlived its
-        // move must never delete a copy the user created or edited later.
-        // It degrades to the same surfaced-legacy path as having no journal.
-        if entry_age(&entry) > MOVE_JOURNAL_MAX_AGE {
-            mark_unusable_journal_entry(&path);
-            tracing::error!(
-                target: "session.store",
-                path = %path.display(),
-                ids = %entry.ids.join(","),
-                "expired move journal entry is insufficient evidence for arbitration; duplicates stay surfaced"
-            );
-            continue;
-        }
-        match repair_journal_entry(&entry, storages, &path) {
-            Ok(true) => {
-                outcome.repaired = true;
-                tracing::info!(
-                    target: "session.store",
-                    ids = %entry.ids.join(","),
-                    "reconciled interrupted profile move from its journal"
-                );
-            }
-            Ok(false) => {
-                // Transient: the referenced stores may simply not be loaded
-                // right now (single-profile mode). Never blacklist these:
-                // blacklisting would poison a perfectly usable entry once the
-                // missing profile is loaded later in the same process.
-                tracing::debug!(
-                    target: "session.store",
-                    path = %path.display(),
-                    "journal-guided repair skipped: entry references stores that are missing or moved"
-                );
-            }
-            Err(error) => {
-                // Genuinely transient failures keep retrying on later passes;
-                // only their logging is once-per-path so a persistently
-                // failing repair cannot spam ERROR lines every reload tick.
-                if mark_repair_failure_logged(&path) {
+                opaque_failure = true;
+                let already_reported = UNUSABLE_JOURNAL_ENTRIES
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .iter()
+                    .any(|unusable| unusable == &path);
+                if !already_reported {
+                    mark_unusable_journal_entry(&path);
                     tracing::error!(
                         target: "session.store",
                         path = %path.display(),
-                        error = %error,
-                        "journal-guided repair failed; the duplicate stays excluded"
+                        reason = %reason,
+                        "opaque move journal evidence blocks arbitration for this reload"
                     );
-                } else {
+                }
+            }
+        }
+    }
+    valid_entries.sort_by_key(|(path, entry)| {
+        std::cmp::Reverse((
+            entry.created_at_epoch_ms,
+            super::move_journal::file_created_at_nanos(path).unwrap_or_default(),
+        ))
+    });
+    if valid_entries.is_empty() && !duplicated {
+        return outcome;
+    }
+    if !opaque_failure {
+        let mut blocked_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for (path, entry) in valid_entries {
+            if entry.ids.iter().any(|id| blocked_ids.contains(id)) {
+                // Shadowing is transitive across a multi-id batch: if X blocks
+                // this X+Y entry, Y must also block still-older evidence.
+                blocked_ids.extend(entry.ids.iter().cloned());
+                tracing::debug!(
+                    target: "session.store",
+                    path = %path.display(),
+                    "older move journal is shadowed by unresolved newer intent"
+                );
+                continue;
+            }
+            let already_unusable = UNUSABLE_JOURNAL_ENTRIES
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .iter()
+                .any(|unusable| unusable == &path);
+            if already_unusable {
+                blocked_ids.extend(entry.ids.iter().cloned());
+                continue;
+            }
+            if entry_age(&entry) > MOVE_JOURNAL_MAX_AGE {
+                mark_unusable_journal_entry(&path);
+                blocked_ids.extend(entry.ids.iter().cloned());
+                tracing::error!(
+                    target: "session.store",
+                    path = %path.display(),
+                    ids = %entry.ids.join(","),
+                    "expired move journal entry is insufficient evidence for arbitration; duplicates stay surfaced"
+                );
+                continue;
+            }
+            match repair_journal_entry(&entry, storages, &path) {
+                Ok(true) => {
+                    outcome.repaired = true;
+                    tracing::info!(
+                        target: "session.store",
+                        ids = %entry.ids.join(","),
+                        "reconciled interrupted profile move from its journal"
+                    );
+                }
+                Ok(false) => {
+                    blocked_ids.extend(entry.ids.iter().cloned());
                     tracing::debug!(
                         target: "session.store",
                         path = %path.display(),
-                        error = %error,
-                        "journal-guided repair failed again"
+                        "newer unresolved move intent blocks older overlapping journals"
                     );
+                }
+                Err(error) => {
+                    blocked_ids.extend(entry.ids.iter().cloned());
+                    if mark_repair_failure_logged(&path) {
+                        tracing::error!(
+                            target: "session.store",
+                            path = %path.display(),
+                            error = %error,
+                            "journal-guided repair failed; older overlapping intent is blocked"
+                        );
+                    } else {
+                        tracing::debug!(
+                            target: "session.store",
+                            path = %path.display(),
+                            error = %error,
+                            "journal-guided repair failed again"
+                        );
+                    }
                 }
             }
         }
@@ -2048,6 +2062,92 @@ fn group_path_covers(candidate: &str, path: &str) -> bool {
     candidate == path || path.starts_with(&format!("{candidate}/"))
 }
 
+fn validate_recovery_journal(
+    entry: &super::move_journal::MoveJournalEntry,
+    source: &Storage,
+    target: &Storage,
+) -> Result<Option<String>> {
+    let mut ids = std::collections::HashSet::with_capacity(entry.ids.len());
+    for id in &entry.ids {
+        if let Err(error) = super::validate_instance_id(id) {
+            return Ok(Some(format!("invalid session id {id:?}: {error}")));
+        }
+        if !ids.insert(id.as_str()) {
+            return Ok(Some(format!(
+                "duplicate session id {id:?} in journal batch"
+            )));
+        }
+    }
+    if std::ptr::eq(source, target) || entry.source_profile == entry.target_profile {
+        return Ok(Some(
+            "source and target resolve to the same loaded store".to_string(),
+        ));
+    }
+    let source_dir = source
+        .sessions_path
+        .parent()
+        .ok_or_else(|| anyhow!("source sessions path has no parent"))?
+        .canonicalize()?;
+    let target_dir = target
+        .sessions_path
+        .parent()
+        .ok_or_else(|| anyhow!("target sessions path has no parent"))?
+        .canonicalize()?;
+    if source_dir == target_dir || paths_share_filesystem_identity(&source_dir, &target_dir)? {
+        return Ok(Some(
+            "source and target resolve to the same physical profile directory".to_string(),
+        ));
+    }
+    if existing_paths_share_filesystem_identity(source.sessions_path(), target.sessions_path())? {
+        return Ok(Some(
+            "source and target resolve to the same physical sessions file".to_string(),
+        ));
+    }
+    Ok(None)
+}
+
+fn with_two_storage_locks<F, R>(source: &Storage, target: &Storage, f: F) -> Result<R>
+where
+    F: FnOnce() -> Result<R>,
+{
+    let source_dir = source
+        .sessions_path
+        .parent()
+        .ok_or_else(|| anyhow!("source sessions path has no parent"))?
+        .canonicalize()?;
+    let target_dir = target
+        .sessions_path
+        .parent()
+        .ok_or_else(|| anyhow!("target sessions path has no parent"))?
+        .canonicalize()?;
+    if source_dir == target_dir || paths_share_filesystem_identity(&source_dir, &target_dir)? {
+        anyhow::bail!("source and target resolve to the same physical profile directory");
+    }
+    let (first, second) = if source_dir < target_dir {
+        (source, target)
+    } else {
+        (target, source)
+    };
+    let _first_mu = first
+        .save_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let _second_mu = second
+        .save_lock
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let first_dir = first.sessions_path.parent().unwrap();
+    let second_dir = second.sessions_path.parent().unwrap();
+    let (first_file, first_path) = open_storage_lock_file(first_dir, STORAGE_LOCK_FILENAME)?;
+    let (second_file, second_path) = open_storage_lock_file(second_dir, STORAGE_LOCK_FILENAME)?;
+    if same_filesystem_identity(&first_file.metadata()?, &second_file.metadata()?) {
+        anyhow::bail!("source and target resolve to the same physical storage lock");
+    }
+    let _first_flock = acquire_open_storage_flock(first_file, &first_path)?;
+    let _second_flock = acquire_open_storage_flock(second_file, &second_path)?;
+    f()
+}
+
 /// Apply the winner policy to one journal entry. Returns Ok(true) when the
 /// entry was consumed (state repaired or already consistent) and Ok(false)
 /// when it cannot be applied because a referenced store is missing or has
@@ -2080,20 +2180,15 @@ where
             None => return Ok(false),
         };
 
-    // An id that fails validation can never pass the title/lifecycle lock
-    // acquisition below: permanently insufficient evidence, blacklisted.
-    for id in &entry.ids {
-        if let Err(error) = super::validate_instance_id(id) {
-            mark_unusable_journal_entry(journal_path);
-            tracing::error!(
-                target: "session.store",
-                path = %journal_path.display(),
-                id = %id,
-                error = %error,
-                "move journal entry carries an invalid session id; duplicates stay surfaced"
-            );
-            return Ok(false);
-        }
+    if let Some(reason) = validate_recovery_journal(entry, source_storage, target_storage)? {
+        mark_unusable_journal_entry(journal_path);
+        tracing::error!(
+            target: "session.store",
+            path = %journal_path.display(),
+            reason = %reason,
+            "move journal entry is semantically invalid; duplicates stay surfaced"
+        );
+        return Ok(false);
     }
 
     // Freshness gate: a losing store modified well after the journal was
@@ -2123,75 +2218,74 @@ where
     let _identity_lock = acquire_session_identity_lock()?;
     let mut ids_sorted = entry.ids.clone();
     ids_sorted.sort();
+    ids_sorted.dedup();
     let mut guards = Vec::with_capacity(ids_sorted.len() * 2);
     for id in &ids_sorted {
         guards.push(acquire_session_title_lock(id)?);
     }
+    let source_scope = source_storage
+        .sessions_path()
+        .parent()
+        .unwrap()
+        .canonicalize()?;
+    let target_scope = target_storage
+        .sessions_path()
+        .parent()
+        .unwrap()
+        .canonicalize()?;
     for id in &ids_sorted {
         guards.push(source_storage.acquire_instance_lifecycle_lock(id)?);
-        guards.push(target_storage.acquire_instance_lifecycle_lock(id)?);
-    }
-
-    let (source_instances, _source_groups) = source_storage.load_with_groups()?;
-    let (target_instances, _) = target_storage.load_with_groups()?;
-    let plan = crate::session::GroupMovePlan {
-        source_path: entry.group_move_source_path.clone(),
-        target_path: entry.group_move_target_path.clone(),
-        move_subtree: entry.group_move_subtree,
-    };
-    // Winner policy: target published means target wins. An id absent from
-    // both stores was already resolved outside this journal (hand edit or
-    // external delete); it is filtered out so sibling ids in the same batch
-    // still arbitrate, and nothing is ever deleted for it.
-    let source_losers: Vec<String> = entry
-        .ids
-        .iter()
-        .filter(|id| {
-            target_instances.iter().any(|row| &row.id == *id)
-                && source_instances.iter().any(|row| &row.id == *id)
-        })
-        .cloned()
-        .collect();
-    if source_losers.is_empty() {
-        // The journal proves no profile mutation phase. It cannot distinguish
-        // pre-existing empty groups from partial target-side residue, so never
-        // prune sidecars without a duplicated row that proves publication.
-        // A prior repair may already have removed the source row but failed its
-        // directory barrier; repeat that barrier before consuming evidence.
-        sync_repaired_profile_durably(source_storage, &mut sync)?;
-        super::move_journal::consume(journal_path)?;
-        return Ok(true);
-    }
-
-    source_storage.update(|instances, groups| {
-        // Re-check the winner evidence against the target file bytes at write
-        // time: the unlocked read plus our own flock acquisition leaves a
-        // window another process could delete the target copy in, and
-        // retaining then would zero out the session. Runs before the backups
-        // so a persistently failing retry cannot accumulate orphan copies.
-        if !target_still_holds(target_storage.sessions_path(), &source_losers)? {
-            anyhow::bail!(
-                "target copies vanished while the repair was starting; leaving the journal for a retry"
-            );
+        if source_scope != target_scope {
+            guards.push(target_storage.acquire_instance_lifecycle_lock(id)?);
         }
-        // Backups run inside the closure so the snapshot is taken under the
-        // save_lock and storage flock it protects, not before them.
-        backup_before_repair(source_storage.sessions_path())?;
-        backup_before_repair(&source_storage.sessions_path().with_file_name("groups.json"))?;
-        instances.retain(|row| !source_losers.contains(&row.id));
-        let winners: Vec<crate::session::Instance> = instances
+    }
+
+    with_two_storage_locks(source_storage, target_storage, || {
+        let (source_instances, _source_groups) = source_storage.load_with_groups()?;
+        let (target_instances, _) = target_storage.load_with_groups()?;
+        let plan = crate::session::GroupMovePlan {
+            source_path: entry.group_move_source_path.clone(),
+            target_path: entry.group_move_target_path.clone(),
+            move_subtree: entry.group_move_subtree,
+        };
+        let source_losers: Vec<String> = entry
+            .ids
             .iter()
-            .filter(|row| entry.ids.contains(&row.id))
+            .filter(|id| {
+                target_instances.iter().any(|row| &row.id == *id)
+                    && source_instances.iter().any(|row| &row.id == *id)
+            })
             .cloned()
             .collect();
-        reconcile_groups_after_repair(instances, groups, &winners, &plan);
-        Ok(())
-    })?;
-    sync_repaired_profile_durably(source_storage, &mut sync)?;
-    #[cfg(test)]
-    test_crash_point("profile-repair-source-written");
-    super::move_journal::consume(journal_path)?;
-    Ok(true)
+        if source_losers.is_empty() {
+            sync_repaired_profile_durably(source_storage, &mut sync)?;
+            super::move_journal::consume(journal_path)?;
+            return Ok(true);
+        }
+
+        source_storage.update_under_lock(|instances, groups| {
+            if !target_still_holds(target_storage.sessions_path(), &source_losers)? {
+                anyhow::bail!(
+                    "target copies vanished while the repair was starting; leaving the journal for a retry"
+                );
+            }
+            backup_before_repair(source_storage.sessions_path())?;
+            backup_before_repair(&source_storage.sessions_path().with_file_name("groups.json"))?;
+            instances.retain(|row| !source_losers.contains(&row.id));
+            let winners: Vec<crate::session::Instance> = instances
+                .iter()
+                .filter(|row| entry.ids.contains(&row.id))
+                .cloned()
+                .collect();
+            reconcile_groups_after_repair(instances, groups, &winners, &plan);
+            Ok(())
+        })?;
+        sync_repaired_profile_durably(source_storage, &mut sync)?;
+        #[cfg(test)]
+        test_crash_point("profile-repair-source-written");
+        super::move_journal::consume(journal_path)?;
+        Ok(true)
+    })
 }
 
 fn sync_repaired_profile_durably<S>(storage: &Storage, mut sync: S) -> Result<()>
@@ -4832,6 +4926,164 @@ mod tests {
             super::unusable_journal_entries_contains(&journal_path),
             "mtime-degraded entry is blacklisted like other permanent causes"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn duplicate_ids_and_aliased_endpoints_are_rejected_before_locks() -> Result<()> {
+        for case in ["duplicate-ids", "aliased-endpoints"] {
+            let (_temp, _guard, source, target, before, _after) = setup_recovery_env(case)?;
+            let mut entry = fresh_journal_entry(&source, &target, &before.id);
+            let stores: Vec<(&str, &Storage)>;
+            if case == "duplicate-ids" {
+                entry.ids.push(before.id.clone());
+                stores = vec![(source.profile(), &source), (target.profile(), &target)];
+            } else {
+                entry.target_profile = source.profile().to_string();
+                entry.target_sessions_path = source.sessions_path().to_path_buf();
+                stores = vec![(source.profile(), &source)];
+            }
+            let journal_path = super::super::move_journal::record(&entry, source.sessions_path())?;
+
+            let outcome = if case == "duplicate-ids" {
+                reconcile_loaded(&[&source, &target], &stores)
+            } else {
+                reconcile_loaded(&[&source], &stores)
+            };
+
+            assert!(!outcome.repaired, "{case}");
+            assert_eq!(journal_entry_count(&source), 1, "{case}: evidence remains");
+            assert!(
+                super::unusable_journal_entries_contains(&journal_path),
+                "{case}: semantic invalidity is permanently recorded"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn dual_storage_lock_blocks_target_only_writer() -> Result<()> {
+        let (_temp, _guard, source, target, _before, _after) = setup_recovery_env("dual-lock")?;
+        let target_path = target.sessions_path().to_path_buf();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut writer = None;
+
+        with_two_storage_locks(&source, &target, || {
+            writer = Some(std::thread::spawn(move || {
+                let target = Storage::new_for_test_path("dual-lock-target", target_path);
+                started_tx.send(()).unwrap();
+                target
+                    .update(|instances, _| {
+                        instances.clear();
+                        Ok(())
+                    })
+                    .unwrap();
+                done_tx.send(()).unwrap();
+            }));
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .expect("writer reached the target update attempt");
+            assert!(
+                done_rx
+                    .recv_timeout(std::time::Duration::from_millis(150))
+                    .is_err(),
+                "target-only writer must block while repair owns both storage flocks"
+            );
+            Ok(())
+        })?;
+
+        done_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("target writer proceeds after dual lock release");
+        writer.unwrap().join().unwrap();
+        Ok(())
+    }
+
+    #[test]
+    fn unresolved_newer_intent_blocks_older_overlapping_journal() -> Result<()> {
+        for case in ["resolve-miss", "opaque"] {
+            let (_temp, _guard, a, b, before, _after) = setup_recovery_env(case)?;
+            b.update(|instances, _| {
+                let mut copy = before.clone();
+                copy.source_profile = b.profile().to_string();
+                instances.push(copy);
+                Ok(())
+            })?;
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)?
+                .as_millis() as u64;
+            let mut older = fresh_journal_entry(&a, &b, &before.id);
+            older.created_at_epoch_ms = now - 60_000;
+            super::super::move_journal::record(&older, a.sessions_path())?;
+            if case == "resolve-miss" {
+                let mut newer = fresh_journal_entry(&b, &a, &before.id);
+                newer.created_at_epoch_ms = now;
+                newer.target_profile = "missing-profile".to_string();
+                newer.target_sessions_path = a.sessions_path().with_file_name("missing.json");
+                super::super::move_journal::record(&newer, b.sessions_path())?;
+            } else {
+                let journal_dir = b.sessions_path().parent().unwrap().join(".move-journal");
+                fs::create_dir_all(&journal_dir)?;
+                fs::write(
+                    journal_dir.join("move-99999999999999999999-1.json"),
+                    b"not-json",
+                )?;
+            }
+            let stores: Vec<(&str, &Storage)> = vec![(a.profile(), &a), (b.profile(), &b)];
+
+            let outcome = reconcile_loaded(&[&a, &b], &stores);
+
+            assert!(!outcome.repaired, "{case}: older intent must not apply");
+            assert_eq!(outcome.reports.len(), 1, "{case}: duplicate stays surfaced");
+            assert_eq!(a.load()?.len(), 1, "{case}: newer target copy remains");
+            assert_eq!(b.load()?.len(), 1, "{case}: no copy is removed");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn shadowed_batch_propagates_block_to_every_id() -> Result<()> {
+        let (_temp, _guard, a, b, x, _after) = setup_recovery_env("transitive")?;
+        let mut y = Instance::new("y", "/repo/y");
+        y.source_profile = a.profile().to_string();
+        a.update(|instances, _| {
+            instances.push(y.clone());
+            Ok(())
+        })?;
+        b.update(|instances, _| {
+            let mut x_copy = x.clone();
+            x_copy.source_profile = b.profile().to_string();
+            let mut y_copy = y.clone();
+            y_copy.source_profile = b.profile().to_string();
+            instances.extend([x_copy, y_copy]);
+            Ok(())
+        })?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_millis() as u64;
+
+        let mut j1 = fresh_journal_entry(&a, &b, &y.id);
+        j1.created_at_epoch_ms = now - 120_000;
+        let mut j2 = fresh_journal_entry(&b, &a, &x.id);
+        j2.ids.push(y.id.clone());
+        j2.ids.sort();
+        j2.created_at_epoch_ms = now - 60_000;
+        let mut j3 = fresh_journal_entry(&a, &b, &x.id);
+        j3.target_profile = "missing".to_string();
+        j3.target_sessions_path = a.sessions_path().with_file_name("missing.json");
+        j3.created_at_epoch_ms = now;
+        super::super::move_journal::record(&j1, a.sessions_path())?;
+        super::super::move_journal::record(&j2, b.sessions_path())?;
+        super::super::move_journal::record(&j3, a.sessions_path())?;
+        let stores: Vec<(&str, &Storage)> = vec![(a.profile(), &a), (b.profile(), &b)];
+
+        let outcome = reconcile_loaded(&[&a, &b], &stores);
+
+        assert!(!outcome.repaired);
+        assert_eq!(outcome.reports.len(), 2);
+        assert_eq!(a.load()?.len(), 2, "newer X+Y target remains intact");
+        assert_eq!(b.load()?.len(), 2, "no stale journal deletes either copy");
         Ok(())
     }
 
