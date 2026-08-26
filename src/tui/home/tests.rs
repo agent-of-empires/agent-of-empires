@@ -20540,3 +20540,76 @@ fn frozen_preview_grows_only_on_coverage_extending_frames() {
         "the frozen read must be able to grow its capture off-thread"
     );
 }
+
+/// Regression: a frame captured before the last retarget must never land
+/// under the new view. The consumer-side `frame_is_current` guard is the
+/// last line of defense against the race where the worker publishes an
+/// old-generation frame after `set_target` cleared the mailbox; without
+/// this test, deleting the guard reintroduces the previous pane's bytes
+/// under the new header.
+#[test]
+#[serial]
+fn preview_rejects_frames_from_previous_generation() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+    env.view
+        .sync_preview_capture_worker(Some("aoe_test_new_target".to_string()));
+    if let Some(worker) = env.view.preview_capture_worker.as_ref() {
+        // Idle the real capture thread before injection, so it cannot
+        // overwrite the synthetic stale frame and make the test pass by
+        // accident even if the consumer guard is deleted.
+        worker.set_target(String::new());
+        worker.inject_stale_generation_frame_for_test(40, "previous pane bytes");
+    }
+
+    env.view.refresh_preview_cache_if_needed(80, 24);
+
+    assert_ne!(
+        env.view.preview_cache.content, "previous pane bytes",
+        "a stale-generation frame must be dropped, never applied"
+    );
+}
+
+/// Regression: entering live-send while a blocking capture is in flight must
+/// revalidate the empty-frame policy on the consumer. An empty frame captured
+/// just before the transition cannot blank the agent/tool pane under the
+/// user's cursor (#1501); the same restored frame must clear stale content
+/// after live-send exits.
+#[test]
+#[serial]
+fn preview_revalidates_empty_policy_across_live_transition() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+    env.view.preview_cache.content = "last good frame".to_string();
+    env.view.preview_cache.captured_lines = 1;
+    env.view.preview_cache.dimensions = (80, 24);
+    env.view.preview_cache.session_id = Some(id);
+    env.view
+        .sync_preview_capture_worker(Some("aoe_test_live_transition".to_string()));
+    let worker = env
+        .view
+        .preview_capture_worker
+        .as_ref()
+        .expect("worker spawned");
+    worker.inject_frame_for_test(40, "");
+    worker.set_live(true);
+
+    env.view.refresh_preview_cache_if_needed(80, 24);
+    assert_eq!(
+        env.view.preview_cache.content, "last good frame",
+        "live transition must preserve the last-good agent frame"
+    );
+
+    env.view
+        .preview_capture_worker
+        .as_ref()
+        .expect("worker retained")
+        .set_live(false);
+    env.view.refresh_preview_cache_if_needed(80, 24);
+    assert_eq!(
+        env.view.preview_cache.content, "",
+        "the restored empty frame must clear stale content after live exit"
+    );
+}

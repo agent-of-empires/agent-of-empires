@@ -2062,6 +2062,15 @@ impl HomeView {
         if !worker.frame_is_current(&frame) {
             return;
         }
+        // Empty-frame policy may change while the worker blocks in tmux.
+        // Revalidate on the paint thread immediately before applying: a
+        // frame captured outside live-send must not blank an agent/tool pane
+        // if live-send began before the capture returned (#1501). Restore it
+        // so it can clear the stale preview once live-send exits.
+        if frame.content.is_empty() && !worker.should_forward_empty() {
+            worker.restore_latest(frame);
+            return;
+        }
         if frozen {
             // While frozen, a routine fresh frame would shift the held
             // content out from under the reader, so apply ONLY when the HELD
@@ -2081,7 +2090,15 @@ impl HomeView {
                 return;
             }
         }
-        let captured_lines = select(self).store_capture(frame.content.clone(), id, (width, height));
+        // All reject/restore paths are complete. The mailbox frame is now
+        // normally the only Arc reference, so unwrap moves its String into
+        // the cache without copying; the Clone fallback only covers a rare
+        // concurrent observer retaining another Arc.
+        let frame_budget = frame.budget;
+        let content_is_empty = frame.content.is_empty();
+        let frame = std::sync::Arc::unwrap_or_clone(frame);
+        let captured_lines = select(self).store_capture(frame.content, id, (width, height));
+
         // An EMPTY frame always applies: terminal / container panes forward
         // empties precisely so a cleared shell drops its stale text (#1501's
         // counterpart outside the agent kill switch), and there is nothing to
@@ -2098,9 +2115,9 @@ impl HomeView {
         // An *exhausted* capture (fewer lines than requested because the pane
         // simply has no more, e.g. an alternate-screen agent with no scrollback)
         // is not undersized: apply it so scroll state tracks the real pane.
-        if !frame.content.is_empty()
+        if !content_is_empty
             && scroll_exceeds_cache(captured_lines, height, scroll_offset)
-            && !capture_is_exhausted(captured_lines, frame.budget)
+            && !capture_is_exhausted(captured_lines, frame_budget)
         {
             return;
         }

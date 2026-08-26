@@ -791,6 +791,11 @@ pub(in crate::tui) struct LiveCaptureWorker {
     /// Sleep between captures, in ms. Adaptive: fast under live-send, idle
     /// otherwise. Read by the worker thread each cycle.
     interval_ms: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    /// Whether live-send is currently attached to this worker's pane. A
+    /// FAILED capture means opposite things on the two sides: outside live
+    /// mode it surfaces as an empty frame ("session gone"); during live-send
+    /// the #1501 kill switch preserves the last-good frame.
+    live: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Whether an empty capture should be forwarded (clearing stale preview
     /// text) or dropped (preserving the last-good frame, the #1501 kill
     /// switch). Terminal / container panes forward empties so a cleared
@@ -1012,6 +1017,7 @@ impl LiveCaptureWorker {
         let target: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
         let latest: Arc<Mutex<Option<std::sync::Arc<CaptureFrame>>>> = Arc::new(Mutex::new(None));
         let interval_ms = Arc::new(AtomicU64::new(LIVE_CAPTURE_INTERVAL_IDLE_MS));
+        let live = Arc::new(AtomicBool::new(false));
         let forward_empty = Arc::new(AtomicBool::new(false));
         let nudge: Arc<(Mutex<()>, Condvar)> = Arc::new((Mutex::new(()), Condvar::new()));
         let stop = Arc::new(AtomicBool::new(false));
@@ -1030,6 +1036,7 @@ impl LiveCaptureWorker {
         let target_cell = target.clone();
         let slot = latest.clone();
         let interval_cell = interval_ms.clone();
+        let live_cell = live.clone();
         let forward_empty_cell = forward_empty.clone();
         let nudge_thread = nudge.clone();
         let stop_flag = stop.clone();
@@ -1234,10 +1241,13 @@ impl LiveCaptureWorker {
                     // authoritatively from the grid). If arming fails (tmux too
                     // old, stopped pane), fall back to a `capture-pane` fork for
                     // this pane and retry on the `VT_REARM_INTERVAL` throttle.
-                    //
-                    // Capture-path semantics on a failed fork: preserve panes
-                    // hold the last-good frame (drop it); forward panes
-                    // (terminals) surface empty so stale text clears.
+                    // Capture-path policy: outside live-send, empty captures
+                    // are FORWARDED (a missing or killed pane must surface
+                    // as "No output available", not stale bytes); during
+                    // live-send the #1501 kill switch preserves the
+                    // last-good frame against transient tmux errors.
+                    let forward_empty = forward_empty_cell.load(Ordering::Relaxed)
+                        || !live_cell.load(Ordering::Relaxed);
                     #[cfg(unix)]
                     let (capture, cursor_now) = if vt_enabled {
                         if vt_source.is_none()
@@ -1310,6 +1320,7 @@ impl LiveCaptureWorker {
                         // them; only changed captures reach (and wake) the
                         // render loop, so an idle pane never repaints.
                         let changed = last_captured.as_deref() != Some(content.as_str());
+
                         // Recheck the target once for both publishes: a retarget
                         // mid-fork means these bytes (and this cursor) belong to
                         // the old pane and must not land under the new view.
@@ -1451,6 +1462,7 @@ impl LiveCaptureWorker {
             latest,
             generation,
             interval_ms,
+            live,
             forward_empty,
             nudge,
             stop,
@@ -1505,6 +1517,16 @@ impl LiveCaptureWorker {
     pub(in crate::tui) fn set_forward_empty(&self, forward: bool) {
         self.forward_empty
             .store(forward, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Current empty-frame policy, re-read by the render consumer after a
+    /// potentially blocking capture. Terminal/container panes always clear;
+    /// agent/tool panes clear only outside live-send, preserving #1501 across
+    /// a live-mode transition that races the capture.
+    pub(in crate::tui) fn should_forward_empty(&self) -> bool {
+        self.forward_empty
+            .load(std::sync::atomic::Ordering::Relaxed)
+            || !self.live.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Wake the worker out of its inter-capture wait so a just-changed
@@ -1572,6 +1594,7 @@ impl LiveCaptureWorker {
         let prev = self
             .interval_ms
             .swap(ms, std::sync::atomic::Ordering::Relaxed);
+        self.live.store(live, std::sync::atomic::Ordering::Relaxed);
         if prev != ms {
             // Apply the new cadence now: a mid-idle-sleep worker would
             // otherwise keep the old (up to 250ms) interval for one cycle,
@@ -1600,6 +1623,7 @@ impl LiveCaptureWorker {
             }
         }
     }
+
     /// Take the newest frame the worker has produced since the last call,
     /// if any. Returns `None` when nothing new has arrived (the render loop
     /// then keeps the current preview).
@@ -1612,6 +1636,27 @@ impl LiveCaptureWorker {
     /// applied under the new view.
     pub(in crate::tui) fn frame_is_current(&self, frame: &CaptureFrame) -> bool {
         self.generation.load(std::sync::atomic::Ordering::Relaxed) == frame.generation
+    }
+
+    /// Hand-publish a frame tagged with a PREVIOUS generation, so consumer
+    /// tests can prove the `frame_is_current` guard rejects it (the exact
+    /// bytes that would otherwise flash under the new view after a
+    /// retarget).
+    #[cfg(test)]
+    pub(in crate::tui) fn inject_stale_generation_frame_for_test(
+        &self,
+        budget: usize,
+        content: &str,
+    ) {
+        let gen = self.current_generation_for_test();
+        if let Ok(mut latest) = self.latest.lock() {
+            *latest = Some(std::sync::Arc::new(CaptureFrame {
+                generation: gen.saturating_sub(1),
+                budget,
+                content: content.to_string(),
+                cursor: None,
+            }));
+        }
     }
 
     /// The newest cursor for the worker's CURRENT target pane, or `None`
@@ -3248,6 +3293,50 @@ mod tests {
             wait_for_latest(&worker, std::time::Duration::from_secs(2)),
             Some(String::new()),
             "forward-empty policy must surface empty captures",
+        );
+    }
+
+    #[test]
+    fn live_capture_worker_publishes_failure_as_empty_outside_live() {
+        // Regression (worker-only cutover): when the displayed agent/tool
+        // pane DIES, the capture fails instead of returning empty content,
+        // and only `forward_empty` panes used to surface that. Outside
+        // live-send a failed capture must publish an empty frame so the
+        // preview shows "No output available" instead of the dead pane's
+        // last bytes forever. Deterministic without tmux: a missing pane
+        // always fails its capture. Live mode keeps the #1501 kill switch.
+        let worker = LiveCaptureWorker::spawn(std::sync::Arc::new(tokio::sync::Notify::new()));
+        worker.set_target("aoe_test_capture_dead_agent".into());
+        worker.set_capture_lines(40);
+        assert_eq!(
+            wait_for_latest(&worker, std::time::Duration::from_secs(2)),
+            Some(String::new()),
+            "a failed capture outside live must surface as an empty frame",
+        );
+    }
+
+    #[test]
+    fn live_capture_worker_republishes_on_budget_change() {
+        // A budget change alone (deeper scroll over a quiet pane) must
+        // republish even when the captured bytes are identical: consumers
+        // waiting for a wider/deeper capture would otherwise stall forever.
+        // Deterministic without tmux: forward-empty + missing pane produces
+        // identical empty content at every budget.
+        let worker = LiveCaptureWorker::spawn(std::sync::Arc::new(tokio::sync::Notify::new()));
+        worker.set_target("aoe_test_capture_budget_change".into());
+        worker.set_forward_empty(true);
+        worker.set_live(true);
+        worker.set_capture_lines(40);
+        assert_eq!(
+            wait_for_latest(&worker, std::time::Duration::from_secs(2)),
+            Some(String::new()),
+            "first capture publishes",
+        );
+        worker.set_capture_lines(80);
+        assert_eq!(
+            wait_for_latest(&worker, std::time::Duration::from_secs(2)),
+            Some(String::new()),
+            "budget change alone must republish identical bytes",
         );
     }
 
