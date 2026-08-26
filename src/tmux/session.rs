@@ -133,19 +133,14 @@ pub struct PaneCursor {
     /// works while an agent streams. `parse` sets it `true`; only the
     /// cross-probe check downgrades it.
     pub position_reliable: bool,
-    /// Pane 0's rectangle within a COMPOSITED preview window, or `None` when
+    /// Pane 0's rectangle within a composited preview window, or `None` when
     /// the preview shows a single pane.
     ///
-    /// Mouse forwarding maps the hovered cell into the previewed app's
-    /// coordinate space by treating the preview rect as the pane, which holds
-    /// while the two describe the same rectangle. A composite makes the rect
-    /// the whole window while input still goes to pane 0 alone (#435, #488),
-    /// and the cursor stays pane relative over a window-relative grid: with
-    /// `pane-border-status top`, pane 0 starts at `pane_top == 1` and every
-    /// row paints one below the cursor row that indexes it (#3515). So this
-    /// carries the full rectangle, not just the extent: consumers translate
-    /// `x`/`y` onto the composite by adding `(left, top)`, and map pointer
-    /// cells back by subtracting it, clamping to `(width, height)`.
+    /// Composite content uses the window grid while the cursor and input stay
+    /// pane relative. Window chrome can give pane 0 a non-zero origin (#3515),
+    /// so full-window consumers add it to cursor coordinates and subtract it
+    /// from pointer coordinates. A cropped preview must also account for rows
+    /// removed before mapping. Input remains pinned to pane 0 (#435, #488).
     pub composite_pane0: Option<PaneGeom>,
 }
 
@@ -869,16 +864,10 @@ impl Session {
     /// [`capture_window_composited`](Self::capture_window_composited) plus pane
     /// 0's cursor, for the live preview.
     ///
-    /// Pane 0 owns the cursor because it is the pane that receives input; its
-    /// coordinates are pane relative, and the composite they index is the
-    /// whole window, so consumers translate them by pane 0's origin carried
-    /// on [`PaneCursor::composite_pane0`] (#3515). The probe targets `^.0`
-    /// explicitly rather than the window, whose format fields would resolve
-    /// against whichever pane the user happens to have selected.
-    ///
-    /// On a composite the cursor is rebased onto the window's dimensions: the
-    /// renderer anchors it by `pane_height` against the painted line count,
-    /// which is now the whole window rather than one pane.
+    /// The probe targets `^.0`, the pane that receives input, rather than the
+    /// window whose format fields resolve against whichever pane is selected.
+    /// On a composite, `pane_height`/`pane_width` are rebased to the window and
+    /// [`PaneCursor::composite_pane0`] retains pane 0's coordinate frame.
     pub fn capture_window_composited_with_cursor(
         &self,
         lines: usize,
@@ -3351,13 +3340,10 @@ mod tests {
         (left, top, width, height)
     }
 
-    /// #3515: a composited preview paints the whole WINDOW grid while the
-    /// cursor stays pane 0 relative, so the two agree only while pane 0 sits
-    /// at the window origin. `pane-border-status top` shifts pane 0 down to
-    /// `pane_top == 1`, and the invariant must hold there: the composite
-    /// paints the pane's cursor row at `cursor.y + top`, and
-    /// `composite_pane0` carries that real origin. Exercised across the three
-    /// split shapes (horizontal, vertical, stacked).
+    /// A top border row shifts pane 0 down. Across horizontal, vertical, and
+    /// stacked splits, verify that the carried rectangle matches tmux and the
+    /// composite paints the cursor row at `cursor.y + top`; the untranslated
+    /// row assertion keeps the test non-vacuous.
     #[test]
     #[serial_test::serial]
     fn composited_cursor_and_pane0_origin_track_pane_border_offset() {
@@ -3672,7 +3658,7 @@ mod tests {
         assert_eq!(
             (first.left, first.top),
             (0, 0),
-            "pane 0 must sit at the origin in this split; a border-status row would shift it (#3515)"
+            "pane 0 must sit at the origin in this split; a border-status row would shift it"
         );
         // Pane 0 is the agent's, even though pane 1 is the active one.
         assert!(

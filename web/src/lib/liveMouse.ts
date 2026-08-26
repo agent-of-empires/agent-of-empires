@@ -91,25 +91,17 @@ export function wheelNotches(
 }
 
 /**
- * The composite line index a frame's cursor points at. Frame content is
- * bottom-anchored to the viewport (`screenRows` lines), so the live edge
- * starts at `lineCount - screenRows`; `cursorY` is already composite-space
- * (the server translates pane 0's row by its origin, #3515). Pure so the
- * cursor mapping is testable without a DOM.
+ * Map a frame cursor onto its bottom-anchored content. `cursorY` already
+ * indexes the composited frame. Pure so the mapping is testable without a DOM.
  */
 export function cursorLineIndex(lineCount: number, screenRows: number, cursorY: number): number {
   return Math.max(0, lineCount - screenRows) + cursorY;
 }
 
 /**
- * Inverse projection for pointer forwarding: map a hovered cell of the
- * composited window grid onto pane 0's 1-based mouse coordinate space.
- * `compositeCol` is 1-based, `compositeRow` is the 0-based composite row
- * under the pointer. Pane 0 may sit away from the window origin (a
- * `pane-border-status` row pushes every pane down one), so subtract the
- * origin the frame reports and clamp to the pane rectangle (#3515). A
- * missing rectangle means pane 0 at the corner, which keeps unsplit and
- * pre-fix frames unchanged.
+ * Map a 1-based column and 0-based row from the composited window grid into
+ * pane 0's 1-based mouse coordinates. Subtract the optional origin, then
+ * clamp to the pane rectangle; missing origin fields mean `(0, 0)`.
  */
 export function pointerPaneCell(
   compositeCol: number,

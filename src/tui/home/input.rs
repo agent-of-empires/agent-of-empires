@@ -202,12 +202,12 @@ fn split_bracketed_paste(text: &str) -> Vec<live_send::TmuxKey> {
 /// report at all, so it is dropped rather than clamped to the nearest edge,
 /// which would otherwise synthesise a click or hover on pane 0's border.
 ///
-/// Pane 0 usually sits at the window origin, so the sub-rectangle shares the
-/// preview's top-left corner and only its extent differs. A window option
-/// like `pane-border-status top` can shift it down (`pane_top == 1`, #3515);
-/// this mapping still assumes the shared corner, so a composited preview with
-/// a shifted pane 0 clamps against the wrong row. Known residual: the TUI
-/// side of #3515 was never reproduced there.
+/// Pane 0 may have a non-zero origin within the full composite. The TUI
+/// bottom-follows a composite taller than its output, clipping reserved rows
+/// above pane 0 before mouse mapping, so its first visible cell still starts
+/// at `pane.x`/`pane.y`. Mapping a non-bottom-aligned slice would additionally
+/// need that slice's first visible row; adding `rect.top` here alone would
+/// shift input below the displayed pane.
 fn mouse_target_rect(
     cursor: &crate::tmux::PaneCursor,
     pane: ratatui::layout::Rect,

@@ -1006,16 +1006,17 @@ fn compose_exclusion_in(
 /// starts. Parked conversations are no longer published in the peer's tmux
 /// environment, so [`build_exclusion_set`] cannot see them. Without this set,
 /// another session can capture the parked conversation before its owner swaps
-/// back. Claude and host Codex additionally need stopped peer protection
-/// because their mtime fallbacks can select a transcript after the owning tmux
-/// pane disappears (#2355). Sandboxed Codex sessions have instance-private
-/// `CODEX_HOME` directories and do not share a transcript store (#3317).
+/// back. Claude, host Codex, and host Kimi additionally need inactive
+/// same-tool protection because their shared-store MRU scans can select a
+/// conversation after the owning pane disappears. Sandboxed Codex and Kimi
+/// omit that protection because their stores are instance-private or are not
+/// captured from the host (#3317).
 ///
-/// Scope: the host transcript directories are keyed by `$HOME`, not by AoE
-/// profile, but this helper only inspects `sessions.json` for the caller's
-/// effective profile. A stopped peer in a different profile against the same
-/// host `$HOME` will not be excluded; the residual gap is narrower than #2355's
-/// trigger and is left for a follow-up.
+/// Scope: host stores are keyed by each agent's effective home, not by AoE
+/// profile, but this helper inspects only `sessions.json` for the caller's
+/// effective profile. A stopped peer in another profile against the same
+/// agent home will not be excluded; callers needing global ownership must
+/// compose their own cross-profile check.
 pub(crate) fn compose_exclusion_with_persisted_peers(
     current_instance_id: &str,
     current_project_path: &str,
@@ -2737,39 +2738,150 @@ fn select_kimi_session(
 
 /// Capture a Kimi Code session ID for `project_path`.
 ///
-/// Reads `~/.kimi-code/session_index.jsonl` (or
-/// `$KIMI_CODE_HOME/session_index.jsonl`) and returns the id of the most
-/// recently created session whose recorded `workDir` matches `project_path`,
-/// skipping any ids in `exclusion`. `launch_time_ms` gates live polling to
-/// sessions created after this run started (`None` for retroactive recovery).
-/// Kimi resumes the returned id with `kimi --session <id>`.
+/// Reads `session_index.jsonl` under the Kimi home resolved from
+/// `environment` and returns the id of the most recently created session
+/// whose recorded `workDir` matches `project_path`, skipping any ids in
+/// `exclusion`. `environment` must be the launched pane's host environment so
+/// the scan reads the same physical store Kimi writes (`KIMI_CODE_HOME`
+/// honored through launch's `$VAR` / bare-key grammar). `launch_time_ms`
+/// gates live polling to sessions created after this run started (`None` for
+/// retroactive recovery). Kimi resumes the returned id with `kimi --session
+/// <id>`.
 pub(crate) fn capture_kimi_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
     launch_time_ms: Option<f64>,
+    environment: &[String],
 ) -> Result<String> {
-    let home = resolve_agent_home(Some("KIMI_CODE_HOME"), ".kimi-code")?;
+    let home = kimi_home_for_environment(environment)
+        .ok_or_else(|| anyhow::anyhow!("could not resolve the Kimi home"))?;
     let sessions = read_kimi_session_index(&home.join("session_index.jsonl"))?;
     select_kimi_session(&sessions, project_path, exclusion, launch_time_ms)
 }
 
 /// Polling closure for Kimi Code session tracking. `launch_time_ms` floors the
 /// live poll so it never claims a conversation that predates this launch.
+/// `environment` is snapshotted from the instance at poller construction so
+/// every tick reads the store the launched pane writes.
 pub(crate) fn kimi_poll_fn(
     project_path: String,
     instance_id: String,
     launch_time_ms: f64,
     extra_excludes: HashSet<String>,
+    environment: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
         let exclusion = compose_exclusion(&instance_id, &extra_excludes);
-        capture_kimi_session_id(&project_path, &exclusion, Some(launch_time_ms))
-            .map_err(
-                |e| tracing::debug!(target: "session.capture", "Kimi poll capture failed: {}", e),
-            )
-            .ok()
-            .and_then(validated_session_id)
+        capture_kimi_session_id(
+            &project_path,
+            &exclusion,
+            Some(launch_time_ms),
+            &environment,
+        )
+        .map_err(|e| tracing::debug!(target: "session.capture", "Kimi poll capture failed: {}", e))
+        .ok()
+        .and_then(validated_session_id)
     }
+}
+
+/// Effective Kimi home for one environment list: `KIMI_CODE_HOME` resolved
+/// through the same `$VAR` / bare-key grammar launch applies
+/// ([`crate::session::environment::resolve_host_environment_value`]), else the
+/// ambient default resolution. An empty resolved value counts as unset; `None`
+/// when even the default cannot be resolved (the sharing predicate fails
+/// closed on `None`).
+fn kimi_home_for_environment(environment: &[String]) -> Option<PathBuf> {
+    crate::session::environment::resolve_host_environment_value(environment, "KIMI_CODE_HOME")
+        .map(PathBuf::from)
+        .filter(|home| !home.as_os_str().is_empty())
+        .or_else(|| resolve_agent_home(Some("KIMI_CODE_HOME"), ".kimi-code").ok())
+        .filter(|home| !home.as_os_str().is_empty())
+}
+
+/// Whether another persisted host AoE session shares this one's Kimi store: a
+/// resolvable own home plus the same canonicalized project path. When true,
+/// the newest matching record in the session index cannot be attributed to
+/// this pane, so the acquire-time MRU scan behind
+/// [`capture_kimi_session_id`] must not run (#3516). The live poller still
+/// runs that scan on shared stores, bounded by its launch-time floor and the
+/// exclusion sets.
+///
+/// `own_resolved_environment` is the caller's
+/// [`Instance::resolved_host_environment`] and `own_profile_environment` its
+/// static profile list; the own side matches peers against either home so a
+/// hook that deterministically mints a different `KIMI_CODE_HOME` still
+/// counts its profile siblings as sharing. Peers are judged on their static
+/// profile list because minted pairs are runtime state that is deliberately
+/// not persisted.
+///
+/// The walk covers every AoE profile because the store is keyed by resolved
+/// home plus cwd, not by profile: two profiles resolving to one home share
+/// one store. It fails closed: an unreadable profile list, config, or store,
+/// or no resolvable own home all report shared, because ownership that cannot
+/// be proven must not license an MRU retarget. Current Kimi peers and peers
+/// with a parked Kimi conversation count even when stopped, pane-less,
+/// archived, or trashed: the former race during recovery and the latter
+/// remain restorable owners. Sandboxed peers are skipped because their Kimi
+/// stores are container-private.
+pub(crate) fn kimi_store_is_shared(
+    current_instance_id: &str,
+    current_project_path: &str,
+    own_resolved_environment: &[String],
+    own_profile_environment: &[String],
+) -> bool {
+    let canonical_current = canonicalize_or_raw(current_project_path);
+    let own_homes = [own_resolved_environment, own_profile_environment]
+        .iter()
+        .filter_map(|env| kimi_home_for_environment(env))
+        .map(|home| canonicalize_or_raw(home.to_string_lossy().as_ref()))
+        .collect::<Vec<_>>();
+    if own_homes.is_empty() {
+        return true;
+    }
+    let Ok(profiles) = crate::session::list_profiles() else {
+        return true;
+    };
+    for peer_profile in profiles {
+        // Judge the namespace before paying for the store read: a peer whose
+        // resolved home differs cannot share this store however many rows its
+        // sessions.json holds. A successful resolve idempotently reinstalls
+        // that profile's status rules; a failed resolve returns shared without
+        // installing fallback rules or clearing the prior registry state.
+        let Ok(peer_config) = super::profile_config::resolve_config(&peer_profile) else {
+            return true;
+        };
+        let Some(peer_home) = kimi_home_for_environment(&peer_config.environment) else {
+            return true;
+        };
+        let peer_home = canonicalize_or_raw(peer_home.to_string_lossy().as_ref());
+        if !own_homes.contains(&peer_home) {
+            continue;
+        }
+        let Ok(storage) = crate::session::storage::Storage::new_unwatched(&peer_profile) else {
+            return true;
+        };
+        let Ok(instances) = storage.load() else {
+            return true;
+        };
+        for inst in instances {
+            if inst.id == current_instance_id || inst.is_sandboxed() {
+                continue;
+            }
+            let owns_kimi = inst.tool == "kimi"
+                || inst
+                    .prior_tool_session_ids
+                    .get("kimi")
+                    .and_then(|prior| prior.agent_session_id.as_deref())
+                    .is_some_and(|sid| !sid.is_empty());
+            if !owns_kimi {
+                continue;
+            }
+            if canonicalize_or_raw(&inst.project_path) == canonical_current {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 // ─── Hermes session capture ───────────────────────────────────────────────────
@@ -6160,6 +6272,16 @@ mod tests {
         let entries = vec![("a".to_string(), "/work/elsewhere".to_string())];
         let result = select_copilot_session(&entries, "/work/proj", &HashSet::new());
         assert!(result.is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn test_kimi_home_rejects_empty_ambient_fallback() {
+        let _env = EnvGuard::set(&[("KIMI_CODE_HOME", "")]);
+        assert!(
+            kimi_home_for_environment(&[]).is_none(),
+            "an explicitly empty ambient home must not become a relative store path"
+        );
     }
 
     #[test]

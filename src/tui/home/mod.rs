@@ -484,6 +484,10 @@ pub struct HomeView {
     /// in-memory mirror. Drained on Ok save.
     pending_added: HashMap<String, HashSet<String>>,
     pub(super) group_trees: HashMap<String, GroupTree>,
+    /// Duplicate session ids that remain ambiguous after journal-guided
+    /// reconciliation (#3459): every copy is excluded from `instances` and
+    /// these details name the exact profiles, files, and mtimes to resolve.
+    pub(super) legacy_duplicate_reports: Vec<crate::session::DuplicateIdReport>,
     pub(super) flat_items: Vec<Item>,
 
     // UI state
@@ -2060,6 +2064,23 @@ impl ReloadFailureState {
     }
 }
 
+/// Log each legacy duplicate's actionable details once per process; the
+/// condition can persist until the user hand-edits files, so repeating it at
+/// ERROR level on every reload tick would be spam.
+pub(super) fn log_legacy_duplicates_once(reports: &[crate::session::DuplicateIdReport]) {
+    static REPORTED_IDS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = REPORTED_IDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for report in reports {
+        if seen.iter().any(|id| id == &report.id) {
+            continue;
+        }
+        seen.push(report.id.clone());
+        tracing::error!(target: "tui.home", "{}", report.actionable_message());
+    }
+}
+
 impl HomeView {
     pub fn new(
         active_profile: Option<String>,
@@ -2071,6 +2092,7 @@ impl HomeView {
         let mut storages = HashMap::new();
         let mut all_instances = Vec::new();
         let mut group_trees = HashMap::new();
+        let mut profile_loads: Vec<(String, Vec<Instance>, Vec<Group>)> = Vec::new();
 
         let profile_names = match &active_profile {
             Some(name) => vec![name.clone()],
@@ -2127,10 +2149,41 @@ impl HomeView {
                     }
                 }
             }
-            let tree = GroupTree::new_with_groups(&instances, &groups);
-            group_trees.insert(profile_name.clone(), tree);
-            all_instances.extend(instances);
+            profile_loads.push((profile_name.clone(), instances, groups));
             storages.insert(profile_name.clone(), storage);
+        }
+
+        // Duplicate detection across every loaded profile runs before any of
+        // the loaded state is published (#3459). Journal-guided repairs fix
+        // durable state under lock here, so a clean reload below publishes
+        // exactly one row per session. Legacy ambiguities stay excluded.
+        let legacy_duplicate_reports = {
+            let loads_view: Vec<(&str, &[Instance])> = profile_loads
+                .iter()
+                .map(|(name, instances, _)| (name.as_str(), instances.as_slice()))
+                .collect();
+            let storages_view: Vec<(&str, &Storage)> = storages
+                .iter()
+                .map(|(name, storage)| (name.as_str(), storage))
+                .collect();
+            let outcome = crate::session::reconcile_profile_duplicates(&loads_view, &storages_view);
+            if outcome.repaired {
+                for (name, instances, groups) in &mut profile_loads {
+                    let (mut fresh, fresh_groups) = storages[name].load_with_groups()?;
+                    for inst in &mut fresh {
+                        inst.source_profile = name.clone();
+                    }
+                    *instances = fresh;
+                    *groups = fresh_groups;
+                }
+            }
+            log_legacy_duplicates_once(&outcome.reports);
+            outcome.reports
+        };
+        for (profile_name, instances, groups) in &profile_loads {
+            let tree = GroupTree::new_with_groups(instances, groups);
+            group_trees.insert(profile_name.clone(), tree);
+            all_instances.extend(instances.iter().cloned());
         }
 
         // In unified mode there is no single active profile, so config is
@@ -2203,6 +2256,7 @@ impl HomeView {
             pending_group_deletions: HashMap::new(),
             pending_added: HashMap::new(),
             group_trees,
+            legacy_duplicate_reports,
             flat_items: Vec::new(),
             cursor: 0,
             selected_session: None,
@@ -2636,19 +2690,51 @@ impl HomeView {
             self.storages.retain(|k, _| current_profiles.contains(k));
         }
 
-        for (profile_name, storage) in &self.storages {
-            let (mut instances, groups) = storage.load_with_groups()?;
-            for inst in &mut instances {
-                inst.source_profile = profile_name.clone();
-                if let Some(prev) = self.instances.get(&inst.id) {
-                    // Field-ownership rules (generation-governed vs runtime-only)
-                    // live on merge_runtime_from_reload.
-                    inst.merge_runtime_from_reload(prev);
+        // Collect per-profile state without publishing it, so duplicate
+        // detection (#3459) can run journal-guided repairs before anything
+        // reaches the unified map.
+        type ProfileLoads = Vec<(String, Vec<Instance>, Vec<Group>)>;
+        let collect_loads = |storages: &HashMap<String, Storage>,
+                             prev: &indexmap::IndexMap<String, Instance>|
+         -> anyhow::Result<ProfileLoads> {
+            let mut loads = Vec::new();
+            for (profile_name, storage) in storages {
+                let (mut instances, groups) = storage.load_with_groups()?;
+                for inst in &mut instances {
+                    inst.source_profile = profile_name.clone();
+                    if let Some(previous) = prev.get(&inst.id) {
+                        // Field-ownership rules (generation-governed vs
+                        // runtime-only) live on merge_runtime_from_reload.
+                        inst.merge_runtime_from_reload(previous);
+                    }
                 }
+                loads.push((profile_name.clone(), instances, groups));
             }
+            Ok(loads)
+        };
+        let mut loads = collect_loads(&self.storages, &self.instances)?;
+        let loads_view: Vec<(&str, &[Instance])> = loads
+            .iter()
+            .map(|(name, instances, _)| (name.as_str(), instances.as_slice()))
+            .collect();
+        let storages_view: Vec<(&str, &Storage)> = self
+            .storages
+            .iter()
+            .map(|(name, storage)| (name.as_str(), storage))
+            .collect();
+        let outcome = crate::session::reconcile_profile_duplicates(&loads_view, &storages_view);
+        if outcome.repaired {
+            // Durable state changed under lock; reload so exactly one row per
+            // session is published.
+            loads = collect_loads(&self.storages, &self.instances)?;
+        }
+        log_legacy_duplicates_once(&outcome.reports);
+        self.legacy_duplicate_reports = outcome.reports;
+
+        for (profile_name, instances, groups) in &loads {
             // Rebuild this profile's tree from disk, preserving any collapsed
             // state that was toggled in-memory but not yet on disk
-            let mut new_tree = GroupTree::new_with_groups(&instances, &groups);
+            let mut new_tree = GroupTree::new_with_groups(instances, groups);
             if let Some(old_tree) = self.group_trees.get(profile_name) {
                 for g in old_tree.get_all_groups() {
                     if g.collapsed {
@@ -2657,7 +2743,7 @@ impl HomeView {
                 }
             }
             self.group_trees.insert(profile_name.clone(), new_tree);
-            all_instances.extend(instances);
+            all_instances.extend(instances.iter().cloned());
         }
 
         // Remove trees for profiles that no longer exist
@@ -5211,8 +5297,9 @@ impl HomeView {
     /// Build the id-keyed `IndexMap` from a `Vec<Instance>` (the storage-load
     /// shape). Duplicate ids across profiles are ambiguous after an interrupted
     /// profile move: selecting either row by iteration order can route lifecycle
-    /// work to the wrong profile. Exclude every copy and fail closed until the
-    /// durable state is reconciled.
+    /// work to the wrong profile. Exclude every copy and fail closed; the
+    /// reload path runs `reconcile_profile_duplicates` first, so only
+    /// legacy duplicates without journal evidence ever reach this state.
     fn build_instances_map(all_instances: Vec<Instance>) -> indexmap::IndexMap<String, Instance> {
         let mut map: indexmap::IndexMap<String, Instance> =
             indexmap::IndexMap::with_capacity(all_instances.len());

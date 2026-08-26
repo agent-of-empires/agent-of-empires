@@ -26,6 +26,7 @@ mod instance;
 pub mod mcp_model;
 pub mod mcp_overrides;
 pub mod mcp_state;
+mod move_journal;
 pub mod poller;
 pub mod profile_config;
 pub mod project_mcp;
@@ -84,7 +85,12 @@ pub use instance::{
     SandboxInfo, SessionBucket, StartOutcome, Status, TerminalInfo, View, WorkspaceInfo,
     WorkspaceRepo, WorktreeInfo, SESSION_COLORS, TMUX_SESSION_GONE_ERROR,
 };
+#[cfg(test)]
+pub(crate) use move_journal::{
+    record as record_move_journal, MoveJournalEntry, MOVE_JOURNAL_VERSION,
+};
 pub(crate) use storage::acquire_session_identity_lock;
+pub(crate) use storage::{reconcile_profile_duplicates, DuplicateIdReport};
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

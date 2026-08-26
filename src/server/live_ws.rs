@@ -21,15 +21,12 @@
 //!   `#{mouse_sgr_flag}`: when the pane is a full-screen mouse app the
 //!   client forwards the wheel to it (as input bytes) instead of widening
 //!   the capture window, since the alternate screen has no scrollback.
-//!   On a composited (split) window the frame also carries `"pane0"`:
-//!   `{"cols":..,"rows":..,"left":..,"top":..}`, pane 0's rectangle within
-//!   the window grid. The cursor is translated onto that grid before it is
-//!   sent, and clients map pointer cells back by subtracting
-//!   `(left, top)` (#3515). Absent on single-pane frames. Clients that
-//!   ignore `left`/`top` still paint the cursor correctly at any origin,
-//!   because the translation already happened here; their mouse forwarding
-//!   is what degrades, back to the one-row shift of #3515 whenever the
-//!   origin is not `(0, 0)`.
+//!   A composited frame also carries `"pane0"` as
+//!   `{"cols":..,"rows":..,"left":..,"top":..}`. Cursor coordinates are
+//!   translated onto the window grid before emission; clients subtract the
+//!   same origin when forwarding pointer cells. Single-pane frames serialize
+//!   `pane0` as `null`. The origin fields are optional for older clients and
+//!   default to zero for frames from older servers.
 //!   `{"type":"size_owner","is_owner":bool}`: whether this client holds
 //!     the session's size-owner lock. Only the owner resizes the shared
 //!     tmux window and may type; a non-owner renders best-effort at the
@@ -1036,13 +1033,9 @@ async fn handle_live_ws(
 /// virtual scroll spacer off `history` and slices the live screen off
 /// the content's last `rows` lines, independent of cursor visibility.
 fn frame_json(content: &str, cursor: Option<&crate::tmux::PaneCursor>) -> String {
-    // On a composited frame the content grid is the whole WINDOW while
-    // `x`/`y` are pane 0 relative; the client paints the cursor by indexing
-    // that grid directly, so translate onto the composite here (#3515).
-    // `composite_pane0` is `None` (or at the origin) on every other frame,
-    // where this is the identity. The origin also rides on `pane0` so the
-    // client's inverse mapping, pointer cell -> pane coordinate, can
-    // subtract it again.
+    // The cursor is pane relative while composited content uses the window
+    // grid. Emit window-relative coordinates and carry the same origin for
+    // the client's inverse pointer mapping. No pane rectangle means identity.
     let pane0 = cursor.and_then(|c| c.composite_pane0);
     let (origin_x, origin_y) = pane0.map_or((0, 0), |p| (p.left, p.top));
     let cursor_value = match cursor {
@@ -1163,7 +1156,7 @@ mod tests {
     #[test]
     fn frame_json_includes_geometry_and_cursor() {
         let cases = [
-            // Unsplit: `pane0` is absent and the cursor is untouched.
+            // Unsplit: `pane0` is null and the cursor is untouched.
             (None, (3, 7), serde_json::Value::Null),
             // Composited with pane 0 at the corner (a borderless split):
             // identity translation, but `pane0` rides with zero origin.
@@ -1182,8 +1175,8 @@ mod tests {
                     "top": 0,
                 }),
             ),
-            // Composited with pane-border-status top: the wire cursor moves
-            // onto the window grid by pane 0's origin (#3515).
+            // Composited with pane-border-status top: move the wire cursor
+            // onto the window grid by pane 0's origin.
             (
                 Some(crate::tmux::PaneGeom {
                     left: 2,
