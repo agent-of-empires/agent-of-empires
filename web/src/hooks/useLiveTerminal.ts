@@ -30,11 +30,8 @@ export interface LiveCursor {
 export interface LivePaneRect {
   cols: number;
   rows: number;
-  /** Pane 0's offset within the composited window grid. A
-   *  `pane-border-status` row pushes every pane down, so the cursor and
-   *  pointer cells the client sees are window-relative while the app speaks
-   *  pane-relative coordinates (#3515). Absent means the origin (pre-fix
-   *  servers, unsplit windows). */
+  /** Optional origin within the composited window grid. Missing fields mean
+   *  `(0, 0)` for compatibility with older frames. */
   left?: number;
   top?: number;
 }

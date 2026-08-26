@@ -81,28 +81,6 @@ test("a click on a bottom-aligned row reports that row to the mouse app", async 
   await expect.poll(() => texts(handle).find((text) => /\x1b\[<0;\d+;\d+M/.test(text))).toMatch(/\x1b\[<0;\d+;2M/);
 });
 
-test("a pane-border-status offset shifts forwarded rows up one (#3515)", async ({ page }) => {
-  const handle = await setup(page);
-  const lines = ["first", "second", ...Array<string>(22).fill("")];
-  handle.pushLiveFrame({
-    content: `${lines.join("\n")}\n`,
-    rows: 24,
-    history: 120,
-    altScreen: true,
-    mouse: true,
-    mouseSgr: true,
-    // Pane 0 starts one composite row down (`pane-border-status top`), so a
-    // click on composite row 1 must report the app's row 1, not 2.
-    pane0: { cols: 80, rows: 24, left: 0, top: 1 },
-  } as Parameters<MockHandle["pushLiveFrame"]>[0]);
-  const secondRow = page.getByText("second", { exact: true });
-  await expect(secondRow).toBeVisible();
-  const box = (await secondRow.boundingBox())!;
-
-  await pointer(page, "pointerdown", box.x + 10, box.y + box.height / 2);
-  await expect.poll(() => texts(handle).find((text) => /\x1b\[<0;\d+;\d+M/.test(text))).toMatch(/\x1b\[<0;\d+;1M/);
-});
-
 test("dragging forwards a motion report (button + 32) per new cell", async ({ page }) => {
   const handle = await setup(page);
   pushFrame(handle, { altScreen: true, mouse: true, mouseSgr: true });

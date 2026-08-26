@@ -103,7 +103,7 @@ describe("pointerPaneCell", () => {
     });
   });
 
-  it("subtracts a non-zero origin (#3515: pane-border-status shifts pane 0 down)", () => {
+  it("subtracts a non-zero pane origin", () => {
     // Composite cell (10, 5) over a pane starting one row down: the app
     // hears its own row 5, not the border row above it.
     expect(pointerPaneCell(10, 5, { cols: 164, rows: 71, left: 0, top: 1 })).toEqual({

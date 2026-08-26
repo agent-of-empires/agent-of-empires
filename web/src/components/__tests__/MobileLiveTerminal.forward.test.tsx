@@ -174,12 +174,25 @@ describe("MobileLiveTerminal wheel forwarding", () => {
     expect(forwardButton.mock.calls[1][1]).toBe(true);
   });
 
-  it("clamps split-window mouse input to pane 0", () => {
-    const { scroller, forwardButton } = renderTerm(
-      frame({ altScreen: true, mouse: true, mouseSgr: true, pane0: { cols: 1, rows: 1 } }),
+  it("maps split-window mouse input into pane 0", () => {
+    const clamped = renderTerm(frame({ altScreen: true, mouse: true, mouseSgr: true, pane0: { cols: 1, rows: 1 } }));
+    fireEvent.pointerDown(clamped.scroller, { pointerType: "mouse", button: 0, clientX: 500, clientY: 500 });
+    expect(clamped.forwardButton.mock.calls[0]!.slice(4)).toEqual([1, 1]);
+    clamped.unmount();
+
+    const base = renderTerm(
+      frame({ altScreen: true, mouse: true, mouseSgr: true, pane0: { cols: 80, rows: 24, left: 0, top: 0 } }),
     );
-    fireEvent.pointerDown(scroller, { pointerType: "mouse", button: 0, clientX: 500, clientY: 500 });
-    expect(forwardButton.mock.calls[0]!.slice(4)).toEqual([1, 1]);
+    fireEvent.pointerDown(base.scroller, { pointerType: "mouse", button: 0, clientX: 100, clientY: 100 });
+    const baseRow = base.forwardButton.mock.calls[0]![5] as number;
+    base.unmount();
+
+    const offset = renderTerm(
+      frame({ altScreen: true, mouse: true, mouseSgr: true, pane0: { cols: 80, rows: 24, left: 0, top: 1 } }),
+    );
+    fireEvent.pointerDown(offset.scroller, { pointerType: "mouse", button: 0, clientX: 100, clientY: 100 });
+    const offsetRow = offset.forwardButton.mock.calls[0]![5] as number;
+    expect(offsetRow).toBe(baseRow - 1);
   });
 
   it("does NOT forward a click for a normal-screen agent", () => {

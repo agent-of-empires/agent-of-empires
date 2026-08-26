@@ -116,28 +116,13 @@ const READING_CAPTURE_LINES: u16 = 2000;
 
 /// Map a tmux pane cursor onto the preview's output rect for live-send.
 ///
-/// `output` is the rect the captured pane text paints into; `visible_rows` is
-/// its height in rows; `line_count` is the parsed capture's line count (the
-/// same value the renderer feeds to `compute_scroll`); `cursor` carries the
-/// pane's `(x, y)` (counted from the top of the visible screen) plus
-/// `pane_height`. The renderer bottom-anchors the capture ONLY when it
-/// overflows `output`; a capture shorter than `output` paints from the top
-/// (`compute_scroll` returns 0). Anchor the cursor the same way so it tracks
-/// the text: a screen row maps to `output.y + (min(line_count, visible_rows) -
-/// pane_height) + cursor.y`. With the pane sized to the output area and a
-/// full-height capture the delta is zero and this is just `output.y +
-/// cursor.y`. When the pane is a row or more shorter than `output` and the
-/// capture doesn't overflow (an alt-screen prompt, or the frame after a
-/// resize), using the bare `visible_rows` here would paint the cursor a row
-/// BELOW the text the user typed (#2742); clamping to `line_count` keeps them
-/// aligned. A hidden cursor, or one that maps outside `output`, yields `None`.
-///
-/// Residual #3515 (TUI side, never reproduced): `y` is pane relative, while
-/// on a COMPOSITED preview the painted grid is the whole window and a
-/// `pane-border-status` row shifts pane 0 down. Indexing that grid with the
-/// untranslated `y` would paint one row high; consumers of
-/// [`crate::tmux::PaneCursor::composite_pane0`] are supposed to translate by
-/// `(left, top)`. This path does not yet.
+/// `cursor.x`/`y` are pane relative. On a composite, add the pane origin
+/// carried by [`crate::tmux::PaneCursor::composite_pane0`]. Vertically the
+/// renderer also bottom-anchors captures that overflow `output`, so the row
+/// formula is `output.y + min(line_count, visible_rows) - pane_height + top +
+/// cursor.y`; a short capture instead anchors at the top. This keeps the
+/// cursor on the same text row for both the status-row offset (#3515) and the
+/// shorter-pane case (#2742). A hidden or out-of-bounds cursor yields `None`.
 fn map_live_preview_cursor(
     output: Rect,
     visible_rows: usize,
@@ -148,8 +133,11 @@ fn map_live_preview_cursor(
         return None;
     }
     let anchor = line_count.min(visible_rows) as i32;
-    let row = output.y as i32 + (anchor - cursor.pane_height as i32) + cursor.y as i32;
-    let col = output.x as i32 + cursor.x as i32;
+    let (left, top) = cursor
+        .composite_pane0
+        .map_or((0, 0), |rect| (rect.left as i32, rect.top as i32));
+    let row = output.y as i32 + (anchor - cursor.pane_height as i32) + top + cursor.y as i32;
+    let col = output.x as i32 + left + cursor.x as i32;
     if row < output.y as i32
         || row >= output.y as i32 + output.height as i32
         || col < output.x as i32
@@ -4203,13 +4191,25 @@ mod tests {
     }
 
     #[test]
-    fn live_cursor_maps_directly_when_pane_matches_output() {
-        // Pane sized to the output area (the steady-state live-send case): the
-        // delta is zero, so cursor (x, y) maps onto output.{x,y} + (x, y). A
-        // full-height capture (line_count >= visible_rows) bottom-anchors.
+    fn live_cursor_maps_single_and_composited_origins() {
         let output = Rect::new(40, 5, 80, 24);
-        let pos = map_live_preview_cursor(output, 24, 200, pane_cursor(3, 2, true, 24));
-        assert_eq!(pos, Some(Position::new(43, 7)));
+
+        // Steady-state single pane: the origin and anchoring delta are zero.
+        let single = map_live_preview_cursor(output, 24, 200, pane_cursor(3, 2, true, 24));
+        assert_eq!(single, Some(Position::new(43, 7)));
+
+        // A top border row makes the composite one row taller than the visible
+        // output and shifts pane 0 down. The anchoring delta clips that row;
+        // adding pane 0's origin puts its pane-relative cursor back on the text.
+        let mut split = pane_cursor(3, 2, true, 25);
+        split.composite_pane0 = Some(crate::tmux::PaneGeom {
+            left: 1,
+            top: 1,
+            width: 79,
+            height: 24,
+        });
+        let composited = map_live_preview_cursor(output, 24, 200, split);
+        assert_eq!(composited, Some(Position::new(44, 7)));
     }
 
     #[test]
