@@ -198,14 +198,14 @@ pub(crate) fn tmux_command() -> Command {
 /// `client.c` prints `error connecting to <socket> (strerror(errno))` for a
 /// non-`ECONNREFUSED` connect failure, and glibc localizes `strerror` by
 /// `LC_MESSAGES`, so on a non-English host the `(No such file or directory)`
-/// ENOENT marker for an absent socket (#3337) would not match. Keeping the
-/// caller's `LC_CTYPE` matters because `list-sessions` returns names later
-/// passed to locale-preserving tmux commands; `LC_ALL=C` substitutes wide
-/// characters with underscores in those names. Used by the status-query
-/// callers (which classify via [`tmux_no_server_running`]) and by
-/// `kill_session_if_present`.
+/// ENOENT marker for an absent socket (#3337) would not match. `LC_ALL` is
+/// removed so it cannot override that. Global `-u` forces UTF-8 session names
+/// even when the caller has `LC_CTYPE=C` or when `LC_ALL` was the only UTF-8
+/// locale source. Used by the status-query callers (which classify via
+/// [`tmux_no_server_running`]) and by `kill_session_if_present`.
 pub(crate) fn tmux_query_command() -> Command {
     let mut cmd = tmux_command();
+    cmd.arg("-u");
     cmd.env_remove("LC_ALL");
     cmd.env("LC_MESSAGES", "C");
     cmd
@@ -1470,6 +1470,11 @@ mod tests {
     #[test]
     fn tmux_query_command_preserves_ctype_for_session_names() {
         let command = tmux_query_command();
+        let args: Vec<_> = command.get_args().map(|a| a.to_owned()).collect();
+        assert!(
+            args.iter().any(|a| a.to_str() == Some("-u")),
+            "tmux -u forces UTF-8 names independently of inherited LC_CTYPE"
+        );
         let message_locale = command
             .get_envs()
             .find(|(key, _)| key.to_str() == Some("LC_MESSAGES"))
@@ -1480,7 +1485,7 @@ mod tests {
                 .get_envs()
                 .find(|(key, _)| key.to_str() == Some("LC_ALL"))
                 .is_some_and(|(_, value)| value.is_none()),
-            "LC_ALL must not override the caller's LC_CTYPE"
+            "LC_ALL must not override LC_MESSAGES=C"
         );
     }
 
