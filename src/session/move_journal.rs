@@ -102,8 +102,6 @@ where
     Ok(path)
 }
 
-/// Delete one consumed entry and sync its parent directory so the removal
-/// itself is durable. Idempotent: a missing file is already consumed.
 /// Nanosecond creation order encoded in record's filename. Used only as a
 /// durable tie-breaker when two entries share the millisecond JSON timestamp.
 pub(crate) fn file_created_at_nanos(path: &Path) -> Option<u128> {
@@ -114,6 +112,8 @@ pub(crate) fn file_created_at_nanos(path: &Path) -> Option<u128> {
         .and_then(|nanos| nanos.parse().ok())
 }
 
+/// Delete one consumed entry and sync its parent directory so the removal
+/// itself is durable. Idempotent: a missing file is already consumed.
 pub(crate) fn consume(path: &Path) -> Result<()> {
     match fs::remove_file(path) {
         Ok(()) => {}
