@@ -2064,6 +2064,23 @@ impl ReloadFailureState {
     }
 }
 
+/// Log each legacy duplicate's actionable details once per process; the
+/// condition can persist until the user hand-edits files, so repeating it at
+/// ERROR level on every reload tick would be spam.
+pub(super) fn log_legacy_duplicates_once(reports: &[crate::session::DuplicateIdReport]) {
+    static REPORTED_IDS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = REPORTED_IDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for report in reports {
+        if seen.iter().any(|id| id == &report.id) {
+            continue;
+        }
+        seen.push(report.id.clone());
+        tracing::error!(target: "tui.home", "{}", report.actionable_message());
+    }
+}
+
 impl HomeView {
     pub fn new(
         active_profile: Option<String>,
@@ -2141,9 +2158,9 @@ impl HomeView {
         // durable state under lock here, so a clean reload below publishes
         // exactly one row per session. Legacy ambiguities stay excluded.
         let legacy_duplicate_reports = {
-            let loads_view: Vec<(String, Vec<Instance>)> = profile_loads
+            let loads_view: Vec<(&str, &[Instance])> = profile_loads
                 .iter()
-                .map(|(name, instances, _)| (name.clone(), instances.clone()))
+                .map(|(name, instances, _)| (name.as_str(), instances.as_slice()))
                 .collect();
             let storages_view: Vec<(&str, &Storage)> = storages
                 .iter()
@@ -2160,13 +2177,7 @@ impl HomeView {
                     *groups = fresh_groups;
                 }
             }
-            for report in &outcome.reports {
-                tracing::error!(
-                    target: "tui.home",
-                    "{}",
-                    report.actionable_message()
-                );
-            }
+            log_legacy_duplicates_once(&outcome.reports);
             outcome.reports
         };
         for (profile_name, instances, groups) in &profile_loads {
@@ -2692,9 +2703,9 @@ impl HomeView {
             Ok(loads)
         };
         let mut loads = collect_loads(&self.storages, &self.instances)?;
-        let loads_view: Vec<(String, Vec<Instance>)> = loads
+        let loads_view: Vec<(&str, &[Instance])> = loads
             .iter()
-            .map(|(name, instances, _)| (name.clone(), instances.clone()))
+            .map(|(name, instances, _)| (name.as_str(), instances.as_slice()))
             .collect();
         let storages_view: Vec<(&str, &Storage)> = self
             .storages
@@ -2707,9 +2718,7 @@ impl HomeView {
             // session is published.
             loads = collect_loads(&self.storages, &self.instances)?;
         }
-        for report in &outcome.reports {
-            tracing::error!(target: "tui.home", "{}", report.actionable_message());
-        }
+        log_legacy_duplicates_once(&outcome.reports);
         self.legacy_duplicate_reports = outcome.reports;
 
         for (profile_name, instances, groups) in &loads {
