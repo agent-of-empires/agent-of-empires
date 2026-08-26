@@ -20130,32 +20130,13 @@ mod daemon_status_apply_tests {
         );
     }
 
-    /// A structured row's turn-end is the daemon's to record, both halves of
-    /// it, so the TUI writes neither field.
+    /// A structured row's turn-end is the daemon's to record, both halves of it,
+    /// so the TUI writes neither field: the status is a daemon-side overlay with
+    /// no durable owner (#3201), and the unread mark is written durably by the
+    /// live ACP turn-end path (`should_mark_acp_unread`, #3181).
     ///
-    /// The status half is #3201: it is a daemon-side overlay with no durable
-    /// owner, and persisting it here strands a row at `Running` with nothing
-    /// left to heal it once the daemon is gone.
-    ///
-    /// The unread half is #3181. This test previously asserted the opposite,
-    /// on the rationale that `decide_passive_transition`'s `mark_unread` was
-    /// ungated so the daemon persisted the mark too and the TUI was merely
-    /// mirroring it. That rationale was already false when it was written:
-    /// since #3162 a structured row compares equal to `prev`, so
-    /// `observed_transitions` never reports one and the poll loop never
-    /// reached that predicate. The TUI was the only writer, which is why the
-    /// mark was missing for anyone not running a TUI home view. The daemon now
-    /// writes it durably from the live ACP turn-end event
-    /// (`should_mark_acp_unread`), so mirroring here would make the TUI a
-    /// second writer of one boolean.
-    ///
-    /// The restart-stranding fear the old rationale named is handled, and by
-    /// the correct owner: `apply_daemon_status_update` is fed only by
-    /// `DaemonStatusPoller`, so reaching this code at all proves a daemon is
-    /// live, and that same daemon produced this `Running -> Idle` reading and
-    /// persisted the mark alongside it. The TUI picks the mark up from disk on
-    /// its next reload; `merge_from_tui` has no `unread` arm, so its own saves
-    /// cannot clobber it.
+    /// The mark still reaches this row, from disk on the next reload;
+    /// `merge_from_tui` has no `unread` arm, so a TUI save cannot clobber it.
     #[test]
     #[serial]
     fn tui_persists_neither_status_nor_unread_for_a_structured_turn_end() {

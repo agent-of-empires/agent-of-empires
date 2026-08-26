@@ -3310,13 +3310,16 @@ impl HomeView {
                     // marks them off the live ACP turn-end event and persists it
                     // there (#3181). Marking here too would be a second writer of
                     // the same boolean for no gain, and `is_live_target` cannot
-                    // even earn its keep on one: live-send needs a tmux pane
-                    // (`LiveSendState.tmux_name`) and a structured row has none,
-                    // so the exemption is always inert for them. What clears the
-                    // mark for a structured row the user is actually reading is
-                    // `tick_unread_dwell`, which re-checks `is_unread()` every
-                    // tick and so picks up a daemon-written mark on the row under
-                    // the cursor.
+                    // even earn its keep on one: `start_live_send` returns `None`
+                    // outright for `is_structured()` (`home/input.rs`, matched by
+                    // the guard in `app.rs`), so the exemption is always inert for
+                    // them. Note it is that explicit guard which makes it inert,
+                    // not the absence of a pane: a structured row can own paired
+                    // terminal and tool panes, so `LiveSendTarget` alone would not
+                    // rule live-send out. What clears the mark for a structured
+                    // row the user is actually reading is `tick_unread_dwell`,
+                    // which re-checks `is_unread()` every tick and so picks up a
+                    // daemon-written mark on the row under the cursor.
                     let should_mark_unread = crate::session::unread_enabled()
                         && !structured
                         && old == Status::Running

@@ -8518,6 +8518,98 @@ mod tests {
         assert!(!row(&terminal_id).unread);
     }
 
+    /// End to end over `acp_event_listener` itself, the path that actually
+    /// closes #3181. The predicate table and the TUI ownership tests all pass
+    /// even if the snapshot is taken *after* `apply_status_intent`, the persist
+    /// is dropped, or the mirror is reordered, because none of them run the
+    /// listener. This one drives a real `Event::Stopped` frame through the
+    /// broadcast and asserts both halves of the write.
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn acp_event_listener_marks_a_finished_turn_unread_on_disk_and_in_memory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+        crate::session::set_unread_enabled(true);
+
+        let profile = "acp-listener-turn-end";
+        let mut inst = Instance::new("acp-session", "/tmp/acp");
+        inst.view = crate::session::View::Structured;
+        inst.source_profile = profile.to_string();
+        // Mid-turn, so the incoming Stopped is a real Running -> Idle edge.
+        inst.status = Status::Running;
+        let id = inst.id.clone();
+        seed_profile_store(profile, vec![inst.clone()]);
+
+        let state = test_support::build_test_app_state(vec![inst]);
+        let listener = tokio::spawn(acp_event_listener(state.clone()));
+
+        // A broadcast only reaches receivers that subscribed before the send,
+        // and the spawned listener subscribes as its first act. Wait for that
+        // rather than racing it; nothing else in this test subscribes, so the
+        // count reaching 1 is precisely "the listener is listening".
+        for _ in 0..500 {
+            if state.acp_events_tx.receiver_count() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(
+            state.acp_events_tx.receiver_count() > 0,
+            "listener never subscribed"
+        );
+
+        // The turn ends.
+        state
+            .acp_events_tx
+            .send(AcpBroadcastFrame {
+                session_id: id.clone(),
+                seq: 1,
+                event: Arc::new(crate::acp::Event::Stopped {
+                    reason: "prompt_complete".into(),
+                }),
+            })
+            .expect("listener is subscribed");
+
+        // The listener owns the write, so poll rather than sleeping a fixed
+        // interval: the persist is a real flock'd file write. Wait on the
+        // *mirror*, which is the last step, so this cannot abort the listener
+        // in between the disk write and the mirror and then blame the mirror.
+        let mut mirrored = false;
+        for _ in 0..500 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            if state
+                .instances
+                .read()
+                .await
+                .iter()
+                .any(|i| i.id == id && i.unread)
+            {
+                mirrored = true;
+                break;
+            }
+        }
+        listener.abort();
+
+        assert!(
+            mirrored,
+            "daemon memory must mirror the mark, so /api/sessions reports it"
+        );
+        assert!(
+            load_profile_row(profile, &id).is_some_and(|i| i.unread),
+            "and the mark must be durable, which is the #3181 fix; a memory-only \
+             mark is dropped by the next reload"
+        );
+        let instances = state.instances.read().await;
+        let row = instances.iter().find(|i| i.id == id).expect("row present");
+        assert_eq!(row.status, Status::Idle, "the Stopped applied");
+    }
+
     // #2755 (follow-up to #2729): the poller must not strand an in-memory
     // unread mark on a persist that never landed. `flush_passive_transition_writes`
     // applies the mark to the live vec only after `persist_session_update`
