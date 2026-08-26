@@ -3059,7 +3059,6 @@ impl HomeView {
                         "structured approval worker gone; respawning a fresh worker",
                     );
                     self.structured_approval_poller = StructuredApprovalPoller::new();
-                    self.pending_daemon_status_refresh = false;
                     return true;
                 }
             }
