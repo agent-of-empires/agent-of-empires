@@ -203,7 +203,10 @@ pub(crate) fn tmux_command() -> Command {
 /// removed so it cannot override that. Global `-u` forces UTF-8 session names
 /// even when the caller has `LC_CTYPE=C` or when `LC_ALL` was the only UTF-8
 /// locale source. Used by the status-query callers (which classify via
-/// [`tmux_no_server_running`]) and by `kill_session_if_present`.
+/// [`tmux_no_server_running`]) and by `kill_session_if_present`. Not folded into
+/// [`tmux_command`]: the interactive attach/switch-client/capture-pane paths must
+/// keep the user's locale, and `-u` would assert UTF-8 to a terminal that may not
+/// be.
 pub(crate) fn tmux_query_command() -> Command {
     let mut cmd = tmux_command();
     cmd.arg("-u");
