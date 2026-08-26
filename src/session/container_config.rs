@@ -3093,18 +3093,22 @@ mod tests {
         assert!(!sandbox.join("subdir").exists());
     }
 
-    // Regression pin for the prime-agent sandbox mount: without "skills" in
-    // copy_dirs, user-authored host skills never reach the container even
-    // though the SkillRoot row advertises ~/.prime/agent/skills.
     #[test]
     fn test_prime_agent_mount_copies_user_skills() {
+        let home = TempDir::new().unwrap();
+        let skill_dir = home.path().join(".prime/agent/skills/reviewing");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(skill_dir.join("SKILL.md"), "review instructions").unwrap();
+
         let prime_mount = AGENT_CONFIG_MOUNTS
             .iter()
             .find(|m| m.tool_name == "prime-agent")
             .expect("prime-agent mount must exist");
-        assert!(
-            prime_mount.copy_dirs.contains(&"skills"),
-            "prime-agent copy_dirs must include 'skills' so host-authored skills land in-container"
+        let sandbox = prepare_sandbox_dir(prime_mount, home.path(), None).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(sandbox.join("skills/reviewing/SKILL.md")).unwrap(),
+            "review instructions"
         );
     }
 

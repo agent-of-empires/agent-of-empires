@@ -2772,8 +2772,6 @@ pub(crate) fn kimi_poll_fn(
     }
 }
 
-// ─── Prime Agent session capture ──────────────────────────────────────────────
-
 /// Slack (ms) applied to the launch-time floor, mirroring
 /// [`KIMI_MTIME_FLOOR_SLACK_MS`]: session files can carry second-granularity
 /// mtimes that land below the millisecond launch timestamp and must still

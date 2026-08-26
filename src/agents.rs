@@ -1362,6 +1362,7 @@ pub const AGENTS: &[AgentDef] = &[
         install_hint:
             "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh",
         permission_response: None,
+        lifecycle: AgentLifecycle::Active,
     },
 ];
 
