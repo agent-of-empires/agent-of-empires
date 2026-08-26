@@ -486,6 +486,20 @@ pub(crate) async fn spawn_structured_session(
             };
             let mut instances = service.instances.write().await;
             crate::server::api::sessions::upsert_instance(&mut instances, instance);
+            // The row is now in both `sessions.json` (persisted above) and
+            // `instances`, so any reloader still carrying a snapshot that
+            // predates the persist must drop it rather than replace
+            // `instances` with a `fresh` the new row was never in. Bump while
+            // still holding the `instances` write lock, for the same reason
+            // the delete path does: a reloader checks the epoch under that
+            // same lock, so the insert and the bump land as one step. Without
+            // this, a `status_poll_loop` tick whose disk read started before
+            // the persist drops the session from `GET /api/sessions` until the
+            // next tick re-reads disk. See invariant 8 on
+            // `reload_state_instances_from_disk`.
+            service
+                .mutation_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             drop(instances);
 
             // Count the create for the opt-in telemetry trend counter. Bounded
@@ -635,5 +649,43 @@ pub(crate) async fn spawn_structured_session(
         }
         Ok(Err(e)) => Err(e),
         Err(e) => Err(anyhow::Error::new(SessionBuildPanicked(e.to_string()))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    /// The create path must bump `mutation_epoch` while it still holds the
+    /// `instances` write lock. A reloader compares the epoch under that same
+    /// lock, so the insert and the bump have to land as one step; bumping
+    /// after `drop(instances)` reopens the window a reload can slip into and
+    /// silently drops the new session from `GET /api/sessions` for a tick.
+    ///
+    /// Source-level rather than behavioural: reaching the bump needs a real
+    /// spawn (tmux pane, worktree, agent subprocess), and the failure mode is
+    /// a future edit moving the bump out of the lock scope, which this
+    /// catches. The reload side is covered behaviourally in
+    /// `server::tests::a_reload_predating_a_create_does_not_drop_the_new_row`.
+    #[test]
+    fn the_create_bumps_the_mutation_epoch_under_the_instances_lock() {
+        // Whitespace-normalised so rustfmt's line wrapping cannot change the
+        // result: the point is the ordering, not how it is laid out.
+        let source = include_str!("session_spawn.rs");
+        let normalised: String = source.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        let lock = normalised
+            .find("let mut instances = service.instances.write().await;")
+            .expect("the create path takes the instances write lock");
+        let bump = normalised[lock..]
+            .find(".mutation_epoch .fetch_add(1, std::sync::atomic::Ordering::SeqCst);")
+            .expect("the create path bumps mutation_epoch after the upsert");
+        let unlock = normalised[lock..]
+            .find("drop(instances);")
+            .expect("the create path releases the instances write lock");
+
+        assert!(
+            bump < unlock,
+            "mutation_epoch must be bumped before drop(instances), so the insert \
+             and the bump are atomic against a concurrent reload"
+        );
     }
 }

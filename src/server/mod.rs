@@ -398,14 +398,20 @@ pub struct AppState {
     /// transitions to `Status::Error` for up to 8 seconds while the agent
     /// is still settling. Periodically GC'd by a background task.
     pub recently_restarted: crate::session::recovery::RecentlyRestarted,
-    /// Bumped once per committed session removal, after the row is gone from
-    /// both `sessions.json` and `instances`. A reloader reads it before its
-    /// disk read and hands the value back to
+    /// Bumped once per committed membership change of the session set: a
+    /// removal, after the row is gone from both `sessions.json` and
+    /// `instances`, and a creation, after the row is in both. A reloader
+    /// reads it before its disk read and hands the value back to
     /// `reload_state_instances_from_disk`, which drops the reload when the
-    /// value moved: the disk snapshot it is carrying predates a delete, so
-    /// folding it in would resurrect the removed row. See invariant 8 on that
-    /// function.
-    pub delete_epoch: std::sync::atomic::AtomicU64,
+    /// value moved: the disk snapshot it is carrying predates the mutation,
+    /// so folding it in would resurrect a removed row or drop a created one.
+    /// See invariant 8 on that function.
+    ///
+    /// Membership only. A field edit on an existing row does not bump, because
+    /// the per-id merge already reconciles those; the epoch exists for the
+    /// two cases the merge cannot see, where the id itself is absent from one
+    /// side.
+    pub mutation_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Ids whose startup-recovery cascade is scheduled but not yet complete.
     /// Phase A seeds it; each Phase B worker drains its id on completion. The
     /// background refresher walks it to keep queued candidates' marks in
@@ -911,12 +917,14 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     let instance_locks = Arc::new(RwLock::new(std::collections::HashMap::new()));
     let idempotency_locks = Arc::new(RwLock::new(std::collections::HashMap::new()));
     let telemetry_session_creates = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let mutation_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
     #[cfg(feature = "serve")]
     let session_service = Arc::new(session_service::SessionService::new(
         Arc::clone(&instances),
         Arc::clone(&instance_locks),
         Arc::clone(&file_watch),
         Arc::clone(&telemetry_session_creates),
+        Arc::clone(&mutation_epoch),
         acp_supervisor.clone(),
         acp_event_store.clone(),
     ));
@@ -926,6 +934,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         Arc::clone(&instance_locks),
         Arc::clone(&file_watch),
         Arc::clone(&telemetry_session_creates),
+        Arc::clone(&mutation_epoch),
     ));
 
     // the daemon serves fine without plugin workers.
@@ -1223,7 +1232,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             crate::session::conversation_summary::MAX_CONCURRENT,
         ),
         recently_restarted: crate::session::recovery::new_recently_restarted(),
-        delete_epoch: std::sync::atomic::AtomicU64::new(0),
+        mutation_epoch: Arc::clone(&mutation_epoch),
         recovery_pending: crate::session::recovery::new_recovery_pending(),
         cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
             // Seed with an already-stale timestamp so the first request
@@ -3296,19 +3305,23 @@ fn skip_tmux_decision_for_structured(inst: &mut Instance) -> bool {
 //    scrape can briefly carry the prior status; it self-corrects on
 //    the next 2s tick. Polling is canonical (invariant 6) so this is
 //    acceptable.
-// 8. Every caller must read `state.delete_epoch` BEFORE its disk read and
+// 8. Every caller must read `state.mutation_epoch` BEFORE its disk read and
 //    pass that value as `read_epoch`. `fresh` is a snapshot of
 //    `sessions.json`, and `*current = merged` below replaces
-//    `state.instances` wholesale, so a delete that commits between the
-//    read and this call would otherwise be undone: the deleted row is
-//    still in `fresh` and comes straight back. The epoch check drops such
-//    a reload rather than resurrecting the row. Dropping ids missing from
+//    `state.instances` wholesale, so a membership change that commits
+//    between the read and this call would otherwise be undone. It cuts both
+//    ways. A delete: the removed row is still in `fresh` and comes straight
+//    back. A create: the new row is absent from `fresh`, and since `merged`
+//    is built exclusively from `fresh`, the wholesale replace drops the row
+//    the create just put in `state.instances`, so `GET /api/sessions` loses
+//    it until the next tick re-reads disk. The epoch check drops such a
+//    reload rather than applying either. Dropping ids missing from
 //    `prior_by_id` is NOT an alternative; that is also how a session
 //    created by another process (the CLI, a peer daemon) legitimately
 //    enters `state.instances`. The comparison happens under the
-//    `state.instances` write lock, and the delete bumps under that same
-//    lock, so the two are ordered against each other; comparing before
-//    taking the lock reopens the race one lock acquisition later.
+//    `state.instances` write lock, and both the delete and the create bump
+//    under that same lock, so they are ordered against each other; comparing
+//    before taking the lock reopens the race one lock acquisition later.
 
 /// Reload `state.instances` by merging caller-supplied `fresh` against the
 /// prior in-memory snapshot per id, then reapplying the acp overlay.
@@ -3358,26 +3371,30 @@ pub(crate) async fn reload_state_instances_from_disk(
 
     let mut current = state.instances.write().await;
 
-    // Invariant 8: `fresh` predates a committed delete, so folding it in would
-    // put the removed row back. Drop the whole reload rather than filter it:
-    // the next poll tick re-reads disk 2s from now and converges, and a delete
-    // is rare enough that losing one tick of status updates costs nothing.
+    // Invariant 8: `fresh` predates a committed create or delete, so folding it
+    // in would put a removed row back, or drop a created one. Drop the whole
+    // reload rather than filter it: the next poll tick re-reads disk 2s from
+    // now and converges, and both mutations are rare enough (each one is a
+    // user action) that losing one tick of status updates costs nothing.
     //
     // Read under the `instances` write lock, and before `drain_from` empties
-    // `current`, so this is atomic against the delete. Checking before taking
-    // the lock leaves a hole: a reload could pass the check, park on the lock,
-    // let a delete take the lock, remove the row and bump, then wake and write
-    // its stale snapshot over the removal. The delete bumps inside the same
-    // lock scope for the same reason. No memory ordering closes that gap; it
+    // `current`, so this is atomic against the mutation. Checking before
+    // taking the lock leaves a hole: a reload could pass the check, park on
+    // the lock, let a delete take the lock, remove the row and bump, then wake
+    // and write its stale snapshot over the removal. Symmetrically for a
+    // create, whose row is missing from the stale snapshot entirely. Both
+    // mutations bump inside the same lock scope for the same reason. No memory ordering closes that gap; it
     // is a check-then-act race, so the check has to happen under the lock that
     // orders the two writers.
-    let current_epoch = state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst);
+    let current_epoch = state
+        .mutation_epoch
+        .load(std::sync::atomic::Ordering::SeqCst);
     if current_epoch != read_epoch {
         tracing::debug!(
             target: "server.file_watch",
             read_epoch,
             current_epoch,
-            "dropping a disk reload whose snapshot predates a session delete"
+            "dropping a disk reload whose snapshot predates a session create or delete"
         );
         return;
     }
@@ -3910,7 +3927,9 @@ async fn disk_watcher_consumer(state: Arc<AppState>) {
         let started = std::time::Instant::now();
         // Invariant 8: read before the disk read, so a delete committing
         // during it invalidates this snapshot.
-        let read_epoch = state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
         let file_watch_for_load = state.file_watch.clone();
         let loaded = match tokio::task::spawn_blocking(move || {
             load_all_instances(&file_watch_for_load)
@@ -4567,7 +4586,9 @@ async fn status_poll_loop(state: Arc<AppState>) {
         // scrape that follows it can block for seconds when the tmux server is
         // unreachable, which is exactly when a concurrent delete has time to
         // land and this tick's snapshot goes stale.
-        let read_epoch = state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
         let updated = tokio::task::spawn_blocking(move || {
             let mut instances = load_all_instances(&file_watch_for_poll).unwrap_or_default();
             seed_unknown_tracking(&mut instances, &prev_unknown_tracking);
@@ -6151,12 +6172,14 @@ pub mod test_support {
         let instance_locks = Arc::new(RwLock::new(HashMap::new()));
         let idempotency_locks = Arc::new(RwLock::new(HashMap::new()));
         let telemetry_session_creates = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mutation_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let file_watch = FileWatchService::noop();
         let session_service = Arc::new(session_service::SessionService::new(
             Arc::clone(&instances),
             Arc::clone(&instance_locks),
             Arc::clone(&file_watch),
             Arc::clone(&telemetry_session_creates),
+            Arc::clone(&mutation_epoch),
             supervisor.clone(),
             event_store.clone(),
         ));
@@ -6186,7 +6209,7 @@ pub mod test_support {
                 crate::session::conversation_summary::MAX_CONCURRENT,
             ),
             recently_restarted: crate::session::recovery::new_recently_restarted(),
-            delete_epoch: std::sync::atomic::AtomicU64::new(0),
+            mutation_epoch: Arc::clone(&mutation_epoch),
             recovery_pending: crate::session::recovery::new_recovery_pending(),
             cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
                 refreshed_at: std::time::Instant::now(),
@@ -6293,7 +6316,9 @@ pub mod test_support {
         fresh: Vec<Instance>,
         live_worker_records: Vec<(crate::process::worker_registry::WorkerRecord, String)>,
     ) {
-        let read_epoch = state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
         super::reload_state_instances_from_disk(
             state,
             fresh,
@@ -6309,7 +6334,9 @@ pub mod test_support {
         fresh: Vec<Instance>,
         live_worker_records: Vec<(crate::process::worker_registry::WorkerRecord, String)>,
     ) {
-        let read_epoch = state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
         super::reload_state_instances_from_disk(
             state,
             fresh,
@@ -8876,7 +8903,9 @@ mod tests {
 
         // Invariant 8: capture the epoch BEFORE the disk read, the order every
         // production caller uses.
-        let read_epoch = state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
         let file_watch = state.file_watch.clone();
         let fresh = tokio::task::spawn_blocking(move || load_all_instances(&file_watch))
             .await
@@ -8925,7 +8954,7 @@ mod tests {
         // The delete already committed: `doomed` is gone from memory, and the
         // epoch moved to say so.
         state
-            .delete_epoch
+            .mutation_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
 
         reload_state_instances_from_disk(
@@ -8951,6 +8980,78 @@ mod tests {
         assert_eq!(titles, vec!["survivor".to_string()]);
     }
 
+    // The mirror image of the delete case, and the reason `mutation_epoch` is
+    // not named `delete_epoch`. `create_session` persists the new row to
+    // `sessions.json` and only then upserts it into `state.instances`
+    // (`upsert_instance`). A poll tick whose disk read STARTED before that
+    // persist carries a `fresh` without the new row, and since the merge
+    // rebuilds `state.instances` exclusively from `fresh`, the wholesale
+    // replace drops the session the create just inserted. `GET /api/sessions`
+    // then loses it until the next tick re-reads disk 2s later. Observed as a
+    // live Playwright failure: `wizard-scratch-launch` polled until the
+    // session appeared, and the very next `GET /api/sessions` returned `[]`.
+    #[tokio::test]
+    async fn a_reload_predating_a_create_does_not_drop_the_new_row() {
+        let existing = Instance::new("existing", "/tmp/existing");
+        let created = Instance::new("created", "/tmp/created");
+        // What a reloader read from disk before the create persisted.
+        let stale_snapshot = vec![existing.clone()];
+
+        // The create already committed: `created` is in memory (and on disk),
+        // and the epoch moved to say so.
+        let state = test_support::build_test_app_state(vec![existing.clone(), created.clone()]);
+        state
+            .mutation_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        reload_state_instances_from_disk(
+            &state,
+            stale_snapshot.clone(),
+            Vec::new(),
+            StatusSource::DiskOnly,
+            0,
+        )
+        .await;
+
+        let titles: Vec<String> = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .map(|i| i.title.clone())
+            .collect();
+        assert!(
+            titles.contains(&"created".to_string()),
+            "a created session must survive a pre-create snapshot: {titles:?}"
+        );
+
+        // And the converse, which is what the create path's bump buys: hand
+        // the same stale snapshot a matching epoch, as if the create had never
+        // bumped, and the row is gone. This is the pre-fix behaviour, pinned so
+        // the bump cannot be dropped as redundant.
+        let unbumped = test_support::build_test_app_state(vec![existing.clone(), created.clone()]);
+        reload_state_instances_from_disk(
+            &unbumped,
+            stale_snapshot,
+            Vec::new(),
+            StatusSource::DiskOnly,
+            0,
+        )
+        .await;
+        let titles: Vec<String> = unbumped
+            .instances
+            .read()
+            .await
+            .iter()
+            .map(|i| i.title.clone())
+            .collect();
+        assert_eq!(
+            titles,
+            vec!["existing".to_string()],
+            "without the epoch bump the reload drops the created row"
+        );
+    }
+
     // The epoch comparison has to be atomic against the delete, not merely
     // ordered by `SeqCst`. Comparing before taking the `instances` write lock
     // leaves a check-then-act race: a reload passes the check, parks on the
@@ -8969,7 +9070,9 @@ mod tests {
         let stale_snapshot = vec![doomed.clone(), survivor.clone()];
 
         let state = test_support::build_test_app_state(vec![survivor.clone()]);
-        let read_epoch = state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
 
         // Hold the lock the reload needs, so it cannot get past it.
         let guard = state.instances.write().await;
@@ -8992,7 +9095,7 @@ mod tests {
         // The delete commits while the reload is parked: row out, epoch up.
         // Both happen before the lock is released, mirroring the real purge.
         state
-            .delete_epoch
+            .mutation_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         drop(guard);
 
@@ -9020,7 +9123,9 @@ mod tests {
         let known = Instance::new("known", "/tmp/known");
         let created_elsewhere = Instance::new("created-elsewhere", "/tmp/elsewhere");
         let state = test_support::build_test_app_state(vec![known.clone()]);
-        let read_epoch = state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
 
         reload_state_instances_from_disk(
             &state,
@@ -9085,7 +9190,9 @@ mod tests {
 
         // Invariant 8: capture the epoch BEFORE the disk read, the order every
         // production caller uses.
-        let read_epoch = state.delete_epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
         let file_watch = state.file_watch.clone();
         let fresh = tokio::task::spawn_blocking(move || load_all_instances(&file_watch))
             .await

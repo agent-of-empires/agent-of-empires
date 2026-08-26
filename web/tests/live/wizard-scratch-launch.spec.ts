@@ -4,7 +4,7 @@
 
 import { basename, dirname } from "node:path";
 import { test as base, expect } from "@playwright/test";
-import { spawnAoeServe, waitForSessions } from "../helpers/aoeServe";
+import { listSessions, spawnAoeServe, waitForSessions } from "../helpers/aoeServe";
 
 base("scratch happy path: launch creates a scratch-dir session", async ({ page }, testInfo) => {
   const serve = await spawnAoeServe({
@@ -39,6 +39,19 @@ base("scratch happy path: launch creates a scratch-dir session", async ({ page }
     // is "the parent dir is named scratch", expressed cross-platform.
     const projectPath = session.project_path as string;
     expect(basename(dirname(projectPath))).toBe("scratch");
+
+    // The row must STAY listed, not merely show up once. A `status_poll_loop`
+    // tick whose disk read started before the create persisted carries a
+    // snapshot without the new session, and the reload rebuilds the list
+    // wholesale from that snapshot, so the row used to vanish for a tick and
+    // a second read returned []. The server drops such a reload now
+    // (`mutation_epoch`). Span more than one 2s tick so a regression here is
+    // caught rather than merely made invisible by reading only once.
+    const deadline = Date.now() + 3_000;
+    while (Date.now() < deadline) {
+      await page.waitForTimeout(250);
+      expect(await listSessions(serve.baseUrl)).toHaveLength(1);
+    }
   } finally {
     await serve.stop();
   }

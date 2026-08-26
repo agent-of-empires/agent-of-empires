@@ -4422,7 +4422,7 @@ async fn purge_session_artifacts(
         // reload cannot slip between them. See invariant 8 on
         // `reload_state_instances_from_disk`.
         state
-            .delete_epoch
+            .mutation_epoch
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
     state.instance_locks.write().await.remove(id);

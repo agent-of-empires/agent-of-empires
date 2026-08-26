@@ -160,6 +160,13 @@ pub struct SessionService {
     /// Opt-in telemetry create counter, shared with
     /// `AppState.telemetry_session_creates`.
     pub telemetry_session_creates: Arc<std::sync::atomic::AtomicU32>,
+    /// Session-set membership epoch, shared with `AppState.mutation_epoch`.
+    /// Bumped under the `instances` write lock once a create is in both
+    /// `sessions.json` and `instances`, so a disk reload still carrying a
+    /// snapshot from before the create drops itself instead of replacing
+    /// `instances` with a `fresh` that never had the new row. See invariant 8
+    /// on `reload_state_instances_from_disk`.
+    pub mutation_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Owns the per-session ACP agent subprocesses, shared with
     /// `AppState.acp_supervisor`.
     #[cfg(feature = "serve")]
@@ -252,6 +259,7 @@ impl SessionService {
         instance_locks: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
         file_watch: Arc<crate::file_watch::FileWatchService>,
         telemetry_session_creates: Arc<std::sync::atomic::AtomicU32>,
+        mutation_epoch: Arc<std::sync::atomic::AtomicU64>,
         acp_supervisor: Arc<
             crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>,
         >,
@@ -262,6 +270,7 @@ impl SessionService {
             instance_locks,
             file_watch,
             telemetry_session_creates,
+            mutation_epoch,
             acp_supervisor,
             acp_event_store,
             create_in_flight: std::sync::Mutex::new(HashMap::new()),
@@ -276,12 +285,14 @@ impl SessionService {
         instance_locks: Arc<RwLock<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
         file_watch: Arc<crate::file_watch::FileWatchService>,
         telemetry_session_creates: Arc<std::sync::atomic::AtomicU32>,
+        mutation_epoch: Arc<std::sync::atomic::AtomicU64>,
     ) -> Self {
         Self {
             instances,
             instance_locks,
             file_watch,
             telemetry_session_creates,
+            mutation_epoch,
             create_in_flight: std::sync::Mutex::new(HashMap::new()),
             pending_drains: std::sync::Mutex::new(std::collections::HashSet::new()),
             persist_locks: RwLock::new(HashMap::new()),
