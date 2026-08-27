@@ -1132,6 +1132,11 @@ struct ReaderCtx {
     grid_gen: Arc<AtomicU64>,
 }
 
+fn stop_and_wake_reader(stop: &AtomicBool, sock_path: &std::path::Path) {
+    stop.store(true, Ordering::Relaxed);
+    let _ = UnixStream::connect(sock_path);
+}
+
 /// The channel's reader loop: accept the forwarder's connection, publish the
 /// writable half for input dispatch, then pump pane output into the vt100
 /// grid, waking viewers on every change. Runs on its own thread; exits on
@@ -1493,8 +1498,7 @@ impl VtChannel {
         let armed = deadline.run(&mut command).ok();
         if !armed.map(|o| o.status.success()).unwrap_or(false) {
             tracing::warn!(%target, "vt: tmux pipe-pane failed; falling back to capture");
-            stop.store(true, Ordering::Relaxed);
-            let _ = UnixStream::connect(&sock_path);
+            stop_and_wake_reader(&stop, &sock_path);
             let _ = reader.join();
             let _ = std::fs::remove_dir_all(&sock_dir);
             // Free the owner lock we claimed above so another process can arm
@@ -1513,10 +1517,10 @@ impl VtChannel {
         while !alive.load(Ordering::Relaxed) {
             if Instant::now() >= connect_deadline {
                 tracing::warn!(%target, "vt: forwarder did not connect; falling back to capture");
+                stop_and_wake_reader(&stop, &sock_path);
                 let mut command = crate::tmux::tmux_command();
                 command.args(["pipe-pane", "-t", &target]);
                 let _ = deadline.run(&mut command);
-                let _ = UnixStream::connect(&sock_path);
                 let _ = reader.join();
                 let _ = std::fs::remove_dir_all(&sock_dir);
                 session.release_vt_owner_with_deadline(&owner, deadline);
@@ -2586,6 +2590,27 @@ mod tests {
         assert!(channel.stop.load(Ordering::Relaxed));
         assert!(started.elapsed() < Duration::from_millis(500));
         drop(channel);
+
+        let late_dir = tempfile::tempdir().expect("late reader tempdir");
+        let sock_path = late_dir.path().join("late-reader.sock");
+        let listener = UnixListener::bind(&sock_path).expect("bind late reader");
+        let stop = Arc::new(AtomicBool::new(false));
+        let reader_stop = stop.clone();
+        let reader = std::thread::spawn(move || {
+            let _ = listener.accept();
+            let deadline = Instant::now() + Duration::from_millis(750);
+            while !reader_stop.load(Ordering::Relaxed) && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+        });
+        let started = Instant::now();
+        stop_and_wake_reader(&stop, &sock_path);
+        reader.join().expect("late reader exits");
+        assert!(stop.load(Ordering::Relaxed));
+        assert!(
+            started.elapsed() < Duration::from_millis(250),
+            "arm-timeout cleanup must stop a reader accepted after the deadline",
+        );
     }
 
     #[test]
