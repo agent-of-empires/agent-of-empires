@@ -624,8 +624,9 @@ fn claude_has_approval_prompt(recent: &[&str], recent_lower: &str) -> bool {
 /// predicate: each pairs it with a second signal rare enough in prose to carry
 /// the pair on its own.
 ///
-/// This narrows rather than closes. A pane quoting a menu with its cursor
-/// included still matches.
+/// This narrows rather than closes. A pane reproducing a menu verbatim, cursor
+/// and all, still matches; a markdown blockquote of one does not, since `>`
+/// ahead of the cursor is not stripped here.
 fn claude_line_is_selected_choice(line: &str) -> bool {
     let trimmed = line.trim_start();
     let Some(rest) = trimmed
