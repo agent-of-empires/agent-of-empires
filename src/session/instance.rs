@@ -3225,28 +3225,67 @@ impl Instance {
     }
 
     /// Whether at least one OTHER host-opencode instance shares this
-    /// session's exact project_path (canonicalized, mirroring the
-    /// exclusion-set walk). Only non-sandboxed opencode instances share the
-    /// global SQLite store: sandboxed sessions own instance-private stores
-    /// (#3317), and other tools scan their own distinct transcript dirs, so
-    /// neither can be confused with this store's freshest conversation.
+    /// session's OpenCode store *and* its canonicalized project_path.
+    ///
+    /// Scope: profiles without their own environment overrides all resolve to
+    /// the default OpenCode store (XDG/home path), so a same-directory peer
+    /// in any such profile is exactly as poisonous as a same-profile one.
+    /// Profiles carrying explicit environment overrides point elsewhere and
+    /// are skipped; if this session itself carries overrides, its store is
+    /// private to its own profile and only that profile is scanned.
+    ///
+    /// Sandboxed instances own instance-private stores (#3317) and other
+    /// tools scan their own distinct transcript dirs, so neither can be
+    /// confused with this store's freshest conversation.
+    ///
+    /// Fail-closed: if the profile registry or any in-scope store cannot be
+    /// read, treat the store as shared and skip the MRU capture — a skipped
+    /// rescan costs one resume; a wrong adoption loses a conversation.
     fn opencode_shares_store_with_peer(&self) -> bool {
         if self.is_sandboxed() {
             return false;
         }
-        let Ok(storage) = super::storage::Storage::new_unwatched(&self.effective_profile()) else {
-            return false;
-        };
-        let Ok(instances) = storage.load() else {
-            return false;
-        };
         let canon = super::capture::canonicalize_or_raw(&self.project_path);
-        instances.iter().any(|i| {
-            i.id != self.id
-                && i.tool == "opencode"
-                && !i.is_sandboxed()
-                && super::capture::canonicalize_or_raw(&i.project_path) == canon
-        })
+        let own_profile = self.effective_profile();
+        let own_env_overridden = !self.profile_host_environment().is_empty();
+        let profiles: Vec<String> = if own_env_overridden {
+            vec![own_profile.clone()]
+        } else {
+            match crate::session::list_profiles() {
+                Ok(mut ps) => {
+                    if !ps.iter().any(|p| p == &own_profile) {
+                        ps.push(own_profile.clone());
+                    }
+                    ps
+                }
+                Err(_) => return true,
+            }
+        };
+        for profile in profiles {
+            if profile != own_profile
+                && !super::profile_config::resolve_config_or_warn(&profile)
+                    .environment
+                    .is_empty()
+            {
+                // Explicit override => different store, not in scope.
+                continue;
+            }
+            let Ok(storage) = super::storage::Storage::new_unwatched(&profile) else {
+                return true;
+            };
+            let Ok(instances) = storage.load() else {
+                return true;
+            };
+            if instances.iter().any(|i| {
+                i.id != self.id
+                    && i.tool == "opencode"
+                    && !i.is_sandboxed()
+                    && super::capture::canonicalize_or_raw(&i.project_path) == canon
+            }) {
+                return true;
+            }
+        }
+        false
     }
 
     /// Whether another AoE session shares this one's Kimi store, which makes
