@@ -16308,6 +16308,18 @@ mod default_attach_mode {
         );
     }
 
+    #[cfg(feature = "serve")]
+    #[test]
+    #[serial]
+    fn send_message_opens_structured_view() {
+        let (mut env, id) = structured_session_env();
+        let action = env.view.handle_key(key(KeyCode::Char('m')), None);
+        assert!(
+            matches!(&action, Some(Action::OpenStructuredView(returned_id)) if returned_id == &id),
+            "m must open the structured composer for the selected session, got {action:?}"
+        );
+    }
+
     /// Render the whole home screen into a string for placeholder /
     /// badge assertions.
     fn render_home(env: &mut TestEnv) -> String {

@@ -2859,7 +2859,14 @@ impl HomeView {
                     }
                 }
             }
-            ActionId::SendMessage => self.open_send_message_dialog(),
+            ActionId::SendMessage => {
+                #[cfg(feature = "serve")]
+                if let Some(id) = self.selected_structured_session() {
+                    self.exit_live_send_if_active();
+                    return Some(Action::OpenStructuredView(id));
+                }
+                self.open_send_message_dialog()
+            }
             ActionId::RespondToPermission => self.open_permission_response_dialog(),
             ActionId::Stop => self.stop_selected(),
             ActionId::Delete => self.open_delete_for_selected(),
