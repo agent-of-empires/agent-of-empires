@@ -2274,20 +2274,32 @@ fn login_shell_probe(agents: &[&crate::agents::AgentDef]) -> std::collections::H
 /// [`invalidate_agent_availability`].
 static AGENT_AVAILABILITY: RwLock<Option<HashMap<String, bool>>> = RwLock::new(None);
 
-/// Drop the memoized availability results so the next probe re-runs. Called
-/// when the user explicitly asks for a recheck (they just installed an agent).
-pub fn invalidate_agent_availability() {
-    if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
-        *cache = None;
-    }
-}
-
 /// Serializes cache population so a set of concurrent cold callers costs one
 /// login shell between them rather than one each. `GET /api/agents` runs
 /// `AvailableTools::detect` in `spawn_blocking`, so a dashboard with several
 /// tabs open can issue simultaneous probes; the TUI's settings rebuild can
 /// land in the same window. Held only around the probe, never around a read.
 static AGENT_PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Drop the memoized availability results so the next probe re-runs. Called
+/// when the user explicitly asks for a recheck (they just installed an agent).
+///
+/// Takes `AGENT_PROBE_LOCK` first so an in-flight probe cannot republish its
+/// pre-install results after the clear. Without that, Recheck
+/// (`invalidate` then `detect`) could observe a probe that started before the
+/// install finish writing in between, find the memo populated, skip its own
+/// probe, and report the freshly installed agent as still unavailable, which
+/// is the one thing Recheck exists to prevent. The wait is bounded by the
+/// probe already running, and the caller is about to pay for a probe anyway.
+///
+/// Lock order matches `probe_agents_available` (probe lock, then the memo), so
+/// the two cannot deadlock.
+pub fn invalidate_agent_availability() {
+    let _probe_guard = AGENT_PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
+        *cache = None;
+    }
+}
 
 /// Names from `agents` that the memo already answers, plus the ones it does
 /// not know about yet. Split under a single read lock.
@@ -2421,6 +2433,61 @@ impl AvailableTools {
 
 #[cfg(test)]
 mod tests {
+    /// Recheck must not race an in-flight probe. `invalidate` has to wait for
+    /// the probe holding `AGENT_PROBE_LOCK` to publish and then clear, or that
+    /// probe's pre-install results survive the clear, the following `detect`
+    /// finds the memo populated, skips its own probe, and reports a freshly
+    /// installed agent as still missing.
+    #[test]
+    #[serial_test::serial]
+    fn invalidate_agent_availability_waits_for_an_in_flight_probe() {
+        let name = crate::agents::AGENTS[0].name.to_string();
+        let restore = AGENT_AVAILABILITY.read().ok().and_then(|c| c.clone());
+
+        let seed = || {
+            if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
+                let map = cache.get_or_insert_with(HashMap::new);
+                map.insert(name.clone(), false);
+            }
+        };
+        let populated = || {
+            AGENT_AVAILABILITY
+                .read()
+                .ok()
+                .and_then(|c| c.as_ref().map(|m| !m.is_empty()))
+                .unwrap_or(false)
+        };
+
+        seed();
+        assert!(populated(), "seeded memo");
+
+        // Stand in for a probe mid-login-shell: holds the probe lock, has not
+        // written yet.
+        let probe_guard = AGENT_PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let invalidating = std::thread::spawn(invalidate_agent_availability);
+
+        // While the probe holds the lock the memo must stand. Polled rather
+        // than slept once, so the thread has ample chance to reach the lock.
+        for _ in 0..25 {
+            assert!(
+                populated(),
+                "invalidate cleared the memo without waiting for the in-flight probe"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(4));
+        }
+
+        drop(probe_guard);
+        invalidating.join().expect("invalidate thread");
+        assert!(
+            !populated(),
+            "invalidate must clear once the in-flight probe releases the lock"
+        );
+
+        if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
+            *cache = restore;
+        }
+    }
+
     /// The memo re-read that makes queueing behind another caller's login
     /// shell free. `probe_agents_available` partitions once before taking
     /// `AGENT_PROBE_LOCK` and again after; without the second partition a
