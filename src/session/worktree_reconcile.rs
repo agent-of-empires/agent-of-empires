@@ -15,7 +15,10 @@
 //!     git listing per session per load to detect it is not worth it.
 //!   - **Never guesses.** git normally forbids two worktrees on one branch, but
 //!     a `--force`d or hand-edited repo can produce it. Two live candidates
-//!     leave the row alone rather than picking one.
+//!     leave the row alone rather than picking one. A lone candidate that
+//!     another session already records is refused for the same reason: git
+//!     only forbids the second worktree while the first registration is live,
+//!     so a pruned session's branch can legally be taken by a later checkout.
 //!   - **Rewrites a pointer, nothing else.** Unlike the trash relocation in
 //!     [`crate::session::trash`], which moves a directory and therefore needs a
 //!     lifecycle reservation, this only corrects a string to match where git
@@ -86,13 +89,16 @@ fn select_live_worktree(
     // Repointing a managed session there would hand its agent the user's
     // primary checkout to work in. Same canonicalize-and-compare guard
     // `crate::git::cleanup::remove_worktree_dir` applies before deleting a
-    // directory.
-    let main = main_repo.canonicalize().ok();
+    // directory, down to falling back on the path as written when it cannot
+    // be canonicalized, so an unresolvable main repo still excludes itself.
+    let main = main_repo
+        .canonicalize()
+        .unwrap_or_else(|_| main_repo.to_path_buf());
     let mut candidates: Vec<PathBuf> = entries
         .iter()
         .filter(|entry| !entry.is_detached && entry.branch.as_deref() == Some(branch))
         .filter_map(|entry| entry.path.canonicalize().ok())
-        .filter(|path| main.as_deref() != Some(path.as_path()))
+        .filter(|path| path != &main)
         .collect();
     candidates.sort();
     candidates.dedup();
@@ -183,11 +189,28 @@ pub fn reconcile_and_persist(
             let id = inst.id.clone();
             let stale = inst.project_path.clone();
             let new_path = found.to_string_lossy().into_owned();
-            // Compare and set. The git lookup runs without holding the storage
-            // lock, so a peer process could have renamed or trashed this
-            // session in the meantime; its path is fresher than ours and must
-            // not be clobbered with a location we resolved from the old one.
+            // Both guards below need the storage lock the git lookup ran
+            // without, so they live inside the update rather than beside it.
+            let mut claimed_by: Option<String> = None;
             let applied = storage.update(|instances, _groups| {
+                // Never adopt a checkout another session already records. git
+                // forbids a second worktree on a branch only while the first
+                // registration is live, so once this session's entry is pruned
+                // a fresh checkout of the branch is legal and the branch-keyed
+                // lookup lands this row on it. Two rows naming one directory
+                // means trashing or deleting the stale one takes the live
+                // one's checkout with it, so leave the stale path alone.
+                if let Some(owner) = instances.iter().find(|c| {
+                    c.id != id
+                        && Path::new(&c.project_path).canonicalize().ok().as_deref()
+                            == Some(found.as_path())
+                }) {
+                    claimed_by = Some(owner.id.clone());
+                    return Ok(false);
+                }
+                // Compare and set: a peer process could have renamed or
+                // trashed this session while the lookup ran, and its path is
+                // fresher than a location we resolved from the old one.
                 let Some(stored) = instances.iter_mut().find(|c| c.id == id) else {
                     return Ok(false);
                 };
@@ -197,6 +220,17 @@ pub fn reconcile_and_persist(
                 stored.project_path = new_path.clone();
                 Ok(true)
             })?;
+            if let Some(owner) = claimed_by {
+                tracing::warn!(
+                    target: "session.worktree",
+                    session = %inst.id,
+                    branch = %info.branch,
+                    owner = %owner,
+                    candidate = %found.display(),
+                    "the only live checkout of the branch already belongs to another session; refusing to adopt it"
+                );
+                return Ok(WorktreePathResolution::Current);
+            }
             if !applied {
                 tracing::info!(
                     target: "session.worktree",

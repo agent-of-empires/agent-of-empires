@@ -667,3 +667,79 @@ fn resolve_reports_missing_when_git_cannot_place_the_branch() {
         WorktreePathResolution::Current
     );
 }
+
+/// A pruned registration frees the branch, so a later checkout of it belongs to
+/// somebody else. The reconcile refuses that lone candidate rather than pointing
+/// two sessions at one directory, where trashing or deleting the stale row would
+/// take the live row's checkout with it.
+///
+/// `#[serial]` for the same reason as the test above: `setup_temp_home` mutates
+/// the process-global `HOME` and `XDG_CONFIG_HOME` that `Storage` resolves its
+/// app dir from.
+#[test]
+#[serial]
+fn reconcile_refuses_a_checkout_another_session_records() {
+    let (repo_dir, _repo, _config_dir) = setup_test_environment();
+    let _temp_home = crate::common::setup_temp_home();
+    let git_wt = GitWorktree::new(repo_dir.path().to_path_buf()).unwrap();
+
+    let stale_dir = repo_dir.path().join("first-session");
+    git_wt
+        .create_worktree("shared-branch", &stale_dir, true, None)
+        .unwrap();
+    let info = managed_info("shared-branch", repo_dir.path());
+
+    // The first checkout is removed by hand and its registration pruned, which
+    // is what lets a second worktree take the branch at all.
+    git_in(
+        repo_dir.path(),
+        &["worktree", "unlock", stale_dir.to_str().unwrap()],
+    );
+    std::fs::remove_dir_all(&stale_dir).unwrap();
+    git_in(repo_dir.path(), &["worktree", "prune"]);
+
+    // A later session (or the user's own shell) checks the branch out again.
+    let live_dir = repo_dir.path().join("second-session");
+    git_in(
+        repo_dir.path(),
+        &[
+            "worktree",
+            "add",
+            live_dir.to_str().unwrap(),
+            "shared-branch",
+        ],
+    );
+    let live_canonical = live_dir.canonicalize().unwrap();
+    // git left the branch discoverable, so the lookup does find a lone
+    // candidate; only the ownership check keeps it from being adopted.
+    assert_eq!(
+        resolve_worktree_path(&git_wt.list_worktrees().unwrap(), &stale_dir, &info),
+        WorktreePathResolution::Moved(live_canonical.clone())
+    );
+
+    let mut stale = Instance::new("First Session", stale_dir.to_str().unwrap());
+    stale.worktree_info = Some(info.clone());
+    let mut live = Instance::new("Second Session", live_canonical.to_str().unwrap());
+    live.worktree_info = Some(info.clone());
+    let storage = Storage::new_unwatched("worktree-reconcile-claimed-profile").unwrap();
+    let seeded = vec![stale.clone(), live.clone()];
+    storage
+        .update(|i, g| {
+            *i = seeded.to_vec();
+            *g = GroupTree::new_with_groups(&seeded, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let mut reconciled = stale.clone();
+    assert_eq!(
+        reconcile_and_persist(&storage, &mut reconciled, &mut Default::default()).unwrap(),
+        WorktreePathResolution::Current
+    );
+    assert_eq!(reconciled.project_path, stale.project_path);
+    let reloaded = storage.load().unwrap();
+    let stale_row = reloaded.iter().find(|i| i.id == stale.id).unwrap();
+    assert_eq!(stale_row.project_path, stale.project_path);
+    let live_row = reloaded.iter().find(|i| i.id == live.id).unwrap();
+    assert_eq!(live_row.project_path, live.project_path);
+}
