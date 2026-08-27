@@ -3217,10 +3217,26 @@ impl Instance {
             &self.project_path,
             &self.tool,
             self.tool == "claude"
+                || self.tool == "opencode"
                 || (matches!(self.tool.as_str(), "codex" | "kimi") && !self.is_sandboxed()),
             &self.effective_profile(),
             &self.retroactive_capture_excludes,
         )
+    }
+
+    /// Whether at least one OTHER AoE instance shares this session's exact
+    /// project_path (canonicalized, mirroring the exclusion-set walk).
+    fn opencode_shares_project_path(&self) -> bool {
+        let Ok(storage) = super::storage::Storage::new_unwatched(&self.effective_profile()) else {
+            return false;
+        };
+        let Ok(instances) = storage.load() else {
+            return false;
+        };
+        let canon = super::capture::canonicalize_or_raw(&self.project_path);
+        instances.iter().any(|i| {
+            i.id != self.id && super::capture::canonicalize_or_raw(&i.project_path) == canon
+        })
     }
 
     /// Whether another AoE session shares this one's Kimi store, which makes
@@ -3264,6 +3280,16 @@ impl Instance {
                 }
             }
             "opencode" => {
+                // Multi-session-same-cwd guard: with >1 AoE instance on this
+                // project_path the launch-time freshest-MRU scan cannot
+                // attribute the directory's newest conversation to THIS
+                // session (#2344/#2708 family). Resume trusts the stored sid.
+                if self.opencode_shares_project_path() {
+                    tracing::debug!(target: "session.capture",
+                        instance = %self.id,
+                        "skipping opencode retroactive capture: project_path shared");
+                    return None;
+                }
                 let exclusion = self.retroactive_capture_exclusion_set();
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
@@ -17421,6 +17447,104 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             inst.status,
             Status::Waiting,
             "Claude blocked on an approval prompt must reconcile Running -> Waiting (#1913)"
+        );
+    }
+}
+
+#[cfg(test)]
+mod opencode_same_cwd_clobbering_tests {
+    use super::*;
+    use std::path::PathBuf;
+    use tempfile::tempdir;
+
+    const OC_SID_SELF: &str = "019342ab-1234-7def-8901-oc0000000001";
+    const OC_SID_PEER: &str = "019342ab-1234-7def-8901-oc0000000002";
+
+    /// Redirects HOME/XDG_CONFIG_HOME into a temp dir while a serial test runs.
+    struct TestHome {
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+    }
+
+    impl TestHome {
+        fn new(dir: &std::path::Path) -> Self {
+            let mut saved = Vec::new();
+            for key in ["HOME", "XDG_CONFIG_HOME"] {
+                saved.push((key, std::env::var_os(key)));
+            }
+            std::env::set_var("HOME", dir);
+            std::env::set_var("XDG_CONFIG_HOME", dir.join(".config"));
+            Self { saved }
+        }
+    }
+
+    impl Drop for TestHome {
+        fn drop(&mut self) {
+            for (key, val) in self.saved.drain(..) {
+                match val {
+                    Some(v) => std::env::set_var(key, v),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn seed_two(profile: &str, me: &Instance, peer: &Instance) {
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        let owned = vec![me.clone(), peer.clone()];
+        storage
+            .update(|instances, groups| {
+                *instances = owned.clone();
+                *groups = crate::session::GroupTree::new_with_groups(&owned, &[]).get_all_groups();
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn exclusion_set_includes_inactive_same_cwd_peer_for_opencode() {
+        let temp = tempdir().unwrap();
+        let _home = TestHome::new(temp.path());
+
+        let profile = "oc-cwd-excl";
+        let mut me = Instance::new("me-row", "/tmp/aoe-shared-cwd-a");
+        me.source_profile = profile.to_string();
+        me.tool = "opencode".to_string();
+        me.agent_session_id = Some(OC_SID_SELF.to_string());
+
+        let mut peer = Instance::new("peer-row", "/tmp/aoe-shared-cwd-a");
+        peer.source_profile = profile.to_string();
+        peer.tool = "opencode".to_string();
+        peer.status = crate::session::Status::Stopped;
+        peer.agent_session_id = Some(OC_SID_PEER.to_string());
+        seed_two(profile, &me, &peer);
+
+        let exclusion = me.retroactive_capture_exclusion_set();
+        assert!(
+            exclusion.contains(OC_SID_PEER),
+            "stopped same-cwd opencode peer sid must be excluded from retroactive capture"
+        );
+    }
+
+    #[test]
+    fn retroactive_capture_is_skipped_when_project_path_is_shared() {
+        let temp = tempdir().unwrap();
+        let _home = TestHome::new(temp.path());
+
+        let profile = "oc-cwd-skip";
+        let mut me = Instance::new("me-row", "/tmp/aoe-shared-cwd-b");
+        me.source_profile = profile.to_string();
+        me.tool = "opencode".to_string();
+        me.agent_session_id = Some(OC_SID_SELF.to_string());
+
+        let mut peer = Instance::new("peer-row", "/tmp/aoe-shared-cwd-b");
+        peer.source_profile = profile.to_string();
+        peer.tool = "opencode".to_string();
+        seed_two(profile, &me, &peer);
+
+        assert_eq!(
+            me.try_retroactive_capture(),
+            None,
+            "shared project_path: resume must trust the stored sid instead of the dir MRU scan"
         );
     }
 }
