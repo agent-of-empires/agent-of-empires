@@ -11,10 +11,11 @@
 //! - `{"kind":"heartbeat"}`: the app-level keepalive the daemon emits
 //!   on every ping tick (`PING_INTERVAL` in `src/server/acp_ws.rs`).
 //!   Carries no state, so the reader loop drops it without waking the
-//!   consumer. Any new `kind` sentinel the daemon grows must be added
-//!   here too: an unrecognised sentinel falls through to the frame
-//!   parse and surfaces as [`WsError::Parse`], which consumers treat
-//!   as a dropped socket. See #2287 and `parse_text`.
+//!   consumer. A frame carrying any other `kind` is a control sentinel; a
+//!   `kind` this build does not recognize is ignored (a debug log, no wake),
+//!   so a newer daemon that grows a sentinel cannot push an older client into
+//!   a tight reconnect loop. Only a `kind`-less object is parsed as a raw
+//!   event frame. See #2287 and `parse_text`.
 //!
 //! Auth: the bearer token is sent as a `?token=<>` query string on the
 //! WebSocket URL. Most WS clients do not surface custom headers cleanly,
@@ -300,7 +301,27 @@ fn parse_text(raw: &str) -> Result<Option<WsMessage>, WsError> {
                     unchanged: frame.unchanged,
                 }));
             }
-            _ => {}
+            // A real event frame carries no top-level `kind`: the custom
+            // `AcpBroadcastFrame` Serialize emits only session_id/seq/event.
+            // So fall through to the frame parse only when `kind` is absent.
+            None => {}
+            // Any other `kind` is a control sentinel this client build does
+            // not recognize. A newer daemon can grow sentinels; treating an
+            // unknown one as a dropped socket pins a worker in a tight
+            // reconnect loop and surfaces the misleading "missing field
+            // `event`" parse error (the control frame has session_id/seq but
+            // no event). The reduced_state / transcript projections are
+            // idempotently re-sent on every event and on connect, so skipping
+            // an unknown sentinel self-heals on the next frame. Ignore it,
+            // exactly like the heartbeat keepalive, instead of reconnecting.
+            Some(other) => {
+                debug!(
+                    target: "acp.client.ws",
+                    kind = other,
+                    "ignoring unrecognized ws control frame (forward-compatible skip)"
+                );
+                return Ok(None);
+            }
         }
     }
     let frame: AcpBroadcastFrame = serde_json::from_str(raw).map_err(|e| {
@@ -403,17 +424,22 @@ mod tests {
         assert!(ws_url(&e, "s-1", 0, true).starts_with("wss://"));
     }
 
-    /// How each `{"kind":...}` sentinel the daemon can send must classify.
+    /// How each `{"kind":...}` frame the daemon can send must classify, and
+    /// how a `kind`-less object must classify.
     ///
-    /// The heartbeat row is the #3171 regression. The daemon emits
-    /// `{"kind":"heartbeat"}` every `PING_INTERVAL` (30s); before this it
-    /// fell through to the `AcpBroadcastFrame` parse, failed on the missing
-    /// `session_id` field, and surfaced as `WsError::Parse`, which
+    /// The heartbeat row is the #3171 regression: the daemon emits
+    /// `{"kind":"heartbeat"}` every `PING_INTERVAL` (30s); before it was
+    /// handled it fell through to the `AcpBroadcastFrame` parse, failed on a
+    /// missing field, and surfaced as `WsError::Parse`, which
     /// `tui::structured_view` treats as a dropped socket: an error toast plus
-    /// a full reconnect every 30 seconds on any quiet session. Asserted
-    /// against the server's literal wire bytes, kept stable by
-    /// `heartbeat_frame_shape_is_stable` in `src/server/acp_ws.rs`, so drift
-    /// on either side fails one of the two tests.
+    /// a full reconnect every 30 seconds on any quiet session.
+    ///
+    /// The `something_new` rows are the general case: a `frames=0` client
+    /// receives only `kind`-tagged control frames, so any `kind` this build
+    /// does not recognize (a newer daemon's sentinel) must be ignored rather
+    /// than fall through to the event-frame parse. That fall-through failed
+    /// with "missing field `event`" and drove acp.tui.ws into a tight
+    /// reconnect loop against the connect-snapshot control frame.
     #[derive(Debug)]
     enum Expect {
         Lagged,
@@ -429,10 +455,23 @@ mod tests {
             // Keepalive: no consumer-visible state, must not wake the
             // consumer and must not read as a dropped socket.
             (r#"{"kind":"heartbeat"}"#, Expect::Ignored),
-            // An unrecognised sentinel must still surface as an error rather
-            // than being silently swallowed: the client cannot know whether
-            // it carried state it needed.
-            (r#"{"kind":"something_new"}"#, Expect::ParseError),
+            // A `kind` this build does not recognize (a newer daemon's
+            // sentinel) is ignored, not surfaced as an error. Before this it
+            // fell through to the event-frame parse, failed with "missing
+            // field `event`", and drove acp.tui.ws into a tight reconnect
+            // loop on every quiet session.
+            (r#"{"kind":"something_new"}"#, Expect::Ignored),
+            // The reported shape: a control sentinel from a newer daemon
+            // carrying session_id/seq but no event. Must be ignored, never a
+            // "missing field `event`" parse error.
+            (
+                r#"{"kind":"something_new","session_id":"s-1","seq":9}"#,
+                Expect::Ignored,
+            ),
+            // A `kind`-less object that is not a valid event frame is
+            // genuinely undecodable, not a forward-compat sentinel, so it
+            // still errors and the consumer treats it as a bad socket.
+            (r#"{"not_a_frame":true}"#, Expect::ParseError),
         ];
         for (raw, expect) in cases {
             let got = parse_text(raw);
