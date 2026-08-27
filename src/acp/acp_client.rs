@@ -8165,6 +8165,10 @@ async fn run_connection_task<W, R>(
 
                         loop {
                             tokio::select! {
+                                // Send the prompt before a queued Cancel. A
+                                // notification delivered first is ignored by agents
+                                // that have not yet started the prompt it should stop.
+                                biased;
                                 res = &mut prompt_fut, if !simulate_orphan => {
                                     match res {
                                         Ok(resp) => {
