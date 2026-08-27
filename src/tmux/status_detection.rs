@@ -612,8 +612,10 @@ fn claude_has_approval_prompt(recent: &[&str], recent_lower: &str) -> bool {
 /// live menu from an assistant-authored list. Claude highlights exactly one
 /// option of a menu it is blocked on.
 ///
-/// Only `\u{276f}` counts. A `>` is how a markdown blockquote and quoted
-/// terminal output render, which is the same reason
+/// `\u{276f}` and `\u{203a}` both count, matching the pair the codex and qwen
+/// detectors already accept ([`codex_line_has_numbered_choice_cursor`],
+/// `detect_qwen_status`). A `>` does not: that is how a markdown blockquote and
+/// quoted terminal output render, which is the same reason
 /// [`claude_trust_choice_option_text`] rejects one.
 ///
 /// Narrower than [`claude_line_is_numbered_choice`], and used only by the
@@ -626,7 +628,10 @@ fn claude_has_approval_prompt(recent: &[&str], recent_lower: &str) -> bool {
 /// included still matches.
 fn claude_line_is_selected_choice(line: &str) -> bool {
     let trimmed = line.trim_start();
-    let Some(rest) = trimmed.strip_prefix('\u{276f}') else {
+    let Some(rest) = trimmed
+        .strip_prefix('\u{276f}')
+        .or_else(|| trimmed.strip_prefix('\u{203a}'))
+    else {
         return false;
     };
     claude_line_is_numbered_choice(rest)
@@ -3399,6 +3404,18 @@ enter to select · esc to cancel";
 ";
 
     #[test]
+    fn claude_approval_prompt_reads_the_alternate_cursor_glyph() {
+        // U+203A is the other selection cursor in use here: the codex helpers
+        // and `detect_qwen_status` both accept it beside U+276F.
+        let content = "\
+  Do you want to proceed?
+  \u{203a} 1. Yes
+    2. No
+\u{2736} Herding\u{2026} (53s \u{b7} \u{2193} 7.0k tokens)";
+        assert_eq!(detect_claude_status(content), Status::Waiting);
+    }
+
+    #[test]
     fn claude_prose_with_a_numbered_list_is_not_waiting() {
         // A blocking prompt outranks the running signal (#1913), so whatever
         // reads as a menu wins over the spinner below it. The cursor is what
@@ -3419,7 +3436,7 @@ enter to select · esc to cancel";
         assert_eq!(detect_claude_status(content), Status::Running);
 
         // A markdown blockquote renders `>` ahead of the number, which is why
-        // only `\u{276f}` counts as a cursor here.
+        // it is not one of the two glyphs above.
         let quoted = "\
 \u{25cf} The menu it showed was:
 > 1. Yes
