@@ -4442,6 +4442,80 @@ async fn purge_session_artifacts(
     Ok((true, messages))
 }
 
+/// Heal managed worktree sessions whose recorded `project_path` no longer
+/// exists because the directory was moved outside aoe, rewriting it from git's
+/// own worktree listing. Runs once on daemon startup, so every later
+/// path-derived decision (worker cwd, diff, the rename pre-flight gates) acts
+/// on the live location. See #2002.
+///
+/// The recorded path existing short-circuits the whole pass inside
+/// [`crate::session::worktree_reconcile::reconcile_and_persist`], so a healthy
+/// session costs one `stat` and never shells out to git. Every non-move outcome
+/// leaves the row untouched.
+pub(crate) async fn reconcile_worktree_paths(state: &Arc<AppState>) {
+    let candidates: Vec<String> = {
+        let instances = state.instances.read().await;
+        instances
+            .iter()
+            .filter(|i| i.worktree_info.as_ref().is_some_and(|wt| wt.managed_by_aoe))
+            .map(|i| i.id.clone())
+            .collect()
+    };
+    for id in candidates {
+        let lock = state.instance_lock(&id).await;
+        let _guard = lock.lock().await;
+
+        let snapshot = {
+            let instances = state.instances.read().await;
+            match instances.iter().find(|instance| instance.id == id) {
+                Some(instance) => instance.clone(),
+                None => continue,
+            }
+        };
+        // `exists()` and the git listing are blocking filesystem work, so the
+        // whole reconcile runs off the runtime and only the resulting path is
+        // reapplied under the write lock.
+        let reconciled = match tokio::task::spawn_blocking(move || {
+            let mut instance = snapshot;
+            // An empty profile resolves to the *default* profile rather than
+            // failing, which would aim the persist at another profile's
+            // sessions.json. The compare-and-set inside the reconcile makes
+            // that a no-op, but refuse outright rather than lean on it.
+            anyhow::ensure!(
+                !instance.source_profile.is_empty(),
+                "session has no source profile; refusing worktree path reconciliation"
+            );
+            let storage = crate::session::Storage::open_unwatched(&instance.source_profile)?;
+            let resolution = crate::session::worktree_reconcile::reconcile_and_persist(
+                &storage,
+                &mut instance,
+                &mut Default::default(),
+            )?;
+            anyhow::Ok((resolution, instance))
+        })
+        .await
+        {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(error)) => {
+                tracing::warn!(target: "http.api.sessions", session = %id, "worktree path reconcile skipped: {error}");
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(target: "http.api.sessions", session = %id, "worktree path reconcile join failed: {error}");
+                continue;
+            }
+        };
+        let crate::session::worktree_reconcile::WorktreePathResolution::Moved(_) = reconciled.0
+        else {
+            continue;
+        };
+        let mut instances = state.instances.write().await;
+        if let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) {
+            instance.project_path = reconciled.1.project_path;
+        }
+    }
+}
+
 /// Relocate any trashed managed worktree still sitting in the active dir into
 /// the holding area, and heal a pointer left stale by a crash between the move
 /// and its persist. Backfills rows trashed before relocation existed. Runs

@@ -106,6 +106,17 @@ This supports only sessions whose worktree is aoe-managed (`worktree_info.manage
 
 The new directory and branch persist across reload and restart. See #1723 and #1927.
 
+### When the Directory Moves Outside aoe
+
+aoe records a worktree session's directory at creation, so relocating it from another shell leaves that record stale. aoe repairs it from `git worktree list`, matching on the session's branch: at TUI startup, at `aoe serve` startup, and on each CLI workdir edit. If exactly one live worktree checks out the branch, the recorded path is rewritten to it and the session keeps working. If two do, aoe leaves the path alone rather than guessing which checkout is yours.
+
+Two caveats:
+
+- aoe locks the worktrees it creates, so an out-of-band `git worktree move` needs `git worktree unlock <path>` first.
+- A plain `mv` is not recoverable on its own. It leaves git's record naming the old path, which is indistinguishable from a deleted checkout, so aoe reports the worktree as missing and changes nothing. Run `git worktree repair <new-path>` from the repo to bring git's record up to date, and aoe will then find it.
+
+Reconciliation is point-in-time, not a watcher: a directory moved while a TUI or `aoe serve` is already running stays stale for that process until it restarts. See #2002.
+
 ## Configuration
 
 ```toml

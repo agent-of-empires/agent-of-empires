@@ -115,13 +115,19 @@ resolves, or symlink the binary into a standard dir (`/usr/local/bin`,
 ### "Project path no longer exists" banner
 
 The session's working directory was renamed, moved, or deleted out from under
-`aoe serve` (most often a `git worktree move` or a manual `mv`). Two ways to
+`aoe serve` (most often a `git worktree move` or a manual `mv`). Three ways to
 recover:
 
-1. **Restore the directory at the path the banner shows** (e.g.
+1. **Restart `aoe serve`.** For an aoe-managed worktree relocated with
+   `git worktree move`, the daemon repairs `project_path` from
+   `git worktree list` on startup and the banner clears on its own. This does
+   not cover a plain `mv` (see the worktrees guide), does not happen while the
+   daemon keeps running, and is skipped entirely on a read-only daemon, which
+   never writes `sessions.json`.
+2. **Restore the directory at the path the banner shows** (e.g.
    `git worktree move <new> <old>`, or recreate the dir), then click **Retry**.
    Transcript continuity is preserved.
-2. **Stop `aoe serve`**, edit `project_path` for this session in
+3. **Stop `aoe serve`**, edit `project_path` for this session in
    `~/.agent-of-empires/profiles/<profile>/sessions.json` to point at the new
    location (update `worktree_info.branch` too if the branch was renamed), then
    start `aoe serve` again. History and `acp_session_id` are preserved; the

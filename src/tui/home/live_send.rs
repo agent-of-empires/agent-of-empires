@@ -949,15 +949,9 @@ fn capture_composited_over_grid(
         return capture_composited(name, lines, forward_empty);
     };
 
-    // The cursor is pane 0's and pane relative, while the painted grid is
-    // the whole window; the two agree only while pane 0 sits at the window
-    // origin, which a `pane-border-status` row breaks (#3515). Consumers are
-    // expected to translate by the origin carried on `composite_pane0`; this
-    // path feeds the TUI preview, whose cursor painting and mouse mapping do
-    // not yet (see `map_live_preview_cursor` and the input.rs residual).
-    // What must be restated here is the frame the cursor is measured
-    // against: the renderer anchors it by `pane_height` against the painted
-    // line count, which is now the whole window rather than one pane.
+    // The sampled cursor stays pane relative after its rows are painted on
+    // the window grid. Rebase only the frame dimensions and carry pane 0's
+    // rectangle so the renderer can add its origin.
     cursor.pane_height = layout.window_height;
     cursor.pane_width = layout.window_width;
     // A composite carries no scrollback (panes have independent histories), so

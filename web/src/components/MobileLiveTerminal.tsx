@@ -986,9 +986,7 @@ export function MobileLiveTerminal({
       const visualRow = Math.floor((clientY - gridTop) / lineH) - effectiveSpacerLines;
       const firstScreenLine = Math.max(0, lines.length - screenRows);
       const screenTopVisual = visual.lineStartRow[firstScreenLine] ?? 0;
-      // The hovered cell is on the window grid; the app receives pane 0
-      // coordinates, so the inverse projection subtracts pane 0's origin
-      // (#3515).
+      // Convert the hovered window cell back into pane 0 coordinates.
       return pointerPaneCell(compositeCol, visualRow - screenTopVisual, pane0);
     },
     [charW, lineH, renderCols, screenRows, effectiveSpacerLines, lines.length, visual, frame?.pane0],

@@ -194,19 +194,24 @@ pub(crate) fn tmux_command() -> Command {
     cmd
 }
 
-/// Like [`tmux_command`], but pins `LC_ALL=C` so tmux's connection-failure
+/// Like [`tmux_command`], but pins `LC_MESSAGES=C` so tmux's connection-failure
 /// messages on stderr stay stable English for callers that match them. tmux's
 /// `client.c` prints `error connecting to <socket> (strerror(errno))` for a
 /// non-`ECONNREFUSED` connect failure, and glibc localizes `strerror` by
 /// `LC_MESSAGES`, so on a non-English host the `(No such file or directory)`
-/// ENOENT marker for an absent socket (#3337) would not match. Used by the
-/// status-query callers (which classify via [`tmux_no_server_running`]) and by
-/// `kill_session_if_present`. NOT folded into [`tmux_command`]: the
-/// interactive attach/switch-client/capture-pane paths must keep the user's
-/// locale for UTF-8 and status-bar rendering.
+/// ENOENT marker for an absent socket (#3337) would not match. `LC_ALL` is
+/// removed so it cannot override that. Global `-u` forces UTF-8 session names
+/// even when the caller has `LC_CTYPE=C` or when `LC_ALL` was the only UTF-8
+/// locale source. Used by the status-query callers (which classify via
+/// [`tmux_no_server_running`]) and by `kill_session_if_present`. NOT folded into
+/// [`tmux_command`]: the interactive attach/switch-client/capture-pane paths must
+/// keep the user's locale for UTF-8 and status-bar rendering, and `-u` would
+/// assert UTF-8 to a terminal that may not be.
 pub(crate) fn tmux_query_command() -> Command {
     let mut cmd = tmux_command();
-    cmd.env("LC_ALL", "C");
+    cmd.arg("-u");
+    cmd.env_remove("LC_ALL");
+    cmd.env("LC_MESSAGES", "C");
     cmd
 }
 
@@ -1582,6 +1587,28 @@ mod tests {
         assert_eq!(args.first().map(|a| a.to_str().unwrap()), Some("-S"));
         assert!(args.get(1).is_some(), "socket path arg present");
         assert_eq!(cmd.get_program().to_str(), Some("tmux"));
+    }
+
+    #[test]
+    fn tmux_query_command_preserves_ctype_for_session_names() {
+        let command = tmux_query_command();
+        let args: Vec<_> = command.get_args().map(|a| a.to_owned()).collect();
+        assert!(
+            args.iter().any(|a| a.to_str() == Some("-u")),
+            "tmux -u forces UTF-8 names independently of inherited LC_CTYPE"
+        );
+        let message_locale = command
+            .get_envs()
+            .find(|(key, _)| key.to_str() == Some("LC_MESSAGES"))
+            .and_then(|(_, value)| value.and_then(|value| value.to_str()));
+        assert_eq!(message_locale, Some("C"));
+        assert!(
+            command
+                .get_envs()
+                .find(|(key, _)| key.to_str() == Some("LC_ALL"))
+                .is_some_and(|(_, value)| value.is_none()),
+            "LC_ALL must not override LC_MESSAGES=C"
+        );
     }
 
     #[cfg(unix)]

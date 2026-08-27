@@ -202,12 +202,12 @@ fn split_bracketed_paste(text: &str) -> Vec<live_send::TmuxKey> {
 /// report at all, so it is dropped rather than clamped to the nearest edge,
 /// which would otherwise synthesise a click or hover on pane 0's border.
 ///
-/// Pane 0 usually sits at the window origin, so the sub-rectangle shares the
-/// preview's top-left corner and only its extent differs. A window option
-/// like `pane-border-status top` can shift it down (`pane_top == 1`, #3515);
-/// this mapping still assumes the shared corner, so a composited preview with
-/// a shifted pane 0 clamps against the wrong row. Known residual: the TUI
-/// side of #3515 was never reproduced there.
+/// Pane 0 may have a non-zero origin within the full composite. The TUI
+/// bottom-follows a composite taller than its output, clipping reserved rows
+/// above pane 0 before mouse mapping, so its first visible cell still starts
+/// at `pane.x`/`pane.y`. Mapping a non-bottom-aligned slice would additionally
+/// need that slice's first visible row; adding `rect.top` here alone would
+/// shift input below the displayed pane.
 fn mouse_target_rect(
     cursor: &crate::tmux::PaneCursor,
     pane: ratatui::layout::Rect,
@@ -7110,6 +7110,8 @@ mod tests {
     /// goes to pane 0 alone, so a pointer over a neighbouring pane must not be
     /// mapped against the full rect: that reported a column past pane 0's right
     /// edge to the agent as though its own pane were window-wide.
+    /// It also round-trips a painted composite cursor cell through mouse mapping,
+    /// pinning the bottom-follow clipping semantics.
     #[test]
     fn composited_preview_maps_the_mouse_into_pane_zero_only() {
         use ratatui::layout::Rect;
@@ -7136,6 +7138,34 @@ mod tests {
         // The last column of pane 0 is still inside it; the first past it is not.
         assert!(hover_forward_bytes(&split, pane, 39, 5).is_some());
         assert_eq!(hover_forward_bytes(&split, pane, 40, 5), None);
+
+        // In the bottom-follow layout, the composite's top border row is
+        // clipped before painting: `first_line == pane0.top == 1`. The cursor
+        // mapper adds `top` after its anchor delta, while the mouse rect stays
+        // at the visible output origin. A click on the painted cursor must
+        // round-trip to that cursor's 1-based app cell.
+        let mut bottom_follow = cursor_for(true, true, true);
+        bottom_follow.x = 10;
+        bottom_follow.y = 4;
+        bottom_follow.pane_height = 25;
+        bottom_follow.composite_pane0 = Some(crate::tmux::PaneGeom {
+            left: 0,
+            top: 1,
+            width: 40,
+            height: 24,
+        });
+        let painted = crate::tui::home::render::map_live_preview_cursor(
+            pane,
+            usize::from(pane.height),
+            25,
+            bottom_follow,
+        )
+        .expect("visible pane cursor");
+        assert_eq!(
+            map_pane_cell(mouse_pane_rect(&bottom_follow, pane), painted.x, painted.y,),
+            (bottom_follow.x + 1, bottom_follow.y + 1),
+            "clicking the painted cursor must report the same app cell"
+        );
 
         // A no-mouse full-screen agent gets no page key from a wheel aimed at
         // the neighbour either, but keeps it over pane 0.
