@@ -566,7 +566,7 @@ fn reconcile_heals_a_worktree_moved_outside_aoe() {
 
     let mut stale = instance.clone();
     assert_eq!(
-        reconcile_and_persist(&storage, &mut stale).unwrap(),
+        reconcile_and_persist(&storage, &mut stale, &mut Default::default()).unwrap(),
         WorktreePathResolution::Moved(relocated.canonicalize().unwrap())
     );
     assert_eq!(
@@ -605,7 +605,7 @@ fn reconcile_heals_a_worktree_moved_outside_aoe() {
     let mut settled = stale.clone();
     settled.project_path = outcome.new_path.to_string_lossy().into_owned();
     assert_eq!(
-        reconcile_and_persist(&storage, &mut settled).unwrap(),
+        reconcile_and_persist(&storage, &mut settled, &mut Default::default()).unwrap(),
         WorktreePathResolution::Current
     );
 }
@@ -635,7 +635,7 @@ fn resolve_reports_missing_when_git_cannot_place_the_branch() {
     let elsewhere = repo_dir.path().join("elsewhere");
     std::fs::rename(&created, &elsewhere).unwrap();
     assert_eq!(
-        resolve_worktree_path(&git_wt, &created, &info).unwrap(),
+        resolve_worktree_path(&git_wt.list_worktrees().unwrap(), &created, &info),
         WorktreePathResolution::Missing
     );
 
@@ -646,14 +646,14 @@ fn resolve_reports_missing_when_git_cannot_place_the_branch() {
         &["worktree", "repair", elsewhere.to_str().unwrap()],
     );
     assert_eq!(
-        resolve_worktree_path(&git_wt, &created, &info).unwrap(),
+        resolve_worktree_path(&git_wt.list_worktrees().unwrap(), &created, &info),
         WorktreePathResolution::Moved(elsewhere.canonicalize().unwrap())
     );
 
     // A checkout that is gone for good stays Missing.
     std::fs::remove_dir_all(&elsewhere).unwrap();
     assert_eq!(
-        resolve_worktree_path(&git_wt, &created, &info).unwrap(),
+        resolve_worktree_path(&git_wt.list_worktrees().unwrap(), &created, &info),
         WorktreePathResolution::Missing
     );
 
@@ -663,7 +663,7 @@ fn resolve_reports_missing_when_git_cannot_place_the_branch() {
         ..info.clone()
     };
     assert_eq!(
-        resolve_worktree_path(&git_wt, &created, &unmanaged).unwrap(),
+        resolve_worktree_path(&git_wt.list_worktrees().unwrap(), &created, &unmanaged),
         WorktreePathResolution::Current
     );
 }

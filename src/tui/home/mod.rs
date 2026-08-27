@@ -2104,10 +2104,13 @@ impl HomeView {
             // from git so attach, status, diff, and rename all act on the live
             // location instead of failing. Only rows whose recorded path is
             // already gone cost anything. See #2002.
+            let mut reconcile_cache = crate::session::worktree_reconcile::ReconcileCache::default();
             for instance in &mut instances {
-                if let Err(error) =
-                    crate::session::worktree_reconcile::reconcile_and_persist(&storage, instance)
-                {
+                if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist(
+                    &storage,
+                    instance,
+                    &mut reconcile_cache,
+                ) {
                     tracing::warn!(
                         target: "tui.home",
                         session = %instance.id,
