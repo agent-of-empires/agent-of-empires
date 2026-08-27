@@ -4435,12 +4435,6 @@ async fn purge_session_artifacts(
     Ok((true, messages))
 }
 
-/// Relocate any trashed managed worktree still sitting in the active dir into
-/// the holding area, and heal a pointer left stale by a crash between the move
-/// and its persist. Backfills rows trashed before relocation existed. Runs
-/// once on daemon startup, best-effort and per-session locked; a failure on one
-/// session logs and moves on. The git move is blocking, so it runs off the
-/// async runtime.
 /// Heal managed worktree sessions whose recorded `project_path` no longer
 /// exists because the directory was moved outside aoe, rewriting it from git's
 /// own worktree listing. Runs once on daemon startup, so every later
@@ -4485,8 +4479,11 @@ pub(crate) async fn reconcile_worktree_paths(state: &Arc<AppState>) {
                 "session has no source profile; refusing worktree path reconciliation"
             );
             let storage = crate::session::Storage::open_unwatched(&instance.source_profile)?;
-            let resolution =
-                crate::session::worktree_reconcile::reconcile_and_persist(&storage, &mut instance)?;
+            let resolution = crate::session::worktree_reconcile::reconcile_and_persist(
+                &storage,
+                &mut instance,
+                &mut Default::default(),
+            )?;
             anyhow::Ok((resolution, instance))
         })
         .await
@@ -4512,6 +4509,12 @@ pub(crate) async fn reconcile_worktree_paths(state: &Arc<AppState>) {
     }
 }
 
+/// Relocate any trashed managed worktree still sitting in the active dir into
+/// the holding area, and heal a pointer left stale by a crash between the move
+/// and its persist. Backfills rows trashed before relocation existed. Runs
+/// once on daemon startup, best-effort and per-session locked; a failure on one
+/// session logs and moves on. The git move is blocking, so it runs off the
+/// async runtime.
 pub(crate) async fn reconcile_trashed_worktrees(state: &Arc<AppState>) {
     let candidates: Vec<(String, String)> = {
         let instances = state.instances.read().await;
