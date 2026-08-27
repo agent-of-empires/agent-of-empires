@@ -3,7 +3,7 @@ members = [".", "xtask", "aoe-settings-derive", "aoe-plugin-api"]
 
 [package]
 name = "agent-of-empires"
-version = "1.14.0"
+version = "1.15.0"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Agent of Empires Contributors"]
@@ -45,6 +45,7 @@ aoe-plugin-api = { path = "aoe-plugin-api" }
 
 # Serialization
 serde = { version = "1.0", features = ["derive"] }
+serde_ignored = "0.1"
 serde_json = "1.0"
 serde_yaml = "0.9"
 toml = "1.1"
@@ -152,17 +153,17 @@ subtle = { version = "2", optional = true }
 # Always-on: used by the TUI for OSC 52 clipboard writes (preview
 # drag-select in live mode) and re-exported via the `serve` feature
 # for Web Push payload encoding.
-base64 = "0.22"
+base64 = "0.23"
 
 # Web Push (VAPID + payload encryption), optional behind "serve".
 p256 = { version = "0.13", features = ["pem", "pkcs8", "ecdsa", "ecdh"], optional = true }
 hkdf = { version = "0.13", optional = true }
 aes-gcm = { version = "0.11", optional = true }
-jsonwebtoken = { version = "10.4", features = ["aws_lc_rs"], optional = true }
+jsonwebtoken = { version = "11.0", features = ["aws_lc_rs"], optional = true }
 getrandom = { version = "0.4", optional = true }
 
 # Agent Client Protocol — drives the structured view surface bundled with `serve`.
-agent-client-protocol = { version = "1.0", optional = true, features = ["unstable_end_turn_token_usage", "unstable_elicitation", "unstable_session_fork"] }
+agent-client-protocol = { version = "2.0", optional = true, features = ["unstable_end_turn_token_usage", "unstable_elicitation", "unstable_session_fork"] }
 
 # Semver parsing for ACP adapter compatibility checks (see src/acp/agent_compat.rs).
 semver = { version = "1", optional = true }
@@ -248,7 +249,7 @@ serve = [
 cap-std = ["dep:cap-std"]
 
 [dev-dependencies]
-serial_test = "3.4"
+serial_test = "4.0"
 # Test-only tracing capture (#2756, I4): asserts the equal-timestamp guard's
 # drop branch logged. Its target `session.store` is rejected by the default
 # `agent_of_empires=trace` env filter, so `no-env-filter` is required; the

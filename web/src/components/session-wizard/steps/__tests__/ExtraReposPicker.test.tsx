@@ -13,8 +13,10 @@ import { ExtraReposPicker } from "../ExtraReposPicker";
 import type { ProjectInfo } from "../../../../lib/types";
 
 const fetchProjects = vi.fn();
+const fetchBranches = vi.fn();
 vi.mock("../../../../lib/api", () => ({
   fetchProjects: () => fetchProjects(),
+  fetchBranches: (...args: unknown[]) => fetchBranches(...args),
 }));
 
 const PROJECTS: ProjectInfo[] = [
@@ -23,16 +25,25 @@ const PROJECTS: ProjectInfo[] = [
   { name: "beta", path: "/repos/beta", scope: "profile", pinned: false },
 ];
 
-function setup(overrides?: { selectedPaths?: string[]; primaryPath?: string }) {
+// `basesEnabled` defaults to false so the per-repo base inputs (#3329) stay out
+// of the way of this file's concern, repo selection. Several assertions here
+// reach for the first `input[type="text"]`, which is the free-text path field.
+// The base fields have their own coverage in
+// `session-wizard/__tests__/ExtraReposPicker.perRepoBase.test.tsx`.
+function setup(overrides?: { selectedPaths?: string[]; primaryPath?: string; basesEnabled?: boolean }) {
   const onChange = vi.fn();
+  const onRepoBasesChange = vi.fn();
   const utils = render(
     <ExtraReposPicker
       primaryPath={overrides?.primaryPath ?? "/repos/primary"}
       selectedPaths={overrides?.selectedPaths ?? []}
       onChange={onChange}
+      repoBases={{}}
+      onRepoBasesChange={onRepoBasesChange}
+      basesEnabled={overrides?.basesEnabled ?? false}
     />,
   );
-  return { ...utils, onChange };
+  return { ...utils, onChange, onRepoBasesChange };
 }
 
 function projectButton(container: HTMLElement, name: string): HTMLButtonElement | undefined {

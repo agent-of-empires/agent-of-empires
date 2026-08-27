@@ -83,9 +83,10 @@ tie_workdir_to_name = true
 
 When tied:
 
-- Renaming a session (TUI rename, web inline rename, `aoe session rename`, or `PATCH /api/sessions/{id}`) moves the worktree directory to the title's path-safe slug first, then sets the title only if the move succeeds, so the two cannot drift on a partial failure.
+- Renaming a session (TUI rename, web inline rename, `aoe session rename`, or `PATCH /api/sessions/{id}`) moves the worktree directory to the title's path-safe slug before committing the title. A failed move leaves the title unchanged. A metadata failure after a successful move is reported as a partial failure.
 - The git branch is never swept in by a title rename by default. To rename it too, check "Also rename git branch" in the TUI rename dialog, pass `--rename-branch` to `aoe session rename`, or send `rename_branch: true` to the PATCH. It stays opt-in because a branch may carry an upstream or an open PR; the TUI toggle warns when the branch tracks a remote, since the remote branch (and any open PR) won't follow the local rename.
-- The session must be stopped first. Moving the directory of a running worktree is unsafe, so a tied rename of a running session is refused with a clear message. Stop the session, or disable the setting, to relabel it freely.
+- A tied rename that relocates the worktree directory, or renames its branch, needs a stopped session: moving or re-pointing a live checkout is unsafe, so it is refused with a clear message while the session is active. Stop the session, or disable the setting, to relabel it freely.
+- A title-only rename whose slug leaves the directory unchanged moves no checkout. `PATCH /api/sessions/{id}` and `aoe session rename` accept it while the session runs unless `rename_branch: true` would change the branch. The PATCH also leaves a live structured-view worker alone. The TUI requires a stopped session for a title-changing tied rename.
 - Naming collapses into the single rename action: the standalone "edit workdir name" affordance is hidden (TUI and web) and the standalone CLI / REST workdir-name edit is rejected, since the directory now follows the title.
 
 Toggle the setting off (TUI settings, web settings, or the toml above) to relabel sessions freely while running and to edit the directory name independently of the title.

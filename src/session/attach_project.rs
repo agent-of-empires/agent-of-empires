@@ -351,6 +351,14 @@ fn plan_conversion(
                 // conservative choice, and closing it needs an authorship field
                 // on `WorktreeInfo`.
                 branch_preexisting: false,
+                // Carry the existing worktree's recorded base and the session's
+                // own diff-base override across the conversion. Once the
+                // session becomes a workspace, `diff_repos_of` stops consulting
+                // `worktree_info` and `Instance::base_branch_override`, so
+                // dropping either here would silently revert a base the user
+                // picked. See #3329.
+                base_branch: wt.base_branch.clone(),
+                base_branch_override: instance.base_branch_override.clone(),
             },
             from: current,
         });
@@ -399,6 +407,10 @@ fn plan_conversion(
             main_repo_path: main_repo.to_string_lossy().to_string(),
             managed_by_aoe: true,
             branch_preexisting: !plan.create,
+            base_branch: plan.create.then(|| plan.base.clone()).flatten(),
+            // Same carry-forward as the MoveIn arm above: the session's own
+            // override has no other home once it is a workspace member.
+            base_branch_override: instance.base_branch_override.clone(),
         },
         create_branch: plan.create,
         base: plan.base,
@@ -674,6 +686,10 @@ pub fn execute(instance: &super::Instance, plan: AttachPlan) -> Result<PreparedA
         // True when the branch was already there and the caller opted into
         // reusing it, so deleting the session leaves the user's branch alone.
         branch_preexisting: !plan.create,
+        // Recorded only when aoe forked the branch from this base; an
+        // attach-existing-branch repo has no base of its own.
+        base_branch: plan.create.then(|| plan.base.clone()).flatten(),
+        base_branch_override: None,
     };
 
     // The repo list the session ends up with: whatever it already had, then the
@@ -1201,6 +1217,8 @@ mod tests {
                 main_repo_path: "/tmp/src/backend".to_string(),
                 managed_by_aoe: true,
                 branch_preexisting: false,
+                base_branch: None,
+                base_branch_override: None,
             }],
             created_at: Utc::now(),
             cleanup_on_delete: true,
@@ -1377,6 +1395,8 @@ mod tests {
                 main_repo_path: backend.to_string_lossy().to_string(),
                 managed_by_aoe: true,
                 branch_preexisting: false,
+                base_branch: None,
+                base_branch_override: None,
             }],
             created_at: Utc::now(),
             cleanup_on_delete: true,
@@ -1508,6 +1528,71 @@ mod tests {
             std::fs::read_to_string(session_wt.join("wip.txt")).unwrap(),
             "in progress"
         );
+    }
+
+    /// Converting a session into a workspace has to carry its diff base with it.
+    /// Both live on the session while it is single-repo (`worktree_info` for the
+    /// recorded base, `Instance::base_branch_override` for the user's pick) and
+    /// neither is consulted once `workspace_info` is set, so a conversion that
+    /// dropped them would silently revert the base the user chose. See #3329.
+    #[test]
+    #[serial_test::serial]
+    fn converting_a_session_keeps_its_diff_base() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let _guard = isolated_profile(temp.path(), "attach-diff-base");
+
+        let backend = temp.path().join("src/backend");
+        let frontend = temp.path().join("src/frontend");
+        init_repo(&backend);
+        init_repo(&frontend);
+        let session_wt = temp.path().join("src/backend-featx");
+        git_in(
+            &backend,
+            &[
+                "worktree",
+                "add",
+                "-b",
+                "featx",
+                session_wt.to_str().unwrap(),
+            ],
+        );
+
+        let mut inst = Instance::new("Worktree Session", session_wt.to_str().unwrap());
+        inst.worktree_info = Some(WorktreeInfo {
+            branch: "featx".to_string(),
+            main_repo_path: backend.to_string_lossy().to_string(),
+            managed_by_aoe: true,
+            created_at: Utc::now(),
+            base_branch: Some("develop".to_string()),
+        });
+        inst.base_branch_override = Some("upstream/main".to_string());
+
+        let plan = plan(&inst, "attach-diff-base", &frontend, ExistingBranch::Refuse)
+            .expect("the attach itself is valid");
+        let prepared = execute(&inst, plan).expect("the worktree must be created");
+
+        let primary = prepared
+            .workspace_info
+            .repos
+            .iter()
+            .find(|r| r.name == "backend")
+            .expect("the session's own repo becomes a workspace member");
+        assert_eq!(primary.base_branch.as_deref(), Some("develop"));
+        assert_eq!(
+            primary.base_branch_override.as_deref(),
+            Some("upstream/main"),
+            "the override the user picked must survive the conversion"
+        );
+
+        // The repo being attached has no base of its own to inherit: the
+        // session's override applied to the session's checkout, not to it.
+        let added = prepared
+            .workspace_info
+            .repos
+            .iter()
+            .find(|r| r.name == "frontend")
+            .expect("the attached repo is recorded");
+        assert_eq!(added.base_branch_override, None);
     }
 
     #[test]

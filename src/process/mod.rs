@@ -3,7 +3,6 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::process::{Child, Command, ExitStatus, Output, Stdio};
-use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -18,6 +17,24 @@ mod linux;
 
 #[cfg(target_os = "macos")]
 mod macos;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod unix;
+
+#[cfg(target_os = "linux")]
+use linux as platform;
+#[cfg(target_os = "macos")]
+use macos as platform;
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+mod platform {
+    pub(super) fn configure_process_group(_: &mut std::process::Command) {}
+
+    pub(super) fn kill_process_group(_: &std::process::Child) {}
+
+    pub(super) fn terminate_process_group(_: &std::process::Child) {}
+}
+
+/// System memory + agent-count sampling for the TUI diagnostics strip.
+pub(crate) mod metrics;
 
 /// Protocol-agnostic plumbing for supervised worker subprocesses, lifted
 /// out of `src/acp/` so the future plugin host can reuse it. Serve-gated
@@ -42,6 +59,7 @@ pub mod worker_registry;
 pub mod runner;
 
 const WAIT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const PROCESS_GROUP_TERMINATION_GRACE: Duration = Duration::from_millis(250);
 
 /// Wait for `child` to exit, killing and reaping it if it outlives `timeout`.
 /// Returns `Ok(None)` when the timeout fired and the child was killed.
@@ -53,65 +71,95 @@ pub fn wait_with_timeout(
     child: &mut Child,
     timeout: Duration,
 ) -> std::io::Result<Option<ExitStatus>> {
+    wait_with_timeout_inner(child, timeout, false)
+}
+
+/// When `kill_process_group` is true, the caller MUST have configured `child`
+/// as a process-group leader, so its process-group id equals `child.id()`.
+/// Otherwise the kill path could signal the parent's process group.
+fn wait_with_timeout_inner(
+    child: &mut Child,
+    timeout: Duration,
+    kill_process_group: bool,
+) -> std::io::Result<Option<ExitStatus>> {
     let deadline = Instant::now() + timeout;
+    let termination_grace = (timeout / 4).min(PROCESS_GROUP_TERMINATION_GRACE);
+    let terminate_at = deadline.checked_sub(termination_grace).unwrap_or(deadline);
+    let mut termination_requested = false;
     loop {
         if let Some(status) = child.try_wait()? {
-            return Ok(Some(status));
+            if !termination_requested {
+                return Ok(Some(status));
+            }
         }
-        if Instant::now() >= deadline {
+        let now = Instant::now();
+        if kill_process_group && !termination_requested && now >= terminate_at {
+            platform::terminate_process_group(child);
+            termination_requested = true;
+            continue;
+        }
+        if now >= deadline {
+            if kill_process_group {
+                platform::kill_process_group(child);
+            }
             let _ = child.kill();
             let _ = child.wait();
             return Ok(None);
         }
-        std::thread::sleep(WAIT_POLL_INTERVAL);
+        std::thread::sleep(WAIT_POLL_INTERVAL.min(deadline.saturating_duration_since(now)));
     }
 }
 
-/// Spawn `cmd` with piped stdout/stderr and wait for it to exit, killing it
-/// if it outlives `timeout`. Returns `Ok(None)` when the timeout fired and
-/// the child was killed; `Err` covers spawn/wait failures.
+/// Spawn `cmd` with stdout/stderr captured in temporary regular files and wait
+/// for it to exit, killing it if it outlives `timeout`. Returns `Ok(None)` when
+/// the timeout fired and the child was killed; `Err` covers spawn/wait failures.
 ///
-/// stdout/stderr are drained on dedicated threads so a full pipe buffer
-/// cannot wedge the child (and thus this wait) before the deadline. The
-/// caller keeps control of stdin; pipe it to null when the child might
+/// Regular temporary files prevent a full pipe buffer from wedging the child
+/// before the deadline and keep capture independent of inherited writers.
+/// The caller keeps control of stdin; pipe it to null when the child might
 /// prompt (SSH passphrases, credential helpers).
 pub fn run_with_timeout(cmd: &mut Command, timeout: Duration) -> std::io::Result<Option<Output>> {
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
+    run_with_timeout_inner(cmd, timeout, false)
+}
+
+/// [`run_with_timeout`] variant that makes the child a process-group leader
+/// and kills the whole group on timeout on Linux and macOS. Other platforms
+/// still bound output capture independently of descendant-owned handles and
+/// fall back to killing and reaping the direct child.
+pub fn run_with_timeout_process_group(
+    cmd: &mut Command,
+    timeout: Duration,
+) -> std::io::Result<Option<Output>> {
+    platform::configure_process_group(cmd);
+    run_with_timeout_inner(
+        cmd,
+        timeout,
+        cfg!(any(target_os = "linux", target_os = "macos")),
+    )
+}
+
+fn run_with_timeout_inner(
+    cmd: &mut Command,
+    timeout: Duration,
+    kill_process_group: bool,
+) -> std::io::Result<Option<Output>> {
+    let mut stdout_file = tempfile::NamedTempFile::new()?;
+    let mut stderr_file = tempfile::NamedTempFile::new()?;
+    cmd.stdout(Stdio::from(stdout_file.reopen()?));
+    cmd.stderr(Stdio::from(stderr_file.reopen()?));
     let mut child = cmd.spawn()?;
 
-    let mut stdout_pipe = child.stdout.take();
-    let mut stderr_pipe = child.stderr.take();
-    let (otx, orx) = mpsc::channel();
-    let (etx, erx) = mpsc::channel();
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(ref mut p) = stdout_pipe {
-            let _ = p.read_to_end(&mut buf);
-        }
-        let _ = otx.send(buf);
-    });
-    std::thread::spawn(move || {
-        let mut buf = Vec::new();
-        if let Some(ref mut p) = stderr_pipe {
-            let _ = p.read_to_end(&mut buf);
-        }
-        let _ = etx.send(buf);
-    });
-
-    let deadline = Instant::now() + timeout;
-    let Some(status) = wait_with_timeout(&mut child, timeout)? else {
+    let Some(status) = wait_with_timeout_inner(&mut child, timeout, kill_process_group)? else {
         return Ok(None);
     };
-    // The child exited, but if it spawned a grandchild that inherited the
-    // pipe (credential helper, pager, backgrounded job), `read_to_end` (and
-    // thus an unbounded `recv`) would block forever. Cap the drain at the
-    // remaining deadline so the timeout guarantee holds even then; the exit
-    // status is already in hand.
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let stdout = orx.recv_timeout(remaining).unwrap_or_default();
-    let remaining = deadline.saturating_duration_since(Instant::now());
-    let stderr = erx.recv_timeout(remaining).unwrap_or_default();
+    // Regular files, rather than pipes drained by background threads, keep
+    // output capture bounded when a descendant outlives the direct child. A
+    // read reaches the current EOF without waiting for every inherited writer
+    // handle to close.
+    let mut stdout = Vec::new();
+    stdout_file.as_file_mut().read_to_end(&mut stdout)?;
+    let mut stderr = Vec::new();
+    stderr_file.as_file_mut().read_to_end(&mut stderr)?;
     Ok(Some(Output {
         status,
         stdout,
@@ -966,14 +1014,60 @@ mod tests {
     }
 
     #[test]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    fn run_with_timeout_process_group_kills_descendants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let pid_path = tmp.path().join("descendant.pid");
+        let term_path = tmp.path().join("terminated");
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            "trap 'printf term > \"$2\"' TERM; sleep 10 & child=$!; printf %s \"$child\" > \"$1\"; wait",
+            "sh",
+        ])
+        .arg(&pid_path)
+        .arg(&term_path);
+
+        let result = run_with_timeout_process_group(&mut cmd, Duration::from_secs(2)).unwrap();
+        assert!(result.is_none(), "process group should time out");
+        assert_eq!(
+            std::fs::read_to_string(term_path).expect("SIGTERM trap should run"),
+            "term",
+            "the process-group leader must receive SIGTERM before escalation"
+        );
+
+        let pid: i32 = std::fs::read_to_string(pid_path)
+            .expect("shell should publish descendant pid")
+            .parse()
+            .unwrap();
+        let process_is_running = |pid: i32| {
+            let output = Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .expect("ps should inspect descendant state");
+            let state = String::from_utf8_lossy(&output.stdout);
+            output.status.success()
+                && !state.trim().is_empty()
+                && !state.trim_start().starts_with('Z')
+        };
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while process_is_running(pid) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !process_is_running(pid),
+            "descendant must be exited or a terminated zombie after the timeout"
+        );
+    }
+
+    #[test]
     #[cfg(unix)]
-    fn run_with_timeout_bounds_drain_when_grandchild_holds_pipe() {
+    fn run_with_timeout_does_not_wait_for_descendant_output_writer() {
         // The immediate child (sh) exits fast but backgrounds a `sleep` that
-        // inherits the pipes, so they never close. The drain must still
-        // return by the deadline rather than blocking on read_to_end; this is
-        // the exact shape of the git-clone hang (a credential helper or pager
-        // grandchild outliving the parent). `sleep 10` (>> the 4s assertion)
-        // ensures an unbounded recv would visibly fail.
+        // retains stdout/stderr. Output capture must read the current regular
+        // file contents without waiting for that descendant to close its
+        // inherited handles. `sleep 10` (>> the 4s assertion) ensures an
+        // inherited pipe plus an unbounded drain would visibly fail.
         let mut cmd = Command::new("sh");
         cmd.args(["-c", "sleep 10 & printf done"]);
 
@@ -983,7 +1077,7 @@ mod tests {
             .expect("the sh child exits quickly, so an Output is produced");
         assert!(
             start.elapsed() < Duration::from_secs(4),
-            "drain must be bounded by the deadline even while the pipe stays open"
+            "output capture must not wait on a descendant that still holds the handle"
         );
         assert!(output.status.success());
     }

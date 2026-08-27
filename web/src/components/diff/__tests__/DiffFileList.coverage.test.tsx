@@ -256,9 +256,9 @@ describe("DiffFileList keyboard navigation", () => {
 
 describe("DiffFileList multi-repo grouping", () => {
   const perRepoBases: RepoBase[] = [
-    { repo_name: "api", base_branch: "main" },
-    { repo_name: "web", base_branch: "develop" },
-    { repo_name: "empty", base_branch: "trunk" },
+    { repo_name: "api", base_branch: "main", repo_path: "/ws/api" },
+    { repo_name: "web", base_branch: "develop", repo_path: "/ws/web" },
+    { repo_name: "empty", base_branch: "trunk", repo_path: "/ws/empty" },
   ];
   const files = [
     file({ path: "src/handler.rs", repo_name: "api", additions: 5, deletions: 1 }),
@@ -270,6 +270,47 @@ describe("DiffFileList multi-repo grouping", () => {
     expect(screen.getByText("3 repos")).toBeTruthy();
     expect(screen.getByText("api")).toBeTruthy();
     expect(screen.getByText("vs develop")).toBeTruthy();
+  });
+
+  // Before #3329 a multi-repo session got a "N repos" chip and no picker at
+  // all, so a workspace whose repos have different bases could not be diffed
+  // correctly from the dashboard.
+  it("gives each repo its own base picker, scoped to that repo", async () => {
+    mock.fetchBranches.mockResolvedValue([{ name: "epic/checkout", is_current: false }]);
+    mock.setSessionDiffBase.mockResolvedValue({});
+    const onBaseBranchChanged = vi.fn();
+    renderList({ files, perRepoBases, sessionId: "s1", onBaseBranchChanged });
+
+    const pickers = screen.getAllByRole("button", { name: /Change diff base/ });
+    expect(pickers).toHaveLength(3);
+
+    // The second group is `web`, whose base is develop.
+    fireEvent.click(pickers[1]);
+    // The typeahead lists the branches of that repo's own worktree.
+    await vi.waitFor(() => expect(mock.fetchBranches).toHaveBeenCalledWith("/ws/web", true));
+    fireEvent.mouseDown(await screen.findByText("epic/checkout"));
+
+    await vi.waitFor(() => expect(mock.setSessionDiffBase).toHaveBeenCalledWith("s1", "epic/checkout", "web"));
+    expect(mock.setSessionDiffBase).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(onBaseBranchChanged).toHaveBeenCalled());
+  });
+
+  it("marks only the repo carrying an override, and resets just that one", async () => {
+    mock.fetchBranches.mockResolvedValue([]);
+    mock.setSessionDiffBase.mockResolvedValue({});
+    const overridden: RepoBase[] = [
+      perRepoBases[0],
+      { ...perRepoBases[1], base_override: "epic/checkout", base_branch: "epic/checkout" },
+      perRepoBases[2],
+    ];
+    renderList({ files, perRepoBases: overridden, sessionId: "s1" });
+
+    fireEvent.click(screen.getAllByRole("button", { name: /Change diff base/ })[0]);
+    expect(screen.queryByText(/Reset to auto-detected/)).toBeNull();
+
+    fireEvent.click(screen.getAllByRole("button", { name: /Change diff base/ })[1]);
+    fireEvent.click(await screen.findByText(/Reset to auto-detected/));
+    await vi.waitFor(() => expect(mock.setSessionDiffBase).toHaveBeenCalledWith("s1", null, "web"));
   });
 
   it("renders an empty-repo note for a repo with no files", () => {
@@ -333,7 +374,7 @@ describe("DiffFileList BasePicker", () => {
     const option = await screen.findByText("develop");
     fireEvent.mouseDown(option);
 
-    await vi.waitFor(() => expect(mock.setSessionDiffBase).toHaveBeenCalledWith("s1", "develop"));
+    await vi.waitFor(() => expect(mock.setSessionDiffBase).toHaveBeenCalledWith("s1", "develop", undefined));
     await vi.waitFor(() => expect(onBaseBranchChanged).toHaveBeenCalled());
   });
 
@@ -347,7 +388,7 @@ describe("DiffFileList BasePicker", () => {
     fireEvent.click(screen.getByRole("button", { name: /Change diff base/ }));
     const reset = await screen.findByText(/Reset to auto-detected/);
     fireEvent.click(reset);
-    await vi.waitFor(() => expect(mock.setSessionDiffBase).toHaveBeenCalledWith("s1", null));
+    await vi.waitFor(() => expect(mock.setSessionDiffBase).toHaveBeenCalledWith("s1", null, undefined));
   });
 
   it("picks the highlighted branch via keyboard Enter and navigates with arrows", async () => {
@@ -362,7 +403,7 @@ describe("DiffFileList BasePicker", () => {
     const input = await screen.findByPlaceholderText("Search branches...");
     fireEvent.keyDown(input, { key: "ArrowDown" }); // highlight index 1 ("two")
     fireEvent.keyDown(input, { key: "Enter" });
-    await vi.waitFor(() => expect(mock.setSessionDiffBase).toHaveBeenCalledWith("s1", "two"));
+    await vi.waitFor(() => expect(mock.setSessionDiffBase).toHaveBeenCalledWith("s1", "two", undefined));
   });
 
   it("falls back to the typed query when Enter is pressed with no suggestion", async () => {
@@ -374,7 +415,7 @@ describe("DiffFileList BasePicker", () => {
     const input = await screen.findByPlaceholderText("Search branches...");
     fireEvent.change(input, { target: { value: "typed-branch" } });
     fireEvent.keyDown(input, { key: "Enter" });
-    await vi.waitFor(() => expect(mock.setSessionDiffBase).toHaveBeenCalledWith("s1", "typed-branch"));
+    await vi.waitFor(() => expect(mock.setSessionDiffBase).toHaveBeenCalledWith("s1", "typed-branch", undefined));
   });
 
   it("closes the popover on Escape", async () => {

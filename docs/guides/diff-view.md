@@ -37,7 +37,7 @@ After saving and exiting, the diff view refreshes automatically to show your cha
 | Key | Action |
 |-----|--------|
 | `s` | Toggle split/unified layout |
-| `b` | Change base branch (persists per-session as `base_branch_override`) |
+| `b` | Change base branch (persisted as that repo's `base_branch_override`) |
 | `r` | Refresh the diff |
 | `y` | Copy the selected file's relative path to the clipboard |
 | `?` | Show help |
@@ -74,21 +74,24 @@ comments" block with a `[stale]` chip; the captured snippet still goes to the
 agent. The feature is hidden for non-structured view sessions, and Send is
 disabled while the worker isn't running.
 
-## Per-session base override
+## Base override
 
-Each session can override the branch it diffs against. Use it when the eventual
+Each repo can override the branch it diffs against. Use it when the eventual
 PR target differs from the project default (stacked PRs, hotfix off `release/*`,
 branch rename). The override is sticky across restarts and only changes the
 comparison, not the worktree (no rebase).
 
-Comparison precedence: per-session override, then the branch the worktree was
-forked from, then `diff.default_branch`, then auto-detection.
+Comparison precedence, applied per repo: that repo's override, then the branch
+its worktree was forked from, then `diff.default_branch`, then auto-detection.
 
 - **Web dashboard**: click the `vs <ref>` chip in the diff header, pick a branch
-  from the typeahead, or reset to clear the override.
+  from the typeahead, or reset to clear the override. A
+  [multi-repo workspace](multi-repo-workspaces.md) has one chip per repo group.
 - **TUI diff view**: press `b`, pick a branch.
 - **CLI**: `aoe session set-base <session> <branch>` to set,
-  `aoe session set-base <session> --clear` to clear.
+  `aoe session set-base <session> --clear` to clear. In a multi-repo workspace
+  each repo has its own base, so pass `--repo <name>` to say which one; without
+  it the command lists the repos and exits.
 
 ## Configuration
 

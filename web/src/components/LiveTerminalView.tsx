@@ -90,6 +90,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
   const inputRef = useRef<HTMLTextAreaElement | null>(null);
   const [ctrlActive, setCtrlActive] = useState(false);
   const ctrlActiveRef = useRef(false);
+  const clearCtrl = useCallback(() => setCtrlActive(false), []);
   useEffect(() => {
     ctrlActiveRef.current = ctrlActive;
   }, [ctrlActive]);
@@ -213,10 +214,10 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
     );
   }
 
-  // iOS regular Safari is the one platform where the layout viewport
-  // does NOT shrink with the keyboard; inset the pane by the measured
-  // keyboard height there. Everywhere else this is 0 and dvh shrink
-  // does the work.
+  // Keyboard-open lift only. The pane root deliberately carries no inset while
+  // the keyboard is closed (#1432): home-indicator clearance is reserved by an
+  // ancestor (see the terminal wrapper in MobileMainPane), not here, so the
+  // mobile-keyboard specs can read a bare `${keyboardHeight}px` off this node.
   const rootStyle = keyboardHeight > 0 ? { paddingBottom: keyboardHeight } : undefined;
 
   return (
@@ -236,7 +237,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
       <div
         aria-hidden="true"
         className={`pointer-events-none absolute inset-0 z-10 ring-inset transition-shadow ${
-          inputFocused ? "ring-2 ring-terminal-active" : "ring-1 ring-surface-700/40"
+          coarse ? "" : inputFocused ? "ring-2 ring-terminal-active" : "ring-1 ring-surface-700/40"
         }`}
       />
 
@@ -249,7 +250,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
         onRetry={live.manualReconnect}
       />
 
-      {live.state.connected && !live.state.isOwner && (
+      {live.state.connected && live.state.ownerKnown && !live.state.isOwner && (
         <div className="absolute left-0 right-0 top-3 flex justify-center z-20 px-3">
           <button
             type="button"
@@ -306,7 +307,7 @@ export function LiveTerminalView({ session, active = true, surface = "agent", te
           forwardWheel={live.forwardWheel}
           forwardButton={live.forwardButton}
           ctrlActiveRef={ctrlActiveRef}
-          clearCtrl={() => setCtrlActive(false)}
+          clearCtrl={clearCtrl}
           inputRef={inputRef}
           onInputFocusChange={setInputFocused}
           bottomAlign={surface === "agent"}

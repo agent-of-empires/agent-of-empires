@@ -97,6 +97,15 @@ updates:
           - "react-dom"
           - "tailwindcss"
           - "@tailwindcss/*"
+          # Pre-1.0 packages: a minor bump is a breaking change by semver
+          # convention, but dependabot still classifies it as "minor" and so
+          # would group it with the routine updates. Excluding them gives each
+          # its own PR, so one breaking library cannot hold the rest hostage.
+          # In #3394, @assistant-ui/react 0.14 to 0.15 dropped three hooks and
+          # blocked 15 unrelated bumps behind a red build.
+          - "@assistant-ui/*"
+          - "eslint-plugin-react-refresh"
+          - "oxfmt"
         update-types: ["minor", "patch"]
     ignore:
       - dependency-name: "react"

@@ -3,6 +3,7 @@
 pub(crate) mod buttons;
 pub(crate) mod checkbox;
 mod cycler;
+pub(crate) mod diagnostics;
 mod dir_picker;
 mod help;
 pub(crate) mod hover;
@@ -25,5 +26,5 @@ pub use text_input::{
     set_input_cursor_position, set_prefixed_input_cursor_position, GroupGhostCompletion,
 };
 pub use tool_config::{
-    handle_tool_config_key, render_tool_config_overlay, tool_config_suffix_spans, ToolConfigOutcome,
+    handle_tool_config_key, render_tool_config_overlay, tool_row_suffix_spans, ToolConfigOutcome,
 };

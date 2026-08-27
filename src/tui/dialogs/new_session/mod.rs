@@ -158,6 +158,9 @@ impl From<NewSessionData> for crate::session::builder::InstanceParams {
             extra_args: data.extra_args,
             command_override: data.command_override,
             extra_repo_paths: data.extra_repo_paths,
+            // The TUI dialog collects one base for the whole session; per-repo
+            // bases are a CLI and web-wizard input for now (#3329).
+            repo_base_branches: Vec::new(),
             scratch: data.scratch,
             fork_seed: data.fork_seed,
         }

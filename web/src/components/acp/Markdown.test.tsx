@@ -115,6 +115,16 @@ describe("Markdown wrapper config", () => {
     const node = container.querySelector(".acp-markdown");
     expect(node).not.toBeNull();
   });
+
+  it("takes its base size from the conversation font-size variable, not a fixed utility", () => {
+    const { container } = render(<Markdown text="x" />);
+    const node = container.querySelector(".acp-markdown") as HTMLElement;
+    // `.acp-markdown-body` is what index.css binds to
+    // var(--acp-conversation-font-size); a `text-sm`-style utility here would
+    // outrank it and defeat the user's setting.
+    expect(node.classList.contains("acp-markdown-body")).toBe(true);
+    expect([...node.classList].some((c) => /^text-(xs|sm|base|lg|\[)/.test(c))).toBe(false);
+  });
 });
 
 describe("Blockquote override", () => {

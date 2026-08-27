@@ -127,4 +127,20 @@ test.describe("Diff rendering (@pierre/diffs)", () => {
 
     await expect(page.getByText("some unknown format content").first()).toBeVisible({ timeout: 10000 });
   });
+
+  // #3362: a worker that fails to load used to hang the pool's initialize()
+  // forever while it still reported healthy, so the renderer waited on it and
+  // the pane stayed blank for every file until a full reload.
+  test("still renders the diff when the highlighter worker fails to load", async ({ page }) => {
+    await setupDiffMocks(page);
+    await page.route("**/assets/worker-*.js", (r) => r.abort());
+    await page.goto("/");
+    await openSessionAndWaitForDiffList(page);
+    await page.getByText("example.ts").first().click();
+
+    await expect(page.getByText("function greet").first()).toBeVisible({
+      timeout: 15000,
+    });
+    await expect(page.getByRole("status").filter({ hasText: "main thread" })).toBeVisible();
+  });
 });

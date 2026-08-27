@@ -35,9 +35,12 @@ fn emit_build_version() {
     use std::process::Command;
 
     // Re-run when the committed revision changes or an override toggles.
-    // HEAD moves on checkout/commit; index moves on stage. Resolve the real
-    // paths via `git rev-parse --git-path` rather than hardcoding `.git/HEAD`:
-    // in a git worktree `.git` is a file pointing at
+    // HEAD moves on checkout; logs/HEAD moves on every commit, pull, merge,
+    // rebase, or reset. `index` is not watched: git rewrites it on a plain
+    // `git status`, which forced a full recompile on builds with no source
+    // change (see `git_watch_paths`'s doc comment). Resolve the real paths
+    // via `git rev-parse --git-path` rather than hardcoding
+    // `.git/HEAD`: in a git worktree `.git` is a file pointing at
     // `<main>/.git/worktrees/<name>/`, so the literal `.git/HEAD` path does not
     // exist. Cargo treats a missing `rerun-if-changed` input as perpetually
     // stale, which reran this script (and recompiled the lib + binary that read

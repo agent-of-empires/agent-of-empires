@@ -7,10 +7,12 @@ use tempfile::TempDir;
 use tui_input::Input;
 
 use super::{ConfigRefreshOrigin, ConfigWatchKey, HomeView, PreviewSelection, ViewMode};
-use crate::session::{GroupTree, Instance, Item, Storage};
+use crate::session::{
+    Group, GroupTree, Instance, Item, LifecycleOperation, LifecycleReservation, Status, Storage,
+};
 use crate::tmux::AvailableTools;
 use crate::tui::app::Action;
-use crate::tui::dialogs::{InfoDialog, NewSessionDialog};
+use crate::tui::dialogs::{InfoDialog, NewSessionData, NewSessionDialog};
 
 fn key(code: KeyCode) -> KeyEvent {
     KeyEvent::new(code, KeyModifiers::NONE)
@@ -20,8 +22,20 @@ fn setup_test_home(temp: &TempDir) -> AppDirGuard {
     isolate_app_dir_at(temp.path())
 }
 
-fn seed_instances(view: &mut HomeView, insts: &[Instance]) {
-    view.instances = insts.iter().cloned().map(|i| (i.id.clone(), i)).collect();
+#[test]
+fn duplicate_session_ids_are_excluded_from_home_map() {
+    let mut first = Instance::new("first", "/tmp/first");
+    first.id = "duplicate-id".to_string();
+    first.source_profile = "alpha".to_string();
+    let mut second = first.clone();
+    second.source_profile = "beta".to_string();
+    let unique = Instance::new("unique", "/tmp/unique");
+    let unique_id = unique.id.clone();
+
+    let map = HomeView::build_instances_map(vec![first, unique, second]);
+
+    assert!(!map.contains_key("duplicate-id"));
+    assert!(map.contains_key(&unique_id));
 }
 
 struct TestEnv {
@@ -428,12 +442,12 @@ fn disable_delete_to_trash() {
     .unwrap();
 }
 
-/// Turn on `session.confirm_delete` so `d` guards the trash with a
-/// confirmation dialog instead of trashing on the keystroke. Must run after
-/// `setup_test_home` so it writes into the test HOME. See #2583.
-fn enable_confirm_delete() {
+/// Turn off `session.confirm_delete` so `d` trashes on the keystroke instead
+/// of opening the confirmation dialog. Must run after `setup_test_home` so it
+/// writes into the test HOME. See #2583, #3364.
+fn disable_confirm_delete() {
     crate::session::config::update_config(|config| {
-        config.session.confirm_delete = true;
+        config.session.confirm_delete = false;
     })
     .unwrap();
 }
@@ -1610,6 +1624,13 @@ fn test_g_key_opens_group_picker() {
     env.view.handle_key(key(KeyCode::Esc), None);
     assert!(env.view.group_picker_dialog.is_none());
     assert_eq!(env.view.group_by, GroupByMode::Project);
+
+    // 'g' again, Down + Enter advances Project -> Org.
+    env.view.handle_key(key(KeyCode::Char('g')), None);
+    env.view.handle_key(key(KeyCode::Down), None);
+    env.view.handle_key(key(KeyCode::Enter), None);
+    assert!(env.view.group_picker_dialog.is_none());
+    assert_eq!(env.view.group_by, GroupByMode::Org);
 }
 
 #[test]
@@ -3913,6 +3934,107 @@ fn test_project_group_collapsed_prunes_stale_paths() {
     );
 }
 
+/// Org-mode counterpart of `test_project_group_collapsed_state_persists_to_config`:
+/// org folder collapse state has no group record either (headers are derived
+/// from each session's resolved remote owner), so it must round-trip through
+/// `app_state.org_group_collapsed` the same way.
+#[test]
+#[serial]
+fn test_org_group_collapsed_state_persists_to_config() {
+    use crate::session::config::GroupByMode;
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Org;
+    env.view.flat_items = env.view.build_flat_items();
+
+    // Find an org folder header and confirm it starts expanded.
+    let (group_idx, group_path) = env
+        .view
+        .flat_items
+        .iter()
+        .enumerate()
+        .find_map(|(idx, item)| match item {
+            Item::Group {
+                path, collapsed, ..
+            } => {
+                assert!(!collapsed, "org folder should start expanded");
+                Some((idx, path.clone()))
+            }
+            _ => None,
+        })
+        .expect("org mode should have a folder header");
+
+    // Collapse it via Enter, which routes through toggle_group_collapsed.
+    env.view.cursor = group_idx;
+    env.view.update_selected();
+    env.view.handle_key(key(KeyCode::Enter), None);
+
+    // The collapsed path must be persisted to the on-disk config.
+    let config = crate::session::config::load_config()
+        .unwrap()
+        .expect("config should exist after collapse");
+    assert!(
+        config.app_state.org_group_collapsed.contains(&group_path),
+        "collapsed org folder path should be persisted to app_state"
+    );
+
+    // A freshly constructed HomeView (simulating relaunch) must restore it.
+    let fresh = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    assert_eq!(
+        fresh.org_group_collapsed.get(&group_path).copied(),
+        Some(true),
+        "relaunched HomeView should restore the collapsed org folder"
+    );
+}
+
+/// Org-mode counterpart of `test_project_group_collapsed_prunes_stale_paths`.
+#[test]
+#[serial]
+fn test_org_group_collapsed_prunes_stale_paths() {
+    use crate::session::config::GroupByMode;
+
+    let mut env = create_test_env_two_projects_mixed_attention();
+    env.view.group_by = GroupByMode::Org;
+    env.view.flat_items = env.view.build_flat_items();
+
+    // A real folder the user collapsed this session.
+    let live_path = env
+        .view
+        .flat_items
+        .iter()
+        .find_map(|item| match item {
+            Item::Group { path, .. } => Some(path.clone()),
+            _ => None,
+        })
+        .expect("org mode should have a folder header");
+
+    env.view.org_group_collapsed.insert(live_path.clone(), true);
+    // A stale entry for an org that isn't part of this session at all.
+    env.view
+        .org_group_collapsed
+        .insert("stale-org".to_string(), true);
+
+    env.view.save_org_group_collapsed();
+
+    let config = crate::session::config::load_config()
+        .unwrap()
+        .expect("config should exist after save");
+    let saved = &config.app_state.org_group_collapsed;
+    assert!(
+        saved.contains(&live_path),
+        "a live collapsed folder must be persisted"
+    );
+    assert!(
+        !saved.iter().any(|p| p == "stale-org"),
+        "a collapse entry for a nonexistent org must be pruned"
+    );
+}
+
 #[test]
 #[serial]
 fn test_list_width_default() {
@@ -5602,6 +5724,8 @@ fn test_row_tag_none_hides_workspace_suffix() {
                 main_repo_path: "/src/api".to_string(),
                 managed_by_aoe: true,
                 branch_preexisting: false,
+                base_branch: None,
+                base_branch_override: None,
             },
             crate::session::WorkspaceRepo {
                 name: "web".to_string(),
@@ -5611,6 +5735,8 @@ fn test_row_tag_none_hides_workspace_suffix() {
                 main_repo_path: "/src/web".to_string(),
                 managed_by_aoe: true,
                 branch_preexisting: false,
+                base_branch: None,
+                base_branch_override: None,
             },
         ],
         created_at: chrono::Utc::now(),
@@ -5640,6 +5766,8 @@ fn test_row_tag_branch_renders_workspace_branch_repo_count() {
                 main_repo_path: "/src/api".to_string(),
                 managed_by_aoe: true,
                 branch_preexisting: false,
+                base_branch: None,
+                base_branch_override: None,
             },
             crate::session::WorkspaceRepo {
                 name: "web".to_string(),
@@ -5649,6 +5777,8 @@ fn test_row_tag_branch_renders_workspace_branch_repo_count() {
                 main_repo_path: "/src/web".to_string(),
                 managed_by_aoe: true,
                 branch_preexisting: false,
+                base_branch: None,
+                base_branch_override: None,
             },
         ],
         created_at: chrono::Utc::now(),
@@ -6051,11 +6181,155 @@ fn test_group_delete_dialog_scoped_to_owning_profile() {
     );
 }
 
-/// Changing a session's profile via the rename dialog must prune the
-/// source profile's now-empty group, just like the restart-with-edits
-/// path does. Without the prune the source keeps an empty group with the
-/// same name as the target's copy, which renders as a duplicate header and
-/// collides on the shared group key.
+// Four rename-collision behaviors (untied duplicate-pair reject, group-only
+// change allowed, tied derived-destination collision, cross-profile target
+// collision) share one test because they need the same `#[serial]`-forcing
+// setup: an isolated home, multiple `HomeView`/`Storage` instances, and a
+// process-global `tie_workdir_to_name` flip. Splitting would multiply that
+// setup and the serial critical-path time; each behavior asserts independently.
+#[test]
+#[serial]
+fn test_rename_selected_rejects_all_identity_collisions_and_allows_group_only_change() {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+    let existing = Instance::new("main branch", "/tmp/repo/");
+    let target = Instance::new("throwaway", "/tmp/stale");
+    let target_id = target.id.clone();
+    storage
+        .update(|instances, _groups| {
+            *instances = vec![existing, target];
+            Ok(())
+        })
+        .unwrap();
+
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.selected_session = Some(target_id.clone());
+    storage
+        .update(|instances, _groups| {
+            instances
+                .iter_mut()
+                .find(|instance| instance.id == target_id)
+                .unwrap()
+                .project_path = "/tmp/repo".to_string();
+            Ok(())
+        })
+        .unwrap();
+
+    view.rename_selected("main branch", None, None, false)
+        .unwrap();
+    assert!(view.info_dialog.is_some());
+    assert_eq!(view.get_instance(&target_id).unwrap().title, "throwaway");
+    assert_eq!(
+        view.get_instance(&target_id).unwrap().project_path,
+        "/tmp/repo"
+    );
+
+    view.info_dialog = None;
+    view.rename_selected("", Some("work"), None, false).unwrap();
+    assert!(view.info_dialog.is_none());
+    assert_eq!(view.get_instance(&target_id).unwrap().group_path, "work");
+    let stored = storage.load().unwrap();
+    let target = stored
+        .iter()
+        .find(|instance| instance.id == target_id)
+        .unwrap();
+    assert_eq!(target.title, "throwaway");
+    assert_eq!(target.group_path, "work");
+
+    // Tied routing derives the destination path from the new title. Reject a
+    // collision on that final pair before attempting the git worktree move.
+    let tie_guard = crate::session::test_support::TieWorkdirToNameGuard::set(true);
+    let derived_existing = Instance::new("main branch", "/tmp/worktrees/main-branch");
+    let mut tied_target = Instance::new("throwaway", "/tmp/worktrees/throwaway");
+    tied_target.worktree_info = Some(crate::session::WorktreeInfo {
+        branch: "throwaway".to_string(),
+        main_repo_path: "/tmp/repo".to_string(),
+        managed_by_aoe: true,
+        created_at: chrono::Utc::now(),
+        base_branch: None,
+    });
+    let tied_id = tied_target.id.clone();
+    storage
+        .update(|instances, _groups| {
+            *instances = vec![derived_existing, tied_target];
+            Ok(())
+        })
+        .unwrap();
+    view.reload().unwrap();
+    view.selected_session = Some(tied_id.clone());
+    view.info_dialog = None;
+    view.rename_selected("main branch", None, None, false)
+        .unwrap();
+    assert!(
+        view.info_dialog.is_some(),
+        "tied derived-destination collision must be rejected"
+    );
+    let tied_stored = storage.load().unwrap();
+    let tied_target = tied_stored
+        .iter()
+        .find(|instance| instance.id == tied_id)
+        .unwrap();
+    assert_eq!(tied_target.title, "throwaway");
+    assert_eq!(tied_target.project_path, "/tmp/worktrees/throwaway");
+
+    drop(tie_guard);
+
+    // Moving between profiles checks the authoritative target storage, not
+    // only the source profile or unified-view cache.
+    let alpha = Storage::new_unwatched("alpha").unwrap();
+    let beta = Storage::new_unwatched("beta").unwrap();
+    let source = Instance::new("source", "/tmp/profile-collision");
+    let source_id = source.id.clone();
+    alpha
+        .update(|instances, _groups| {
+            *instances = vec![source];
+            Ok(())
+        })
+        .unwrap();
+    beta.update(|instances, _groups| {
+        *instances = vec![Instance::new("occupied", "/tmp/profile-collision")];
+        Ok(())
+    })
+    .unwrap();
+    let mut unified = HomeView::new(
+        None,
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    unified.selected_session = Some(source_id.clone());
+    let error = unified
+        .rename_selected("occupied", None, Some("beta"), false)
+        .expect_err("target-profile identity collision must reject the transaction");
+    assert!(
+        error
+            .to_string()
+            .contains("Session already exists with same title and path"),
+        "unexpected collision error: {error:#}"
+    );
+    assert_eq!(
+        alpha
+            .load()
+            .unwrap()
+            .iter()
+            .find(|instance| instance.id == source_id)
+            .unwrap()
+            .title,
+        "source"
+    );
+    assert_eq!(beta.load().unwrap().len(), 1);
+}
+
+/// Changing a session's profile via the rename dialog must transfer its group
+/// metadata in the same storage transaction. Otherwise the source can reload
+/// an empty duplicate while the target row renders under a separately-created
+/// group.
 #[test]
 #[serial]
 fn test_rename_profile_change_prunes_source_group() {
@@ -6103,6 +6377,16 @@ fn test_rename_profile_change_prunes_source_group() {
             .unwrap_or(false),
         "alpha's now-empty 'work' group should be pruned after the profile move"
     );
+    let (_, source_groups) = Storage::new_unwatched("alpha")
+        .unwrap()
+        .load_with_groups()
+        .unwrap();
+    let (_, target_groups) = Storage::new_unwatched("beta")
+        .unwrap()
+        .load_with_groups()
+        .unwrap();
+    assert!(!source_groups.iter().any(|group| group.path == "work"));
+    assert!(target_groups.iter().any(|group| group.path == "work"));
 }
 
 #[test]
@@ -6881,6 +7165,103 @@ fn test_rename_group_empty_group() {
 
 #[test]
 #[serial]
+fn test_move_explicit_empty_group_between_profiles() {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let source = Storage::new_unwatched("alpha").unwrap();
+    source
+        .update(|_instances, groups| {
+            let mut group = Group::new("empty", "empty");
+            group.collapsed = true;
+            groups.push(group);
+            Ok(())
+        })
+        .unwrap();
+    let _target = Storage::new_unwatched("beta").unwrap();
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.group_rename_context = Some(super::GroupRenameContext {
+        old_path: "empty".to_string(),
+        old_profile: "alpha".to_string(),
+    });
+
+    view.rename_selected_group(Some("moved-empty"), Some("beta"))
+        .unwrap();
+
+    assert!(Storage::new_unwatched("alpha")
+        .unwrap()
+        .load_with_groups()
+        .unwrap()
+        .1
+        .iter()
+        .all(|group| group.path != "empty"));
+    let moved = Storage::new_unwatched("beta")
+        .unwrap()
+        .load_with_groups()
+        .unwrap()
+        .1
+        .into_iter()
+        .find(|group| group.path == "moved-empty")
+        .expect("empty group metadata moved to target profile");
+    assert!(moved.collapsed);
+}
+
+#[test]
+#[serial]
+fn test_group_profile_move_rejects_concurrent_fresh_member_without_metadata_split() {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let source = Storage::new_unwatched("alpha").unwrap();
+    let mut known = Instance::new("known", "/tmp/known");
+    known.group_path = "team".to_string();
+    source
+        .update(|instances, groups| {
+            instances.push(known.clone());
+            groups.push(Group::new("team", "team"));
+            Ok(())
+        })
+        .unwrap();
+    let _target = Storage::new_unwatched("beta").unwrap();
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.group_rename_context = Some(super::GroupRenameContext {
+        old_path: "team".to_string(),
+        old_profile: "alpha".to_string(),
+    });
+
+    source
+        .update(|instances, _groups| {
+            let mut concurrent = Instance::new("concurrent", "/tmp/concurrent");
+            concurrent.group_path = "team/fresh".to_string();
+            instances.push(concurrent);
+            Ok(())
+        })
+        .unwrap();
+    let error = view
+        .rename_selected_group(Some("moved-team"), Some("beta"))
+        .expect_err("a concurrent group member must abort the move");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("group membership changed while the cross-profile move was pending"),
+        "unexpected profile-move rejection: {message}"
+    );
+    let (source_rows, source_groups) = source.load_with_groups().unwrap();
+    assert_eq!(source_rows.len(), 2);
+    assert!(source_rows
+        .iter()
+        .all(|instance| instance.group_path.starts_with("team")));
+    assert!(source_groups.iter().any(|group| group.path == "team"));
+    assert!(Storage::new_unwatched("beta")
+        .unwrap()
+        .load()
+        .unwrap()
+        .is_empty());
+}
+
+#[test]
+#[serial]
 fn test_rename_group_duplicate_returns_error() {
     use crate::session::GroupTree;
 
@@ -6920,6 +7301,189 @@ fn test_rename_group_duplicate_returns_error() {
 
     let result = view.rename_selected_group(Some("personal"), None);
     assert!(result.is_err(), "renaming to an existing group should fail");
+}
+
+#[test]
+#[serial]
+fn test_group_profile_move_is_all_or_nothing() {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let source = Storage::new_unwatched("alpha").unwrap();
+    let mut first = Instance::new("first", "/tmp/first");
+    first.group_path = "work".to_string();
+    let mut second = Instance::new("second", "/tmp/second");
+    second.group_path = "work".to_string();
+    let mut work_group = Group::new("work", "work");
+    work_group.collapsed = true;
+    let source_empty = Group::new("keep-empty", "keep-empty");
+    source
+        .update(|instances, groups| {
+            *instances = vec![first.clone(), second.clone()];
+            *groups = vec![work_group.clone(), source_empty.clone()];
+            Ok(())
+        })
+        .unwrap();
+    let target = Storage::new_unwatched("beta").unwrap();
+    let target_empty = Group::new("target-empty", "target-empty");
+    target
+        .update(|instances, groups| {
+            instances.push(Instance::new("second", "/tmp/second/"));
+            groups.push(target_empty.clone());
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(
+        None,
+        tools.clone(),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.group_rename_context = Some(super::GroupRenameContext {
+        old_path: "work".to_string(),
+        old_profile: "alpha".to_string(),
+    });
+    assert!(view.rename_selected_group(None, Some("beta")).is_err());
+    assert_eq!(source.load().unwrap().len(), 2);
+    assert_eq!(target.load().unwrap().len(), 1);
+    let (_, source_groups) = source.load_with_groups().unwrap();
+    let (_, target_groups) = target.load_with_groups().unwrap();
+    assert_eq!(
+        source_groups,
+        vec![work_group.clone(), source_empty.clone()]
+    );
+    assert_eq!(target_groups, vec![target_empty.clone()]);
+
+    target
+        .update(|instances, _groups| {
+            instances.clear();
+            Ok(())
+        })
+        .unwrap();
+    view.group_rename_context = Some(super::GroupRenameContext {
+        old_path: "work".to_string(),
+        old_profile: "alpha".to_string(),
+    });
+    view.rename_selected_group(None, Some("beta")).unwrap();
+    assert!(source.load().unwrap().is_empty());
+    assert_eq!(target.load().unwrap().len(), 2);
+    let published: Vec<_> = view
+        .instances()
+        .filter(|instance| instance.group_path == "work")
+        .collect();
+    assert_eq!(
+        published.len(),
+        2,
+        "both members must be published in memory"
+    );
+    assert!(published
+        .iter()
+        .all(|instance| instance.source_profile == "beta"));
+    let (_, source_groups) = source.load_with_groups().unwrap();
+    assert_eq!(source_groups, vec![source_empty]);
+    let (_, target_groups) = target.load_with_groups().unwrap();
+    assert!(target_groups
+        .iter()
+        .any(|group| group.path == "work" && group.collapsed));
+    assert!(target_groups
+        .iter()
+        .any(|group| group.path == "target-empty"));
+    let reloaded = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    assert!(!reloaded.group_trees["alpha"].group_exists("work"));
+    assert!(reloaded.group_trees["alpha"].group_exists("keep-empty"));
+    assert!(reloaded.group_trees["beta"].group_exists("work"));
+    assert!(reloaded.group_trees["beta"].group_exists("target-empty"));
+}
+
+#[test]
+#[serial]
+fn group_profile_move_preflights_creating_and_expired_reservations() {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let source = Storage::new_unwatched("alpha").unwrap();
+    let mut first = Instance::new("first", "/tmp/preflight-first");
+    first.group_path = "work".to_string();
+    let mut second = Instance::new("second", "/tmp/preflight-second");
+    second.group_path = "work".to_string();
+    source
+        .update(|instances, groups| {
+            *instances = vec![first.clone(), second.clone()];
+            groups.push(Group::new("work", "work"));
+            Ok(())
+        })
+        .unwrap();
+    let target = Storage::new_unwatched("beta").unwrap();
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+    view.mutate_instance(&second.id, |instance| {
+        instance.status = Status::Creating;
+    });
+    view.group_rename_context = Some(super::GroupRenameContext {
+        old_path: "work".to_string(),
+        old_profile: "alpha".to_string(),
+    });
+
+    let error = view
+        .rename_selected_group(Some("moved"), Some("beta"))
+        .expect_err("a creating member must reject the complete group move");
+
+    assert!(error.to_string().contains("being created"));
+    assert!(view
+        .instances()
+        .filter(|instance| instance.id == first.id || instance.id == second.id)
+        .all(|instance| instance.source_profile == "alpha" && instance.group_path == "work"));
+    let source_rows = source.load().unwrap();
+    assert_eq!(source_rows.len(), 2);
+    assert!(source_rows
+        .iter()
+        .all(|instance| instance.group_path == "work"));
+    assert!(target.load().unwrap().is_empty());
+
+    view.mutate_instance(&second.id, |instance| {
+        instance.status = Status::Deleting;
+    });
+    view.group_rename_context = Some(super::GroupRenameContext {
+        old_path: "work".to_string(),
+        old_profile: "alpha".to_string(),
+    });
+    let error = view
+        .rename_selected_group(Some("moved"), Some("beta"))
+        .expect_err("a deleting member must reject the complete group move");
+    assert!(error.to_string().contains("being deleted"));
+    assert_eq!(source.load().unwrap().len(), 2);
+    assert!(target.load().unwrap().is_empty());
+
+    let stale = LifecycleReservation {
+        op: LifecycleOperation::Launch,
+        generation: 1,
+        at: chrono::Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1),
+    };
+    view.mutate_instance(&second.id, |instance| {
+        instance.status = Status::Idle;
+        instance.lifecycle_generation = 1;
+        instance.lifecycle_reservation = Some(stale.clone());
+    });
+    source
+        .update(|instances, _groups| {
+            let instance = instances
+                .iter_mut()
+                .find(|instance| instance.id == second.id)
+                .unwrap();
+            instance.lifecycle_generation = 1;
+            instance.lifecycle_reservation = Some(stale);
+            Ok(())
+        })
+        .unwrap();
+    view.group_rename_context = Some(super::GroupRenameContext {
+        old_path: "work".to_string(),
+        old_profile: "alpha".to_string(),
+    });
+
+    view.rename_selected_group(Some("moved"), Some("beta"))
+        .expect("expired reservation must not block the group move");
+    assert!(source.load().unwrap().is_empty());
+    assert_eq!(target.load().unwrap().len(), 2);
 }
 
 #[test]
@@ -7015,20 +7579,38 @@ fn test_has_dialog_true_when_search_active() {
     assert!(view.has_dialog());
 }
 
-/// Verify that the async CreationPoller path returns a session ID from
-/// `apply_creation_results` once the background thread finishes. This is
-/// the code path that was previously starved by continuous input events
-/// in the tokio::select! event loop (see #633).
-#[test]
-#[serial]
-fn test_apply_creation_results_returns_session_id() {
-    use crate::tui::dialogs::NewSessionData;
+/// Shared fixture for the async-creation finalization tests: a fresh
+/// single-commit git repo under a temp `$HOME`, a `HomeView` bound to the
+/// `default` profile in manual-group mode, and an unwatched `Storage` handle
+/// onto the same profile. Each test spawns a real background builder against
+/// this repo, so the setup is factored out rather than duplicated.
+struct CreationTestEnv {
+    view: HomeView,
+    storage: Storage,
+    project_dir: std::path::PathBuf,
+    _guard: AppDirGuard,
+    _temp: TempDir,
+}
 
+fn setup_creation_test_env() -> CreationTestEnv {
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
 
     let project_dir = temp.path().join("project");
     std::fs::create_dir_all(&project_dir).unwrap();
+    {
+        let repo = git2::Repository::init(&project_dir).unwrap();
+        let signature = git2::Signature::now("Test", "test@example.com").unwrap();
+        std::fs::write(project_dir.join("README.md"), "test\n").unwrap();
+        let tree_id = {
+            let mut index = repo.index().unwrap();
+            index.add_path(std::path::Path::new("README.md")).unwrap();
+            index.write_tree().unwrap()
+        };
+        let tree = repo.find_tree(tree_id).unwrap();
+        repo.commit(Some("HEAD"), &signature, &signature, "init", &tree, &[])
+            .unwrap();
+    }
 
     let tools = AvailableTools::with_tools(&["claude"]);
     let mut view = HomeView::new(
@@ -7041,11 +7623,24 @@ fn test_apply_creation_results_returns_session_id() {
     view.flat_items = view.build_flat_items();
     view.update_selected();
 
-    let data = NewSessionData {
+    let storage = Storage::new_unwatched("default").unwrap();
+    CreationTestEnv {
+        view,
+        storage,
+        project_dir,
+        _guard,
+        _temp: temp,
+    }
+}
+
+/// Base new-session data targeting the shared repo. Callers tweak the
+/// title/group and worktree fields per scenario.
+fn creation_data(project_dir: &std::path::Path, title: &str, group: &str) -> NewSessionData {
+    NewSessionData {
         profile: "default".to_string(),
-        title: "Async Test".to_string(),
+        title: title.to_string(),
         path: project_dir.to_str().unwrap().to_string(),
-        group: String::new(),
+        group: group.to_string(),
         tool: "claude".to_string(),
         worktree_enabled: false,
         worktree_branch: None,
@@ -7061,43 +7656,320 @@ fn test_apply_creation_results_returns_session_id() {
         scratch: false,
         fork_seed: None,
         structured: false,
-    };
+    }
+}
 
-    // Use the async CreationPoller path (pass None hooks, non-sandbox,
-    // but call request_creation directly to force the async path)
-    view.request_creation(data, None);
-    assert!(view.is_creation_pending());
-
-    // Wait for the background thread to finish (should be near-instant
-    // for non-sandbox, non-hook creation)
+/// Pump `apply_creation_results` until the background builder delivers a
+/// result, returning the finalized session id (`Some`) or the rollback outcome
+/// (`None`). Consuming the result clears `is_creation_pending`, so this
+/// terminates once a result lands; it fails the test on timeout rather than
+/// looping forever. Centralizes the poll so the tests carry no bespoke timing
+/// loops of their own.
+fn drain_creation_result(view: &mut HomeView) -> Option<String> {
     let start = std::time::Instant::now();
-    let mut session_id = None;
-    while start.elapsed() < std::time::Duration::from_secs(5) {
+    loop {
         if let Some(id) = view.apply_creation_results() {
-            session_id = Some(id);
-            break;
+            return Some(id);
         }
+        if !view.is_creation_pending() {
+            return None;
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(10),
+            "background creation timed out"
+        );
         std::thread::sleep(std::time::Duration::from_millis(10));
     }
+}
 
-    let session_id = session_id.expect("apply_creation_results should return Some(session_id)");
+/// The async CreationPoller result must replace a `Creating` stub even when an
+/// intervening TUI save already persisted it, keep the finalized row's group,
+/// and treat the committed row as authoritative: it is not a provisional
+/// pending add, and a later peer deletion is not resurrected by `save`.
+#[test]
+#[serial]
+fn apply_creation_results_finalizes_persisted_stub() {
+    let CreationTestEnv {
+        mut view,
+        storage,
+        project_dir,
+        _guard,
+        _temp,
+    } = setup_creation_test_env();
+
+    view.request_creation(
+        creation_data(&project_dir, "Async Test", "async-success"),
+        None,
+    );
+    assert!(view.is_creation_pending());
+    let stub_id = view
+        .creating_stub_id
+        .clone()
+        .expect("request should install a Creating stub");
+    view.save().unwrap();
+    let (persisted_while_creating, groups_while_creating) = storage.load_with_groups().unwrap();
+    assert_eq!(persisted_while_creating.len(), 1);
+    assert_eq!(persisted_while_creating[0].id, stub_id);
+    assert_eq!(
+        persisted_while_creating[0].status,
+        crate::session::Status::Creating
+    );
+    assert!(
+        groups_while_creating
+            .iter()
+            .any(|group| group.path == "async-success"),
+        "the intervening save should persist the stub's provisional group"
+    );
+
+    let session_id = drain_creation_result(&mut view)
+        .expect("apply_creation_results should return Some(session_id)");
+    assert!(
+        view.creating_provisional_group_paths.is_empty(),
+        "finalization must leave no provisional group paths behind"
+    );
     assert!(
         view.get_instance(&session_id).is_some(),
         "created session should be findable after apply_creation_results"
     );
+    assert!(
+        !view
+            .pending_added
+            .get("default")
+            .is_some_and(|pending| pending.contains(&session_id)),
+        "a row committed by finalization is not a provisional pending add"
+    );
+    let (persisted_after_finalization, groups_after_finalization) =
+        storage.load_with_groups().unwrap();
+    assert_eq!(
+        persisted_after_finalization.len(),
+        1,
+        "finalization should replace the persisted stub with one real row"
+    );
+    assert_eq!(persisted_after_finalization[0].id, session_id);
+    assert!(
+        persisted_after_finalization
+            .iter()
+            .all(|instance| instance.id != stub_id
+                && instance.status != crate::session::Status::Creating),
+        "the persisted Creating stub must not survive finalization"
+    );
+    assert!(
+        groups_after_finalization
+            .iter()
+            .any(|group| group.path == "async-success"),
+        "the finalized row's group should remain persisted"
+    );
+    assert!(
+        view.get_instance(&stub_id).is_none(),
+        "the in-memory Creating stub must be replaced too"
+    );
+
+    storage
+        .update(|instances, _groups| {
+            instances.retain(|instance| instance.id != session_id);
+            Ok(())
+        })
+        .unwrap();
+    view.save().unwrap();
+    assert!(
+        view.get_instance(&session_id).is_none(),
+        "save must evict the peer-deleted finalized row from memory"
+    );
+    assert!(
+        !storage
+            .load()
+            .unwrap()
+            .iter()
+            .any(|instance| instance.id == session_id),
+        "a peer-deleted finalized row must not be resurrected by save"
+    );
+}
+
+/// A peer can commit the same title/path while the background builder waits for
+/// finalization. The duplicate rollback must preserve every resource the
+/// persisted winner references (worktree, branch) and its own pre-existing
+/// empty group, while discarding the losing stub's provisional group, both in
+/// memory and across a later save.
+#[test]
+#[serial]
+fn apply_creation_results_rolls_back_on_peer_collision() {
+    let CreationTestEnv {
+        mut view,
+        storage,
+        project_dir,
+        _guard,
+        _temp,
+    } = setup_creation_test_env();
+
+    // Use a real created branch/worktree so rollback proves it preserves
+    // resources referenced by the persisted winner.
+    let preexisting_group = "existing-empty";
+    let transient_group = "existing-empty/collision";
+    view.group_trees
+        .get_mut("default")
+        .expect("default profile should have a group tree")
+        .create_group(preexisting_group);
+    view.save().unwrap();
+    assert!(
+        storage
+            .load_with_groups()
+            .unwrap()
+            .1
+            .iter()
+            .any(|group| group.path == preexisting_group),
+        "the parent group must be intentionally persisted before the request"
+    );
+    let branch = "raced-worktree";
+    let mut raced = creation_data(&project_dir, "Raced title", transient_group);
+    raced.worktree_enabled = true;
+    raced.worktree_branch = Some(branch.to_string());
+    raced.create_new_branch = true;
+    view.request_creation(raced, None);
+    let raced_stub_id = view
+        .creating_stub_id
+        .clone()
+        .expect("raced request should install a Creating stub");
+    view.save().unwrap();
+    let (raced_rows, raced_groups) = storage.load_with_groups().unwrap();
+    assert!(raced_rows.iter().any(|instance| {
+        instance.id == raced_stub_id && instance.status == crate::session::Status::Creating
+    }));
+    assert!(
+        raced_groups
+            .iter()
+            .any(|group| group.path == transient_group),
+        "the intervening save should persist the raced stub's child group"
+    );
+
+    let main_repo_path = project_dir.canonicalize().unwrap();
+    let git = crate::git::GitWorktree::new(main_repo_path.clone()).unwrap();
+    let start = std::time::Instant::now();
+    let winner_path = loop {
+        if let Some(path) = git
+            .list_worktrees()
+            .unwrap()
+            .into_iter()
+            .find(|worktree| worktree.branch.as_deref() == Some(branch))
+            .map(|worktree| worktree.path)
+        {
+            break path;
+        }
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(5),
+            "background worktree creation timed out"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
+
+    let mut owner = Instance::new("Raced title", winner_path.to_str().unwrap());
+    owner.source_profile = "default".to_string();
+    owner.worktree_info = Some(crate::session::WorktreeInfo {
+        branch: branch.to_string(),
+        main_repo_path: main_repo_path.to_string_lossy().into_owned(),
+        managed_by_aoe: false,
+        created_at: chrono::Utc::now(),
+        base_branch: None,
+    });
+    let owner_id = owner.id.clone();
+    storage
+        .update(|instances, _groups| {
+            instances.push(owner);
+            Ok(())
+        })
+        .unwrap();
+
+    let unexpected_id = drain_creation_result(&mut view);
+    assert_eq!(unexpected_id, None);
+    assert!(
+        view.creating_provisional_group_paths.is_empty(),
+        "rollback must leave no provisional group paths behind"
+    );
+    assert!(view.info_dialog.is_some());
+    assert!(
+        winner_path.is_dir(),
+        "rollback must preserve the winner's worktree"
+    );
+    assert!(
+        git.list_worktrees()
+            .unwrap()
+            .iter()
+            .any(|worktree| worktree.path == winner_path),
+        "winner worktree must remain registered"
+    );
+    assert!(
+        git2::Repository::open(&main_repo_path)
+            .unwrap()
+            .find_branch(branch, git2::BranchType::Local)
+            .is_ok(),
+        "rollback must preserve the winner's branch"
+    );
+    assert!(
+        view.group_trees.get("default").is_none_or(|tree| tree
+            .get_all_groups()
+            .iter()
+            .all(|group| group.path != transient_group)),
+        "duplicate rejection must discard the stub's provisional group"
+    );
+    assert!(
+        view.group_trees
+            .get("default")
+            .is_some_and(|tree| tree.group_exists(preexisting_group)),
+        "duplicate rejection must preserve an intentionally pre-existing empty group"
+    );
+
+    view.save().unwrap();
+    let (persisted, groups) = storage.load_with_groups().unwrap();
+    assert_eq!(
+        persisted
+            .iter()
+            .filter(|instance| {
+                instance.title == "Raced title"
+                    && std::path::Path::new(&instance.project_path) == winner_path
+            })
+            .count(),
+        1
+    );
+    assert_eq!(
+        persisted.len(),
+        1,
+        "duplicate rejection should leave only the authoritative peer row"
+    );
+    assert!(
+        persisted.iter().all(|instance| {
+            instance.id != raced_stub_id && instance.status != crate::session::Status::Creating
+        }),
+        "duplicate rejection must remove the persisted Creating stub"
+    );
+    assert!(
+        groups.iter().all(|group| group.path != transient_group),
+        "a later save must not persist the rejected stub's group"
+    );
+    assert!(
+        groups.iter().any(|group| group.path == preexisting_group),
+        "a later save must preserve the pre-existing empty parent group"
+    );
+
+    storage
+        .update(|instances, _groups| {
+            instances.retain(|instance| instance.id != owner_id);
+            Ok(())
+        })
+        .unwrap();
+    git.remove_worktree(&winner_path, true).unwrap();
+    git.delete_branch(branch).unwrap();
 }
 
 #[test]
-fn test_project_group_name_uses_last_path_segment() {
-    use super::project_group_name;
+fn test_project_group_key_uses_last_path_segment() {
+    use super::project_group_key;
 
     let inst = Instance::new("test", "/home/user/my-project");
-    assert_eq!(project_group_name(&inst), "my-project");
+    assert_eq!(project_group_key(&inst), "my-project");
 }
 
 #[test]
-fn test_project_group_name_uses_main_repo_for_worktree() {
-    use super::project_group_name;
+fn test_project_group_key_uses_main_repo_for_worktree() {
+    use super::project_group_key;
     use crate::session::WorktreeInfo;
     use chrono::Utc;
 
@@ -7109,27 +7981,31 @@ fn test_project_group_name_uses_main_repo_for_worktree() {
         created_at: Utc::now(),
         base_branch: None,
     });
-    assert_eq!(project_group_name(&inst), "my-project");
+    assert_eq!(project_group_key(&inst), "my-project");
 }
 
 #[test]
-fn test_project_group_name_handles_trailing_slash() {
-    use super::project_group_name;
+fn test_project_group_key_handles_trailing_slash() {
+    use super::project_group_key;
 
     let inst = Instance::new("test", "/home/user/my-project/");
-    assert_eq!(project_group_name(&inst), "my-project");
+    assert_eq!(project_group_key(&inst), "my-project");
 }
 
 #[test]
-fn test_project_group_name_groups_scratch_under_scratch() {
-    use super::project_group_name;
+fn test_project_group_key_scratch_uses_sentinel_not_label() {
+    use super::project_group_key;
+    use crate::session::{project_group_display_name, SCRATCH_GROUP_PATH};
 
     let mut inst = Instance::new(
         "test",
         "/home/user/.config/agent-of-empires/scratch/a4535853054b4096",
     );
     inst.scratch = true;
-    assert_eq!(project_group_name(&inst), "scratch");
+    // Scratch keys on the sentinel identity, not the display label, so a real
+    // repo named `scratch` keeps a distinct identity (#3237).
+    assert_eq!(project_group_key(&inst), SCRATCH_GROUP_PATH);
+    assert_eq!(project_group_display_name(SCRATCH_GROUP_PATH), "Scratch");
 }
 
 #[test]
@@ -8069,6 +8945,53 @@ fn pollable_instances_recovers_after_inflight_clear() {
     assert_eq!(env.view.pollable_instances().len(), 1);
 }
 
+#[test]
+#[serial]
+fn system_health_survives_refresh_but_closes_on_selection_change() {
+    let mut env = create_test_env_with_sessions(2);
+    env.view.update_selected();
+    env.view.open_system_health();
+
+    env.view.update_selected();
+    assert!(env.view.system_health_open);
+
+    env.view.cursor = 1;
+    env.view.update_selected();
+    assert!(!env.view.system_health_open);
+}
+
+#[test]
+#[serial]
+fn system_health_tip_requires_three_six_agent_samples() {
+    let mut env = create_test_env_empty();
+    env.view.metrics.counts.agents = 6;
+
+    env.view.observe_system_health_tip_load();
+    env.view.observe_system_health_tip_load();
+    assert!(!env.view.system_health_tip_earned);
+    assert!(env.view.pending_tip_pop.is_none());
+
+    env.view.metrics.counts.agents = 5;
+    env.view.observe_system_health_tip_load();
+    assert_eq!(env.view.system_health_tip_high_samples, 0);
+
+    env.view.metrics.counts.agents = 6;
+    for _ in 0..3 {
+        env.view.observe_system_health_tip_load();
+    }
+    assert!(env.view.system_health_tip_earned);
+    assert_eq!(
+        env.view.pending_tip_pop.map(|tip| tip.id),
+        Some("system-health")
+    );
+
+    env.view.open_system_health();
+    assert!(env.view.pending_tip_pop.is_none());
+    let config = crate::session::Config::load().unwrap();
+    assert!(config.app_state.system_health_tip_earned);
+    assert!(config.app_state.used_system_health);
+}
+
 /// Footer discoverability hints track where each key actually does something.
 /// Archive/Snooze are Attention-only. Fav follows its keybind's own gate
 /// (`Context::FavoritesUsable`): usable in Attention, or in any sort order
@@ -8296,13 +9219,12 @@ fn trash_offloads_blocking_teardown_to_poller() {
     );
 }
 
-/// Trashing marks the teardown as in flight on the durable row: `d` sets the
-/// Trash claim under the storage flock so peer processes observe the teardown
-/// as state instead of inferring it. Driven directly against storage because
-/// `merge_user_action_diff` deliberately drops `op_claim` (#2541).
+/// Trashing reserves a durable lifecycle generation before queueing teardown.
+/// The worker may already have completed and released the lease by the time the
+/// test reloads, but the monotonic generation proves ownership was acquired.
 #[test]
 #[serial]
-fn trash_sets_durable_teardown_claim() {
+fn trash_reserves_durable_lifecycle_generation() {
     let mut env = create_test_env_with_sessions(2);
     let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
@@ -8310,19 +9232,13 @@ fn trash_sets_durable_teardown_claim() {
     env.view.trash_session_by_id(&id);
 
     let rows = env.view.storages.get("test").unwrap().load().unwrap();
-    let row = rows.iter().find(|i| i.id == id).unwrap();
+    let row = rows.iter().find(|instance| instance.id == id).unwrap();
     assert!(row.is_trashed());
-    assert_eq!(
-        row.op_claim.as_ref().map(|c| c.op),
-        Some(crate::session::ClaimOp::Trash),
-        "the durable row must carry the in-flight Trash claim"
-    );
+    assert_eq!(row.lifecycle_generation, 1);
 }
 
-/// The teardown's no-relocation terminal path releases the durable Trash
-/// claim: a plain (non-worktree) session's teardown ends in `Skipped`, and
-/// draining that result must clear the claim set at `d` time, leaving a
-/// trashed row with no in-flight marker.
+/// A plain session's no-relocation teardown releases its durable Trash reservation
+/// before the worker publishes completion.
 #[test]
 #[serial]
 fn trash_teardown_release_clears_durable_claim() {
@@ -8341,14 +9257,8 @@ fn trash_teardown_release_clears_durable_claim() {
             .find(|i| i.id == id)
             .unwrap()
     };
-    assert_eq!(
-        row(&env.view).op_claim.as_ref().map(|c| c.op),
-        Some(crate::session::ClaimOp::Trash),
-        "claim set at d time"
-    );
 
-    // Drain the worker's (Skipped) teardown result; the drain is the
-    // terminal path and must release the claim.
+    // Drain the worker's completed transition.
     let mut drained = false;
     for _ in 0..100 {
         env.view.apply_trash_results();
@@ -8362,7 +9272,7 @@ fn trash_teardown_release_clears_durable_claim() {
     let final_row = row(&env.view);
     assert!(final_row.is_trashed(), "row stays trashed");
     assert_eq!(
-        final_row.op_claim, None,
+        final_row.lifecycle_reservation, None,
         "Skipped teardown must release the Trash claim"
     );
 }
@@ -8396,7 +9306,7 @@ fn trash_then_immediate_restore_hands_off_cleanly() {
     let restored = row(&env.view);
     assert!(!restored.is_trashed(), "restore must win instantly");
     assert_eq!(
-        restored.op_claim, None,
+        restored.lifecycle_reservation, None,
         "restore seized the Trash claim and released it on commit"
     );
 
@@ -8413,7 +9323,10 @@ fn trash_then_immediate_restore_hands_off_cleanly() {
     assert!(drained, "teardown result never drained");
     let final_row = row(&env.view);
     assert!(!final_row.is_trashed(), "row stays restored");
-    assert_eq!(final_row.op_claim, None, "no claim resurrected");
+    assert_eq!(
+        final_row.lifecycle_reservation, None,
+        "no claim resurrected"
+    );
 }
 
 /// Right-clicking the synthetic Trash section header opens the bulk menu
@@ -8490,7 +9403,7 @@ fn right_click_archived_header_shows_restore_menu() {
 }
 
 /// "Empty Trash" routes through a destructive confirm carrying the count; the
-/// confirmed action marks every trashed row for deletion (claimed + Deleting).
+/// confirmed action queues every trashed row without taking a flock.
 #[test]
 #[serial]
 fn empty_trash_confirm_purges_every_trashed_row() {
@@ -8518,11 +9431,7 @@ fn empty_trash_confirm_purges_every_trashed_row() {
         assert_eq!(
             inst.status,
             Status::Deleting,
-            "each trashed row must be claimed and marked Deleting"
-        );
-        assert!(
-            env.view.purge_claimed.contains(id),
-            "each row's purge claim must be owned"
+            "each trashed row must be marked Deleting"
         );
     }
 }
@@ -8642,8 +9551,8 @@ fn shelf_renders_trash_with_glyph_and_divider_sort() {
         "shelf must show the Trash count"
     );
     assert!(
-        screen.contains("sort:"),
-        "the sort indicator rides the shelf divider"
+        !screen.contains("sort:"),
+        "the shelf divider must not duplicate the header's sort indicator"
     );
     assert!(
         env.view.shelf_inner_area.height > 0,
@@ -9070,17 +9979,28 @@ fn w_skips_archived_idle_session_in_fallback() {
     );
 }
 
+/// The default gesture: `d` opens the confirm dialog and a second `d` accepts
+/// it, trashing the session both in memory and on disk. See #3364.
 #[test]
 #[serial]
-fn d_on_session_with_default_trash_persists_trash_marker() {
+fn d_then_d_confirms_the_trash_and_persists_the_marker() {
     let mut env = create_test_env_with_sessions(2);
     let id = env.view.selected_session.clone().unwrap();
 
     env.view.handle_key(key(KeyCode::Char('d')), None);
+    assert!(
+        !env.view.get_instance(&id).unwrap().is_trashed(),
+        "the first d must only open the dialog"
+    );
+    env.view.handle_key(key(KeyCode::Char('d')), None);
 
     assert!(
+        env.view.confirm_dialog.is_none(),
+        "the confirming d must close the dialog"
+    );
+    assert!(
         env.view.get_instance(&id).unwrap().is_trashed(),
-        "pressing d with default trash-first config must mark the row trashed in memory"
+        "a confirmed delete with default trash-first config must mark the row trashed in memory"
     );
     assert!(
         env.view.unified_delete_dialog.is_none(),
@@ -9095,18 +10015,65 @@ fn d_on_session_with_default_trash_persists_trash_marker() {
         .expect("disk row present");
     assert!(
         disk_row.is_trashed(),
-        "pressing d must persist trashed_at so a storage refresh cannot resurrect a killed session"
+        "confirming must persist trashed_at so a storage refresh cannot resurrect a killed session"
     );
 }
 
-/// With `session.confirm_delete` on, `d` opens a confirmation dialog and does
-/// not trash until the dialog is accepted; accepting then runs the same trash
-/// path as the instant flow. See #2583.
+/// Turning `session.confirm_delete` off restores the historical
+/// one-keystroke trash. See #3364.
+#[test]
+#[serial]
+fn d_with_confirm_delete_off_trashes_on_the_keystroke() {
+    let mut env = create_test_env_with_sessions(2);
+    disable_confirm_delete();
+    let id = env.view.selected_session.clone().unwrap();
+
+    env.view.handle_key(key(KeyCode::Char('d')), None);
+
+    assert!(
+        env.view.confirm_dialog.is_none(),
+        "confirm_delete off must not open a dialog"
+    );
+    assert!(
+        env.view.get_instance(&id).unwrap().is_trashed(),
+        "confirm_delete off must trash on the keystroke"
+    );
+}
+
+/// Ticking the dialog's "don't warn me again" checkbox trashes the session
+/// and persists `confirm_delete = false`, so the next `d` goes back to the
+/// one-keystroke trash without a trip through the settings pane. See #3364.
+#[test]
+#[serial]
+fn confirm_delete_dont_ask_again_persists_the_opt_out() {
+    let mut env = create_test_env_with_sessions(2);
+    let id = env.view.selected_session.clone().unwrap();
+
+    env.view.handle_key(key(KeyCode::Char('d')), None);
+    // Space ticks the checkbox, the second `d` accepts.
+    env.view.handle_key(key(KeyCode::Char(' ')), None);
+    env.view.handle_key(key(KeyCode::Char('d')), None);
+
+    assert!(
+        env.view.get_instance(&id).unwrap().is_trashed(),
+        "accepting with the checkbox ticked must still trash the session"
+    );
+    assert!(
+        !crate::session::config::Config::load()
+            .unwrap()
+            .session
+            .confirm_delete,
+        "the opt-out must be persisted to config"
+    );
+}
+
+/// With `session.confirm_delete` on (the default), `d` opens a confirmation
+/// dialog and does not trash until the dialog is accepted; accepting then runs
+/// the same trash path as the instant flow. See #2583.
 #[test]
 #[serial]
 fn d_with_confirm_delete_prompts_before_trashing() {
     let mut env = create_test_env_with_sessions(2);
-    enable_confirm_delete();
     let id = env.view.selected_session.clone().unwrap();
 
     env.view.handle_key(key(KeyCode::Char('d')), None);
@@ -9145,7 +10112,6 @@ fn d_with_confirm_delete_prompts_before_trashing() {
 #[serial]
 fn confirm_delete_dialog_cancel_leaves_session() {
     let mut env = create_test_env_with_sessions(2);
-    enable_confirm_delete();
     let id = env.view.selected_session.clone().unwrap();
 
     env.view.handle_key(key(KeyCode::Char('d')), None);
@@ -9500,6 +10466,178 @@ fn restart_selected_session_debounces_via_cooldown_map() {
     );
 }
 
+/// An engine swap must not carry the old agent's session state to the new
+/// one, in memory OR on disk. Session ids are per-agent namespaces, so a
+/// carried-over sid makes the next launch emit `--resume <foreign-sid>`; and
+/// an in-memory-only reset is reverted by `reconcile_from_disk` (which is why
+/// this asserts the disk row too). Follow-on to #3077, which is what made the
+/// swap reach disk in the first place.
+#[test]
+#[serial]
+fn restart_selected_session_tool_swap_clears_old_agent_session_state() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+    let seed = |inst: &mut Instance| {
+        inst.tool = "claude".to_string();
+        inst.agent_session_id = Some("11111111-2222-3333-4444-555555555555".to_string());
+        inst.acp_session_id = Some("acp-sess-1".to_string());
+        inst.agent_name = Some("claude-code".to_string());
+        inst.acp_effort = Some("high".to_string());
+        inst.agent_model = Some("claude-opus-4-7".to_string());
+        // The approval posture is deliberately NOT reset; see the comment in
+        // `Instance::swap_tool`.
+        inst.acp_mode_id = Some("plan".to_string());
+    };
+    env.view.mutate_instance(&id, seed);
+    // Seed the disk row directly rather than through `save()`: `merge_from_tui`
+    // syncs only status + launch config, so a `save()` here would leave these
+    // fields absent on disk and the disk assertions below would pass
+    // vacuously.
+    env.view
+        .storages
+        .get("test")
+        .unwrap()
+        .update(|instances, _groups| {
+            seed(instances.iter_mut().find(|i| i.id == id).unwrap());
+            Ok(())
+        })
+        .unwrap();
+
+    env.view
+        .restart_selected_session(None, Some("codex"), None, None)
+        .unwrap();
+
+    let inst = env.view.instance_at(0);
+    assert_eq!(inst.tool, "codex");
+    assert_eq!(inst.agent_session_id, None, "in-memory sid must be dropped");
+    assert_eq!(inst.acp_session_id, None);
+    assert_eq!(inst.agent_name, None);
+    assert_eq!(inst.acp_effort, None);
+    assert_eq!(
+        inst.agent_model, None,
+        "the old agent's model must be dropped"
+    );
+    assert_eq!(
+        inst.acp_mode_id.as_deref(),
+        Some("plan"),
+        "the approval posture must survive: clearing it resolves the adapter's \
+         bypass mode on a yolo_mode row"
+    );
+
+    let disk = Storage::new_unwatched("test").unwrap().load().unwrap();
+    let row = disk.iter().find(|i| i.id == id).unwrap();
+    assert_eq!(
+        row.agent_session_id, None,
+        "the old engine's sid must be gone from disk too, else reconcile_from_disk \
+         restores it and the new engine launches with --resume <foreign-sid>"
+    );
+    assert_eq!(row.acp_session_id, None);
+    assert_eq!(row.agent_name, None);
+    assert_eq!(row.agent_model, None);
+    assert_eq!(row.acp_mode_id.as_deref(), Some("plan"));
+    // Parked, not discarded: the disk row is the one a swap back reads, so this
+    // is what makes claude -> codex -> claude resumable. Round-trip mechanics
+    // are covered by `swap_tool_parks_and_restores_per_tool_session_ids`.
+    let parked = row.prior_tool_session_ids.get("claude").unwrap();
+    assert_eq!(
+        parked.agent_session_id.as_deref(),
+        Some("11111111-2222-3333-4444-555555555555")
+    );
+    assert_eq!(parked.acp_session_id.as_deref(), Some("acp-sess-1"));
+}
+
+/// The disk row a tool swap writes must resolve `agent_detect_as` against the
+/// session's own profile. `source_profile` is `skip_serializing`, so a
+/// storage-loaded row comes back blank and would key the default profile's
+/// aliases instead; `detect_as` is not in `reconcile_from_disk`'s carry set,
+/// so that wrong value is what the next launch reads.
+#[test]
+#[serial]
+fn restart_selected_session_tool_swap_resolves_detect_as_for_the_row_profile() {
+    // The registries are process-globals and every config resolve in this
+    // test (env boot included) rewrites the touched profiles' entries, so
+    // snapshot before anything runs and restore on the way out.
+    let _registry_test = crate::tmux::status_rules::ProfileRegistryGuard::take("test");
+    let _registry_other = crate::tmux::status_rules::ProfileRegistryGuard::take("other");
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    env.view.selected_session = Some(id.clone());
+
+    // Pin the resolved default profile to something other than the row's own
+    // profile, so a blank `source_profile` is observably the wrong key.
+    let app_dir = crate::session::get_app_dir().expect("app dir");
+    std::fs::create_dir_all(app_dir.join("profiles").join("other")).expect("other profile");
+    std::fs::write(app_dir.join("config.toml"), "default_profile = \"other\"\n")
+        .expect("global config");
+
+    let mut config = crate::session::Config::default();
+    config
+        .session
+        .agent_detect_as
+        .insert("gjc".to_string(), "claude".to_string());
+    crate::tmux::status_rules::install_from_config("test", &config);
+    crate::tmux::status_rules::install_from_config("other", &crate::session::Config::default());
+
+    env.view
+        .restart_selected_session(None, Some("gjc"), None, None)
+        .unwrap();
+
+    let disk = Storage::new_unwatched("test").unwrap().load().unwrap();
+    let row = disk.iter().find(|i| i.id == id).unwrap();
+    assert_eq!(row.tool, "gjc");
+    assert_eq!(
+        row.detect_as, "claude",
+        "the swap must read profile 'test' aliases, not the default profile's"
+    );
+}
+
+/// Repro for the open CodeRabbit thread on #3509: the tool-swap test above
+/// mutates the process-global `agent_detect_as` registry through
+/// `install_from_config` without restoring prior entries, and the registry
+/// outlives the test, so any later reader of those profiles observes state
+/// its config never contained. Sentinel aliases stand in for entries an
+/// earlier test installed; both must survive the swap test unchanged.
+#[test]
+#[serial]
+fn tool_swap_test_restores_the_detect_as_registry() {
+    // (profile, sentinel agent, target)
+    let sentinels = [
+        ("test", "zz-sentinel-test", "codex"),
+        ("other", "zz-sentinel-other", "claude"),
+    ];
+    // The probe's own seeds must not leak either: restore the pre-probe
+    // entries once the assertion below has run.
+    let _registry_test = crate::tmux::status_rules::ProfileRegistryGuard::take("test");
+    let _registry_other = crate::tmux::status_rules::ProfileRegistryGuard::take("other");
+    for (profile, agent, target) in sentinels {
+        let mut seeded = crate::session::Config::default();
+        seeded
+            .session
+            .agent_detect_as
+            .insert(agent.to_string(), target.to_string());
+        crate::tmux::status_rules::install_from_config(profile, &seeded);
+    }
+
+    // serial_test 4's default-key lock is reentrant, so this serialized test
+    // can be called directly and observed after its nested guards have dropped.
+    restart_selected_session_tool_swap_resolves_detect_as_for_the_row_profile();
+
+    for (profile, agent, target) in sentinels {
+        assert_eq!(
+            crate::tmux::status_rules::effective_detect_as(profile, agent, ""),
+            target,
+            "the tool-swap test clobbered pre-existing alias {agent} in profile '{profile}'"
+        );
+    }
+    assert_eq!(
+        crate::tmux::status_rules::effective_detect_as("test", "gjc", ""),
+        "",
+        "the tool-swap test leaked `gjc -> claude` into profile 'test'"
+    );
+}
+
 #[test]
 #[serial]
 fn restart_selected_session_surfaces_resume_failed_after_async_restart() {
@@ -9815,6 +10953,208 @@ fn create_test_env_two_projects_mixed_attention() -> TestEnv {
     }
 }
 
+/// Build a HomeView seeded with three sessions: two live in real git repos
+/// with distinct hosted `origin` remotes on different hosts entirely
+/// (GitHub, GitLab) to prove owner resolution isn't GitHub-specific, and one
+/// live in a real git repo with no `origin` remote at all. Helper for
+/// `build_flat_items_by_org` grouping tests, which (unlike project mode)
+/// need an actual `.git` directory since `get_remote_owner` reads the
+/// on-disk remote configuration rather than parsing the path string.
+fn create_test_env_two_orgs() -> TestEnv {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+
+    let repo_a = temp.path().join("repo-a");
+    std::fs::create_dir_all(&repo_a).unwrap();
+    git2::Repository::init(&repo_a)
+        .unwrap()
+        .remote("origin", "git@github.com:org-a/repo-a.git")
+        .unwrap();
+
+    let repo_b = temp.path().join("repo-b");
+    std::fs::create_dir_all(&repo_b).unwrap();
+    git2::Repository::init(&repo_b)
+        .unwrap()
+        .remote("origin", "git@gitlab.com:org-b/repo-b.git")
+        .unwrap();
+
+    let repo_no_remote = temp.path().join("repo-no-remote");
+    std::fs::create_dir_all(&repo_no_remote).unwrap();
+    git2::Repository::init(&repo_no_remote).unwrap();
+
+    let inst_a = Instance::new("a-session", repo_a.to_str().unwrap());
+    let inst_b = Instance::new("b-session", repo_b.to_str().unwrap());
+    let inst_no_remote = Instance::new("no-remote-session", repo_no_remote.to_str().unwrap());
+
+    let instances = vec![inst_a, inst_b, inst_no_remote];
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    TestEnv {
+        view,
+        _guard,
+        _temp: temp,
+    }
+}
+
+/// `build_flat_items_by_org` must group sessions by each repo's resolved
+/// remote owner (any hosted git remote, not just GitHub), and fall a
+/// session with no resolvable owner into the synthetic "No organization"
+/// bucket.
+#[test]
+#[serial]
+fn build_flat_items_by_org_groups_by_resolved_owner() {
+    use crate::session::config::GroupByMode;
+
+    let mut env = create_test_env_two_orgs();
+    env.view.group_by = GroupByMode::Org;
+    env.view.flat_items = env.view.build_flat_items();
+
+    let mut membership: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut current_group: Option<String> = None;
+    for item in &env.view.flat_items {
+        match item {
+            Item::Group { name, .. } => current_group = Some(name.clone()),
+            Item::Session { id, .. } => {
+                if let Some(inst) = env.view.instances().find(|i| &i.id == id) {
+                    membership.insert(inst.title.clone(), current_group.clone().unwrap());
+                }
+            }
+        }
+    }
+
+    assert_eq!(membership.get("a-session"), Some(&"org-a".to_string()));
+    assert_eq!(membership.get("b-session"), Some(&"org-b".to_string()));
+    assert_eq!(
+        membership.get("no-remote-session"),
+        Some(&"No organization".to_string())
+    );
+}
+
+/// Build a HomeView seeded with two sessions whose repos share the same
+/// owner login ("acme") but live on different hosts (GitHub, GitLab).
+/// Regression fixture for the Required #1 review fix: before it,
+/// `org_group_key` returned the bare owner, so these two repos merged into
+/// one org bucket and one bulk-archive scope despite having nothing to do
+/// with each other.
+fn create_test_env_same_owner_two_hosts() -> TestEnv {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+
+    let repo_gh = temp.path().join("repo-gh");
+    std::fs::create_dir_all(&repo_gh).unwrap();
+    git2::Repository::init(&repo_gh)
+        .unwrap()
+        .remote("origin", "git@github.com:acme/repo-gh.git")
+        .unwrap();
+
+    let repo_gl = temp.path().join("repo-gl");
+    std::fs::create_dir_all(&repo_gl).unwrap();
+    git2::Repository::init(&repo_gl)
+        .unwrap()
+        .remote("origin", "git@gitlab.com:acme/repo-gl.git")
+        .unwrap();
+
+    let inst_gh = Instance::new("gh-session", repo_gh.to_str().unwrap());
+    let inst_gl = Instance::new("gl-session", repo_gl.to_str().unwrap());
+
+    let instances = vec![inst_gh, inst_gl];
+    storage
+        .update(|i, g| {
+            *i = instances.to_vec();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    TestEnv {
+        view,
+        _guard,
+        _temp: temp,
+    }
+}
+
+/// Required-fix regression (#3284 review): two repos owned by the same
+/// login on different hosts (GitHub "acme" vs GitLab "acme") must render as
+/// two separate org headers, both displayed "acme", and a bulk operation
+/// scoped to one must never pull in the other's session.
+#[test]
+#[serial]
+fn build_flat_items_by_org_scopes_same_named_owners_by_host() {
+    use crate::session::config::GroupByMode;
+
+    let mut env = create_test_env_same_owner_two_hosts();
+    env.view.group_by = GroupByMode::Org;
+    env.view.flat_items = env.view.build_flat_items();
+
+    let group_paths: Vec<String> = env
+        .view
+        .flat_items
+        .iter()
+        .filter_map(|item| match item {
+            Item::Group { path, name, .. } => {
+                assert_eq!(name, "acme", "both headers should display the bare owner");
+                Some(path.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        group_paths.len(),
+        2,
+        "same-named owners on different hosts must render as two separate headers, got {group_paths:?}"
+    );
+    assert_ne!(
+        group_paths[0], group_paths[1],
+        "the two org headers must have distinct identity keys"
+    );
+
+    // Selecting one host's group must not pull in the other host's session.
+    let gh_id = env
+        .view
+        .instances()
+        .find(|i| i.title == "gh-session")
+        .map(|i| i.id.clone())
+        .expect("gh-session instance must exist");
+    let gl_id = env
+        .view
+        .instances()
+        .find(|i| i.title == "gl-session")
+        .map(|i| i.id.clone())
+        .expect("gl-session instance must exist");
+    let gh_inst = env.view.get_instance(&gh_id).unwrap();
+    let gh_key = env.view.org_group_key(gh_inst);
+    env.view.selected_group = Some(gh_key);
+    let scoped_ids = env.view.active_sessions_in_selected_group();
+    assert_eq!(
+        scoped_ids,
+        vec![gh_id],
+        "archiving the GitHub org header must not include the GitLab session ({gl_id})"
+    );
+}
+
 /// Project grouping must survive Attention sort. Previously `build_flat_items`
 /// short-circuited on `SortOrder::Attention` before checking `GroupByMode`,
 /// flattening the list and dropping project headers. The headers are the
@@ -9965,7 +11305,7 @@ fn project_attention_archive_selected_group_removes_empty_main_header() {
         env.view
             .instances
             .values()
-            .filter(|i| super::project_group_name(i) == "beta")
+            .filter(|i| super::project_group_key(i) == "beta")
             .all(|i| i.is_archived()),
         "all beta sessions must be archived"
     );
@@ -10109,58 +11449,72 @@ fn p_key_opens_projects_dialog_off_project_header() {
 /// synthetic scratch bucket (sessions with no repo, living under
 /// `<app_dir>/scratch/<id>`) stays excluded. The gate used to reject the header
 /// by its display LABEL, which collapsed both cases together and left `p` on a
-/// real `~/scratch` repo falling through to the Projects dialog. See #3133.
+/// real `~/scratch` repo falling through to the Projects dialog. See #3133; #3237
+/// then gave the synthetic bucket its own sentinel identity, so the real repo
+/// and the bucket render as two separate headers, keyed here by path.
 #[test]
 #[serial]
 fn scratch_label_pin_gate_keys_on_backing_repo_not_label() {
     use crate::session::config::GroupByMode;
     use crate::session::projects::canonical_key;
+    use crate::session::SCRATCH_GROUP_PATH;
 
     // (case, has a real repo named `scratch`, has a synthetic scratch session,
     //  a pre-existing registry entry for `/repos/scratch` and its pin flag,
-    //  the pin gate opens on the header, the header is pinned after `p`)
+    //  the path of the header this case targets, the pin gate opens on it, and
+    //  whether it is pinned after `p`)
     let cases = [
         // The reporter's setup: a plain repo at `~/scratch`, no scratch sessions.
-        ("real repo only", true, false, None, true, true),
+        ("real repo only", true, false, None, "scratch", true, true),
         // Nothing but the synthetic bucket: no repo exists to register.
-        ("synthetic bucket only", false, true, None, false, false),
-        // Both derive the same label and so share one header today. The real
-        // repo backs it, so the header is pinnable and the pin must resolve to
-        // that repo rather than the app-internal scratch directory.
+        (
+            "synthetic bucket only",
+            false,
+            true,
+            None,
+            SCRATCH_GROUP_PATH,
+            false,
+            false,
+        ),
+        // The real repo and the synthetic bucket now render as two separate
+        // headers (#3237). This case targets the real repo header, which backs a
+        // pinnable project; the bucket's own header is covered by
+        // `synthetic_scratch_bucket_is_distinct_from_real_repo`.
         (
             "real repo plus scratch session",
             true,
             true,
             None,
+            "scratch",
             true,
             true,
         ),
         // A saved-but-unpinned repo named `scratch` surfaces no header of its
-        // own, so the synthetic bucket is the only thing rendering this one and
-        // the toggle has no path to act on. `p` must keep its global meaning
-        // rather than resolve to a pin that silently does nothing.
+        // own (only pinned empties do), so the synthetic bucket is the only
+        // `scratch` header and `p` must keep its global meaning.
         (
             "saved unpinned repo plus scratch session",
             false,
             true,
             Some(false),
+            SCRATCH_GROUP_PATH,
             false,
             false,
         ),
-        // A pinned registry entry backs the header even with no live session of
-        // its own, so `p` must reach the unpin path instead of being swallowed
-        // as the synthetic bucket.
+        // A pinned registry entry surfaces its own empty header even with no live
+        // session, so `p` must reach the unpin path on that header.
         (
             "pinned empty repo plus scratch session",
             false,
             true,
             Some(true),
+            "scratch",
             true,
             false,
         ),
     ];
 
-    for (case, has_repo, has_scratch, saved, gate_open, pinned_after) in cases {
+    for (case, has_repo, has_scratch, saved, target_path, gate_open, pinned_after) in cases {
         let temp = TempDir::new().unwrap();
         let _guard = setup_test_home(&temp);
         let storage = Storage::new_unwatched("test").unwrap();
@@ -10209,8 +11563,8 @@ fn scratch_label_pin_gate_keys_on_backing_repo_not_label() {
         let idx = view
             .flat_items
             .iter()
-            .position(|i| matches!(i, Item::Group { name, .. } if name == "scratch"))
-            .unwrap_or_else(|| panic!("{case}: scratch header must be present"));
+            .position(|i| matches!(i, Item::Group { path, .. } if path == target_path))
+            .unwrap_or_else(|| panic!("{case}: header at path {target_path} must be present"));
         view.cursor = idx;
         view.update_selected();
 
@@ -10257,6 +11611,180 @@ fn scratch_label_pin_gate_keys_on_backing_repo_not_label() {
     }
 }
 
+/// #3237: a real repo named `scratch` and the synthetic scratch bucket must
+/// render as two separate project headers with distinct identity paths, one
+/// session each (not a pooled count), and independent pin/scope state. Mirrors
+/// the org same-owner-two-hosts separation test above.
+#[test]
+#[serial]
+fn synthetic_scratch_bucket_is_distinct_from_real_repo() {
+    use crate::session::config::GroupByMode;
+    use crate::session::{SCRATCH_GROUP_NAME, SCRATCH_GROUP_PATH};
+
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+
+    let real = Instance::new("work", "/repos/scratch");
+    let mut throwaway = Instance::new("throwaway", "/app-dir/scratch/abc123");
+    throwaway.scratch = true;
+    let scratch_id = throwaway.id.clone();
+    let instances = vec![real, throwaway];
+    storage
+        .update(|i, g| {
+            *i = instances.clone();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.group_by = GroupByMode::Project;
+    view.flat_items = view.build_flat_items();
+
+    // Two headers on distinct identity paths, one session each rather than a
+    // pooled count of two. The repo header keeps its basename; the bucket
+    // renders the capitalized system label.
+    let scratch_headers: Vec<(&str, &str, usize)> = view
+        .flat_items
+        .iter()
+        .filter_map(|i| match i {
+            Item::Group {
+                path,
+                name,
+                session_count,
+                ..
+            } if name.eq_ignore_ascii_case("scratch") => {
+                Some((path.as_str(), name.as_str(), *session_count))
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        scratch_headers.len(),
+        2,
+        "real repo and synthetic bucket must be two headers, got {scratch_headers:?}"
+    );
+    assert!(scratch_headers.contains(&("scratch", "scratch", 1)));
+    assert!(scratch_headers.contains(&(SCRATCH_GROUP_PATH, SCRATCH_GROUP_NAME, 1)));
+
+    // The synthetic bucket is not a pinnable project; the real repo is.
+    let real_idx = view
+        .flat_items
+        .iter()
+        .position(|i| matches!(i, Item::Group { path, .. } if path == "scratch"))
+        .unwrap();
+    view.cursor = real_idx;
+    assert_eq!(view.project_group_at_cursor().as_deref(), Some("scratch"));
+    let bucket_idx = view
+        .flat_items
+        .iter()
+        .position(|i| matches!(i, Item::Group { path, .. } if path == SCRATCH_GROUP_PATH))
+        .unwrap();
+    view.cursor = bucket_idx;
+    assert_eq!(view.project_group_at_cursor(), None);
+
+    // Bulk-archive scope on the synthetic bucket touches only the scratch
+    // session, never the real repo's session.
+    view.selected_group = Some(SCRATCH_GROUP_PATH.to_string());
+    assert_eq!(view.active_sessions_in_selected_group(), vec![scratch_id]);
+}
+
+/// #3237: New Session from the synthetic scratch bucket must not prefill
+/// another scratch session's throwaway `<app_dir>/scratch/<id>` directory as
+/// the working cwd; the dialog should fall through to the default cwd instead
+/// of tying the new session's lifetime to an unrelated scratch dir. Mirrors
+/// the same invariant `project_header_repo_path` enforces for the pin action.
+#[test]
+#[serial]
+fn scratch_bucket_lends_no_repo_path_for_new_session_prefill() {
+    use crate::session::config::GroupByMode;
+    use crate::session::SCRATCH_GROUP_PATH;
+
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+
+    let mut throwaway = Instance::new("throwaway", "/app-dir/scratch/abc123");
+    throwaway.scratch = true;
+    let instances = vec![throwaway];
+    storage
+        .update(|i, g| {
+            *i = instances.clone();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    assert_eq!(view.group_by, GroupByMode::Project);
+    assert_eq!(view.group_repo_path(SCRATCH_GROUP_PATH), None);
+}
+
+/// #3237 pitfall guard: when the only scratch session is archived, the seed
+/// must not create a phantom empty `scratch` header in the main flow (an
+/// archived-only project header is undeletable in project mode). The bucket
+/// appears only nested under the Archived section.
+#[test]
+#[serial]
+fn scratch_bucket_absent_from_main_flow_when_only_scratch_is_archived() {
+    use crate::session::config::GroupByMode;
+    use crate::session::{is_within_archived_section, SCRATCH_GROUP_NAME, SCRATCH_GROUP_PATH};
+
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+
+    let mut throwaway = Instance::new("throwaway", "/app-dir/scratch/abc123");
+    throwaway.scratch = true;
+    throwaway.archive();
+    let instances = vec![throwaway];
+    storage
+        .update(|i, g| {
+            *i = instances.clone();
+            *g = GroupTree::new_with_groups(&instances, &[]).get_all_groups();
+            Ok(())
+        })
+        .unwrap();
+
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.group_by = GroupByMode::Project;
+    // Expand the Archived shelf so its per-project sub-headers are emitted.
+    view.archived_section_collapsed = false;
+    view.flat_items = view.build_flat_items();
+
+    assert!(
+        !view
+            .flat_items
+            .iter()
+            .any(|i| matches!(i, Item::Group { path, .. } if path == SCRATCH_GROUP_PATH)),
+        "an archived-only scratch session must not seed a phantom main-flow bucket"
+    );
+    assert!(
+        view.flat_items.iter().any(|i| matches!(
+            i,
+            Item::Group { path, name, .. }
+                if is_within_archived_section(path) && name == SCRATCH_GROUP_NAME
+        )),
+        "the archived scratch session should still render under the Archived section"
+    );
+}
+
 /// Pin a project, archive its only session, then unpin: the empty header must
 /// leave the main flow (the archived session stays under the Archived section).
 #[test]
@@ -10285,7 +11813,7 @@ fn unpin_archived_only_project_leaves_main_flow() {
         .view
         .instances
         .values()
-        .filter(|i| super::project_group_name(i) == "beta")
+        .filter(|i| super::project_group_key(i) == "beta")
         .map(|i| i.id.clone())
         .collect();
     for id in &beta_ids {
@@ -10465,7 +11993,7 @@ fn pinned_project_survives_losing_last_session() {
     // entry keeps the header alive even with zero members.
     env.view
         .instances
-        .retain(|_, i| super::project_group_name(i) != "alpha");
+        .retain(|_, i| super::project_group_key(i) != "alpha");
     env.view.flat_items = env.view.build_flat_items();
 
     let alpha_header = env.view.flat_items.iter().find_map(|i| match i {
@@ -10921,167 +12449,11 @@ fn manual_grouping_attention_sort_stays_flat() {
     );
 }
 
-/// `prune_empty_group` is the post-move cleanup that drops the source
-/// profile's now-empty copy of a group after a session moves to a
-/// different profile. Without it, both profiles end up with the same
-/// group name in unified view, the source one empty and the target one
-/// populated, which reads as a duplicate group header.
+/// A profile move commits the source-group removal with the row transfer, so
+/// reloading cannot resurrect metadata from the source profile.
 #[test]
 #[serial]
-fn prune_empty_group_drops_source_when_no_session_remains() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let _ = Storage::new_unwatched("alpha").unwrap();
-    let _ = Storage::new_unwatched("beta").unwrap();
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
-
-    // Pre-state: alpha has one session in group "work", beta is empty.
-    let mut moved = Instance::new("moved", "/tmp/moved");
-    moved.source_profile = "alpha".to_string();
-    moved.group_path = "work".to_string();
-    let insts = vec![moved];
-    seed_instances(&mut view, &insts);
-    view.group_trees.clear();
-    view.group_trees
-        .insert("alpha".to_string(), GroupTree::new_with_groups(&insts, &[]));
-    view.group_trees
-        .insert("beta".to_string(), GroupTree::new_with_groups(&[], &[]));
-    assert!(view.group_trees["alpha"].group_exists("work"));
-
-    // Simulate the move: re-tag source_profile, then prune the now-empty
-    // source group.
-    view.instance_at_mut(0).source_profile = "beta".to_string();
-    view.prune_empty_group("alpha", "work");
-
-    assert!(
-        !view.group_trees["alpha"].group_exists("work"),
-        "alpha should no longer own the now-empty 'work' group after the move"
-    );
-}
-
-/// Prune must NOT drop the source group when the source profile still
-/// has other sessions sitting at the same path (or nested under it).
-/// Two sessions, only one moved → source profile keeps the group.
-#[test]
-#[serial]
-fn prune_empty_group_keeps_source_when_sibling_session_remains() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let _ = Storage::new_unwatched("alpha").unwrap();
-    let _ = Storage::new_unwatched("beta").unwrap();
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
-
-    let mut moved = Instance::new("moved", "/tmp/moved");
-    moved.source_profile = "alpha".to_string();
-    moved.group_path = "work".to_string();
-    let mut sibling = Instance::new("sibling", "/tmp/sibling");
-    sibling.source_profile = "alpha".to_string();
-    sibling.group_path = "work".to_string();
-    let insts = vec![moved, sibling];
-    seed_instances(&mut view, &insts);
-    view.group_trees.clear();
-    view.group_trees
-        .insert("alpha".to_string(), GroupTree::new_with_groups(&insts, &[]));
-    view.group_trees
-        .insert("beta".to_string(), GroupTree::new_with_groups(&[], &[]));
-
-    view.instance_at_mut(0).source_profile = "beta".to_string();
-    view.prune_empty_group("alpha", "work");
-
-    assert!(
-        view.group_trees["alpha"].group_exists("work"),
-        "alpha must keep 'work' because the sibling session still lives there"
-    );
-}
-
-/// Prune must also keep the source group when a session sits in a
-/// *descendant* path. Only the leaf moved out; the parent still has
-/// rows under it.
-#[test]
-#[serial]
-fn prune_empty_group_keeps_source_when_descendant_session_remains() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let _ = Storage::new_unwatched("alpha").unwrap();
-    let _ = Storage::new_unwatched("beta").unwrap();
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
-
-    let mut moved = Instance::new("moved", "/tmp/moved");
-    moved.source_profile = "alpha".to_string();
-    moved.group_path = "work".to_string();
-    let mut nested = Instance::new("nested", "/tmp/nested");
-    nested.source_profile = "alpha".to_string();
-    nested.group_path = "work/frontend".to_string();
-    let insts = vec![moved, nested];
-    seed_instances(&mut view, &insts);
-    view.group_trees.clear();
-    view.group_trees
-        .insert("alpha".to_string(), GroupTree::new_with_groups(&insts, &[]));
-    view.group_trees
-        .insert("beta".to_string(), GroupTree::new_with_groups(&[], &[]));
-
-    view.instance_at_mut(0).source_profile = "beta".to_string();
-    view.prune_empty_group("alpha", "work");
-
-    assert!(
-        view.group_trees["alpha"].group_exists("work"),
-        "alpha must keep 'work' because the nested session still lives under it"
-    );
-}
-
-/// Prune must keep the source group when the profile's tree carries a
-/// descendant *group* (even with no session under it). Lets users keep
-/// hand-built structure like `work/anchor` that survives moves of every
-/// session out of the parent. Without this guard, `delete_group`'s
-/// `starts_with(prefix)` cascade nukes the anchor sub-group too.
-#[test]
-#[serial]
-fn prune_empty_group_keeps_source_when_descendant_group_remains() {
-    let temp = TempDir::new().unwrap();
-    let _guard = setup_test_home(&temp);
-    let _ = Storage::new_unwatched("alpha").unwrap();
-    let _ = Storage::new_unwatched("beta").unwrap();
-    let tools = AvailableTools::with_tools(&["claude"]);
-    let mut view = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
-
-    let mut moved = Instance::new("moved", "/tmp/moved");
-    moved.source_profile = "alpha".to_string();
-    moved.group_path = "work".to_string();
-    let insts = vec![moved];
-    seed_instances(&mut view, &insts);
-    view.group_trees.clear();
-    let mut alpha_tree = GroupTree::new_with_groups(&insts, &[]);
-    alpha_tree.create_group("work/anchor");
-    view.group_trees.insert("alpha".to_string(), alpha_tree);
-    view.group_trees
-        .insert("beta".to_string(), GroupTree::new_with_groups(&[], &[]));
-    assert!(view.group_trees["alpha"].group_exists("work/anchor"));
-
-    view.instance_at_mut(0).source_profile = "beta".to_string();
-    view.prune_empty_group("alpha", "work");
-
-    assert!(
-        view.group_trees["alpha"].group_exists("work"),
-        "alpha must keep 'work' because of the user-anchored 'work/anchor' sub-group"
-    );
-    assert!(
-        view.group_trees["alpha"].group_exists("work/anchor"),
-        "anchor sub-group must survive the no-op prune"
-    );
-}
-
-/// The prune must persist through save+reload. Without tombstoning in
-/// `pending_group_deletions`, the in-memory delete is reverted on next
-/// startup because `HomeView::new` reloads `existing_groups` from disk
-/// and reseeds the tree with the supposedly-pruned group. Mirrors the
-/// restart_selected_session sequence: seed + persist, then move + prune
-/// + persist.
-#[test]
-#[serial]
-fn prune_empty_group_survives_save_and_reload() {
+fn profile_move_group_metadata_survives_reload() {
     let temp = TempDir::new().unwrap();
     let _guard = setup_test_home(&temp);
     let _ = Storage::new_unwatched("alpha").unwrap();
@@ -11116,11 +12488,9 @@ fn prune_empty_group_survives_save_and_reload() {
         view.group_trees
             .entry("beta".to_string())
             .or_insert_with(|| GroupTree::new_with_groups(&[], &[]));
-        let old_path = view.instances["moved"].group_path.clone();
-        view.move_to_profile("moved", "beta", old_path.clone())
+        let requested = view.instances["moved"].clone();
+        view.move_to_profile("moved", "beta", requested, None)
             .unwrap();
-        view.prune_empty_group("alpha", &old_path);
-        view.save().unwrap();
     }
 
     let reloaded = HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
@@ -11132,6 +12502,20 @@ fn prune_empty_group_survives_save_and_reload() {
         !reloaded.group_trees["alpha"].group_exists("work"),
         "pruned 'work' must stay gone after save+reload, not get re-seeded from disk"
     );
+    assert!(
+        reloaded.group_trees["beta"].group_exists("work"),
+        "target group metadata must be committed with the moved row"
+    );
+    let (_, source_groups) = Storage::new_unwatched("alpha")
+        .unwrap()
+        .load_with_groups()
+        .unwrap();
+    let (_, target_groups) = Storage::new_unwatched("beta")
+        .unwrap()
+        .load_with_groups()
+        .unwrap();
+    assert!(!source_groups.iter().any(|group| group.path == "work"));
+    assert!(target_groups.iter().any(|group| group.path == "work"));
 }
 
 /// Favorite, snooze, and urgent decorations only render in Attention sort.
@@ -15542,10 +16926,10 @@ mod live_send_mode {
         //! tmux operations the live-send worker can actually deliver.
         //! Single-line pastes stay on the simple `Literal` + `Named("Tab")`
         //! path so raw shells and bracketed-paste-unaware agents keep
-        //! working. Multi-line pastes get wrapped in xterm bracketed-
-        //! paste markers (#1546) and dispatched as a single `HexBytes`
-        //! payload so the receiving agent sees one paste instead of one
-        //! `Enter` per line.
+        //! working. Multi-line pastes are dispatched as one `TmuxKey::Paste`
+        //! payload without escape markers; tmux delegates bracketed-paste
+        //! handling to `paste-buffer -p`, so the agent sees one paste instead
+        //! of one `Enter` per line.
 
         use crate::tui::home::input::split_paste_for_live_send;
         use crate::tui::home::live_send::TmuxKey;
@@ -15557,152 +16941,93 @@ mod live_send_mode {
             TmuxKey::Named(name.to_string())
         }
 
-        /// xterm bracketed-paste start: `ESC [ 2 0 0 ~`.
-        const BP_START: &[u8] = &[0x1b, b'[', b'2', b'0', b'0', b'~'];
-        /// xterm bracketed-paste end: `ESC [ 2 0 1 ~`.
-        const BP_END: &[u8] = &[0x1b, b'[', b'2', b'0', b'1', b'~'];
-
-        /// Build the expected `HexBytes` payload for a multi-line
-        /// paste: start marker, then the per-line `body` bytes, then
-        /// end marker. Keeps each test focused on the *shape* of the
-        /// paste content rather than on hand-rolled byte arithmetic.
-        fn wrap(body: &[u8]) -> Vec<TmuxKey> {
-            let mut out = Vec::with_capacity(BP_START.len() + body.len() + BP_END.len());
-            out.extend_from_slice(BP_START);
-            out.extend_from_slice(body);
-            out.extend_from_slice(BP_END);
-            vec![TmuxKey::HexBytes(out)]
+        /// Expected shape for a multi-line paste: one `Paste` action
+        /// carrying the payload verbatim. No bracketed-paste markers
+        /// appear here on purpose. tmux adds them via `paste-buffer -p`
+        /// only for panes that set DECSET 2004, so a raw shell or SQL
+        /// REPL no longer receives markers it would render as literal
+        /// `00~` / `01~` text. Interior newlines stay `\n`; tmux
+        /// translates them to CR when it performs the paste.
+        fn paste(body: &str) -> Vec<TmuxKey> {
+            vec![TmuxKey::Paste(body.to_string())]
         }
 
         #[test]
-        fn printable_paste_stays_one_literal() {
-            assert_eq!(
-                split_paste_for_live_send("hello world"),
-                vec![lit("hello world")],
-            );
+        fn paste_shapes_are_normalized_and_dispatched() {
+            let cases = [
+                ("printable", "hello world", vec![lit("hello world")]),
+                ("multiline", "first\nsecond", paste("first\nsecond")),
+                ("trailing newline", "only line\n", paste("only line\n")),
+                ("leading newline", "\nbody", paste("\nbody")),
+                // Windows and legacy-Mac line endings normalize to LF in the
+                // payload; tmux translates LF to CR while performing the paste.
+                ("crlf to lf", "a\r\nb", paste("a\nb")),
+                ("bare cr to lf", "a\rb", paste("a\nb")),
+                (
+                    "single-line tab",
+                    "a\tb",
+                    vec![lit("a"), named("Tab"), lit("b")],
+                ),
+                ("multiline tab", "a\tb\nc", paste("a\tb\nc")),
+                // BEL and ESC have no safe mapping and are dropped.
+                (
+                    "single-line control bytes",
+                    "a\x07b\x1bc",
+                    vec![lit("a"), lit("b"), lit("c")],
+                ),
+                ("multiline control bytes", "a\x07b\x1bc\nd", paste("abc\nd")),
+                (
+                    "drag-select multiline",
+                    "alpha beta\nsecond line\nthird",
+                    paste("alpha beta\nsecond line\nthird"),
+                ),
+                ("multiline utf8", "café\n🚀", paste("café\n🚀")),
+            ];
+
+            for (name, input, expected) in cases {
+                assert_eq!(split_paste_for_live_send(input), expected, "{name}");
+            }
         }
 
+        /// The bug: we used to hand-roll `\e[200~` / `\e[201~` into the
+        /// payload and ship it as raw bytes, so every pane got the markers
+        /// whether or not it had set DECSET 2004. A raw shell or SQL REPL
+        /// parses `\e[2` as a partial Insert-key sequence, discards it, and
+        /// self-inserts the leftover `00~` / `01~` into the user's text.
+        /// The payload must now carry no escape bytes at all; tmux decides.
         #[test]
-        fn newline_wraps_in_bracketed_paste() {
-            // Two-line paste must wrap in `\e[200~` / `\e[201~` markers,
-            // with the interior newline riding as a raw CR. Without the
-            // wrapping the agent treats the `\n` as Enter -> submit and
-            // posts each line as its own user message (#1546).
-            assert_eq!(
-                split_paste_for_live_send("first\nsecond"),
-                wrap(b"first\x0dsecond"),
-            );
-        }
-
-        #[test]
-        fn trailing_newline_stays_inside_bracketed_paste() {
-            // A single line plus a trailing newline still wraps: the
-            // user gets a paste with a trailing CR in the agent's input
-            // buffer rather than a paste-then-submit. Lets the user
-            // review before sending.
-            assert_eq!(
-                split_paste_for_live_send("only line\n"),
-                wrap(b"only line\x0d"),
-            );
-        }
-
-        #[test]
-        fn leading_newline_stays_inside_bracketed_paste() {
-            assert_eq!(split_paste_for_live_send("\nbody"), wrap(b"\x0dbody"));
-        }
-
-        #[test]
-        fn crlf_coalesces_to_single_cr() {
-            // Windows-style line endings collapse to one CR inside the
-            // bracketed paste so the agent doesn't see a double newline.
-            assert_eq!(split_paste_for_live_send("a\r\nb"), wrap(b"a\x0db"));
-        }
-
-        #[test]
-        fn bare_cr_becomes_cr_inside_bracketed_paste() {
-            assert_eq!(split_paste_for_live_send("a\rb"), wrap(b"a\x0db"));
-        }
-
-        #[test]
-        fn tab_in_single_line_paste_emits_named_tab() {
-            // Single-line tab pastes stay on the historical path.
-            assert_eq!(
-                split_paste_for_live_send("a\tb"),
-                vec![lit("a"), named("Tab"), lit("b")],
-            );
-        }
-
-        #[test]
-        fn tab_in_multiline_paste_rides_as_raw_byte() {
-            // Inside a bracketed paste, tab is a literal character of
-            // the paste content, not a key event, so we send it as a
-            // raw 0x09 byte alongside the rest of the payload.
-            assert_eq!(split_paste_for_live_send("a\tb\nc"), wrap(b"a\x09b\x0dc"),);
-        }
-
-        #[test]
-        fn other_control_bytes_are_dropped_in_single_line_path() {
-            // BEL (0x07) and ESC (0x1b) have no safe paste mapping;
-            // they're dropped to avoid surprising agent input cancels.
-            assert_eq!(
-                split_paste_for_live_send("a\x07b\x1bc"),
-                vec![lit("a"), lit("b"), lit("c")],
-            );
-        }
-
-        #[test]
-        fn other_control_bytes_are_dropped_inside_bracketed_paste() {
-            // Same drop policy applies inside the bracketed paste: an
-            // embedded ESC could prematurely close the paste sequence
-            // on the agent's side, so we strip it rather than forward.
-            assert_eq!(
-                split_paste_for_live_send("a\x07b\x1bc\nd"),
-                wrap(b"abc\x0dd"),
-            );
-        }
-
-        #[test]
-        fn multiline_drag_select_paste_round_trip() {
-            // Exact shape that comes back from drag-select copy: lines
-            // joined with `\n` and no trailing newline. After the fix
-            // for #1546 this wraps in bracketed-paste markers so the
-            // agent sees one paste instead of three Enter keypresses.
-            assert_eq!(
-                split_paste_for_live_send("alpha beta\nsecond line\nthird"),
-                wrap(b"alpha beta\x0dsecond line\x0dthird"),
-            );
-        }
-
-        #[test]
-        fn multiline_paste_dispatches_as_one_hex_payload() {
-            // Single-fork dispatch: the entire paste (markers, content,
-            // CRs) is one `HexBytes` so the worker fires exactly one
-            // `tmux send-keys -H` subprocess. Verifies the length-of-1
-            // invariant the worker relies on for paste latency.
-            let out = split_paste_for_live_send("a\nb\nc\nd");
-            assert_eq!(out.len(), 1, "multiline paste must be one TmuxKey");
-            match &out[0] {
-                TmuxKey::HexBytes(_) => {}
-                other => panic!("expected HexBytes, got {other:?}"),
+        fn multiline_paste_carries_no_escape_markers() {
+            let keys = split_paste_for_live_send("SELECT id\nFROM users;");
+            assert_eq!(keys, paste("SELECT id\nFROM users;"));
+            match &keys[0] {
+                TmuxKey::Paste(body) => {
+                    assert!(
+                        !body.contains('\x1b'),
+                        "paste payload must not carry ESC: {body:?}"
+                    );
+                    assert!(!body.contains("200~") && !body.contains("201~"));
+                }
+                other => panic!("expected Paste, got {other:?}"),
             }
         }
 
         #[test]
-        fn multiline_paste_with_utf8_preserves_bytes() {
-            // Non-ASCII chars (emoji, accented letters) ride as their
-            // UTF-8 byte sequences so the agent receives the same text
-            // the user copied. Regression guard for any future "ASCII
-            // only" filter.
-            assert_eq!(
-                split_paste_for_live_send("café\n🚀"),
-                wrap("café\x0d🚀".as_bytes()),
-            );
+        fn multiline_paste_dispatches_as_one_payload() {
+            // Single-dispatch: the entire paste is one `Paste` action, so
+            // the worker fires exactly one `load-buffer` + `paste-buffer`
+            // pair. Verifies the length-of-1 invariant the worker relies
+            // on for paste latency.
+            let out = split_paste_for_live_send("a\nb\nc\nd");
+            assert_eq!(out.len(), 1, "multiline paste must be one TmuxKey");
+            match &out[0] {
+                TmuxKey::Paste(_) => {}
+                other => panic!("expected Paste, got {other:?}"),
+            }
         }
 
         #[test]
         fn empty_paste_is_empty() {
-            // An empty paste should drop the entire bracketed-paste
-            // wrapper too: pushing `\e[200~\e[201~` with no payload
+            // An empty paste emits nothing at all: an empty tmux paste
             // would still flash through some agents' paste handlers.
             assert!(split_paste_for_live_send("").is_empty());
         }
@@ -16548,6 +17873,7 @@ mod default_attach_mode {
 
 mod save_field_merge {
     use super::*;
+    use crate::session::Status;
     use chrono::Utc;
 
     fn boot_view_with_one_session(
@@ -16575,6 +17901,29 @@ mod save_field_merge {
         )
         .unwrap();
         (temp, guard, view, id)
+    }
+    #[test]
+    #[serial]
+    fn delete_action_does_not_wait_for_lifecycle_flock() {
+        use crate::tui::dialogs::DeleteOptions;
+
+        let (_temp, _guard, mut view, id) =
+            boot_view_with_one_session("session", "/tmp/delete-lock");
+        view.selected_session = Some(id.clone());
+        let storage = Storage::new_unwatched("test").unwrap();
+        let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&id).unwrap();
+
+        let started = std::time::Instant::now();
+        view.delete_selected(&DeleteOptions::default()).unwrap();
+        assert!(
+            started.elapsed() < std::time::Duration::from_millis(100),
+            "the event-loop action must only enqueue deletion"
+        );
+        assert_eq!(
+            view.get_instance(&id).map(|instance| instance.status),
+            Some(crate::session::Status::Deleting)
+        );
+        drop(lifecycle_lock);
     }
 
     #[test]
@@ -16907,31 +18256,56 @@ mod save_field_merge {
 
     #[test]
     #[serial]
-    fn test_move_to_profile_marks_tombstone_and_pending_added() {
+    fn test_move_to_profile_commits_without_pending_bookkeeping() {
         let (_temp, _guard, mut view, id) = boot_view_with_one_session("victim", "/tmp/move");
         view.storages.insert(
             "target".to_string(),
             Storage::new_unwatched("target").unwrap(),
         );
+        let runtime_sentinel = std::time::Instant::now();
+        view.mutate_instance(&id, |instance| {
+            instance.last_error = Some("live-only-error".to_string());
+            instance.last_error_check = Some(runtime_sentinel);
+            instance.last_start_time = Some(runtime_sentinel);
+            instance.live_status_baseline = Some(Status::Waiting);
+            instance.ever_confirmed_present = true;
+            instance.unknown_since = Some(runtime_sentinel);
+            instance.pane_dead_observed = true;
+            instance.force_fresh_next_launch = true;
+        });
 
-        view.move_to_profile(&id, "target", "moved/group".to_string())
+        let mut requested = view.get_instance(&id).unwrap().clone();
+        requested.group_path = "moved/group".to_string();
+        view.move_to_profile(&id, "target", requested, None)
+            .unwrap();
+        view.reload_preserving_profile_move_runtime(std::slice::from_ref(&id))
             .unwrap();
 
-        assert!(
-            view.pending_deletions
-                .get("test")
-                .is_some_and(|s| s.contains(&id)),
-            "old profile must have tombstone"
+        assert!(!view.pending_deletions.values().any(|ids| ids.contains(&id)));
+        assert!(!view.pending_added.values().any(|ids| ids.contains(&id)));
+        let source = Storage::new_unwatched("test").unwrap().load().unwrap();
+        let target = Storage::new_unwatched("target").unwrap().load().unwrap();
+        assert!(!source.iter().any(|instance| instance.id == id));
+        let moved = target
+            .iter()
+            .find(|instance| instance.id == id)
+            .expect("target row committed");
+        assert_eq!(moved.group_path, "moved/group");
+        let in_memory = view.get_instance(&id).unwrap();
+        assert_eq!(in_memory.source_profile, "target");
+        assert_eq!(in_memory.group_path, "moved/group");
+        assert_eq!(
+            in_memory.last_error.as_deref(),
+            Some("live-only-error"),
+            "runtime-only error must survive publication"
         );
-        assert!(
-            view.pending_added
-                .get("target")
-                .is_some_and(|s| s.contains(&id)),
-            "new profile must have pending_added entry"
-        );
-        let inst = view.get_instance(&id).unwrap();
-        assert_eq!(inst.source_profile, "target");
-        assert_eq!(inst.group_path, "moved/group");
+        assert_eq!(in_memory.last_error_check, Some(runtime_sentinel));
+        assert_eq!(in_memory.last_start_time, Some(runtime_sentinel));
+        assert_eq!(in_memory.live_status_baseline, Some(Status::Waiting));
+        assert!(in_memory.ever_confirmed_present);
+        assert_eq!(in_memory.unknown_since, Some(runtime_sentinel));
+        assert!(in_memory.pane_dead_observed);
+        assert!(in_memory.force_fresh_next_launch);
     }
 
     #[test]
@@ -16943,7 +18317,10 @@ mod save_field_merge {
             Storage::new_unwatched("target").unwrap(),
         );
 
-        view.move_to_profile(&id, "target", String::new()).unwrap();
+        let mut requested = view.get_instance(&id).unwrap().clone();
+        requested.group_path.clear();
+        view.move_to_profile(&id, "target", requested, None)
+            .unwrap();
         view.save().expect("save must succeed across profiles");
 
         let old_disk = Storage::new_unwatched("test").unwrap().load().unwrap();
@@ -16960,11 +18337,295 @@ mod save_field_merge {
 
     #[test]
     #[serial]
+    fn restart_profile_move_rejects_target_identity_collision_before_mutation() {
+        let (_temp, _guard, mut view, id) =
+            boot_view_with_one_session("source", "/tmp/profile-restart-collision");
+        let target = Storage::new_unwatched("target").unwrap();
+        target
+            .update(|instances, _groups| {
+                let mut collision = Instance::new("source", "/tmp/profile-restart-collision/");
+                collision.source_profile = "target".to_string();
+                instances.push(collision);
+                Ok(())
+            })
+            .unwrap();
+        view.storages.insert("target".to_string(), target);
+        view.selected_session = Some(id.clone());
+
+        let error = view
+            .restart_selected_session(Some("target"), Some("claude"), None, None)
+            .expect_err("target identity collision must reject restart profile move");
+
+        assert!(error
+            .to_string()
+            .contains("Session already exists with same title and path"));
+        assert_eq!(view.get_instance(&id).unwrap().source_profile, "test");
+        assert!(!view.restart_cooldown_at.contains_key(&id));
+        assert_eq!(
+            Storage::new_unwatched("test")
+                .unwrap()
+                .load()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            Storage::new_unwatched("target")
+                .unwrap()
+                .load()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn group_profile_move_reloads_members_and_registers_fallback_source() {
+        let temp = TempDir::new().unwrap();
+        let _guard = setup_test_home(&temp);
+        let source = Storage::new_unwatched("alpha").unwrap();
+        let mut row = Instance::new("stale-title", "/tmp/group-profile-authority");
+        row.group_path = "work".to_string();
+        let id = row.id.clone();
+        source
+            .update(|instances, groups| {
+                instances.push(row);
+                groups.push(crate::session::Group::new("work", "work"));
+                Ok(())
+            })
+            .unwrap();
+        let target = Storage::new_unwatched("beta").unwrap();
+        let tools = AvailableTools::with_tools(&["claude"]);
+        let mut view =
+            HomeView::new(None, tools, crate::file_watch::FileWatchService::noop()).unwrap();
+        view.mutate_instance(&id, |instance| {
+            instance.title = "stale-memory-title".to_string();
+            instance.lifecycle_generation = 3;
+        });
+        source
+            .update(|instances, _groups| {
+                let authoritative = instances.iter_mut().find(|row| row.id == id).unwrap();
+                authoritative.title = "peer-title".to_string();
+                authoritative.lifecycle_generation = 7;
+                Ok(())
+            })
+            .unwrap();
+        view.storages.remove("alpha");
+        view.group_rename_context = Some(super::super::GroupRenameContext {
+            old_path: "work".to_string(),
+            old_profile: "alpha".to_string(),
+        });
+
+        view.rename_selected_group(None, Some("beta")).unwrap();
+
+        assert!(source.load().unwrap().is_empty());
+        let moved = target
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .expect("authoritative row must move to the target");
+        assert_eq!(moved.title, "peer-title");
+        assert_eq!(moved.lifecycle_generation, 7);
+    }
+
+    #[test]
+    #[serial]
+    fn profile_only_move_seeds_target_from_authoritative_title_and_lifecycle() {
+        let (_temp, _guard, mut view, id) =
+            boot_view_with_one_session("stale-title", "/tmp/profile-authority");
+        view.storages.insert(
+            "target".to_string(),
+            Storage::new_unwatched("target").unwrap(),
+        );
+
+        view.mutate_instance(&id, |row| {
+            row.lifecycle_generation = 3;
+            row.status = Status::Idle;
+        });
+        let source = Storage::new_unwatched("test").unwrap();
+        source
+            .update(|instances, _groups| {
+                let row = instances.iter_mut().find(|row| row.id == id).unwrap();
+                row.title = "peer-new-title".to_string();
+                row.lifecycle_generation = 7;
+                row.status = Status::Running;
+                Ok(())
+            })
+            .unwrap();
+
+        let _guards = view.lock_session_mutation_and_reload(&id).unwrap();
+        let authoritative = view.get_instance(&id).cloned().unwrap();
+        assert_eq!(authoritative.title, "peer-new-title");
+        assert_eq!(authoritative.lifecycle_generation, 7);
+        assert_eq!(authoritative.status, Status::Running);
+
+        let requested = authoritative.clone();
+        view.move_to_profile(&id, "target", requested, None)
+            .unwrap();
+        view.save().unwrap();
+
+        let target = Storage::new_unwatched("target")
+            .unwrap()
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        assert_eq!(target.title, "peer-new-title");
+        assert_eq!(target.lifecycle_generation, 7);
+        assert_eq!(target.status, Status::Running);
+    }
+
+    #[test]
+    #[serial]
+    fn profile_move_blocks_fresh_but_allows_stale_lifecycle_reservation() {
+        let (_temp, _guard, mut view, id) =
+            boot_view_with_one_session("reserved", "/tmp/profile-reserved");
+        view.storages.insert(
+            "target".to_string(),
+            Storage::new_unwatched("target").unwrap(),
+        );
+        let reservation = LifecycleReservation {
+            op: LifecycleOperation::Launch,
+            generation: 1,
+            at: chrono::Utc::now(),
+        };
+        view.mutate_instance(&id, |row| {
+            row.lifecycle_generation = 1;
+            row.lifecycle_reservation = Some(reservation.clone());
+            row.status = Status::Starting;
+        });
+        let source = Storage::new_unwatched("test").unwrap();
+        source
+            .update(|instances, _groups| {
+                let row = instances.iter_mut().find(|row| row.id == id).unwrap();
+                row.lifecycle_generation = 1;
+                row.lifecycle_reservation = Some(reservation);
+                row.status = Status::Starting;
+                Ok(())
+            })
+            .unwrap();
+
+        let _guards = view.lock_session_mutation_and_reload(&id).unwrap();
+        let requested = view.get_instance(&id).cloned().unwrap();
+        let error = view
+            .move_to_profile(&id, "target", requested, None)
+            .expect_err("reserved session must not move profiles");
+
+        assert!(error
+            .to_string()
+            .contains("lifecycle operation is in progress"));
+        assert_eq!(view.get_instance(&id).unwrap().source_profile, "test");
+        assert!(view
+            .pending_deletions
+            .get("test")
+            .is_none_or(|ids| !ids.contains(&id)));
+        assert!(Storage::new_unwatched("target")
+            .unwrap()
+            .load()
+            .unwrap()
+            .is_empty());
+        assert!(source.load().unwrap().iter().any(|row| row.id == id));
+
+        let stale_at =
+            chrono::Utc::now() - Instance::LIFECYCLE_RESERVATION_TTL - chrono::Duration::seconds(1);
+        view.mutate_instance(&id, |row| {
+            row.lifecycle_reservation.as_mut().unwrap().at = stale_at;
+        });
+        source
+            .update(|instances, _groups| {
+                instances
+                    .iter_mut()
+                    .find(|row| row.id == id)
+                    .unwrap()
+                    .lifecycle_reservation
+                    .as_mut()
+                    .unwrap()
+                    .at = stale_at;
+                Ok(())
+            })
+            .unwrap();
+
+        let requested = view.get_instance(&id).unwrap().clone();
+        let baseline = requested.clone();
+        view.move_to_profile(&id, "target", requested, Some(&baseline))
+            .expect("stale reservation must not block profile move");
+        assert!(source.load().unwrap().is_empty());
+        assert!(Storage::new_unwatched("target")
+            .unwrap()
+            .load()
+            .unwrap()
+            .iter()
+            .any(|row| row.id == id));
+    }
+
+    #[test]
+    #[serial]
+    fn restart_profile_move_rejects_invalid_targets_before_mutation() {
+        let (_temp, _guard, mut view, id) =
+            boot_view_with_one_session("source", "/tmp/profile-restart-collision");
+        view.selected_session = Some(id.clone());
+
+        let error = view
+            .restart_selected_session(Some("missing-target"), Some("claude"), None, None)
+            .expect_err("missing target profile must reject restart profile move");
+        assert!(error
+            .to_string()
+            .contains("Profile 'missing-target' does not exist"));
+        assert!(!crate::session::list_profiles()
+            .unwrap()
+            .contains(&"missing-target".to_string()));
+        assert_eq!(view.get_instance(&id).unwrap().source_profile, "test");
+        assert!(!view.restart_cooldown_at.contains_key(&id));
+
+        let target = Storage::new_unwatched("target").unwrap();
+        target
+            .update(|instances, _groups| {
+                let mut collision = Instance::new("source", "/tmp/profile-restart-collision/");
+                collision.source_profile = "target".to_string();
+                instances.push(collision);
+                Ok(())
+            })
+            .unwrap();
+        view.storages.insert("target".to_string(), target);
+
+        let error = view
+            .restart_selected_session(Some("target"), Some("claude"), None, None)
+            .expect_err("target identity collision must reject restart profile move");
+
+        assert!(error
+            .to_string()
+            .contains("Session already exists with same title and path"));
+        assert_eq!(view.get_instance(&id).unwrap().source_profile, "test");
+        assert!(!view.restart_cooldown_at.contains_key(&id));
+        assert_eq!(
+            Storage::new_unwatched("test")
+                .unwrap()
+                .load()
+                .unwrap()
+                .len(),
+            1
+        );
+        assert_eq!(
+            Storage::new_unwatched("target")
+                .unwrap()
+                .load()
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    #[serial]
     fn test_move_to_profile_same_profile_only_updates_group_path() {
         let (_temp, _guard, mut view, id) = boot_view_with_one_session("victim", "/tmp/move");
 
-        view.move_to_profile(&id, "test", "newgrp".to_string())
-            .unwrap();
+        let mut requested = view.get_instance(&id).unwrap().clone();
+        requested.group_path = "newgrp".to_string();
+        view.move_to_profile(&id, "test", requested, None).unwrap();
 
         assert!(
             !view.pending_deletions.contains_key("test")
@@ -17033,6 +18694,7 @@ mod save_field_merge {
                 _ => false,
             })
         };
+
         assert!(
             archived_section_present(&view.flat_items),
             "precondition: Archived section header rendered"
@@ -17059,6 +18721,228 @@ mod save_field_merge {
             !archived_section_present(&view.flat_items),
             "Archived section must disappear once the only archived row is unsunk"
         );
+    }
+    #[test]
+    #[serial]
+    fn restart_profile_move_commits_staged_launch_edit() {
+        let (_temp, _guard, mut view, id) =
+            boot_view_with_one_session("victim", "/tmp/profile-launch");
+        fn seed_swap_state(instance: &mut Instance) {
+            instance.tool = "claude".to_string();
+            instance.agent_session_id = Some("claude-session".to_string());
+        }
+        view.mutate_instance(&id, seed_swap_state);
+        view.storages["test"]
+            .update(|instances, _groups| {
+                seed_swap_state(instances.iter_mut().find(|row| row.id == id).unwrap());
+                Ok(())
+            })
+            .unwrap();
+        view.storages["test"]
+            .update(|instances, _groups| {
+                let fresh = instances.iter_mut().find(|row| row.id == id).unwrap();
+                fresh.agent_session_id = Some("fresh-claude-session".to_string());
+                Ok(())
+            })
+            .unwrap();
+        view.storages.insert(
+            "target".to_string(),
+            Storage::new_unwatched("target").unwrap(),
+        );
+        view.selected_session = Some(id.clone());
+
+        view.restart_selected_session(
+            Some("target"),
+            Some("codex"),
+            Some("--fast"),
+            Some("codex-wrapper"),
+        )
+        .unwrap();
+
+        let (source_rows, _) = Storage::new_unwatched("test")
+            .unwrap()
+            .load_with_groups()
+            .unwrap();
+        assert!(!source_rows.iter().any(|row| row.id == id));
+        let target_rows = Storage::new_unwatched("target").unwrap().load().unwrap();
+        let moved = target_rows.iter().find(|row| row.id == id).unwrap();
+        assert_eq!(moved.tool, "codex");
+        assert_eq!(moved.command, "codex-wrapper");
+        assert_eq!(moved.extra_args, "--fast");
+        assert_eq!(moved.agent_session_id, None);
+        assert_eq!(
+            moved.prior_tool_session_ids["claude"]
+                .agent_session_id
+                .as_deref(),
+            Some("fresh-claude-session")
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn restart_profile_move_rejection_leaves_source_tool_state_unchanged() {
+        let (_temp, _guard, mut view, id) =
+            boot_view_with_one_session("victim", "/tmp/profile-reject");
+        view.mutate_instance(&id, |instance| {
+            instance.tool = "claude".to_string();
+            instance.agent_session_id = Some("source-durable-sid".to_string());
+        });
+        view.storages["test"]
+            .update(|instances, _groups| {
+                let source = instances.iter_mut().find(|row| row.id == id).unwrap();
+                source.tool = "claude".to_string();
+                source.agent_session_id = Some("source-durable-sid".to_string());
+                Ok(())
+            })
+            .unwrap();
+        let target = Storage::new_unwatched("target").unwrap();
+        target
+            .update(|instances, _groups| {
+                instances.push(Instance::new("victim", "/tmp/profile-reject/"));
+                Ok(())
+            })
+            .unwrap();
+        view.storages.insert("target".to_string(), target);
+        view.selected_session = Some(id.clone());
+
+        let result = view.restart_selected_session(
+            Some("target"),
+            Some("codex"),
+            Some("--new"),
+            Some("codex-wrapper"),
+        );
+        assert!(result.is_err());
+
+        let source = Storage::new_unwatched("test")
+            .unwrap()
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        assert_eq!(source.tool, "claude");
+        assert_eq!(
+            source.agent_session_id.as_deref(),
+            Some("source-durable-sid")
+        );
+        assert!(source.prior_tool_session_ids.is_empty());
+        let live = view.get_instance(&id).unwrap();
+        assert_eq!(live.source_profile, "test");
+        assert_eq!(live.tool, "claude");
+        assert_eq!(live.agent_session_id.as_deref(), Some("source-durable-sid"));
+        assert!(!view.restart_in_flight.contains(&id));
+        assert!(!view.restart_cooldown_at.contains_key(&id));
+    }
+
+    #[test]
+    #[serial]
+    fn rename_profile_move_validates_complete_candidate_before_commit() {
+        let (_temp, _guard, mut view, id) =
+            boot_view_with_one_session("old-name", "/tmp/profile-rename");
+        let target = Storage::new_unwatched("target").unwrap();
+        target
+            .update(|instances, groups| {
+                let mut collision = Instance::new("new-name", "/tmp/profile-rename/");
+                collision.source_profile = "target".to_string();
+                instances.push(collision);
+                groups.push(Group::new("existing", "existing"));
+                Ok(())
+            })
+            .unwrap();
+        view.storages.insert("target".to_string(), target);
+        view.selected_session = Some(id.clone());
+
+        let result = view.rename_selected("new-name", Some("renamed/group"), Some("target"), false);
+        assert!(result.is_err());
+
+        let (source_rows, source_groups) = Storage::new_unwatched("test")
+            .unwrap()
+            .load_with_groups()
+            .unwrap();
+        let source = source_rows.iter().find(|row| row.id == id).unwrap();
+        assert_eq!(source.title, "old-name");
+        assert!(source.group_path.is_empty());
+        assert!(source_groups.is_empty());
+        let (target_rows, target_groups) = Storage::new_unwatched("target")
+            .unwrap()
+            .load_with_groups()
+            .unwrap();
+        assert_eq!(target_rows.len(), 1);
+        assert_eq!(target_groups.len(), 1);
+        assert_eq!(target_groups[0].path, "existing");
+        let in_memory = view.get_instance(&id).unwrap();
+        assert_eq!(in_memory.source_profile, "test");
+        assert_eq!(in_memory.title, "old-name");
+    }
+
+    #[test]
+    #[serial]
+    fn tied_cross_profile_collision_rejects_before_worktree_effects() {
+        let temp = TempDir::new().unwrap();
+        let old_path = temp.path().join("old-name");
+        let new_path = temp.path().join("new-name");
+        std::fs::create_dir_all(&old_path).unwrap();
+        std::fs::write(old_path.join("sentinel"), b"untouched").unwrap();
+        let (_home, _guard, mut view, id) =
+            boot_view_with_one_session("old-name", old_path.to_str().unwrap());
+        let worktree = crate::session::WorktreeInfo {
+            branch: "old-name".to_string(),
+            main_repo_path: temp
+                .path()
+                .join("missing-repo")
+                .to_string_lossy()
+                .to_string(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        };
+        view.mutate_instance(&id, |instance| {
+            instance.worktree_info = Some(worktree.clone());
+            instance.status = Status::Stopped;
+        });
+        view.storages["test"]
+            .update(|instances, _groups| {
+                let source = instances.iter_mut().find(|row| row.id == id).unwrap();
+                source.worktree_info = Some(worktree.clone());
+                source.status = Status::Stopped;
+                Ok(())
+            })
+            .unwrap();
+        let target = Storage::new_unwatched("target").unwrap();
+        target
+            .update(|instances, _groups| {
+                instances.push(Instance::new(
+                    "new-name",
+                    new_path.to_string_lossy().as_ref(),
+                ));
+                Ok(())
+            })
+            .unwrap();
+        view.storages.insert("target".to_string(), target);
+        view.selected_session = Some(id.clone());
+
+        let result = view.rename_selected("new-name", None, Some("target"), true);
+
+        assert!(result.is_err());
+        assert!(old_path.exists());
+        assert_eq!(
+            std::fs::read(old_path.join("sentinel")).unwrap(),
+            b"untouched"
+        );
+        assert!(
+            !new_path.exists(),
+            "no target directory may be created before validation"
+        );
+        let source = Storage::new_unwatched("test")
+            .unwrap()
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|row| row.id == id)
+            .unwrap();
+        assert_eq!(source.title, "old-name");
+        assert_eq!(source.project_path, old_path.to_string_lossy().to_string());
+        assert_eq!(source.worktree_info.unwrap().branch, "old-name");
     }
 
     /// Snoozed siblings of the archive case: `snoozed_until` is also cleared
@@ -17698,7 +19582,7 @@ mod apply_session_id_updates {
 
     use super::*;
     use crate::session::poller::SessionPoller;
-    use crate::session::ResumeIntent;
+    use crate::session::{ResumeIntent, View};
     use std::sync::{Arc, Mutex};
 
     const NEW_SID: &str = "019342ab-1111-7aaa-8bbb-cccdddeeefff";
@@ -18007,6 +19891,75 @@ mod apply_session_id_updates {
             captured_env(&expected_name).is_none(),
             "no tmux session means no publish target"
         );
+    }
+
+    #[test]
+    #[serial]
+    fn repair_session_id_pollers_skips_structured_and_repairs_live_terminal() {
+        if skip_if_no_tmux() {
+            return;
+        }
+        let temp = TempDir::new().unwrap();
+        let _guard = setup_test_home(&temp);
+
+        let profile = "apply-poller-repair";
+        let terminal = fresh_instance(profile, "repair-terminal");
+        let mut structured = fresh_instance(profile, "repair-structured");
+        structured.view = View::Structured;
+        let mut view = build_view_with_inst(profile, &terminal);
+        view.instances
+            .insert(structured.id.clone(), structured.clone());
+        let terminal_stopped = Arc::new(Mutex::new(SessionPoller::new("stopped".to_string())));
+        let structured_stopped = Arc::new(Mutex::new(SessionPoller::new("stopped".to_string())));
+        view.instances
+            .get_mut(&terminal.id)
+            .unwrap()
+            .session_id_poller = Some(terminal_stopped.clone());
+        view.instances
+            .get_mut(&structured.id)
+            .unwrap()
+            .session_id_poller = Some(structured_stopped.clone());
+        let _tmux = TmuxSession::create(&terminal.id, &terminal.title);
+
+        assert!(!view.apply_session_id_updates());
+        assert!(
+            Arc::ptr_eq(
+                &view
+                    .instances
+                    .get(&terminal.id)
+                    .and_then(|i| i.session_id_poller.clone())
+                    .expect("drain should retain the stopped poller"),
+                &terminal_stopped,
+            ),
+            "the hot drain path must not repair pollers"
+        );
+
+        view.repair_session_id_pollers();
+        let repaired = view
+            .instances
+            .get(&terminal.id)
+            .and_then(|i| i.session_id_poller.clone())
+            .expect("live pane should receive a replacement poller");
+        assert!(!Arc::ptr_eq(&repaired, &terminal_stopped));
+        assert!(repaired
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_running());
+        assert!(
+            Arc::ptr_eq(
+                &view
+                    .instances
+                    .get(&structured.id)
+                    .and_then(|i| i.session_id_poller.clone())
+                    .expect("structured poller should be untouched"),
+                &structured_stopped,
+            ),
+            "structured sessions must not probe tmux or start terminal pollers"
+        );
+        repaired
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .stop();
     }
 
     /// Discarding unsaved Settings changes via a mouse click on the
@@ -18827,16 +20780,16 @@ mod daemon_status_apply_tests {
         );
     }
 
-    /// #3201, the deliberately-ungated half: the status patch is skipped
-    /// for a structured row, but the unread mark still lands, mirroring the
-    /// daemon (`decide_passive_transition` gates only `patch` on
-    /// `is_structured()`; its `mark_unread` is ungated and
-    /// `flush_passive_transition_writes` persists it). A future refactor that
-    /// gates unread the same way it gates status would strand structured rows
-    /// as read across a restart; this locks against it.
+    /// A structured row's turn-end is the daemon's to record, both halves of it,
+    /// so the TUI writes neither field: the status is a daemon-side overlay with
+    /// no durable owner (#3201), and the unread mark is written durably by the
+    /// live ACP turn-end path (`should_mark_acp_unread`, #3181).
+    ///
+    /// The mark still reaches this row, from disk on the next reload;
+    /// `merge_from_tui` has no `unread` arm, so a TUI save cannot clobber it.
     #[test]
     #[serial]
-    fn daemon_status_persists_the_unread_mark_but_not_the_status_for_structured() {
+    fn tui_persists_neither_status_nor_unread_for_a_structured_turn_end() {
         crate::session::set_unread_enabled(true);
         let mut env = create_test_env_empty();
         let id = structured_row(&mut env, Status::Running);
@@ -18844,9 +20797,16 @@ mod daemon_status_apply_tests {
             .save()
             .expect("seed the structured row on disk as read/Running");
 
-        // A finished turn (Running -> Idle) marks the row unread.
+        // A finished turn (Running -> Idle).
         env.view
             .apply_daemon_status_update(update(&id, Status::Idle));
+
+        let inst = env.view.get_instance(&id).expect("row still present");
+        assert_eq!(inst.status, Status::Idle, "the turn-end still applies");
+        assert!(
+            !inst.is_unread(),
+            "the structured turn-end mark is the daemon's to write, not ours"
+        );
 
         let rows = env.view.storages.get("test").unwrap().load().unwrap();
         let disk = rows.iter().find(|i| i.id == id).expect("disk row present");
@@ -18856,8 +20816,8 @@ mod daemon_status_apply_tests {
             "structured status must not be passively persisted (#3201)"
         );
         assert!(
-            disk.is_unread(),
-            "the unread mark must still persist for a structured row, mirroring the daemon (#3201)"
+            !disk.is_unread(),
+            "structured unread must not be passively persisted either (#3181)"
         );
     }
 
@@ -18960,5 +20920,274 @@ mod daemon_status_apply_tests {
                 "a {label} row is sunk; the daemon overlay must not drive its status (#3201)"
             );
         }
+    }
+}
+
+#[test]
+#[serial]
+fn every_view_mode_paints_the_same_sunk_row_decoration() {
+    // `render_item_line`'s three view arms each carried their own copy of the
+    // archive / snooze / favorite block (Structured and Terminal had
+    // byte-identical title blocks), and the Tool arm had none at all: an
+    // archived or snoozed session in Tool view kept painting its live glyph
+    // with no `z ` prefix. `decorate_row` owns the overlay for every mode now,
+    // so the three must agree.
+    //
+    // The pane views are seeded live on purpose. `ICON_IDLE` and `ICON_STOPPED`
+    // are the same glyph and an unseeded pane row is already dimmed, so a row
+    // whose terminal is NOT running renders identically with and without the
+    // sink override, and every assertion below would pass on a renderer that
+    // dropped `decorate_row` entirely. Injecting the pane names into the shared
+    // tmux snapshot makes the seed a bright animated spinner, which is what
+    // gives the override something to actually override.
+    use super::{ViewMode, ICON_STOPPED};
+    use crate::session::Status;
+    use ratatui::style::Modifier;
+
+    let mut env = create_test_env_with_sessions(1);
+    let id = match env.view.flat_items.first() {
+        Some(Item::Session { id, .. }) => id.clone(),
+        _ => panic!("expected the fixture to seed a single Session item"),
+    };
+    let title = env
+        .view
+        .get_instance(&id)
+        .expect("session present")
+        .title
+        .clone();
+    // Snooze decoration is Attention-gated; archive is universal.
+    env.view.sort_order = crate::session::config::SortOrder::Attention;
+    let theme = crate::tui::styles::Theme::default();
+    let item = Item::Session {
+        id: id.clone(),
+        depth: 0,
+    };
+
+    let seed_panes_live = || {
+        crate::tmux::test_inject_session_into_cache(&crate::tmux::TerminalSession::generate_name(
+            &id, &title,
+        ));
+        crate::tmux::test_inject_session_into_cache(&crate::tmux::ToolSession::generate_name(
+            &id, &title, "lazygit",
+        ));
+    };
+
+    // (label, archived, snoozed, expected title prefix, extra modifiers)
+    let cases = [
+        ("archived", true, false, "", Modifier::empty()),
+        (
+            "snoozed",
+            false,
+            true,
+            "z ",
+            Modifier::ITALIC | Modifier::DIM,
+        ),
+    ];
+
+    for mode in [
+        ViewMode::Structured,
+        ViewMode::Terminal,
+        ViewMode::Tool("lazygit".to_string()),
+    ] {
+        env.view.view_mode = mode.clone();
+
+        // Anti-vacuity: a live, unsunk row must NOT already look sunk, or the
+        // sink assertions below prove nothing about this mode.
+        seed_panes_live();
+        env.view.mutate_instance(&id, |inst| {
+            inst.status = Status::Running;
+            inst.archived_at = None;
+            inst.snoozed_until = None;
+        });
+        let live = env.view.render_item_line(&item, false, false, &theme, 120);
+        assert_ne!(
+            live.spans[1].style.fg,
+            Some(theme.dimmed),
+            "{mode:?}: a live row must not already paint dimmed; \
+             the sink assertions below would be vacuous"
+        );
+
+        for (label, archived, snoozed, prefix, extra) in cases {
+            seed_panes_live();
+            // Status stays Running so the live-glyph branch would fire in
+            // every mode if the sink override were missing.
+            env.view.mutate_instance(&id, |inst| {
+                inst.status = Status::Running;
+                inst.archived_at = archived.then(chrono::Utc::now);
+                inst.snoozed_until =
+                    snoozed.then(|| chrono::Utc::now() + chrono::Duration::minutes(15));
+            });
+
+            let line = env.view.render_item_line(&item, false, false, &theme, 120);
+            let icon = line.spans[1].content.trim().to_string();
+            let rendered = line.spans[2].content.to_string();
+
+            assert_eq!(
+                icon, ICON_STOPPED,
+                "{mode:?}/{label}: sunk row must drop its live glyph"
+            );
+            assert_eq!(
+                line.spans[1].style.fg,
+                Some(theme.dimmed),
+                "{mode:?}/{label}: sunk row must paint dimmed"
+            );
+            assert!(
+                line.spans[1].style.add_modifier.contains(extra),
+                "{mode:?}/{label}: expected {extra:?}, got {:?}",
+                line.spans[1].style.add_modifier
+            );
+            assert_eq!(
+                rendered,
+                format!("{prefix}{title}"),
+                "{mode:?}/{label}: wrong title decoration"
+            );
+        }
+
+        // Error and Deleting punch through the sink mask in Structured only.
+        // There the seed carries ICON_ERROR + theme.error, so a failed Empty
+        // Trash stays distinguishable from a healthy trash row. The pane views
+        // seed from terminal liveness and have no error affordance, so
+        // punching through would paint a bright animated "still alive" row
+        // inside the Archived shelf while signalling nothing about the failure.
+        for status in [Status::Error, Status::Deleting] {
+            seed_panes_live();
+            env.view.mutate_instance(&id, |inst| {
+                inst.status = status;
+                inst.archived_at = Some(chrono::Utc::now());
+                inst.snoozed_until = None;
+            });
+            let line = env.view.render_item_line(&item, false, false, &theme, 120);
+            let sunk = line.spans[1].style.fg == Some(theme.dimmed);
+            assert_eq!(
+                sunk,
+                !matches!(mode, ViewMode::Structured),
+                "{mode:?}/archived+{status:?}: only Structured may punch through the sink mask"
+            );
+        }
+    }
+}
+
+mod profile_duplicate_reconciliation {
+    use super::*;
+    use ratatui::backend::TestBackend;
+    use ratatui::Terminal;
+
+    /// One session id present in `alpha` and `beta`, plus an optional valid
+    /// move journal claiming alpha -> beta (target published, target wins).
+    fn boot_ambiguous_state(with_journal: bool) -> (TempDir, AppDirGuard, String) {
+        let temp = TempDir::new().unwrap();
+        let guard = setup_test_home(&temp);
+        let alpha = Storage::new_unwatched("alpha").unwrap();
+        let mut inst = Instance::new("moved", "/repo/moved");
+        inst.group_path = "work".to_string();
+        let id = inst.id.clone();
+        alpha
+            .update(|i, g| {
+                i.push(inst.clone());
+                g.push(Group::new("work", "work"));
+                Ok(())
+            })
+            .unwrap();
+        let beta = Storage::new_unwatched("beta").unwrap();
+        beta.update(|i, _| {
+            let mut copy = inst.clone();
+            copy.source_profile = "beta".to_string();
+            i.push(copy);
+            Ok(())
+        })
+        .unwrap();
+        if with_journal {
+            crate::session::record_move_journal(
+                &crate::session::MoveJournalEntry {
+                    version: crate::session::MOVE_JOURNAL_VERSION,
+                    ids: vec![id.clone()],
+                    source_profile: "alpha".to_string(),
+                    target_profile: "beta".to_string(),
+                    source_sessions_path: alpha.sessions_path().to_path_buf(),
+                    target_sessions_path: beta.sessions_path().to_path_buf(),
+                    group_move_source_path: "work".to_string(),
+                    group_move_target_path: "moved".to_string(),
+                    group_move_subtree: false,
+                    created_at_epoch_ms: std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or_default(),
+                },
+                alpha.sessions_path(),
+            )
+            .unwrap();
+        }
+        (temp, guard, id)
+    }
+
+    #[test]
+    #[serial]
+    fn interrupted_move_with_journal_repairs_before_publish() {
+        let (_temp, _guard, id) = boot_ambiguous_state(true);
+
+        let view = HomeView::new(
+            None,
+            AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+
+        // The journal arbitrates before the unified map is published, so the
+        // repaired row is usable immediately instead of being excluded.
+        assert_eq!(view.instances.len(), 1, "exactly the winning row publishes");
+        let row = view.instances.get(&id).expect("repaired row present");
+        assert_eq!(row.source_profile, "beta", "target copy wins per journal");
+        assert!(view.legacy_duplicate_reports.is_empty());
+        assert!(
+            Storage::new_unwatched("alpha")
+                .unwrap()
+                .load()
+                .unwrap()
+                .is_empty(),
+            "losing source copy removed on disk"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_duplicate_stays_excluded_and_is_surfaced() {
+        let (_temp, _guard, id) = boot_ambiguous_state(false);
+
+        let mut view = HomeView::new(
+            None,
+            AvailableTools::with_tools(&["claude"]),
+            crate::file_watch::FileWatchService::noop(),
+        )
+        .unwrap();
+
+        assert!(
+            view.instances.get(&id).is_none(),
+            "without journal evidence every copy stays excluded"
+        );
+        assert_eq!(view.legacy_duplicate_reports.len(), 1);
+        let message = view.legacy_duplicate_reports[0].actionable_message();
+        assert!(message.contains(&id) && message.contains("alpha") && message.contains("beta"));
+
+        // The fail-closed state must be visible, not silent.
+        let theme = crate::tui::styles::load_theme("empire");
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        terminal
+            .draw(|f| {
+                let area = f.area();
+                view.render(f, area, &theme, None, None, None);
+            })
+            .unwrap();
+        let buf = terminal.backend().buffer();
+        let mut out = String::new();
+        for y in 0..buf.area.height {
+            for x in 0..buf.area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        assert!(
+            out.contains("\u{26a0} 1 ambiguous"),
+            "the list title must flag ambiguous sessions.\nFull buffer:\n{out}"
+        );
     }
 }

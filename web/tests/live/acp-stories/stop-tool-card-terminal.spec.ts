@@ -84,7 +84,7 @@ test("stopping mid-tool settles the card and survives reload", async ({ page }, 
       timeout: 10_000,
     });
 
-    const stopButton = page.getByRole("button", { name: "Stop" });
+    const stopButton = page.getByTestId("composer-actions").getByRole("button", { name: "Stop" });
     await expect(stopButton).toBeVisible({ timeout: 10_000 });
     await stopButton.click();
 

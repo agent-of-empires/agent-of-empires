@@ -726,16 +726,11 @@ pub enum UiSlot {
     ComposerAction,
     /// A badge in a session's detail view (per session).
     DetailBadge,
-    /// A routed full page mounted as its own entry in the dashboard settings
-    /// nav (global). The host renders the plugin's pushed page body (the same
-    /// `blocks` vocabulary as `Pane`) so a plugin can host a full management
-    /// panel without a per-session dock.
-    SettingsPage,
-    /// A badge on a tool-call card in a session's transcript, matched to a
-    /// specific call by its target (per session). The payload carries a
-    /// target-keyed list so one entry can badge every MCP server or skill the
-    /// plugin knows about; the host renders the pill on the matching card.
-    ToolCardBadge,
+    /// A host-wide docked pane on the home view (global), carrying the same
+    /// `blocks` vocabulary as `Pane` but not tied to any session; the host docks
+    /// it on the home view. The reusable slot for a machine-wide panel: `Pane`
+    /// is per-session and `Card` is text-only, so neither fits.
+    HomePane,
     /// A transient notification, pushed via `ui.notify` (gated by the
     /// `notifications` capability rather than a slot declaration).
     Notification,
@@ -752,7 +747,6 @@ impl UiSlot {
                 | UiSlot::Pane
                 | UiSlot::ComposerAction
                 | UiSlot::DetailBadge
-                | UiSlot::ToolCardBadge
         )
     }
 
@@ -770,8 +764,7 @@ impl UiSlot {
             UiSlot::Pane => "pane",
             UiSlot::ComposerAction => "composer-action",
             UiSlot::DetailBadge => "detail-badge",
-            UiSlot::SettingsPage => "settings-page",
-            UiSlot::ToolCardBadge => "tool-card-badge",
+            UiSlot::HomePane => "home-pane",
             UiSlot::Notification => "notification",
         }
     }
@@ -1288,18 +1281,6 @@ impl PluginManifest {
                 "dynamic_select / object_list / cron settings require api_version >= 9".into(),
             );
         }
-        // `settings-page` and `tool-card-badge` are api_version 10 slots; force
-        // the bump for the same reason as the gates above.
-        if self.api_version < 10 {
-            check(
-                self.ui.iter().all(|u| u.slot != UiSlot::SettingsPage),
-                "settings-page UI slots require api_version >= 10".into(),
-            );
-            check(
-                self.ui.iter().all(|u| u.slot != UiSlot::ToolCardBadge),
-                "tool-card-badge UI slots require api_version >= 10".into(),
-            );
-        }
         // `dynamic_multi_select` object-list fields are api_version 11; same
         // reasoning as the gates above.
         if self.api_version < 11 {
@@ -1310,6 +1291,14 @@ impl PluginManifest {
                         .all(|f| f.value_type != ObjectFieldType::DynamicMultiSelect)
                 }),
                 "dynamic_multi_select settings fields require api_version >= 11".into(),
+            );
+        }
+        // `home-pane` is an api_version 13 slot; force the bump so an older host
+        // reports "upgrade aoe" rather than a confusing unknown-variant error.
+        if self.api_version < 13 {
+            check(
+                self.ui.iter().all(|u| u.slot != UiSlot::HomePane),
+                "home-pane UI slots require api_version >= 13".into(),
             );
         }
         for key in self.setting_defaults.keys() {
@@ -1487,6 +1476,25 @@ mod tests {
              [[ui]]\nslot = \"{ui_slot}\"\nid = \"link\"\n\n\
              [[commands]]\nid = \"open\"\ntitle = \"Open\"\n[commands.action]\nkind = \"open-ui-link\"\nslot = \"{action_slot}\"\nid = \"link\"\n"
         )
+    }
+
+    fn home_pane_toml(api_version: u32) -> String {
+        format!(
+            "id = \"acme.diag\"\nname = \"Diag\"\nversion = \"1.0.0\"\napi_version = {api_version}\n\n\
+             [[ui]]\nslot = \"home-pane\"\nid = \"mem\"\n"
+        )
+    }
+
+    #[test]
+    fn home_pane_requires_api_version_13() {
+        let err = PluginManifest::from_toml_str(&home_pane_toml(12))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("home-pane") && err.contains("api_version"),
+            "{err}"
+        );
+        assert!(PluginManifest::from_toml_str(&home_pane_toml(13)).is_ok());
     }
 
     #[test]

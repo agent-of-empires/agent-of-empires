@@ -455,6 +455,8 @@ export function DiffFileList({
             viewMode={viewMode}
             collapsedDirs={collapsedDirs}
             onToggleDir={toggleDir}
+            sessionId={sessionId}
+            onBaseBranchChanged={onBaseBranchChanged}
           />
         ) : viewMode === "tree" ? (
           <TreeView
@@ -497,6 +499,8 @@ function MultiRepoGroups({
   viewMode,
   collapsedDirs,
   onToggleDir,
+  sessionId,
+  onBaseBranchChanged,
 }: {
   perRepoBases: RepoBase[];
   filesByRepo: Map<string, RichDiffFile[]>;
@@ -508,6 +512,8 @@ function MultiRepoGroups({
   viewMode: "flat" | "tree";
   collapsedDirs: Set<string>;
   onToggleDir: (dirPath: string) => void;
+  sessionId?: string | null;
+  onBaseBranchChanged?: () => void;
 }) {
   return (
     <>
@@ -519,29 +525,45 @@ function MultiRepoGroups({
         const dels = repoFiles.reduce((s, f) => s + f.deletions, 0);
         return (
           <div key={name || "_default"} className="border-b border-surface-700/20 last:border-b-0">
-            <button
-              type="button"
-              onClick={() => onToggleRepo(name)}
-              aria-expanded={!collapsed}
-              className="w-full text-left px-3 py-1.5 cursor-pointer transition-colors flex items-center gap-1.5 bg-surface-850 hover:bg-surface-800 text-text-secondary"
-            >
-              <svg
-                className={`w-3 h-3 shrink-0 text-text-dim transition-transform duration-75 ${
-                  collapsed ? "-rotate-90" : ""
-                }`}
-                viewBox="0 0 16 16"
-                fill="currentColor"
+            {/* The row is a container rather than one big button so each repo's
+                base picker gets its own click target; nesting a button inside a
+                button is invalid. See #3329. */}
+            <div className="w-full px-3 py-1.5 transition-colors flex items-center gap-1.5 bg-surface-850 hover:bg-surface-800 text-text-secondary">
+              <button
+                type="button"
+                onClick={() => onToggleRepo(name)}
+                aria-expanded={!collapsed}
+                className="min-w-0 flex-1 text-left cursor-pointer flex items-center gap-1.5"
               >
-                <path d="M4 6l4 4 4-4" />
-              </svg>
-              <span className="font-mono text-[12px] truncate flex-1">{repo.repo_name ?? "(default)"}</span>
-              <span className="font-mono text-[10px] text-text-dim">vs {repo.base_branch}</span>
+                <svg
+                  className={`w-3 h-3 shrink-0 text-text-dim transition-transform duration-75 ${
+                    collapsed ? "-rotate-90" : ""
+                  }`}
+                  viewBox="0 0 16 16"
+                  fill="currentColor"
+                >
+                  <path d="M4 6l4 4 4-4" />
+                </svg>
+                <span className="font-mono text-[12px] truncate">{repo.repo_name ?? "(default)"}</span>
+              </button>
+              {sessionId ? (
+                <BasePicker
+                  sessionId={sessionId}
+                  repoPath={repo.repo_path}
+                  repoName={repo.repo_name}
+                  currentBase={repo.base_branch}
+                  hasOverride={Boolean(repo.base_override)}
+                  onChanged={onBaseBranchChanged}
+                />
+              ) : (
+                <span className="font-mono text-[10px] text-text-dim">vs {repo.base_branch}</span>
+              )}
               <span className="font-mono text-[11px] text-text-muted">{repoFiles.length}</span>
               <span className="font-mono text-[11px] flex items-center gap-1">
                 {adds > 0 && <span className="text-status-running">+{adds}</span>}
                 {dels > 0 && <span className="text-status-error">-{dels}</span>}
               </span>
-            </button>
+            </div>
             {!collapsed && repoFiles.length === 0 && (
               <div className="px-3 py-2 text-[11px] text-text-dim italic">No changes in this repo.</div>
             )}
@@ -657,13 +679,16 @@ interface BasePickerProps {
   repoPath: string;
   currentBase: string;
   hasOverride: boolean;
+  /** Workspace repo this picker sets the base for. Omitted on a single-repo
+   *  session, whose only entry is its own checkout. See #3329. */
+  repoName?: string;
   onChanged?: () => void;
 }
 
-/// Clickable chip + typeahead popover for the per-session diff base.
+/// Clickable chip + typeahead popover for one repo's diff base.
 /// Persists via `PATCH /api/sessions/{id}/diff-base`; the parent
-/// triggers a diff refetch on success. See #970.
-function BasePicker({ sessionId, repoPath, currentBase, hasOverride, onChanged }: BasePickerProps) {
+/// triggers a diff refetch on success. See #970, #3329.
+function BasePicker({ sessionId, repoPath, currentBase, hasOverride, repoName, onChanged }: BasePickerProps) {
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState("");
   const [branches, setBranches] = useState<BranchInfo[] | null>(null);
@@ -699,7 +724,7 @@ function BasePicker({ sessionId, repoPath, currentBase, hasOverride, onChanged }
 
   const apply = async (value: string | null) => {
     setBusy(true);
-    const ok = await setSessionDiffBase(sessionId, value);
+    const ok = await setSessionDiffBase(sessionId, value, repoName);
     setBusy(false);
     if (ok) {
       setOpen(false);

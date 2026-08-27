@@ -8,7 +8,7 @@ use super::DialogResult;
 use crate::session::config::GroupByMode;
 use crate::tui::styles::Theme;
 
-const OPTIONS: &[GroupByMode] = &[GroupByMode::Manual, GroupByMode::Project];
+const OPTIONS: &[GroupByMode] = &[GroupByMode::Manual, GroupByMode::Project, GroupByMode::Org];
 
 pub struct GroupPickerDialog {
     selected: usize,
@@ -162,6 +162,12 @@ mod tests {
     }
 
     #[test]
+    fn test_new_selects_current_org() {
+        let dialog = GroupPickerDialog::new(GroupByMode::Org);
+        assert_eq!(dialog.selected, 2);
+    }
+
+    #[test]
     fn test_esc_cancels() {
         let mut dialog = GroupPickerDialog::new(GroupByMode::Manual);
         assert!(matches!(
@@ -179,12 +185,22 @@ mod tests {
     }
 
     #[test]
+    fn test_enter_submits_org_after_two_downs() {
+        let mut dialog = GroupPickerDialog::new(GroupByMode::Manual);
+        dialog.handle_key(key(KeyCode::Down));
+        dialog.handle_key(key(KeyCode::Down));
+        let result = dialog.handle_key(key(KeyCode::Enter));
+        assert!(matches!(result, DialogResult::Submit(GroupByMode::Org)));
+    }
+
+    #[test]
     fn test_navigation_clamps() {
         let mut dialog = GroupPickerDialog::new(GroupByMode::Manual);
         dialog.handle_key(key(KeyCode::Up));
         assert_eq!(dialog.selected, 0);
         dialog.handle_key(key(KeyCode::Down));
         dialog.handle_key(key(KeyCode::Down));
-        assert_eq!(dialog.selected, 1);
+        dialog.handle_key(key(KeyCode::Down));
+        assert_eq!(dialog.selected, 2);
     }
 }

@@ -49,6 +49,23 @@ export function autoLoadDecision(i: AutoLoadInput): AutoLoadDecision {
   return { armed: i.armed, fire: false };
 }
 
+/** Pixels of slop for the "pinned to the bottom" test. Sub-pixel rounding and
+ *  momentary content reflows otherwise drop us out of the pinned state for one
+ *  frame; assistant-ui's own stick-to-bottom uses a similar tolerance. */
+export const PINNED_BOTTOM_SLOP_PX = 16;
+
+/** Whether the scroll viewport is at (or within `slop` of) the bottom. Drives
+ *  both the composer-grow re-pin sampling and the mobile jump-to-bottom
+ *  button's visibility, so it lives here as one tested threshold. */
+export function isPinnedToBottom(
+  scrollTop: number,
+  clientHeight: number,
+  scrollHeight: number,
+  slop: number = PINNED_BOTTOM_SLOP_PX,
+): boolean {
+  return scrollTop + clientHeight >= scrollHeight - slop;
+}
+
 /** Scroll delta to add after older rows grow the transcript at the top so
  *  the read position is frozen. 0 when pinned to the bottom (live appends
  *  keep their stick-to-bottom) or when nothing grew. */

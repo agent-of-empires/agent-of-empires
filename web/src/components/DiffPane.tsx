@@ -17,7 +17,7 @@ interface Props {
   commentsEnabled: boolean;
   commentsCount: number;
   commentsSendEnabled: boolean;
-  commentsSendDisabledReason?: string;
+  commentsSendDisabledReason: string;
   onOpenSendDialog: () => void;
   onDiscardAllComments: () => void;
 }

@@ -90,7 +90,8 @@ fn prompt_until_accepted(h: &TuiTestHarness, session_id: &str, timeout: Duration
 ///   1. A pending approval grabs focus on its own (no Tab): the shelf shows
 ///      the decision hints immediately.
 ///   2. A non-decision key does NOT resolve it (only a/A/d act).
-///   3. Pressing `a` resolves it, with no focus switch anywhere.
+///   3. Pressing `a` resolves it and clears the shelf, with no focus switch
+///      anywhere and no key leaking into the composer.
 #[test]
 #[parallel]
 fn tui_acp_modal_approval_with_live_daemon() {
@@ -191,8 +192,12 @@ fn tui_acp_modal_approval_with_live_daemon() {
     h.assert_screen_contains("Approval 1/1 · Edit a file");
 
     // --- Positive path: `a` resolves it directly, no focus switch ---
+    // Resolving dismisses the shelf and leaves no transcript record: since
+    // Tier 4 the transcript is server-owned and approvals are control state,
+    // so the decision lives only in the shelf while it is pending (the web
+    // has never recorded it either). The gated tool card carries the outcome.
     h.send_keys("a"); // resolve: allow
-    h.wait_for("Allowed once · Edit a file");
+    h.wait_for_absent("Approval 1/1 · Edit a file", Duration::from_secs(10));
     // Neither the ignored `z` nor the resolving `a` may leak into the
     // composer: the empty-composer placeholder proves the modal owned
     // both keys end to end.

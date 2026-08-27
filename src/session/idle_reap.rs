@@ -88,10 +88,9 @@ pub fn idle_reap_candidates(
 /// - the idle anchor is at least `threshold_secs` in the past.
 ///
 /// The anchor is `max(idle_entered_at, last_accessed_at)`: `last_accessed_at`
-/// is bumped on user interaction (and equals `idle_entered_at` at the moment a
-/// session enters `Idle`), so a session the user recently touched is spared
-/// even if the agent went idle earlier. A negative elapsed (clock skew, anchor
-/// in the future) is treated as not-yet-eligible rather than panicking.
+/// is bumped on user interaction, so a session the user recently touched is
+/// spared even if the agent went idle earlier. A negative elapsed (clock skew,
+/// anchor in the future) is treated as not-yet-eligible rather than panicking.
 pub fn should_auto_stop_session(
     now: DateTime<Utc>,
     status: Status,

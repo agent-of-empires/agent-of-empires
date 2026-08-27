@@ -3,8 +3,10 @@ name: CI
 on:
   push:
     branches: [main]
+  # No branch filter: a stacked PR targets its parent branch rather than main,
+  # and a base filter would leave every PR but the bottom of the stack with no
+  # checks at all.
   pull_request:
-    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -31,11 +33,22 @@ jobs:
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
         with:
           components: clippy
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: "false"
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo clippy -- -D warnings
+      # `--all-features` so the `serve`-gated tree gets linted too. A plain
+      # `cargo clippy` resolves `default = ["default-plugins"]`, which leaves
+      # src/acp/ and src/serve/ (the structured view, the dashboard backend,
+      # roughly 42k lines) out of every lint run; only the cargo-test legs
+      # ever compiled them. The web-dist placeholder stands in for the npm
+      # bundle that build.rs would otherwise build, so this job still needs
+      # no Node setup; same trick as the rustdoc step in the docs job.
+      - name: Clippy (all features)
+        run: |
+          mkdir -p target/ci-web-dist
+          printf '<!doctype html><title>aoe clippy placeholder</title>\n' > target/ci-web-dist/index.html
+          AOE_WEB_DIST="$PWD/target/ci-web-dist" cargo clippy --all-features -- -D warnings
       - name: file_watch consolidation guard
         run: |
           set -euo pipefail
@@ -94,7 +107,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: "false"
           save-if: ${{ github.ref == 'refs/heads/main' }}
@@ -119,7 +132,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
-      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           cache-bin: "false"
           save-if: ${{ github.ref == 'refs/heads/main' }}

@@ -28,7 +28,9 @@ Enter / Space opens a file or toggles a directory.
 
 ## Base override
 
-By default the diff is computed against the branch the worktree was forked from (its recorded base branch), falling back to the configured `diff.default_branch` and then auto-detection. The **base picker** chip overrides it per session: type to filter branches, pick one, and the diff recomputes. A reset affordance appears while an override is active. The override is sent to the server (`PATCH /api/sessions/{id}/diff-base`) so it persists for the session, not just the browser.
+By default the diff is computed against the branch the worktree was forked from (its recorded base branch), falling back to the configured `diff.default_branch` and then auto-detection. The **base picker** chip overrides it: type to filter branches, pick one, and the diff recomputes. A reset affordance appears while an override is active. The override is sent to the server (`PATCH /api/sessions/{id}/diff-base`) so it persists for that repo, not just the browser.
+
+The base is per repo. In a [multi-repo workspace](../multi-repo-workspaces.md) every repo group header has its own picker, listing that repo's branches, so a workspace whose repos were forked from different branches compares each one correctly. An override on one repo leaves the others alone.
 
 ## Inline review comments
 

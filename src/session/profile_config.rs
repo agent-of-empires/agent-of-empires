@@ -64,15 +64,48 @@ pub fn load_profile_config(profile: &str) -> Result<ProfileConfig> {
     Ok(config)
 }
 
+/// Merge a sparse override object onto a full serialized `Config::default()`,
+/// yielding the resolved JSON that would land in memory if this profile were
+/// applied. Shared prelude for [`validate_overrides_typecheck`] (which
+/// re-deserializes it into `Config` to type-check) and
+/// [`profile_config_ignored_keys`] (which runs `serde_ignored` to enumerate
+/// unknown keys).
+fn merged_onto_default(overrides: &serde_json::Value) -> Result<serde_json::Value> {
+    let mut base = serde_json::to_value(Config::default())?;
+    crate::session::settings_schema::merge_json(&mut base, overrides);
+    Ok(base)
+}
+
 /// Confirm a sparse override object deserializes back into a [`Config`] when
 /// merged onto the defaults. Used at load time so a malformed override file is
 /// a graceful error rather than a merge-time panic.
 pub(super) fn validate_overrides_typecheck(overrides: &serde_json::Value) -> Result<()> {
-    let mut base = serde_json::to_value(Config::default())?;
-    crate::session::settings_schema::merge_json(&mut base, overrides);
+    let base = merged_onto_default(overrides)?;
     serde_json::from_value::<Config>(base)
         .map_err(|e| anyhow::anyhow!("invalid override value: {e}"))?;
     Ok(())
+}
+
+/// Dotted paths of keys in this profile that `Config` does not recognize
+/// (unknown struct fields at any depth), so a typo like `[sandbox] privildged
+/// = true` surfaces instead of being silently dropped. Runs `serde_ignored`
+/// against the profile's overrides merged onto a default `Config`; a raw
+/// `serde_ignored::deserialize::<ProfileConfig>` would report nothing, since
+/// `#[serde(flatten)] overrides` absorbs every unknown key as valid JSON.
+/// Map-keyed sections (`agents`, `tools`, `plugins`, `session.custom_agents`,
+/// `acp.acp_defaults`, ...) never flag because their keys are entries, not
+/// struct fields; nested struct-field typos inside them still do. Takes the
+/// already-loaded `ProfileConfig` so the caller does not read+parse the
+/// profile file a second time.
+pub(crate) fn profile_config_ignored_keys(cfg: &ProfileConfig) -> Vec<String> {
+    let Ok(base) = merged_onto_default(&cfg.overrides_value()) else {
+        return Vec::new();
+    };
+    let mut ignored = Vec::new();
+    let _ = serde_ignored::deserialize::<_, _, Config>(base, |path| {
+        ignored.push(path.to_string());
+    });
+    ignored
 }
 
 /// Save profile-specific config
@@ -116,6 +149,11 @@ pub fn resolve_config(profile: &str) -> Result<Config> {
     let profile_config = load_profile_config(profile)?;
     let mut config = merge_configs(global, &profile_config);
     apply_cityhall_overrides(&mut config);
+    // (Re)install the declarative status-rule registry from the effective
+    // config. The status poll hot path never loads config, so this resolve,
+    // which every polling surface passes through at startup, is where
+    // `[[agents.<name>.status_rules]]` edits become visible.
+    crate::tmux::status_rules::install_from_config(profile, &config);
     Ok(config)
 }
 
@@ -129,9 +167,15 @@ pub fn resolve_config_or_warn(profile: &str) -> Config {
                 "Failed to load config for profile '{}', using defaults: {e}",
                 profile
             );
-            let mut config = Config::default();
-            apply_cityhall_overrides(&mut config);
-            config
+            let mut fallback = Config::default();
+            apply_cityhall_overrides(&mut fallback);
+            // Keep the status-rule registry consistent with the config the
+            // caller proceeds with: a failed resolve must not leave this
+            // profile's rules from an earlier successful resolve installed.
+            // Only this profile's entries are cleared; other profiles' rules
+            // are untouched.
+            crate::tmux::status_rules::install_from_config(profile, &fallback);
+            fallback
         }
     }
 }
@@ -507,11 +551,23 @@ mod tests {
     /// made a profile `[tmux]` block inert no matter what a caller resolved.
     /// `Enabled` / `Disabled` are used rather than `Auto` so the assertions do
     /// not depend on whether the host has a `~/.tmux.conf`.
+    ///
+    /// Iterates [`TmuxSetting::ALL`], so a new managed option is covered by
+    /// this invariant without editing the loop. The setup above stays manual
+    /// per field: it has to name the `[tmux]` keys it flips. Without it a new
+    /// row would resolve as `Auto`, the profile assertion (== `ForceOff`)
+    /// would fail deterministically (Auto is never ForceOff), and the global
+    /// one (== `Apply`) would additionally depend on the host's tmux config.
     #[test]
+    #[serial_test::serial]
     fn test_tmux_decisions_follow_the_config_they_are_given() {
         use crate::session::config::{
             resolve_tmux_setting, TmuxSetting, TmuxSettingAction, TmuxSettingMode,
         };
+        // The resolver probes the user's tmux config on every call, even for
+        // explicit modes; isolate HOME so the probe stays off the real files.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let _home = crate::session::test_support::isolate_home(tmp.path());
         let mut global = Config::default();
         global.tmux.mouse = TmuxSettingMode::Enabled;
         global.tmux.status_bar = TmuxSettingMode::Enabled;
@@ -522,11 +578,7 @@ mod tests {
         }));
         let merged = merge_configs(global.clone(), &profile);
 
-        for setting in [
-            TmuxSetting::StatusBar,
-            TmuxSetting::Mouse,
-            TmuxSetting::Clipboard,
-        ] {
+        for setting in TmuxSetting::ALL {
             assert_eq!(
                 resolve_tmux_setting(setting, &global),
                 TmuxSettingAction::Apply,

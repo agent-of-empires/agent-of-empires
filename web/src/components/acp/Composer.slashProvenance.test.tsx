@@ -29,7 +29,8 @@ vi.mock("./SwitchAgentModal", () => ({ SwitchAgentModal: () => null }));
 vi.mock("../../hooks/useMobileKeyboard", () => ({ useMobileKeyboard: () => ({ keyboardOpen: false }) }));
 vi.mock("../../hooks/useFocusTerminalTarget", () => ({ useFocusTerminalTarget: () => {} }));
 vi.mock("../../lib/agentProfileContext", () => ({
-  useAgentProfile: () => ({ clearAliases: [], capabilities: { legacyModeFallback: false } }),
+  useAgentProfile: () => ({ capabilities: { legacyModeFallback: false } }),
+  useClearAliases: () => [],
 }));
 vi.mock("../../lib/acpDrafts", () => ({
   getDraft: () => "",
@@ -79,7 +80,6 @@ function Harness() {
         availableCommands={COMMANDS}
         connected={true}
         turnActive={false}
-        queuedCount={0}
         enqueuePrompt={() => {}}
         promptCapabilities={null}
         pendingAttachments={[]}

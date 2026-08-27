@@ -48,6 +48,10 @@ AoE drives Claude Code, OpenCode, Mistral Vibe, Codex CLI, Gemini CLI, Cursor CL
 
 For per-agent structured-view support (which agents render plan panels, which tools are recognized), see the [Structured view feature matrix](structured-view.md#feature-matrix).
 
+### Agent lifecycle states
+
+Agents carry a lifecycle state in AoE's registry. When an upstream vendor deprecates a CLI, AoE keeps supporting it but marks it everywhere it appears (`aoe agents`, `aoe acp doctor`, session creation, the new-session and restart pickers, the web wizard, and the switch-agent modal), so you always know before you launch one.
+
 ### Agent command overrides
 
 Wrap any agent in a custom script or sandboxed launcher. Useful for injecting environment variables, swapping in a containerized runtime, or pinning a specific binary path per profile or repo.

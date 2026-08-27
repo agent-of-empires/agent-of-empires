@@ -11,6 +11,9 @@ use std::time::{Duration, Instant};
 
 pub const AOE_INSTANCE_ID_KEY: &str = "AOE_INSTANCE_ID";
 pub const AOE_CAPTURED_SESSION_ID_KEY: &str = "AOE_CAPTURED_SESSION_ID";
+pub const AOE_OMP_CAPTURE_META_KEY: &str = "AOE_OMP_CAPTURE_META";
+pub const AOE_OMP_LAUNCH_ID_KEY: &str = "AOE_OMP_LAUNCH_ID";
+pub const AOE_OMP_CAPTURE_READY_KEY: &str = "AOE_OMP_CAPTURE_READY";
 
 const ENV_CACHE_TTL: Duration = Duration::from_secs(30);
 const ENV_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(5);
@@ -78,7 +81,7 @@ pub fn get_hidden_env(session_name: &str, key: &str) -> Option<String> {
         }
     }
 
-    let value = fetch_hidden_env(session_name, key);
+    let value = get_hidden_env_uncached(session_name, key);
 
     if let Ok(mut cache) = ENV_CACHE.write() {
         let entries = cache.entries.get_or_insert_with(HashMap::new);
@@ -94,11 +97,21 @@ pub fn get_hidden_env(session_name: &str, key: &str) -> Option<String> {
     value
 }
 
-fn fetch_hidden_env(session_name: &str, key: &str) -> Option<String> {
-    let output = crate::tmux::tmux_command()
-        .args(["show-environment", "-h", "-t", session_name, key])
-        .output()
-        .ok()?;
+pub(crate) fn get_hidden_env_uncached(session_name: &str, key: &str) -> Option<String> {
+    fetch_env_uncached(session_name, key, true)
+}
+
+pub(crate) fn get_env_uncached(session_name: &str, key: &str) -> Option<String> {
+    fetch_env_uncached(session_name, key, false)
+}
+
+fn fetch_env_uncached(session_name: &str, key: &str, hidden: bool) -> Option<String> {
+    let mut command = crate::tmux::tmux_command();
+    command.arg("show-environment");
+    if hidden {
+        command.arg("-h");
+    }
+    let output = command.args(["-t", session_name, key]).output().ok()?;
 
     if !output.status.success() {
         return None;
@@ -106,17 +119,10 @@ fn fetch_hidden_env(session_name: &str, key: &str) -> Option<String> {
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let line = stdout.trim();
-
-    // tmux outputs "-KEY" when the variable is unset
     if line.starts_with('-') {
         return None;
     }
-
-    if let Some((_, value)) = line.split_once('=') {
-        Some(value.to_string())
-    } else {
-        None
-    }
+    line.split_once('=').map(|(_, value)| value.to_string())
 }
 
 /// Remove a hidden environment variable from a tmux session

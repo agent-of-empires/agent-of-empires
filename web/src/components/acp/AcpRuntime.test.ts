@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { SUBAGENT_TASK_NAME, TODO_GROUP_NAME, TOOL_GROUP_NAME, activityToThreadMessages } from "./AcpRuntime";
-import { applyEvent, emptyAcpState, type AcpFrame, type ActivityRow, type ToolCall } from "../../lib/acpTypes";
+import { type ActivityRow, type ToolCall } from "../../lib/acpTypes";
 
 function userRow(text: string, id = "u1"): ActivityRow {
   return {
@@ -57,108 +57,34 @@ function messageRow(text: string, id = "m1"): ActivityRow {
 }
 
 describe("activityToThreadMessages; reused tool ids", () => {
-  it("keeps message ids unique when a rate-limited adapter reuses a tool_call_id", () => {
-    const session_id = "digests";
-    const tool_call_id = "toolu_reused_after_resume";
-    const frames: AcpFrame[] = [
-      { session_id, seq: 1, event: { UserPromptSent: { text: "first digest" } } },
-      {
-        session_id,
-        seq: 2,
-        event: {
-          ToolCallStarted: {
-            tool_call: {
-              id: tool_call_id,
-              name: "Terminal",
-              kind: "execute",
-              args_preview: "{}",
-              started_at: "2026-07-20T14:48:22Z",
-            },
-          },
-        },
-      },
-      {
-        session_id,
-        seq: 3,
-        event: { ToolCallCompleted: { tool_call_id, is_error: false, content: "first result" } },
-      },
-      { session_id, seq: 4, event: { UserPromptSent: { text: "second digest" } } },
-      {
-        session_id,
-        seq: 5,
-        event: {
-          ToolCallStarted: {
-            tool_call: {
-              id: tool_call_id,
-              name: "Terminal",
-              kind: "execute",
-              args_preview: "{}",
-              started_at: "2026-07-25T00:00:05Z",
-            },
-          },
-        },
-      },
-      {
-        session_id,
-        seq: 6,
-        event: { ToolCallCompleted: { tool_call_id, is_error: false, content: "second result" } },
-      },
-      {
-        session_id,
-        seq: 7,
-        event: { AgentMessageChunk: { text: "You've hit your weekly limit" } },
-      },
-      {
-        session_id,
-        seq: 8,
-        event: {
-          RateLimit: {
-            info: {
-              status: "You've hit your weekly limit",
-              resets_at: "2026-07-28T06:00:00Z",
-              kind: "rate_limit",
-            },
-          },
-        },
-      },
-      { session_id, seq: 9, event: { Stopped: { reason: "rate_limited" } } },
-      { session_id, seq: 10, event: { UserPromptSent: { text: "third digest" } } },
-      {
-        session_id,
-        seq: 11,
-        event: {
-          ToolCallStarted: {
-            tool_call: {
-              id: tool_call_id,
-              name: "Terminal",
-              kind: "execute",
-              args_preview: "{}",
-              started_at: "2026-07-25T00:17:03Z",
-            },
-          },
-        },
-      },
-      {
-        session_id,
-        seq: 12,
-        event: { ToolCallCompleted: { tool_call_id, is_error: false, content: "third result" } },
-      },
-      {
-        session_id,
-        seq: 13,
-        event: { AgentMessageChunk: { text: "You've hit your weekly limit" } },
-      },
+  it("keeps message ids unique when the server-owned transcript reuses a tool_call_id", () => {
+    // A rate-limited adapter reuses one tool_call_id across three turns. The
+    // server-owned transcript (Tier 4) disambiguates the completion row ids by
+    // seq (`done-X`, `done-X-6`, `done-X-12`; see transcript.rs), so the render
+    // must not collapse them into a duplicate assistant message id (which
+    // crashes assistant-ui's MessageRepository). Feed those server rows and
+    // assert unique message ids.
+    const id = "toolu_reused_after_resume";
+    const done = (rowId: string, text: string, at: string): ActivityRow => ({
+      id: rowId,
+      kind: "tool_complete",
+      text,
+      toolCallId: id,
+      at,
+    });
+    const activity: ActivityRow[] = [
+      userRow("first digest", "u1"),
+      toolStart(id, "execute"),
+      done(`done-${id}`, "first result", "2026-07-20T14:49:00Z"),
+      userRow("second digest", "u2"),
+      done(`done-${id}-6`, "second result", "2026-07-25T00:01:00Z"),
+      userRow("third digest", "u3"),
+      done(`done-${id}-12`, "third result", "2026-07-25T00:18:00Z"),
+      messageRow("You've hit your weekly limit", "m-final"),
     ];
 
-    const state = frames.reduce(applyEvent, emptyAcpState());
-    const messages = activityToThreadMessages(state.activity, false);
+    const messages = activityToThreadMessages(activity, false);
     const ids = messages.map((message) => message.id);
-
-    expect(state.activity.filter((row) => row.kind === "tool_complete").map((row) => row.id)).toEqual([
-      `done-${tool_call_id}`,
-      `done-${tool_call_id}-6`,
-      `done-${tool_call_id}-12`,
-    ]);
     expect(new Set(ids).size).toBe(ids.length);
   });
 });

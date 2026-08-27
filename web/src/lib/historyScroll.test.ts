@@ -7,6 +7,8 @@ import {
   earlierAction,
   HISTORY_AUTOLOAD_COOLDOWN_MS,
   HISTORY_PRELOAD_PX,
+  isPinnedToBottom,
+  PINNED_BOTTOM_SLOP_PX,
   scrollRestoreDelta,
 } from "./historyScroll";
 
@@ -53,6 +55,28 @@ describe("autoLoadDecision", () => {
 
   it("does not fire when there is no older history left", () => {
     expect(autoLoadDecision({ ...base, canLoadEarlier: false })).toEqual({ armed: true, fire: false });
+  });
+});
+
+describe("isPinnedToBottom", () => {
+  it("treats exact-bottom and within-slop positions as pinned, and further up as not", () => {
+    const clientHeight = 500;
+    const scrollHeight = 5000;
+    // (scrollTop, expected pinned)
+    const cases: [number, boolean][] = [
+      [4500, true], // exact bottom: 4500 + 500 === 5000
+      [4500 - PINNED_BOTTOM_SLOP_PX, true], // within slop
+      [4500 - PINNED_BOTTOM_SLOP_PX - 1, false], // just past the slop
+      [0, false], // scrolled to the top of a long transcript
+    ];
+    for (const [scrollTop, expected] of cases) {
+      expect(isPinnedToBottom(scrollTop, clientHeight, scrollHeight), `scrollTop=${scrollTop}`).toBe(expected);
+    }
+  });
+
+  it("is pinned when content fits the viewport (no overflow)", () => {
+    expect(isPinnedToBottom(0, 800, 800)).toBe(true);
+    expect(isPinnedToBottom(0, 800, 400)).toBe(true);
   });
 });
 

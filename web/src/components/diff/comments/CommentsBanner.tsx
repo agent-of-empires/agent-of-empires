@@ -1,15 +1,19 @@
+import { Tooltip } from "../../Tooltip";
+
 interface Props {
   count: number;
   sendEnabled: boolean;
-  sendDisabledReason?: string;
+  /** Required, and phrased as cause + remedy: this is the only place the user
+   *  ever learns why the Send button is dead. */
+  sendDisabledReason: string;
   onSend: () => void;
   onDiscardAll: () => void;
 }
 
 /** Floating chip rendered above the right-panel diff list. Visible
  *  whenever the active session has at least one comment and supports
- *  the feature (acp-only). The send button is disabled while the
- *  structured view worker is not running so the prompt doesn't sink. */
+ *  the feature (acp-only). The send button is disabled only for a
+ *  trashed session, which never resumes a worker to drain into. */
 export function CommentsBanner({ count, sendEnabled, sendDisabledReason, onSend, onDiscardAll }: Props) {
   if (count === 0) return null;
   return (
@@ -30,15 +34,29 @@ export function CommentsBanner({ count, sendEnabled, sendDisabledReason, onSend,
         >
           Discard all
         </button>
-        <button
-          type="button"
-          onClick={onSend}
-          disabled={!sendEnabled}
-          title={sendEnabled ? "Send comments to agent" : sendDisabledReason}
-          className="px-2 py-0.5 rounded bg-brand-600 text-white hover:bg-brand-500 disabled:bg-surface-700 disabled:text-text-dim disabled:cursor-not-allowed cursor-pointer transition-colors"
-        >
-          Send
-        </button>
+        {/* Tooltip, not the native `title`: the browser never renders a
+            `title` on a button it won't send pointer events to, so the reason
+            the send is blocked stayed invisible. `aria-disabled` rather than
+            `disabled` for the same reason one rung up: a natively disabled
+            button is not focusable, so a keyboard user could never reach the
+            explanation at all. The button stays in the tab order, announces
+            itself as disabled, and `onSend` guards the click. */}
+        <Tooltip text={sendEnabled ? "Send comments to agent" : sendDisabledReason} multiline>
+          <button
+            type="button"
+            onClick={() => {
+              if (sendEnabled) onSend();
+            }}
+            aria-disabled={!sendEnabled}
+            className={`px-2 py-0.5 rounded-md transition-colors ${
+              sendEnabled
+                ? "bg-brand-600 text-white hover:bg-brand-500 cursor-pointer"
+                : "bg-surface-700 text-text-dim cursor-not-allowed"
+            }`}
+          >
+            Send
+          </button>
+        </Tooltip>
       </div>
     </div>
   );

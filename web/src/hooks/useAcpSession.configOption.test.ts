@@ -327,25 +327,25 @@ describe("useAcpSession / setConfigOption", () => {
   });
 });
 
-// ---- normaliseTurnCounters backfill -------------------------------------
+// ---- normaliseTurnState backfill -------------------------------------
 
-describe("normaliseTurnCounters / config-option backfill", () => {
+describe("normaliseTurnState / config-option backfill", () => {
   it("backfills empty configOptions when the persisted entry pre-dates #1403", async () => {
-    const { normaliseTurnCounters } = await import("../lib/acpTypes");
+    const { normaliseTurnState } = await import("../lib/acpTypes");
     const stale = {
       ...emptyAcpState(),
     } as Record<string, unknown>;
     delete stale.configOptions;
     delete stale.configOptionSwitchFailed;
     delete stale.pendingConfigOption;
-    const next = normaliseTurnCounters(stale as unknown as Parameters<typeof normaliseTurnCounters>[0]);
+    const next = normaliseTurnState(stale as unknown as Parameters<typeof normaliseTurnState>[0]);
     expect(next.configOptions).toEqual([]);
     expect(next.configOptionSwitchFailed).toBeNull();
     expect(next.pendingConfigOption).toBeNull();
   });
 
   it("preserves a populated configOptions list across hydration", async () => {
-    const { normaliseTurnCounters } = await import("../lib/acpTypes");
+    const { normaliseTurnState } = await import("../lib/acpTypes");
     const seeded = {
       ...emptyAcpState(),
       configOptions: [
@@ -358,7 +358,7 @@ describe("normaliseTurnCounters / config-option backfill", () => {
         },
       ],
     };
-    const next = normaliseTurnCounters(seeded);
+    const next = normaliseTurnState(seeded);
     expect(next.configOptions).toHaveLength(1);
     expect(next.configOptions[0]!.current_value).toBe("claude-opus-4-7");
   });

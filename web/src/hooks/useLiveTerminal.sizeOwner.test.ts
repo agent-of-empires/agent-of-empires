@@ -72,10 +72,13 @@ afterEach(() => {
 });
 
 describe("useLiveTerminal size-owner", () => {
-  it("defaults to owner before any size_owner frame", () => {
+  it("waits for a size_owner frame before allowing input", () => {
     const { result } = renderHook(() => useLiveTerminal("s1"));
-    open(sockets[0]);
-    expect(result.current.state.isOwner).toBe(true);
+    const socket = sockets[0];
+    open(socket);
+    expect(result.current.state.isOwner).toBe(false);
+    expect(result.current.state.ownerKnown).toBe(false);
+    expect(socket.sent).toContain(JSON.stringify({ type: "claim_if_vacant" }));
   });
 
   it("becomes read-only on size_owner false and back on true", () => {
@@ -85,12 +88,13 @@ describe("useLiveTerminal size-owner", () => {
 
     deliver(socket, { type: "size_owner", is_owner: false });
     expect(result.current.state.isOwner).toBe(false);
+    expect(result.current.state.ownerKnown).toBe(true);
 
     deliver(socket, { type: "size_owner", is_owner: true });
     expect(result.current.state.isOwner).toBe(true);
   });
 
-  it("drops input while a non-owner, sends it once owner", () => {
+  it("drops input after ownership is denied instead of sending it after a later takeover", () => {
     const { result } = renderHook(() => useLiveTerminal("s1"));
     const socket = sockets[0];
     open(socket);
@@ -101,8 +105,25 @@ describe("useLiveTerminal size-owner", () => {
     expect(socket.sent).toHaveLength(0);
 
     deliver(socket, { type: "size_owner", is_owner: true });
-    act(() => result.current.sendData("x"));
-    expect(socket.sent.some((m) => m instanceof Uint8Array)).toBe(true);
+    expect(socket.sent.some((m) => m instanceof Uint8Array)).toBe(false);
+    act(() => result.current.sendData("y"));
+    const typed = socket.sent.find((m): m is Uint8Array => m instanceof Uint8Array);
+    expect(new TextDecoder().decode(typed)).toBe("y");
+  });
+
+  it("queues the first typed bytes until a newly selected session owns the pane", () => {
+    const { result } = renderHook(() => useLiveTerminal("s1"));
+    const socket = sockets[0];
+    act(() => result.current.sendData("first"));
+    expect(socket.sent).toHaveLength(0);
+
+    open(socket);
+    expect(socket.sent.some((m) => m instanceof Uint8Array)).toBe(false);
+
+    deliver(socket, { type: "size_owner", is_owner: true });
+    const typed = socket.sent.find((m): m is Uint8Array => m instanceof Uint8Array);
+    expect(typed).toBeDefined();
+    expect(new TextDecoder().decode(typed)).toBe("first");
   });
 
   it("emits a claim message on explicit take-over", () => {
@@ -124,5 +145,38 @@ describe("useLiveTerminal size-owner", () => {
     socket.sent.length = 0;
     act(() => result.current.sendResize(52, 20));
     expect(socket.sent).toContain(JSON.stringify({ type: "resize", cols: 52, rows: 20 }));
+  });
+
+  it("ignores a superseded socket closing after its replacement owns the pane", () => {
+    const { result } = renderHook(() => useLiveTerminal("s1"));
+    const oldSocket = sockets[0];
+    open(oldSocket);
+
+    oldSocket.readyState = FakeWebSocket.CLOSED;
+    act(() => window.dispatchEvent(new Event("online")));
+    const replacement = sockets[1];
+    open(replacement);
+    deliver(replacement, { type: "size_owner", is_owner: true });
+
+    act(() => oldSocket.onclose?.(new CloseEvent("close")));
+    expect(result.current.state.isOwner).toBe(true);
+    expect(result.current.state.ownerKnown).toBe(true);
+  });
+
+  it("resets ownership when the active socket closes", () => {
+    vi.useFakeTimers();
+    try {
+      const { result } = renderHook(() => useLiveTerminal("s1"));
+      const socket = sockets[0];
+      open(socket);
+      deliver(socket, { type: "size_owner", is_owner: true });
+
+      act(() => socket.onclose?.(new CloseEvent("close")));
+      expect(result.current.state.isOwner).toBe(false);
+      expect(result.current.state.ownerKnown).toBe(false);
+    } finally {
+      vi.clearAllTimers();
+      vi.useRealTimers();
+    }
   });
 });

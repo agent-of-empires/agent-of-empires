@@ -36,7 +36,7 @@ jobs:
           fetch-depth: 0
 
       - name: Install release tools
-        uses: taiki-e/install-action@41049aa56687c35e0afa74eed4f09cec4f9afabf # v2.85.2
+        uses: taiki-e/install-action@b6b84cf49ebfe0176417bdce007c624f0db37f20 # v2.86.2
         with:
           tool: cargo-edit,git-cliff
 

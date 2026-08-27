@@ -30,8 +30,10 @@ const ATTENTION_FILE_READ_CAP: usize = 16 * 1024;
 /// `/tmp/aoe-hooks-<euid>` resolved by `dir_guard::hook_base_path()`.
 /// `Err` if `instance_id` fails `validate_instance_id`.
 ///
-/// The path is informational (used by the sandbox bind-mount source string and
-/// by debug logs); production I/O goes through `dir_guard` and never path-joins.
+/// The path is informational (tests); production I/O goes
+/// through `dir_guard` and never path-joins. The sandbox bind-mount source is
+/// `dir_guard::ensure_instance_dir_path`, canonically resolved since #3240,
+/// so on symlinked prefixes it spells differently from this lexical value.
 pub fn hook_status_dir(instance_id: &str) -> Result<PathBuf> {
     crate::session::validate_instance_id(instance_id)?;
     Ok(dir_guard::hook_base_path().join(instance_id))
@@ -245,6 +247,39 @@ mod tests {
         assert!(dir.exists());
         cleanup_hook_status_dir("cleanup_existing");
         assert!(!dir.exists());
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn test_ensure_instance_dir_path_resolves_symlinked_prefix() {
+        // #3240: podman machine shares host paths under their real
+        // paths (/private, not /tmp) inside the VM, so the bind-mount source
+        // handed to the runtime must be canonically resolved.
+        use tempfile::TempDir;
+        let cases = [
+            ("symlinked base prefix resolves to the real path", true),
+            (
+                "already-real base prefix is passed through unchanged",
+                false,
+            ),
+        ];
+        for (label, symlinked) in cases {
+            let tmp = TempDir::new().unwrap();
+            let real_parent = tmp.path().join("real-parent");
+            std::fs::create_dir(&real_parent).unwrap();
+            let base = if symlinked {
+                let link_parent = tmp.path().join("via-symlink");
+                std::os::unix::fs::symlink(&real_parent, &link_parent).unwrap();
+                link_parent.join("aoe-hooks")
+            } else {
+                real_parent.join("aoe-hooks")
+            };
+            let _g = BaseGuard::with_base(base.clone());
+            let got = crate::hooks::ensure_instance_dir_path("pathres")
+                .expect("instance dir must verify-and-create");
+            let want = std::fs::canonicalize(&base).unwrap().join("pathres");
+            assert_eq!(got, want, "{label}");
+        }
     }
 
     #[test]

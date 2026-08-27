@@ -1,11 +1,14 @@
 //! `agent-of-empires session` subcommands implementation
 
-use anyhow::{bail, Result};
+use anyhow::{bail, Context, Result};
 use clap::{Args, Subcommand};
 use serde::Serialize;
 use std::collections::HashSet;
 
-use crate::session::{ClaimOp, GroupTree, Instance, ResumeIntent, StartOutcome, Storage};
+use crate::session::{
+    acquire_session_identity_lock, duplicate_session_error, is_duplicate_session, GroupTree,
+    Instance, LifecycleOperation, ResumeIntent, StartOutcome, Storage,
+};
 
 #[derive(Subcommand)]
 pub enum SessionCommands {
@@ -305,10 +308,16 @@ pub struct SetBaseArgs {
     /// remote-qualified like `upstream/main`). Required unless
     /// `--clear` is passed.
     pub branch: Option<String>,
-    /// Clear the override and fall back to the profile default /
-    /// auto-detected base.
+    /// Clear the override and fall back to the recorded creation base,
+    /// then the profile default, then the auto-detected base.
     #[arg(long, conflicts_with = "branch")]
     pub clear: bool,
+    /// Workspace repo to set the base for, by directory name (as shown in
+    /// the diff panel and `aoe list --json`). Required on a multi-repo
+    /// workspace session, where each repo has its own base; omit it on a
+    /// single-repo session.
+    #[arg(long)]
+    pub repo: Option<String>,
 }
 
 #[derive(Args)]
@@ -329,11 +338,50 @@ struct SessionDetails {
     tool: String,
     command: String,
     status: String,
+    /// The same `live`/`archived`/`trashed` tag `aoe list --json` carries
+    /// (#3350/#3361), so a consumer does not have to fall back to `list` to
+    /// learn whether the session it just looked up is still around. `status`
+    /// cannot carry it: an archived session can be running, so the two are
+    /// independent and collapsing them loses one.
+    state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trashed_at: Option<chrono::DateTime<chrono::Utc>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    archived_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// Gated on [`Instance::is_snoozed`] exactly like `aoe list --json` and
+    /// the API: surfaced only while the deadline is in the future, so a row
+    /// whose snooze expired omits the key instead of advertising it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    snoozed_until: Option<chrono::DateTime<chrono::Utc>>,
+    /// Set iff the session is currently pinned for the web sidebar.
+    /// Independent of `state`, matching the API field from #1581.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pinned_at: Option<chrono::DateTime<chrono::Utc>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     agent_session_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parent_session_id: Option<String>,
     profile: String,
+}
+
+fn session_details(inst: &Instance, profile: &str) -> SessionDetails {
+    SessionDetails {
+        id: inst.id.clone(),
+        title: inst.title.clone(),
+        path: inst.project_path.clone(),
+        group: inst.group_path.clone(),
+        tool: inst.tool.clone(),
+        command: inst.command.clone(),
+        status: format!("{:?}", inst.status).to_lowercase(),
+        state: super::list::state_tag(inst),
+        trashed_at: inst.trashed_at,
+        archived_at: inst.archived_at,
+        snoozed_until: super::list::active_snoozed_until(inst),
+        pinned_at: inst.pinned_at,
+        agent_session_id: inst.agent_session_id.clone(),
+        parent_session_id: inst.parent_session_id.clone(),
+        profile: profile.to_string(),
+    }
 }
 
 #[tracing::instrument(target = "cli.session", skip_all, fields(profile = %profile))]
@@ -424,19 +472,23 @@ async fn archive_session(profile: &str, args: ArchiveArgs) -> Result<()> {
     let title = inst.title.clone();
     let inst = inst.clone();
 
-    // Phase 2 (unlocked): tmux work. Agent kill split from ancillary so
-    // the CLI prints a warn on agent failure. #1868.
+    // Serialize teardown and the archive commit as one lifecycle transition.
+    let _lifecycle_lock = storage
+        .acquire_instance_lifecycle_lock(&id)
+        .context("failed to acquire instance archive lock")?;
     if !args.no_kill {
-        if let Err(e) = inst.kill() {
+        if let Err(e) = inst.kill_locked() {
             eprintln!("Warning: failed to kill agent tmux session: {}", e);
         }
-        inst.kill_ancillary_tmux_sessions();
+        inst.kill_ancillary_tmux_sessions_locked();
     }
 
-    // Phase 3 (locked, fast): set archived_at by id.
+    // Archive under the lifecycle lock so the state and its generation bump are
+    // durable before the lock releases and a concurrent restart can observe them.
     let landed = storage.update(|instances, _groups| {
         if let Some(stored) = instances.iter_mut().find(|i| i.id == id) {
             stored.archive();
+            stored.lifecycle_generation = stored.lifecycle_generation.saturating_add(1);
             Ok(true)
         } else {
             Ok(false)
@@ -484,27 +536,24 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         .clone();
     let restore_id = inst.id.clone();
 
-    // Symmetric claim (#2541): win the Restore claim under the flock BEFORE the
-    // unlocked worktree move, so a concurrent purge from another process cannot
-    // tear the worktree down while this restore relocates it. A fresh Purge
-    // claim wins here and the restore bails.
-    let claim = storage.update(|instances, _groups| {
-        Ok(crate::session::claim::decide_restore_claim(
-            instances,
-            &restore_id,
-            chrono::Utc::now(),
-        ))
+    let _lifecycle_lock = storage
+        .acquire_instance_lifecycle_lock(&restore_id)
+        .context("failed to acquire instance restore lock")?;
+    let decision = storage.update(|instances, _groups| {
+        crate::session::claim::decide_restore_claim(instances, &restore_id, chrono::Utc::now())
+            .map_err(anyhow::Error::new)
     })?;
-    match claim {
+    let restore_generation = match decision {
         crate::session::claim::RestoreClaimDecision::AlreadyGone => {
             anyhow::bail!("No trashed session matching '{}'", args.identifier)
         }
-        crate::session::claim::RestoreClaimDecision::PurgeInProgress => anyhow::bail!(
-            "Session {} is being purged by another process, so it was not restored",
-            inst.title
+        crate::session::claim::RestoreClaimDecision::Busy(holder) => anyhow::bail!(
+            "Session {} is {}, so it was not restored",
+            inst.title,
+            holder.busy_reason()
         ),
-        crate::session::claim::RestoreClaimDecision::Claimed => {}
-    }
+        crate::session::claim::RestoreClaimDecision::Claimed(generation) => generation,
+    };
 
     // Move the worktree back to its pre-trash location before flipping the
     // marker. Strict: if the original path is occupied or git refuses, leave
@@ -513,7 +562,7 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     if let crate::session::trash::RestoreOutcome::Failed { reason } =
         crate::session::trash::restore_worktree_location(&mut inst)
     {
-        release_restore_claim(&storage, &restore_id);
+        release_restore_reservation(&storage, &restore_id, restore_generation);
         anyhow::bail!("Cannot restore worktree: {reason}");
     }
     let restored_path = inst.project_path.clone();
@@ -523,14 +572,15 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         Ok(crate::session::claim::finalize_restore_commit(
             instances,
             &restore_id,
+            restore_generation,
             &restored_path,
             &restored_pre,
         ))
     })?;
     match commit {
         crate::session::claim::RestoreCommit::Committed => {}
-        crate::session::claim::RestoreCommit::PurgeStoleClaim => anyhow::bail!(
-            "Session {} was claimed by a purge mid-restore, so it was not restored",
+        crate::session::claim::RestoreCommit::Superseded => anyhow::bail!(
+            "Session {} lost its lifecycle reservation during restore",
             inst.title
         ),
         crate::session::claim::RestoreCommit::AlreadyGone => {
@@ -541,12 +591,13 @@ async fn restore_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     Ok(())
 }
 
-/// Release a Restore claim after a failed worktree move, ownership-guarded so a
-/// peer's fresh Purge claim (stale-override) is never cleared. See #2541.
-fn release_restore_claim(storage: &Storage, restore_id: &str) {
+fn release_restore_reservation(storage: &Storage, restore_id: &str, generation: u64) {
     let _ = storage.update(|instances, _groups| {
-        if let Some(stored) = instances.iter_mut().find(|i| i.id == restore_id) {
-            stored.clear_op_claim_if_owned(ClaimOp::Restore);
+        if let Some(stored) = instances
+            .iter_mut()
+            .find(|instance| instance.id == restore_id)
+        {
+            stored.release_lifecycle_reservation_if_owned(LifecycleOperation::Restore, generation);
         }
         Ok(())
     });
@@ -574,69 +625,48 @@ async fn list_trash(profile: &str) -> Result<()> {
 async fn empty_trash(profile: &str) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
 
-    // Phase 1 (unlocked): snapshot the trashed sessions and run the slow
-    // teardown for each. Purge is permanent; force removal so a dirty
-    // worktree cannot keep an emptied session pinned in the trash.
+    // Snapshot the trashed sessions. Each row's selected-profile lifecycle
+    // lock is acquired immediately before its purge claim and retained through
+    // that row's durable finalize. Purge forces removal so a dirty worktree
+    // cannot keep an emptied session pinned in the trash.
     let (instances, _groups) = storage.load_with_groups()?;
-    let trashed: Vec<_> = instances
+    let mut trashed: Vec<_> = instances
         .iter()
         .filter(|i| i.is_trashed())
         .cloned()
         .collect();
+    for instance in &mut trashed {
+        instance.source_profile = storage.profile().to_string();
+    }
+    // Deterministic order keeps concurrent batch reports stable. Each row is
+    // finalized before the next lock is acquired, so batches cannot deadlock.
+    trashed.sort_by(|left, right| left.id.cmp(&right.id));
     if trashed.is_empty() {
         println!("Trash is empty.");
         return Ok(());
     }
 
-    let mut purged_ids = Vec::new();
-    // Rows we claimed and tore down but whose teardown/transcript purge failed:
-    // genuinely kept for retry (distinct from rows a peer is restoring). See #2541.
-    let mut claimed_failed_ids = Vec::new();
-    // Rows a peer is restoring: either it holds a fresh Restore claim
-    // (RestoreInProgress) or it already un-trashed the row before our claim
-    // (Restored). Either way we never tore anything down, so they are benign and
-    // reported as one figure.
+    let mut removed = 0usize;
+    let mut restored_after_teardown = 0usize;
+    let mut kept_for_retry = 0usize;
+    // Rows whose reservation was refused before teardown are benign and
+    // reported separately from restores that land after teardown began.
     let mut being_restored_elsewhere = 0usize;
+    let mut being_purged_elsewhere = 0usize;
     for inst in &trashed {
-        // Per-row claim just before each teardown (#2541), via the shared
-        // decision. A single up-front batch claim would risk overrunning the
-        // TTL for late rows in a large empty-trash; claiming per row keeps every
-        // teardown inside a fresh claim. Only a `Claimed` decision tears down;
-        // every other outcome is skipped and counted for an honest report.
-        let claim = storage.update(|all_instances, _groups| {
-            Ok(crate::session::claim::decide_purge_claim(
-                all_instances,
-                &inst.id,
-                true,
-                chrono::Utc::now(),
-            ))
-        })?;
-        match claim {
-            crate::session::claim::PurgeClaimDecision::Claimed => {}
-            crate::session::claim::PurgeClaimDecision::RestoreInProgress
-            | crate::session::claim::PurgeClaimDecision::Restored => {
-                being_restored_elsewhere += 1;
-                continue;
-            }
-            crate::session::claim::PurgeClaimDecision::AlreadyGone => continue,
-        }
-
         let config = crate::session::repo_config::resolve_config_with_repo_or_warn(
             profile,
             std::path::Path::new(&inst.project_path),
         );
         let delete_worktree =
             config.worktree.auto_cleanup && inst.has_managed_worktree_or_workspace();
-        // Tie branch deletion to worktree deletion + config so it also fires
-        // for multi-repo workspace sessions (which have no `worktree_info`);
-        // `perform_deletion` keys the workspace-repo branch cleanup off this
-        // same flag. See #2489.
         let delete_branch = delete_worktree && config.worktree.delete_branch_on_cleanup;
         let delete_sandbox =
             inst.sandbox_info.as_ref().is_some_and(|s| s.enabled) && config.sandbox.auto_cleanup;
-
-        let result = crate::session::deletion::perform_deletion(
-            &crate::session::deletion::DeletionRequest {
+        let row_storage = Storage::open_unwatched(profile)?;
+        let reservation = crate::session::deletion::PurgeTransaction::reserve(
+            row_storage,
+            crate::session::deletion::DeletionRequest {
                 session_id: inst.id.clone(),
                 instance: inst.clone(),
                 delete_worktree,
@@ -646,49 +676,52 @@ async fn empty_trash(profile: &str) -> Result<()> {
                 detach_hooks: false,
                 keep_scratch: false,
             },
-        );
+        )?;
+        let transaction = match reservation {
+            crate::session::deletion::PurgeReservation::Reserved(transaction) => transaction,
+            crate::session::deletion::PurgeReservation::Rejected(result) => {
+                match result.disposition {
+                    crate::session::deletion::DeletionDisposition::KeptRestored => {
+                        being_restored_elsewhere += 1;
+                    }
+                    crate::session::deletion::DeletionDisposition::Busy => {
+                        being_purged_elsewhere += 1;
+                    }
+                    _ => {}
+                }
+                continue;
+            }
+        };
+        let result = transaction.run_hooks().complete_with(|instance| {
+            super::purge_acp_transcript(instance).map_err(|error| {
+                format!("transcript not purged, keeping session in trash: {error}")
+            })
+        });
         for err in &result.errors {
             eprintln!("Warning ({}): {}", inst.title, err);
         }
-        // Only after teardown succeeded: purge the durable structured-view
-        // transcript (the daemon does this via the supervisor; the CLI opens
-        // the event store directly since it has no live worker) and drop the
-        // session row. Doing the irreversible transcript delete last keeps a
-        // failed purge fully restorable, and keeping the row on failure (here
-        // or in perform_deletion) lets the orphaned worktree/container/
-        // transcript be retried instead of abandoned. See #2489.
-        if result.success {
-            match super::purge_acp_transcript(inst) {
-                Ok(()) => purged_ids.push(inst.id.clone()),
-                Err(e) => {
-                    eprintln!(
-                        "Warning ({}): transcript not purged, keeping session in trash: {}",
-                        inst.title, e
-                    );
-                    claimed_failed_ids.push(inst.id.clone());
+        match result.disposition {
+            crate::session::deletion::DeletionDisposition::Removed => removed += 1,
+            crate::session::deletion::DeletionDisposition::KeptRestored => {
+                if result.teardown_started {
+                    restored_after_teardown += 1;
+                } else {
+                    being_restored_elsewhere += 1;
                 }
             }
-        } else {
-            claimed_failed_ids.push(inst.id.clone());
+            crate::session::deletion::DeletionDisposition::Busy => {
+                being_purged_elsewhere += 1;
+            }
+            crate::session::deletion::DeletionDisposition::Failed => kept_for_retry += 1,
+            crate::session::deletion::DeletionDisposition::AlreadyGone => {}
         }
     }
-
-    // Phase 2 (locked): drop every successfully-purged id from the latest disk
-    // state. #2534: revalidate under the lock; a candidate restored mid-purge
-    // (no longer trashed) must survive even though its teardown already ran on
-    // the snapshot. #2527: report the count actually removed, not the candidate
-    // count. `kept_for_retry` counts only rows we claimed whose teardown failed,
-    // NOT rows a peer is restoring (those are reported separately). See #2541.
-    let purged_set: HashSet<String> = purged_ids.into_iter().collect();
-    let claimed_failed_set: HashSet<String> = claimed_failed_ids.into_iter().collect();
-    let outcome = storage.update(|all_instances, _groups| {
-        Ok(super::finalize_empty_trash(
-            all_instances,
-            &purged_set,
-            &claimed_failed_set,
-        ))
-    })?;
-    // A restore that raced our teardown (after it began) is the only case that
+    let outcome = super::EmptyTrashOutcome {
+        removed,
+        restored_after_teardown,
+        kept_for_retry,
+    };
+    // A restore that raced our teardown after it began is the only case that
     // risks orphaned artifacts, so it gets the repair warning; benign
     // being-restored-elsewhere rows (no teardown ran) do not.
     if outcome.restored_after_teardown > 0 {
@@ -708,6 +741,11 @@ async fn empty_trash(profile: &str) -> Result<()> {
     if being_restored_elsewhere > 0 {
         parts.push(format!(
             "{being_restored_elsewhere} being restored by another process"
+        ));
+    }
+    if being_purged_elsewhere > 0 {
+        parts.push(format!(
+            "{being_purged_elsewhere} being purged by another process"
         ));
     }
     if outcome.restored_after_teardown > 0 {
@@ -781,10 +819,9 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     // user's clear.
     let prior_sid = working.agent_session_id.clone();
 
-    // Phase 2 (unlocked): tmux work happens outside the cross-process flock
-    // so a slow agent startup does not block peer mutators on the same
-    // profile (daemon poller, sibling CLI invocations).
-    working.start_with_size(crate::terminal::get_size())?;
+    // Launch orchestration owns its lifecycle locks and deliberately releases
+    // them while user hooks run.
+    let _ = working.start_with_size_opts(crate::terminal::get_size(), false)?;
 
     // Cleared on this launch, so the sid we came in with is abandoned.
     if working.agent_session_id.is_none() {
@@ -808,8 +845,11 @@ async fn start_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let title = working.title.clone();
     let id = working.id.clone();
 
-    // Phase 3 (locked, fast): merge the post-start instance back by id, so
-    // any concurrent mutation to OTHER sessions during phase 2 is preserved.
+    // Reacquire only for the final merge. The generation-aware merge rejects
+    // this working snapshot if a peer completed a newer lifecycle operation.
+    let _merge_lock = storage
+        .acquire_instance_lifecycle_lock(&id)
+        .context("failed to acquire instance start merge lock")?;
     let landed = storage.update(|instances, _groups| {
         if let Some(stored) = instances.iter_mut().find(|i| i.id == id) {
             stored.merge_post_start(&working);
@@ -1125,11 +1165,12 @@ fn launch_imported(profile: &str, ids: &[String]) -> Result<()> {
 async fn stop_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let storage = Storage::open_unwatched(profile)?;
 
-    // Phase 1 (unlocked): resolve identifier, do tmux/container shutdown.
-    // Loaded snapshot is read-only here; the persistence happens in phase 2.
+    // Resolve the identifier before the lifecycle-locked shutdown.
     let (instances, _groups) = storage.load_with_groups()?;
     let inst = super::resolve_session(&args.identifier, &instances)?;
     bail_if_acp(inst, "stop")?;
+    let mut working = inst.clone();
+    working.source_profile = profile.to_string();
     let session_id = inst.id.clone();
     let title = inst.title.clone();
     let tmux_session = crate::tmux::Session::new(&inst.id, &inst.title)?;
@@ -1145,19 +1186,12 @@ async fn stop_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         return Ok(());
     }
 
-    inst.stop()?;
+    working.stop()?;
 
-    // Phase 2 (locked): persist Stopped status by id so it survives TUI
-    // restarts. Field-level merge preserves any concurrent mutation that
-    // landed between phase 1 and phase 2.
-    let landed = storage.update(|instances, _groups| {
-        if let Some(stored) = instances.iter_mut().find(|i| i.id == session_id) {
-            stored.status = crate::session::Status::Stopped;
-            Ok(true)
-        } else {
-            Ok(false)
-        }
-    })?;
+    // `Instance::stop` persisted Stopped while still holding the lifecycle
+    // lock. Only verify that a peer did not remove the row; writing status here
+    // would race a restart that linearized after the stop.
+    let landed = storage.load()?.iter().any(|stored| stored.id == session_id);
     if !landed {
         bail!(
             "Session {} was removed by another process before stop could land",
@@ -1394,10 +1428,13 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     // fresh poller can re-observe it. Excluded below so the drain rejects it.
     let prior_sid = working.agent_session_id.clone();
 
-    // Phase 2 (unlocked): tmux restart, agent boot, optional wake-up
-    // send-keys. Slow; the cross-process flock is not held here so peer
-    // mutators on this profile are not starved.
-    let outcome = working.restart_with_size(crate::terminal::get_size())?;
+    // Restart orchestration owns its lifecycle locks and releases them while
+    // user hooks run, so recursive same-id commands cannot deadlock.
+    let outcome = working.restart_with_resume_policy(
+        crate::terminal::get_size(),
+        false,
+        crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting,
+    )?;
     let title = working.title.clone();
     let session_id = working.id.clone();
     let tool = working.tool.clone();
@@ -1412,12 +1449,16 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
     let mut wake_succeeded = false;
     if !wake_msg.is_empty() && !matches!(outcome, StartOutcome::ResumeFailed { .. }) {
         // Restart re-execs the agent at a blank prompt; nudge it back into
-        // its prior task. Poll capture-pane for steady-state output instead
-        // of a blind sleep, so the keys land as soon as the agent is at a
-        // prompt and don't get stranded mid-banner on slow machines.
-        wait_for_pane_ready(&session_id, &title, std::time::Duration::from_secs(5)).await;
-
+        // its prior task. Wait for a real readiness signal when one is
+        // known for this agent, falling back to steady-state pane output
+        // otherwise, so the keys land as soon as the agent is at a prompt
+        // and don't get stranded mid-banner on slow machines.
         let tmux_session = crate::tmux::Session::new(&session_id, &title)?;
+        tmux_session.wait_until_ready(
+            std::time::Duration::from_secs(5),
+            crate::agents::ready_marker(&tool),
+        );
+
         if tmux_session.exists() {
             let delay = crate::agents::send_keys_enter_delay(&tool);
             match tmux_session.send_keys_with_delay(&wake_msg, delay) {
@@ -1451,8 +1492,11 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         true,
     );
 
-    // touch_last_accessed runs on `stored`, not `working`: its fields are
-    // peer-mutable and do not belong in `merge_post_restart`.
+    // Reacquire only for the final generation-aware merge. A newer peer
+    // lifecycle wins instead of being overwritten by this snapshot.
+    let _merge_lock = storage
+        .acquire_instance_lifecycle_lock(&session_id)
+        .context("failed to acquire instance restart merge lock")?;
     let landed = storage.update(|instances, _groups| {
         if let Some(stored) = instances.iter_mut().find(|i| i.id == session_id) {
             stored.merge_post_restart(&working);
@@ -1491,32 +1535,6 @@ async fn restart_session(profile: &str, args: SessionIdArgs) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Poll the tmux pane until capture-pane content stops changing for two
-/// consecutive samples (the agent has finished printing its startup banner
-/// and is sitting at a prompt) or `max_wait` elapses. Failsafe: always
-/// returns by `max_wait` so the caller's send-keys still runs even if the
-/// pane never settles.
-async fn wait_for_pane_ready(session_id: &str, title: &str, max_wait: std::time::Duration) {
-    let Ok(tmux) = crate::tmux::Session::new(session_id, title) else {
-        return;
-    };
-    let poll_interval = std::time::Duration::from_millis(200);
-    let start = std::time::Instant::now();
-    let mut last: Option<String> = None;
-    while start.elapsed() < max_wait {
-        tokio::time::sleep(poll_interval).await;
-        let Ok(now) = tmux.capture_pane(5) else {
-            continue;
-        };
-        if now.trim().len() > 20 {
-            if last.as_deref() == Some(&now) {
-                return;
-            }
-            last = Some(now);
-        }
-    }
 }
 
 async fn attach_session(profile: &str, args: SessionIdArgs) -> Result<()> {
@@ -1562,6 +1580,12 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
             bail!("Not in a tmux session. Specify a session ID or run inside tmux.");
         }
     };
+    inst.source_profile = storage.profile().to_string();
+
+    // Resolving the profile config installs the declarative status-rule
+    // registry for this profile; the status detection below never loads config
+    // itself, so a rules-having custom agent would otherwise report Idle.
+    crate::session::profile_config::resolve_config_or_warn(profile);
 
     // Refresh status from tmux so the output reflects current state
     // rather than the stale persisted value.
@@ -1571,19 +1595,7 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
     inst.self_heal_session_id(profile, &contended);
 
     if args.json {
-        let details = SessionDetails {
-            id: inst.id.clone(),
-            title: inst.title.clone(),
-            path: inst.project_path.clone(),
-            group: inst.group_path.clone(),
-            tool: inst.tool.clone(),
-            command: inst.command.clone(),
-            status: format!("{:?}", inst.status).to_lowercase(),
-            agent_session_id: inst.agent_session_id.clone(),
-            parent_session_id: inst.parent_session_id.clone(),
-            profile: storage.profile().to_string(),
-        };
-        super::output::print_json(&details)?;
+        super::output::print_json(&session_details(&inst, storage.profile()))?;
     } else {
         println!("Session: {}", inst.title);
         println!("  ID:      {}", inst.id);
@@ -1592,6 +1604,16 @@ async fn show_session(profile: &str, args: ShowArgs) -> Result<()> {
         println!("  Tool:    {}", inst.tool);
         println!("  Command: {}", inst.command);
         println!("  Status:  {:?}", inst.status);
+        // Only for a session that is not live: an archived or trashed row is
+        // otherwise indistinguishable here from a stopped one, and `status`
+        // cannot carry it (a session can be archived and running at once).
+        if let Some(at) = inst.trashed_at.or(inst.archived_at) {
+            println!(
+                "  State:   {} ({})",
+                super::list::state_tag(&inst),
+                at.to_rfc3339()
+            );
+        }
         println!("  Profile: {}", storage.profile());
         if let Some(parent_id) = &inst.parent_session_id {
             println!("  Parent:  {}", parent_id);
@@ -1624,17 +1646,19 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
         }
     };
 
+    // Resolving the profile config installs the declarative status-rule
+    // registry for this profile; the status detection below never loads config
+    // itself, so a rules-having custom agent would otherwise report Idle.
+    crate::session::profile_config::resolve_config_or_warn(profile);
+
     let tmux_session = crate::tmux::Session::new(&inst.id, &inst.title)?;
 
     let (content, status) = if !tmux_session.exists() {
         (String::new(), "stopped".to_string())
     } else {
         let raw = tmux_session.capture_pane(args.lines)?;
-        let detection_tool = if inst.detect_as.is_empty() {
-            &inst.tool
-        } else {
-            &inst.detect_as
-        };
+        let detection_tool =
+            crate::tmux::status_rules::detection_tool(profile, &inst.tool, &inst.detect_as);
         let status = if let Some(hook_status) = crate::hooks::read_hook_status(&inst.id) {
             if detection_tool == "codex" && hook_status == crate::session::Status::Running {
                 let status_raw;
@@ -1652,7 +1676,7 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
             }
         } else {
             tmux_session
-                .detect_status(detection_tool)
+                .detect_status(profile, &detection_tool)
                 .unwrap_or_default()
         };
         let content = if args.strip_ansi {
@@ -1680,6 +1704,18 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
     Ok(())
 }
 
+fn rename_success_message(
+    persisted_old_title: &str,
+    committed_title: &str,
+    title_requested: bool,
+) -> String {
+    if title_requested && persisted_old_title != committed_title {
+        format!("✓ Renamed session: {persisted_old_title} → {committed_title}")
+    } else {
+        format!("✓ Updated session: {committed_title}")
+    }
+}
+
 async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     if args.title.is_none() && args.group.is_none() {
         bail!("At least one of --title or --group must be specified");
@@ -1692,7 +1728,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     // tmux rename outside the storage flock.
     let (instances, _groups) = storage.load_with_groups()?;
     let inst = if let Some(id) = &args.identifier {
-        super::resolve_session(id, &instances)?
+        super::resolve_session(id, &instances)?.clone()
     } else {
         let current_session = std::env::var("TMUX_PANE")
             .ok()
@@ -1702,6 +1738,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
             instances
                 .iter()
                 .find(|i| crate::tmux::agent_session_belongs_to(&session_name, &i.id))
+                .cloned()
                 .ok_or_else(|| {
                     anyhow::anyhow!("Current tmux session is not an Agent of Empires session")
                 })?
@@ -1711,8 +1748,37 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     };
 
     let id = inst.id.clone();
-    let old_title = inst.title.clone();
+    let title_requested = args.title.is_some();
+    let session_lock_required = title_requested || args.rename_branch;
 
+    // The initial load only resolves the requested row. Serialize every
+    // identity-changing rename from the fresh duplicate check through external
+    // effects and the durable commit. Existing-session mutations nest the
+    // per-session title and source lifecycle guards beneath the identity lock.
+    let _identity_lock = acquire_session_identity_lock()?;
+    let _session_title_lock = if session_lock_required {
+        Some(
+            crate::session::acquire_session_title_lock(&id)
+                .context("failed to acquire session title lock")?,
+        )
+    } else {
+        None
+    };
+    let _lifecycle_lock = if session_lock_required {
+        Some(
+            storage
+                .acquire_instance_lifecycle_lock(&id)
+                .context("failed to acquire session lifecycle lock")?,
+        )
+    } else {
+        None
+    };
+    let (authoritative_instances, _groups) = storage.load_with_groups()?;
+    let inst = authoritative_instances
+        .iter()
+        .find(|instance| instance.id == id)
+        .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
+    let old_title = inst.title.clone();
     let effective_title = args
         .title
         .clone()
@@ -1727,39 +1793,64 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
     // the two cannot drift. Decided per-session from the resolved setting.
     let config = crate::session::profile_config::resolve_config_or_warn(profile);
     let tied = inst.tie_workdir_applies(config.session.tie_workdir_to_name);
+    let tied_edit = tied && (args.title.is_some() || args.rename_branch);
+    let duplicate_path = if tied_edit {
+        crate::session::worktree_edit::derived_worktree_path(
+            std::path::Path::new(&inst.project_path),
+            &effective_title,
+        )
+    } else {
+        inst.project_path.clone()
+    };
+    let pair_changed = title_changed
+        || duplicate_path.trim_end_matches('/') != inst.project_path.trim_end_matches('/');
+    if pair_changed
+        && is_duplicate_session(
+            authoritative_instances.iter(),
+            &effective_title,
+            &duplicate_path,
+            Some(&id),
+        )
+    {
+        return Err(duplicate_session_error(&effective_title));
+    }
 
     let mut new_path: Option<String> = None;
     let mut new_branch: Option<String> = None;
-    if tied && (title_changed || args.rename_branch) {
+    if tied_edit {
         let current_path = inst.project_path.clone();
         let worktree_info = inst
             .worktree_info
             .clone()
             .expect("tie_workdir_applies implies worktree_info is Some");
-        // Persisted status can lag the live tmux pane; moving a running
-        // worktree is unsafe, so recompute before enforcing the gate.
-        let mut live = inst.clone();
-        crate::tmux::refresh_session_cache();
-        live.update_status();
         let leaf = crate::session::worktree_edit::worktree_leaf_from_title(&effective_title);
-        // A sandbox session's container keeps the worktree dir mounted even
-        // while the agent is Idle, so `git worktree move` would fail. The gate
-        // drops a merely-stopped container to free the mount and only reports
-        // held for a live one, which the user has to stop. Gated on the
-        // directory actually moving so a branch-only rename does not discard a
-        // container for a move that never happens.
         let moves_worktree = crate::session::worktree_edit::worktree_move_required(
             std::path::Path::new(&current_path),
             &leaf,
         );
-        if live.status.blocks_worktree_edit()
-            || (moves_worktree
+        let renames_branch = crate::session::worktree_edit::worktree_branch_rename_required(
+            &worktree_info,
+            &leaf,
+            args.rename_branch,
+        );
+        let is_sandboxed = inst.is_sandboxed();
+        if moves_worktree || renames_branch {
+            // Persisted status can lag the live tmux pane; recompute only when
+            // the request will mutate the checkout. A cwd/branch-stable title
+            // no-op must remain valid for an active session.
+            let mut live = inst.clone();
+            live.source_profile = profile.to_string();
+            crate::tmux::refresh_session_cache();
+            live.update_status();
+            let container_holds = !live.status.blocks_worktree_edit()
+                && moves_worktree
                 && crate::session::worktree_edit::ensure_sandbox_container_released(
                     &id,
-                    live.is_sandboxed(),
-                ))
-        {
-            bail!("Stop the session before renaming it: its worktree directory moves to match the new name. Disable session.tie_workdir_to_name to relabel a running session.");
+                    is_sandboxed,
+                );
+            if live.status.blocks_worktree_edit() || container_holds {
+                bail!("Stop the session before renaming its worktree directory or branch. Disable session.tie_workdir_to_name to relabel a running session.");
+            }
         }
         match crate::session::worktree_edit::edit_worktree_workdir(
             crate::session::worktree_edit::WorktreeEditRequest {
@@ -1777,7 +1868,7 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
                 if outcome.new_path != std::path::Path::new(&current_path) {
                     crate::session::worktree_edit::discard_sandbox_container_after_move(
                         &id,
-                        live.is_sandboxed(),
+                        is_sandboxed,
                     );
                 }
                 new_path = Some(outcome.new_path.to_string_lossy().to_string());
@@ -1792,32 +1883,20 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         bail!("--rename-branch only applies to a tied aoe-managed worktree session (session.tie_workdir_to_name)");
     }
 
-    // Phase 2 (unlocked): tmux rename if the title changed. Side effect on
-    // the running tmux server, fast but external state, do it outside the
-    // closure.
-    if title_changed {
-        let tmux_session = crate::tmux::Session::new(&id, &old_title)?;
-        if tmux_session.exists() {
-            let new_tmux_name = crate::tmux::Session::generate_name(&id, &effective_title);
-            if let Err(e) = tmux_session.rename(&new_tmux_name) {
-                eprintln!("Warning: failed to rename tmux session: {}", e);
-            } else {
-                crate::tmux::refresh_session_cache();
-            }
-        }
-    }
-
-    // Phase 3 (locked): persist the new title and (optional) new group.
-    // Re-resolve by id under the lock so concurrent mutations to other
-    // sessions are preserved. `create_group` is idempotent and only runs
-    // when the closure actually mutated `group_path`, so `groups.json` is
-    // rewritten only on real group changes (cf. `update`'s diff check).
+    // Persist before rekeying the live tmux session. Re-resolve by id under
+    // the profile lock so concurrent mutations to other sessions are
+    // preserved. `create_group` is idempotent and only runs when the closure
+    // actually mutated `group_path`, so `groups.json` is rewritten only on
+    // real group changes (cf. `update`'s diff check).
     let persist = storage.update(|instances, groups| {
         let inst = instances
             .iter_mut()
             .find(|i| i.id == id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
-        inst.title = effective_title.clone();
+        let persisted_old_title = inst.title.clone();
+        if title_requested {
+            inst.title = effective_title.clone();
+        }
         if let Some(path) = &new_path {
             inst.project_path = path.clone();
         }
@@ -1829,21 +1908,44 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
         if let Some(group) = &new_group {
             inst.group_path = group.clone();
         }
+        let committed_title = inst.title.clone();
         let group_path = inst.group_path.clone();
         if !group_path.is_empty() {
             let mut group_tree = GroupTree::new_with_groups(instances, groups);
             group_tree.create_group(&group_path);
             *groups = group_tree.get_all_groups();
         }
-        Ok(())
+        Ok((persisted_old_title, committed_title))
     });
-    if let Err(e) = persist {
-        // When the git move already landed, surface that the disk and metadata
-        // are out of sync rather than a bare persist error.
-        if let Some(path) = &new_path {
-            bail!("Worktree was moved on disk to {path}, but persisting the new session metadata failed: {e}. Re-run to retry.");
+    let (persisted_old_title, committed_title) = match persist {
+        Ok(titles) => titles,
+        Err(error) => {
+            // When the git move already landed, surface that the disk and
+            // metadata are out of sync rather than a bare persist error.
+            if let Some(path) = &new_path {
+                bail!("Worktree was moved on disk to {path}, but persisting the new session metadata failed: {error}. Re-run to retry.");
+            }
+            return Err(error);
         }
-        return Err(e);
+    };
+    // Storage::update durably commits the identity and publishes its file-watch
+    // notification. Rekey needs only the per-session title/lifecycle guards.
+    drop(_identity_lock);
+
+    let committed_title_changed = title_requested && persisted_old_title != committed_title;
+    if committed_title_changed {
+        let rekey_id = id.clone();
+        let rekey_old_title = persisted_old_title.clone();
+        let rekey_new_title = committed_title.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::tmux::rekey_session(&rekey_id, &rekey_old_title, &rekey_new_title)
+        })
+        .await
+        {
+            Ok(Ok(_)) => {}
+            Ok(Err(error)) => eprintln!("Warning: failed to rename tmux session: {error}"),
+            Err(error) => eprintln!("Warning: tmux rename task failed: {error}"),
+        }
     }
 
     if let Some(path) = &new_path {
@@ -1852,13 +1954,167 @@ async fn rename_session(profile: &str, args: RenameArgs) -> Result<()> {
             println!("  Branch renamed to: {}", branch);
         }
     }
-    if title_changed {
-        println!("✓ Renamed session: {} → {}", old_title, effective_title);
-    } else {
-        println!("✓ Updated session: {}", effective_title);
-    }
+    println!(
+        "{}",
+        rename_success_message(&persisted_old_title, &committed_title, title_requested,)
+    );
 
     Ok(())
+}
+
+#[cfg(test)]
+mod rename_tests {
+    use super::{rename_session, rename_success_message, RenameArgs};
+    use crate::session::{Instance, Status, Storage};
+    use serial_test::serial;
+
+    // Three duplicate-identity behaviors kept in one test on purpose: they
+    // share the costly setup that forces `#[serial]` (an isolated app dir plus
+    // a process-global `tie_workdir_to_name` config flip), so splitting them
+    // into three serial tests would triple that setup and the critical-path
+    // serial time for no added coverage. Each behavior asserts independently.
+    #[tokio::test]
+    #[serial]
+    async fn rename_rejects_duplicate_pair_but_allows_group_only_change() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let storage = Storage::new_unwatched("rename-duplicate").unwrap();
+        let existing = Instance::new("main branch", "/tmp/repo/");
+        let target = Instance::new("throwaway", "/tmp/repo");
+        let target_id = target.id.clone();
+        storage
+            .update(|instances, _groups| {
+                *instances = vec![existing, target];
+                Ok(())
+            })
+            .unwrap();
+
+        let error = rename_session(
+            "rename-duplicate",
+            RenameArgs {
+                identifier: Some(target_id.clone()),
+                title: Some("main branch".to_string()),
+                group: None,
+                rename_branch: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Session already exists with same title and path"));
+
+        rename_session(
+            "rename-duplicate",
+            RenameArgs {
+                identifier: Some(target_id.clone()),
+                title: None,
+                group: Some("work".to_string()),
+                rename_branch: false,
+            },
+        )
+        .await
+        .unwrap();
+
+        let instances = storage.load().unwrap();
+        let target = instances
+            .iter()
+            .find(|instance| instance.id == target_id)
+            .unwrap();
+        assert_eq!(target.title, "throwaway");
+        assert_eq!(target.group_path, "work");
+        // In tied mode the duplicate identity uses the derived destination
+        // path, not the row's current worktree path. The collision must reject
+        // before any git side effect is attempted.
+        let _tie_guard = crate::session::test_support::TieWorkdirToNameGuard::set(true);
+        let existing = Instance::new("main branch", "/tmp/worktrees/main-branch");
+        let mut tied = Instance::new("main branch", "/tmp/worktrees/drifted");
+        tied.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "drifted".to_string(),
+            main_repo_path: "/tmp/repo".to_string(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+        let tied_id = tied.id.clone();
+        storage
+            .update(|instances, _groups| {
+                *instances = vec![existing, tied];
+                Ok(())
+            })
+            .unwrap();
+
+        let error = rename_session(
+            "rename-duplicate",
+            RenameArgs {
+                identifier: Some(tied_id.clone()),
+                title: Some("main branch".to_string()),
+                group: None,
+                rename_branch: false,
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("Session already exists with same title and path"));
+        let tied = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|instance| instance.id == tied_id)
+            .unwrap();
+        assert_eq!(tied.title, "main branch");
+        assert_eq!(tied.project_path, "/tmp/worktrees/drifted");
+
+        // An explicit unchanged title still enters tied mode so a drifted
+        // directory can be repaired. When the directory and branch are already
+        // stable, however, it is a true no-op and must remain valid even if the
+        // persisted session is active.
+        let mut active = Instance::new("Main Branch", "/tmp/worktrees/main-branch");
+        active.status = Status::Running;
+        active.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "main-branch".to_string(),
+            main_repo_path: "/tmp/repo".to_string(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+        let active_id = active.id.clone();
+        storage
+            .update(|instances, _groups| {
+                *instances = vec![active];
+                Ok(())
+            })
+            .unwrap();
+
+        rename_session(
+            "rename-duplicate",
+            RenameArgs {
+                identifier: Some(active_id.clone()),
+                title: Some("Main Branch".to_string()),
+                group: None,
+                rename_branch: false,
+            },
+        )
+        .await
+        .expect("active cwd-stable title no-op must succeed");
+        let active = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|instance| instance.id == active_id)
+            .unwrap();
+        assert_eq!(active.title, "Main Branch");
+        assert_eq!(active.project_path, "/tmp/worktrees/main-branch");
+    }
+
+    #[test]
+    fn group_only_success_uses_authoritative_committed_title() {
+        assert_eq!(
+            rename_success_message("stale resolver title", "peer committed title", false),
+            "✓ Updated session: peer committed title"
+        );
+    }
 }
 
 async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<()> {
@@ -1883,6 +2139,15 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
     };
 
     let id = inst.id.clone();
+    let _identity_lock = acquire_session_identity_lock()?;
+    let _lifecycle_lock = storage
+        .acquire_instance_lifecycle_lock(&id)
+        .context("failed to acquire worktree rename lifecycle lock")?;
+    let authoritative_instances = storage.load()?;
+    let inst = authoritative_instances
+        .iter()
+        .find(|instance| instance.id == id)
+        .ok_or_else(|| anyhow::anyhow!("Session not found: {}", id))?;
     let current_path = inst.project_path.clone();
     let Some(worktree_info) = inst.worktree_info.clone() else {
         bail!("Session does not use a worktree");
@@ -1895,6 +2160,23 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
             .tie_workdir_to_name,
     ) {
         bail!("Renaming is unified while session.tie_workdir_to_name is on; use 'aoe session rename --title <name>' instead, and the worktree directory follows. Disable the setting to edit the directory independently.");
+    }
+    let duplicate_path = crate::session::worktree_edit::target_worktree_path(
+        std::path::Path::new(&current_path),
+        args.name.trim(),
+    )
+    .unwrap_or_else(|| std::path::PathBuf::from(&current_path))
+    .to_string_lossy()
+    .into_owned();
+    if duplicate_path.trim_end_matches('/') != current_path.trim_end_matches('/')
+        && is_duplicate_session(
+            authoritative_instances.iter(),
+            &inst.title,
+            &duplicate_path,
+            Some(&id),
+        )
+    {
+        return Err(duplicate_session_error(&inst.title));
     }
     // Persisted status can lag the real tmux pane, and moving the worktree of
     // a still-running session is unsafe. Recompute from live tmux state before
@@ -1961,6 +2243,7 @@ async fn set_worktree_name(profile: &str, args: SetWorktreeNameArgs) -> Result<(
                 "Worktree was moved on disk to {new_path}, but persisting the new session metadata failed: {e}. Re-run to retry."
             )
         })?;
+    drop(_identity_lock);
 
     println!("✓ Worktree moved to: {}", new_path);
     if let Some(branch) = &new_branch {
@@ -2031,8 +2314,17 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
     };
 
     let storage = Storage::open_unwatched(profile)?;
+    let target_id = {
+        let instances = storage.load()?;
+        super::resolve_session(&args.identifier, &instances)?
+            .id
+            .clone()
+    };
+    let lifecycle_lock = storage
+        .acquire_instance_lifecycle_lock(&target_id)
+        .context("failed to acquire instance resume-target lock")?;
     let (title, tool) = storage.update(|instances, _groups| {
-        super::patch_instance(instances, &args.identifier, |inst| {
+        super::patch_instance(instances, &target_id, |inst| {
             #[cfg(feature = "serve")]
             if inst.is_structured() {
                 anyhow::bail!(
@@ -2045,6 +2337,7 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
             Ok((inst.title.clone(), inst.tool.clone()))
         })
     })?;
+    drop(lifecycle_lock);
 
     match &new_intent {
         crate::session::ResumeIntent::Use(id) => {
@@ -2194,6 +2487,11 @@ async fn set_base(profile: &str, args: SetBaseArgs) -> Result<()> {
     let id = inst.id.clone();
     let title = inst.title.clone();
 
+    // Each repo in a workspace has its own base, so the target has to be
+    // named. Validating and writing against the first repo, as this used to,
+    // set a ref the other repos may not even have. See #3329.
+    let target = resolve_base_target(inst, args.repo.as_deref())?;
+
     let new_value = if args.clear {
         None
     } else {
@@ -2201,38 +2499,104 @@ async fn set_base(profile: &str, args: SetBaseArgs) -> Result<()> {
         if trimmed.is_empty() {
             bail!("Branch name is empty. Pass --clear to remove the override.");
         }
-        let validate_path = inst
-            .workspace_info
-            .as_ref()
-            .and_then(|w| w.repos.first().map(|r| r.worktree_path.clone()))
-            .unwrap_or_else(|| inst.project_path.clone());
         if let Err(e) =
-            crate::git::diff::validate_ref(std::path::Path::new(&validate_path), &trimmed)
+            crate::git::diff::validate_ref(std::path::Path::new(&target.validate_path), &trimmed)
         {
             bail!(
                 "Branch '{}' does not resolve in {}: {}",
                 trimmed,
-                validate_path,
+                target.validate_path,
                 e
             );
         }
         Some(trimmed)
     };
 
+    let repo_name = target.repo_name.clone();
     storage.update(|instances, _groups| {
         let stored = instances
             .iter_mut()
             .find(|i| i.id == id)
             .ok_or_else(|| anyhow::anyhow!("Session not found: {}", args.identifier))?;
-        stored.base_branch_override = new_value.clone();
+        match repo_name.as_deref() {
+            // The target was resolved from the copy loaded above, so a repo
+            // missing here means the session changed under us (the workspace
+            // was converted, the repo detached). Fail instead of dropping the
+            // write and printing success.
+            Some(name) => {
+                let repo = stored
+                    .workspace_info
+                    .as_mut()
+                    .and_then(|ws| ws.repos.iter_mut().find(|r| r.name == name))
+                    .ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "Repo '{}' is no longer part of this session; nothing was changed",
+                            name
+                        )
+                    })?;
+                repo.base_branch_override = new_value.clone();
+            }
+            None => stored.base_branch_override = new_value.clone(),
+        }
         Ok(())
     })?;
 
+    // Quoted here rather than in the format strings below: leaving the quotes
+    // out there and relying on the label to supply its own middle pair reads as
+    // unbalanced at a glance, even though it composes correctly.
+    let label = match target.repo_name {
+        Some(ref name) => format!("'{title}' / '{name}'"),
+        None => format!("'{title}'"),
+    };
     match new_value {
-        Some(ref v) => println!("✓ Set diff base for '{}': {}", title, v),
-        None => println!("✓ Cleared diff base override for '{}'", title),
+        Some(ref v) => println!("✓ Set diff base for {}: {}", label, v),
+        None => println!("✓ Cleared diff base override for {}", label),
     }
     Ok(())
+}
+
+/// Which entry a `set-base` invocation writes, and the checkout its ref is
+/// validated against.
+#[derive(Debug)]
+struct BaseTarget {
+    /// Workspace repo name, or None for the session's own checkout.
+    repo_name: Option<String>,
+    validate_path: String,
+}
+
+/// Resolve `--repo` against a session. A workspace session must name one of
+/// its repos; a single-repo session must not name any, since the only entry
+/// it has is its own checkout.
+fn resolve_base_target(inst: &crate::session::Instance, repo: Option<&str>) -> Result<BaseTarget> {
+    let names = || {
+        inst.all_repos()
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    match repo {
+        Some(name) => match inst.all_repos().iter().find(|r| r.name == name) {
+            Some(r) => Ok(BaseTarget {
+                repo_name: Some(r.name.clone()),
+                validate_path: r.worktree_path.clone(),
+            }),
+            None if inst.all_repos().is_empty() => bail!(
+                "This session has no workspace repos, so --repo does not apply. Drop it to set \
+                 the session's own diff base."
+            ),
+            None => bail!("Unknown repo '{}'. This session has: {}", name, names()),
+        },
+        None if inst.workspace_info.is_some() => bail!(
+            "This session is a multi-repo workspace, and each repo has its own diff base.\nPass \
+             --repo <name> to pick one. Available: {}",
+            names()
+        ),
+        None => Ok(BaseTarget {
+            repo_name: None,
+            validate_path: inst.project_path.clone(),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -2359,6 +2723,80 @@ mod restart_args_tests {
         assert!(
             result.is_err(),
             "passing both branch and --clear should error"
+        );
+    }
+}
+
+#[cfg(test)]
+mod set_base_target_tests {
+    use super::resolve_base_target;
+    use crate::session::{Instance, WorkspaceInfo, WorkspaceRepo};
+
+    fn workspace_instance() -> Instance {
+        let mut inst = Instance::new("ws", "/ws");
+        inst.workspace_info = Some(WorkspaceInfo {
+            branch: "feature/x".to_string(),
+            workspace_dir: "/ws".to_string(),
+            repos: ["api", "web"]
+                .iter()
+                .map(|n| WorkspaceRepo {
+                    name: n.to_string(),
+                    source_path: format!("/src/{n}"),
+                    branch: "feature/x".to_string(),
+                    worktree_path: format!("/ws/{n}"),
+                    main_repo_path: format!("/src/{n}"),
+                    managed_by_aoe: true,
+                    branch_preexisting: false,
+                    base_branch: None,
+                    base_branch_override: None,
+                })
+                .collect(),
+            created_at: chrono::Utc::now(),
+            cleanup_on_delete: true,
+        });
+        inst
+    }
+
+    #[test]
+    fn resolves_named_repo_and_validates_against_its_own_worktree() {
+        let inst = workspace_instance();
+        let t = resolve_base_target(&inst, Some("web")).expect("named repo resolves");
+        assert_eq!(t.repo_name.as_deref(), Some("web"));
+        // The bug this replaces validated every ref against repos[0].
+        assert_eq!(t.validate_path, "/ws/web");
+    }
+
+    #[test]
+    fn rejects_unknown_repo_and_missing_repo_on_a_workspace() {
+        let inst = workspace_instance();
+        let err = resolve_base_target(&inst, Some("nope"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("api, web"),
+            "should list the repos, got: {err}"
+        );
+
+        let err = resolve_base_target(&inst, None).unwrap_err().to_string();
+        assert!(
+            err.contains("--repo") && err.contains("api, web"),
+            "should demand a repo and list them, got: {err}"
+        );
+    }
+
+    #[test]
+    fn single_repo_session_targets_its_own_checkout() {
+        let inst = Instance::new("solo", "/tmp/solo");
+        let t = resolve_base_target(&inst, None).expect("single repo resolves");
+        assert_eq!(t.repo_name, None);
+        assert_eq!(t.validate_path, "/tmp/solo");
+
+        let err = resolve_base_target(&inst, Some("api"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("no workspace repos"),
+            "should explain --repo does not apply, got: {err}"
         );
     }
 }
@@ -2668,5 +3106,158 @@ mod import_tests {
         assert!(already_imported(&instances, "id-1"));
         assert!(already_imported(&instances, "id-2"));
         assert!(!already_imported(&instances, "id-3"));
+    }
+}
+
+#[cfg(test)]
+mod show_json_tests {
+    use super::*;
+
+    /// #3350 gave `aoe list --json` a `state` tag and both timestamps;
+    /// `session show --json` was left behind, so a scripted consumer that
+    /// looked a session up by id could not tell an archived one from a live
+    /// one without a second `aoe list` shellout.
+    #[test]
+    fn show_json_exposes_state_and_archived_at_for_an_archived_row() {
+        let mut inst = Instance::new("z", "/repo");
+        inst.archive();
+        let details = session_details(&inst, "p");
+        assert_eq!(details.state, "archived");
+        assert!(details.archived_at.is_some());
+        assert!(details.trashed_at.is_none());
+    }
+
+    /// `trash()` deliberately leaves `archived_at` alone so a restore is
+    /// faithful, so both keys can be present at once and `state` reports
+    /// `trashed`: the same precedence `list --json` reports, from the same
+    /// `state_tag`.
+    #[test]
+    fn show_json_reports_trashed_for_a_row_that_was_archived_first() {
+        let mut inst = Instance::new("z", "/repo");
+        inst.archive();
+        inst.trash();
+        let details = session_details(&inst, "p");
+        assert_eq!(details.state, "trashed");
+        assert!(details.trashed_at.is_some());
+        assert!(details.archived_at.is_some());
+    }
+
+    /// A live row must serialize exactly as wide as it did before, so a
+    /// consumer parsing today's output sees one new key (`state`) and no
+    /// `null` timestamps.
+    #[test]
+    fn show_json_omits_absent_timestamps_and_keeps_state_live() {
+        let inst = Instance::new("z", "/repo");
+        let serialized = serde_json::to_string(&session_details(&inst, "p")).unwrap();
+        assert!(!serialized.contains("trashed_at"), "{serialized}");
+        assert!(!serialized.contains("archived_at"), "{serialized}");
+        assert!(serialized.contains("\"state\":\"live\""), "{serialized}");
+    }
+
+    /// #3415: same four-timestamp mirror as `aoe list --json`, gated the
+    /// same way: the snooze key surfaces only while `is_snoozed()` holds,
+    /// the pin key whenever set, neither appears on a plain row, and
+    /// `state` stays the untouched bucket tag throughout.
+    #[test]
+    fn show_json_mirrors_the_api_snooze_and_pin_keys() {
+        let now = chrono::Utc::now();
+        let future = now + chrono::Duration::minutes(15);
+        let past = now - chrono::Duration::minutes(15);
+
+        let mut snoozed = Instance::new("z", "/repo");
+        snoozed.snoozed_until = Some(future);
+
+        let mut expired = Instance::new("z", "/repo");
+        expired.snoozed_until = Some(past);
+
+        let mut pinned = Instance::new("z", "/repo");
+        pinned.pinned_at = Some(now);
+
+        // pin() and snooze() clear each other's marker, but peer store
+        // writes bypass the mutators, so a row can carry both at once
+        // and neither key may suppress the other.
+        let mut both = Instance::new("z", "/repo");
+        both.pinned_at = Some(now);
+        both.snoozed_until = Some(future);
+
+        // archive() clears a concurrent snooze through the mutators, but
+        // snooze() leaves archived_at alone, so archiving a row and then
+        // snoozing it persists the pair through ordinary CLI commands:
+        // the keys must stay independent of the bucket tag.
+        let mut sunk = Instance::new("z", "/repo");
+        sunk.archived_at = Some(now);
+        sunk.snoozed_until = Some(future);
+
+        // snoozed then trashed through ordinary commands: trash()
+        // preserves the sibling timestamps, so a triaged row must still
+        // report its deadline from the trash.
+        let mut trashed_snoozed = Instance::new("z", "/repo");
+        trashed_snoozed.snooze(30);
+        trashed_snoozed.trash();
+
+        // pinned for the web sidebar, then trashed the same way.
+        let mut trashed_pinned = Instance::new("z", "/repo");
+        trashed_pinned.pin();
+        trashed_pinned.trash();
+
+        // pin() clears archived_at through the mutators, but peer store
+        // writes bypass them: an archived row can still carry a pin.
+        let mut archived_pinned = Instance::new("z", "/repo");
+        archived_pinned.archived_at = Some(now);
+        archived_pinned.pinned_at = Some(now);
+
+        let plain = Instance::new("z", "/repo");
+
+        let cases = [
+            ("active snooze", &snoozed, true, false, "live"),
+            ("expired snooze", &expired, false, false, "live"),
+            ("pinned", &pinned, false, true, "live"),
+            ("plain row", &plain, false, false, "live"),
+            ("snoozed and archived", &sunk, true, false, "archived"),
+            ("pinned and snoozed", &both, true, true, "live"),
+            (
+                "trashed and snoozed",
+                &trashed_snoozed,
+                true,
+                false,
+                "trashed",
+            ),
+            (
+                "trashed and pinned",
+                &trashed_pinned,
+                false,
+                true,
+                "trashed",
+            ),
+            (
+                "pinned and archived",
+                &archived_pinned,
+                false,
+                true,
+                "archived",
+            ),
+        ];
+        for (label, inst, want_snooze, want_pin, want_state) in cases {
+            let value = serde_json::to_value(session_details(inst, "p")).unwrap();
+            assert_eq!(
+                value.get("snoozed_until").is_some(),
+                want_snooze,
+                "{label}: {value}"
+            );
+            assert_eq!(
+                value.get("pinned_at").is_some(),
+                want_pin,
+                "{label}: {value}"
+            );
+            assert_eq!(value["state"].as_str(), Some(want_state), "{label}");
+        }
+
+        // Value fidelity on the one row whose exact deadline we set:
+        // presence alone would accept a regression emitting any instant.
+        let active = serde_json::to_value(session_details(&snoozed, "p")).unwrap();
+        assert_eq!(
+            active["snoozed_until"],
+            serde_json::to_value(future).unwrap()
+        );
     }
 }

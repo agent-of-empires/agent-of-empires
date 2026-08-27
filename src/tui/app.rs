@@ -357,6 +357,21 @@ impl App {
         }
     }
 
+    /// Holding a key produces a stream of Press events on terminals that do not
+    /// report key-event types, or an initial Press followed by Repeat events on
+    /// terminals that do. That stream has the same timing as Mosh's paste
+    /// fallback, but it is navigation, not pasted text. Keep it on the normal
+    /// input path so held `j`/`k` continue scrolling the session list instead of
+    /// opening the message composer.
+    fn is_auto_repeat_burst(keys: &[KeyEvent]) -> bool {
+        let Some(first) = keys.first() else {
+            return false;
+        };
+        keys.iter()
+            .skip(1)
+            .all(|key| key.code == first.code && key.modifiers == first.modifiers)
+    }
+
     /// Peel a trailing Enter off a paste burst so plain-Enter Submit
     /// semantics survive when the user types or dictates fast enough to
     /// pump everything through the burst path.
@@ -576,13 +591,20 @@ impl App {
                 self.home.live_send.is_some(),
                 self.home.has_non_live_send_overlay(),
             );
-        crossterm::execute!(
+        // QUEUE, never execute: `execute!` flushes, and flushing the batch
+        // opener on its own puts the ~10ms widget build INSIDE the
+        // synchronized-update bracket, so the terminal holds its display
+        // frozen for a third of every frame instead of batching the result of
+        // one. Queued, these ride out in `terminal.draw`'s own flush together
+        // with the cells and the trailing Show, which is the whole point of
+        // the bracket: one write, one atomic frame.
+        crossterm::queue!(
             terminal.backend_mut(),
             crossterm::terminal::BeginSynchronizedUpdate
         )?;
         let draw_result = (|| -> Result<()> {
             if !skip_hide {
-                crossterm::execute!(terminal.backend_mut(), crossterm::cursor::Hide)?;
+                crossterm::queue!(terminal.backend_mut(), crossterm::cursor::Hide)?;
             }
             terminal.draw(|f| self.render(f))?;
             Ok(())
@@ -830,6 +852,7 @@ impl App {
         let mut last_refresh_at: Option<std::time::Instant> = None;
         const REFRESH_COOLDOWN: Duration = Duration::from_millis(15);
         let mut last_status_refresh = std::time::Instant::now();
+        let mut last_metrics_sample = std::time::Instant::now();
         #[cfg(feature = "serve")]
         let mut last_daemon_status_refresh = std::time::Instant::now();
         let mut last_disk_refresh = std::time::Instant::now();
@@ -850,6 +873,10 @@ impl App {
         #[cfg(feature = "serve")]
         const DAEMON_STATUS_REFRESH_INTERVAL: Duration = Duration::from_secs(1);
         const DISK_REFRESH_INTERVAL: Duration = Duration::from_secs(5);
+        // Diagnostics-strip sampling. 1s keeps the sparkline responsive to a
+        // fast memory climb; request_metrics_refresh is a no-op unless the strip
+        // is visible, so this costs nothing when the pane is hidden.
+        const METRICS_SAMPLE_INTERVAL: Duration = Duration::from_secs(1);
         // Fastest spinner (breathe) changes every 180ms; 120ms ensures smooth animation
         const SPINNER_REDRAW_INTERVAL: Duration = Duration::from_millis(120);
         const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(10);
@@ -864,14 +891,14 @@ impl App {
         // never double-stop a session when run side by side.
         const SESSION_IDLE_REAP_INTERVAL: Duration = Duration::from_secs(60);
         // A presence file counts as live while its mtime is within this window.
-        // Larger than HEARTBEAT_INTERVAL so a couple of missed beats (busy loop,
+        // Larger than the liveness heartbeat so a couple of missed beats (busy loop,
         // brief stall) don't drop an instance; matches the push consumer.
         const PRESENCE_FRESH_WINDOW: Duration = Duration::from_secs(30);
 
-        // Signal that the TUI is active so the web push consumer can
-        // suppress notifications while the user is watching the dashboard, and
-        // so other TUIs can count this instance.
+        // Register this TUI as live for the footer, and as recently interacted
+        // with for short-lived push suppression.
         crate::session::write_tui_heartbeat();
+        crate::session::write_tui_activity();
         self.home.active_tui_count = crate::session::count_active_tuis(PRESENCE_FRESH_WINDOW);
 
         // Telemetry (opt-in, no-op otherwise): announce this surface on boot,
@@ -934,6 +961,7 @@ impl App {
                             if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                                 continue;
                             }
+                            crate::session::write_tui_activity();
                             // Paste-burst detector for VoiceInk + Mosh ergonomics.
                             // Mosh strips bracketed-paste markers, so pasted
                             // dictation arrives as a stream of individual KeyEvents
@@ -988,7 +1016,9 @@ impl App {
                                         _ => break,
                                     }
                                 }
-                                if burst_keys.len() >= PASTE_BURST_MIN_LEN {
+                                if burst_keys.len() >= PASTE_BURST_MIN_LEN
+                                    && !Self::is_auto_repeat_burst(&burst_keys)
+                                {
                                     // Peel a trailing Enter so the dialog's
                                     // plain-Enter Submit branch still fires.
                                     // Embedded mid-burst Enters stay as '\n'
@@ -1086,6 +1116,8 @@ impl App {
                                                             // Sidebar collapse/expand toggle; must
                                                             // precede hit_list (button is on the
                                                             // list's top border).
+                                                        } else if self.home.handle_diagnostics_click(mouse.column, mouse.row) {
+                                                            // Compact system-health strip opened the read-only detail view.
                                                         } else if self.home.handle_tips_badge_click(mouse.column, mouse.row) {
                                                             // Footer tips badge opened the overlay;
                                                             // drop any stale preview highlight, like
@@ -1167,6 +1199,9 @@ impl App {
                             continue;
                         }
                         Some(Ok(Event::Mouse(mouse))) => {
+                            if !matches!(mouse.kind, MouseEventKind::Moved) {
+                                crate::session::write_tui_activity();
+                            }
                             // Structured preview mouse routing is deliberately
                             // thin: the transcript is ordinary preview content,
                             // so drags fall through to the home view's own
@@ -1385,6 +1420,13 @@ impl App {
                                     None
                                 } else if self
                                     .home
+                                    .handle_diagnostics_click(mouse.column, mouse.row)
+                                {
+                                    let _ = self.home.clear_preview_selection();
+                                    self.draw(terminal)?;
+                                    None
+                                } else if self
+                                    .home
                                     .handle_tips_badge_click(mouse.column, mouse.row)
                                 {
                                     // Footer tips badge opened the overlay.
@@ -1551,6 +1593,7 @@ impl App {
                             continue;
                         }
                         Some(Ok(Event::Paste(text))) => {
+                            crate::session::write_tui_activity();
                             // An ACTIVE structured view owns pasted text (it
                             // goes to its composer, same as the full-screen
                             // view). A merely-mounted preview must NOT eat
@@ -1767,12 +1810,24 @@ impl App {
 
             if last_status_refresh.elapsed() >= STATUS_REFRESH_INTERVAL {
                 self.home.request_status_refresh();
+                self.home.repair_session_id_pollers();
                 last_status_refresh = std::time::Instant::now();
             }
 
             if self.home.apply_status_updates() {
                 refresh_needed = true;
                 needs_full_refresh = true;
+            }
+
+            if last_metrics_sample.elapsed() >= METRICS_SAMPLE_INTERVAL {
+                self.home.request_metrics_refresh();
+                last_metrics_sample = std::time::Instant::now();
+            }
+
+            // A new sample only repaints the strip, so a diffed redraw is
+            // enough; no full clear.
+            if self.home.apply_metrics_updates() {
+                refresh_needed = true;
             }
 
             #[cfg(feature = "serve")]
@@ -3453,7 +3508,7 @@ impl App {
                 // bottom-anchored preview paint up a row for the frame's
                 // lifetime, and a warm send is too fast for the toast to
                 // inform anyone.
-                let warm = self.home.agent_pane_is_warm(&id);
+                let warm = self.home.send_entry_is_warm(&id);
                 if !warm {
                     self.home
                         .set_instance_status(&id, crate::session::Status::Starting);
@@ -4757,6 +4812,61 @@ mod tests {
             KeyCode::Backspace,
             KeyModifiers::NONE
         )));
+    }
+
+    #[test]
+    fn auto_repeat_burst_rejects_held_navigation_but_not_pasted_text() {
+        let cases = [
+            (
+                vec![
+                    key(KeyCode::Char('j'), KeyModifiers::NONE),
+                    key(KeyCode::Char('j'), KeyModifiers::NONE),
+                    key(KeyCode::Char('j'), KeyModifiers::NONE),
+                ],
+                true,
+            ),
+            (
+                vec![
+                    key(KeyCode::Char('k'), KeyModifiers::NONE),
+                    key(KeyCode::Char('k'), KeyModifiers::NONE),
+                    key(KeyCode::Char('k'), KeyModifiers::NONE),
+                ],
+                true,
+            ),
+            (
+                vec![
+                    KeyEvent::new_with_kind(
+                        KeyCode::Char('j'),
+                        KeyModifiers::NONE,
+                        KeyEventKind::Press,
+                    ),
+                    KeyEvent::new_with_kind(
+                        KeyCode::Char('j'),
+                        KeyModifiers::NONE,
+                        KeyEventKind::Repeat,
+                    ),
+                    KeyEvent::new_with_kind(
+                        KeyCode::Char('j'),
+                        KeyModifiers::NONE,
+                        KeyEventKind::Repeat,
+                    ),
+                ],
+                true,
+            ),
+            (
+                vec![
+                    key(KeyCode::Char('p'), KeyModifiers::NONE),
+                    key(KeyCode::Char('a'), KeyModifiers::NONE),
+                    key(KeyCode::Char('s'), KeyModifiers::NONE),
+                    key(KeyCode::Char('t'), KeyModifiers::NONE),
+                    key(KeyCode::Char('e'), KeyModifiers::NONE),
+                ],
+                false,
+            ),
+        ];
+        for (keys, expected) in cases {
+            assert_eq!(App::is_auto_repeat_burst(&keys), expected, "{keys:?}");
+        }
     }
 
     #[test]

@@ -57,9 +57,13 @@ use super::project_mcp::ProjectMcpServer;
 /// [`HostHooksConfig`]), so honoring it from a repo would let a checked-out
 /// repository execute arbitrary host commands. Host hooks are profile/global
 /// only.
-const REPO_OVERRIDABLE_SECTIONS: &[&str] = &[
-    "hooks", "session", "sandbox", "worktree", "updates", "tmux", "sound",
-];
+///
+/// `tmux` and `sound` are deliberately absent (#3229): every consumer
+/// resolves them through profile/global-only paths (`resolve_config_or_warn`
+/// or `Config::load*`), never a repo-aware resolver, so a repo entry here
+/// could never take effect. Wire those resolvers before making either
+/// section repo-overridable.
+const REPO_OVERRIDABLE_SECTIONS: &[&str] = &["hooks", "session", "sandbox", "worktree", "updates"];
 
 /// What a repo may set inside one overridable section (#3154).
 enum SectionPolicy {
@@ -267,10 +271,52 @@ const REPO_CONFIG_PATH: &str = ".agent-of-empires/config.toml";
 /// Legacy path (pre-1.1) for backwards compatibility.
 const LEGACY_REPO_CONFIG_PATH: &str = ".aoe/config.toml";
 
+/// The user's global `config.toml`, resolved without creating the app dir
+/// (unlike [`super::config::config_path`], which goes through `get_app_dir`).
+/// `None` when the app dir cannot be resolved at all; no collision is provable
+/// then, so the repo layer proceeds as before.
+fn global_config_path() -> Option<PathBuf> {
+    super::get_app_dir_path()
+        .ok()
+        .map(|dir| dir.join("config.toml"))
+}
+
+/// Whether a `<project>/.agent-of-empires/config.toml` is in fact the user's
+/// global `config.toml`. On macOS and Windows the app dir is
+/// `~/.agent-of-empires`, so a project path of `$HOME` makes the repo layer
+/// resolve onto the global config file by construction (#3400).
+///
+/// The containing directories are compared canonicalized (see
+/// [`normalize_path`]), so the collision is still caught when the project path
+/// reaches the app dir through a symlink or a non-canonical prefix such as
+/// `/tmp` vs `/private/tmp`. Canonicalizing the directory rather than the file
+/// matters on the save path, where the target file need not exist yet while the
+/// app dir always does.
+fn resolves_to_global_config(candidate: &Path) -> bool {
+    let Some(global) = global_config_path() else {
+        return false;
+    };
+    match (candidate.parent(), global.parent()) {
+        (Some(candidate_dir), Some(global_dir)) => {
+            candidate.file_name() == global.file_name()
+                && normalize_path(candidate_dir) == normalize_path(global_dir)
+        }
+        _ => false,
+    }
+}
+
 /// Load repo config from `<project_path>/.agent-of-empires/config.toml`.
 /// Falls back to the legacy `.aoe/config.toml` path with a deprecation warning.
 /// Returns `None` if neither file exists.
 pub fn load_repo_config(project_path: &Path) -> Result<Option<RepoConfig>> {
+    // An empty path is how a project-less session (scratch, see
+    // `super::builder::build_instance`) says "no repo". Joining onto it yields
+    // the *relative* `.agent-of-empires/config.toml`, which would otherwise
+    // read whatever directory the process was launched in.
+    if project_path.as_os_str().is_empty() {
+        return Ok(None);
+    }
+
     let config_path = project_path.join(REPO_CONFIG_PATH);
     let (config_path, is_legacy) = if config_path.exists() {
         (config_path, false)
@@ -282,6 +328,19 @@ pub fn load_repo_config(project_path: &Path) -> Result<Option<RepoConfig>> {
             return Ok(None);
         }
     };
+
+    // A project path of `$HOME` resolves this to the user's own global
+    // `config.toml` on macOS and Windows (#3400). That file is not a repo
+    // config: loading it re-merges the global layer onto itself and reports
+    // every global-only section as a rejected repo override. Decline, and log
+    // the path so the upstream caller that passed such a path is findable.
+    if resolves_to_global_config(&config_path) {
+        tracing::debug!(target: "session.store",
+            path = %config_path.display(),
+            "Skipping repo config: this project path resolves to the global config.toml"
+        );
+        return Ok(None);
+    }
 
     if is_legacy {
         tracing::warn!(target: "session.store",
@@ -324,11 +383,23 @@ pub fn load_repo_config(project_path: &Path) -> Result<Option<RepoConfig>> {
 /// If a legacy `.aoe/config.toml` exists, it is removed after a successful save
 /// to prevent stale config from silently reactivating.
 pub fn save_repo_config(project_path: &Path, config: &RepoConfig) -> Result<()> {
+    let config_path = project_path.join(REPO_CONFIG_PATH);
+    // The read side's collision (#3400) is destructive here: writing the
+    // repo-permitted subset over the global `config.toml` drops every
+    // global-only section. Refuse loudly rather than truncating the user's
+    // config; the caller surfaces the error.
+    if resolves_to_global_config(&config_path) {
+        anyhow::bail!(
+            "Refusing to save repo config to {}: that file is the global config.toml, \
+             not a repo config (this project path resolves onto the app dir)",
+            config_path.display()
+        );
+    }
+
     let config_dir = project_path.join(".agent-of-empires");
     fs::create_dir_all(&config_dir)
         .with_context(|| format!("Failed to create {}", config_dir.display()))?;
 
-    let config_path = project_path.join(REPO_CONFIG_PATH);
     // Sanitize here rather than trusting callers, so a field the merge path
     // would strip is never written to disk in the first place.
     let (allowed, rejected) = sanitize_repo_overrides(&config.overrides);
@@ -458,6 +529,15 @@ pub fn profile_to_repo_config(profile: &ProfileConfig) -> RepoConfig {
 /// matching the guard in `compute_volume_paths` (avoids `Repository::discover`
 /// walking up to an unrelated ancestor repo, e.g. a dotfile-managed `$HOME`).
 pub fn repo_config_source_path(project_path: &Path) -> PathBuf {
+    // An empty path means "no project repo" (scratch sessions, see
+    // `super::builder::build_instance`). Every probe below is relative to it,
+    // so it would interrogate the *launch directory* instead: a cwd whose
+    // `.git` is a file (a linked worktree) resolves to that worktree's main
+    // repo and hands `load_repo_config` a real path, putting back the repo
+    // layer that the empty path exists to suppress.
+    if project_path.as_os_str().is_empty() {
+        return PathBuf::new();
+    }
     if project_path.join(".git").exists() {
         if let Ok(main_repo) = crate::git::GitWorktree::find_main_repo(project_path) {
             return main_repo;
@@ -1306,16 +1386,30 @@ fn parse_env_kv_lines(stdout: &str) -> Vec<(String, String)> {
         };
         let key = key.trim();
         if !super::environment::is_valid_env_key(key) {
-            tracing::warn!(
-                target: "session.create",
-                "hook produced an invalid environment key; skipping"
-            );
+            if warn_on_malformed_key(key) {
+                // Hook stdout is the documented secret channel, so never log a
+                // malformed key derived from it.
+                tracing::warn!(
+                    target: "session.create",
+                    "hook produced an invalid environment key; skipping"
+                );
+            }
             continue;
         }
         out.retain(|(k, _)| k != key);
         out.push((key.to_string(), value.to_string()));
     }
     out
+}
+
+/// True when a malformed env key should still raise a warning. A multi-word key
+/// (e.g. `fetching token from url`) is a hook diagnostic, not an env assignment;
+/// the documented contract ignores non-KEY=VALUE lines, so it is dropped
+/// silently. A single-token key that fails the grammar (e.g. `FOO-BAR`, `9BAD`)
+/// looks like an intended assignment and is worth surfacing, so a real config
+/// mistake is not buried under per-diagnostic log noise.
+fn warn_on_malformed_key(key: &str) -> bool {
+    !key.chars().any(|c| c.is_whitespace())
 }
 
 /// Run `host_hooks.before_start` commands on the host and collect the
@@ -1608,18 +1702,29 @@ pub const INIT_TEMPLATE: &str = r#"# Agent of Empires - Repository Configuration
 
 # [updates]
 # update_check_mode = "off"
-
-# [tmux]
-# status_bar = "auto"
-# mouse = "auto"
-
-# [sound]
-# enabled = false
 "#;
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing_test::traced_test;
+
+    /// Pin `SHELL` for a test that spawns a local hook. `build_hook_command`'s
+    /// local arm runs `user_shell()`, so an ambient `SHELL` this host cannot
+    /// run, or one another test is mid-way through exporting, surfaces here as
+    /// a hook failure naming the wrong cause. Resolved rather than hardcoded so
+    /// the FHS assumption #3421 removed stays removed; the guard also takes
+    /// `ENV_LOCK`, which closes the window from the writer side. See #3449.
+    #[must_use = "bind it to `_shell`; dropped immediately, it unpins SHELL again"]
+    fn pin_host_shell() -> Option<crate::session::test_support::EnvGuard> {
+        let Ok(sh) = which::which("sh") else {
+            eprintln!("not pinning SHELL: sh not found on PATH");
+            return None;
+        };
+        Some(crate::session::test_support::EnvGuard::set(&[(
+            "SHELL", &sh,
+        )]))
+    }
 
     #[test]
     fn test_hooks_config_empty() {
@@ -1665,8 +1770,48 @@ mod tests {
     }
 
     #[test]
+    fn test_warn_on_malformed_key() {
+        // Single-token keys that look like intended assignments warn; multi-word
+        // diagnostic lines stay silent so a hook printing `fetching token from
+        // url=...` does not spam the log.
+        let cases = [
+            ("FOO-BAR", true),
+            ("9BAD", true),
+            ("foo.bar", true),
+            ("fetching token from url", false),
+            ("error: token invalid", false),
+            ("", true),
+        ];
+        for (key, expected) in cases {
+            assert_eq!(
+                warn_on_malformed_key(key),
+                expected,
+                "warn_on_malformed_key({key:?})"
+            );
+        }
+    }
+
+    #[traced_test]
+    #[test]
+    fn test_parse_env_kv_lines_does_not_log_malformed_key() {
+        // Hook stdout is a secret channel. A no-whitespace diagnostic can look
+        // like a malformed assignment, so the warning must not repeat it.
+        tracing::callsite::rebuild_interest_cache();
+        let parsed = parse_env_kv_lines("https://token:topsecret@example.test?x=ignored\n");
+        assert!(parsed.is_empty());
+        logs_assert(|lines: &[&str]| {
+            if lines.iter().any(|line| line.contains("topsecret")) {
+                Err("hook stdout secret leaked into logs".to_string())
+            } else {
+                Ok(())
+            }
+        });
+    }
+
+    #[test]
     fn test_run_before_start_hooks_collects_kv() {
-        // Real host shell; multiple commands, later command's keys appended.
+        let _shell = pin_host_shell();
+        // Multiple commands; later command's keys appended.
         let tmp = tempfile::tempdir().unwrap();
         let cmds = vec![
             "echo GH_TOKEN=ghs_abc".to_string(),
@@ -1685,6 +1830,7 @@ mod tests {
 
     #[test]
     fn test_run_before_start_hooks_reads_session_env() {
+        let _shell = pin_host_shell();
         // A per-session value reaches the hook and can scope what it mints.
         let tmp = tempfile::tempdir().unwrap();
         let cmds = vec!["echo \"GH_TOKEN=tok-$TEST_VAR\"".to_string()];
@@ -1699,6 +1845,7 @@ mod tests {
 
     #[test]
     fn test_run_before_start_hooks_hard_fail() {
+        let _shell = pin_host_shell();
         let tmp = tempfile::tempdir().unwrap();
         let cmds = vec!["exit 3".to_string()];
         let err = run_before_start_hooks(&cmds, tmp.path(), &[], &[])
@@ -1708,6 +1855,7 @@ mod tests {
 
     #[test]
     fn test_run_before_start_hooks_error_omits_stdout_secret() {
+        let _shell = pin_host_shell();
         // A failing hook may have already printed secret KEY=VALUE lines; those
         // must never appear in the error (which can be logged/displayed). The
         // secret is supplied via env so it lives only in the hook's stdout, not
@@ -1761,6 +1909,7 @@ mod tests {
 
     #[test]
     fn test_run_before_session_hooks_collects_kv() {
+        let _shell = pin_host_shell();
         // The host counterpart of `before_start`: same stdout contract, so the
         // account/provider env a switcher prints is picked up verbatim.
         let tmp = tempfile::tempdir().unwrap();
@@ -1787,6 +1936,7 @@ mod tests {
 
     #[test]
     fn test_run_before_session_hooks_reads_lifecycle_env() {
+        let _shell = pin_host_shell();
         // The hook resolves what to mint from the session's identity, which is
         // the whole point of running it per launch rather than reading a file.
         let tmp = tempfile::tempdir().unwrap();
@@ -1805,6 +1955,7 @@ mod tests {
 
     #[test]
     fn test_run_before_session_hooks_error_names_before_session() {
+        let _shell = pin_host_shell();
         // A failure must point at the config key the user wrote, not at
         // `before_start`, and must still withhold stdout (the secret channel).
         let tmp = tempfile::tempdir().unwrap();
@@ -1986,13 +2137,69 @@ mod tests {
 
     #[test]
     fn test_repo_may_override_field() {
-        assert!(repo_may_override_field("session", "default_tool"));
-        assert!(repo_may_override_field("session", "agent_detect_as"));
-        assert!(repo_may_override_field("sandbox", "memory_limit"));
-        assert!(repo_may_override_field("worktree", "path_template"));
-        assert!(!repo_may_override_field("session", "custom_agents"));
-        assert!(!repo_may_override_field("sandbox", "default_image"));
-        assert!(!repo_may_override_field("acp", "auto_approve"));
+        // (section, field, expected) — the whitelist and denylist behavior
+        // across every scope the sanitizer / TUI query at runtime. tmux and
+        // sound rows guard #3229: their sections are not repo-overridable, so
+        // every field on them must answer false.
+        let cases = [
+            ("session", "default_tool", true),
+            ("session", "agent_detect_as", true),
+            ("sandbox", "memory_limit", true),
+            ("worktree", "path_template", true),
+            ("session", "custom_agents", false),
+            ("sandbox", "default_image", false),
+            ("acp", "auto_approve", false),
+            ("tmux", "status_bar", false),
+            ("tmux", "mouse", false),
+            ("tmux", "clipboard", false),
+            ("tmux", "socket_name", false),
+            ("tmux", "vt_live", false),
+            ("sound", "enabled", false),
+            ("sound", "on_start", false),
+        ];
+        for (section, field, expected) in cases {
+            assert_eq!(
+                repo_may_override_field(section, field),
+                expected,
+                "{section}.{field}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_merge_repo_config_strips_tmux_and_sound() {
+        // #3229: a repo config that sets `[tmux]` or `[sound]` merges to a
+        // no-op and the blocks are stripped from the allowed-override view
+        // used for save/edit.
+        // Every override must differ from the section's default value, or
+        // the "merge is a no-op" assertion below is a false-green (it would
+        // hold whether or not the sanitizer strips the block).
+        let repo: RepoConfig = toml::from_str(
+            r#"
+            [tmux]
+            status_bar = "enabled"
+            mouse = "enabled"
+            [sound]
+            enabled = true
+        "#,
+        )
+        .unwrap();
+        let base = Config::default();
+        let merged = merge_repo_config(base.clone(), &repo);
+        // Compare via serde_json since TmuxConfig/SoundConfig do not derive
+        // PartialEq; the JSON round-trip is the same shape the merge uses.
+        let merged_json = serde_json::to_value(&merged).unwrap();
+        let base_json = serde_json::to_value(&base).unwrap();
+        assert_eq!(
+            merged_json["tmux"], base_json["tmux"],
+            "repo-declared tmux must be dropped on merge"
+        );
+        assert_eq!(
+            merged_json["sound"], base_json["sound"],
+            "repo-declared sound must be dropped on merge"
+        );
+        assert!(repo.allowed_overrides().get("tmux").is_none());
+        assert!(repo.allowed_overrides().get("sound").is_none());
     }
 
     #[test]
@@ -2546,6 +2753,7 @@ trusted_at = "2026-01-31T00:00:00Z"
     ///   3. `GIT_ASKPASS` / `SSH_ASKPASS` are defanged
     #[test]
     fn streamed_hook_detached_from_tty() {
+        let _shell = pin_host_shell();
         let tmp = tempfile::tempdir().unwrap();
         let probe = r#"
             if [ -t 0 ]; then echo "STDIN=tty"; else echo "STDIN=notty"; fi
@@ -2596,6 +2804,7 @@ trusted_at = "2026-01-31T00:00:00Z"
     /// that explains why the hook failed.
     #[test]
     fn streamed_hook_failure_error_includes_output() {
+        let _shell = pin_host_shell();
         let tmp = tempfile::tempdir().unwrap();
         // The failure detail lives in a script file, not the hook command
         // line, mirroring real hooks (`npm install`, `./setup.sh`) whose
@@ -2625,6 +2834,7 @@ trusted_at = "2026-01-31T00:00:00Z"
     /// later hooks ran.
     #[test]
     fn streamed_hook_failure_names_position_when_multiple() {
+        let _shell = pin_host_shell();
         let tmp = tempfile::tempdir().unwrap();
         let hooks = vec![
             "true".to_string(),
@@ -2646,6 +2856,7 @@ trusted_at = "2026-01-31T00:00:00Z"
     /// text omits the "remaining hooks skipped" suffix.
     #[test]
     fn streamed_hook_failure_omits_skip_note_for_last_hook() {
+        let _shell = pin_host_shell();
         let tmp = tempfile::tempdir().unwrap();
         let hooks = vec!["true".to_string(), "sh -c 'exit 7'".to_string()];
         let (tx, _rx) = mpsc::channel();
@@ -2659,6 +2870,7 @@ trusted_at = "2026-01-31T00:00:00Z"
     /// A single hook keeps the error free of position noise.
     #[test]
     fn streamed_hook_failure_omits_position_when_single() {
+        let _shell = pin_host_shell();
         let tmp = tempfile::tempdir().unwrap();
         let (tx, _rx) = mpsc::channel();
         let err = execute_hooks_streamed(&["sh -c 'exit 7'".to_string()], tmp.path(), &tx, &[])
@@ -2672,7 +2884,10 @@ trusted_at = "2026-01-31T00:00:00Z"
     /// only verify the env vars are NOT forced here (stdin may or may not be
     /// a TTY depending on how tests are launched).
     #[test]
+    #[serial_test::serial]
     fn captured_hook_does_not_force_git_env() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["GIT_TERMINAL_PROMPT"]);
+        let _shell = pin_host_shell();
         let tmp = tempfile::tempdir().unwrap();
         let probe = "echo \"GIT_TERMINAL_PROMPT=${GIT_TERMINAL_PROMPT:-unset}\" > out.txt";
         execute_hooks(&[probe.to_string()], tmp.path(), &[]).unwrap();
@@ -2742,6 +2957,7 @@ trusted_at = "2026-01-31T00:00:00Z"
     /// `detach_tty` flag on `execute_hooks_best_effort` actually flows through.
     #[test]
     fn best_effort_hook_detaches_when_requested() {
+        let _shell = pin_host_shell();
         let tmp = tempfile::tempdir().unwrap();
         let probe = "echo \"GIT_TERMINAL_PROMPT=${GIT_TERMINAL_PROMPT:-unset}\" > out.txt";
         let errors = execute_hooks_best_effort(&[probe.to_string()], tmp.path(), true, &[]);
@@ -2759,7 +2975,10 @@ trusted_at = "2026-01-31T00:00:00Z"
     }
 
     #[test]
+    #[serial_test::serial]
     fn best_effort_hook_attached_for_cli() {
+        let _env = crate::session::test_support::EnvGuard::unset(&["GIT_TERMINAL_PROMPT"]);
+        let _shell = pin_host_shell();
         let tmp = tempfile::tempdir().unwrap();
         let probe = "echo \"GIT_TERMINAL_PROMPT=${GIT_TERMINAL_PROMPT:-unset}\" > out.txt";
         let errors = execute_hooks_best_effort(&[probe.to_string()], tmp.path(), false, &[]);
@@ -2840,6 +3059,7 @@ trusted_at = "2026-01-31T00:00:00Z"
     /// paths so a regression in any one of them fails this test.
     #[test]
     fn local_hooks_see_session_env_vars() {
+        let _shell = pin_host_shell();
         use crate::session::Instance;
 
         let tmp = tempfile::tempdir().unwrap();

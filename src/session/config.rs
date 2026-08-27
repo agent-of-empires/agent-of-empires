@@ -118,6 +118,37 @@ pub struct AgentRuntimeConfig {
     /// defaults by event name when status hooks are installed.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub status_map: BTreeMap<String, crate::agents::HookStatus>,
+
+    /// Declarative pane status rules (`[[agents.<name>.status_rules]]`).
+    /// Gives an agent with no built-in pane detector, typically a
+    /// `[session.custom_agents]` harness that is not the same binary as any
+    /// built-in, basic status detection without a code change. Ordered,
+    /// first match wins, no match reports `idle`. Rules take precedence over
+    /// `agent_detect_as` and over a built-in detector of the same name.
+    /// Compiled into `tmux::status_rules` on config resolve.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub status_rules: Vec<StatusRule>,
+}
+
+/// One declarative pane status rule. `status` is required; exactly one of
+/// `contains` (case-insensitive substring) or `regex` (Rust regex syntax)
+/// must be set. Both are matched against the ANSI-stripped pane snapshot.
+/// A rule with neither, both, or an invalid regex is skipped with a warning
+/// at compile time (`tmux::status_rules::install_from_config`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct StatusRule {
+    /// Status to report when the rule matches: `running`, `waiting`,
+    /// `idle`, or `error`.
+    pub status: crate::agents::HookStatus,
+
+    /// Case-insensitive substring to look for in the pane text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub contains: Option<String>,
+
+    /// Regex (Rust `regex` crate syntax) matched against the pane text as
+    /// written; prefix with `(?i)` for case-insensitive matching.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub regex: Option<String>,
 }
 
 /// Configuration for one plugin: whether it is enabled, its install source and
@@ -684,13 +715,15 @@ pub enum GroupByMode {
     #[default]
     Manual,
     Project,
+    Org,
 }
 
 impl GroupByMode {
     pub fn cycle(self) -> Self {
         match self {
             GroupByMode::Manual => GroupByMode::Project,
-            GroupByMode::Project => GroupByMode::Manual,
+            GroupByMode::Project => GroupByMode::Org,
+            GroupByMode::Org => GroupByMode::Manual,
         }
     }
 
@@ -698,6 +731,7 @@ impl GroupByMode {
         match self {
             GroupByMode::Manual => "Manual",
             GroupByMode::Project => "Project",
+            GroupByMode::Org => "Org",
         }
     }
 }
@@ -806,6 +840,13 @@ pub struct AppStateConfig {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub project_group_collapsed: Vec<String>,
 
+    /// Paths of org-mode sidebar folders the user has collapsed. Same shape
+    /// and rationale as `project_group_collapsed`: org headers are derived
+    /// from each session's resolved remote owner rather than a persisted
+    /// group record, so their collapse state has nowhere else to live.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub org_group_collapsed: Vec<String>,
+
     /// Ids of tips the user has already seen/acknowledged. Drives the unseen
     /// badge count and stops earned tips from re-popping. Ids come from
     /// [`crate::tips`] and are stable, so this list stays meaningful across
@@ -825,6 +866,16 @@ pub struct AppStateConfig {
     /// the count above crosses the threshold.
     #[serde(default)]
     pub used_new_from_selection: bool,
+
+    /// Set after six live agents have been observed for three consecutive
+    /// health samples, making the System Health discovery tip eligible.
+    #[serde(default)]
+    pub system_health_tip_earned: bool,
+
+    /// Set once the detailed System Health view has been opened. Users who
+    /// found it themselves do not need its earned discovery tip.
+    #[serde(default)]
+    pub used_system_health: bool,
 
     /// Server-side mirror of the web dashboard's syncable UI state, keyed by
     /// the frontend's localStorage key (the value is the opaque string the
@@ -856,6 +907,13 @@ pub struct SessionConfig {
     #[serde(default)]
     #[setting(label = "YOLO Mode Default", widget = "toggle")]
     pub yolo_mode_default: bool,
+
+    /// Show the compact system-health strip below the session list. It reports
+    /// CPU, memory pressure, and running agent and process counts. Off by
+    /// default; also toggleable from the command palette.
+    #[serde(default)]
+    #[setting(label = "Show system health strip", widget = "toggle")]
+    pub show_diagnostics_pane: bool,
 
     /// Forward AoE's whole environment to host sessions instead of just the
     /// desktop vars (DISPLAY, XDG_*, DBUS). Lets vars like GOPATH reach an
@@ -1097,13 +1155,15 @@ pub struct SessionConfig {
     pub delete_to_trash: bool,
 
     /// Ask for confirmation before deleting a session with the TUI `d` key.
-    /// Off by default so the trash-first flow stays low-friction: `d` moves
-    /// the session straight to the trash. When on, `d` opens a confirmation
-    /// dialog first, guarding against a fumbled keystroke trashing the wrong
-    /// (possibly running) session. Only affects the TUI trash path; the web
-    /// delete dialog already confirms, and the permanent-delete/force-remove
-    /// paths are gated by their own dialogs regardless. See #2583.
-    #[serde(default)]
+    /// On by default: `d` opens a confirmation dialog that a second `d`
+    /// accepts and `Esc` dismisses, so typing into the sidebar while a
+    /// session is selected can no longer trash it outright. Turn it off (here
+    /// or with the dialog's "don't warn me again" checkbox) to get the
+    /// historical one-keystroke trash back. Only affects the TUI
+    /// trash path; the web delete dialog already confirms, and the
+    /// permanent-delete/force-remove paths are gated by their own dialogs
+    /// regardless. See #2583, #3364.
+    #[serde(default = "default_true")]
     #[setting(label = "Confirm Before Delete", widget = "toggle")]
     pub confirm_delete: bool,
 
@@ -1513,6 +1573,7 @@ impl Default for SessionConfig {
         Self {
             default_tool: None,
             yolo_mode_default: false,
+            show_diagnostics_pane: false,
             inherit_host_environment: false,
             agent_extra_args: HashMap::new(),
             agent_command_override: HashMap::new(),
@@ -1531,7 +1592,7 @@ impl Default for SessionConfig {
             strict_hotkeys: false,
             snooze_duration_minutes: 30,
             delete_to_trash: true,
-            confirm_delete: false,
+            confirm_delete: true,
             trash_retention_days: default_trash_retention_days(),
             auto_stop_idle_secs: default_auto_stop_idle_secs(),
             prevent_sleep_when_active: false,
@@ -2424,12 +2485,11 @@ pub struct TmuxConfig {
     )]
     pub socket_name: Option<String>,
 
-    /// Render live views from a persistent VT channel (`tmux pipe-pane` into
-    /// an in-process terminal grid) instead of polling `capture-pane` and
-    /// forking `send-keys` per keystroke. Needs tmux 3.4+; panes that cannot
-    /// arm a channel fall back to the capture path automatically. Disable
-    /// only to troubleshoot the VT transport; the fallback is slower and
-    /// loses agent clipboard forwarding in live-send.
+    /// Render native agent and tool previews from a persistent VT channel
+    /// (`tmux pipe-pane` into an in-process terminal grid) instead of polling
+    /// `capture-pane` and forking `send-keys` per keystroke. Terminal previews,
+    /// including the web terminal, always use tmux's rendered capture and keep
+    /// OSC 52 forwarding through a raw observer.
     #[serde(default = "default_true")]
     #[setting(label = "VT Live Transport", widget = "toggle", advanced, global_only)]
     pub vt_live: bool,
@@ -2487,8 +2547,13 @@ pub fn user_has_tmux_config() -> bool {
 /// A tmux option group aoe manages on its own sessions, one variant per
 /// `[tmux]` setting that writes to tmux.
 ///
-/// Adding a managed option is a variant plus a `TmuxSetting::row` arm, not a
-/// new `should_apply_*` helper plus an edit to each of the three create paths.
+/// Adding a managed option is a variant plus a `TmuxSetting::row` arm and an
+/// entry in `TmuxSetting::ALL`, not a new `should_apply_*` helper plus an
+/// edit to each of the three create paths. A setting whose application is
+/// post-creation (theme painting, unsets of stale session-scoped values)
+/// also needs a change in
+/// [`crate::tmux::status_bar::apply_all_tmux_options`], which does not
+/// iterate `ALL`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TmuxSetting {
     /// aoe's themed status bar, nine session options wide.
@@ -2533,48 +2598,161 @@ enum TmuxAutoDefer {
     WhenUserHasAnyConfig,
 }
 
-/// One row of the managed-settings table: where the mode is read from, and what
-/// makes `auto` defer. Returned by value; it is two words wide.
+/// One tmux `set-option` aoe writes on its own sessions, at creation.
+///
+/// The variant is the scope the write addresses (session `-t <target>`,
+/// server `-s`, window `-w -t <target>`), so a write's scope flags follow
+/// from its variant alone; the target of session/window writes is a runtime
+/// parameter of the emitter, not a property of the write. Scope flags are
+/// emitted explicitly (`-s`, `-w`, `-t`) rather than left to tmux's scope
+/// inference, so the write is unambiguous and resilient to future inference
+/// changes (same convention as `append_remain_on_exit_args`). `quiet` adds
+/// tmux's `-q` (ignore unknown options), which aoe needs for
+/// `allow-passthrough` on tmux < 3.3, where `allow-passthrough` does not
+/// exist and the set-option call would otherwise fail the whole
+/// `new-session` invocation; it is a per-write property, not a scope
+/// property.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum TmuxOptionWrite {
+    /// `set-option [-q] -t <target> <option> <value>` on the new session.
+    Session {
+        option: &'static str,
+        value: &'static str,
+        quiet: bool,
+    },
+    /// `set-option [-q] -s <option> <value>` on the shared server (no target).
+    Server {
+        option: &'static str,
+        value: &'static str,
+        quiet: bool,
+    },
+    /// `set-option [-q] -w -t <target> <option> <value>` on the new window.
+    Window {
+        option: &'static str,
+        value: &'static str,
+        quiet: bool,
+    },
+}
+
+/// One row of the managed-settings table: where the mode is read from, what
+/// makes `auto` defer, and the writes aoe emits at creation (`apply`) or to
+/// turn the setting off where "off" is expressible (`force_off`).
+///
+/// The enum variant is the row's identity; there is no `key` field because
+/// nothing consumes one (the issue sketch reserved it for docs and logs).
 struct TmuxManagedSetting {
     mode: fn(&TmuxConfig) -> TmuxSettingMode,
     defer: TmuxAutoDefer,
+    /// Writes emitted when the setting resolves to [`TmuxSettingAction::Apply`].
+    apply: &'static [TmuxOptionWrite],
+    /// Writes emitted when the setting resolves to
+    /// [`TmuxSettingAction::ForceOff`]; empty when "off" is not expressible.
+    force_off: &'static [TmuxOptionWrite],
 }
 
 impl TmuxSetting {
-    /// The single source of truth for how each managed setting resolves. Both
-    /// facts live in one arm so they cannot drift apart.
+    /// The settings aoe manages, in the order the create path applies them.
+    /// `StatusBar` is resolved but emits nothing at creation (its write lists
+    /// are empty), so the emitted order is `Mouse` then `Clipboard`, as the
+    /// create path has always used. Not exhaustive by construction: a variant
+    /// added without an `ALL` entry compiles and is silently skipped, so keep
+    /// the list in step with the enum (a tripwire test enforces it).
+    pub(crate) const ALL: [TmuxSetting; 3] = [Self::StatusBar, Self::Mouse, Self::Clipboard];
+
+    /// The single source of truth for how each managed setting resolves and
+    /// applies. Every fact of the row lives in one arm so they cannot drift
+    /// apart: the config field the mode is read from, the `auto` defer rule,
+    /// and the writes each action emits.
     fn row(self) -> TmuxManagedSetting {
         match self {
+            // Painted after creation by `status_bar::apply_all_tmux_options`,
+            // which computes the theme's values dynamically; both lists are
+            // empty so creation emits nothing for it.
             Self::StatusBar => TmuxManagedSetting {
                 mode: |tmux| tmux.status_bar,
                 defer: TmuxAutoDefer::WhenUserHasAnyConfig,
+                apply: &[],
+                force_off: &[],
             },
             Self::Mouse => TmuxManagedSetting {
                 mode: |tmux| tmux.mouse,
                 defer: TmuxAutoDefer::WhenUserSets(&["mouse"]),
+                apply: &[TmuxOptionWrite::Session {
+                    option: "mouse",
+                    value: "on",
+                    quiet: false,
+                }],
+                force_off: &[TmuxOptionWrite::Session {
+                    option: "mouse",
+                    value: "off",
+                    quiet: false,
+                }],
             },
             // Both options aoe writes count: a user who set either one has
             // taken over OSC 52 forwarding, and aoe applying only the other
-            // half would be a partial override of a deliberate choice.
+            // half would be a partial override of a deliberate choice. Both
+            // are written defensively: programs vary in which form they emit
+            // (raw OSC 52 vs the `\ePtmux;...\e\\`-wrapped form OpenCode
+            // uses), so one half alone would drop the other's passthrough.
+            // `force_off` stays empty: the options are server- and
+            // window-scoped, so unsetting them would reach past aoe's own
+            // sessions into the user's whole tmux server.
             Self::Clipboard => TmuxManagedSetting {
                 mode: |tmux| tmux.clipboard,
                 defer: TmuxAutoDefer::WhenUserSets(&["set-clipboard", "allow-passthrough"]),
+                apply: &[
+                    TmuxOptionWrite::Server {
+                        option: "set-clipboard",
+                        value: "on",
+                        quiet: true,
+                    },
+                    TmuxOptionWrite::Window {
+                        option: "allow-passthrough",
+                        value: "on",
+                        quiet: true,
+                    },
+                ],
+                force_off: &[],
             },
         }
+    }
+}
+
+/// The writes one action emits for one managed setting, straight from the
+/// table. `LeaveToUser` is creation-time skip: a fresh session has no
+/// session-scoped value aoe wrote, so declining to write one already leaves
+/// the user's own config in charge (#3207). (The post-creation path,
+/// `status_bar::apply_all_tmux_options`, actively unsets instead; that is a
+/// different concern and keeps its own code.)
+pub(crate) fn tmux_setting_writes(
+    setting: TmuxSetting,
+    action: TmuxSettingAction,
+) -> &'static [TmuxOptionWrite] {
+    let row = setting.row();
+    match action {
+        TmuxSettingAction::Apply => row.apply,
+        TmuxSettingAction::ForceOff => row.force_off,
+        TmuxSettingAction::LeaveToUser => &[],
     }
 }
 
 /// What aoe should do with one managed tmux setting.
 ///
 /// Resolution is uniform across settings; *application* is not, because tmux
-/// options differ in scope and not all of them can express every action. Each
-/// applier maps the three actions like this:
+/// options differ in scope and not all of them can express every action. The
+/// table's `apply` / `force_off` lists map the three actions like this:
 ///
 /// | setting | `Apply` | `ForceOff` | `LeaveToUser` |
 /// |---|---|---|---|
 /// | `Mouse` | `mouse on` | `mouse off` | unset the session's `mouse` |
 /// | `StatusBar` | paint aoe's themed bar | unset aoe's `status*` overrides | same as `ForceOff` |
 /// | `Clipboard` | set both options | write nothing | write nothing |
+///
+/// The `StatusBar` row and the `Mouse` `LeaveToUser` column describe the
+/// post-creation path (`status_bar::apply_all_tmux_options`), which paints the
+/// theme and clears stale session-scoped values on existing sessions; at
+/// creation only the `apply` / `force_off` lists are emitted, so `StatusBar`
+/// writes nothing and `Mouse` `LeaveToUser` writes nothing.
 ///
 /// `StatusBar` has no way to express "hide the bar": `disabled` means "stop
 /// painting aoe's", which reverts to whatever the user's own config says. The
@@ -2780,7 +2958,12 @@ fn config_save_lock() -> &'static Mutex<()> {
 }
 
 impl Config {
-    pub fn load() -> Result<Self> {
+    /// Read and parse `config.toml` into a raw `toml::Table`, with the
+    /// stale `app_state` section stripped. Shared prelude for [`Config::load`]
+    /// and [`Config::config_ignored_keys`]; keeping the read + strip in one
+    /// place stops the ignored-key probe from ever flagging a section `load`
+    /// silently drops.
+    fn load_raw_table() -> Result<toml::Table> {
         let path = config_path()?;
         let mut table: toml::Table = if path.exists() {
             toml::from_str(&fs::read_to_string(&path)?)?
@@ -2791,9 +2974,35 @@ impl Config {
         // from before the split (or written by an out-of-date peer) so it
         // never shadows the authoritative source below.
         table.remove("app_state");
+        Ok(table)
+    }
+
+    pub fn load() -> Result<Self> {
+        let table = Self::load_raw_table()?;
         let mut config: Config = table.try_into()?;
         config.app_state = AppStateConfig::load()?;
         Ok(config)
+    }
+
+    /// Dotted paths of keys in the on-disk `config.toml` that `Config` does not
+    /// recognize (unknown struct fields at any depth), so a typo like
+    /// `[sandbox] privildged = true` surfaces instead of being silently
+    /// dropped. Only called on the Ok path: `Config::load` errored out already
+    /// carries the load-error text, and the two failure classes are per-file
+    /// mutually exclusive (no `deny_unknown_fields`, so an unknown key never
+    /// fails the load). Map-keyed sections (`agents`, `tools`, `plugins`,
+    /// `session.custom_agents`, `acp.acp_defaults`, ...) never flag because
+    /// their keys are entries, not struct fields; nested struct-field typos
+    /// inside them still do.
+    pub(crate) fn config_ignored_keys() -> Vec<String> {
+        let Ok(table) = Self::load_raw_table() else {
+            return Vec::new();
+        };
+        let mut ignored = Vec::new();
+        let _ = serde_ignored::deserialize::<_, _, Config>(toml::Value::Table(table), |path| {
+            ignored.push(path.to_string());
+        });
+        ignored
     }
 
     /// Like [`Config::load`], but logs a warning on failure and returns defaults
@@ -3314,6 +3523,63 @@ mod tests {
         }
     }
 
+    /// The options `auto` defers on must be exactly the options the row writes
+    /// on `Apply`: a write added without its defer entry would override a user
+    /// who took that option in hand, the #3207 failure mode for a new option.
+    /// Compared as sets, because the defer's order is unobservable: the
+    /// recognizer matches any order.
+    #[test]
+    fn test_tmux_setting_defer_matches_apply_options() {
+        for setting in TmuxSetting::ALL {
+            let row = setting.row();
+            let TmuxAutoDefer::WhenUserSets(defer_options) = row.defer else {
+                // StatusBar defers on config existence, not on any option.
+                continue;
+            };
+            let mut defer_names: Vec<&str> = defer_options.to_vec();
+            defer_names.sort_unstable();
+            let mut apply_names: Vec<&str> = row
+                .apply
+                .iter()
+                .map(|w| match *w {
+                    TmuxOptionWrite::Session { option, .. }
+                    | TmuxOptionWrite::Server { option, .. }
+                    | TmuxOptionWrite::Window { option, .. } => option,
+                })
+                .collect();
+            apply_names.sort_unstable();
+            assert_eq!(
+                apply_names, defer_names,
+                "{setting:?}: defer options and apply writes must name the same options"
+            );
+        }
+    }
+
+    /// The compiler tripwire for [`TmuxSetting::ALL`]: the exhaustive match
+    /// fails to compile when an enum variant is added, forcing a reviewer to
+    /// add a brace here; the equality then pins `ALL`'s content and emission
+    /// order against this literal. The unified applier iterates `ALL`, so a
+    /// setting missing from both the list and this literal would be silently
+    /// never applied; keeping the two in step is the point of the test.
+    #[test]
+    fn test_tmux_setting_all_is_exhaustive() {
+        let setting = TmuxSetting::StatusBar;
+        match setting {
+            TmuxSetting::StatusBar => {}
+            TmuxSetting::Mouse => {}
+            TmuxSetting::Clipboard => {}
+        }
+        assert_eq!(
+            TmuxSetting::ALL,
+            [
+                TmuxSetting::StatusBar,
+                TmuxSetting::Mouse,
+                TmuxSetting::Clipboard
+            ],
+            "ALL must list every variant exactly once, in emission order"
+        );
+    }
+
     #[test]
     fn test_effective_profile_returns_input_when_non_empty() {
         // Non-empty input is passed through verbatim, regardless of what's
@@ -3800,16 +4066,22 @@ mod tests {
         assert!(app.tips_seen.is_empty());
         assert_eq!(app.new_session_with_selection_count, 0);
         assert!(!app.used_new_from_selection);
+        assert!(!app.system_health_tip_earned);
+        assert!(!app.used_system_health);
 
         let toml = r#"
             tips_seen = ["new-from-selection"]
             new_session_with_selection_count = 4
             used_new_from_selection = true
+            system_health_tip_earned = true
+            used_system_health = true
         "#;
         let app: AppStateConfig = toml::from_str(toml).unwrap();
         assert_eq!(app.tips_seen, vec!["new-from-selection"]);
         assert_eq!(app.new_session_with_selection_count, 4);
         assert!(app.used_new_from_selection);
+        assert!(app.system_health_tip_earned);
+        assert!(app.used_system_health);
 
         // Round-trips back out.
         let serialized = toml::to_string(&app).unwrap();
@@ -4116,6 +4388,45 @@ mod tests {
     }
 
     #[test]
+    fn agent_status_rules_roundtrip() {
+        let toml = r#"
+            [[agents.gjc.status_rules]]
+            status = "running"
+            contains = "esc to interrupt"
+
+            [[agents.gjc.status_rules]]
+            status = "waiting"
+            regex = "\\(y/n\\)"
+        "#;
+
+        let config: Config = toml::from_str(toml).unwrap();
+        let rules = &config.agents["gjc"].status_rules;
+        assert_eq!(rules.len(), 2);
+        assert_eq!(rules[0].status, crate::agents::HookStatus::Running);
+        assert_eq!(rules[0].contains.as_deref(), Some("esc to interrupt"));
+        assert!(rules[0].regex.is_none());
+        assert_eq!(rules[1].status, crate::agents::HookStatus::Waiting);
+        assert_eq!(rules[1].regex.as_deref(), Some(r"\(y/n\)"));
+
+        let serialized = toml::to_string_pretty(&config).unwrap();
+        assert!(serialized.contains("[[agents.gjc.status_rules]]"));
+        let reparsed: Config = toml::from_str(&serialized).unwrap();
+        assert_eq!(reparsed.agents["gjc"].status_rules, *rules);
+    }
+
+    #[test]
+    fn agent_status_rules_reject_invalid_status() {
+        let toml = r#"
+            [[agents.gjc.status_rules]]
+            status = "stopped"
+            contains = "x"
+        "#;
+
+        let err = toml::from_str::<Config>(toml).unwrap_err();
+        assert!(err.to_string().contains("stopped"));
+    }
+
+    #[test]
     fn acp_defaults_effort_for_model_prefers_per_model_then_flat() {
         let mut defaults = AcpAgentDefaults {
             effort: Some("low".to_string()),
@@ -4286,11 +4597,14 @@ mod tests {
     }
 
     #[test]
-    fn test_confirm_before_quit_absent_from_toml_defaults_on() {
-        // An older config.toml with no `confirm_before_quit` key must
-        // deserialize to the enabled default, not false.
+    fn test_default_on_guards_absent_from_toml_default_on() {
+        // An older config.toml with no key for a default-on guard must
+        // deserialize to the enabled default, not false. A plain
+        // `#[serde(default)]` would give `bool::default()` here and silently
+        // strand every pre-existing config on the old behavior.
         let session: SessionConfig = toml::from_str("").unwrap();
-        assert!(session.confirm_before_quit);
+        assert!(session.confirm_before_quit, "confirm_before_quit (#1569)");
+        assert!(session.confirm_delete, "confirm_delete (#3364)");
     }
 
     #[test]
@@ -4592,7 +4906,7 @@ volume_ignores_strategy = "named"
         // call below. `update_config` loads fresh internally, so this must
         // survive.
         let mut external = Config::load().unwrap();
-        external.session.confirm_delete = true;
+        external.session.confirm_delete = false;
         let table = toml::Table::try_from(&external).unwrap();
         super::super::atomic_write(
             &config_path().unwrap(),
@@ -4611,7 +4925,7 @@ volume_ignores_strategy = "named"
             "the field update_config touched must be applied"
         );
         assert!(
-            final_config.session.confirm_delete,
+            !final_config.session.confirm_delete,
             "an external process's concurrent edit to an unrelated field must survive"
         );
     }

@@ -4,7 +4,7 @@
 // Setup docs now promise. Closes #1841.
 
 import { test, expect } from "@playwright/test";
-import { listSessions, spawnAoeServe, waitForView } from "../helpers/aoeServe";
+import { spawnAoeServe, waitForSessions, waitForView } from "../helpers/aoeServe";
 import { waitForStructuredView } from "../helpers/acp";
 
 test("wizard with Use structured view on creates a structured_view session", async ({ page }, testInfo) => {
@@ -40,13 +40,7 @@ test("wizard with Use structured view on creates a structured_view session", asy
 
     // Server-side: one session exists and is persisted with structured_view
     // true, the behavior the rewritten docs describe.
-    await expect
-      .poll(async () => (await listSessions(serve.baseUrl)).length, {
-        timeout: 15_000,
-      })
-      .toBeGreaterThan(0);
-
-    const sessions = await listSessions(serve.baseUrl);
+    const sessions = await waitForSessions(serve.baseUrl);
     expect(sessions).toHaveLength(1);
     await waitForView(serve.baseUrl, sessions[0]!.id, "structured");
   } finally {
@@ -83,7 +77,7 @@ test("wizard auto-approve starts Codex in full-access mode", async ({ page }, te
     await waitForStructuredView(page);
     await expect(page.getByRole("button", { name: /Agent \(full access\)/ }).first()).toBeVisible({ timeout: 15_000 });
 
-    const sessions = await listSessions(serve.baseUrl);
+    const sessions = await waitForSessions(serve.baseUrl);
     expect(sessions).toHaveLength(1);
     expect(sessions[0]!.tool).toBe("codex");
     expect(sessions[0]!.yolo_mode).toBe(true);

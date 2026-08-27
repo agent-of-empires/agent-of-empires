@@ -6,11 +6,10 @@ import type { PluginUiEntry } from "../../../lib/api";
 import {
   PluginCards,
   PluginComposerActions,
+  PluginHomePanes,
   PluginPaneBody,
   PluginRowBadges,
-  PluginSettingsPage,
   PluginStatusBarSegments,
-  PluginToolCardBadges,
 } from "../PluginSlots";
 import { composerDraftOperation } from "../composerDraftOperation";
 
@@ -114,6 +113,76 @@ describe("plugin slot renderers", () => {
     render(<PluginCards />);
     expect(screen.getByText("Coverage")).toBeTruthy();
     expect(screen.getByText("92%")).toBeTruthy();
+  });
+
+  it("sparkline block renders one line segment per value gap, colored by band", () => {
+    const entry: PluginUiEntry = {
+      plugin_id: "acme.diag",
+      slot: "pane",
+      id: "p",
+      session_id: "s1",
+      payload: {
+        blocks: [
+          {
+            kind: "sparkline",
+            values: [10, 70, 95],
+            max: 100,
+            bands: [
+              { at: 70, tone: "warn" },
+              { at: 90, tone: "danger" },
+            ],
+          },
+        ],
+      },
+    };
+    const { container } = render(<PluginPaneBody entry={entry} />);
+    expect(screen.getByTestId("plugin-pane-sparkline")).toBeTruthy();
+    const lines = container.querySelectorAll("line");
+    // n values -> n-1 segments.
+    expect(lines.length).toBe(2);
+    // Each segment is colored by the band its right-hand value reaches (70 ->
+    // warn, 95 -> danger); base is neither.
+    expect(lines[0].getAttribute("class")).toContain("text-status-waiting");
+    expect(lines[1].getAttribute("class")).toContain("text-status-error");
+  });
+
+  it("sparkline block renders a band-colored point for one value", () => {
+    const entry: PluginUiEntry = {
+      plugin_id: "acme.diag",
+      slot: "pane",
+      id: "p",
+      session_id: "s1",
+      payload: {
+        blocks: [{ kind: "sparkline", values: [95], max: 100, bands: [{ at: 90, tone: "danger" }] }],
+      },
+    };
+    const { container } = render(<PluginPaneBody entry={entry} />);
+    const point = container.querySelector("circle");
+    expect(point).toBeTruthy();
+    expect(point?.getAttribute("class")).toContain("text-status-error");
+  });
+
+  it("home-pane renders a global entry's blocks on the overview", () => {
+    set([
+      {
+        plugin_id: "acme.diag",
+        slot: "home-pane",
+        id: "mem",
+        payload: { title: "memory", blocks: [{ kind: "sparkline", values: [1, 2, 3] }] },
+      },
+    ]);
+    render(<PluginHomePanes />);
+    expect(screen.getByText("memory")).toBeTruthy();
+    expect(screen.getByTestId("plugin-pane-sparkline")).toBeTruthy();
+  });
+
+  it("home-pane renders the simple title/body form's title exactly once", () => {
+    // The card chrome renders the title; the body must not repeat it for the
+    // block-less {title, body} payload.
+    set([{ plugin_id: "acme.disk", slot: "home-pane", id: "d", payload: { title: "Disk", body: "42% used" } }]);
+    render(<PluginHomePanes />);
+    expect(screen.getAllByText("Disk")).toHaveLength(1);
+    expect(screen.getByText("42% used")).toBeTruthy();
   });
 
   it("pane action button forwards the named worker method", async () => {
@@ -586,98 +655,6 @@ describe("plugin slot renderers", () => {
     expect(toggle.getAttribute("aria-expanded")).toBe("true");
     fireEvent.click(toggle);
     expect(body.className).toContain("line-clamp-3");
-  });
-
-  it("settings-page shows a waiting state until its global entry is pushed", () => {
-    // Nav appears on declaration, so before the worker pushes anything the page
-    // is empty: render an explicit waiting state, not a blank page.
-    set([]);
-    const { rerender } = render(<PluginSettingsPage pluginId="acme.mcp" contribId="servers" pluginName="MCP" />);
-    expect(screen.getByTestId("plugin-settings-page-waiting")).toBeTruthy();
-    expect(screen.getByText(/Waiting for MCP/)).toBeTruthy();
-
-    // Once the plugin pushes its global (session-less) settings-page entry, the
-    // page body renders through the shared block vocabulary.
-    set([
-      {
-        plugin_id: "acme.mcp",
-        slot: "settings-page",
-        id: "servers",
-        payload: { blocks: [{ kind: "heading", text: "Servers" }] },
-      },
-    ]);
-    rerender(<PluginSettingsPage pluginId="acme.mcp" contribId="servers" pluginName="MCP" />);
-    expect(screen.queryByTestId("plugin-settings-page-waiting")).toBeNull();
-    expect(screen.getByTestId("plugin-settings-page")).toBeTruthy();
-    expect(screen.getByText("Servers")).toBeTruthy();
-  });
-
-  it("settings-page selects only the matching (plugin_id, id) global entry", () => {
-    // A different plugin's or contribution's entry must not fill this page, and
-    // a per-session entry (session_id set) is never a settings-page match.
-    set([
-      { plugin_id: "other.kit", slot: "settings-page", id: "servers", payload: { title: "Other" } },
-      {
-        plugin_id: "acme.mcp",
-        slot: "settings-page",
-        id: "other",
-        payload: { title: "Wrong page" },
-      },
-      {
-        plugin_id: "acme.mcp",
-        slot: "settings-page",
-        id: "servers",
-        session_id: "s1",
-        payload: { title: "Scoped" },
-      },
-    ]);
-    render(<PluginSettingsPage pluginId="acme.mcp" contribId="servers" pluginName="MCP" />);
-    expect(screen.getByTestId("plugin-settings-page-waiting")).toBeTruthy();
-    expect(screen.queryByText("Other")).toBeNull();
-    expect(screen.queryByText("Wrong page")).toBeNull();
-    expect(screen.queryByText("Scoped")).toBeNull();
-  });
-});
-
-describe("tool-card-badge renderer", () => {
-  beforeEach(() => {
-    entriesRef.current = [];
-  });
-
-  const badge = (target: { kind: string; name: string }, text: string): PluginUiEntry => ({
-    plugin_id: "acme.prov",
-    slot: "tool-card-badge",
-    id: "provenance",
-    session_id: "s1",
-    payload: { items: [{ target, text }] },
-  });
-
-  it("renders the pill whose target matches the card kind and name", () => {
-    set([badge({ kind: "mcp", name: "github" }, "MCP")]);
-    render(<PluginToolCardBadges sessionId="s1" kind="mcp" target="github" />);
-    expect(screen.getByText("MCP")).toBeTruthy();
-  });
-
-  it("ignores badges whose target name differs", () => {
-    set([badge({ kind: "mcp", name: "github" }, "MCP")]);
-    const { container } = render(<PluginToolCardBadges sessionId="s1" kind="mcp" target="gitlab" />);
-    expect(container.textContent).toBe("");
-  });
-
-  it("does not cross-render an mcp badge onto a same-named skill card", () => {
-    set([badge({ kind: "mcp", name: "deploy" }, "from-mcp")]);
-    const { container } = render(<PluginToolCardBadges sessionId="s1" kind="skill" target="deploy" />);
-    expect(container.textContent).toBe("");
-  });
-
-  it("renders only the addressed session's badges", () => {
-    set([
-      { ...badge({ kind: "mcp", name: "github" }, "mine"), session_id: "s1" },
-      { ...badge({ kind: "mcp", name: "github" }, "other"), session_id: "s2" },
-    ]);
-    render(<PluginToolCardBadges sessionId="s1" kind="mcp" target="github" />);
-    expect(screen.getByText("mine")).toBeTruthy();
-    expect(screen.queryByText("other")).toBeNull();
   });
 });
 

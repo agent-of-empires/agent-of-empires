@@ -11,6 +11,7 @@ import { describe, expect, it, vi, beforeAll } from "vitest";
 import { fireEvent, render } from "@testing-library/react";
 import { MobileLiveTerminal } from "../MobileLiveTerminal";
 import type { LiveFrame } from "../../hooks/useLiveTerminal";
+import { deliverMobileKeyboardProxyInput } from "../../lib/mobileKeyboardProxy";
 
 // Both font keys: jsdom's matchMedia reports a fine pointer, so the component
 // reads desktopFontSize; leaving it undefined made fontSize (and every px of
@@ -37,11 +38,13 @@ function frame(over: Partial<LiveFrame>): LiveFrame {
     altScreen: false,
     mouse: false,
     mouseSgr: false,
+    pane0: null,
     ...over,
   };
 }
 
 function renderTerm(f: LiveFrame, forwardWheel = vi.fn(), forwardButton = vi.fn(), sendData = vi.fn()) {
+  const inputRef = createRef<HTMLTextAreaElement>();
   const utils = render(
     <MobileLiveTerminal
       frame={f}
@@ -58,14 +61,14 @@ function renderTerm(f: LiveFrame, forwardWheel = vi.fn(), forwardButton = vi.fn(
       forwardButton={forwardButton}
       ctrlActiveRef={createRef<boolean>() as React.RefObject<boolean>}
       clearCtrl={vi.fn()}
-      inputRef={createRef<HTMLTextAreaElement>()}
+      inputRef={inputRef}
       onInputFocusChange={vi.fn()}
       bottomAlign
       keyboardOpen={false}
     />,
   );
   const scroller = utils.container.querySelector("[data-live-terminal] > div") as HTMLElement;
-  return { ...utils, scroller, forwardWheel, forwardButton, sendData };
+  return { ...utils, scroller, forwardWheel, forwardButton, sendData, inputRef };
 }
 
 describe("MobileLiveTerminal wheel forwarding", () => {
@@ -91,9 +94,19 @@ describe("MobileLiveTerminal wheel forwarding", () => {
     expect(scroller.style.touchAction).toBe("none");
   });
 
+  it("cancels a native touch move in forward mode as a WebKit fallback", () => {
+    const { scroller } = renderTerm(frame({ altScreen: true, mouse: true, mouseSgr: true }));
+    const move = new Event("touchmove", { cancelable: true });
+    scroller.dispatchEvent(move);
+    expect(move.defaultPrevented).toBe(true);
+  });
+
   it("leaves touch-action unset outside forward mode (native capture scroll)", () => {
     const { scroller } = renderTerm(frame({ altScreen: false, mouse: false }));
     expect(scroller.style.touchAction).toBe("");
+    const move = new Event("touchmove", { cancelable: true });
+    scroller.dispatchEvent(move);
+    expect(move.defaultPrevented).toBe(false);
   });
 
   it("normalizes line-mode wheel deltas (deltaMode 1)", () => {
@@ -127,6 +140,30 @@ describe("MobileLiveTerminal wheel forwarding", () => {
     expect(forwardWheel.mock.calls[0][0]).toBe(false); // up === false (wheel down)
   });
 
+  it("uses touchend's final position when iOS coalesces a quick swipe", () => {
+    const { scroller, forwardWheel } = renderTerm(frame({ altScreen: true, mouse: true, mouseSgr: true }));
+    fireEvent.touchStart(scroller, { touches: [{ clientX: 100, clientY: 300 } as Touch] });
+    fireEvent.touchEnd(scroller, {
+      touches: [],
+      changedTouches: [{ clientX: 100, clientY: 220 } as Touch],
+    });
+    expect(forwardWheel).toHaveBeenCalled();
+    expect(forwardWheel.mock.calls[0][0]).toBe(false);
+  });
+
+  it("does not turn a forward-mode swipe into a keyboard-opening click", () => {
+    const { scroller, inputRef } = renderTerm(frame({ altScreen: true, mouse: true, mouseSgr: true }));
+    const touch = (y: number) => ({ clientX: 100, clientY: y }) as Touch;
+    fireEvent.touchStart(scroller, { touches: [touch(300)] });
+    fireEvent.touchMove(scroller, { touches: [touch(220)] });
+    fireEvent.touchEnd(scroller, { touches: [] });
+    // WebKit can synthesize this click even though touch-action:none kept the
+    // browser from recognizing a native scroll. A moved touch must not focus
+    // the hidden terminal input and raise the keyboard.
+    fireEvent.click(scroller);
+    expect(document.activeElement).not.toBe(inputRef.current);
+  });
+
   it("forwards a mouse click (press then release) to a full-screen mouse app", () => {
     const { scroller, forwardButton } = renderTerm(frame({ altScreen: true, mouse: true, mouseSgr: true }));
     fireEvent.pointerDown(scroller, { pointerType: "mouse", button: 0, clientX: 10, clientY: 10 });
@@ -135,6 +172,27 @@ describe("MobileLiveTerminal wheel forwarding", () => {
     // press: base left=0, release=false; then release=true.
     expect(forwardButton.mock.calls[0].slice(0, 3)).toEqual([0, false, false]);
     expect(forwardButton.mock.calls[1][1]).toBe(true);
+  });
+
+  it("maps split-window mouse input into pane 0", () => {
+    const clamped = renderTerm(frame({ altScreen: true, mouse: true, mouseSgr: true, pane0: { cols: 1, rows: 1 } }));
+    fireEvent.pointerDown(clamped.scroller, { pointerType: "mouse", button: 0, clientX: 500, clientY: 500 });
+    expect(clamped.forwardButton.mock.calls[0]!.slice(4)).toEqual([1, 1]);
+    clamped.unmount();
+
+    const base = renderTerm(
+      frame({ altScreen: true, mouse: true, mouseSgr: true, pane0: { cols: 80, rows: 24, left: 0, top: 0 } }),
+    );
+    fireEvent.pointerDown(base.scroller, { pointerType: "mouse", button: 0, clientX: 100, clientY: 100 });
+    const baseRow = base.forwardButton.mock.calls[0]![5] as number;
+    base.unmount();
+
+    const offset = renderTerm(
+      frame({ altScreen: true, mouse: true, mouseSgr: true, pane0: { cols: 80, rows: 24, left: 0, top: 1 } }),
+    );
+    fireEvent.pointerDown(offset.scroller, { pointerType: "mouse", button: 0, clientX: 100, clientY: 100 });
+    const offsetRow = offset.forwardButton.mock.calls[0]![5] as number;
+    expect(offsetRow).toBe(baseRow - 1);
   });
 
   it("does NOT forward a click for a normal-screen agent", () => {
@@ -174,14 +232,15 @@ describe("MobileLiveTerminal wheel forwarding", () => {
 
   it("gears a touch drag up by the forward touch gain", () => {
     const { scroller, forwardWheel } = renderTerm(frame({ altScreen: true, mouse: true, mouseSgr: true }));
-    // lineH = 14 * 1.2 = 16.8px: a 34px drag is 2 notches at 1:1; the x2
-    // touch gain makes it 4.
+    // lineH = 14 * 1.2 = 16.8px: a 34px drag produces two notches with the
+    // small assist, but only the first leaves immediately. The second drains
+    // on the next animation frame to avoid a delayed remote redraw jumping.
     fireEvent.touchStart(scroller, { touches: [{ clientX: 100, clientY: 300 } as Touch] });
     fireEvent.touchMove(scroller, { touches: [{ clientX: 100, clientY: 266 } as Touch] });
-    expect(forwardWheel).toHaveBeenCalledTimes(4);
+    expect(forwardWheel).toHaveBeenCalledTimes(1);
   });
 
-  it("reports touch wheels at the pane's middle row; desktop wheels keep the pointer cell", () => {
+  it("reports touch wheels at the input pane's middle row; desktop wheels keep the pointer cell", () => {
     // Position-aware apps (Claude Code) hit-test the wheel's row and ignore
     // notches over their pinned input box, which shrank the usable touch area
     // to the transcript sliver above it. The touch path therefore clamps to
@@ -194,6 +253,15 @@ describe("MobileLiveTerminal wheel forwarding", () => {
     forwardWheel.mockClear();
     fireEvent.wheel(scroller, { deltaY: 120, clientX: 100, clientY: 266 });
     expect(forwardWheel.mock.calls[0]![3]).toBe(3);
+
+    // A top/bottom split retains the composite's full row count in `rows`,
+    // but touch input stays in pane 0 and must use that pane's smaller extent.
+    const split = renderTerm(
+      frame({ rows: 8, altScreen: true, mouse: true, mouseSgr: true, pane0: { cols: 80, rows: 2 } }),
+    );
+    fireEvent.touchStart(split.scroller, { touches: [{ clientX: 100, clientY: 300 } as Touch] });
+    fireEvent.touchMove(split.scroller, { touches: [{ clientX: 100, clientY: 266 } as Touch] });
+    expect(split.forwardWheel.mock.calls[0]![3]).toBe(1);
   });
 
   it("does not enter reading mode on scroll while forwarding", () => {
@@ -223,6 +291,23 @@ describe("MobileLiveTerminal wheel forwarding", () => {
     const scroller = utils.container.querySelector("[data-live-terminal] > div") as HTMLElement;
     fireEvent.scroll(scroller);
     expect(enterReading).not.toHaveBeenCalled();
+  });
+
+  it("relays text entered into the session-selection keyboard proxy", () => {
+    const proxy = document.createElement("textarea");
+    proxy.dataset.keyboardProxy = "";
+    document.body.append(proxy);
+    try {
+      const { sendData } = renderTerm(frame({ altScreen: true, mouse: true, mouseSgr: true }));
+      deliverMobileKeyboardProxyInput({
+        inputType: "insertText",
+        data: "hello",
+        isComposing: false,
+      });
+      expect(sendData).toHaveBeenCalledWith("hello");
+    } finally {
+      proxy.remove();
+    }
   });
 });
 

@@ -194,6 +194,7 @@ Add a new session
 * `-w`, `--worktree <WORKTREE_BRANCH>` — Create session in a git worktree for the specified branch
 * `-b`, `--new-branch` — Create a new branch (use with --worktree)
 * `--base-branch <BASE_BRANCH>` — Branch to base the new worktree branch on (use with --new-branch). Defaults to the repository's default branch. Useful for stacking work on top of an in-flight PR branch, hot-fixing a release branch, or branching off a teammate's branch
+* `--repo-base <REPO_BASES>` — Base branch for one repo of a multi-repo workspace, as `<repo>=<branch>` (repeatable). `<repo>` is the repo's directory name or the path you passed to `--repo`. Outranks `--base-branch`, which stays the base for every repo this does not name. Example: `--base-branch develop --repo-base api=epic/checkout`
 * `-r`, `--repo <EXTRA_REPOS>` — Additional repositories for multi-repo workspace (use with --worktree)
 * `--project <PROJECTS>` — Names of registered projects to include as extra repos (use with --worktree). Resolves against the union of global + profile project registries
 * `--no-submodules` — Skip `git submodule update --init --recursive` after creating the worktree, overriding the `worktree.init_submodules` config (default true). Useful for repos with large or deeply nested submodule trees that you don't need inside the agent session
@@ -242,6 +243,18 @@ List all sessions
 
 * `--json` — Output as JSON
 * `--all` — List sessions from all profiles
+* `--state <STATE>` — Filter by session state. Defaults to `all`, every persisted session, which is what `aoe list` has always shown. Pass `--state=live` to skip trashed and archived rows; the vocabulary matches the REST API's `GET /api/sessions?state=`
+
+  Default value: `all`
+
+  Possible values:
+  - `live`:
+    Only sessions that are neither archived nor trashed
+  - `trashed`:
+    Only sessions currently in the trash
+  - `all`:
+    Every persisted session in the profile (default)
+
 
 
 
@@ -575,7 +588,8 @@ Set or clear the per-session diff base branch. The diff view compares the worktr
 
 ###### **Options:**
 
-* `--clear` — Clear the override and fall back to the profile default / auto-detected base
+* `--clear` — Clear the override and fall back to the recorded creation base, then the profile default, then the auto-detected base
+* `--repo <REPO>` — Workspace repo to set the base for, by directory name (as shown in the diff panel and `aoe list --json`). Required on a multi-repo workspace session, where each repo has its own base; omit it on a single-repo session
 
 
 
@@ -1581,7 +1595,7 @@ Manage the ACP structured-view workers (doctor, ps, logs, prompt, approve, ...)
 * `cancel` — Cancel the in-flight prompt for an agent session
 * `tail` — Stream the agent broadcast for a session to stdout as JSON lines (one frame per line). Press Ctrl-C to stop
 * `attach` — Open the TUI structured view directly for a known session id. Combine with `AOE_DAEMON_URL` (+ `AOE_DAEMON_TOKEN`) to attach across machines without going through the home session list
-* `switch-agent` — Switch an agent session to a different ACP agent, keeping the transcript. The new agent starts fresh; use `aoe acp agents` to list valid targets. Handy for returning to claude after a rate-limit handoff to codex
+* `switch-agent` — Switch an agent session to a different ACP agent, keeping the transcript. Valid targets are built-in registry agents and any custom agent configured in `[session.agent_acp_cmd]`. The new agent starts fresh; use `aoe acp agents` to list built-in targets. Handy for returning to claude after a rate-limit handoff to codex
 
 
 
@@ -1777,14 +1791,14 @@ Open the TUI structured view directly for a known session id. Combine with `AOE_
 
 ## `aoe acp switch-agent`
 
-Switch an agent session to a different ACP agent, keeping the transcript. The new agent starts fresh; use `aoe acp agents` to list valid targets. Handy for returning to claude after a rate-limit handoff to codex
+Switch an agent session to a different ACP agent, keeping the transcript. Valid targets are built-in registry agents and any custom agent configured in `[session.agent_acp_cmd]`. The new agent starts fresh; use `aoe acp agents` to list built-in targets. Handy for returning to claude after a rate-limit handoff to codex
 
 **Usage:** `aoe acp switch-agent [OPTIONS] <SESSION> <TARGET>`
 
 ###### **Arguments:**
 
 * `<SESSION>` — Acp session id
-* `<TARGET>` — Registry key of the target agent (e.g. `claude`, `codex`)
+* `<TARGET>` — Registry key or configured custom ACP agent name (e.g. `claude`, `codex`, `my-custom-bridge`)
 
 ###### **Options:**
 

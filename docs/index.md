@@ -35,6 +35,12 @@ Running several AI coding agents in parallel across tasks or branches means jugg
 
 Claude Code, OpenCode, Mistral Vibe, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi, Oh My Pi (OMP), Factory Droid, Hermes, Kiro CLI, Qwen Code, and Kimi Code. AoE auto-detects which are installed.
 
+Agents carry a lifecycle state in AoE's registry. When an upstream vendor
+deprecates a CLI, AoE keeps supporting it but marks it everywhere it appears
+(`aoe agents`, `aoe acp doctor`, session creation, the new-session and restart
+pickers, the web wizard, and the switch-agent modal), so you always know before
+you launch one.
+
 <div class="cta-box">
 <p><strong>Ready to get started?</strong></p>
 <p><a href="installation.html">Install AoE</a></p>

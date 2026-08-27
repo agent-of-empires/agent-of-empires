@@ -10,7 +10,7 @@ This page covers running the server, access modes, the security model, and PWA i
 
 - **[Dashboard & workspaces](web/dashboard.md)**: layout, status glyphs, session-creation wizard, sidebar sort/grouping, triage (pin / archive / snooze), command palette, first-run tutorial.
 - **[Terminal view](web/terminal.md)**: agent and paired terminals, reconnect behavior, WebSocket close codes, read-only mode.
-- **[Diff view](web/diff.md)**: reviewing changed files, flat / tree file list, per-session base override, inline review comments.
+- **[Diff view](web/diff.md)**: reviewing changed files, flat / tree file list, per-repo base override, inline review comments.
 - **[Settings & profiles](web/settings.md)**: settings tabs, profile picker, connected-device tracking, step-up elevation.
 
 Mobile and touch behavior is documented inline on each page.

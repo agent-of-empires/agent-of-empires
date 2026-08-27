@@ -1284,7 +1284,7 @@ impl RunnerShared {
         Ok(result)
     }
 
-    /// Run (once) or replay (from cache) the session-creation request the
+    /// Run (once) or replay (from cache) the session-establishment request the
     /// runner now owns. `method` is `session/new|load|fork`. Caches
     /// `(acp_session_id, raw result)`; later calls replay the cache. `Ok`
     /// carries `(acp_session_id, result)`; `Err` is the raw JSON-RPC error
@@ -1299,15 +1299,11 @@ impl RunnerShared {
             return Ok(cached);
         }
         let response = self
-            .agent_request(agent_stdin, method, request)
+            .agent_request(agent_stdin, method, request.clone())
             .await
             .ok_or_else(|| transport_error(&format!("agent closed before answering {method}")))?;
         let result = handshake_result(&response)?;
-        let acp_session_id = result
-            .get("sessionId")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| transport_error(&format!("{method} response missing sessionId")))?
-            .to_string();
+        let acp_session_id = established_session_id(method, &request, &result)?;
         let cached = (acp_session_id, result);
         self.handshake.lock().await.session = Some(cached.clone());
         Ok(cached)
@@ -1413,6 +1409,48 @@ fn handshake_result(response: &serde_json::Value) -> Result<serde_json::Value, s
         .get("result")
         .cloned()
         .ok_or_else(|| transport_error("response had neither result nor error"))
+}
+
+/// Resolve the session identity established by a successful session request.
+/// New and fork create an identity, so their response must provide it. Load
+/// reopens the identity named by the request; ACP's `LoadSessionResponse` does
+/// not contain a session id. Some agents include one as an extension, which is
+/// accepted only when it agrees with the requested identity.
+fn established_session_id(
+    method: &str,
+    request: &serde_json::Value,
+    result: &serde_json::Value,
+) -> Result<String, serde_json::Value> {
+    match method {
+        "session/load" => {
+            let requested = request
+                .get("sessionId")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| transport_error("session/load request missing sessionId"))?;
+            let result = result
+                .as_object()
+                .ok_or_else(|| transport_error("session/load response result was not an object"))?;
+            if let Some(returned) = result.get("sessionId") {
+                let returned = returned.as_str().ok_or_else(|| {
+                    transport_error("session/load response sessionId was not a string")
+                })?;
+                if returned != requested {
+                    return Err(transport_error(
+                        "session/load response sessionId did not match request",
+                    ));
+                }
+            }
+            Ok(requested.to_string())
+        }
+        "session/new" | "session/fork" => result
+            .get("sessionId")
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| transport_error(&format!("{method} response missing sessionId")))
+            .map(str::to_string),
+        _ => Err(transport_error(&format!(
+            "unsupported session establishment method {method}"
+        ))),
+    }
 }
 
 /// A synthetic JSON-RPC error object for a runner-side transport failure
@@ -2033,6 +2071,88 @@ mod tests {
             parse_response_any_id(br#"{"jsonrpc":"2.0","id":1,"method":"m","params":{}}"#),
             None
         );
+    }
+
+    #[test]
+    fn established_session_id_is_method_sensitive() {
+        let cases = [
+            (
+                "session/new",
+                serde_json::json!({}),
+                serde_json::json!({"sessionId": "new-id"}),
+                Ok("new-id"),
+            ),
+            (
+                "session/new",
+                serde_json::json!({}),
+                serde_json::json!({}),
+                Err("session/new response missing sessionId"),
+            ),
+            (
+                "session/fork",
+                serde_json::json!({"sessionId": "parent-id"}),
+                serde_json::json!({"sessionId": "fork-id"}),
+                Ok("fork-id"),
+            ),
+            (
+                "session/fork",
+                serde_json::json!({"sessionId": "parent-id"}),
+                serde_json::json!({}),
+                Err("session/fork response missing sessionId"),
+            ),
+            (
+                "session/load",
+                serde_json::json!({"sessionId": "existing-id"}),
+                serde_json::json!({"configOptions": []}),
+                Ok("existing-id"),
+            ),
+            (
+                "session/load",
+                serde_json::json!({"sessionId": "existing-id"}),
+                serde_json::json!({"sessionId": "existing-id"}),
+                Ok("existing-id"),
+            ),
+            (
+                "session/load",
+                serde_json::json!({"sessionId": "existing-id"}),
+                serde_json::json!({"sessionId": "different-id"}),
+                Err("session/load response sessionId did not match request"),
+            ),
+            (
+                "session/load",
+                serde_json::json!({}),
+                serde_json::json!({}),
+                Err("session/load request missing sessionId"),
+            ),
+            (
+                "session/load",
+                serde_json::json!({"sessionId": "existing-id"}),
+                serde_json::json!({"sessionId": 42}),
+                Err("session/load response sessionId was not a string"),
+            ),
+            (
+                "session/load",
+                serde_json::json!({"sessionId": "existing-id"}),
+                serde_json::json!(null),
+                Err("session/load response result was not an object"),
+            ),
+            (
+                "session/resume",
+                serde_json::json!({}),
+                serde_json::json!({}),
+                Err("unsupported session establishment method session/resume"),
+            ),
+        ];
+
+        for (method, request, result, expected) in cases {
+            match (established_session_id(method, &request, &result), expected) {
+                (Ok(actual), Ok(expected)) => assert_eq!(actual, expected, "{method}"),
+                (Err(actual), Err(expected)) => {
+                    assert_eq!(actual["message"], expected, "{method}")
+                }
+                (actual, expected) => panic!("{method}: got {actual:?}, expected {expected:?}"),
+            }
+        }
     }
 
     /// #2979: a daemon-driven relay `session/new` (conversation reset)

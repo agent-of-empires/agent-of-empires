@@ -13,7 +13,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::git::error::GitError;
 use crate::session::config::SessionConfig;
-use crate::session::{ClaimOp, EnsureReadyError, EnsureReadyOutcome, Instance, Status, Storage};
+use crate::session::{
+    duplicate_session_error, is_duplicate_session, EnsureReadyError, EnsureReadyOutcome, Instance,
+    LifecycleOperation, Status, Storage,
+};
 
 use super::validate_display_label;
 use super::validate_no_shell_injection;
@@ -172,6 +175,14 @@ pub struct SessionResponse {
     pub profile: String,
     pub cleanup_defaults: CleanupDefaults,
     pub remote_owner: Option<String>,
+    /// Host-scoped identity for `remote_owner` ("owner@host"), so the web
+    /// sidebar's org axis can bucket by this instead of the bare owner: two
+    /// owners of the same name on different hosts (GitHub "acme" vs GitLab
+    /// "acme") must never merge into one group or one bulk-archive scope.
+    /// `remote_owner` stays the display label. Populated the same way and on
+    /// the same cadence as `remote_owner` (see the cache fill in
+    /// `list_sessions`); `None` whenever `remote_owner` is `None`.
+    pub remote_owner_key: Option<String>,
     /// Per-session push-notification overrides. None means the session
     /// inherits the server-wide default (`web.notify_on_*`) for that
     /// event type; Some(true)/Some(false) is an explicit toggle.
@@ -207,6 +218,14 @@ pub struct SessionResponse {
     /// available, replacing the hardcoded client-side tool list.
     #[cfg(feature = "serve")]
     pub acp_capable: bool,
+    /// The session's server-owned prompt queue (follow-ups the user lined up
+    /// while a turn was busy), ordered by `seq`. The daemon owns it, so it is
+    /// visible across the user's devices and survives a client reload; the
+    /// structured view renders it and drains happen server-side. See
+    /// `docs/development/server-side-prompt-queue.md`.
+    #[cfg(feature = "serve")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub queued_prompts: Vec<crate::acp::state::QueuedPromptEntry>,
     /// The session's captured ACP session id, present only once the
     /// structured-view worker has minted one. The web dashboard passes this
     /// as `fork_from` on a structured fork create, so the sidebar only offers
@@ -239,6 +258,24 @@ pub struct SessionResponse {
     #[cfg(feature = "serve")]
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub acp_can_fork: bool,
+    /// Whether switching this session between terminal and structured view
+    /// preserves the conversation (only claude pairings share one
+    /// CLI-resumable transcript). Server-owned via
+    /// `agents::acp_transcript_cli_resumable` so the dashboard and TUI stop
+    /// each recomputing it from `tool` + `acp_agent`. Omitted (read as false)
+    /// for non-preserving pairings. See docs/development/server-owned-sv-state.md.
+    #[cfg(feature = "serve")]
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub keeps_context: bool,
+    /// Slash-command aliases that reset the conversation for this session's
+    /// agent (claude `/clear`, codex/opencode `/new`). Server-owned from
+    /// `acp::agent_profiles::resolve(...).clear_aliases` so the composer's `/`
+    /// palette and the queued-prompt clear-boundary hint stop mirroring the
+    /// per-agent list client-side. Omitted (read as empty) for agents with no
+    /// clear alias. See docs/development/server-owned-sv-state.md.
+    #[cfg(feature = "serve")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clear_aliases: Vec<String>,
     /// True when the session is a Claude Code session AND the user has
     /// enabled Claude's fullscreen renderer (`tui: "fullscreen"` in
     /// `~/.claude/settings.json`). The web client uses this to skip
@@ -248,11 +285,13 @@ pub struct SessionResponse {
     /// Each entry mirrors `WorkspaceRepo` minus paths the dashboard does
     /// not need to display.
     pub workspace_repos: Vec<WorkspaceRepoSummary>,
-    /// Non-fatal warnings emitted during worktree creation (e.g.
-    /// post-checkout hook failures where the worktree was created
-    /// successfully). Only populated on the create-session response;
-    /// omitted from subsequent fetches because it lives on `BuildResult`
-    /// and is not persisted to the instance.
+    /// Non-fatal warnings surfaced by a mutation response. On create these are
+    /// worktree-creation warnings (e.g. post-checkout hook failures where the
+    /// worktree was still created successfully). On rename these carry the
+    /// tmux rekey warning emitted when the title was persisted durably but the
+    /// live tmux session could not be renamed afterwards. Both live on the
+    /// response only: the field is not persisted to the instance, so it is
+    /// omitted from list/fetch responses.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub warnings: Vec<String>,
     /// Latest plan snapshot summarised for the sidebar. Present only on
@@ -425,11 +464,18 @@ impl SessionResponse {
                 delete_to_trash: true,
             },
             remote_owner: None,
+            remote_owner_key: None,
             notify_on_waiting: inst.notify_on_waiting,
             notify_on_idle: inst.notify_on_idle,
             notify_on_error: inst.notify_on_error,
             #[cfg(feature = "serve")]
             view: inst.view,
+            #[cfg(feature = "serve")]
+            queued_prompts: {
+                let mut q = inst.queued_prompts.clone();
+                q.sort_by_key(|e| e.seq);
+                q
+            },
             #[cfg(feature = "serve")]
             acp_worker_state,
             #[cfg(feature = "serve")]
@@ -467,6 +513,30 @@ impl SessionResponse {
             // cannot drift: forkable = ACP-capable AND a real fork strategy.
             #[cfg(feature = "serve")]
             acp_can_fork: agent_is_structured_fork_capable(&inst.tool, inst.agent_name.as_deref()),
+            // Same agent resolution as `acp_agent` above; computed once here so
+            // the web dashboard and native TUI stop mirroring the gate.
+            #[cfg(feature = "serve")]
+            keeps_context: crate::agents::acp_transcript_cli_resumable(
+                &inst.tool,
+                inst.agent_name
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(inst.tool.as_str()),
+            ),
+            // Same agent resolution as `acp_agent` above; the composer palette
+            // and queued-prompt clear-boundary hint read these instead of a
+            // client-side per-agent mirror.
+            #[cfg(feature = "serve")]
+            clear_aliases: crate::acp::agent_profiles::resolve(
+                inst.agent_name
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or(inst.tool.as_str()),
+            )
+            .clear_aliases
+            .iter()
+            .map(|s| s.to_string())
+            .collect(),
             claude_fullscreen: claude_fullscreen && inst.tool == "claude",
             // A session converted by `attach_project` (#3103) has a real
             // `workspace_info`, so this lists both repos with no special case:
@@ -544,14 +614,17 @@ fn builtin_acp_registry() -> &'static crate::acp::AgentRegistry {
     REG.get_or_init(crate::acp::AgentRegistry::with_defaults)
 }
 
-/// True iff this custom agent declares a valid `agent_acp_cmd` in the
-/// given profile-resolved map. Built-in capability is handled separately
-/// in the constructor, so this only covers the custom case.
+/// True iff this custom agent can run in structured view: it declares a valid
+/// `agent_acp_cmd`, or it inherits a registry-backed base via
+/// `agent_detect_as`. Built-in capability is handled separately in the
+/// constructor, so this only covers the custom case.
 #[cfg(feature = "serve")]
-fn custom_agent_acp_capable(agent_acp_cmd: &HashMap<String, String>, tool: &str) -> bool {
-    agent_acp_cmd
+fn custom_agent_acp_capable(session: &crate::session::config::SessionConfig, tool: &str) -> bool {
+    session
+        .agent_acp_cmd
         .get(tool)
         .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(tool, cmd).is_ok())
+        || crate::acp::inherited_acp_base(tool, &session.agent_detect_as).is_some()
 }
 
 /// Resolve the [`SessionConfig`] for `(profile, project_path)` through the
@@ -607,30 +680,12 @@ pub async fn get_recent_projects() -> Json<RecentProjectsResponse> {
     Json(RecentProjectsResponse { projects })
 }
 
-/// Archival scope for `GET /api/sessions?state=`. `Live` excludes archived
-/// and trashed rows so a headless dispatcher polling the list doesn't have
-/// to know to filter `trashed_at`/`archived_at` client-side; `All` (or no
-/// `state` param) keeps the historical unfiltered behavior the web
-/// dashboard's client-side Trash view still relies on. See #3156.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum SessionScope {
-    Live,
-    Trashed,
-    All,
-}
-
+/// Query params for `GET /api/sessions`. `state` shares its vocabulary with
+/// the CLI's `aoe list --state` via [`crate::session::SessionScope`] so a
+/// future third caller cannot drift.
 #[derive(Deserialize)]
 pub struct ListSessionsQuery {
-    pub state: Option<SessionScope>,
-}
-
-fn instance_matches_scope(inst: &Instance, scope: Option<SessionScope>) -> bool {
-    match scope {
-        None | Some(SessionScope::All) => true,
-        Some(SessionScope::Live) => !inst.is_archived() && !inst.is_trashed(),
-        Some(SessionScope::Trashed) => inst.is_trashed(),
-    }
+    pub state: Option<crate::session::SessionScope>,
 }
 
 pub async fn list_sessions(
@@ -654,7 +709,7 @@ pub async fn list_sessions(
         // it never appears in the list. The lifecycle routes apply the matching
         // structured-target gate. See #7.
         .filter(|inst| !state.cityhall_mode || inst.is_structured())
-        .filter(|inst| instance_matches_scope(inst, query.state))
+        .filter(|inst| crate::session::SessionScope::matches(query.state, inst))
         .collect();
     let mut sessions: Vec<SessionResponse> = scoped_instances
         .iter()
@@ -751,7 +806,7 @@ pub async fn list_sessions(
                 &inst.source_profile,
                 &inst.project_path,
             );
-            resp.acp_capable = custom_agent_acp_capable(&cfg.agent_acp_cmd, &inst.tool);
+            resp.acp_capable = custom_agent_acp_capable(cfg, &inst.tool);
         }
     }
 
@@ -872,8 +927,9 @@ pub async fn list_sessions(
                 .main_repo_path
                 .as_deref()
                 .unwrap_or(&session.project_path);
-            if let Some(owner) = cache.get(repo_path) {
-                session.remote_owner = owner.clone();
+            if let Some(resolved) = cache.get(repo_path) {
+                session.remote_owner = resolved.as_ref().map(|(owner, _)| owner.clone());
+                session.remote_owner_key = resolved.as_ref().map(|(_, key)| key.clone());
             }
         }
     }
@@ -895,8 +951,8 @@ pub async fn list_sessions(
         let mut cache = state.remote_owner_cache.write().await;
         for path in &uncached {
             if !cache.contains_key(path.as_str()) {
-                let owner = crate::git::get_remote_owner(std::path::Path::new(path));
-                cache.insert(path.clone(), owner);
+                let resolved = crate::git::get_remote_owner_with_key(std::path::Path::new(path));
+                cache.insert(path.clone(), resolved);
             }
         }
         for session in &mut sessions {
@@ -905,8 +961,9 @@ pub async fn list_sessions(
                 .as_deref()
                 .unwrap_or(&session.project_path);
             if session.remote_owner.is_none() {
-                if let Some(owner) = cache.get(repo_path) {
-                    session.remote_owner = owner.clone();
+                if let Some(resolved) = cache.get(repo_path) {
+                    session.remote_owner = resolved.as_ref().map(|(owner, _)| owner.clone());
+                    session.remote_owner_key = resolved.as_ref().map(|(_, key)| key.clone());
                 }
             }
         }
@@ -1080,6 +1137,68 @@ fn apply_session_title_rename(inst: &mut Instance, title: String) {
     inst.title = title;
 }
 
+/// Publish only fields owned by the rename transaction onto the current cache
+/// row. Watchers and user actions may have advanced every other field while the
+/// blocking git and storage work ran. Identity fields that the rename did not
+/// change are reconciled from the authoritative disk snapshot only while the
+/// cache still matches the live baseline captured at the start of the request.
+struct SessionRenameCachePatch<'a> {
+    title: &'a str,
+    initial_path: &'a str,
+    initial_branch: Option<&'a str>,
+    authoritative_path: &'a str,
+    authoritative_branch: Option<&'a str>,
+    renamed_path: Option<&'a str>,
+    renamed_branch: Option<&'a str>,
+}
+
+/// Reconcile one identity field the rename transaction does not own, returning
+/// the value to write or `None` to keep the current cached value.
+///
+/// `renamed` is `Some` when the rename explicitly changed the field and always
+/// wins. Otherwise the field is adopted from the `authoritative` disk snapshot
+/// only while the live `cached` value still equals the `baseline` captured at
+/// the start of the request; if a watcher or user action advanced it since,
+/// `None` is returned so the newer cached value survives. `path` and `branch`
+/// share this exact rule, so both route through here.
+fn reconcile_unowned_identity<'a>(
+    cached: Option<&str>,
+    baseline: Option<&str>,
+    authoritative: Option<&'a str>,
+    renamed: Option<&'a str>,
+) -> Option<&'a str> {
+    match renamed {
+        Some(_) => renamed,
+        None if cached == baseline => authoritative,
+        None => None,
+    }
+}
+
+fn apply_session_rename_cache_patch(inst: &mut Instance, patch: SessionRenameCachePatch<'_>) {
+    inst.title = patch.title.to_string();
+    if let Some(path) = reconcile_unowned_identity(
+        Some(inst.project_path.as_str()),
+        Some(patch.initial_path),
+        Some(patch.authoritative_path),
+        patch.renamed_path,
+    ) {
+        inst.project_path = path.to_string();
+    }
+    let cached_branch = inst
+        .worktree_info
+        .as_ref()
+        .map(|worktree| worktree.branch.as_str());
+    let branch = reconcile_unowned_identity(
+        cached_branch,
+        patch.initial_branch,
+        patch.authoritative_branch,
+        patch.renamed_branch,
+    );
+    if let (Some(worktree), Some(branch)) = (inst.worktree_info.as_mut(), branch) {
+        worktree.branch = branch.to_string();
+    }
+}
+
 /// Quiesce a structured-view worker before its worktree directory is moved.
 /// A live ACP worker is pinned to the current cwd; `git worktree move` pulls
 /// that directory out, the worker crashes, and the supervisor respawns it at
@@ -1158,6 +1277,32 @@ async fn ensure_sandbox_container_released_blocking(id: &str, is_sandboxed: bool
     })
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum RenamePersistOutcome {
+    Updated { old_title: String },
+    Missing,
+}
+
+fn persist_rename_metadata(
+    storage: &Storage,
+    id: &str,
+    title: &str,
+    new_path: Option<&str>,
+    new_branch: Option<&str>,
+) -> anyhow::Result<RenamePersistOutcome> {
+    storage.update(|instances, _groups| {
+        let Some(inst) = instances.iter_mut().find(|instance| instance.id == id) else {
+            return Ok(RenamePersistOutcome::Missing);
+        };
+        let old_title = inst.title.clone();
+        if let Some(path) = new_path {
+            apply_worktree_name_edit(inst, path, new_branch);
+        }
+        apply_session_title_rename(inst, title.to_string());
+        Ok(RenamePersistOutcome::Updated { old_title })
+    })
+}
+
 /// Rename a session's title (and, when tied, its worktree directory).
 ///
 /// The sandbox container probe runs on the blocking pool via
@@ -1204,78 +1349,179 @@ pub async fn rename_session(
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
-    let (worktree_info, current_path, status, profile, is_sandboxed, is_structured) = {
+    let live = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return super::session_not_found();
         };
-        (
-            inst.worktree_info.clone(),
-            inst.project_path.clone(),
-            inst.status,
-            inst.source_profile.clone(),
-            inst.is_sandboxed(),
-            inst.is_structured(),
-        )
+        inst.clone()
     };
+    let profile = live.source_profile.clone();
+    // App-wide and per-session flocks may wait on another process, so never
+    // acquire them on a Tokio worker. Identity nests outside session title,
+    // source lifecycle, and profile Storage.
+    let _identity_lock = match tokio::task::spawn_blocking(
+        crate::session::acquire_session_identity_lock,
+    )
+    .await
+    {
+        Ok(Ok(lock)) => lock,
+        Ok(Err(error)) => {
+            tracing::error!(target: "http.api.sessions", session = %id, %error, "Failed to acquire session identity lock");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        Err(error) => {
+            tracing::error!(target: "http.api.sessions", session = %id, %error, "Session identity lock task failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let lock_id = id.clone();
+    let lock_profile = profile.clone();
+    let lock_file_watch = state.file_watch.clone();
+    let (_session_title_lock, _lifecycle_lock, storage, disk_instances) =
+        match tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let session_title_lock = crate::session::acquire_session_title_lock(&lock_id)?;
+            let storage = Storage::new(&lock_profile, lock_file_watch)?;
+            let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&lock_id)?;
+            let instances = storage.load()?;
+            Ok((session_title_lock, lifecycle_lock, storage, instances))
+        })
+        .await
+        {
+            Ok(Ok(locks)) => locks,
+            Ok(Err(error)) => {
+                tracing::error!(target: "http.api.sessions", session = %id, "failed to acquire rename locks or load authoritative state: {error}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "title_lock_failed",
+                        "message": "Could not serialize the session rename"
+                    })),
+                )
+                    .into_response();
+            }
+            Err(error) => {
+                tracing::error!(target: "http.api.sessions", session = %id, "rename lock task failed: {error}");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "error": "title_lock_failed",
+                        "message": "Could not serialize the session rename"
+                    })),
+                )
+                    .into_response();
+            }
+        };
+    let Some(mut fresh) = disk_instances
+        .iter()
+        .find(|instance| instance.id == id)
+        .cloned()
+    else {
+        return super::session_not_found();
+    };
+    fresh.source_profile.clone_from(&profile);
+    fresh.merge_runtime_from_reload(&live);
+    let current_title = fresh.title.clone();
+    let worktree_info = fresh.worktree_info.clone();
+    let current_path = fresh.project_path.clone();
+    let current_branch = worktree_info
+        .as_ref()
+        .map(|worktree| worktree.branch.clone());
+    let status = fresh.status;
+    let is_sandboxed = fresh.is_sandboxed();
+    let is_structured = fresh.is_structured();
 
     // Tied mode (#1927): renaming an aoe-managed worktree session also moves
     // its directory leaf to match the title, so title and dir cannot drift.
-    let tied = crate::session::profile_config::resolve_config_or_warn(&profile)
-        .session
-        .tie_workdir_to_name
-        && worktree_info.as_ref().is_some_and(|w| w.managed_by_aoe);
+    let tied = fresh.tie_workdir_applies(
+        crate::session::profile_config::resolve_config_or_warn(&profile)
+            .session
+            .tie_workdir_to_name,
+    );
+    let duplicate_path = if tied {
+        crate::session::worktree_edit::derived_worktree_path(
+            std::path::Path::new(&current_path),
+            &title,
+        )
+    } else {
+        current_path.clone()
+    };
+    let pair_changed = title != current_title
+        || duplicate_path.trim_end_matches('/') != current_path.trim_end_matches('/');
+    if pair_changed
+        && is_duplicate_session(disk_instances.iter(), &title, &duplicate_path, Some(&id))
+    {
+        let message = duplicate_session_error(&title).to_string();
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "duplicate_session",
+                "message": message,
+            })),
+        )
+            .into_response();
+    }
 
     // What to write to disk + memory once any git side effect has landed.
     let mut new_path: Option<String> = None;
     let mut new_branch: Option<String> = None;
 
     if tied {
-        // The dir move is gated on a quiescent worktree, exactly like the
-        // standalone worktree-name edit. A running session must be stopped
-        // first; the setting is the escape hatch for free-form relabeling.
+        // A directory move or branch rename is gated on a quiescent worktree,
+        // exactly like the standalone worktree-name edit. A running session
+        // must be stopped first; the setting is the escape hatch for
+        // free-form relabeling.
+        //
         // A sandbox session's container keeps the worktree dir mounted even
-        // while the agent is Idle, so the move would fail. The helper drops a
-        // merely-stopped container to free the mount and only reports held for
-        // a live one, which the user has to stop.
+        // while the agent is Idle, so a directory move would fail. The helper
+        // drops a merely-stopped container to free the mount and only reports
+        // held for a live one, which the user has to stop.
+        //
         // Short-circuited twice, because the helper removes a stopped
         // container: once on the status check, so a request about to be
         // rejected never discards, and once on whether the directory is
         // actually going to move, so a no-op or branch-only rename does not
-        // either. The tied leaf comes from the title, matching what is handed
-        // to `edit_worktree_workdir` below.
+        // either.
+        let leaf = crate::session::worktree_edit::worktree_leaf_from_title(&title);
         let moves_worktree = crate::session::worktree_edit::worktree_move_required(
             std::path::Path::new(&current_path),
-            &crate::session::worktree_edit::worktree_leaf_from_title(&title),
+            &leaf,
         );
+        let renames_branch = worktree_info.as_ref().is_some_and(|wt| {
+            crate::session::worktree_edit::worktree_branch_rename_required(
+                wt,
+                &leaf,
+                body.rename_branch,
+            )
+        });
         let container_holds = !status.blocks_worktree_edit()
             && moves_worktree
             && ensure_sandbox_container_released_blocking(&id, is_sandboxed).await;
-        if status.blocks_worktree_edit() || container_holds {
+        if (moves_worktree || renames_branch) && (status.blocks_worktree_edit() || container_holds)
+        {
             return (
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
                     "error": "session_running",
-                    "message": "Stop the session before renaming it: its worktree directory moves to match the new name. Disable \"Tie Worktree Directory to Session Name\" to relabel a running session."
+                    "message": "Stop the session before renaming its worktree directory or branch. Disable \"Tie Worktree Directory to Session Name\" to relabel a running session."
                 })),
             )
                 .into_response();
         }
 
-        // Stop any live structured-view worker before the move so it can't
-        // crash on the pulled-out cwd and respawn-loop at the stale path
-        // (#2260). Done under the instance_lock held since the top of this
-        // function. Preserves the agent transcript so the reconciler resumes
-        // context at the new path.
-        if let Err(resp) =
-            quiesce_structured_worker_for_worktree_move(&state, &id, is_structured).await
-        {
-            return resp;
+        // Stop a live structured-view worker only when its cwd will move. A
+        // title-only or branch-only edit leaves the cwd valid and must not
+        // interrupt the worker.
+        if moves_worktree {
+            if let Err(response) =
+                quiesce_structured_worker_for_worktree_move(&state, &id, is_structured).await
+            {
+                return response;
+            }
         }
 
         let wt = worktree_info.expect("tied implies worktree_info is Some");
         let cur = current_path.clone();
-        let leaf = crate::session::worktree_edit::worktree_leaf_from_title(&title);
         let rename_branch = body.rename_branch;
         let edit = tokio::task::spawn_blocking(move || {
             crate::session::worktree_edit::edit_worktree_workdir(
@@ -1334,56 +1580,85 @@ pub async fn rename_session(
     // silent persist failure would otherwise leave metadata pointing at the
     // old path after a daemon restart, so it returns 500 rather than a
     // misleading 200.
-    let persisted = {
-        let storage = Storage::new(&profile, state.file_watch.clone());
-        let title_clone = title.clone();
-        let id_clone = id.clone();
-        let new_path_clone = new_path.clone();
-        let new_branch_clone = new_branch.clone();
-        match storage {
-            Ok(storage) => tokio::task::spawn_blocking(move || {
-                storage.update(|instances, _groups| {
-                    if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
-                        if let Some(path) = new_path_clone.as_deref() {
-                            apply_worktree_name_edit(inst, path, new_branch_clone.as_deref());
-                        }
-                        apply_session_title_rename(inst, title_clone);
-                    }
-                    Ok(())
-                })
-            })
-            .await
-            .map_err(|e| e.to_string())
-            .and_then(|r| r.map_err(|e| e.to_string())),
-            Err(e) => Err(e.to_string()),
+    let title_clone = title.clone();
+    let id_clone = id.clone();
+    let new_path_clone = new_path.clone();
+    let new_branch_clone = new_branch.clone();
+    let persisted = tokio::task::spawn_blocking(move || {
+        persist_rename_metadata(
+            &storage,
+            &id_clone,
+            &title_clone,
+            new_path_clone.as_deref(),
+            new_branch_clone.as_deref(),
+        )
+    })
+    .await
+    .map_err(|error| error.to_string())
+    .and_then(|result| result.map_err(|error| error.to_string()));
+    let persisted_old_title = match persisted {
+        Ok(RenamePersistOutcome::Updated { old_title }) => old_title,
+        Ok(RenamePersistOutcome::Missing) => {
+            // AppState can lag an external delete. A missing authoritative row
+            // is not a successful rename and must not trigger tmux/cache work.
+            if let Some(path) = new_path.as_deref() {
+                tracing::warn!(
+                    target: "http.api.sessions",
+                    session = %id,
+                    new_path = %path,
+                    "authoritative row vanished after the worktree move; the moved directory is unreferenced"
+                );
+            }
+            return super::session_not_found();
+        }
+        Err(error) => {
+            tracing::error!(target: "http.api.sessions", session = %id, "Failed to save after rename: {error}");
+            // Persist-first: never fall through to mutate in-memory state on a
+            // failed write, or the rename silently reverts on restart. When a
+            // dir move already landed, say so; otherwise it is a plain title
+            // persist.
+            let message = if new_path.is_some() {
+                "Worktree was moved on disk, but persisting the new session metadata failed"
+            } else {
+                "Persisting the renamed session failed"
+            };
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({ "error": "persist_failed", "message": message })),
+            )
+                .into_response();
         }
     };
-    if let Err(e) = persisted {
-        tracing::error!(target: "http.api.sessions", session = %id, "Failed to save after rename: {e}");
-        // Persist-first: never fall through to mutate in-memory state on a
-        // failed write, or the rename silently reverts on restart. When a dir
-        // move already landed, say so; otherwise it is a plain title persist.
-        let message = if new_path.is_some() {
-            "Worktree was moved on disk, but persisting the new session metadata failed"
-        } else {
-            "Persisting the renamed session failed"
-        };
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({ "error": "persist_failed", "message": message })),
-        )
-            .into_response();
-    }
 
+    let published_path = new_path.as_deref().unwrap_or(&current_path);
+    let renamed_path = new_path
+        .as_deref()
+        .filter(|path| *path != current_path.as_str());
+    let published_branch = new_branch.as_deref().or(current_branch.as_deref());
+    let renamed_branch = new_branch
+        .as_deref()
+        .filter(|branch| current_branch.as_deref() != Some(*branch));
+    let initial_branch = live
+        .worktree_info
+        .as_ref()
+        .map(|worktree| worktree.branch.as_str());
     let mut response = {
         let mut instances = state.instances.write().await;
         let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
             return super::session_not_found();
         };
-        if let Some(path) = new_path.as_deref() {
-            apply_worktree_name_edit(inst, path, new_branch.as_deref());
-        }
-        apply_session_title_rename(inst, title.clone());
+        apply_session_rename_cache_patch(
+            inst,
+            SessionRenameCachePatch {
+                title: &title,
+                initial_path: &live.project_path,
+                initial_branch,
+                authoritative_path: published_path,
+                authoritative_branch: published_branch,
+                renamed_path,
+                renamed_branch,
+            },
+        );
         SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen())
     };
     // Single-session responses are not run through list_sessions' overlay, so
@@ -1391,6 +1666,37 @@ pub async fn rename_session(
     // trusts the mutation response would see a managed worktree claim it is
     // untied until the next list refresh.
     response.tie_workdir_to_name = tied;
+    drop(_identity_lock);
+
+    let tmux_warning = if persisted_old_title != title && !is_structured {
+        let rekey_id = id.clone();
+        let rekey_old_title = persisted_old_title.clone();
+        let rekey_new_title = title.clone();
+        match tokio::task::spawn_blocking(move || {
+            crate::tmux::rekey_session(&rekey_id, &rekey_old_title, &rekey_new_title)
+        })
+        .await
+        {
+            Ok(Ok(_)) => None,
+            Ok(Err(error)) => {
+                tracing::warn!(target: "http.api.sessions", session = %id, "tmux rename failed after persistence: {error}");
+                Some(format!(
+                    "Session metadata was renamed, but its live tmux session could not be rekeyed: {error}"
+                ))
+            }
+            Err(error) => {
+                tracing::warn!(target: "http.api.sessions", session = %id, "tmux rename task failed after persistence: {error}");
+                Some(format!(
+                    "Session metadata was renamed, but its live tmux session could not be rekeyed: {error}"
+                ))
+            }
+        }
+    } else {
+        None
+    };
+    if let Some(warning) = tmux_warning {
+        response.warnings.push(warning);
+    }
 
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
@@ -1497,20 +1803,66 @@ pub async fn set_worktree_name(
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
 
-    let (worktree_info, current_path, status, profile, is_sandboxed, is_structured) = {
+    let live = {
         let instances = state.instances.read().await;
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return super::session_not_found();
         };
-        (
-            inst.worktree_info.clone(),
-            inst.project_path.clone(),
-            inst.status,
-            inst.source_profile.clone(),
-            inst.is_sandboxed(),
-            inst.is_structured(),
-        )
+        inst.clone()
     };
+    let profile = live.source_profile.clone();
+    let _identity_lock = match tokio::task::spawn_blocking(
+        crate::session::acquire_session_identity_lock,
+    )
+    .await
+    {
+        Ok(Ok(lock)) => lock,
+        Ok(Err(error)) => {
+            tracing::error!(target: "http.api.sessions", session = %id, %error, "Failed to acquire worktree identity lock");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        Err(error) => {
+            tracing::error!(target: "http.api.sessions", session = %id, %error, "Worktree identity lock task failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let lock_id = id.clone();
+    let lock_profile = profile.clone();
+    let lock_file_watch = state.file_watch.clone();
+    let (_lifecycle_lock, storage, authoritative_instances) = match tokio::task::spawn_blocking(
+        move || -> anyhow::Result<_> {
+            let storage = Storage::new(&lock_profile, lock_file_watch)?;
+            let lifecycle = storage.acquire_instance_lifecycle_lock(&lock_id)?;
+            let instances = storage.load()?;
+            Ok((lifecycle, storage, instances))
+        },
+    )
+    .await
+    {
+        Ok(Ok(locked)) => locked,
+        Ok(Err(error)) => {
+            tracing::error!(target: "http.api.sessions", session = %id, %error, "Failed to lock or load worktree rename");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+        Err(error) => {
+            tracing::error!(target: "http.api.sessions", session = %id, %error, "Worktree rename lock task failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+    let Some(mut fresh) = authoritative_instances
+        .iter()
+        .find(|instance| instance.id == id)
+        .cloned()
+    else {
+        return super::session_not_found();
+    };
+    fresh.source_profile.clone_from(&profile);
+    fresh.merge_runtime_from_reload(&live);
+    let worktree_info = fresh.worktree_info.clone();
+    let current_path = fresh.project_path.clone();
+    let status = fresh.status;
+    let is_sandboxed = fresh.is_sandboxed();
+    let is_structured = fresh.is_structured();
 
     let Some(worktree_info) = worktree_info else {
         return (
@@ -1532,6 +1884,31 @@ pub async fn set_worktree_name(
             Json(serde_json::json!({
                 "error": "tied",
                 "message": "Renaming is unified while \"Tie Worktree Directory to Session Name\" is on; rename the session instead, and its directory follows."
+            })),
+        )
+            .into_response();
+    }
+    let duplicate_path = crate::session::worktree_edit::target_worktree_path(
+        std::path::Path::new(&current_path),
+        &name,
+    )
+    .unwrap_or_else(|| std::path::PathBuf::from(&current_path))
+    .to_string_lossy()
+    .into_owned();
+    if duplicate_path.trim_end_matches('/') != current_path.trim_end_matches('/')
+        && is_duplicate_session(
+            authoritative_instances.iter(),
+            &fresh.title,
+            &duplicate_path,
+            Some(&id),
+        )
+    {
+        let message = duplicate_session_error(&fresh.title).to_string();
+        return (
+            StatusCode::CONFLICT,
+            Json(serde_json::json!({
+                "error": "duplicate_session",
+                "message": message,
             })),
         )
             .into_response();
@@ -1563,10 +1940,18 @@ pub async fn set_worktree_name(
 
     // Stop any live structured-view worker before the move so it can't crash on
     // the pulled-out cwd and respawn-loop at the stale path (#2260). Held under
-    // the instance_lock acquired at the top of this function.
-    if let Err(resp) = quiesce_structured_worker_for_worktree_move(&state, &id, is_structured).await
-    {
-        return resp;
+    // the instance_lock acquired at the top of this function. Gated on
+    // `moves_worktree` for the same reason as the tied `rename_session` path: a
+    // branch-only edit (name unchanged, `rename_branch` set) leaves the cwd
+    // valid, so interrupting the worker would be a needless respawn. When the
+    // name is unchanged and no branch rename is requested, `edit_worktree_workdir`
+    // rejects with `Unchanged` below and nothing is touched either way.
+    if moves_worktree {
+        if let Err(resp) =
+            quiesce_structured_worker_for_worktree_move(&state, &id, is_structured).await
+        {
+            return resp;
+        }
     }
 
     let wt = worktree_info.clone();
@@ -1634,27 +2019,30 @@ pub async fn set_worktree_name(
             .into_response()
     };
 
-    let storage = match Storage::new(&profile, state.file_watch.clone()) {
-        Ok(s) => s,
-        Err(e) => {
-            tracing::error!(target: "http.api.sessions", session = %id, "Storage::new failed after worktree edit: {e}");
-            return persist_failed();
-        }
-    };
     let id_clone = id.clone();
     let new_path_clone = new_path.clone();
     let new_branch_clone = new_branch.clone();
     match tokio::task::spawn_blocking(move || {
         storage.update(|instances, _groups| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
-                apply_worktree_name_edit(inst, &new_path_clone, new_branch_clone.as_deref());
-            }
-            Ok(())
+            let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) else {
+                return Ok(false);
+            };
+            apply_worktree_name_edit(inst, &new_path_clone, new_branch_clone.as_deref());
+            Ok(true)
         })
     })
     .await
     {
-        Ok(Ok(())) => {}
+        Ok(Ok(true)) => {}
+        Ok(Ok(false)) => {
+            tracing::warn!(
+                target: "http.api.sessions",
+                session = %id,
+                new_path = %new_path,
+                "authoritative row vanished after the worktree move; the moved directory is unreferenced"
+            );
+            return super::session_not_found();
+        }
         Ok(Err(e)) => {
             tracing::error!(target: "http.api.sessions", "Failed to save after worktree edit: {e}");
             return persist_failed();
@@ -1673,6 +2061,7 @@ pub async fn set_worktree_name(
         apply_worktree_name_edit(inst, &new_path, new_branch.as_deref());
         SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen())
     };
+    drop(_identity_lock);
 
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
@@ -2075,65 +2464,6 @@ fn persist_failed_response() -> axum::response::Response {
         .into_response()
 }
 
-/// Run `f` on the disk instances under the storage flock (off the async
-/// runtime) and return its result. The single serialization point shared by
-/// every server claim/commit; the claim/commit decision itself lives in the
-/// neutral `session::claim` helpers so the CLI, daemon, and TUI agree.
-///
-/// Claims are written to disk ONLY: the in-memory `state.instances.op_claim` is
-/// eventually-consistent (the disk watcher reloads it) and never authoritative,
-/// so no claim decision ever reads it. See #2541.
-async fn with_locked_storage<T, F>(state: &Arc<AppState>, profile: &str, f: F) -> Result<T, ()>
-where
-    T: Send + 'static,
-    F: FnOnce(&mut Vec<Instance>) -> T + Send + 'static,
-{
-    let profile = profile.to_string();
-    let file_watch = state.file_watch.clone();
-    match tokio::task::spawn_blocking(move || {
-        let storage = Storage::new(&profile, file_watch).map_err(|e| e.to_string())?;
-        storage
-            .update(|instances, _groups| Ok(f(instances)))
-            .map_err(|e| e.to_string())
-    })
-    .await
-    {
-        Ok(Ok(v)) => Ok(v),
-        Ok(Err(e)) => {
-            tracing::error!(target: "http.api.sessions", "locked storage op failed: {e}");
-            Err(())
-        }
-        Err(e) => {
-            tracing::error!(target: "http.api.sessions", "locked storage op join failed: {e}");
-            Err(())
-        }
-    }
-}
-
-/// Release the `op` claim for session `id` on disk and in memory,
-/// ownership-guarded so a peer's fresh claim (stale-override) is never cleared.
-/// Best-effort: a stranded claim self-heals via the TTL. See #2541.
-async fn release_op_claim(state: &Arc<AppState>, profile: &str, id: &str, op: ClaimOp) {
-    let _ = persist_session_update(
-        profile.to_string(),
-        "op-claim-release",
-        state.file_watch.clone(),
-        {
-            let id = id.to_string();
-            move |instances| {
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                    inst.clear_op_claim_if_owned(op);
-                }
-            }
-        },
-    )
-    .await;
-    let mut instances = state.instances.write().await;
-    if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-        inst.clear_op_claim_if_owned(op);
-    }
-}
-
 pub async fn update_session_notifications(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
@@ -2219,19 +2549,47 @@ pub async fn update_session_notifications(
 
 // --- Diff base override ---
 //
-// `PATCH /api/sessions/{id}/diff-base` sets / clears the per-session
-// override for the diff base ref. The web `vs <ref>` chip popover, the
+// `PATCH /api/sessions/{id}/diff-base` sets / clears the override for the
+// diff base ref, scoped to one repo. The web `vs <ref>` chip popover, the
 // TUI diff view's `b` keybind, and `aoe session set-base` all funnel
-// through this endpoint so the override is persisted alongside the
-// session record and survives restart. See #970.
+// through this endpoint (or its storage equivalent) so the override is
+// persisted alongside the session record and survives restart. A workspace
+// session must name the repo; a single-repo session omits it and the
+// override lands on the session's own checkout. See #970, #3329.
 
 #[derive(Deserialize)]
 pub struct UpdateDiffBaseBody {
     /// New override. `Some(non-empty)` sets the override; `Some("")` or
-    /// `None` clears it (the diff then falls back to the profile default
-    /// and then auto-detection).
+    /// `None` clears it (the diff then falls back to the recorded creation
+    /// base, the profile default, and then auto-detection).
     #[serde(default)]
     pub base_branch: Option<String>,
+    /// Workspace repo this override applies to. Omitted targets the
+    /// session's own checkout, which only exists on a single-repo session;
+    /// omitting it on a workspace is rejected rather than writing state
+    /// nothing reads. See #3329.
+    #[serde(default)]
+    pub repo: Option<String>,
+}
+
+/// Write a diff-base override onto the entry `repo` names, or onto the
+/// session's own checkout when it is `None`. Split out so the persist
+/// closure and the in-memory update cannot drift.
+fn apply_diff_base_override(
+    inst: &mut crate::session::Instance,
+    repo: Option<&str>,
+    value: Option<String>,
+) {
+    match repo {
+        Some(name) => {
+            if let Some(ws) = inst.workspace_info.as_mut() {
+                if let Some(r) = ws.repos.iter_mut().find(|r| r.name == name) {
+                    r.base_branch_override = value;
+                }
+            }
+        }
+        None => inst.base_branch_override = value,
+    }
 }
 
 pub async fn update_session_diff_base(
@@ -2261,6 +2619,39 @@ pub async fn update_session_diff_base(
         let Some(inst) = instances.iter().find(|i| i.id == id) else {
             return super::session_not_found();
         };
+        // Reject a target that names no entry, so a stale client cannot
+        // silently write an override the diff never reads.
+        match body.repo.as_deref() {
+            Some(name) => {
+                if !inst.all_repos().iter().any(|r| r.name == name) {
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": "bad_request",
+                            "message": "unknown workspace repo"
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+            None => {
+                if inst.workspace_info.is_some() {
+                    let names: Vec<&str> =
+                        inst.all_repos().iter().map(|r| r.name.as_str()).collect();
+                    return (
+                        StatusCode::BAD_REQUEST,
+                        Json(serde_json::json!({
+                            "error": "bad_request",
+                            "message": format!(
+                                "this session is a multi-repo workspace; name the repo to set a diff base for ({})",
+                                names.join(", ")
+                            )
+                        })),
+                    )
+                        .into_response();
+                }
+            }
+        }
         inst.source_profile.clone()
     };
 
@@ -2274,13 +2665,14 @@ pub async fn update_session_diff_base(
     // Persist first; only mutate memory once disk is durable. See #1589.
     let persist_id = id.clone();
     let persist_override = new_override.clone();
+    let persist_repo = body.repo.clone();
     if persist_session_update(
         profile,
         "diff-base update",
         state.file_watch.clone(),
         move |instances| {
             if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                inst.base_branch_override = persist_override;
+                apply_diff_base_override(inst, persist_repo.as_deref(), persist_override);
             }
         },
     )
@@ -2299,7 +2691,7 @@ pub async fn update_session_diff_base(
         );
         return super::session_gone_after_persist();
     };
-    inst.base_branch_override = new_override;
+    apply_diff_base_override(inst, body.repo.as_deref(), new_override);
 
     let response =
         SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
@@ -2693,290 +3085,193 @@ pub async fn update_session_archive(
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
-/// Release the teardown's in-flight Trash claim on a no-relocation terminal
-/// path (the relocation paths release inside `commit_trash_relocation`).
-/// Ownership-guarded; best-effort, a stranded claim self-heals via the TTL.
-/// Mirrors the CLI's `release_trash_claim_best_effort` so the two surfaces
-/// stay symmetric.
-async fn release_trash_claim_best_effort(state: &Arc<AppState>, profile: String, id: &str) {
-    let release_id = id.to_string();
-    let _ = persist_session_update(
-        profile,
-        "trash-claim-release",
-        state.file_watch.clone(),
-        move |instances| {
-            crate::session::claim::release_trash_claim(instances, &release_id);
-        },
-    )
-    .await;
-}
-
-/// `POST /api/sessions/:id/trash`. Soft-delete a session into the trash
-/// bucket: persist `trashed_at`, then stop the live session the same way
-/// archive does (structured-view supervisor `shutdown`, which PRESERVES the
-/// transcript, plus optional tmux teardown). Durable artifacts (transcript,
-/// worktree, branch, container) are kept so `restore` is faithful; permanent
-/// teardown happens only on purge (`DELETE`). See #2489.
+/// `POST /api/sessions/:id/trash`. The per-instance lifecycle flock is held
+/// from the durable Trash reservation through teardown, relocation, and final commit.
 pub async fn trash_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
     body: Option<Json<TrashSessionBody>>,
 ) -> impl IntoResponse {
-    // CityHall: only act on structured sessions this mode created; refuse a
-    // non-structured (or unknown) target so a locked-down client cannot
-    // respawn/destroy/edit an enumerated plain session. See #7.
-    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
-        return resp;
+    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
+        return response;
     }
     if state.read_only {
         return super::read_only_response();
     }
-    let body = body.map(|Json(b)| b).unwrap_or_default();
+    let body = body.map(|Json(body)| body).unwrap_or_default();
 
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
-
-    let profile = {
+    let (profile, snapshot) = {
         let instances = state.instances.read().await;
-        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+        let Some(instance) = instances.iter().find(|instance| instance.id == id) else {
             return super::session_not_found();
         };
-        inst.source_profile.clone()
+        (instance.source_profile.clone(), instance.clone())
     };
 
-    let persist_id = id.clone();
-    if persist_session_update(
-        profile,
-        "trash",
-        state.file_watch.clone(),
-        move |instances| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                inst.trash();
-                // Mark the teardown in flight (ClaimOp::Trash) so peers
-                // observe it as durable state. Best-effort: a refused claim
-                // still tears down, gated by the pre-move re-check and the
-                // locked relocation commit.
-                if let Err(holder) = inst.try_claim(
-                    crate::session::ClaimOp::Trash,
-                    Instance::OP_CLAIM_TTL,
-                    chrono::Utc::now(),
-                ) {
-                    tracing::info!(
-                        target: "http.api.sessions",
-                        session = %inst.id,
-                        "trash teardown runs unclaimed; a fresh {holder:?} claim holds the row"
-                    );
-                }
-            }
+    let reserve_profile = profile.clone();
+    let reserve_id = id.clone();
+    let file_watch = state.file_watch.clone();
+    let (storage, lifecycle_lock, generation) = match tokio::task::spawn_blocking(
+        move || -> anyhow::Result<_> {
+            let storage = Storage::new(&reserve_profile, file_watch)?;
+            let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&reserve_id)?;
+            let generation = storage.update(|instances, _groups| {
+                let Some(instance) = instances
+                    .iter_mut()
+                    .find(|instance| instance.id == reserve_id)
+                else {
+                    anyhow::bail!("session disappeared before trash");
+                };
+                instance
+                    .try_acquire_lifecycle_reservation(
+                        LifecycleOperation::Trash,
+                        Instance::LIFECYCLE_RESERVATION_TTL,
+                        chrono::Utc::now(),
+                    )
+                    .map_err(anyhow::Error::new)?;
+                instance.trash();
+                Ok(instance.lifecycle_generation)
+            })?;
+            Ok((storage, lifecycle_lock, generation))
         },
     )
     .await
-    .is_err()
     {
-        return persist_failed_response();
-    }
-
-    // Disk durable; apply to memory and snapshot what teardown needs.
-    let (was_structured_view, inst_clone) = {
-        let mut instances = state.instances.write().await;
-        let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-            tracing::warn!(
-                target: "http.api.sessions",
-                session = %id,
-                "trash: instance vanished after persist"
-            );
-            return super::session_gone_after_persist();
-        };
-        inst.trash();
-        let structured_view;
-        #[cfg(feature = "serve")]
-        {
-            structured_view = inst.is_structured();
+        Ok(Ok(reserved)) => reserved,
+        Ok(Err(error)) => {
+            tracing::warn!(target: "http.api.sessions", session = %id, "trash reservation failed: {error}");
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "lifecycle_busy",
+                    "message": error.to_string()
+                })),
+            )
+                .into_response();
         }
-        #[cfg(not(feature = "serve"))]
-        {
-            structured_view = false;
+        Err(error) => {
+            tracing::error!(target: "http.api.sessions", session = %id, "trash reservation join failed: {error}");
+            return persist_failed_response();
         }
-        (structured_view, inst.clone())
     };
 
-    // Stop the live session (mirror archive teardown). shutdown() preserves
-    // the transcript (#1710); purge is the only path that deletes it.
+    let was_structured_view = snapshot.is_structured();
+    {
+        let mut instances = state.instances.write().await;
+        let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) else {
+            return super::session_gone_after_persist();
+        };
+        instance.trash();
+        instance.lifecycle_generation = generation;
+    }
+
     if was_structured_view {
         #[cfg(feature = "serve")]
         match state.acp_supervisor.shutdown(&id).await {
             Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
-            Err(e) => tracing::warn!(
+            Err(error) => tracing::warn!(
                 target: "acp.supervisor",
                 session = %id,
-                "shutdown during trash failed: {e}"
+                "shutdown during trash failed: {error}"
             ),
-        }
-        if body.kill_pane {
-            let inst_for_kill = inst_clone.clone();
-            if let Err(e) =
-                tokio::task::spawn_blocking(move || inst_for_kill.kill_ancillary_tmux_sessions())
-                    .await
-            {
-                tracing::warn!(target: "http.api.sessions", "Trash: ancillary tmux kill join failed: {e}");
-            }
-        }
-    } else if body.kill_pane {
-        let inst_for_kill = inst_clone.clone();
-        if let Err(e) =
-            tokio::task::spawn_blocking(move || inst_for_kill.kill_all_tmux_sessions()).await
-        {
-            tracing::warn!(target: "http.api.sessions", "Trash: tmux kill join failed: {e}");
         }
     }
 
-    // The session is durably trashed; stop its sandbox container (so it doesn't
-    // keep running for the whole retention window) and relocate its managed
-    // worktree out of the active dir into the holding area, then persist the
-    // repointed project_path. Stopping the container is not enough on its own
-    // to release the worktree bind mount (a stopped container keeps pinning it,
-    // which is why the rename gate discards it); the stop is here so the
-    // sandbox isn't left running for the whole retention window. Both the
-    // container stop and the git move are blocking, so this runs on a blocking
-    // thread.
-    // Best-effort: a failure leaves the worktree in place and the daemon's
-    // reconcile pass can move it later. Never blocks the trash itself, which
-    // already landed above.
-    {
-        let profile = inst_clone.source_profile.clone();
-        match tokio::task::spawn_blocking(move || {
-            let mut inst = inst_clone;
-            let outcome = crate::session::trash::prepare_trashed_worktree(&mut inst);
-            (outcome, inst)
-        })
-        .await
-        {
-            Ok((crate::session::trash::RelocateOutcome::Relocated { .. }, moved)) => {
-                // Atomic durable check-and-commit: a peer restore or purge can
-                // land between the teardown's pre-move re-check and this
-                // persist, so the decision is re-taken on the durable row
-                // under the flock (`commit_trash_relocation`). Superseded
-                // means such a peer won: the paths are not recorded and the
-                // disk move is undone off-thread instead.
-                let reloc = crate::session::trash::TrashRelocation {
-                    new_project_path: moved.project_path.clone(),
-                    pre_trash_project_path: moved.pre_trash_project_path.clone(),
-                };
-                let decision: std::sync::Arc<
-                    std::sync::Mutex<Option<crate::session::claim::RelocationCommit>>,
-                > = std::sync::Arc::new(std::sync::Mutex::new(None));
-                let persist_id = id.clone();
-                let (decision_slot, closure_reloc) = (decision.clone(), reloc.clone());
-                let persisted = persist_session_update(
-                    profile,
-                    "trash-relocate",
-                    state.file_watch.clone(),
-                    move |instances| {
-                        let commit = crate::session::claim::commit_trash_relocation(
-                            instances,
-                            &persist_id,
-                            &closure_reloc,
-                            chrono::Utc::now(),
-                        );
-                        *decision_slot.lock().unwrap() = Some(commit);
-                    },
-                )
-                .await;
-                let commit = decision.lock().unwrap().take();
-                // The undo keys off the closure's decision alone, not the
-                // write outcome: the closure can decide Superseded (row
-                // already restored on disk) and the final write then fail,
-                // and skipping the undo in that case would leave a live
-                // restored row pointing at a worktree parked in the holding
-                // area. A Persisted decision whose write failed needs no
-                // undo: the durable row is still trashed at its old path,
-                // and the reconcile pass repoints it to the holding area.
-                match (persisted, commit) {
-                    (Ok(()), Some(crate::session::claim::RelocationCommit::Persisted)) => {
-                        let mut instances = state.instances.write().await;
-                        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                            inst.project_path = reloc.new_project_path.clone();
-                            inst.pre_trash_project_path = reloc.pre_trash_project_path.clone();
-                        }
-                    }
-                    (_, Some(crate::session::claim::RelocationCommit::Superseded)) => {
-                        let undo_id = id.clone();
-                        let outcome = tokio::task::spawn_blocking(move || {
-                            crate::session::trash::undo_raced_relocation(&moved, &reloc)
-                        })
-                        .await;
-                        match outcome {
-                            Ok(crate::session::trash::RestoreOutcome::Failed { reason }) => {
-                                tracing::warn!(
-                                    target: "http.api.sessions",
-                                    session = %undo_id,
-                                    "superseded trash relocation could not be moved back: {reason}"
-                                );
-                            }
-                            Ok(outcome) => {
-                                tracing::info!(
-                                    target: "http.api.sessions",
-                                    session = %undo_id,
-                                    "trash relocation superseded by a restore/claim; undone ({outcome:?})"
-                                );
-                            }
-                            Err(e) => {
-                                tracing::warn!(
-                                    target: "http.api.sessions",
-                                    session = %undo_id,
-                                    "superseded trash relocation undo join failed: {e}"
-                                );
-                            }
-                        }
-                    }
-                    _ => {}
-                }
+    let work_id = id.clone();
+    let kill_pane = body.kill_pane;
+    let transition = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+        let _lifecycle_lock = lifecycle_lock;
+        let mut instance = snapshot;
+        if kill_pane {
+            if was_structured_view {
+                instance.kill_ancillary_tmux_sessions_locked();
+            } else {
+                instance.kill_all_tmux_sessions_locked();
             }
-            Ok((crate::session::trash::RelocateOutcome::Failed { reason }, _)) => {
-                tracing::warn!(
-                    target: "http.api.sessions",
-                    session = %id,
-                    "trash worktree relocation skipped: {reason}"
+        }
+        let outcome = crate::session::trash::prepare_trashed_worktree(&mut instance);
+        let relocation = match &outcome {
+            crate::session::trash::RelocateOutcome::Relocated { .. } => {
+                Some(crate::session::trash::TrashRelocation {
+                    new_project_path: instance.project_path.clone(),
+                    pre_trash_project_path: instance.pre_trash_project_path.clone(),
+                })
+            }
+            crate::session::trash::RelocateOutcome::Skipped
+            | crate::session::trash::RelocateOutcome::Failed { .. } => None,
+        };
+        storage.update(|instances, _groups| {
+            if let Some(relocation) = &relocation {
+                let commit = crate::session::claim::commit_trash_relocation(
+                    instances, &work_id, generation, relocation,
                 );
-                release_trash_claim_best_effort(&state, profile, &id).await;
+                anyhow::ensure!(
+                    commit == crate::session::claim::RelocationCommit::Persisted,
+                    "trash relocation reservation was superseded"
+                );
+            } else if let Some(stored) = instances
+                .iter_mut()
+                .find(|candidate| candidate.id == work_id)
+            {
+                stored
+                    .release_lifecycle_reservation_if_owned(LifecycleOperation::Trash, generation);
             }
-            Ok((crate::session::trash::RelocateOutcome::Skipped, _)) => {
-                release_trash_claim_best_effort(&state, profile, &id).await;
-            }
-            Err(e) => tracing::warn!(
-                target: "http.api.sessions",
-                session = %id,
-                "trash worktree relocation join failed: {e}"
-            ),
+            Ok(())
+        })?;
+        let durable = storage
+            .load()?
+            .into_iter()
+            .find(|candidate| candidate.id == work_id);
+        Ok((outcome, durable))
+    })
+    .await;
+
+    let (outcome, durable) = match transition {
+        Ok(Ok(result)) => result,
+        Ok(Err(error)) => {
+            tracing::warn!(target: "http.api.sessions", session = %id, "trash transition failed: {error}");
+            return persist_failed_response();
         }
+        Err(error) => {
+            tracing::warn!(target: "http.api.sessions", session = %id, "trash transition join failed: {error}");
+            return persist_failed_response();
+        }
+    };
+    if let crate::session::trash::RelocateOutcome::Failed { reason } = outcome {
+        tracing::warn!(
+            target: "http.api.sessions",
+            session = %id,
+            "trash worktree relocation skipped: {reason}",
+        );
     }
 
-    let instances = state.instances.read().await;
-    let response = match instances.iter().find(|i| i.id == id) {
-        Some(inst) => {
-            SessionResponse::from_instance(inst, crate::claude_settings::read_tui_fullscreen())
-        }
-        None => {
-            return super::session_not_found();
-        }
+    let Some(durable) = durable else {
+        return super::session_not_found();
+    };
+    let response = {
+        let mut instances = state.instances.write().await;
+        let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) else {
+            return super::session_gone_after_persist();
+        };
+        instance.project_path = durable.project_path;
+        instance.pre_trash_project_path = durable.pre_trash_project_path;
+        instance.lifecycle_generation = durable.lifecycle_generation;
+        instance.lifecycle_reservation = durable.lifecycle_reservation;
+        SessionResponse::from_instance(instance, crate::claude_settings::read_tui_fullscreen())
     };
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
-/// `POST /api/sessions/:id/restore`. Move a session out of the trash bucket
-/// by clearing `trashed_at`. The session returns to its prior bucket (active,
-/// or archived if it was archived before trashing); the reconciler respawns a
-/// structured-view worker on the next tick since the row is no longer
-/// trashed. No teardown. See #2489.
+/// `POST /api/sessions/:id/restore`. The lifecycle flock covers reservation
+/// acquisition, worktree restoration, and durable untrash as one transition.
 pub async fn restore_session(
     State(state): State<Arc<AppState>>,
     Path(id): Path<String>,
 ) -> impl IntoResponse {
-    // CityHall: only act on structured sessions this mode created; refuse a
-    // non-structured (or unknown) target so a locked-down client cannot
-    // respawn/destroy/edit an enumerated plain session. See #7.
-    if let Some(resp) = cityhall_block_non_structured(&state, &id).await {
-        return resp;
+    if let Some(response) = cityhall_block_non_structured(&state, &id).await {
+        return response;
     }
     if state.read_only {
         return super::read_only_response();
@@ -2984,125 +3279,153 @@ pub async fn restore_session(
 
     let lock = state.instance_lock(&id).await;
     let _guard = lock.lock().await;
-
-    let (profile, snapshot) = {
+    let profile = {
         let instances = state.instances.read().await;
-        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+        let Some(instance) = instances.iter().find(|instance| instance.id == id) else {
             return super::session_not_found();
         };
-        (inst.source_profile.clone(), inst.clone())
+        instance.source_profile.clone()
     };
 
-    // Symmetric claim (#2541): win the Restore claim on disk BEFORE the unlocked
-    // worktree move. The in-memory `instance_lock` held above does not serialize
-    // a purge running in another process (CLI / another daemon); only the
-    // durable on-disk claim does. A fresh peer Purge claim wins and the restore
-    // is refused.
-    let claim_id = id.clone();
-    match with_locked_storage(&state, &profile, move |instances| {
-        crate::session::claim::decide_restore_claim(instances, &claim_id, chrono::Utc::now())
+    enum RestoreTransitionError {
+        NotFound,
+        Busy(String),
+        Worktree(String),
+        Persist(String),
+    }
+
+    let restore_profile = profile.clone();
+    let restore_id = id.clone();
+    let file_watch = state.file_watch.clone();
+    let restored = tokio::task::spawn_blocking(move || {
+        let run = || -> Result<Instance, RestoreTransitionError> {
+            let storage = Storage::new(&restore_profile, file_watch)
+                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
+            let _lifecycle_lock = storage
+                .acquire_instance_lifecycle_lock(&restore_id)
+                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
+            let decision = storage
+                .update(|instances, _groups| {
+                    crate::session::claim::decide_restore_claim(
+                        instances,
+                        &restore_id,
+                        chrono::Utc::now(),
+                    )
+                    .map_err(anyhow::Error::new)
+                })
+                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
+            let generation = match decision {
+                crate::session::claim::RestoreClaimDecision::Claimed(generation) => generation,
+                crate::session::claim::RestoreClaimDecision::AlreadyGone => {
+                    return Err(RestoreTransitionError::NotFound);
+                }
+                crate::session::claim::RestoreClaimDecision::Busy(holder) => {
+                    return Err(RestoreTransitionError::Busy(holder.busy_reason()));
+                }
+            };
+            let Some(mut instance) = storage
+                .load()
+                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?
+                .into_iter()
+                .find(|candidate| candidate.id == restore_id)
+            else {
+                return Err(RestoreTransitionError::NotFound);
+            };
+            if let crate::session::trash::RestoreOutcome::Failed { reason } =
+                crate::session::trash::restore_worktree_location(&mut instance)
+            {
+                let _ = storage.update(|instances, _groups| {
+                    if let Some(stored) = instances
+                        .iter_mut()
+                        .find(|candidate| candidate.id == restore_id)
+                    {
+                        stored.release_lifecycle_reservation_if_owned(
+                            LifecycleOperation::Restore,
+                            generation,
+                        );
+                    }
+                    Ok(())
+                });
+                return Err(RestoreTransitionError::Worktree(reason));
+            }
+            let restored_path = instance.project_path.clone();
+            let restored_pre = instance.pre_trash_project_path.clone();
+            let commit = storage
+                .update(|instances, _groups| {
+                    Ok(crate::session::claim::finalize_restore_commit(
+                        instances,
+                        &restore_id,
+                        generation,
+                        &restored_path,
+                        &restored_pre,
+                    ))
+                })
+                .map_err(|error| RestoreTransitionError::Persist(error.to_string()))?;
+            match commit {
+                crate::session::claim::RestoreCommit::Committed => {
+                    instance.untrash();
+                    instance.lifecycle_reservation = None;
+                    Ok(instance)
+                }
+                crate::session::claim::RestoreCommit::Superseded => {
+                    Err(RestoreTransitionError::Busy(
+                        crate::session::NEWER_GENERATION_BUSY_REASON.to_string(),
+                    ))
+                }
+                crate::session::claim::RestoreCommit::AlreadyGone => {
+                    Err(RestoreTransitionError::NotFound)
+                }
+            }
+        };
+        run()
     })
-    .await
-    {
-        Ok(crate::session::claim::RestoreClaimDecision::Claimed) => {}
-        Ok(crate::session::claim::RestoreClaimDecision::AlreadyGone) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
-        }
-        Ok(crate::session::claim::RestoreClaimDecision::PurgeInProgress) => {
+    .await;
+
+    let restored = match restored {
+        Ok(Ok(instance)) => instance,
+        Ok(Err(RestoreTransitionError::NotFound)) => return super::session_not_found(),
+        Ok(Err(RestoreTransitionError::Busy(holder))) => {
             return (
                 StatusCode::CONFLICT,
                 Json(serde_json::json!({
-                    "error": "purge_in_progress",
-                    "message": "Session is being purged; restore was refused"
+                    "error": "lifecycle_busy",
+                    "message": format!("Session is {holder}, so it was not restored")
                 })),
             )
                 .into_response();
         }
-        Err(()) => return persist_failed_response(),
-    }
-
-    // Move the worktree back to its pre-trash location before clearing the
-    // marker. Strict: if the original path is occupied or git refuses, keep
-    // the session trashed and surface a conflict, rather than restoring it to
-    // the holding-area path. The git move is blocking, so it runs off the
-    // async runtime.
-    let restored = match tokio::task::spawn_blocking(move || {
-        let mut inst = snapshot;
-        let outcome = crate::session::trash::restore_worktree_location(&mut inst);
-        (outcome, inst)
-    })
-    .await
-    {
-        Ok(pair) => pair,
-        Err(e) => {
-            tracing::warn!(target: "http.api.sessions", session = %id, "restore relocation join failed: {e}");
-            release_op_claim(&state, &profile, &id, ClaimOp::Restore).await;
+        Ok(Err(RestoreTransitionError::Worktree(reason))) => {
+            return (
+                StatusCode::CONFLICT,
+                Json(serde_json::json!({
+                    "error": "worktree_restore_failed",
+                    "message": format!("Could not restore the worktree: {reason}")
+                })),
+            )
+                .into_response();
+        }
+        Ok(Err(RestoreTransitionError::Persist(error))) => {
+            tracing::warn!(target: "http.api.sessions", session = %id, "restore transition failed: {error}");
+            return persist_failed_response();
+        }
+        Err(error) => {
+            tracing::warn!(target: "http.api.sessions", session = %id, "restore transition join failed: {error}");
             return persist_failed_response();
         }
     };
-    if let crate::session::trash::RestoreOutcome::Failed { reason } = &restored.0 {
-        release_op_claim(&state, &profile, &id, ClaimOp::Restore).await;
-        return (
-            StatusCode::CONFLICT,
-            Json(serde_json::json!({
-                "error": "worktree_restore_failed",
-                "message": format!("Could not restore the worktree: {reason}")
-            })),
-        )
-            .into_response();
-    }
-    let restored_path = restored.1.project_path.clone();
-    let restored_pre = restored.1.pre_trash_project_path.clone();
 
-    // Final commit under the flock: untrash + release our claim, but only if we
-    // still own it. A stale-override purge (past the TTL) may have stolen it
-    // mid-move; in that case do not untrash and let the purge win (degrades to
-    // #2534, never worse than the status quo). See #2541.
-    let commit_id = id.clone();
-    let (rp, pre) = (restored_path.clone(), restored_pre.clone());
-    let commit = match with_locked_storage(&state, &profile, move |instances| {
-        crate::session::claim::finalize_restore_commit(instances, &commit_id, &rp, &pre)
-    })
-    .await
-    {
-        Ok(v) => v,
-        Err(()) => return persist_failed_response(),
+    let response = {
+        let mut instances = state.instances.write().await;
+        let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) else {
+            return super::session_gone_after_persist();
+        };
+        instance.project_path = restored.project_path;
+        instance.pre_trash_project_path = restored.pre_trash_project_path;
+        instance.lifecycle_generation = restored.lifecycle_generation;
+        instance.lifecycle_reservation = restored.lifecycle_reservation;
+        instance.untrash();
+        SessionResponse::from_instance(instance, crate::claude_settings::read_tui_fullscreen())
     };
-    match commit {
-        crate::session::claim::RestoreCommit::Committed => {}
-        crate::session::claim::RestoreCommit::PurgeStoleClaim => {
-            return (
-                StatusCode::CONFLICT,
-                Json(serde_json::json!({
-                    "error": "purge_in_progress",
-                    "message": "Session was claimed by a purge mid-restore; restore was refused"
-                })),
-            )
-                .into_response();
-        }
-        crate::session::claim::RestoreCommit::AlreadyGone => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({ "message": "Session not found" })),
-            )
-                .into_response();
-        }
-    }
-
-    let mut instances = state.instances.write().await;
-    let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
-        return persist_failed_response();
-    };
-    inst.project_path = restored_path;
-    inst.pre_trash_project_path = restored_pre;
-    inst.untrash();
-    inst.clear_op_claim_if_owned(ClaimOp::Restore);
-    let response =
-        SessionResponse::from_instance(&*inst, crate::claude_settings::read_tui_fullscreen());
     (StatusCode::OK, Json(serde_json::json!(response))).into_response()
 }
 
@@ -3415,43 +3738,42 @@ pub async fn stop_session(
         return (StatusCode::OK, Json(serde_json::json!(response))).into_response();
     }
 
-    // Persist Stopped first. For structured sessions also mark the row
-    // idle-dormant so the acp reconciler does not respawn the worker we are
-    // about to shut down (mirrors the structured auto-stop reaper).
-    let persist_id = id.clone();
-    if persist_session_update(
-        profile,
-        "stop session",
-        state.file_watch.clone(),
-        move |instances| {
-            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                inst.status = Status::Stopped;
-                if is_structured {
+    // Structured sessions have no tmux/container teardown transaction, so
+    // persist their dormant stop before asking the supervisor to shut down.
+    // Plain sessions delegate the full reserve/teardown/commit sequence to
+    // `Instance::stop` below.
+    if is_structured {
+        let persist_id = id.clone();
+        if persist_session_update(
+            profile.clone(),
+            "stop session",
+            state.file_watch.clone(),
+            move |instances| {
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                    inst.status = Status::Stopped;
                     inst.mark_idle_dormant();
                 }
-            }
-        },
-    )
-    .await
-    .is_err()
-    {
-        return persist_failed_response();
+            },
+        )
+        .await
+        .is_err()
+        {
+            return persist_failed_response();
+        }
     }
 
-    // Disk is durable; apply to memory and snapshot the instance for the
-    // side effects below.
     let inst_clone = {
         let mut instances = state.instances.write().await;
         let Some(inst) = instances.iter_mut().find(|i| i.id == id) else {
             tracing::warn!(
                 target: "http.api.sessions",
                 session = %id,
-                "stop session: instance vanished after persist"
+                "stop session: instance vanished before teardown"
             );
             return super::session_gone_after_persist();
         };
-        inst.status = Status::Stopped;
         if is_structured {
+            inst.status = Status::Stopped;
             inst.mark_idle_dormant();
         }
         inst.clone()
@@ -3475,12 +3797,40 @@ pub async fn stop_session(
         // container. `Instance::stop` can block ~10s on `docker stop`, so run
         // it off the async runtime. Mirrors the TUI's StopPoller.
         let inst_for_stop = inst_clone.clone();
-        match tokio::task::spawn_blocking(move || inst_for_stop.stop()).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!(
-                target: "http.api.sessions",
-                "Stop: session stop failed: {e}"
-            ),
+        let stop_profile = profile.clone();
+        let stop_id = id.clone();
+        match tokio::task::spawn_blocking(move || {
+            let stop_result = inst_for_stop.stop();
+            let disk_result = Storage::new_unwatched(&stop_profile)
+                .and_then(|storage| storage.load())
+                .map(|instances| {
+                    instances
+                        .into_iter()
+                        .find(|instance| instance.id == stop_id)
+                });
+            (stop_result, disk_result)
+        })
+        .await
+        {
+            Ok((stop_result, disk_result)) => {
+                if let Err(e) = stop_result {
+                    tracing::warn!(target: "http.api.sessions", "Stop: session stop failed: {e}");
+                }
+                match disk_result {
+                    Ok(Some(stopped)) => {
+                        let mut instances = state.instances.write().await;
+                        if let Some(live) = instances.iter_mut().find(|instance| instance.id == id)
+                        {
+                            live.merge_post_start(&stopped);
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(
+                        target: "http.api.sessions",
+                        "Stop: failed to reload lifecycle generation: {e}"
+                    ),
+                }
+            }
             Err(e) => tracing::warn!(
                 target: "http.api.sessions",
                 "Stop: stop join failed: {e}"
@@ -3616,12 +3966,11 @@ pub async fn start_session(
     let restart_result = tokio::task::spawn_blocking(
         move || -> Result<(Instance, crate::session::StartOutcome), Box<(Instance, anyhow::Error)>> {
             let mut inst = instance;
-            if let Err(e) = inst.kill_clean() {
-                return Err(Box::new((inst, e)));
-            }
             // Explicit restart endpoint (web dashboard Restart button):
-            // honor auto_resume_on_restart, same as TUI `e`/`Enter`. See #2609.
-            match inst.start_with_resume_fallback(
+            // honor auto_resume_on_restart, same as TUI `e`/`Enter`. The
+            // instance-level cascade holds the lifecycle lock across final
+            // poller drain, exact-pane OMP capture, kill, and relaunch.
+            match inst.restart_with_resume_policy(
                 None,
                 false,
                 crate::session::ResumeAttemptPolicy::HonorAutoResumeSetting,
@@ -3671,9 +4020,10 @@ pub async fn start_session(
             tracing::warn!(target: "http.api.sessions", "start_session restart failed for {id}: {msg}");
             let mut instances = state.instances.write().await;
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                apply_post_restart_sync(inst, &sync_base, &started);
-                inst.status = Status::Error;
-                inst.last_error = Some(msg.clone());
+                if apply_post_restart_sync(inst, &sync_base, &started) {
+                    inst.status = Status::Error;
+                    inst.last_error = Some(msg.clone());
+                }
             }
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -3947,11 +4297,10 @@ async fn mark_delete_error(state: &AppState, id: &str, message: String) {
 /// view), optional sidecar cleanup (worktree/branch/container/scratch per
 /// `body`), and removal from both `sessions.json` and the in-memory list.
 /// Shared by the `DELETE /api/sessions/{id}` handler and the retention
-/// auto-purge worker so the permanent-delete path can never diverge between
-/// the two. Returns the user-facing messages from `perform_deletion` on
-/// success, or a descriptive error string on failure (the caller decides how
-/// to surface it). The caller is expected to hold the per-instance lock.
-///
+/// auto-purge worker so the permanent-delete path cannot diverge between the
+/// two. Returns user-facing deletion messages on success, or a descriptive
+/// error string on failure. Blocking reservation, hook, and completion phases
+/// are dispatched internally; no caller-held lifecycle guard crosses an await.
 /// The `bool` in the success tuple is `true` when the session row was actually
 /// removed, and `false` when a concurrent restore won the race and the row was
 /// deliberately kept (see the `kept_restored` branch). Callers must not report
@@ -3965,89 +4314,143 @@ async fn purge_session_artifacts(
     recent_entry: Option<crate::session::RecentProjectEntry>,
 ) -> Result<(bool, Vec<String>), String> {
     let profile = instance.source_profile.clone();
-    let was_trashed = instance.is_trashed();
-
-    // Symmetric claim (#2541): win the Purge claim on disk before any
-    // irreversible teardown, so a restore from another process cannot bring the
-    // session back after its artifacts are gone. Refuse when a fresh Restore
-    // claim holds the row; a row already gone from disk proceeds (the teardown
-    // is idempotent and the final removal is a no-op).
-    let claim_id = id.to_string();
-    match with_locked_storage(state, &profile, move |instances| {
-        crate::session::claim::decide_purge_claim(
-            instances,
-            &claim_id,
-            was_trashed,
-            chrono::Utc::now(),
-        )
+    if profile.is_empty() {
+        return Err(
+            "Session has no source profile; refusing to acquire a default-profile purge lock"
+                .to_string(),
+        );
+    }
+    let delete_request = crate::session::deletion::DeletionRequest {
+        session_id: id.to_string(),
+        instance: instance.clone(),
+        delete_worktree: body.delete_worktree,
+        delete_branch: body.delete_branch,
+        delete_sandbox: body.delete_sandbox,
+        force_delete: body.force_delete,
+        detach_hooks: true,
+        keep_scratch: body.keep_scratch,
+    };
+    let file_watch = state.file_watch.clone();
+    let reserve_profile = profile.clone();
+    let reservation = tokio::task::spawn_blocking(move || {
+        let storage = Storage::new(&reserve_profile, file_watch)
+            .map_err(|e| format!("Storage init failed before session teardown: {e}"))?;
+        crate::session::deletion::PurgeTransaction::reserve(storage, delete_request)
+            .map_err(|e| format!("Failed to reserve session purge: {e}"))
     })
     .await
-    {
-        Ok(crate::session::claim::PurgeClaimDecision::Claimed)
-        | Ok(crate::session::claim::PurgeClaimDecision::AlreadyGone) => {}
-        Ok(crate::session::claim::PurgeClaimDecision::Restored)
-        | Ok(crate::session::claim::PurgeClaimDecision::RestoreInProgress) => {
-            return Err("Session is being restored, so it was not purged".to_string())
+    .map_err(|e| format!("Deletion reservation task failed: {e}"))??;
+    let transaction = match reservation {
+        crate::session::deletion::PurgeReservation::Reserved(transaction) => transaction,
+        crate::session::deletion::PurgeReservation::Rejected(result) => {
+            return match result.disposition {
+                crate::session::deletion::DeletionDisposition::AlreadyGone => {
+                    remove_instance(
+                        &mut *state.instances.write().await,
+                        id,
+                        &state.mutation_epoch,
+                    );
+                    state.instance_locks.write().await.remove(id);
+                    Ok((true, result.messages))
+                }
+                crate::session::deletion::DeletionDisposition::KeptRestored => {
+                    Err("Session is being restored, so it was not purged".to_string())
+                }
+                crate::session::deletion::DeletionDisposition::Busy => {
+                    Err(result.errors.first().cloned().unwrap_or_else(|| {
+                        "Session is busy with another lifecycle operation, so it was not purged"
+                            .to_string()
+                    }))
+                }
+                crate::session::deletion::DeletionDisposition::Failed
+                | crate::session::deletion::DeletionDisposition::Removed => {
+                    Err(result.errors.join("; "))
+                }
+            };
         }
-        Err(()) => {
-            return Err("Failed to acquire the purge claim under the storage lock".to_string())
-        }
-    }
+    };
+    let transaction = tokio::task::spawn_blocking(move || transaction.run_hooks())
+        .await
+        .map_err(|e| format!("Deletion hook task failed: {e}"))?;
 
-    // True once we have crossed the irreversible line (the structured-view
-    // transcript has been deleted). After that point a sidecar-cleanup
-    // failure must NOT leave the session row restorable, since the restore
-    // would resurrect a session whose transcript is already gone. See #2489.
     #[cfg(feature = "serve")]
     let transcript_purged = instance.is_structured();
     #[cfg(not(feature = "serve"))]
     let transcript_purged = false;
 
-    // Tear down the structured view worker FIRST so the ACP subprocess + its
-    // claude-agent-acp child don't leak past the session delete. Permanent
-    // removal releases the agent's persisted transcript too (#1710); the
-    // event store purge prevents a recreated same-id session from inheriting
-    // the deleted transcript.
-    #[cfg(feature = "serve")]
-    if transcript_purged {
-        match state.acp_supervisor.shutdown_and_delete(id).await {
-            Ok(()) | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
-            Err(e) => {
-                tracing::warn!(
-                    target: "acp.supervisor",
-                    session = %id,
-                    "shutdown during purge failed: {e}"
+    let deletion_result = if transcript_purged {
+        // Commit the row removal before deleting the ACP transcript. A lost
+        // restore/generation race therefore leaves both row and transcript
+        // intact; a successful commit makes later cleanup failures
+        // non-restorable by construction.
+        let committed = tokio::task::spawn_blocking(move || transaction.begin_irreversible())
+            .await
+            .map_err(|e| format!("Irreversible deletion commit task failed: {e}"))?;
+        match committed {
+            Err(result) => *result,
+            Ok(committed) => {
+                // Remove the local mirror before awaiting ACP so the reconciler
+                // cannot surface a durable row that no longer exists. Bumps the
+                // epoch under the same lock: the ACP teardown below is slow, and
+                // a reload landing inside it would otherwise restore the row.
+                remove_instance(
+                    &mut *state.instances.write().await,
+                    id,
+                    &state.mutation_epoch,
                 );
+
+                // The worker may still use the worktree, so ACP teardown stays
+                // ahead of sidecar cleanup. The durable row is already gone.
+                #[cfg(feature = "serve")]
+                {
+                    match state.acp_supervisor.shutdown_and_delete(id).await {
+                        Ok(())
+                        | Err(crate::acp::supervisor::SupervisorError::UnknownSession(_)) => {}
+                        Err(e) => {
+                            tracing::warn!(
+                                target: "acp.supervisor",
+                                session = %id,
+                                "shutdown during purge failed: {e}"
+                            );
+                        }
+                    }
+                    state.acp_supervisor.forget_session(id);
+                    state.acp_event_store.delete_session(id);
+                }
+
+                tokio::task::spawn_blocking(move || committed.finish())
+                    .await
+                    .map_err(|e| format!("Deletion cleanup task failed: {e}"))?
             }
         }
-        state.acp_supervisor.forget_session(id);
-        state.acp_event_store.delete_session(id);
-    }
-
-    let (delete_worktree, delete_branch, delete_sandbox, force_delete, keep_scratch) = (
-        body.delete_worktree,
-        body.delete_branch,
-        body.delete_sandbox,
-        body.force_delete,
-        body.keep_scratch,
-    );
-    let deletion_id = id.to_string();
-    let deletion_result = tokio::task::spawn_blocking(move || {
-        crate::session::deletion::perform_deletion(&crate::session::deletion::DeletionRequest {
-            session_id: deletion_id,
-            instance,
-            delete_worktree,
-            delete_branch,
-            delete_sandbox,
-            force_delete,
-            detach_hooks: true,
-            keep_scratch,
-        })
-    })
-    .await
-    .map_err(|e| format!("Deletion task failed: {e}"))?;
+    } else {
+        tokio::task::spawn_blocking(move || transaction.complete())
+            .await
+            .map_err(|e| format!("Deletion task failed: {e}"))?
+    };
 
     let mut messages = deletion_result.messages.clone();
+    match deletion_result.disposition {
+        crate::session::deletion::DeletionDisposition::KeptRestored
+        | crate::session::deletion::DeletionDisposition::Busy => {
+            tracing::warn!(
+                target: "http.api.sessions",
+                session = %id,
+                "session changed or was restored before purge completion; kept the durable row"
+            );
+            return Ok((false, messages));
+        }
+        crate::session::deletion::DeletionDisposition::Failed => {
+            let errs = if deletion_result.errors.is_empty() {
+                "Unknown error".to_string()
+            } else {
+                deletion_result.errors.join("; ")
+            };
+            return Err(errs);
+        }
+        crate::session::deletion::DeletionDisposition::Removed
+        | crate::session::deletion::DeletionDisposition::AlreadyGone => {}
+    }
     if !deletion_result.success {
         let errs = if deletion_result.errors.is_empty() {
             "Unknown error".to_string()
@@ -4055,69 +4458,28 @@ async fn purge_session_artifacts(
             deletion_result.errors.join("; ")
         };
         if !transcript_purged {
-            // Nothing irreversible happened (no transcript to lose), so keep
-            // the row intact and let the caller surface the error; the user
-            // can retry, e.g. with force on a dirty worktree.
-            release_op_claim(state, &profile, id, ClaimOp::Purge).await;
             return Err(errs);
         }
-        // The durable transcript is already gone; a kept row would only allow
-        // a broken restore. Commit the removal and surface the sidecar errors
-        // as warnings so the orphaned worktree/container can be cleaned up by
-        // hand. See #2489.
         tracing::warn!(
             target: "http.api.sessions",
             session = %id,
-            "purge sidecar cleanup failed after the transcript was deleted; removing the session row anyway: {errs}"
+            "purge sidecar cleanup failed after durable removal; session stays removed: {errs}"
         );
         messages.push(format!(
             "Cleanup incomplete (session removed anyway): {errs}"
         ));
     }
 
-    // Disk first: if persistence fails, in-memory state stays intact and the
-    // poll loop will not re-add a half-deleted row.
-    // #2534/#2541: revalidate under the flock. The teardown ran on an unlocked
-    // snapshot; if a restore from another process brought the session back
-    // (stale-override past the claim TTL), keep the row and release our purge
-    // claim (ownership-guarded) rather than deleting a session the user just
-    // restored. Degrades that rare residual to #2534 behavior, never worse.
-    // Deliberately hand-rolled rather than routed through `with_locked_storage`:
-    // this fn returns `Result<_, String>` and must propagate the storage error
-    // string up to the caller, whereas `with_locked_storage` logs and collapses
-    // to `Result<_, ()>`. See #2541.
-    let storage = Storage::new(&profile, state.file_watch.clone())
-        .map_err(|e| format!("Session was torn down but storage init failed: {e}"))?;
-    let id_for_save = id.to_string();
-    let kept_restored = tokio::task::spawn_blocking(move || {
-        storage.update(|instances, _groups| {
-            Ok(matches!(
-                crate::session::claim::finalize_purge_removal(instances, &id_for_save, was_trashed),
-                crate::session::claim::PurgeCommit::KeptRestored
-            ))
-        })
-    })
-    .await
-    .map_err(|e| format!("Persist task panicked: {e}"))?
-    .map_err(|e| {
-        format!("Session deletion completed on disk, but sessions.json could not be updated: {e}")
-    })?;
-
-    if kept_restored {
-        tracing::warn!(
-            target: "http.api.sessions",
-            session = %id,
-            "session was restored while its purge ran; kept the restored row, but its worktree, branch, container, or transcript may already be gone"
-        );
-        // Leave the in-memory row and its lock in place; the poll loop
-        // converges its trashed flag from the peer's on-disk untrash. The row
-        // was NOT removed, so report removed=false.
-        return Ok((false, messages));
-    }
-
     {
+        // The row is now gone from both disk and memory, so any reloader still
+        // carrying a `sessions.json` snapshot that predates either removal must
+        // drop it rather than fold the deleted row back in. `remove_instance`
+        // bumps while still holding the `instances` write lock: a reloader
+        // checks the epoch under that same lock, so the removal and the bump
+        // land as one step and a reload cannot slip between them. See
+        // invariant 8 on `reload_state_instances_from_disk`.
         let mut instances = state.instances.write().await;
-        instances.retain(|i| i.id != id);
+        remove_instance(&mut instances, id, &state.mutation_epoch);
     }
     state.instance_locks.write().await.remove(id);
     if let Some(entry) = recent_entry {
@@ -4144,52 +4506,31 @@ pub(crate) async fn reconcile_trashed_worktrees(state: &Arc<AppState>) {
             .map(|i| (i.id.clone(), i.source_profile.clone()))
             .collect()
     };
-
-    // Self-heal (#2541): clear op_claims left by a purge/restore that crashed
-    // mid-operation. `try_claim` already treats an expired claim as free (that
-    // is the authoritative self-heal), so this startup sweep is
-    // belt-and-suspenders that tidies stale claims on disk. It only visits
-    // profiles that currently have a trashed candidate; a stray claim elsewhere
-    // is still healed by the next `try_claim`.
-    let profiles: std::collections::HashSet<String> =
-        candidates.iter().map(|(_, p)| p.clone()).collect();
-    let now = chrono::Utc::now();
-    let ttl = Instance::OP_CLAIM_TTL;
-    for profile in profiles {
-        let _ = persist_session_update(
-            profile,
-            "op-claim-self-heal",
-            state.file_watch.clone(),
-            move |instances| {
-                for inst in instances.iter_mut() {
-                    inst.clear_expired_op_claim(ttl, now);
-                }
-            },
-        )
-        .await;
-    }
-
-    for (id, profile) in candidates {
+    for (id, _profile) in candidates {
         let lock = state.instance_lock(&id).await;
         let _guard = lock.lock().await;
 
         let snapshot = {
             let instances = state.instances.read().await;
-            match instances.iter().find(|i| i.id == id) {
-                Some(i) if i.is_trashed() => i.clone(),
+            match instances.iter().find(|instance| instance.id == id) {
+                Some(instance) if instance.is_trashed() => instance.clone(),
                 _ => continue,
             }
         };
         let reconciled = match tokio::task::spawn_blocking(move || {
-            let mut inst = snapshot;
-            let changed = crate::session::trash::reconcile_trashed_location(&mut inst);
-            (changed, inst)
+            let mut instance = snapshot;
+            let changed = crate::session::trash::reconcile_trashed_transition(&mut instance)?;
+            anyhow::Ok((changed, instance))
         })
         .await
         {
-            Ok(pair) => pair,
-            Err(e) => {
-                tracing::warn!(target: "http.api.sessions", session = %id, "trash reconcile join failed: {e}");
+            Ok(Ok(pair)) => pair,
+            Ok(Err(error)) => {
+                tracing::warn!(target: "http.api.sessions", session = %id, "trash reconcile skipped: {error}");
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(target: "http.api.sessions", session = %id, "trash reconcile join failed: {error}");
                 continue;
             }
         };
@@ -4197,27 +4538,12 @@ pub(crate) async fn reconcile_trashed_worktrees(state: &Arc<AppState>) {
             continue;
         }
         let moved = reconciled.1;
-        let (np, pre) = (
-            moved.project_path.clone(),
-            moved.pre_trash_project_path.clone(),
-        );
-        let persist_id = id.clone();
-        let _ = persist_session_update(
-            profile,
-            "trash-reconcile",
-            state.file_watch.clone(),
-            move |instances| {
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
-                    inst.project_path = np.clone();
-                    inst.pre_trash_project_path = pre.clone();
-                }
-            },
-        )
-        .await;
         let mut instances = state.instances.write().await;
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            inst.project_path = moved.project_path;
-            inst.pre_trash_project_path = moved.pre_trash_project_path;
+        if let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) {
+            instance.project_path = moved.project_path;
+            instance.pre_trash_project_path = moved.pre_trash_project_path;
+            instance.lifecycle_generation = moved.lifecycle_generation;
+            instance.lifecycle_reservation = moved.lifecycle_reservation;
         }
     }
 }
@@ -4735,6 +5061,13 @@ pub async fn delete_workspace(
 
 // --- Create session ---
 
+/// One repo's creation base in a create-session request. See #3329.
+#[derive(Deserialize)]
+pub struct RepoBaseInput {
+    pub repo: String,
+    pub base_branch: String,
+}
+
 #[derive(Deserialize)]
 pub struct CreateSessionBody {
     pub title: Option<String>,
@@ -4767,6 +5100,12 @@ pub struct CreateSessionBody {
     pub extra_env: Vec<String>,
     #[serde(default)]
     pub extra_repo_paths: Vec<String>,
+    /// Base branch for individual repos, as `{ repo, base_branch }` entries.
+    /// `repo` is a repo directory name or one of the paths in `path` /
+    /// `extra_repo_paths`. Outranks `base_branch`, which stays the base for
+    /// every repo no entry names. See #3329.
+    #[serde(default)]
+    pub repo_bases: Vec<RepoBaseInput>,
     #[serde(default)]
     pub command_override: String,
     #[serde(default)]
@@ -4938,11 +5277,16 @@ fn agent_is_acp_capable(
     // custom map by that same name. Looking up `tool` here would report
     // not-capable for an agent that spawns fine, skipping the up-front 403 in
     // favor of a late refusal at spawn.
-    crate::session::repo_config::resolve_config_with_repo_or_warn(profile, project_path)
-        .session
+    let session =
+        crate::session::repo_config::resolve_config_with_repo_or_warn(profile, project_path)
+            .session;
+    session
         .agent_acp_cmd
         .get(resolved)
         .is_some_and(|cmd| crate::acp::AgentSpec::from_acp_cmd(resolved, cmd).is_ok())
+        // A custom agent inheriting a registry-backed base via `agent_detect_as`
+        // spawns fine through the base adapter, so report it capable up front.
+        || crate::acp::inherited_acp_base(resolved, &session.agent_detect_as).is_some()
 }
 
 fn validate_session_tool_identity(
@@ -4987,6 +5331,35 @@ pub(crate) fn upsert_instance(
         *existing = instance;
     } else {
         instances.push(instance);
+    }
+}
+
+/// Remove `id` from the live registry, bumping `mutation_epoch` when a row was
+/// actually removed.
+///
+/// The delete path removes a row from `state.instances` in three places: the
+/// `AlreadyGone` short-circuit, the structured purge's early mirror removal
+/// (which then awaits ACP teardown before the handler finishes), and the final
+/// commit block. Every one of them has to bump, and has to bump while the
+/// caller still holds the `instances` write lock, because a reloader compares
+/// the epoch under that same lock. A removal that skips the bump leaves a
+/// window where a disk reload carrying a pre-delete snapshot rebuilds
+/// `state.instances` from it and puts the deleted row back, so
+/// `GET /api/sessions` lists a session the user just deleted.
+///
+/// Bumping only on an actual removal keeps the final commit block from
+/// spending an epoch when the early removal already took the row; if a stale
+/// reload DID restore it in between, the retain here finds it, removes it
+/// again, and bumps as it should.
+pub(crate) fn remove_instance(
+    instances: &mut Vec<crate::session::Instance>,
+    id: &str,
+    mutation_epoch: &std::sync::atomic::AtomicU64,
+) {
+    let before = instances.len();
+    instances.retain(|i| i.id != id);
+    if instances.len() != before {
+        mutation_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -5761,6 +6134,11 @@ pub async fn create_session(
         extra_args: body.extra_args,
         command_override: body.command_override,
         extra_repo_paths: body.extra_repo_paths,
+        repo_base_branches: body
+            .repo_bases
+            .into_iter()
+            .map(|r| (r.repo, r.base_branch))
+            .collect(),
         scratch: body.scratch,
         trust_hooks: body.trust_hooks,
         custom_instruction: body.custom_instruction,
@@ -5813,13 +6191,12 @@ pub async fn create_session(
                         .tie_workdir_to_name;
                 }
                 if !resp.acp_capable {
-                    let acp_cmd = crate::session::repo_config::resolve_config_with_repo_or_warn(
+                    let session = crate::session::repo_config::resolve_config_with_repo_or_warn(
                         &instance.source_profile,
                         std::path::Path::new(&instance.project_path),
                     )
-                    .session
-                    .agent_acp_cmd;
-                    resp.acp_capable = custom_agent_acp_capable(&acp_cmd, &instance.tool);
+                    .session;
+                    resp.acp_capable = custom_agent_acp_capable(&session, &instance.tool);
                 }
             }
 
@@ -5917,31 +6294,49 @@ fn public_create_session_error(e: &anyhow::Error) -> String {
 /// `agent_session_id = None` and generate (and persist) a new UUID,
 /// silently orphaning the previous Claude conversation.
 fn apply_post_restart_identity_sync(live: &mut Instance, before: &Instance, started: &Instance) {
+    if started.lifecycle_generation < live.lifecycle_generation {
+        return;
+    }
     // Treat the pre-restart snapshot as a CAS baseline for peer-writable
     // identity fields. If a poller/CLI/TUI peer changed the sid while the
     // restart clone was blocking, that newer sid and its marker stay
     // authoritative.
+    let generation_can_merge = live.omp_capture_generation == before.omp_capture_generation
+        || live.omp_capture_generation == started.omp_capture_generation;
     let sid_unchanged = live.agent_session_id == before.agent_session_id;
     let marker_unchanged = live.resume_probe_failed_sid == before.resume_probe_failed_sid;
-    if sid_unchanged {
-        live.agent_session_id = started.agent_session_id.clone();
+    if generation_can_merge {
+        live.omp_capture_generation = started.omp_capture_generation.clone();
+        live.session_id_poller = started.session_id_poller.clone();
+        if sid_unchanged {
+            live.agent_session_id = started.agent_session_id.clone();
+        }
+    } else if started.session_id_poller_is_running() {
+        // The worker follows the pane name and will rebind itself to the
+        // concurrently published generation on its next metadata refresh.
+        live.session_id_poller = started.session_id_poller.clone();
     }
-    if marker_unchanged && live.agent_session_id == started.agent_session_id {
+    if generation_can_merge && marker_unchanged && live.agent_session_id == started.agent_session_id
+    {
         live.resume_probe_failed_sid = started.resume_probe_failed_sid.clone();
     }
+    live.lifecycle_generation = started.lifecycle_generation;
 }
 
-fn apply_post_restart_sync(live: &mut Instance, before: &Instance, started: &Instance) {
-    live.status = started.status;
+fn apply_post_restart_sync(live: &mut Instance, before: &Instance, started: &Instance) -> bool {
+    if started.lifecycle_generation < live.lifecycle_generation {
+        return false;
+    }
+    live.merge_post_restart_with_baseline(before, started);
     live.last_error = if started.status == Status::Error {
         started.last_error.clone()
     } else {
         None
     };
     live.last_error_check = started.last_error_check;
-    apply_post_restart_identity_sync(live, before, started);
     live.last_start_time = started.last_start_time;
     live.retroactive_capture_excludes = started.retroactive_capture_excludes.clone();
+    true
 }
 
 /// Narrow sibling of [`apply_post_restart_sync`] that propagates only the
@@ -5956,6 +6351,9 @@ fn apply_post_restart_sync(live: &mut Instance, before: &Instance, started: &Ins
 /// post-cascade `finalize_launch`) would briefly mis-paint a broken pane
 /// as `Starting` until the 2s status poll loop reconciles.
 fn apply_cascade_state_sync(live: &mut Instance, before: &Instance, started: &Instance) {
+    if started.lifecycle_generation < live.lifecycle_generation {
+        return;
+    }
     apply_post_restart_identity_sync(live, before, started);
     live.retroactive_capture_excludes = started.retroactive_capture_excludes.clone();
 }
@@ -6095,25 +6493,13 @@ pub async fn ensure_session(
     let restart_result = tokio::task::spawn_blocking(
         move || -> Result<(Instance, crate::session::StartOutcome), Box<(Instance, anyhow::Error)>> {
             let mut inst = instance;
-            // Use kill_clean (vs bare tmux kill) so a remain-on-exit dead
-            // pane is respawned-then-killed; bare kill races against the
-            // session cache on macOS and can leave the corpse pane behind,
-            // which then trips the next start_with_resume_fallback's
-            // `pane_was_preexisting` short-circuit. See `Instance::kill_clean`.
-            if let Err(e) = inst.kill_clean() {
-                return Err(Box::new((inst, e)));
-            }
-            // Surface the moved Instance on the Err arm so the caller can
-            // sync resume-path mutations back to live state. Otherwise the
-            // live entry can retain stale marker/sid state until the next
-            // `status_poll_loop` reload window (~2s). See
-            // `apply_post_restart_sync`.
-            //
-            // `ensure_session` respawns on-demand before a WS attach/send,
+            // `ensure_session` respawns on demand before a WS attach/send,
             // the server-side analog of `ensure_pane_ready`: always `Allow`,
-            // ignoring `auto_resume_on_restart`, so attaching doesn't
-            // silently drop the agent's context. See #2609.
-            match inst.start_with_resume_fallback(
+            // ignoring `auto_resume_on_restart`, so attaching does not drop
+            // the agent's context. The instance-level cascade holds the
+            // lifecycle lock across final poller drain, exact-pane OMP
+            // capture, kill, and relaunch.
+            match inst.restart_with_resume_policy(
                 None,
                 false,
                 crate::session::ResumeAttemptPolicy::Allow,
@@ -6168,9 +6554,10 @@ pub async fn ensure_session(
             tracing::warn!(target: "http.api.sessions", "ensure_session restart failed for {id}: {msg}");
             let mut instances = state.instances.write().await;
             if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-                apply_post_restart_sync(inst, &sync_base, &started);
-                inst.status = crate::session::Status::Error;
-                inst.last_error = Some(msg.clone());
+                if apply_post_restart_sync(inst, &sync_base, &started) {
+                    inst.status = crate::session::Status::Error;
+                    inst.last_error = Some(msg.clone());
+                }
             }
             (
                 StatusCode::INTERNAL_SERVER_ERROR,
@@ -6505,6 +6892,17 @@ pub struct RepoBase {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub repo_name: Option<String>,
     pub base_branch: String,
+    /// Worktree path this entry's diff was computed in. The web base
+    /// picker queries it for that repo's branch list, so a workspace
+    /// member's typeahead lists its own branches rather than the launch
+    /// repo's. See #3329.
+    pub repo_path: String,
+    /// This entry's explicit override, when one is set. Absent means
+    /// `base_branch` came from the recorded creation base, the profile
+    /// default, or auto-detection, so the client hides its reset
+    /// affordance. See #3329.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub base_override: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -6608,26 +7006,31 @@ fn validate_diff_path(
     }
 }
 
-/// One repo's worth of diff context: a name (for workspace members)
-/// and the filesystem path the diff helper walks. See #1047.
+/// One repo's worth of diff context: a name (for workspace members),
+/// the filesystem path the diff helper walks, and the two base-branch
+/// layers that vary per repo. See #1047, #3329.
 #[derive(Clone, Debug)]
 struct DiffRepo {
     /// Workspace member name, or None for single-repo sessions.
     name: Option<String>,
     path: String,
+    /// Explicit override for this entry's diff base, set via
+    /// `PATCH /api/sessions/{id}/diff-base`, the `aoe session set-base`
+    /// CLI, or the TUI diff view's `b` keybind. For a workspace member
+    /// that is `WorkspaceRepo::base_branch_override`; for a single-repo
+    /// session's own checkout it is `Instance::base_branch_override`.
+    /// See #970, #3329.
+    base_override: Option<String>,
+    /// The branch this entry's worktree was created from, recorded at
+    /// creation. `WorkspaceRepo::base_branch` for a workspace member,
+    /// `WorktreeInfo::base_branch` for a single-repo session. Slots
+    /// below the explicit override but above the profile default and
+    /// auto-detection. See #1951, #3329.
+    recorded_base: Option<String>,
 }
 
 struct DiffContext {
     repos: Vec<DiffRepo>,
-    /// Per-session override for the diff base (set via
-    /// `PATCH /api/sessions/{id}/diff-base`, the `aoe session set-base`
-    /// CLI, or the TUI diff view's `b` keybind). Wins over the
-    /// profile-level default and the auto-detected ref. See #970.
-    base_branch_override: Option<String>,
-    /// The branch the worktree was created from, recorded at creation
-    /// time. Slots below the explicit override but above the profile
-    /// default and auto-detection. See #1951.
-    base_from_worktree: Option<String>,
 }
 
 /// Expand a session into the list of repos whose diffs the sidebar
@@ -6644,6 +7047,14 @@ async fn resolve_diff_repos(
         .iter()
         .find(|i| i.id == id)
         .ok_or_else(super::session_not_found)?;
+    Ok(DiffContext {
+        repos: diff_repos_of(inst),
+    })
+}
+
+/// The repo entries for one session, split out of [`resolve_diff_repos`] so the
+/// per-repo base plumbing is testable without an `AppState`.
+fn diff_repos_of(inst: &crate::session::Instance) -> Vec<DiffRepo> {
     // A session with any repo record (a creation-time workspace, repos attached
     // later, or both) lists one entry per repo. A session with none falls back
     // to its project_path, which is the single-repo flow unchanged.
@@ -6653,43 +7064,47 @@ async fn resolve_diff_repos(
         .map(|r| DiffRepo {
             name: Some(r.name.clone()),
             path: r.worktree_path.clone(),
+            base_override: r.base_branch_override.clone(),
+            recorded_base: r.base_branch.clone(),
         })
         .collect();
     if inst.workspace_info.is_none() {
-        // An attached repo widens a single-repo session rather than replacing
-        // it, so the session's own checkout stays first in the list.
+        // A session with no repo records is single-repo: its own checkout is
+        // the only entry, and the session-level override is that entry's
+        // override. `attach_project` converts a session into a workspace, so
+        // a named entry and this unnamed one never coexist. See #3329.
         repos.insert(
             0,
             DiffRepo {
                 name: None,
                 path: inst.project_path.clone(),
+                base_override: inst.base_branch_override.clone(),
+                recorded_base: inst
+                    .worktree_info
+                    .as_ref()
+                    .and_then(|w| w.base_branch.clone()),
             },
         );
     }
-    Ok(DiffContext {
-        repos,
-        base_branch_override: inst.base_branch_override.clone(),
-        base_from_worktree: inst
-            .worktree_info
-            .as_ref()
-            .and_then(|w| w.base_branch.clone()),
-    })
+    repos
 }
 
-/// Resolve the diff base for one repo path. Override (per-session)
-/// wins over the worktree's recorded base, which wins over the
-/// profile's `DiffConfig.default_branch`, which wins over
-/// auto-detection (`get_default_base_ref`). See #970, #1951.
+/// Resolve the diff base for one repo. The repo's own override wins
+/// over the base its worktree was recorded as forked from, which wins
+/// over the profile's `DiffConfig.default_branch`, which wins over
+/// auto-detection (`get_default_base_ref`). Every layer above the
+/// config default is per repo, so each workspace member resolves
+/// independently. See #970, #1951, #3329.
 fn resolve_diff_base(
     override_value: Option<&str>,
-    worktree_base: Option<&str>,
+    recorded_base: Option<&str>,
     config_default: Option<&str>,
     repo_path: &std::path::Path,
 ) -> String {
     if let Some(v) = override_value.map(str::trim).filter(|v| !v.is_empty()) {
         return v.to_string();
     }
-    if let Some(v) = worktree_base.map(str::trim).filter(|v| !v.is_empty()) {
+    if let Some(v) = recorded_base.map(str::trim).filter(|v| !v.is_empty()) {
         return v.to_string();
     }
     if let Some(v) = config_default.map(str::trim).filter(|v| !v.is_empty()) {
@@ -6725,8 +7140,8 @@ pub async fn session_diff_files(
         for repo in &ctx.repos {
             let path = std::path::Path::new(&repo.path);
             let base_branch = resolve_diff_base(
-                ctx.base_branch_override.as_deref(),
-                ctx.base_from_worktree.as_deref(),
+                repo.base_override.as_deref(),
+                repo.recorded_base.as_deref(),
                 config_default.as_deref(),
                 path,
             );
@@ -6748,6 +7163,8 @@ pub async fn session_diff_files(
             per_repo_bases.push(RepoBase {
                 repo_name: repo.name.clone(),
                 base_branch: base_branch.clone(),
+                repo_path: repo.path.clone(),
+                base_override: repo.base_override.clone(),
             });
             if let Some(w) = warning {
                 match repo.name.as_deref() {
@@ -6844,8 +7261,8 @@ pub async fn session_diff_file(
         };
     let project_path = selected_repo.path;
     let selected_repo_name = selected_repo.name;
-    let base_branch_override = ctx.base_branch_override.clone();
-    let base_from_worktree = ctx.base_from_worktree.clone();
+    let base_override = selected_repo.base_override;
+    let recorded_base = selected_repo.recorded_base;
     let scan_state = state.clone();
 
     let result =
@@ -6860,8 +7277,8 @@ pub async fn session_diff_file(
                 .default_branch
                 .clone();
             let base_branch = resolve_diff_base(
-                base_branch_override.as_deref(),
-                base_from_worktree.as_deref(),
+                base_override.as_deref(),
+                recorded_base.as_deref(),
                 config_default.as_deref(),
                 repo_path,
             );
@@ -7336,6 +7753,252 @@ pub async fn serve_session_artifact(Path((id, path)): Path<(String, String)>) ->
 mod tests {
     use super::*;
 
+    /// `remove_instance` is the only way a row leaves `state.instances` on the
+    /// delete path, so the epoch bump has to be tied to an actual removal
+    /// rather than to reaching the call. Bumping unconditionally would spend
+    /// an epoch on the final commit block after the structured purge's early
+    /// removal already took the row, dropping a reload that was perfectly
+    /// valid; not bumping at all leaves the window a stale reload uses to put
+    /// a deleted row back.
+    #[test]
+    fn remove_instance_bumps_the_epoch_only_when_it_removes_a_row() {
+        let epoch = std::sync::atomic::AtomicU64::new(0);
+        let read = || epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let mut instances = vec![
+            Instance::new("keep", "/tmp/keep"),
+            Instance::new("doomed", "/tmp/doomed"),
+        ];
+        let doomed_id = instances[1].id.clone();
+
+        remove_instance(&mut instances, &doomed_id, &epoch);
+        assert_eq!(read(), 1, "a real removal bumps");
+        assert_eq!(
+            instances
+                .iter()
+                .map(|i| i.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["keep"]
+        );
+
+        // The structured purge reaches the final commit block after its early
+        // removal already took the row. Nothing left to remove, nothing to
+        // invalidate, so no epoch is spent.
+        remove_instance(&mut instances, &doomed_id, &epoch);
+        assert_eq!(read(), 1, "a no-op removal does not bump");
+
+        remove_instance(&mut instances, "never-existed", &epoch);
+        assert_eq!(read(), 1, "an unknown id does not bump");
+    }
+    fn build_rename_test_state(
+        persisted: Vec<Instance>,
+        cached: Vec<Instance>,
+    ) -> (Storage, std::sync::Arc<crate::server::AppState>) {
+        let storage = Storage::new_unwatched("default").unwrap();
+        storage
+            .update(|instances, _groups| {
+                *instances = persisted;
+                Ok(())
+            })
+            .unwrap();
+        let state = crate::server::test_support::build_test_app_state(cached);
+        (storage, state)
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rename_session_rejects_duplicate_and_preserves_newer_cache() {
+        use axum::body::to_bytes;
+
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let mut existing = Instance::new("main branch", "/tmp/repo/");
+        existing.source_profile = "default".to_string();
+        let mut target = Instance::new("throwaway", "/tmp/repo");
+        target.source_profile = "default".to_string();
+        let target_id = target.id.clone();
+        let mut stale_existing = existing.clone();
+        stale_existing.title = "previous title".to_string();
+        let mut stale_target = target.clone();
+        stale_target.project_path = "/tmp/stale".to_string();
+        let (storage, state) =
+            build_rename_test_state(vec![existing, target], vec![stale_existing, stale_target]);
+
+        let response = rename_session(
+            State(state.clone()),
+            Path(target_id.clone()),
+            Ok(Json(RenameSessionBody {
+                title: "main branch".to_string(),
+                rename_branch: false,
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let body = to_bytes(response.into_body(), 2048).await.unwrap();
+        assert!(String::from_utf8_lossy(&body).contains("duplicate_session"));
+        assert_eq!(
+            state
+                .instances
+                .read()
+                .await
+                .iter()
+                .find(|instance| instance.id == target_id)
+                .unwrap()
+                .title,
+            "throwaway"
+        );
+
+        storage
+            .update(|instances, _groups| {
+                instances
+                    .iter_mut()
+                    .find(|instance| instance.id != target_id)
+                    .unwrap()
+                    .title = "other".to_string();
+                Ok(())
+            })
+            .unwrap();
+        // A user action can advance the live cache while the disk snapshot the
+        // rename will persist still has the older row. Publication must patch
+        // only rename-owned identity fields, not replace this favorite.
+        state
+            .instances
+            .write()
+            .await
+            .iter_mut()
+            .find(|instance| instance.id == target_id)
+            .unwrap()
+            .favorite();
+        let response = rename_session(
+            State(state.clone()),
+            Path(target_id.clone()),
+            Ok(Json(RenameSessionBody {
+                title: "main branch".to_string(),
+                rename_branch: false,
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let instances = state.instances.read().await;
+        let target = instances
+            .iter()
+            .find(|instance| instance.id == target_id)
+            .unwrap();
+        assert_eq!(target.title, "main branch");
+        assert_eq!(target.project_path, "/tmp/repo");
+        assert_eq!(target.source_profile, "default");
+        assert!(
+            target.is_favorited(),
+            "newer cached user action must survive rename publication"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rename_session_rejects_tied_drifted_path_collision() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let _tie_guard = crate::session::test_support::TieWorkdirToNameGuard::set(true);
+        let mut existing = Instance::new("main branch", "/tmp/worktrees/main-branch");
+        existing.source_profile = "default".to_string();
+        let mut drifted = Instance::new("main branch", "/tmp/worktrees/drifted");
+        drifted.source_profile = "default".to_string();
+        drifted.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "main-branch".to_string(),
+            main_repo_path: "/tmp/repo".to_string(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+        let drifted_id = drifted.id.clone();
+        let (_storage, state) = build_rename_test_state(
+            vec![existing.clone(), drifted.clone()],
+            vec![existing, drifted],
+        );
+
+        let response = rename_session(
+            State(state),
+            Path(drifted_id),
+            Ok(Json(RenameSessionBody {
+                title: "main branch".to_string(),
+                rename_branch: false,
+            })),
+        )
+        .await
+        .into_response();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn concurrent_renames_commit_only_one_same_identity_pair() {
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let mut first = Instance::new("first", "/tmp/shared");
+        first.source_profile = "default".to_string();
+        let mut second = Instance::new("second", "/tmp/shared/");
+        second.source_profile = "default".to_string();
+        let first_id = first.id.clone();
+        let second_id = second.id.clone();
+        let storage = Storage::new_unwatched("default").unwrap();
+        storage
+            .update(|instances, _groups| {
+                *instances = vec![first.clone(), second.clone()];
+                Ok(())
+            })
+            .unwrap();
+        let state = crate::server::test_support::build_test_app_state(vec![first, second]);
+
+        let first_rename = rename_session(
+            State(state.clone()),
+            Path(first_id),
+            Ok(Json(RenameSessionBody {
+                title: "shared title".to_string(),
+                rename_branch: false,
+            })),
+        );
+        let second_rename = rename_session(
+            State(state.clone()),
+            Path(second_id),
+            Ok(Json(RenameSessionBody {
+                title: "shared title".to_string(),
+                rename_branch: false,
+            })),
+        );
+        let (first_response, second_response) = tokio::join!(first_rename, second_rename);
+        let statuses = [
+            first_response.into_response().status(),
+            second_response.into_response().status(),
+        ];
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == StatusCode::OK)
+                .count(),
+            1
+        );
+        assert_eq!(
+            statuses
+                .iter()
+                .filter(|status| **status == StatusCode::CONFLICT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            storage
+                .load()
+                .unwrap()
+                .iter()
+                .filter(|instance| {
+                    instance.title == "shared title"
+                        && instance.project_path.trim_end_matches('/') == "/tmp/shared"
+                })
+                .count(),
+            1
+        );
+    }
+
     // #2536: the workspace-delete order must tear down record-only siblings
     // first and the shared-worktree owner last, so a sibling failure can never
     // orphan a session against an already-removed worktree.
@@ -7761,7 +8424,7 @@ mod tests {
         let live_only = list_sessions(
             axum::extract::State(state.clone()),
             axum::extract::Query(ListSessionsQuery {
-                state: Some(SessionScope::Live),
+                state: Some(crate::session::SessionScope::Live),
             }),
         )
         .await;
@@ -7770,7 +8433,7 @@ mod tests {
         let trashed_only = list_sessions(
             axum::extract::State(state.clone()),
             axum::extract::Query(ListSessionsQuery {
-                state: Some(SessionScope::Trashed),
+                state: Some(crate::session::SessionScope::Trashed),
             }),
         )
         .await;
@@ -7779,7 +8442,7 @@ mod tests {
         let explicit_all = list_sessions(
             axum::extract::State(state),
             axum::extract::Query(ListSessionsQuery {
-                state: Some(SessionScope::All),
+                state: Some(crate::session::SessionScope::All),
             }),
         )
         .await;
@@ -8245,6 +8908,8 @@ mod tests {
                 main_repo_path: "/tmp/src/repo-a".to_string(),
                 managed_by_aoe: true,
                 branch_preexisting: false,
+                base_branch: None,
+                base_branch_override: None,
             }],
             created_at: chrono::Utc::now(),
             cleanup_on_delete: true,
@@ -8457,6 +9122,133 @@ mod tests {
         // Auto-detect when nothing is set. The tmp dir is not a repo so
         // `get_default_base_ref` returns Err -> "main" fallback.
         assert_eq!(resolve_diff_base(None, None, None, tmp.path()), "main");
+    }
+
+    /// Each workspace member carries its own override and recorded base, and
+    /// the session-level `base_branch_override` does not leak into any of
+    /// them. That leak is what made a multi-repo diff compare every repo
+    /// against one ref. See #3329.
+    #[test]
+    fn diff_repos_of_scopes_bases_per_workspace_repo() {
+        fn repo(
+            name: &str,
+            base: Option<&str>,
+            over: Option<&str>,
+        ) -> crate::session::WorkspaceRepo {
+            crate::session::WorkspaceRepo {
+                name: name.to_string(),
+                source_path: format!("/src/{name}"),
+                branch: "feature/x".to_string(),
+                worktree_path: format!("/ws/{name}"),
+                main_repo_path: format!("/src/{name}"),
+                managed_by_aoe: true,
+                branch_preexisting: false,
+                base_branch: base.map(str::to_string),
+                base_branch_override: over.map(str::to_string),
+            }
+        }
+
+        let mut inst = make_test_instance();
+        inst.base_branch_override = Some("session-wide".to_string());
+        inst.workspace_info = Some(crate::session::WorkspaceInfo {
+            branch: "feature/x".to_string(),
+            workspace_dir: "/ws".to_string(),
+            repos: vec![
+                repo("api", Some("develop"), None),
+                repo("web", Some("develop"), Some("epic/checkout")),
+                repo("infra", None, None),
+            ],
+            created_at: chrono::Utc::now(),
+            cleanup_on_delete: true,
+        });
+
+        let repos = diff_repos_of(&inst);
+        let seen: Vec<_> = repos
+            .iter()
+            .map(|r| {
+                (
+                    r.name.as_deref(),
+                    r.base_override.as_deref(),
+                    r.recorded_base.as_deref(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            seen,
+            vec![
+                (Some("api"), None, Some("develop")),
+                (Some("web"), Some("epic/checkout"), Some("develop")),
+                (Some("infra"), None, None),
+            ],
+            "workspace members must not inherit the session-level override"
+        );
+
+        // A single-repo session is the other shape: one unnamed entry whose
+        // override IS the session-level field.
+        let mut single = make_test_instance();
+        single.base_branch_override = Some("upstream/main".to_string());
+        single.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "feature/x".to_string(),
+            main_repo_path: "/src/only".to_string(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: Some("develop".to_string()),
+        });
+        let repos = diff_repos_of(&single);
+        assert_eq!(repos.len(), 1);
+        assert_eq!(repos[0].name, None);
+        assert_eq!(repos[0].base_override.as_deref(), Some("upstream/main"));
+        assert_eq!(repos[0].recorded_base.as_deref(), Some("develop"));
+    }
+
+    /// The PATCH write lands on exactly the named repo, and the unnamed
+    /// target still writes the session field. See #3329.
+    #[test]
+    fn apply_diff_base_override_writes_only_the_named_repo() {
+        let mut inst = make_test_instance();
+        inst.workspace_info = Some(crate::session::WorkspaceInfo {
+            branch: "feature/x".to_string(),
+            workspace_dir: "/ws".to_string(),
+            repos: ["api", "web"]
+                .iter()
+                .map(|n| crate::session::WorkspaceRepo {
+                    name: n.to_string(),
+                    source_path: format!("/src/{n}"),
+                    branch: "feature/x".to_string(),
+                    worktree_path: format!("/ws/{n}"),
+                    main_repo_path: format!("/src/{n}"),
+                    managed_by_aoe: true,
+                    branch_preexisting: false,
+                    base_branch: None,
+                    base_branch_override: None,
+                })
+                .collect(),
+            created_at: chrono::Utc::now(),
+            cleanup_on_delete: true,
+        });
+
+        apply_diff_base_override(&mut inst, Some("web"), Some("epic/checkout".to_string()));
+        let overrides: Vec<_> = inst
+            .all_repos()
+            .iter()
+            .map(|r| (r.name.as_str(), r.base_branch_override.as_deref()))
+            .collect();
+        assert_eq!(
+            overrides,
+            vec![("api", None), ("web", Some("epic/checkout"))]
+        );
+        assert_eq!(
+            inst.base_branch_override, None,
+            "a per-repo write must not touch the session field"
+        );
+
+        // Clearing one repo leaves its sibling alone.
+        apply_diff_base_override(&mut inst, Some("web"), None);
+        assert_eq!(inst.all_repos()[1].base_branch_override, None);
+
+        // The unnamed target is the session's own checkout.
+        apply_diff_base_override(&mut inst, None, Some("develop".to_string()));
+        assert_eq!(inst.base_branch_override.as_deref(), Some("develop"));
     }
 
     #[test]
@@ -8677,6 +9469,401 @@ mod tests {
     }
 
     #[test]
+    fn title_only_rename_cache_patch_preserves_newer_path_and_branch() {
+        let mut cached = make_test_instance();
+        cached.title = "Old title".to_string();
+        cached.project_path = "/tmp/worktrees/concurrent".to_string();
+        cached.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "concurrent-branch".to_string(),
+            main_repo_path: "/tmp/repo".to_string(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+
+        apply_session_rename_cache_patch(
+            &mut cached,
+            SessionRenameCachePatch {
+                title: "New title",
+                initial_path: "/tmp/worktrees/initial",
+                initial_branch: Some("initial-branch"),
+                authoritative_path: "/tmp/worktrees/earlier-snapshot",
+                authoritative_branch: Some("earlier-snapshot-branch"),
+                renamed_path: None,
+                renamed_branch: None,
+            },
+        );
+
+        assert_eq!(cached.title, "New title");
+        assert_eq!(cached.project_path, "/tmp/worktrees/concurrent");
+        assert_eq!(
+            cached
+                .worktree_info
+                .as_ref()
+                .map(|worktree| worktree.branch.as_str()),
+            Some("concurrent-branch")
+        );
+        let response = SessionResponse::from_instance(&cached, false);
+        assert_eq!(response.title, "New title");
+    }
+
+    #[test]
+    fn tied_rename_cache_patch_publishes_owned_path_and_branch() {
+        let mut cached = make_test_instance();
+        cached.project_path = "/tmp/worktrees/concurrent".to_string();
+        cached.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "concurrent-branch".to_string(),
+            main_repo_path: "/tmp/repo".to_string(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+
+        apply_session_rename_cache_patch(
+            &mut cached,
+            SessionRenameCachePatch {
+                title: "New title",
+                initial_path: "/tmp/worktrees/initial",
+                initial_branch: Some("initial-branch"),
+                authoritative_path: "/tmp/worktrees/renamed",
+                authoritative_branch: Some("renamed-branch"),
+                renamed_path: Some("/tmp/worktrees/renamed"),
+                renamed_branch: Some("renamed-branch"),
+            },
+        );
+
+        assert_eq!(cached.title, "New title");
+        assert_eq!(cached.project_path, "/tmp/worktrees/renamed");
+        assert_eq!(
+            cached
+                .worktree_info
+                .as_ref()
+                .map(|worktree| worktree.branch.as_str()),
+            Some("renamed-branch")
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rename_session_distinguishes_cwd_stable_title_and_branch_changes() {
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        let paths = tempfile::tempdir().unwrap();
+        let title_path = paths.path().join("my-session");
+        let branch_path = paths.path().join("branch-only");
+        let title_id = "rename-title-only".to_string();
+        let branch_id = "rename-branch-only".to_string();
+
+        let mut title_only = Instance::new(
+            "Original title",
+            title_path.to_str().expect("UTF-8 temp path"),
+        );
+        title_only.id = title_id.clone();
+        title_only.status = Status::Running;
+        title_only.view = crate::session::View::Structured;
+        title_only.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "my-session".to_string(),
+            main_repo_path: paths
+                .path()
+                .join("missing-repo")
+                .to_string_lossy()
+                .into_owned(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+
+        let mut branch_only = Instance::new(
+            "Branch Only",
+            branch_path.to_str().expect("UTF-8 temp path"),
+        );
+        branch_only.id = branch_id.clone();
+        branch_only.status = Status::Running;
+        branch_only.worktree_info = Some(crate::session::WorktreeInfo {
+            branch: "existing-branch".to_string(),
+            main_repo_path: paths
+                .path()
+                .join("missing-repo")
+                .to_string_lossy()
+                .into_owned(),
+            managed_by_aoe: true,
+            created_at: chrono::Utc::now(),
+            base_branch: None,
+        });
+
+        let (_storage, state) = build_rename_test_state(
+            vec![title_only.clone(), branch_only.clone()],
+            vec![title_only, branch_only],
+        );
+        state.acp_supervisor.test_insert_worker(&title_id).await;
+
+        // The title changes, but its slug already matches both the cwd leaf
+        // and branch. Even with the branch toggle armed, this is title-only.
+        let title_response = rename_session(
+            State(state.clone()),
+            Path(title_id.clone()),
+            Ok(Json(RenameSessionBody {
+                title: "My Session!".to_string(),
+                rename_branch: true,
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(title_response.status(), StatusCode::OK);
+        let title_json: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(title_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(title_json["tie_workdir_to_name"], true);
+        assert!(
+            state.acp_supervisor.is_running(&title_id).await,
+            "a cwd-stable title-only rename must not stop the structured worker"
+        );
+
+        {
+            let instances = state.instances.read().await;
+            let renamed = instances.iter().find(|inst| inst.id == title_id).unwrap();
+            assert_eq!(renamed.title, "My Session!");
+            assert_eq!(renamed.project_path, title_path.to_str().unwrap());
+            assert_eq!(
+                renamed.worktree_info.as_ref().map(|wt| wt.branch.as_str()),
+                Some("my-session")
+            );
+        }
+
+        let branch_response = rename_session(
+            State(state.clone()),
+            Path(branch_id.clone()),
+            Ok(Json(RenameSessionBody {
+                title: "Branch Only".to_string(),
+                rename_branch: true,
+            })),
+        )
+        .await
+        .into_response();
+        assert_eq!(branch_response.status(), StatusCode::CONFLICT);
+        let branch_json: serde_json::Value = serde_json::from_slice(
+            &axum::body::to_bytes(branch_response.into_body(), usize::MAX)
+                .await
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(branch_json["error"], "session_running");
+
+        let instances = state.instances.read().await;
+        let rejected = instances.iter().find(|inst| inst.id == branch_id).unwrap();
+        assert_eq!(rejected.title, "Branch Only");
+        assert_eq!(rejected.project_path, branch_path.to_str().unwrap());
+        assert_eq!(
+            rejected.worktree_info.as_ref().map(|wt| wt.branch.as_str()),
+            Some("existing-branch"),
+            "the active branch-only request must be rejected before git mutation"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn rename_session_quiesces_structured_worker_only_when_its_cwd_moves() {
+        // Invariant #2260: a live structured-view worker is pinned to its cwd,
+        // so a tied rename that MOVES the worktree directory must stop the
+        // worker first (else it crash-loops at the pulled-out path), while a
+        // rename that leaves the cwd in place must NOT interrupt it. The
+        // quiesce runs before the git edit, so the cwd-moving assertion holds
+        // even though the edit itself then fails on a fixture with no real
+        // worktree to move: what #2260 pins is that the worker is gone by then.
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+
+        struct Case {
+            id: &'static str,
+            leaf: &'static str,
+            new_title: &'static str,
+            // Whether the new title's slug relocates the worktree directory.
+            moves_cwd: bool,
+        }
+        // The cwd-stable row's slug ("my-session") equals the existing leaf, so
+        // the edit is a no-op move; the cwd-moving row's slug differs, forcing
+        // a relocation.
+        let cases = [
+            Case {
+                id: "quiesce-cwd-stable",
+                leaf: "my-session",
+                new_title: "My Session!",
+                moves_cwd: false,
+            },
+            Case {
+                id: "quiesce-cwd-moving",
+                leaf: "old-leaf",
+                new_title: "A Brand New Name",
+                moves_cwd: true,
+            },
+        ];
+
+        for case in cases {
+            let paths = tempfile::tempdir().unwrap();
+            let project_path = paths.path().join(case.leaf);
+            let mut inst = Instance::new(
+                "Original title",
+                project_path.to_str().expect("UTF-8 temp path"),
+            );
+            inst.id = case.id.to_string();
+            // Idle, not Running: a structured session the user "stopped" sits
+            // at Idle yet still owns a live worker, which is exactly the gap
+            // `blocks_worktree_edit` misses and quiesce closes.
+            inst.status = Status::Idle;
+            inst.view = crate::session::View::Structured;
+            inst.worktree_info = Some(crate::session::WorktreeInfo {
+                branch: case.leaf.to_string(),
+                main_repo_path: paths
+                    .path()
+                    .join("missing-repo")
+                    .to_string_lossy()
+                    .into_owned(),
+                managed_by_aoe: true,
+                created_at: chrono::Utc::now(),
+                base_branch: None,
+            });
+
+            let (_storage, state) = build_rename_test_state(vec![inst.clone()], vec![inst]);
+            state.acp_supervisor.test_insert_worker(case.id).await;
+
+            let _ = rename_session(
+                State(state.clone()),
+                Path(case.id.to_string()),
+                Ok(Json(RenameSessionBody {
+                    title: case.new_title.to_string(),
+                    rename_branch: false,
+                })),
+            )
+            .await
+            .into_response();
+
+            assert_eq!(
+                state.acp_supervisor.is_running(case.id).await,
+                !case.moves_cwd,
+                "{}: worker should be {} for moves_cwd={}",
+                case.id,
+                if case.moves_cwd {
+                    "stopped"
+                } else {
+                    "preserved"
+                },
+                case.moves_cwd
+            );
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn set_worktree_name_quiesces_structured_worker_only_when_its_cwd_moves() {
+        // The standalone-endpoint mirror of the rename_session gate above: both
+        // stop a live structured-view worker only when the edit actually moves
+        // the worktree cwd (#2260), never for a cwd-stable or branch-only edit.
+        // The quiesce precedes the git edit, so the cwd-moving assertion holds
+        // even though the edit itself then fails on a fixture with no real
+        // worktree to move: what #2260 pins is that the worker is gone by then.
+        let _app_dir = crate::session::test_support::isolate_app_dir();
+        // set_worktree_name refuses a tied managed worktree (tied callers must
+        // go through rename_session), so untie the profile to reach the worker
+        // gate that this test exercises.
+        let mut overrides = serde_json::Map::new();
+        overrides.insert(
+            "session".to_string(),
+            serde_json::json!({ "tie_workdir_to_name": false }),
+        );
+        crate::session::profile_config::save_profile_config(
+            "test",
+            &crate::session::profile_config::ProfileConfig {
+                description: None,
+                overrides,
+            },
+        )
+        .expect("write test profile override");
+
+        struct Case {
+            id: &'static str,
+            leaf: &'static str,
+            new_name: &'static str,
+            // Whether the requested name relocates the worktree directory.
+            moves_cwd: bool,
+        }
+        // The cwd-stable row's name equals the existing leaf (a no-op move); the
+        // cwd-moving row's name differs, forcing a relocation.
+        let cases = [
+            Case {
+                id: "sw-cwd-stable",
+                leaf: "my-session",
+                new_name: "my-session",
+                moves_cwd: false,
+            },
+            Case {
+                id: "sw-cwd-moving",
+                leaf: "old-leaf",
+                new_name: "new-leaf",
+                moves_cwd: true,
+            },
+        ];
+
+        for case in cases {
+            let paths = tempfile::tempdir().unwrap();
+            let project_path = paths.path().join(case.leaf);
+            let mut inst = Instance::new(
+                "Original title",
+                project_path.to_str().expect("UTF-8 temp path"),
+            );
+            inst.id = case.id.to_string();
+            inst.source_profile = "test".to_string();
+            inst.status = Status::Idle;
+            inst.view = crate::session::View::Structured;
+            inst.worktree_info = Some(crate::session::WorktreeInfo {
+                branch: case.leaf.to_string(),
+                main_repo_path: paths
+                    .path()
+                    .join("missing-repo")
+                    .to_string_lossy()
+                    .into_owned(),
+                managed_by_aoe: true,
+                created_at: chrono::Utc::now(),
+                base_branch: None,
+            });
+
+            let storage = Storage::new_unwatched("test").unwrap();
+            storage
+                .update(|instances, _groups| {
+                    *instances = vec![inst.clone()];
+                    Ok(())
+                })
+                .unwrap();
+            let state = crate::server::test_support::build_test_app_state(vec![inst]);
+            state.acp_supervisor.test_insert_worker(case.id).await;
+
+            let _ = set_worktree_name(
+                State(state.clone()),
+                Path(case.id.to_string()),
+                Ok(Json(SetWorktreeNameBody {
+                    name: case.new_name.to_string(),
+                    rename_branch: false,
+                })),
+            )
+            .await
+            .into_response();
+
+            assert_eq!(
+                state.acp_supervisor.is_running(case.id).await,
+                !case.moves_cwd,
+                "{}: worker should be {} for moves_cwd={}",
+                case.id,
+                if case.moves_cwd {
+                    "stopped"
+                } else {
+                    "preserved"
+                },
+                case.moves_cwd
+            );
+        }
+    }
+
+    #[test]
     fn worktree_name_edit_updates_path_and_optionally_branch() {
         let mut inst = make_test_instance();
         inst.project_path = "/tmp/repo-worktrees/old".to_string();
@@ -8726,6 +9913,11 @@ mod tests {
         let mut started = make_test_instance();
         started.status = Status::Starting;
         started.agent_session_id = Some("claude-uuid-restart".to_string());
+        started.omp_capture_generation = Some("omp-generation-restart".to_string());
+        let mut poller = crate::session::poller::SessionPoller::new("omp-restarted".to_string());
+        assert!(poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,));
+        let restarted_poller = std::sync::Arc::new(std::sync::Mutex::new(poller));
+        started.session_id_poller = Some(restarted_poller.clone());
         started.last_start_time = Some(std::time::Instant::now());
 
         apply_post_restart_sync(&mut live, &before, &started);
@@ -8736,7 +9928,41 @@ mod tests {
             live.agent_session_id.as_deref(),
             Some("claude-uuid-restart")
         );
+        assert_eq!(
+            live.omp_capture_generation.as_deref(),
+            Some("omp-generation-restart")
+        );
+        assert!(live.session_id_poller.is_some());
         assert_eq!(live.last_start_time, started.last_start_time);
+
+        let mut generation_converged = before.clone();
+        generation_converged.agent_session_id = Some("peer-sid".to_string());
+        generation_converged.omp_capture_generation = Some("omp-generation-restart".to_string());
+        apply_post_restart_identity_sync(&mut generation_converged, &before, &started);
+        assert_eq!(
+            generation_converged.agent_session_id.as_deref(),
+            Some("peer-sid")
+        );
+        assert!(generation_converged.session_id_poller.is_some());
+
+        let mut peer_relaunched = before.clone();
+        peer_relaunched.omp_capture_generation = Some("peer-generation".to_string());
+        apply_post_restart_identity_sync(&mut peer_relaunched, &before, &started);
+        assert_eq!(
+            peer_relaunched.omp_capture_generation.as_deref(),
+            Some("peer-generation")
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            peer_relaunched
+                .session_id_poller
+                .as_ref()
+                .expect("running restart poller"),
+            &restarted_poller,
+        ));
+        restarted_poller
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .stop();
     }
 
     #[test]
@@ -8833,6 +10059,34 @@ mod tests {
         assert_eq!(
             live.resume_probe_failed_sid.as_deref(),
             Some("peer-fresh-sid")
+        );
+    }
+
+    #[test]
+    fn restart_sync_rejects_an_older_lifecycle_generation() {
+        let mut before = make_test_instance();
+        before.lifecycle_generation = 4;
+
+        let mut started = before.clone();
+        started.status = Status::Error;
+        started.agent_session_id = Some("stale-restart-sid".to_string());
+        started.retroactive_capture_excludes = ["stale-exclusion".to_string()].into();
+
+        let mut live = before.clone();
+        live.lifecycle_generation = 5;
+        live.status = Status::Running;
+        live.agent_session_id = Some("newer-restart-sid".to_string());
+        live.retroactive_capture_excludes = ["newer-exclusion".to_string()].into();
+
+        assert!(!apply_post_restart_sync(&mut live, &before, &started));
+        apply_cascade_state_sync(&mut live, &before, &started);
+
+        assert_eq!(live.lifecycle_generation, 5);
+        assert_eq!(live.status, Status::Running);
+        assert_eq!(live.agent_session_id.as_deref(), Some("newer-restart-sid"));
+        assert_eq!(
+            live.retroactive_capture_excludes,
+            ["newer-exclusion".to_string()].into()
         );
     }
 
@@ -9459,6 +10713,23 @@ mod tests {
     // helper's two guarantees directly: a success durably writes, and every
     // storage failure surfaces as `Err`.
 
+    #[test]
+    #[serial_test::serial]
+    fn rename_persistence_reports_missing_authoritative_row() {
+        let temp_home = tempfile::tempdir().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        let _ = isolated_app_dir(temp_home.path());
+        let storage = Storage::new_unwatched("rename-missing").unwrap();
+
+        let outcome =
+            persist_rename_metadata(&storage, "missing-id", "New title", None, None).unwrap();
+        assert_eq!(outcome, RenamePersistOutcome::Missing);
+        assert!(
+            storage.load().unwrap().is_empty(),
+            "a missing row must not be synthesized by rename persistence"
+        );
+    }
+
     #[tokio::test]
     #[serial_test::serial]
     async fn persist_session_update_writes_to_disk() {
@@ -10070,9 +11341,10 @@ pub async fn send_message(
                     // must be copied back from the clone).
                     let mut instances = state.instances.write().await;
                     if let Some(i) = instances.iter_mut().find(|i| i.id == id) {
-                        apply_post_restart_sync(i, &sync_base, &started);
-                        i.status = crate::session::Status::Error;
-                        i.last_error = Some(msg);
+                        if apply_post_restart_sync(i, &sync_base, &started) {
+                            i.status = crate::session::Status::Error;
+                            i.last_error = Some(msg);
+                        }
                     }
                     (
                         StatusCode::INTERNAL_SERVER_ERROR,
@@ -10430,6 +11702,7 @@ mod workspace_ordering_tests {
             },
             trashed_at: None,
             remote_owner: None,
+            remote_owner_key: None,
             notify_on_waiting: None,
             notify_on_idle: None,
             notify_on_error: None,
@@ -10437,6 +11710,7 @@ mod workspace_ordering_tests {
             view: crate::session::View::Terminal,
             #[cfg(feature = "serve")]
             acp_worker_state: crate::acp::supervisor::AcpWorkerState::Absent,
+            queued_prompts: Vec::new(),
             #[cfg(feature = "serve")]
             pending_approvals: Vec::new(),
             #[cfg(feature = "serve")]
@@ -10447,6 +11721,10 @@ mod workspace_ordering_tests {
             acp_agent: None,
             #[cfg(feature = "serve")]
             acp_can_fork: false,
+            #[cfg(feature = "serve")]
+            keeps_context: false,
+            #[cfg(feature = "serve")]
+            clear_aliases: Vec::new(),
             claude_fullscreen: false,
             workspace_repos: Vec::new(),
             warnings: Vec::new(),

@@ -5,10 +5,10 @@
 // Single acp-enabled session: kick off a long turn, queue two
 // follow-ups via the composer's Queue button, then navigate to `/` so
 // the sidebar is the primary surface and StructuredView unmounts. The
-// queued prompts are client-only state mirrored into localStorage by
-// persistState, so the sidebar row reads the count (2) without the
-// structured view mounted. The queue does not drain while no structured view hook
-// is running, so the badge is stable on the dashboard.
+// daemon owns the queue, so the test waits for each enqueue acknowledgement
+// before navigating. The confirmed reducer state is mirrored into localStorage
+// by persistState, so the sidebar row reads the count (2) without the structured
+// view mounted. The active turn keeps the daemon from draining the queue first.
 
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -75,16 +75,30 @@ base("sidebar row shows the queued-prompt count badge", async ({ page }, testInf
       name: /Queue follow-up message/i,
     });
     await expect(queueBtn).toBeVisible({ timeout: 5_000 });
-    await composer.fill("follow-up one");
-    await queueBtn.click();
-    await composer.fill("follow-up two");
-    await queueBtn.click();
+    const promptEndpoint = `${serve.baseUrl}/api/sessions/${encodeURIComponent(sessionA.id)}/acp/prompt`;
+    const queueFollowUp = async (text: string) => {
+      await composer.fill(text);
+      const responsePromise = page.waitForResponse(
+        (response) => response.url() === promptEndpoint && response.request().method() === "POST",
+      );
+      await queueBtn.click();
+      const response = await responsePromise;
+      expect(response.status()).toBe(202);
+      expect(await response.json()).toMatchObject({ disposition: "queued" });
+    };
+
+    await queueFollowUp("follow-up one");
+    await queueFollowUp("follow-up two");
+
+    // The reducer persists only confirmed queue rows for this path. Verify
+    // that local projection before the hard navigation.
+    await expect(page.getByText("Queued (2)", { exact: true })).toBeVisible();
 
     // Navigate to the dashboard so the sidebar is the primary surface.
     await page.goto(serve.baseUrl);
 
     // The row for session A should carry a "2 queued" badge, read from
-    // the persisted client-only queue state.
+    // the confirmed queue state mirrored into localStorage.
     await expect(page.getByTitle("2 queued prompts")).toBeVisible({
       timeout: 15_000,
     });

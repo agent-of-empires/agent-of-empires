@@ -11,6 +11,7 @@ use clap::Subcommand;
 use crate::acp::agent_registry::AgentRegistry;
 use crate::acp::install_hints::install_hint_for;
 use crate::acp::node;
+use crate::agents::registry_lifecycle;
 
 #[derive(Subcommand)]
 pub enum AcpCommands {
@@ -149,13 +150,16 @@ pub enum AcpCommands {
         session: String,
     },
     /// Switch an agent session to a different ACP agent, keeping the
-    /// transcript. The new agent starts fresh; use `aoe acp agents`
-    /// to list valid targets. Handy for returning to claude after a
-    /// rate-limit handoff to codex.
+    /// transcript. Valid targets are built-in registry agents and any
+    /// custom agent configured in `[session.agent_acp_cmd]`. The new
+    /// agent starts fresh; use `aoe acp agents` to list built-in
+    /// targets. Handy for returning to claude after a rate-limit handoff
+    /// to codex.
     SwitchAgent {
         /// Acp session id.
         session: String,
-        /// Registry key of the target agent (e.g. `claude`, `codex`).
+        /// Registry key or configured custom ACP agent name (e.g.
+        /// `claude`, `codex`, `my-custom-bridge`).
         target: String,
         /// Optional model override forwarded to the new agent.
         #[arg(long)]
@@ -226,6 +230,24 @@ struct AgentDoctorEntry {
     name: String,
     command_present: bool,
     description: String,
+    /// Registry lifecycle state; omitted while Active so existing JSON
+    /// consumers see no change for supported agents.
+    #[serde(skip_serializing_if = "crate::agents::AgentLifecycle::is_active")]
+    lifecycle: crate::agents::AgentLifecycle,
+    /// Set when the copy aoe would spawn is not proven compatible with
+    /// the adapter's minimum version (#3267): below-floor, or unprobeable
+    /// so compatibility cannot be proven. The listing must not read
+    /// `[OK]` then.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    version_issue: Option<AgentVersionIssue>,
+}
+
+/// A version-gate finding for one configured agent: the remediation is
+/// the same `install_command` the startup error carries.
+#[derive(Debug, Clone, serde::Serialize)]
+struct AgentVersionIssue {
+    reason: String,
+    install_command: String,
 }
 
 #[cfg(feature = "serve")]
@@ -291,6 +313,145 @@ fn skip_gate_check(binary: &str, on_path: bool) -> bool {
     !on_path && crate::acp::adapters::is_bundled(binary)
 }
 
+/// Version-gate finding for one configured agent, the listing-side twin
+/// of `doctor_fix_action`: same verdicts, plus the one distinction the
+/// plain listing needs that `--fix` does not. The `bundle_ok` flag
+/// means a pinned bundled copy exists AND provably satisfies the floor
+/// (existence alone is not compliance: a floor bump can strand an older
+/// pin in the data dir). Only a PATH copy whose version parses below
+/// the floor is backed by such a bundle, because that is the only case
+/// `path_copy_below_floor` proves at spawn (see #1017); an unparseable
+/// or failed probe keeps the PATH copy at spawn, so it stays flagged
+/// here. Absence with nothing installed stays the presence check's
+/// report; probing cannot sharpen it.
+#[cfg(feature = "serve")]
+fn doctor_version_issue(
+    gate: &crate::acp::agent_compat::VersionGate,
+    probe: &crate::acp::version_probe::ProbeStatus,
+    bundle_ok: bool,
+) -> Option<AgentVersionIssue> {
+    use crate::acp::version_probe::ProbeStatus;
+    if matches!(probe, ProbeStatus::Missing) {
+        return None;
+    }
+    match doctor_fix_action(Some(*gate), probe) {
+        DoctorFixAction::Skip => None,
+        DoctorFixAction::PrintHint { reason } => {
+            // The bundle only backs the PATH copy when the SPAWN-side
+            // tokenizer agrees the version parses below the floor: it
+            // splits on whitespace and parses strictly, while this
+            // probe folds stderr in and splits on punctuation, so a raw
+            // like `version=0.37.0` parses here but not at spawn. When
+            // spawn would keep the PATH copy, keep the flag.
+            let bundle_backs_spawn = match probe {
+                ProbeStatus::Version { stdout_raw, .. } => semver::Version::parse(gate.min_version)
+                    // Like the sibling consumers of the floor (spawn's
+                    // path_copy_below_floor, doctor_fix_action), an
+                    // unparseable floor degrades to conservative: no
+                    // bundle credit, flag stays.
+                    .is_ok_and(|min| {
+                        crate::acp::version_probe::whitespace_token_below_floor(stdout_raw, min)
+                    }),
+                // Without a parseable version spawn cannot prove
+                // below-floor either, so it keeps the PATH copy.
+                _ => false,
+            };
+            if bundle_ok && bundle_backs_spawn {
+                return None;
+            }
+            Some(AgentVersionIssue {
+                reason,
+                install_command: gate.install_command.to_string(),
+            })
+        }
+    }
+}
+
+/// True when aoe's pinned bundled copy of `binary` is actually installed
+/// in the app data dir, not merely bundleable. Shared by the `--fix`
+/// reporter and the plain listing so the #1017 fallback semantics have
+/// one definition.
+#[cfg(feature = "serve")]
+fn bundled_copy_installed(binary: &str) -> bool {
+    crate::session::get_app_dir()
+        .is_ok_and(|app_dir| crate::acp::adapters::bundled_adapter_bin(&app_dir, binary).is_some())
+}
+
+/// Resolve whether `gate`'s adapter would miss its version floor at
+/// spawn time: probe the PATH copy (the one `--fix`'s gate loop checks)
+/// and credit the pinned bundle only when its own copy provably meets
+/// the floor. Skips the probe subprocess entirely when nothing usable
+/// is installed; the presence branch already reports that.
+#[cfg(feature = "serve")]
+async fn run_doctor_version_issue(
+    gate: &crate::acp::agent_compat::VersionGate,
+) -> Option<AgentVersionIssue> {
+    let on_path = find_in_path(gate.binary).is_some();
+    let bundle_installed = bundled_copy_installed(gate.binary);
+    if !on_path && !bundle_installed {
+        return None;
+    }
+
+    // Bundle-only installs are invisible to a PATH probe: which::which
+    // cannot see the data dir, so the pinned copy itself decides. A
+    // floor bump can strand an older pin there, and spawn would run it
+    // unconditionally while validate() rejects its handshake (#3267).
+    if !on_path {
+        let strict = bundled_copy_strict_version(gate.binary).await;
+        let min = semver::Version::parse(gate.min_version);
+        if strict
+            .as_ref()
+            .is_some_and(|found| min.as_ref().is_ok_and(|min| found >= min))
+        {
+            return None;
+        }
+        let reason = match (strict, min) {
+            (Some(found), Ok(min)) => {
+                format!("installed {found} (aoe's pinned copy); requires >={min}")
+            }
+            (_, _) => {
+                format!(
+                    "the bundled copy did not report a usable version; requires >={}",
+                    gate.min_version
+                )
+            }
+        };
+        return Some(AgentVersionIssue {
+            reason,
+            install_command: gate.install_command.to_string(),
+        });
+    }
+
+    let probe = crate::acp::version_probe::probe_binary_version(gate.binary).await;
+    let bundle_ok = bundle_installed && bundled_copy_meets_floor(gate).await;
+    doctor_version_issue(gate, &probe, bundle_ok)
+}
+
+/// Strict stdout semver of the installed pinned copy, probed at its
+/// resolved data-dir path (`which::which` cannot see it there).
+#[cfg(feature = "serve")]
+async fn bundled_copy_strict_version(binary: &str) -> Option<semver::Version> {
+    let app_dir = crate::session::get_app_dir().ok()?;
+    let path = crate::acp::adapters::bundled_adapter_bin(&app_dir, binary)?;
+    match crate::acp::version_probe::probe_path_version(&path).await {
+        crate::acp::version_probe::ProbeStatus::Version { stdout_raw, .. } => {
+            crate::acp::version_probe::whitespace_token_semver(&stdout_raw)
+        }
+        _ => None,
+    }
+}
+
+/// True when the installed pinned copy's own `--version` parses, on the
+/// strict stdout stream, at or above the floor. A floor bump can strand
+/// an older pin in the data dir; crediting it would reproduce #3267
+/// behind a green doctor, since spawn prefers it whenever the PATH copy
+/// looks stale and validate() then rejects the handshake.
+#[cfg(feature = "serve")]
+async fn bundled_copy_meets_floor(gate: &crate::acp::agent_compat::VersionGate) -> bool {
+    let found = bundled_copy_strict_version(gate.binary).await;
+    semver::Version::parse(gate.min_version).is_ok_and(|min| found.is_some_and(|v| v >= min))
+}
+
 #[cfg(feature = "serve")]
 async fn run_doctor_fix_action(binary: &str) {
     let gate = crate::acp::agent_compat::version_gate_for(
@@ -304,9 +465,7 @@ async fn run_doctor_fix_action(binary: &str) {
             // actually installed. Since #1017, resolution prefers the pinned
             // bundle whenever it can prove the PATH copy is below the floor, so
             // with a bundle present the shadowing advice is simply false.
-            let bundle_installed = crate::session::get_app_dir().is_ok_and(|app_dir| {
-                crate::acp::adapters::bundled_adapter_bin(&app_dir, binary).is_some()
-            });
+            let bundle_installed = bundled_copy_installed(binary);
             if crate::acp::adapters::is_bundled(binary) && !bundle_installed {
                 println!(
                     "{binary}: {reason}. That copy is on your PATH and no bundled copy is \
@@ -431,25 +590,48 @@ async fn doctor(json: bool, fix: bool, adapter: Vec<String>, all_adapters: bool)
     let registry = AgentRegistry::with_defaults();
 
     let node_status = check_node();
-    let agent_entries: Vec<AgentDoctorEntry> = registry
-        .list()
-        .into_iter()
-        .map(|(name, spec)| AgentDoctorEntry {
+    #[cfg(feature = "serve")]
+    let mut gate_issues: Vec<(&'static str, Option<AgentVersionIssue>)> = Vec::new();
+    let mut agent_entries: Vec<AgentDoctorEntry> = Vec::new();
+    for (name, spec) in registry.list() {
+        let command_present = command_present(&spec.command);
+        #[cfg(feature = "serve")]
+        let version_issue = if command_present {
+            let expected = crate::acp::agent_compat::ExpectedAgent::from_command(&spec.command);
+            match crate::acp::agent_compat::version_gate_for(expected) {
+                None => None,
+                Some(gate) => {
+                    // Aliases share a binary (claude / claude-code);
+                    // probe each gated binary once.
+                    match gate_issues
+                        .iter()
+                        .find(|(binary, _)| *binary == gate.binary)
+                    {
+                        Some((_, cached)) => cached.clone(),
+                        None => {
+                            let issue = run_doctor_version_issue(&gate).await;
+                            gate_issues.push((gate.binary, issue.clone()));
+                            issue
+                        }
+                    }
+                }
+            }
+        } else {
+            None
+        };
+        agent_entries.push(AgentDoctorEntry {
+            lifecycle: registry_lifecycle(name),
             name: name.clone(),
-            command_present: command_present(&spec.command),
+            command_present,
             description: spec.description.clone(),
-        })
-        .collect();
+            version_issue,
+        });
+    }
 
     let any_agent_ok = agent_entries.iter().any(|e| e.command_present);
+    let any_version_issue = agent_entries.iter().any(|e| e.version_issue.is_some());
     let node_ok = node_status.meets_minimum.unwrap_or(false);
-    let overall = if node_ok && any_agent_ok {
-        "ok"
-    } else if node_ok || any_agent_ok {
-        "partial"
-    } else {
-        "fail"
-    };
+    let overall = overall_status(node_ok, any_agent_ok, any_version_issue);
     let report = DoctorReport {
         node: node_status,
         agents: agent_entries,
@@ -487,12 +669,11 @@ async fn doctor(json: bool, fix: bool, adapter: Vec<String>, all_adapters: bool)
     println!("Configured agents:");
     let registry_for_hints = AgentRegistry::with_defaults();
     for entry in &report.agents {
-        let mark = if entry.command_present {
-            "[OK]"
-        } else {
-            "[!! ]"
-        };
+        let mark = agent_mark(entry);
         println!("{} {}  ({})", mark, entry.name, entry.description);
+        if let Some(notice) = entry.lifecycle.notice() {
+            println!("{}", crate::cli::lifecycle_notice_line("    ", &notice));
+        }
         if !entry.command_present {
             // Look up the binary name via the registry so we can
             // print a tailored install hint instead of generic
@@ -503,6 +684,9 @@ async fn doctor(json: bool, fix: bool, adapter: Vec<String>, all_adapters: bool)
                     println!("    install: {hint}");
                 }
             }
+        } else if let Some(issue) = &entry.version_issue {
+            println!("    {}", issue.reason);
+            println!("    install: {}", issue.install_command);
         }
     }
     println!();
@@ -512,6 +696,29 @@ async fn doctor(json: bool, fix: bool, adapter: Vec<String>, all_adapters: bool)
         std::process::exit(if overall == "partial" { 2 } else { 1 });
     }
     Ok(())
+}
+
+/// `[OK]` only when the binary exists AND the version gate is satisfied;
+/// presence alone is not compatibility (#3267).
+fn agent_mark(entry: &AgentDoctorEntry) -> &'static str {
+    if entry.command_present && entry.version_issue.is_none() {
+        "[OK]"
+    } else {
+        "[!! ]"
+    }
+}
+
+/// Overall verdict. A version issue means configured sessions die at
+/// startup even though the binary exists, so it caps the verdict at
+/// partial exactly like a missing prerequisite (#3267).
+fn overall_status(node_ok: bool, any_agent_ok: bool, any_version_issue: bool) -> &'static str {
+    if node_ok && any_agent_ok && !any_version_issue {
+        "ok"
+    } else if node_ok || any_agent_ok {
+        "partial"
+    } else {
+        "fail"
+    }
 }
 
 fn check_node() -> NodeStatus {
@@ -584,6 +791,9 @@ fn agents() -> Result<()> {
         let present = command_present(&spec.command);
         let mark = if present { "[OK]" } else { "[!! ]" };
         println!("{} {:<14}  {}", mark, name, spec.description);
+        if let Some(notice) = registry_lifecycle(name).notice() {
+            println!("{}", crate::cli::lifecycle_notice_line("        ", &notice));
+        }
         let args = if spec.args.is_empty() {
             String::new()
         } else {
@@ -957,6 +1167,12 @@ async fn tail(session: &str, since: u64) -> Result<()> {
             Ok(WsMessage::Lagged) => {
                 eprintln!("warning: ring buffer lagged; some events lost. Refetch with `aoe acp history <session>`.");
             }
+            // `aoe acp tail` dumps the raw event frames; the server-folded
+            // control-state and transcript projections are derived from
+            // those, so they add nothing here.
+            Ok(WsMessage::TranscriptSnapshot(_))
+            | Ok(WsMessage::TranscriptDelta(_))
+            | Ok(WsMessage::ReducedState { .. }) => {}
             Err(e) => {
                 eprintln!("ws error: {e}");
                 anyhow::bail!("ws disconnected: {e}");
@@ -1046,6 +1262,46 @@ mod tests {
         assert_eq!(parse_node_major("not a version"), None);
     }
 
+    #[test]
+    fn registry_lifecycle_mirrors_agents_registry() {
+        // (registry key, expected active). gemini is the only deprecated
+        // entry; keys with no AGENTS counterpart fall back to Active.
+        let cases = [
+            ("gemini", false),
+            ("claude", true),
+            ("codex", true),
+            ("opencode", true),
+            ("no-such-adapter", true),
+        ];
+        for (key, active) in cases {
+            assert_eq!(registry_lifecycle(key).is_active(), active, "{key}");
+        }
+    }
+
+    #[test]
+    fn doctor_entry_json_omits_active_lifecycle() {
+        let active = AgentDoctorEntry {
+            name: "claude".to_string(),
+            command_present: true,
+            description: "claude adapter".to_string(),
+            lifecycle: registry_lifecycle("claude"),
+            version_issue: None,
+        };
+        let value = serde_json::to_value(&active).unwrap();
+        assert!(value.get("lifecycle").is_none(), "{value}");
+
+        let deprecated = AgentDoctorEntry {
+            name: "gemini".to_string(),
+            command_present: false,
+            description: "gemini adapter".to_string(),
+            lifecycle: registry_lifecycle("gemini"),
+            version_issue: None,
+        };
+        let value = serde_json::to_value(&deprecated).unwrap();
+        assert_eq!(value["lifecycle"]["replacement"], "antigravity", "{value}");
+        assert_eq!(value["lifecycle"]["since"], "2026-06-18", "{value}");
+    }
+
     #[cfg(feature = "serve")]
     #[test]
     fn doctor_fix_hints_missing_and_stale_gated_agents() {
@@ -1062,6 +1318,7 @@ mod tests {
                 &crate::acp::version_probe::ProbeStatus::Version {
                     raw: "0.0.1".to_string(),
                     parsed: semver::Version::parse("0.0.1").unwrap(),
+                    stdout_raw: "0.0.1".to_string(),
                 },
             ),
             DoctorFixAction::PrintHint { .. }
@@ -1083,6 +1340,7 @@ mod tests {
                         crate::acp::agent_compat::CLAUDE_AGENT_ACP_MIN_VERSION,
                     )
                     .unwrap(),
+                    stdout_raw: crate::acp::agent_compat::CLAUDE_AGENT_ACP_MIN_VERSION.to_string(),
                 },
             ),
             DoctorFixAction::Skip,
@@ -1137,10 +1395,205 @@ mod tests {
                 &crate::acp::version_probe::ProbeStatus::Version {
                     raw: "1.15.0".to_string(),
                     parsed: semver::Version::parse("1.15.0").unwrap(),
+                    stdout_raw: "1.15.0".to_string(),
                 },
             ),
             DoctorFixAction::PrintHint { .. }
         ));
+    }
+
+    /// Gate fixture for the doctor version-issue tests.
+    #[cfg(feature = "serve")]
+    fn claude_gate() -> crate::acp::agent_compat::VersionGate {
+        crate::acp::agent_compat::version_gate_for(
+            crate::acp::agent_compat::ExpectedAgent::ClaudeAgentAcp,
+        )
+        .expect("claude-agent-acp must carry a version gate")
+    }
+
+    /// #3267: the plain doctor listing applies the runtime's version
+    /// gate, not mere binary presence. The exact repro from the issue:
+    /// global adapter at 0.37.0 against the 0.55.0 floor, on PATH,
+    /// nothing bundled, sessions dying at initialize.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn doctor_flags_stale_gated_adapter_with_remediation() {
+        let gate = claude_gate();
+        let stale = crate::acp::version_probe::ProbeStatus::Version {
+            raw: "0.37.0".to_string(),
+            parsed: semver::Version::parse("0.37.0").unwrap(),
+            stdout_raw: "0.37.0".to_string(),
+        };
+        let issue = doctor_version_issue(&gate, &stale, false)
+            .expect("a below-floor adapter must produce a version issue");
+        assert!(issue.reason.contains("0.37.0"), "{}", issue.reason);
+        assert!(
+            issue.reason.contains(gate.min_version),
+            "reason must name the required floor: {}",
+            issue.reason
+        );
+        assert_eq!(issue.install_command, gate.install_command);
+    }
+
+    /// The listing borrows `--fix`'s verdicts verbatim and adds only the
+    /// bundle-awareness the spawn resolver acts on: a floor-COMPLIANT
+    /// pinned bundled copy satisfies the gate even when the PATH copy is
+    /// stale, and absence stays the presence check's report instead of a
+    /// second complaint. Bundle-only installs never reach this function:
+    /// the runner judges them from the pinned copy itself.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn doctor_version_issue_verdicts() {
+        use crate::acp::version_probe::ProbeStatus;
+        let gate = claude_gate();
+        let ver = |v: &str| ProbeStatus::Version {
+            raw: v.to_string(),
+            parsed: semver::Version::parse(v).unwrap(),
+            stdout_raw: v.to_string(),
+        };
+        // (label, probe, bundle_ok: a pinned copy exists AND provably
+        // meets the floor, expect_issue)
+        let cases: Vec<(&str, ProbeStatus, bool, bool)> = vec![
+            // At-floor and above satisfy the gate; no false positive.
+            (
+                "at_floor",
+                ver(crate::acp::agent_compat::CLAUDE_AGENT_ACP_MIN_VERSION),
+                false,
+                false,
+            ),
+            ("above_floor", ver("1.0.0"), false, false),
+            // A pinned bundled copy backs the spawn below the floor
+            // only when the SPAWN-side tokenizer can parse the raw
+            // below-floor too (resolve_agent_command switches on its
+            // own strict parse), so nothing to report.
+            ("stale_but_bundled", ver("0.37.0"), true, false),
+            // The doctor parser is more lenient than spawn's: it splits
+            // `version=0.37.0` on punctuation while spawn needs a
+            // whitespace token. Spawn keeps the PATH copy, so the
+            // listing must keep flagging despite the bundle.
+            (
+                "lenient_raw_but_bundled",
+                ProbeStatus::Version {
+                    raw: "version=0.37.0".to_string(),
+                    parsed: semver::Version::parse("0.37.0").unwrap(),
+                    stdout_raw: "version=0.37.0".to_string(),
+                },
+                true,
+                true,
+            ),
+            // Spawn's probe reads stdout only (stderr is nulled), so a
+            // version printed solely to stderr is invisible to it even
+            // though this probe folded it into `raw`: keep flagging.
+            (
+                "stderr_only_but_bundled",
+                ProbeStatus::Version {
+                    raw: "0.37.0".to_string(),
+                    parsed: semver::Version::parse("0.37.0").unwrap(),
+                    stdout_raw: String::new(),
+                },
+                true,
+                true,
+            ),
+            // Absence is reported by the presence branch either way;
+            // with a compliant bundle the runner's bundle-only branch
+            // owns that cell, so Missing itself never flags here.
+            ("missing_but_bundled", ProbeStatus::Missing, true, false),
+            ("absent_unbundled", ProbeStatus::Missing, false, false),
+            // Unprobeable copies cannot prove compatibility, with or
+            // without a bundle: path_copy_below_floor only rescues a
+            // parsed below-floor version, so spawn keeps the PATH copy
+            // and the listing must flag it.
+            (
+                "unparseable",
+                ProbeStatus::Unparseable {
+                    raw: "junk".to_string(),
+                },
+                false,
+                true,
+            ),
+            (
+                "unparseable_but_bundled",
+                ProbeStatus::Unparseable {
+                    raw: "junk".to_string(),
+                },
+                true,
+                true,
+            ),
+            (
+                "failed",
+                ProbeStatus::Failed {
+                    message: "boom".to_string(),
+                },
+                false,
+                true,
+            ),
+            (
+                "failed_but_bundled",
+                ProbeStatus::Failed {
+                    message: "boom".to_string(),
+                },
+                true,
+                true,
+            ),
+            ("timed_out", ProbeStatus::TimedOut, false, true),
+            ("timed_out_but_bundled", ProbeStatus::TimedOut, true, true),
+        ];
+        for (label, probe, bundled, expect_issue) in cases {
+            let issue = doctor_version_issue(&gate, &probe, bundled);
+            assert_eq!(issue.is_some(), expect_issue, "{label}: {issue:?}");
+        }
+        // Non-npm gated adapter: remediation is its own hint.
+        let opencode = crate::acp::agent_compat::version_gate_for(
+            crate::acp::agent_compat::ExpectedAgent::OpenCode,
+        )
+        .expect("opencode must carry a version gate");
+        let issue = doctor_version_issue(&opencode, &ver("1.15.0"), false)
+            .expect("stale opencode must produce a version issue");
+        assert_eq!(issue.install_command, opencode.install_command);
+    }
+
+    /// The `[!! ]` mark must react to version issues, not only to
+    /// missing binaries (#3267).
+    #[test]
+    fn agent_mark_demotes_on_version_issue() {
+        let entry = |present: bool, issue: Option<AgentVersionIssue>| AgentDoctorEntry {
+            name: "claude".to_string(),
+            command_present: present,
+            description: String::new(),
+            lifecycle: registry_lifecycle("claude"),
+            version_issue: issue,
+        };
+        let stale_issue = AgentVersionIssue {
+            reason: "installed 0.37.0; requires >=0.55.0".to_string(),
+            install_command: "npm install -g @x/y@latest".to_string(),
+        };
+        let marks = [
+            (entry(true, None), "[OK]"),
+            (entry(true, Some(stale_issue)), "[!! ]"),
+            (entry(false, None), "[!! ]"),
+        ];
+        for (e, mark) in &marks {
+            assert_eq!(&agent_mark(e), mark);
+        }
+    }
+
+    /// The overall verdict must cap at partial when a configured adapter
+    /// fails its version gate even though its binary exists (#3267).
+    #[test]
+    fn overall_status_caps_at_partial_on_version_issue() {
+        // (node_ok, any_agent_ok, any_version_issue, expected)
+        let cases = [
+            (true, true, false, "ok"),
+            // The #3267 regression row: everything installed but stale
+            // must not read as fully green.
+            (true, true, true, "partial"),
+            (true, false, false, "partial"),
+            (false, true, false, "partial"),
+            (false, false, false, "fail"),
+        ];
+        for (node_ok, agents_ok, stale, expected) in cases {
+            assert_eq!(overall_status(node_ok, agents_ok, stale), expected);
+        }
     }
 
     /// #1858: `aoe acp cancel` must explain the conditional

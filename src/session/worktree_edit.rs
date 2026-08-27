@@ -50,10 +50,27 @@ pub fn worktree_leaf_from_title(title: &str) -> String {
 /// The single source of truth for the sanitizer chain (git-ref sanitizer, then
 /// the path-safe one) so [`worktree_move_required`] cannot drift from the
 /// operation it gates.
-fn target_worktree_path(current_path: &Path, new_name: &str) -> Option<PathBuf> {
+pub(crate) fn target_worktree_path(current_path: &Path, new_name: &str) -> Option<PathBuf> {
     let parent = current_path.parent()?;
     let new_leaf = sanitize_branch_name(&git_sanitize_branch_name(new_name));
     Some(parent.join(new_leaf))
+}
+
+/// The tied-rename destination directory for `title`, as a string: the path
+/// [`edit_worktree_workdir`] would move `current_path` to, or `current_path`
+/// unchanged when it has no parent to rename within.
+///
+/// Single source for the destination the duplicate-identity check keys on
+/// across the CLI, server, and TUI rename paths: it slugs `title` to a
+/// sibling leaf ([`worktree_leaf_from_title`]) and resolves the move target
+/// ([`target_worktree_path`]), so the uniqueness gate always tests the exact
+/// path the directory would land on rather than the row's current path.
+pub(crate) fn derived_worktree_path(current_path: &Path, title: &str) -> String {
+    let leaf = worktree_leaf_from_title(title);
+    target_worktree_path(current_path, &leaf)
+        .unwrap_or_else(|| current_path.to_path_buf())
+        .to_string_lossy()
+        .into_owned()
 }
 
 /// Whether a workdir edit for `new_name` would actually move the worktree
@@ -81,6 +98,27 @@ pub fn worktree_move_required(current_path: &Path, new_name: &str) -> bool {
         return false;
     }
     target_worktree_path(current_path, new_name).is_some_and(|p| p != current_path)
+}
+
+/// Whether a workdir edit for `new_name` would actually rename the git branch.
+///
+/// The single source of truth for the branch-change predicate, mirroring
+/// [`worktree_move_required`] for the directory-move half. Callers that need to
+/// predict "will this edit rename the branch?" (to gate a running-session
+/// check, or to decide whether a structured-view worker must be quiesced) route
+/// through this so they cannot drift from [`edit_worktree_workdir`]'s own
+/// `branch_changes` decision.
+///
+/// Applies the same git-ref sanitizer (`git_sanitize_branch_name`) the edit
+/// applies to `new_name`, so a raw name that sanitizes to the branch the
+/// worktree already has is correctly reported as "no rename". A raw leaf
+/// comparison would miss that and over-report a rename.
+pub fn worktree_branch_rename_required(
+    worktree_info: &WorktreeInfo,
+    new_name: &str,
+    rename_branch: bool,
+) -> bool {
+    rename_branch && git_sanitize_branch_name(new_name) != worktree_info.branch
 }
 
 /// Release a sandbox session's hold on its worktree directory ahead of a
@@ -345,7 +383,8 @@ pub fn edit_worktree_workdir(
     let new_path = target_worktree_path(req.current_path, req.new_name)
         .ok_or_else(|| WorktreeEditError::NoParent(req.current_path.to_path_buf()))?;
 
-    let branch_changes = req.rename_branch && new_branch != req.worktree_info.branch;
+    let branch_changes =
+        worktree_branch_rename_required(req.worktree_info, req.new_name, req.rename_branch);
     let path_changes = new_path != req.current_path;
     if !branch_changes && !path_changes {
         return Err(WorktreeEditError::Unchanged);
@@ -478,6 +517,39 @@ mod tests {
                 target != cur,
                 "disagreement for {name:?}: target resolved to {}",
                 target.display()
+            );
+        }
+    }
+
+    /// `worktree_branch_rename_required` is the branch-half counterpart of
+    /// `worktree_move_required`, and must agree with the `branch_changes`
+    /// decision `edit_worktree_workdir` actually makes: `rename_branch` armed
+    /// AND the git-ref-sanitized name differing from the current branch. The
+    /// sanitizer step is the point a raw leaf comparison would get wrong.
+    #[test]
+    fn worktree_branch_rename_required_matches_the_sanitized_branch_change() {
+        let info = wt_info("feature/login", "/tmp/repo", true);
+        let cases = [
+            // rename_branch off: never a rename, whatever the name.
+            ("feature/logout", false, false),
+            // A genuinely different name with the toggle on renames the branch.
+            ("feature/logout", true, true),
+            // Sanitizes back to the current branch: git_sanitize_branch_name is
+            // idempotent on an already-valid ref, so this is NOT a rename even
+            // with the toggle on. A raw comparison would agree here.
+            ("feature/login", true, false),
+            // The case a raw string comparison gets WRONG: a forbidden ref
+            // char ('~') the git-ref sanitizer folds to '-' and then strips as
+            // a trailing dash lands back on the current branch, so the
+            // sanitized comparison must report no rename where a raw one would
+            // over-report one.
+            ("feature/login~", true, false),
+        ];
+        for (name, rename_branch, expected) in cases {
+            assert_eq!(
+                worktree_branch_rename_required(&info, name, rename_branch),
+                expected,
+                "name={name:?} rename_branch={rename_branch}"
             );
         }
     }

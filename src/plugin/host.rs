@@ -89,6 +89,23 @@ struct WorkerTable {
     next_supervisor_id: u64,
 }
 
+/// Level and reason for a runtime-declaring plugin that boot will not launch.
+///
+/// A plugin switched off in settings is the configuration doing exactly what
+/// the user asked for, so it belongs at DEBUG; it was ~13% of one user's WARN
+/// volume over ten days (#3403). The other reasons are states nobody chose
+/// (a stale grant, a manifest the host rejected) and keep their WARN, which
+/// is the whole point of logging the zero-launch case.
+fn inactive_launch_diagnostic(enabled: bool, granted: bool) -> (tracing::Level, &'static str) {
+    if !enabled {
+        (tracing::Level::DEBUG, "disabled")
+    } else if !granted {
+        (tracing::Level::WARN, "ungranted; awaiting reapproval")
+    } else {
+        (tracing::Level::WARN, "inactive")
+    }
+}
+
 /// The plugin worker host, owned by the daemon for its lifetime.
 pub struct PluginHost {
     api: Arc<HostApiState>,
@@ -217,7 +234,7 @@ impl PluginHost {
     /// launch path; the daemon calls it at startup and the web enable/disable
     /// handler calls it to recover a worker without a full restart.
     pub async fn start(self: &Arc<Self>, registry: &PluginRegistry) {
-        self.log_start_observability(registry);
+        Self::log_start_observability(registry);
         self.reconcile(registry).await;
     }
 
@@ -227,7 +244,10 @@ impl PluginHost {
     /// reason buried in `load_errors` (surfaced only in the plugin manager UI),
     /// so the daemon log shows a silent zero-launch. Boot-only: reconcile does
     /// not re-log this on every enable/disable.
-    fn log_start_observability(&self, registry: &PluginRegistry) {
+    ///
+    /// Takes the registry rather than `&self` so the level classification is
+    /// unit-testable without standing up a host.
+    fn log_start_observability(registry: &PluginRegistry) {
         for err in registry.load_errors() {
             tracing::warn!(
                 target: "plugin.host",
@@ -236,19 +256,15 @@ impl PluginHost {
         }
         for p in registry.all() {
             if p.manifest.runtime.is_some() && !p.active() {
-                let reason = if !p.enabled {
-                    "disabled"
-                } else if !p.granted {
-                    "ungranted; awaiting reapproval"
+                let (level, reason) = inactive_launch_diagnostic(p.enabled, p.granted);
+                let msg = "plugin declares a runtime but is inactive; not launching a worker";
+                // `tracing` resolves the level at the callsite, so the two
+                // levels need two macro invocations.
+                if level == tracing::Level::DEBUG {
+                    tracing::debug!(target: "plugin.host", plugin = %p.id(), reason, "{msg}");
                 } else {
-                    "inactive"
-                };
-                tracing::warn!(
-                    target: "plugin.host",
-                    plugin = %p.id(),
-                    reason,
-                    "plugin declares a runtime but is inactive; not launching a worker"
-                );
+                    tracing::warn!(target: "plugin.host", plugin = %p.id(), reason, "{msg}");
+                }
             }
         }
     }
@@ -813,6 +829,31 @@ mod tests {
     use super::*;
     use crate::plugin::host_api::PluginRpcContext;
     use serde_json::json;
+
+    /// Only the user-chosen "off" state drops out of the WARN stream; a
+    /// stale grant or any other inactive state stays a warning, because
+    /// nobody asked for it.
+    #[test]
+    fn inactive_launch_diagnostic_warns_only_on_unchosen_states() {
+        let cases = [
+            (false, false, tracing::Level::DEBUG, "disabled"),
+            (false, true, tracing::Level::DEBUG, "disabled"),
+            (
+                true,
+                false,
+                tracing::Level::WARN,
+                "ungranted; awaiting reapproval",
+            ),
+            (true, true, tracing::Level::WARN, "inactive"),
+        ];
+        for (enabled, granted, level, reason) in cases {
+            assert_eq!(
+                inactive_launch_diagnostic(enabled, granted),
+                (level, reason),
+                "enabled={enabled} granted={granted}"
+            );
+        }
+    }
 
     /// Spawn the single stdin-writer task `serve_connection` now expects, and
     /// return its sender (mirrors what `spawn_once` wires in production).

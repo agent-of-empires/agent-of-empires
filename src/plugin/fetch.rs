@@ -139,8 +139,20 @@ pub async fn fetch(source: &PluginSource) -> Result<FetchedPlugin> {
 
 fn read_manifest(tree: &Path) -> Result<(PluginManifest, Vec<u8>)> {
     let path = tree.join("aoe-plugin.toml");
-    let bytes = std::fs::read(&path)
-        .with_context(|| format!("no aoe-plugin.toml at {}", path.display()))?;
+    let bytes = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        // Discovery filters most of these out, but it fails open when the raw
+        // CDN is unreachable, so this stays the authoritative answer and leads
+        // with the likely cause rather than a staging path. Scoped to a real
+        // absence: a permission error or a directory at that path is an I/O
+        // problem, not a repo that turned out to be an Age of Empires mod.
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => bail!(
+            "no aoe-plugin.toml at {}; this repository is not an installable plugin. \
+             The GitHub `aoe-plugin` topic is also used by unrelated Age of Empires projects.",
+            path.display()
+        ),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
+    };
     let text = std::str::from_utf8(&bytes).context("aoe-plugin.toml is not valid UTF-8")?;
     let manifest = PluginManifest::from_toml_str(text).map_err(|e| anyhow!("{e}"))?;
     Ok((manifest, bytes))

@@ -490,6 +490,12 @@ pub struct SpawnConfig {
     /// fixed container mount, so this host path is only used when
     /// `sandbox_info` is `None`. `None` disables the export. See #2587.
     pub artifact_dir: Option<PathBuf>,
+    /// Set when this launch runs an `agent_detect_as` wrapper's base
+    /// adapter instead of the wrapper itself (#3422): `(wrapper, base)`.
+    /// Watchdog respawns reuse a cloned `SpawnConfig`, so they re-emit the
+    /// same substitution warning the initial spawn logged, one line per
+    /// launch.
+    pub wrapper_substitution: Option<(String, String)>,
 }
 
 /// Params for the `_session/steering` extension request: apply a
@@ -2306,6 +2312,25 @@ impl AcpClient {
         (client, event_tx)
     }
 
+    /// Like `fake_for_test`, but with a live `cmd_tx` whose consumer is
+    /// already gone, reproducing a worker between its connection task
+    /// ending (force-stop teardown) and the respawn installing a fresh
+    /// client: every `ClientCmd` send fails immediately with
+    /// `AgentExited`. See #3401.
+    #[cfg(test)]
+    pub fn fake_for_test_dead_connection(session_id: AcpSessionId) -> Self {
+        let (_event_tx, event_rx) = mpsc::channel(64);
+        let (cmd_tx, cmd_rx) = mpsc::channel::<ClientCmd>(16);
+        drop(cmd_rx);
+        Self {
+            session_id,
+            inbound: Some(event_rx),
+            cmd_tx: Some(cmd_tx),
+            pending_responders: Arc::new(Mutex::new(HashMap::new())),
+            _child: None,
+        }
+    }
+
     /// Like `fake_for_test`, but wires a live `cmd_tx` whose consumer
     /// records whether a `session/delete` RPC was issued. The returned
     /// `AtomicBool` flips to `true` the moment a
@@ -3372,10 +3397,7 @@ fn path_copy_below_floor(command: &str, path: &std::path::Path) -> bool {
     let Some(raw) = probe_version_bounded(path) else {
         return false;
     };
-    raw.split_whitespace()
-        .filter_map(|tok| semver::Version::parse(tok.trim_start_matches('v')).ok())
-        .next()
-        .is_some_and(|found| found < min)
+    crate::acp::version_probe::whitespace_token_below_floor(&raw, min)
 }
 
 /// Run `<path> --version` with a deadline and return its stdout.
@@ -3787,37 +3809,20 @@ fn build_sandbox_docker_argv(
         container_workdir.to_string(),
     ];
     // `collect_environment` already dedupes by key, so the entry list is
-    // unique. We still track `seen_keys` so the provider-auth block below
-    // can skip keys we've already forwarded.
+    // unique. We still track `seen_keys` so the explicit auth sources below
+    // cannot override sandbox configuration.
     let mut seen_keys: std::collections::HashSet<String> =
         env_entries.iter().map(|e| e.key().to_string()).collect();
     let (env_argv, inherit_pairs) = docker_env_args(&env_entries);
     docker_args.extend(env_argv);
     let mut inherit_env: Vec<(String, String)> = inherit_pairs;
 
-    // Provider auth keys: forward into the container only when set on
-    // the host AND not already in the sandbox env list. Value-typed
-    // only; host filesystem paths (e.g. `CLAUDE_CONFIG_DIR`) must not
-    // cross the namespace boundary because they reference paths that
-    // don't exist inside the container. The agent's config dir is
-    // already bind-mounted at the canonical container path via
-    // `AGENT_CONFIG_MOUNTS`.
-    const PROVIDER_AUTH_KEYS: &[&str] = &[
-        "ANTHROPIC_API_KEY",
-        "ANTHROPIC_AUTH_TOKEN",
-        "CLAUDE_CODE_OAUTH_TOKEN",
-    ];
-    for &key in PROVIDER_AUTH_KEYS {
-        if seen_keys.contains(key) {
-            continue;
-        }
-        if let Ok(value) = std::env::var(key) {
-            seen_keys.insert(key.to_string());
-            docker_args.push("-e".into());
-            docker_args.push(key.into());
-            inherit_env.push((key.into(), value));
-        }
-    }
+    // Auth sources are claimed highest-priority first, because `seen_keys` is
+    // first-claim-wins. The order mirrors the non-sandboxed paths, where the
+    // per-request `provider_env` is applied last and so wins a shared key over
+    // the ambient host keys: request auth (`provider_env`) > per-adapter
+    // allowlist. The sandbox env list (`collect_environment` above) is claimed
+    // before both, matching the operator-config precedence on the host paths.
 
     // Per-spawn provider_env entries (the request's auth payload).
     for (key, value) in &config.provider_env {
@@ -3828,6 +3833,29 @@ fn build_sandbox_docker_argv(
             docker_args.push("-e".into());
             docker_args.push(key.clone());
             inherit_env.push((key.clone(), value.clone()));
+        }
+    }
+
+    // Per-adapter env allowlist (#3238). The same keys `apply_env_filter`
+    // forwards on the non-sandboxed paths must also cross the container
+    // boundary, or a sandboxed non-Claude session silently loses its
+    // provider auth (the #3238 symptom). docker only forwards a name handed
+    // to it via `-e`, so each allowlisted host value is set on the runner
+    // (`inherit_env`) and named with `-e KEY`.
+    //
+    // Value-typed entries only: a host path names nothing inside the container,
+    // so forwarding it points the adapter at a directory that does not exist
+    // instead of the one `AGENT_CONFIG_MOUNTS` bind-mounts at the canonical
+    // container path. These keys stay host-only and keep flowing on the two
+    // non-sandboxed spawn paths, where they are the point.
+    for (key, value) in allowlisted_env_pairs(config) {
+        if is_host_only_path_env(&key) {
+            continue;
+        }
+        if seen_keys.insert(key.clone()) {
+            docker_args.push("-e".into());
+            docker_args.push(key.clone());
+            inherit_env.push((key, value));
         }
     }
 
@@ -3847,11 +3875,10 @@ fn build_sandbox_docker_argv(
     })
 }
 
-/// Env vars forwarded from the operator environment to every spawned
-/// agent, on both the detached-runner path (`apply_env_filter`) and the
-/// in-proc stdio path (`spawn_subprocess`). Both spawn sites `env_clear()`
-/// first, so this is the whole inheritance surface; keeping it in one const
-/// is what stops the two paths drifting apart.
+/// Infrastructure variables forwarded from the operator environment to every
+/// host-side agent, on both the detached-runner path (`apply_env_filter`) and
+/// the in-proc stdio path (`spawn_subprocess`). Provider credentials come only
+/// from the adapter's `env_allowlist` or explicit session configuration.
 const ALWAYS_FORWARD_ENV: &[&str] = &[
     "PATH",
     "HOME",
@@ -3877,10 +3904,6 @@ const ALWAYS_FORWARD_ENV: &[&str] = &[
     // lives in the environment). The value is a socket path, not a secret;
     // the security lives in the ssh-agent behind it. See #2691.
     "SSH_AUTH_SOCK",
-    "ANTHROPIC_API_KEY",
-    "ANTHROPIC_AUTH_TOKEN",
-    "CLAUDE_CODE_OAUTH_TOKEN",
-    "CLAUDE_CONFIG_DIR",
 ];
 
 /// The inherited host environment layer for a structured-view agent, applied
@@ -3888,7 +3911,7 @@ const ALWAYS_FORWARD_ENV: &[&str] = &[
 ///
 /// This is the fix for #3262. #3079 added desktop-env forwarding for the tmux
 /// paths only, so an agent in the structured view still got `env_clear()` plus
-/// the twelve names in `ALWAYS_FORWARD_ENV` and never saw `DISPLAY`: the very
+/// the fixed base allowlist and never saw `DISPLAY`: the very
 /// symptom #3075 reported, still live for anyone driving aoe from the browser.
 /// Routing both views through
 /// [`crate::session::environment::inherited_host_env`] is what keeps them from
@@ -3909,6 +3932,48 @@ fn inherited_host_env_pairs(config: &SpawnConfig) -> Vec<(String, String)> {
     crate::session::environment::inherited_host_env(profile)
 }
 
+/// Allowlist entries whose value is a host filesystem path rather than a
+/// credential. They are legitimate on the two host spawn paths and must not
+/// cross into a container: the path names nothing there, so forwarding it
+/// points the adapter away from the config dir `AGENT_CONFIG_MOUNTS` mounts
+/// at the canonical container location. `CLAUDE_CONFIG_DIR` is the case that
+/// established the rule; the other two arrived with the per-adapter allowlists
+/// in #3238. Adding a path-valued key to `env_allowlist_for` means adding it
+/// here too.
+fn is_host_only_path_env(key: &str) -> bool {
+    matches!(
+        key,
+        "CLAUDE_CONFIG_DIR" | "CODEX_HOME" | "GOOGLE_APPLICATION_CREDENTIALS"
+    )
+}
+
+/// Resolve the adapter's `env_allowlist` (#3238) against the operator's live
+/// environment, dropping any key the provider-env deny policy rejects
+/// (`AOE_TOKEN`, infra keys, `LD_*`/`DYLD_*` linker hooks). Shared by all
+/// three spawn paths (detached runner, in-proc stdio, and the docker-exec
+/// sandbox wrap) so the forwarded set and the deny posture cannot drift
+/// between them. Returns `(key, value)` for each allowlisted key present in
+/// the host env, warning on a rejected one. It deliberately does not cover
+/// the daemon->runner carrier `AOE_ACP_AGENT_ENV`; that is
+/// `host_environment_denyreason`'s job, and the runner clears the carrier
+/// before exec regardless.
+fn allowlisted_env_pairs(config: &SpawnConfig) -> Vec<(String, String)> {
+    let Some(allowlist) = config.spec.env_allowlist.as_ref() else {
+        return Vec::new();
+    };
+    let mut pairs = Vec::new();
+    for name in allowlist {
+        if let Some(reason) = provider_env_denyreason(name) {
+            warn!(target: "acp", key = %name, reason, "ignoring env allowlist entry");
+            continue;
+        }
+        if let Ok(value) = std::env::var(name) {
+            pairs.push((name.clone(), value));
+        }
+    }
+    pairs
+}
+
 /// Apply the env_clear + allowlist + provider_env filtering used by both
 /// the detached-runner path and the in-proc stdio path. Pulled out so
 /// the two spawn sites share the same security posture.
@@ -3921,15 +3986,8 @@ fn apply_env_filter(cmd: &mut std::process::Command, config: &SpawnConfig) {
             cmd.env(name, value);
         }
     }
-    if let Some(extra_allowlist) = &config.spec.env_allowlist {
-        for name in extra_allowlist {
-            if name == "AOE_TOKEN" {
-                continue;
-            }
-            if let Ok(value) = std::env::var(name) {
-                cmd.env(name, value);
-            }
-        }
+    for (key, value) in allowlisted_env_pairs(config) {
+        cmd.env(key, value);
     }
     for (key, value) in &config.provider_env {
         if provider_env_denyreason(key).is_some() {
@@ -4355,11 +4413,9 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
 
-    // Env: clear, then forward the shared allowlist + provider-specific
-    // creds. AOE_TOKEN must NEVER reach the agent. Uses the same
-    // `ALWAYS_FORWARD_ENV` const as the runner path so the two spawn
-    // sites cannot drift; provider auth (`ANTHROPIC_API_KEY`, etc.) and
-    // `SSH_AUTH_SOCK` for git-over-SSH ride along in that list.
+    // Env: clear, then forward shared infrastructure plus the selected
+    // adapter's provider allowlist. AOE_TOKEN must NEVER reach the agent. The
+    // shared helper keeps the runner and in-proc paths from drifting.
     cmd.env_clear();
     // Under the allowlist, so ALWAYS_FORWARD_ENV's PATH prepend still wins.
     // Same layer the runner path applies in `apply_env_filter`; see #3262.
@@ -4392,17 +4448,12 @@ fn spawn_subprocess(config: &SpawnConfig) -> Result<tokio::process::Child, AcpEr
             forwarded_keys.push(name);
         }
     }
-    if let Some(extra_allowlist) = &config.spec.env_allowlist {
-        for name in extra_allowlist {
-            if name == "AOE_TOKEN" {
-                warn!(target: "acp", "ignoring AOE_TOKEN in agent env allowlist");
-                continue;
-            }
-            if let Ok(value) = std::env::var(name) {
-                cmd.env(name, value);
-                forwarded_keys.push(name.as_str());
-            }
-        }
+    // Same allowlist + deny posture as the detached-runner path, via the
+    // shared helper so the two spawn sites cannot drift (#3238).
+    let allowlisted = allowlisted_env_pairs(config);
+    for (key, value) in &allowlisted {
+        cmd.env(key, value);
+        forwarded_keys.push(key.as_str());
     }
     let mut provider_keys: Vec<&str> = Vec::new();
     for (key, value) in &config.provider_env {
@@ -5078,6 +5129,7 @@ fn map_update_to_events(
             ContentBlock::Text(text) => vec![Event::UserPromptSent {
                 text: text.text,
                 attachments: Vec::new(),
+                prompt_id: None,
             }],
             other => vec![raw_event(&other)],
         },
@@ -5711,6 +5763,15 @@ fn map_acp_config_option(
         SessionConfigOptionCategory::Mode => ConfigOptionCategory::Mode,
         SessionConfigOptionCategory::Model => ConfigOptionCategory::Model,
         SessionConfigOptionCategory::ThoughtLevel => ConfigOptionCategory::ThoughtLevel,
+        // "Model-related configuration parameter", a sibling of `Model`
+        // rather than another model picker (an adapter ships both), so it
+        // must not collapse into `ConfigOptionCategory::Model`. Nothing
+        // renders it specially yet, so it carries its upstream wire name
+        // through the generic `Other` arm instead of the `Other("")` the
+        // catch-all below used to produce (#3403).
+        SessionConfigOptionCategory::ModelConfig => {
+            ConfigOptionCategory::Other("model_config".to_string())
+        }
         SessionConfigOptionCategory::Other(s) => ConfigOptionCategory::Other(s),
         // The schema enum is `#[non_exhaustive]`, so this arm is required
         // to compile. Unknown category *names* arrive via the untagged
@@ -6403,6 +6464,19 @@ async fn run_connection_task<W, R>(
         &cwd,
     );
 
+    // Async sub-agent transcripts live inside the container for a sandboxed
+    // session (their path is not on a mounted volume), so the tailer must
+    // read them via `<runtime> exec`, not host `tokio::fs`. Capture the
+    // container name once; a host session reads the file directly. See
+    // `background_agent::TranscriptSource`.
+    let bg_transcript_source = match resources.sandbox.as_ref() {
+        Some(sandbox) => crate::acp::background_agent::TranscriptSource::Container {
+            runtime: crate::containers::get_container_runtime().base.binary,
+            container: sandbox.container_name.clone(),
+        },
+        None => crate::acp::background_agent::TranscriptSource::Host,
+    };
+
     // After a successful `session/load`, claude-agent-acp re-emits the
     // full prior transcript as `session/update` notifications (each
     // historical assistant turn replayed as agent_message_chunk
@@ -6511,6 +6585,7 @@ async fn run_connection_task<W, R>(
     let between_prompt_tools_for_notif = between_prompt_tools.clone();
     let between_prompt_off_protocol_for_notif = between_prompt_off_protocol.clone();
     let between_prompt_bg_agents_for_notif = between_prompt_bg_agents.clone();
+    let bg_transcript_source_for_notif = bg_transcript_source.clone();
     let adopted_turn_active_for_notif = adopted_turn_active.clone();
     let prompt_in_flight_for_notif = prompt_in_flight.clone();
 
@@ -6541,6 +6616,7 @@ async fn run_connection_task<W, R>(
                 let lifecycle_signal_tx = lifecycle_signal_tx_for_notif.clone();
                 let current_prompt_epoch = current_prompt_epoch_for_notif.clone();
                 let agent_msg_dedup = agent_msg_dedup_for_notif.clone();
+                let bg_transcript_source = bg_transcript_source_for_notif.clone();
                 let last_lifecycle_at = last_lifecycle_at_for_notif.clone();
                 let between_prompt_active = between_prompt_active_for_notif.clone();
                 let terminal_claim = terminal_claim_for_notif.clone();
@@ -6804,6 +6880,7 @@ async fn run_connection_task<W, R>(
                                 crate::acp::background_agent::spawn_tailer(
                                     agent_id.clone(),
                                     output_file.clone(),
+                                    bg_transcript_source.clone(),
                                     event_tx.clone(),
                                     between_prompt_bg_agents.clone(),
                                 );
@@ -9829,6 +9906,44 @@ async fn handle_elicitation_request(
 mod tests {
     use super::*;
     use rusqlite::Connection;
+    use tracing_test::traced_test;
+
+    /// `ModelConfig` is a category upstream already names, so it must map
+    /// through the explicit arm: the catch-all's "bump claude-agent-acp"
+    /// warning is for variants this build has genuinely never seen, and it
+    /// discards the category name on the way past (#3403).
+    #[traced_test]
+    #[test]
+    fn model_config_category_maps_without_the_unknown_variant_warning() {
+        use agent_client_protocol::schema::v1::{
+            SessionConfigOption, SessionConfigOptionCategory, SessionConfigSelectOption,
+        };
+        tracing::callsite::rebuild_interest_cache();
+        let mapped = map_acp_config_option(
+            SessionConfigOption::select(
+                "reasoning-effort",
+                "Reasoning effort",
+                "high",
+                vec![SessionConfigSelectOption::new("high", "High")],
+            )
+            .category(SessionConfigOptionCategory::ModelConfig),
+        )
+        .expect("a select option maps");
+        assert_eq!(
+            mapped.category,
+            ConfigOptionCategory::Other("model_config".to_string())
+        );
+        logs_assert(|lines: &[&str]| {
+            match lines
+                .iter()
+                .filter(|l| l.contains("unknown SessionConfigOptionCategory"))
+                .count()
+            {
+                0 => Ok(()),
+                n => Err(format!("expected no unknown-category warning, got {n}")),
+            }
+        });
+    }
 
     /// The steer wire contract (#2805). `sessionId` must be camelCase and
     /// the `_meta` opt-in must be spelled exactly as the adapter reads it:
@@ -11612,6 +11727,7 @@ mod tests {
             container_workdir: None,
         };
         let config = SpawnConfig {
+            wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
             spec: AgentSpec {
@@ -11686,6 +11802,7 @@ mod tests {
             container_workdir: None,
         };
         let config = SpawnConfig {
+            wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
             spec: AgentSpec {
@@ -11738,20 +11855,34 @@ mod tests {
         );
     }
 
-    /// `CLAUDE_CONFIG_DIR` is a host filesystem path, not a value, so
-    /// it must NOT be auto-forwarded into the container even when set
-    /// on the host. The agent's config dir is bind-mounted at the
-    /// canonical container path by `AGENT_CONFIG_MOUNTS`.
+    /// A host filesystem path is not a credential, so it must NOT be
+    /// auto-forwarded into the container even when set on the host and even
+    /// when the adapter's `env_allowlist` names it (#3238). The path resolves
+    /// to nothing inside the container, so forwarding it points the adapter
+    /// away from the config dir `AGENT_CONFIG_MOUNTS` bind-mounts at the
+    /// canonical container location. `CLAUDE_CONFIG_DIR` established the rule;
+    /// `CODEX_HOME` and `GOOGLE_APPLICATION_CREDENTIALS` reach the same
+    /// function through the per-adapter allowlists.
     ///
     /// Tagged `#[serial]` because the test mutates the process-wide
     /// env; parallel readers of `std::env::var` would race.
     #[test]
     #[serial_test::serial]
-    fn build_sandbox_docker_argv_drops_host_only_claude_config_dir() {
-        // Set the env var to simulate the host having it; the function
-        // under test must still skip it.
-        let prev = std::env::var("CLAUDE_CONFIG_DIR").ok();
-        std::env::set_var("CLAUDE_CONFIG_DIR", "/Users/operator/.claude");
+    fn build_sandbox_docker_argv_drops_host_only_path_env() {
+        // Set the vars to simulate the host having them; the function under
+        // test must still skip every one. `OPENAI_API_KEY` rides along as the
+        // control: a value-typed allowlist entry alongside them must still
+        // cross, or the assertion below would pass on a function that forwards
+        // nothing at all.
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("CLAUDE_CONFIG_DIR", "/Users/operator/.claude"),
+            ("CODEX_HOME", "/Users/operator/.codex"),
+            (
+                "GOOGLE_APPLICATION_CREDENTIALS",
+                "/Users/operator/gcp-key.json",
+            ),
+            ("OPENAI_API_KEY", "sk-test-value"),
+        ]);
         let tmp = tempfile::tempdir().unwrap();
         let sandbox = SandboxInfo {
             enabled: true,
@@ -11764,13 +11895,19 @@ mod tests {
             container_workdir: None,
         };
         let config = SpawnConfig {
-            agent_key: "claude".into(),
-            tool: "claude".into(),
+            wrapper_substitution: None,
+            agent_key: "codex".into(),
+            tool: "codex".into(),
             spec: AgentSpec {
-                command: "claude-agent-acp".into(),
+                command: "codex-acp".into(),
                 args: vec![],
                 description: "test".into(),
-                env_allowlist: None,
+                env_allowlist: Some(vec![
+                    "CLAUDE_CONFIG_DIR".into(),
+                    "CODEX_HOME".into(),
+                    "GOOGLE_APPLICATION_CREDENTIALS".into(),
+                    "OPENAI_API_KEY".into(),
+                ]),
             },
             cwd: tmp.path().to_path_buf(),
             additional_dirs: vec![],
@@ -11789,27 +11926,155 @@ mod tests {
         };
         let argv = build_sandbox_docker_argv(&config, &sandbox, "/workspace/proj")
             .expect("docker argv built");
-        match prev {
-            Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
-            None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
+
+        for key in [
+            "CLAUDE_CONFIG_DIR",
+            "CODEX_HOME",
+            "GOOGLE_APPLICATION_CREDENTIALS",
+        ] {
+            assert!(
+                !argv.docker_args.iter().any(|a| a == key),
+                "{key} is a host path and must not be forwarded as `-e KEY`"
+            );
+            assert!(
+                !argv
+                    .docker_args
+                    .iter()
+                    .any(|a| a.starts_with(&format!("{key}="))),
+                "{key} must not appear as a literal `KEY=VALUE` either"
+            );
+            assert!(
+                !argv.inherit_env.iter().any(|(k, _)| k == key),
+                "{key} must not land in inherit_env"
+            );
         }
+        assert_eq!(
+            argv.inherit_env
+                .iter()
+                .find(|(k, _)| k == "OPENAI_API_KEY")
+                .map(|(_, v)| v.as_str()),
+            Some("sk-test-value"),
+            "the value-typed allowlist entry must still cross the boundary"
+        );
+    }
+
+    /// #3238 regression guard: the per-adapter `env_allowlist` must cross the
+    /// container boundary for a sandboxed session. Before the fix,
+    /// `build_sandbox_docker_argv` forwarded only a fixed Claude-key block plus
+    /// `provider_env`, so an operator's `OPENAI_API_KEY` never reached a
+    /// sandboxed `codex`/`aoe-agent` session and auth silently failed. The
+    /// value must ride `inherit_env` (not `-e KEY=VALUE`, which would leak the
+    /// secret into argv), and a denied key (`LD_PRELOAD`) must still be
+    /// dropped even when allowlisted.
+    #[test]
+    #[serial_test::serial]
+    fn build_sandbox_docker_argv_forwards_env_allowlist() {
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("OPENAI_API_KEY", "sk-openai"),
+            ("ANTHROPIC_API_KEY", "sk-unrelated-anthropic"),
+            ("LD_PRELOAD", "/tmp/evil.so"),
+        ]);
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox = SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "alpine:latest".into(),
+            container_name: "aoe-sandbox-allowlist".into(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
+        let mut config = env_test_spawn_config(tmp.path().to_path_buf());
+        config.spec.command = "codex-acp".into();
+        config.spec.env_allowlist = Some(vec!["OPENAI_API_KEY".into(), "LD_PRELOAD".into()]);
+        config.sandbox_info = Some(sandbox.clone());
+
+        let argv = build_sandbox_docker_argv(&config, &sandbox, "/workspace/proj")
+            .expect("docker argv built");
+
         assert!(
-            !argv.docker_args.iter().any(|a| a == "CLAUDE_CONFIG_DIR"),
-            "CLAUDE_CONFIG_DIR is a host path and must not be forwarded as `-e KEY`"
+            argv.docker_args
+                .windows(2)
+                .any(|w| w[0] == "-e" && w[1] == "OPENAI_API_KEY"),
+            "allowlisted OPENAI_API_KEY must be named with `-e KEY`, got {:?}",
+            argv.docker_args
+        );
+        assert_eq!(
+            argv.inherit_env
+                .iter()
+                .find(|(k, _)| k == "OPENAI_API_KEY")
+                .map(|(_, v)| v.as_str()),
+            Some("sk-openai"),
+            "the value must ride inherit_env so it stays out of argv"
         );
         assert!(
             !argv
                 .docker_args
                 .iter()
-                .any(|a| a.starts_with("CLAUDE_CONFIG_DIR=")),
-            "CLAUDE_CONFIG_DIR must not appear as a literal `KEY=VALUE` either"
+                .any(|a| a.starts_with("OPENAI_API_KEY=")),
+            "secret must not appear as `KEY=VALUE` in argv"
         );
         assert!(
-            !argv
-                .inherit_env
-                .iter()
-                .any(|(k, _)| k == "CLAUDE_CONFIG_DIR"),
-            "CLAUDE_CONFIG_DIR must not land in inherit_env"
+            !argv.docker_args.iter().any(|a| a == "LD_PRELOAD")
+                && !argv.inherit_env.iter().any(|(k, _)| k == "LD_PRELOAD"),
+            "a denied linker hook must not cross the boundary even when allowlisted, got {:?}",
+            argv.docker_args
+        );
+        assert!(
+            !argv.docker_args.iter().any(|a| a == "ANTHROPIC_API_KEY")
+                && !argv
+                    .inherit_env
+                    .iter()
+                    .any(|(k, _)| k == "ANTHROPIC_API_KEY"),
+            "a credential outside this adapter's allowlist must not cross the boundary"
+        );
+    }
+
+    /// The per-session `provider_env` auth payload must win a shared key over
+    /// the adapter's ambient allowlist, matching the non-sandboxed paths (where
+    /// `provider_env` is applied last). Before the ordering fix the sandbox
+    /// claimed the host key first, so a session that selected a different
+    /// Anthropic credential silently ran under the operator's ambient one
+    /// inside the container.
+    #[test]
+    #[serial_test::serial]
+    fn build_sandbox_docker_argv_provider_env_beats_ambient_host_key() {
+        let _env = crate::session::test_support::EnvGuard::set(&[(
+            "ANTHROPIC_API_KEY",
+            "sk-host-ambient",
+        )]);
+        let tmp = tempfile::tempdir().unwrap();
+        let sandbox = SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "alpine:latest".into(),
+            container_name: "aoe-sandbox-precedence".into(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
+        let mut config = env_test_spawn_config(tmp.path().to_path_buf());
+        let reg = crate::acp::agent_registry::AgentRegistry::with_defaults();
+        config.spec = reg.get("claude").expect("claude default").clone();
+        config.provider_env = vec![("ANTHROPIC_API_KEY".into(), "sk-session-request".into())];
+        config.sandbox_info = Some(sandbox.clone());
+
+        let argv = build_sandbox_docker_argv(&config, &sandbox, "/workspace/proj")
+            .expect("docker argv built");
+
+        let values: Vec<&str> = argv
+            .inherit_env
+            .iter()
+            .filter(|(k, _)| k == "ANTHROPIC_API_KEY")
+            .map(|(_, v)| v.as_str())
+            .collect();
+        assert_eq!(
+            values,
+            vec!["sk-session-request"],
+            "the request credential must win and be forwarded exactly once, got {:?}",
+            argv.inherit_env
         );
     }
 
@@ -11983,6 +12248,7 @@ done
     #[cfg(unix)]
     fn reset_fake_spawn_config(script: &std::path::Path, cwd: &std::path::Path) -> SpawnConfig {
         SpawnConfig {
+            wrapper_substitution: None,
             agent_key: "codex".into(),
             tool: "codex".into(),
             spec: AgentSpec {
@@ -12050,6 +12316,7 @@ done
     /// old-session updates to the fresh conversation.
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial]
     async fn reset_between_prompts_with_open_tool_is_refused() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let initial_update = serde_json::json!({
@@ -12091,6 +12358,7 @@ done
     /// tailer removes the agent from the between-prompt in-flight set.
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial]
     async fn reset_between_prompts_with_background_agent_is_refused() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let transcript = tmp.path().join("background-agent.jsonl");
@@ -12144,6 +12412,7 @@ done
     /// abandoned request.
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial]
     async fn reset_session_new_timeout_releases_the_connection_loop() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let (script, _capture) = write_reset_fake_agent(tmp.path(), 0, 1, 0);
@@ -12189,6 +12458,7 @@ done
     /// client and runner would disagree about the live session.
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial]
     async fn reset_config_timeout_commits_and_releases_the_connection_loop() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let (script, capture) = write_reset_fake_agent(tmp.path(), 0, 0, 1);
@@ -12376,6 +12646,7 @@ done
     /// The success-only `SessionCleared` boundary must remain absent.
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial]
     async fn reset_during_in_flight_prompt_is_refused_with_prompt_rejected() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         // 3s prompt delay: long enough to land the reset mid-turn, short
@@ -12578,8 +12849,10 @@ done
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn spawn_with_nonexistent_command_errors_cleanly() {
         let config = SpawnConfig {
+            wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
             spec: AgentSpec {
@@ -12618,6 +12891,7 @@ done
         // Ensure the path truly does not exist.
         let _ = std::fs::remove_dir_all(&missing);
         let config = SpawnConfig {
+            wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
             spec: AgentSpec {
@@ -14057,7 +14331,9 @@ done
         );
         assert_eq!(events.len(), 1);
         match &events[0] {
-            Event::UserPromptSent { text, attachments } => {
+            Event::UserPromptSent {
+                text, attachments, ..
+            } => {
                 assert_eq!(text, "hello from the past");
                 assert!(attachments.is_empty());
             }
@@ -15121,6 +15397,7 @@ done
     /// Build a minimal host (non-sandboxed) `SpawnConfig` for env tests.
     fn env_test_spawn_config(cwd: std::path::PathBuf) -> SpawnConfig {
         SpawnConfig {
+            wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
             spec: AgentSpec {
@@ -15193,6 +15470,155 @@ done
                 "{key} must reach a structured-view agent, got {applied:#?}"
             );
         }
+    }
+
+    /// #3238: `AgentSpec.env_allowlist` populated by `with_defaults` must
+    /// reach the agent via `apply_env_filter`. Uses the `aoe-agent` spec (the
+    /// one that would silently no-op if we keyed `env_allowlist_for` on
+    /// `spec.command`, which is placeholder-templated, instead of the binary
+    /// token).
+    /// A negative case rides along: `GEMINI_API_KEY` is set but not in the
+    /// AI-SDK-based `aoe-agent`'s allowlist, so it must NOT be forwarded.
+    #[test]
+    #[serial_test::serial]
+    fn apply_env_filter_forwards_agent_env_allowlist() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("ANTHROPIC_API_KEY", "sk-anthropic"),
+            ("OPENAI_API_KEY", "sk-openai"),
+            ("GOOGLE_GENERATIVE_AI_API_KEY", "ai-google"),
+            ("GEMINI_API_KEY", "ai-gemini-cli-key"),
+        ]);
+
+        let mut config = env_test_spawn_config(tmp.path().to_path_buf());
+        let reg = crate::acp::agent_registry::AgentRegistry::with_defaults();
+        config.spec = reg.get("aoe-agent").expect("aoe-agent default").clone();
+
+        let mut cmd = std::process::Command::new("/bin/true");
+        cmd.env_clear();
+        apply_env_filter(&mut cmd, &config);
+
+        let applied: std::collections::HashMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        assert_eq!(
+            applied.get("ANTHROPIC_API_KEY").map(String::as_str),
+            Some("sk-anthropic")
+        );
+        assert_eq!(
+            applied.get("OPENAI_API_KEY").map(String::as_str),
+            Some("sk-openai")
+        );
+        assert_eq!(
+            applied
+                .get("GOOGLE_GENERATIVE_AI_API_KEY")
+                .map(String::as_str),
+            Some("ai-google")
+        );
+        assert!(
+            !applied.contains_key("GEMINI_API_KEY"),
+            "aoe-agent (AI-SDK) must not receive the gemini-CLI-native key, got {applied:#?}"
+        );
+
+        config.spec = reg.get("codex").expect("codex default").clone();
+        let mut codex_cmd = std::process::Command::new("/bin/true");
+        codex_cmd.env_clear();
+        apply_env_filter(&mut codex_cmd, &config);
+        let codex_env: std::collections::HashMap<String, String> = codex_cmd
+            .get_envs()
+            .filter_map(|(key, value)| {
+                Some((
+                    key.to_string_lossy().into_owned(),
+                    value?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        assert_eq!(
+            codex_env.get("OPENAI_API_KEY").map(String::as_str),
+            Some("sk-openai")
+        );
+        assert!(
+            !codex_env.contains_key("ANTHROPIC_API_KEY"),
+            "Codex must not receive another adapter's ambient credential, got {codex_env:#?}"
+        );
+
+        // A custom `agent_acp_cmd` adapter carries no allowlist at all, so it
+        // gets no ambient provider credential: the whole point of moving the
+        // Claude keys off `ALWAYS_FORWARD_ENV`.
+        config.spec = crate::acp::AgentSpec::from_acp_cmd("custom", "/bin/true").expect("spec");
+        let mut custom_cmd = std::process::Command::new("/bin/true");
+        custom_cmd.env_clear();
+        apply_env_filter(&mut custom_cmd, &config);
+        let custom_keys: Vec<String> = custom_cmd
+            .get_envs()
+            .map(|(key, _)| key.to_string_lossy().into_owned())
+            .collect();
+        for key in ["ANTHROPIC_API_KEY", "OPENAI_API_KEY"] {
+            assert!(
+                !custom_keys.iter().any(|k| k == key),
+                "a custom adapter must not receive the ambient {key}, got {custom_keys:?}"
+            );
+        }
+    }
+
+    /// #3238 security posture: `spec.env_allowlist` (which a custom-agent
+    /// definition or an edited config could populate) must not become a
+    /// smuggling channel. Every entry runs through `provider_env_denyreason`,
+    /// so `AOE_TOKEN` and `LD_*`/`DYLD_*` linker hooks are dropped even when
+    /// the operator's environment has them set, while a legitimate provider
+    /// key still forwards. The deny predicate the fix routes through had
+    /// positive coverage only.
+    #[test]
+    #[serial_test::serial]
+    fn apply_env_filter_drops_denied_allowlist_entries() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(tmp.path());
+        let _env = crate::session::test_support::EnvGuard::set(&[
+            ("OPENAI_API_KEY", "sk-openai"),
+            ("AOE_TOKEN", "daemon-secret"),
+            ("LD_PRELOAD", "/tmp/evil.so"),
+        ]);
+
+        let mut config = env_test_spawn_config(tmp.path().to_path_buf());
+        config.spec.env_allowlist = Some(vec![
+            "OPENAI_API_KEY".into(),
+            "AOE_TOKEN".into(),
+            "LD_PRELOAD".into(),
+        ]);
+
+        let mut cmd = std::process::Command::new("/bin/true");
+        cmd.env_clear();
+        apply_env_filter(&mut cmd, &config);
+
+        let applied: std::collections::HashMap<String, String> = cmd
+            .get_envs()
+            .filter_map(|(k, v)| {
+                Some((
+                    k.to_string_lossy().into_owned(),
+                    v?.to_string_lossy().into_owned(),
+                ))
+            })
+            .collect();
+        assert_eq!(
+            applied.get("OPENAI_API_KEY").map(String::as_str),
+            Some("sk-openai"),
+            "a legitimately allowlisted provider key must forward"
+        );
+        assert!(
+            !applied.contains_key("AOE_TOKEN"),
+            "the daemon auth token must never reach the agent, got {applied:#?}"
+        );
+        assert!(
+            !applied.contains_key("LD_PRELOAD"),
+            "a linker hook must be denied even when allowlisted, got {applied:#?}"
+        );
     }
 
     /// A sandboxed agent's environment is `sandbox.environment` by contract:

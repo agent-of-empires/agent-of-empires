@@ -929,47 +929,47 @@ fn apply_terminal_title(
 ) -> anyhow::Result<()> {
     let id = id.to_string();
     let new_title = new_title.map(str::to_string);
-    storage.update(|instances, _groups| {
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
-            inst.smart_rename_attempted = true;
-            if let Some(t) = &new_title {
-                if title_is_auto_overwritable(inst) && &inst.title != t {
-                    // The tmux session name embeds the title
-                    // (Session::generate_name), and both status pollers derive
-                    // the name from the current title. Rekey the live session
-                    // to match, else attach/stop/poll would target a name the
-                    // running pane no longer has. Best-effort, mirroring the
-                    // manual TUI rename (src/tui/home/operations.rs).
-                    rekey_tmux_session(&id, &inst.title, t);
-                    tracing::info!(target: "smart_rename", session = %id, old = %inst.title, new = %t, "auto-renamed terminal session");
-                    inst.title = t.clone();
-                    inst.last_auto_title = Some(t.clone());
+    let identity_lock = crate::session::acquire_session_identity_lock()?;
+    let _session_title_lock = crate::session::storage::acquire_session_title_lock(&id)?;
+    let _lifecycle_lock = storage.acquire_instance_lifecycle_lock(&id)?;
+    let rekey = storage.update(|instances, _groups| {
+        let mut rekey = None;
+        if let Some(index) = instances.iter().position(|instance| instance.id == id) {
+            instances[index].smart_rename_attempted = true;
+            if let Some(title) = &new_title {
+                let should_write = title_is_auto_overwritable(&instances[index])
+                    && instances[index].title != *title;
+                // Manual and automatic rename paths share one domain predicate;
+                // exclude this row explicitly so the uniqueness contract does
+                // not depend on `should_write` remaining title-sensitive.
+                let path = instances[index].project_path.clone();
+                let duplicate = should_write
+                    && crate::session::is_duplicate_session(
+                        instances.iter(),
+                        title,
+                        &path,
+                        Some(&id),
+                    );
+                if duplicate {
+                    tracing::warn!(target: "smart_rename", session = %id, title = %title, "skipped duplicate auto-title");
+                } else if should_write {
+                    let instance = &mut instances[index];
+                    rekey = Some((instance.title.clone(), title.clone()));
+                    tracing::info!(target: "smart_rename", session = %id, old = %instance.title, new = %title, "auto-renamed terminal session");
+                    instance.title = title.clone();
+                    instance.last_auto_title = Some(title.clone());
                 }
             }
         }
-        Ok(())
+        Ok(rekey)
     })?;
-    Ok(())
-}
-
-/// Rename the live tmux session from its old title-derived name to the new one,
-/// keeping the pane reachable after the stored title changes. Best-effort: a
-/// missing session or a failed rename is logged, not fatal (matches the manual
-/// rename path).
-fn rekey_tmux_session(id: &str, old_title: &str, new_title: &str) {
-    let Ok(session) = crate::tmux::Session::new(id, old_title) else {
-        return;
-    };
-    if !session.exists() {
-        return;
-    }
-    let new_name = crate::tmux::Session::generate_name(id, new_title);
-    match session.rename(&new_name) {
-        Ok(()) => crate::tmux::refresh_session_cache(),
-        Err(e) => {
-            tracing::warn!(target: "smart_rename", session = %id, "tmux rename failed: {e}")
+    drop(identity_lock);
+    if let Some((old_title, new_title)) = rekey {
+        if let Err(error) = crate::tmux::rekey_session(&id, &old_title, &new_title) {
+            tracing::warn!(target: "smart_rename", session = %id, "tmux rename failed: {error}");
         }
     }
+    Ok(())
 }
 
 /// Entry point for the detached `aoe __smart-rename [--force] <profile> <id>`
@@ -1114,24 +1114,25 @@ pub async fn run_terminal_rename(
     };
 
     let tmux = crate::tmux::Session::new(session_id, &title)?;
-    let detect_tool = if detect_as.is_empty() {
-        tool.as_str()
-    } else {
-        detect_as.as_str()
-    };
+    // Same resolution the status poller uses: own status rules first, then the
+    // `agent_detect_as` alias, resolved through the live registry so a session
+    // whose alias entry landed after it was created is not stranded on the raw
+    // tool name here (which would skip `strip_agent_banner` and read the pane
+    // with no detector).
+    let detect_tool = crate::tmux::status_rules::detection_tool(profile, &tool, &detect_as);
 
     // Best-effort no-race: the poller fired on Running -> Idle, but the user may
     // have started another turn since. Only proceed while the pane still reads
     // idle; a later idle edge retries.
     if let Ok(content) = tmux.capture_pane(50) {
-        if crate::tmux::detect_status_from_content(&content, detect_tool)
+        if crate::tmux::detect_status_from_content_in(profile, &content, &detect_tool)
             == crate::session::Status::Running
         {
             return Ok(());
         }
     }
 
-    let Some(context) = capture_terminal_context(&tmux, detect_tool) else {
+    let Some(context) = capture_terminal_context(&tmux, &detect_tool) else {
         tracing::debug!(target: "smart_rename", session = %session_id, "terminal skip: unusable pane capture");
         return Ok(());
     };
@@ -1393,14 +1394,13 @@ mod serve {
         apply_auto_title(&state, &session_id, &profile, &new_title).await;
     }
 
-    /// Apply an automatically-generated title to a session, persisting to
-    /// storage and mirroring the in-memory instance list so connected clients
-    /// see it without a reload. The write happens only while the current title
-    /// is still a default civ name or still equals the last auto title we wrote
-    /// (`title_is_auto_overwritable`), so a manual rename is never clobbered.
-    /// Serializes against manual renames / worktree edits on this session via
-    /// the per-session instance lock, and mirrors memory only when the storage
-    /// write actually happened so the two never diverge.
+    /// Persist an automatically generated title and mirror it into AppState.
+    /// The title changes only while it remains auto-overwritable. The
+    /// process-local instance lock, global identity lock, and per-session title
+    /// lock serialize the write with manual renames. Identity covers duplicate
+    /// validation through the durable write. The title lock remains held
+    /// through the AppState mirror so a later writer cannot be overwritten in
+    /// memory. Unchanged and duplicate titles are skipped.
     pub(crate) async fn apply_auto_title(
         state: &Arc<AppState>,
         id: &str,
@@ -1418,24 +1418,55 @@ mod serve {
                 return;
             }
         };
+        // Own copies for the closure below: `storage.update` runs inside
+        // `spawn_blocking`, whose body must be `'static + Send`, so the borrowed
+        // `id`/`new_title` cannot cross the thread boundary. The in-memory
+        // mirror after the join reuses the borrowed `new_title` directly.
         let id_owned = id.to_string();
         let title_owned = new_title.to_string();
-        let persisted = tokio::task::spawn_blocking(move || {
-            storage.update(|instances, _groups| {
-                let Some(inst) = instances.iter_mut().find(|i| i.id == id_owned) else {
+        let persisted = tokio::task::spawn_blocking(move || -> anyhow::Result<_> {
+            let identity_lock = crate::session::acquire_session_identity_lock()?;
+            let session_title_lock =
+                crate::session::storage::acquire_session_title_lock(&id_owned)?;
+            let wrote = storage.update(|instances, _groups| {
+                let Some(index) = instances
+                    .iter()
+                    .position(|instance| instance.id == id_owned)
+                else {
                     return Ok(false);
                 };
-                if title_is_auto_overwritable(inst) {
-                    inst.title = title_owned.clone();
-                    inst.last_auto_title = Some(title_owned.clone());
-                    return Ok(true);
+                // Manual and automatic rename paths share one domain predicate;
+                // exclude this row explicitly so a future no-op policy change
+                // cannot make the row collide with itself.
+                let should_write = title_is_auto_overwritable(&instances[index])
+                    && instances[index].title != title_owned;
+                let path = instances[index].project_path.clone();
+                let duplicate = should_write
+                    && crate::session::is_duplicate_session(
+                        instances.iter(),
+                        &title_owned,
+                        &path,
+                        Some(&id_owned),
+                    );
+                if duplicate {
+                    tracing::warn!(target: "smart_rename", session = %id_owned, title = %title_owned, "skipped duplicate auto-title");
+                    Ok(false)
+                } else if should_write {
+                    instances[index].title = title_owned.clone();
+                    // Last owned use of `title_owned`: move it into the field
+                    // rather than cloning a second time.
+                    instances[index].last_auto_title = Some(title_owned);
+                    Ok(true)
+                } else {
+                    Ok(false)
                 }
-                Ok(false)
-            })
+            })?;
+            drop(identity_lock);
+            Ok((wrote, session_title_lock))
         })
         .await;
-        let wrote = match persisted {
-            Ok(Ok(wrote)) => wrote,
+        let (wrote, _session_title_lock) = match persisted {
+            Ok(Ok(result)) => result,
             Ok(Err(e)) => {
                 tracing::warn!(target: "smart_rename", session = %id, "persist failed: {e}");
                 return;
@@ -1461,6 +1492,76 @@ mod serve {
     mod tests {
         use super::*;
         use std::time::Duration;
+
+        #[tokio::test]
+        #[serial_test::serial]
+        async fn apply_auto_title_skips_duplicate_title_and_path() {
+            let _guard = crate::session::test_support::isolate_app_dir();
+            let storage =
+                crate::session::storage::Storage::new_unwatched("default").expect("storage");
+            let mut target = crate::session::Instance::new("Franks", "/tmp/shared/");
+            target.source_profile = "default".to_string();
+            let target_id = target.id.clone();
+            let mut owner = crate::session::Instance::new("Already owned", "/tmp/shared");
+            owner.source_profile = "default".to_string();
+            storage
+                .update(|instances, _groups| {
+                    *instances = vec![target.clone(), owner.clone()];
+                    Ok(())
+                })
+                .unwrap();
+            let state = crate::server::test_support::build_test_app_state(vec![target, owner]);
+
+            apply_auto_title(&state, &target_id, "default", "Already owned").await;
+
+            let persisted = storage.load().unwrap();
+            assert_eq!(
+                persisted
+                    .iter()
+                    .find(|instance| instance.id == target_id)
+                    .unwrap()
+                    .title,
+                "Franks"
+            );
+            let in_memory = state.instances.read().await;
+            assert_eq!(
+                in_memory
+                    .iter()
+                    .find(|instance| instance.id == target_id)
+                    .unwrap()
+                    .title,
+                "Franks"
+            );
+        }
+
+        #[test]
+        fn is_duplicate_session_normalizes_trailing_slash() {
+            // The skip in `apply_auto_title` / `apply_terminal_title` reuses the
+            // creation predicate, which trims trailing '/' on both sides before
+            // comparing paths. Pin that normalization explicitly: an existing
+            // session at "/tmp/shared" collides with a candidate whose path
+            // differs only by a trailing slash.
+            let mut existing = crate::session::Instance::new("Already owned", "/tmp/shared");
+            existing.source_profile = "default".to_string();
+            let instances = vec![existing];
+            let cases = [
+                ("Already owned", "/tmp/shared", true),
+                // "/tmp/shared/" and "/tmp/shared" are equal after trim_end_matches('/').
+                ("Already owned", "/tmp/shared/", true),
+                // trim_end_matches removes every trailing slash, not just one.
+                ("Already owned", "/tmp/shared//", true),
+                ("Already owned", "/tmp/other", false),
+                // Same path, different title: not a duplicate.
+                ("Different", "/tmp/shared", false),
+            ];
+            for (title, path, expected) in cases {
+                assert_eq!(
+                    crate::session::is_duplicate_session(instances.iter(), title, path, None),
+                    expected,
+                    "title {title:?} path {path:?}"
+                );
+            }
+        }
 
         #[tokio::test]
         async fn run_oneshot_returns_none_on_spawn_failure() {
@@ -1540,6 +1641,7 @@ mod serve {
             }
 
             let non_stop = Event::UserPromptSent {
+                prompt_id: None,
                 text: "hi".into(),
                 attachments: vec![],
             };
@@ -2611,46 +2713,257 @@ claude = "repo-wrapper"
         assert_eq!(extract_echo_baseline(""), "");
     }
 
+    /// Explicit named skip for tests that need a live tmux server. Returns
+    /// `true` when tmux is usable; otherwise prints a per-test skip line and
+    /// the caller early-returns, so a tmux-less environment reports the skip
+    /// instead of silently asserting nothing.
+    fn require_tmux(test: &str) -> bool {
+        let available = crate::tmux::tmux_command()
+            .arg("-V")
+            .output()
+            .map(|output| output.status.success())
+            .unwrap_or(false);
+        if !available {
+            eprintln!("Skipping {test}: tmux not available");
+        }
+        available
+    }
+
     #[test]
     #[serial_test::serial]
-    fn apply_terminal_title_marks_attempted_and_respects_manual_rename() {
+    fn title_mutation_locks_validate_and_serialize_writers() {
         use crate::session::instance::Instance;
         use crate::session::storage::Storage;
         let home = tempfile::tempdir().expect("tempdir HOME");
-        // SAFETY: serialized by `#[serial]`; matches the sibling config test.
-        unsafe {
-            std::env::set_var("HOME", home.path());
-            std::env::set_var("XDG_CONFIG_HOME", home.path().join(".config"));
-        }
-        let storage = Storage::new_unwatched("default").expect("storage");
+        let _home_guard = crate::session::test_support::isolate_home(home.path());
 
-        // Story 1: a still-civ-named session gets renamed and marked attempted.
+        assert!(crate::session::storage::acquire_session_title_lock("../unsafe").is_err());
+
+        let instance = Instance::new("Vikings", "/tmp/x");
+        let id = instance.id.clone();
+        let first_title_lock = crate::session::storage::acquire_session_title_lock(&id).unwrap();
+        let (acquired_tx, acquired_rx) = std::sync::mpsc::channel();
+        let competing_id = id.clone();
+        let competing_writer = std::thread::spawn(move || {
+            let _lock = crate::session::storage::acquire_session_title_lock(&competing_id).unwrap();
+            acquired_tx.send(()).unwrap();
+        });
+        assert!(
+            acquired_rx
+                .recv_timeout(std::time::Duration::from_millis(150))
+                .is_err(),
+            "a competing title writer entered before release"
+        );
+        drop(first_title_lock);
+        acquired_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("competing writer should enter after release");
+        competing_writer.join().unwrap();
+
+        let storage = Storage::new_unwatched("identity-lock").unwrap();
+        storage
+            .update(|instances, _groups| {
+                instances.push(instance);
+                Ok(())
+            })
+            .unwrap();
+        let identity_lock = crate::session::acquire_session_identity_lock().unwrap();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let writer_id = id.clone();
+        let identity_writer = std::thread::spawn(move || {
+            let storage = Storage::new_unwatched("identity-lock").unwrap();
+            apply_terminal_title(&storage, &writer_id, Some("Shared title")).unwrap();
+            finished_tx.send(()).unwrap();
+        });
+        assert!(
+            finished_rx
+                .recv_timeout(std::time::Duration::from_millis(150))
+                .is_err(),
+            "smart rename bypassed the identity transaction"
+        );
+        drop(identity_lock);
+        finished_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("smart rename should finish after identity release");
+        identity_writer.join().unwrap();
+        assert_eq!(
+            storage.load().unwrap()[0].title,
+            "Shared title",
+            "smart rename should commit after entering the transaction"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_terminal_title_renames_auto_named_session_and_marks_attempted() {
+        use crate::session::instance::Instance;
+        use crate::session::storage::Storage;
+        let home = tempfile::tempdir().expect("tempdir HOME");
+        let _home_guard = crate::session::test_support::isolate_home(home.path());
+        let storage = Storage::new_unwatched("default").expect("storage");
         let civ = Instance::new("Vikings", "/tmp/x");
         let civ_id = civ.id.clone();
-        // Story 2: a manually-named session must never be overwritten.
-        let mut manual = Instance::new("Britons", "/tmp/y");
-        manual.title = "Hand-picked".to_string();
-        let manual_id = manual.id.clone();
         storage
             .update(|instances, _groups| {
                 instances.push(civ);
-                instances.push(manual);
                 Ok(())
             })
             .unwrap();
 
         apply_terminal_title(&storage, &civ_id, Some("Fix login bug")).unwrap();
+
+        let inst = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|i| i.id == civ_id)
+            .unwrap();
+        assert_eq!(inst.title, "Fix login bug");
+        assert_eq!(inst.last_auto_title.as_deref(), Some("Fix login bug"));
+        assert!(inst.smart_rename_attempted);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_terminal_title_never_overwrites_a_manual_title() {
+        use crate::session::instance::Instance;
+        use crate::session::storage::Storage;
+        let home = tempfile::tempdir().expect("tempdir HOME");
+        let _home_guard = crate::session::test_support::isolate_home(home.path());
+        let storage = Storage::new_unwatched("default").expect("storage");
+        let mut manual = Instance::new("Britons", "/tmp/y");
+        manual.title = "Hand-picked".to_string();
+        let manual_id = manual.id.clone();
+        let duplicate_candidate = Instance::new("Franks", "/tmp/z/");
+        let duplicate_id = duplicate_candidate.id.clone();
+        let mut duplicate_owner = Instance::new("Saxons", "/tmp/z");
+        duplicate_owner.title = "Already owned".to_string();
+        storage
+            .update(|instances, _groups| {
+                instances.extend([manual, duplicate_candidate, duplicate_owner]);
+                Ok(())
+            })
+            .unwrap();
+
         apply_terminal_title(&storage, &manual_id, Some("Should Not Apply")).unwrap();
+        apply_terminal_title(&storage, &duplicate_id, Some("Already owned")).unwrap();
 
-        let (instances, _) = storage.load_with_groups().unwrap();
-        let civ = instances.iter().find(|i| i.id == civ_id).unwrap();
-        assert_eq!(civ.title, "Fix login bug");
-        assert_eq!(civ.last_auto_title.as_deref(), Some("Fix login bug"));
-        assert!(civ.smart_rename_attempted);
-
+        let instances = storage.load().unwrap();
         let manual = instances.iter().find(|i| i.id == manual_id).unwrap();
         assert_eq!(manual.title, "Hand-picked");
-        // Still marked attempted so the poller does not respawn on every turn.
         assert!(manual.smart_rename_attempted);
+        let duplicate = instances.iter().find(|i| i.id == duplicate_id).unwrap();
+        assert_eq!(duplicate.title, "Franks");
+        assert_eq!(duplicate.last_auto_title, None);
+        assert!(duplicate.smart_rename_attempted);
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_terminal_title_write_failure_preserves_metadata_and_tmux() {
+        use crate::session::instance::Instance;
+        use crate::session::storage::Storage;
+        use crate::tmux::test_helpers::TmuxTestSession;
+        let home = tempfile::tempdir().expect("tempdir HOME");
+        let _home_guard = crate::session::test_support::isolate_home(home.path());
+        let mut storage = Storage::new_unwatched("default").expect("storage");
+        let failed = Instance::new("Franks", "/tmp/write-failure");
+        let failed_id = failed.id.clone();
+        let failed_tmux_name = crate::tmux::Session::generate_name(&failed_id, &failed.title);
+        storage
+            .update(|instances, _groups| {
+                instances.push(failed);
+                Ok(())
+            })
+            .unwrap();
+
+        let tmux = require_tmux("apply_terminal_title_write_failure_preserves_metadata_and_tmux");
+        let _tmux_guard = if tmux {
+            let guard = TmuxTestSession::from_name(failed_tmux_name.clone());
+            let output = crate::tmux::tmux_command()
+                .args(["new-session", "-d", "-s", guard.name(), "sleep 60"])
+                .output()
+                .expect("tmux new-session");
+            assert!(
+                output.status.success(),
+                "failed to create tmux session {}: {}",
+                guard.name(),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            crate::tmux::refresh_session_cache();
+            Some(guard)
+        } else {
+            None
+        };
+
+        storage.set_fail_writes_for_test(true);
+        let error = apply_terminal_title(&storage, &failed_id, Some("Must Not Land"))
+            .expect_err("injected persistence failure must abort the title mutation");
+        assert!(error
+            .to_string()
+            .contains("injected sessions write failure"));
+
+        let failed = storage
+            .load()
+            .unwrap()
+            .into_iter()
+            .find(|i| i.id == failed_id)
+            .unwrap();
+        assert_eq!(failed.title, "Franks");
+        assert!(!failed.smart_rename_attempted);
+        if tmux {
+            crate::tmux::refresh_session_cache();
+            assert!(
+                crate::tmux::Session::from_name(&failed_tmux_name).exists(),
+                "tmux must not rekey when the title commit fails"
+            );
+        }
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn apply_terminal_title_rekeys_live_tmux_to_committed_title() {
+        if !require_tmux("apply_terminal_title_rekeys_live_tmux_to_committed_title") {
+            return;
+        }
+        use crate::session::instance::Instance;
+        use crate::session::storage::Storage;
+        use crate::tmux::test_helpers::TmuxTestSession;
+        let home = tempfile::tempdir().expect("tempdir HOME");
+        let _home_guard = crate::session::test_support::isolate_home(home.path());
+        let storage = Storage::new_unwatched("default").expect("storage");
+        let civ = Instance::new("Vikings", "/tmp/x");
+        let civ_id = civ.id.clone();
+        let old_tmux_name = crate::tmux::Session::generate_name(&civ_id, &civ.title);
+        let new_tmux_name = crate::tmux::Session::generate_name(&civ_id, "Fix login bug");
+        storage
+            .update(|instances, _groups| {
+                instances.push(civ);
+                Ok(())
+            })
+            .unwrap();
+
+        let old_guard = TmuxTestSession::from_name(old_tmux_name.clone());
+        let new_guard = TmuxTestSession::from_name(new_tmux_name.clone());
+        let output = crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", old_guard.name(), "sleep 60"])
+            .output()
+            .expect("tmux new-session");
+        assert!(
+            output.status.success(),
+            "failed to create tmux session {}: {}",
+            old_guard.name(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        crate::tmux::refresh_session_cache();
+
+        apply_terminal_title(&storage, &civ_id, Some("Fix login bug")).unwrap();
+
+        assert!(!crate::tmux::Session::from_name(&old_tmux_name).exists());
+        assert!(
+            crate::tmux::Session::from_name(&new_tmux_name).exists(),
+            "the committed title must determine the tmux destination"
+        );
+        drop((old_guard, new_guard));
     }
 }

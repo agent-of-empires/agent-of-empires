@@ -24,7 +24,7 @@ Top-level roots:
 | `tui` | Key dispatch, screen transitions, dialog lifecycle, sampled render diagnostics. |
 | `session` | Session/profile/group CRUD, terminal capture, heartbeat, storage IO. |
 | `tmux` | tmux invocations, cache refresh, status detection, pane CRUD. |
-| `http` | Axum request span (`request_id`/`method`/`path`/`status`/`latency_ms`) + per-route events. |
+| `http` | Axum request span (`request_id`/`method`/`path`) and one completion event per request repeating those plus `status`/`latency_ms`, plus per-route events. `path` is the matched route template (`/api/sessions/{id}`), never the raw URI, so session ids and the query-string auth token stay out of the log. A client-supplied `X-Request-Id` is echoed only when it is a short alphanumeric token; anything else is replaced by a generated uuid. |
 | `serve` | `aoe serve` startup, PID/URL file IO, tunnel up/down, signal shutdown. |
 | `hooks` | Agent hook install/uninstall, status-file lifecycle, hook command + watcher failures. |
 | `sound` | Notification sound download/install and per-event playback. |
@@ -39,6 +39,15 @@ Top-level roots:
 - **info**: lifecycle / state transitions (token rotate, container start, migration completed)
 - **debug**: frequent / per-operation detail (every git invocation, every signal)
 - **trace**: per-byte / per-message firehose (`terminal.ws.bytes`, ACP JSON-RPC transport)
+
+An outcome the call site has already classified as expected is **debug**, even
+when it is a failure underneath: a best-effort `git worktree unlock` that finds
+nothing to unlock, or a plugin that is not launching because the user switched
+it off. Those are the configuration and the code working as intended, and at
+warn they crowd out the failures nobody chose. Where a shared helper cannot
+tell the two apart, give it a quiet variant the classifying caller opts into
+(`git::command::run_git_quiet`) rather than dropping the record entirely; the
+stderr summary is what makes a surprise diagnosable later.
 
 ## Env variables
 

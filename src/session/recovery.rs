@@ -112,8 +112,8 @@ fn recovery_lock_path() -> Result<PathBuf> {
 /// cascade? Excludes structured view-mode sessions (handled by `acp_reconciler`),
 /// sessions whose agent has `ResumeStrategy::Unsupported`, sessions without
 /// a valid `agent_session_id`, and sunk rows (archived, currently snoozed, or
-/// explicitly stopped). Live tmux panes are filtered separately by the caller
-/// using `Instance::has_live_tmux_pane()`.
+/// explicitly stopped). Live tmux panes are filtered separately by the caller,
+/// from one batched tmux observation.
 ///
 /// Archive, snooze, and stop are explicit "leave this session alone" signals;
 /// each of them kills the tmux pane, so without this guard the next TUI
@@ -197,7 +197,7 @@ pub fn orphaned_agents_alive(insts: &[Instance]) -> Vec<bool> {
 /// this process can no longer see: on a mid-crash `/tmp` wipe (WSL2) the
 /// server's socket file is unlinked, orphaning the still-running server, and a
 /// later pass resolving a fresh default socket observes the session as
-/// "missing" (`has_live_tmux_pane()` is false) and would recreate it,
+/// "missing" (no live pane carries its id) and would recreate it,
 /// orphaning the first batch's agent processes. After a socket loss the OS
 /// process table is the *only* source of truth that survives (the socket file,
 /// and therefore any `tmux` query, is gone), and it is host-local, so unlike a

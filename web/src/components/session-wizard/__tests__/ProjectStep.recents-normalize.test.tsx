@@ -2,7 +2,7 @@
 // `collectRecentProjects` (#1843). Two sessions on the same project that
 // differ only by a trailing `/` must collapse to a single Recent entry
 // with a summed session count, mirroring the backend's dedup convention
-// (`src/cli/add.rs` is_duplicate_session, `src/server/api/sessions.rs`
+// (`src/session/instance.rs` is_duplicate_session, `src/server/api/sessions.rs`
 // workspace_id_for_session, both `trim_end_matches('/')`).
 //
 // Sits next to ProjectStep.workspace.test.tsx (#1645) and
