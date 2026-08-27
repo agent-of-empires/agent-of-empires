@@ -29,6 +29,7 @@
 //!     is never released, and the `git worktree move` then runs against a live
 //!     bind mount.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::git::{GitWorktree, WorktreeEntry};
@@ -73,11 +74,25 @@ pub enum WorktreePathResolution {
 /// worktree's path as configured, so on macOS, where `/var` is a symlink to
 /// `/private/var`, one checkout can arrive under two spellings and would
 /// otherwise read as [`WorktreePathResolution::Ambiguous`].
-fn select_live_worktree(entries: &[WorktreeEntry], branch: &str) -> WorktreePathResolution {
+fn select_live_worktree(
+    entries: &[WorktreeEntry],
+    branch: &str,
+    main_repo: &Path,
+) -> WorktreePathResolution {
+    // The main worktree is never a candidate. `list_worktrees` reports it like
+    // any other entry, and it can legitimately end up on the session's branch
+    // once the linked checkout is gone (`git worktree unlock` plus `prune` plus
+    // `git checkout`, or a single `git checkout --ignore-other-worktrees`).
+    // Repointing a managed session there would hand its agent the user's
+    // primary checkout to work in. Same canonicalize-and-compare guard
+    // `crate::git::cleanup::remove_worktree_dir` applies before deleting a
+    // directory.
+    let main = main_repo.canonicalize().ok();
     let mut candidates: Vec<PathBuf> = entries
         .iter()
         .filter(|entry| !entry.is_detached && entry.branch.as_deref() == Some(branch))
         .filter_map(|entry| entry.path.canonicalize().ok())
+        .filter(|path| main.as_deref() != Some(path.as_path()))
         .collect();
     candidates.sort();
     candidates.dedup();
@@ -89,21 +104,46 @@ fn select_live_worktree(entries: &[WorktreeEntry], branch: &str) -> WorktreePath
     }
 }
 
-/// Resolve where `info`'s checkout is, consulting git only when `recorded` is
-/// absent from disk.
+/// One pass's worth of `git worktree list` results, keyed by main repo path.
 ///
-/// `Err` means git itself could not be consulted, which is deliberately
-/// distinct from [`WorktreePathResolution::Missing`]: a broken repo must not be
-/// logged as "the worktree is gone".
+/// [`GitWorktree::list_worktrees`] opens the repo once for the listing and
+/// again per registered worktree (`get_current_branch`), so N broken sessions
+/// sharing a repo that holds M worktrees would otherwise cost N*(M+1) libgit2
+/// opens. The TUI pays that synchronously before its first paint, and a
+/// worktree-heavy repo makes M large, so the whole sweep shares one cache.
+#[derive(Default)]
+pub struct ReconcileCache(HashMap<String, Vec<WorktreeEntry>>);
+
+impl ReconcileCache {
+    /// The listing for `main_repo`, fetched once per pass.
+    ///
+    /// A failure is not cached: it is nearly always "this repo is unreachable
+    /// right now", and the next session in the same repo should get a fresh
+    /// attempt rather than inherit a stale verdict.
+    fn entries(&mut self, main_repo: &str) -> crate::git::error::Result<&[WorktreeEntry]> {
+        if !self.0.contains_key(main_repo) {
+            let git = GitWorktree::new(PathBuf::from(main_repo))?;
+            self.0.insert(main_repo.to_string(), git.list_worktrees()?);
+        }
+        Ok(&self.0[main_repo])
+    }
+}
+
+/// Resolve where `info`'s checkout is, given git's current worktree listing.
+///
+/// Takes the entries rather than a [`GitWorktree`] so one listing can serve
+/// every session in a repo; obtaining it is [`ReconcileCache`]'s job, which
+/// keeps the "git could not be consulted" failure distinct from
+/// [`WorktreePathResolution::Missing`] by surfacing it before this is called.
 pub fn resolve_worktree_path(
-    git: &GitWorktree,
+    entries: &[WorktreeEntry],
     recorded: &Path,
     info: &WorktreeInfo,
-) -> crate::git::error::Result<WorktreePathResolution> {
+) -> WorktreePathResolution {
     if !info.managed_by_aoe || recorded.exists() {
-        return Ok(WorktreePathResolution::Current);
+        return WorktreePathResolution::Current;
     }
-    Ok(select_live_worktree(&git.list_worktrees()?, &info.branch))
+    select_live_worktree(entries, &info.branch, Path::new(&info.main_repo_path))
 }
 
 /// Reconcile one session: on [`WorktreePathResolution::Moved`], rewrite
@@ -119,6 +159,7 @@ pub fn resolve_worktree_path(
 pub fn reconcile_and_persist(
     storage: &Storage,
     inst: &mut Instance,
+    cache: &mut ReconcileCache,
 ) -> anyhow::Result<WorktreePathResolution> {
     let Some(info) = inst.worktree_info.clone() else {
         return Ok(WorktreePathResolution::Current);
@@ -136,8 +177,7 @@ pub fn reconcile_and_persist(
         return Ok(WorktreePathResolution::Current);
     }
 
-    let git = GitWorktree::new(PathBuf::from(&info.main_repo_path))?;
-    let resolution = resolve_worktree_path(&git, &recorded, &info)?;
+    let resolution = resolve_worktree_path(cache.entries(&info.main_repo_path)?, &recorded, &info);
     match &resolution {
         WorktreePathResolution::Moved(found) => {
             let id = inst.id.clone();
@@ -212,8 +252,10 @@ mod tests {
         let live = dir.path().join("live");
         let other = dir.path().join("other");
         let gone = dir.path().join("gone");
+        let main_repo = dir.path().join("main-repo");
         std::fs::create_dir(&live).unwrap();
         std::fs::create_dir(&other).unwrap();
+        std::fs::create_dir(&main_repo).unwrap();
         let canon_live = live.canonicalize().unwrap();
 
         let cases = [
@@ -269,10 +311,29 @@ mod tests {
                 vec![entry(&live, Some("feat")), entry(&canon_live, Some("feat"))],
                 WorktreePathResolution::Moved(canon_live.clone()),
             ),
+            (
+                // The main repo can be left on the branch once the linked
+                // checkout is gone. Selecting it would point the session at
+                // the user's primary checkout.
+                "the main worktree on the branch is never selected",
+                vec![entry(&main_repo, Some("feat"))],
+                WorktreePathResolution::Missing,
+            ),
+            (
+                // Nor does excluding it turn a real relocation into an
+                // ambiguity.
+                "the main worktree does not make a real move ambiguous",
+                vec![entry(&main_repo, Some("feat")), entry(&live, Some("feat"))],
+                WorktreePathResolution::Moved(canon_live.clone()),
+            ),
         ];
 
         for (name, entries, expected) in cases {
-            assert_eq!(select_live_worktree(&entries, "feat"), expected, "{name}");
+            assert_eq!(
+                select_live_worktree(&entries, "feat", &main_repo),
+                expected,
+                "{name}"
+            );
         }
     }
 }
