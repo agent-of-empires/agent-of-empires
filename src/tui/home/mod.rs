@@ -480,6 +480,10 @@ pub struct HomeView {
     /// in-memory mirror. Drained on Ok save.
     pending_added: HashMap<String, HashSet<String>>,
     pub(super) group_trees: HashMap<String, GroupTree>,
+    /// Duplicate session ids that remain ambiguous after journal-guided
+    /// reconciliation (#3459): every copy is excluded from `instances` and
+    /// these details name the exact profiles, files, and mtimes to resolve.
+    pub(super) legacy_duplicate_reports: Vec<crate::session::DuplicateIdReport>,
     pub(super) flat_items: Vec<Item>,
 
     // UI state
@@ -2048,6 +2052,23 @@ impl ReloadFailureState {
     }
 }
 
+/// Log each legacy duplicate's actionable details once per process; the
+/// condition can persist until the user hand-edits files, so repeating it at
+/// ERROR level on every reload tick would be spam.
+pub(super) fn log_legacy_duplicates_once(reports: &[crate::session::DuplicateIdReport]) {
+    static REPORTED_IDS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = REPORTED_IDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for report in reports {
+        if seen.iter().any(|id| id == &report.id) {
+            continue;
+        }
+        seen.push(report.id.clone());
+        tracing::error!(target: "tui.home", "{}", report.actionable_message());
+    }
+}
+
 impl HomeView {
     pub fn new(
         active_profile: Option<String>,
@@ -2059,6 +2080,7 @@ impl HomeView {
         let mut storages = HashMap::new();
         let mut all_instances = Vec::new();
         let mut group_trees = HashMap::new();
+        let mut profile_loads: Vec<(String, Vec<Instance>, Vec<Group>)> = Vec::new();
 
         let profile_names = match &active_profile {
             Some(name) => vec![name.clone()],
@@ -2084,6 +2106,25 @@ impl HomeView {
                         target: "tui.home",
                         session = %instance.id,
                         "trash reconciliation skipped: {error}",
+                    );
+                }
+            }
+            // Heal a managed worktree whose directory was moved outside aoe
+            // (a `git worktree move` from another shell): rewrite project_path
+            // from git so attach, status, diff, and rename all act on the live
+            // location instead of failing. Only rows whose recorded path is
+            // already gone cost anything. See #2002.
+            let mut reconcile_cache = crate::session::worktree_reconcile::ReconcileCache::default();
+            for instance in &mut instances {
+                if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist(
+                    &storage,
+                    instance,
+                    &mut reconcile_cache,
+                ) {
+                    tracing::warn!(
+                        target: "tui.home",
+                        session = %instance.id,
+                        "worktree path reconciliation skipped: {error}",
                     );
                 }
             }
@@ -2115,10 +2156,41 @@ impl HomeView {
                     }
                 }
             }
-            let tree = GroupTree::new_with_groups(&instances, &groups);
-            group_trees.insert(profile_name.clone(), tree);
-            all_instances.extend(instances);
+            profile_loads.push((profile_name.clone(), instances, groups));
             storages.insert(profile_name.clone(), storage);
+        }
+
+        // Duplicate detection across every loaded profile runs before any of
+        // the loaded state is published (#3459). Journal-guided repairs fix
+        // durable state under lock here, so a clean reload below publishes
+        // exactly one row per session. Legacy ambiguities stay excluded.
+        let legacy_duplicate_reports = {
+            let loads_view: Vec<(&str, &[Instance])> = profile_loads
+                .iter()
+                .map(|(name, instances, _)| (name.as_str(), instances.as_slice()))
+                .collect();
+            let storages_view: Vec<(&str, &Storage)> = storages
+                .iter()
+                .map(|(name, storage)| (name.as_str(), storage))
+                .collect();
+            let outcome = crate::session::reconcile_profile_duplicates(&loads_view, &storages_view);
+            if outcome.repaired {
+                for (name, instances, groups) in &mut profile_loads {
+                    let (mut fresh, fresh_groups) = storages[name].load_with_groups()?;
+                    for inst in &mut fresh {
+                        inst.source_profile = name.clone();
+                    }
+                    *instances = fresh;
+                    *groups = fresh_groups;
+                }
+            }
+            log_legacy_duplicates_once(&outcome.reports);
+            outcome.reports
+        };
+        for (profile_name, instances, groups) in &profile_loads {
+            let tree = GroupTree::new_with_groups(instances, groups);
+            group_trees.insert(profile_name.clone(), tree);
+            all_instances.extend(instances.iter().cloned());
         }
 
         // In unified mode there is no single active profile, so config is
@@ -2191,6 +2263,7 @@ impl HomeView {
             pending_group_deletions: HashMap::new(),
             pending_added: HashMap::new(),
             group_trees,
+            legacy_duplicate_reports,
             flat_items: Vec::new(),
             cursor: 0,
             selected_session: None,
@@ -2449,11 +2522,21 @@ impl HomeView {
 
         // Batch-sync instance IDs and captured session IDs to tmux hidden env
         // so that build_exclusion_set() on other AoE instances can see them.
+        // One observation for both per-instance walks below. They visit every
+        // instance in the view, so a per-item `list-sessions` fork scales with
+        // the whole store, measured as the dominant tmux cost of this pass on
+        // a store of a few hundred sessions.
+        let live = crate::tmux::LiveSessionSnapshot::new();
         {
             let mut set_batch: Vec<(String, String, String)> = Vec::new();
             let mut unset_batch: Vec<(String, String)> = Vec::new();
             for inst in view.instances.values() {
-                let Some(tmux_name) = inst.tmux_env_session_name() else {
+                // This publication is one-shot: no reload re-runs it and a
+                // poller does not re-emit an unchanged sid, so a row dropped
+                // here stays unpublished until an unrelated sid change or a
+                // relaunch. A snapshot that could not reach the server is
+                // therefore probed per row rather than read as "no live pane".
+                let Some(tmux_name) = inst.tmux_env_session_name_in_or_probe(&live) else {
                     continue;
                 };
 
@@ -2497,12 +2580,12 @@ impl HomeView {
 
         // Recover session IDs for pre-existing sessions via pollers.
         for inst in view.instances.values_mut() {
-            let has_live_tmux = inst.has_live_tmux_pane();
+            let has_live_tmux = inst.has_live_tmux_pane_in(&live);
             if !has_live_tmux {
                 continue;
             }
 
-            inst.repair_session_id_poller_if_needed();
+            inst.repair_session_id_poller_if_needed(&live);
         }
 
         // Startup auto-recovery: kick off a worker pool to restart any
@@ -2614,19 +2697,51 @@ impl HomeView {
             self.storages.retain(|k, _| current_profiles.contains(k));
         }
 
-        for (profile_name, storage) in &self.storages {
-            let (mut instances, groups) = storage.load_with_groups()?;
-            for inst in &mut instances {
-                inst.source_profile = profile_name.clone();
-                if let Some(prev) = self.instances.get(&inst.id) {
-                    // Field-ownership rules (generation-governed vs runtime-only)
-                    // live on merge_runtime_from_reload.
-                    inst.merge_runtime_from_reload(prev);
+        // Collect per-profile state without publishing it, so duplicate
+        // detection (#3459) can run journal-guided repairs before anything
+        // reaches the unified map.
+        type ProfileLoads = Vec<(String, Vec<Instance>, Vec<Group>)>;
+        let collect_loads = |storages: &HashMap<String, Storage>,
+                             prev: &indexmap::IndexMap<String, Instance>|
+         -> anyhow::Result<ProfileLoads> {
+            let mut loads = Vec::new();
+            for (profile_name, storage) in storages {
+                let (mut instances, groups) = storage.load_with_groups()?;
+                for inst in &mut instances {
+                    inst.source_profile = profile_name.clone();
+                    if let Some(previous) = prev.get(&inst.id) {
+                        // Field-ownership rules (generation-governed vs
+                        // runtime-only) live on merge_runtime_from_reload.
+                        inst.merge_runtime_from_reload(previous);
+                    }
                 }
+                loads.push((profile_name.clone(), instances, groups));
             }
+            Ok(loads)
+        };
+        let mut loads = collect_loads(&self.storages, &self.instances)?;
+        let loads_view: Vec<(&str, &[Instance])> = loads
+            .iter()
+            .map(|(name, instances, _)| (name.as_str(), instances.as_slice()))
+            .collect();
+        let storages_view: Vec<(&str, &Storage)> = self
+            .storages
+            .iter()
+            .map(|(name, storage)| (name.as_str(), storage))
+            .collect();
+        let outcome = crate::session::reconcile_profile_duplicates(&loads_view, &storages_view);
+        if outcome.repaired {
+            // Durable state changed under lock; reload so exactly one row per
+            // session is published.
+            loads = collect_loads(&self.storages, &self.instances)?;
+        }
+        log_legacy_duplicates_once(&outcome.reports);
+        self.legacy_duplicate_reports = outcome.reports;
+
+        for (profile_name, instances, groups) in &loads {
             // Rebuild this profile's tree from disk, preserving any collapsed
             // state that was toggled in-memory but not yet on disk
-            let mut new_tree = GroupTree::new_with_groups(&instances, &groups);
+            let mut new_tree = GroupTree::new_with_groups(instances, groups);
             if let Some(old_tree) = self.group_trees.get(profile_name) {
                 for g in old_tree.get_all_groups() {
                     if g.collapsed {
@@ -2635,7 +2750,7 @@ impl HomeView {
                 }
             }
             self.group_trees.insert(profile_name.clone(), new_tree);
-            all_instances.extend(instances);
+            all_instances.extend(instances.iter().cloned());
         }
 
         // Remove trees for profiles that no longer exist
@@ -3117,13 +3232,13 @@ impl HomeView {
     }
 
     /// Fold one daemon-sourced structured status into the shared apply path,
-    /// so sounds, status hooks, and unread marking behave exactly as they do
-    /// for a tmux-derived transition. The `sessions.json` status patch is the
-    /// one deliberate exception: this path only handles structured rows, and
-    /// `persist_passive_status_transition` skips the passive status patch for
-    /// `is_structured()` (only the unread mark persists there), since a
-    /// structured row's status is a daemon-side overlay with no durable owner.
-    /// See #3201.
+    /// so sounds and status hooks fire exactly as they do for a tmux-derived
+    /// transition. Persistence is the deliberate exception: this path only
+    /// handles structured rows, and nothing about one is the TUI's to write, so
+    /// `persist_passive_status_transition` returns early for `is_structured()`.
+    /// The status is a daemon-side overlay with no durable owner (#3201), and
+    /// the automatic unread mark is the daemon's too, written from the live ACP
+    /// turn-end event (#3181).
     ///
     /// The row is re-checked against `is_structured()` here rather than
     /// trusted from the wire: the daemon's `view` and the local row's could
@@ -3290,9 +3405,26 @@ impl HomeView {
                     // Skip when already unread (the mark is a no-op) so a
                     // re-finishing session doesn't churn the flock once
                     // per turn.
-                    let already_unread =
-                        self.get_instance(&update.id).is_some_and(|i| i.is_unread());
+                    let (already_unread, structured) = self
+                        .get_instance(&update.id)
+                        .map(|i| (i.is_unread(), i.is_structured()))
+                        .unwrap_or((false, false));
+                    // Structured rows are the daemon's: `should_mark_acp_unread`
+                    // marks them off the live ACP turn-end event and persists it
+                    // there (#3181). Marking here too would be a second writer of
+                    // the same boolean for no gain, and `is_live_target` cannot
+                    // even earn its keep on one: `start_live_send` returns `None`
+                    // outright for `is_structured()` (`home/input.rs`, matched by
+                    // the guard in `app.rs`), so the exemption is always inert for
+                    // them. Note it is that explicit guard which makes it inert,
+                    // not the absence of a pane: a structured row can own paired
+                    // terminal and tool panes, so `LiveSendTarget` alone would not
+                    // rule live-send out. What clears the mark for a structured
+                    // row the user is actually reading is `tick_unread_dwell`,
+                    // which re-checks `is_unread()` every tick and so picks up a
+                    // daemon-written mark on the row under the cursor.
                     let should_mark_unread = crate::session::unread_enabled()
+                        && !structured
                         && old == Status::Running
                         && new_status == Status::Idle
                         && !is_live_target
@@ -3631,8 +3763,14 @@ impl HomeView {
     /// [`Self::apply_session_id_updates`], which runs on every input/render
     /// wake while live views are open.
     pub fn repair_session_id_pollers(&mut self) {
+        // One observation for the whole walk. This runs on the `App::run` tick
+        // over every instance, so a per-item `list-sessions` fork scales with
+        // the store and lands on the thread that also serves keystrokes.
+        // Profiling a store of a few hundred sessions put this path at the top
+        // of the main thread.
+        let live = crate::tmux::LiveSessionSnapshot::new();
         for instance in self.instances.values_mut() {
-            instance.repair_session_id_poller_if_needed();
+            instance.repair_session_id_poller_if_needed(&live);
         }
     }
 
@@ -3945,11 +4083,11 @@ impl HomeView {
         };
 
         let mut candidates: Vec<crate::session::Instance> = Vec::new();
-        // Single fallible tmux probe instead of per-instance
-        // `inst.has_live_tmux_pane()` calls. On Err: skip recovery this
-        // launch (a transient tmux glitch must NOT collapse to "all panes
-        // dead" and trigger phantom cascades). Bonus: one subprocess call
-        // regardless of instance count (was 1-2 per instance).
+        // Single fallible tmux probe instead of a per-instance liveness
+        // lookup. On Err: skip recovery this launch (a transient tmux glitch
+        // must NOT collapse to "all panes dead" and trigger phantom
+        // cascades). Bonus: one subprocess call regardless of instance count
+        // (was 1-2 per instance).
         let pane_meta = match crate::tmux::batch_pane_metadata() {
             Ok(map) => map,
             Err(e) => {
@@ -5164,17 +5302,30 @@ impl HomeView {
     }
 
     /// Build the id-keyed `IndexMap` from a `Vec<Instance>` (the storage-load
-    /// shape). Logs a warning on a duplicate id so a corrupt disk state
-    /// surfaces in logs rather than silently keeping only the last row.
+    /// shape). Duplicate ids across profiles are ambiguous after an interrupted
+    /// profile move: selecting either row by iteration order can route lifecycle
+    /// work to the wrong profile. Exclude every copy and fail closed; the
+    /// reload path runs `reconcile_profile_duplicates` first, so only
+    /// legacy duplicates without journal evidence ever reach this state.
     fn build_instances_map(all_instances: Vec<Instance>) -> indexmap::IndexMap<String, Instance> {
-        let mut map = indexmap::IndexMap::with_capacity(all_instances.len());
+        let mut map: indexmap::IndexMap<String, Instance> =
+            indexmap::IndexMap::with_capacity(all_instances.len());
+        let mut duplicate_ids = std::collections::HashSet::new();
         for inst in all_instances {
-            if let Some(prev) = map.insert(inst.id.clone(), inst) {
-                tracing::warn!(
+            if duplicate_ids.contains(&inst.id) {
+                continue;
+            }
+            if let Some(previous) = map.shift_remove(&inst.id) {
+                duplicate_ids.insert(inst.id.clone());
+                tracing::error!(
                     target: "tui.home",
-                    id = %prev.id,
-                    "duplicate session id in loaded rows; keeping later entry"
+                    id = %inst.id,
+                    first_profile = %previous.source_profile,
+                    second_profile = %inst.source_profile,
+                    "duplicate session id across profiles; excluding every copy until durable reconciliation"
                 );
+            } else {
+                map.insert(inst.id.clone(), inst);
             }
         }
         map
@@ -6528,41 +6679,6 @@ impl HomeView {
         }
     }
 
-    /// Drop `group_path` from `profile`'s tree when no remaining session in
-    /// that profile sits at the path or anywhere underneath it AND the path
-    /// carries no user-anchored descendant group. Used after a session moves
-    /// to a different profile: without this, the source profile keeps an
-    /// empty group header that renders alongside the target profile's new
-    /// copy of the same group, reading as a duplicate. Delegates to
-    /// `delete_group_in_profile` so the deletion is tombstoned for `save()`
-    /// and survives the next reload.
-    pub(super) fn prune_empty_group(&mut self, profile: &str, group_path: &str) {
-        if group_path.is_empty() {
-            return;
-        }
-        let prefix = format!("{}/", group_path);
-        let still_used = self.instances.values().any(|i| {
-            i.source_profile == profile
-                && (i.group_path == group_path || i.group_path.starts_with(&prefix))
-        });
-        if still_used {
-            return;
-        }
-        // Preserve hand-built structure: if the tree carries a descendant
-        // group (e.g. user-anchored `work/anchor`) under this path, leave
-        // the parent alone. The duplicate-header in unified view is the
-        // lesser evil compared to nuking the user's hierarchy.
-        let has_descendant_group = self.group_trees.get(profile).is_some_and(|tree| {
-            tree.get_all_groups()
-                .iter()
-                .any(|g| g.path.starts_with(&prefix))
-        });
-        if has_descendant_group {
-            return;
-        }
-        self.delete_group_in_profile(profile, group_path);
-    }
-
     /// Determine which profile the item at the given cursor position belongs to.
     pub(super) fn profile_for_cursor(&self, cursor: usize) -> Option<String> {
         if let Some(profile) = &self.active_profile {
@@ -6761,35 +6877,54 @@ impl HomeView {
             _lifecycle: lifecycle,
         })
     }
-
-    /// Cross-profile move: structurally distinct from `mutate_instance`
-    /// because the row must be tombstoned in the old profile's disk file
-    /// AND marked as TUI-new for the target profile. Without this, save()'s
-    /// per-profile loop misclassifies the row as peer-deleted in the new
-    /// profile and leaves the old profile's disk row, which next reload
-    /// resurrects under the original profile.
-    ///
-    /// Callers that need cross-process title/lifecycle serialization retain
-    /// [`SessionMutationGuards`] around this mutation and its durable save.
+    /// Move a row between profiles as one dual-locked storage transaction,
+    /// then publish the committed row in memory.
     pub(super) fn move_to_profile(
         &mut self,
         id: &str,
         target: &str,
-        new_group_path: String,
+        requested: Instance,
+        baseline: Option<&Instance>,
     ) -> anyhow::Result<()> {
-        let now = chrono::Utc::now();
-        let Some((old_profile, lifecycle_reserved)) = self.instances.get(id).map(|instance| {
-            (
-                instance.source_profile.clone(),
-                instance.has_fresh_lifecycle_reservation(now),
-            )
-        }) else {
+        self.move_to_profile_with_effect(id, target, requested, baseline, |_| Ok(()))
+    }
+
+    /// Cross-profile move: structurally distinct from `mutate_instance`
+    /// because the source row and group metadata must be removed in the same
+    /// transaction that durably publishes the target row and metadata.
+    ///
+    /// `before_commit` runs after authoritative target validation while both
+    /// profile storage locks are held. It may perform only bounded
+    /// worktree/container effects; it must not re-enter storage or rekey tmux.
+    /// Callers retain [`SessionMutationGuards`] around the transaction and any
+    /// post-persist tmux rekey.
+    pub(super) fn move_to_profile_with_effect<B>(
+        &mut self,
+        id: &str,
+        target: &str,
+        mut requested: Instance,
+        baseline: Option<&Instance>,
+        before_commit: B,
+    ) -> anyhow::Result<()>
+    where
+        B: FnOnce(&Instance) -> anyhow::Result<()>,
+    {
+        let Some(current) = self.instances.get(id).cloned() else {
             return Ok(());
         };
+        let lifecycle_reserved = current.has_fresh_lifecycle_reservation(chrono::Utc::now());
+        let before = baseline.cloned().unwrap_or_else(|| current.clone());
+        let old_profile = before.source_profile.clone();
+        requested.source_profile = old_profile.clone();
         if old_profile == target {
-            self.mutate_instance(id, |inst| inst.group_path = new_group_path);
+            requested.source_profile = target.to_string();
+            self.instances.insert(id.to_string(), requested);
             return Ok(());
         }
+        anyhow::ensure!(
+            current.status != crate::session::Status::Creating,
+            "Cannot move session {id} between profiles while it is being created"
+        );
         anyhow::ensure!(
             !lifecycle_reserved,
             "Cannot move session {id} between profiles while a lifecycle operation is in progress"
@@ -6801,22 +6936,57 @@ impl HomeView {
                 Storage::open(target, self.file_watch.clone())?,
             );
         }
+        let source = self
+            .storages
+            .get(&old_profile)
+            .ok_or_else(|| anyhow::anyhow!("Source profile storage is not loaded"))?;
+        let target_storage = self
+            .storages
+            .get(target)
+            .ok_or_else(|| anyhow::anyhow!("Target profile storage is not loaded"))?;
+        let mut moved = source.move_instance_to_with_effect(
+            target_storage,
+            &before,
+            &requested,
+            |instances, candidate| {
+                if crate::session::is_duplicate_session(
+                    instances.iter(),
+                    &candidate.title,
+                    &candidate.project_path,
+                    None,
+                ) {
+                    return Err(crate::session::duplicate_session_error(&candidate.title));
+                }
+                Ok(())
+            },
+            before_commit,
+        )?;
+        moved.merge_runtime_for_profile_move(&current);
+        moved.source_profile = target.to_string();
+        self.instances.insert(id.to_string(), moved);
+        Ok(())
+    }
 
-        self.pending_deletions
-            .entry(old_profile.clone())
-            .or_default()
-            .insert(id.to_string());
-        if let Some(set) = self.pending_added.get_mut(&old_profile) {
-            set.remove(id);
-        }
-        self.pending_added
-            .entry(target.to_string())
-            .or_default()
-            .insert(id.to_string());
-
-        if let Some(inst) = self.instances.get_mut(id) {
-            inst.group_path = new_group_path;
-            inst.source_profile = target.to_string();
+    /// Reload storage after a profile move without dropping runtime-only state
+    /// from the rows the transaction just published.
+    pub(super) fn reload_preserving_profile_move_runtime(
+        &mut self,
+        ids: &[String],
+    ) -> anyhow::Result<()> {
+        let previous: Vec<(String, Instance)> = ids
+            .iter()
+            .filter_map(|id| {
+                self.instances
+                    .get(id)
+                    .cloned()
+                    .map(|instance| (id.clone(), instance))
+            })
+            .collect();
+        self.reload()?;
+        for (id, prior) in previous {
+            if let Some(reloaded) = self.instances.get_mut(&id) {
+                reloaded.merge_runtime_for_profile_move(&prior);
+            }
         }
         Ok(())
     }
@@ -6833,7 +7003,8 @@ impl HomeView {
     /// `mark_unread` folds the Running -> Idle unread mark into the same
     /// `Storage::update` call instead of a second flock round-trip on the
     /// same row in the same tick, matching the daemon's per-tick batching
-    /// shape in `status_poll_loop`.
+    /// shape in `status_poll_loop`. Terminal rows only; see the
+    /// `is_structured()` return below.
     pub(super) fn persist_passive_status_transition(&self, id: &str, mark_unread: bool) {
         let Some(inst) = self.instances.get(id) else {
             return;
@@ -6841,32 +7012,31 @@ impl HomeView {
         let Some(storage) = self.storages.get(&inst.source_profile) else {
             return;
         };
-        // Structured rows are not durable: their status is a daemon-side
-        // overlay rebuilt from live worker state (`apply_acp_overlay_inplace`)
-        // and re-derived at daemon boot by `seed_acp_statuses`. The daemon's
-        // own passive writer gates the status patch on exactly this predicate
+        // A structured row has nothing for the TUI to persist, so bail before
+        // taking the flock at all.
+        //
+        // Its status is not durable: that is a daemon-side overlay rebuilt from
+        // live worker state (`apply_acp_overlay_inplace`) and re-derived at
+        // daemon boot by `seed_acp_statuses`, and the daemon's own passive
+        // writer gates the patch on exactly this predicate
         // (`decide_passive_transition` returns `patch: None` for
-        // `is_structured()`, `server/mod.rs`). Persisting it here would strand
-        // a row at `Running` or `Error` with no producer left to heal it once
-        // the daemon is gone, since the tmux poller now bails on structured
-        // rows (`status_poller.rs`); this is the #3201 regression from #3170.
-        // The unread mark is deliberately NOT gated: the daemon marks a
-        // structured row unread on a Running -> Idle turn (its `mark_unread` is
-        // not gated on `is_structured`), so mirroring it here keeps the two
-        // producers symmetric.
-        let structured = inst.is_structured();
-        // Pure optimization, not a correctness gate: a structured row with
-        // nothing to mark unread has no patch and no unread write, so skip the
-        // empty-write flock round-trip entirely.
-        if structured && !mark_unread {
+        // `is_structured()`, `server/mod.rs`). Persisting it here would strand a
+        // row at `Running` or `Error` with no producer left to heal it once the
+        // daemon is gone, since the tmux poller now bails on structured rows
+        // (`status_poller.rs`); this is the #3201 regression from #3170.
+        //
+        // Its unread mark is not ours either, as of #3181: the daemon writes it
+        // from the live ACP turn-end event (`should_mark_acp_unread`), and the
+        // caller's predicate is gated on `!structured` to match. So `mark_unread`
+        // is only ever `false` here for a structured row and this return is
+        // total, not an optimization.
+        if inst.is_structured() {
             return;
         }
-        let patch = (!structured).then(|| crate::session::PassiveStatusPatch::from_instance(inst));
+        let patch = crate::session::PassiveStatusPatch::from_instance(inst);
         if let Err(e) = storage.update(|insts, _groups| {
             if let Some(disk) = insts.iter_mut().find(|i| i.id == id) {
-                if let Some(patch) = &patch {
-                    disk.merge_passive_status_patch(id, patch);
-                }
+                disk.merge_passive_status_patch(id, &patch);
                 if mark_unread {
                     disk.mark_unread();
                 }

@@ -91,6 +91,75 @@ pub enum ForkStrategy {
     Unsupported,
 }
 
+/// Lifecycle state of an agent CLI in the registry. Data-only: it never
+/// gates spawning, resume, hook installs, or any other support path; every
+/// surface that lists or launches an agent renders the state alongside it
+/// (CLI listings, doctor, spawn warnings, TUI picker badge, dashboard).
+///
+/// Wire mirror: `web/src/lib/types.ts` (`AgentLifecycleInfo`, served by
+/// `/api/agents` and `/api/acp/agents`) and the static fallback mirror in
+/// `web/src/lib/agentProfiles.ts`. When adding a variant, update both TS
+/// files and give the variant an arm in [`AgentDef::lifecycle_label`] in
+/// the same change: the closed `"state"` union on the TS side and that
+/// match arm are the two places a new variant does not fail compilation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum AgentLifecycle {
+    /// Fully supported upstream; nothing to surface.
+    Active,
+    /// Still functional in AoE but deprecated upstream. Support (detection,
+    /// status, resume, hooks) is unchanged; the notice travels with the
+    /// agent everywhere it appears.
+    Deprecated {
+        /// ISO date (`YYYY-MM-DD`) the deprecation took effect upstream.
+        since: &'static str,
+        /// One-line human-facing reason.
+        note: &'static str,
+        /// Canonical registry name of a suggested replacement, when one exists.
+        replacement: Option<&'static str>,
+    },
+}
+
+impl AgentLifecycle {
+    /// True for the plain [`AgentLifecycle::Active`] default. Used by
+    /// serializers to omit the field for active agents so the common case
+    /// keeps its wire shape.
+    pub fn is_active(&self) -> bool {
+        matches!(self, AgentLifecycle::Active)
+    }
+
+    /// Full one-line notice for any non-active state; `None` while Active.
+    /// The single rendering entry point for CLI listings and spawn
+    /// warnings, so a future variant automatically surfaces its Display
+    /// everywhere without per-site match updates.
+    pub fn notice(&self) -> Option<String> {
+        if self.is_active() {
+            None
+        } else {
+            Some(self.to_string())
+        }
+    }
+}
+
+impl std::fmt::Display for AgentLifecycle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            AgentLifecycle::Active => write!(f, "active"),
+            AgentLifecycle::Deprecated {
+                since,
+                note,
+                replacement,
+            } => {
+                write!(f, "deprecated since {since}: {note}")?;
+                match replacement {
+                    Some(name) => write!(f, "; consider switching to {name}"),
+                    None => Ok(()),
+                }
+            }
+        }
+    }
+}
+
 /// A single hook event that AoE registers in an agent's settings file.
 #[derive(Debug)]
 pub struct HookEvent {
@@ -338,6 +407,10 @@ pub struct AgentDef {
     /// `docs/development/adding-agents.md` for how to determine these
     /// sequences for a new agent.
     pub permission_response: Option<PermissionResponse>,
+    /// Lifecycle state (active, deprecated, ...). Data-only: rendered by the
+    /// agent-facing surfaces (`aoe agents`, `aoe acp doctor`, spawn warnings,
+    /// TUI picker badge, dashboard), never consulted by support paths.
+    pub lifecycle: AgentLifecycle,
 }
 
 /// A tmux keystroke: either literal text sent verbatim (e.g. a menu digit) or
@@ -738,6 +811,7 @@ pub const AGENTS: &[AgentDef] = &[
             allow_always: Some(&[KeyToken::Literal("2")]),
             deny: &[KeyToken::Literal("3")],
         }),
+        lifecycle: AgentLifecycle::Active,
     },
     AgentDef {
         name: "opencode",
@@ -776,6 +850,7 @@ pub const AGENTS: &[AgentDef] = &[
                 KeyToken::Named("Enter"),
             ],
         }),
+        lifecycle: AgentLifecycle::Active,
     },
     AgentDef {
         name: "vibe",
@@ -798,6 +873,7 @@ pub const AGENTS: &[AgentDef] = &[
         ready_marker: None,
         install_hint: "pip install mistral-vibe",
         permission_response: None,
+        lifecycle: AgentLifecycle::Active,
     },
     AgentDef {
         name: "codex",
@@ -836,6 +912,7 @@ pub const AGENTS: &[AgentDef] = &[
             allow_always: Some(&[KeyToken::Literal("a")]),
             deny: &[KeyToken::Literal("d")],
         }),
+        lifecycle: AgentLifecycle::Active,
     },
     AgentDef {
         name: "gemini",
@@ -892,6 +969,11 @@ pub const AGENTS: &[AgentDef] = &[
         ready_marker: None,
         install_hint: "npm install -g @google/gemini-cli",
         permission_response: None,
+        lifecycle: AgentLifecycle::Deprecated {
+            since: "2026-06-18",
+            note: "consumer accounts cut off by Google; enterprise/API-key remain valid",
+            replacement: Some("antigravity"),
+        },
     },
     AgentDef {
         name: "cursor",
@@ -919,6 +1001,7 @@ pub const AGENTS: &[AgentDef] = &[
         ready_marker: None,
         install_hint: "see https://docs.cursor.com/cli",
         permission_response: None,
+        lifecycle: AgentLifecycle::Active,
     },
     AgentDef {
         name: "copilot",
@@ -947,6 +1030,7 @@ pub const AGENTS: &[AgentDef] = &[
         ready_marker: None,
         install_hint: "see https://docs.github.com/en/copilot/github-copilot-in-the-cli",
         permission_response: None,
+        lifecycle: AgentLifecycle::Active,
     },
     AgentDef {
         name: "pi",
@@ -970,6 +1054,7 @@ pub const AGENTS: &[AgentDef] = &[
         ready_marker: None,
         install_hint: "npm install -g @earendil-works/pi-coding-agent",
         permission_response: None,
+        lifecycle: AgentLifecycle::Active,
     },
     AgentDef {
         name: "droid",
@@ -992,6 +1077,7 @@ pub const AGENTS: &[AgentDef] = &[
         ready_marker: None,
         install_hint: "npm install -g droid",
         permission_response: None,
+        lifecycle: AgentLifecycle::Active,
     },
     AgentDef {
         name: "settl",
@@ -1026,6 +1112,7 @@ pub const AGENTS: &[AgentDef] = &[
         ready_marker: None,
         install_hint: "brew install --cask mozilla-ai/tap/settl",
         permission_response: None,
+        lifecycle: AgentLifecycle::Active,
     },
     AgentDef {
         name: "hermes",
@@ -1067,6 +1154,7 @@ pub const AGENTS: &[AgentDef] = &[
         install_hint:
             "curl -fsSL https://raw.githubusercontent.com/NousResearch/hermes-agent/main/scripts/install.sh | bash",
         permission_response: None,
+        lifecycle: AgentLifecycle::Active,
     },
     AgentDef {
         name: "kiro",
@@ -1114,6 +1202,7 @@ pub const AGENTS: &[AgentDef] = &[
         ready_marker: None,
         install_hint: "curl -fsSL https://cli.kiro.dev/install | bash",
         permission_response: None,
+        lifecycle: AgentLifecycle::Active,
     },
     AgentDef {
         name: "qwen",
@@ -1144,6 +1233,7 @@ pub const AGENTS: &[AgentDef] = &[
         ready_marker: None,
         install_hint: "npm install -g @qwen-code/qwen-code",
         permission_response: None,
+        lifecycle: AgentLifecycle::Active,
     },
     AgentDef {
         name: "antigravity",
@@ -1166,6 +1256,7 @@ pub const AGENTS: &[AgentDef] = &[
         ready_marker: None,
         install_hint: "curl -fsSL https://antigravity.google/cli/install.sh | bash",
         permission_response: None,
+        lifecycle: AgentLifecycle::Active,
     },
     AgentDef {
         name: "kimi",
@@ -1206,6 +1297,7 @@ pub const AGENTS: &[AgentDef] = &[
         ready_marker: None,
         install_hint: "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash",
         permission_response: None,
+        lifecycle: AgentLifecycle::Active,
     },
     AgentDef {
         name: "omp",
@@ -1232,11 +1324,27 @@ pub const AGENTS: &[AgentDef] = &[
             allow_always: None,
             deny: &[KeyToken::Named("Down"), KeyToken::Named("Enter")],
         }),
+        lifecycle: AgentLifecycle::Active,
     },
 ];
 
 /// Look up an agent by canonical name.
 impl AgentDef {
+    /// Short lifecycle label for compact surfaces (TUI picker suffix, web
+    /// badge); `None` while Active so those surfaces stay unchanged.
+    pub fn lifecycle_label(&self) -> Option<&'static str> {
+        match self.lifecycle {
+            AgentLifecycle::Active => None,
+            AgentLifecycle::Deprecated { .. } => Some("deprecated"),
+        }
+    }
+
+    /// Full one-line lifecycle notice for CLI listings and spawn warnings;
+    /// `None` while Active.
+    pub fn lifecycle_notice(&self) -> Option<String> {
+        self.lifecycle.notice()
+    }
+
     /// Extra argv tokens inserted between the one-shot flag and the prompt for a
     /// one-shot (smart-rename) title call. These are static, never user input,
     /// so the no-injection contract (prompt stays the final argv element) holds.
@@ -1333,6 +1441,17 @@ impl AgentDef {
 
 pub fn get_agent(name: &str) -> Option<&'static AgentDef> {
     AGENTS.iter().find(|a| a.name == name)
+}
+
+/// Registry lifecycle state for an ACP-registry key. Falls back to Active
+/// for registry entries with no `AGENTS` counterpart (bundled or alias-only
+/// keys). Shared by the doctor, `/api/acp/agents`, and `aoe acp agents`
+/// surfaces; every consumer is serve-gated, so the helper is too.
+#[cfg(feature = "serve")]
+pub(crate) fn registry_lifecycle(name: &str) -> AgentLifecycle {
+    get_agent(name)
+        .map(|def| def.lifecycle)
+        .unwrap_or(AgentLifecycle::Active)
 }
 
 /// Whether switching a structured-view session back to a terminal can hand
@@ -1820,6 +1939,129 @@ mod tests {
         assert_eq!(get_agent("antigravity").unwrap().binary, "agy");
         assert_eq!(get_agent("kimi").unwrap().binary, "kimi");
         assert_eq!(get_agent("omp").unwrap().binary, "omp");
+    }
+
+    #[test]
+    fn test_lifecycle_active_by_default_except_gemini() {
+        // Invariant across the registry: exactly one deprecated agent today
+        // (gemini); a new entry that forgets its lifecycle must fail here.
+        let cases: Vec<(&str, bool)> = AGENTS
+            .iter()
+            .map(|a| (a.name, a.lifecycle.is_active()))
+            .collect();
+        for (name, active) in cases {
+            let expect_active = name != "gemini";
+            assert_eq!(active, expect_active, "{name}");
+        }
+    }
+
+    #[test]
+    fn test_lifecycle_notice_and_label() {
+        // (agent, label, notice fragment or None). Active agents surface
+        // nothing; the deprecated one carries date, reason, and replacement.
+        let cases = [
+            ("claude", None, None),
+            ("antigravity", None, None),
+            (
+                "gemini",
+                Some("deprecated"),
+                Some("deprecated since 2026-06-18"),
+            ),
+        ];
+        for (name, label, notice_fragment) in cases {
+            let def = get_agent(name).unwrap();
+            assert_eq!(def.lifecycle_label(), label, "{name}");
+            match (notice_fragment, def.lifecycle_notice()) {
+                (None, None) => {}
+                (Some(fragment), Some(notice)) => {
+                    assert!(notice.contains(fragment), "{name}: {notice}");
+                    if name == "gemini" {
+                        assert!(
+                            notice.contains("consider switching to antigravity"),
+                            "{notice}"
+                        );
+                        assert!(
+                            notice.contains("enterprise/API-key remain valid"),
+                            "{notice}"
+                        );
+                    }
+                }
+                _ => panic!("{name}: label and notice must agree"),
+            }
+            // The enum-level entry point (used by the acp surfaces) must
+            // agree with the AgentDef helper for every variant, including
+            // future ones: any non-active state surfaces its Display.
+            assert_eq!(def.lifecycle.notice(), def.lifecycle_notice(), "{name}");
+        }
+    }
+
+    #[test]
+    fn test_lifecycle_notice_without_replacement() {
+        // Boundary: a Deprecated state with no suggested replacement must
+        // still render its full notice, minus the "consider switching"
+        // clause (Display's None arm).
+        let lifecycle = AgentLifecycle::Deprecated {
+            since: "2026-01-01",
+            note: "upstream shut down",
+            replacement: None,
+        };
+        let notice = lifecycle.to_string();
+        assert_eq!(notice, "deprecated since 2026-01-01: upstream shut down");
+        assert!(!notice.contains("consider switching"), "{notice}");
+        assert_eq!(lifecycle.notice().as_deref(), Some(notice.as_str()));
+    }
+
+    #[test]
+    fn test_lifecycle_serialization_shape() {
+        // Wire contract consumed by the dashboard (`web/src/lib/types.ts`
+        // AgentLifecycleInfo). Active agents are omitted by callers via
+        // skip_serializing_if; here we pin each variant's JSON shape.
+        assert_eq!(
+            serde_json::to_string(&AgentLifecycle::Active).unwrap(),
+            r#"{"state":"active"}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&get_agent("gemini").unwrap().lifecycle).unwrap(),
+            concat!(
+                r#"{"state":"deprecated","since":"2026-06-18","#,
+                r#""note":"consumer accounts cut off by Google; enterprise/API-key remain valid","#,
+                r#""replacement":"antigravity"}"#
+            )
+        );
+    }
+
+    #[test]
+    fn test_lifecycle_facts_stay_synced_with_ts_mirror() {
+        // The dashboard keeps a static fallback mirror of the gemini facts
+        // (web/src/lib/agentProfiles.ts). Each side has its own pinning
+        // tests, so a coordinated update of one side alone would ship a
+        // silent desync; this cross-checks the literal strings instead.
+        let mirror_path =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("web/src/lib/agentProfiles.ts");
+        let Ok(mirror) = std::fs::read_to_string(&mirror_path) else {
+            // Nix-filtered cargo-test sources omit web/. The TS suite still
+            // pins the mirror there; cross-check it whenever the monorepo
+            // source is available instead of failing a filtered package.
+            eprintln!(
+                "skipping TS lifecycle mirror check: {} is absent",
+                mirror_path.display()
+            );
+            return;
+        };
+        let AgentLifecycle::Deprecated {
+            since,
+            note,
+            replacement: Some(replacement),
+        } = get_agent("gemini").unwrap().lifecycle
+        else {
+            panic!("gemini must stay Deprecated with a replacement");
+        };
+        for fact in [since, note, replacement] {
+            assert!(
+                mirror.contains(fact),
+                "TS mirror is missing {fact:?}; update web/src/lib/agentProfiles.ts in the same change"
+            );
+        }
     }
 
     #[test]

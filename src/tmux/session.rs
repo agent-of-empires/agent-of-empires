@@ -133,22 +133,15 @@ pub struct PaneCursor {
     /// works while an agent streams. `parse` sets it `true`; only the
     /// cross-probe check downgrades it.
     pub position_reliable: bool,
-    /// Pane 0's `(width, height)` within a COMPOSITED preview, or `None` when
+    /// Pane 0's rectangle within a composited preview window, or `None` when
     /// the preview shows a single pane.
     ///
-    /// Mouse forwarding maps the hovered cell into the previewed app's
-    /// coordinate space by treating the preview rect as the pane, which holds
-    /// while the two describe the same rectangle. A composite makes the rect the
-    /// whole window, so a pointer over a neighbouring pane maps to a column past
-    /// pane 0's right edge and is reported to the agent as though its own pane
-    /// were that wide. Pane 0 is the only pane that receives input (#435, #488),
-    /// so this carries its extent and the forward clamps to it, dropping events
-    /// that land outside.
-    ///
-    /// Only the extent is needed, never the origin: tmux keeps pane 0 at the
-    /// window origin, because pane indices follow layout order and closing pane
-    /// 0 renumbers whichever pane takes that corner.
-    pub composite_pane0: Option<(u16, u16)>,
+    /// Composite content uses the window grid while the cursor and input stay
+    /// pane relative. Window chrome can give pane 0 a non-zero origin (#3515),
+    /// so full-window consumers add it to cursor coordinates and subtract it
+    /// from pointer coordinates. A cropped preview must also account for rows
+    /// removed before mapping. Input remains pinned to pane 0 (#435, #488).
+    pub composite_pane0: Option<PaneGeom>,
 }
 
 /// tmux format line every cursor probe requests, parsed by
@@ -874,15 +867,10 @@ impl Session {
     /// misbehaving.
     /// Composite window capture plus pane 0's cursor, for the live preview.
     ///
-    /// Pane 0 owns the cursor because it is the pane that receives input, and
-    /// tmux puts it at the window origin, so its coordinates index the
-    /// composite untranslated. The probe targets `^.0` explicitly rather than
-    /// the window, whose format fields would resolve against whichever pane the
-    /// user happens to have selected.
-    ///
-    /// On a composite the cursor is rebased onto the window's dimensions: the
-    /// renderer anchors it by `pane_height` against the painted line count,
-    /// which is now the whole window rather than one pane.
+    /// The probe targets `^.0`, the pane that receives input, rather than the
+    /// window whose format fields resolve against whichever pane is selected.
+    /// On a composite, `pane_height`/`pane_width` are rebased to the window and
+    /// [`PaneCursor::composite_pane0`] retains pane 0's coordinate frame.
     pub fn capture_window_composited_with_cursor(
         &self,
         lines: usize,
@@ -1043,9 +1031,9 @@ impl Session {
             c.pane_width = layout.window_width;
             c.history_size = 0;
             // Rebasing the frame onto the window is what the renderer needs, but
-            // it also erases the only record of how wide the input pane is, which
-            // mouse forwarding maps into. Carry pane 0's extent alongside.
-            c.composite_pane0 = layout.first_pane().map(|p| (p.width, p.height));
+            // it also erases where pane 0 sits in it, which cursor painting and
+            // mouse forwarding both need. Carry pane 0's rectangle alongside.
+            c.composite_pane0 = layout.first_pane();
             c
         });
         let content = pane0_rows.as_deref().map_or_else(
@@ -3541,6 +3529,111 @@ mod tests {
         );
     }
 
+    /// Pane 0's rectangle as tmux reports it, `(left, top, width, height)`.
+    fn pane0_tmux_geometry(session: &Session) -> (u16, u16, u16, u16) {
+        let out = crate::tmux::tmux_command()
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                &format!("{}:^.0", session.name),
+                "-F",
+                "#{pane_left} #{pane_top} #{pane_width} #{pane_height}",
+            ])
+            .output()
+            .expect("display-message");
+        assert!(out.status.success(), "display-message failed");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let mut fields = text.split_whitespace();
+        let left = fields.next().expect("pane_left").parse().expect("u16");
+        let top = fields.next().expect("pane_top").parse().expect("u16");
+        let width = fields.next().expect("pane_width").parse().expect("u16");
+        let height = fields.next().expect("pane_height").parse().expect("u16");
+        (left, top, width, height)
+    }
+
+    /// A top border row shifts pane 0 down. Across horizontal, vertical, and
+    /// stacked splits, verify that the carried rectangle matches tmux and the
+    /// composite paints the cursor row at `cursor.y + top`; the untranslated
+    /// row assertion keeps the test non-vacuous.
+    #[test]
+    #[serial_test::serial]
+    fn composited_cursor_and_pane0_origin_track_pane_border_offset() {
+        if !tmux_available() {
+            eprintln!("Skipping test: tmux not available");
+            return;
+        }
+
+        // Each layout's second-pane splits; the pane parks its cursor right
+        // after `MARKER` on its row 0 (`printf` emits no newline).
+        let layouts: [(&str, &[&[&str]]); 3] = [
+            ("aoe_test_cursor_h", &[&["split-window", "-h"]]),
+            ("aoe_test_cursor_v", &[&["split-window", "-v"]]),
+            (
+                "aoe_test_cursor_stack",
+                &[&["split-window", "-v"], &["split-window", "-v"]],
+            ),
+        ];
+        for (name, splits) in layouts {
+            let guard = TmuxTestSession::new(name);
+            let session =
+                start_composite_session(guard.name(), 80, 24, "sh -c 'printf MARKER; sleep 60'");
+            for args in splits {
+                let status = crate::tmux::tmux_command()
+                    .args(args.iter().copied().chain(["-t", session.name.as_str()]))
+                    .status()
+                    .expect("tmux split-window");
+                assert!(status.success(), "{name}: split failed");
+            }
+            let status = crate::tmux::tmux_command()
+                .args([
+                    "set-option",
+                    "-w",
+                    "-t",
+                    &session.name,
+                    "pane-border-status",
+                    "top",
+                ])
+                .status()
+                .expect("tmux set-option");
+            assert!(status.success(), "{name}: set-option failed");
+            wait_for_composite_text(&session, "MARKER");
+
+            let (content, cursor) = session
+                .capture_window_composited_with_cursor(20)
+                .expect("capture_window_composited_with_cursor");
+            let cursor = cursor.unwrap_or_else(|| panic!("{name}: composited cursor missing"));
+            let rect = cursor
+                .composite_pane0
+                .unwrap_or_else(|| panic!("{name}: composite_pane0 missing"));
+            assert_eq!(
+                (rect.left, rect.top, rect.width, rect.height),
+                pane0_tmux_geometry(&session),
+                "{name}: carried rectangle must match tmux"
+            );
+            assert_eq!(rect.top, 1, "{name}: border status must shift pane 0");
+
+            // The untranslated index (cursor.y alone) must NOT land on the
+            // marker row, or the assertion below proves nothing.
+            let lines: Vec<&str> = content.lines().collect();
+            assert!(
+                !lines[cursor.y as usize].contains("MARKER"),
+                "{name}: marker unexpectedly at untranslated row {}",
+                cursor.y
+            );
+            let painted = lines
+                .get(cursor.y as usize + rect.top as usize)
+                .unwrap_or_else(|| panic!("{name}: translated row out of range"));
+            assert!(
+                painted.contains("MARKER"),
+                "{name}: cursor row {} painted {:?}, expected MARKER at +{}",
+                cursor.y,
+                painted,
+                rect.top
+            );
+        }
+    }
+
     /// A full-screen TUI (opencode's dimmed modal backdrop, its empty home
     /// screen) paints its background as full-width runs of bg-styled spaces.
     /// `capture-pane` trims trailing spaces by default, styled or not, while
@@ -3723,8 +3816,10 @@ mod tests {
     }
 
     /// The live path caches a layout and re-renders only pane 0 from its VT
-    /// grid, so the layout must come back with pane 0 first, at the window
-    /// origin, and with rectangles that tile the real window.
+    /// grid, so the layout must come back with pane 0 first and with
+    /// rectangles that tile the real window. This split sets no
+    /// border-status option, so pane 0 additionally sits at the window
+    /// origin here.
     #[test]
     #[serial_test::serial]
     fn captured_layout_puts_pane_zero_first_at_the_origin() {
@@ -3775,7 +3870,7 @@ mod tests {
         assert_eq!(
             (first.left, first.top),
             (0, 0),
-            "pane 0 must sit at the window origin for the cursor math to hold"
+            "pane 0 must sit at the origin in this split; a border-status row would shift it"
         );
         // Pane 0 is the agent's, even though pane 1 is the active one.
         assert!(

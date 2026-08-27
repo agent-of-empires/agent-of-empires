@@ -12316,6 +12316,7 @@ done
     /// old-session updates to the fresh conversation.
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial]
     async fn reset_between_prompts_with_open_tool_is_refused() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let initial_update = serde_json::json!({
@@ -12357,6 +12358,7 @@ done
     /// tailer removes the agent from the between-prompt in-flight set.
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial]
     async fn reset_between_prompts_with_background_agent_is_refused() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let transcript = tmp.path().join("background-agent.jsonl");
@@ -12410,6 +12412,7 @@ done
     /// abandoned request.
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial]
     async fn reset_session_new_timeout_releases_the_connection_loop() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let (script, _capture) = write_reset_fake_agent(tmp.path(), 0, 1, 0);
@@ -12455,6 +12458,7 @@ done
     /// client and runner would disagree about the live session.
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial]
     async fn reset_config_timeout_commits_and_releases_the_connection_loop() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let (script, capture) = write_reset_fake_agent(tmp.path(), 0, 0, 1);
@@ -12642,6 +12646,7 @@ done
     /// The success-only `SessionCleared` boundary must remain absent.
     #[cfg(unix)]
     #[tokio::test]
+    #[serial_test::serial]
     async fn reset_during_in_flight_prompt_is_refused_with_prompt_rejected() {
         let tmp = tempfile::TempDir::new().expect("tempdir");
         // 3s prompt delay: long enough to land the reset mid-turn, short
@@ -12844,6 +12849,7 @@ done
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn spawn_with_nonexistent_command_errors_cleanly() {
         let config = SpawnConfig {
             wrapper_substitution: None,

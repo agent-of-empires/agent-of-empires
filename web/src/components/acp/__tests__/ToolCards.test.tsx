@@ -22,18 +22,8 @@ import {
 } from "../ToolCards";
 import { BackgroundAgentsContext } from "../backgroundAgentsContext";
 import { AgentProfileProvider } from "../../../lib/agentProfileContext";
-import { AcpSessionContext } from "../../../lib/acpSessionContext";
 import type { ActivityRow, BackgroundAgent, ToolCall, ToolOutputBlock } from "../../../lib/acpTypes";
-import type { PluginUiEntry } from "../../../lib/api";
 import { buildSkillIndex, type SkillIndex } from "../../../lib/skillProvenance";
-
-// The tool-card-badge renderer reads the plugin ui snapshot from context; mock
-// it so the badge tests drive a fixed set of entries. Defaults to empty, so
-// every other card test renders unchanged (no badges).
-const { pluginEntriesRef } = vi.hoisted(() => ({ pluginEntriesRef: { current: [] as PluginUiEntry[] } }));
-vi.mock("../../../lib/pluginUiContext", () => ({
-  usePluginUiEntries: () => pluginEntriesRef.current,
-}));
 
 // SkillToolCard resolves the skill index synchronously through this hook
 // (#3052); mock it so tests control the index directly instead of racing a
@@ -652,7 +642,7 @@ describe("SkillToolCard (claude profile)", () => {
     expect(container.textContent).not.toContain("_aoe_title");
   });
 
-  it("renders the resolved skill's provenance badge alongside the plugin badges (#3052)", () => {
+  it("renders the resolved skill's provenance badge (#3052)", () => {
     skillIndexRef.current = buildSkillIndex({
       roots: [
         { id: "claude-user", label: "Claude", relativePath: ".claude/skills", consumers: ["claude"], legacy: false },
@@ -792,61 +782,6 @@ describe("DurationLabel", () => {
     // running card has no result; duration ticks from start to now
     expect(container.textContent).toContain("running");
     expect(/\ds/.test(container.textContent ?? "")).toBe(true);
-  });
-});
-
-describe("plugin tool-card-badge on cards", () => {
-  afterEach(() => {
-    pluginEntriesRef.current = [];
-  });
-
-  const provenance = (target: { kind: string; name: string }, text: string): PluginUiEntry => ({
-    plugin_id: "acme.prov",
-    slot: "tool-card-badge",
-    id: "provenance",
-    session_id: "s1",
-    payload: { items: [{ target, text }] },
-  });
-
-  it("shows the plugin badge on the matching MCP card", () => {
-    pluginEntriesRef.current = [provenance({ kind: "mcp", name: "github" }, "Company MCP")];
-    const tool = toolWith({ kind: "other", name: "mcp__github__get_issue" });
-    const { container } = render(
-      <AcpSessionContext.Provider value="s1">
-        <ToolCard tool={tool} result={completeRow()} />
-      </AcpSessionContext.Provider>,
-    );
-    expect(container.textContent).toContain("MCP · Github");
-    expect(container.textContent).toContain("Company MCP");
-  });
-
-  it("shows the plugin badge on the matching skill card", () => {
-    pluginEntriesRef.current = [provenance({ kind: "skill", name: "investigate" }, "Bundled")];
-    const tool = toolWith({
-      kind: "other",
-      name: "Skill",
-      args_preview: JSON.stringify({ skill: "investigate", _aoe_title: "Skill" }),
-    });
-    const { container } = render(
-      <AgentProfileProvider toolKey="claude">
-        <AcpSessionContext.Provider value="s1">
-          <ToolCard tool={tool} result={completeRow({ text: "ran" })} />
-        </AcpSessionContext.Provider>
-      </AgentProfileProvider>,
-    );
-    expect(container.textContent).toContain("investigate");
-    expect(container.textContent).toContain("Bundled");
-  });
-
-  it("does not badge a card whose target does not match", () => {
-    pluginEntriesRef.current = [provenance({ kind: "mcp", name: "gitlab" }, "wrong")];
-    const tool = toolWith({ kind: "other", name: "mcp__github__get_issue" });
-    const { container } = render(
-      <AcpSessionContext.Provider value="s1">
-        <ToolCard tool={tool} result={completeRow()} />
-      </AcpSessionContext.Provider>,
-    );
-    expect(container.textContent).not.toContain("wrong");
   });
 });
 

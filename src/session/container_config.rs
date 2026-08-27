@@ -4639,6 +4639,11 @@ agent_detect_as = { "wrapped-codex" = "codex" }
             container_workdir: None,
         };
         let instance_id = "wrapped-codex-sandbox-hooks-test";
+        // resolve_config_or_warn inside build_container_config installs the
+        // profile overlay's agent_detect_as into the process-global
+        // registry; restore the prior entries afterwards.
+        let _registry =
+            crate::tmux::status_rules::ProfileRegistryGuard::take("sandbox-wrapped-codex");
         let config = build_container_config(
             project_dir.path().to_str().unwrap(),
             &sandbox_info,

@@ -726,16 +726,6 @@ pub enum UiSlot {
     ComposerAction,
     /// A badge in a session's detail view (per session).
     DetailBadge,
-    /// A routed full page mounted as its own entry in the dashboard settings
-    /// nav (global). The host renders the plugin's pushed page body (the same
-    /// `blocks` vocabulary as `Pane`) so a plugin can host a full management
-    /// panel without a per-session dock.
-    SettingsPage,
-    /// A badge on a tool-call card in a session's transcript, matched to a
-    /// specific call by its target (per session). The payload carries a
-    /// target-keyed list so one entry can badge every MCP server or skill the
-    /// plugin knows about; the host renders the pill on the matching card.
-    ToolCardBadge,
     /// A host-wide docked pane on the home view (global), carrying the same
     /// `blocks` vocabulary as `Pane` but not tied to any session; the host docks
     /// it on the home view. The reusable slot for a machine-wide panel: `Pane`
@@ -757,7 +747,6 @@ impl UiSlot {
                 | UiSlot::Pane
                 | UiSlot::ComposerAction
                 | UiSlot::DetailBadge
-                | UiSlot::ToolCardBadge
         )
     }
 
@@ -775,8 +764,6 @@ impl UiSlot {
             UiSlot::Pane => "pane",
             UiSlot::ComposerAction => "composer-action",
             UiSlot::DetailBadge => "detail-badge",
-            UiSlot::SettingsPage => "settings-page",
-            UiSlot::ToolCardBadge => "tool-card-badge",
             UiSlot::HomePane => "home-pane",
             UiSlot::Notification => "notification",
         }
@@ -1292,18 +1279,6 @@ impl PluginManifest {
                     )
                 }),
                 "dynamic_select / object_list / cron settings require api_version >= 9".into(),
-            );
-        }
-        // `settings-page` and `tool-card-badge` are api_version 10 slots; force
-        // the bump for the same reason as the gates above.
-        if self.api_version < 10 {
-            check(
-                self.ui.iter().all(|u| u.slot != UiSlot::SettingsPage),
-                "settings-page UI slots require api_version >= 10".into(),
-            );
-            check(
-                self.ui.iter().all(|u| u.slot != UiSlot::ToolCardBadge),
-                "tool-card-badge UI slots require api_version >= 10".into(),
             );
         }
         // `dynamic_multi_select` object-list fields are api_version 11; same

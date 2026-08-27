@@ -152,53 +152,6 @@ struct RowBadgePayload {
     items: Vec<BadgeItem>,
 }
 
-/// Which tool-call card a `tool-card-badge` attaches to. MCP servers and skills
-/// share no namespace guarantee (both can be named "github"), so the card kind
-/// is part of the match key, not just the raw name. The host does not
-/// canonicalize the name: it is an external identifier the plugin resolves,
-/// matched by exact string equality against the card's target.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
-enum ToolCardTarget {
-    Mcp { name: String },
-    Skill { name: String },
-}
-
-impl ToolCardTarget {
-    fn name(&self) -> &str {
-        match self {
-            ToolCardTarget::Mcp { name } | ToolCardTarget::Skill { name } => name,
-        }
-    }
-}
-
-/// One badge inside a `tool-card-badge` `items` list, keyed to a specific
-/// tool-call target. A badge with neither `text` nor `icon` renders nothing, so
-/// at least one is required.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ToolCardBadge {
-    target: ToolCardTarget,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    text: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    tone: Option<Tone>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    tooltip: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    icon: Option<String>,
-}
-
-/// `tool-card-badge` payload: a target-keyed `items` list so one declared entry
-/// can badge every MCP server or skill the plugin knows about. Empty `items: []`
-/// is valid and clears the plugin's badges (matching `row-badge`).
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct ToolCardBadgePayload {
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    items: Vec<ToolCardBadge>,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RowColumnPayload {
@@ -301,28 +254,6 @@ struct PanePayload {
     icon: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     footer: Option<PaneFooter>,
-}
-
-/// `settings-page` payload (the routed full-page slot). Mirrors `PanePayload`'s
-/// content shape, the simple `{ title, body }` form or an ordered forward-
-/// compatible `blocks` list, so the web renders it through the same block
-/// vocabulary. It drops `default_location`: a full page is not docked, so a
-/// dock hint would be meaningless, and `deny_unknown_fields` rejects it rather
-/// than silently accepting a no-op field.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct SettingsPagePayload {
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    title: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    body: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    blocks: Option<Vec<Value>>,
-    /// Lucide icon name for the page's nav entry. Opaque to the host (the web
-    /// resolves it against its allowlist); kept only so `deny_unknown_fields`
-    /// accepts it.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    icon: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -817,7 +748,7 @@ impl UiStore {
 /// it gets a larger budget than the small single-value slots.
 fn max_payload_bytes(slot: UiSlot) -> usize {
     match slot {
-        UiSlot::Pane | UiSlot::HomePane | UiSlot::SettingsPage => MAX_PANE_PAYLOAD_BYTES,
+        UiSlot::Pane | UiSlot::HomePane => MAX_PANE_PAYLOAD_BYTES,
         UiSlot::ComposerAction => MAX_COMPOSER_ACTION_PAYLOAD_BYTES,
         _ => MAX_PAYLOAD_BYTES,
     }
@@ -896,12 +827,6 @@ fn validate_payload(slot: UiSlot, raw: &Value) -> Result<Value, String> {
             check_block_depth(parsed.blocks.as_deref())?;
             serde_json::to_value(parsed).map_err(|e| e.to_string())
         }
-        UiSlot::SettingsPage => {
-            let parsed: SettingsPagePayload =
-                serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
-            check_block_depth(parsed.blocks.as_deref())?;
-            serde_json::to_value(parsed).map_err(|e| e.to_string())
-        }
         UiSlot::ComposerAction => {
             let parsed: ComposerActionPayload =
                 serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
@@ -917,24 +842,6 @@ fn validate_payload(slot: UiSlot, raw: &Value) -> Result<Value, String> {
                 .is_some_and(|op| !op.valid())
             {
                 return Err("composer draft operation requires a bounded id and text".into());
-            }
-            serde_json::to_value(parsed).map_err(|e| e.to_string())
-        }
-        UiSlot::ToolCardBadge => {
-            let parsed: ToolCardBadgePayload =
-                serde_json::from_value(raw.clone()).map_err(|e| e.to_string())?;
-            for badge in &parsed.items {
-                if badge.target.name().is_empty() {
-                    return Err("tool-card badge target name is required".into());
-                }
-                // An empty or whitespace-only string is absent as far as the
-                // web BadgeChip is concerned (it renders nothing), so treat it
-                // the same as a missing field rather than storing a blank pill.
-                let has_text = badge.text.as_deref().is_some_and(|t| !t.trim().is_empty());
-                let has_icon = badge.icon.as_deref().is_some_and(|i| !i.trim().is_empty());
-                if !has_text && !has_icon {
-                    return Err("tool-card badge requires text or icon".into());
-                }
             }
             serde_json::to_value(parsed).map_err(|e| e.to_string())
         }
@@ -1038,38 +945,6 @@ mod tests {
         s.remove("acme.kit", g, UiSlot::StatusBar, "build", None)
             .unwrap();
         assert_eq!(s.snapshot().entries.len(), 0);
-    }
-
-    #[test]
-    fn settings_page_accepts_blocks_and_rejects_unknown_field() {
-        let s = store();
-        let g = s.begin_generation("acme.kit");
-        // Global page with a block list is accepted and stored.
-        s.set(
-            "acme.kit",
-            g,
-            UiSlot::SettingsPage,
-            "main",
-            None,
-            &json!({"title": "MCP", "blocks": [{"kind": "heading", "text": "Servers"}]}),
-        )
-        .unwrap();
-        let snap = s.snapshot();
-        assert_eq!(snap.entries.len(), 1);
-        assert_eq!(snap.entries[0].slot, UiSlot::SettingsPage);
-        // `default_location` is a pane-only field; the dedicated payload rejects
-        // it via deny_unknown_fields.
-        assert!(matches!(
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::SettingsPage,
-                "main",
-                None,
-                &json!({"title": "MCP", "default_location": "right"}),
-            ),
-            Err(UiError::BadRequest(_))
-        ));
     }
 
     #[test]
@@ -1270,104 +1145,6 @@ mod tests {
                         "text": "x".repeat(MAX_COMPOSER_DRAFT_TEXT_BYTES + 1)
                     }
                 })
-            ),
-            Err(UiError::BadRequest(_))
-        ));
-    }
-
-    #[test]
-    fn tool_card_badge_payload_validated() {
-        let s = store();
-        let g = s.begin_generation("acme.kit");
-        // A valid target-keyed list normalizes and stores.
-        s.set(
-            "acme.kit",
-            g,
-            UiSlot::ToolCardBadge,
-            "provenance",
-            Some("s1"),
-            &json!({"items": [
-                {"target": {"kind": "mcp", "name": "github"}, "text": "MCP", "tone": "info"},
-                {"target": {"kind": "skill", "name": "deploy"}, "icon": "sparkles"}
-            ]}),
-        )
-        .unwrap();
-        let snap = s.snapshot();
-        assert_eq!(snap.entries.len(), 1);
-        assert_eq!(
-            snap.entries[0].payload["items"][0]["target"]["kind"],
-            json!("mcp")
-        );
-
-        // Empty items is a valid clear.
-        s.set(
-            "acme.kit",
-            g,
-            UiSlot::ToolCardBadge,
-            "provenance",
-            Some("s1"),
-            &json!({"items": []}),
-        )
-        .unwrap();
-
-        // Per-session slot needs a session_id.
-        assert!(matches!(
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::ToolCardBadge,
-                "provenance",
-                None,
-                &json!({"items": [{"target": {"kind": "mcp", "name": "x"}, "text": "y"}]})
-            ),
-            Err(UiError::BadRequest(_))
-        ));
-        // Empty target name rejected.
-        assert!(matches!(
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::ToolCardBadge,
-                "provenance",
-                Some("s1"),
-                &json!({"items": [{"target": {"kind": "mcp", "name": ""}, "text": "y"}]})
-            ),
-            Err(UiError::BadRequest(_))
-        ));
-        // A badge with neither text nor icon renders nothing, so it is rejected.
-        assert!(matches!(
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::ToolCardBadge,
-                "provenance",
-                Some("s1"),
-                &json!({"items": [{"target": {"kind": "skill", "name": "deploy"}}]})
-            ),
-            Err(UiError::BadRequest(_))
-        ));
-        // Empty or whitespace-only text/icon is absent to the web renderer, so
-        // it is rejected just like an omitted field.
-        assert!(matches!(
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::ToolCardBadge,
-                "provenance",
-                Some("s1"),
-                &json!({"items": [{"target": {"kind": "mcp", "name": "github"}, "text": "", "icon": "  "}]})
-            ),
-            Err(UiError::BadRequest(_))
-        ));
-        // Unknown target kind rejected (closed tagged enum).
-        assert!(matches!(
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::ToolCardBadge,
-                "provenance",
-                Some("s1"),
-                &json!({"items": [{"target": {"kind": "tool", "name": "x"}, "text": "y"}]})
             ),
             Err(UiError::BadRequest(_))
         ));
@@ -1621,18 +1398,6 @@ mod tests {
             ),
             Err(UiError::BadRequest(_))
         ));
-        // The same bound covers `settings-page`, which shares the vocabulary.
-        assert!(matches!(
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::SettingsPage,
-                "page",
-                None,
-                &chain(MAX_BLOCK_DEPTH + 1)
-            ),
-            Err(UiError::BadRequest(_))
-        ));
         // Deep JSON that is not a `children` array is inert data the renderers
         // never walk, so it must not trip the cap.
         let mut inert = json!("leaf");
@@ -1679,19 +1444,6 @@ mod tests {
                 "gh",
                 Some("s1"),
                 &json!({"footer": {"txt": "oops"}})
-            ),
-            Err(UiError::BadRequest(_))
-        ));
-        // `settings-page` has no footer: a full page is not docked, so a pinned
-        // status line would have nothing to pin against.
-        assert!(matches!(
-            s.set(
-                "acme.kit",
-                g,
-                UiSlot::SettingsPage,
-                "page",
-                None,
-                &json!({"footer": {"text": "x"}})
             ),
             Err(UiError::BadRequest(_))
         ));

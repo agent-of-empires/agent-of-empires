@@ -762,13 +762,12 @@ impl App {
         terminal: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
     ) -> Result<()> {
         // Keep the display snapshots (sessions, pane metadata) fresh off the
-        // paint thread: every `_for_display` helper and the passive preview
-        // resize executor answer from these snapshots and must never fork
-        // from render.
-        // Warm the first session snapshot before starting the owner thread, so
-        // its first cycle observes fresh data instead of issuing a duplicate
-        // list-sessions command during startup.
-        crate::tmux::refresh_session_cache();
+        // paint thread: every _for_display helper and the passive preview
+        // resize executor answers from these snapshots and never forks in render.
+        // HomeView's authoritative startup liveness pass also warms this
+        // cache when it observes any stored sessions. Refresh only if that
+        // lazy pass did not run, then start the background owner.
+        crate::tmux::refresh_session_cache_if_due();
         crate::tmux::spawn_snapshot_poller();
 
         // Initial render

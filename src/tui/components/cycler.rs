@@ -87,6 +87,21 @@ pub fn tool_cycler_spans(
     spans
 }
 
+/// Discreet lifecycle suffix for the Tool cycler: an amber ` ⚠ deprecated`
+/// span when the selected tool's registry entry is deprecated, empty for
+/// Active (and unknown) tools so the common row is unchanged.
+pub fn tool_lifecycle_spans(tool: &str, theme: &Theme) -> Vec<Span<'static>> {
+    let Some(label) =
+        crate::agents::get_agent(tool).and_then(crate::agents::AgentDef::lifecycle_label)
+    else {
+        return Vec::new();
+    };
+    vec![Span::styled(
+        format!(" ⚠ {label}"),
+        Style::default().fg(theme.waiting),
+    )]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -147,5 +162,24 @@ mod tests {
         let theme = Theme::default();
         let spans = tool_cycler_spans("Tool:", "claude", 0, 1, true, &theme);
         assert!(spans[0].style.add_modifier.contains(Modifier::UNDERLINED));
+    }
+
+    #[test]
+    fn tool_lifecycle_spans_mark_only_deprecated_tools() {
+        // (tool, expected suffix). Unknown tools behave like Active: no
+        // suffix, so custom-agent rows stay unchanged.
+        let theme = Theme::default();
+        let cases = [
+            ("gemini", vec![" ⚠ deprecated"]),
+            ("claude", vec![]),
+            ("not-an-agent", vec![]),
+        ];
+        for (tool, expected) in cases {
+            let spans = tool_lifecycle_spans(tool, &theme);
+            assert_eq!(contents(&spans), expected, "{tool}");
+            if !spans.is_empty() {
+                assert_eq!(spans[0].style.fg, Some(theme.waiting), "{tool}");
+            }
+        }
     }
 }

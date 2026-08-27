@@ -14,7 +14,7 @@
 //   - the manual trigger swaps the copy and drops the codex preference.
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 
 import { SwitchAgentModal } from "./SwitchAgentModal";
 
@@ -40,6 +40,15 @@ beforeEach(() => {
     },
     { name: "codex", description: "OpenAI Codex", command: "codex-acp" },
     { name: "opencode", description: "OpenCode", command: "opencode-acp" },
+    { name: "gemini", description: "Gemini CLI", command: "gemini" },
+    {
+      name: "legacy",
+      description: "Legacy backend",
+      command: "legacy-acp",
+      // Deprecated server-side only: absent from the static profile
+      // mirror, so the label must come from the endpoint field.
+      lifecycle: { state: "deprecated", since: "2026-01-01", note: "upstream shut down", replacement: null },
+    },
   ]);
   mockSwitch.mockResolvedValue({
     session_id: "s-1",
@@ -201,6 +210,25 @@ describe("SwitchAgentModal (rate_limit)", () => {
       /Continue in/.test(b.textContent ?? ""),
     );
     expect(confirm?.disabled).toBe(true);
+  });
+  it("marks deprecated registry targets next to their name", async () => {
+    // gemini is deprecated in the static profile mirror; "legacy" is
+    // deprecated only through the endpoint's lifecycle field. Both get
+    // the label so a rate-limit handoff never silently steers into a
+    // deprecated backend.
+    const { findByTestId } = mount();
+    const geminiBadge = await findByTestId("switch-agent-deprecated-gemini");
+    expect(geminiBadge.parentElement?.textContent).toContain("gemini");
+    expect(geminiBadge.parentElement?.nextElementSibling?.textContent).toBe("Gemini CLI");
+    expect(await findByTestId("switch-agent-deprecated-legacy")).not.toBeNull();
+    expect(screen.queryByTestId("switch-agent-deprecated-claude")).toBeNull();
+    expect(screen.queryByTestId("switch-agent-deprecated-codex")).toBeNull();
+    expect(screen.queryByTestId("switch-agent-deprecated-opencode")).toBeNull();
+    // The deprecation label is additive: every row keeps its description.
+    const descriptions = ["Claude (Sonnet)", "OpenAI Codex", "OpenCode", "Gemini CLI", "Legacy backend"];
+    for (const text of descriptions) {
+      expect(screen.getByText(text)).not.toBeNull();
+    }
   });
 });
 

@@ -1,3 +1,4 @@
+import type { AgentLifecycleInfo } from "./agentProfiles";
 import { clientFormFactor } from "./formFactor";
 import type {
   SessionResponse,
@@ -744,8 +745,6 @@ export type PluginUiSlot =
   | "pane"
   | "composer-action"
   | "detail-badge"
-  | "settings-page"
-  | "tool-card-badge"
   | "home-pane"
   | "notification";
 
@@ -1413,6 +1412,10 @@ export interface AcpAgentInfo {
   name: string;
   description: string;
   command: string;
+  /** Registry lifecycle state, same contract as `/api/agents`: omitted
+   *  while Active so older daemons and existing consumers read as active.
+   *  Mirrors `AgentLifecycle` in src/agents.rs. */
+  lifecycle?: AgentLifecycleInfo;
 }
 
 /** List ACP registry entries the acp supervisor knows about.

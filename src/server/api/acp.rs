@@ -850,6 +850,12 @@ pub struct AcpAgentInfo {
     pub name: String,
     pub description: String,
     pub command: String,
+    /// Registry lifecycle state, same contract as `/api/agents`: omitted
+    /// while Active so existing consumers see no change. Lets the
+    /// switch-agent modal label deprecated backends without depending on
+    /// the static frontend mirror being current.
+    #[serde(skip_serializing_if = "crate::agents::AgentLifecycle::is_active")]
+    pub lifecycle: crate::agents::AgentLifecycle,
 }
 
 /// `GET /api/acp/agents`: list the built-in ACP registry entries the
@@ -884,6 +890,7 @@ fn acp_agent_entries(
             name: name.clone(),
             description: spec.description.clone(),
             command: spec.command.clone(),
+            lifecycle: crate::agents::registry_lifecycle(name),
         })
         .collect();
     entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -2969,6 +2976,33 @@ mod tests {
         assert!(!entries[0].description.is_empty());
 
         assert!(names(&AgentPolicy::for_test(true, &[])).is_empty());
+    }
+
+    #[test]
+    fn acp_agent_entries_lifecycle_wire_shape() {
+        // Same contract as /api/agents: lifecycle omitted while Active,
+        // full metadata for deprecated registry keys. Pinned so the
+        // switch-agent modal's server-wins precedence has a stable shape.
+        use crate::acp::agent_policy::AgentPolicy;
+        let registry = crate::acp::AgentRegistry::with_defaults();
+        let entries = acp_agent_entries(
+            &registry,
+            &AgentPolicy::for_test(true, &["claude", "gemini"]),
+        );
+        let cases = [("claude", false), ("gemini", true)];
+        for (name, deprecated) in cases {
+            let entry = entries.iter().find(|e| e.name == name).unwrap();
+            let value = serde_json::to_value(entry).unwrap();
+            assert_eq!(
+                value.get("lifecycle").is_some(),
+                deprecated,
+                "{name}: {value}"
+            );
+            if deprecated {
+                assert_eq!(value["lifecycle"]["state"], "deprecated");
+                assert_eq!(value["lifecycle"]["replacement"], "antigravity");
+            }
+        }
     }
 
     #[test]

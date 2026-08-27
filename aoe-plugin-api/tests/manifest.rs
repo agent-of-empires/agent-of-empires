@@ -661,21 +661,28 @@ slot = "status-bar"
 fn unknown_ui_slot_is_a_parse_error() {
     // `slot` is a typed enum (closed set), so a slot this host does not render
     // is rejected at parse time, not carried forward like an unknown capability.
-    let toml = r#"
+    // `settings-page` and `tool-card-badge` were real slots until the
+    // MCP/Skills-plugin approach was abandoned (#3054); a manifest still
+    // declaring one must fail rather than load with the slot silently inert.
+    for slot in ["sidebar", "settings-page", "tool-card-badge"] {
+        let toml = format!(
+            r#"
 id = "acme.thing"
 name = "Thing"
 version = "0.1.0"
-api_version = 2
+api_version = 13
 
 [[ui]]
-slot = "sidebar"
+slot = "{slot}"
 id = "panel"
-"#;
-    let err = PluginManifest::from_toml_str(toml).unwrap_err();
-    assert!(
-        matches!(err, ManifestError::Parse(_)),
-        "expected Parse, got {err:?}"
-    );
+"#
+        );
+        let err = PluginManifest::from_toml_str(&toml).unwrap_err();
+        assert!(
+            matches!(err, ManifestError::Parse(_)),
+            "expected Parse for {slot:?}, got {err:?}"
+        );
+    }
 }
 
 #[test]
@@ -687,52 +694,11 @@ fn ui_slot_as_str_round_trips_the_wire_name() {
         ("row-badge", UiSlot::RowBadge),
         ("pane", UiSlot::Pane),
         ("composer-action", UiSlot::ComposerAction),
-        ("settings-page", UiSlot::SettingsPage),
-        ("tool-card-badge", UiSlot::ToolCardBadge),
         ("home-pane", UiSlot::HomePane),
         ("notification", UiSlot::Notification),
     ] {
         assert_eq!(slot.as_str(), toml_slot);
     }
-}
-
-#[test]
-fn settings_page_requires_api_version_10() {
-    let toml = r#"
-id = "acme.thing"
-name = "Thing"
-version = "0.1.0"
-api_version = 9
-
-[[ui]]
-slot = "settings-page"
-id = "main"
-"#;
-    let err = PluginManifest::from_toml_str(toml).unwrap_err();
-    assert!(
-        format!("{err:?}").contains("settings-page UI slots require api_version >= 10"),
-        "{err:?}"
-    );
-}
-
-#[test]
-fn settings_page_parses_at_api_version_10() {
-    let toml = r#"
-id = "acme.thing"
-name = "Thing"
-version = "0.1.0"
-api_version = 10
-
-[[ui]]
-slot = "settings-page"
-id = "main"
-"#;
-    let m = PluginManifest::from_toml_str(toml).expect("api 10 manifest parses");
-    assert_eq!(m.ui[0].slot, UiSlot::SettingsPage);
-    assert!(
-        !UiSlot::SettingsPage.is_per_session(),
-        "settings-page is global"
-    );
 }
 
 #[test]
@@ -750,25 +716,6 @@ id = "voice"
     let err = PluginManifest::from_toml_str(toml).unwrap_err();
     assert!(
         format!("{err:?}").contains("composer-action UI slots require api_version >= 8"),
-        "{err:?}"
-    );
-}
-
-#[test]
-fn tool_card_badge_requires_api_version_10() {
-    let toml = r#"
-id = "acme.thing"
-name = "Thing"
-version = "0.1.0"
-api_version = 9
-
-[[ui]]
-slot = "tool-card-badge"
-id = "provenance"
-"#;
-    let err = PluginManifest::from_toml_str(toml).unwrap_err();
-    assert!(
-        format!("{err:?}").contains("tool-card-badge UI slots require api_version >= 10"),
         "{err:?}"
     );
 }

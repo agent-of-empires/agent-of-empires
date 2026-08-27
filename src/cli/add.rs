@@ -1489,18 +1489,18 @@ fn pick_acp_agent_name(
 /// Precedence mirrors the inline create flow: explicit `--tool`, then
 /// `--cmd`, then the resolved config default / first available tool / claude.
 fn resolve_tool_for_add(args: &AddArgs, config: &crate::session::Config) -> Result<String> {
-    if let Some(tool) = &args.tool {
+    let tool_name = if let Some(tool) = &args.tool {
         let selection = resolve_named_tool(tool, config)?;
         if selection.is_custom() && args.cmd_override.is_some() {
             bail!("--cmd-override cannot be used with configured custom agent --tool selections");
         }
-        Ok(selection.name().to_string())
+        selection.name().to_string()
     } else if let Some(cmd) = &args.command {
         let tool_name = detect_tool(cmd)?;
         // Verify the binary that will actually launch is on PATH before
         // creating the session. A configured session.agent_command_override
         // (or custom_agents) entry replaces the built-in binary, so check the
-        // resolved command, not the built-in name, otherwise `--cmd opencode`
+        // resolved command, not the built-in name, otherwise --cmd opencode
         // falsely bails when only the override binary (e.g.
         // opencode-plannotator) is installed. See #1910.
         match override_launch_binary(&tool_name, &config.session) {
@@ -1531,14 +1531,15 @@ fn resolve_tool_for_add(args: &AddArgs, config: &crate::session::Config) -> Resu
                 }
             }
         }
-        Ok(tool_name)
+        tool_name
     } else {
-        // Use default_tool from resolved config, then first available tool, then "claude".
-        // Check custom_agents first (exact match) before resolve_tool_name (substring match),
-        // so names like "lenovo-claude" resolve as the custom agent, not built-in "claude".
+        // Use default_tool from resolved config, then first available tool,
+        // then "claude". Check custom_agents first (exact match) before
+        // resolve_tool_name (substring match), so names like "lenovo-claude"
+        // resolve as the custom agent, not built-in "claude".
         let available_tools = crate::tmux::AvailableTools::detect();
         let tools_list = available_tools.available_list();
-        Ok(config
+        config
             .session
             .default_tool
             .as_deref()
@@ -1551,8 +1552,18 @@ fn resolve_tool_for_add(args: &AddArgs, config: &crate::session::Config) -> Resu
             })
             .or_else(|| tools_list.first().map(|s| s.as_str()))
             .unwrap_or("claude")
-            .to_string())
+            .to_string()
+    };
+
+    // One post-resolution emission point covers explicit tools, --cmd with
+    // or without a command override, and configured/default detection. A
+    // custom agent has no AgentDef and therefore never receives this warning.
+    if let Some(notice) =
+        crate::agents::get_agent(&tool_name).and_then(crate::agents::AgentDef::lifecycle_notice)
+    {
+        eprintln!("Warning: {tool_name} is {notice}");
     }
+    Ok(tool_name)
 }
 
 fn detect_tool(cmd: &str) -> Result<String> {

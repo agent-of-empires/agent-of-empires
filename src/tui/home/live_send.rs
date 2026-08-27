@@ -1035,19 +1035,15 @@ fn capture_composited_over_grid(
         return capture_composited(name, lines, forward_empty, deadline);
     };
 
-    // The cursor is pane 0's, and tmux puts pane 0 at the window origin, so its
-    // coordinates already index the composite with no translation. What must be
-    // restated is the frame it is measured against: the renderer anchors the
-    // cursor by `pane_height` against the painted line count, which is now the
-    // whole window rather than one pane.
+    // The sampled cursor stays pane relative after its rows are painted on
+    // the window grid. Rebase only the frame dimensions and carry pane 0's
+    // rectangle so the renderer can add its origin.
     cursor.pane_height = layout.window_height;
     cursor.pane_width = layout.window_width;
     // A composite carries no scrollback (panes have independent histories), so
     // the preview must not advertise any to scroll into.
     cursor.history_size = 0;
-    // Rebasing onto the window erases how wide the input pane is, which mouse
-    // forwarding maps into; carry pane 0's extent so it can clamp.
-    cursor.composite_pane0 = Some((first.width, first.height));
+    cursor.composite_pane0 = Some(first);
     (
         Some(layout.composite_with_first_pane_rows(&rows)),
         Some(cursor),

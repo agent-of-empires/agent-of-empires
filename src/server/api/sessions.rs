@@ -4296,7 +4296,11 @@ async fn purge_session_artifacts(
         crate::session::deletion::PurgeReservation::Rejected(result) => {
             return match result.disposition {
                 crate::session::deletion::DeletionDisposition::AlreadyGone => {
-                    state.instances.write().await.retain(|row| row.id != id);
+                    remove_instance(
+                        &mut *state.instances.write().await,
+                        id,
+                        &state.mutation_epoch,
+                    );
                     state.instance_locks.write().await.remove(id);
                     Ok((true, result.messages))
                 }
@@ -4337,8 +4341,14 @@ async fn purge_session_artifacts(
             Err(result) => *result,
             Ok(committed) => {
                 // Remove the local mirror before awaiting ACP so the reconciler
-                // cannot surface a durable row that no longer exists.
-                state.instances.write().await.retain(|row| row.id != id);
+                // cannot surface a durable row that no longer exists. Bumps the
+                // epoch under the same lock: the ACP teardown below is slow, and
+                // a reload landing inside it would otherwise restore the row.
+                remove_instance(
+                    &mut *state.instances.write().await,
+                    id,
+                    &state.mutation_epoch,
+                );
 
                 // The worker may still use the worktree, so ACP teardown stays
                 // ahead of sidecar cleanup. The durable row is already gone.
@@ -4412,18 +4422,15 @@ async fn purge_session_artifacts(
     }
 
     {
-        let mut instances = state.instances.write().await;
-        instances.retain(|i| i.id != id);
         // The row is now gone from both disk and memory, so any reloader still
         // carrying a `sessions.json` snapshot that predates either removal must
-        // drop it rather than fold the deleted row back in. Bump while still
-        // holding the `instances` write lock: a reloader checks the epoch under
-        // that same lock, so the removal and the bump land as one step and a
-        // reload cannot slip between them. See invariant 8 on
-        // `reload_state_instances_from_disk`.
-        state
-            .delete_epoch
-            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        // drop it rather than fold the deleted row back in. `remove_instance`
+        // bumps while still holding the `instances` write lock: a reloader
+        // checks the epoch under that same lock, so the removal and the bump
+        // land as one step and a reload cannot slip between them. See
+        // invariant 8 on `reload_state_instances_from_disk`.
+        let mut instances = state.instances.write().await;
+        remove_instance(&mut instances, id, &state.mutation_epoch);
     }
     state.instance_locks.write().await.remove(id);
     if let Some(entry) = recent_entry {
@@ -4433,6 +4440,80 @@ async fn purge_session_artifacts(
         }
     }
     Ok((true, messages))
+}
+
+/// Heal managed worktree sessions whose recorded `project_path` no longer
+/// exists because the directory was moved outside aoe, rewriting it from git's
+/// own worktree listing. Runs once on daemon startup, so every later
+/// path-derived decision (worker cwd, diff, the rename pre-flight gates) acts
+/// on the live location. See #2002.
+///
+/// The recorded path existing short-circuits the whole pass inside
+/// [`crate::session::worktree_reconcile::reconcile_and_persist`], so a healthy
+/// session costs one `stat` and never shells out to git. Every non-move outcome
+/// leaves the row untouched.
+pub(crate) async fn reconcile_worktree_paths(state: &Arc<AppState>) {
+    let candidates: Vec<String> = {
+        let instances = state.instances.read().await;
+        instances
+            .iter()
+            .filter(|i| i.worktree_info.as_ref().is_some_and(|wt| wt.managed_by_aoe))
+            .map(|i| i.id.clone())
+            .collect()
+    };
+    for id in candidates {
+        let lock = state.instance_lock(&id).await;
+        let _guard = lock.lock().await;
+
+        let snapshot = {
+            let instances = state.instances.read().await;
+            match instances.iter().find(|instance| instance.id == id) {
+                Some(instance) => instance.clone(),
+                None => continue,
+            }
+        };
+        // `exists()` and the git listing are blocking filesystem work, so the
+        // whole reconcile runs off the runtime and only the resulting path is
+        // reapplied under the write lock.
+        let reconciled = match tokio::task::spawn_blocking(move || {
+            let mut instance = snapshot;
+            // An empty profile resolves to the *default* profile rather than
+            // failing, which would aim the persist at another profile's
+            // sessions.json. The compare-and-set inside the reconcile makes
+            // that a no-op, but refuse outright rather than lean on it.
+            anyhow::ensure!(
+                !instance.source_profile.is_empty(),
+                "session has no source profile; refusing worktree path reconciliation"
+            );
+            let storage = crate::session::Storage::open_unwatched(&instance.source_profile)?;
+            let resolution = crate::session::worktree_reconcile::reconcile_and_persist(
+                &storage,
+                &mut instance,
+                &mut Default::default(),
+            )?;
+            anyhow::Ok((resolution, instance))
+        })
+        .await
+        {
+            Ok(Ok(pair)) => pair,
+            Ok(Err(error)) => {
+                tracing::warn!(target: "http.api.sessions", session = %id, "worktree path reconcile skipped: {error}");
+                continue;
+            }
+            Err(error) => {
+                tracing::warn!(target: "http.api.sessions", session = %id, "worktree path reconcile join failed: {error}");
+                continue;
+            }
+        };
+        let crate::session::worktree_reconcile::WorktreePathResolution::Moved(_) = reconciled.0
+        else {
+            continue;
+        };
+        let mut instances = state.instances.write().await;
+        if let Some(instance) = instances.iter_mut().find(|instance| instance.id == id) {
+            instance.project_path = reconciled.1.project_path;
+        }
+    }
 }
 
 /// Relocate any trashed managed worktree still sitting in the active dir into
@@ -5275,6 +5356,35 @@ pub(crate) fn upsert_instance(
         *existing = instance;
     } else {
         instances.push(instance);
+    }
+}
+
+/// Remove `id` from the live registry, bumping `mutation_epoch` when a row was
+/// actually removed.
+///
+/// The delete path removes a row from `state.instances` in three places: the
+/// `AlreadyGone` short-circuit, the structured purge's early mirror removal
+/// (which then awaits ACP teardown before the handler finishes), and the final
+/// commit block. Every one of them has to bump, and has to bump while the
+/// caller still holds the `instances` write lock, because a reloader compares
+/// the epoch under that same lock. A removal that skips the bump leaves a
+/// window where a disk reload carrying a pre-delete snapshot rebuilds
+/// `state.instances` from it and puts the deleted row back, so
+/// `GET /api/sessions` lists a session the user just deleted.
+///
+/// Bumping only on an actual removal keeps the final commit block from
+/// spending an epoch when the early removal already took the row; if a stale
+/// reload DID restore it in between, the retain here finds it, removes it
+/// again, and bumps as it should.
+pub(crate) fn remove_instance(
+    instances: &mut Vec<crate::session::Instance>,
+    id: &str,
+    mutation_epoch: &std::sync::atomic::AtomicU64,
+) {
+    let before = instances.len();
+    instances.retain(|i| i.id != id);
+    if instances.len() != before {
+        mutation_epoch.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     }
 }
 
@@ -7667,6 +7777,43 @@ pub async fn serve_session_artifact(Path((id, path)): Path<(String, String)>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `remove_instance` is the only way a row leaves `state.instances` on the
+    /// delete path, so the epoch bump has to be tied to an actual removal
+    /// rather than to reaching the call. Bumping unconditionally would spend
+    /// an epoch on the final commit block after the structured purge's early
+    /// removal already took the row, dropping a reload that was perfectly
+    /// valid; not bumping at all leaves the window a stale reload uses to put
+    /// a deleted row back.
+    #[test]
+    fn remove_instance_bumps_the_epoch_only_when_it_removes_a_row() {
+        let epoch = std::sync::atomic::AtomicU64::new(0);
+        let read = || epoch.load(std::sync::atomic::Ordering::SeqCst);
+        let mut instances = vec![
+            Instance::new("keep", "/tmp/keep"),
+            Instance::new("doomed", "/tmp/doomed"),
+        ];
+        let doomed_id = instances[1].id.clone();
+
+        remove_instance(&mut instances, &doomed_id, &epoch);
+        assert_eq!(read(), 1, "a real removal bumps");
+        assert_eq!(
+            instances
+                .iter()
+                .map(|i| i.title.as_str())
+                .collect::<Vec<_>>(),
+            vec!["keep"]
+        );
+
+        // The structured purge reaches the final commit block after its early
+        // removal already took the row. Nothing left to remove, nothing to
+        // invalidate, so no epoch is spent.
+        remove_instance(&mut instances, &doomed_id, &epoch);
+        assert_eq!(read(), 1, "a no-op removal does not bump");
+
+        remove_instance(&mut instances, "never-existed", &epoch);
+        assert_eq!(read(), 1, "an unknown id does not bump");
+    }
     fn build_rename_test_state(
         persisted: Vec<Instance>,
         cached: Vec<Instance>,
