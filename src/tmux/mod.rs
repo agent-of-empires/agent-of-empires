@@ -2282,27 +2282,52 @@ pub fn invalidate_agent_availability() {
     }
 }
 
+/// Serializes cache population so a set of concurrent cold callers costs one
+/// login shell between them rather than one each. `GET /api/agents` runs
+/// `AvailableTools::detect` in `spawn_blocking`, so a dashboard with several
+/// tabs open can issue simultaneous probes; the TUI's settings rebuild can
+/// land in the same window. Held only around the probe, never around a read.
+static AGENT_PROBE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+/// Names from `agents` that the memo already answers, plus the ones it does
+/// not know about yet. Split under a single read lock.
+fn partition_cached_agents<'a>(
+    agents: &[&'a crate::agents::AgentDef],
+) -> (HashSet<String>, Vec<&'a crate::agents::AgentDef>) {
+    let mut found = HashSet::new();
+    let mut uncached = Vec::new();
+    let cache = AGENT_AVAILABILITY.read().ok();
+    let cached = cache.as_ref().and_then(|c| c.as_ref());
+    for agent in agents {
+        match cached.and_then(|c| c.get(agent.name)) {
+            Some(true) => {
+                found.insert(agent.name.to_string());
+            }
+            Some(false) => {}
+            None => uncached.push(*agent),
+        }
+    }
+    (found, uncached)
+}
+
 /// Availability for `agents`, memoized across calls and batched so the whole
 /// uncached set costs at most ONE login shell. Returns the subset of names
 /// that resolved.
 pub(crate) fn probe_agents_available(
     agents: &[&crate::agents::AgentDef],
 ) -> std::collections::HashSet<String> {
-    let mut found = HashSet::new();
-    let mut uncached: Vec<&crate::agents::AgentDef> = Vec::new();
-    {
-        let cache = AGENT_AVAILABILITY.read().ok();
-        let cached = cache.as_ref().and_then(|c| c.as_ref());
-        for agent in agents {
-            match cached.and_then(|c| c.get(agent.name)) {
-                Some(true) => {
-                    found.insert(agent.name.to_string());
-                }
-                Some(false) => {}
-                None => uncached.push(agent),
-            }
-        }
+    let (mut found, uncached) = partition_cached_agents(agents);
+    if uncached.is_empty() {
+        return found;
     }
+
+    // Serialize the probe itself, then re-read the memo: a caller that queued
+    // behind another's login shell wants that shell's answer, not a second
+    // shell of its own. A poisoned lock is not a reason to skip the probe, so
+    // take the guard either way.
+    let _probe_guard = AGENT_PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let (already_found, uncached) = partition_cached_agents(&uncached);
+    found.extend(already_found);
     if uncached.is_empty() {
         return found;
     }
@@ -2396,6 +2421,47 @@ impl AvailableTools {
 
 #[cfg(test)]
 mod tests {
+    /// The memo re-read that makes queueing behind another caller's login
+    /// shell free. `probe_agents_available` partitions once before taking
+    /// `AGENT_PROBE_LOCK` and again after; without the second partition a
+    /// waiter would run its own shell for agents the holder just resolved.
+    #[test]
+    #[serial_test::serial]
+    fn partition_cached_agents_reads_the_memo_so_a_queued_prober_reprobes_nothing() {
+        // Two real built-ins, so the names line up with what the memo keys on.
+        let defs: Vec<&crate::agents::AgentDef> = crate::agents::AGENTS.iter().take(2).collect();
+        let (a, b) = (defs[0].name, defs[1].name);
+
+        let restore = AGENT_AVAILABILITY.read().ok().and_then(|c| c.clone());
+        invalidate_agent_availability();
+
+        // Empty memo: nothing is answered, everything needs a probe.
+        let (found, uncached) = partition_cached_agents(&defs);
+        assert!(found.is_empty());
+        assert_eq!(uncached.len(), 2);
+
+        // Stand in for the lock holder having just published its results,
+        // one available and one not, so both polarities are covered.
+        if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
+            let map = cache.get_or_insert_with(HashMap::new);
+            map.insert(a.to_string(), true);
+            map.insert(b.to_string(), false);
+        }
+
+        let (found, uncached) = partition_cached_agents(&defs);
+        assert!(
+            uncached.is_empty(),
+            "a memoized answer, either polarity, must not be re-probed"
+        );
+        assert_eq!(found.len(), 1);
+        assert!(found.contains(a), "an available agent is reported found");
+        assert!(!found.contains(b), "an absent agent is answered, not found");
+
+        if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
+            *cache = restore;
+        }
+    }
+
     use super::test_helpers::TmuxTestSession;
     use super::*;
 
