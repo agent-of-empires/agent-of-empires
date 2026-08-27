@@ -709,31 +709,55 @@ impl HomeView {
         Ok(())
     }
 
+    fn persist_group_delete_with_sessions(
+        &mut self,
+        profile: &str,
+        group_path: &str,
+    ) -> anyhow::Result<Vec<Instance>> {
+        let prefix = format!("{group_path}/");
+        let storage = self
+            .storages
+            .get(profile)
+            .ok_or_else(|| anyhow::anyhow!("No storage registered for profile '{profile}'"))?;
+        let mut members = storage.update(|instances, groups| {
+            let mut members = Vec::new();
+            for instance in instances.iter_mut() {
+                if instance.group_path == group_path || instance.group_path.starts_with(&prefix) {
+                    members.push(instance.clone());
+                    instance.group_path.clear();
+                }
+            }
+            groups.retain(|group| group.path != group_path && !group.path.starts_with(&prefix));
+            Ok(members)
+        })?;
+        for instance in &mut members {
+            instance.source_profile.clear();
+            instance.source_profile.push_str(profile);
+        }
+        if let Some(tree) = self.group_trees.get_mut(profile) {
+            tree.delete_group(group_path);
+        }
+        Ok(members)
+    }
+
     pub(super) fn delete_group_with_sessions(
         &mut self,
         options: &GroupDeleteOptions,
     ) -> anyhow::Result<()> {
         if let Some(group_path) = self.selected_group.take() {
             let owning_profile = self.selected_group_profile.take();
-            let prefix = format!("{}/", group_path);
-
-            // Scoped so the borrow of `group_path` / `owning_profile` ends
-            // before the restart-in-flight bail-out moves them back into self.
-            let mut sessions_to_delete: Vec<String> = {
+            let member_ids: Vec<String> = {
+                let prefix = format!("{group_path}/");
                 let is_member = group_membership(&group_path, &prefix, owning_profile.as_deref());
                 self.instances()
-                    .filter(|i| is_member(i))
-                    .map(|i| i.id.clone())
+                    .filter(|instance| is_member(instance))
+                    .map(|instance| instance.id.clone())
                     .collect()
             };
-            sessions_to_delete.sort();
 
-            // Refuse the whole group delete if any member is mid-restart (same
-            // concurrent-docker race as delete_selected). Restore the selection
-            // we `take()`'d above so the group stays put.
-            if sessions_to_delete
+            if member_ids
                 .iter()
-                .any(|sid| self.restart_in_flight.contains(sid))
+                .any(|session_id| self.restart_in_flight.contains(session_id))
             {
                 self.selected_group = Some(group_path);
                 self.selected_group_profile = owning_profile;
@@ -743,46 +767,51 @@ impl HomeView {
                 ));
                 return Ok(());
             }
-            for session_id in &sessions_to_delete {
-                self.mutate_instance(session_id, |inst| {
-                    inst.status = Status::Deleting;
-                    inst.group_path = String::new();
+
+            let profiles: Vec<String> = owning_profile
+                .as_ref()
+                .map(|profile| vec![profile.clone()])
+                .unwrap_or_else(|| self.group_trees.keys().cloned().collect());
+            let mut sessions_to_delete = Vec::new();
+            for profile in profiles {
+                match self.persist_group_delete_with_sessions(&profile, &group_path) {
+                    Ok(mut members) => sessions_to_delete.append(&mut members),
+                    Err(error) => {
+                        self.selected_group = Some(group_path);
+                        self.selected_group_profile = owning_profile;
+                        return Err(error);
+                    }
+                }
+            }
+            sessions_to_delete.sort_by(|left, right| left.id.cmp(&right.id));
+
+            for instance in sessions_to_delete {
+                let session_id = instance.id.clone();
+                if let Some(current) = self.instances.get_mut(&session_id) {
+                    current.status = Status::Deleting;
+                    current.group_path.clear();
+                }
+                let delete_worktree =
+                    options.delete_worktrees && instance.has_managed_worktree_or_workspace();
+                let delete_branch =
+                    options.delete_branches && instance.has_managed_worktree_or_workspace();
+                let delete_sandbox = options.delete_containers
+                    && instance
+                        .sandbox_info
+                        .as_ref()
+                        .is_some_and(|sandbox| sandbox.enabled);
+                self.deletion_poller.request_deletion(DeletionRequest {
+                    session_id,
+                    instance,
+                    delete_worktree,
+                    delete_branch,
+                    delete_sandbox,
+                    force_delete: options.force_delete_worktrees,
+                    detach_hooks: true,
+                    keep_scratch: false,
                 });
             }
 
-            for session_id in &sessions_to_delete {
-                if let Some(inst) = self.get_instance(session_id) {
-                    let delete_worktree =
-                        options.delete_worktrees && inst.has_managed_worktree_or_workspace();
-                    let delete_branch =
-                        options.delete_branches && inst.has_managed_worktree_or_workspace();
-                    let delete_sandbox = options.delete_containers
-                        && inst.sandbox_info.as_ref().is_some_and(|s| s.enabled);
-                    let request = DeletionRequest {
-                        session_id: session_id.clone(),
-                        instance: inst.clone(),
-                        delete_worktree,
-                        delete_branch,
-                        delete_sandbox,
-                        force_delete: options.force_delete_worktrees,
-                        detach_hooks: true,
-                        // Group-delete UX doesn't have a per-session
-                        // keep-scratch toggle; scratch dirs in a group
-                        // delete are removed unconditionally.
-                        keep_scratch: false,
-                    };
-                    self.deletion_poller.request_deletion(request);
-                }
-            }
-
-            if let Some(profile) = &owning_profile {
-                self.delete_group_in_profile(profile, &group_path);
-            } else {
-                let profiles: Vec<String> = self.group_trees.keys().cloned().collect();
-                for profile in profiles {
-                    self.delete_group_in_profile(&profile, &group_path);
-                }
-            }
             self.rebuild_flat_items();
         }
         Ok(())
