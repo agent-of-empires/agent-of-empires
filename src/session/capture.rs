@@ -1552,8 +1552,17 @@ fn select_opencode_session_from_values(
 ///   2. Most recently modified `opencode*.db` in the data dir (covers both
 ///      the standard `opencode.db` and channel variants like `opencode-dev.db`).
 fn opencode_db_path() -> Result<PathBuf> {
+    opencode_store_identity(&|key| std::env::var(key).ok())
+}
+
+/// Resolve the effective OpenCode store identity for an arbitrary
+/// environment (process env, or a profile's environment layered over the
+/// process env). Same resolution order as [`opencode_db_path`]; the lookup
+/// indirection lets callers compare store identities across AoE profiles
+/// without touching the process environment.
+pub(crate) fn opencode_store_identity(lookup: &dyn Fn(&str) -> Option<String>) -> Result<PathBuf> {
     // 1. Explicit override via OPENCODE_DB (same env var opencode reads).
-    if let Ok(db_env) = std::env::var("OPENCODE_DB") {
+    if let Some(db_env) = lookup("OPENCODE_DB") {
         if !db_env.is_empty() {
             if db_env == ":memory:" {
                 anyhow::bail!("opencode is using an in-memory DB; cannot read sessions via SQLite");
@@ -1562,11 +1571,11 @@ fn opencode_db_path() -> Result<PathBuf> {
             if p.is_absolute() {
                 return Ok(p);
             }
-            return Ok(opencode_data_dir()?.join(p));
+            return Ok(opencode_data_dir_with(lookup)?.join(p));
         }
     }
 
-    let data_dir = opencode_data_dir()?;
+    let data_dir = opencode_data_dir_with(lookup)?;
 
     // 2. Find the most recently modified opencode DB in data_dir.
     //    Covers both the standard filename (latest/beta/prod) and channel
@@ -1598,24 +1607,23 @@ fn opencode_db_path() -> Result<PathBuf> {
     Ok(data_dir.join("opencode.db"))
 }
 
-/// Resolve opencode's data directory.
-///
-/// Uses `XDG_DATA_HOME` if set (same `xdg-basedir` npm package opencode uses),
-/// otherwise `$HOME/.local/share`. Both Linux and macOS use this path.
-fn opencode_data_dir() -> Result<PathBuf> {
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+fn opencode_data_dir_with(lookup: &dyn Fn(&str) -> Option<String>) -> Result<PathBuf> {
+    if let Some(xdg) = lookup("XDG_DATA_HOME") {
         if !xdg.is_empty() {
             return Ok(PathBuf::from(xdg).join("opencode"));
         }
     }
-    let home =
-        std::env::var("HOME").context("HOME is not set; cannot resolve opencode data dir")?;
+    let home = lookup("HOME").context("HOME is not set; cannot resolve opencode data dir")?;
     Ok(PathBuf::from(home)
         .join(".local")
         .join("share")
         .join("opencode"))
 }
 
+/// Resolve opencode's data directory.
+///
+/// Uses `XDG_DATA_HOME` if set (same `xdg-basedir` npm package opencode uses),
+/// otherwise `$HOME/.local/share`. Both Linux and macOS use this path.
 /// Load opencode's session rows from its SQLite store at `db_path`.
 ///
 /// Selects `id`, `directory`, and `time_updated` from the `session` table

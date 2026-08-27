@@ -3224,50 +3224,65 @@ impl Instance {
         )
     }
 
+    /// Effective env lookup for one profile: explicit `KEY=value` entries
+    /// win, bare `KEY` entries inherit the process value, anything unset
+    /// falls through to the process environment.
+    fn opencode_profile_env_lookup(profile: &str, key: &str) -> Option<String> {
+        let config = super::profile_config::resolve_config_or_warn(profile);
+        for entry in &config.environment {
+            if let Some(value) = entry.strip_prefix(&format!("{key}=")) {
+                return Some(value.to_string());
+            }
+        }
+        std::env::var(key).ok()
+    }
+
     /// Whether at least one OTHER host-opencode instance shares this
     /// session's OpenCode store *and* its canonicalized project_path.
     ///
-    /// Scope: profiles without their own environment overrides all resolve to
-    /// the default OpenCode store (XDG/home path), so a same-directory peer
-    /// in any such profile is exactly as poisonous as a same-profile one.
-    /// Profiles carrying explicit environment overrides point elsewhere and
-    /// are skipped; if this session itself carries overrides, its store is
-    /// private to its own profile and only that profile is scanned.
+    /// Store identity is resolved per profile with opencode's own rules
+    /// ([`super::capture::opencode_store_identity`]: `OPENCODE_DB` override,
+    /// else `XDG_DATA_HOME`/`HOME` data dir), layered over the process env by
+    /// that profile's `environment` entries. Profiles resolving to a
+    /// different store are skipped; an unrelated environment entry therefore
+    /// never hides a same-store peer.
     ///
     /// Sandboxed instances own instance-private stores (#3317) and other
     /// tools scan their own distinct transcript dirs, so neither can be
     /// confused with this store's freshest conversation.
     ///
-    /// Fail-closed: if the profile registry or any in-scope store cannot be
-    /// read, treat the store as shared and skip the MRU capture — a skipped
-    /// rescan costs one resume; a wrong adoption loses a conversation.
+    /// Fail-closed: if the profile registry, this session's own store
+    /// identity, or any same-store listing cannot be read, treat the store
+    /// as shared and skip the MRU capture — a skipped rescan costs one
+    /// resume; a wrong adoption loses a conversation.
     fn opencode_shares_store_with_peer(&self) -> bool {
         if self.is_sandboxed() {
             return false;
         }
-        let canon = super::capture::canonicalize_or_raw(&self.project_path);
         let own_profile = self.effective_profile();
-        let own_env_overridden = !self.profile_host_environment().is_empty();
-        let profiles: Vec<String> = if own_env_overridden {
-            vec![own_profile.clone()]
-        } else {
-            match crate::session::list_profiles() {
-                Ok(mut ps) => {
-                    if !ps.iter().any(|p| p == &own_profile) {
-                        ps.push(own_profile.clone());
-                    }
-                    ps
-                }
-                Err(_) => return true,
-            }
+        let own_store = match super::capture::opencode_store_identity(&|key: &str| {
+            Self::opencode_profile_env_lookup(&own_profile, key)
+        }) {
+            Ok(path) => path,
+            Err(_) => return true,
         };
+        let Ok(mut profiles) = crate::session::list_profiles() else {
+            return true;
+        };
+        if !profiles.iter().any(|p| p == &own_profile) {
+            profiles.push(own_profile.clone());
+        }
+        let canon = super::capture::canonicalize_or_raw(&self.project_path);
         for profile in profiles {
-            if profile != own_profile
-                && !super::profile_config::resolve_config_or_warn(&profile)
-                    .environment
-                    .is_empty()
-            {
-                // Explicit override => different store, not in scope.
+            let store = match super::capture::opencode_store_identity(&|key: &str| {
+                Self::opencode_profile_env_lookup(&profile, key)
+            }) {
+                Ok(path) => path,
+                // Unresolvable peer store identity: it cannot be proven to
+                // be the same store, so it cannot hide a same-store peer.
+                Err(_) => continue,
+            };
+            if store != own_store {
                 continue;
             }
             let Ok(storage) = super::storage::Storage::new_unwatched(&profile) else {
@@ -17579,6 +17594,69 @@ mod opencode_same_cwd_clobbering_tests {
             me.try_retroactive_capture(),
             None,
             "shared project_path: resume must trust the stored sid instead of the dir MRU scan"
+        );
+    }
+
+    #[serial_test::serial]
+    #[test]
+    fn cross_profile_peer_with_unrelated_env_is_still_same_store() {
+        let temp = tempdir().unwrap();
+        #[allow(unused_mut)]
+        let mut pairs: Vec<(&'static str, PathBuf)> = vec![("HOME", temp.path().to_path_buf())];
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        pairs.push(("XDG_CONFIG_HOME", temp.path().join(".config")));
+        let _guard = EnvGuard::set(&pairs);
+
+        let app = std::path::PathBuf::from(std::env::var("XDG_CONFIG_HOME").unwrap())
+            .join("agent-of-empires");
+        let other_profile = "oc-unrelated-env";
+        let cfg_dir = app.join("profiles").join(other_profile);
+        std::fs::create_dir_all(&cfg_dir).unwrap();
+        // Unrelated entry only: must NOT make the store look different.
+        std::fs::write(
+            cfg_dir.join("config.toml"),
+            "environment = [\"RUST_LOG=debug\"]\n",
+        )
+        .unwrap();
+
+        let me_profile = "oc-main-cwd";
+        let mut me = Instance::new("me-row", "/tmp/aoe-shared-cwd-c");
+        me.source_profile = me_profile.to_string();
+        me.tool = "opencode".to_string();
+        me.agent_session_id = Some(OC_SID_SELF.to_string());
+        {
+            let storage = crate::session::storage::Storage::new_unwatched(me_profile).unwrap();
+            let owned = vec![me.clone()];
+            storage
+                .update(|i, g| {
+                    *i = owned.clone();
+                    *g = crate::session::GroupTree::new_with_groups(&owned, &[]).get_all_groups();
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        let mut peer = Instance::new("peer-row", "/tmp/aoe-shared-cwd-c");
+        peer.source_profile = other_profile.to_string();
+        peer.tool = "opencode".to_string();
+        peer.status = crate::session::Status::Stopped;
+        peer.agent_session_id = Some(OC_SID_PEER.to_string());
+        {
+            let storage = crate::session::storage::Storage::new_unwatched(other_profile).unwrap();
+            let owned = vec![peer.clone()];
+            storage
+                .update(|i, g| {
+                    *i = owned.clone();
+                    *g = crate::session::GroupTree::new_with_groups(&owned, &[]).get_all_groups();
+                    Ok(())
+                })
+                .unwrap();
+        }
+
+        assert_eq!(
+            me.try_retroactive_capture(),
+            None,
+            "a peer profile differing only by an unrelated env entry shares the default store; the guard must still skip the MRU scan"
         );
     }
 }
