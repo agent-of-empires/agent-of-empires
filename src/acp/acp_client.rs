@@ -207,6 +207,27 @@ pub(crate) fn classify_rate_limit_error(
     })
 }
 
+/// Recognize the agent's rejection of a stored/resumed ACP session id it no
+/// longer holds (e.g. OMP replying `Unsupported ACP session`). A resumed
+/// worker reuses the persisted `acp_session_id` without re-issuing
+/// `session/load`, so if the agent dropped that session across the
+/// interruption the first `session/prompt` fails with this class of error
+/// rather than a rate limit or a transport drop. The caller recovers via the
+/// established `SessionContextReset` path: the supervisor clears the stored
+/// id so the respawn opens a fresh `session/new`, while the SQLite transcript
+/// is preserved for replay. Deliberately narrow, a message fingerprint, so an
+/// unrelated prompt failure still ends the turn as an ordinary error instead
+/// of being silently swallowed into a context reset.
+pub(crate) fn is_unsupported_session_error(err: &agent_client_protocol::Error) -> bool {
+    let msg = err.message.to_ascii_lowercase();
+    msg.contains("session")
+        && (msg.contains("unsupported")
+            || msg.contains("unknown")
+            || msg.contains("not found")
+            || msg.contains("no such")
+            || msg.contains("does not exist"))
+}
+
 /// Defensive fallback for the connection-task end path. The outer
 /// error type carries no structured `data`, only a Display string, so
 /// match on the fingerprint claude-agent-acp embeds in its error
@@ -8218,6 +8239,34 @@ async fn run_connection_task<W, R>(
                                                 shutdown = true;
                                                 break;
                                             }
+                                            // A resumed worker reuses the stored
+                                            // acp_session_id without re-issuing
+                                            // session/load; if the agent dropped
+                                            // that session across the interruption
+                                            // it rejects the first prompt (OMP:
+                                            // "Unsupported ACP session"). Emit the
+                                            // established SessionContextReset so the
+                                            // supervisor clears the persisted id and
+                                            // the respawn opens a fresh session/new
+                                            // (the SQLite transcript is preserved for
+                                            // replay), then return the original error
+                                            // to end this connection so the restart
+                                            // fires. See resume-rejection recovery.
+                                            if is_unsupported_session_error(&e) {
+                                                warn!(
+                                                    target: "acp.protocol",
+                                                    session = %session_label,
+                                                    acp_session_id = %acp_session_id.0,
+                                                    "resumed ACP session rejected as unsupported; resetting context so the respawn starts fresh: {e}"
+                                                );
+                                                let _ = event_tx_for_block
+                                                    .send(Event::SessionContextReset {
+                                                        reason: format!(
+                                                            "resumed session no longer available: {e}"
+                                                        ),
+                                                    })
+                                                    .await;
+                                            }
                                             return Err(e);
                                         }
                                     }
@@ -11499,6 +11548,38 @@ mod tests {
         assert!(classify_rate_limit_error(&err, None).is_none());
     }
 
+    /// The resume-rejection recovery hinges on recognizing the agent's
+    /// "stored session is gone" rejection (OMP: `Unsupported ACP session`)
+    /// and nothing else: a false positive would silently rewrite an
+    /// unrelated prompt failure into a context reset, and a false negative
+    /// would leave the resumed session terminating the runner with no
+    /// recovery. Table pins both edges.
+    #[test]
+    fn is_unsupported_session_error_matches_only_stale_session_rejections() {
+        let classify = |m: &str| {
+            let mut err = agent_client_protocol::Error::internal_error();
+            err.message = m.into();
+            is_unsupported_session_error(&err)
+        };
+        let cases = [
+            // The observed OMP rejection of a resumed stored id, plus the
+            // common phrasings other adapters use for the same condition.
+            ("Unsupported ACP session", true),
+            ("Unknown session 01a040bb-...", true),
+            ("session not found", true),
+            ("no such session: abc", true),
+            ("Session does not exist", true),
+            // Unrelated failures must stay ordinary errors.
+            ("You've hit your limit", false),
+            ("transport closed", false),
+            ("permission denied", false),
+            ("unsupported model", false),
+        ];
+        for (msg, expected) in cases {
+            assert_eq!(classify(msg), expected, "{msg:?}");
+        }
+    }
+
     #[test]
     fn classify_rate_limit_from_message_matches_acp_fingerprint() {
         let msg = "ACP connection failed: Internal error: You've hit your limit · resets 12:10pm (Europe/Paris): {\n  \"errorKind\":\"rate_limit\"\n}";
@@ -12272,6 +12353,92 @@ done
             source_profile: None,
             mcp_servers: Vec::new(),
         }
+    }
+
+    /// Scripted stdio ACP agent for the resume-rejection recovery test:
+    /// answers `initialize` (loadSession:false) and `session/new` (mints
+    /// `sid-1`), then rejects every `session/prompt` with the exact error
+    /// OMP returns for a stored id it no longer holds. Mirrors the verified
+    /// failure: the session establishes, then the first prompt is rejected.
+    #[cfg(unix)]
+    fn write_unsupported_session_fake_agent(dir: &std::path::Path) -> std::path::PathBuf {
+        use std::os::unix::fs::PermissionsExt;
+        let capture = dir.join("capture.ndjson");
+        let script_path = dir.join("fake-unsupported-session-agent.sh");
+        let script = r#"#!/bin/sh
+CAPTURE=__CAPTURE__
+while IFS= read -r line; do
+  printf '%s\n' "$line" >> "$CAPTURE"
+  id=$(printf '%s' "$line" | sed -En 's/.*"id":("[^"]*"|[0-9]+).*/\1/p')
+  case $line in
+    *'"method":"initialize"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"protocolVersion":1,"agentCapabilities":{"loadSession":false}}}\n' "$id"
+      ;;
+    *'"method":"session/new"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"result":{"sessionId":"sid-1"}}\n' "$id"
+      ;;
+    *'"method":"session/prompt"'*)
+      printf '{"jsonrpc":"2.0","id":%s,"error":{"code":-32602,"message":"Unsupported ACP session"}}\n' "$id"
+      ;;
+  esac
+done
+"#
+        .replace("__CAPTURE__", capture.to_str().expect("utf8 tmp path"));
+        std::fs::write(&script_path, script).expect("write fake agent script");
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod fake agent script");
+        script_path
+    }
+
+    /// Behavior contract for the resume-rejection recovery: when a
+    /// `session/prompt` is rejected because the agent no longer holds the
+    /// session (OMP: "Unsupported ACP session"), the connection task must
+    /// emit `SessionContextReset` BEFORE ending on the error, so the
+    /// supervisor clears the stored id and the respawn opens a fresh
+    /// session/new (transcript preserved for replay) instead of terminating
+    /// with no recovery. Drives a real prompt round-trip against a scripted
+    /// agent rather than unit-testing the classifier in isolation.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unsupported_session_prompt_rejection_emits_context_reset_before_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let cwd = tempfile::tempdir().unwrap();
+        let script = write_unsupported_session_fake_agent(dir.path());
+        let config = reset_fake_spawn_config(&script, cwd.path());
+        let mut client = AcpClient::spawn(config, AcpSessionId("resume-reject".into()))
+            .await
+            .expect("spawn fake agent");
+        client
+            .send_prompt("enrich the kb", &[])
+            .await
+            .expect("queue prompt");
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut saw_reset = false;
+        loop {
+            let ev = tokio::time::timeout_at(deadline, client.next_event())
+                .await
+                .expect("timed out waiting for the recovery reset");
+            match ev {
+                Some(Event::SessionContextReset { reason }) => {
+                    assert!(
+                        reason.contains("resumed session no longer available"),
+                        "reset reason should name the rejected resume, got {reason:?}"
+                    );
+                    saw_reset = true;
+                }
+                // The event channel closes once the connection task takes the
+                // error path. Reaching it having seen the reset proves the
+                // ordering (reset emitted, THEN the error ended the task).
+                None => break,
+                _ => {}
+            }
+        }
+        assert!(
+            saw_reset,
+            "an unsupported-session prompt rejection must emit SessionContextReset before ending on the error"
+        );
+        let _ = client.shutdown().await;
     }
 
     /// The deadline starts before enqueueing. If it has already expired
