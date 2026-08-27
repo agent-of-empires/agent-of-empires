@@ -2889,6 +2889,26 @@ fn switching_view_retargets_capture_worker_pane() {
 
 #[test]
 #[serial]
+fn retarget_same_session_tool_clears_previous_pane_content() {
+    let env = create_test_env_with_sessions(1);
+    let mut view = env.view;
+    view.view_mode = ViewMode::Tool("lazygit".to_string());
+    view.sync_preview_capture_worker(Some("aoe_test_tool_a".to_string()));
+    view.tool_preview_cache.content = "tool A screen".to_string();
+    view.tool_preview_cache.capture_target = Some("aoe_test_tool_a".to_string());
+    view.tool_preview_cache.session_id = view.selected_session.clone();
+
+    view.sync_preview_capture_worker(Some("aoe_test_tool_b".to_string()));
+
+    assert!(
+        view.tool_preview_cache.content.is_empty(),
+        "a cold pane must not render another tool's bytes from the same session",
+    );
+    assert!(view.tool_preview_cache.capture_target.is_none());
+}
+
+#[test]
+#[serial]
 fn test_enter_returns_attach_terminal_in_terminal_view() {
     let env = create_test_env_with_sessions(1);
     let mut view = env.view;
@@ -12935,9 +12955,6 @@ mod scroll_pane_isolation {
         setup_panes(&mut env);
         env.view.cursor = 1;
         env.view.update_selected();
-        env.view.preview_cache.dimensions = (80, 24);
-        env.view.preview_cache.captured_lines = 200;
-        env.view.preview_scroll_offset = 10;
         env.view.live_send = Some(LiveSendState {
             session_id: "fake".to_string(),
             title: "fake".to_string(),
@@ -12951,6 +12968,9 @@ mod scroll_pane_isolation {
         env.view.live_send_worker = Some(LiveSendWorker::spawn("fake".to_string(), None));
         env.view
             .sync_preview_capture_worker(Some("fake".to_string()));
+        env.view.preview_cache.dimensions = (80, 24);
+        env.view.preview_cache.captured_lines = 200;
+        env.view.preview_scroll_offset = 10;
         env.view.preview_cache.cursor = Some(cursor);
         env.view.preview_cache.capture_target = Some("fake".to_string());
         env.view.preview_cache.capture_generation = env
@@ -12972,11 +12992,11 @@ mod scroll_pane_isolation {
         setup_panes(&mut env);
         env.view.cursor = 1;
         env.view.update_selected();
+        env.view
+            .sync_preview_capture_worker(Some("fake".to_string()));
         env.view.preview_cache.dimensions = (80, 24);
         env.view.preview_cache.captured_lines = 200;
         env.view.preview_scroll_offset = 10;
-        env.view
-            .sync_preview_capture_worker(Some("fake".to_string()));
         env.view.preview_capture_target = Some("fake".to_string());
         env.view.preview_cache.cursor = Some(cursor);
         env.view.preview_cache.capture_target = Some("fake".to_string());
@@ -20634,12 +20654,19 @@ fn preview_revalidates_empty_policy_across_live_transition() {
     let mut env = create_test_env_with_sessions(1);
     let id = env.view.instance_at(0).id.clone();
     env.view.selected_session = Some(id.clone());
+    let target = "aoe_test_live_transition".to_string();
+    env.view.sync_preview_capture_worker(Some(target.clone()));
     env.view.preview_cache.content = "last good frame".to_string();
     env.view.preview_cache.captured_lines = 1;
     env.view.preview_cache.dimensions = (80, 24);
     env.view.preview_cache.session_id = Some(id);
-    env.view
-        .sync_preview_capture_worker(Some("aoe_test_live_transition".to_string()));
+    env.view.preview_cache.capture_target = Some(target);
+    env.view.preview_cache.capture_generation = env
+        .view
+        .preview_capture_worker
+        .as_ref()
+        .expect("worker spawned")
+        .current_generation_for_test();
     let worker = env
         .view
         .preview_capture_worker

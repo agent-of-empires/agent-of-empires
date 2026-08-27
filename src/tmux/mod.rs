@@ -1373,6 +1373,7 @@ pub(crate) struct PassiveResizeDone {
 static PASSIVE_RESIZE_INTENTS: Mutex<Vec<PassiveResizeIntent>> = Mutex::new(Vec::new());
 static PASSIVE_RESIZE_DONES: Mutex<Vec<PassiveResizeDone>> = Mutex::new(Vec::new());
 static PASSIVE_RESIZE_IN_FLIGHT: Mutex<Vec<PassiveResizeDone>> = Mutex::new(Vec::new());
+static SNAPSHOT_POLLER_THREAD: OnceLock<std::thread::Thread> = OnceLock::new();
 
 /// Replace any queued resize for the same session with the latest geometry.
 /// Paint can queue every frame while the pending slot stays armed; an exact
@@ -1400,13 +1401,18 @@ fn queue_latest_passive_resize(
 /// Queue a passive preview resize for the poller. Non-blocking by contract:
 /// this is called from paint.
 pub(crate) fn queue_passive_resize(intent: PassiveResizeIntent) {
-    let mut queue = PASSIVE_RESIZE_INTENTS
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let in_flight = PASSIVE_RESIZE_IN_FLIGHT
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    queue_latest_passive_resize(&mut queue, &in_flight, intent);
+    {
+        let mut queue = PASSIVE_RESIZE_INTENTS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let in_flight = PASSIVE_RESIZE_IN_FLIGHT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        queue_latest_passive_resize(&mut queue, &in_flight, intent);
+    }
+    if let Some(thread) = SNAPSHOT_POLLER_THREAD.get() {
+        thread.unpark();
+    }
 }
 
 fn remove_pending_passive_resize(queue: &mut Vec<PassiveResizeIntent>, session_id: &str) {
@@ -1536,29 +1542,33 @@ pub fn spawn_snapshot_poller() {
     }
     let spawn_result = std::thread::Builder::new()
         .name("aoe-display-snapshot".to_string())
-        .spawn(|| loop {
-            let cycle = std::panic::catch_unwind(|| {
-                if session_snapshot_refresh_due() {
-                    refresh_session_cache();
+        .spawn(|| {
+            let _ = SNAPSHOT_POLLER_THREAD.set(std::thread::current());
+            loop {
+                let cycle = std::panic::catch_unwind(|| {
+                    execute_passive_resizes();
+                    if session_snapshot_refresh_due() {
+                        refresh_session_cache();
+                    }
+                    if pane_snapshot_refresh_due() {
+                        let _ = refresh_pane_meta_cache();
+                    }
+                });
+                if cycle.is_err() {
+                    tracing::error!(
+                        target: "tmux.cache",
+                        "display snapshot poller cycle panicked; retrying"
+                    );
                 }
-                if pane_snapshot_refresh_due() {
-                    let _ = refresh_pane_meta_cache();
-                }
-                execute_passive_resizes();
-            });
-            if cycle.is_err() {
-                tracing::error!(
-                    target: "tmux.cache",
-                    "display snapshot poller cycle panicked; retrying"
-                );
+                // Half the TTL, not the TTL: the refresh work itself takes time
+                // and the timestamps are stamped when each query lands, so a
+                // full-TTL period would guarantee an expired-snapshot window
+                // every cycle (cache-only display answers would flicker to
+                // "absent" inside it). Half keeps each snapshot fresh across the
+                // whole cycle at one extra bounded fork pair per ~1s. A queued
+                // resize unparks this wait and runs before the snapshot probes.
+                std::thread::park_timeout(CACHE_TTL / 2);
             }
-            // Half the TTL, not the TTL: the refresh work itself takes time
-            // and the timestamps are stamped when each query lands, so a
-            // full-TTL period would guarantee an expired-snapshot window
-            // every cycle (cache-only display answers would flicker to
-            // "absent" inside it). Half keeps each snapshot fresh across the
-            // whole cycle at one extra bounded fork pair per ~1s.
-            std::thread::sleep(CACHE_TTL / 2);
         });
     if let Err(error) = spawn_result {
         STARTED.store(false, std::sync::atomic::Ordering::Release);

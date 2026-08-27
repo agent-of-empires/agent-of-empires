@@ -1986,10 +1986,34 @@ impl HomeView {
             if let Some(worker) = self.preview_capture_worker.as_ref() {
                 worker.set_target(desired.clone().unwrap_or_default());
             }
-            self.preview_cache.cursor = None;
-            self.terminal_preview_cache.cursor = None;
-            self.container_terminal_preview_cache.cursor = None;
-            self.tool_preview_cache.cursor = None;
+            let terminal_mode = if matches!(&self.view_mode, ViewMode::Terminal) {
+                self.selected_session
+                    .as_ref()
+                    .and_then(|id| self.get_instance(id).map(|inst| (id, inst)))
+                    .map(|(id, inst)| {
+                        if inst.is_sandboxed() {
+                            self.get_terminal_mode(id)
+                        } else {
+                            TerminalMode::Host
+                        }
+                    })
+                    .unwrap_or(TerminalMode::Host)
+            } else {
+                TerminalMode::Host
+            };
+            let cache = match &self.view_mode {
+                ViewMode::Structured => &mut self.preview_cache,
+                ViewMode::Tool(_) => &mut self.tool_preview_cache,
+                ViewMode::Terminal => match terminal_mode {
+                    TerminalMode::Container => &mut self.container_terminal_preview_cache,
+                    TerminalMode::Host => &mut self.terminal_preview_cache,
+                },
+            };
+            if cache.capture_target.as_deref() != desired.as_deref() {
+                *cache = super::PreviewCache::default();
+            } else {
+                cache.cursor = None;
+            }
             self.preview_capture_target = desired;
             // New pane under the pointer: drop the hover dedup cell so a
             // stationary pointer still reports its cell to the new agent.
@@ -2101,13 +2125,10 @@ impl HomeView {
                 return;
             }
         }
-        // All reject/restore paths are complete. The mailbox frame is now
-        // normally the only Arc reference, so unwrap moves its String into
-        // the cache without copying; the Clone fallback only covers a rare
-        // concurrent observer retaining another Arc.
+        // All reject/restore paths are complete. Move the owned mailbox frame
+        // into the cache without copying its content.
         let frame_budget = frame.budget;
         let content_is_empty = frame.content.is_empty();
-        let frame = std::sync::Arc::unwrap_or_clone(frame);
         let captured_lines = select(self).store_capture(
             frame.content,
             id,

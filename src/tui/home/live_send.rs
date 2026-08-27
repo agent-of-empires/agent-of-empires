@@ -424,6 +424,10 @@ pub(super) fn batch_needs_owner_first(batch: &[WorkerMsg]) -> bool {
     batch.iter().any(|m| matches!(m, WorkerMsg::Resize { .. }))
 }
 
+fn resize_dispatch_authorized(owned: bool, lock_lost: bool) -> bool {
+    owned && !lock_lost
+}
+
 /// One unit of work the worker can be asked to perform. Resizes don't
 /// coalesce with keys because they're sticky pane-level changes; a
 /// burst of keystrokes that brackets a resize must arrive on either
@@ -548,6 +552,7 @@ impl LiveSendWorker {
                         // Geometry must not race another owner's grid, so a
                         // batch carrying a resize VERIFIES ownership first;
                         // plain keystrokes never read the lock.
+                        let mut resize_unverified = false;
                         if batch_needs_owner_first(&batch) {
                             if !owned {
                                 // Entry steal failed. Claim rather than steal:
@@ -560,22 +565,30 @@ impl LiveSendWorker {
                                 // and would never flag the loss.
                                 owned = session
                                     .claim_size_owner(&owner_id, crate::tmux::SIZE_OWNER_TTL);
-                                if !owned && session.has_active_size_owner() == Some(true) {
-                                    // Our own claim would have succeeded if the
-                                    // live owner were us, so this is a takeover.
-                                    thread_lock_lost.store(true, Ordering::Relaxed);
+                                if !owned {
+                                    match session.has_active_size_owner() {
+                                        Some(true) => {
+                                            // Our own claim would have succeeded if the
+                                            // live owner were us, so this is a takeover.
+                                            thread_lock_lost.store(true, Ordering::Relaxed);
+                                        }
+                                        Some(false) | None => resize_unverified = true,
+                                    }
                                 }
                             } else {
                                 maintain(owned);
                             }
                             last_owner_maintenance = std::time::Instant::now();
                         }
-                        if thread_lock_lost.load(Ordering::Relaxed) {
-                            // The resize would stomp the new owner's grid.
-                            // Keys still deliver: they were typed before the
-                            // UI could tear live mode down, and pane input
-                            // is not lock-gated.
+                        let lock_lost = thread_lock_lost.load(Ordering::Relaxed);
+                        if !resize_dispatch_authorized(owned, lock_lost) {
+                            // A resize without verified ownership could stomp
+                            // another surface's grid. Keys remain independent
+                            // of the size lock and still deliver in order.
                             batch.retain(|m| !matches!(m, WorkerMsg::Resize { .. }));
+                            if resize_unverified {
+                                thread_resize_failed.store(true, Ordering::Relaxed);
+                            }
                         }
                         if !batch.is_empty() {
                             if dispatch_batch(&tmux_name, batch) {
@@ -759,7 +772,7 @@ impl LiveCaptureWake {
 /// cycle, the line budget it was captured under, and the target generation
 /// it belongs to. Published as a single unit so a consumer can never see a
 /// frame torn across a retarget or a budget change.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub(in crate::tui) struct CaptureFrame {
     /// Target generation at capture time; compared against the worker's
     /// current generation so a frame captured before a retarget is dropped
@@ -771,6 +784,13 @@ pub(in crate::tui) struct CaptureFrame {
     pub(in crate::tui) budget: usize,
     pub(in crate::tui) content: String,
     pub(in crate::tui) cursor: Option<crate::tmux::PaneCursor>,
+}
+
+#[derive(Debug)]
+struct ClipboardFrame {
+    generation: u64,
+    target: String,
+    text: String,
 }
 
 /// Whether the worker must reset target-scoped dedup and transport state.
@@ -824,7 +844,7 @@ pub(in crate::tui) struct LiveCaptureWorker {
     /// consumed by the render loop. A new frame overwrites an unconsumed one
     /// (the render only ever wants the latest), so this can't grow unbounded
     /// if the render thread stalls.
-    latest: std::sync::Arc<std::sync::Mutex<Option<std::sync::Arc<CaptureFrame>>>>,
+    latest: std::sync::Arc<std::sync::Mutex<Option<CaptureFrame>>>,
     /// Bumped on every `set_target` change. Published frames carry the value
     /// read at capture time; a consumer drops frames whose generation no
     /// longer matches, so stale bytes can never land under a new view even if
@@ -853,7 +873,7 @@ pub(in crate::tui) struct LiveCaptureWorker {
     /// Newest OSC 52 clipboard write the displayed pane has emitted. A VT grid
     /// extracts it from the live byte stream; terminal capture uses a separate
     /// raw observer so rendered snapshots never need to carry the escape.
-    clipboard: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    clipboard: std::sync::Arc<std::sync::Mutex<Option<ClipboardFrame>>>,
     /// Whether the worker may render through a VT channel (`[tmux] vt_live`).
     /// Pushed by the render reconcile at spawn and on config refresh
     /// (`set_vt_enabled`), read by the worker each cycle: toggling off tears
@@ -1081,13 +1101,13 @@ impl LiveCaptureWorker {
         use std::sync::{Arc, Condvar, Mutex};
         let capture_lines = Arc::new(AtomicUsize::new(0));
         let target: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
-        let latest: Arc<Mutex<Option<std::sync::Arc<CaptureFrame>>>> = Arc::new(Mutex::new(None));
+        let latest: Arc<Mutex<Option<CaptureFrame>>> = Arc::new(Mutex::new(None));
         let interval_ms = Arc::new(AtomicU64::new(LIVE_CAPTURE_INTERVAL_IDLE_MS));
         let live = Arc::new(AtomicBool::new(false));
         let forward_empty = Arc::new(AtomicBool::new(false));
         let nudge: Arc<(Mutex<()>, Condvar)> = Arc::new((Mutex::new(()), Condvar::new()));
         let stop = Arc::new(AtomicBool::new(false));
-        let clipboard: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let clipboard: Arc<Mutex<Option<ClipboardFrame>>> = Arc::new(Mutex::new(None));
         let generation = Arc::new(AtomicU64::new(0));
         // Spawned enabled; the render reconcile pushes the real
         // `[tmux] vt_live` value right after spawn (and on every config
@@ -1421,7 +1441,11 @@ impl LiveCaptureWorker {
                             // whether or not the grid changed visibly.
                             if let Some(text) = clipboard_now {
                                 if let Ok(mut guard) = clipboard_cell.lock() {
-                                    *guard = Some(text);
+                                    *guard = Some(ClipboardFrame {
+                                        generation: generation_now,
+                                        target: name.clone(),
+                                        text,
+                                    });
                                 }
                                 wake.notify_one();
                             }
@@ -1459,13 +1483,13 @@ impl LiveCaptureWorker {
                                 };
                                 if floor == 0 && debounce == 0 {
                                     if let Ok(mut guard) = slot.lock() {
-                                        *guard = Some(std::sync::Arc::new(CaptureFrame {
+                                        *guard = Some(CaptureFrame {
                                             generation: generation_now,
                                             target: name.clone(),
                                             budget: lines,
                                             content: content.clone(),
                                             cursor: cursor_now,
-                                        }));
+                                        });
                                     }
                                     last_captured = Some(content);
                                     last_published_budget = lines;
@@ -1700,7 +1724,7 @@ impl LiveCaptureWorker {
     /// consumed-and-dropped frame (e.g. a terminal-clear empty frame landing
     /// while the preview is frozen) would otherwise never be republished.
     /// Never overwrites a newer frame.
-    pub(in crate::tui) fn restore_latest(&self, frame: std::sync::Arc<CaptureFrame>) {
+    pub(in crate::tui) fn restore_latest(&self, frame: CaptureFrame) {
         if let Ok(mut guard) = self.latest.lock() {
             if guard.is_none() {
                 *guard = Some(frame);
@@ -1711,7 +1735,7 @@ impl LiveCaptureWorker {
     /// Take the newest frame the worker has produced since the last call,
     /// if any. Returns `None` when nothing new has arrived (the render loop
     /// then keeps the current preview).
-    pub(in crate::tui) fn take_latest(&self) -> Option<std::sync::Arc<CaptureFrame>> {
+    pub(in crate::tui) fn take_latest(&self) -> Option<CaptureFrame> {
         self.latest.lock().ok().and_then(|mut guard| guard.take())
     }
 
@@ -1742,7 +1766,7 @@ impl LiveCaptureWorker {
     ) {
         let generation = self.current_generation_for_test();
         if let Ok(mut latest) = self.latest.lock() {
-            *latest = Some(std::sync::Arc::new(CaptureFrame {
+            *latest = Some(CaptureFrame {
                 generation: generation.saturating_sub(1),
                 target: self
                     .target
@@ -1753,17 +1777,16 @@ impl LiveCaptureWorker {
                 budget,
                 content: content.to_string(),
                 cursor: None,
-            }));
+            });
         }
     }
 
     /// Take the newest OSC 52 clipboard write the displayed pane's agent has
     /// emitted since the last call, if any.
     pub(in crate::tui) fn take_agent_clipboard(&self) -> Option<String> {
-        self.clipboard
-            .lock()
-            .ok()
-            .and_then(|mut guard| guard.take())
+        let frame = self.clipboard.lock().ok()?.take()?;
+        self.capture_identity_is_current(&frame.target, frame.generation)
+            .then_some(frame.text)
     }
 
     /// Current target generation for tests that hand-build frames.
@@ -1786,7 +1809,7 @@ impl LiveCaptureWorker {
         cursor: Option<crate::tmux::PaneCursor>,
     ) {
         if let Ok(mut latest) = self.latest.lock() {
-            *latest = Some(std::sync::Arc::new(CaptureFrame {
+            *latest = Some(CaptureFrame {
                 generation: self.current_generation_for_test(),
                 target: self
                     .target
@@ -1797,7 +1820,7 @@ impl LiveCaptureWorker {
                 budget,
                 content: content.to_string(),
                 cursor,
-            }));
+            });
         }
     }
 }
@@ -3248,27 +3271,51 @@ mod tests {
         ));
     }
     #[test]
-    fn live_capture_worker_retarget_drops_previous_capture() {
+    fn retarget_invalidates_capture_and_clipboard_mailboxes() {
         // Swapping the target must clear any queued capture so the render
         // never applies the previous pane's bytes under the new view.
         let worker = LiveCaptureWorker::spawn(std::sync::Arc::new(tokio::sync::Notify::new()));
         worker.set_capture_lines(40);
         if let Ok(mut latest) = worker.latest.lock() {
-            *latest = Some(std::sync::Arc::new(CaptureFrame {
+            *latest = Some(CaptureFrame {
                 generation: 0,
                 target: String::new(),
                 budget: 40,
                 content: "stale previous-pane content".to_string(),
                 cursor: None,
-            }));
+            });
         }
         worker.set_target("aoe_test_capture_new_target".into());
         assert!(
             worker.take_latest().is_none(),
             "retarget must drop the previous pane's queued capture",
         );
-    }
 
+        let generation = worker.current_generation_for_test();
+        if let Ok(mut clipboard) = worker.clipboard.lock() {
+            *clipboard = Some(ClipboardFrame {
+                generation: generation.saturating_sub(1),
+                target: String::new(),
+                text: "stale secret".to_string(),
+            });
+        }
+        assert!(
+            worker.take_agent_clipboard().is_none(),
+            "an in-flight old-target publish must be rejected after retarget",
+        );
+
+        if let Ok(mut clipboard) = worker.clipboard.lock() {
+            *clipboard = Some(ClipboardFrame {
+                generation,
+                target: "aoe_test_capture_new_target".to_string(),
+                text: "current copy".to_string(),
+            });
+        }
+        assert_eq!(
+            worker.take_agent_clipboard().as_deref(),
+            Some("current copy"),
+        );
+    }
     #[test]
     fn publish_floor_first_change_after_quiet_publishes_immediately() {
         // The typed-echo case: no prior publish (or one long past) must never
@@ -3358,7 +3405,7 @@ mod tests {
     }
 
     #[test]
-    fn only_resize_batches_reassert_ownership_before_dispatch() {
+    fn resize_batches_require_verified_ownership_before_dispatch() {
         // Keystroke batches must dispatch without waiting on the size-owner
         // check (a few tmux forks); putting it back ahead of plain input
         // re-creates the per-keystroke latency this classifier exists to
@@ -3378,6 +3425,20 @@ mod tests {
             WorkerMsg::Send(TmuxKey::HexBytes(vec![0x1b])),
         ]));
         assert!(!batch_needs_owner_first(&[]));
+
+        let cases = [
+            (true, false, true),
+            (false, false, false), // Unknown or vacant after a failed claim.
+            (true, true, false),
+            (false, true, false),
+        ];
+        for (owned, lock_lost, expected) in cases {
+            assert_eq!(
+                resize_dispatch_authorized(owned, lock_lost),
+                expected,
+                "owned={owned}, lock_lost={lock_lost}",
+            );
+        }
     }
 
     #[test]

@@ -887,9 +887,6 @@ impl Session {
         &self,
         lines: usize,
     ) -> Result<(String, Option<PaneCursor>)> {
-        if !self.exists() {
-            return Ok((String::new(), None));
-        }
         let deadline = crate::tmux::TmuxCommandDeadline::new();
         self.capture_window_composited_with_cursor_with_deadline(lines, &deadline)
     }
@@ -1208,9 +1205,6 @@ impl Session {
     /// which beats painting it on the wrong row. At rest the first try
     /// agrees and the cursor never blinks.
     pub fn capture_pane_with_cursor(&self, lines: usize) -> Result<(String, Option<PaneCursor>)> {
-        if !self.exists() {
-            return Ok((String::new(), None));
-        }
         let deadline = crate::tmux::TmuxCommandDeadline::new();
         self.capture_pane_with_cursor_with_deadline(lines, &deadline)
     }
@@ -2867,6 +2861,24 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(100));
         }
         let (content, cursor) = painted;
+
+        for (label, composited) in [("pane", false), ("composited window", true)] {
+            let _ = crate::tmux::fork_probe::take();
+            let probe = crate::tmux::fork_probe::arm();
+            if composited {
+                session
+                    .capture_window_composited_with_cursor(5)
+                    .expect("composited capture");
+            } else {
+                session.capture_pane_with_cursor(5).expect("pane capture");
+            }
+            drop(probe);
+            assert_eq!(
+                crate::tmux::fork_probe::take(),
+                1,
+                "{label} capture must use one operation deadline and one tmux invocation",
+            );
+        }
 
         // The capture content is the same text the plain path would return:
         // the cursor line must have been split off, not leak into the body.
