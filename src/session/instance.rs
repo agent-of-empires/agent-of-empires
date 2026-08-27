@@ -3224,9 +3224,16 @@ impl Instance {
         )
     }
 
-    /// Whether at least one OTHER AoE instance shares this session's exact
-    /// project_path (canonicalized, mirroring the exclusion-set walk).
-    fn opencode_shares_project_path(&self) -> bool {
+    /// Whether at least one OTHER host-opencode instance shares this
+    /// session's exact project_path (canonicalized, mirroring the
+    /// exclusion-set walk). Only non-sandboxed opencode instances share the
+    /// global SQLite store: sandboxed sessions own instance-private stores
+    /// (#3317), and other tools scan their own distinct transcript dirs, so
+    /// neither can be confused with this store's freshest conversation.
+    fn opencode_shares_store_with_peer(&self) -> bool {
+        if self.is_sandboxed() {
+            return false;
+        }
         let Ok(storage) = super::storage::Storage::new_unwatched(&self.effective_profile()) else {
             return false;
         };
@@ -3235,7 +3242,10 @@ impl Instance {
         };
         let canon = super::capture::canonicalize_or_raw(&self.project_path);
         instances.iter().any(|i| {
-            i.id != self.id && super::capture::canonicalize_or_raw(&i.project_path) == canon
+            i.id != self.id
+                && i.tool == "opencode"
+                && !i.is_sandboxed()
+                && super::capture::canonicalize_or_raw(&i.project_path) == canon
         })
     }
 
@@ -3280,11 +3290,12 @@ impl Instance {
                 }
             }
             "opencode" => {
-                // Multi-session-same-cwd guard: with >1 AoE instance on this
-                // project_path the launch-time freshest-MRU scan cannot
-                // attribute the directory's newest conversation to THIS
-                // session (#2344/#2708 family). Resume trusts the stored sid.
-                if self.opencode_shares_project_path() {
+                // Multi-session-same-cwd guard: with another HOST-OPENCODE
+                // instance on this project_path/store, the launch-time
+                // freshest-MRU scan cannot attribute the directory's newest
+                // conversation to THIS session (#2344/#2708 family). Resume
+                // trusts the stored sid.
+                if self.opencode_shares_store_with_peer() {
                     tracing::debug!(target: "session.capture",
                         instance = %self.id,
                         "skipping opencode retroactive capture: project_path shared");
@@ -17454,39 +17465,13 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
 #[cfg(test)]
 mod opencode_same_cwd_clobbering_tests {
     use super::*;
+    use crate::session::test_support::EnvGuard;
+    use crate::session::Status;
     use std::path::PathBuf;
     use tempfile::tempdir;
 
     const OC_SID_SELF: &str = "019342ab-1234-7def-8901-oc0000000001";
     const OC_SID_PEER: &str = "019342ab-1234-7def-8901-oc0000000002";
-
-    /// Redirects HOME/XDG_CONFIG_HOME into a temp dir while a serial test runs.
-    struct TestHome {
-        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
-    }
-
-    impl TestHome {
-        fn new(dir: &std::path::Path) -> Self {
-            let mut saved = Vec::new();
-            for key in ["HOME", "XDG_CONFIG_HOME"] {
-                saved.push((key, std::env::var_os(key)));
-            }
-            std::env::set_var("HOME", dir);
-            std::env::set_var("XDG_CONFIG_HOME", dir.join(".config"));
-            Self { saved }
-        }
-    }
-
-    impl Drop for TestHome {
-        fn drop(&mut self) {
-            for (key, val) in self.saved.drain(..) {
-                match val {
-                    Some(v) => std::env::set_var(key, v),
-                    None => std::env::remove_var(key),
-                }
-            }
-        }
-    }
 
     fn seed_two(profile: &str, me: &Instance, peer: &Instance) {
         let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
@@ -17500,10 +17485,15 @@ mod opencode_same_cwd_clobbering_tests {
             .unwrap();
     }
 
+    #[serial_test::serial]
     #[test]
     fn exclusion_set_includes_inactive_same_cwd_peer_for_opencode() {
         let temp = tempdir().unwrap();
-        let _home = TestHome::new(temp.path());
+        #[allow(unused_mut)]
+        let mut pairs: Vec<(&'static str, PathBuf)> = vec![("HOME", temp.path().to_path_buf())];
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        pairs.push(("XDG_CONFIG_HOME", temp.path().join(".config")));
+        let _guard = EnvGuard::set(&pairs);
 
         let profile = "oc-cwd-excl";
         let mut me = Instance::new("me-row", "/tmp/aoe-shared-cwd-a");
@@ -17514,7 +17504,7 @@ mod opencode_same_cwd_clobbering_tests {
         let mut peer = Instance::new("peer-row", "/tmp/aoe-shared-cwd-a");
         peer.source_profile = profile.to_string();
         peer.tool = "opencode".to_string();
-        peer.status = crate::session::Status::Stopped;
+        peer.status = Status::Stopped;
         peer.agent_session_id = Some(OC_SID_PEER.to_string());
         seed_two(profile, &me, &peer);
 
@@ -17525,10 +17515,15 @@ mod opencode_same_cwd_clobbering_tests {
         );
     }
 
+    #[serial_test::serial]
     #[test]
     fn retroactive_capture_is_skipped_when_project_path_is_shared() {
         let temp = tempdir().unwrap();
-        let _home = TestHome::new(temp.path());
+        #[allow(unused_mut)]
+        let mut pairs: Vec<(&'static str, PathBuf)> = vec![("HOME", temp.path().to_path_buf())];
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        pairs.push(("XDG_CONFIG_HOME", temp.path().join(".config")));
+        let _guard = EnvGuard::set(&pairs);
 
         let profile = "oc-cwd-skip";
         let mut me = Instance::new("me-row", "/tmp/aoe-shared-cwd-b");
