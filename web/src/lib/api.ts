@@ -1,3 +1,4 @@
+import type { AgentLifecycleInfo } from "./agentProfiles";
 import { clientFormFactor } from "./formFactor";
 import type {
   SessionResponse,
@@ -744,8 +745,7 @@ export type PluginUiSlot =
   | "pane"
   | "composer-action"
   | "detail-badge"
-  | "settings-page"
-  | "tool-card-badge"
+  | "home-pane"
   | "notification";
 
 /** One piece of UI state a worker pushed. `payload` shape is determined by
@@ -1412,6 +1412,10 @@ export interface AcpAgentInfo {
   name: string;
   description: string;
   command: string;
+  /** Registry lifecycle state, same contract as `/api/agents`: omitted
+   *  while Active so older daemons and existing consumers read as active.
+   *  Mirrors `AgentLifecycle` in src/agents.rs. */
+  lifecycle?: AgentLifecycleInfo;
 }
 
 /** List ACP registry entries the acp supervisor knows about.
@@ -1502,6 +1506,116 @@ export async function acpDisable(sessionId: string): Promise<ViewSwitchResponse 
   return fetchJson<ViewSwitchResponse>(`/api/sessions/${encodeURIComponent(sessionId)}/acp/disable`, {
     method: "POST",
   });
+}
+
+// --- Server-owned prompt queue (docs/development/server-side-prompt-queue.md) ---
+//
+// The daemon owns the structured-view prompt queue, so a follow-up queued
+// behind a busy turn survives a client reload / closed PWA and drains
+// server-side. These wrap the /queue endpoints; the queue itself reflects to
+// the client on `SessionResponse.queued_prompts`.
+
+/** Metadata-only view of one queued-prompt attachment. The bytes live
+ *  server-side (the pending-attachment store) and are delivered on drain, so
+ *  the client only receives id/kind/mime/name/size for display. */
+export interface ServerQueuedAttachmentRef {
+  id: string;
+  kind: "image" | "audio" | "resource";
+  mime_type: string;
+  name?: string | null;
+  size: number;
+}
+
+/** One entry of a session's server-owned queue, as the API returns it. */
+export interface ServerQueuedPrompt {
+  id: string;
+  seq: number;
+  text: string;
+  attachments?: ServerQueuedAttachmentRef[];
+  created_at: string;
+  origin_device?: string | null;
+}
+
+/** Attachment upload shape for the queue enqueue, matching `/acp/prompt`'s
+ *  `PromptAttachmentUpload` (base64 `data`, no `data:` prefix). */
+export interface QueueAttachmentUpload {
+  kind: "image" | "audio" | "resource";
+  mimeType: string;
+  name?: string;
+  dataB64: string;
+}
+
+async function fetchOk(url: string, init?: RequestInit): Promise<boolean> {
+  try {
+    return (await fetch(url, init)).ok;
+  } catch {
+    return false;
+  }
+}
+
+const jsonInit = (method: string, body: unknown): RequestInit => ({
+  method,
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify(body),
+});
+
+/** Enqueue a prompt server-side (POST /queue). `id` is the client-minted stable
+ *  id so an optimistic row reconciles against the returned entry; re-posting the
+ *  same id updates it in place rather than duplicating. Returns the stored entry
+ *  (with its assigned `seq`) or null on non-2xx. */
+export async function enqueueServerPrompt(
+  sessionId: string,
+  prompt: {
+    id: string;
+    text: string;
+    createdAt?: string;
+    originDevice?: string;
+    attachments?: QueueAttachmentUpload[];
+  },
+): Promise<ServerQueuedPrompt | null> {
+  return fetchJson<ServerQueuedPrompt>(
+    `/api/sessions/${encodeURIComponent(sessionId)}/queue`,
+    jsonInit("POST", {
+      id: prompt.id,
+      text: prompt.text,
+      created_at: prompt.createdAt,
+      origin_device: prompt.originDevice,
+      attachments: (prompt.attachments ?? []).map((a) => ({
+        kind: a.kind,
+        mime_type: a.mimeType,
+        data: a.dataB64,
+        name: a.name,
+      })),
+    }),
+  );
+}
+
+/** The session's server queue, ordered by `seq` (GET /queue). Always returns an
+ *  array: a non-array body (error page, unexpected shape) yields `[]` so callers
+ *  can `.map` without guarding. */
+export async function listServerQueue(sessionId: string): Promise<ServerQueuedPrompt[]> {
+  const rows = await fetchJson<ServerQueuedPrompt[]>(`/api/sessions/${encodeURIComponent(sessionId)}/queue`);
+  return Array.isArray(rows) ? rows : [];
+}
+
+/** Replace a queued prompt's text (PATCH /queue/{id}). */
+export async function editServerQueuedPrompt(sessionId: string, promptId: string, text: string): Promise<boolean> {
+  return fetchOk(
+    `/api/sessions/${encodeURIComponent(sessionId)}/queue/${encodeURIComponent(promptId)}`,
+    jsonInit("PATCH", { text }),
+  );
+}
+
+/** Remove one queued prompt (DELETE /queue/{id}). */
+export async function removeServerQueuedPrompt(sessionId: string, promptId: string): Promise<boolean> {
+  return fetchOk(`/api/sessions/${encodeURIComponent(sessionId)}/queue/${encodeURIComponent(promptId)}`, {
+    method: "DELETE",
+  });
+}
+
+/** Drop the whole server queue for a session (DELETE /queue). */
+export async function clearServerQueue(sessionId: string): Promise<boolean> {
+  return fetchOk(`/api/sessions/${encodeURIComponent(sessionId)}/queue`, { method: "DELETE" });
 }
 
 // --- Acp install agent (Tier 2 of #2109) ---
@@ -1618,10 +1732,12 @@ export async function browseFilesystem(
   path: string,
   limit?: number,
   filter?: string,
+  showHidden = false,
 ): Promise<BrowseResponse & { ok: boolean }> {
   const params = new URLSearchParams({ path });
   if (limit != null) params.set("limit", String(limit));
   if (filter) params.set("filter", filter);
+  if (showHidden) params.set("show_hidden", "true");
   const data = await fetchJson<BrowseResponse>(`/api/filesystem/browse?${params}`);
   if (!data) return { entries: [], has_more: false, ok: false };
   return { ...data, ok: true };
@@ -2049,14 +2165,23 @@ export async function logout(): Promise<void> {
  * to match and returns 409 if the session is running, so the message is
  * surfaced to the caller. See #1927.
  */
-export async function renameSession(id: string, title: string): Promise<{ ok: boolean; message?: string }> {
+export async function renameSession(
+  id: string,
+  title: string,
+): Promise<{ ok: boolean; message?: string; warnings?: string[] }> {
   try {
     const res = await fetch(`/api/sessions/${id}`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ title }),
     });
-    if (res.ok) return { ok: true };
+    if (res.ok) {
+      const body = await res.json().catch(() => null);
+      const warnings = Array.isArray(body?.warnings)
+        ? body.warnings.filter((warning: unknown): warning is string => typeof warning === "string")
+        : [];
+      return warnings.length > 0 ? { ok: true, warnings } : { ok: true };
+    }
     let message: string | undefined;
     try {
       const body = await res.json();
@@ -2267,15 +2392,21 @@ export async function setSessionNotifications(id: string, preset: "off" | "defau
   }
 }
 
-/** Set the per-session diff-base override. Pass `null` to clear the
- *  override and fall back to the profile default / auto-detection.
- *  See #970. */
-export async function setSessionDiffBase(id: string, baseBranch: string | null): Promise<SessionResponse | null> {
+/** Set the diff-base override for one repo. Pass `null` as the branch to
+ *  clear it and fall back to the repo's recorded creation base, then the
+ *  profile default, then auto-detection. `repo` names a workspace member;
+ *  omit it for a single-repo session's own checkout, which is the only entry
+ *  such a session has. See #970, #3329. */
+export async function setSessionDiffBase(
+  id: string,
+  baseBranch: string | null,
+  repo?: string | null,
+): Promise<SessionResponse | null> {
   try {
     const res = await fetch(`/api/sessions/${id}/diff-base`, {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ base_branch: baseBranch }),
+      body: JSON.stringify(repo ? { base_branch: baseBranch, repo } : { base_branch: baseBranch }),
     });
     if (!res.ok) return null;
     return (await res.json()) as SessionResponse;

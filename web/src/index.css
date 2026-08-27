@@ -179,6 +179,12 @@ html {
   height: 100dvh;
   overflow: hidden;
   overscroll-behavior: none;
+  overscroll-behavior-x: none;
+  /* Claim horizontal edge drags for the app. On iOS this prevents a swipe
+     from beginning the browser-history gesture while an overlay sidebar is
+     handling the same touch. Terminal forward mode opts into `none` on its
+     own scroller, so its custom vertical gesture remains unaffected. */
+  touch-action: pan-y pinch-zoom;
   /* safe-area insets are handled by the App root, not html, to avoid
      making the document taller than the viewport (which lets iOS scroll
      the page when the keyboard opens, breaking keyboard-height math). */
@@ -199,14 +205,53 @@ body {
   background: var(--color-surface-900);
   color: var(--color-text-primary);
   overscroll-behavior: none;
+  overscroll-behavior-x: none;
+  touch-action: pan-y pinch-zoom;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
+}
+
+#root {
+  height: 100%;
+}
+
+@media (pointer: coarse) {
+  #root {
+    position: fixed;
+    inset: 0;
+    width: 100%;
+    overflow: hidden;
+  }
 }
 
 /* Structured view markdown — assistant-ui's MarkdownTextPrimitive renders
    raw <p>/<ul>/<ol>/<h*>/<blockquote>/<code> elements (no class
    names). Style them via descendant selectors so the prose looks
    right inside the structured-view conversation. */
+/* The structured-view root publishes both conversation font-size preferences as
+   custom properties; CSS picks the active one, so a resize or an orientation
+   change switches sizes without a reload. Desktop is the default and mobile is
+   the override, keyed on the same classifier `clientFormFactor()` uses: coarse
+   primary pointer AND a viewport below the 768px `md` breakpoint. A touch
+   laptop and a narrow desktop window both stay on the desktop size, matching
+   how the rest of the dashboard decides what "mobile" means. */
+.acp-conversation-scope {
+  --acp-conversation-font-size: var(--acp-conversation-font-size-desktop, 0.875rem);
+}
+@media (pointer: coarse) and (max-width: 767.98px) {
+  .acp-conversation-scope {
+    --acp-conversation-font-size: var(--acp-conversation-font-size-mobile, 0.875rem);
+  }
+}
+/* Only the conversation renderer (Markdown.tsx) opts in. The other
+   `.acp-markdown` consumers (tool-card bodies, the diff pane's file viewer)
+   keep their own explicit sizes, so the child typography below stays in `rem`
+   for them and is re-expressed in `em` under `.acp-markdown-body` only. */
+.acp-markdown-body {
+  /* Fallback matches the previous fixed `text-sm` for transcript markdown
+     rendered outside the structured-view root (e.g. the skills manager). */
+  font-size: var(--acp-conversation-font-size, 0.875rem);
+}
 .acp-markdown p {
   margin: 0.5rem 0;
 }
@@ -368,6 +413,28 @@ body {
 }
 .acp-markdown tbody tr:last-child td {
   border-bottom: none;
+}
+
+/* Child typography for the opted-in conversation renderer only, in `em` so the
+   whole hierarchy scales with the user's base size. The doubled class outranks
+   the single-class `.acp-markdown <type>` rules above regardless of where they
+   sit in the file. Ratios reproduce the `rem` values at the 14px default; the
+   other `.acp-markdown` consumers set their own base (tool cards render at
+   11px) and keep the fixed `rem` sizes. */
+.acp-markdown.acp-markdown-body h1 {
+  font-size: 1.43em; /* 20px at the 14px default */
+}
+.acp-markdown.acp-markdown-body h2 {
+  font-size: 1.29em; /* 18px at the 14px default */
+}
+.acp-markdown.acp-markdown-body h3 {
+  font-size: 1.14em; /* 16px at the 14px default */
+}
+.acp-markdown.acp-markdown-body th {
+  font-size: 0.79em; /* 11px at the 14px default */
+}
+.acp-markdown.acp-markdown-body td {
+  font-size: 0.86em; /* 12px at the 14px default */
 }
 
 /* Subtle scrollbar styling */
@@ -571,5 +638,12 @@ select:focus-visible,
 }
 
 .safe-area-inset {
-  padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
+  /* Top/right/left only. The BOTTOM inset is intentionally NOT reserved here:
+     the App root is `overflow-hidden`, so a bottom-anchored child (the ACP
+     composer, the terminal toolbar) that tried to reach the physical edge got
+     clipped at the padding edge on iOS. Instead each bottom-anchored surface
+     owns its own `env(safe-area-inset-bottom)` clearance, and the composer
+     hugs the bottom with no reservation. iOS reports the bottom inset as 0
+     while the keyboard is open, so the keyboard-lift math is unaffected. */
+  padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);
 }

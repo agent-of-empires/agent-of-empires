@@ -23,6 +23,21 @@ pub const ARCHIVED_SECTION_NAME: &str = "Archived";
 pub const TRASH_SECTION_PATH: &str = "__aoe_trash_section__";
 pub const TRASH_SECTION_NAME: &str = "Trash";
 
+/// Synthetic group identity for the scratch bucket in project mode. Unlike the
+/// Archived/Trash shelves this IS a real in-flow GroupTree node built from live
+/// scratch sessions, so it is keyed on a sentinel PATH whose `__aoe_*_group__`
+/// shape no plausible real repo basename equals (same accepted tradeoff as
+/// `ARCHIVED_/TRASH_SECTION_PATH`), while its display name is seeded separately
+/// (the way org host-scoped keys are). That keeps a user's own repo named
+/// `scratch` on a distinct identity instead of merging into the bucket (#3237).
+pub const SCRATCH_GROUP_PATH: &str = "__aoe_scratch_group__";
+/// Capitalized so the bucket reads as a system group rather than a repo
+/// basename, matching the web sidebar's `Scratch` label. Only safe to differ
+/// from the basename because the identity above no longer rides on the label.
+/// Name sorts lowercase both here and in `sort_by_name`, so the header still
+/// lands at `s`.
+pub const SCRATCH_GROUP_NAME: &str = "Scratch";
+
 #[inline]
 pub fn is_archived_section_path(path: &str) -> bool {
     path == ARCHIVED_SECTION_PATH
@@ -31,6 +46,12 @@ pub fn is_archived_section_path(path: &str) -> bool {
 #[inline]
 pub fn is_trash_section_path(path: &str) -> bool {
     path == TRASH_SECTION_PATH
+}
+
+/// Exact match for the synthetic scratch bucket's sentinel identity path.
+#[inline]
+fn is_scratch_group_path(path: &str) -> bool {
+    path == SCRATCH_GROUP_PATH
 }
 
 /// True for the Trash section sentinel or anything nested under it. Mirrors
@@ -58,6 +79,27 @@ pub fn is_within_archived_section(path: &str) -> bool {
 #[inline]
 pub fn archived_project_sub_path(project_name: &str) -> String {
     format!("{}/{}", ARCHIVED_SECTION_PATH, project_name)
+}
+
+/// True for any project-mode header that is synthetic rather than a real,
+/// pinnable repo: the Archived/Trash shelves (and anything nested under them)
+/// and the scratch bucket. Keyed on the path (identity), never the display
+/// label, so a real repo named `scratch` is not caught.
+#[inline]
+pub fn is_synthetic_project_header(path: &str) -> bool {
+    is_within_archived_section(path) || is_within_trash_section(path) || is_scratch_group_path(path)
+}
+
+/// Map a project-mode group identity key to its human display label, for the
+/// sites that render a raw `group_path` to the user. Only the scratch sentinel
+/// differs from its key; every real repo key already IS its label.
+#[inline]
+pub fn project_group_display_name(key: &str) -> &str {
+    if is_scratch_group_path(key) {
+        SCRATCH_GROUP_NAME
+    } else {
+        key
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1169,7 +1211,7 @@ pub fn append_archived_section_by_project(
         let sub_collapsed = project_collapsed.get(&sub_path).copied().unwrap_or(false);
         items.push(Item::Group {
             path: sub_path,
-            name: project_name,
+            name: project_group_display_name(&project_name).to_string(),
             depth: 1,
             collapsed: sub_collapsed,
             session_count: sessions.len(),
@@ -1196,10 +1238,18 @@ pub fn append_archived_section_by_project(
 /// uses the min `archived_at` ascending. Attention falls back to
 /// most-recently-archived because archived rows are all tier 99 in the
 /// attention bucket and the tier offers no discriminator inside the shelf.
+///
+/// The bucket key is an identity, not always the label, so AZ/ZA sort on the
+/// display name: the scratch sentinel would otherwise sort under `_` and jump
+/// ahead of every real project instead of landing at `s` (#3237).
 fn sort_archived_project_buckets(buckets: &mut [(String, Vec<&Instance>)], sort_order: SortOrder) {
     match sort_order {
-        SortOrder::AZ => buckets.sort_by_key(|b| b.0.to_lowercase()),
-        SortOrder::ZA => buckets.sort_by_key(|b| Reverse(b.0.to_lowercase())),
+        SortOrder::AZ => {
+            buckets.sort_by_key(|b| project_group_display_name(&b.0).to_lowercase());
+        }
+        SortOrder::ZA => {
+            buckets.sort_by_key(|b| Reverse(project_group_display_name(&b.0).to_lowercase()));
+        }
         SortOrder::Oldest => {
             buckets.sort_by_key(|(_, sessions)| {
                 sessions
@@ -2300,7 +2350,7 @@ mod tests {
         let mut new_plain = Instance::new("new_plain", "/tmp/np");
         new_plain.created_at = chrono::Utc::now();
 
-        let instances = vec![old_fav, new_plain];
+        let instances = [old_fav, new_plain];
 
         // Feature off: plain newest-first, unchanged behavior.
         let mut refs: Vec<&Instance> = instances.iter().collect();
@@ -2325,7 +2375,7 @@ mod tests {
         fav_new.favorite();
         let plain = Instance::new("plain", "/tmp/p");
 
-        let instances = vec![fav_old, fav_new, plain];
+        let instances = [fav_old, fav_new, plain];
         let mut refs: Vec<&Instance> = instances.iter().collect();
         sort_sessions_inner(&mut refs, SortOrder::Newest, true);
 
@@ -2341,7 +2391,7 @@ mod tests {
         z_fav.favorite();
         let a_plain = Instance::new("apple", "/tmp/a");
 
-        let instances = vec![z_fav, a_plain];
+        let instances = [z_fav, a_plain];
 
         let mut refs: Vec<&Instance> = instances.iter().collect();
         sort_sessions_inner(&mut refs, SortOrder::AZ, true);
@@ -2362,7 +2412,7 @@ mod tests {
         let mut new_plain = Instance::new("new_plain", "/tmp/np");
         new_plain.created_at = chrono::Utc::now();
 
-        let instances = vec![snoozed_fav, new_plain];
+        let instances = [snoozed_fav, new_plain];
         let mut refs: Vec<&Instance> = instances.iter().collect();
         sort_sessions_inner(&mut refs, SortOrder::Newest, true);
 
@@ -2516,7 +2566,7 @@ mod tests {
         let mut plain_waiting = Instance::new("plain_waiting", "/tmp/pw");
         plain_waiting.status = crate::session::Status::Waiting;
 
-        let instances = vec![fav_idle, plain_waiting];
+        let instances = [fav_idle, plain_waiting];
 
         let mut on: Vec<&Instance> = instances.iter().collect();
         sort_sessions_inner(&mut on, SortOrder::Attention, true);
@@ -2869,5 +2919,32 @@ mod tests {
         let inst: Instance = serde_json::from_str(legacy).unwrap();
         assert!(!inst.is_archived());
         assert!(inst.archived_at.is_none());
+    }
+
+    /// #3237: the scratch bucket's key is a sentinel, so name-ordering the
+    /// archived sub-folders on the raw key would sort it under `_` and hoist
+    /// it above every real project. It must sort where its label reads.
+    #[test]
+    fn archived_project_buckets_name_sort_uses_display_label() {
+        let myrepo = Instance::new("a", "/repos/myrepo");
+        let throwaway = Instance::new("b", "/app/scratch/x");
+        let zeta = Instance::new("c", "/repos/zeta");
+        let cases = [
+            (SortOrder::AZ, ["myrepo", SCRATCH_GROUP_NAME, "zeta"]),
+            (SortOrder::ZA, ["zeta", SCRATCH_GROUP_NAME, "myrepo"]),
+        ];
+        for (order, expected) in cases {
+            let mut buckets: Vec<(String, Vec<&Instance>)> = vec![
+                ("myrepo".to_string(), vec![&myrepo]),
+                (SCRATCH_GROUP_PATH.to_string(), vec![&throwaway]),
+                ("zeta".to_string(), vec![&zeta]),
+            ];
+            sort_archived_project_buckets(&mut buckets, order);
+            let labels: Vec<&str> = buckets
+                .iter()
+                .map(|b| project_group_display_name(&b.0))
+                .collect();
+            assert_eq!(labels, expected, "{order:?}");
+        }
     }
 }

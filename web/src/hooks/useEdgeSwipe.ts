@@ -13,6 +13,9 @@ interface EdgeSwipeOptions {
 }
 
 const EDGE_PX = 24;
+// iOS reserves a strip on the left for browser / system back navigation. A
+// from-anywhere sidebar gesture must leave it alone or both handlers fire.
+const SYSTEM_BACK_GUARD_PX = 32;
 const THRESHOLD_PX = 60;
 // A from-anywhere swipe needs to travel further (and stay clearly horizontal)
 // so it doesn't trigger on a stray drag mid-screen.
@@ -41,6 +44,7 @@ export function useEdgeSwipe({ edge, enabled, onSwipe, blurOnSwipe = false, anyw
       if (!t) return;
       const inEdge = edge === "left" ? t.clientX <= EDGE_PX : t.clientX >= window.innerWidth - EDGE_PX;
       if (!anywhere && !inEdge) return;
+      if (anywhere && edge === "left" && t.clientX <= SYSTEM_BACK_GUARD_PX) return;
       tracking = true;
       startX = t.clientX;
       startY = t.clientY;

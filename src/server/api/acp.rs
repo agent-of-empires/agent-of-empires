@@ -13,6 +13,7 @@ use axum::Json;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::acp::acp_client::AcpError;
 use crate::acp::approvals::Nonce;
 use crate::acp::elicitations::ElicitationResolution;
 use crate::acp::event_store::AttachmentBlob;
@@ -96,7 +97,7 @@ pub(crate) fn sniff_image_mime(bytes: &[u8]) -> Option<&'static str> {
 /// and forward, or an HTTP `(status, message)` to return verbatim.
 /// Runs entirely before the prompt is published so a rejected prompt
 /// never leaves a half-rendered attachment in the transcript.
-fn validate_attachments(
+pub(crate) fn validate_attachments(
     state: &AppState,
     session_id: &str,
     uploads: &[PromptAttachmentUpload],
@@ -307,6 +308,21 @@ fn supervisor_error_response(context: &str, err: &SupervisorError) -> axum::resp
         SupervisorError::CapacityFull { .. } => {
             (StatusCode::SERVICE_UNAVAILABLE, err.to_string()).into_response()
         }
+        // 503, not 500: the worker's connection task has ended but its
+        // handle is still in the map, so the command send fails
+        // instantly. That is the teardown window a user-initiated force
+        // stop opens (kill the process group, respawn with
+        // `session/load`), and the worker is on its way back, so the
+        // request lost a race with a restart the user asked for rather
+        // than hitting a fault. The `worker_not_ready` prefix is the
+        // marker the structured view already treats as transient: it
+        // re-queues and re-fires instead of retiring the prompt and
+        // banner-ing the user. See #3401.
+        SupervisorError::Acp(AcpError::AgentExited | AcpError::NotRunning) => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            format!("worker_not_ready: {context}: {err}"),
+        )
+            .into_response(),
         SupervisorError::Acp(_)
         | SupervisorError::InvalidAgentCommand(_)
         | SupervisorError::SpawnCancelled(_) => (
@@ -834,13 +850,20 @@ pub struct AcpAgentInfo {
     pub name: String,
     pub description: String,
     pub command: String,
+    /// Registry lifecycle state, same contract as `/api/agents`: omitted
+    /// while Active so existing consumers see no change. Lets the
+    /// switch-agent modal label deprecated backends without depending on
+    /// the static frontend mirror being current.
+    #[serde(skip_serializing_if = "crate::agents::AgentLifecycle::is_active")]
+    pub lifecycle: crate::agents::AgentLifecycle,
 }
 
-/// `GET /api/acp/agents`: list the ACP registry entries the
+/// `GET /api/acp/agents`: list the built-in ACP registry entries the
 /// supervisor knows about. Distinct from `/api/agents` (which lists
 /// session-tool agents like claude/codex/cursor for the wizard);
 /// this returns the *structured view* ACP backend registry so the recovery
-/// modal can show what the user can hand off to. See #1282.
+/// modal can show what the user can hand off to. Custom `agent_acp_cmd`
+/// agents are intentionally not included here. See #1282.
 ///
 /// Filtered by the operator agent allowlist (#3241), so the switch-agent modal
 /// offers only what the policy permits instead of listing a target that
@@ -867,6 +890,7 @@ fn acp_agent_entries(
             name: name.clone(),
             description: spec.description.clone(),
             command: spec.command.clone(),
+            lifecycle: crate::agents::registry_lifecycle(name),
         })
         .collect();
     entries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -893,7 +917,12 @@ pub async fn get_option_catalog() -> impl IntoResponse {
 /// transcript; only the recorded `reason` differs.
 ///
 /// Sequence:
-///   1. Validate `target` exists in the structured view registry.
+///   1. Look up the instance, then validate `target` is a built-in
+///      registry agent or a configured custom ACP agent for the
+///      session's profile. Looking up the instance first is required
+///      because custom agents are profile-specific; it also means a
+///      non-existent session returns 404 before an unknown agent
+///      returns 400.
 ///   2. Snapshot `before_seq` = highest seq in the event store, so the
 ///      handoff `AgentSwitched` event lands at a known cursor and the
 ///      frontend's primer fetch (`fetchContextPrimer(before_seq)`)
@@ -929,7 +958,28 @@ pub async fn switch_acp_agent(
     if target.is_empty() {
         return (StatusCode::BAD_REQUEST, "target is required").into_response();
     }
-    if !state.acp_supervisor.registry_has_agent(&target).await {
+
+    // Look up the instance first: custom agents are profile-specific, so
+    // validation needs the session's source_profile and project_path. This
+    // also means a non-existent session returns 404 before an unknown agent
+    // returns 400, and a configured-but-disallowed custom agent returns 403
+    // instead of 400.
+    let instance = {
+        let instances = state.instances.read().await;
+        match instances.iter().find(|i| i.id == id).cloned() {
+            Some(inst) => inst,
+            None => return (StatusCode::NOT_FOUND, "session not found").into_response(),
+        }
+    };
+    if !state
+        .acp_supervisor
+        .agent_is_valid_switch_target(
+            &target,
+            &instance.source_profile,
+            std::path::Path::new(&instance.project_path),
+        )
+        .await
+    {
         return (
             StatusCode::BAD_REQUEST,
             format!("unknown structured view agent: {target}"),
@@ -939,7 +989,7 @@ pub async fn switch_acp_agent(
     // Refuse a disallowed target here, before the shutdown below tears the
     // current worker down. The spawn choke point would refuse it anyway, but by
     // then the session has lost the worker it was happily using and the user is
-    // left with nothing running. Same reason the registry check above is a
+    // left with nothing running. Same reason the validation check above is a
     // preflight. See #3241.
     if !super::agent_policy().await.allows(&target) {
         return (
@@ -948,14 +998,6 @@ pub async fn switch_acp_agent(
         )
             .into_response();
     }
-
-    let instance = {
-        let instances = state.instances.read().await;
-        match instances.iter().find(|i| i.id == id).cloned() {
-            Some(inst) => inst,
-            None => return (StatusCode::NOT_FOUND, "session not found").into_response(),
-        }
-    };
     let from_agent = state
         .acp_supervisor
         .pick_agent_for_tool(
@@ -1132,12 +1174,11 @@ pub async fn switch_acp_agent(
     .into_response()
 }
 
-/// Auto-wake an archived, snoozed, or idle-dormant session before a
-/// prompt is forwarded, matching the tmux send path
-/// (`/api/sessions/{id}/send`). `touch_last_accessed` clears
-/// `archived_at`, `snoozed_until`, and `idle_dormant_since` so the
-/// structured view reconciler stops skipping the session on its next ~2s tick and
-/// respawns the worker; the frontend's queue drains as soon as the fresh
+/// Touches the row's `last_accessed_at` on every prompt (a prompt is a
+/// user gesture, and structured rows have no other per-prompt recency
+/// writer since the intent stamp was dropped for #3465), then wakes a
+/// sunk row: archived_at/snoozed_until are cleared and an idle-dormant
+/// worker respawns; the frontend's queue drains as soon as the fresh
 /// `AcpSessionAssigned` lands. The idle_dormant clear is the wake path for
 /// auto-stopped idle workers (#1689); a worker reaped for inactivity
 /// respawns on the next prompt. See #1581.
@@ -1155,33 +1196,33 @@ pub async fn switch_acp_agent(
 /// Returns whether the wake cleared an idle-dormant marker, so the caller
 /// can synchronously kick a background respawn (the reconciler's ~2s tick
 /// is too slow for the prompt that triggered the wake; see #1748).
-async fn touch_and_wake_if_sunk(state: &Arc<AppState>, id: &str) -> bool {
+async fn touch_on_prompt_and_wake_if_sunk(state: &Arc<AppState>, id: &str) -> bool {
     let inst_lock = state.instance_lock(id).await;
     let _guard = inst_lock.lock().await;
-    let (triage_changed, woke_idle_dormant) = {
+    let (found, wake, woke_idle_dormant) = {
         let mut instances = state.instances.write().await;
         if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
             let was_idle_dormant = inst.is_idle_dormant();
-            let was_sunk = inst.is_archived() || inst.is_snoozed() || was_idle_dormant;
-            if was_sunk {
-                inst.touch_last_accessed();
-                if was_idle_dormant {
-                    // Pairs with the "auto-stopped idle structured view worker"
-                    // info log in the reconciler's reap pass (#1689) so the
-                    // stop/resume cycle is traceable in the daemon log.
-                    tracing::info!(
-                        target: "acp.supervisor",
-                        session = %id,
-                        "waking idle-dormant structured view session on prompt; spawning a fresh worker"
-                    );
-                }
+            let wake = inst.is_archived() || inst.is_snoozed() || was_idle_dormant;
+            // Memory side: a prompt is a user gesture, so refresh recency
+            // and lift sinks unconditionally.
+            inst.touch_last_accessed();
+            if was_idle_dormant {
+                // Pairs with the "auto-stopped idle structured view worker"
+                // info log in the reconciler's reap pass (#1689) so the
+                // stop/resume cycle is traceable in the daemon log.
+                tracing::info!(
+                    target: "acp.supervisor",
+                    session = %id,
+                    "waking idle-dormant structured view session on prompt; spawning a fresh worker"
+                );
             }
-            (was_sunk, was_idle_dormant)
+            (true, wake, was_idle_dormant)
         } else {
-            (false, false)
+            (false, false, false)
         }
     };
-    if triage_changed {
+    if found {
         let profile = {
             let instances = state.instances.read().await;
             instances
@@ -1196,7 +1237,7 @@ async fn touch_and_wake_if_sunk(state: &Arc<AppState>, id: &str) -> bool {
             match tokio::task::spawn_blocking(move || {
                 storage.update(|instances, _groups| {
                     if let Some(inst) = instances.iter_mut().find(|i| i.id == id_clone) {
-                        inst.touch_last_accessed();
+                        apply_prompt_persist_to_disk(inst, wake);
                     }
                     Ok(())
                 })
@@ -1207,17 +1248,63 @@ async fn touch_and_wake_if_sunk(state: &Arc<AppState>, id: &str) -> bool {
                 Ok(Err(e)) => tracing::warn!(
                     target: "http.api.acp",
                     session = %session_id_for_log,
-                    "failed to save after triage auto-wake: {e}"
+                    "failed to save after prompt touch and wake: {e}"
                 ),
                 Err(join_err) => tracing::warn!(
                     target: "http.api.acp",
                     session = %session_id_for_log,
-                    "spawn_blocking join error during triage auto-wake save: {join_err}"
+                    "spawn_blocking join error during prompt touch save: {join_err}"
                 ),
             }
         }
     }
     woke_idle_dormant
+}
+
+/// Disk-side half of [`touch_on_prompt_and_wake_if_sunk`], mirroring onto disk
+/// whatever the memory side actually did. A waking prompt keeps touch semantics
+/// and lifts the sink; any other prompt advances recency monotonically and
+/// leaves sink state alone.
+///
+/// What the second tier buys, precisely: `wake` is computed from
+/// `state.instances`, so a daemon whose memory predates a peer's archive would
+/// otherwise clear a sink it has never observed. Tier 2 stops that, and only
+/// that.
+///
+/// It does NOT make this save path safe against #3465's wipe, and it was a
+/// mistake to claim otherwise. Advancing `last_accessed_at` on disk arms the
+/// very signal the wipe keys on: `merge_user_action_diff` computes
+/// `touched = self.last_accessed_at > pre.last_accessed_at`
+/// (`session/instance.rs`) and clears `archived_at` / `snoozed_until` /
+/// `idle_dormant_since` when it holds, so a writer whose `pre` snapshot
+/// predates this advance still loses its archive one hop later. That is the
+/// documented invariant rather than a bug (a prompt is a real user gesture, and
+/// a real touch is meant to dethrone a concurrent archive); what #3465 was
+/// about is a *passive* stamp reaching the same arm with no gesture behind it.
+fn apply_prompt_persist_to_disk(disk: &mut crate::session::Instance, wake: bool) {
+    if wake {
+        disk.touch_last_accessed();
+    } else {
+        let now = chrono::Utc::now();
+        disk.last_accessed_at = disk.last_accessed_at.max(Some(now));
+    }
+}
+
+/// `POST /api/sessions/{id}/acp/prompt` success body.
+///
+/// **Breaking**: this endpoint used to answer a bare 202 with no body. It now
+/// reports what the daemon did with the prompt, because the daemon is what
+/// decides (Tier 3). Flattened, so the wire shape is
+/// `{"disposition":"sent"}` / `{"disposition":"steered"}` /
+/// `{"disposition":"queued","reason":"cancelling","queued_id":"..."}`.
+#[derive(Debug, serde::Serialize)]
+pub struct PromptDispatchResponse {
+    #[serde(flatten)]
+    pub dispatch: crate::acp::dispatch::PromptDispatch,
+    /// The queue row's id on a `queued` disposition, so a client reconciles its
+    /// optimistic row the same way the transcript reconciles by row id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub queued_id: Option<String>,
 }
 
 pub async fn acp_prompt(
@@ -1232,7 +1319,7 @@ pub async fn acp_prompt(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
-    let woke_idle_dormant = touch_and_wake_if_sunk(&state, &id).await;
+    let woke_idle_dormant = touch_on_prompt_and_wake_if_sunk(&state, &id).await;
     {
         let instances = state.instances.read().await;
         if !instances.iter().any(|i| i.id == id) {
@@ -1271,6 +1358,57 @@ pub async fn acp_prompt(
         let _serialized = inst_lock.lock().await;
         state.session_service.clear_pending_initial_turn(&id).await;
     }
+    // Tier 3: the daemon, not the client, decides whether this prompt can be
+    // sent now. See `docs/development/server-owned-prompt-dispatch.md`.
+    let dispatch = {
+        let control = crate::server::acp_ws::fold_control_state(&state, &id).await;
+        let liveness = crate::acp::dispatch::WorkerLiveness {
+            running: state.acp_supervisor.is_running(&id).await,
+            // `touch_on_prompt_and_wake_if_sunk` above already cleared the marker for a
+            // dormant session, so read the pre-clear answer it returned rather
+            // than the instance, which now says "awake".
+            idle_dormant: woke_idle_dormant,
+        };
+        crate::acp::dispatch::decide(&control, liveness)
+    };
+    if let crate::acp::dispatch::PromptDispatch::Queued { reason } = dispatch {
+        // Park it on the server-owned queue the turn-end drain already
+        // services. A client-minted id reconciles the caller's optimistic row;
+        // without one the server mints the id it returns.
+        let prompt_id = req
+            .prompt_id
+            .clone()
+            .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+        return match super::queue::buffer_and_enqueue(
+            &state,
+            &id,
+            &prompt_id,
+            req.text.clone(),
+            &attachments,
+            None,
+            chrono::Utc::now().to_rfc3339(),
+        )
+        .await
+        {
+            Ok(entry) => (
+                StatusCode::ACCEPTED,
+                Json(PromptDispatchResponse {
+                    dispatch,
+                    queued_id: Some(entry.id),
+                }),
+            )
+                .into_response(),
+            Err((status, msg)) => {
+                tracing::warn!(
+                    target: "http.api.acp",
+                    session = %id,
+                    ?reason,
+                    "prompt dispatch chose the queue but enqueue failed: {msg}"
+                );
+                (status, msg).into_response()
+            }
+        };
+    }
     let outcome = state
         .session_service
         .send_turn(
@@ -1279,6 +1417,7 @@ pub async fn acp_prompt(
             &req.text,
             &attachments,
             woke_idle_dormant,
+            req.prompt_id.clone(),
         )
         .await;
     // Smart-rename fires from `acp_event_listener` on the first clean
@@ -1286,7 +1425,14 @@ pub async fn acp_prompt(
     // races this handler's live worker for the provider API. See
     // `session::smart_rename` and #2348.
     match outcome {
-        Ok(()) => StatusCode::ACCEPTED.into_response(),
+        Ok(()) => (
+            StatusCode::ACCEPTED,
+            Json(PromptDispatchResponse {
+                dispatch,
+                queued_id: None,
+            }),
+        )
+            .into_response(),
         Err(SendTurnError::SessionNotFound) => {
             (StatusCode::NOT_FOUND, "session not found").into_response()
         }
@@ -1335,7 +1481,7 @@ pub async fn acp_prompt_diff_comments(
         Ok(j) => j,
         Err(rej) => return rej.into_response(),
     };
-    let woke_idle_dormant = touch_and_wake_if_sunk(&state, &id).await;
+    let woke_idle_dormant = touch_on_prompt_and_wake_if_sunk(&state, &id).await;
     {
         let instances = state.instances.read().await;
         if !instances.iter().any(|i| i.id == id) {
@@ -1826,65 +1972,78 @@ pub async fn acp_enable(
     // this user-initiated action; ancillary kinds delegate to the
     // shared helper so any future kind picked up by the audit lands
     // here automatically.
-    let inst_for_kill = instance.clone();
+    let inst_for_transition = instance.clone();
     let id_for_log = id.clone();
-    let kill_join = tokio::task::spawn_blocking(move || {
-        if let Err(e) = inst_for_kill.kill() {
-            tracing::warn!(target: "acp.switch", session = %inst_for_kill.id, "kill tmux failed: {e}");
+    let profile_for_transition = profile.clone();
+    let file_watch_for_transition = state.file_watch.clone();
+    let transition = tokio::task::spawn_blocking(move || -> anyhow::Result<u64> {
+        let storage =
+            crate::session::Storage::new(&profile_for_transition, file_watch_for_transition)?;
+        let _lifecycle_lock = storage
+            .acquire_instance_lifecycle_lock(&inst_for_transition.id)
+            .map_err(|error| {
+                anyhow::anyhow!("failed to acquire terminal-to-ACP lifecycle lock: {error}")
+            })?;
+        if let Err(e) = inst_for_transition.kill_locked() {
+            tracing::warn!(target: "acp.switch", session = %inst_for_transition.id, "kill tmux failed: {e}");
         }
-        inst_for_kill.kill_ancillary_tmux_sessions();
-    })
-    .await;
-    if let Err(join_err) = kill_join {
-        tracing::error!(target: "acp.switch", session = %id_for_log, "tmux teardown task panicked: {join_err}");
-    }
-    instance.view = crate::session::View::Structured;
-    instance.resume_intent = crate::session::ResumeIntent::Default;
-
-    // Persist before spawning so a crash mid-swap leaves us in the
-    // declared end state, not a half-broken intermediate.
-    //
-    // The on-disk and in-memory updates mutate ONLY the structured view-specific
-    // fields (`structured_view = true`, `resume_intent = Default`).
-    // Wholesale replacement with a pre-lock snapshot would clobber
-    // concurrent writes to other fields (status, last_accessed,
-    // agent_session_id) made by the status poll loop or other handlers
-    // between the snapshot and the lock acquisition.
-    //
-    // Clearing `resume_intent` here closes the dormant-intent gap: the
-    // CLI `set-session-id` writes `Use(sid)` to disk, then the user
-    // toggles structured view on; without this reset, a future `acp_disable`
-    // would reload the stale `Use(sid)` and the next non-structured view launch
-    // would honor a session id the user no longer expects. See #1745.
-    {
-        let mut instances = state.instances.write().await;
-        if let Some(slot) = instances.iter_mut().find(|i| i.id == id) {
+        inst_for_transition.kill_ancillary_tmux_sessions_locked();
+        storage.update(|all, _groups| {
+            let Some(slot) = all
+                .iter_mut()
+                .find(|candidate| candidate.id == inst_for_transition.id)
+            else {
+                anyhow::bail!("session disappeared during terminal-to-ACP transition");
+            };
             slot.view = crate::session::View::Structured;
             slot.resume_intent = crate::session::ResumeIntent::Default;
-        }
-    }
-    let id_for_save = id.clone();
-    let profile_for_save = profile.clone();
-    let file_watch_for_save = state.file_watch.clone();
-    let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-        let storage = crate::session::Storage::new(&profile_for_save, file_watch_for_save)?;
-        storage.update(|all, _groups| {
-            if let Some(slot) = all.iter_mut().find(|i| i.id == id_for_save) {
-                slot.view = crate::session::View::Structured;
-                slot.resume_intent = crate::session::ResumeIntent::Default;
-            }
-            Ok(())
-        })?;
-        Ok(())
+            // Reset to Idle: killing tmux above removes the poller that would
+            // settle a terminal session's status, and structured rows are
+            // skipped by the tmux poller. Structured status is event-driven
+            // (`derive_acp_status`), where only a `Stopped` maps back to Idle
+            // and the worker's connect (`AcpSessionAssigned` -> HealError)
+            // clears only Error/Stopped. So a session that was Running/Waiting
+            // at conversion would otherwise stay stuck "working" with no live
+            // turn to stop. The freshly spawned worker has no turn; a real
+            // prompt drives Running -> Stopped -> Idle normally.
+            slot.status = crate::session::Status::Idle;
+            slot.lifecycle_generation = slot.lifecycle_generation.saturating_add(1);
+            Ok(slot.lifecycle_generation)
+        })
     })
     .await;
-    match save_result {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => {
-            tracing::error!(target: "acp.switch", "save after enable: {e}");
+    let lifecycle_generation = match transition {
+        Ok(Ok(generation)) => generation,
+        Ok(Err(error)) => {
+            tracing::error!(target: "acp.switch", session = %id_for_log, "terminal-to-ACP transition failed: {error:#}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to switch session to structured view",
+            )
+                .into_response();
         }
-        Err(join_err) => {
-            tracing::error!(target: "acp.switch", "save task panicked after enable: {join_err}");
+        Err(join_error) => {
+            tracing::error!(target: "acp.switch", session = %id_for_log, "terminal-to-ACP transition task panicked: {join_error}");
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "failed to switch session to structured view",
+            )
+                .into_response();
+        }
+    };
+    instance.view = crate::session::View::Structured;
+    instance.resume_intent = crate::session::ResumeIntent::Default;
+    instance.status = crate::session::Status::Idle;
+    instance.lifecycle_generation = lifecycle_generation;
+    {
+        let mut instances = state.instances.write().await;
+        if let Some(slot) = instances.iter_mut().find(|candidate| candidate.id == id) {
+            if lifecycle_generation >= slot.lifecycle_generation {
+                slot.view = crate::session::View::Structured;
+                slot.resume_intent = crate::session::ResumeIntent::Default;
+                slot.status = crate::session::Status::Idle;
+                slot.lifecycle_generation = lifecycle_generation;
+            }
         }
     }
 
@@ -1914,6 +2073,7 @@ pub async fn acp_enable(
                 !crate::session::capture::claude_host_transcript_confirmed_absent(
                     &instance.project_path,
                     sid,
+                    &instance.resolved_host_environment(),
                 )
             })
             .unwrap_or(false);
@@ -2612,15 +2772,31 @@ pub async fn acp_replay(
     let lowest_seq = page.lowest_seq;
     let next_cursor = page.last_scanned_seq;
     let has_more = page.has_more;
-    let frames: Vec<crate::server::AcpBroadcastFrame> = page
-        .events
-        .into_iter()
-        .map(|(seq, event)| crate::server::AcpBroadcastFrame {
-            session_id: id.clone(),
-            seq,
-            event: Arc::new(event),
-        })
-        .collect();
+    // `view=rows` folds THIS page through `TranscriptModel` and returns the
+    // built rows instead of raw frames, keeping the pagination metadata
+    // identical so the client's recent-first / older-page cursor logic is
+    // unchanged. Per-page folding cannot see earlier context, so a page whose
+    // `tool_start` sits in an older page relies on `TranscriptModel`'s
+    // synth-on-missing-start (already implemented; the intended behavior).
+    let want_rows = q.view.as_deref() == Some("rows");
+    let (frames, rows) = if want_rows {
+        let mut model = crate::acp::transcript::TranscriptModel::new();
+        for (seq, event) in &page.events {
+            model.apply_event(*seq, event);
+        }
+        (Vec::new(), Some(model.rows().to_vec()))
+    } else {
+        let frames: Vec<crate::server::AcpBroadcastFrame> = page
+            .events
+            .into_iter()
+            .map(|(seq, event)| crate::server::AcpBroadcastFrame {
+                session_id: id.clone(),
+                seq,
+                event: Arc::new(event),
+            })
+            .collect();
+        (frames, None)
+    };
     // `lost = true` when the client's `since` cursor predates the oldest
     // seq still on disk. The retention cap can evict older events, so a
     // client that returns after a long absence may legitimately need a
@@ -2641,6 +2817,7 @@ pub async fn acp_replay(
         lowest_seq,
         next_cursor,
         has_more,
+        rows,
     })
     .into_response()
 }
@@ -2715,6 +2892,54 @@ mod tests {
             .with_timezone(&Utc)
     }
 
+    /// #3401: pressing Stop tears the worker down and respawns it, and a
+    /// request that lands in that window fails its command send with
+    /// `AgentExited`. Answering the user's own stop with a 500 reported a
+    /// fault for a recovery that worked, so the window maps to the
+    /// retryable `worker_not_ready` contract the structured view already
+    /// re-queues on. A real protocol fault still has to reach 500.
+    #[tokio::test]
+    async fn agent_exited_maps_to_the_retryable_status_not_a_fault() {
+        let cases = [
+            (
+                SupervisorError::Acp(AcpError::AgentExited),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                SupervisorError::Acp(AcpError::NotRunning),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                SupervisorError::Acp(AcpError::Protocol("bad frame".into())),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (
+                SupervisorError::UnknownSession("s-1".into()),
+                StatusCode::NOT_FOUND,
+            ),
+        ];
+        for (err, expected) in cases {
+            assert_eq!(
+                supervisor_error_response("prompt failed", &err).status(),
+                expected,
+                "{err}"
+            );
+        }
+
+        // The prefix is load-bearing: the composer keys its re-queue (and
+        // its banner suppression) on a 503 body that starts with it.
+        let body = supervisor_error_response(
+            "prompt failed",
+            &SupervisorError::Acp(AcpError::AgentExited),
+        )
+        .into_body();
+        let bytes = axum::body::to_bytes(body, 4096).await.unwrap();
+        assert!(
+            String::from_utf8_lossy(&bytes).starts_with("worker_not_ready"),
+            "body must carry the transient marker, got {bytes:?}"
+        );
+    }
+
     /// #3241: the switch-agent modal must not offer a target the policy refuses,
     /// so the response is filtered rather than listing everything the registry
     /// knows. Runs the real projection, not pre-filtered input.
@@ -2751,6 +2976,33 @@ mod tests {
         assert!(!entries[0].description.is_empty());
 
         assert!(names(&AgentPolicy::for_test(true, &[])).is_empty());
+    }
+
+    #[test]
+    fn acp_agent_entries_lifecycle_wire_shape() {
+        // Same contract as /api/agents: lifecycle omitted while Active,
+        // full metadata for deprecated registry keys. Pinned so the
+        // switch-agent modal's server-wins precedence has a stable shape.
+        use crate::acp::agent_policy::AgentPolicy;
+        let registry = crate::acp::AgentRegistry::with_defaults();
+        let entries = acp_agent_entries(
+            &registry,
+            &AgentPolicy::for_test(true, &["claude", "gemini"]),
+        );
+        let cases = [("claude", false), ("gemini", true)];
+        for (name, deprecated) in cases {
+            let entry = entries.iter().find(|e| e.name == name).unwrap();
+            let value = serde_json::to_value(entry).unwrap();
+            assert_eq!(
+                value.get("lifecycle").is_some(),
+                deprecated,
+                "{name}: {value}"
+            );
+            if deprecated {
+                assert_eq!(value["lifecycle"]["state"], "deprecated");
+                assert_eq!(value["lifecycle"]["replacement"], "antigravity");
+            }
+        }
     }
 
     #[test]
@@ -3112,6 +3364,7 @@ mod tests {
                     Ok(Json(PromptRequest {
                         text: "lgtm".to_string(),
                         attachments: Vec::new(),
+                        prompt_id: None,
                     })),
                 )
                 .await
@@ -3161,6 +3414,87 @@ mod tests {
 
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert!(state.instance_locks.read().await.is_empty());
+    }
+
+    #[tokio::test]
+    async fn acp_replay_view_rows_matches_frames_pagination() {
+        use crate::acp::transcript::TranscriptRowKind;
+        use axum::body::to_bytes;
+
+        let inst = crate::session::Instance::new("t", "/tmp");
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        // Scripted session: a prompt, two assistant chunks, and a terminal
+        // Stopped. Recorded straight into the store the handler reads.
+        let events = [
+            Event::UserPromptSent {
+                text: "hello".into(),
+                attachments: Vec::new(),
+                prompt_id: None,
+            },
+            Event::AgentMessageChunk { text: "hi".into() },
+            Event::AgentMessageChunk {
+                text: " there".into(),
+            },
+            Event::Stopped {
+                reason: "prompt_complete".into(),
+            },
+        ];
+        for (i, ev) in events.iter().enumerate() {
+            state
+                .acp_event_store
+                .record(&id, i as u64 + 1, ev)
+                .expect("record");
+        }
+
+        // A small page so has_more / next_cursor are non-trivial and must
+        // match between the two projections.
+        let base = ReplayQuery {
+            since: 0,
+            limit: Some(2),
+            before: None,
+            view: None,
+        };
+        let read = |q: ReplayQuery| {
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            async move {
+                let resp = acp_replay(State(state), Path(id), axum::extract::Query(q))
+                    .await
+                    .into_response();
+                let bytes = to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+                serde_json::from_slice::<ReplayResponse>(&bytes).unwrap()
+            }
+        };
+
+        // Default projection: frames, no rows, byte-shape unchanged.
+        let frames_resp = read(ReplayQuery { view: None, ..base }).await;
+        assert_eq!(frames_resp.frames.len(), 2, "page holds the first 2 events");
+        assert!(frames_resp.rows.is_none(), "no rows key on default replay");
+        assert!(frames_resp.has_more);
+
+        // `view=rows`: same page folded to rows, no frames, identical paging.
+        let rows_resp = read(ReplayQuery {
+            view: Some("rows".into()),
+            ..base
+        })
+        .await;
+        assert!(rows_resp.frames.is_empty(), "rows projection drops frames");
+        let rows = rows_resp.rows.as_ref().expect("rows present");
+        assert_eq!(
+            rows.iter().map(|r| r.kind).collect::<Vec<_>>(),
+            vec![TranscriptRowKind::UserPrompt, TranscriptRowKind::Message],
+            "the 2-event page folds to a prompt row and one message row"
+        );
+
+        // Pagination metadata is identical across projections; only the payload
+        // differs, so the client's cursor logic is unchanged.
+        assert_eq!(rows_resp.next_cursor, frames_resp.next_cursor);
+        assert_eq!(rows_resp.has_more, frames_resp.has_more);
+        assert_eq!(rows_resp.highest_seq, frames_resp.highest_seq);
+        assert_eq!(rows_resp.lowest_seq, frames_resp.lowest_seq);
+        assert_eq!(rows_resp.lost, frames_resp.lost);
     }
 
     #[test]
@@ -3374,5 +3708,42 @@ mod tests {
         let (files, truncated) = list_files(dir.path(), 3).unwrap();
         assert!(truncated);
         assert_eq!(files, vec!["f0.rs", "f1.rs", "f2.rs"]);
+    }
+
+    #[test]
+    fn recency_only_persist_does_not_itself_clear_a_peer_sink() {
+        // Scope, deliberately narrow: this pins that the recency-only tier
+        // performs no clear of its own on a sink this daemon's memory has
+        // not observed. It does NOT claim the archive survives everything
+        // afterwards -- advancing last_accessed_at still arms
+        // merge_user_action_diff's `touched` arm for a later writer holding
+        // a pre-prompt snapshot. See apply_prompt_persist_to_disk's docs.
+        let mut disk = crate::session::Instance::new("s", "/tmp/x");
+        disk.view = crate::session::View::Structured;
+        disk.last_accessed_at = Some(chrono::Utc::now() - chrono::Duration::seconds(60));
+        disk.archived_at = Some(chrono::Utc::now() - chrono::Duration::seconds(30));
+
+        apply_prompt_persist_to_disk(&mut disk, false);
+
+        assert!(
+            disk.archived_at.is_some(),
+            "the recency-only tier must not clear peer sink state itself"
+        );
+        assert!(disk.last_accessed_at > disk.archived_at);
+    }
+
+    #[test]
+    fn wake_persist_keeps_touch_semantics_for_sunk_rows() {
+        let mut disk = crate::session::Instance::new("s", "/tmp/x");
+        disk.view = crate::session::View::Structured;
+        disk.snoozed_until = Some(chrono::Utc::now() + chrono::Duration::minutes(10));
+
+        apply_prompt_persist_to_disk(&mut disk, true);
+
+        assert!(
+            disk.snoozed_until.is_none(),
+            "wake persist lifts the sunk row (messaging-unarchives)"
+        );
+        assert!(disk.last_accessed_at.is_some());
     }
 }

@@ -18,10 +18,22 @@ import { reportTelemetrySeen } from "../lib/api";
 
 /** Mirrors CLOSE_CODE_PTY_DEAD in src/server/pane.rs. */
 const CLOSE_CODE_PTY_DEAD = 4001;
+/** Keep a short burst typed while a newly selected session's socket opens.
+ * The cap prevents an offline tab from retaining unbounded paste data. */
+const MAX_PENDING_INPUT_BYTES = 64 * 1024;
 
 export interface LiveCursor {
   x: number;
   y: number;
+}
+
+export interface LivePaneRect {
+  cols: number;
+  rows: number;
+  /** Optional origin within the composited window grid. Missing fields mean
+   *  `(0, 0)` for compatibility with older frames. */
+  left?: number;
+  top?: number;
 }
 
 export interface LiveFrame {
@@ -44,6 +56,9 @@ export interface LiveFrame {
   /** App is in SGR (1006) mouse encoding; picks the forwarded wire format
    *  (SGR vs legacy X10). */
   mouseSgr: boolean;
+  /** Pane 0's rectangle within the composited window grid (a split
+   *  window). */
+  pane0?: LivePaneRect | null;
 }
 
 export interface LiveTerminalState {
@@ -62,11 +77,12 @@ export interface LiveTerminalState {
   /** Whether this client holds the session's size-owner lock and may
    *  resize/type. Only one client at a time owns it across every surface
    *  (web PTY attach, mobile live view, native TUI); a non-owner renders
-   *  best-effort at the owner's grid and shows a "take over" banner.
-   *  Defaults true so a lone client (and an older server that never sends
-   *  `size_owner`) behaves as owner; the server corrects it within a
-   *  round-trip of the first resize. */
+   *  best-effort at the owner's grid and shows a "take over" banner. */
   isOwner: boolean;
+  /** The server has answered this connection's initial size-owner request.
+   * Until then input is buffered and the UI must not present a takeover
+   * banner as though another viewer had been confirmed. */
+  ownerKnown: boolean;
 }
 
 const INITIAL_STATE: LiveTerminalState = {
@@ -76,7 +92,8 @@ const INITIAL_STATE: LiveTerminalState = {
   retryCountdown: 0,
   frame: null,
   reading: false,
-  isOwner: true,
+  isOwner: false,
+  ownerKnown: false,
 };
 
 export function useLiveTerminal(
@@ -106,6 +123,12 @@ export function useLiveTerminal(
   // "this terminal was opened", not "the socket reconnected N times". Ported
   // from the removed xterm useTerminal hook.
   const telemetrySeenRef = useRef(false);
+  const pendingInputRef = useRef<Uint8Array<ArrayBuffer>[]>([]);
+  // A resize and the resulting size-owner result are ordered on the socket,
+  // but React has not necessarily rendered that result when a mobile user
+  // types their first key. Hold that burst until the server confirms this
+  // connection owns the pane instead of relying on a speculative default.
+  const ownerKnownRef = useRef(false);
 
   const storeRef = useRef<{
     snapshot: LiveTerminalState;
@@ -140,9 +163,15 @@ export function useLiveTerminal(
   };
 
   useEffect(() => {
-    if (!sessionId) return;
+    if (!sessionId) {
+      pendingInputRef.current = [];
+      ownerKnownRef.current = false;
+      return;
+    }
 
     wsRef.current?.close();
+    pendingInputRef.current = [];
+    ownerKnownRef.current = false;
     if (retryTimerRef.current) clearTimeout(retryTimerRef.current);
     if (countdownRef.current) clearInterval(countdownRef.current);
     retryCountRef.current = 0;
@@ -160,6 +189,7 @@ export function useLiveTerminal(
     function connect() {
       if (disposed) return;
       disposeInflater();
+      ownerKnownRef.current = false;
       const proto = location.protocol === "https:" ? "wss:" : "ws:";
       // A leading-slash `wsPath` is an absolute relay path; otherwise it is a
       // per-session suffix under `/sessions/<id>/`.
@@ -182,7 +212,15 @@ export function useLiveTerminal(
       ws.binaryType = "arraybuffer";
       wsRef.current = ws;
 
+      const flushPendingInput = () => {
+        if (wsRef.current !== ws || !ownerKnownRef.current || ws.readyState !== WebSocket.OPEN) return;
+        const pending = pendingInputRef.current;
+        pendingInputRef.current = [];
+        for (const data of pending) ws.send(data);
+      };
+
       ws.onopen = () => {
+        if (wsRef.current !== ws) return;
         if (!telemetrySeenRef.current) {
           telemetrySeenRef.current = true;
           reportTelemetrySeen("web_terminal");
@@ -192,6 +230,10 @@ export function useLiveTerminal(
           connected: true,
           reconnecting: false,
         }));
+        // Negotiate ownership even if mobile keyboard occlusion has deferred
+        // the first safe resize. The server claims only a vacant lock here;
+        // an explicit takeover remains a separate user action.
+        ws.send(JSON.stringify({ type: "claim_if_vacant" }));
         // Replay the component's desired geometry so a reconnected
         // server-side handler matches the client immediately.
         const desired = desiredRef.current;
@@ -208,10 +250,14 @@ export function useLiveTerminal(
         if (supportsFrameDeflate()) {
           ws.send(JSON.stringify({ type: "caps", deflate: true }));
         }
+        // Preserve the selector's gesture-bound first burst, but do not flush
+        // it yet: the resize that establishes size ownership may still be in
+        // flight, especially when a native TUI currently owns the pane.
       };
 
       let hasReceivedData = false;
       const handleMessageText = (text: string) => {
+        if (wsRef.current !== ws) return;
         let msg: {
           type?: string;
           content?: string;
@@ -223,6 +269,7 @@ export function useLiveTerminal(
           altScreen?: boolean;
           mouse?: boolean;
           mouseSgr?: boolean;
+          pane0?: LivePaneRect | null;
         };
         try {
           msg = JSON.parse(text) as typeof msg;
@@ -231,7 +278,11 @@ export function useLiveTerminal(
         }
         if (msg.type === "size_owner") {
           const owner = msg.is_owner ?? true;
-          setState((prev) => (prev.isOwner === owner ? prev : { ...prev, isOwner: owner }));
+          ownerKnownRef.current = true;
+          setState((prev) =>
+            prev.isOwner === owner && prev.ownerKnown ? prev : { ...prev, isOwner: owner, ownerKnown: true },
+          );
+          if (owner) flushPendingInput();
           return;
         }
         if (msg.type === "clipboard") {
@@ -254,6 +305,7 @@ export function useLiveTerminal(
           altScreen: msg.altScreen ?? false,
           mouse: msg.mouse ?? false,
           mouseSgr: msg.mouseSgr ?? false,
+          pane0: msg.pane0 ?? null,
         };
         // While reading, keep the capture window covering the FULL
         // history as the agent appends: the window was sized at entry,
@@ -277,6 +329,7 @@ export function useLiveTerminal(
       };
 
       ws.onmessage = (event: MessageEvent) => {
+        if (wsRef.current !== ws) return;
         if (typeof event.data === "string") {
           handleMessageText(event.data);
         } else if (event.data instanceof ArrayBuffer) {
@@ -290,9 +343,10 @@ export function useLiveTerminal(
       };
 
       ws.onclose = (event: CloseEvent) => {
+        if (disposed || wsRef.current !== ws) return;
         disposeInflater();
-        if (disposed) return;
-        setState((prev) => ({ ...prev, connected: false }));
+        ownerKnownRef.current = false;
+        setState((prev) => ({ ...prev, connected: false, isOwner: false, ownerKnown: false }));
         if (event.code === CLOSE_CODE_PTY_DEAD) {
           retryCountRef.current = MAX_RETRIES;
         }
@@ -369,12 +423,21 @@ export function useLiveTerminal(
   }, [sessionId, wsPath, setState]);
 
   const sendData = useCallback((data: string) => {
-    // Only the size owner may type; the server drops a non-owner's input
-    // anyway, but gating here keeps the wire quiet and matches the banner.
-    if (!storeRef.current!.snapshot.isOwner) return;
     const ws = wsRef.current;
-    if (ws?.readyState === WebSocket.OPEN) {
+    const canSend = ownerKnownRef.current && storeRef.current!.snapshot.isOwner;
+    if (canSend && ws?.readyState === WebSocket.OPEN) {
       ws.send(new TextEncoder().encode(data));
+      return;
+    }
+    // A confirmed non-owner must not leave keystrokes queued for a later
+    // takeover. Only the short, unresolved initial handshake (or a socket
+    // reconnect while we were the owner) may retain input.
+    if (ownerKnownRef.current && !storeRef.current!.snapshot.isOwner) return;
+    const bytes = new TextEncoder().encode(data);
+    const pending = pendingInputRef.current;
+    const used = pending.reduce((total, item) => total + item.byteLength, 0);
+    if (bytes.byteLength <= MAX_PENDING_INPUT_BYTES - used) {
+      pending.push(bytes);
     }
   }, []);
 

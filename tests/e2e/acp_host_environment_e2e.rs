@@ -1,9 +1,10 @@
 //! Full-stack e2e: the configured Host Environment (`Config.environment`)
 //! reaches a non-sandboxed STRUCTURED worker, not just a terminal pane.
 //!
-//! Terminal view prefixes the pane command with the resolved entries
-//! (`host_environment_prefix`), so `CODEX_HOME=... claude` is what a tmux row
-//! runs. The structured path builds its own `SpawnConfig`, and before the fix
+//! Terminal view installs the resolved entries through the protected pane
+//! environment channel (`create_with_size_env`), so `CODEX_HOME=...` reaches the
+//! agent a tmux row runs without ever entering the pane command's argv. The
+//! structured path builds its own `SpawnConfig`, and before the fix
 //! it dropped those entries entirely: a Codex structured worker launched with
 //! no `CODEX_HOME`, fell back to a directory it could not write, and died
 //! during startup.

@@ -6,7 +6,7 @@
 
 import { basename, dirname } from "node:path";
 import { test, expect } from "../helpers/liveTest";
-import { listSessions } from "../helpers/aoeServe";
+import { waitForSessions } from "../helpers/aoeServe";
 
 const PALETTE_PLACEHOLDER = "Search actions, sessions, settings…";
 
@@ -32,13 +32,7 @@ test("palette 'New scratch session' opens the wizard and launches a scratch sess
 
   await page.keyboard.press("ControlOrMeta+Enter");
 
-  await expect
-    .poll(async () => (await listSessions(serve.baseUrl)).length, {
-      timeout: 15_000,
-    })
-    .toBeGreaterThan(0);
-
-  const sessions = await listSessions(serve.baseUrl);
+  const sessions = await waitForSessions(serve.baseUrl);
   expect(sessions).toHaveLength(1);
   const session = sessions[0]!;
   expect(session.scratch).toBe(true);

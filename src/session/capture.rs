@@ -1,18 +1,28 @@
 //! Session ID capture logic for all supported agent types.
 
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use uuid::Uuid;
+mod omp;
+
+pub(crate) use omp::*;
 
 /// Iterate directory entries, silently skipping unreadable ones.
 ///
 /// Wraps `std::fs::read_dir` and filters out individual entry errors (e.g.
-/// broken symlinks, transient permission failures) so that one bad entry
-/// doesn't abort the entire directory scan.
+/// transient permission failures) so that one bad entry doesn't abort the
+/// entire directory scan.
+///
+/// This filters `read_dir`'s per-entry `Err` only, which is a much narrower
+/// guarantee than it sounds. Nothing here stats the entry, so a dangling
+/// symlink, a symlink cycle, a directory, or a FIFO is yielded as an ordinary
+/// entry. Callers that need a real file behind the name have to check for
+/// themselves; see `scan_claude_project_dir`.
 pub(crate) fn resilient_read_dir(
     dir: &std::path::Path,
 ) -> Result<impl Iterator<Item = std::fs::DirEntry> + '_> {
@@ -33,6 +43,35 @@ fn resolve_agent_home(env_var: Option<&str>, default_subdir: &str) -> Result<Pat
     Ok(dirs::home_dir()
         .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
         .join(default_subdir))
+}
+
+/// Resolve the Claude config dir the *launched pane* will see.
+///
+/// The launch path injects the session's profile-scoped `environment` entries
+/// into the pane, so a profile pinning `CLAUDE_CONFIG_DIR` makes the agent read
+/// and write a config tree that is not `~/.claude`. Every host-side read of
+/// Claude's on-disk state has to resolve the same way or it inspects a tree the
+/// agent never touches: the transcript probe then reports a real conversation
+/// absent, and the project-dir scan can hand back a conversation belonging to
+/// another profile that happens to share the cwd. See #3399.
+///
+/// Precedence mirrors [`crate::hooks::agent_settings_path_in`]: the session's
+/// host environment first, then AoE's own env (a var exported in the shell that
+/// launched `aoe` is inherited by the agent too), then `~/.claude`.
+fn claude_home_for_host_environment(host_env: &[String]) -> Result<PathBuf> {
+    match claude_config_dir_override(host_env) {
+        Some(dir) => Ok(PathBuf::from(dir)),
+        None => resolve_agent_home(None, ".claude"),
+    }
+}
+
+/// The `CLAUDE_CONFIG_DIR` value the launched pane will see, if any: the
+/// session's host environment wins, then AoE's own env. Empty is unset.
+///
+/// Shares [`crate::hooks::resolve_config_dir_override`] with the hook-install
+/// path so the read side and the write side cannot drift on precedence.
+fn claude_config_dir_override(host_env: &[String]) -> Option<String> {
+    crate::hooks::resolve_config_dir_override("CLAUDE_CONFIG_DIR", host_env)
 }
 
 /// Resolve a path to a comparable identity: canonicalize when the directory
@@ -82,15 +121,24 @@ pub(crate) fn encode_claude_project_path(project_path: &str) -> String {
 }
 
 /// Capture Claude Code session ID from the most recently active project directory,
-/// falling back to `~/.claude.json` if the dir scan result is stale.
+/// falling back to `.claude.json` if the dir scan result is stale.
+///
+/// `host_env` is the session's profile-scoped host environment, which selects
+/// the config tree both reads resolve against (see
+/// [`claude_home_for_host_environment`]).
 ///
 /// Used as a fallback when hooks don't fire (e.g. after `/clear` or `/new`).
+/// Both arms only ever yield an id with a transcript on disk: the dir scan by
+/// construction, and the `.claude.json` arm because it is gated on one. A
+/// freshly cleared thread is therefore declined until its first content lands,
+/// which is the one case this narrows.
 pub(crate) fn capture_claude_session_id(
     project_path: &str,
     known_session_id: Option<&str>,
     exclusion: &HashSet<String>,
+    host_env: &[String],
 ) -> Result<String> {
-    let claude_home = resolve_agent_home(Some("CLAUDE_CONFIG_DIR"), ".claude")?;
+    let claude_home = claude_home_for_host_environment(host_env)?;
     let canonical = canonicalize_or_raw(project_path);
 
     if let Some((id, modified)) =
@@ -102,21 +150,37 @@ pub(crate) fn capture_claude_session_id(
         }
     }
 
-    if let Some(id) = read_claude_json_session_id(&canonical) {
+    let claude_json_path = claude_json_path(&claude_home, host_env);
+    if let Some(id) = read_claude_json_session_id(&claude_json_path, &canonical) {
         if exclusion.contains(&id) {
             return Err(anyhow::anyhow!(
                 "claude.json lastSessionId {} is excluded (claimed by another instance)",
                 id
             ));
         }
-        let claude_json = dirs::home_dir()
-            .map(|h| h.join(".claude.json"))
-            .and_then(|p| std::fs::metadata(&p).ok())
+        let claude_json = std::fs::metadata(&claude_json_path)
+            .ok()
             .and_then(|m| m.modified().ok());
         let is_fresh = claude_json
             .and_then(|t| t.elapsed().ok())
             .is_some_and(|age| age <= Duration::from_secs(5 * 60));
-        if is_fresh && Uuid::parse_str(&id).is_ok() {
+        // `is_fresh` is the mtime of `.claude.json` itself, which any live
+        // Claude anywhere rewrites, so it says nothing about when *this*
+        // directory's `lastSessionId` was set and a value months old still
+        // reads as fresh. And unlike the dir scan above, which can only return
+        // ids it found as files, this slot can name a UUID no transcript was
+        // ever written for. Requiring the conversation to exist is what keeps
+        // `--resume` off an id Claude answers with "No conversation found",
+        // which leaves the pane dead on every restart from then on.
+        //
+        // The cost is the short window after `/clear` or `/new` where the slot
+        // names a thread Claude has not written to yet: the arm declines it,
+        // and the dir scan picks the new id up once content lands. Resuming it
+        // in that window would fail anyway.
+        if is_fresh
+            && Uuid::parse_str(&id).is_ok()
+            && !claude_host_transcript_confirmed_absent(&canonical.to_string_lossy(), &id, host_env)
+        {
             return Ok(id);
         }
     }
@@ -127,13 +191,20 @@ pub(crate) fn capture_claude_session_id(
 /// Whether we can affirmatively prove Claude has *no* persisted transcript for
 /// `session_id` under `project_path` on the host filesystem.
 ///
-/// Claude only writes `~/.claude/projects/<encoded-cwd>/<uuid>.jsonl` once a
+/// Claude only writes `<config>/projects/<encoded-cwd>/<uuid>.jsonl` once a
 /// conversation has real content. A session AoE minted a UUID for but that was
 /// killed before the first prompt (an "empty thread") therefore has a stored
 /// `agent_session_id` that never hit disk, and `claude --resume <uuid>` on it
 /// fails with "No conversation found" every time. Callers use this to launch
 /// such an id as a fresh pinned session (`--session-id <uuid>`) instead of a
 /// guaranteed-to-fail `--resume`.
+///
+/// `<config>` is resolved from the session's profile-scoped `host_env`, the
+/// same way the launch path resolves it (see
+/// [`claude_home_for_host_environment`]). Probing the default `~/.claude` for a
+/// profile pinned elsewhere would report every real conversation absent and
+/// downgrade it to `--session-id <uuid>`, which the agent rejects as already in
+/// use, killing the pane outright. See #3399.
 ///
 /// Returns `true` ONLY when the Claude home resolves and the transcript file is
 /// confirmed missing. Any uncertainty (home dir unresolved) returns `false` so
@@ -144,8 +215,9 @@ pub(crate) fn capture_claude_session_id(
 pub(crate) fn claude_host_transcript_confirmed_absent(
     project_path: &str,
     session_id: &str,
+    host_env: &[String],
 ) -> bool {
-    let Ok(claude_home) = resolve_agent_home(Some("CLAUDE_CONFIG_DIR"), ".claude") else {
+    let Ok(claude_home) = claude_home_for_host_environment(host_env) else {
         return false;
     };
     let canonical = canonicalize_or_raw(project_path);
@@ -195,10 +267,20 @@ fn scan_claude_project_dir(
             continue;
         }
 
-        let modified = entry
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        // `fs::metadata` rather than `DirEntry::metadata`/`file_type`, which
+        // describe the link rather than its target. A symlinked transcript has
+        // to keep counting (#3399's workaround tells users to make one), and
+        // following the link reports the target's mtime, the one that advances
+        // as Claude appends. A directory, FIFO or dangling link named
+        // `<uuid>.jsonl` is otherwise handed back as a resume id with no
+        // transcript behind it.
+        let Ok(meta) = std::fs::metadata(&path) else {
+            continue;
+        };
+        if !meta.is_file() {
+            continue;
+        }
+        let modified = meta.modified().unwrap_or(std::time::SystemTime::UNIX_EPOCH);
 
         if known == Some(stem) && !exclusion.contains(stem) {
             known_hit = Some((stem.to_string(), modified));
@@ -236,10 +318,22 @@ fn scan_claude_project_dir(
     Ok(best)
 }
 
-/// Read `lastSessionId` from `~/.claude.json` for a given project path.
-fn read_claude_json_session_id(project_path: &Path) -> Option<String> {
-    let claude_json = dirs::home_dir()?.join(".claude.json");
-    let content = std::fs::read_to_string(&claude_json).ok()?;
+/// Where Claude keeps `.claude.json` for the config tree at `claude_home`.
+///
+/// It sits *inside* the dir when `CLAUDE_CONFIG_DIR` selects it, but next to
+/// (not inside) the default `~/.claude`, so the default case cannot be derived
+/// from `claude_home` alone.
+fn claude_json_path(claude_home: &Path, host_env: &[String]) -> PathBuf {
+    if claude_config_dir_override(host_env).is_some() {
+        claude_home.join(".claude.json")
+    } else {
+        claude_home.with_file_name(".claude.json")
+    }
+}
+
+/// Read `lastSessionId` from `.claude.json` for a given project path.
+fn read_claude_json_session_id(claude_json: &Path, project_path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(claude_json).ok()?;
     let content = content.trim();
     if content.is_empty() {
         return None;
@@ -263,7 +357,9 @@ fn read_claude_json_session_id(project_path: &Path) -> Option<String> {
 /// 1. Read `/tmp/aoe-hooks-<euid>/<instance_id>/session_id` (written by Claude's
 ///    `SessionStart` / `UserPromptSubmit` hooks). When present and ≤ 5 min
 ///    old, return it and skip the disk scan.
-/// 2. Otherwise scan `~/.claude/projects/<encoded-path>/`. The scan uses
+/// 2. Otherwise scan `<config>/projects/<encoded-path>/`, where `<config>` is
+///    the session's profile-scoped Claude config dir (`host_env`), so a
+///    same-cwd peer in another profile is never a candidate. The scan uses
 ///    `compose_exclusion(instance_id, extra_excludes)` to skip UUIDs claimed
 ///    by peers via tmux env, and the `last_known` mutex to anchor this
 ///    closure to its own session even when a peer's jsonl is more recent.
@@ -274,6 +370,7 @@ pub(crate) fn claude_poll_fn(
     known_session_id: Option<String>,
     instance_id: String,
     extra_excludes: HashSet<String>,
+    host_env: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     let last_known = std::sync::Mutex::new(known_session_id);
     move || {
@@ -300,6 +397,7 @@ pub(crate) fn claude_poll_fn(
             &project_path,
             current_known.as_deref(),
             &exclusion,
+            &host_env,
         )
         .map_err(|e| tracing::debug!(target: "session.capture", "Claude disk scan failed: {}", e))
         .ok()
@@ -315,6 +413,29 @@ pub(crate) fn claude_poll_fn(
     }
 }
 
+/// The `sh` snippet shipped to `docker exec` to list candidate transcripts.
+///
+/// All three checks dereference: `[ -f ]` for type, `find -L` for freshness,
+/// `ls -tL` for ordering. A symlink's own mtime is frozen at creation, so a
+/// link left undereferenced ages out of the five-minute gate while its target
+/// is still being appended. The host scan reads through links for the same
+/// reason (#3454), and the two have to agree for
+/// `claude_host_transcript_confirmed_absent` to mean anything.
+fn claude_container_list_snippet(dir_name: &str) -> String {
+    format!(
+        r#"
+CLAUDE_HOME="${{CLAUDE_CONFIG_DIR:-$HOME/.claude}}"
+DIR="$CLAUDE_HOME/projects/{dir_name}"
+[ -d "$DIR" ] || exit 0
+for f in $(ls -tL "$DIR"/*.jsonl 2>/dev/null); do
+  [ -f "$f" ] || continue
+  [ -n "$(find -L "$f" -mmin -5 2>/dev/null)" ] || continue
+  basename "$f" .jsonl
+done
+"#
+    )
+}
+
 /// Capture Claude Code session ID inside a Docker container.
 ///
 /// Lists every fresh (≤ 5 min mtime) UUID-named jsonl in
@@ -328,19 +449,7 @@ pub(crate) fn capture_claude_session_id_in_container(
     exclusion: &HashSet<String>,
     known_session_id: Option<&str>,
 ) -> Result<String> {
-    let dir_name = encode_claude_project_path(container_cwd);
-
-    let snippet = format!(
-        r#"
-CLAUDE_HOME="${{CLAUDE_CONFIG_DIR:-$HOME/.claude}}"
-DIR="$CLAUDE_HOME/projects/{dir_name}"
-[ -d "$DIR" ] || exit 0
-for f in $(ls -t "$DIR"/*.jsonl 2>/dev/null); do
-  [ -n "$(find "$f" -mmin -5 2>/dev/null)" ] || continue
-  basename "$f" .jsonl
-done
-"#
-    );
+    let snippet = claude_container_list_snippet(&encode_claude_project_path(container_cwd));
 
     let mut cmd = std::process::Command::new("docker");
     cmd.args(["exec", container_name, "sh", "-c", &snippet]);
@@ -457,17 +566,59 @@ pub(crate) fn encode_pi_project_path(cwd: &str) -> String {
     format!("--{encoded}--")
 }
 
+/// Number of leading lines and bytes scanned when locating a pi-family
+/// session header. The byte cap matters because `BufRead::lines` otherwise
+/// allocates without bound for one hostile or corrupt line.
+const PI_HEADER_SCAN_LINES: usize = 8;
+const PI_HEADER_SCAN_BYTES: usize = 64 * 1024;
+
 fn extract_pi_header_fields(path: &Path) -> Option<(Option<String>, Option<String>)> {
-    let file = std::fs::File::open(path).ok()?;
-    let reader = std::io::BufReader::new(file);
-    let first_line = std::io::BufRead::lines(reader).next()?.ok()?;
-    parse_pi_header_json(&first_line)
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    #[cfg(not(unix))]
+    if std::fs::symlink_metadata(path)
+        .ok()?
+        .file_type()
+        .is_symlink()
+    {
+        return None;
+    }
+    let file = options.open(path).ok()?;
+    if !file.metadata().ok()?.is_file() {
+        return None;
+    }
+    let mut reader = std::io::BufReader::new(file);
+    let mut consumed = 0usize;
+    for _ in 0..PI_HEADER_SCAN_LINES {
+        let mut line = String::new();
+        let mut limited =
+            (&mut reader).take((PI_HEADER_SCAN_BYTES.saturating_sub(consumed) + 1) as u64);
+        let read = std::io::BufRead::read_line(&mut limited, &mut line).ok()?;
+        if read == 0 {
+            return None;
+        }
+        consumed = consumed.saturating_add(read);
+        if consumed > PI_HEADER_SCAN_BYTES {
+            return None;
+        }
+        if let Some(header) = parse_pi_header_json(&line) {
+            return Some(header);
+        }
+    }
+    None
 }
 
-/// Parse the first line of a Pi `.jsonl` session file (already in memory).
+/// Parse a single already-in-memory `.jsonl` line into a pi-family session
+/// header's `(id, cwd)`, returning `None` unless the record's `"type"` is
+/// `"session"`.
 ///
-/// Shared by the host scanner and the container scanner, which receives
-/// header lines via `docker exec` rather than direct filesystem reads.
+/// Non-session and malformed lines yield `None`, so bounded scanners can keep
+/// the first matching record.
 fn parse_pi_header_json(line: &str) -> Option<(Option<String>, Option<String>)> {
     let parsed: serde_json::Value = serde_json::from_str(line).ok()?;
     if parsed.get("type")?.as_str()? != "session" {
@@ -511,22 +662,11 @@ pub(crate) fn capture_pi_session_id(
     capture_pi_family_session_id(project_path, exclusion, ".pi/agent")
 }
 
-/// Capture an Oh My Pi (omp) session ID.
+/// Scan Pi's on-disk session store.
 ///
-/// OMP is a pi fork that shares pi's on-disk session format and the
-/// `PI_CODING_AGENT_DIR` override, but defaults its data dir to `~/.omp/agent`
-/// on the host rather than `~/.pi/agent`. Only the host default differs, so
-/// this delegates to the shared pi scan with the omp default subdir.
-pub(crate) fn capture_omp_session_id(
-    project_path: &str,
-    exclusion: &HashSet<String>,
-) -> Result<String> {
-    capture_pi_family_session_id(project_path, exclusion, ".omp/agent")
-}
-
-/// Shared pi-family session scan. `default_subdir` is the host home directory
-/// used when `PI_CODING_AGENT_DIR` is unset (`.pi/agent` for pi, `.omp/agent`
-/// for omp).
+/// This retains Pi's encoded-path fast path, cwd fallback, and historical
+/// newest-directory fallback. OMP deliberately does not use this heuristic:
+/// its dedicated capture module requires an exact terminal breadcrumb.
 fn capture_pi_family_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
@@ -574,6 +714,11 @@ fn capture_pi_family_session_id(
     // Fallback: scan all subdirectories and match via CWD header
     let canonical_project = canonicalize_or_raw(project_path);
     let mut fallback_candidates: Vec<(String, std::time::SystemTime)> = Vec::new();
+    // Whether any file recorded a cwd equal to the project, tracked before the
+    // exclusion filter. If a project session exists but every cwd match is
+    // excluded, we must not fall through to the project-agnostic newest-dir
+    // heuristic, which would resume a different project's session.
+    let mut saw_cwd_match = false;
 
     for subdir_entry in resilient_read_dir(&sessions_dir)? {
         let subdir_path = subdir_entry.path();
@@ -597,6 +742,7 @@ fn capture_pi_family_session_id(
             if canonical_cwd != canonical_project {
                 continue;
             }
+            saw_cwd_match = true;
             let session_id = match fields.0 {
                 Some(id) if !id.is_empty() && !exclusion.contains(&id) => id,
                 _ => continue,
@@ -615,25 +761,40 @@ fn capture_pi_family_session_id(
         return Ok(id.clone());
     }
 
-    // Third fallback: when all JSONL headers fail to parse, pick the most
-    // recently modified session directory and extract a UUID from its files.
-    let mut dirs_by_mtime: Vec<(PathBuf, std::time::SystemTime)> = Vec::new();
+    // A session for this project exists on disk but every cwd match was
+    // excluded (e.g. the just-crashed sid the resume cascade cleared). Return
+    // an error rather than the project-scoped newest-dir fallback below, which
+    // would otherwise resume a different project's session.
+    if saw_cwd_match {
+        anyhow::bail!("All Pi sessions matching project path are excluded");
+    }
+
+    // Third fallback: when JSONL headers fail to parse (no `id` field),
+    // extract a UUID from the filename. Only consider directories whose
+    // encoded name matches the target project path, so we never grab a
+    // session from the wrong project.
+    let mut project_dirs: Vec<PathBuf> = Vec::new();
     if let Ok(entries) = resilient_read_dir(&sessions_dir) {
         for entry in entries {
             let path = entry.path();
             if !path.is_dir() {
                 continue;
             }
-            let mtime = entry
-                .metadata()
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            dirs_by_mtime.push((path, mtime));
+            if path.file_name().and_then(|n| n.to_str()) == Some(&encoded_name) {
+                project_dirs.push(path);
+            }
         }
     }
-    dirs_by_mtime.sort_by_key(|c| std::cmp::Reverse(c.1));
+    // Sort by mtime descending so we pick the newest project directory
+    // (handles the case where the directory itself was recently recreated).
+    project_dirs.sort_by_key(|d| {
+        d.metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH)
+    });
+    project_dirs.reverse();
 
-    for (dir, _) in &dirs_by_mtime {
+    for dir in &project_dirs {
         if let Ok(entries) = resilient_read_dir(dir) {
             let mut file_candidates: Vec<(String, std::time::SystemTime)> = Vec::new();
             for entry in entries {
@@ -677,33 +838,27 @@ pub(crate) fn pi_poll_fn(
     }
 }
 
-/// Host polling closure for Oh My Pi (omp), mirroring [`pi_poll_fn`] against
-/// omp's `~/.omp/agent` default data dir. Sandboxed omp reuses
-/// [`pi_poll_fn_sandboxed`], since `PI_CODING_AGENT_DIR` is set in the omp
-/// container so the shared container scan already resolves the right dir.
-pub(crate) fn omp_poll_fn(
-    project_path: String,
-    instance_id: String,
-    extra_excludes: HashSet<String>,
-) -> impl Fn() -> Option<String> + Send + 'static {
-    move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
-        capture_omp_session_id(&project_path, &exclusion)
-            .map_err(
-                |e| tracing::debug!(target: "session.capture", "OMP poll capture failed: {}", e),
-            )
-            .ok()
-            .and_then(validated_session_id)
-    }
-}
-
 const PI_COMMAND_TIMEOUT_SECS: u64 = 5;
 
-/// Shell snippet executed via `docker exec` to enumerate Pi `.jsonl` session
-/// files inside the container. Each file is emitted as a `===PI:<unix-mtime>===`
-/// header followed by the first line of the file (the session header) and a
-/// `===END===` trailer; the host parses this stream rather than spawning one
-/// `docker exec head` per file.
+/// Shell snippet executed via `docker exec` to enumerate pi-family `.jsonl`
+/// session files inside the container. Each file is emitted as a
+/// `===PI:<unix-mtime>===` header followed by the file's `{"type":"session",...}`
+/// record and a `===END===` trailer; the host parses this stream rather than
+/// spawning one `docker exec head` per file.
+///
+/// `pi` writes that record on line 0, but `omp` (a pi fork) prefixes a
+/// `{"type":"title",...}` record, so the session record can be on line 1. The
+/// script scans the first 8 lines (mirroring `PI_HEADER_SCAN_LINES`) and emits
+/// only the session line, matched via `grep -m1 '^{"type":"session"'`. The
+/// anchor ties the match to a session record at the start of a line, so that
+/// `title` line 0 is skipped and a `"type":"session"` substring nested inside
+/// an earlier record is not picked in its place. Emitting one line per
+/// file keeps a conversation line (arbitrary text on later lines) from ever
+/// colliding with the `===PI:`/`===END===` delimiters.
+///
+/// `grep -m1` is a GNU and BusyBox extension rather than strict POSIX; both the
+/// Debian and Alpine container bases support it, so it is safe for the images
+/// pi-family agents run in.
 const PI_CONTAINER_LIST_SCRIPT: &str = r#"SESS_DIR="${PI_CODING_AGENT_DIR:-$HOME/.pi/agent}/sessions"
 [ -d "$SESS_DIR" ] || exit 0
 for d in "$SESS_DIR"/*/; do
@@ -711,7 +866,7 @@ for d in "$SESS_DIR"/*/; do
     [ -f "$f" ] || continue
     ts=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)
     printf '===PI:%s===\n' "$ts"
-    head -n 1 "$f"
+    head -n 8 "$f" | grep -m1 '^{"type":"session"'
     printf '\n===END===\n'
   done
 done
@@ -821,37 +976,65 @@ pub(crate) fn compose_exclusion(
     current_instance_id: &str,
     extra: &HashSet<String>,
 ) -> HashSet<String> {
-    let mut set = build_exclusion_set(current_instance_id);
+    compose_exclusion_in(
+        current_instance_id,
+        extra,
+        &crate::tmux::LiveSessionSnapshot::new(),
+    )
+}
+
+/// [`compose_exclusion`] against a snapshot the caller already holds, so a
+/// pass that also probes per-instance liveness observes tmux once instead of
+/// twice.
+fn compose_exclusion_in(
+    current_instance_id: &str,
+    extra: &HashSet<String>,
+    live: &crate::tmux::LiveSessionSnapshot,
+) -> HashSet<String> {
+    let mut set = build_exclusion_set(current_instance_id, live);
     set.extend(extra.iter().cloned());
     set
 }
 
-/// Extend [`compose_exclusion`] with the sids of stopped, archived, or
-/// pane-less Claude peers in the same `project_path`, read from
-/// `sessions.json` via `Storage` for the caller's effective profile.
+/// Extend [`compose_exclusion`] with conversations same-project peers parked
+/// for `current_tool` during an engine swap. When
+/// `include_inactive_same_tool` is true, also include the sids of stopped,
+/// archived, or pane-less peers using `current_tool`. Persisted peers are read
+/// from `sessions.json` via `Storage` for the caller's effective profile.
 ///
-/// Used only by the Claude branch of `Instance::try_retroactive_capture`
-/// when the per-instance sidecar is absent or stale: the mtime fallback
-/// over `~/.claude/projects/<encoded-cwd>/` otherwise picks a co-located
-/// stopped peer's jsonl, since [`build_exclusion_set`] only sees live
-/// tmux peers, and the resume binds to the peer's conversation (#2355).
+/// Used by `Instance::try_retroactive_capture` and snapshotted when its poller
+/// starts. Parked conversations are no longer published in the peer's tmux
+/// environment, so [`build_exclusion_set`] cannot see them. Without this set,
+/// another session can capture the parked conversation before its owner swaps
+/// back. Claude, host Codex, and host Kimi additionally need inactive
+/// same-tool protection because their shared-store MRU scans can select a
+/// conversation after the owning pane disappears. Sandboxed Codex and Kimi
+/// omit that protection because their stores are instance-private or are not
+/// captured from the host (#3317).
 ///
-/// `claude_poll_fn` keeps the live-only exclusion via [`compose_exclusion`]:
-/// it runs on a hot polling path, and live peers already surface in the
-/// tmux env scan.
-///
-/// Scope: `~/.claude/projects/` is keyed by `$HOME`, not by AoE profile,
-/// but this helper only inspects `sessions.json` for the caller's effective
-/// profile. A stopped peer in a different profile against the same host
-/// `$HOME` will not be excluded; the residual gap is narrower than #2355's
-/// trigger and is left for a follow-up.
-pub(crate) fn compose_exclusion_with_stopped_peers(
+/// Scope: host stores are keyed by each agent's effective home, not by AoE
+/// profile, but this helper inspects only `sessions.json` for the caller's
+/// effective profile. A stopped peer in another profile against the same
+/// agent home will not be excluded; callers needing global ownership must
+/// compose their own cross-profile check.
+pub(crate) fn compose_exclusion_with_persisted_peers(
     current_instance_id: &str,
     current_project_path: &str,
+    current_tool: &str,
+    include_inactive_same_tool: bool,
     profile: &str,
     retroactive_capture_excludes: &HashSet<String>,
 ) -> HashSet<String> {
-    let mut set = compose_exclusion(current_instance_id, retroactive_capture_excludes);
+    // One observation for the whole pass. Both halves consult tmux: the
+    // cross-instance scan needs the live session names, and the walk below
+    // visits every stored session sharing the project path, trashed ones
+    // included, so a per-instance liveness probe costs a fork each. A store of
+    // a few hundred sessions made that the dominant cost of the pass.
+    // `names() == None` (server unreachable) reads as "no live pane" here,
+    // which is what the per-item probe already did when its own
+    // `list-sessions` failed, and this pass re-runs.
+    let live = crate::tmux::LiveSessionSnapshot::new();
+    let mut set = compose_exclusion_in(current_instance_id, retroactive_capture_excludes, &live);
     let Ok(storage) = crate::session::storage::Storage::new_unwatched(profile) else {
         return set;
     };
@@ -868,15 +1051,27 @@ pub(crate) fn compose_exclusion_with_stopped_peers(
         if inst.id == current_instance_id {
             continue;
         }
-        if inst.tool != "claude" {
+        if canonicalize_or_raw(&inst.project_path) != canonical_current {
             continue;
         }
-        if canonicalize_or_raw(&inst.project_path) != canonical_current {
+        // A peer that swapped away still owns the conversation it parked and
+        // intends to resume it on a swap back. It is excluded regardless of the
+        // peer's current tool or liveness: its pane is running another engine,
+        // so the live tmux ownership scan cannot discover this id.
+        if let Some(parked) = inst
+            .prior_tool_session_ids
+            .get(current_tool)
+            .and_then(|p| p.agent_session_id.as_deref())
+            .filter(|s| !s.is_empty())
+        {
+            set.insert(parked.to_string());
+        }
+        if !include_inactive_same_tool || inst.tool != current_tool {
             continue;
         }
         let should_exclude = matches!(inst.status, crate::session::Status::Stopped)
             || inst.is_archived()
-            || !inst.has_live_tmux_pane();
+            || !inst.has_live_tmux_pane_in(&live);
         if !should_exclude {
             continue;
         }
@@ -899,18 +1094,17 @@ pub(crate) fn compose_exclusion_with_stopped_peers(
 /// the resume-fallback cascade's just-crashed sid) should use
 /// [`compose_exclusion`] instead, which composes this function with the
 /// per-instance exclusion list.
-fn build_exclusion_set(current_instance_id: &str) -> HashSet<String> {
-    let output = match crate::tmux::tmux_command()
-        .args(["list-sessions", "-F", "#{session_name}"])
-        .output()
-    {
-        Ok(o) if o.status.success() => o,
-        _ => return HashSet::new(),
+fn build_exclusion_set(
+    current_instance_id: &str,
+    live: &crate::tmux::LiveSessionSnapshot,
+) -> HashSet<String> {
+    let Some(names) = live.names() else {
+        return HashSet::new();
     };
 
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let aoe_sessions: Vec<&str> = stdout
-        .lines()
+    let aoe_sessions: Vec<&str> = names
+        .iter()
+        .map(String::as_str)
         .filter(|name| {
             name.starts_with(crate::tmux::SESSION_PREFIX)
                 && !name.starts_with(crate::tmux::TOOL_PREFIX)
@@ -1220,10 +1414,24 @@ const OPENCODE_COMMAND_TIMEOUT_SECS: u64 = 5;
 
 /// Spawn `cmd`, read stdout to EOF on a worker thread, and wait for the
 /// process to exit. Kills the child if `timeout` elapses first.
-fn run_with_timeout(
+fn run_with_timeout(cmd: std::process::Command, timeout: Duration, label: &str) -> Result<Vec<u8>> {
+    run_with_timeout_inner(cmd, timeout, label, None)
+}
+
+pub(super) fn run_with_timeout_limit(
+    cmd: std::process::Command,
+    timeout: Duration,
+    label: &str,
+    max_stdout_bytes: usize,
+) -> Result<Vec<u8>> {
+    run_with_timeout_inner(cmd, timeout, label, Some(max_stdout_bytes))
+}
+
+fn run_with_timeout_inner(
     mut cmd: std::process::Command,
     timeout: Duration,
     label: &str,
+    max_stdout_bytes: Option<usize>,
 ) -> Result<Vec<u8>> {
     cmd.stdout(Stdio::piped()).stderr(Stdio::null());
     let mut child = cmd
@@ -1231,18 +1439,27 @@ fn run_with_timeout(
         .with_context(|| format!("Failed to spawn '{}'", label))?;
 
     let stdout_pipe = child.stdout.take();
-    let stdout_handle = std::thread::spawn(move || {
-        stdout_pipe.map(|mut r| {
+    let (stdout_tx, stdout_rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let buf = stdout_pipe.map(|mut reader| {
             let mut buf = Vec::new();
-            std::io::Read::read_to_end(&mut r, &mut buf).ok();
+            if let Some(limit) = max_stdout_bytes {
+                reader
+                    .take(limit.saturating_add(1) as u64)
+                    .read_to_end(&mut buf)
+                    .ok();
+            } else {
+                reader.read_to_end(&mut buf).ok();
+            }
             buf
-        })
+        });
+        let _ = stdout_tx.send(buf);
     });
 
     let deadline = std::time::Instant::now() + timeout;
     let status = loop {
         match child.try_wait() {
-            Ok(Some(s)) => break s,
+            Ok(Some(status)) => break status,
             Ok(None) => {
                 if std::time::Instant::now() >= deadline {
                     let _ = child.kill();
@@ -1251,12 +1468,31 @@ fn run_with_timeout(
                 }
                 std::thread::sleep(Duration::from_millis(50));
             }
-            Err(e) => return Err(anyhow::anyhow!("Failed to wait on {}: {}", label, e)),
+            Err(error) => {
+                return Err(anyhow::anyhow!("Failed to wait on {}: {}", label, error));
+            }
         }
     };
 
-    let stdout_bytes = stdout_handle.join().ok().flatten().unwrap_or_default();
-
+    // The child exited, but a grandchild that inherited the stdout write end
+    // (a backgrounded helper the command spawned) keeps `read_to_end` blocking
+    // even though the child is gone. Bound the drain by the remaining deadline
+    // so the timeout guarantee holds on the success path too, not just on the
+    // kill path; mirrors `process::run_with_timeout`. When the try_wait loop
+    // already burned the budget, `remaining` is zero and recv_timeout returns an
+    // empty buffer at once: intended fail-open, never a block. The reader thread
+    // is deliberately detached; it exits once the grandchild closes the fd, so
+    // the leak is bounded by the grandchild's lifetime. Joining it would
+    // reintroduce the unbounded block the timeout exists to prevent.
+    let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+    let stdout_bytes = stdout_rx
+        .recv_timeout(remaining)
+        .ok()
+        .flatten()
+        .unwrap_or_default();
+    if max_stdout_bytes.is_some_and(|limit| stdout_bytes.len() > limit) {
+        anyhow::bail!("{} exceeded its stdout limit", label);
+    }
     if !status.success() {
         anyhow::bail!("{} command failed", label);
     }
@@ -2502,95 +2738,374 @@ fn select_kimi_session(
 
 /// Capture a Kimi Code session ID for `project_path`.
 ///
-/// Reads `~/.kimi-code/session_index.jsonl` (or
-/// `$KIMI_CODE_HOME/session_index.jsonl`) and returns the id of the most
-/// recently created session whose recorded `workDir` matches `project_path`,
-/// skipping any ids in `exclusion`. `launch_time_ms` gates live polling to
-/// sessions created after this run started (`None` for retroactive recovery).
-/// Kimi resumes the returned id with `kimi --session <id>`.
+/// Reads `session_index.jsonl` under the Kimi home resolved from
+/// `environment` and returns the id of the most recently created session
+/// whose recorded `workDir` matches `project_path`, skipping any ids in
+/// `exclusion`. `environment` must be the launched pane's host environment so
+/// the scan reads the same physical store Kimi writes (`KIMI_CODE_HOME`
+/// honored through launch's `$VAR` / bare-key grammar). `launch_time_ms`
+/// gates live polling to sessions created after this run started (`None` for
+/// retroactive recovery). Kimi resumes the returned id with `kimi --session
+/// <id>`.
 pub(crate) fn capture_kimi_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
     launch_time_ms: Option<f64>,
+    environment: &[String],
 ) -> Result<String> {
-    let home = resolve_agent_home(Some("KIMI_CODE_HOME"), ".kimi-code")?;
+    let home = kimi_home_for_environment(environment)
+        .ok_or_else(|| anyhow::anyhow!("could not resolve the Kimi home"))?;
     let sessions = read_kimi_session_index(&home.join("session_index.jsonl"))?;
     select_kimi_session(&sessions, project_path, exclusion, launch_time_ms)
 }
 
 /// Polling closure for Kimi Code session tracking. `launch_time_ms` floors the
 /// live poll so it never claims a conversation that predates this launch.
+/// `environment` is snapshotted from the instance at poller construction so
+/// every tick reads the store the launched pane writes.
 pub(crate) fn kimi_poll_fn(
     project_path: String,
     instance_id: String,
     launch_time_ms: f64,
     extra_excludes: HashSet<String>,
+    environment: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
         let exclusion = compose_exclusion(&instance_id, &extra_excludes);
-        capture_kimi_session_id(&project_path, &exclusion, Some(launch_time_ms))
-            .map_err(
-                |e| tracing::debug!(target: "session.capture", "Kimi poll capture failed: {}", e),
-            )
-            .ok()
-            .and_then(validated_session_id)
+        capture_kimi_session_id(
+            &project_path,
+            &exclusion,
+            Some(launch_time_ms),
+            &environment,
+        )
+        .map_err(|e| tracing::debug!(target: "session.capture", "Kimi poll capture failed: {}", e))
+        .ok()
+        .and_then(validated_session_id)
     }
+}
+
+/// Effective Kimi home for one environment list: `KIMI_CODE_HOME` resolved
+/// through the same `$VAR` / bare-key grammar launch applies
+/// ([`crate::session::environment::resolve_host_environment_value`]), else the
+/// ambient default resolution. An empty resolved value counts as unset; `None`
+/// when even the default cannot be resolved (the sharing predicate fails
+/// closed on `None`).
+fn kimi_home_for_environment(environment: &[String]) -> Option<PathBuf> {
+    crate::session::environment::resolve_host_environment_value(environment, "KIMI_CODE_HOME")
+        .map(PathBuf::from)
+        .filter(|home| !home.as_os_str().is_empty())
+        .or_else(|| resolve_agent_home(Some("KIMI_CODE_HOME"), ".kimi-code").ok())
+        .filter(|home| !home.as_os_str().is_empty())
+}
+
+/// Whether another persisted host AoE session shares this one's Kimi store: a
+/// resolvable own home plus the same canonicalized project path. When true,
+/// the newest matching record in the session index cannot be attributed to
+/// this pane, so the acquire-time MRU scan behind
+/// [`capture_kimi_session_id`] must not run (#3516). The live poller still
+/// runs that scan on shared stores, bounded by its launch-time floor and the
+/// exclusion sets.
+///
+/// `own_resolved_environment` is the caller's
+/// [`Instance::resolved_host_environment`] and `own_profile_environment` its
+/// static profile list; the own side matches peers against either home so a
+/// hook that deterministically mints a different `KIMI_CODE_HOME` still
+/// counts its profile siblings as sharing. Peers are judged on their static
+/// profile list because minted pairs are runtime state that is deliberately
+/// not persisted.
+///
+/// The walk covers every AoE profile because the store is keyed by resolved
+/// home plus cwd, not by profile: two profiles resolving to one home share
+/// one store. It fails closed: an unreadable profile list, config, or store,
+/// or no resolvable own home all report shared, because ownership that cannot
+/// be proven must not license an MRU retarget. Current Kimi peers and peers
+/// with a parked Kimi conversation count even when stopped, pane-less,
+/// archived, or trashed: the former race during recovery and the latter
+/// remain restorable owners. Sandboxed peers are skipped because their Kimi
+/// stores are container-private.
+pub(crate) fn kimi_store_is_shared(
+    current_instance_id: &str,
+    current_project_path: &str,
+    own_resolved_environment: &[String],
+    own_profile_environment: &[String],
+) -> bool {
+    let canonical_current = canonicalize_or_raw(current_project_path);
+    let own_homes = [own_resolved_environment, own_profile_environment]
+        .iter()
+        .filter_map(|env| kimi_home_for_environment(env))
+        .map(|home| canonicalize_or_raw(home.to_string_lossy().as_ref()))
+        .collect::<Vec<_>>();
+    if own_homes.is_empty() {
+        return true;
+    }
+    let Ok(profiles) = crate::session::list_profiles() else {
+        return true;
+    };
+    for peer_profile in profiles {
+        // Judge the namespace before paying for the store read: a peer whose
+        // resolved home differs cannot share this store however many rows its
+        // sessions.json holds. A successful resolve idempotently reinstalls
+        // that profile's status rules; a failed resolve returns shared without
+        // installing fallback rules or clearing the prior registry state.
+        let Ok(peer_config) = super::profile_config::resolve_config(&peer_profile) else {
+            return true;
+        };
+        let Some(peer_home) = kimi_home_for_environment(&peer_config.environment) else {
+            return true;
+        };
+        let peer_home = canonicalize_or_raw(peer_home.to_string_lossy().as_ref());
+        if !own_homes.contains(&peer_home) {
+            continue;
+        }
+        let Ok(storage) = crate::session::storage::Storage::new_unwatched(&peer_profile) else {
+            return true;
+        };
+        let Ok(instances) = storage.load() else {
+            return true;
+        };
+        for inst in instances {
+            if inst.id == current_instance_id || inst.is_sandboxed() {
+                continue;
+            }
+            let owns_kimi = inst.tool == "kimi"
+                || inst
+                    .prior_tool_session_ids
+                    .get("kimi")
+                    .and_then(|prior| prior.agent_session_id.as_deref())
+                    .is_some_and(|sid| !sid.is_empty());
+            if !owns_kimi {
+                continue;
+            }
+            if canonicalize_or_raw(&inst.project_path) == canonical_current {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 // ─── Hermes session capture ───────────────────────────────────────────────────
 
 const HERMES_COMMAND_TIMEOUT_SECS: u64 = 5;
 
-/// Python one-liner executed via `docker exec` to query active Hermes sessions.
+/// Python one-liner executed via `docker exec` to dump active Hermes sessions.
 /// Respects `$HERMES_HOME` env var, falling back to `~/.hermes/state.db`.
-/// Prints one session ID per line to stdout.
-const HERMES_CONTAINER_CAPTURE_SCRIPT: &str = "import sqlite3, os; \
+///
+/// Prints a mode line (`SIGNAL` when the schema has at least one of the
+/// `cwd`/`git_repo_root` columns, else `LEGACY`) followed by one
+/// TAB-separated `id\tcwd\tgit_repo_root` tuple per active CLI session,
+/// newest first. A missing `state.db` exits without output (a read-only poll
+/// must never create the store it probes); the poll then fails closed. The
+/// script deliberately performs no matching: the recorded
+/// cwd values may need host-side canonicalization, so selection happens in
+/// Rust (see `select_hermes_session_in_container`).
+const HERMES_CONTAINER_CAPTURE_SCRIPT: &str = "import sqlite3, os, sys; \
 db=os.path.join(os.environ.get('HERMES_HOME', os.path.expanduser('~/.hermes')), 'state.db'); \
+sys.exit(0) if not os.path.exists(db) else None; \
 conn=sqlite3.connect(db, timeout=1.0); \
-[print(r[0]) for r in conn.execute(\"SELECT id FROM sessions WHERE source='cli' AND ended_at IS NULL ORDER BY started_at DESC LIMIT 10\")]";
+cols={r[1] for r in conn.execute('PRAGMA table_info(sessions)')}; \
+has_cwd='cwd' in cols; \
+has_root='git_repo_root' in cols; \
+print('SIGNAL' if (has_cwd or has_root) else 'LEGACY'); \
+cwd_col='cwd' if has_cwd else 'NULL'; \
+root_col='git_repo_root' if has_root else 'NULL'; \
+[print('%s\\t%s\\t%s' % (r[0], r[1] or '', r[2] or '')) for r in conn.execute('SELECT id, ' + cwd_col + ', ' + root_col + \" FROM sessions WHERE source='cli' AND ended_at IS NULL ORDER BY started_at DESC, id DESC\")]";
 
-/// Parse newline-separated session IDs from sqlite3/python3 output and return
-/// the first ID not present in the exclusion set.
-fn select_hermes_session(output: &[u8], exclusion: &HashSet<String>) -> Result<String> {
+/// One active Hermes CLI session row with its recorded project signal.
+///
+/// `cwd`/`git_repo_root` are `None` when the column is missing from the
+/// schema, the value is NULL, or it is empty: such rows carry no usable
+/// project signal.
+struct HermesSessionRow {
+    id: String,
+    cwd: Option<String>,
+    git_repo_root: Option<String>,
+}
+
+/// Snapshot of the active Hermes CLI sessions read from `state.db`.
+///
+/// `rows` is ordered newest-first (by `started_at`, then `id`).
+/// `signal_columns_present` is true when the schema has at least one of the
+/// `cwd`/`git_repo_root` columns; selection differs between a signal-capable
+/// schema and a legacy one (see `select_hermes_session_id`).
+struct HermesSessionScan {
+    rows: Vec<HermesSessionRow>,
+    signal_columns_present: bool,
+}
+
+/// Normalize a Hermes project-signal value: NULL or empty means "no signal".
+fn normalize_hermes_signal(value: Option<String>) -> Option<String> {
+    value.filter(|v| !v.is_empty())
+}
+
+/// Parse `docker exec` output from [`HERMES_CONTAINER_CAPTURE_SCRIPT`] and
+/// pick the conversation for `container_cwd`.
+///
+/// The mode line is required: anything else means the script drifted from
+/// this parser's contract and the poll fails closed. Rows with fewer than
+/// three fields are skipped (a cwd containing a newline fragments into such
+/// rows; pathological, accepted). Fields are not trimmed, and an empty
+/// signal maps to `None`; selection then runs through
+/// [`select_hermes_session_id`].
+///
+/// Residuals, all pathological and mostly benign (they degrade to a fresh
+/// start): a newline in the trailing `git_repo_root` field yields a row with
+/// a truncated root (its cwd arm still matches); a TAB in a cwd truncates it
+/// at the first TAB, so a needle equal to the truncated prefix matches a row
+/// whose real cwd differs (a wrong-match corner, accepted for a literal TAB
+/// in a path); and row/needle paths are canonicalized against the host
+/// filesystem, so a container path that happens to exist on the host as a
+/// symlink can compare differently than the value Hermes recorded inside the
+/// container.
+fn select_hermes_session_in_container(
+    output: &[u8],
+    container_cwd: &str,
+    exclusion: &HashSet<String>,
+) -> Result<String> {
     let text = String::from_utf8_lossy(output);
-    let id = text
-        .lines()
-        .map(|l| l.trim())
-        .filter(|l| !l.is_empty())
-        .find(|l| !exclusion.contains(*l));
+    let mut lines = text.lines().filter(|l| !l.trim().is_empty());
+    let mode = lines
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("No active Hermes session found"))?;
+    let signal_columns_present = match mode {
+        "SIGNAL" => true,
+        "LEGACY" => false,
+        _ => anyhow::bail!("Unexpected Hermes capture output: {mode:?}"),
+    };
 
-    match id {
-        Some(session_id) => Ok(session_id.to_string()),
-        None => anyhow::bail!("No active Hermes session found"),
+    let mut rows = Vec::new();
+    for line in lines {
+        let mut fields = line.splitn(3, '\t');
+        let id = fields.next().unwrap_or_default();
+        if id.is_empty() {
+            continue;
+        }
+        let (cwd, root) = match (fields.next(), fields.next()) {
+            (Some(cwd), Some(root)) => (
+                normalize_hermes_signal(Some(cwd.to_string())),
+                normalize_hermes_signal(Some(root.to_string())),
+            ),
+            _ => continue,
+        };
+        rows.push(HermesSessionRow {
+            id: id.to_string(),
+            cwd,
+            git_repo_root: root,
+        });
+    }
+
+    let scan = HermesSessionScan {
+        rows,
+        signal_columns_present,
+    };
+    select_hermes_session_id(&scan, container_cwd, exclusion)
+}
+
+/// Pick the Hermes conversation this AoE session should resume.
+///
+/// With a signal-capable schema (at least one of `cwd`/`git_repo_root`
+/// present), only rows whose canonicalized `cwd` or `git_repo_root` equals
+/// the canonicalized project path are eligible. The `cwd` signal is tried
+/// first across the whole active set and only then `git_repo_root`, because
+/// a repo-root match is weaker: it also holds for a conversation started in
+/// a subdirectory of the same repo, which may be a sibling AoE session's.
+/// Within each pass the most recent row not in `exclusion` wins. Rows with
+/// no signal, or with a signal pointing at a different project, are never
+/// returned: resuming them would bind the wrong conversation, the #3373 bug
+/// class.
+///
+/// A project path spelled through a now-deleted symlink falls back to its
+/// raw spelling in [`canonicalize_or_raw`] and never equals Hermes' recorded
+/// physical path, so such sessions start fresh (benign direction, pre-#2858
+/// corner shared with the other agents' captures).
+///
+/// On a legacy schema (neither column present) no row carries a project
+/// signal. The sole unclaimed active conversation is returned (unambiguous);
+/// with more than one, capture fails closed so the agent starts fresh rather
+/// than silently guessing.
+///
+/// Deliberate divergences from `hermes -c` (which is workspace-scoped via
+/// its git-root-or-cwd key and only then falls back to the global
+/// most-recent conversation; on a pre-cwd schema Hermes auto-migrates the
+/// missing columns on open, its workspace search then finds no
+/// signal-bearing rows, and it falls back to the global MRU): AoE requires
+/// exact canonicalized equality, considers only active rows (`ended_at IS
+/// NULL`, so a cleanly-exited conversation starts fresh by design), orders
+/// by `started_at` rather than Hermes' `last_active` recency, and never
+/// dips into a global-MRU fallback. That fallback is the mis-attribution
+/// bug shape for a project-scoped AoE session.
+fn select_hermes_session_id(
+    scan: &HermesSessionScan,
+    project_path: &str,
+    exclusion: &HashSet<String>,
+) -> Result<String> {
+    if scan.signal_columns_present {
+        let needle = canonicalize_or_raw(project_path);
+        // Two passes, cwd first: a row whose `cwd` IS the project directory is
+        // unambiguously this project's conversation, while a `git_repo_root`
+        // match only proves same-repo membership and can point at a sibling
+        // AoE session running in a subdirectory of the same repo. Scanning
+        // both signals in one pass let a newer subdir row outrank this
+        // project's own conversation.
+        let matched =
+            |signal: Option<&str>| signal.is_some_and(|s| canonicalize_or_raw(s) == needle);
+        for row in &scan.rows {
+            if !exclusion.contains(&row.id) && matched(row.cwd.as_deref()) {
+                return Ok(row.id.clone());
+            }
+        }
+        for row in &scan.rows {
+            if !exclusion.contains(&row.id) && matched(row.git_repo_root.as_deref()) {
+                return Ok(row.id.clone());
+            }
+        }
+        anyhow::bail!("No active Hermes session found matching project path")
+    } else {
+        let mut unclaimed = scan
+            .rows
+            .iter()
+            .map(|row| row.id.as_str())
+            .filter(|id| !exclusion.contains(*id));
+        match (unclaimed.next(), unclaimed.next()) {
+            (None, _) => anyhow::bail!("No active Hermes session found"),
+            (Some(id), None) => Ok(id.to_string()),
+            _ => anyhow::bail!(
+                "Multiple active Hermes sessions without a project signal; starting fresh"
+            ),
+        }
     }
 }
 
 /// Capture session ID from Hermes's SQLite state database.
 ///
 /// Queries `~/.hermes/state.db` (or `$HERMES_HOME/state.db`) for active CLI
-/// sessions. Unlike other agents, Hermes does not record the working directory
-/// in its session table, so capture returns the most recent active CLI session
-/// regardless of project. Cross-instance isolation relies on the exclusion set.
+/// sessions. Hermes records the working directory on each local CLI session
+/// row (`git_repo_root` only when a gateway or TUI frontend later enriches
+/// it), so capture scopes the active set to the canonicalized project path
+/// (exact `cwd` or `git_repo_root` match), mirroring how the other agents'
+/// captures validate cwd or project hash. On legacy databases without those
+/// columns capture fails closed when more than one unclaimed active
+/// conversation exists (the poller then yields `None`), so the agent starts
+/// fresh instead of silently resuming the wrong conversation. Cross-instance
+/// isolation for same-project peers still relies on the exclusion set.
 pub(crate) fn capture_hermes_session_id(
-    _project_path: &str,
+    project_path: &str,
     exclusion: &HashSet<String>,
 ) -> Result<String> {
     let hermes_home = resolve_agent_home(Some("HERMES_HOME"), ".hermes")?;
     let db_path = hermes_home.join("state.db");
 
-    let ids = read_hermes_sessions_from_sqlite(&db_path)?;
-
-    ids.into_iter()
-        .find(|id| !exclusion.contains(id))
-        .ok_or_else(|| anyhow::anyhow!("No active Hermes session found"))
+    let scan = read_hermes_sessions_from_sqlite(&db_path)?;
+    select_hermes_session_id(&scan, project_path, exclusion)
 }
 
-/// Read active CLI session IDs from Hermes's SQLite state database.
+/// Read active CLI session rows from Hermes's SQLite state database.
 ///
-/// Returns session IDs ordered by most recent first. An `Err` means the DB
-/// is unreadable (missing, locked, schema mismatch); the poller will retry
-/// on the next tick.
-fn read_hermes_sessions_from_sqlite(db_path: &Path) -> Result<Vec<String>> {
+/// Returns the full active CLI set, newest first, with each row's `cwd` and
+/// `git_repo_root` when the schema has those columns (NULL literal
+/// otherwise). An `Err` means the DB is unreadable (missing, locked, schema
+/// mismatch); the poller will retry on the next tick.
+fn read_hermes_sessions_from_sqlite(db_path: &Path) -> Result<HermesSessionScan> {
     use rusqlite::{Connection, OpenFlags};
 
     if !db_path.exists() {
@@ -2605,24 +3120,67 @@ fn read_hermes_sessions_from_sqlite(db_path: &Path) -> Result<Vec<String>> {
     conn.busy_timeout(Duration::from_millis(100))
         .context("Failed to set Hermes DB busy timeout")?;
 
+    // Probe the schema per column: hermes adds cwd/git_repo_root in a later
+    // schema generation, and older databases lack them. The SELECT arms are
+    // built from a fixed whitelist so a partially-migrated schema (one column
+    // present) still carries its usable signal instead of failing prepare.
+    let (has_cwd, has_git_repo_root) = {
+        // PRAGMA table_info on a missing table returns zero rows (no error),
+        // so a prepare failure here is a genuinely unreadable store; a missing
+        // table surfaces at the SELECT prepare below.
+        let mut stmt = conn
+            .prepare("PRAGMA table_info(sessions)")
+            .context("Failed to prepare Hermes sessions table probe")?;
+        let cols = stmt
+            .query_map([], |row| row.get::<_, String>(1))
+            .context("Failed to read Hermes sessions table columns")?;
+        let mut has_cwd = false;
+        let mut has_git_repo_root = false;
+        for col in cols {
+            let col = col.context("Failed to read Hermes session column name")?;
+            has_cwd |= col == "cwd";
+            has_git_repo_root |= col == "git_repo_root";
+        }
+        (has_cwd, has_git_repo_root)
+    };
+
+    let cwd_expr = if has_cwd { "cwd" } else { "NULL" };
+    let root_expr = if has_git_repo_root {
+        "git_repo_root"
+    } else {
+        "NULL"
+    };
+    let sql = format!(
+        "SELECT id, {cwd_expr}, {root_expr} FROM sessions \
+         WHERE source='cli' AND ended_at IS NULL \
+         ORDER BY started_at DESC, id DESC"
+    );
     let mut stmt = conn
-        .prepare(
-            "SELECT id FROM sessions \
-             WHERE source='cli' AND ended_at IS NULL \
-             ORDER BY started_at DESC LIMIT 10",
-        )
-        .context("Hermes sessions table schema mismatch")?;
+        .prepare(&sql)
+        .context("Hermes sessions table missing or schema mismatch")?;
 
     let rows = stmt
-        .query_map([], |row| row.get(0))
+        .query_map([], |row| {
+            let id: String = row.get(0)?;
+            let cwd: Option<String> = row.get(1)?;
+            let root: Option<String> = row.get(2)?;
+            Ok(HermesSessionRow {
+                id,
+                cwd: normalize_hermes_signal(cwd),
+                git_repo_root: normalize_hermes_signal(root),
+            })
+        })
         .context("Failed to query Hermes sessions table")?;
 
-    let mut ids: Vec<String> = Vec::new();
+    let mut out: Vec<HermesSessionRow> = Vec::new();
     for row in rows {
-        ids.push(row.context("Failed to read Hermes session row")?);
+        out.push(row.context("Failed to read Hermes session row")?);
     }
 
-    Ok(ids)
+    Ok(HermesSessionScan {
+        rows: out,
+        signal_columns_present: has_cwd || has_git_repo_root,
+    })
 }
 
 /// Capture a Hermes session ID from inside a Docker container.
@@ -2631,7 +3189,7 @@ fn read_hermes_sessions_from_sqlite(db_path: &Path) -> Result<Vec<String>> {
 /// `sqlite3` CLI binary, which may not be installed in minimal containers.
 pub(crate) fn try_capture_hermes_session_id_in_container(
     container_name: &str,
-    _container_cwd: &str,
+    container_cwd: &str,
     exclusion: &HashSet<String>,
 ) -> Result<String> {
     let mut cmd = std::process::Command::new("docker");
@@ -2649,7 +3207,7 @@ pub(crate) fn try_capture_hermes_session_id_in_container(
         "docker exec python3 (hermes session scan)",
     )?;
 
-    select_hermes_session(&stdout_bytes, exclusion)
+    select_hermes_session_in_container(&stdout_bytes, container_cwd, exclusion)
 }
 
 /// Polling closure for Hermes session tracking.
@@ -2690,6 +3248,128 @@ mod tests {
     use super::*;
     use crate::session::test_support::EnvGuard;
     use serial_test::serial;
+
+    /// Well before the 5-minute live-capture window, in the same absolute-epoch
+    /// form the other mtime-ordering tests in this module pin.
+    const STALE_JSONL_MTIME: u64 = 1_700_000_000;
+
+    /// Scaffold for the `.claude.json` fallback arm: a project dir whose only
+    /// jsonl is older than the 5-minute live-capture window, so
+    /// `capture_claude_session_id` falls past the dir scan, plus a
+    /// `.claude.json` naming `last_session_id` for that directory. Returns the
+    /// encoded transcript dir.
+    fn claude_json_fallback_home(
+        temp: &tempfile::TempDir,
+        project_path: &str,
+        stale_transcript: &str,
+        last_session_id: &str,
+    ) -> std::path::PathBuf {
+        let dir = temp
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join(encode_claude_project_path(
+                &canonicalize_or_raw(project_path).to_string_lossy(),
+            ));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let jsonl = dir.join(format!("{stale_transcript}.jsonl"));
+        std::fs::write(&jsonl, "").unwrap();
+        set_mtime_secs(&jsonl, STALE_JSONL_MTIME);
+
+        // Placed and keyed the way production reads it. `.claude.json` sits
+        // *inside* the config dir when `CLAUDE_CONFIG_DIR` selects it (#3410),
+        // which this fixture sets, and the `projects` key is canonicalized: on
+        // macOS `/tmp` is a symlink, so a raw key would miss and the reject
+        // case below would pass without ever reaching the gate.
+        std::fs::write(
+            temp.path().join(".claude").join(".claude.json"),
+            serde_json::json!({
+                "projects": {
+                    canonicalize_or_raw(project_path).to_string_lossy().to_string():
+                        { "lastSessionId": last_session_id }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+        dir
+    }
+
+    fn claude_json_env(temp: &tempfile::TempDir) -> EnvGuard {
+        EnvGuard::set(&[
+            ("HOME", temp.path().to_path_buf()),
+            ("CLAUDE_CONFIG_DIR", temp.path().join(".claude")),
+        ])
+    }
+
+    /// `.claude.json`'s `lastSessionId` is one slot per *directory*, and the
+    /// freshness gate around it reads the mtime of `.claude.json` itself,
+    /// which any live Claude rewrites, so a months-old value still passes.
+    /// Handing that id out for `--resume` when no transcript backs it is a
+    /// guaranteed "No conversation found" and a dead pane on every restart.
+    #[test]
+    #[serial]
+    fn claude_json_fallback_rejects_sid_with_no_transcript() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_path = "/tmp/aoe-test-claude-json-phantom";
+        let _guard = claude_json_env(&temp);
+        claude_json_fallback_home(
+            &temp,
+            project_path,
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            "11111111-2222-3333-4444-555555555555",
+        );
+
+        let err = capture_claude_session_id(project_path, None, &HashSet::new(), &[])
+            .expect_err("a lastSessionId with no transcript must not be captured");
+        assert!(
+            err.to_string().contains("No active Claude session found"),
+            "unexpected error: {err}"
+        );
+    }
+
+    /// Companion: the arm still works when the named conversation exists. Only
+    /// the phantom case is rejected, so a genuinely idle session in a
+    /// single-session directory is still recoverable through this path.
+    #[test]
+    #[serial]
+    fn claude_json_fallback_accepts_sid_with_transcript() {
+        let temp = tempfile::tempdir().unwrap();
+        let project_path = "/tmp/aoe-test-claude-json-real";
+        let named = "11111111-2222-3333-4444-555555555555";
+        let _guard = claude_json_env(&temp);
+        let dir = claude_json_fallback_home(
+            &temp,
+            project_path,
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+            named,
+        );
+        // Same stale mtime as the decoy, so the dir scan still falls through
+        // and this is reached via the `.claude.json` arm, not the scan.
+        let jsonl = dir.join(format!("{named}.jsonl"));
+        std::fs::write(&jsonl, "").unwrap();
+        set_mtime_secs(&jsonl, STALE_JSONL_MTIME);
+
+        assert_eq!(
+            capture_claude_session_id(project_path, None, &HashSet::new(), &[]).unwrap(),
+            named
+        );
+    }
+
+    /// Pin a modification time so mtime ordering in tests never depends on the
+    /// host filesystem's timestamp resolution. Opened read-only, which lets the
+    /// same call set the mtime of both files and directories on Unix.
+    fn set_mtime_secs(path: &Path, secs: u64) {
+        std::fs::File::options()
+            .read(true)
+            .open(path)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(
+                std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(secs),
+            ))
+            .unwrap();
+    }
 
     #[test]
     fn canonicalize_or_raw_normalizes_deleted_dirs_lexically() {
@@ -2796,7 +3476,7 @@ mod tests {
         let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
         std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
 
-        let result = capture_claude_session_id("/tmp/myproject", None, &HashSet::new());
+        let result = capture_claude_session_id("/tmp/myproject", None, &HashSet::new(), &[]);
         assert_eq!(result.unwrap(), uuid_new);
 
         match old_val {
@@ -2830,23 +3510,79 @@ mod tests {
         std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
 
         assert!(
-            !claude_host_transcript_confirmed_absent("/tmp/myproject", present),
+            !claude_host_transcript_confirmed_absent("/tmp/myproject", present, &[]),
             "a transcript on disk (even stale) must not be reported absent"
         );
         assert!(
-            claude_host_transcript_confirmed_absent("/tmp/myproject", missing),
+            claude_host_transcript_confirmed_absent("/tmp/myproject", missing, &[]),
             "an unwritten sid must be reported confirmed-absent"
         );
         // A project dir that was never created is also confirmed-absent.
         assert!(claude_host_transcript_confirmed_absent(
             "/tmp/never-opened-project",
-            present
+            present,
+            &[]
         ));
 
         match old_val {
             Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
             None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
         }
+    }
+
+    /// #3399: both Claude reads resolve the config dir the launched pane will
+    /// see, so two profiles sharing a cwd each see only their own conversation.
+    /// Against the default tree neither transcript exists, so the probe would
+    /// call every real conversation absent and downgrade it to `--session-id`,
+    /// and the project-dir scan would hand back the other profile's sid.
+    #[test]
+    #[serial]
+    fn claude_reads_resolve_the_profile_scoped_config_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = "/tmp/aoe-3399-shared-cwd";
+        let personal_sid = "11111111-1111-4111-8111-111111111111";
+        let work_sid = "22222222-2222-4222-8222-222222222222";
+        let mut homes = Vec::new();
+        for (name, sid) in [("personal", personal_sid), ("work", work_sid)] {
+            let home = tmp.path().join(format!("claude-{name}"));
+            let dir = home
+                .join("projects")
+                .join(encode_claude_project_path(project));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join(format!("{sid}.jsonl")), "data\n").unwrap();
+            homes.push(vec![format!("CLAUDE_CONFIG_DIR={}", home.display())]);
+        }
+        let (personal_env, work_env) = (&homes[0], &homes[1]);
+
+        // The process-level dir stands in for "no profile override", and holds
+        // neither conversation.
+        let _guard = EnvGuard::set(&[("CLAUDE_CONFIG_DIR", tmp.path().join("claude-default"))]);
+
+        for (env, own, other) in [
+            (personal_env, personal_sid, work_sid),
+            (work_env, work_sid, personal_sid),
+        ] {
+            assert!(
+                !claude_host_transcript_confirmed_absent(project, own, env),
+                "{own} lives in this profile's config dir and must read as present"
+            );
+            assert!(
+                claude_host_transcript_confirmed_absent(project, other, env),
+                "{other} belongs to the other profile and must not read as present"
+            );
+            assert_eq!(
+                capture_claude_session_id(project, None, &HashSet::new(), env).unwrap(),
+                own,
+                "the project-dir scan must only see this profile's conversations"
+            );
+        }
+
+        // No profile override falls back to AoE's own env, which sees neither.
+        assert!(claude_host_transcript_confirmed_absent(
+            project,
+            personal_sid,
+            &[]
+        ));
     }
 
     #[test]
@@ -2872,29 +3608,32 @@ mod tests {
         std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
 
         assert_eq!(
-            capture_claude_session_id("/tmp/myproject", None, &HashSet::new()).unwrap(),
+            capture_claude_session_id("/tmp/myproject", None, &HashSet::new(), &[]).unwrap(),
             uuid_b
         );
 
         assert_eq!(
-            capture_claude_session_id("/tmp/myproject", Some(uuid_a), &HashSet::new()).unwrap(),
+            capture_claude_session_id("/tmp/myproject", Some(uuid_a), &HashSet::new(), &[])
+                .unwrap(),
             uuid_b
         );
 
         let exclusion: HashSet<String> = std::iter::once(uuid_b.to_string()).collect();
         assert_eq!(
-            capture_claude_session_id("/tmp/myproject", Some(uuid_a), &exclusion).unwrap(),
+            capture_claude_session_id("/tmp/myproject", Some(uuid_a), &exclusion, &[]).unwrap(),
             uuid_a
         );
 
         assert_eq!(
-            capture_claude_session_id("/tmp/myproject", Some(uuid_b), &HashSet::new()).unwrap(),
+            capture_claude_session_id("/tmp/myproject", Some(uuid_b), &HashSet::new(), &[])
+                .unwrap(),
             uuid_b
         );
 
         let absent = "99999999-9999-9999-9999-999999999999";
         assert_eq!(
-            capture_claude_session_id("/tmp/myproject", Some(absent), &HashSet::new()).unwrap(),
+            capture_claude_session_id("/tmp/myproject", Some(absent), &HashSet::new(), &[])
+                .unwrap(),
             uuid_b
         );
 
@@ -2929,7 +3668,8 @@ mod tests {
         std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
 
         assert_eq!(
-            capture_claude_session_id("/tmp/myproject", Some(uuid_known), &HashSet::new()).unwrap(),
+            capture_claude_session_id("/tmp/myproject", Some(uuid_known), &HashSet::new(), &[])
+                .unwrap(),
             uuid_fresh
         );
 
@@ -2969,6 +3709,7 @@ mod tests {
             Some(uuid_startup.to_string()),
             "test-instance-promote-last-known".to_string(),
             extra_excludes,
+            Vec::new(),
         );
 
         assert_eq!(poll().as_deref(), Some(uuid_post_fork));
@@ -2999,7 +3740,7 @@ mod tests {
         let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
         std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
 
-        let result = capture_claude_session_id("/tmp/myproject", None, &HashSet::new());
+        let result = capture_claude_session_id("/tmp/myproject", None, &HashSet::new(), &[]);
         assert!(result.is_err(), "Agent files should not be picked up");
 
         match old_val {
@@ -3031,7 +3772,7 @@ mod tests {
         let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
         std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
 
-        let result = capture_claude_session_id("/tmp/myproject", None, &HashSet::new());
+        let result = capture_claude_session_id("/tmp/myproject", None, &HashSet::new(), &[]);
         assert!(result.is_err(), "Stale session file should be rejected");
         assert!(
             result
@@ -3057,7 +3798,7 @@ mod tests {
         let old_val = std::env::var("CLAUDE_CONFIG_DIR").ok();
         std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
 
-        let result = capture_claude_session_id("/tmp/myproject", None, &HashSet::new());
+        let result = capture_claude_session_id("/tmp/myproject", None, &HashSet::new(), &[]);
         assert!(result.is_err(), "Empty dir should return error");
 
         match old_val {
@@ -3075,6 +3816,88 @@ mod tests {
             None,
         );
         assert!(result.is_err());
+    }
+
+    /// Runs the production snippet under `sh` against a real directory, so the
+    /// guard is exercised without Docker. `CLAUDE_CONFIG_DIR` goes to the child
+    /// only, so this needs no `EnvGuard` and no serial key.
+    #[cfg(unix)]
+    #[test]
+    fn test_container_list_snippet_lists_only_regular_files() {
+        let sid = "11111111-1111-4111-8111-111111111111";
+        // `listed` is what the snippet should emit for each shape. The glob
+        // does match a directory, but `ls -tL` on one lists its contents
+        // rather than itself, so that entry never reaches `[ -f ]`; the row
+        // pins the listing step, not the guard.
+        let cases = [
+            ("regular", true),
+            ("symlink-to-transcript", true),
+            ("directory", false),
+            ("dangling-link", false),
+            ("symlink-cycle", false),
+            ("fifo", false),
+        ];
+        for (kind, listed) in cases {
+            let home = tempfile::tempdir().unwrap();
+            let project_path = format!("/tmp/container-scan-probe-{kind}");
+            let dir = home
+                .path()
+                .join("projects")
+                .join(encode_claude_project_path(&project_path));
+            std::fs::create_dir_all(&dir).unwrap();
+            let entry = dir.join(format!("{sid}.jsonl"));
+            match kind {
+                "regular" => std::fs::write(&entry, "{}\n").unwrap(),
+                "symlink-to-transcript" => {
+                    let target = dir.join("target.data");
+                    std::fs::write(&target, "{}\n").unwrap();
+                    std::os::unix::fs::symlink(&target, &entry).unwrap();
+                    // Age the link past the five-minute gate while its target
+                    // stays fresh. Without this the row passes on a link too
+                    // young to distinguish lstat from stat, which is the case
+                    // that actually breaks. BSD `touch` rejects this date
+                    // form, so skip the row where it is unavailable rather
+                    // than let it pass without testing anything.
+                    let aged = std::process::Command::new("touch")
+                        .args(["-h", "-d", "10 minutes ago"])
+                        .arg(&entry)
+                        .status()
+                        .is_ok_and(|s| s.success());
+                    if !aged {
+                        continue;
+                    }
+                }
+                "directory" => std::fs::create_dir(&entry).unwrap(),
+                "dangling-link" => {
+                    std::os::unix::fs::symlink(dir.join("gone.jsonl"), &entry).unwrap()
+                }
+                "symlink-cycle" => std::os::unix::fs::symlink(&entry, &entry).unwrap(),
+                "fifo" => {
+                    // Skipped rather than failed where `mkfifo` is unavailable;
+                    // the other rows still gate the guard.
+                    match std::process::Command::new("mkfifo").arg(&entry).status() {
+                        Ok(s) if s.success() => {}
+                        _ => continue,
+                    }
+                }
+                _ => continue,
+            }
+
+            let out = std::process::Command::new("sh")
+                .arg("-c")
+                .arg(claude_container_list_snippet(&encode_claude_project_path(
+                    &project_path,
+                )))
+                .env("CLAUDE_CONFIG_DIR", home.path())
+                .output()
+                .expect("snippet invocation failed");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            assert_eq!(
+                stdout.lines().any(|l| l.trim() == sid),
+                listed,
+                "{kind}: unexpected listing, stdout {stdout:?}",
+            );
+        }
     }
 
     #[test]
@@ -3159,6 +3982,66 @@ mod tests {
             extract_pi_uuid_from_filename(&path),
             Some("019342ab-1234-7def-8901-abcdef012345".to_string())
         );
+    }
+
+    /// Regression (#3078 family): omp writes a `{"type":"title"}` record on line
+    /// 0 and the `{"type":"session"}` header on line 1, so a line-0-only read
+    /// returned no id and no cwd. The bounded multi-line scan recovers both from
+    /// the title-first layout while leaving pi (session on line 0) unchanged.
+    #[test]
+    fn test_extract_pi_header_fields_title_first() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("session.jsonl");
+        let mut contents =
+            "{\"type\":\"title\",\"v\":1,\"title\":\"t\"}\n\
+             {\"type\":\"session\",\"version\":3,\"id\":\"019fc9a0-f688-7000-ae45-d9e51e5e1b8a\",\"cwd\":\"/Users/dev/proj\"}\n"
+                .to_string();
+        contents.push_str(&"x".repeat(PI_HEADER_SCAN_BYTES * 2));
+        std::fs::write(&path, contents).unwrap();
+        assert_eq!(
+            extract_pi_session_id_from_header(&path),
+            Some("019fc9a0-f688-7000-ae45-d9e51e5e1b8a".to_string())
+        );
+        assert_eq!(
+            extract_pi_cwd_from_header(&path),
+            Some("/Users/dev/proj".to_string())
+        );
+
+        let oversized_prefix = format!(
+            "{}\n{{\"type\":\"session\",\"id\":\"019fc9a0-f688-7000-ae45-d9e51e5e1b8a\",\"cwd\":\"/Users/dev/proj\"}}\n",
+            "x".repeat(PI_HEADER_SCAN_BYTES)
+        );
+        std::fs::write(&path, oversized_prefix).unwrap();
+        assert!(
+            extract_pi_session_id_from_header(&path).is_none(),
+            "a single oversized leading line must fail closed without scanning past the byte cap"
+        );
+    }
+
+    /// The header scan is bounded by `PI_HEADER_SCAN_LINES`: a `session` record
+    /// within the window is found, one past it is not (so a large `.jsonl` body
+    /// is never walked).
+    #[test]
+    fn test_extract_pi_header_fields_scan_bound() {
+        let session = r#"{"type":"session","id":"aaa","cwd":"/p"}"#;
+        let cases = [
+            (0usize, true),
+            (PI_HEADER_SCAN_LINES - 1, true),
+            (PI_HEADER_SCAN_LINES, false),
+        ];
+        for (index, expected_found) in cases {
+            let tmp = tempfile::tempdir().unwrap();
+            let path = tmp.path().join("session.jsonl");
+            let mut contents = String::new();
+            for _ in 0..index {
+                contents.push_str("{\"type\":\"title\",\"v\":1}\n");
+            }
+            contents.push_str(session);
+            contents.push('\n');
+            std::fs::write(&path, &contents).unwrap();
+            let found = extract_pi_session_id_from_header(&path).is_some();
+            assert_eq!(found, expected_found, "session at line index {index}");
+        }
     }
 
     /// Real e2e: run the same shell script we ship to `docker exec` against a
@@ -3263,92 +4146,11 @@ mod tests {
         }
     }
 
-    /// omp shares pi's on-disk format: with `PI_CODING_AGENT_DIR` set, the omp
-    /// capture reads the same sessions dir the pi capture would.
-    #[test]
-    #[serial]
-    fn test_capture_omp_session_id_basic() {
-        let tmp = tempfile::tempdir().unwrap();
-        let sessions_dir = tmp.path().join("sessions");
-        let project_encoded = encode_pi_project_path("/home/user/project");
-        let project_dir = sessions_dir.join(&project_encoded);
-        std::fs::create_dir_all(&project_dir).unwrap();
-
-        let uuid = "019342ab-1234-7def-8901-abcdef012345";
-        std::fs::write(
-            project_dir.join(format!("2024-12-03T14-00-00-000Z_{uuid}.jsonl")),
-            format!(r#"{{"type":"session","id":"{uuid}","cwd":"/home/user/project"}}"#),
-        )
-        .unwrap();
-
-        let old_val = std::env::var("PI_CODING_AGENT_DIR").ok();
-        std::env::set_var("PI_CODING_AGENT_DIR", tmp.path());
-
-        let result = capture_omp_session_id("/home/user/project", &HashSet::new());
-
-        match old_val {
-            Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
-            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-        }
-
-        assert_eq!(result.unwrap(), uuid);
-    }
-
-    /// Path-adjustment regression (#3065 follow-up): with `PI_CODING_AGENT_DIR`
-    /// unset, omp must default its host data dir to `~/.omp/agent`, NOT pi's
-    /// `~/.pi/agent`. A session written under `~/.omp/agent` is found by the omp
-    /// capture but not by the pi capture. Without the remap, omp resume would
-    /// silently scan the wrong (empty) dir and never resume.
-    #[test]
-    #[serial]
-    fn test_capture_omp_defaults_to_omp_agent_dir() {
-        let tmp = tempfile::tempdir().unwrap();
-        let project_encoded = encode_pi_project_path("/home/user/project");
-        let omp_project_dir = tmp
-            .path()
-            .join(".omp/agent/sessions")
-            .join(&project_encoded);
-        std::fs::create_dir_all(&omp_project_dir).unwrap();
-
-        let uuid = "019342ab-1234-7def-8901-abcdef012345";
-        std::fs::write(
-            omp_project_dir.join(format!("2024-12-03T14-00-00-000Z_{uuid}.jsonl")),
-            format!(r#"{{"type":"session","id":"{uuid}","cwd":"/home/user/project"}}"#),
-        )
-        .unwrap();
-
-        let old_pi_dir = std::env::var("PI_CODING_AGENT_DIR").ok();
-        let old_home = std::env::var("HOME").ok();
-        std::env::remove_var("PI_CODING_AGENT_DIR");
-        std::env::set_var("HOME", tmp.path());
-
-        let omp_result = capture_omp_session_id("/home/user/project", &HashSet::new());
-        let pi_result = capture_pi_session_id("/home/user/project", &HashSet::new());
-
-        match old_pi_dir {
-            Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
-            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-        }
-        match old_home {
-            Some(v) => std::env::set_var("HOME", v),
-            None => std::env::remove_var("HOME"),
-        }
-
-        assert_eq!(
-            omp_result.unwrap(),
-            uuid,
-            "omp capture should default to ~/.omp/agent"
-        );
-        assert!(
-            pi_result.is_err(),
-            "pi capture must NOT find omp's session under ~/.omp/agent"
-        );
-    }
-
     #[test]
     #[serial]
     fn test_capture_pi_session_id_most_recent_wins() {
         let tmp = tempfile::tempdir().unwrap();
+
         let sessions_dir = tmp.path().join("sessions");
         let project_encoded = encode_pi_project_path("/home/user/project");
         let project_dir = sessions_dir.join(&project_encoded);
@@ -3357,17 +4159,20 @@ mod tests {
         let uuid_old = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
         let uuid_new = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
 
+        let old_path = project_dir.join(format!("2024-12-01T10-00-00-000Z_{uuid_old}.jsonl"));
+        let new_path = project_dir.join(format!("2024-12-03T14-00-00-000Z_{uuid_new}.jsonl"));
         std::fs::write(
-            project_dir.join(format!("2024-12-01T10-00-00-000Z_{uuid_old}.jsonl")),
+            &old_path,
             format!(r#"{{"type":"session","id":"{uuid_old}","cwd":"/home/user/project"}}"#),
         )
         .unwrap();
-        std::thread::sleep(std::time::Duration::from_millis(50));
         std::fs::write(
-            project_dir.join(format!("2024-12-03T14-00-00-000Z_{uuid_new}.jsonl")),
+            &new_path,
             format!(r#"{{"type":"session","id":"{uuid_new}","cwd":"/home/user/project"}}"#),
         )
         .unwrap();
+        set_mtime_secs(&old_path, 1_700_000_000);
+        set_mtime_secs(&new_path, 1_700_000_100);
 
         let old_val = std::env::var("PI_CODING_AGENT_DIR").ok();
         std::env::set_var("PI_CODING_AGENT_DIR", tmp.path());
@@ -3423,6 +4228,51 @@ mod tests {
 
     #[test]
     #[serial]
+    fn test_capture_pi_session_id_all_cwd_matches_excluded_errs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+
+        // Only session whose cwd matches the project, in a non-encoded dir so it
+        // is reached via the cwd-fallback scan; its id is excluded.
+        let target_id = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let target_dir = sessions_dir.join("--wrong-name--");
+        std::fs::create_dir_all(&target_dir).unwrap();
+        std::fs::write(
+            target_dir.join(format!("2024-12-01T10-00-00-000Z_{target_id}.jsonl")),
+            format!(r#"{{"type":"session","id":"{target_id}","cwd":"/home/user/project"}}"#),
+        )
+        .unwrap();
+
+        // A different project's session, newer: the newest-dir fallback would
+        // resume it if the cwd-match bail did not fire first.
+        let decoy_id = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let decoy_dir = sessions_dir.join("--decoy--");
+        std::fs::create_dir_all(&decoy_dir).unwrap();
+        std::fs::write(
+            decoy_dir.join(format!("2024-12-09T10-00-00-000Z_{decoy_id}.jsonl")),
+            format!(r#"{{"type":"session","id":"{decoy_id}","cwd":"/home/user/other"}}"#),
+        )
+        .unwrap();
+
+        let old_val = std::env::var("PI_CODING_AGENT_DIR").ok();
+        std::env::set_var("PI_CODING_AGENT_DIR", tmp.path());
+
+        let mut exclusion = HashSet::new();
+        exclusion.insert(target_id.to_string());
+        let result = capture_pi_session_id("/home/user/project", &exclusion);
+
+        match old_val {
+            Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
+            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
+        }
+
+        let err =
+            result.expect_err("all cwd matches excluded must error, not cross-project resume");
+        assert!(err.to_string().contains("are excluded"), "{err:?}");
+    }
+
+    #[test]
+    #[serial]
     fn test_capture_pi_session_id_cwd_fallback_most_recent_wins() {
         let tmp = tempfile::tempdir().unwrap();
         let sessions_dir = tmp.path().join("sessions");
@@ -3432,21 +4282,23 @@ mod tests {
 
         let dir_a = sessions_dir.join("--wrong-name-a--");
         std::fs::create_dir_all(&dir_a).unwrap();
+        let path_a = dir_a.join(format!("2024-12-01T10-00-00-000Z_{uuid_old}.jsonl"));
         std::fs::write(
-            dir_a.join(format!("2024-12-01T10-00-00-000Z_{uuid_old}.jsonl")),
+            &path_a,
             format!(r#"{{"type":"session","id":"{uuid_old}","cwd":"/home/user/project"}}"#),
         )
         .unwrap();
 
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
         let dir_b = sessions_dir.join("--wrong-name-b--");
         std::fs::create_dir_all(&dir_b).unwrap();
+        let path_b = dir_b.join(format!("2024-12-03T14-00-00-000Z_{uuid_new}.jsonl"));
         std::fs::write(
-            dir_b.join(format!("2024-12-03T14-00-00-000Z_{uuid_new}.jsonl")),
+            &path_b,
             format!(r#"{{"type":"session","id":"{uuid_new}","cwd":"/home/user/project"}}"#),
         )
         .unwrap();
+        set_mtime_secs(&path_a, 1_700_000_000);
+        set_mtime_secs(&path_b, 1_700_000_100);
 
         let old_val = std::env::var("PI_CODING_AGENT_DIR").ok();
         std::env::set_var("PI_CODING_AGENT_DIR", tmp.path());
@@ -3494,48 +4346,80 @@ mod tests {
         }
     }
 
+    /// Third fallback: when JSONL headers fail to parse, extract a UUID from
+    /// the filename. Only consider directories whose encoded name matches the
+    /// target project path, so we never grab a session from the wrong project.
     #[test]
     #[serial]
     fn test_capture_pi_session_id_fallback_by_dir_mtime() {
         let tmp = tempfile::tempdir().unwrap();
         let sessions_dir = tmp.path().join("sessions");
 
-        let uuid_old = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
-        let uuid_new = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        let uuid_match = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let uuid_other = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
 
-        let dir_old = sessions_dir.join("--old-dir--");
-        std::fs::create_dir_all(&dir_old).unwrap();
+        // Create the matching directory first, with the older session.
+        let dir_match = sessions_dir.join("--nonexistent-path-for-test--");
+        std::fs::create_dir_all(&dir_match).unwrap();
         std::fs::write(
-            dir_old.join(format!("2024-12-01T10-00-00-000Z_{uuid_old}.jsonl")),
-            "not valid json\n",
-        )
-        .unwrap();
-
-        std::thread::sleep(std::time::Duration::from_millis(50));
-
-        let dir_new = sessions_dir.join("--new-dir--");
-        std::fs::create_dir_all(&dir_new).unwrap();
-        std::fs::write(
-            dir_new.join(format!("2024-12-03T14-00-00-000Z_{uuid_new}.jsonl")),
+            dir_match.join(format!("2024-12-01T10-00-00-000Z_{uuid_match}.jsonl")),
             "also not valid json\n",
         )
         .unwrap();
 
-        let old_val = std::env::var("PI_CODING_AGENT_DIR").ok();
-        std::env::set_var("PI_CODING_AGENT_DIR", tmp.path());
+        // Create a non-matching directory (different project) with a *newer*
+        // session — must still be ignored, so this pins the scoping filter
+        // rather than the mtime sort alone.
+        let dir_other = sessions_dir.join("--other-dir--");
+        std::fs::create_dir_all(&dir_other).unwrap();
+        std::fs::write(
+            dir_other.join(format!("2024-12-03T14-00-00-000Z_{uuid_other}.jsonl")),
+            "not valid json\n",
+        )
+        .unwrap();
+        set_mtime_secs(&dir_match, 1_700_000_000);
+        set_mtime_secs(&dir_other, 1_700_000_100);
 
+        let _env = EnvGuard::set(&[("PI_CODING_AGENT_DIR", tmp.path())]);
+
+        // Should find the session in the matching directory, not the newer
+        // (but unrelated) one.
         let result = capture_pi_session_id("/nonexistent/path/for/test", &HashSet::new());
         assert!(
             result.is_ok(),
             "Dir-mtime fallback should find session: {:?}",
             result
         );
-        assert_eq!(result.unwrap(), uuid_new);
+        assert_eq!(result.unwrap(), uuid_match);
+    }
 
-        match old_val {
-            Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
-            None => std::env::remove_var("PI_CODING_AGENT_DIR"),
-        }
+    /// Third fallback: when no matching project directory exists, should
+    /// return an error rather than picking from any directory.
+    #[test]
+    #[serial]
+    fn test_capture_pi_session_id_fallback_no_match_returns_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+
+        let uuid = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+
+        // Only a non-matching directory exists.
+        let dir_other = sessions_dir.join("--other-dir--");
+        std::fs::create_dir_all(&dir_other).unwrap();
+        std::fs::write(
+            dir_other.join(format!("2024-12-03T14-00-00-000Z_{uuid}.jsonl")),
+            "not valid json\n",
+        )
+        .unwrap();
+
+        let _env = EnvGuard::set(&[("PI_CODING_AGENT_DIR", tmp.path())]);
+
+        let result = capture_pi_session_id("/nonexistent/path/for/test", &HashSet::new());
+        assert!(
+            result.is_err(),
+            "Should error when no matching project directory exists: {:?}",
+            result
+        );
     }
 
     #[test]
@@ -3900,7 +4784,10 @@ mod tests {
 
     #[test]
     fn test_build_exclusion_set_empty() {
-        let result = build_exclusion_set("nonexistent-instance-id-12345");
+        let result = build_exclusion_set(
+            "nonexistent-instance-id-12345",
+            &crate::tmux::LiveSessionSnapshot::new(),
+        );
         // The exclusion set should never contain our own instance ID
         // (it collects OTHER instances' captured session IDs).
         // On a machine with active AoE tmux sessions, the set may be
@@ -4516,42 +5403,658 @@ mod tests {
 
     // ─── Hermes tests ────────────────────────────────────────────────────────────
 
+    /// A seed row for [`seed_hermes_db`]: id, source, started_at, cwd,
+    /// git_repo_root.
+    type HermesSeedRow<'a> = (&'a str, &'a str, f64, Option<&'a str>, Option<&'a str>);
+
+    /// Seed a Hermes `state.db` under `home` (the dir `HERMES_HOME` points
+    /// at). `full_schema` selects the current schema (with
+    /// `cwd`/`git_repo_root` columns) or the legacy minimal schema.
+    fn seed_hermes_db(home: &Path, rows: &[HermesSeedRow], full_schema: bool) {
+        let db_path = home.join("state.db");
+        let conn = rusqlite::Connection::open(&db_path).unwrap();
+        if full_schema {
+            conn.execute_batch(
+                "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, started_at REAL, ended_at REAL, cwd TEXT, git_repo_root TEXT);",
+            )
+            .unwrap();
+            for (id, source, started_at, cwd, root) in rows {
+                conn.execute(
+                    "INSERT INTO sessions (id, source, started_at, ended_at, cwd, git_repo_root) \
+                     VALUES (?1, ?2, ?3, NULL, ?4, ?5)",
+                    rusqlite::params![id, source, started_at, cwd, root],
+                )
+                .unwrap();
+            }
+        } else {
+            conn.execute_batch(
+                "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, started_at REAL, ended_at REAL);",
+            )
+            .unwrap();
+            for (id, source, started_at, _, _) in rows {
+                conn.execute(
+                    "INSERT INTO sessions (id, source, started_at, ended_at) VALUES (?1, ?2, ?3, NULL)",
+                    rusqlite::params![id, source, started_at],
+                )
+                .unwrap();
+            }
+        }
+        drop(conn);
+    }
+
     #[test]
-    fn test_select_hermes_session_parsing() {
-        let output = b"20260429_193246_aaa\n20260429_193246_bbb\n";
-        let exclusion = HashSet::new();
-        let result = select_hermes_session(output, &exclusion).unwrap();
+    fn test_select_hermes_session_in_container_scoped_parsing() {
+        let output = b"SIGNAL\n\
+20260429_193246_aaa\t/tmp/hermes-a\t\n\
+20260429_193246_bbb\t/tmp/hermes-b\t\n";
+        let result =
+            select_hermes_session_in_container(output, "/tmp/hermes-a", &HashSet::new()).unwrap();
         assert_eq!(result, "20260429_193246_aaa");
     }
 
     #[test]
-    fn test_select_hermes_session_with_exclusion() {
-        let output = b"20260429_193246_aaa\n20260429_193246_bbb\n";
+    fn test_select_hermes_session_in_container_scoped_with_exclusion() {
+        // Both rows carry the needle's cwd, so the exclusion filter is what
+        // separates them (mirrors the DB-level second-match test).
+        let output = b"SIGNAL\n\
+20260429_193246_aaa\t/tmp/hermes-a\t\n\
+20260429_193246_bbb\t/tmp/hermes-a\t\n";
         let mut exclusion = HashSet::new();
         exclusion.insert("20260429_193246_aaa".to_string());
-        let result = select_hermes_session(output, &exclusion).unwrap();
+        let result =
+            select_hermes_session_in_container(output, "/tmp/hermes-a", &exclusion).unwrap();
         assert_eq!(result, "20260429_193246_bbb");
     }
 
     #[test]
-    fn test_select_hermes_session_empty_output() {
-        let output = b"";
-        let exclusion = HashSet::new();
-        let result = select_hermes_session(output, &exclusion);
+    fn test_select_hermes_session_in_container_scoped_no_match() {
+        // In SIGNAL mode a row whose cwd points at another project is never
+        // returned, even when it is the only active conversation.
+        let output = b"SIGNAL\n20260429_193246_aaa\t/tmp/other-project\t\n";
+        let result = select_hermes_session_in_container(output, "/tmp/hermes-a", &HashSet::new());
         assert!(result.is_err());
     }
 
     #[test]
-    fn test_select_hermes_session_whitespace_lines() {
-        let output = b"  \n\n20260429_193246_ccc\n  \n";
-        let exclusion = HashSet::new();
-        let result = select_hermes_session(output, &exclusion).unwrap();
+    fn test_select_hermes_session_in_container_legacy_single_row() {
+        let output = b"LEGACY\n20260429_193246_aaa\t\t\n";
+        let result =
+            select_hermes_session_in_container(output, "/tmp/anywhere", &HashSet::new()).unwrap();
+        assert_eq!(result, "20260429_193246_aaa");
+    }
+
+    #[test]
+    fn test_select_hermes_session_in_container_legacy_multiple_ambiguous() {
+        let output = b"LEGACY\n20260429_193246_aaa\t\t\n20260429_193246_bbb\t\t\n";
+        let result = select_hermes_session_in_container(output, "/tmp/anywhere", &HashSet::new());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_select_hermes_session_in_container_legacy_multiple_exclusion_narrows() {
+        let output = b"LEGACY\n20260429_193246_aaa\t\t\n20260429_193246_bbb\t\t\n";
+        let mut exclusion = HashSet::new();
+        exclusion.insert("20260429_193246_aaa".to_string());
+        let result =
+            select_hermes_session_in_container(output, "/tmp/anywhere", &exclusion).unwrap();
+        assert_eq!(result, "20260429_193246_bbb");
+    }
+
+    #[test]
+    fn test_select_hermes_session_in_container_empty_output() {
+        let result = select_hermes_session_in_container(b"", "/tmp/hermes-a", &HashSet::new());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_select_hermes_session_in_container_whitespace_only_lines_skipped() {
+        // Whitespace-only lines before the mode line are tolerated; the first
+        // non-empty line must still be the mode line.
+        let output = b"  \n\nSIGNAL\n20260429_193246_ccc\t/tmp/hermes-c\t\n  \n";
+        let result =
+            select_hermes_session_in_container(output, "/tmp/hermes-c", &HashSet::new()).unwrap();
         assert_eq!(result, "20260429_193246_ccc");
+    }
+
+    #[test]
+    fn test_select_hermes_session_in_container_garbage_mode_line() {
+        // Old id-only output (or a drifted script) must fail closed, not
+        // misparse into a bogus id.
+        let output = b"20260429_193246_aaa\n20260429_193246_bbb\n";
+        let result = select_hermes_session_in_container(output, "/tmp/hermes-a", &HashSet::new());
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_select_hermes_session_in_container_malformed_rows_skipped() {
+        // A cwd containing a newline fragments the row into lines with fewer
+        // than three fields; those are skipped without panicking, and the
+        // healthy row still wins.
+        let output = b"SIGNAL\n\
+20260429_193246_good\t/tmp/hermes-a\t\n\
+20260429_193246_bad\t/tmp/hermes-b\nwith-newline\t\n";
+        let result =
+            select_hermes_session_in_container(output, "/tmp/hermes-a", &HashSet::new()).unwrap();
+        assert_eq!(result, "20260429_193246_good");
+    }
+
+    #[test]
+    fn test_select_hermes_session_in_container_newline_in_root_accepted_truncated() {
+        // A newline in the trailing git_repo_root field yields a row with a
+        // truncated root (documented residual); the cwd arm still matches.
+        let output = b"SIGNAL\n\
+20260429_193246_root\t/tmp/hermes-a\t/tmp/root\npart2\t\n";
+        let result =
+            select_hermes_session_in_container(output, "/tmp/hermes-a", &HashSet::new()).unwrap();
+        assert_eq!(result, "20260429_193246_root");
+    }
+
+    #[test]
+    fn test_select_hermes_session_in_container_tab_in_cwd_truncates() {
+        // A cwd containing a TAB truncates at the first TAB (documented
+        // residual). The byte input mirrors what the script emits for a real
+        // cwd "/tmp/hermes-a<TAB>rest" with an empty script-side root field:
+        // id, the pre-TAB cwd, the remainder, then the empty root field
+        // separator. splitn(3) puts the remainder into the parser-side root
+        // ("rest\t"), so a needle equal to the truncated cwd matches; a
+        // different needle must not.
+        let output = b"SIGNAL\n20260429_193246_aaa\t/tmp/hermes-a\trest\t\n";
+        let result =
+            select_hermes_session_in_container(output, "/tmp/hermes-a/sub", &HashSet::new());
+        assert!(result.is_err());
+        let result =
+            select_hermes_session_in_container(output, "/tmp/hermes-a", &HashSet::new()).unwrap();
+        assert_eq!(result, "20260429_193246_aaa");
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_hermes_matches_project_cwd() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(tmp.path()).unwrap();
+        let project_str = project.to_string_lossy().to_string();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+        seed_hermes_db(
+            tmp.path(),
+            &[(
+                "20260429_193246_aaa",
+                "cli",
+                1000.0,
+                Some(&project_str),
+                None,
+            )],
+            true,
+        );
+        let result = capture_hermes_session_id(&project_str, &HashSet::new()).unwrap();
+        assert_eq!(result, "20260429_193246_aaa");
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_hermes_prefers_exact_cwd_over_repo_root() {
+        // A conversation started in a subdirectory of the same repo carries
+        // this project's git_repo_root once a hermes gateway/TUI enriches it
+        // (or backfill_repo_roots runs), and is usually a sibling AoE
+        // session's. The row whose cwd IS this project must win even when the
+        // subdir row is newer.
+        let tmp = tempfile::tempdir().unwrap();
+        let repo = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let sub_str = std::fs::canonicalize(&sub)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+        seed_hermes_db(
+            tmp.path(),
+            &[
+                (
+                    "20260429_193246_own",
+                    "cli",
+                    1000.0,
+                    Some(&repo_str),
+                    Some(&repo_str),
+                ),
+                (
+                    "20260429_193246_sub",
+                    "cli",
+                    2000.0,
+                    Some(&sub_str),
+                    Some(&repo_str),
+                ),
+            ],
+            true,
+        );
+        assert_eq!(
+            capture_hermes_session_id(&repo_str, &HashSet::new()).unwrap(),
+            "20260429_193246_own"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_hermes_matches_git_repo_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(tmp.path()).unwrap();
+        let project_str = project.to_string_lossy().to_string();
+        let sub = tmp.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let sub_str = std::fs::canonicalize(&sub)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+        seed_hermes_db(
+            tmp.path(),
+            &[(
+                "20260429_193246_aaa",
+                "cli",
+                1000.0,
+                Some(&sub_str),
+                Some(&project_str),
+            )],
+            true,
+        );
+        let result = capture_hermes_session_id(&project_str, &HashSet::new()).unwrap();
+        assert_eq!(result, "20260429_193246_aaa");
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_hermes_subdir_project_matches_via_cwd() {
+        // A project that is a proper subdir of a git repo records
+        // git_repo_root != project; the cwd arm must still match (the empty
+        // git_repo_root gate of hermes' own clause would drop this).
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("pkg");
+        std::fs::create_dir_all(&project).unwrap();
+        let project_str = std::fs::canonicalize(&project)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let repo = std::fs::canonicalize(tmp.path()).unwrap();
+        let repo_str = repo.to_string_lossy().to_string();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+        seed_hermes_db(
+            tmp.path(),
+            &[(
+                "20260429_193246_aaa",
+                "cli",
+                1000.0,
+                Some(&project_str),
+                Some(&repo_str),
+            )],
+            true,
+        );
+        let result = capture_hermes_session_id(&project_str, &HashSet::new()).unwrap();
+        assert_eq!(result, "20260429_193246_aaa");
+    }
+
+    #[test]
+    #[serial]
+    #[cfg(unix)]
+    fn test_capture_hermes_symlinked_project_path() {
+        let tmp = tempfile::tempdir().unwrap();
+        let real = tmp.path().join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        let real_str = std::fs::canonicalize(&real)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+        let link_str = link.to_string_lossy().to_string();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+        seed_hermes_db(
+            tmp.path(),
+            &[("20260429_193246_aaa", "cli", 1000.0, Some(&real_str), None)],
+            true,
+        );
+        let result = capture_hermes_session_id(&link_str, &HashSet::new()).unwrap();
+        assert_eq!(result, "20260429_193246_aaa");
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_hermes_unnormalized_project_spelling() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(tmp.path()).unwrap();
+        let project_str = project.to_string_lossy().to_string();
+        let spelled = project
+            .join("decoy")
+            .join("..")
+            .to_string_lossy()
+            .to_string();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+        seed_hermes_db(
+            tmp.path(),
+            &[(
+                "20260429_193246_aaa",
+                "cli",
+                1000.0,
+                Some(&project_str),
+                None,
+            )],
+            true,
+        );
+        let result = capture_hermes_session_id(&spelled, &HashSet::new()).unwrap();
+        assert_eq!(result, "20260429_193246_aaa");
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_hermes_ignores_newer_foreign_row() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(tmp.path()).unwrap();
+        let project_str = project.to_string_lossy().to_string();
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let other_str = std::fs::canonicalize(&other)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+        // The foreign row is newer; the matching row must still win.
+        seed_hermes_db(
+            tmp.path(),
+            &[
+                (
+                    "20260429_193246_aaa",
+                    "cli",
+                    1000.0,
+                    Some(&project_str),
+                    None,
+                ),
+                ("20260429_193246_bbb", "cli", 2000.0, Some(&other_str), None),
+            ],
+            true,
+        );
+        let result = capture_hermes_session_id(&project_str, &HashSet::new()).unwrap();
+        assert_eq!(result, "20260429_193246_aaa");
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_hermes_foreign_only_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(tmp.path()).unwrap();
+        let project_str = project.to_string_lossy().to_string();
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let other_str = std::fs::canonicalize(&other)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+        seed_hermes_db(
+            tmp.path(),
+            &[("20260429_193246_aaa", "cli", 1000.0, Some(&other_str), None)],
+            true,
+        );
+        // Never resume a conversation attributable to another project.
+        assert!(capture_hermes_session_id(&project_str, &HashSet::new()).is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_hermes_null_cwd_never_resumed() {
+        // Full-schema rows with NULL (or empty) cwd carry no project signal
+        // and are never returned; resuming one is the #3373 bug shape. Hermes
+        // stamps cwd on the row it creates for a local CLI launch, and records
+        // None for a non-local TERMINAL_ENV backend. Two known gaps leave a
+        // no-signal row this capture then skips: a `/new` inside a running
+        // hermes pane rotates to a fresh row created without a cwd, and a
+        // hermes upgrade that predates the column leaves history unstamped.
+        // Such a session keeps whatever agent_session_id it already had rather
+        // than following the rotation.
+        for cwd in [None, Some("")] {
+            let tmp = tempfile::tempdir().unwrap();
+            let project = std::fs::canonicalize(tmp.path()).unwrap();
+            let project_str = project.to_string_lossy().to_string();
+            let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+            seed_hermes_db(
+                tmp.path(),
+                &[("20260429_193246_aaa", "cli", 1000.0, cwd, None)],
+                true,
+            );
+            assert!(
+                capture_hermes_session_id(&project_str, &HashSet::new()).is_err(),
+                "NULL/empty cwd row must not be resumed (cwd={cwd:?})"
+            );
+        }
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_hermes_multiple_null_cwd_ambiguous() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(tmp.path()).unwrap();
+        let project_str = project.to_string_lossy().to_string();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+        seed_hermes_db(
+            tmp.path(),
+            &[
+                ("20260429_193246_aaa", "cli", 1000.0, None, None),
+                ("20260429_193246_bbb", "cli", 2000.0, None, None),
+            ],
+            true,
+        );
+        assert!(capture_hermes_session_id(&project_str, &HashSet::new()).is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_hermes_legacy_multiple_ambiguous() {
+        let tmp = tempfile::tempdir().unwrap();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+        seed_hermes_db(
+            tmp.path(),
+            &[
+                ("20260429_193246_aaa", "cli", 1000.0, None, None),
+                ("20260429_193246_bbb", "cli", 2000.0, None, None),
+            ],
+            false,
+        );
+        assert!(capture_hermes_session_id("/tmp/hermes-proj", &HashSet::new()).is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_hermes_all_matched_excluded_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(tmp.path()).unwrap();
+        let project_str = project.to_string_lossy().to_string();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+        seed_hermes_db(
+            tmp.path(),
+            &[
+                (
+                    "20260429_193246_aaa",
+                    "cli",
+                    1000.0,
+                    Some(&project_str),
+                    None,
+                ),
+                (
+                    "20260429_193246_bbb",
+                    "cli",
+                    2000.0,
+                    Some(&project_str),
+                    None,
+                ),
+            ],
+            true,
+        );
+        // A same-project peer owns this project's conversations; never dip
+        // into no-signal or foreign rows.
+        let exclusion = HashSet::from([
+            "20260429_193246_aaa".to_string(),
+            "20260429_193246_bbb".to_string(),
+        ]);
+        assert!(capture_hermes_session_id(&project_str, &exclusion).is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_hermes_exclusion_picks_second_match() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(tmp.path()).unwrap();
+        let project_str = project.to_string_lossy().to_string();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+        seed_hermes_db(
+            tmp.path(),
+            &[
+                (
+                    "20260429_193246_aaa",
+                    "cli",
+                    1000.0,
+                    Some(&project_str),
+                    None,
+                ),
+                (
+                    "20260429_193246_bbb",
+                    "cli",
+                    2000.0,
+                    Some(&project_str),
+                    None,
+                ),
+            ],
+            true,
+        );
+        let mut exclusion = HashSet::new();
+        exclusion.insert("20260429_193246_bbb".to_string());
+        let result = capture_hermes_session_id(&project_str, &exclusion).unwrap();
+        assert_eq!(result, "20260429_193246_aaa");
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_hermes_cwd_only_and_root_only_schemas() {
+        // Partially-migrated schemas must not fail prepare and must use the
+        // single present column (F1 regression).
+        let tmp = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(tmp.path()).unwrap();
+        let project_str = project.to_string_lossy().to_string();
+        let other = tmp.path().join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        let other_str = std::fs::canonicalize(&other)
+            .unwrap()
+            .to_string_lossy()
+            .to_string();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+
+        // cwd-only schema.
+        let cwd_db = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(cwd_db.path().join("state.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, started_at REAL, ended_at REAL, cwd TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at, ended_at, cwd) VALUES (?1, 'cli', 1000.0, NULL, ?2)",
+            rusqlite::params!["20260429_193246_aaa", project_str],
+        )
+        .unwrap();
+        drop(conn);
+        let _cwd_guard = EnvGuard::set(&[("HERMES_HOME", cwd_db.path())]);
+        assert_eq!(
+            capture_hermes_session_id(&project_str, &HashSet::new()).unwrap(),
+            "20260429_193246_aaa"
+        );
+        drop(_cwd_guard);
+
+        // root-only schema: a matching row resolves via the root arm.
+        let root_db = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(root_db.path().join("state.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, started_at REAL, ended_at REAL, git_repo_root TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at, ended_at, git_repo_root) VALUES (?1, 'cli', 1000.0, NULL, ?2)",
+            rusqlite::params!["20260429_193246_bbb", project_str],
+        )
+        .unwrap();
+        drop(conn);
+        let _root_guard = EnvGuard::set(&[("HERMES_HOME", root_db.path())]);
+        assert_eq!(
+            capture_hermes_session_id(&project_str, &HashSet::new()).unwrap(),
+            "20260429_193246_bbb"
+        );
+        // A root-only row pointing at another project must not match.
+        let other_db = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(other_db.path().join("state.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, started_at REAL, ended_at REAL, git_repo_root TEXT);",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at, ended_at, git_repo_root) VALUES (?1, 'cli', 1000.0, NULL, ?2)",
+            rusqlite::params!["20260429_193246_ccc", other_str],
+        )
+        .unwrap();
+        drop(conn);
+        let _other_guard = EnvGuard::set(&[("HERMES_HOME", other_db.path())]);
+        assert!(capture_hermes_session_id(&project_str, &HashSet::new()).is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn test_hermes_poll_fn_matches_own_project() {
+        // Issue story 1 at the poller level: the closure resolves the
+        // project-scoped conversation.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = std::fs::canonicalize(tmp.path()).unwrap();
+        let project_str = project.to_string_lossy().to_string();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+        seed_hermes_db(
+            tmp.path(),
+            &[(
+                "20260429_193246_aaa",
+                "cli",
+                1000.0,
+                Some(&project_str),
+                None,
+            )],
+            true,
+        );
+
+        let poll = hermes_poll_fn(project_str, "test-instance".to_string(), HashSet::new());
+        assert_eq!(poll(), Some("20260429_193246_aaa".to_string()));
+    }
+
+    #[test]
+    #[serial]
+    fn test_hermes_poll_fn_legacy_multi_row_returns_none() {
+        // Issue story 2: with multiple active conversations and no project
+        // signal, the poller yields None so the agent starts fresh instead of
+        // silently resuming a wrong conversation.
+        let tmp = tempfile::tempdir().unwrap();
+        let _hermes = EnvGuard::set(&[("HERMES_HOME", tmp.path())]);
+        seed_hermes_db(
+            tmp.path(),
+            &[
+                ("20260429_193246_aaa", "cli", 1000.0, None, None),
+                ("20260429_193246_bbb", "cli", 2000.0, None, None),
+            ],
+            false,
+        );
+
+        let poll = hermes_poll_fn(
+            "/tmp/hermes-proj".to_string(),
+            "test-instance".to_string(),
+            HashSet::new(),
+        );
+        assert_eq!(poll(), None);
     }
 
     #[test]
     #[serial]
     fn test_capture_hermes_basic() {
+        // Legacy minimal schema: a single active conversation is unambiguous
+        // and is returned (sole-row rule).
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("state.db");
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -4607,6 +6110,8 @@ mod tests {
     #[test]
     #[serial]
     fn test_capture_hermes_exclusion_set() {
+        // Legacy schema, two active rows, one claimed by a peer: the single
+        // unclaimed row is unambiguous and returned.
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("state.db");
         let conn = rusqlite::Connection::open(&db_path).unwrap();
@@ -4638,6 +6143,82 @@ mod tests {
     #[test]
     fn test_hermes_session_id_format_valid() {
         assert!(is_valid_session_id("20260429_193246_adcddd"));
+    }
+
+    #[test]
+    fn test_hermes_container_script_modes() {
+        // Run the literal HERMES_CONTAINER_CAPTURE_SCRIPT against a temp db
+        // with the host python3 (no docker needed), verifying the SIGNAL and
+        // LEGACY mode lines and the TAB row format. No process-global state
+        // is touched (HERMES_HOME goes to the child only), so no #[serial].
+        // Skips when python3 is unavailable.
+        let ok = std::process::Command::new("python3")
+            .arg("--version")
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false);
+        if !ok {
+            return;
+        }
+
+        // Missing store: the read-only poll must not create state.db and must
+        // produce no output (the parser then fails closed).
+        let empty_home = tempfile::tempdir().unwrap();
+        let out = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(HERMES_CONTAINER_CAPTURE_SCRIPT)
+            .env("HERMES_HOME", empty_home.path())
+            .output()
+            .unwrap();
+        assert!(out.stdout.is_empty());
+        assert!(
+            !empty_home.path().join("state.db").exists(),
+            "script must not create the store it probes"
+        );
+
+        // SIGNAL arm: full schema, two rows in different projects.
+        let signal_db = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(signal_db.path().join("state.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, started_at REAL, ended_at REAL, cwd TEXT, git_repo_root TEXT);
+             INSERT INTO sessions (id, source, started_at, ended_at, cwd, git_repo_root) VALUES ('20260429_193246_aaa','cli',1000.0,NULL,'/tmp/proj-a',NULL);
+             INSERT INTO sessions (id, source, started_at, ended_at, cwd, git_repo_root) VALUES ('20260429_193246_bbb','cli',2000.0,NULL,'/tmp/proj-b',NULL);",
+        )
+        .unwrap();
+        drop(conn);
+        let out = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(HERMES_CONTAINER_CAPTURE_SCRIPT)
+            .env("HERMES_HOME", signal_db.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let mut lines = stdout.lines();
+        assert_eq!(lines.next(), Some("SIGNAL"));
+        assert_eq!(lines.next(), Some("20260429_193246_bbb\t/tmp/proj-b\t"));
+        assert_eq!(lines.next(), Some("20260429_193246_aaa\t/tmp/proj-a\t"));
+        assert_eq!(lines.next(), None);
+
+        // LEGACY arm: minimal schema, no signal columns.
+        let legacy_db = tempfile::tempdir().unwrap();
+        let conn = rusqlite::Connection::open(legacy_db.path().join("state.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE sessions (id TEXT PRIMARY KEY, source TEXT, started_at REAL, ended_at REAL);
+             INSERT INTO sessions VALUES ('20260429_193246_aaa','cli',1000.0,NULL);",
+        )
+        .unwrap();
+        drop(conn);
+        let out = std::process::Command::new("python3")
+            .arg("-c")
+            .arg(HERMES_CONTAINER_CAPTURE_SCRIPT)
+            .env("HERMES_HOME", legacy_db.path())
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let mut lines = stdout.lines();
+        assert_eq!(lines.next(), Some("LEGACY"));
+        assert_eq!(lines.next(), Some("20260429_193246_aaa\t\t"));
+        assert_eq!(lines.next(), None);
     }
 
     fn create_copilot_test_db(rows: &[(&str, &str, &str)]) -> tempfile::TempDir {
@@ -4691,6 +6272,16 @@ mod tests {
         let entries = vec![("a".to_string(), "/work/elsewhere".to_string())];
         let result = select_copilot_session(&entries, "/work/proj", &HashSet::new());
         assert!(result.is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn test_kimi_home_rejects_empty_ambient_fallback() {
+        let _env = EnvGuard::set(&[("KIMI_CODE_HOME", "")]);
+        assert!(
+            kimi_home_for_environment(&[]).is_none(),
+            "an explicitly empty ambient home must not become a relative store path"
+        );
     }
 
     #[test]
@@ -5274,6 +6865,7 @@ mod tests {
             None,
             instance_id.to_string(),
             HashSet::new(),
+            Vec::new(),
         );
         assert_eq!(poll().as_deref(), Some(sidecar_uuid));
 
@@ -5331,6 +6923,7 @@ mod tests {
             None,
             instance_id.to_string(),
             HashSet::new(),
+            Vec::new(),
         );
         assert_eq!(poll().as_deref(), Some(disk_uuid));
 
@@ -5364,7 +6957,7 @@ mod tests {
         std::env::set_var("CLAUDE_CONFIG_DIR", tmp.path());
 
         assert_eq!(
-            capture_claude_session_id("/tmp/myproject", Some(uuid_anchor), &HashSet::new())
+            capture_claude_session_id("/tmp/myproject", Some(uuid_anchor), &HashSet::new(), &[])
                 .unwrap(),
             uuid_active
         );
@@ -5373,5 +6966,91 @@ mod tests {
             Some(v) => std::env::set_var("CLAUDE_CONFIG_DIR", v),
             None => std::env::remove_var("CLAUDE_CONFIG_DIR"),
         }
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn run_with_timeout_inner_bounds_drain_when_grandchild_holds_pipe() {
+        // The immediate child (sh) exits fast but backgrounds a `sleep` that
+        // inherits the stdout pipe, so the write end never closes. The drain
+        // must still return by the deadline instead of blocking on read_to_end;
+        // `sleep 10` (>> the 4s assertion) makes an unbounded recv visibly fail.
+        let mut cmd = std::process::Command::new("sh");
+        cmd.args(["-c", "sleep 10 & printf done"]);
+        let start = Instant::now();
+        let out = run_with_timeout_inner(cmd, Duration::from_millis(500), "grandchild-test", None)
+            .expect("the sh child exits quickly, so a buffer is produced");
+        assert!(
+            start.elapsed() < Duration::from_secs(4),
+            "drain must be bounded by the deadline even while the pipe stays open"
+        );
+        assert!(out.is_empty() || out == b"done");
+    }
+
+    /// Every entry here has the exact shape a real transcript has, a `.jsonl`
+    /// extension and a UUID stem, and nothing behind it. `main` hands all four
+    /// back as resume ids: `DirEntry::metadata` is an `lstat`, which succeeds
+    /// on all of them and reports the creation time, so they read as *fresh*
+    /// and win the `best` comparison outright.
+    #[test]
+    fn test_scan_skips_entries_that_are_not_regular_files() {
+        let sid = "11111111-1111-4111-8111-111111111111";
+        for kind in ["directory", "dangling-link", "symlink-cycle", "fifo"] {
+            let home = tempfile::tempdir().unwrap();
+            let project_path = format!("/tmp/scan-probe-{kind}");
+            let project = std::path::Path::new(&project_path);
+            let dir = home
+                .path()
+                .join("projects")
+                .join(encode_claude_project_path(&project.to_string_lossy()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let entry = dir.join(format!("{sid}.jsonl"));
+            match kind {
+                "directory" => std::fs::create_dir(&entry).unwrap(),
+                #[cfg(unix)]
+                "dangling-link" => {
+                    std::os::unix::fs::symlink(dir.join("gone.jsonl"), &entry).unwrap()
+                }
+                // `fs::metadata` returns `ELOOP` here rather than spinning, so
+                // the `Err` arm is what rejects this one, not `is_file`.
+                #[cfg(unix)]
+                "symlink-cycle" => std::os::unix::fs::symlink(&entry, &entry).unwrap(),
+                #[cfg(unix)]
+                "fifo" => {
+                    // Skipped rather than failed where `mkfifo` is unavailable;
+                    // the other three rows still gate the guard.
+                    match std::process::Command::new("mkfifo").arg(&entry).status() {
+                        Ok(s) if s.success() => {}
+                        _ => continue,
+                    }
+                }
+                _ => continue,
+            }
+
+            assert_eq!(
+                scan_claude_project_dir(home.path(), project, None, &HashSet::new()).unwrap(),
+                None,
+                "{kind} must not be handed back as a resume id",
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_scan_follows_a_symlinked_transcript() {
+        let home = tempfile::tempdir().unwrap();
+        let project = std::path::Path::new("/tmp/scan-link-probe");
+        let dir = home
+            .path()
+            .join("projects")
+            .join(encode_claude_project_path(&project.to_string_lossy()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let real = home.path().join("real.jsonl");
+        std::fs::write(&real, "{}\n").unwrap();
+        let sid = "22222222-2222-4222-8222-222222222222";
+        std::os::unix::fs::symlink(&real, dir.join(format!("{sid}.jsonl"))).unwrap();
+
+        let found = scan_claude_project_dir(home.path(), project, None, &HashSet::new()).unwrap();
+        assert_eq!(found.map(|(id, _)| id), Some(sid.to_string()));
     }
 }

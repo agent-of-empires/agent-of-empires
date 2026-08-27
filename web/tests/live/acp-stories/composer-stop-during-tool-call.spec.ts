@@ -60,7 +60,7 @@ base("Stop button cancels a turn during a tool call", async ({ page }, testInfo)
     await composer.fill("run a slow tool");
     await composer.press("Enter");
 
-    const stopButton = page.getByRole("button", { name: "Stop" });
+    const stopButton = page.getByTestId("composer-actions").getByRole("button", { name: "Stop" });
     await expect(stopButton).toBeVisible({ timeout: 10_000 });
     await stopButton.click();
 

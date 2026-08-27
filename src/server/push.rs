@@ -528,6 +528,25 @@ fn should_fire(
     override_val.unwrap_or(global)
 }
 
+/// A status event can sit in the dwell map while a concurrent user action
+/// trashes its session. The status poller also sees a deliberately torn-down
+/// tmux pane briefly. Check the current row before delivery so neither race
+/// can turn a trashed session into a false "errored" notification.
+fn notification_matches_live_instance(
+    event: NotificationEvent,
+    instance: &crate::session::Instance,
+) -> bool {
+    if instance.is_trashed() {
+        return false;
+    }
+    matches!(
+        (event, instance.status),
+        (NotificationEvent::Waiting, Status::Waiting)
+            | (NotificationEvent::Idle, Status::Idle)
+            | (NotificationEvent::Error, Status::Error)
+    )
+}
+
 async fn fire_due_pushes(
     app_state: std::sync::Arc<super::AppState>,
     client: &reqwest::Client,
@@ -630,6 +649,9 @@ async fn fire_due_pushes(
             dwell.remove(&instance_id);
             continue;
         };
+        if !notification_matches_live_instance(event, instance) {
+            continue;
+        }
         if !should_fire(event, &web_config, Some(instance)) {
             continue;
         }
@@ -1480,6 +1502,30 @@ mod tests {
 
         // Error unaffected: per-event-type overrides don't cross-pollute.
         assert!(should_fire(NotificationEvent::Error, &web, Some(&inst)));
+    }
+
+    #[test]
+    fn notification_delivery_requires_a_current_live_matching_status() {
+        use crate::session::Instance;
+
+        let mut inst = Instance::new("t", "/tmp");
+        inst.status = Status::Waiting;
+        assert!(notification_matches_live_instance(
+            NotificationEvent::Waiting,
+            &inst
+        ));
+        assert!(!notification_matches_live_instance(
+            NotificationEvent::Error,
+            &inst
+        ));
+
+        // Trash deliberately stops the pane. A late poll result must not turn
+        // that teardown into a false error notification.
+        inst.trash();
+        assert!(!notification_matches_live_instance(
+            NotificationEvent::Waiting,
+            &inst
+        ));
     }
 
     #[test]

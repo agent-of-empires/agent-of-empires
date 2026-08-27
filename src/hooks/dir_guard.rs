@@ -527,9 +527,9 @@ pub(crate) fn unlink_session_id_via_guard(instance_id: &str) -> Result<()> {
 }
 
 /// Ensure the per-instance hook directory exists with `dir_guard` discipline
-/// and return its host path. Used by callers that hand the path to an
-/// external resolver (Docker bind-mount source, sidecar config writer)
-/// rather than performing in-process I/O directly.
+/// and return its host path, canonically resolved. Used by callers that hand
+/// the path to an external resolver (Docker/Podman bind-mount source, sidecar
+/// config writer) rather than performing in-process I/O directly.
 ///
 /// The function calls `open_instance_dir` to verify-and-create with
 /// `*at`+`O_NOFOLLOW`+`fstat-on-fd`, then drops the fd and returns the
@@ -539,12 +539,22 @@ pub(crate) fn unlink_session_id_via_guard(instance_id: &str) -> Result<()> {
 /// would reject) and the multi-tenant pre-squat + symlink-swap race
 /// against Docker's bind-mount resolution.
 ///
-/// Caller policy on `Err`: skip the bind-mount push, surface a
-/// `tracing::warn!` and let the agent boot without status hooks
-/// (pane-detection fallback).
+/// #3240: VM-backed runtimes resolve mount sources inside their VM,
+/// against a fixed share set keyed by real paths (podman machine shares
+/// `/private`, never `/tmp`). The lexical base (`/tmp/aoe-hooks-<euid>`) is
+/// therefore canonicalized before it leaves the process; on macOS that turns
+/// `/tmp/...` into the shared `/private/tmp/...` spelling.
+///
+/// Resolution errors propagate: a path that no longer resolves on the host
+/// would fail container creation with the same `statfs` error class this
+/// fixes, so callers apply their graceful `Err` policy instead. On
+/// `Err`: skip the bind-mount push, surface a `tracing::warn!` and let the
+/// agent boot without status hooks (pane-detection fallback).
 pub(crate) fn ensure_instance_dir_path(instance_id: &str) -> Result<PathBuf> {
     let _fd = open_instance_dir(instance_id)?;
-    Ok(hook_base_path().join(instance_id))
+    let lexical = hook_base_path().join(instance_id);
+    std::fs::canonicalize(&lexical)
+        .with_context(|| format!("canonicalize hook dir {}", lexical.display()))
 }
 
 // Cleanup.

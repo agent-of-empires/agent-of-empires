@@ -7,13 +7,13 @@
 //! `error: unexpected argument '--trust-all-tools' found`.
 //!
 //! These tests drive the full `aoe add --launch` path and assert on the command
-//! tmux was actually told to run (`pane_start_command`), so a regression in
-//! launch-command construction is caught at the session-launch layer, not just
-//! in the `build_host_command` unit tests. We read the command tmux recorded
-//! rather than executing a fake `kiro-cli`: aoe wraps the launch in a login
-//! shell (`sh -lc`) that re-resolves `kiro-cli` from the real PATH, so a stub
-//! would be shadowed; `pane_start_command` captures the exact intended command
-//! regardless of whether the binary is installed.
+//! the launch actually executed, so a regression in launch-command construction
+//! is caught at the session-launch layer, not just in the `build_host_command`
+//! unit tests. Launches run the pane command through an ephemeral env-file
+//! wrapper (`exec <shell> <file>`) that keeps the command out of tmux's
+//! `pane_start_command` argv, so we install a recording `kiro-cli` stub and read
+//! the argv it was actually invoked with: a more faithful check than the old
+//! `pane_start_command` read, since it observes the command as executed.
 //!
 //! A separate test covers the other half of `--agent` support: that AoE's
 //! status hooks are installed into the agent config Kiro actually loads. Kiro
@@ -73,30 +73,14 @@ fn launched_tmux_name(h: &TuiTestHarness, title: &str) -> String {
     )
 }
 
-/// The command tmux was told to run for the session's pane. This is the launch
-/// command aoe built, captured before (and independent of) execution.
-fn pane_start_command(sock: &std::path::Path, session: &str) -> String {
-    let out = Command::new("tmux")
-        .arg("-S")
-        .arg(sock)
-        .args(["list-panes", "-t", session, "-F", "#{pane_start_command}"])
-        .output()
-        .expect("tmux list-panes");
-    assert!(
-        out.status.success(),
-        "tmux list-panes failed for {session}: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    String::from_utf8_lossy(&out.stdout).trim().to_string()
-}
-
 /// Run `aoe add --launch ...` for a kiro session and return the command tmux
-/// was told to run. `--launch` creates the tmux session and then attempts a
-/// foreground attach, which fails under the test's non-TTY stdio; that attach
-/// failure is expected and irrelevant here, so the exit status is not asserted.
-/// The session (and its recorded pane command) is created regardless, and
-/// `launched_tmux_name` fails loudly if it wasn't. The returned guard kills the
-/// session when the caller's scope ends, including on assertion panic.
+/// was told to run. `--launch` starts the tmux session and, since the test
+/// harness's `run_cli` has no controlling terminal, skips the interactive
+/// attach step instead of failing because of it; the exit status IS asserted
+/// here to cover that behavior. The session (and its recorded pane command)
+/// is created regardless, and `launched_tmux_name` fails loudly if it
+/// wasn't. The returned guard kills the session when the caller's scope
+/// ends, including on assertion panic.
 fn launch_kiro_and_read_command(
     h: &mut TuiTestHarness,
     title: &str,
@@ -104,11 +88,12 @@ fn launch_kiro_and_read_command(
 ) -> (String, TmuxSessionGuard) {
     // `aoe add --tool kiro` verifies `kiro-cli` is on PATH before persisting the
     // session, so without a stub it bails (and never writes sessions.json) in
-    // CI / any machine without kiro-cli installed. Installing an exit-0 stub
-    // lets `add` proceed. We assert on the command tmux is *told* to run
-    // (`pane_start_command`), which aoe builds regardless of the binary, so the
-    // stub never needs to behave like real kiro-cli.
-    h.install_path_command("kiro-cli");
+    // CI / any machine without kiro-cli installed. A recording stub both lets
+    // `add` proceed AND captures the exact argv the launch actually executed:
+    // launches now run through an ephemeral env-file wrapper (`exec zsh <file>`)
+    // that keeps the command out of tmux's `pane_start_command`, so the stub's
+    // recorded argv is the only faithful observation of the launch command.
+    let argv_file = h.install_recording_path_command("kiro-cli");
 
     let project = h.project_path();
     let mut args = vec![
@@ -121,16 +106,43 @@ fn launch_kiro_and_read_command(
         "--launch",
     ];
     args.extend_from_slice(extra);
-    let _ = h.run_cli(&args);
+    let output = h.run_cli(&args);
+    assert!(
+        output.status.success(),
+        "aoe add --launch should succeed without a controlling terminal: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 
     let session = launched_tmux_name(h, title);
     let socket = h.home_path().join("tmux.sock");
-    let cmd = pane_start_command(&socket, &session);
     let guard = TmuxSessionGuard {
         socket,
         name: session,
     };
+    // `wait_until_consumed` returns once the pane `rm`s the env file, which is
+    // BEFORE it execs kiro-cli, so poll for the stub to record its argv.
+    let cmd = wait_for_recorded_argv(&argv_file);
     (cmd, guard)
+}
+
+/// Poll (up to 10s) for the recording stub to write the argv the launch ran it
+/// with. Returns the recorded command line.
+fn wait_for_recorded_argv(path: &std::path::Path) -> String {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            if !content.trim().is_empty() {
+                return content.trim().to_string();
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            panic!(
+                "kiro-cli stub never recorded its argv at {} (launch did not exec it)",
+                path.display()
+            );
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
 }
 
 #[test]

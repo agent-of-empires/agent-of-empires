@@ -30,4 +30,6 @@ pub mod ws;
 pub use daemon_manager::{require_daemon, ManagerError};
 pub use discovery::{discover, DaemonEndpoint, DiscoveryError, Source};
 pub use http::{HttpClient, HttpError, PluginCommandView, REPLAY_PAGE_SIZE};
-pub use ws::{connect as ws_connect, WsError, WsHandle, WsMessage};
+pub use ws::{
+    connect as ws_connect, connect_with as ws_connect_with, WsError, WsHandle, WsMessage,
+};

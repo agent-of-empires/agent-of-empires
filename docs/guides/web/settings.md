@@ -3,7 +3,8 @@
 The settings view mirrors the TUI settings layout so muscle memory
 carries over. It is grouped into tabs you can edit per profile or
 globally. This page maps the tabs and covers the web-only pieces:
-the profile picker, connected-device tracking, and step-up elevation.
+the conversation font size, the profile picker, connected-device
+tracking, and step-up elevation.
 For running the server, see the [Web Dashboard overview](../web-dashboard.md).
 
 ![The settings view with its tab groups and profile picker](../../assets/web/settings.png)
@@ -26,6 +27,38 @@ panel is generated from the same settings schema as the TUI, so a field
 declared once appears on both surfaces and they never drift. The only host-side
 knob the dashboard does not surface is the host environment list, which stays
 TUI/`config.toml`-only.
+
+## Conversation font size
+
+**Sessions > Structured view > Conversation display** sets the base font size
+of the structured-view conversation transcript, separately for mobile and
+desktop. Prose, headings, lists, tables, and fenced code all scale from that
+base, so shrinking it fits more of a transcript on a phone screen.
+
+The mobile value applies when the device has a coarse primary pointer (touch)
+*and* the viewport is narrower than 768px, the same rule the rest of the
+dashboard uses to decide what counts as mobile. A touch laptop and a narrowed
+desktop window both keep the desktop value. The switch happens live, so
+resizing the window or rotating a phone reflows the transcript without a
+reload.
+
+Each axis runs from 6px to 28px in 1px steps and defaults to 14px, the same
+range as the terminal font sizes under **Web Dashboard > Terminal**, so the two
+sliders read alike. Drag the slider or pick the exact size from the px dropdown
+next to it; the two stay in sync.
+
+The number you pick is relative to your browser's own font-size setting rather
+than an absolute pixel size: the 14px default renders at 14px with the usual
+16px browser default, and at 17.5px if you have raised your browser's base font
+size to 20px. Every size scales by that same factor, so the setting stacks with
+browser-level zoom or accessibility preferences instead of overriding them.
+
+Both values are dashboard preferences rather than agent config: they live in
+the `aoe-web-settings` browser storage entry, which the dashboard mirrors to
+the daemon's web-UI state, so they follow you to your other browsers and
+devices the same way the terminal font sizes do. They are stored separately
+from the terminal font sizes and are not part of the agent config schema, so
+they are not per profile and do not appear in `config.toml`.
 
 ## Profiles
 

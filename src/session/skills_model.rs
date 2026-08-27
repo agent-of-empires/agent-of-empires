@@ -115,8 +115,8 @@ pub fn primary_root_for_agent(agent: &str) -> Option<&'static SkillRoot> {
 /// Where a skill was discovered. The read-only host layers carry a root key;
 /// the single writable layer is [`SkillProvenance::AoeManaged`]. Serializes to a
 /// tagged object (`{ "kind": "external", "root": "claude-user" }` /
-/// `{ "kind": "aoe-managed" }`) so it round-trips as both `skills.list` output
-/// and a source-qualified `skills.read` / `skills.adopt` parameter.
+/// `{ "kind": "aoe-managed" }`) so it round-trips as both list output and a
+/// source-qualified read / adopt parameter on the surfaces built on this model.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum SkillProvenance {
@@ -159,7 +159,7 @@ impl SkillProvenance {
 
 /// One discovered skill's list-safe metadata: its identity (`directory`), its
 /// frontmatter `name`/`description`, and where it came from. The body is not
-/// included; `skills.read` returns that.
+/// included; [`read_skill`] returns that.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DiscoveredSkill {

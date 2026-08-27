@@ -30,7 +30,7 @@ use crate::session::{
 };
 use crate::tmux::AvailableTools;
 
-use super::creation_poller::{CreationPoller, CreationRequest};
+use super::creation_poller::{CreatedWorktreeInfo, CreationPoller, CreationRequest};
 use super::deletion_poller::DeletionPoller;
 #[cfg(feature = "serve")]
 use super::dialogs::ServeView;
@@ -48,24 +48,60 @@ use super::settings::SettingsView;
 use super::status_poller::{StatusPoller, StatusUpdate};
 use super::stop_poller::StopPoller;
 
-/// Header label the synthetic scratch bucket renders under in project view.
-/// Not an identity: a user's own repo whose basename happens to be `scratch`
-/// derives the same label from its path, so anything deciding whether a header
-/// has a backing repo must test the repo path, not this string (#3133).
-const SCRATCH_GROUP_LABEL: &str = "scratch";
+fn cleanup_creation_resources(
+    instance: &Instance,
+    created_worktree: Option<&CreatedWorktreeInfo>,
+    created_workspace_worktrees: &[CreatedWorktreeInfo],
+    protected_owner: Option<&Instance>,
+) {
+    let worktree = created_worktree.map(crate::session::builder::CreatedWorktree::from);
+    let workspace_worktrees: Vec<_> = created_workspace_worktrees
+        .iter()
+        .map(crate::session::builder::CreatedWorktree::from)
+        .collect();
+    crate::session::builder::cleanup_instance(
+        instance,
+        worktree.as_ref(),
+        &workspace_worktrees,
+        protected_owner,
+    );
+}
 
-/// Extract a project group name from a session instance.
-/// Uses `worktree_info.main_repo_path` for worktree sessions (so all branches of the
-/// same repo group together), otherwise uses `project_path`. Returns the last path segment.
-fn project_group_name(inst: &Instance) -> String {
-    // Scratch sessions live under `<app_dir>/scratch/<instance-id>/`, so the last
-    // path segment is the opaque instance id. Group them under a readable label.
+enum CreationCommit {
+    Inserted,
+    Duplicate(Box<Instance>),
+}
+
+/// Cross-process guards for a single-session title mutation or profile move.
+/// The source profile's lifecycle flock is intentionally nested inside the
+/// per-session title flock; callers retain this value through durable
+/// persistence and any tmux rekey so a terminal launch cannot observe the
+/// transition halfway through.
+pub(super) struct SessionMutationGuards {
+    _session_title: crate::session::StorageFlock,
+    _lifecycle: crate::session::StorageFlock,
+}
+
+/// The GroupTree identity key for a session in project mode. Worktree sessions
+/// key on `main_repo_path` (so all branches of a repo group together); other
+/// sessions key on the last segment of `project_path`. Scratch sessions key on
+/// the `SCRATCH_GROUP_PATH` sentinel, which no real repo basename can equal, so
+/// a user's own repo named `scratch` keeps a distinct identity (#3237); the
+/// bucket's display name is seeded separately in `build_flat_items_by_project`.
+fn project_group_key(inst: &Instance) -> String {
     if inst.scratch {
-        return SCRATCH_GROUP_LABEL.to_string();
+        return crate::session::SCRATCH_GROUP_PATH.to_string();
     }
 
     crate::session::projects::repo_label(inst.repo_path())
 }
+
+/// Header label the synthetic "no resolvable owner" bucket renders under in
+/// org view. This is a display label; a hosted remote whose owner is literally
+/// "No organization" would share it, but that collision is vanishingly unlikely
+/// (unlike `scratch`, a plausible real repo basename), so org does not give it a
+/// sentinel identity the way project mode does for scratch (#3237).
+const NO_ORG_GROUP_LABEL: &str = "No organization";
 
 /// Kinds of in-progress mouse drags. Today only the list/preview divider
 /// is draggable; the enum keeps future drag targets (diff split, group
@@ -448,6 +484,10 @@ pub struct HomeView {
     /// in-memory mirror. Drained on Ok save.
     pending_added: HashMap<String, HashSet<String>>,
     pub(super) group_trees: HashMap<String, GroupTree>,
+    /// Duplicate session ids that remain ambiguous after journal-guided
+    /// reconciliation (#3459): every copy is excluded from `instances` and
+    /// these details name the exact profiles, files, and mtimes to resolve.
+    pub(super) legacy_duplicate_reports: Vec<crate::session::DuplicateIdReport>,
     pub(super) flat_items: Vec<Item>,
 
     // UI state
@@ -482,6 +522,23 @@ pub struct HomeView {
     pub(super) profile_default_attach_mode: crate::session::AttachMode,
     /// Collapsed state for project-mode groups (persists across rebuilds)
     pub(super) project_group_collapsed: HashMap<String, bool>,
+    /// Collapsed state for org-mode groups (persists across rebuilds), same
+    /// shape and lifecycle as `project_group_collapsed`.
+    pub(super) org_group_collapsed: HashMap<String, bool>,
+    /// Memoizes `crate::git::get_remote_owner_with_key` per repo path so
+    /// org-mode grouping doesn't re-open a git repo on every
+    /// `rebuild_flat_items`. Stores `(display owner, host-scoped identity
+    /// key)`: the key disambiguates same-named owners on different hosts
+    /// (GitHub "acme" vs GitLab "acme"), the owner alone is the header's
+    /// display text. Mirrors the server's `AppState.remote_owner_cache`
+    /// (`src/server/api/sessions.rs`), but process-local to this TUI
+    /// instance. `RefCell` gives interior mutability so `org_group_key` can
+    /// stay `&self`, matching every other `*_group_name` call site.
+    /// Cleared on every `reload_storage_only` so a `git remote
+    /// add`/`set-url` picked up on the next periodic reload, not stuck
+    /// under a stale cached owner (or lack thereof) for the rest of the
+    /// process.
+    pub(super) remote_owner_cache: std::cell::RefCell<HashMap<String, Option<(String, String)>>>,
     /// Merged project registry (global + active profile), refreshed on reload
     /// and after a pin/unpin. Project view injects the registered projects
     /// with no live sessions as empty "pinned" headers, and the renderer reads
@@ -726,6 +783,21 @@ pub struct HomeView {
     pub(super) status_poller: StatusPoller,
     pub(super) pending_status_refresh: bool,
 
+    // Compact system-health strip controlled by `session.show_diagnostics_pane`.
+    // The poller samples host resources and agent counts off the UI thread;
+    // `metrics` holds the latest sample for the strip and detail view.
+    pub(super) show_diagnostics: bool,
+    pub(super) metrics_poller: super::metrics_poller::MetricsPoller,
+    pub(super) pending_metrics_refresh: bool,
+    pub(super) metrics: crate::process::metrics::MetricsSnapshot,
+    pub(super) system_health_open: bool,
+    pub(super) system_health_scroll: usize,
+    pub(super) diagnostics_area: Rect,
+    pub(super) diagnostics_hovered: bool,
+    pub(super) system_health_tip_high_samples: u8,
+    pub(super) system_health_tip_earned: bool,
+    pub(super) system_health_discovered: bool,
+
     // Structured (ACP) rows: the tmux poller above bails on them, so their
     // status comes from the daemon instead. See `daemon_status_poller`.
     #[cfg(feature = "serve")]
@@ -759,12 +831,6 @@ pub struct HomeView {
     /// attach would race the first one's worktree creation and its worker bounce.
     pub(super) attach_project_in_flight: std::collections::HashSet<String>,
 
-    /// Trashed sessions whose permanent-purge Purge claim (#2541) this TUI won
-    /// before dispatching the teardown. Their delete finalize applies the #2534
-    /// restore-race recheck and releases the claim (ownership-guarded), instead
-    /// of the plain live-session removal.
-    pub(super) purge_claimed: std::collections::HashSet<String>,
-
     // Performance: background session creation (for sandbox)
     pub(super) creation_poller: CreationPoller,
     /// Set to true if user cancelled while creation was pending
@@ -776,6 +842,10 @@ pub struct HomeView {
     pub(super) creating_hook_progress: HashMap<String, CreatingHookProgress>,
     /// The stub instance ID for the current background creation
     pub(super) creating_stub_id: Option<String>,
+    /// Group paths introduced only to display the current Creating stub.
+    /// Finalization removes these from persisted metadata before replacing the
+    /// stub, while preserving groups that were already present when requested.
+    creating_provisional_group_paths: HashSet<String>,
 
     // Performance: preview caching
     pub(super) preview_cache: PreviewCache,
@@ -1154,6 +1224,8 @@ pub(super) fn tips_unseen_count(config: &crate::session::Config) -> usize {
         &crate::tips::TipSignals {
             new_session_with_selection_count: config.app_state.new_session_with_selection_count,
             used_new_from_selection: config.app_state.used_new_from_selection,
+            system_health_tip_earned: config.app_state.system_health_tip_earned,
+            used_system_health: config.app_state.used_system_health,
         },
     )
 }
@@ -1992,6 +2064,23 @@ impl ReloadFailureState {
     }
 }
 
+/// Log each legacy duplicate's actionable details once per process; the
+/// condition can persist until the user hand-edits files, so repeating it at
+/// ERROR level on every reload tick would be spam.
+pub(super) fn log_legacy_duplicates_once(reports: &[crate::session::DuplicateIdReport]) {
+    static REPORTED_IDS: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+    let mut seen = REPORTED_IDS
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for report in reports {
+        if seen.iter().any(|id| id == &report.id) {
+            continue;
+        }
+        seen.push(report.id.clone());
+        tracing::error!(target: "tui.home", "{}", report.actionable_message());
+    }
+}
+
 impl HomeView {
     pub fn new(
         active_profile: Option<String>,
@@ -2003,6 +2092,7 @@ impl HomeView {
         let mut storages = HashMap::new();
         let mut all_instances = Vec::new();
         let mut group_trees = HashMap::new();
+        let mut profile_loads: Vec<(String, Vec<Instance>, Vec<Group>)> = Vec::new();
 
         let profile_names = match &active_profile {
             Some(name) => vec![name.clone()],
@@ -2019,41 +2109,100 @@ impl HomeView {
             // the active dir (rows trashed before relocation existed) and fix a
             // pointer a crash left stale. Best-effort and only touches trashed
             // rows, which are typically few. See #2522.
-            for inst in &mut instances {
-                if crate::session::trash::reconcile_trashed_location(inst) {
-                    let new_path = inst.project_path.clone();
-                    let pre = inst.pre_trash_project_path.clone();
-                    let target_id = inst.id.clone();
-                    let _ = storage.update(|disk, _groups| {
-                        if let Some(d) = disk.iter_mut().find(|i| i.id == target_id) {
-                            d.project_path = new_path.clone();
-                            d.pre_trash_project_path = pre.clone();
-                        }
-                        Ok(())
-                    });
+            for instance in &mut instances {
+                if !instance.is_trashed() {
+                    continue;
+                }
+                if let Err(error) = crate::session::trash::reconcile_trashed_transition(instance) {
+                    tracing::warn!(
+                        target: "tui.home",
+                        session = %instance.id,
+                        "trash reconciliation skipped: {error}",
+                    );
                 }
             }
-            // Self-heal (#2541): clear op_claims left by a purge/restore that
-            // crashed mid-operation. `try_claim` already treats an expired claim
-            // as free, so this is belt-and-suspenders that stops a stranded
-            // claim from lingering on disk after a crash.
-            let ttl = crate::session::Instance::OP_CLAIM_TTL;
+            // Heal a managed worktree whose directory was moved outside aoe
+            // (a `git worktree move` from another shell): rewrite project_path
+            // from git so attach, status, diff, and rename all act on the live
+            // location instead of failing. Only rows whose recorded path is
+            // already gone cost anything. See #2002.
+            let mut reconcile_cache = crate::session::worktree_reconcile::ReconcileCache::default();
+            for instance in &mut instances {
+                if let Err(error) = crate::session::worktree_reconcile::reconcile_and_persist(
+                    &storage,
+                    instance,
+                    &mut reconcile_cache,
+                ) {
+                    tracing::warn!(
+                        target: "tui.home",
+                        session = %instance.id,
+                        "worktree path reconciliation skipped: {error}",
+                    );
+                }
+            }
+            // Clear expired lifecycle reservations only while holding the same
+            // per-instance flock used by live transitions.
+            let ttl = crate::session::Instance::LIFECYCLE_RESERVATION_TTL;
             let now = chrono::Utc::now();
-            for inst in &mut instances {
-                if inst.clear_expired_op_claim(ttl, now) {
-                    let target_id = inst.id.clone();
-                    let _ = storage.update(|disk, _groups| {
-                        if let Some(d) = disk.iter_mut().find(|i| i.id == target_id) {
-                            d.clear_expired_op_claim(ttl, now);
-                        }
-                        Ok(())
-                    });
+            for instance in &mut instances {
+                if !instance.has_fresh_lifecycle_reservation(now)
+                    && instance.lifecycle_reservation.is_some()
+                {
+                    let Ok(_lifecycle_lock) = storage.acquire_instance_lifecycle_lock(&instance.id)
+                    else {
+                        continue;
+                    };
+                    let target_id = instance.id.clone();
+                    if storage
+                        .update(|disk, _groups| {
+                            if let Some(stored) =
+                                disk.iter_mut().find(|candidate| candidate.id == target_id)
+                            {
+                                stored.clear_expired_lifecycle_reservation(ttl, now);
+                            }
+                            Ok(())
+                        })
+                        .is_ok()
+                    {
+                        instance.clear_expired_lifecycle_reservation(ttl, now);
+                    }
                 }
             }
-            let tree = GroupTree::new_with_groups(&instances, &groups);
-            group_trees.insert(profile_name.clone(), tree);
-            all_instances.extend(instances);
+            profile_loads.push((profile_name.clone(), instances, groups));
             storages.insert(profile_name.clone(), storage);
+        }
+
+        // Duplicate detection across every loaded profile runs before any of
+        // the loaded state is published (#3459). Journal-guided repairs fix
+        // durable state under lock here, so a clean reload below publishes
+        // exactly one row per session. Legacy ambiguities stay excluded.
+        let legacy_duplicate_reports = {
+            let loads_view: Vec<(&str, &[Instance])> = profile_loads
+                .iter()
+                .map(|(name, instances, _)| (name.as_str(), instances.as_slice()))
+                .collect();
+            let storages_view: Vec<(&str, &Storage)> = storages
+                .iter()
+                .map(|(name, storage)| (name.as_str(), storage))
+                .collect();
+            let outcome = crate::session::reconcile_profile_duplicates(&loads_view, &storages_view);
+            if outcome.repaired {
+                for (name, instances, groups) in &mut profile_loads {
+                    let (mut fresh, fresh_groups) = storages[name].load_with_groups()?;
+                    for inst in &mut fresh {
+                        inst.source_profile = name.clone();
+                    }
+                    *instances = fresh;
+                    *groups = fresh_groups;
+                }
+            }
+            log_legacy_duplicates_once(&outcome.reports);
+            outcome.reports
+        };
+        for (profile_name, instances, groups) in &profile_loads {
+            let tree = GroupTree::new_with_groups(instances, groups);
+            group_trees.insert(profile_name.clone(), tree);
+            all_instances.extend(instances.iter().cloned());
         }
 
         // In unified mode there is no single active profile, so config is
@@ -2126,6 +2275,7 @@ impl HomeView {
             pending_group_deletions: HashMap::new(),
             pending_added: HashMap::new(),
             group_trees,
+            legacy_duplicate_reports,
             flat_items: Vec::new(),
             cursor: 0,
             selected_session: None,
@@ -2149,6 +2299,17 @@ impl HomeView {
                         .collect()
                 })
                 .unwrap_or_default(),
+            org_group_collapsed: user_config
+                .as_ref()
+                .map(|c| {
+                    c.app_state
+                        .org_group_collapsed
+                        .iter()
+                        .map(|path| (path.clone(), true))
+                        .collect()
+                })
+                .unwrap_or_default(),
+            remote_owner_cache: std::cell::RefCell::new(HashMap::new()),
             registered_projects: Vec::new(),
             show_help: false,
             help_scroll: 0,
@@ -2239,6 +2400,21 @@ impl HomeView {
             available_tools,
             status_poller: StatusPoller::new(),
             pending_status_refresh: false,
+            show_diagnostics: resolved.session.show_diagnostics_pane,
+            metrics_poller: super::metrics_poller::MetricsPoller::new(),
+            pending_metrics_refresh: false,
+            metrics: crate::process::metrics::MetricsSnapshot::default(),
+            system_health_open: false,
+            system_health_scroll: 0,
+            diagnostics_area: Rect::default(),
+            diagnostics_hovered: false,
+            system_health_tip_high_samples: 0,
+            system_health_tip_earned: user_config
+                .as_ref()
+                .is_some_and(|config| config.app_state.system_health_tip_earned),
+            system_health_discovered: user_config
+                .as_ref()
+                .is_some_and(|config| config.app_state.used_system_health),
             #[cfg(feature = "serve")]
             daemon_status_poller: super::daemon_status_poller::DaemonStatusPoller::new(),
             #[cfg(feature = "serve")]
@@ -2250,12 +2426,12 @@ impl HomeView {
             restart_in_flight: std::collections::HashSet::new(),
             attach_project_poller: crate::tui::attach_project_poller::AttachProjectPoller::new(),
             attach_project_in_flight: std::collections::HashSet::new(),
-            purge_claimed: std::collections::HashSet::new(),
             creation_poller: CreationPoller::new(),
             creation_cancelled: false,
             on_launch_hooks_ran: HashSet::new(),
             creating_hook_progress: HashMap::new(),
             creating_stub_id: None,
+            creating_provisional_group_paths: HashSet::new(),
             preview_cache: PreviewCache::default(),
             preview_timings: PreviewTimings::default(),
             terminal_preview_cache: PreviewCache::default(),
@@ -2358,11 +2534,21 @@ impl HomeView {
 
         // Batch-sync instance IDs and captured session IDs to tmux hidden env
         // so that build_exclusion_set() on other AoE instances can see them.
+        // One observation for both per-instance walks below. They visit every
+        // instance in the view, so a per-item `list-sessions` fork scales with
+        // the whole store, measured as the dominant tmux cost of this pass on
+        // a store of a few hundred sessions.
+        let live = crate::tmux::LiveSessionSnapshot::new();
         {
             let mut set_batch: Vec<(String, String, String)> = Vec::new();
             let mut unset_batch: Vec<(String, String)> = Vec::new();
             for inst in view.instances.values() {
-                let Some(tmux_name) = inst.tmux_env_session_name() else {
+                // This publication is one-shot: no reload re-runs it and a
+                // poller does not re-emit an unchanged sid, so a row dropped
+                // here stays unpublished until an unrelated sid change or a
+                // relaunch. A snapshot that could not reach the server is
+                // therefore probed per row rather than read as "no live pane".
+                let Some(tmux_name) = inst.tmux_env_session_name_in_or_probe(&live) else {
                     continue;
                 };
 
@@ -2406,14 +2592,12 @@ impl HomeView {
 
         // Recover session IDs for pre-existing sessions via pollers.
         for inst in view.instances.values_mut() {
-            let has_live_tmux = inst.has_live_tmux_pane();
+            let has_live_tmux = inst.has_live_tmux_pane_in(&live);
             if !has_live_tmux {
                 continue;
             }
 
-            if inst.supports_session_poller() && inst.session_id_poller.is_none() {
-                inst.maybe_start_poller();
-            }
+            inst.repair_session_id_poller_if_needed(&live);
         }
 
         // Startup auto-recovery: kick off a worker pool to restart any
@@ -2525,36 +2709,51 @@ impl HomeView {
             self.storages.retain(|k, _| current_profiles.contains(k));
         }
 
-        for (profile_name, storage) in &self.storages {
-            let (mut instances, groups) = storage.load_with_groups()?;
-            for inst in &mut instances {
-                inst.source_profile = profile_name.clone();
-                if let Some(prev) = self.instances.get(&inst.id) {
-                    inst.status = prev.status;
-                    inst.last_error = prev.last_error.clone();
-                    inst.last_error_check = prev.last_error_check;
-                    inst.last_start_time = prev.last_start_time;
-                    inst.session_id_poller = prev.session_id_poller.clone();
-                    // Carry the in-memory idle_entered_at across reloads
-                    // so a freshly-stopped session doesn't lose its
-                    // freshness state when the user toggles a setting
-                    // that triggers a reload mid-window.
-                    inst.idle_entered_at = prev.idle_entered_at;
-                    // agent_session_id is disk-authoritative; writers persist
-                    // synchronously through Storage::update before reload runs.
-                    // Carry the resume-fallback exclusion set across
-                    // reloads. Without this, a stale sid that the cascade
-                    // just cleared would be re-imported on the next 5s reload
-                    // (the on-disk session artifact persists for ~5-10
-                    // min after the agent's crash). The set is
-                    // `#[serde(skip)]` runtime-only so disk reloads
-                    // would otherwise reset it to empty.
-                    inst.retroactive_capture_excludes = prev.retroactive_capture_excludes.clone();
+        // Collect per-profile state without publishing it, so duplicate
+        // detection (#3459) can run journal-guided repairs before anything
+        // reaches the unified map.
+        type ProfileLoads = Vec<(String, Vec<Instance>, Vec<Group>)>;
+        let collect_loads = |storages: &HashMap<String, Storage>,
+                             prev: &indexmap::IndexMap<String, Instance>|
+         -> anyhow::Result<ProfileLoads> {
+            let mut loads = Vec::new();
+            for (profile_name, storage) in storages {
+                let (mut instances, groups) = storage.load_with_groups()?;
+                for inst in &mut instances {
+                    inst.source_profile = profile_name.clone();
+                    if let Some(previous) = prev.get(&inst.id) {
+                        // Field-ownership rules (generation-governed vs
+                        // runtime-only) live on merge_runtime_from_reload.
+                        inst.merge_runtime_from_reload(previous);
+                    }
                 }
+                loads.push((profile_name.clone(), instances, groups));
             }
+            Ok(loads)
+        };
+        let mut loads = collect_loads(&self.storages, &self.instances)?;
+        let loads_view: Vec<(&str, &[Instance])> = loads
+            .iter()
+            .map(|(name, instances, _)| (name.as_str(), instances.as_slice()))
+            .collect();
+        let storages_view: Vec<(&str, &Storage)> = self
+            .storages
+            .iter()
+            .map(|(name, storage)| (name.as_str(), storage))
+            .collect();
+        let outcome = crate::session::reconcile_profile_duplicates(&loads_view, &storages_view);
+        if outcome.repaired {
+            // Durable state changed under lock; reload so exactly one row per
+            // session is published.
+            loads = collect_loads(&self.storages, &self.instances)?;
+        }
+        log_legacy_duplicates_once(&outcome.reports);
+        self.legacy_duplicate_reports = outcome.reports;
+
+        for (profile_name, instances, groups) in &loads {
             // Rebuild this profile's tree from disk, preserving any collapsed
             // state that was toggled in-memory but not yet on disk
-            let mut new_tree = GroupTree::new_with_groups(&instances, &groups);
+            let mut new_tree = GroupTree::new_with_groups(instances, groups);
             if let Some(old_tree) = self.group_trees.get(profile_name) {
                 for g in old_tree.get_all_groups() {
                     if g.collapsed {
@@ -2563,7 +2762,7 @@ impl HomeView {
                 }
             }
             self.group_trees.insert(profile_name.clone(), new_tree);
-            all_instances.extend(instances);
+            all_instances.extend(instances.iter().cloned());
         }
 
         // Remove trees for profiles that no longer exist
@@ -2571,9 +2770,8 @@ impl HomeView {
         self.group_trees.retain(|k, _| storage_keys.contains(k));
 
         // Snapshot the in-flight Creating stub before `self.instances` is
-        // overwritten. The stub isn't on disk (added via `add_instance` from
-        // `create_session` before the async worker starts) and would
-        // otherwise vanish across reload.
+        // overwritten. An intervening save may have persisted it, but while it
+        // is still memory-only it would otherwise vanish across reload.
         let creating_stub_snapshot: Option<Instance> = self
             .creating_stub_id
             .as_ref()
@@ -2588,6 +2786,15 @@ impl HomeView {
         // Refresh the project registry so project view's empty pinned headers
         // and pin indicators reflect the current on-disk registry.
         self.refresh_registered_projects();
+
+        // Drop memoized remote-owner lookups so a `git remote add`/`set-url`
+        // run since the last reload is picked up on the next org-mode
+        // rebuild, instead of sticking with a stale cached owner (or a
+        // stale cached "no owner") for the rest of the process. Cheap: this
+        // only re-reads local `.git/config` state, no network access, and
+        // this reload path already runs on a multi-second cadence, not
+        // per-render.
+        self.remote_owner_cache.borrow_mut().clear();
 
         // Remember what the cursor was pointing at so we can follow it
         let prev_selected_session = self.selected_session.clone();
@@ -2837,6 +3044,124 @@ impl HomeView {
         }
     }
 
+    /// Request a system-health sample in the background while either health
+    /// surface is visible. Call `apply_metrics_updates` to pick up the result.
+    pub fn request_metrics_refresh(&mut self) {
+        let instances = self.pollable_instances();
+        let tip_candidate = !self.system_health_tip_earned
+            && !self.system_health_discovered
+            && instances.len() >= crate::tips::SYSTEM_HEALTH_AGENT_THRESHOLD;
+        if (self.show_diagnostics || self.system_health_open || tip_candidate)
+            && !self.pending_metrics_refresh
+        {
+            self.metrics_poller.request_refresh(instances);
+            self.pending_metrics_refresh = true;
+        }
+    }
+
+    /// Apply any pending metrics sample. Returns true if a sample was applied
+    /// so the caller can repaint the live readouts.
+    pub fn apply_metrics_updates(&mut self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+
+        match self.metrics_poller.try_recv_updates() {
+            Ok(snapshot) => {
+                self.metrics = snapshot;
+                self.observe_system_health_tip_load();
+                self.pending_metrics_refresh = false;
+                true
+            }
+            Err(TryRecvError::Empty) => false,
+            Err(TryRecvError::Disconnected) => {
+                // The sampler thread died (a panic in sample_memory /
+                // count_running_agents). Respawn so pending_metrics_refresh
+                // does not stay stuck and freeze the strip.
+                tracing::error!(
+                    target: "tui.home",
+                    "metrics poller worker gone; respawning a fresh poller",
+                );
+                self.metrics_poller = super::metrics_poller::MetricsPoller::new();
+                self.pending_metrics_refresh = false;
+                false
+            }
+        }
+    }
+
+    /// Toggle the diagnostics strip and persist the new state to
+    /// `session.show_diagnostics_pane` so it survives restarts.
+    pub fn toggle_diagnostics(&mut self) {
+        self.show_diagnostics = !self.show_diagnostics;
+        let enabled = self.show_diagnostics;
+        if let Err(e) = update_config(|config| {
+            config.session.show_diagnostics_pane = enabled;
+        }) {
+            tracing::warn!(
+                target: "tui.home",
+                "failed to persist show_diagnostics_pane: {e}",
+            );
+        }
+    }
+
+    pub fn open_system_health(&mut self) {
+        self.system_health_discovered = true;
+        if self.pending_tip_pop.map(|tip| tip.id) == Some("system-health") {
+            self.pending_tip_pop = None;
+        }
+        let already_used = load_config()
+            .ok()
+            .flatten()
+            .is_some_and(|config| config.app_state.used_system_health);
+        if !already_used {
+            if let Err(error) = update_app_state(|state| state.used_system_health = true) {
+                tracing::warn!(target: "tui.home", "failed to persist System Health discovery: {error}");
+            } else if let Ok(config) = load_config().map(|config| config.unwrap_or_default()) {
+                self.tips_unseen = tips_unseen_count(&config);
+            }
+        }
+        self.system_health_open = true;
+        self.system_health_scroll = 0;
+        self.diff_view = None;
+        self.live_send = None;
+        self.request_metrics_refresh();
+    }
+
+    fn observe_system_health_tip_load(&mut self) {
+        if self.system_health_tip_earned || self.system_health_discovered {
+            return;
+        }
+        if self.metrics.counts.agents < crate::tips::SYSTEM_HEALTH_AGENT_THRESHOLD {
+            self.system_health_tip_high_samples = 0;
+            return;
+        }
+        self.system_health_tip_high_samples = self.system_health_tip_high_samples.saturating_add(1);
+        if self.system_health_tip_high_samples < crate::tips::SYSTEM_HEALTH_SAMPLE_THRESHOLD {
+            return;
+        }
+
+        self.system_health_tip_earned = true;
+        if let Err(error) = update_app_state(|state| state.system_health_tip_earned = true) {
+            tracing::warn!(target: "tui.home", "failed to persist System Health tip signal: {error}");
+            return;
+        }
+        let Ok(config) = load_config().map(|config| config.unwrap_or_default()) else {
+            return;
+        };
+        self.tips_unseen = tips_unseen_count(&config);
+        if config.session.show_tips
+            && !config.app_state.used_system_health
+            && !config
+                .app_state
+                .tips_seen
+                .iter()
+                .any(|id| id == "system-health")
+            && self.pending_tip_pop.is_none()
+        {
+            self.pending_tip_pop = crate::tips::catalog()
+                .iter()
+                .find(|tip| tip.id == "system-health");
+        }
+    }
+
     /// Request the daemon's view of every structured row's status
     /// (non-blocking). Skipped entirely when no structured session is
     /// loaded, so a terminal-only home view never talks to the daemon.
@@ -2919,13 +3244,13 @@ impl HomeView {
     }
 
     /// Fold one daemon-sourced structured status into the shared apply path,
-    /// so sounds, status hooks, and unread marking behave exactly as they do
-    /// for a tmux-derived transition. The `sessions.json` status patch is the
-    /// one deliberate exception: this path only handles structured rows, and
-    /// `persist_passive_status_transition` skips the passive status patch for
-    /// `is_structured()` (only the unread mark persists there), since a
-    /// structured row's status is a daemon-side overlay with no durable owner.
-    /// See #3201.
+    /// so sounds and status hooks fire exactly as they do for a tmux-derived
+    /// transition. Persistence is the deliberate exception: this path only
+    /// handles structured rows, and nothing about one is the TUI's to write, so
+    /// `persist_passive_status_transition` returns early for `is_structured()`.
+    /// The status is a daemon-side overlay with no durable owner (#3201), and
+    /// the automatic unread mark is the daemon's too, written from the live ACP
+    /// turn-end event (#3181).
     ///
     /// The row is re-checked against `is_structured()` here rather than
     /// trusted from the wire: the daemon's `view` and the local row's could
@@ -3092,9 +3417,26 @@ impl HomeView {
                     // Skip when already unread (the mark is a no-op) so a
                     // re-finishing session doesn't churn the flock once
                     // per turn.
-                    let already_unread =
-                        self.get_instance(&update.id).is_some_and(|i| i.is_unread());
+                    let (already_unread, structured) = self
+                        .get_instance(&update.id)
+                        .map(|i| (i.is_unread(), i.is_structured()))
+                        .unwrap_or((false, false));
+                    // Structured rows are the daemon's: `should_mark_acp_unread`
+                    // marks them off the live ACP turn-end event and persists it
+                    // there (#3181). Marking here too would be a second writer of
+                    // the same boolean for no gain, and `is_live_target` cannot
+                    // even earn its keep on one: `start_live_send` returns `None`
+                    // outright for `is_structured()` (`home/input.rs`, matched by
+                    // the guard in `app.rs`), so the exemption is always inert for
+                    // them. Note it is that explicit guard which makes it inert,
+                    // not the absence of a pane: a structured row can own paired
+                    // terminal and tool panes, so `LiveSendTarget` alone would not
+                    // rule live-send out. What clears the mark for a structured
+                    // row the user is actually reading is `tick_unread_dwell`,
+                    // which re-checks `is_unread()` every tick and so picks up a
+                    // daemon-written mark on the row under the cursor.
                     let should_mark_unread = crate::session::unread_enabled()
+                        && !structured
                         && old == Status::Running
                         && new_status == Status::Idle
                         && !is_live_target
@@ -3161,115 +3503,76 @@ impl HomeView {
     }
 
     pub fn apply_deletion_results(&mut self) -> bool {
+        use crate::session::deletion::DeletionDisposition;
         use crate::session::Status;
         use std::sync::mpsc::TryRecvError;
 
         match self.deletion_poller.try_recv_result() {
             Ok(result) => {
-                if result.success {
-                    // Captured before the remove (the instance is still in
-                    // `self.instances`); recorded only after the deletion is
-                    // durably saved, so a failed save leaves no tombstone (#2141).
-                    let recent_entry = self
-                        .instances
-                        .get(&result.session_id)
-                        .and_then(crate::session::recent_project_entry_for);
-
-                    // A claimed trashed-purge (#2541) commits under the flock with
-                    // the #2534 restore-race recheck: if a peer restored the session
-                    // mid-purge, keep the restored row and release our claim rather
-                    // than dropping it. Otherwise it removes the row on disk itself,
-                    // so the normal in-memory removal is skipped in favor of a
-                    // reload that converges with disk.
-                    if self.purge_claimed.remove(&result.session_id) {
-                        match self.finalize_claimed_purge(&result.session_id) {
-                            Ok(true) => {
-                                self.info_dialog = Some(InfoDialog::new(
-                                    "Session restored",
-                                    "This session was restored while its delete ran; the record was kept, but its worktree, branch, container, or transcript may already be gone. Inspect and repair it.",
-                                ));
-                            }
-                            Ok(false) => {
-                                if let Some(entry) = recent_entry {
-                                    if let Err(e) = crate::session::record_recent_project(entry) {
-                                        tracing::warn!(target: "tui.home",
-                                            "recording recent project after delete failed: {e}");
-                                    }
-                                }
-                            }
-                            Err(()) => {
-                                // Storage failed: the row is untouched on disk (still
-                                // trashed + Purge-claimed by us). Release our claim so
-                                // it is not wedged until the TTL, surface the error,
-                                // and let the reload bring the row back.
-                                self.release_trashed_purge_claim(&result.session_id);
-                                self.info_dialog = Some(InfoDialog::new(
-                                    "Delete Failed",
-                                    "Could not finalize the delete under the storage lock. Try again.",
-                                ));
+                match result.disposition {
+                    DeletionDisposition::Removed | DeletionDisposition::AlreadyGone => {
+                        self.instances.shift_remove(&result.session_id);
+                        self.rebuild_group_trees();
+                        self.rebuild_flat_items();
+                    }
+                    DeletionDisposition::KeptRestored => {
+                        if let (Some(current), Some(retained)) = (
+                            self.instances.get_mut(&result.session_id),
+                            result.retained_instance,
+                        ) {
+                            current.lifecycle_generation = retained.lifecycle_generation;
+                            current.status = retained.status;
+                            current.trashed_at = retained.trashed_at;
+                            current.project_path = retained.project_path;
+                            current.pre_trash_project_path = retained.pre_trash_project_path;
+                            current.lifecycle_reservation = retained.lifecycle_reservation;
+                        }
+                        let message = if result.teardown_started {
+                            "This session was restored while its delete ran; the record was kept, but its worktree, branch, container, or transcript may already be gone. Inspect and repair it."
+                        } else {
+                            "This session is being restored by another process; it was not deleted."
+                        };
+                        self.info_dialog = Some(InfoDialog::new("Session restored", message));
+                        self.rebuild_flat_items();
+                    }
+                    DeletionDisposition::Busy => {
+                        if let Some(current) = self.instances.get_mut(&result.session_id) {
+                            if let Some(retained) = result.retained_instance {
+                                current.status = retained.status;
+                                current.lifecycle_generation = retained.lifecycle_generation;
+                                current.lifecycle_reservation = retained.lifecycle_reservation;
+                            } else {
+                                current.status = Status::Error;
                             }
                         }
-                        if let Err(e) = self.reload() {
-                            tracing::warn!(target: "tui.home", "Failed to reload session state: {e}");
-                        }
-                        return true;
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Delete in progress",
+                            "This session is already being deleted by another process.",
+                        ));
                     }
-
-                    self.remove_instance(&result.session_id);
-                    self.rebuild_group_trees();
-
-                    if let Err(e) = self.save() {
-                        tracing::error!(target: "tui.home", "Failed to save after deletion: {}", e);
-                    } else if let Some(entry) = recent_entry {
-                        // Best-effort; keeps the project in the wizard Recent tab.
-                        if let Err(e) = crate::session::record_recent_project(entry) {
-                            tracing::warn!(target: "tui.home",
-                                "recording recent project after delete failed: {e}");
-                        }
+                    DeletionDisposition::Failed => {
+                        let error = if result.errors.is_empty() {
+                            None
+                        } else {
+                            Some(result.errors.join("; "))
+                        };
+                        self.mutate_instance(&result.session_id, |inst| {
+                            inst.status = Status::Error;
+                            inst.last_error = error;
+                        });
                     }
-                    if let Err(e) = self.reload() {
-                        tracing::warn!(target: "tui.home", "Failed to reload session state: {e}");
-                    }
-                } else {
-                    // A claimed trashed-purge whose teardown failed keeps the row
-                    // for retry; release our owned Purge claim so it is not wedged
-                    // (a peer restore is then free to win). See #2541.
-                    if self.purge_claimed.remove(&result.session_id) {
-                        self.release_trashed_purge_claim(&result.session_id);
-                    }
-                    let error = if result.errors.is_empty() {
-                        None
-                    } else {
-                        Some(result.errors.join("; "))
-                    };
-                    self.mutate_instance(&result.session_id, |inst| {
-                        inst.status = Status::Error;
-                        inst.last_error = error;
-                    });
                 }
                 true
             }
             Err(TryRecvError::Empty) => false,
             Err(TryRecvError::Disconnected) => {
-                // The single worker thread is gone (a panic in
-                // perform_deletion dropped result_tx). Deleting rows are
-                // frozen for the StatusPoller (tier 0), so without this they
-                // would sit on "Deleting" forever. Mirrors the Disconnected
-                // handling in `apply_restart_results`.
                 let stuck: Vec<String> = self
                     .instances
                     .values()
-                    .filter(|i| i.status == Status::Deleting)
-                    .map(|i| i.id.clone())
+                    .filter(|instance| instance.status == Status::Deleting)
+                    .map(|instance| instance.id.clone())
                     .collect();
-                // The dead worker will never finalize any purge we claimed;
-                // release every owned claim so peers are not wedged until the
-                // claim TTL expires (#2541).
-                let claimed: Vec<String> = self.purge_claimed.drain().collect();
-                for id in &claimed {
-                    self.release_trashed_purge_claim(id);
-                }
-                if stuck.is_empty() && claimed.is_empty() {
+                if stuck.is_empty() {
                     return false;
                 }
                 tracing::error!(
@@ -3284,9 +3587,6 @@ impl HomeView {
                             Some("Deletion worker crashed; session was not deleted".to_string());
                     });
                 }
-                if let Err(e) = self.save() {
-                    tracing::error!(target: "tui.home", "Failed to save after deletion: {}", e);
-                }
                 true
             }
         }
@@ -3300,18 +3600,31 @@ impl HomeView {
 
         match self.stop_poller.try_recv_result() {
             Ok(result) => {
-                if result.success {
-                    // Status was already set to Stopped optimistically when the
-                    // stop was requested; reassert it in case the disk reload or
-                    // a race changed it, and clear any stale error.
-                    self.set_instance_error(&result.session_id, None);
-                    self.set_instance_status(&result.session_id, Status::Stopped);
-                } else {
+                // `Instance::stop` committed its terminal state while holding
+                // the cross-process lifecycle lock. Merge that durable row on
+                // both success and failure so the in-memory error message is
+                // attached to the generation that actually failed.
+                let committed = self
+                    .get_instance(&result.session_id)
+                    .map(|instance| instance.source_profile.clone())
+                    .and_then(|profile| self.storages.get(&profile))
+                    .and_then(|storage| storage.load().ok())
+                    .and_then(|instances| {
+                        instances
+                            .into_iter()
+                            .find(|instance| instance.id == result.session_id)
+                    });
+                if let Some(committed) = committed {
+                    self.mutate_instance(&result.session_id, |instance| {
+                        instance.merge_post_start(&committed);
+                    });
+                }
+                if !result.success {
                     self.set_instance_error(&result.session_id, result.error);
                     self.set_instance_status(&result.session_id, Status::Error);
-                }
-                if let Err(e) = self.save() {
-                    tracing::error!(target: "tui.home", "Failed to save after stop: {}", e);
+                    if let Err(e) = self.save() {
+                        tracing::error!(target: "tui.home", "Failed to save after stop: {}", e);
+                    }
                 }
                 true
             }
@@ -3348,153 +3661,51 @@ impl HomeView {
         }
     }
 
-    /// Apply the result of a background trash prepare: persist the relocated
-    /// worktree path onto the (already-trashed) row. Returns true if an
-    /// instance was updated so the caller can trigger a redraw.
+    /// Apply a background trash result. The worker already committed durable
+    /// state while holding the lifecycle flock; this drain only refreshes the
+    /// in-memory path after confirming the same durable row is still trashed.
     pub fn apply_trash_results(&mut self) -> bool {
         use std::sync::mpsc::TryRecvError;
 
         match self.trash_poller.try_recv_result() {
             Ok(result) => {
                 let mut changed = false;
-                // Only persist the relocation if the row is still trashed. The
-                // teardown ran off-thread, so a fast restore or purge could have
-                // landed in between; applying the holding-area path to a row the
-                // user just restored would repoint a live session's worktree
-                // into `.aoe-trash/`. A purged row is gone from the map and this
-                // skips too. The relocation is best-effort regardless: a later
-                // reconcile pass heals a still-trashed row whose move was
-                // dropped here.
-                if result.relocation.is_none() {
-                    // Skipped/Failed teardown: nothing moved, but the drain is
-                    // this teardown's terminal path, so release its in-flight
-                    // Trash claim (ownership-guarded; a claim a purge/restore
-                    // seized is untouched). The row stays trashed in place and
-                    // the next reconcile pass relocates it.
-                    if let Some(storage) = self
+                if let Some(relocation) = result.relocation {
+                    let durable = self
                         .instances
                         .get(&result.session_id)
-                        .map(|i| i.source_profile.clone())
+                        .map(|instance| instance.source_profile.clone())
                         .and_then(|profile| self.storages.get(&profile))
-                    {
-                        if let Err(e) = storage.update(|insts, _groups| {
-                            crate::session::claim::release_trash_claim(insts, &result.session_id);
-                            Ok(())
-                        }) {
-                            tracing::warn!(
-                                target: "tui.session",
-                                session = %result.session_id,
-                                "could not release the Trash claim: {e}"
-                            );
-                        }
-                    }
-                }
-                if let Some(reloc) = result.relocation {
-                    // Atomic durable check-and-commit under the storage flock.
-                    // The worker's pre-move re-check leaves a window before
-                    // this drain in which a restore or purge (local or from a
-                    // peer process) can supersede the teardown; deciding
-                    // against the in-memory map would re-open that window
-                    // cross-process, so the decision is re-taken on the
-                    // durable row instead, serialized with the restore/purge
-                    // commits. Superseded means such a peer won: the disk move
-                    // is undone (a same-filesystem rename, the same tick-loop
-                    // trade `restore_selected_from_trash` makes). A row absent
-                    // from the map was purged locally and is skipped; its
-                    // holding dir falls to the purge teardown.
-                    // The decision travels through this captured slot rather
-                    // than the closure's return value, so it survives an
-                    // update that decided Superseded and then failed its
-                    // final write; the undo below keys off the decision
-                    // alone, since the durable row was already restored in
-                    // that case and skipping the undo would strand its
-                    // worktree in the holding area.
-                    let mut decided: Option<(
-                        crate::session::claim::RelocationCommit,
-                        Option<crate::session::Instance>,
-                    )> = None;
-                    let update_result = self
-                        .instances
-                        .get(&result.session_id)
-                        .map(|i| i.source_profile.clone())
-                        .and_then(|profile| self.storages.get(&profile))
-                        .map(|storage| {
-                            storage.update(|insts, _groups| {
-                                let commit = crate::session::claim::commit_trash_relocation(
-                                    insts,
-                                    &result.session_id,
-                                    &reloc,
-                                    chrono::Utc::now(),
-                                );
-                                let row = insts.iter().find(|i| i.id == result.session_id).cloned();
-                                decided = Some((commit, row));
-                                Ok(())
-                            })
+                        .and_then(|storage| storage.load().ok())
+                        .and_then(|instances| {
+                            instances
+                                .into_iter()
+                                .find(|instance| instance.id == result.session_id)
                         });
-                    if let Some(Err(e)) = &update_result {
-                        // A Persisted decision whose write failed needs no
-                        // repair here: the durable row is still trashed at its
-                        // old path and the load-time reconcile repoints it to
-                        // the holding area.
-                        tracing::error!(
-                            target: "tui.home",
-                            session = %result.session_id,
-                            "failed to persist trash worktree relocation: {e}",
-                        );
-                    }
-                    use crate::session::claim::RelocationCommit;
-                    match decided {
-                        Some((RelocationCommit::Persisted, _))
-                            if matches!(update_result, Some(Ok(()))) =>
-                        {
-                            if let Some(inst) = self.instances.get_mut(&result.session_id) {
-                                inst.project_path = reloc.new_project_path.clone();
-                                inst.pre_trash_project_path = reloc.pre_trash_project_path.clone();
-                            }
+                    if let Some(durable) = durable.filter(|instance| {
+                        instance.is_trashed()
+                            && instance.project_path == relocation.new_project_path
+                    }) {
+                        if let Some(instance) = self.instances.get_mut(&result.session_id) {
+                            instance.project_path = durable.project_path;
+                            instance.pre_trash_project_path = durable.pre_trash_project_path;
+                            instance.lifecycle_generation = durable.lifecycle_generation;
+                            instance.lifecycle_reservation = durable.lifecycle_reservation;
                             changed = true;
                         }
-                        Some((RelocationCommit::Superseded, row)) => {
-                            let undo_with =
-                                row.or_else(|| self.instances.get(&result.session_id).cloned());
-                            if let Some(live) = undo_with {
-                                match crate::session::trash::undo_raced_relocation(&live, &reloc) {
-                                    crate::session::trash::RestoreOutcome::Failed { reason } => {
-                                        tracing::warn!(
-                                            target: "tui.session",
-                                            session = %result.session_id,
-                                            "could not move a superseded trash relocation back ({reason}); worktree remains at {}",
-                                            reloc.new_project_path,
-                                        );
-                                    }
-                                    outcome => {
-                                        tracing::info!(
-                                            target: "tui.session",
-                                            session = %result.session_id,
-                                            "trash relocation superseded by a restore/claim; undone ({outcome:?})",
-                                        );
-                                    }
-                                }
-                            }
-                        }
-                        _ => {}
                     }
                 }
                 if let Some(reason) = result.relocate_warning {
                     tracing::warn!(
                         target: "tui.session",
                         session = %result.session_id,
-                        "trash worktree relocation skipped: {reason}",
+                        "trash transition incomplete: {reason}",
                     );
                 }
                 changed
             }
             Err(TryRecvError::Empty) => false,
             Err(TryRecvError::Disconnected) => {
-                // The worker thread is gone (a panic in perform_trash dropped
-                // result_tx). The rows are already durably trashed, so no
-                // status surgery is needed; their worktrees just did not
-                // relocate. A later reconcile pass (`reconcile_trashed_location`
-                // at load) moves them, so this only logs which are deferred.
                 let stuck = self.trash_poller.take_pending();
                 if stuck.is_empty() {
                     return false;
@@ -3502,7 +3713,7 @@ impl HomeView {
                 tracing::error!(
                     target: "tui.home",
                     rows = stuck.len(),
-                    "trash poller worker gone; worktree relocation deferred to next reconcile",
+                    "trash poller worker gone; transitions recover after reservation expiry",
                 );
                 false
             }
@@ -3514,40 +3725,65 @@ impl HomeView {
     /// Tmux env may also be republished when this returns `false`
     /// (filtered or Failed paths republish the in-memory mirror).
     pub fn apply_session_id_updates(&mut self) -> bool {
-        // Fast path: no poller can produce a sid update this tick, so skip
-        // the whole-map snapshot clone on idle ticks (this function runs
-        // every 500ms).
-        if !self
+        // Drain before repair: a poller can have one final queued observation
+        // after its worker exits, and replacing it first would discard that
+        // durable update.
+        let mut changed = false;
+        if self
             .instances
             .values()
             .any(|i| i.session_id_poller.is_some())
         {
-            return false;
+            // `drain_and_persist_session_ids` takes `&mut [Instance]` and is
+            // shared with `src/server/mod.rs`. Snapshot into a `Vec` at the
+            // boundary, then re-`insert` touched ids back into the map;
+            // `IndexMap::insert` on an existing key updates in place,
+            // preserving position. The full-object re-insert is sound here
+            // because the TUI event loop is single-threaded: nothing mutates
+            // `self.instances` between this snapshot and the re-insert, so the
+            // snapshot cannot go stale and clobber a concurrent field write.
+            // The daemon holds `instances` under a shared async lock, so it
+            // merges only the identity under a baseline CAS in
+            // `apply_drained_identity_if_unchanged`; keep the two in sync.
+            let mut snapshot: Vec<Instance> = self.cloned_instances();
+            let outcome = crate::session::sync::drain_and_persist_session_ids(
+                &mut snapshot,
+                &self.file_watch,
+            );
+            if outcome.touched() {
+                let touched: HashSet<&str> = outcome
+                    .applied
+                    .iter()
+                    .chain(outcome.rolled_back.iter())
+                    .map(String::as_str)
+                    .collect();
+                for inst in snapshot
+                    .into_iter()
+                    .filter(|i| touched.contains(i.id.as_str()))
+                {
+                    self.instances.insert(inst.id.clone(), inst);
+                }
+                changed = !outcome.applied.is_empty() || !outcome.rolled_back.is_empty();
+            }
         }
-        // `drain_and_persist_session_ids` takes `&mut [Instance]` and is
-        // shared with `src/server/mod.rs`. Snapshot into a `Vec` at the
-        // boundary, then re-`insert` touched ids back into the map;
-        // `IndexMap::insert` on an existing key updates in place, preserving
-        // position.
-        let mut snapshot: Vec<Instance> = self.cloned_instances();
-        let outcome =
-            crate::session::sync::drain_and_persist_session_ids(&mut snapshot, &self.file_watch);
-        if !outcome.touched() {
-            return false;
+
+        changed
+    }
+
+    /// Recreate stopped terminal session-id pollers after a status-refresh
+    /// cadence has refreshed tmux state. This is deliberately separate from
+    /// [`Self::apply_session_id_updates`], which runs on every input/render
+    /// wake while live views are open.
+    pub fn repair_session_id_pollers(&mut self) {
+        // One observation for the whole walk. This runs on the `App::run` tick
+        // over every instance, so a per-item `list-sessions` fork scales with
+        // the store and lands on the thread that also serves keystrokes.
+        // Profiling a store of a few hundred sessions put this path at the top
+        // of the main thread.
+        let live = crate::tmux::LiveSessionSnapshot::new();
+        for instance in self.instances.values_mut() {
+            instance.repair_session_id_poller_if_needed(&live);
         }
-        let touched: HashSet<&str> = outcome
-            .applied
-            .iter()
-            .chain(outcome.rolled_back.iter())
-            .map(String::as_str)
-            .collect();
-        for inst in snapshot
-            .into_iter()
-            .filter(|i| touched.contains(i.id.as_str()))
-        {
-            self.instances.insert(inst.id.clone(), inst);
-        }
-        !outcome.applied.is_empty() || !outcome.rolled_back.is_empty()
     }
 
     /// Drain the startup-recovery channel and apply each `RecoveryUpdate`
@@ -3859,11 +4095,11 @@ impl HomeView {
         };
 
         let mut candidates: Vec<crate::session::Instance> = Vec::new();
-        // Single fallible tmux probe instead of per-instance
-        // `inst.has_live_tmux_pane()` calls. On Err: skip recovery this
-        // launch (a transient tmux glitch must NOT collapse to "all panes
-        // dead" and trigger phantom cascades). Bonus: one subprocess call
-        // regardless of instance count (was 1-2 per instance).
+        // Single fallible tmux probe instead of a per-instance liveness
+        // lookup. On Err: skip recovery this launch (a transient tmux glitch
+        // must NOT collapse to "all panes dead" and trigger phantom
+        // cascades). Bonus: one subprocess call regardless of instance count
+        // (was 1-2 per instance).
         let pane_meta = match crate::tmux::batch_pane_metadata() {
             Ok(map) => map,
             Err(e) => {
@@ -4096,6 +4332,16 @@ impl HomeView {
 
         let stub_id = stub.id.clone();
         let target_profile = data.profile.clone();
+        let existing_group_paths: HashSet<String> = self
+            .group_trees
+            .get(&target_profile)
+            .map(|tree| {
+                tree.get_all_groups()
+                    .into_iter()
+                    .map(|group| group.path)
+                    .collect()
+            })
+            .unwrap_or_default();
 
         // Add stub to instance list
         self.add_instance(stub);
@@ -4105,6 +4351,17 @@ impl HomeView {
                 tree.create_group(&data.group);
             }
         }
+        self.creating_provisional_group_paths = self
+            .group_trees
+            .get(&target_profile)
+            .map(|tree| {
+                tree.get_all_groups()
+                    .into_iter()
+                    .map(|group| group.path)
+                    .filter(|path| !existing_group_paths.contains(path))
+                    .collect()
+            })
+            .unwrap_or_default();
 
         // Initialize progress tracking and select the stub
         self.creating_hook_progress.insert(
@@ -4154,6 +4411,7 @@ impl HomeView {
         }
         // Remove the stub instance
         if let Some(stub_id) = self.creating_stub_id.take() {
+            self.creating_provisional_group_paths.clear();
             self.remove_instance(&stub_id);
             self.creating_hook_progress.remove(&stub_id);
             self.rebuild_group_trees();
@@ -4167,13 +4425,16 @@ impl HomeView {
     /// Returns Some(session_id) if creation succeeded and we should attach.
     pub fn apply_creation_results(&mut self) -> Option<String> {
         use super::creation_poller::CreationResult;
-        use crate::session::builder::{self, CreatedWorktree};
-        use std::path::PathBuf;
 
         let result = self.creation_poller.try_recv_result()?;
 
         // Clean up the stub and progress tracking
         let stub_id = self.creating_stub_id.take();
+        // Taken (not borrowed) so every early return below leaves the field
+        // empty: the provisional group paths belong to this stub alone, and a
+        // rolled-back or failed finalize must not carry them into the next
+        // creation.
+        let provisional_group_paths = std::mem::take(&mut self.creating_provisional_group_paths);
         if let Some(ref id) = stub_id {
             self.creating_hook_progress.remove(id);
         }
@@ -4187,14 +4448,16 @@ impl HomeView {
             if let CreationResult::Success {
                 ref instance,
                 ref created_worktree,
+                ref created_workspace_worktrees,
                 ..
             } = result
             {
-                let worktree = created_worktree.as_ref().map(|wt| CreatedWorktree {
-                    path: PathBuf::from(&wt.path),
-                    main_repo_path: PathBuf::from(&wt.main_repo_path),
-                });
-                builder::cleanup_instance(instance, worktree.as_ref(), &[]);
+                cleanup_creation_resources(
+                    instance,
+                    created_worktree.as_ref(),
+                    created_workspace_worktrees,
+                    None,
+                );
             }
             self.rebuild_group_trees();
             self.rebuild_flat_items();
@@ -4206,9 +4469,10 @@ impl HomeView {
             CreationResult::Success {
                 session_id,
                 instance,
+                created_worktree,
+                created_workspace_worktrees,
                 on_launch_hooks_ran,
-                warnings,
-                ..
+                mut warnings,
             } => {
                 // Remove the stub instance
                 if let Some(id) = &stub_id {
@@ -4223,24 +4487,150 @@ impl HomeView {
                 });
                 instance.source_profile = target_profile.clone();
 
-                // Ensure target profile storage exists
                 if !self.storages.contains_key(&target_profile) {
-                    if let Ok(s) = Storage::new(&target_profile, self.file_watch.clone()) {
-                        self.storages.insert(target_profile.clone(), s);
+                    match Storage::new(&target_profile, self.file_watch.clone()) {
+                        Ok(storage) => {
+                            self.storages.insert(target_profile.clone(), storage);
+                        }
+                        Err(error) => {
+                            cleanup_creation_resources(
+                                &instance,
+                                created_worktree.as_ref(),
+                                &created_workspace_worktrees,
+                                None,
+                            );
+                            self.info_dialog = Some(InfoDialog::sized_to_fit(
+                                "Creation Failed",
+                                &format!("Failed to open profile storage: {error}"),
+                            ));
+                            self.new_dialog = None;
+                            self.rebuild_group_trees();
+                            self.rebuild_flat_items();
+                            self.update_selected();
+                            return None;
+                        }
                     }
                 }
 
-                self.add_instance(instance.clone());
-                self.rebuild_group_trees();
-                if !instance.group_path.is_empty() {
-                    if let Some(tree) = self.group_trees.get_mut(&target_profile) {
+                let Some(storage) = self.storages.get(&target_profile) else {
+                    // The block above either found or inserted this profile's
+                    // storage, so this is unreachable; bail without attaching
+                    // rather than panicking on a production path.
+                    return None;
+                };
+                let persist_result = storage.update(|instances, groups| {
+                    // `save()` can run while the builder is working and persist
+                    // the placeholder. Remove that exact row under the same
+                    // storage lock used for collision detection and insertion,
+                    // otherwise the placeholder collides with its own result.
+                    let removed_persisted_stub = stub_id.as_deref().is_some_and(|stub_id| {
+                        let before = instances.len();
+                        instances.retain(|row| row.id != stub_id);
+                        instances.len() != before
+                    });
+                    if removed_persisted_stub && !provisional_group_paths.is_empty() {
+                        groups.retain(|group| !provisional_group_paths.contains(&group.path));
+                        // A peer may have committed another row into one of
+                        // these paths. Rebuild from the remaining rows so its
+                        // group survives even though the stub-created metadata
+                        // was provisional.
+                        *groups = GroupTree::new_with_groups(instances, groups).get_all_groups();
+                    }
+                    if let Some(owner) = crate::session::find_duplicate_session(
+                        instances.iter(),
+                        &instance.title,
+                        &instance.project_path,
+                        None,
+                    ) {
+                        return Ok(CreationCommit::Duplicate(Box::new(owner.clone())));
+                    }
+                    instances.push(instance.clone());
+                    if !instance.group_path.is_empty() {
+                        let mut tree = GroupTree::new_with_groups(instances, groups);
                         tree.create_group(&instance.group_path);
+                        *groups = tree.get_all_groups();
                     }
+                    Ok(CreationCommit::Inserted)
+                });
+                match persist_result {
+                    Ok(CreationCommit::Inserted) => {}
+                    Ok(CreationCommit::Duplicate(owner)) => {
+                        cleanup_creation_resources(
+                            &instance,
+                            created_worktree.as_ref(),
+                            &created_workspace_worktrees,
+                            Some(&owner),
+                        );
+                        self.info_dialog = Some(InfoDialog::sized_to_fit(
+                            "Creation Failed",
+                            &crate::session::duplicate_session_error(&instance.title).to_string(),
+                        ));
+                        self.new_dialog = None;
+                        if let Err(error) = self.reload() {
+                            tracing::warn!(
+                                target: "tui.home",
+                                "Failed to reload authoritative state after creation collision: {error}"
+                            );
+                        }
+                        return None;
+                    }
+                    Err(error) => match storage.load() {
+                        Ok(instances) if instances.iter().any(|row| row.id == instance.id) => {
+                            warnings.push(format!(
+                                "Session metadata was written, but finalizing profile storage reported an error: {error}"
+                            ));
+                        }
+                        Ok(instances) => {
+                            let owner = crate::session::find_duplicate_session(
+                                &instances,
+                                &instance.title,
+                                &instance.project_path,
+                                None,
+                            )
+                            .cloned();
+                            cleanup_creation_resources(
+                                &instance,
+                                created_worktree.as_ref(),
+                                &created_workspace_worktrees,
+                                owner.as_ref(),
+                            );
+                            self.info_dialog = Some(InfoDialog::sized_to_fit(
+                                "Creation Failed",
+                                &format!("Failed to save session: {error}"),
+                            ));
+                            self.new_dialog = None;
+                            if let Err(reload_error) = self.reload() {
+                                tracing::warn!(
+                                    target: "tui.home",
+                                    "Failed to reload authoritative state after creation rollback: {reload_error}"
+                                );
+                            }
+                            return None;
+                        }
+                        Err(verify_error) => {
+                            self.info_dialog = Some(InfoDialog::sized_to_fit(
+                                "Creation Failed",
+                                &format!(
+                                    "Failed to save session and could not verify the result: {error}\n\
+                                     Created resources were retained to avoid deleting a persisted session: {verify_error}"
+                                ),
+                            ));
+                            self.new_dialog = None;
+                            self.rebuild_group_trees();
+                            self.rebuild_flat_items();
+                            self.update_selected();
+                            return None;
+                        }
+                    },
                 }
 
-                if let Err(e) = self.save() {
-                    tracing::error!(target: "tui.home", "Failed to save after creation: {}", e);
-                }
+                // `publish_persisted_instance` records the create-count and
+                // clears the id from `pending_added` (the row is authoritative
+                // now, not a provisional add). Its in-memory insert is
+                // superseded by the `reload()` below on success, but is the
+                // fallback that keeps the row visible if that reload fails.
+                self.publish_persisted_instance(instance.clone());
+                self.rebuild_group_trees();
 
                 if on_launch_hooks_ran {
                     self.on_launch_hooks_ran.insert(session_id.clone());
@@ -4364,6 +4754,27 @@ impl HomeView {
         }
     }
 
+    /// Persist the "don't warn me again" opt-out for whichever confirm
+    /// offered the checkbox. Both call sites (keyboard and click) route
+    /// through this so the two paths can't disagree about which confirms
+    /// are opt-out-able. Actions without a checkbox never reach it.
+    pub(super) fn apply_confirm_dont_ask_again(&mut self, action: &str) {
+        match action {
+            "quit" => self.disable_confirm_before_quit(),
+            // Written globally, matching the quit opt-out. A profile that
+            // overrides confirm_delete = true keeps prompting; that override
+            // is cleared from the settings pane, not from here.
+            "trash_session" => {
+                if let Err(e) = update_config(|config| {
+                    config.session.confirm_delete = false;
+                }) {
+                    tracing::warn!(target: "tui.home", "Failed to save config: {e}");
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Clean up a pending creation on TUI shutdown. Waits briefly for the
     /// background thread to finish so we can clean up worktrees/instances.
     /// If the thread doesn't finish in time, the hook subprocess will
@@ -4387,17 +4798,16 @@ impl HomeView {
         if let Some(crate::tui::creation_poller::CreationResult::Success {
             ref instance,
             ref created_worktree,
+            ref created_workspace_worktrees,
             ..
         }) = result
         {
-            let worktree =
-                created_worktree
-                    .as_ref()
-                    .map(|wt| crate::session::builder::CreatedWorktree {
-                        path: std::path::PathBuf::from(&wt.path),
-                        main_repo_path: std::path::PathBuf::from(&wt.main_repo_path),
-                    });
-            crate::session::builder::cleanup_instance(instance, worktree.as_ref(), &[]);
+            cleanup_creation_resources(
+                instance,
+                created_worktree.as_ref(),
+                created_workspace_worktrees,
+                None,
+            );
             tracing::info!(target: "tui.home", "Cleaned up cancelled session on exit");
         }
     }
@@ -4713,7 +5123,7 @@ impl HomeView {
     fn known_project_group_paths(&self) -> std::collections::HashSet<String> {
         let mut paths = std::collections::HashSet::new();
         for inst in self.instances.values() {
-            let group = project_group_name(inst);
+            let group = project_group_key(inst);
             if group.is_empty() {
                 continue;
             }
@@ -4750,6 +5160,40 @@ impl HomeView {
         Self::persist_app_state("project group collapsed", |s| {
             s.project_group_collapsed = collapsed
         });
+    }
+
+    /// Org-mode counterpart of `known_project_group_paths`: the org group of
+    /// every live session (across all profiles) and the per-org archived
+    /// sub-folders. No registered-projects loop: org headers have no
+    /// registry to surface empty "pinned" headers from (#3283 out of scope).
+    fn known_org_group_paths(&self) -> std::collections::HashSet<String> {
+        let mut paths = std::collections::HashSet::new();
+        for inst in self.instances.values() {
+            let group = self.org_group_key(inst);
+            if group.is_empty() {
+                continue;
+            }
+            if inst.is_archived() {
+                paths.insert(crate::session::archived_project_sub_path(&group));
+            } else {
+                paths.insert(group);
+            }
+        }
+        paths
+    }
+
+    /// Persist the set of collapsed org-mode folders. Same shape and pruning
+    /// rationale as `save_project_group_collapsed`.
+    fn save_org_group_collapsed(&self) {
+        let known = self.known_org_group_paths();
+        let mut collapsed: Vec<String> = self
+            .org_group_collapsed
+            .iter()
+            .filter(|(path, &c)| c && known.contains(path.as_str()))
+            .map(|(path, _)| path.clone())
+            .collect();
+        collapsed.sort();
+        Self::persist_app_state("org group collapsed", |s| s.org_group_collapsed = collapsed);
     }
 
     pub fn toggle_preview_info(&mut self) {
@@ -4870,17 +5314,30 @@ impl HomeView {
     }
 
     /// Build the id-keyed `IndexMap` from a `Vec<Instance>` (the storage-load
-    /// shape). Logs a warning on a duplicate id so a corrupt disk state
-    /// surfaces in logs rather than silently keeping only the last row.
+    /// shape). Duplicate ids across profiles are ambiguous after an interrupted
+    /// profile move: selecting either row by iteration order can route lifecycle
+    /// work to the wrong profile. Exclude every copy and fail closed; the
+    /// reload path runs `reconcile_profile_duplicates` first, so only
+    /// legacy duplicates without journal evidence ever reach this state.
     fn build_instances_map(all_instances: Vec<Instance>) -> indexmap::IndexMap<String, Instance> {
-        let mut map = indexmap::IndexMap::with_capacity(all_instances.len());
+        let mut map: indexmap::IndexMap<String, Instance> =
+            indexmap::IndexMap::with_capacity(all_instances.len());
+        let mut duplicate_ids = std::collections::HashSet::new();
         for inst in all_instances {
-            if let Some(prev) = map.insert(inst.id.clone(), inst) {
-                tracing::warn!(
+            if duplicate_ids.contains(&inst.id) {
+                continue;
+            }
+            if let Some(previous) = map.shift_remove(&inst.id) {
+                duplicate_ids.insert(inst.id.clone());
+                tracing::error!(
                     target: "tui.home",
-                    id = %prev.id,
-                    "duplicate session id in loaded rows; keeping later entry"
+                    id = %inst.id,
+                    first_profile = %previous.source_profile,
+                    second_profile = %inst.source_profile,
+                    "duplicate session id across profiles; excluding every copy until durable reconciliation"
                 );
+            } else {
+                map.insert(inst.id.clone(), inst);
             }
         }
         map
@@ -4951,22 +5408,25 @@ impl HomeView {
     }
 
     pub(super) fn build_flat_items(&self) -> Vec<Item> {
-        // Project grouping is honored across every sort order. Combined with
-        // Attention sort, sessions sort by tier within each project and the
-        // project headers float by their top-attention member (driven by
-        // sort_groups + attention_group_key in flatten_tree). Check this
-        // first so Project + Attention doesn't fall through to the flat
-        // Attention branch and lose the project headers.
+        // Project and org grouping are honored across every sort order.
+        // Combined with Attention sort, sessions sort by tier within each
+        // group and the headers float by their top-attention member (driven
+        // by sort_groups + attention_group_key in flatten_tree). Check these
+        // first so Project/Org + Attention doesn't fall through to the flat
+        // Attention branch and lose the group headers.
         if self.group_by == GroupByMode::Project {
             return self.build_flat_items_by_project();
+        }
+        if self.group_by == GroupByMode::Org {
+            return self.build_flat_items_by_org();
         }
 
         // Manual grouping + Attention sort is the cross-cutting flat
         // priority view: skip groups entirely so Waiting/Error rows from
         // different groups can interleave by tier instead of being walled
-        // off behind group headers. Project grouping above opts into a
+        // off behind group headers. Project/org grouping above opt into a
         // different shape on purpose (attention triage within explicit
-        // project boundaries).
+        // group boundaries).
         if self.sort_order == SortOrder::Attention {
             let filtered: Vec<Instance> = self.cloned_instances_in_active_view();
             let mut items = flatten_sessions_by_attention(&filtered);
@@ -5007,7 +5467,7 @@ impl HomeView {
         let grouped: Vec<Instance> = base_instances
             .into_iter()
             .map(|mut inst| {
-                inst.group_path = project_group_name(&inst);
+                inst.group_path = project_group_key(&inst);
                 inst
             })
             .collect();
@@ -5037,7 +5497,7 @@ impl HomeView {
             .map(|i| i.group_path.clone())
             .filter(|p| !p.is_empty())
             .collect();
-        let empty_pinned: Vec<crate::session::Group> =
+        let mut seed_groups: Vec<crate::session::Group> =
             crate::session::projects::unpopulated_projects(
                 &populated_labels,
                 &self.registered_projects,
@@ -5045,7 +5505,18 @@ impl HomeView {
             .into_iter()
             .map(|p| crate::session::Group::new(&p.label, &p.label))
             .collect();
-        let mut tree = GroupTree::new_with_groups(&tree_seed, &empty_pinned);
+        // The synthetic scratch bucket keys on a sentinel path so a real repo
+        // named `scratch` keeps its own identity (#3237); seed its display name
+        // the way org seeds host-scoped keys, but only when a live scratch
+        // session populates it (an archived-only scratch group would otherwise
+        // render an undeletable empty header, per the phantom-header note above).
+        if populated_labels.contains(crate::session::SCRATCH_GROUP_PATH) {
+            seed_groups.push(crate::session::Group::new(
+                crate::session::SCRATCH_GROUP_NAME,
+                crate::session::SCRATCH_GROUP_PATH,
+            ));
+        }
+        let mut tree = GroupTree::new_with_groups(&tree_seed, &seed_groups);
         for (path, &collapsed) in &self.project_group_collapsed {
             if collapsed {
                 tree.set_collapsed(path, true);
@@ -5060,6 +5531,114 @@ impl HomeView {
             self.sort_order,
         );
         // Trash is a flat shelf even in project mode (recovery list, not a
+        // workspace), pinned below the Archived section.
+        append_trash_section(&mut items, &grouped, self.trashed_section_collapsed);
+        items
+    }
+
+    /// Resolve `inst`'s org display owner and host-scoped identity key
+    /// together, memoized per repo path in `remote_owner_cache` so grouping
+    /// doesn't re-open a git repo on every rebuild. Scratch sessions need no
+    /// special case: they live under `<app_dir>/scratch/<instance-id>/`,
+    /// never a git checkout, so `get_remote_owner_with_key` already returns
+    /// `None` for them and they fall into the "No organization" bucket for
+    /// free, same as any other repo with no hosted `origin` remote.
+    fn resolve_org(&self, inst: &Instance) -> (String, String) {
+        let repo_path = inst.repo_path();
+        if let Some(cached) = self.remote_owner_cache.borrow().get(repo_path) {
+            return match cached {
+                Some((owner, key)) => (owner.clone(), key.clone()),
+                None => (
+                    NO_ORG_GROUP_LABEL.to_string(),
+                    NO_ORG_GROUP_LABEL.to_string(),
+                ),
+            };
+        }
+        let resolved = crate::git::get_remote_owner_with_key(std::path::Path::new(repo_path));
+        self.remote_owner_cache
+            .borrow_mut()
+            .insert(repo_path.to_string(), resolved.clone());
+        match resolved {
+            Some((owner, key)) => (owner, key),
+            None => (
+                NO_ORG_GROUP_LABEL.to_string(),
+                NO_ORG_GROUP_LABEL.to_string(),
+            ),
+        }
+    }
+
+    /// The org header's display text: the bare remote owner, or "No
+    /// organization". Never use this for `group_path`/collapse-state
+    /// matching; two owners of the same name on different hosts share this
+    /// label but not the same identity, see `org_group_key`.
+    fn org_group_name(&self, inst: &Instance) -> String {
+        self.resolve_org(inst).0
+    }
+
+    /// The org group's identity key ("owner@host", or "No organization"),
+    /// used for `group_path`, collapse-state matching, and group-membership
+    /// filters. Host-scoped so same-named owners on different hosts (GitHub
+    /// "acme" vs GitLab "acme") never merge into one bucket or one
+    /// bulk-archive scope.
+    fn org_group_key(&self, inst: &Instance) -> String {
+        self.resolve_org(inst).1
+    }
+
+    /// Org-mode counterpart of `build_flat_items_by_project`: groups sessions
+    /// by their repo's resolved remote owner instead of by repo basename.
+    /// Unlike project mode, there is no org registry to surface empty
+    /// "pinned" headers for (#3283 explicitly scopes org grouping to live
+    /// sessions only), so the tree is seeded with only the display-named
+    /// groups derived below rather than `unpopulated_projects`.
+    fn build_flat_items_by_org(&self) -> Vec<Item> {
+        let base_instances: Vec<Instance> = self.cloned_instances_in_active_view();
+
+        let grouped: Vec<Instance> = base_instances
+            .into_iter()
+            .map(|mut inst| {
+                inst.group_path = self.org_group_key(&inst);
+                inst
+            })
+            .collect();
+
+        // Same phantom-header rationale as project mode: seed the tree from
+        // non-archived, non-trashed members only, so an org whose only
+        // remaining member is archived doesn't render an empty, undeletable
+        // header in the main flow.
+        let tree_seed: Vec<Instance> = grouped
+            .iter()
+            .filter(|i| !i.is_archived() && !i.is_trashed())
+            .cloned()
+            .collect();
+
+        // `group_path` is now the host-scoped identity key ("owner@host"),
+        // not the display text, so pre-seed a `Group` per distinct key
+        // carrying the bare-owner display name; `GroupTree` renders these
+        // verbatim instead of deriving a name by splitting the key on '/'
+        // (which the key never contains, so it would otherwise stay a flat
+        // group named after the whole key).
+        let mut seen_keys = std::collections::HashSet::new();
+        let org_labels: Vec<crate::session::Group> = tree_seed
+            .iter()
+            .filter(|i| !i.group_path.is_empty() && seen_keys.insert(i.group_path.clone()))
+            .map(|i| crate::session::Group::new(&self.org_group_name(i), &i.group_path))
+            .collect();
+
+        let mut tree = GroupTree::new_with_groups(&tree_seed, &org_labels);
+        for (path, &collapsed) in &self.org_group_collapsed {
+            if collapsed {
+                tree.set_collapsed(path, true);
+            }
+        }
+        let mut items = flatten_tree(&tree, &grouped, self.sort_order);
+        append_archived_section_by_project(
+            &mut items,
+            &grouped,
+            self.archived_section_collapsed,
+            &self.org_group_collapsed,
+            self.sort_order,
+        );
+        // Trash is a flat shelf even in org mode (recovery list, not a
         // workspace), pinned below the Archived section.
         append_trash_section(&mut items, &grouped, self.trashed_section_collapsed);
         items
@@ -5439,18 +6018,17 @@ impl HomeView {
             &mut self.pending_send_target,
             live_send::LiveSendTarget::Agent,
         );
-        let size = crate::terminal::get_size();
         // Same pane-readiness cascades as live-send: agent runs the
         // full `ensure_pane_ready` (Docker, splash, resume); terminals
-        // just need their tmux session to exist with a live pane. Seed a
-        // cold/dead agent pane at the terminal size for the same reason
-        // live-send does (see `ensure_pane_ready_with_size`): otherwise it
-        // boots at tmux's 80x24 default and runs narrow until something
-        // resizes it.
+        // just need their tmux session to exist with a live pane. Every cold
+        // target starts at the visible preview size, avoiding an immediate
+        // full-terminal-to-preview resize and its SIGWINCH repaint.
+        let boot_size = self.live_send_boot_size();
         match &target {
             live_send::LiveSendTarget::Agent => {
                 let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
-                    inst.ensure_pane_ready_with_size(size).map_err(Into::into)
+                    inst.ensure_pane_ready_with_size(boot_size)
+                        .map_err(Into::into)
                 });
                 match outcome {
                     Ok(Some(EnsureReadyOutcome::ResumeFailed { sid })) => {
@@ -5471,7 +6049,7 @@ impl HomeView {
                 }
             }
             live_send::LiveSendTarget::Terminal => {
-                if let Err(e) = self.ensure_terminal_pane_ready(session_id, size) {
+                if let Err(e) = self.ensure_terminal_pane_ready(session_id, boot_size) {
                     self.info_dialog = Some(InfoDialog::new(
                         "Send Failed",
                         &format!("Cannot prepare terminal: {}", e),
@@ -5480,7 +6058,7 @@ impl HomeView {
                 }
             }
             live_send::LiveSendTarget::ContainerTerminal => {
-                if let Err(e) = self.ensure_container_terminal_pane_ready(session_id, size) {
+                if let Err(e) = self.ensure_container_terminal_pane_ready(session_id, boot_size) {
                     self.info_dialog = Some(InfoDialog::new(
                         "Send Failed",
                         &format!("Cannot prepare container terminal: {}", e),
@@ -5490,7 +6068,7 @@ impl HomeView {
             }
             live_send::LiveSendTarget::Tool(name) => {
                 let name = name.clone();
-                if let Err(e) = self.ensure_tool_pane_ready(session_id, &name, size) {
+                if let Err(e) = self.ensure_tool_pane_ready(session_id, &name, boot_size) {
                     self.info_dialog = Some(InfoDialog::new(
                         "Send Failed",
                         &format!("Cannot prepare tool '{}': {}", name, e),
@@ -5613,47 +6191,6 @@ fn permission_response_tokens(
     }
 }
 
-#[cfg(test)]
-mod permission_response_tokens_tests {
-    use super::*;
-    use crate::agents::{KeyToken, PermissionResponse};
-    use crate::tui::dialogs::PermissionResponseChoice;
-
-    #[test]
-    fn maps_each_choice_to_its_own_field() {
-        let response = PermissionResponse {
-            allow: &[KeyToken::Literal("1")],
-            allow_always: Some(&[KeyToken::Literal("2")]),
-            deny: &[KeyToken::Literal("3")],
-        };
-        assert_eq!(
-            permission_response_tokens(&response, PermissionResponseChoice::Allow),
-            Some(response.allow)
-        );
-        assert_eq!(
-            permission_response_tokens(&response, PermissionResponseChoice::AllowAlways),
-            response.allow_always
-        );
-        assert_eq!(
-            permission_response_tokens(&response, PermissionResponseChoice::Deny),
-            Some(response.deny)
-        );
-    }
-
-    #[test]
-    fn allow_always_none_maps_to_none() {
-        let response = PermissionResponse {
-            allow: &[KeyToken::Named("Enter")],
-            allow_always: None,
-            deny: &[KeyToken::Named("Down"), KeyToken::Named("Enter")],
-        };
-        assert_eq!(
-            permission_response_tokens(&response, PermissionResponseChoice::AllowAlways),
-            None
-        );
-    }
-}
-
 impl HomeView {
     /// Whether the agent row is in a live status with its tmux pane up, so a
     /// revive cascade (`ensure_pane_ready` / `prepare_live_send`) is expected
@@ -5688,16 +6225,15 @@ impl HomeView {
         inst.tmux_session().is_ok_and(|s| s.exists())
     }
 
-    /// [`agent_pane_is_warm`](Self::agent_pane_is_warm) for the pane the
-    /// pending live-send target actually drives. Terminal / tool targets check
-    /// their own pane's existence and ignore the agent's status (a stopped
-    /// agent can have a live paired terminal); the Agent target defers to the
-    /// full agent predicate.
-    pub fn live_entry_is_warm(&self, session_id: &str) -> bool {
+    /// Whether the target pane is already live, so its entry can skip the
+    /// transient revive toast. Terminal and tool targets check their own pane's
+    /// existence and ignore the agent's status, because a stopped agent can
+    /// have a live paired terminal.
+    fn target_pane_is_warm(&self, session_id: &str, target: &live_send::LiveSendTarget) -> bool {
         let Some(inst) = self.get_instance(session_id) else {
             return false;
         };
-        let tmux_name = match &self.pending_live_send_target {
+        let tmux_name = match target {
             live_send::LiveSendTarget::Agent => return self.agent_pane_is_warm(session_id),
             live_send::LiveSendTarget::Terminal => {
                 crate::tmux::TerminalSession::resolve_name(&inst.id, &inst.title)
@@ -5714,7 +6250,15 @@ impl HomeView {
         crate::tmux::Session::from_name(&tmux_name).exists()
     }
 
-    /// Size to boot a cold/dead agent pane at on live-send entry: the visible
+    pub fn live_entry_is_warm(&self, session_id: &str) -> bool {
+        self.target_pane_is_warm(session_id, &self.pending_live_send_target)
+    }
+
+    pub fn send_entry_is_warm(&self, session_id: &str) -> bool {
+        self.target_pane_is_warm(session_id, &self.pending_send_target)
+    }
+
+    /// Size to boot a cold/dead pane at on live-send entry: the visible
     /// preview output rect when known, else the full terminal. `preview_pane_area`
     /// is the exact rect `finalize_live_send_resize` resizes to, so seeding the
     /// boot here makes the post-boot resize a no-op for cold starts (no reflow,
@@ -5757,24 +6301,23 @@ impl HomeView {
             &mut self.pending_live_send_target,
             live_send::LiveSendTarget::Agent,
         );
-        let size = crate::terminal::get_size();
         // Agent targets revive the agent pane via the full
         // ensure_pane_ready cascade (Docker, splash, resume). Terminal
         // targets are simpler: the paired terminal is a plain shell,
         // so we just ensure the tmux session exists and re-spawn it if
         // the pane has died (matches `attach_terminal`).
         //
-        // Boot the agent at the size it will be shown at, not tmux's 80x24
-        // default. A cold-started agent that boots narrow relies on
+        // Boot every target at the size it will be shown at, not tmux's 80x24
+        // default. A cold-started pane that boots narrow relies on
         // `finalize_live_send_resize`'s single post-boot SIGWINCH to grow into
         // the live area, a resize that races the agent's startup and, when
         // lost, leaves the pane pinned at ~50% width until live mode is
         // re-entered. See `Instance::ensure_pane_ready_with_size`.
-        let agent_boot_size = self.live_send_boot_size();
+        let boot_size = self.live_send_boot_size();
         match &target {
             live_send::LiveSendTarget::Agent => {
                 let outcome = self.try_mutate_instance_writeback_on_err(session_id, |inst| {
-                    inst.ensure_pane_ready_with_size(agent_boot_size)
+                    inst.ensure_pane_ready_with_size(boot_size)
                         .map_err(Into::into)
                 });
                 match outcome {
@@ -5796,7 +6339,7 @@ impl HomeView {
                 }
             }
             live_send::LiveSendTarget::Terminal => {
-                if let Err(e) = self.ensure_terminal_pane_ready(session_id, size) {
+                if let Err(e) = self.ensure_terminal_pane_ready(session_id, boot_size) {
                     self.info_dialog = Some(InfoDialog::new(
                         "Live send failed",
                         &format!("Cannot prepare terminal: {}", e),
@@ -5805,7 +6348,7 @@ impl HomeView {
                 }
             }
             live_send::LiveSendTarget::ContainerTerminal => {
-                if let Err(e) = self.ensure_container_terminal_pane_ready(session_id, size) {
+                if let Err(e) = self.ensure_container_terminal_pane_ready(session_id, boot_size) {
                     self.info_dialog = Some(InfoDialog::new(
                         "Live send failed",
                         &format!("Cannot prepare container terminal: {}", e),
@@ -5815,7 +6358,7 @@ impl HomeView {
             }
             live_send::LiveSendTarget::Tool(name) => {
                 let name = name.clone();
-                if let Err(e) = self.ensure_tool_pane_ready(session_id, &name, size) {
+                if let Err(e) = self.ensure_tool_pane_ready(session_id, &name, boot_size) {
                     self.info_dialog = Some(InfoDialog::new(
                         "Live send failed",
                         &format!("Cannot prepare tool '{}': {}", name, e),
@@ -6150,41 +6693,6 @@ impl HomeView {
         }
     }
 
-    /// Drop `group_path` from `profile`'s tree when no remaining session in
-    /// that profile sits at the path or anywhere underneath it AND the path
-    /// carries no user-anchored descendant group. Used after a session moves
-    /// to a different profile: without this, the source profile keeps an
-    /// empty group header that renders alongside the target profile's new
-    /// copy of the same group, reading as a duplicate. Delegates to
-    /// `delete_group_in_profile` so the deletion is tombstoned for `save()`
-    /// and survives the next reload.
-    pub(super) fn prune_empty_group(&mut self, profile: &str, group_path: &str) {
-        if group_path.is_empty() {
-            return;
-        }
-        let prefix = format!("{}/", group_path);
-        let still_used = self.instances.values().any(|i| {
-            i.source_profile == profile
-                && (i.group_path == group_path || i.group_path.starts_with(&prefix))
-        });
-        if still_used {
-            return;
-        }
-        // Preserve hand-built structure: if the tree carries a descendant
-        // group (e.g. user-anchored `work/anchor`) under this path, leave
-        // the parent alone. The duplicate-header in unified view is the
-        // lesser evil compared to nuking the user's hierarchy.
-        let has_descendant_group = self.group_trees.get(profile).is_some_and(|tree| {
-            tree.get_all_groups()
-                .iter()
-                .any(|g| g.path.starts_with(&prefix))
-        });
-        if has_descendant_group {
-            return;
-        }
-        self.delete_group_in_profile(profile, group_path);
-    }
-
     /// Determine which profile the item at the given cursor position belongs to.
     pub(super) fn profile_for_cursor(&self, cursor: usize) -> Option<String> {
         if let Some(profile) = &self.active_profile {
@@ -6252,6 +6760,22 @@ impl HomeView {
         self.instances.insert(instance.id.clone(), instance);
     }
 
+    /// Publish a row that this process already committed through
+    /// `Storage::update`. Unlike a provisional TUI add, a later missing disk row
+    /// is a peer deletion and must not be recreated by `save()`.
+    fn publish_persisted_instance(&mut self, instance: Instance) {
+        let profile = instance.source_profile.clone();
+        let id = instance.id.clone();
+        self.add_instance(instance);
+        let remove_profile_entry = self.pending_added.get_mut(&profile).is_some_and(|pending| {
+            pending.remove(&id);
+            pending.is_empty()
+        });
+        if remove_profile_entry {
+            self.pending_added.remove(&profile);
+        }
+    }
+
     /// Centralized instance removal: shift-removes from the ordered map
     /// (preserves the order of trailing rows; swap_remove would silently
     /// reorder the sidebar), records the id in `pending_deletions` so the
@@ -6306,48 +6830,177 @@ impl HomeView {
         }
     }
 
-    /// Cross-profile move: structurally distinct from `mutate_instance`
-    /// because the row must be tombstoned in the old profile's disk file
-    /// AND marked as TUI-new for the target profile. Without this, save()'s
-    /// per-profile loop misclassifies the row as peer-deleted in the new
-    /// profile and leaves the old profile's disk row, which next reload
-    /// resurrects under the original profile.
+    /// Acquire the per-session title flock followed by the source profile's
+    /// per-instance lifecycle flock, then replace the TUI snapshot with the
+    /// authoritative source row. Only TUI-owned launch configuration is merged
+    /// from the snapshot; lifecycle/runtime fields always remain the values
+    /// reloaded under the source lifecycle lock.
+    pub(super) fn lock_session_mutation_and_reload(
+        &mut self,
+        id: &str,
+    ) -> anyhow::Result<SessionMutationGuards> {
+        let snapshot = self
+            .instances
+            .get(id)
+            .cloned()
+            .ok_or_else(|| anyhow::anyhow!("Session not found: {id}"))?;
+        let source_profile = snapshot.source_profile.clone();
+        let session_title = crate::session::acquire_session_title_lock(id)
+            .map_err(|error| anyhow::anyhow!("failed to acquire session title lock: {error}"))?;
+        if !self.storages.contains_key(&source_profile) {
+            self.storages.insert(
+                source_profile.clone(),
+                Storage::open(&source_profile, self.file_watch.clone())?,
+            );
+        }
+        let storage = self
+            .storages
+            .get(&source_profile)
+            .expect("source storage was registered above");
+        let lifecycle = storage
+            .acquire_instance_lifecycle_lock(id)
+            .map_err(|error| {
+                anyhow::anyhow!("failed to acquire session lifecycle lock: {error}")
+            })?;
+        // Read-only: both flocks (title + lifecycle) are already held above, so
+        // a plain `load()` gives the authoritative on-disk row without going
+        // through `update()`, which would unconditionally rewrite sessions.json
+        // and fire a `notify_local_change` even when nothing changed. Callers
+        // like `move_group_to_profile` acquire these guards per member in a
+        // loop, so an update-per-read would be N identical rewrites.
+        let mut authoritative = storage
+            .load()?
+            .into_iter()
+            .find(|instance| instance.id == id)
+            .ok_or_else(|| anyhow::anyhow!("Session not found in source profile: {id}"))?;
+        let authoritative_generation = authoritative.lifecycle_generation;
+        let authoritative_status = authoritative.status;
+        let authoritative_idle_entered_at = authoritative.idle_entered_at;
+        let authoritative_last_accessed_at = authoritative.last_accessed_at;
+        authoritative.merge_runtime_from_reload(&snapshot);
+        authoritative.merge_from_tui(&snapshot);
+        authoritative.source_profile.clone_from(&source_profile);
+        authoritative.lifecycle_generation = authoritative_generation;
+        authoritative.status = authoritative_status;
+        authoritative.idle_entered_at = authoritative_idle_entered_at;
+        authoritative.last_accessed_at =
+            authoritative_last_accessed_at.max(snapshot.last_accessed_at);
+        self.instances.insert(id.to_string(), authoritative);
+        Ok(SessionMutationGuards {
+            _session_title: session_title,
+            _lifecycle: lifecycle,
+        })
+    }
+    /// Move a row between profiles as one dual-locked storage transaction,
+    /// then publish the committed row in memory.
     pub(super) fn move_to_profile(
         &mut self,
         id: &str,
         target: &str,
-        new_group_path: String,
+        requested: Instance,
+        baseline: Option<&Instance>,
     ) -> anyhow::Result<()> {
-        let Some(old_profile) = self.instances.get(id).map(|i| i.source_profile.clone()) else {
+        self.move_to_profile_with_effect(id, target, requested, baseline, |_| Ok(()))
+    }
+
+    /// Cross-profile move: structurally distinct from `mutate_instance`
+    /// because the source row and group metadata must be removed in the same
+    /// transaction that durably publishes the target row and metadata.
+    ///
+    /// `before_commit` runs after authoritative target validation while both
+    /// profile storage locks are held. It may perform only bounded
+    /// worktree/container effects; it must not re-enter storage or rekey tmux.
+    /// Callers retain [`SessionMutationGuards`] around the transaction and any
+    /// post-persist tmux rekey.
+    pub(super) fn move_to_profile_with_effect<B>(
+        &mut self,
+        id: &str,
+        target: &str,
+        mut requested: Instance,
+        baseline: Option<&Instance>,
+        before_commit: B,
+    ) -> anyhow::Result<()>
+    where
+        B: FnOnce(&Instance) -> anyhow::Result<()>,
+    {
+        let Some(current) = self.instances.get(id).cloned() else {
             return Ok(());
         };
+        let lifecycle_reserved = current.has_fresh_lifecycle_reservation(chrono::Utc::now());
+        let before = baseline.cloned().unwrap_or_else(|| current.clone());
+        let old_profile = before.source_profile.clone();
+        requested.source_profile = old_profile.clone();
         if old_profile == target {
-            self.mutate_instance(id, |inst| inst.group_path = new_group_path);
+            requested.source_profile = target.to_string();
+            self.instances.insert(id.to_string(), requested);
             return Ok(());
         }
+        anyhow::ensure!(
+            current.status != crate::session::Status::Creating,
+            "Cannot move session {id} between profiles while it is being created"
+        );
+        anyhow::ensure!(
+            !lifecycle_reserved,
+            "Cannot move session {id} between profiles while a lifecycle operation is in progress"
+        );
 
         if !self.storages.contains_key(target) {
             self.storages.insert(
                 target.to_string(),
-                Storage::new(target, self.file_watch.clone())?,
+                Storage::open(target, self.file_watch.clone())?,
             );
         }
+        let source = self
+            .storages
+            .get(&old_profile)
+            .ok_or_else(|| anyhow::anyhow!("Source profile storage is not loaded"))?;
+        let target_storage = self
+            .storages
+            .get(target)
+            .ok_or_else(|| anyhow::anyhow!("Target profile storage is not loaded"))?;
+        let mut moved = source.move_instance_to_with_effect(
+            target_storage,
+            &before,
+            &requested,
+            |instances, candidate| {
+                if crate::session::is_duplicate_session(
+                    instances.iter(),
+                    &candidate.title,
+                    &candidate.project_path,
+                    None,
+                ) {
+                    return Err(crate::session::duplicate_session_error(&candidate.title));
+                }
+                Ok(())
+            },
+            before_commit,
+        )?;
+        moved.merge_runtime_for_profile_move(&current);
+        moved.source_profile = target.to_string();
+        self.instances.insert(id.to_string(), moved);
+        Ok(())
+    }
 
-        self.pending_deletions
-            .entry(old_profile.clone())
-            .or_default()
-            .insert(id.to_string());
-        if let Some(set) = self.pending_added.get_mut(&old_profile) {
-            set.remove(id);
-        }
-        self.pending_added
-            .entry(target.to_string())
-            .or_default()
-            .insert(id.to_string());
-
-        if let Some(inst) = self.instances.get_mut(id) {
-            inst.group_path = new_group_path;
-            inst.source_profile = target.to_string();
+    /// Reload storage after a profile move without dropping runtime-only state
+    /// from the rows the transaction just published.
+    pub(super) fn reload_preserving_profile_move_runtime(
+        &mut self,
+        ids: &[String],
+    ) -> anyhow::Result<()> {
+        let previous: Vec<(String, Instance)> = ids
+            .iter()
+            .filter_map(|id| {
+                self.instances
+                    .get(id)
+                    .cloned()
+                    .map(|instance| (id.clone(), instance))
+            })
+            .collect();
+        self.reload()?;
+        for (id, prior) in previous {
+            if let Some(reloaded) = self.instances.get_mut(&id) {
+                reloaded.merge_runtime_for_profile_move(&prior);
+            }
         }
         Ok(())
     }
@@ -6364,7 +7017,8 @@ impl HomeView {
     /// `mark_unread` folds the Running -> Idle unread mark into the same
     /// `Storage::update` call instead of a second flock round-trip on the
     /// same row in the same tick, matching the daemon's per-tick batching
-    /// shape in `status_poll_loop`.
+    /// shape in `status_poll_loop`. Terminal rows only; see the
+    /// `is_structured()` return below.
     pub(super) fn persist_passive_status_transition(&self, id: &str, mark_unread: bool) {
         let Some(inst) = self.instances.get(id) else {
             return;
@@ -6372,32 +7026,31 @@ impl HomeView {
         let Some(storage) = self.storages.get(&inst.source_profile) else {
             return;
         };
-        // Structured rows are not durable: their status is a daemon-side
-        // overlay rebuilt from live worker state (`apply_acp_overlay_inplace`)
-        // and re-derived at daemon boot by `seed_acp_statuses`. The daemon's
-        // own passive writer gates the status patch on exactly this predicate
+        // A structured row has nothing for the TUI to persist, so bail before
+        // taking the flock at all.
+        //
+        // Its status is not durable: that is a daemon-side overlay rebuilt from
+        // live worker state (`apply_acp_overlay_inplace`) and re-derived at
+        // daemon boot by `seed_acp_statuses`, and the daemon's own passive
+        // writer gates the patch on exactly this predicate
         // (`decide_passive_transition` returns `patch: None` for
-        // `is_structured()`, `server/mod.rs`). Persisting it here would strand
-        // a row at `Running` or `Error` with no producer left to heal it once
-        // the daemon is gone, since the tmux poller now bails on structured
-        // rows (`status_poller.rs`); this is the #3201 regression from #3170.
-        // The unread mark is deliberately NOT gated: the daemon marks a
-        // structured row unread on a Running -> Idle turn (its `mark_unread` is
-        // not gated on `is_structured`), so mirroring it here keeps the two
-        // producers symmetric.
-        let structured = inst.is_structured();
-        // Pure optimization, not a correctness gate: a structured row with
-        // nothing to mark unread has no patch and no unread write, so skip the
-        // empty-write flock round-trip entirely.
-        if structured && !mark_unread {
+        // `is_structured()`, `server/mod.rs`). Persisting it here would strand a
+        // row at `Running` or `Error` with no producer left to heal it once the
+        // daemon is gone, since the tmux poller now bails on structured rows
+        // (`status_poller.rs`); this is the #3201 regression from #3170.
+        //
+        // Its unread mark is not ours either, as of #3181: the daemon writes it
+        // from the live ACP turn-end event (`should_mark_acp_unread`), and the
+        // caller's predicate is gated on `!structured` to match. So `mark_unread`
+        // is only ever `false` here for a structured row and this return is
+        // total, not an optimization.
+        if inst.is_structured() {
             return;
         }
-        let patch = (!structured).then(|| crate::session::PassiveStatusPatch::from_instance(inst));
+        let patch = crate::session::PassiveStatusPatch::from_instance(inst);
         if let Err(e) = storage.update(|insts, _groups| {
             if let Some(disk) = insts.iter_mut().find(|i| i.id == id) {
-                if let Some(patch) = &patch {
-                    disk.merge_passive_status_patch(id, patch);
-                }
+                disk.merge_passive_status_patch(id, &patch);
                 if mark_unread {
                     disk.mark_unread();
                 }
@@ -6420,50 +7073,34 @@ impl HomeView {
         }
     }
 
-    /// Atomic per-action mutate: in-memory once, disk via
-    /// `Instance::merge_user_action_diff` under the flock. On disk persist
-    /// failure, in-memory is rolled back to `pre` so memory and disk stay
-    /// consistent.
+    /// Atomic per-action mutate: update memory once, then merge the user-owned
+    /// diff under the storage flock. Roll memory back if persistence fails.
     pub(super) fn apply_user_action<F>(&mut self, id: &str, mutate: F) -> anyhow::Result<()>
     where
         F: FnOnce(&mut Instance),
     {
-        self.apply_user_action_with(id, mutate, |_| {})
-    }
-
-    /// [`Self::apply_user_action`] with a same-flock post-mutation hook on the
-    /// DISK row, run inside the same `storage.update` closure after
-    /// `merge_user_action_diff`. For durable state the diff-merge deliberately
-    /// drops (`op_claim`, #2541) that must still land atomically with the
-    /// action: the trash path uses it so a peer can never read a trashed row
-    /// without its in-flight Trash claim. The hook mutates the disk row only;
-    /// in-memory rows never carry claims.
-    pub(super) fn apply_user_action_with<F, H>(
-        &mut self,
-        id: &str,
-        mutate: F,
-        post_disk: H,
-    ) -> anyhow::Result<()>
-    where
-        F: FnOnce(&mut Instance),
-        H: FnOnce(&mut Instance),
-    {
-        let Some(profile) = self.instances.get(id).map(|i| i.source_profile.clone()) else {
+        let Some(profile) = self
+            .instances
+            .get(id)
+            .map(|instance| instance.source_profile.clone())
+        else {
             return Ok(());
         };
-        let Some(in_mem) = self.instances.get_mut(id) else {
+        let Some(in_memory) = self.instances.get_mut(id) else {
             return Ok(());
         };
-        let pre = in_mem.clone();
-        mutate(in_mem);
-        let post = in_mem.clone();
+        let before = in_memory.clone();
+        mutate(in_memory);
+        let after = in_memory.clone();
 
         let id_owned = id.to_string();
-        let res = if let Some(storage) = self.storages.get(&profile) {
-            storage.update(|insts, _groups| {
-                if let Some(disk) = insts.iter_mut().find(|i| i.id == id_owned) {
-                    disk.merge_user_action_diff(&pre, &post);
-                    post_disk(disk);
+        let result = if let Some(storage) = self.storages.get(&profile) {
+            storage.update(|instances, _groups| {
+                if let Some(disk) = instances
+                    .iter_mut()
+                    .find(|instance| instance.id == id_owned)
+                {
+                    disk.merge_user_action_diff(&before, &after);
                     Ok(true)
                 } else {
                     Ok(false)
@@ -6478,23 +7115,23 @@ impl HomeView {
             );
             Ok(true)
         };
-        match res {
+        match result {
             Ok(true) => Ok(()),
             Ok(false) => {
                 let added = self
                     .pending_added
                     .get(&profile)
-                    .is_some_and(|s| s.contains(id));
+                    .is_some_and(|pending| pending.contains(id));
                 if !added {
                     self.drop_peer_deleted_rows(&[id.to_string()]);
                 }
                 Ok(())
             }
-            Err(e) => {
+            Err(error) => {
                 if let Some(slot) = self.instances.get_mut(id) {
-                    *slot = pre;
+                    *slot = before;
                 }
-                Err(e)
+                Err(error)
             }
         }
     }
@@ -6895,15 +7532,13 @@ impl HomeView {
     /// strings) render an unpinnable phantom header: pinned by label, judged
     /// by path.
     ///
-    /// Scratch sessions are excluded for the same reason: their `repo_path()` is
-    /// the throwaway `<app_dir>/scratch/<id>` directory, not a repo anyone can
-    /// register. They share the `scratch` header with a user repo of that
-    /// basename (#3133), so letting one lend the header its path would both hide
-    /// the real repo and offer an app-internal directory up for pinning.
+    /// A scratch session never matches here: its `project_group_key` is the
+    /// `SCRATCH_GROUP_PATH` sentinel, which no display label equals, so the
+    /// synthetic bucket has no backing repo path to lend (#3237).
     pub(super) fn project_header_repo_path(&self, label: &str) -> Option<String> {
         self.instances
             .values()
-            .find(|i| !i.is_archived() && !i.scratch && project_group_name(i) == label)
+            .find(|i| !i.is_archived() && project_group_key(i) == label)
             .map(|i| crate::session::projects::canonical_key(i.repo_path()))
     }
 
@@ -6929,38 +7564,17 @@ impl HomeView {
         }
     }
 
-    /// True when project header `label` is nothing but the synthetic scratch
-    /// bucket, so there is no repo behind it to register or pin. Judged by
-    /// backing identity rather than by the label: scratch sessions and a user's
-    /// own repo named `scratch` derive the same header label, and that header is
-    /// a real project (#3133). A PINNED registry entry carrying the label also
-    /// counts as backing, so an empty pinned `scratch` project stays reachable to
-    /// unpin. The pin flag is required because it is what `unpopulated_projects`
-    /// and `is_project_label_pinned`'s label branch key on: a saved-but-unpinned
-    /// entry never surfaces a header of its own, so counting it as backing would
-    /// open the gate on a header the toggle has no path to act on, and `p` would
-    /// silently do nothing instead of keeping its global meaning. With no
-    /// backing repo path, `is_project_label_pinned` IS that pinned-label
-    /// lookup, so it is reused here rather than restating the predicate.
-    fn is_synthetic_scratch_header(&self, label: &str) -> bool {
-        label == SCRATCH_GROUP_LABEL
-            && self.project_header_repo_path(label).is_none()
-            && !self.is_project_label_pinned(label)
-    }
-
     /// The project-view header label under the cursor when it is a real,
     /// pinnable project: project grouping is active, the cursor is on a group
-    /// header, and that header is neither the synthetic Archived section nor the
-    /// synthetic `scratch` bucket (scratch sessions have no backing repo to pin).
+    /// header, and that header is not a synthetic one (the Archived/Trash
+    /// shelves or the scratch bucket, none of which have a backing repo to pin).
     pub(super) fn project_group_at_cursor(&self) -> Option<String> {
         if self.group_by != GroupByMode::Project {
             return None;
         }
         match self.flat_items.get(self.cursor) {
             Some(Item::Group { path, name, .. })
-                if !crate::session::is_within_archived_section(path)
-                    && !crate::session::is_within_trash_section(path)
-                    && !self.is_synthetic_scratch_header(name) =>
+                if !crate::session::is_synthetic_project_header(path) =>
             {
                 Some(name.clone())
             }
@@ -7075,8 +7689,8 @@ impl HomeView {
     }
 
     /// Pin selection to `session_id` and place the cursor on its row.
-    /// If the containing group is collapsed (manual grouping or
-    /// project grouping), it's force-expanded and `flat_items` is
+    /// If the containing group is collapsed (manual, project, or
+    /// org grouping), it's force-expanded and `flat_items` is
     /// rebuilt so the row is actually present before the cursor
     /// search. No-op when the session can't be resolved at all
     /// (deleted between caller and us): leaves the prior selection
@@ -7091,7 +7705,8 @@ impl HomeView {
             return;
         };
         let group_path = match self.group_by {
-            GroupByMode::Project => Some(project_group_name(inst)),
+            GroupByMode::Project => Some(project_group_key(inst)),
+            GroupByMode::Org => Some(self.org_group_key(inst)),
             GroupByMode::Manual => {
                 let p = inst.group_path.clone();
                 if p.is_empty() {
@@ -7109,6 +7724,9 @@ impl HomeView {
             match self.group_by {
                 GroupByMode::Project => {
                     self.project_group_collapsed.insert(gpath, false);
+                }
+                GroupByMode::Org => {
+                    self.org_group_collapsed.insert(gpath, false);
                 }
                 GroupByMode::Manual => {
                     if let Some(tree) = self.group_trees.get_mut(&target_profile) {
@@ -7189,11 +7807,17 @@ impl HomeView {
         self.strict_hotkeys = config.session.strict_hotkeys;
         self.confirm_before_quit = config.session.confirm_before_quit;
         self.row_tag_mode = config.session.row_tag;
+        // Keep the strip in sync when the Settings UI or a config-file edit
+        // flips the toggle from any settings surface.
+        self.show_diagnostics = config.session.show_diagnostics_pane;
         self.agent_clipboard_forward =
             config.tmux.clipboard != crate::session::config::TmuxSettingMode::Disabled;
         self.vt_live_enabled = config.tmux.vt_live;
         if let Some(worker) = self.preview_capture_worker.as_ref() {
-            worker.set_vt_enabled(self.vt_live_enabled);
+            worker.set_vt_enabled(
+                self.vt_live_enabled && !matches!(self.view_mode, ViewMode::Terminal),
+            );
+            worker.set_clipboard_capture_enabled(self.agent_clipboard_forward);
         }
         self.profile_default_attach_mode = config.session.default_attach_mode;
         self.idle_decay_window =
@@ -7333,5 +7957,45 @@ impl HomeView {
     ) -> anyhow::Result<()> {
         self.try_mutate_instance(id, |inst| inst.start_container_terminal_with_size(size))
             .map(|_| ())
+    }
+}
+#[cfg(test)]
+mod permission_response_tokens_tests {
+    use super::*;
+    use crate::agents::{KeyToken, PermissionResponse};
+    use crate::tui::dialogs::PermissionResponseChoice;
+
+    #[test]
+    fn maps_each_choice_to_its_own_field() {
+        let response = PermissionResponse {
+            allow: &[KeyToken::Literal("1")],
+            allow_always: Some(&[KeyToken::Literal("2")]),
+            deny: &[KeyToken::Literal("3")],
+        };
+        assert_eq!(
+            permission_response_tokens(&response, PermissionResponseChoice::Allow),
+            Some(response.allow)
+        );
+        assert_eq!(
+            permission_response_tokens(&response, PermissionResponseChoice::AllowAlways),
+            response.allow_always
+        );
+        assert_eq!(
+            permission_response_tokens(&response, PermissionResponseChoice::Deny),
+            Some(response.deny)
+        );
+    }
+
+    #[test]
+    fn allow_always_none_maps_to_none() {
+        let response = PermissionResponse {
+            allow: &[KeyToken::Named("Enter")],
+            allow_always: None,
+            deny: &[KeyToken::Named("Down"), KeyToken::Named("Enter")],
+        };
+        assert_eq!(
+            permission_response_tokens(&response, PermissionResponseChoice::AllowAlways),
+            None
+        );
     }
 }

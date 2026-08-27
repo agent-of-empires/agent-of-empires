@@ -46,8 +46,10 @@ fn compose_list_title(
     sort_order: SortOrder,
 ) -> String {
     let mut suffix = String::new();
-    if group_by == GroupByMode::Project {
-        suffix.push_str(" · project");
+    match group_by {
+        GroupByMode::Project => suffix.push_str(" · project"),
+        GroupByMode::Org => suffix.push_str(" · org"),
+        GroupByMode::Manual => {}
     }
     if sort_order != SortOrder::default() {
         suffix.push_str(" · ");
@@ -102,6 +104,9 @@ impl PaneLayout {
 /// requested scroll.
 const CAPTURE_BUFFER: u16 = 20;
 
+/// Rows the compact system-health strip occupies.
+const DIAGNOSTICS_STRIP_HEIGHT: u16 = 1;
+
 /// Window captured while the user is off the live edge (reading scrollback):
 /// the full scrollback in one shot, rather than a window that tracks the offset
 /// and re-anchors to the advancing live edge on every capture. Matches tmux's
@@ -111,22 +116,14 @@ const READING_CAPTURE_LINES: u16 = 2000;
 
 /// Map a tmux pane cursor onto the preview's output rect for live-send.
 ///
-/// `output` is the rect the captured pane text paints into; `visible_rows` is
-/// its height in rows; `line_count` is the parsed capture's line count (the
-/// same value the renderer feeds to `compute_scroll`); `cursor` carries the
-/// pane's `(x, y)` (counted from the top of the visible screen) plus
-/// `pane_height`. The renderer bottom-anchors the capture ONLY when it
-/// overflows `output`; a capture shorter than `output` paints from the top
-/// (`compute_scroll` returns 0). Anchor the cursor the same way so it tracks
-/// the text: a screen row maps to `output.y + (min(line_count, visible_rows) -
-/// pane_height) + cursor.y`. With the pane sized to the output area and a
-/// full-height capture the delta is zero and this is just `output.y +
-/// cursor.y`. When the pane is a row or more shorter than `output` and the
-/// capture doesn't overflow (an alt-screen prompt, or the frame after a
-/// resize), using the bare `visible_rows` here would paint the cursor a row
-/// BELOW the text the user typed (#2742); clamping to `line_count` keeps them
-/// aligned. A hidden cursor, or one that maps outside `output`, yields `None`.
-fn map_live_preview_cursor(
+/// `cursor.x`/`y` are pane relative. On a composite, add the pane origin
+/// carried by [`crate::tmux::PaneCursor::composite_pane0`]. Vertically the
+/// renderer also bottom-anchors captures that overflow `output`, so the row
+/// formula is `output.y + min(line_count, visible_rows) - pane_height + top +
+/// cursor.y`; a short capture instead anchors at the top. This keeps the
+/// cursor on the same text row for both the status-row offset (#3515) and the
+/// shorter-pane case (#2742). A hidden or out-of-bounds cursor yields `None`.
+pub(super) fn map_live_preview_cursor(
     output: Rect,
     visible_rows: usize,
     line_count: usize,
@@ -136,8 +133,11 @@ fn map_live_preview_cursor(
         return None;
     }
     let anchor = line_count.min(visible_rows) as i32;
-    let row = output.y as i32 + (anchor - cursor.pane_height as i32) + cursor.y as i32;
-    let col = output.x as i32 + cursor.x as i32;
+    let (left, top) = cursor
+        .composite_pane0
+        .map_or((0, 0), |rect| (rect.left as i32, rect.top as i32));
+    let row = output.y as i32 + (anchor - cursor.pane_height as i32) + top + cursor.y as i32;
+    let col = output.x as i32 + left + cursor.x as i32;
     if row < output.y as i32
         || row >= output.y as i32 + output.height as i32
         || col < output.x as i32
@@ -389,6 +389,116 @@ pub(crate) fn agent_row_icon(inst: &crate::session::Instance) -> &'static str {
     } else {
         icon
     }
+}
+
+/// A view mode's contribution to a session row: the glyph, color, and any
+/// modifier describing the state of *its own* backing pane. Structured seeds
+/// from the poller-maintained `Instance.status`, Terminal from the paired
+/// terminal's liveness, Tool from the tool pane's. Everything layered on top
+/// is mode-independent and lives in [`decorate_row`].
+struct RowSeed {
+    icon: &'static str,
+    color: Color,
+    modifier: ratatui::style::Modifier,
+}
+
+/// How a view mode resolves a sunk row (archived / trashed / snoozed).
+enum SunkRow {
+    /// Structured: the agent's own resting glyph. Error and Deleting punch
+    /// through the sink mask here, because they are live delete-op states this
+    /// TUI set rather than stale pane statuses, and the seed carries
+    /// `ICON_ERROR` + `theme.error` for them. Swallowing that left a failed
+    /// Empty Trash indistinguishable from a healthy trash row.
+    /// [`agent_row_icon`] applies the same exception to the glyph.
+    AgentStatus(&'static str),
+    /// Terminal / Tool: one muted glyph, unconditionally. These seeds describe
+    /// pane liveness and carry no error affordance, so letting a delete-op
+    /// status punch through would paint a bright animated "the terminal is
+    /// alive" row inside a shelf whose whole premise is that the row is put
+    /// away, while signalling nothing about the failure.
+    Pane,
+}
+
+/// The archive/trash, snooze, urgent, and favorite overlays every view mode
+/// paints on top of its [`RowSeed`], plus the title prefix that goes with them.
+///
+/// This was three copies: the Structured and Terminal arms of
+/// `render_item_line` carried byte-identical title blocks and near-identical
+/// style blocks, and the Tool arm had silently dropped all of it, so an
+/// archived or snoozed session in Tool view kept painting its running glyph
+/// with no `z ` / `! ` prefix.
+///
+/// `sunk` says how this view resolves a sunk row; see [`SunkRow`].
+fn decorate_row(
+    inst: &crate::session::Instance,
+    in_attention: bool,
+    show_favorite: bool,
+    seed: RowSeed,
+    sunk: SunkRow,
+    theme: &Theme,
+) -> (&'static str, std::borrow::Cow<'static, str>, Style) {
+    use ratatui::style::Modifier;
+    use std::borrow::Cow;
+
+    let mut icon = seed.icon;
+    let mut style = Style::default().fg(seed.color).add_modifier(seed.modifier);
+
+    let (sunk_icon, punches_through) = match sunk {
+        SunkRow::AgentStatus(resting) => (
+            resting,
+            matches!(inst.status, Status::Error | Status::Deleting),
+        ),
+        SunkRow::Pane => (ICON_STOPPED, false),
+    };
+    if (inst.is_archived() || inst.is_trashed()) && !punches_through {
+        // Archived and trashed rows render with one uniform muted glyph
+        // regardless of underlying pane status. The pane is dead, so painting
+        // the persisted status would be misleading. The Archived section
+        // header is the sole textual cue, so no italic/dim modifier here; just
+        // a dim color.
+        icon = sunk_icon;
+        style = Style::default().fg(theme.dimmed);
+    } else if in_attention && inst.is_snoozed() {
+        // Snooze decoration is Attention-only. Outside Attention the row
+        // paints its real state (the timer keeps running; the visual
+        // treatment just doesn't surface).
+        icon = sunk_icon;
+        style = Style::default()
+            .fg(theme.dimmed)
+            .add_modifier(Modifier::ITALIC)
+            .add_modifier(Modifier::DIM);
+    } else if in_attention && inst.is_urgent() {
+        // Urgent decoration is Attention-only. The flag still persists in
+        // non-Attention modes, but the cross-tier promoter visual only makes
+        // sense when tier ordering is in effect.
+        style = Style::default()
+            .fg(theme.error)
+            .add_modifier(Modifier::BOLD)
+            .add_modifier(Modifier::RAPID_BLINK);
+    } else if show_favorite && crate::session::is_live_favorite(inst) {
+        style = style
+            .add_modifier(Modifier::BOLD)
+            .add_modifier(Modifier::UNDERLINED);
+    }
+
+    // Prefix priority: archive (no prefix) wins over snooze (`z `) wins over
+    // urgent (`! `) wins over favorite (`* `). Snooze and urgent are
+    // Attention-mode-only so users in Newest / AZ / etc. don't see decoration
+    // for state they didn't opt into managing; the favorite star also shows
+    // elsewhere, because favorites-first pins the row there too.
+    let title_text = if inst.is_archived() || inst.is_trashed() {
+        Cow::Owned(inst.title.clone())
+    } else if in_attention && inst.is_snoozed() {
+        Cow::Owned(format!("z {}", inst.title))
+    } else if in_attention && inst.is_urgent() {
+        Cow::Owned(format!("! {}", inst.title))
+    } else if show_favorite && crate::session::is_live_favorite(inst) {
+        Cow::Owned(format!("* {}", inst.title))
+    } else {
+        Cow::Owned(inst.title.clone())
+    };
+
+    (icon, title_text, style)
 }
 
 /// Append the selected row's `last_error` (in red) to a shelf placeholder's
@@ -715,6 +825,9 @@ impl HomeView {
         if let Some(ref mut diff) = self.diff_view {
             // Compute diff for selected file if not cached
             let _ = diff.get_current_diff();
+            if diff.selected_file_is_markdown() {
+                let _ = diff.get_current_file_contents();
+            }
 
             // No list/preview divider exists while the diff takeover owns
             // the screen; clear it so a stale value from the previous frame
@@ -756,11 +869,11 @@ impl HomeView {
             .constraints(constraints)
             .split(area);
 
-        // Below STACKED_BREAKPOINT (80 cols), put the list above the preview
-        // instead of side-by-side. At 80 cols a side-by-side preview is only
-        // ~45 cols (with default list_width 35), too cramped for output;
-        // stacking gives the preview the full width.
-        let available_width = main_chunks[0].width;
+        // The diagnostics strip docks under the session-list column (see
+        // `diagnostics_dock`) so it stays narrow and the preview keeps its full
+        // height.
+        let content_area = main_chunks[0];
+        let available_width = content_area.width;
         self.main_area_width = available_width;
         // Collapsed sidebar: the list shrinks to a narrow click-to-expand
         // strip on the left and the preview takes the rest of the width
@@ -773,7 +886,7 @@ impl HomeView {
             let chunks = Layout::default()
                 .direction(Direction::Horizontal)
                 .constraints([Constraint::Length(strip_width), Constraint::Min(0)])
-                .split(main_chunks[0]);
+                .split(content_area);
             // The full list isn't drawn, so its hit-test rects would
             // otherwise keep last frame's values and a click in the now-
             // preview area could resolve to an invisible list row (and
@@ -783,10 +896,13 @@ impl HomeView {
             self.list_area = Rect::default();
             self.list_inner_area = Rect::default();
             self.shelf_inner_area = Rect::default();
-            self.render_collapsed_strip(frame, chunks[0], theme);
+            // Preview keeps full height; the strip docks under the collapsed
+            // list column.
+            let strip_col = self.diagnostics_dock(frame, chunks[0], theme);
+            self.render_collapsed_strip(frame, strip_col, theme);
             self.render_preview(frame, chunks[1], theme, PaneLayout::Collapsed);
         } else if available_width < responsive::STACKED_BREAKPOINT {
-            let main_height = main_chunks[0].height;
+            let main_height = content_area.height;
             let list_height = responsive::stacked_list_height(main_height);
             let chunks = Layout::default()
                 .direction(Direction::Vertical)
@@ -794,13 +910,17 @@ impl HomeView {
                     Constraint::Length(list_height),
                     Constraint::Min(responsive::STACKED_PREVIEW_MIN),
                 ])
-                .split(main_chunks[0]);
+                .split(content_area);
 
             // Stacked layout has no vertical divider; only the side-by-side
             // path exposes the resize-by-drag affordance.
             self.divider_col = None;
 
-            self.render_list(frame, chunks[0], theme, PaneLayout::Stacked);
+            // Stacked: the list is on top with the preview below, so there is no
+            // list column to dock under; the strip spans the list's width above
+            // the preview.
+            let list_rect = self.diagnostics_dock(frame, chunks[0], theme);
+            self.render_list(frame, list_rect, theme, PaneLayout::Stacked);
             self.render_preview(frame, chunks[1], theme, PaneLayout::Stacked);
         } else {
             // Side-by-side: cap list width so the preview pane keeps its
@@ -815,7 +935,7 @@ impl HomeView {
                     Constraint::Length(effective_list_width),
                     Constraint::Min(responsive::PREVIEW_MIN_WIDTH),
                 ])
-                .split(main_chunks[0]);
+                .split(content_area);
 
             // Layout chunks are contiguous, so chunks[1].x is the first
             // column of the preview block, i.e. the visible left border
@@ -823,7 +943,9 @@ impl HomeView {
             // list's y-range (matches preview's y-range in side-by-side).
             self.divider_col = Some(chunks[1].x);
 
-            self.render_list(frame, chunks[0], theme, PaneLayout::SideBySide);
+            // Strip docks under the list column; the preview keeps full height.
+            let list_rect = self.diagnostics_dock(frame, chunks[0], theme);
+            self.render_list(frame, list_rect, theme, PaneLayout::SideBySide);
             self.render_preview(frame, chunks[1], theme, PaneLayout::SideBySide);
         }
         self.render_status_bar(frame, main_chunks[1], theme);
@@ -914,6 +1036,34 @@ impl HomeView {
         );
     }
 
+    /// Dock the diagnostics strip under the session-list column: carve
+    /// `DIAGNOSTICS_STRIP_HEIGHT` rows off the bottom of `column`, render the
+    /// strip there, and return the reduced rect for the list. Returns `column`
+    /// unchanged when the strip is hidden or the column is too short to spare
+    /// the rows, so the list is never starved below one row.
+    fn diagnostics_dock(&mut self, frame: &mut Frame, column: Rect, theme: &Theme) -> Rect {
+        self.diagnostics_area = Rect::default();
+        if !self.show_diagnostics || column.height <= DIAGNOSTICS_STRIP_HEIGHT {
+            return column;
+        }
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(DIAGNOSTICS_STRIP_HEIGHT),
+            ])
+            .split(column);
+        crate::tui::components::diagnostics::render(
+            frame,
+            rows[1],
+            theme,
+            &self.metrics,
+            self.diagnostics_hovered,
+        );
+        self.diagnostics_area = rows[1];
+        rows[0]
+    }
+
     fn active_diff_area(&self, area: Rect) -> Rect {
         let Some(diff) = &self.diff_view else {
             return Rect::default();
@@ -986,7 +1136,7 @@ impl HomeView {
     fn render_list(&mut self, frame: &mut Frame, area: Rect, theme: &Theme, layout: PaneLayout) {
         self.list_area = area;
         let profile = self.active_profile_display();
-        let title = match &self.view_mode {
+        let mut title = match &self.view_mode {
             ViewMode::Structured => {
                 compose_list_title("aoe", profile, self.group_by, self.sort_order)
             }
@@ -1000,6 +1150,13 @@ impl HomeView {
                 self.sort_order,
             ),
         };
+        if !self.legacy_duplicate_reports.is_empty() {
+            // Fail-closed surface (#3459): ambiguous copies are hidden from
+            // the list, so without this marker the loss is silent.
+            let count = self.legacy_duplicate_reports.len();
+            let plural = if count == 1 { "" } else { "s" };
+            title.push_str(&format!("  \u{26a0} {count} ambiguous session{plural}"));
+        }
         let (border_color, title_color) = match self.view_mode {
             ViewMode::Structured => (theme.border, theme.title),
             ViewMode::Terminal | ViewMode::Tool(_) => {
@@ -1185,16 +1342,12 @@ impl HomeView {
         }
         frame.render_widget(Paragraph::new(lines), list_region);
 
-        // --- Divider carrying the sort indicator (between list and shelf) ---
+        // --- Divider between the workspace list and pinned shelf ---
         if let Some(dy) = divider_y {
-            let label = format!(" sort: {} ", self.sort_order.label());
-            let dw = list_region.width as usize;
-            let label_w = label.chars().count().min(dw);
-            let fill = dw.saturating_sub(label_w);
-            let divider = Line::from(vec![
-                Span::styled("─".repeat(fill), Style::default().fg(theme.border)),
-                Span::styled(label, Style::default().fg(theme.dimmed)),
-            ]);
+            let divider = Line::from(Span::styled(
+                "─".repeat(list_region.width as usize),
+                Style::default().fg(theme.border),
+            ));
             frame.render_widget(
                 Paragraph::new(divider),
                 Rect {
@@ -1402,8 +1555,7 @@ impl HomeView {
                 // rather than stale. Project view only; the registry lookup is
                 // keyed by the header label.
                 let pinned = self.group_by == GroupByMode::Project
-                    && !crate::session::is_within_archived_section(path)
-                    && !crate::session::is_within_trash_section(path)
+                    && !crate::session::is_synthetic_project_header(path)
                     && self.is_project_label_pinned(name);
                 // The top-level shelf section headers get a leading type glyph
                 // so they read as system shelves, not user groups. Project
@@ -1442,7 +1594,11 @@ impl HomeView {
             }
             Item::Session { id, .. } => {
                 if let Some(inst) = self.get_instance(id) {
-                    match self.view_mode {
+                    // Each view mode contributes only the live-state glyph
+                    // and color for its own backing pane; every overlay on top
+                    // of that (archive/trash, snooze, urgent, favorite) is
+                    // mode-independent and belongs to `decorate_row`.
+                    let (seed, sunk) = match self.view_mode {
                         ViewMode::Structured => {
                             // For Idle sessions, decay color from `fresh_idle`
                             // toward `idle` over `idle_decay_window`. A slow
@@ -1452,11 +1608,6 @@ impl HomeView {
                             // attention-worthy states (Running, Waiting,
                             // Starting). Also serves as a redundant cue for
                             // colorblind users / monochrome terminals.
-                            //
-                            // Archive/snooze then overrides the live spinner.
-                            // A shelved session's underlying status is noise;
-                            // an animated row reads as "still alive" and pulls
-                            // the eye away from real attention items.
                             let idle_age = inst.idle_age();
                             let is_fresh_idle =
                                 matches!(idle_age, Some(age) if age < self.idle_decay_window);
@@ -1490,16 +1641,15 @@ impl HomeView {
                             // Starting/...) supersedes it and keeps its own
                             // color AND spinner. Auto-unread only ever lands
                             // on Idle; a manual flag on a live row defers to
-                            // the live state. Archived/snoozed/urgent below
-                            // still override on top.
-                            // Sunk rows (archived/snoozed) never paint unread:
-                            // the user dismissed the row, so surfacing it as
-                            // unread contradicts that. The flag stays on disk,
-                            // so unarchiving/unsnoozing restores it. Snooze is
-                            // checked in every sort mode here (unlike the
-                            // Attention-only snooze decoration below), so a
-                            // snoozed unread row outside Attention sort still
-                            // drops the dot (#2571).
+                            // the live state. Sunk rows (archived/snoozed)
+                            // never paint unread: the user dismissed the row,
+                            // so surfacing it as unread contradicts that. The
+                            // flag stays on disk, so unarchiving/unsnoozing
+                            // restores it. Snooze is checked in every sort
+                            // mode here (unlike the Attention-only snooze
+                            // decoration in `decorate_row`), so a snoozed
+                            // unread row outside Attention sort still drops
+                            // the dot (#2571).
                             let unread_resting = crate::session::unread_enabled()
                                 && inst.is_unread()
                                 && !inst.is_archived()
@@ -1524,78 +1674,23 @@ impl HomeView {
                                     Status::Creating => theme.accent,
                                 }
                             };
-                            let mut style = Style::default().fg(color);
+                            let mut modifier = ratatui::style::Modifier::empty();
                             if unread_resting {
                                 // Make unread unmistakable: a solid dot glyph
                                 // plus bold, on top of the `theme.unread`
                                 // color set above. A plain color swap read as
-                                // too subtle (#2088 review). Sink/urgent
-                                // states below still override icon + style.
+                                // too subtle (#2088 review).
                                 icon = ICON_UNREAD;
-                                style = style.add_modifier(ratatui::style::Modifier::BOLD);
+                                modifier = ratatui::style::Modifier::BOLD;
                             }
-                            if (inst.is_archived() || inst.is_trashed())
-                                && !matches!(inst.status, Status::Error | Status::Deleting)
-                            {
-                                // Archived and trashed rows render with one
-                                // uniform muted glyph regardless of underlying
-                                // pane status. The pane is dead, so painting
-                                // the persisted Running/Waiting status
-                                // would be misleading. The Archived
-                                // section header is the sole textual
-                                // cue, so no italic/dim modifier is
-                                // applied here; just a dim color. Error and
-                                // Deleting are live delete-operation states,
-                                // not pane statuses, so they keep their real
-                                // glyph and color (see `agent_row_icon`).
-                                icon = agent_row_icon(inst);
-                                style = Style::default().fg(theme.dimmed);
-                            } else if in_attention && inst.is_snoozed() {
-                                // Snooze decoration is Attention-only.
-                                // Outside Attention the row paints its
-                                // real status (the timer keeps running;
-                                // the visual treatment just doesn't
-                                // surface).
-                                icon = agent_row_icon(inst);
-                                style = Style::default()
-                                    .fg(theme.dimmed)
-                                    .add_modifier(ratatui::style::Modifier::ITALIC)
-                                    .add_modifier(ratatui::style::Modifier::DIM);
-                            } else if in_attention && inst.is_urgent() {
-                                // Urgent decoration is Attention-only.
-                                // The flag still persists in non-
-                                // Attention modes, but the cross-tier
-                                // promoter visual only makes sense when
-                                // tier ordering is in effect.
-                                style = Style::default()
-                                    .fg(theme.error)
-                                    .add_modifier(ratatui::style::Modifier::BOLD)
-                                    .add_modifier(ratatui::style::Modifier::RAPID_BLINK);
-                            } else if show_favorite && crate::session::is_live_favorite(inst) {
-                                style = style
-                                    .add_modifier(ratatui::style::Modifier::BOLD)
-                                    .add_modifier(ratatui::style::Modifier::UNDERLINED);
-                            }
-                            // Prefix priority: archive (no prefix) wins
-                            // over snooze (`z `) wins over urgent (`! `)
-                            // wins over favorite (`* `). Snooze and urgent
-                            // are Attention-mode-only so users in Newest /
-                            // AZ / etc. don't see decoration for state they
-                            // didn't opt into managing; the favorite star
-                            // also shows elsewhere, because favorites-first
-                            // pins the row there too.
-                            let title_text = if inst.is_archived() || inst.is_trashed() {
-                                Cow::Owned(inst.title.clone())
-                            } else if in_attention && inst.is_snoozed() {
-                                Cow::Owned(format!("z {}", inst.title))
-                            } else if in_attention && inst.is_urgent() {
-                                Cow::Owned(format!("! {}", inst.title))
-                            } else if show_favorite && crate::session::is_live_favorite(inst) {
-                                Cow::Owned(format!("* {}", inst.title))
-                            } else {
-                                Cow::Owned(inst.title.clone())
-                            };
-                            (icon, title_text, style)
+                            (
+                                RowSeed {
+                                    icon,
+                                    color,
+                                    modifier,
+                                },
+                                SunkRow::AgentStatus(agent_row_icon(inst)),
+                            )
                         }
                         ViewMode::Terminal => {
                             // For sandboxed sessions, check the appropriate terminal based on mode
@@ -1605,85 +1700,58 @@ impl HomeView {
                                 TerminalMode::Host
                             };
                             let terminal_running = match terminal_mode {
-                                TerminalMode::Container => inst
-                                    .container_terminal_tmux_session()
-                                    .map(|s| s.exists())
-                                    .unwrap_or(false),
-                                TerminalMode::Host => inst
-                                    .terminal_tmux_session()
-                                    .map(|s| s.exists())
-                                    .unwrap_or(false),
+                                TerminalMode::Container => {
+                                    inst.container_terminal_tmux_session().is_ok_and(|s| {
+                                        crate::tmux::session_exists_for_display(s.name())
+                                    })
+                                }
+                                TerminalMode::Host => inst.terminal_tmux_session().is_ok_and(|s| {
+                                    crate::tmux::session_exists_for_display(s.name())
+                                }),
                             };
                             // Unread is an Agent-view concept: it means the agent
                             // produced output the user hasn't looked at. The
                             // paired terminal has no such notion, so Terminal
                             // view never paints the unread dot; the row just
                             // tracks whether its terminal pane is live.
-                            let (mut icon, color) = if terminal_running {
+                            let (icon, color) = if terminal_running {
                                 (spinner_running(&inst.created_at), theme.terminal_active)
                             } else {
                                 (ICON_IDLE, theme.dimmed)
                             };
-                            let mut style = Style::default().fg(color);
-                            if inst.is_archived() || inst.is_trashed() {
-                                // Archive/trash lifecycle override mirrors the
-                                // Agent-view path: dim color, stopped
-                                // icon, no italic/dim modifier; the
-                                // Archived section header is the cue.
-                                icon = ICON_STOPPED;
-                                style = Style::default().fg(theme.dimmed);
-                            } else if in_attention && inst.is_snoozed() {
-                                icon = ICON_STOPPED;
-                                style = Style::default()
-                                    .fg(theme.dimmed)
-                                    .add_modifier(ratatui::style::Modifier::ITALIC)
-                                    .add_modifier(ratatui::style::Modifier::DIM);
-                            } else if in_attention && inst.is_urgent() {
-                                style = Style::default()
-                                    .fg(theme.error)
-                                    .add_modifier(ratatui::style::Modifier::BOLD)
-                                    .add_modifier(ratatui::style::Modifier::RAPID_BLINK);
-                            } else if show_favorite && crate::session::is_live_favorite(inst) {
-                                style = style
-                                    .add_modifier(ratatui::style::Modifier::BOLD)
-                                    .add_modifier(ratatui::style::Modifier::UNDERLINED);
-                            }
-                            let title_text = if inst.is_archived() || inst.is_trashed() {
-                                Cow::Owned(inst.title.clone())
-                            } else if in_attention && inst.is_snoozed() {
-                                Cow::Owned(format!("z {}", inst.title))
-                            } else if in_attention && inst.is_urgent() {
-                                Cow::Owned(format!("! {}", inst.title))
-                            } else if show_favorite && crate::session::is_live_favorite(inst) {
-                                Cow::Owned(format!("* {}", inst.title))
-                            } else {
-                                Cow::Owned(inst.title.clone())
-                            };
-                            (icon, title_text, style)
+                            (
+                                RowSeed {
+                                    icon,
+                                    color,
+                                    modifier: ratatui::style::Modifier::empty(),
+                                },
+                                SunkRow::Pane,
+                            )
                         }
                         ViewMode::Tool(ref tool_name) => {
                             let tool_session =
                                 crate::tmux::ToolSession::new(&inst.id, &inst.title, tool_name);
-                            let tool_running =
-                                tool_session.exists() && !tool_session.is_pane_dead();
+                            let tool_running = crate::tmux::session_exists_for_display(
+                                tool_session.session_name(),
+                            ) && !crate::tmux::pane_dead_for_display(
+                                tool_session.session_name(),
+                            );
                             let (icon, color) = if tool_running {
                                 (spinner_running(&inst.created_at), theme.terminal_active)
                             } else {
                                 (ICON_IDLE, theme.dimmed)
                             };
-                            let mut style = Style::default().fg(color);
-                            let title_text =
-                                if show_favorite && crate::session::is_live_favorite(inst) {
-                                    style = style
-                                        .add_modifier(ratatui::style::Modifier::BOLD)
-                                        .add_modifier(ratatui::style::Modifier::UNDERLINED);
-                                    Cow::Owned(format!("* {}", inst.title))
-                                } else {
-                                    Cow::Owned(inst.title.clone())
-                                };
-                            (icon, title_text, style)
+                            (
+                                RowSeed {
+                                    icon,
+                                    color,
+                                    modifier: ratatui::style::Modifier::empty(),
+                                },
+                                SunkRow::Pane,
+                            )
                         }
-                    }
+                    };
+                    decorate_row(inst, in_attention, show_favorite, seed, sunk, theme)
                 } else {
                     (
                         "?",
@@ -1993,10 +2061,15 @@ impl HomeView {
         }
         if self.preview_capture_worker.is_none() {
             let worker = live_send::LiveCaptureWorker::spawn(self.preview_wake.clone());
-            // The worker spawns VT-enabled; hand it the real `[tmux] vt_live`
-            // value (cached on the view, refreshed with the config) before it
-            // can arm a channel.
-            worker.set_vt_enabled(self.vt_live_enabled);
+            // Shell terminals use capture-pane's authoritative cell snapshot.
+            // Their prompt repaint can transiently expose a PROMPT_EOL_MARK to
+            // a pipe-pane seed, producing a visible false frame before the
+            // grid reconciles. The capture path is slower but has no seed
+            // handoff, and live input still uses the existing send-keys path.
+            worker.set_vt_enabled(
+                self.vt_live_enabled && !matches!(self.view_mode, ViewMode::Terminal),
+            );
+            worker.set_clipboard_capture_enabled(self.agent_clipboard_forward);
             self.preview_capture_worker = Some(worker);
         }
         if self.preview_capture_target != desired {
@@ -2025,6 +2098,8 @@ impl HomeView {
         if let Some(worker) = self.preview_capture_worker.as_ref() {
             worker.set_live(live);
             worker.set_forward_empty(forward_empty);
+            worker.set_vt_enabled(self.vt_live_enabled && !forward_empty);
+            worker.set_clipboard_capture_enabled(self.agent_clipboard_forward);
         }
     }
 
@@ -2412,6 +2487,21 @@ impl HomeView {
     }
 
     fn render_preview(&mut self, frame: &mut Frame, area: Rect, theme: &Theme, layout: PaneLayout) {
+        if self.system_health_open {
+            self.preview_outer_area = area;
+            self.preview_area = area;
+            self.preview_pane_area = area;
+            self.preview_visible_rows = area.height as usize;
+            self.sync_preview_capture_worker(None);
+            crate::tui::components::diagnostics::render_system_health(
+                frame,
+                area,
+                theme,
+                &self.metrics,
+                self.system_health_scroll,
+            );
+            return;
+        }
         let compact = area.width < responsive::STACKED_BREAKPOINT;
         let (border_color, title_color) = match self.view_mode {
             ViewMode::Structured => (theme.border, theme.title),
@@ -2890,22 +2980,25 @@ impl HomeView {
 
                     // Now borrow instance for rendering
                     if let Some(inst) = self.get_instance(&id) {
+                        // Snapshot-backed like the list rows: this runs on
+                        // every frame, and the preview capture above is already
+                        // worker-driven, so a per-name `has-session` here would
+                        // be the only fork left in a steady-state frame.
                         let (terminal_running, preview_text) = match terminal_mode {
                             TerminalMode::Container => {
-                                let running = inst
-                                    .container_terminal_tmux_session()
-                                    .map(|s| s.exists())
-                                    .unwrap_or(false);
+                                let running =
+                                    inst.container_terminal_tmux_session().is_ok_and(|s| {
+                                        crate::tmux::session_exists_for_display(s.name())
+                                    });
                                 (
                                     running,
                                     self.container_terminal_preview_cache.parsed_text.as_ref(),
                                 )
                             }
                             TerminalMode::Host => {
-                                let running = inst
-                                    .terminal_tmux_session()
-                                    .map(|s| s.exists())
-                                    .unwrap_or(false);
+                                let running = inst.terminal_tmux_session().is_ok_and(|s| {
+                                    crate::tmux::session_exists_for_display(s.name())
+                                });
                                 (running, self.terminal_preview_cache.parsed_text.as_ref())
                             }
                         };
@@ -2968,7 +3061,12 @@ impl HomeView {
                     if let Some(inst) = self.get_instance(&id) {
                         let tool_session =
                             crate::tmux::ToolSession::new(&inst.id, &inst.title, &tool_name);
-                        let tool_running = tool_session.exists() && !tool_session.is_pane_dead();
+                        // Snapshot-backed for the same reason as the rows:
+                        // this pair used to be the two remaining per-frame
+                        // forks on the render thread in Tool view.
+                        let tool_running =
+                            crate::tmux::session_exists_for_display(tool_session.session_name())
+                                && !crate::tmux::pane_dead_for_display(tool_session.session_name());
 
                         Preview::render_terminal_preview(
                             frame,
@@ -4100,13 +4198,25 @@ mod tests {
     }
 
     #[test]
-    fn live_cursor_maps_directly_when_pane_matches_output() {
-        // Pane sized to the output area (the steady-state live-send case): the
-        // delta is zero, so cursor (x, y) maps onto output.{x,y} + (x, y). A
-        // full-height capture (line_count >= visible_rows) bottom-anchors.
+    fn live_cursor_maps_single_and_composited_origins() {
         let output = Rect::new(40, 5, 80, 24);
-        let pos = map_live_preview_cursor(output, 24, 200, pane_cursor(3, 2, true, 24));
-        assert_eq!(pos, Some(Position::new(43, 7)));
+
+        // Steady-state single pane: the origin and anchoring delta are zero.
+        let single = map_live_preview_cursor(output, 24, 200, pane_cursor(3, 2, true, 24));
+        assert_eq!(single, Some(Position::new(43, 7)));
+
+        // A top border row makes the composite one row taller than the visible
+        // output and shifts pane 0 down. The anchoring delta clips that row;
+        // adding pane 0's origin puts its pane-relative cursor back on the text.
+        let mut split = pane_cursor(3, 2, true, 25);
+        split.composite_pane0 = Some(crate::tmux::PaneGeom {
+            left: 1,
+            top: 1,
+            width: 79,
+            height: 24,
+        });
+        let composited = map_live_preview_cursor(output, 24, 200, split);
+        assert_eq!(composited, Some(Position::new(44, 7)));
     }
 
     #[test]
@@ -4218,6 +4328,19 @@ mod tests {
     fn compose_list_title_shows_by_project_only() {
         let title = compose_list_title("aoe", None, GroupByMode::Project, SortOrder::Newest);
         assert_eq!(title, " aoe · project ");
+    }
+
+    #[test]
+    fn compose_list_title_group_by_suffix_per_mode() {
+        let cases = [
+            (GroupByMode::Manual, ""),
+            (GroupByMode::Project, " · project"),
+            (GroupByMode::Org, " · org"),
+        ];
+        for (mode, suffix) in cases {
+            let title = compose_list_title("aoe", None, mode, SortOrder::Newest);
+            assert_eq!(title, format!(" aoe{suffix} "), "{mode:?}");
+        }
     }
 
     #[test]

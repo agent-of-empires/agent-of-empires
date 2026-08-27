@@ -189,13 +189,9 @@ declares: `capabilities`, `commands`, `keybinds`, `settings`, `ui`, and a
 `runtime` worker entrypoint. These are the sections the first external plugin
 declares; they are defined in `aoe-plugin-api` and parsed/validated by the
 host, but consumed by later issues (the settings registry in #2094, the runtime
-host in #2095, the command/keybind/UI surfaces in #2366). `api_version` is now
-10 (bumped to 2 for the contribution sections, 3 when the `detail-panel` slot
-became the dockable `pane` slot, 4 for the `status` section and the
-`aoe_version` field, 5 for screenshots, 6 for command actions, 7 for identity
-icons, 8 for the `composer-action` slot, 9 for ACP-capability discovery,
-host-owned sessions, plugin-private storage, and structured settings widgets,
-and 10 for the `settings-page` and `tool-card-badge` slots); an
+host in #2095, the command/keybind/UI surfaces in #2366). The current
+`api_version` and what each bump added are recorded on `API_VERSION` in
+`aoe-plugin-api/src/lib.rs`; an
 older `api_version` manifest still loads as long as it targets no newer field. Unknown top-level keys remain
 a hard parse error
 (`deny_unknown_fields`).
@@ -602,14 +598,6 @@ reuse the existing taxonomy:
 | `session.meta.set` / `session.meta.cas` | `session.write` |
 | `sessions.list` | `session.read` |
 | `config.get` | `runtime.worker` |
-| `config.read` | `config.read` |
-| `config.write` | `config.write` |
-| `mcp.list` / `mcp.resolve` | `config.read` |
-| `mcp.add` / `mcp.edit` / `mcp.delete` | `config.write` |
-| `mcp.keep` / `mcp.drop` / `mcp.resolve-conflict` | `config.write` |
-| `fs.read` / `fs.write` | `fs.read` / `fs.write` |
-| `skills.list` / `skills.read` | `fs.read` or `config.read` |
-| `skills.create` / `skills.edit` / `skills.delete` / `skills.adopt` / `skills.propagate` | `fs.write` |
 
 `events.*` run over a shared plugin event bus (a `plugin_host` schema on the
 durable event-log substrate, `src/events/`); `subscribe { topics, after_seq }`
@@ -642,96 +630,8 @@ for the calling plugin's own id, so a worker reads back the settings the user
 edited on the TUI/web surfaces, falling back to its own default when the key is
 unset (the call returns null). The id is the caller's own, never a request
 parameter, so a plugin can only read its own table. Reading one's own declared
-settings needs no `config.*` capability: `config.read` / `config.write` gate
-host/global configuration, a different surface from a plugin's own table, so
-`config.get` rides on `runtime.worker` like `events.*`.
-
-`config.read { section, field }` (capability `config.read`) reads one
-host/global settings field. The `(section, field)` pair must be a plain
-(non-elevated) schema descriptor (`settings_schema::descriptor`), gated
-symmetrically with `config.write`: an unknown field is `INVALID_PARAMS`, and a
-host-execution (`local_only`, e.g. `acp.node_path`) or elevation-gated field
-(e.g. the `worktree` / `sandbox` sections) is `FORBIDDEN`. The elevation-gated
-set can hold literal secrets, notably `sandbox.environment` env values, so it is
-off-limits for reads too, not just writes. The value comes from the serialized
-global `Config`, or null when unset.
-
-`config.write { patch }` (capability `config.write`) mutates host/global
-settings. The `patch` is the web-PATCH shape `{ section: { field: value } }`
-and goes through the same schema gate the web dashboard uses
-(`settings_schema::validate_patch`), but at the **non-elevated** level: a
-`config.write` plugin gets exactly what a non-elevated web client may write.
-Unlike the web path (which silently strips host-execution `local_only` leaves),
-the RPC rejects every disallowed leaf loudly so a plugin never believes a
-refused write landed: an unknown field is `INVALID_PARAMS`; a host-execution
-(`local_only`, e.g. `acp.node_path`) or elevation-required field (e.g. the
-`worktree` / `sandbox` sections) is `FORBIDDEN`. Sections with no descriptor,
-notably `hooks` (arbitrary shell), are rejected as unknown.
-
-The `mcp.*` methods manage the unified MCP surface (the merged
-agent-native / global / profile / project-local server set, resolved by
-`src/session/mcp_model.rs`), gated on `config.read` (reads) and `config.write`
-(writes) because MCP definitions are host/global config. `mcp.list` returns the redacted effective
-forwarded set (a pure resolve, no drift write); `mcp.resolve` returns the full
-management view (`effective`, `keptOnRemoval`, `conflicts`, `driftPaused`) and
-reconciles the drift snapshot as it goes, mirroring `GET /api/mcp/servers`. The
-writes touch only the AoE-owned global `mcp.json`: `mcp.add` creates a server
-(refusing a name that already exists globally; use `mcp.edit`), `mcp.edit`
-replaces an existing global server as a full replacement (omitted fields,
-including env / header secrets, are dropped), and `mcp.delete` removes a global
-server. A write that targets a name resolving from an `agent-native`, `profile`,
-or `project-local` layer is `FORBIDDEN`, because AoE never writes those files.
-`mcp.keep` / `mcp.drop` finalize a keep-on-removal decision and
-`mcp.resolve-conflict { name, winner, fingerprint }` resolves a drift conflict
-under an optimistic-concurrency token (a stale token returns
-`{ status: "stale" }`). Because the daemon runs no plugin workers in read-only
-serve mode, these writes need no separate read-only check.
-
-`fs.read { root, path }` / `fs.write { root, path, content }` (#2984) implement the
-previously-declared `fs.*` capabilities. They read and write a UTF-8 file (capped
-at 1 MiB) under one of two AoE-owned roots selected by `root`: `plugin` (the
-caller's private `<app_dir>/plugins/<id>/files`, namespaced to the caller's own
-id) or `skills` (the managed `<app_dir>/skills` store). A `path` is confined to
-its root by a lexical guard (no absolute, `..`, or prefix components) plus a
-canonical-ancestor check, and symlinks are refused. No arbitrary host path is
-reachable; a host-discovered agent skills dir (`~/.claude/skills`,
-`~/.kimi-code/skills`) is not an `fs.*` root, so `fs.write` can never mutate a
-read-only host skill.
-The complete discovery registry also includes `~/.agents/skills`,
-`~/.gemini/skills`, and `~/.config/opencode/skills`.
-
-`skills.*` (#2984, #3050) manage the skill set modelled in
-`src/session/skills_model.rs`.
-A skill's identity is its directory name, and skills are source-qualified by
-provenance, so `skills.list` returns every host-discovered and managed skill
-without shadow-merging. External provenance is keyed by the physical root, for
-example `{ "kind": "external", "root": "claude-user" }`, rather than by an
-agent name because multiple agents consume `~/.agents/skills`.
-`skills.read { source, directory }` returns one skill's `SKILL.md`. `create` /
-`edit` / `delete` mutate the managed store in place and refuse a
-host-discovered (read-only) target with `FORBIDDEN` (adopt it first). `adopt`
-copies a host-discovered skill into the managed store, leaving the original.
-The copy rejects links, special files, and packages outside the same byte,
-file-count, per-file, and nesting limits enforced by the REST API.
-`skills.propagate { agent }` is the one method that writes OUT of the store: it
-reconciles every managed skill into the skills dir that agent is the primary
-consumer of, and returns one `outcomes` entry per skill. It replaces or removes
-only copies AoE itself deployed that still match the digest recorded in their
-`.aoe-managed.json` marker; anything else is reported as a conflict and left
-alone. It previously took a `directory` and copied one named skill, refusing any
-existing target; propagation is now root-level, so a single skill is no longer an
-addressable unit.
-
-It deliberately does not consult `skills.auto_propagate`. That setting gates
-the automatic path, where AoE would write into an agent's directory without
-being asked; an explicit `skills.propagate` call is a request, like
-`aoe skill sync`, which is not gated either. The gate on writing out of the
-store is the `fs.write` capability, which the user granted when they approved
-the plugin.
-
-Every `fs.*`/`skills.*` write inherits read-only safety for free: the plugin host
-is not spawned at all in read-only serve mode (`src/server/mod.rs` gates
-`PluginHost::new` on `!read_only`), so no per-method read-only check is needed.
+settings needs no `config.*` capability, so `config.get` rides on
+`runtime.worker` like `events.*`.
 
 ### Sandboxing
 
@@ -755,8 +655,7 @@ the TUI renders).
 
 The slots are a closed `UiSlot` set (`aoe-plugin-api`), kebab-case on the
 wire: `status-bar`, `row-badge`, `row-column`, `sort-key`, `filter-facet`,
-`card`, `pane`, `composer-action`, `detail-badge`, `settings-page`,
-`tool-card-badge`, `notification`. A plugin declares the `(slot, id)` pairs it
+`card`, `pane`, `composer-action`, `detail-badge`, `notification`. A plugin declares the `(slot, id)` pairs it
 may fill in its manifest `[[ui]]` section; an unknown slot is a hard parse error
 (the host must know how to render each).
 
@@ -773,9 +672,8 @@ manager, and the web Plugins panel (via `PluginView.ui_contributions`).
   the `(slot, id)` being declared in the manifest: no dedicated `ui` capability
   is introduced. The `payload` is validated against the slot's typed shape and
   stored normalized; an unknown field or bad tone is rejected. Per-session slots
-  (`row-badge`, `row-column`, `pane`, `composer-action`, `detail-badge`,
-  `tool-card-badge`) require a
-  `session_id`; global slots must not carry one. The text-based slots
+  (`row-badge`, `row-column`, `pane`, `composer-action`, `detail-badge`)
+  require a `session_id`; global slots must not carry one. The text-based slots
   (`status-bar`, `row-badge`, `detail-badge`) accept optional `icon` (a lucide
   icon name in kebab-case, e.g. `git-pull-request-arrow`; the client maps it
   through an allowlist, an unknown name renders nothing) and `href` (when set,
@@ -803,7 +701,7 @@ manager, and the web Plugins panel (via `PluginView.ui_contributions`).
   operation once per operation id so a persistent UI-state entry cannot replay
   on every poll.
 
-#### Richer payloads: `row-badge` items, `tool-card-badge` items, and the `pane` block list
+#### Richer payloads: `row-badge` items and the `pane` block list
 
 These slots carry more than a single value, so one entry (one declared
 `(slot, id)`) can render a list:
@@ -813,15 +711,6 @@ These slots carry more than a single value, so one entry (one declared
   compact, tone-tinted icon (falling back to `text`), linked when `href` is a
   safe URL. The single `{ text, tone, tooltip, icon, href }` form still works.
   An empty `items: []` clears the row.
-- `tool-card-badge` carries `items: ToolCardBadge[]` where
-  `ToolCardBadge = { target, text?, icon?, tone?, tooltip? }` and
-  `target = { kind: "mcp" | "skill", name }`. A plugin declares one `(slot, id)`
-  per session and pushes every badge it knows in this one list; the host matches
-  each item to a transcript MCP or skill tool-call card by `target`, keeping the
-  match keyed on both `kind` and the raw (uncanonicalized) `name` since an MCP
-  server and a skill can share a name. Each item needs `text` or `icon` and a
-  non-empty target name. An empty `items: []` clears the plugin's badges. The web
-  dashboard renders the pill in the card header; the TUI ignores this slot.
 - `pane` also accepts `blocks: Block[]`, an ordered list of typed
   blocks. The web renderer knows these kinds: `heading { text }`,
   `row { label?, value?, prefix?, sublabel?, icon?, avatar?, tone?, value_tone?, color?, href?, tooltip?, mono?, selected?, badges?, method?, params? }`,
@@ -872,16 +761,6 @@ These slots carry more than a single value, so one entry (one declared
   JSON may be up to 64KB, against 8KB for every other slot (`status-bar`,
   `row-badge`, `row-column`, `card`, `detail-badge`), so a plugin can push a full
   comment list in one pane entry without truncating to fit.
-
-- `settings-page` is a routed full page (api_version 10). It is global (no
-  `session_id`) and carries the same `{ title, body }` or `blocks` content as a
-  pane (drawn by the same block renderer), minus `default_location`, which a full
-  page has no use for and which `deny_unknown_fields` rejects. It shares the
-  pane's 64KB budget. The web mounts one Settings nav entry per declared
-  `(settings-page, id)` contribution, routed under `/settings/plugin-page:<...>`;
-  the entry's page body is the plugin's pushed state. The nav entry appears on
-  declaration, so the page shows a "waiting for the plugin" state until the
-  worker pushes its first entry.
 
 **Block parsing is forward-compatible by design.** The host stores `blocks` as
 opaque JSON (`Vec<Value>`); it validates only that the payload envelope is
@@ -984,10 +863,7 @@ entry is headed by its payload `title`, falling back to the `plugin_id`, so
 stacked panes stay attributable without the web's dock tabs. It renders text and
 tone only; `icon`, `tooltip`, `href`, and a pane's `default_location` are dropped
 (a single toggleable overlay has no docks to choose between), and `card`,
-`row-badge`,
-`sort-key`, `filter-facet`, and `settings-page` have no
-structured-view surface (a terminal cannot render a routed full page; it is a
-documented web-only no-op).
+`row-badge`, `sort-key`, and `filter-facet` have no structured-view surface.
 
 The **remote-home picker** (the daemon-connected session list, reached with
 `AOE_DAEMON_URL`) renders each session's `row-column` text in its own

@@ -80,7 +80,7 @@ base("ApprovalCard Deny resolves and the turn ends", async ({ page }, testInfo) 
     await expect(composer).toBeVisible({ timeout: 10_000 });
     await expect(composer).toBeEnabled({ timeout: 10_000 });
     await expect(composer).toHaveValue("");
-    await expect(page.getByRole("button", { name: "Stop" })).toBeHidden({
+    await expect(page.getByTestId("composer-actions").getByRole("button", { name: "Stop" })).toBeHidden({
       timeout: 10_000,
     });
   } finally {

@@ -75,19 +75,39 @@ mod tests {
     use crate::session::Instance;
     use std::time::Duration;
 
-    fn create_test_instance() -> Instance {
-        Instance::new("Test Session", "/tmp/test-project")
+    fn create_test_instance() -> (crate::session::test_support::AppDirGuard, Instance, u64) {
+        let guard = crate::session::test_support::isolate_app_dir();
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
+        let mut instance = Instance::new("Test Session", "/tmp/test-project");
+        instance.source_profile = "default".to_string();
+        instance.trash();
+        let generation = instance
+            .try_acquire_lifecycle_reservation(
+                crate::session::LifecycleOperation::Trash,
+                Instance::LIFECYCLE_RESERVATION_TTL,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        storage
+            .update(|instances, _groups| {
+                instances.push(instance.clone());
+                Ok(())
+            })
+            .unwrap();
+        (guard, instance, generation)
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_trash_poller_channel_communication() {
         let mut poller = TrashPoller::new();
-        let instance = create_test_instance();
+        let (_guard, instance, generation) = create_test_instance();
         let session_id = instance.id.clone();
 
         poller.request_trash(TrashRequest {
             session_id: session_id.clone(),
             instance,
+            generation,
         });
 
         let mut result = None;
@@ -115,14 +135,16 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_trash_poller_tracks_pending_requests() {
         let mut poller = TrashPoller::new();
-        let instance = create_test_instance();
+        let (_guard, instance, generation) = create_test_instance();
         let session_id = instance.id.clone();
 
         poller.request_trash(TrashRequest {
             session_id: session_id.clone(),
             instance,
+            generation,
         });
 
         assert_eq!(poller.take_pending(), vec![session_id]);

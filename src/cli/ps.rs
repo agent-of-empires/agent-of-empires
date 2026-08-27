@@ -562,7 +562,15 @@ fn load_instances(profile: &str, profile_explicit: bool) -> Vec<Instance> {
     };
     for name in &profiles {
         if let Ok(storage) = Storage::open_unwatched(name) {
-            if let Ok((instances, _)) = storage.load_with_groups() {
+            if let Ok((mut instances, _)) = storage.load_with_groups() {
+                // `load_with_groups` does not stamp the source profile (it is
+                // `#[serde(default, skip_serializing)]`), so set it here the way
+                // the serve loader does. The status poll keys the profile-scoped
+                // status-rule registry on it; without it a profile's rules would
+                // install and look up under the empty profile and never match.
+                for inst in &mut instances {
+                    inst.source_profile = name.clone();
+                }
                 out.extend(instances);
             }
         }
@@ -583,8 +591,27 @@ fn is_agent_session_name(name: &str) -> bool {
 fn collect_tmux_states(instances: &mut [Instance]) -> Vec<TmuxState> {
     use std::collections::HashSet;
 
+    // The poll below never loads config, so install the declarative status-rule
+    // registry once per distinct profile up front; otherwise a rules-having
+    // custom agent reports Idle. The registry is keyed by profile, so each
+    // install replaces only that profile's entries.
+    {
+        let mut resolved: HashSet<&str> = HashSet::new();
+        for inst in instances.iter() {
+            if resolved.insert(inst.source_profile.as_str()) {
+                crate::session::profile_config::resolve_config_or_warn(&inst.source_profile);
+            }
+        }
+    }
+
     crate::tmux::refresh_session_cache();
-    let meta = crate::tmux::batch_pane_metadata().unwrap_or_default();
+    let meta = match crate::tmux::batch_pane_metadata() {
+        Ok(meta) => meta,
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to collect tmux pane metadata");
+            return Vec::new();
+        }
+    };
 
     let mut states = Vec::new();
     let mut known: HashSet<String> = HashSet::new();
@@ -1242,5 +1269,28 @@ mod tests {
         for (version, stale, expected) in cases {
             assert_eq!(render_build_cell(version, stale), expected, "{version:?}");
         }
+    }
+
+    /// C1 regression guard: `load_instances` must stamp `source_profile` on
+    /// each loaded instance. The status poll keys the profile-scoped
+    /// status-rule registry on it; if it stayed empty, a profile's rules would
+    /// install and look up under the empty profile and never match in `aoe ps`.
+    #[test]
+    #[serial_test::serial]
+    fn load_instances_stamps_source_profile() {
+        let temp = tempfile::tempdir().unwrap();
+        let _guard = crate::session::test_support::isolate_app_dir_at(temp.path());
+
+        let storage = Storage::new_unwatched("pstest").unwrap();
+        storage
+            .update(|i, _| {
+                *i = vec![Instance::new("sess", "/tmp/sess")];
+                Ok(())
+            })
+            .unwrap();
+
+        let loaded = load_instances("pstest", true);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].source_profile, "pstest");
     }
 }

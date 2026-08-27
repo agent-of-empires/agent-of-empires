@@ -22,6 +22,8 @@ mod mcp;
 pub(crate) mod plugin_settings;
 pub mod plugins;
 mod projects;
+#[cfg(feature = "serve")]
+mod queue;
 pub(crate) mod sessions;
 mod skills;
 pub(crate) mod system;
@@ -37,6 +39,9 @@ pub use acp::{
     list_claude_sessions, resolve_approval, resolve_elicitation, shutdown_acp, spawn_acp,
     switch_acp_agent,
 };
+
+#[cfg(feature = "serve")]
+pub use queue::{queue_clear, queue_edit, queue_enqueue, queue_list, queue_remove};
 
 #[cfg(feature = "serve")]
 pub use client_log::post_client_log;
@@ -72,15 +77,15 @@ pub(crate) use sessions::persist_session_update;
 pub(crate) use sessions::purge_expired_trash;
 // Startup backfill that relocates trashed worktrees; not a route handler.
 #[cfg(feature = "serve")]
-pub(crate) use sessions::reconcile_trashed_worktrees;
+pub(crate) use sessions::{reconcile_trashed_worktrees, reconcile_worktree_paths};
 pub use system::{
     browse_filesystem, create_profile, default_profile, delete_profile, dismiss_update,
     docker_status, filesystem_home, get_about, get_cityhall_bundle, get_current_theme,
     get_profile_settings, get_resolved_theme, get_settings, get_settings_resolved,
     get_settings_schema, get_tips, get_update_status, get_web_ui_state, list_agents, list_groups,
     list_profiles, list_sounds, list_themes, mark_tip_seen, mark_volume_ignores_globs_acknowledged,
-    mark_web_tour_seen, patch_web_ui_state, rename_profile, serve_sound_file, set_show_tips,
-    update_profile_settings, update_settings, update_theme,
+    mark_web_tour_seen, patch_web_ui_state, post_dashboard_presence, rename_profile,
+    serve_sound_file, set_show_tips, update_profile_settings, update_settings, update_theme,
 };
 pub use telemetry::{
     get_telemetry_status, post_telemetry_seen, post_telemetry_structured_interaction,

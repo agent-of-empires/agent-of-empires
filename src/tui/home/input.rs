@@ -98,17 +98,6 @@ fn persist_telemetry_consent(opt_in: bool) {
     crate::telemetry::apply_opt_in_change(opt_in);
 }
 
-/// xterm bracketed-paste start sequence: `ESC [ 2 0 0 ~`. An agent that
-/// has enabled bracketed paste mode (`\e[?2004h`) treats everything
-/// between this marker and the matching end marker as one paste rather
-/// than as keystrokes, so interior newlines accumulate in the input
-/// buffer instead of firing `submit` per line.
-const BRACKETED_PASTE_START: &[u8] = &[0x1b, b'[', b'2', b'0', b'0', b'~'];
-
-/// xterm bracketed-paste end sequence: `ESC [ 2 0 1 ~`. Pairs with
-/// [`BRACKETED_PASTE_START`].
-const BRACKETED_PASTE_END: &[u8] = &[0x1b, b'[', b'2', b'0', b'1', b'~'];
-
 /// Decompose pasted text into a series of `TmuxKey`s safe for the
 /// live-send worker to dispatch.
 ///
@@ -119,17 +108,17 @@ const BRACKETED_PASTE_END: &[u8] = &[0x1b, b'[', b'2', b'0', b'1', b'~'];
 /// literal text. Tabs in single-line pastes still go through as
 /// `Named("Tab")` to mirror the historical path.
 ///
-/// Multi-line pastes get wrapped in xterm bracketed-paste markers
-/// (`\e[200~` / `\e[201~`) so the receiving agent sees the entire
-/// payload as one paste rather than as N independent Enter keypresses.
+/// Multi-line pastes are handed to tmux as a single paste
+/// (`load-buffer` + `paste-buffer -p`), so the receiving agent sees the
+/// entire payload as one paste rather than as N independent Enter
+/// keypresses, and tmux emits the bracketed-paste markers only for panes
+/// that actually set DECSET 2004.
 /// Without the wrapping, agents that submit on Enter (Claude Code,
 /// Codex, OpenCode, ...) post one user message per pasted line, which
-/// is the bug behind #1546. The whole payload (markers, printable
-/// runs, interior CRs, and tabs) goes through as a single `HexBytes`
-/// action, which the worker dispatches as one or more size-bounded
-/// `tmux send-keys -H` forks (a per-byte argv overflows `ARG_MAX` on a
-/// large paste, so it can't always be one fork). `\r\n` pairs coalesce
-/// to a single CR so
+/// is the bug behind #1546. The whole payload goes through as a single
+/// `Paste` action, which the worker delivers with one `load-buffer` +
+/// `paste-buffer` pair (no `ARG_MAX` chunking, unlike the per-byte hex
+/// encoding this replaced). `\r\n` pairs coalesce to a single newline so
 /// Windows-line-ending pastes don't double up; other control bytes
 /// (BEL, ESC, ...) are dropped rather than risk that an embedded
 /// escape closes the bracketed-paste sequence on the agent's side.
@@ -166,40 +155,38 @@ fn split_inline_paste(text: &str) -> Vec<live_send::TmuxKey> {
 }
 
 fn split_bracketed_paste(text: &str) -> Vec<live_send::TmuxKey> {
-    // Build one contiguous byte payload: start marker, then the paste
-    // content with printables as their UTF-8 bytes / interior newlines
-    // as CR (0x0d) / tabs as 0x09, then the end marker. Sending it as
-    // one `HexBytes` means the worker fires exactly one `tmux send-keys
-    // -H` subprocess per paste rather than one per chunk.
-    let mut bytes = Vec::with_capacity(text.len() + BRACKETED_PASTE_START.len() * 2);
-    bytes.extend_from_slice(BRACKETED_PASTE_START);
-
+    // Hand the payload to tmux as one paste and let `paste-buffer -p` decide
+    // about the markers. Emitting `\e[200~` / `\e[201~` ourselves delivered
+    // them to every pane, including raw shells and SQL REPLs that never set
+    // DECSET 2004; those parse `\e[2` as a partial Insert-key sequence, drop
+    // it, and self-insert the leftover `00~` / `01~` into the user's text.
+    // tmux tracks the pane's paste mode and brackets only when the program
+    // asked for it, which keeps the #1546 fix for agents intact.
+    //
+    // tmux replaces LF with CR in the buffer by default, so interior newlines
+    // land exactly as the old raw-byte encoding delivered them. `\r\n` pairs
+    // still coalesce here so Windows-line-ending pastes don't double up, and
+    // other control bytes (BEL, ESC, ...) are still dropped rather than risk
+    // an embedded escape closing the bracketed-paste sequence on the agent's
+    // side.
+    let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
-    let mut utf8_buf = [0u8; 4];
     while let Some(ch) = chars.next() {
         match ch {
-            '\n' => bytes.push(0x0d),
+            '\n' => out.push('\n'),
             '\r' => {
                 if chars.peek() == Some(&'\n') {
                     chars.next();
                 }
-                bytes.push(0x0d);
+                out.push('\n');
             }
-            '\t' => bytes.push(0x09),
-            c if (c as u32) < 0x20 || c == '\x7f' => {
-                // Embedded ESC / BEL / etc. has no safe encoding
-                // inside the paste payload; drop rather than risk a
-                // bogus terminal escape closing the paste early.
-            }
-            c => {
-                let s = c.encode_utf8(&mut utf8_buf);
-                bytes.extend_from_slice(s.as_bytes());
-            }
+            '\t' => out.push('\t'),
+            c if (c as u32) < 0x20 || c == '\x7f' => {}
+            c => out.push(c),
         }
     }
 
-    bytes.extend_from_slice(BRACKETED_PASTE_END);
-    vec![live_send::TmuxKey::HexBytes(bytes)]
+    vec![live_send::TmuxKey::Paste(out)]
 }
 
 /// The rectangle mouse coordinates are mapped into, or `None` when the pointer
@@ -214,8 +201,12 @@ fn split_bracketed_paste(text: &str) -> Vec<live_send::TmuxKey> {
 /// report at all, so it is dropped rather than clamped to the nearest edge,
 /// which would otherwise synthesise a click or hover on pane 0's border.
 ///
-/// Pane 0 sits at the window origin, so the sub-rectangle shares the preview's
-/// top-left corner and only its extent differs.
+/// Pane 0 may have a non-zero origin within the full composite. The TUI
+/// bottom-follows a composite taller than its output, clipping reserved rows
+/// above pane 0 before mouse mapping, so its first visible cell still starts
+/// at `pane.x`/`pane.y`. Mapping a non-bottom-aligned slice would additionally
+/// need that slice's first visible row; adding `rect.top` here alone would
+/// shift input below the displayed pane.
 fn mouse_target_rect(
     cursor: &crate::tmux::PaneCursor,
     pane: ratatui::layout::Rect,
@@ -248,11 +239,11 @@ fn mouse_pane_rect(
     pane: ratatui::layout::Rect,
 ) -> ratatui::layout::Rect {
     match cursor.composite_pane0 {
-        Some((width, height)) => ratatui::layout::Rect {
+        Some(rect) => ratatui::layout::Rect {
             x: pane.x,
             y: pane.y,
-            width: width.min(pane.width),
-            height: height.min(pane.height),
+            width: rect.width.min(pane.width),
+            height: rect.height.min(pane.height),
         },
         None => pane,
     }
@@ -637,6 +628,19 @@ impl HomeView {
         let pos = Position::from((col, row));
         if self.collapse_button_area.contains(pos) || self.expand_strip_area.contains(pos) {
             self.toggle_sidebar_collapsed();
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Open the read-only System Health view when the compact strip is clicked.
+    pub fn handle_diagnostics_click(&mut self, col: u16, row: u16) -> bool {
+        if self.has_non_live_send_overlay() {
+            return false;
+        }
+        if self.diagnostics_area.contains(Position::from((col, row))) {
+            self.open_system_health();
             true
         } else {
             false
@@ -1245,7 +1249,7 @@ impl HomeView {
     }
 
     /// Confirm before archiving every active session under the focused group.
-    /// Archiving a whole project at once is a bigger hammer than the single-row
+    /// Archiving a whole project or organization at once is a bigger hammer than the single-row
     /// `z`, so it routes through a prompt. Archiving is reversible, hence the
     /// calmer neutral tone rather than the destructive red. No-ops silently
     /// (no prompt) when the group has no active sessions left to archive.
@@ -1257,19 +1261,22 @@ impl HomeView {
         if count == 0 {
             return;
         }
-        // Project mode groups by repo, Manual mode by user-assigned path; name
-        // the scope accordingly and show the full path so nested groups that
-        // share a leaf segment aren't ambiguous.
-        let (title, scope) = if self.group_by == crate::session::config::GroupByMode::Project {
-            ("Archive project", "project")
-        } else {
-            ("Archive group", "group")
+        // Project/Org mode groups by repo/owner, Manual mode by
+        // user-assigned path; name the scope accordingly and show the full
+        // path so nested groups that share a leaf segment aren't ambiguous.
+        let (title, scope) = match self.group_by {
+            crate::session::config::GroupByMode::Project => ("Archive project", "project"),
+            crate::session::config::GroupByMode::Org => ("Archive org", "org"),
+            crate::session::config::GroupByMode::Manual => ("Archive group", "group"),
         };
         let noun = if count == 1 { "session" } else { "sessions" };
         self.confirm_dialog = Some(
             ConfirmDialog::new(
                 title,
-                &format!("Archive all {count} {noun} in {scope} \"{group_path}\"?"),
+                &format!(
+                    "Archive all {count} {noun} in {scope} \"{}\"?",
+                    crate::session::project_group_display_name(&group_path)
+                ),
                 "archive_group",
             )
             .neutral(),
@@ -1418,8 +1425,8 @@ impl HomeView {
                             self.pending_dialog_click_action =
                                 Some(self.discard_settings_changes());
                         } else {
-                            if action == "quit" && dont_ask_again {
-                                self.disable_confirm_before_quit();
+                            if dont_ask_again {
+                                self.apply_confirm_dont_ask_again(&action);
                             }
                             self.pending_dialog_click_action =
                                 self.dispatch_confirm_submit(&action);
@@ -2235,8 +2242,8 @@ impl HomeView {
                     let action = dialog.action().to_string();
                     let dont_ask_again = dialog.dont_ask_again();
                     self.confirm_dialog = None;
-                    if action == "quit" && dont_ask_again {
-                        self.disable_confirm_before_quit();
+                    if dont_ask_again {
+                        self.apply_confirm_dont_ask_again(&action);
                     }
                     if let Some(emit) = self.dispatch_confirm_submit(&action) {
                         return Some(emit);
@@ -2905,6 +2912,8 @@ impl HomeView {
             }
             ActionId::ToggleContainer => self.toggle_container_for_selected(),
             ActionId::TogglePreviewInfo => self.toggle_preview_info(),
+            ActionId::ToggleDiagnostics => self.toggle_diagnostics(),
+            ActionId::OpenSystemHealth => self.open_system_health(),
             ActionId::SortPicker => self.show_sort_picker(),
             ActionId::GroupBy => self.show_group_picker(),
             ActionId::ToggleProjectPin => self.toggle_project_pin_at_cursor(),
@@ -2957,7 +2966,13 @@ impl HomeView {
                     Some(inst.group_path.clone())
                 }
             })
-            .or_else(|| self.selected_group.clone());
+            .or_else(|| {
+                // The scratch bucket's group_path is an internal sentinel; show
+                // its display label in the Group field, not the raw sentinel (#3237).
+                self.selected_group
+                    .as_deref()
+                    .map(|g| crate::session::project_group_display_name(g).to_string())
+            });
 
         if prefill_path.is_some() || prefill_group.is_some() {
             let existing_groups: Vec<String> =
@@ -3321,17 +3336,29 @@ impl HomeView {
     }
 
     /// Pick a representative repo path for a selected group so "New Session"
-    /// from a project/group can prefill the working directory. In project mode
-    /// the group label is a derived basename, so match members by
-    /// `project_group_name`; in manual mode match by the stored `group_path`,
-    /// including nested subgroups. Returns `None` for an empty group (no member
-    /// to borrow a path from), leaving the dialog on the default cwd.
+    /// from a project/group can prefill the working directory. In project
+    /// mode the group label is a derived repo basename, so match members by
+    /// `project_group_key`; in manual mode match by the stored
+    /// `group_path`, including nested subgroups. In org mode there is no
+    /// single unambiguous repo to prefill (unlike Project, an org spans many
+    /// repos by design), so this always returns `None` there, mirroring the
+    /// web org header, which routes "New Session" through the generic
+    /// create flow instead of a specific repo path. Also returns `None` for
+    /// an empty group (no member to borrow a path from), leaving the dialog
+    /// on the default cwd. The synthetic scratch bucket lends no path either:
+    /// a session under it would return its throwaway `<app_dir>/scratch/<id>`
+    /// as the prefill, and creating a new session rooted there ties its cwd
+    /// to another scratch session's lifetime (#3237).
     pub(super) fn group_repo_path(&self, group_path: &str) -> Option<String> {
+        if crate::session::is_synthetic_project_header(group_path) {
+            return None;
+        }
         self.instances
             .values()
             .find(|inst| match self.group_by {
-                GroupByMode::Project => super::project_group_name(inst) == group_path,
-                _ => {
+                GroupByMode::Project => super::project_group_key(inst) == group_path,
+                GroupByMode::Org => false,
+                GroupByMode::Manual => {
                     inst.group_path == group_path
                         || inst.group_path.starts_with(&format!("{group_path}/"))
                 }
@@ -3859,10 +3886,14 @@ impl HomeView {
                     {
                         continue;
                     }
-                    let label = if name == path {
+                    // The parenthetical disambiguates org keys (owner vs
+                    // owner@host); route it through the display mapper so a
+                    // synthetic bucket's sentinel path never leaks (#3237).
+                    let disambiguator = crate::session::project_group_display_name(path);
+                    let label = if name.as_str() == disambiguator {
                         format!("Jump to group: {}", name)
                     } else {
-                        format!("Jump to group: {} ({})", name, path)
+                        format!("Jump to group: {} ({})", name, disambiguator)
                     };
                     entries.push(PaletteCommand {
                         id: "jump-group",
@@ -4145,6 +4176,7 @@ impl HomeView {
     /// between the `Enter` keybind and double-click activation so the two
     /// paths can't drift.
     pub(super) fn activate_selected_session(&mut self) -> Option<Action> {
+        self.system_health_open = false;
         let id = self.selected_session.clone()?;
         if let Some(inst) = self.get_instance(&id) {
             if matches!(inst.status, Status::Deleting | Status::Creating) {
@@ -4294,6 +4326,7 @@ impl HomeView {
                 }
             }
             if self.selected_session != prev_session {
+                self.system_health_open = false;
                 self.preview_scroll_offset = 0;
                 // A finalized preview selection pins to the previous pane's
                 // cells; carried into a different session it would paint a
@@ -4366,6 +4399,26 @@ impl HomeView {
         }
     }
 
+    /// Info-dialog copy for rename/delete attempted on a header whose
+    /// grouping mode derives it automatically (Project/Org), so there is no
+    /// user-owned group to rename or delete. Returns `None` for `Manual`,
+    /// where group membership is user-managed and the caller should proceed
+    /// with its normal rename/delete flow instead.
+    fn automatic_group_hint(&self) -> Option<(String, String)> {
+        let mode_label = match self.group_by {
+            GroupByMode::Manual => return None,
+            GroupByMode::Project => "Project",
+            GroupByMode::Org => "Org",
+        };
+        let toggle = if self.strict_hotkeys { "Ctrl+G" } else { "'g'" };
+        Some((
+            format!("Cannot Modify {mode_label} Groups"),
+            format!(
+                "{mode_label} groups are automatic. Press {toggle} and pick Manual to manage groups."
+            ),
+        ))
+    }
+
     fn toggle_group_collapsed(&mut self, path: &str) {
         // The synthetic Archived section is not a member of any
         // GroupTree; its collapsed state lives on HomeView and persists
@@ -4389,6 +4442,14 @@ impl HomeView {
                 .insert(path.to_string(), !collapsed);
             self.rebuild_flat_items();
             self.save_project_group_collapsed();
+            return;
+        }
+        if self.group_by == GroupByMode::Org {
+            let collapsed = self.org_group_collapsed.get(path).copied().unwrap_or(false);
+            self.org_group_collapsed
+                .insert(path.to_string(), !collapsed);
+            self.rebuild_flat_items();
+            self.save_org_group_collapsed();
             return;
         }
         // Route to the correct profile's GroupTree
@@ -4634,6 +4695,10 @@ impl HomeView {
         // the wheel via `has_dialog()`.
         if let Some(view) = &mut self.settings_view {
             return view.handle_wheel_scroll(true);
+        }
+        if self.system_health_open && self.hit_preview(col, row) {
+            self.system_health_scroll = self.system_health_scroll.saturating_sub(3);
+            return true;
         }
         // A preview selection is anchored to absolute scrollback lines,
         // not screen cells, so scrolling no longer invalidates it: the
@@ -5088,6 +5153,8 @@ impl HomeView {
         let signals = crate::tips::TipSignals {
             new_session_with_selection_count: config.app_state.new_session_with_selection_count,
             used_new_from_selection: config.app_state.used_new_from_selection,
+            system_health_tip_earned: config.app_state.system_health_tip_earned,
+            used_system_health: config.app_state.used_system_health,
         };
         let eligible = crate::tips::eligible(crate::tips::TipSurface::Tui, &signals);
         self.tips_dialog = Some(TipsDialog::new(
@@ -5184,6 +5251,8 @@ impl HomeView {
         let signals = crate::tips::TipSignals {
             new_session_with_selection_count: config.app_state.new_session_with_selection_count,
             used_new_from_selection: config.app_state.used_new_from_selection,
+            system_health_tip_earned: config.app_state.system_health_tip_earned,
+            used_system_health: config.app_state.used_system_health,
         };
         self.pending_tip_pop = crate::tips::next_earned_pop(
             crate::tips::TipSurface::Tui,
@@ -5245,7 +5314,7 @@ impl HomeView {
     }
 
     /// Open the rename dialog for whatever the sidebar has selected (a
-    /// session row, or a manual-mode group). Project-mode groups can't be
+    /// session row, or a manual-mode group). Project and organization-mode groups can't be
     /// renamed, so they raise an info dialog explaining how to switch
     /// modes. No-op when nothing is selected, or when the selected session
     /// is mid-create or mid-delete (renaming under those states would race
@@ -5298,13 +5367,8 @@ impl HomeView {
             }
             self.rename_dialog = Some(dialog);
         } else if let Some(group_path) = &self.selected_group {
-            if self.group_by == GroupByMode::Project {
-                let hint = if self.strict_hotkeys {
-                    "Project groups are automatic. Press Ctrl+G and pick Manual to manage groups."
-                } else {
-                    "Project groups are automatic. Press 'g' and pick Manual to manage groups."
-                };
-                self.info_dialog = Some(InfoDialog::new("Cannot Modify Project Groups", hint));
+            if let Some((title, hint)) = self.automatic_group_hint() {
+                self.info_dialog = Some(InfoDialog::new(&title, &hint));
                 return;
             }
             let group_path = group_path.clone();
@@ -5395,7 +5459,7 @@ impl HomeView {
     ///   - Terminal view rejects deletion with an info dialog,
     ///   - Creating sessions are inert,
     ///   - Stuck-Deleting sessions get a force-remove confirm,
-    ///   - Project-mode groups can't be deleted (info dialog).
+    ///   - Project and organization-mode groups can't be deleted (info dialog).
     ///
     /// Shared by the `'d'` / `'D'` key handlers and the right-click
     /// context menu.
@@ -5446,21 +5510,46 @@ impl HomeView {
                 let delete_to_trash = session_cfg.delete_to_trash;
                 if delete_to_trash && !already_trashed {
                     let sid = session_id.clone();
-                    // When session.confirm_delete is on, guard the trash with a
-                    // confirmation dialog instead of trashing on the keystroke.
-                    // The accept path (dispatch_confirm_submit "trash_session")
-                    // runs the same trash_session_by_id as the instant path.
+                    // When session.confirm_delete is on (the default), guard the
+                    // trash with a confirmation dialog instead of trashing on the
+                    // keystroke. The delete key itself accepts the dialog, so the
+                    // deliberate gesture stays two taps of one key while a single
+                    // stray keystroke is harmless. The accept path
+                    // (dispatch_confirm_submit "trash_session") runs the same
+                    // trash_session_by_id as the instant path.
                     if session_cfg.confirm_delete {
-                        let message = format!(
-                            "Move '{}' to the trash? It can be restored from the Trash section.",
-                            inst.title
-                        );
+                        // Read the accept key off the binding table instead of
+                        // spelling it out here, so relocating Delete can't drift
+                        // the hint (or the key that accepts) from the key that
+                        // opened the dialog. A chord that isn't a bare character
+                        // (a hypothetical Ctrl+D) can't be an opt-in confirm
+                        // char, so it falls back to the dialog's own y/Enter.
+                        let delete_key = bindings::label(ActionId::Delete, self.strict_hotkeys);
+                        let mut key_chars = delete_key.chars();
+                        let accept_char = match (key_chars.next(), key_chars.next()) {
+                            (Some(c), None) => Some(c),
+                            _ => None,
+                        };
+                        let hint = match accept_char {
+                            Some(_) => {
+                                format!("Press {delete_key} again to confirm, Esc to cancel.")
+                            }
+                            None => "Press y to confirm, Esc to cancel.".to_string(),
+                        };
+                        let message = format!("Move '{}' to the trash?\n{hint}", inst.title);
                         self.pending_trash_session = Some(sid);
-                        self.confirm_dialog = Some(ConfirmDialog::new(
-                            "Confirm Delete",
-                            &message,
-                            "trash_session",
-                        ));
+                        // Offer the same in-dialog opt-out the quit confirm has:
+                        // this guard is on by default, so a user who wants the
+                        // one-keystroke trash back shouldn't have to go find the
+                        // setting. Ticking it persists confirm_delete = false.
+                        let mut dialog =
+                            ConfirmDialog::new("Confirm Delete", &message, "trash_session")
+                                .buttons("Delete", "Cancel")
+                                .offering_dont_ask_again();
+                        if let Some(c) = accept_char {
+                            dialog = dialog.confirmed_by(c);
+                        }
+                        self.confirm_dialog = Some(dialog);
                         return;
                     }
                     self.trash_session_by_id(&sid);
@@ -5494,13 +5583,8 @@ impl HomeView {
                 ));
             }
         } else if let Some(group_path) = &self.selected_group {
-            if self.group_by == GroupByMode::Project {
-                let hint = if self.strict_hotkeys {
-                    "Project groups are automatic. Press Ctrl+G and pick Manual to manage groups."
-                } else {
-                    "Project groups are automatic. Press 'g' and pick Manual to manage groups."
-                };
-                self.info_dialog = Some(InfoDialog::new("Cannot Modify Project Groups", hint));
+            if let Some((title, hint)) = self.automatic_group_hint() {
+                self.info_dialog = Some(InfoDialog::new(&title, &hint));
                 return;
             }
             // Scope the count to the selected group's profile: two groups in
@@ -5612,6 +5696,7 @@ impl HomeView {
                 None
             }
             Item::Session { id, .. } => {
+                self.system_health_open = false;
                 if self.cursor != abs_idx {
                     self.cursor = abs_idx;
                     self.update_selected();
@@ -5825,6 +5910,11 @@ impl HomeView {
             .map(|(_, key)| *key);
         let footer_changed = prev_footer_hover != self.footer_hover;
 
+        let diagnostics_hovered = !self.has_non_live_send_overlay()
+            && self.diagnostics_area.contains(Position::from((col, row)));
+        let diagnostics_changed = diagnostics_hovered != self.diagnostics_hovered;
+        self.diagnostics_hovered = diagnostics_hovered;
+
         // Hover is live over both the scrolling list and the pinned shelf, so
         // a shelf row (Trash / Archived) highlights under the pointer the same
         // way a list row does. `resolve_row_to_index` maps either region.
@@ -5845,7 +5935,11 @@ impl HomeView {
         let badge_changed = badge_hover != self.tips_badge_hovered;
         self.tips_badge_hovered = badge_hover;
 
-        overlay_changed || footer_changed || badge_changed || prev_idx != new_idx
+        overlay_changed
+            || footer_changed
+            || diagnostics_changed
+            || badge_changed
+            || prev_idx != new_idx
     }
 
     /// Route a mouse-wheel-down at (col, row); see handle_scroll_up.
@@ -5854,6 +5948,14 @@ impl HomeView {
         // Settings takeover owns the wheel; see handle_scroll_up.
         if let Some(view) = &mut self.settings_view {
             return view.handle_wheel_scroll(false);
+        }
+        if self.system_health_open && self.hit_preview(col, row) {
+            let visible_rows = crate::tui::components::diagnostics::agent_table_visible_rows(
+                self.preview_area.height,
+            );
+            let max = self.metrics.agents.len().saturating_sub(visible_rows);
+            self.system_health_scroll = self.system_health_scroll.saturating_add(3).min(max);
+            return true;
         }
         // Mirror handle_scroll_up: the selection is anchored to scrollback
         // lines, so it survives the scroll and is left in place.
@@ -7007,6 +7109,8 @@ mod tests {
     /// goes to pane 0 alone, so a pointer over a neighbouring pane must not be
     /// mapped against the full rect: that reported a column past pane 0's right
     /// edge to the agent as though its own pane were window-wide.
+    /// It also round-trips a painted composite cursor cell through mouse mapping,
+    /// pinning the bottom-follow clipping semantics.
     #[test]
     fn composited_preview_maps_the_mouse_into_pane_zero_only() {
         use ratatui::layout::Rect;
@@ -7014,7 +7118,12 @@ mod tests {
         let pane = Rect::new(0, 0, 80, 24);
         let mut split = cursor_for(true, true, true);
         split.mouse_all = true;
-        split.composite_pane0 = Some((40, 24));
+        split.composite_pane0 = Some(crate::tmux::PaneGeom {
+            left: 0,
+            top: 0,
+            width: 40,
+            height: 24,
+        });
 
         // Inside pane 0: maps as before, 1-based.
         assert_eq!(
@@ -7029,10 +7138,43 @@ mod tests {
         assert!(hover_forward_bytes(&split, pane, 39, 5).is_some());
         assert_eq!(hover_forward_bytes(&split, pane, 40, 5), None);
 
+        // In the bottom-follow layout, the composite's top border row is
+        // clipped before painting: `first_line == pane0.top == 1`. The cursor
+        // mapper adds `top` after its anchor delta, while the mouse rect stays
+        // at the visible output origin. A click on the painted cursor must
+        // round-trip to that cursor's 1-based app cell.
+        let mut bottom_follow = cursor_for(true, true, true);
+        bottom_follow.x = 10;
+        bottom_follow.y = 4;
+        bottom_follow.pane_height = 25;
+        bottom_follow.composite_pane0 = Some(crate::tmux::PaneGeom {
+            left: 0,
+            top: 1,
+            width: 40,
+            height: 24,
+        });
+        let painted = crate::tui::home::render::map_live_preview_cursor(
+            pane,
+            usize::from(pane.height),
+            25,
+            bottom_follow,
+        )
+        .expect("visible pane cursor");
+        assert_eq!(
+            map_pane_cell(mouse_pane_rect(&bottom_follow, pane), painted.x, painted.y,),
+            (bottom_follow.x + 1, bottom_follow.y + 1),
+            "clicking the painted cursor must report the same app cell"
+        );
+
         // A no-mouse full-screen agent gets no page key from a wheel aimed at
         // the neighbour either, but keeps it over pane 0.
         let mut no_mouse = cursor_for(true, false, false);
-        no_mouse.composite_pane0 = Some((40, 24));
+        no_mouse.composite_pane0 = Some(crate::tmux::PaneGeom {
+            left: 0,
+            top: 0,
+            width: 40,
+            height: 24,
+        });
         assert_eq!(wheel_forward_key(&no_mouse, true, pane, 60, 5), None);
         assert!(wheel_forward_key(&no_mouse, true, pane, 10, 5).is_some());
 
@@ -7065,7 +7207,12 @@ mod tests {
         use ratatui::layout::Rect;
         let pane = Rect::new(2, 3, 20, 10);
         let mut cursor = cursor_for(true, true, true);
-        cursor.composite_pane0 = Some((999, 999));
+        cursor.composite_pane0 = Some(crate::tmux::PaneGeom {
+            left: 0,
+            top: 0,
+            width: 999,
+            height: 999,
+        });
         assert_eq!(mouse_pane_rect(&cursor, pane), pane);
         // And the origin is honoured: a cell above/left of the rect is outside.
         assert_eq!(mouse_target_rect(&cursor, pane, 1, 3), None);

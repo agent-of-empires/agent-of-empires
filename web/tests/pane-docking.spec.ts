@@ -122,11 +122,17 @@ test.describe("Dockable pane system", () => {
 
     await page.goto(`/session/${SESSION}`);
 
-    // The plugin pane gets its own activity-bar toggle and a dock tab.
+    // The plugin pane gets its own activity-bar toggle, but no tab until asked
+    // for: `autoOpenPluginPanes` defaults off, so an installed plugin does not
+    // push its pane into every session. Opening it from the activity bar is
+    // the on-demand path that default now relies on.
     const paneId = "plugin:acme.demo:demo_pane";
     await expect(page.locator(`[data-testid="pane-toggle-${paneId}"]`)).toBeVisible();
-    // Only the active tab's body mounts, so activate the plugin tab first.
-    await page.getByTestId(`pane-tab-${paneId}`).click();
+    await expect(page.getByTestId(`pane-tab-${paneId}`)).toHaveCount(0);
+    // openOrRevealTab both adds the tab and activates it, and only the active
+    // tab's body mounts, so the pane body follows from the one click.
+    await page.locator(`[data-testid="pane-toggle-${paneId}"]`).click();
+    await expect(page.getByTestId(`pane-tab-${paneId}`)).toBeVisible();
     await expect(page.locator('[data-testid="plugin-pane-body"][data-plugin-id="acme.demo"]')).toBeVisible();
 
     // Clicking the pane's action button forwards its method to the worker.
@@ -160,8 +166,10 @@ test.describe("Dockable pane system", () => {
 
     await page.goto(`/session/${SESSION}`);
 
+    // Plugin panes default closed, so open this one from the activity bar
+    // before checking that a collapse round-trip preserves it.
     const paneId = "plugin:acme.demo:demo_pane";
-    await page.getByTestId(`pane-tab-${paneId}`).click();
+    await page.locator(`[data-testid="pane-toggle-${paneId}"]`).click();
     await expect(page.locator('[data-testid="plugin-pane-body"][data-plugin-id="acme.demo"]')).toBeVisible();
 
     const handle = page.getByTestId("content-split-resize-handle");

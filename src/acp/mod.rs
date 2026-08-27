@@ -24,7 +24,9 @@ pub mod background_agent;
 pub mod capability_probe;
 pub mod client;
 pub mod context_primer;
+pub mod control_cache;
 pub mod control_protocol;
+pub mod dispatch;
 pub mod elicitations;
 pub mod event_store;
 pub mod fs_handler;
@@ -44,9 +46,10 @@ pub mod session_tee;
 pub mod state;
 pub mod supervisor;
 pub mod terminal_handler;
+pub mod transcript;
 #[cfg(feature = "serve")]
 pub mod version_probe;
 
-pub use agent_registry::{AgentRegistry, AgentSpec};
+pub use agent_registry::{inherited_acp_base, AgentRegistry, AgentSpec};
 pub use approvals::{Approval, ApprovalDecision, Nonce};
 pub use state::{AcpState, Event};

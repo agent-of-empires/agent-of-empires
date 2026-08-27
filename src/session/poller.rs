@@ -103,11 +103,84 @@ impl AdaptiveInterval {
     }
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) enum SessionIdGuard {
+    Unguarded,
+    /// Pre-launch-marker compat path: OMP sessions captured before the launch
+    /// marker generation existed carry no generation to CAS against, so they
+    /// persist unguarded. Kept so panes launched by an older aoe stay
+    /// attributable across an upgrade; new launches always emit
+    /// `OmpGeneration`. Removable once no unmarked OMP pane can outlive an
+    /// upgrade.
+    OmpLegacy,
+    OmpGeneration(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct SessionIdObservation {
+    pub(crate) sid: String,
+    pub(crate) guard: SessionIdGuard,
+}
+
+pub(crate) type SessionIdPollFn =
+    Box<dyn Fn(&str) -> Option<SessionIdObservation> + Send + 'static>;
+
+impl SessionIdObservation {
+    pub(crate) fn unguarded(sid: String) -> Self {
+        Self {
+            sid,
+            guard: SessionIdGuard::Unguarded,
+        }
+    }
+
+    pub(crate) fn omp_legacy(sid: String) -> Self {
+        Self {
+            sid,
+            guard: SessionIdGuard::OmpLegacy,
+        }
+    }
+    pub(crate) fn omp(sid: String, generation: String) -> Self {
+        Self {
+            sid,
+            guard: SessionIdGuard::OmpGeneration(generation),
+        }
+    }
+}
+
 /// Command sent to the session poller thread
 #[derive(Debug, Clone, Copy)]
 enum PollCommand {
-    /// Stop the poller thread
+    /// Stop the poller thread.
     Stop,
+    /// Forget the last report so an observation whose durable write failed or
+    /// lost a CAS can be emitted again.
+    RetryLast,
+}
+
+/// Resolve and observe one poll target. A dead name must remain the resolved
+/// target for two consecutive ticks before it terminates the poller: a tmux
+/// rename between resolution and the liveness probe makes the old name look
+/// absent for one tick, while the next tick can resolve the renamed pane.
+fn poll_resolved_target<T>(
+    instance_id: &str,
+    initial_session_name: &str,
+    resolve_target: impl FnOnce(&str, &str) -> String,
+    is_pane_dead: impl FnOnce(&str) -> bool,
+    observe: impl FnOnce(&str) -> Option<T>,
+    dead_candidate: &mut Option<String>,
+) -> (String, bool, Option<T>) {
+    let target = resolve_target(instance_id, initial_session_name);
+    if is_pane_dead(&target) {
+        let should_stop = dead_candidate.as_deref() == Some(target.as_str());
+        if !should_stop {
+            *dead_candidate = Some(target.clone());
+        }
+        return (target, should_stop, None);
+    }
+
+    *dead_candidate = None;
+    let observation = observe(&target);
+    (target, false, observation)
 }
 
 /// Manages polling thread lifecycle and inter-thread communication via mpsc channels.
@@ -118,7 +191,7 @@ enum PollCommand {
 /// `Drop` alone cannot guarantee prompt shutdown. The poller thread holds
 /// the `cmd_rx` receiver; when `SessionPoller` drops, the corresponding
 /// `cmd_tx` sender is dropped too and `recv_timeout` returns `Disconnected`
-/// immediately -- so in the common case the thread exits promptly.
+/// immediately; so in the common case the thread exits promptly.
 ///
 /// `stop()` sends an explicit `PollCommand::Stop` and joins the thread,
 /// providing a deterministic shutdown path for callers like `Instance::kill`
@@ -127,8 +200,9 @@ pub struct SessionPoller {
     session_name: String,
     cmd_tx: mpsc::Sender<PollCommand>,
     cmd_rx: Option<mpsc::Receiver<PollCommand>>,
-    result_tx: mpsc::Sender<(String, String)>,
-    result_rx: Option<mpsc::Receiver<(String, String)>>,
+    result_tx: mpsc::Sender<(String, SessionIdObservation)>,
+    result_rx: Option<mpsc::Receiver<(String, SessionIdObservation)>>,
+    pending_observation: Option<(String, SessionIdObservation)>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -152,6 +226,7 @@ impl SessionPoller {
             cmd_rx: Some(cmd_rx),
             result_tx,
             result_rx: Some(result_rx),
+            pending_observation: None,
             handle: None,
         }
     }
@@ -166,6 +241,21 @@ impl SessionPoller {
         poll_fn: Box<dyn Fn() -> Option<String> + Send + 'static>,
         on_change: Box<dyn Fn(&str) + Send + 'static>,
         initial_known: Option<String>,
+    ) -> bool {
+        self.start_observations(
+            instance_id,
+            Box::new(move |_| poll_fn().map(SessionIdObservation::unguarded)),
+            on_change,
+            initial_known.map(SessionIdObservation::unguarded),
+        )
+    }
+
+    pub(crate) fn start_observations(
+        &mut self,
+        instance_id: String,
+        poll_fn: SessionIdPollFn,
+        on_change: Box<dyn Fn(&str) + Send + 'static>,
+        initial_known: Option<SessionIdObservation>,
     ) -> bool {
         let cmd_rx = match self.cmd_rx.take() {
             Some(rx) => rx,
@@ -193,7 +283,7 @@ impl SessionPoller {
             }
         };
 
-        let session_name = self.session_name.clone();
+        let initial_session_name = self.session_name.clone();
         let thread_label = format!("aoe-poller/{}", instance_id);
         let result_tx = self.result_tx.clone();
 
@@ -215,36 +305,68 @@ impl SessionPoller {
                     POLL_STABLE_THRESHOLD,
                 );
 
-                let report = |new_id_opt: Option<String>,
-                              last: &mut Option<String>,
+                let report = |new_observation: Option<SessionIdObservation>,
+                              last: &mut Option<SessionIdObservation>,
                               interval: &mut AdaptiveInterval| {
-                    match new_id_opt {
-                        Some(new_id) if last.as_deref() != Some(&new_id) => {
-                            on_change(&new_id);
-                            let _ = result_tx.send((instance_id.clone(), new_id.clone()));
-                            *last = Some(new_id);
+                    match new_observation {
+                        Some(observation) if last.as_ref() != Some(&observation) => {
+                            on_change(&observation.sid);
+                            let _ =
+                                result_tx.send((instance_id.clone(), observation.clone()));
+                            *last = Some(observation);
                             interval.record_change();
                         }
                         _ => interval.record_no_change(),
                     }
                 };
 
-                // Immediate first poll (e.g. pre-existing sessions loaded from disk).
-                report(poll_fn(), &mut last_known, &mut interval);
+                let mut dead_candidate = None;
+                let mut poll_tick = || {
+                    poll_resolved_target(
+                        &instance_id,
+                        &initial_session_name,
+                        crate::tmux::live_agent_session_name,
+                        crate::tmux::utils::is_pane_dead,
+                        |target| poll_fn(target),
+                        &mut dead_candidate,
+                    )
+                };
 
+                // Immediate first poll (e.g. pre-existing sessions loaded from disk).
+                let (target, should_stop, observation) = poll_tick();
+                if should_stop {
+                    tracing::info!(target: "session.create", "Pane dead for {}, stopping poller", target);
+                    return;
+                }
+                report(observation, &mut last_known, &mut interval);
                 loop {
                     match cmd_rx.recv_timeout(interval.current()) {
-                        Ok(PollCommand::Stop) => break,
+                        Ok(PollCommand::Stop) => {
+                            // Capture the pane's final observable state before
+                            // the owner joins and drains this poller. Restart
+                            // relies on this boundary to preserve a session
+                            // switch that landed just before teardown.
+                            let (_, should_stop, observation) = poll_tick();
+                            if !should_stop {
+                                report(observation, &mut last_known, &mut interval);
+                            }
+                            break;
+                        }
+                        Ok(PollCommand::RetryLast) => {
+                            last_known = None;
+                            interval.record_change();
+                        }
                         Err(RecvTimeoutError::Timeout) => {}
                         Err(RecvTimeoutError::Disconnected) => break,
                     }
 
-                    if crate::tmux::utils::is_pane_dead(&session_name) {
-                        tracing::info!(target: "session.create", "Pane dead for {}, stopping poller", session_name);
+                    let (target, should_stop, observation) = poll_tick();
+                    if should_stop {
+                        tracing::info!(target: "session.create", "Pane dead for {}, stopping poller", target);
                         break;
                     }
 
-                    report(poll_fn(), &mut last_known, &mut interval);
+                    report(observation, &mut last_known, &mut interval);
                 }
             });
 
@@ -262,21 +384,78 @@ impl SessionPoller {
                 let (result_tx, result_rx) = mpsc::channel();
                 self.result_tx = result_tx;
                 self.result_rx = Some(result_rx);
+                self.pending_observation = None;
                 false
             }
         }
     }
 
-    /// Drain a pending session ID update, if any. Returns `(instance_id, session_id)`.
-    pub fn try_recv_session_update(&self) -> Option<(String, String)> {
+    pub(crate) fn try_recv_observation(&self) -> Option<(String, SessionIdObservation)> {
         self.result_rx.as_ref()?.try_recv().ok()
     }
 
-    #[cfg(any(test, feature = "test-support"))]
-    pub(crate) fn inject_test_update(&self, instance_id: &str, session_id: &str) {
+    /// Drain newly queued observations into a sticky one-slot mailbox and
+    /// lease the newest value without consuming it. The value remains
+    /// available to a concurrent stop/final flush until a terminal outcome
+    /// acknowledges it.
+    pub(crate) fn latest_observation(&mut self) -> Option<(String, SessionIdObservation)> {
+        while let Some(observation) = self.try_recv_observation() {
+            self.pending_observation = Some(observation);
+        }
+        self.pending_observation.clone()
+    }
+
+    /// Acknowledge only the observation that reached a terminal outcome. A
+    /// stale writer must not erase a newer correction queued in the meantime.
+    pub(crate) fn acknowledge_observation(
+        &mut self,
+        expected: &(String, SessionIdObservation),
+    ) -> bool {
+        if self.pending_observation.as_ref() == Some(expected) {
+            self.pending_observation = None;
+            true
+        } else {
+            false
+        }
+    }
+
+    #[cfg(any(test, all(feature = "test-support", feature = "serve")))]
+    pub fn inject_test_update(&self, instance_id: &str, session_id: &str) {
         self.result_tx
-            .send((instance_id.to_string(), session_id.to_string()))
+            .send((
+                instance_id.to_string(),
+                SessionIdObservation::unguarded(session_id.to_string()),
+            ))
             .expect("inject_test_update: result channel disconnected");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_test_omp_update(
+        &self,
+        instance_id: &str,
+        session_id: &str,
+        generation: &str,
+    ) {
+        self.result_tx
+            .send((
+                instance_id.to_string(),
+                SessionIdObservation::omp(session_id.to_string(), generation.to_string()),
+            ))
+            .expect("inject_test_omp_update: result channel disconnected");
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_test_omp_legacy_update(&self, instance_id: &str, session_id: &str) {
+        self.result_tx
+            .send((
+                instance_id.to_string(),
+                SessionIdObservation::omp_legacy(session_id.to_string()),
+            ))
+            .expect("inject_test_omp_legacy_update: result channel disconnected");
+    }
+
+    pub(crate) fn retry_last_observation(&self) {
+        let _ = self.cmd_tx.send(PollCommand::RetryLast);
     }
 
     /// Stop the poller thread and wait for it to finish
@@ -308,7 +487,13 @@ impl Default for SessionPoller {
 mod tests {
     use super::*;
     use serial_test::serial;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{Arc, Mutex, MutexGuard};
+
+    fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+        mutex
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 
     /// Restores `ACTIVE_POLLER_COUNT` to its original value on drop.
     struct CountRestorer(u32);
@@ -428,6 +613,59 @@ mod tests {
     }
 
     #[test]
+    fn rename_between_resolution_and_liveness_retries_the_new_name() {
+        let initial = "aoe_Old_12345678";
+        let renamed = "aoe_New_12345678";
+        let current = std::cell::RefCell::new(initial.to_string());
+        let resolution_count = std::cell::Cell::new(0);
+        let observed = std::cell::RefCell::new(Vec::new());
+        let mut dead_candidate = None;
+
+        let (target, should_stop, observation) = poll_resolved_target(
+            "12345678abcdef",
+            initial,
+            |_, derived| {
+                assert_eq!(derived, initial);
+                resolution_count.set(resolution_count.get() + 1);
+                current.borrow().clone()
+            },
+            |target| {
+                assert_eq!(target, initial);
+                *current.borrow_mut() = renamed.to_string();
+                true
+            },
+            |_| -> Option<&str> {
+                panic!("a name that became dead during the tick must not be observed")
+            },
+            &mut dead_candidate,
+        );
+        assert_eq!(target, initial);
+        assert!(!should_stop, "one dead tick may be an in-flight rename");
+        assert!(observation.is_none());
+
+        let (target, should_stop, observation) = poll_resolved_target(
+            "12345678abcdef",
+            initial,
+            |_, _| {
+                resolution_count.set(resolution_count.get() + 1);
+                current.borrow().clone()
+            },
+            |_| false,
+            |target| {
+                observed.borrow_mut().push(target.to_string());
+                Some("sid-after-rename")
+            },
+            &mut dead_candidate,
+        );
+        assert_eq!(target, renamed);
+        assert!(!should_stop);
+        assert_eq!(observation, Some("sid-after-rename"));
+        assert_eq!(observed.into_inner(), vec![renamed.to_string()]);
+        assert_eq!(resolution_count.get(), 2, "one resolution per tick");
+        assert!(dead_candidate.is_none());
+    }
+
+    #[test]
     fn test_adaptive_interval_with_constants() {
         let mut interval = AdaptiveInterval::new(
             POLL_INITIAL_INTERVAL,
@@ -448,7 +686,7 @@ mod tests {
         let call_count_clone = call_count.clone();
 
         let poll_fn: Box<dyn Fn() -> Option<String> + Send + 'static> = Box::new(move || {
-            let mut count = call_count_clone.lock().unwrap();
+            let mut count = lock_unpoisoned(&call_count_clone);
             *count += 1;
             if *count <= 1 {
                 Some("id-1".to_string())
@@ -459,9 +697,8 @@ mod tests {
 
         let changed_ids: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let changed_ids_clone = changed_ids.clone();
-
         let on_change: Box<dyn Fn(&str) + Send + 'static> = Box::new(move |id: &str| {
-            changed_ids_clone.lock().unwrap().push(id.to_string());
+            lock_unpoisoned(&changed_ids_clone).push(id.to_string());
         });
 
         let mut poller = SessionPoller::new("test-session".to_string());
@@ -472,19 +709,21 @@ mod tests {
             Some("id-1".to_string()),
         );
 
-        // Wait for the adaptive interval (2s initial) to fire at least once
+        // Wait for the adaptive interval (2s initial) to fire at least once.
         std::thread::sleep(Duration::from_millis(2500));
+        poller.retry_last_observation();
+        std::thread::sleep(Duration::from_millis(100));
         poller.stop();
 
-        let ids = changed_ids.lock().unwrap();
-        assert!(
-            ids.contains(&"id-2".to_string()),
-            "on_change should have been called with id-2, got: {:?}",
-            *ids
-        );
+        let ids = lock_unpoisoned(&changed_ids);
         assert!(
             !ids.contains(&"id-1".to_string()),
             "on_change should NOT have been called with id-1 (initial known)"
+        );
+        assert_eq!(
+            ids.iter().filter(|id| id.as_str() == "id-2").count(),
+            2,
+            "a failed durable write must be able to request the same observation again"
         );
     }
 
@@ -533,14 +772,14 @@ mod tests {
     #[test]
     #[serial]
     fn test_poller_cleanup_decrements_counter() {
-        let entered = Arc::new(Mutex::new(false));
-        let entered_clone = entered.clone();
+        let poll_count = Arc::new(Mutex::new(0u32));
+        let poll_count_clone = poll_count.clone();
 
         let mut poller = SessionPoller::new("test-session".to_string());
         poller.start(
             "test-cleanup".to_string(),
             Box::new(move || {
-                *entered_clone.lock().unwrap() = true;
+                *lock_unpoisoned(&poll_count_clone) += 1;
                 Some("id".to_string())
             }),
             Box::new(|_| {}),
@@ -560,7 +799,10 @@ mod tests {
             count_before_stop,
             count_after_stop
         );
-        assert!(*entered.lock().unwrap(), "poll_fn should have been called");
+        assert!(
+            *lock_unpoisoned(&poll_count) >= 2,
+            "stop must perform a final poll after the immediate first poll"
+        );
     }
 
     #[test]
@@ -630,7 +872,7 @@ mod tests {
         let poll_count_clone = poll_count.clone();
 
         let poll_fn: Box<dyn Fn() -> Option<String> + Send + 'static> = Box::new(move || {
-            let mut count = poll_count_clone.lock().unwrap();
+            let mut count = lock_unpoisoned(&poll_count_clone);
             *count += 1;
             Some("ses_polled".to_string())
         });
@@ -642,7 +884,7 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(100));
 
-        let count = *poll_count.lock().unwrap();
+        let count = *lock_unpoisoned(&poll_count);
         assert!(
             count > 0,
             "poller should have started polling immediately (count={})",

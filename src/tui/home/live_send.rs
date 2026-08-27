@@ -351,6 +351,8 @@ pub(super) enum TmuxAction {
         count: usize,
     },
     HexBytes(Vec<u8>),
+    /// A multi-line paste routed through `paste-buffer -p`.
+    Paste(String),
     Resize {
         cols: u16,
         rows: u16,
@@ -395,6 +397,13 @@ pub(super) fn coalesce(batch: Vec<WorkerMsg>) -> Vec<TmuxAction> {
                     Some(TmuxAction::HexBytes(prev)) => prev.extend_from_slice(&bytes),
                     _ => out.push(TmuxAction::HexBytes(bytes)),
                 }
+            }
+            WorkerMsg::Send(TmuxKey::Paste(text)) => {
+                // Never merged: a paste is one discrete tmux paste-buffer
+                // call, and folding it into a neighbouring run would put the
+                // payload back on the literal path the markers came from.
+                flush(&mut out, &mut run);
+                out.push(TmuxAction::Paste(text));
             }
             WorkerMsg::Resize { cols, rows } => {
                 flush(&mut out, &mut run);
@@ -783,12 +792,9 @@ pub(in crate::tui) struct LiveCaptureWorker {
     /// cursor query (a one-line `display-message` folded into the capture
     /// fork) runs every cycle, not just live ones.
     cursor: std::sync::Arc<std::sync::Mutex<Option<crate::tmux::PaneCursor>>>,
-    /// Newest OSC 52 clipboard write the displayed pane's agent has emitted
-    /// (VT path only; `capture-pane` returns rendered cells, so the fallback
-    /// path never sees the escape). Single-slot like `latest`; drained by the
-    /// render loop via `take_agent_clipboard`, which forwards it to the host
-    /// clipboard (#2420). Cleared on `set_target` so a copy from the old pane
-    /// can't land after a retarget.
+    /// Newest OSC 52 clipboard write the displayed pane has emitted. A VT grid
+    /// extracts it from the live byte stream; terminal capture uses a separate
+    /// raw observer so rendered snapshots never need to carry the escape.
     clipboard: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     /// Whether the worker may render through a VT channel (`[tmux] vt_live`).
     /// Pushed by the render reconcile at spawn and on config refresh
@@ -796,6 +802,10 @@ pub(in crate::tui) struct LiveCaptureWorker {
     /// down an armed channel (disabling its `pipe-pane`) and falls back to
     /// the capture path in place, no restart needed.
     vt_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the raw OSC 52 observer may run when terminal rendering uses
+    /// capture-pane. Mirrors the Clipboard Pass-through setting, so disabled
+    /// mode does not keep a second pipe-pane connection open.
+    clipboard_capture_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl Drop for LiveCaptureWorker {
@@ -939,19 +949,15 @@ fn capture_composited_over_grid(
         return capture_composited(name, lines, forward_empty);
     };
 
-    // The cursor is pane 0's, and tmux puts pane 0 at the window origin, so its
-    // coordinates already index the composite with no translation. What must be
-    // restated is the frame it is measured against: the renderer anchors the
-    // cursor by `pane_height` against the painted line count, which is now the
-    // whole window rather than one pane.
+    // The sampled cursor stays pane relative after its rows are painted on
+    // the window grid. Rebase only the frame dimensions and carry pane 0's
+    // rectangle so the renderer can add its origin.
     cursor.pane_height = layout.window_height;
     cursor.pane_width = layout.window_width;
     // A composite carries no scrollback (panes have independent histories), so
     // the preview must not advertise any to scroll into.
     cursor.history_size = 0;
-    // Rebasing onto the window erases how wide the input pane is, which mouse
-    // forwarding maps into; carry pane 0's extent so it can clamp.
-    cursor.composite_pane0 = Some((first.width, first.height));
+    cursor.composite_pane0 = Some(first);
     (
         Some(layout.composite_with_first_pane_rows(&rows)),
         Some(cursor),
@@ -990,6 +996,10 @@ impl LiveCaptureWorker {
         // `[tmux] vt_live` value right after spawn (and on every config
         // refresh), so the worker itself never touches the config file.
         let vt_enabled = Arc::new(AtomicBool::new(true));
+        // Start disabled until the render reconcile publishes the Clipboard
+        // Pass-through setting, avoiding an observer before configuration is
+        // available for a newly created worker.
+        let clipboard_capture_enabled = Arc::new(AtomicBool::new(false));
         let lines_cell = capture_lines.clone();
         let target_cell = target.clone();
         let slot = latest.clone();
@@ -1001,6 +1011,8 @@ impl LiveCaptureWorker {
         let clipboard_cell = clipboard.clone();
         #[cfg(unix)]
         let vt_enabled_cell = vt_enabled.clone();
+        #[cfg(unix)]
+        let clipboard_capture_enabled_cell = clipboard_capture_enabled.clone();
         std::thread::spawn(move || {
             let mut last_target = String::new();
             let mut last_captured: Option<String> = None;
@@ -1022,6 +1034,15 @@ impl LiveCaptureWorker {
             // worker also falls back to capture for that pane.
             #[cfg(unix)]
             let mut vt_source: Option<std::sync::Arc<crate::tmux::vt::VtChannel>> = None;
+            // Terminal snapshots do not include raw OSC 52 escapes. When VT is
+            // intentionally off for a terminal pane, this observer restores
+            // clipboard forwarding without constructing a grid or seed.
+            #[cfg(unix)]
+            let mut osc52_source: Option<
+                std::sync::Arc<crate::tmux::vt::Osc52Channel>,
+            > = None;
+            #[cfg(unix)]
+            let mut osc52_seen = 0;
             // When the last arm attempt for the current target ran, so a
             // failure (or a channel death: pane killed and the tmux session
             // recreated under the same name, e.g. a session restart) retries
@@ -1030,6 +1051,8 @@ impl LiveCaptureWorker {
             // panes. Reset on target change so a new pane arms immediately.
             #[cfg(unix)]
             let mut last_vt_arm: Option<std::time::Instant> = None;
+            #[cfg(unix)]
+            let mut last_osc52_arm: Option<std::time::Instant> = None;
             // Panes in the target window, refreshed on the lazy
             // `PANE_COUNT_PROBE_MS` cadence. The seed only covers the window
             // between arming and the first probe, which runs on the first cycle
@@ -1078,6 +1101,9 @@ impl LiveCaptureWorker {
                     {
                         vt_source = None;
                         last_vt_arm = None;
+                        osc52_source = None;
+                        osc52_seen = 0;
+                        last_osc52_arm = None;
                     }
                     pane_count = 1;
                     last_pane_probe = None;
@@ -1089,12 +1115,21 @@ impl LiveCaptureWorker {
                 // for the same target instead of waiting for a retarget.
                 #[cfg(unix)]
                 let vt_enabled = vt_enabled_cell.load(Ordering::Relaxed);
+                #[cfg(unix)]
+                let clipboard_capture_enabled =
+                    clipboard_capture_enabled_cell.load(Ordering::Relaxed);
                 // The throttle resets even when no channel is armed (a failed
                 // arm attempt), so re-enabling always arms on the next cycle.
                 #[cfg(unix)]
                 if !vt_enabled {
                     vt_source = None;
                     last_vt_arm = None;
+                }
+                #[cfg(unix)]
+                if !clipboard_capture_enabled {
+                    osc52_source = None;
+                    osc52_seen = 0;
+                    last_osc52_arm = None;
                 }
                 if lines > 0 && !name.is_empty() {
                     let forward_empty = forward_empty_cell.load(Ordering::Relaxed);
@@ -1119,11 +1154,40 @@ impl LiveCaptureWorker {
                     // still comes from the grid, and only the panes beside it
                     // are re-captured, on their own slower cadence.
                     let composite = pane_count > 1;
-                    // An OSC 52 clipboard write the displayed agent emitted
-                    // since the last cycle (VT path only). Published below
-                    // under the same retarget guard as the cursor.
+                    // An OSC 52 clipboard write the displayed pane emitted
+                    // since the last cycle. Published below under the same
+                    // retarget guard as the cursor.
                     #[cfg(unix)]
-                    let mut clipboard_now: Option<String> = None;
+                    let observe_osc52 = !vt_enabled && forward_empty && clipboard_capture_enabled;
+                    #[cfg(unix)]
+                    if !observe_osc52 {
+                        osc52_source = None;
+                        last_osc52_arm = None;
+                    }
+                    #[cfg(unix)]
+                    if observe_osc52
+                        && osc52_source.is_none()
+                        && last_osc52_arm.is_none_or(|t| t.elapsed() >= VT_REARM_INTERVAL)
+                    {
+                        last_osc52_arm = Some(std::time::Instant::now());
+                        osc52_source = crate::tmux::vt::Osc52Channel::acquire(&name);
+                        if let Some(source) = osc52_source.as_ref() {
+                            osc52_seen = source.clipboard_sequence();
+                        }
+                    }
+                    #[cfg(unix)]
+                    if osc52_source
+                        .as_ref()
+                        .is_some_and(|source| !source.is_alive())
+                    {
+                        osc52_source = None;
+                        osc52_seen = 0;
+                    }
+                    #[cfg(unix)]
+                    let mut clipboard_now = osc52_source.as_ref().and_then(|source| {
+                        source.refresh_owner_heartbeat();
+                        source.clipboard_after(&mut osc52_seen)
+                    });
                     #[cfg(not(unix))]
                     let clipboard_now: Option<String> = None;
                     // Acquire one frame + cursor. Default: sample the in-process
@@ -1342,6 +1406,7 @@ impl LiveCaptureWorker {
             cursor,
             clipboard,
             vt_enabled,
+            clipboard_capture_enabled,
         }
     }
 
@@ -1353,6 +1418,18 @@ impl LiveCaptureWorker {
     pub(in crate::tui) fn set_vt_enabled(&self, enabled: bool) {
         let prev = self
             .vt_enabled
+            .swap(enabled, std::sync::atomic::Ordering::Relaxed);
+        if prev != enabled {
+            self.nudge();
+        }
+    }
+
+    /// Enable raw OSC 52 observation for terminal previews that render via
+    /// capture-pane. This does not affect a VT grid, which already extracts
+    /// clipboard writes from its own pipe.
+    pub(in crate::tui) fn set_clipboard_capture_enabled(&self, enabled: bool) {
+        let prev = self
+            .clipboard_capture_enabled
             .swap(enabled, std::sync::atomic::Ordering::Relaxed);
         if prev != enabled {
             self.nudge();
@@ -1499,8 +1576,18 @@ impl LiveCaptureWorker {
 /// coalescing ordering via `coalesce` directly without needing a real
 /// session.
 fn dispatch_batch(tmux_name: &str, batch: Vec<WorkerMsg>) {
-    for action in coalesce(batch) {
-        if let Err(err) = dispatch_via_fork(tmux_name, &action) {
+    let actions = coalesce(batch);
+    // A `Paste` can only go through tmux (`paste-buffer -p` is what decides
+    // whether the pane gets bracketed-paste markers), so a batch holding one
+    // would otherwise split across two writers: the paste via tmux and its
+    // neighbouring keystrokes via the vt socket. The socket hands bytes to the
+    // `pipe-pane -I` forwarder, which writes to the pty independently, so the
+    // two can land out of order and scramble a type-then-paste sequence. Pin
+    // the whole batch to tmux instead, which serializes its own writes, and
+    // keep the single-writer invariant in `tmux::vt::input_mode` intact.
+    let force_tmux = actions.iter().any(|a| matches!(a, TmuxAction::Paste(_)));
+    for action in actions {
+        if let Err(err) = dispatch_via_fork(tmux_name, &action, force_tmux) {
             tracing::warn!(
                 target: "tui.live_send",
                 error = %err,
@@ -1514,7 +1601,7 @@ fn dispatch_batch(tmux_name: &str, batch: Vec<WorkerMsg>) {
 /// Execute one `TmuxAction` as a one-shot `tmux` subprocess. Module-
 /// level fn (rather than a method on the worker) so it stays callable
 /// from the spawned thread without holding a worker reference.
-fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()> {
+fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction, force_tmux: bool) -> anyhow::Result<()> {
     use std::process::Stdio;
 
     // Fast path (`[tmux] vt_live`): when a *live* input channel is armed for this
@@ -1541,8 +1628,8 @@ fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()>
     // failure to prove the writer is dead, so falling back here could race a
     // still-live socket writer.
     #[cfg(unix)]
-    if let Some(app_cursor) = crate::tmux::vt::input_mode(tmux_name) {
-        if !matches!(action, TmuxAction::Resize { .. }) {
+    if let Some(app_cursor) = crate::tmux::vt::input_mode(tmux_name).filter(|_| !force_tmux) {
+        if !matches!(action, TmuxAction::Resize { .. } | TmuxAction::Paste(_)) {
             let bytes = encode_action_bytes(action, app_cursor);
             if bytes.is_empty() {
                 return Ok(());
@@ -1606,6 +1693,12 @@ fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction) -> anyhow::Result<()>
             // (the web live view's input path uses the same fn).
             return crate::tmux::Session::from_name(tmux_name).send_raw_bytes(bytes);
         }
+        TmuxAction::Paste(text) => {
+            // tmux emits the bracketed-paste markers only if the program in
+            // the pane set DECSET 2004, so a raw shell or a SQL REPL gets
+            // clean text instead of literal `00~` / `01~` leftovers.
+            return crate::tmux::Session::from_name(tmux_name).paste_text(text);
+        }
         TmuxAction::Resize { cols, rows } => {
             // Size the window through `Session::resize_window` so the pane lands
             // at exactly `rows` after tmux's status-bar chrome, the same math the
@@ -1644,6 +1737,9 @@ fn encode_action_bytes(action: &TmuxAction, app_cursor: bool) -> Vec<u8> {
             let one = encode_named_key(name, app_cursor);
             one.repeat(*count)
         }
+        // Paste never reaches here: the vt fast path is skipped for it so
+        // tmux can make the bracketed-paste decision.
+        TmuxAction::Paste(_) => Vec::new(),
         TmuxAction::Resize { .. } => Vec::new(),
     }
 }
@@ -1919,6 +2015,7 @@ pub(super) fn send_key_oneshot(tmux_name: &str, key: TmuxKey) {
         TmuxKey::Named(name) => TmuxAction::Named(name),
         TmuxKey::NamedRepeat { name, count } => TmuxAction::NamedRepeat { name, count },
         TmuxKey::HexBytes(bytes) => TmuxAction::HexBytes(bytes),
+        TmuxKey::Paste(text) => TmuxAction::Paste(text),
     };
     // `Builder::spawn` returns the OS error instead of panicking (`spawn`
     // panics if the OS refuses a new thread), so a thread-creation failure
@@ -1929,7 +2026,8 @@ pub(super) fn send_key_oneshot(tmux_name: &str, key: TmuxKey) {
         .name("aoe-wheel-forward".to_string())
         .spawn(move || {
             let _slot = OneshotSlot;
-            if let Err(err) = dispatch_via_fork(&tmux_name, &action) {
+            // A wheel notch is never a paste, so the vt fast path stays open.
+            if let Err(err) = dispatch_via_fork(&tmux_name, &action, false) {
                 tracing::warn!(
                     target: "tui.live_send",
                     error = %err,
@@ -2019,6 +2117,10 @@ pub(super) enum TmuxKey {
         count: usize,
     },
     HexBytes(Vec<u8>),
+    /// A multi-line paste, delivered through tmux's `paste-buffer -p` so
+    /// tmux decides whether the receiving program gets bracketed-paste
+    /// markers. Never merged with neighbours: it is one discrete paste.
+    Paste(String),
 }
 
 /// Map one crossterm `KeyEvent` onto a `LiveDispatch`.
@@ -2791,6 +2893,32 @@ mod tests {
                     rows: 40
                 },
                 TmuxAction::Literal("c".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn coalesce_paste_breaks_literal_run_and_never_merges() {
+        // A paste must stay its own action: folding it into a
+        // neighbouring literal run would put the payload back on the
+        // `send-keys` path, where tmux never gets to decide about the
+        // bracketed-paste markers (the `00~` / `01~` bug), and would
+        // also drop the #1546 one-paste framing for agents that DO set
+        // DECSET 2004. Ordering across the batch has to survive too.
+        let out = coalesce(vec![
+            snd_lit("a"),
+            snd_lit("b"),
+            WorkerMsg::Send(TmuxKey::Paste("x\ny".into())),
+            snd_lit("c"),
+            WorkerMsg::Send(TmuxKey::Paste("p\nq".into())),
+        ]);
+        assert_eq!(
+            out,
+            vec![
+                TmuxAction::Literal("ab".into()),
+                TmuxAction::Paste("x\ny".into()),
+                TmuxAction::Literal("c".into()),
+                TmuxAction::Paste("p\nq".into()),
             ]
         );
     }

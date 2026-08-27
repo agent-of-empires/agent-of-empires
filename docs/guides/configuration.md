@@ -135,12 +135,13 @@ Notification = "waiting"
 | `agent_extra_args` | `{}` | Per-agent extra arguments appended after the binary (e.g., `{ opencode = "--port 8080" }`). |
 | `agent_command_override` | `{}` | Per-agent command override replacing the binary entirely (e.g., `{ claude = "my-claude-wrapper" }`). |
 | `custom_agents` | `{}` | User-defined agents: name to command mapping. Custom agent names appear in the TUI agent picker alongside built-in agents. |
-| `agent_detect_as` | `{}` | Status detection mapping: maps an agent name to a built-in agent whose status heuristics should be used. |
+| `agent_detect_as` | `{}` | Maps a custom agent to a built-in agent it inherits. Reuses that built-in's status heuristics, and (when the built-in has an ACP adapter) makes the custom agent structured view-capable through it without an `agent_acp_cmd`; the base's adapter binary then runs instead of the wrapper (see [Running a custom agent in the structured view](#running-a-custom-agent-in-the-structured-view)). |
 | `agent_acp_cmd` | `{}` | ACP launch command for a custom agent, enabling it to run in structured view (e.g., `{ "oc-superpowers" = "ocp run sp acp" }`). A custom agent with an entry here is structured view-capable; without one it stays tmux-only. Unlike `custom_agents`, the value is split into argv and run directly, with no shell. |
 | `acp.restrict_agents` | `false` | Restrict structured view sessions to `acp.allowed_agents`. Off leaves every registered agent available. Read from the global config only: a profile override cannot widen it, so a shared or locked-down deployment cannot be loosened by its own users. Changing the web value requires the passphrase step-up. |
 | `acp.allowed_agents` | `[]` | ACP registry keys a structured view session may run while `acp.restrict_agents` is on, e.g. `["claude", "codex"]`. These are registry keys, not binary names, and each alias counts separately (allowing `claude` does not allow `claude-code`). With the restriction on, an empty list denies every agent. Governs the structured view only; a terminal session runs in a pane where any binary can be launched, so it is not constrained here. A policy change applies to new sessions immediately and to an already-running worker when it next respawns or when the daemon restarts, at which point a worker on a now-disallowed agent is terminated rather than reattached. |
 | `acp.acp_defaults` | `{}` | Per-agent defaults for structured view startup (under the `[acp]` section, not `[session]`). `model` is forwarded when the worker starts; `effort` (thinking) and `mode` are applied through the agent's ACP config options (`thought_level`, `mode`) when advertised, and skipped with a warning otherwise. `effort_by_model` (a `{model = effort}` map) overrides `effort` for the resolved model. Editable per agent from the web dashboard (Structured view tab, Structured View Defaults). Example: `[acp.acp_defaults.opencode] model = "openai/gpt-5.5" effort = "high" mode = "plan"`. |
 | `agents.<name>.status_map` | `{}` | Trusted global/profile-only hook event to AoE status mappings. Valid statuses are `running`, `waiting`, `idle`, and `error`. Entries apply by event name to built-in hook defaults, so duplicate event names with different matchers all receive the same status; new event names are added to the installed hooks when the agent format supports event keys. Existing hook files update on the next hook install, usually a new or restarted session. Agent processes with installed status hooks receive `AOE_PROFILE`, so hook scripts can query the resolved map with `aoe -p "$AOE_PROFILE" profile show --status-map <agent> --json`. |
+| `agents.<name>.status_rules` | `[]` | Trusted global/profile-only declarative pane status rules (`[[agents.<name>.status_rules]]` array of tables). Each rule has `status` (`running`, `waiting`, `idle`, or `error`) and exactly one of `contains` (case-insensitive substring) or `regex` (Rust regex, matched as written; use `(?i)` for case-insensitive). Rules are evaluated in order against the ANSI-stripped pane snapshot; first match wins, no match reports `idle`. Rules take precedence over `agent_detect_as` and over a built-in detector of the same name. Invalid rules are skipped with a warning in the debug log. Takes effect on the next config resolve (TUI or daemon start). |
 
 For Codex, AoE preserves existing `[hooks.state]` trust data and writes `~/.codex/config.toml` through `config.toml.lock` plus an atomic replace. This keeps repeated or concurrent AoE launches from duplicating hook blocks or leaving partial TOML.
 
@@ -193,11 +194,30 @@ agent_detect_as = { "lenovo-claude" = "claude" }
 ```
 
 - **`custom_agents`**: Maps a display name to the shell command AoE runs in a tmux pane when that agent is selected. Names appear in the TUI picker alongside built-ins like `claude`, `opencode`, and `codex`, and work with `aoe add --tool <name>`.
-- **`agent_detect_as`** (optional): Reuses a built-in agent's status detection for the custom agent. Without it, custom agents default to `Idle`.
+- **`agent_detect_as`** (optional): Reuses a built-in agent's status detection for the custom agent, and marks the custom agent as inheriting that built-in. Without it (and without `status_rules`, below), custom agents default to `Idle`. Best for wrappers that run the *same* binary differently (SSH, scripts); for an agent whose output differs from every built-in, use `status_rules` instead. When the base agent has an ACP adapter, this mapping also lets the wrapper run in the structured view through that adapter (see [Running a custom agent in the structured view](#running-a-custom-agent-in-the-structured-view)).
 - **`agent_acp_cmd`** (optional): ACP launch command that lets the agent run in the structured view (see below).
 - **`default_tool`** (optional): Can point at a custom-agent name to default new sessions to it.
 
 Custom agents are always shown as available in the picker since their command may target a remote host or wrapper. All three maps are editable in config files or the TUI settings screen and support profile/repo overrides; profile/repo values fully replace the global map (redeclare any agents you want to keep). The Web wizard can select a configured custom agent but does not expose or edit the command strings.
+
+#### Status rules for custom agents
+
+`agent_detect_as` only works when the custom agent renders the same output as the built-in it aliases. For a harness that is *similar to but not the same binary as* any built-in, declare pane status rules instead; no change to the agent is needed:
+
+```toml
+[session.custom_agents]
+gjc = "gjc"
+
+[[agents.gjc.status_rules]]
+status = "waiting"
+contains = "(y/n)"
+
+[[agents.gjc.status_rules]]
+status = "running"
+regex = "esc to interrupt|thinking"
+```
+
+Rules are checked in order against the last screenful of ANSI-stripped pane text every status poll; the first match wins and no match reports `idle`. Put the more specific states (`waiting`, `error`) before the broad `running` matchers. When an agent has rules, they take precedence over its `agent_detect_as` alias and over a built-in detector of the same name.
 
 #### Running a custom agent in the structured view
 
@@ -213,6 +233,20 @@ Give an agent an ACP launch command in `agent_acp_cmd` to run it in the structur
 
 The `agent_acp_cmd` value is split into argv and executed directly with no shell, so for shell features wrap explicitly, e.g. `"sh -lc 'source ~/.profile && ocp run sp acp'"`. The name must match a `custom_agents` entry and cannot shadow a built-in. A custom agent with no `agent_acp_cmd` runs in the terminal view.
 
+**Inheriting a supported agent.** If your custom agent only wraps a supported one (for example separate tools that each run Claude Code against a different profile / oauth location), you do not need to spell out `agent_acp_cmd` at all. Map the wrapper to its base with `agent_detect_as`, and it inherits the base's ACP adapter automatically:
+
+```toml
+[session.custom_agents]
+"work-claude" = "CLAUDE_CONFIG_DIR=/Users/me/.claude-work claude"
+
+[session.agent_detect_as]
+"work-claude" = "claude"
+```
+
+`work-claude` is now structured view-capable through `claude-agent-acp`, and the existing terminal session's **Switch to structured view** action becomes available. **The wrapper binary itself is never executed**: structured view runs the base agent's adapter instead (inheriting its version gate and env allowlist), so it renders exactly like the base agent. Anything the wrapper does outside that CLI, such as selecting an account, gateway, or profile by setting env, does not apply. AoE logs a warning to the daemon log at spawn whenever a structured view session launches this way. Inheritance only works when the base has a built-in ACP adapter (`claude`, `codex`, `opencode`, `gemini`, `vibe`, `pi`, `omp`, `kimi`); a wrapper mapped to a terminal-only base (e.g. `cursor`) stays tmux-only.
+
+To pass overrides to a host (non-sandboxed) structured session anyway, use the session's `extra_env` / [Host Environment](#host-environment) (for example `environment = ["CLAUDE_CONFIG_DIR=/Users/me/.claude-work"]`) or `session.inherit_host_environment`, the same as any other agent. Those are host paths and host env: they do not reach a Docker-sandboxed session, which reads only `sandbox.environment` and pins its own config dir at a container path (`AGENT_CONFIG_MOUNTS` bind-mounts it and path-valued vars like `CLAUDE_CONFIG_DIR` are stripped at the container boundary). For a sandboxed wrapper, set the container-side value in `sandbox.environment`, or give the wrapper a real ACP command with `agent_acp_cmd`. An explicit `agent_acp_cmd` still wins if you set both.
+
 ## Host Environment
 
 ```toml
@@ -226,6 +260,8 @@ environment = [
 Top-level `environment` injects env vars into every host (non-sandboxed) session spawned at global scope, in both the terminal and the structured view. Useful for pinning a Claude/Codex/Gemini config dir per profile, forwarding an API token, or otherwise scoping per-agent state without exporting variables shell-wide.
 
 Each entry follows the same grammar as `sandbox.environment`:
+
+Keys must match `[A-Za-z_][A-Za-z0-9_]*` (an ASCII letter or `_` first, then ASCII alphanumerics or `_`). Any other key is dropped with a warning; Docker and `Command::env` are laxer than this, so a key like `FOO-BAR` or `foo.bar` is accepted by the runtime but silently rejected here.
 
 - **`KEY=value`**: literal value, passed through verbatim. `~` is not expanded; use an absolute path.
 - **`KEY=$VAR`**: read `$VAR` from the host env at spawn time (skipped with a warning if `$VAR` is unset).
@@ -354,7 +390,7 @@ before_session = ['my-account-switcher env']                            # host s
 
 The two fields mirror the split the static env lists already make: `before_start` serves sandboxed sessions (the dynamic counterpart of `sandbox.environment`), `before_session` serves host sessions (the counterpart of the top-level [`environment`](#host-environment)). A launch runs exactly one of them, chosen by whether the session is sandboxed, so the same key is never minted twice.
 
-`before_start` runs each time a sandbox container comes up (on create and on restart, so short-lived values are refreshed before the agent launches). It re-mints when the container is created fresh or restarted from a stopped state (including after a Docker daemon restart leaves it stopped); attaching to an already-running container reuses the values from the last run and only backfills if none are stashed yet, so it is not re-run on every reattach. Each `KEY=VALUE` line the command prints to stdout is injected into the container environment as an **inherited** variable: the value is passed to the `docker` invocation through the process environment, never in argv, so it does not appear in `ps`. Lines that are not `KEY=VALUE` are ignored, and the hook's stdout is never logged, so it is safe to print a secret. A non-zero exit aborts bringing the container up.
+`before_start` runs each time a sandbox container comes up (on create and on restart, so short-lived values are refreshed before the agent launches). It re-mints when the container is created fresh or restarted from a stopped state (including after a Docker daemon restart leaves it stopped); attaching to an already-running container reuses the values from the last run and only backfills if none are stashed yet, so it is not re-run on every reattach. Each `KEY=VALUE` line the command prints to stdout is injected into the container environment as an **inherited** variable: the value is passed to the `docker` invocation through the process environment, never in argv, so it does not appear in `ps`. Lines that are not `KEY=VALUE` are ignored, and the hook's stdout is never logged, so it is safe to print a secret. A non-zero exit aborts bringing the container up. A line whose key is a single token but does not match `[A-Za-z_][A-Za-z0-9_]*` (e.g. `FOO-BAR=x`) is dropped with a warning; a diagnostic line whose key contains spaces (e.g. `fetching token from url=https://...`) is ignored silently.
 
 `before_session` runs each time a **host** (non-sandboxed) session is launched, before the agent starts, and applies its `KEY=VALUE` lines to the agent's own environment. Same stdout contract as `before_start`: other lines are ignored, stdout is never logged, and a non-zero exit aborts the launch. It re-runs on every host launch, including restart and a view switch that respawns the agent, and nothing is persisted between launches, so a short-lived value is refreshed rather than replayed.
 
@@ -400,11 +436,11 @@ vt_live = true
 |--------|---------|-------------|
 | `status_bar` | `"auto"` | Paints aoe's themed status bar (session title, branch, sandbox, detach hint) on its own sessions. `"auto"` steps aside whenever you have a tmux config at all, because the bar is a whole theme rather than one option and a half-merge of yours with aoe's would please nobody; `"enabled"` always paints it; `"disabled"` never does. Not painting it reverts aoe's session-scoped `status*` overrides so your own config governs, so `"disabled"` means "stop styling the bar", not "hide it". |
 | `mouse` | `"auto"` | Sets tmux `mouse` on aoe's sessions, which is what turns a wheel scroll (or the Web dashboard's touch scroll) into tmux copy-mode scrollback. `"auto"` leaves the option untouched when your own tmux config sets `mouse`, so your `set -g mouse ...` governs, and enables it otherwise (including when your tmux config exists but never mentions `mouse`, since tmux's own default is off). `"enabled"` always turns it on; `"disabled"` always turns it off, for aoe's sessions only. |
-| `clipboard` | `"auto"` | Forwards OSC 52 clipboard escape sequences from the wrapped agent (Claude Code, OpenCode, Codex, etc.) to your terminal or Web dashboard. Without this, "select to copy" inside the agent silently fails. Sets `set-clipboard on` and `allow-passthrough on` for the aoe session (the attached path), and in live-send aoe itself extracts the agent's OSC 52 from the pane stream and pushes it to the native or browser clipboard. `"auto"` steps aside only when your own tmux config sets one of those two options, the same per-option rule as `mouse`; `"enabled"` always applies them; `"disabled"` never does. Live-send forwarding is on for `"auto"` and `"enabled"` (your tmux config cannot affect aoe's in-process transport, so `"auto"` does not defer to it here); `"disabled"` turns it off. |
+| `clipboard` | `"auto"` | Forwards OSC 52 clipboard escape sequences from the wrapped agent (Claude Code, OpenCode, Codex, etc.) to your terminal or Web dashboard. Without this, "select to copy" inside the agent silently fails. Sets `set-clipboard on` and `allow-passthrough on` for the aoe session (the attached path), and in live-send aoe extracts OSC 52 from either the VT stream or a terminal snapshot's raw observer before pushing it to the native or browser clipboard. `"auto"` steps aside only when your own tmux config sets one of those two options, the same per-option rule as `mouse`; `"enabled"` always applies them; `"disabled"` never does. Live-send forwarding is on for `"auto"` and `"enabled"` (your tmux config cannot affect aoe's in-process transport, so `"auto"` does not defer to it here); `"disabled"` turns it off. |
 
 Detection for the per-option modes (`mouse`, `clipboard`) reads `~/.tmux.conf`, `$XDG_CONFIG_HOME/tmux/tmux.conf`, and `~/.config/tmux/tmux.conf`, looking for a `set` / `setw` of the option. It is deliberately conservative: an option reached via `source-file`, wrapped in `if-shell`, guarded by a false `%if`, or set from inside a key binding (`bind m set -g mouse`) is not detected, and aoe applies its own value. Set the mode to `"disabled"` if you keep yours in one of those places. `/etc/tmux.conf` is not consulted; it is not your file.
 | `socket_name` | unset | Run aoe's sessions on a private tmux server with this socket name (passed as `tmux -L <name>`), so your own `tmux ls` and hand-managed sessions stay separate from aoe's. Leave unset to share the default tmux server (the current behavior). Must be a bare name, not a path; a value with a `/` or `\` is ignored. Takes effect on the next aoe start. Global/profile only. |
-| `vt_live` | `true` | Render live views (the TUI live preview and the web/mobile live terminal) from a persistent VT channel: `tmux pipe-pane` streams the pane into an in-process terminal grid, and keystrokes go back over the same socket. Needs tmux 3.4+; panes that cannot arm a channel fall back to the polling `capture-pane` / `send-keys` path automatically. Disable only to troubleshoot the VT transport; the fallback is slower and loses agent clipboard forwarding in live-send. Applies in place: the TUI picks a change up on the next capture cycle, web connections on their next reconnect. |
+| `vt_live` | `true` | Render native agent and tool previews from a persistent VT channel: `tmux pipe-pane` streams the pane into an in-process terminal grid, and keystrokes go back over the same socket. Terminal previews, including the Web dashboard, always use tmux's rendered `capture-pane` snapshots to avoid prompt-paint races; a raw observer retains OSC 52 clipboard forwarding without affecting rendering. Disabling this setting makes native agent and tool previews use the slower `capture-pane` / `send-keys` path. Applies in place on the next TUI capture cycle. |
 
 ## Diff
 
@@ -481,6 +517,6 @@ Profile overrides go in `~/.agent-of-empires/profiles/<name>/config.toml` and us
 
 Per-repo settings go in `.agent-of-empires/config.toml` at your project root. Run `aoe init` to generate a template.
 
-Repo config supports: `[hooks]`, `[session]`, `[sandbox]`, and `[worktree]` sections. It does not support `[tmux]`, `[updates]`, `[claude]`, or `[diff]` (those are personal settings).
+Repo config supports: `[hooks]`, `[session]`, `[sandbox]`, and `[worktree]` sections. It does not support `[tmux]`, `[sound]`, `[updates]`, `[claude]`, or `[diff]` (those are personal settings).
 
 See [Repo Config & Hooks](repo-config.md) for details.

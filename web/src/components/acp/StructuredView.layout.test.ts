@@ -1,3 +1,8 @@
+// @vitest-environment jsdom
+//
+// jsdom (not node) because importing StructuredView pulls in useWebSettings,
+// whose module-level default snapshot reads window.innerWidth.
+//
 // Layout-decision test for the structured-view root keyboard reservation
 // added in #2011. The pure helper lets us check the inline style across the
 // iOS-regular-Safari case (keyboardHeight > 0) and the layout-shrinking

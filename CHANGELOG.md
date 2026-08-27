@@ -4,6 +4,147 @@ All notable changes to Agent of Empires will be documented in this file.
 
 The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 
+## [1.15.0](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.15.0) - 2026-08-21
+
+
+
+### Bug Fixes
+
+- **session:** Attribute OMP captures to the launching pane in [#3230](https://github.com/agent-of-empires/agent-of-empires/pull/3230) by [@jerome-benoit](https://github.com/jerome-benoit) ([`e7a35d7`](https://github.com/agent-of-empires/agent-of-empires/commit/e7a35d75420e6eee43f409cff0491ca32353064e))
+- **tui:** Keep poller repair off the render loop in [#3348](https://github.com/agent-of-empires/agent-of-empires/pull/3348) by [@njbrake](https://github.com/njbrake) ([`5c79164`](https://github.com/agent-of-empires/agent-of-empires/commit/5c7916444bcca9d9cc1123deb2c7b39f607cbb68))
+- **tui:** Preserve trailing bg fills in preview captures in [#3339](https://github.com/agent-of-empires/agent-of-empires/pull/3339) by [@mikaoelitiana](https://github.com/mikaoelitiana) ([`ca81ec3`](https://github.com/agent-of-empires/agent-of-empires/commit/ca81ec3a0039c6a4ca16ef4a99160c098d2ee4d8))
+- **tui:** Keep held keys out of paste bursts in [#3352](https://github.com/agent-of-empires/agent-of-empires/pull/3352) by [@njbrake](https://github.com/njbrake) ([`76e86b6`](https://github.com/agent-of-empires/agent-of-empires/commit/76e86b635674495a33b9a78e78a71b356a66bc73))
+- **tui:** Truncate settings custom-instruction preview on a char boundary in [#3354](https://github.com/agent-of-empires/agent-of-empires/pull/3354) by [@BTForIT](https://github.com/BTForIT) ([`56ebc37`](https://github.com/agent-of-empires/agent-of-empires/commit/56ebc375fc0c2ca750c1d39718e7615aeeba3e3d))
+- **send:** Claude Enter swallowed by paste-burst window leaves unsubmitted [Pasted text] in [#3355](https://github.com/agent-of-empires/agent-of-empires/pull/3355) by [@BTForIT](https://github.com/BTForIT) ([`9a6db1a`](https://github.com/agent-of-empires/agent-of-empires/commit/9a6db1ab8068779e01c886839c172f2e5a2a7a16))
+- **acp:** Allow switching structured sessions to configured custom agents in [#3338](https://github.com/agent-of-empires/agent-of-empires/pull/3338) by [@karljuhlthefool](https://github.com/karljuhlthefool) ([`44cda8d`](https://github.com/agent-of-empires/agent-of-empires/commit/44cda8d088c48d8c1bd8448b6331cf070610b31e))
+- **config:** Stop advertising inert repo [tmux] and [sound] overrides in [#3359](https://github.com/agent-of-empires/agent-of-empires/pull/3359) by [@MatthewWolff](https://github.com/MatthewWolff) ([`98953c9`](https://github.com/agent-of-empires/agent-of-empires/commit/98953c95506ae7a0635676cb535fc6b1e4df4400))
+- **tui:** Give the synthetic scratch bucket its own group identity in [#3357](https://github.com/agent-of-empires/agent-of-empires/pull/3357) by [@MatthewWolff](https://github.com/MatthewWolff) ([`e7c5780`](https://github.com/agent-of-empires/agent-of-empires/commit/e7c5780c7e79258c1c475a63b03136a318324768))
+- **config:** Surface config load errors and unrecognized keys in [#3358](https://github.com/agent-of-empires/agent-of-empires/pull/3358) by [@MatthewWolff](https://github.com/MatthewWolff) ([`9382840`](https://github.com/agent-of-empires/agent-of-empires/commit/938284044d7786ff808647e017039f67f7180aed))
+- **tui:** Report sandbox container usage in System Health in [#3365](https://github.com/agent-of-empires/agent-of-empires/pull/3365) by [@njbrake](https://github.com/njbrake) ([`dda9a27`](https://github.com/agent-of-empires/agent-of-empires/commit/dda9a27f701d32d50e24c28ca9a21af7df8ac1a8))
+- **test:** Wait for the pane command to exec instead of sleeping 200ms in [#3367](https://github.com/agent-of-empires/agent-of-empires/pull/3367) by [@njbrake](https://github.com/njbrake) ([`05f9206`](https://github.com/agent-of-empires/agent-of-empires/commit/05f9206e6eb68a2b14e52a2c18eb249853f11984))
+- **acp:** Forward non-Claude provider keys to their ACP adapters in [#3360](https://github.com/agent-of-empires/agent-of-empires/pull/3360) by [@MatthewWolff](https://github.com/MatthewWolff) ([`de6dc53`](https://github.com/agent-of-empires/agent-of-empires/commit/de6dc539366d32b51b2cf6b5b05087895f3b735c))
+- **web:** Fall back to main-thread highlighting when the diff worker fails to load in [#3363](https://github.com/agent-of-empires/agent-of-empires/pull/3363) by [@Seluj78](https://github.com/Seluj78) ([`2f106f1`](https://github.com/agent-of-empires/agent-of-empires/commit/2f106f19cb33b786298569ab15d3c7d43e8e1e33))
+- **session:** Resolve a stale agent_detect_as alias instead of freezing at Idle in [#3398](https://github.com/agent-of-empires/agent-of-empires/pull/3398) by [@njbrake](https://github.com/njbrake) ([`9881155`](https://github.com/agent-of-empires/agent-of-empires/commit/9881155bec50631976503b5b3140ab6688df7d6a))
+- **logging:** Keep expected git failures and disabled plugins out of WARN in [#3404](https://github.com/agent-of-empires/agent-of-empires/pull/3404) by [@njbrake](https://github.com/njbrake) ([`82cefed`](https://github.com/agent-of-empires/agent-of-empires/commit/82cefedd11d072f6dd8b02b78fd53b09d02f4134))
+- **serve:** Stop reporting a force-stop teardown race as a server fault in [#3406](https://github.com/agent-of-empires/agent-of-empires/pull/3406) by [@njbrake](https://github.com/njbrake) ([`dd05c9b`](https://github.com/agent-of-empires/agent-of-empires/commit/dd05c9b8dc42d40a98cbc4153161c01dba67fb64))
+- **logging:** Put method and route template on http.request completion in [#3405](https://github.com/agent-of-empires/agent-of-empires/pull/3405) by [@njbrake](https://github.com/njbrake) ([`9b0572f`](https://github.com/agent-of-empires/agent-of-empires/commit/9b0572f7bf4fba2c27f79801ed336f3e90a2ae7b))
+- **config:** Never treat the global config.toml as a repo config in [#3407](https://github.com/agent-of-empires/agent-of-empires/pull/3407) by [@njbrake](https://github.com/njbrake) ([`71bf927`](https://github.com/agent-of-empires/agent-of-empires/commit/71bf927308291a2029b84aa77edc06212128ff2a))
+- **tui:** Confirm the quick-delete shortcut instead of trashing on one keystroke in [#3408](https://github.com/agent-of-empires/agent-of-empires/pull/3408) by [@klubrake](https://github.com/klubrake) ([`efb73ae`](https://github.com/agent-of-empires/agent-of-empires/commit/efb73aef36e82eef36adf187f6eaaea6fc1e388f))
+- **session:** Resolve Claude's config dir per profile when reading its state in [#3410](https://github.com/agent-of-empires/agent-of-empires/pull/3410) by [@njbrake](https://github.com/njbrake) ([`d2b76ff`](https://github.com/agent-of-empires/agent-of-empires/commit/d2b76ff13797dc32ef49bc43697ab662dbd03890))
+- **web:** Let diff comments send to a dormant session, and say why when Send is blocked in [#3416](https://github.com/agent-of-empires/agent-of-empires/pull/3416) by [@Seluj78](https://github.com/Seluj78) ([`26e5fe9`](https://github.com/agent-of-empires/agent-of-empires/commit/26e5fe9399463c1fa7d979f4eee511b092a7431f))
+- **web:** Splice slash commands at the caret through the DOM in [#3420](https://github.com/agent-of-empires/agent-of-empires/pull/3420) by [@Seluj78](https://github.com/Seluj78) ([`c6a41c4`](https://github.com/agent-of-empires/agent-of-empires/commit/c6a41c4069a814243126e30dce5ee5fa2bd5d2f7))
+- **sv:** Adopt the daemon's turn_active so steered prompts stop wedging the composer in [#3419](https://github.com/agent-of-empires/agent-of-empires/pull/3419) by [@Seluj78](https://github.com/Seluj78) ([`5d9dccb`](https://github.com/agent-of-empires/agent-of-empires/commit/5d9dccbdb103cf3b295a9a87c200e96deeb0a351))
+- **session:** Scope hermes conversation capture to the project in [#3381](https://github.com/agent-of-empires/agent-of-empires/pull/3381) by [@jerome-benoit](https://github.com/jerome-benoit) ([`8a5a4ed`](https://github.com/agent-of-empires/agent-of-empires/commit/8a5a4ed867ab0a0d5200f5785f4094e380f8982d))
+- **tmux:** Omp provider errors and retries no longer read Idle in [#3383](https://github.com/agent-of-empires/agent-of-empires/pull/3383) by [@jerome-benoit](https://github.com/jerome-benoit) ([`5e38f7f`](https://github.com/agent-of-empires/agent-of-empires/commit/5e38f7f9db6396c36aaa916aefd0d6a50c5bff94))
+- **tmux:** Read Claude's folder-trust prompt as waiting, not idle in [#3412](https://github.com/agent-of-empires/agent-of-empires/pull/3412) by [@blueagledev](https://github.com/blueagledev) ([`a4361e8`](https://github.com/agent-of-empires/agent-of-empires/commit/a4361e88dae9b037c3ae4d043b4ffea704837567))
+- **tui:** Let tmux decide bracketed paste on live-send multi-line pastes in [#3431](https://github.com/agent-of-empires/agent-of-empires/pull/3431) by [@klubrake](https://github.com/klubrake) ([`0910523`](https://github.com/agent-of-empires/agent-of-empires/commit/0910523bf483fc49187f421ac24575e429654b81))
+- **acp:** Scope ambient Claude credentials in [#3382](https://github.com/agent-of-empires/agent-of-empires/pull/3382) by [@shixi-li](https://github.com/shixi-li) ([`710ac06`](https://github.com/agent-of-empires/agent-of-empires/commit/710ac06eeef8188a75a6c633b588aba6de47e1be))
+- **tmux:** Require an idle pane for the folder-trust arm in [#3447](https://github.com/agent-of-empires/agent-of-empires/pull/3447) by [@njbrake](https://github.com/njbrake) ([`e04d727`](https://github.com/agent-of-empires/agent-of-empires/commit/e04d7270abde31fa9b06b054b160fcc7a4e09cb2))
+- **acp:** Accept standard session/load response in [#3385](https://github.com/agent-of-empires/agent-of-empires/pull/3385) by [@amatouhake](https://github.com/amatouhake) ([`07751aa`](https://github.com/agent-of-empires/agent-of-empires/commit/07751aa1236ccb0c6958832e69df0b849b41018d))
+- **build:** Stop watching .git/index for the build-version rerun trigger in [#3432](https://github.com/agent-of-empires/agent-of-empires/pull/3432) by [@cwrau](https://github.com/cwrau) ([`b094cf9`](https://github.com/agent-of-empires/agent-of-empires/commit/b094cf961f4b2b161c1a1cce2f3ba99839ed57b9))
+- **session:** Require a regular file in the Claude transcript scan in [#3454](https://github.com/agent-of-empires/agent-of-empires/pull/3454) by [@blueagledev](https://github.com/blueagledev) ([`a7ebc08`](https://github.com/agent-of-empires/agent-of-empires/commit/a7ebc08e2095b05667651bff18cd3329e8e0a885))
+- **sv:** Keep workers alive for cwd-stable renames in [#3428](https://github.com/agent-of-empires/agent-of-empires/pull/3428) by [@jerome-benoit](https://github.com/jerome-benoit) ([`5762f00`](https://github.com/agent-of-empires/agent-of-empires/commit/5762f006588742765b877df75135bae3380809e6))
+- **session:** Reject duplicate smart rename titles in [#3426](https://github.com/agent-of-empires/agent-of-empires/pull/3426) by [@jerome-benoit](https://github.com/jerome-benoit) ([`42c9b9d`](https://github.com/agent-of-empires/agent-of-empires/commit/42c9b9dd8e216ffc399f0725eb7bb5a203174e8f))
+- **storage:** Preserve atomic write error contract in [#3423](https://github.com/agent-of-empires/agent-of-empires/pull/3423) by [@jerome-benoit](https://github.com/jerome-benoit) ([`6500195`](https://github.com/agent-of-empires/agent-of-empires/commit/6500195718192b91aa7bb3d8e50b3c008432e308))
+- **tui:** Finalize session creation atomically in [#3424](https://github.com/agent-of-empires/agent-of-empires/pull/3424) by [@jerome-benoit](https://github.com/jerome-benoit) ([`7148ad5`](https://github.com/agent-of-empires/agent-of-empires/commit/7148ad5efac4f44d7ee1598fd9ddd1a71a67d1a1))
+- **session:** Require a regular file in the container transcript scan in [#3467](https://github.com/agent-of-empires/agent-of-empires/pull/3467) by [@blueagledev](https://github.com/blueagledev) ([`4861602`](https://github.com/agent-of-empires/agent-of-empires/commit/48616026b06ebc60a0deca9b1e6e340f2221e9cd))
+- **containers:** Bound runtime control commands in [#3458](https://github.com/agent-of-empires/agent-of-empires/pull/3458) by [@jerome-benoit](https://github.com/jerome-benoit) ([`560d6a8`](https://github.com/agent-of-empires/agent-of-empires/commit/560d6a8d0b63f4e1a285790ffa1ebf898afb7798))
+- **web:** Keep plugin panes closed by default in [#3464](https://github.com/agent-of-empires/agent-of-empires/pull/3464) by [@karljuhlthefool](https://github.com/karljuhlthefool) ([`91e3370`](https://github.com/agent-of-empires/agent-of-empires/commit/91e3370268cd8c919f7da3bb4f48f75886d5da1e))
+- **git:** Bound worktree mutation commands in [#3457](https://github.com/agent-of-empires/agent-of-empires/pull/3457) by [@jerome-benoit](https://github.com/jerome-benoit) ([`d91186f`](https://github.com/agent-of-empires/agent-of-empires/commit/d91186f82c5253c133dd2c24b5064afa778ab62f))
+- **core:** Enforce session rename uniqueness in [#3411](https://github.com/agent-of-empires/agent-of-empires/pull/3411) by [@jerome-benoit](https://github.com/jerome-benoit) ([`c93e0ec`](https://github.com/agent-of-empires/agent-of-empires/commit/c93e0ec4c99c6e69e93d7421fefe20ca2e8f5f2a))
+
+
+### Features
+
+- **tui:** Add codex quick permission responses in [#3347](https://github.com/agent-of-empires/agent-of-empires/pull/3347) by [@athal7](https://github.com/athal7) ([`4768122`](https://github.com/agent-of-empires/agent-of-empires/commit/4768122945874beac2f29ecf95be65ad98bfdd36))
+- **tui:** Add optional memory diagnostics strip in [#3326](https://github.com/agent-of-empires/agent-of-empires/pull/3326) by [@MatthewWolff](https://github.com/MatthewWolff) ([`9ed5799`](https://github.com/agent-of-empires/agent-of-empires/commit/9ed579937cde8bf29c1d2873dd3e7c4612d6ece7))
+- **plugin:** Add home-pane UI extensions in [#3346](https://github.com/agent-of-empires/agent-of-empires/pull/3346) by [@MatthewWolff](https://github.com/MatthewWolff) ([`8d69fb3`](https://github.com/agent-of-empires/agent-of-empires/commit/8d69fb379d3fa0be4f85abfd4cc27b9290cc917e))
+- **web:** Add conversation font size controls to the structured view in [#3299](https://github.com/agent-of-empires/agent-of-empires/pull/3299) by [@summelon](https://github.com/summelon) ([`1dec841`](https://github.com/agent-of-empires/agent-of-empires/commit/1dec8419e69a0a97a5379c9d3c2460ab2b3fab19))
+- **worktree:** Per-repo base branches in multi-repo workspaces, and a per-repo diff base in [#3333](https://github.com/agent-of-empires/agent-of-empires/pull/3333) by [@Seluj78](https://github.com/Seluj78) ([`59628ac`](https://github.com/agent-of-empires/agent-of-empires/commit/59628acac833286e53f0e55323600e37a8885e74))
+- **cli:** Filter and expose session state in `aoe list` in [#3361](https://github.com/agent-of-empires/agent-of-empires/pull/3361) by [@MatthewWolff](https://github.com/MatthewWolff) ([`2110173`](https://github.com/agent-of-empires/agent-of-empires/commit/21101735671f9fef396de098a399920a0df6e6e5))
+- **sv:** Mobile UX fixes, agent inheritance, sandbox sub-agent transcript in [#3386](https://github.com/agent-of-empires/agent-of-empires/pull/3386) by [@njbrake](https://github.com/njbrake) ([`67407b6`](https://github.com/agent-of-empires/agent-of-empires/commit/67407b6e6e5590efbd69979b38e1a650f2a06f8b))
+- **web:** Show hidden folders toggle in the directory browser in [#3443](https://github.com/agent-of-empires/agent-of-empires/pull/3443) by [@Seluj78](https://github.com/Seluj78) ([`a412957`](https://github.com/agent-of-empires/agent-of-empires/commit/a41295782a3bf029f0f11639f9b8af78bf9f0147))
+- **cli:** Add state and timestamps to `session show --json` in [#3414](https://github.com/agent-of-empires/agent-of-empires/pull/3414) by [@blueagledev](https://github.com/blueagledev) ([`a5d33d0`](https://github.com/agent-of-empires/agent-of-empires/commit/a5d33d06ce3b6ba65addcb8dbedfed14eafed5c0))
+
+
+### Other
+
+- Merge pull request #3345 from jerome-benoit/test/absolute-shell-path-independent in [#3345](https://github.com/agent-of-empires/agent-of-empires/pull/3345) by [@njbrake](https://github.com/njbrake) ([`b25f96d`](https://github.com/agent-of-empires/agent-of-empires/commit/b25f96d51c1353d24ec8c9516e672eb8b2a69362))
+- Remove Star History section from README by [@njbrake](https://github.com/njbrake) ([`f1177fc`](https://github.com/agent-of-empires/agent-of-empires/commit/f1177fc289fad11e75d5d2be2b27daf1d36b7b31))
+
+
+
+### New Contributors
+
+- [@karljuhlthefool](https://github.com/karljuhlthefool) made their first contribution in [#3464](https://github.com/agent-of-empires/agent-of-empires/pull/3464)
+- [@blueagledev](https://github.com/blueagledev) made their first contribution in [#3467](https://github.com/agent-of-empires/agent-of-empires/pull/3467)
+- [@amatouhake](https://github.com/amatouhake) made their first contribution in [#3385](https://github.com/agent-of-empires/agent-of-empires/pull/3385)
+- [@klubrake](https://github.com/klubrake) made their first contribution in [#3431](https://github.com/agent-of-empires/agent-of-empires/pull/3431)
+- [@floze-the-genius](https://github.com/floze-the-genius) made their first contribution in [#3356](https://github.com/agent-of-empires/agent-of-empires/pull/3356)
+- [@mikaoelitiana](https://github.com/mikaoelitiana) made their first contribution in [#3339](https://github.com/agent-of-empires/agent-of-empires/pull/3339)
+
+**Full Changelog**: https://github.com/agent-of-empires/agent-of-empires/compare/v1.14.1...v1.15.0
+## [1.14.1](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.14.1) - 2026-08-12
+
+
+
+### Bug Fixes
+
+- **session:** Forward host env to structured-view agents in [#3266](https://github.com/agent-of-empires/agent-of-empires/pull/3266) by [@njbrake](https://github.com/njbrake) ([`b40982d`](https://github.com/agent-of-empires/agent-of-empires/commit/b40982db9da57a23e20c8b6213beade7daaeac95))
+- **containers:** Accept Apple container 1.0+ inspect status shape in [#3263](https://github.com/agent-of-empires/agent-of-empires/pull/3263) by [@shixi-li](https://github.com/shixi-li) ([`985de43`](https://github.com/agent-of-empires/agent-of-empires/commit/985de4392d22c9870444e34821de0dc6819eea4d))
+- **web:** Scope skills spec status locators past the update banner in [#3273](https://github.com/agent-of-empires/agent-of-empires/pull/3273) by [@njbrake](https://github.com/njbrake) ([`b5855f6`](https://github.com/agent-of-empires/agent-of-empires/commit/b5855f66cc3ffc61c8c87773f2212f73aabb4667))
+- **session:** Reject shell-injection env keys at every ingestion point in [#3270](https://github.com/agent-of-empires/agent-of-empires/pull/3270) by [@jerome-benoit](https://github.com/jerome-benoit) ([`7159fb4`](https://github.com/agent-of-empires/agent-of-empires/commit/7159fb49355c14367eee80d0215f07ec18f1b160))
+- **session:** Remove workspace dir non-recursively to protect user data in [#3271](https://github.com/agent-of-empires/agent-of-empires/pull/3271) by [@jerome-benoit](https://github.com/jerome-benoit) ([`55619b8`](https://github.com/agent-of-empires/agent-of-empires/commit/55619b8d44055a5cce6eb18f26fcc295eeba3608))
+- **session:** Ignore Codex subagent rollouts during capture in [#3261](https://github.com/agent-of-empires/agent-of-empires/pull/3261) by [@jona-wilmsmann](https://github.com/jona-wilmsmann) ([`75d69ea`](https://github.com/agent-of-empires/agent-of-empires/commit/75d69ea451a3264190428bdf2c49b5f63f7d8b52))
+- **tui:** Stop TUI from persisting structured-session status, and two related daemon-apply guards (#3201) in [#3209](https://github.com/agent-of-empires/agent-of-empires/pull/3209) by [@jerome-benoit](https://github.com/jerome-benoit) ([`c7e24ef`](https://github.com/agent-of-empires/agent-of-empires/commit/c7e24efe8e8131a2b64f0468a1cec9e45283824f))
+- **web:** Improve iOS terminal input and scrolling in [#3286](https://github.com/agent-of-empires/agent-of-empires/pull/3286) by [@njbrake](https://github.com/njbrake) ([`6301a3b`](https://github.com/agent-of-empires/agent-of-empires/commit/6301a3bdf4603cfe921467a859492a5e4392edce))
+- Repair push notification suppression by [@njbrake](https://github.com/njbrake) ([`f5e2550`](https://github.com/agent-of-empires/agent-of-empires/commit/f5e25503e34b05c3b13b93e706d8c0c9672530c8))
+- Correct mobile recent sessions by [@njbrake](https://github.com/njbrake) ([`fb35819`](https://github.com/agent-of-empires/agent-of-empires/commit/fb35819943c0b07ad48e55d23e2a38344ca3c466))
+- **web:** Preserve mobile live input through ownership handshake in [#3288](https://github.com/agent-of-empires/agent-of-empires/pull/3288) by [@njbrake](https://github.com/njbrake) ([`9cd37b6`](https://github.com/agent-of-empires/agent-of-empires/commit/9cd37b63f8dc46ff6ff0d0718f4195cc3406838f))
+- **web:** Prevent iOS page scroll in alternate-screen terminals in [#3291](https://github.com/agent-of-empires/agent-of-empires/pull/3291) by [@njbrake](https://github.com/njbrake) ([`6954cd3`](https://github.com/agent-of-empires/agent-of-empires/commit/6954cd3fd048df61f892f4212552fdf3c9286cdb))
+- **config:** Document env key grammar and quiet the hook-stdout warning in [#3292](https://github.com/agent-of-empires/agent-of-empires/pull/3292) by [@njbrake](https://github.com/njbrake) ([`7a4913e`](https://github.com/agent-of-empires/agent-of-empires/commit/7a4913e82f273db1d529fa495bdb57f136626dc4))
+- Render terminal previews from tmux snapshots in [#3315](https://github.com/agent-of-empires/agent-of-empires/pull/3315) by [@njbrake](https://github.com/njbrake) ([`2df8c76`](https://github.com/agent-of-empires/agent-of-empires/commit/2df8c7644b708331deb33515830dee4adec869e1))
+- **cli:** Error on duplicate session add in [#3311](https://github.com/agent-of-empires/agent-of-empires/pull/3311) by [@shixi-li](https://github.com/shixi-li) ([`62b3aab`](https://github.com/agent-of-empires/agent-of-empires/commit/62b3aab38d26ed466a38742012c61bd527acef1a))
+- **sandbox:** Isolate Codex homes per session in [#3317](https://github.com/agent-of-empires/agent-of-empires/pull/3317) by [@njbrake](https://github.com/njbrake) ([`af50d46`](https://github.com/agent-of-empires/agent-of-empires/commit/af50d468958f8d43878ee2477aca6383ee49bdaa))
+- **session:** Clear the old engine's session state on a tool swap in [#3289](https://github.com/agent-of-empires/agent-of-empires/pull/3289) by [@Eric162](https://github.com/Eric162) ([`6cbc4cb`](https://github.com/agent-of-empires/agent-of-empires/commit/6cbc4cb29a1160353819c117263e2540ad14953c))
+- **web:** Align forwarded mouse clicks with live grid in [#3318](https://github.com/agent-of-empires/agent-of-empires/pull/3318) by [@njbrake](https://github.com/njbrake) ([`623767f`](https://github.com/agent-of-empires/agent-of-empires/commit/623767f900f1374a7b9f9027da85600fd926f7f1))
+- Composite split panes in web terminal in [#3321](https://github.com/agent-of-empires/agent-of-empires/pull/3321) by [@njbrake](https://github.com/njbrake) ([`2e593c4`](https://github.com/agent-of-empires/agent-of-empires/commit/2e593c4a74b4fe42110581546df40c1dd16529b9))
+- **session:** Keep host Codex resumes on their own conversation in [#3300](https://github.com/agent-of-empires/agent-of-empires/pull/3300) by [@bjkim95](https://github.com/bjkim95) ([`7559245`](https://github.com/agent-of-empires/agent-of-empires/commit/75592456f8e62c9d3e73e954705dbaa7f27cd2e3))
+- Preserve working directory after login shell startup in [#3314](https://github.com/agent-of-empires/agent-of-empires/pull/3314) by [@adRn-s](https://github.com/adRn-s) ([`1271390`](https://github.com/agent-of-empires/agent-of-empires/commit/1271390bb67fe0d1f5c7fe943a01d5d8ae72ebc5))
+- **tui:** Retain low-contrast fallback for permission selector focused choice in [#3269](https://github.com/agent-of-empires/agent-of-empires/pull/3269) by [@athal7](https://github.com/athal7) ([`2115427`](https://github.com/agent-of-empires/agent-of-empires/commit/21154272450b29efc755144730428dcda6ff6764))
+- **cli:** Harden tmux dispatch for headless add --launch and send in [#3293](https://github.com/agent-of-empires/agent-of-empires/pull/3293) by [@athal7](https://github.com/athal7) ([`62008cd`](https://github.com/agent-of-empires/agent-of-empires/commit/62008cdd2da7b90c6022404ad280d30cc95e611c))
+- **session:** Scope pi session-id fallback to the target project in [#3325](https://github.com/agent-of-empires/agent-of-empires/pull/3325) by [@athal7](https://github.com/athal7) ([`087fac2`](https://github.com/agent-of-empires/agent-of-empires/commit/087fac2ccfa5978ee443d59863b01534c369bb68))
+- Preserve statuses when tmux probe fails in [#3335](https://github.com/agent-of-empires/agent-of-empires/pull/3335) by [@njbrake](https://github.com/njbrake) ([`f2b81a6`](https://github.com/agent-of-empires/agent-of-empires/commit/f2b81a62b7991dce6b88a956b21a21128627d818))
+- **plugin:** Drop aoe-plugin topic results that carry no manifest in [#3330](https://github.com/agent-of-empires/agent-of-empires/pull/3330) by [@Seluj78](https://github.com/Seluj78) ([`174a2fc`](https://github.com/agent-of-empires/agent-of-empires/commit/174a2fcee27a61a346875166e0084395ff57a5b3))
+- **web:** Drain queued structured-view prompts while the chat is unmounted in [#3332](https://github.com/agent-of-empires/agent-of-empires/pull/3332) by [@Seluj78](https://github.com/Seluj78) ([`47119c7`](https://github.com/agent-of-empires/agent-of-empires/commit/47119c7dc463c1aa7b654db8d3324a80abec2666))
+- Classify absent tmux socket as no-server, not error in [#3341](https://github.com/agent-of-empires/agent-of-empires/pull/3341) by [@jerome-benoit](https://github.com/jerome-benoit) ([`afdcaf2`](https://github.com/agent-of-empires/agent-of-empires/commit/afdcaf2bfcfbc0559039e4674ad7895eaa8e5274))
+
+
+### Features
+
+- **cli:** Remove `aoe acp ps` in favour of `aoe ps --acp` in [#3208](https://github.com/agent-of-empires/agent-of-empires/pull/3208) by [@jerome-benoit](https://github.com/jerome-benoit) ([`e3f46ef`](https://github.com/agent-of-empires/agent-of-empires/commit/e3f46ef69ac74ed2e7ec7c04dedb25af33162619))
+- **agents:** Add omp permission_response with optional allow_always in [#3264](https://github.com/agent-of-empires/agent-of-empires/pull/3264) by [@athal7](https://github.com/athal7) ([`f287e61`](https://github.com/agent-of-empires/agent-of-empires/commit/f287e61109aa47751d9734cd4bb3d0f4496b9504))
+- Show recent sessions on mobile home by [@njbrake](https://github.com/njbrake) ([`47c522e`](https://github.com/agent-of-empires/agent-of-empires/commit/47c522e10b8e92e580ba4a2507b95e7030849fad))
+- **web:** Add collapsible header and composer on mobile conversations in [#3275](https://github.com/agent-of-empires/agent-of-empires/pull/3275) by [@summelon](https://github.com/summelon) ([`86ccdd1`](https://github.com/agent-of-empires/agent-of-empires/commit/86ccdd16ee19c91a91bbbd5a01fe061e494903e4))
+- **tui:** Render Markdown files in diff viewer in [#3294](https://github.com/agent-of-empires/agent-of-empires/pull/3294) by [@alloutflo](https://github.com/alloutflo) ([`712e692`](https://github.com/agent-of-empires/agent-of-empires/commit/712e692ec96e5ec1bb4ade8bcc3529f994ce1e76))
+- **sessions:** Add remote-owner (org) grouping axis to TUI and web sidebar in [#3284](https://github.com/agent-of-empires/agent-of-empires/pull/3284) by [@athal7](https://github.com/athal7) ([`d397ca0`](https://github.com/agent-of-empires/agent-of-empires/commit/d397ca06da732f0261eeab340fd8ddf34c1386d2))
+- **agents:** Declarative status rules for custom agents in [#3139](https://github.com/agent-of-empires/agent-of-empires/pull/3139) by [@bjkim95](https://github.com/bjkim95) ([`e637915`](https://github.com/agent-of-empires/agent-of-empires/commit/e637915a963651b45a005919437fb0a740db72eb))
+
+
+### Other
+
+- Merge pull request #3287 from agent-of-empires/fix/push-notification-presence in [#3287](https://github.com/agent-of-empires/agent-of-empires/pull/3287) by [@njbrake](https://github.com/njbrake) ([`129bc48`](https://github.com/agent-of-empires/agent-of-empires/commit/129bc487d32d0c549cd38100ac2adb5026e3067d))
+
+
+
+### New Contributors
+
+- [@adRn-s](https://github.com/adRn-s) made their first contribution in [#3314](https://github.com/agent-of-empires/agent-of-empires/pull/3314)
+- [@alloutflo](https://github.com/alloutflo) made their first contribution in [#3294](https://github.com/agent-of-empires/agent-of-empires/pull/3294)
+- [@summelon](https://github.com/summelon) made their first contribution in [#3275](https://github.com/agent-of-empires/agent-of-empires/pull/3275)
+- [@jona-wilmsmann](https://github.com/jona-wilmsmann) made their first contribution in [#3261](https://github.com/agent-of-empires/agent-of-empires/pull/3261)
+
+**Full Changelog**: https://github.com/agent-of-empires/agent-of-empires/compare/v1.14.0...v1.14.1
 ## [1.14.0](https://github.com/agent-of-empires/agent-of-empires/releases/tag/v1.14.0) - 2026-08-05
 
 
@@ -69,7 +210,6 @@ The format follows [Conventional Commits](https://www.conventionalcommits.org/).
 ### Other
 
 - Revert "share the live playwright build across shards" in [#3168](https://github.com/agent-of-empires/agent-of-empires/pull/3168) by [@njbrake](https://github.com/njbrake) ([`c857547`](https://github.com/agent-of-empires/agent-of-empires/commit/c857547cf043d8e2fa3d1b22e2ac3323fe9fb806))
-- Merge branch 'main' into release-staging/v1.13.3 ([`f18b5df`](https://github.com/agent-of-empires/agent-of-empires/commit/f18b5df0424c7a2befaab961b8e39349a54bf48c))
 
 
 ### Performance

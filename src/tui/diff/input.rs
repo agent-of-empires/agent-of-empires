@@ -154,6 +154,12 @@ impl DiffView {
                 DiffAction::Continue
             }
 
+            // Toggle Markdown between rendered prose and its raw diff.
+            (KeyCode::Char('m'), _) => {
+                self.toggle_markdown_rendering();
+                DiffAction::Continue
+            }
+
             // Resize file list panel
             (KeyCode::Char('h'), _) | (KeyCode::Left, _) => {
                 self.shrink_file_list();
@@ -275,6 +281,21 @@ mod tests {
         }
     }
 
+    fn cache_file_contents(view: &mut DiffView, path: &str, is_binary: bool) {
+        view.file_contents_cache.insert(
+            std::path::PathBuf::from(path),
+            crate::git::diff::FileContents {
+                path: std::path::PathBuf::from(path),
+                old_path: None,
+                status: crate::git::diff::FileStatus::Modified,
+                old_content: String::new(),
+                new_content: "# Preview".to_string(),
+                patch: String::new(),
+                is_binary,
+            },
+        );
+    }
+
     #[test]
     fn selected_path_string_returns_the_selected_file_path() {
         let mut view = make_diff_view_no_warning();
@@ -287,6 +308,51 @@ mod tests {
     fn selected_path_string_is_none_without_files() {
         let view = make_diff_view_no_warning();
         assert_eq!(view.selected_path_string(), None);
+    }
+
+    #[test]
+    fn markdown_extensions_are_case_insensitive() {
+        for path in ["README.md", "guide.markdown", "NOTES.MD"] {
+            let mut view = make_diff_view_no_warning();
+            view.files = vec![diff_file(path)];
+            assert!(view.selected_file_is_markdown(), "expected {path} to match");
+        }
+
+        let mut view = make_diff_view_no_warning();
+        view.files = vec![diff_file("src/main.rs")];
+        assert!(!view.selected_file_is_markdown());
+    }
+
+    #[test]
+    fn m_key_toggles_markdown_mode_and_resets_scroll() {
+        let mut view = make_diff_view_no_warning();
+        view.files = vec![diff_file("README.md")];
+        cache_file_contents(&mut view, "README.md", false);
+        view.scroll_offset = 7;
+
+        let action = view.handle_key(key(KeyCode::Char('m')));
+
+        assert!(matches!(action, DiffAction::Continue));
+        assert!(!view.markdown_rendered);
+        assert_eq!(view.scroll_offset, 0);
+
+        view.handle_key(key(KeyCode::Char('m')));
+        assert!(view.markdown_rendered);
+    }
+
+    #[test]
+    fn m_key_ignores_non_markdown_and_binary_files() {
+        for (path, is_binary) in [("src/main.rs", false), ("README.md", true)] {
+            let mut view = make_diff_view_no_warning();
+            view.files = vec![diff_file(path)];
+            cache_file_contents(&mut view, path, is_binary);
+            view.scroll_offset = 7;
+
+            view.handle_key(key(KeyCode::Char('m')));
+
+            assert!(view.markdown_rendered, "{path} should stay rendered");
+            assert_eq!(view.scroll_offset, 7, "{path} should keep its scroll");
+        }
     }
 
     #[test]

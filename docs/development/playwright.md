@@ -60,7 +60,7 @@ Per-test isolation: fresh `mkdtemp` `HOME` with `XDG_CONFIG_HOME` / `TMPDIR` / `
 
 ## Fake ACP agent (`web/tests/helpers/fakeAcpAgent.mjs`)
 
-Structured view specs need a deterministic ACP agent (the real `claude` depends on credentials and emits non-deterministic output). The fake speaks a minimal slice of the Agent Client Protocol over newline-delimited JSON-RPC 2.0: `initialize` returns protocolVersion 1 + capabilities; `session/new` and `session/load` return a deterministic id; `session/prompt` consumes one entry from the script file (`FAKE_ACP_SCRIPT` env, default emits one `agent_message_chunk` then stops), emits its `session/update` notifications, then responds with `stopReason`; `session/setMode` emits `current_mode_changed`; `session/cancel` emits `stopped {stopReason: "cancelled"}`; everything else returns `-32601`.
+Structured view specs need a deterministic ACP agent (the real `claude` depends on credentials and emits non-deterministic output). The fake speaks a minimal slice of the Agent Client Protocol over newline-delimited JSON-RPC 2.0: `initialize` returns protocolVersion 1 + capabilities; `session/new` returns a deterministic id; `session/load` restores the requested id and omits it from the response when impersonating Codex; `session/prompt` consumes one entry from the script file (`FAKE_ACP_SCRIPT` env, default emits one `agent_message_chunk` then stops), emits its `session/update` notifications, then responds with `stopReason`; `session/setMode` emits `current_mode_changed`; `session/cancel` emits `stopped {stopReason: "cancelled"}`; everything else returns `-32601`.
 
 Script file shape:
 

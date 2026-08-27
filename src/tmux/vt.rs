@@ -6,11 +6,9 @@
 //! pane. tmux still owns the pane (process, persistence, kill-tree); only the
 //! live render/input transport lives here.
 //!
-//! One [`VtChannel`] per tmux session, shared and refcounted: every viewer (the
-//! native TUI live preview and the web/mobile live terminal) holds an `Arc`, so
-//! a session is parsed once no matter how many surfaces watch it. The channel
-//! tears down (disables the pipe, stops the forwarder) when the last `Arc`
-//! drops. Unix-only; the whole module is `#[cfg(unix)]`.
+//! One [`VtChannel`] per tmux session, shared and refcounted by native live
+//! previews. The channel tears down (disables the pipe, stops the forwarder)
+//! when the last `Arc` drops. Unix-only; the whole module is `#[cfg(unix)]`.
 
 use std::collections::HashMap;
 use std::io::Read;
@@ -240,6 +238,14 @@ static REGISTRY: LazyLock<Mutex<HashMap<String, Weak<VtChannel>>>> =
 static ARM_LOCKS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
+/// Read-only OSC 52 observers need the same in-process sharing as VT grids:
+/// `pipe-pane` permits one command per pane, so two browser connections must
+/// hold one observer rather than replacing each other's forwarder.
+static OSC52_REGISTRY: LazyLock<Mutex<HashMap<String, Weak<Osc52Channel>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+static OSC52_ARM_LOCKS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
 static SOCK_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Monotonic base for chunk-arrival timestamps. The reader stamps each chunk's
@@ -261,9 +267,7 @@ fn vt_owner_id() -> String {
 /// A `(Mutex, Condvar)` pair an in-process poller parks on. Registered via
 /// [`VtChannel::set_change_wakeup`]; the reader thread pokes it after every
 /// grid change (and on death) so the poller samples the moment output lands
-/// instead of after the remainder of a fixed poll interval. Web viewers use
-/// the tokio `watch` channel instead; this is the std-thread equivalent for
-/// the TUI capture worker.
+/// instead of after the remainder of a fixed poll interval.
 pub(crate) type ChangeWakeup = Arc<(Mutex<()>, Condvar)>;
 
 /// Poke a registered change wakeup, if any. The slot lock is held only to
@@ -290,6 +294,14 @@ pub(crate) const SCROLLBACK_LINES: usize = 2000;
 
 fn lookup(session: &str) -> Option<Arc<VtChannel>> {
     REGISTRY
+        .lock()
+        .unwrap()
+        .get(session)
+        .and_then(Weak::upgrade)
+}
+
+fn lookup_osc52(session: &str) -> Option<Arc<Osc52Channel>> {
+    OSC52_REGISTRY
         .lock()
         .unwrap()
         .get(session)
@@ -614,7 +626,10 @@ fn capture_seed_snapshot(target: &str) -> Option<(Vec<u8>, PaneSeedState)> {
         };
         // The alternate screen has no scrollback, so only the normal buffer
         // pulls history (`-S`); the pane keeps that history across re-arms.
-        let mut args = vec!["capture-pane", "-t", target, "-p", "-e"];
+        // `-N` keeps trailing bg-styled fills (a modal backdrop painted as
+        // full-width styled spaces) so the seeded grid renders them the same
+        // way live chunks do (#3336).
+        let mut args = vec!["capture-pane", "-t", target, "-p", "-e", "-N"];
         if !pre.alt {
             args.extend_from_slice(&["-S", &seed_start]);
         }
@@ -1075,11 +1090,6 @@ struct ReaderCtx {
     /// copy overwrites an unconsumed older one, matching clipboard
     /// semantics (only the last copy matters).
     clipboard: Arc<Mutex<Option<String>>>,
-    /// Broadcast copy of the clipboard slot for Web viewers. Each live-ws
-    /// connection owns a receiver, so one viewer cannot consume another's
-    /// OSC 52 event.
-    #[cfg(feature = "serve")]
-    clipboard_tx: Arc<tokio::sync::watch::Sender<Option<String>>>,
     /// Chunk-arrival bookkeeping for the sample debounce (see the fields of the
     /// same name on `VtChannel`): a chunk counter, the last chunk's arrival
     /// (millis since `CHUNK_CLOCK`), and the gap between the two most recent
@@ -1092,8 +1102,6 @@ struct ReaderCtx {
     /// from `chunk_seq`: re-seeds bump this too, and the debounce's
     /// first-chunk special case must not see seed bumps.
     grid_gen: Arc<AtomicU64>,
-    #[cfg(feature = "serve")]
-    changed_tx: Arc<tokio::sync::watch::Sender<()>>,
 }
 
 /// The channel's reader loop: accept the forwarder's connection, publish the
@@ -1131,8 +1139,6 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                     if let Ok(mut guard) = ctx.clipboard.lock() {
                         *guard = Some(text.clone());
                     }
-                    #[cfg(feature = "serve")]
-                    let _ = ctx.clipboard_tx.send_replace(Some(text.clone()));
                 }
                 // Bytes that arrive before the seed are ALREADY IN IT, so they
                 // must be dropped rather than applied. `arm` orders the pipe
@@ -1206,12 +1212,6 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                 // just-landed output samples now, not after the remainder of
                 // its poll interval. This is the echo-latency path.
                 notify_change_wakeup(&ctx.wakeup);
-                // Wake every viewer waiting on output. The watch
-                // coalesces (a viewer that wasn't parked sees the
-                // bumped version on its next wait), so a chunk that
-                // lands between waits is not lost.
-                #[cfg(feature = "serve")]
-                ctx.changed_tx.send_modify(|_| {});
             }
             Err(ref e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
@@ -1226,8 +1226,6 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
     // Wake parked viewers so they observe the death promptly
     // instead of waiting out their heartbeat sleep.
     notify_change_wakeup(&ctx.wakeup);
-    #[cfg(feature = "serve")]
-    ctx.changed_tx.send_modify(|_| {});
 }
 
 /// One shared pane channel: a vt100 grid fed by a `pipe-pane -IO` byte stream,
@@ -1250,13 +1248,6 @@ pub(crate) struct VtChannel {
     /// true, so a live channel is the single-writer; once it clears, input and
     /// capture both fall back to the legacy tmux path instead of black-holing.
     alive: Arc<AtomicBool>,
-    /// Bumped by the reader thread on each grid change (and on death). A watch
-    /// (not a `Notify`) so EVERY viewer of this shared channel wakes on a
-    /// change, not just one; `subscribe` hands each connection its own
-    /// receiver. Server-only. The carried value is unused (it is the version
-    /// bump that matters), so it is `()`.
-    #[cfg(feature = "serve")]
-    changed_tx: Arc<tokio::sync::watch::Sender<()>>,
     /// Slot for one in-process poller's wakeup (the TUI capture worker).
     /// The reader thread pokes it on each grid change and on death; last
     /// registration wins (one capture worker per process, so a slot rather
@@ -1265,10 +1256,6 @@ pub(crate) struct VtChannel {
     /// Latest decoded OSC 52 clipboard write from the pane, filled by the
     /// reader thread, drained by [`Self::take_clipboard`].
     clipboard: Arc<Mutex<Option<String>>>,
-    /// Broadcast OSC 52 stream for Web viewers. Unlike the TUI's consuming
-    /// slot above, every live-ws connection gets its own watch receiver.
-    #[cfg(feature = "serve")]
-    clipboard_tx: Arc<tokio::sync::watch::Sender<Option<String>>>,
     /// Number of chunks the reader has parsed. `0` means none yet, so
     /// `chunk_timing` reports `None` and the caller leaves pacing untouched.
     chunk_seq: Arc<AtomicU64>,
@@ -1320,20 +1307,6 @@ struct SampleCache {
 }
 
 impl VtChannel {
-    /// The session's existing *live* channel, if any, WITHOUT arming a new
-    /// one. The `[tmux] vt_live = false` web gate uses this so a connection
-    /// opened after the toggle still joins a channel that other holders keep
-    /// alive: while that channel lives it is the pane's single input writer,
-    /// and a viewer that fell back to `send-keys` beside it would interleave
-    /// two writers on the one pty input stream. Once the last holder drops,
-    /// the channel dies and fallback becomes genuine. Server-only: the TUI
-    /// worker owns its channel lifecycle and its input path already routes
-    /// through the registry (`input_mode` / `try_send_input`).
-    #[cfg(feature = "serve")]
-    pub(crate) fn reuse(session: &str) -> Option<Arc<VtChannel>> {
-        lookup(session).filter(|c| c.is_alive())
-    }
-
     /// Get the shared channel for `session`, arming a new one if none is live.
     /// Returns `None` if tmux is too old or the pane is gone or any tmux/socket
     /// step fails; callers then use the legacy capture/send-keys path. The
@@ -1427,16 +1400,6 @@ impl VtChannel {
         let app_cursor = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(false));
         let clipboard: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        // Bumped by the reader thread on every grid change (and on death) so
-        // a web viewer can render on output instead of polling on a cadence.
-        // A watch so all viewers wake, not just one. Server-only; the TUI
-        // repaints from its own draw loop. The initial receiver is dropped;
-        // `subscribe` mints one per connection.
-        #[cfg(feature = "serve")]
-        let changed_tx = Arc::new(tokio::sync::watch::channel(()).0);
-        #[cfg(feature = "serve")]
-        let clipboard_tx = Arc::new(tokio::sync::watch::channel(None).0);
-
         // Bind the socket inside an owner-only (0700) directory so other users
         // on a shared host cannot connect to the pane channel and capture
         // keystrokes or spoof rendered output (mirrors the worker-dir
@@ -1470,14 +1433,10 @@ impl VtChannel {
                 alive: alive.clone(),
                 wakeup: wakeup.clone(),
                 clipboard: clipboard.clone(),
-                #[cfg(feature = "serve")]
-                clipboard_tx: clipboard_tx.clone(),
                 chunk_seq: chunk_seq.clone(),
                 last_chunk_ms: last_chunk_ms.clone(),
                 prev_gap_ms: prev_gap_ms.clone(),
                 grid_gen: grid_gen.clone(),
-                #[cfg(feature = "serve")]
-                changed_tx: changed_tx.clone(),
             };
             std::thread::spawn(move || run_reader(listener, ctx))
         };
@@ -1547,12 +1506,8 @@ impl VtChannel {
             stream,
             app_cursor,
             alive,
-            #[cfg(feature = "serve")]
-            changed_tx,
             wakeup,
             clipboard,
-            #[cfg(feature = "serve")]
-            clipboard_tx,
             chunk_seq,
             last_chunk_ms,
             prev_gap_ms,
@@ -1676,31 +1631,6 @@ impl VtChannel {
         self.clear_drift();
     }
 
-    /// Re-sync the in-process grid to the new pane size immediately. The
-    /// size-owner calls this right after `resize-window` so the grid tracks the
-    /// new geometry without waiting for the periodic `reconcile_grid`. It
-    /// re-seeds from `capture-pane` (tmux's authoritative reflowed state) rather
-    /// than locally `set_size`-ing: tmux reflows on resize but pipe-pane carries
-    /// no reflow redraw, so a bare `set_size` would leave the grid diverged from
-    /// tmux - a duplicated prompt and a cursor stranded on the wrong row that no
-    /// later output reconciles (see `seed_parser`). Server-only.
-    #[cfg(feature = "serve")]
-    pub(crate) fn set_grid_size(&self, cols: u16, rows: u16) {
-        if cols == 0 || rows == 0 {
-            return;
-        }
-        if (cols, rows)
-            != (
-                self.cols.load(Ordering::Relaxed),
-                self.rows.load(Ordering::Relaxed),
-            )
-        {
-            self.cols.store(cols, Ordering::Relaxed);
-            self.rows.store(rows, Ordering::Relaxed);
-            self.reseed(cols, rows);
-        }
-    }
-
     /// Serialise up to `max_lines` of (scrollback + screen) to per-row ANSI,
     /// plus the authoritative cursor (with `history_size` set to the full
     /// scrollback depth). `max_lines` mirrors the capture path's window: both
@@ -1812,16 +1742,6 @@ impl VtChannel {
             .and_then(|mut guard| guard.take())
     }
 
-    /// Subscribe to future OSC 52 clipboard writes. The current value is
-    /// marked seen before returning, so a newly opened dashboard does not
-    /// replay an old copy into the browser clipboard.
-    #[cfg(feature = "serve")]
-    pub(crate) fn subscribe_clipboard(&self) -> tokio::sync::watch::Receiver<Option<String>> {
-        let mut rx = self.clipboard_tx.subscribe();
-        let _ = rx.borrow_and_update();
-        rx
-    }
-
     /// Register the in-process poller wakeup this channel pokes on each grid
     /// change (and on death). The TUI capture worker hands over the same
     /// condvar pair its retarget/cadence nudges use, so pane output wakes it
@@ -1846,16 +1766,6 @@ impl VtChannel {
         }
         let since_last = chunk_now_ms().saturating_sub(self.last_chunk_ms.load(Ordering::Relaxed));
         Some((since_last, self.prev_gap_ms.load(Ordering::Relaxed)))
-    }
-
-    /// A receiver that fires whenever the grid changes (output arrived) or the
-    /// channel dies. Each connection holds its own, so every viewer of this
-    /// shared channel wakes on a change; `changed()` also returns immediately
-    /// if a bump happened since the last wait, so output between waits is never
-    /// missed. Lets a viewer render on output instead of polling. Server-only.
-    #[cfg(feature = "serve")]
-    pub(crate) fn subscribe(&self) -> tokio::sync::watch::Receiver<()> {
-        self.changed_tx.subscribe()
     }
 
     fn write_input(&self, bytes: &[u8]) -> bool {
@@ -1893,6 +1803,258 @@ impl Drop for VtChannel {
         // Free the cross-process VT-owner lock so another viewer (a second
         // TUI, the serve daemon) can arm immediately instead of waiting out
         // the TTL. Best-effort like the rest of this teardown.
+        crate::tmux::Session::from_name(&self.name).release_vt_owner(&vt_owner_id());
+    }
+}
+
+/// A raw `pipe-pane` reader used when a shell preview renders through
+/// `capture-pane`. It observes OSC 52 writes without constructing a terminal
+/// grid, so prompt redraws cannot affect the displayed frame.
+pub(crate) struct Osc52Channel {
+    name: String,
+    target: String,
+    clipboard: Arc<Mutex<Option<String>>>,
+    /// Monotonically bumps after publishing a clipboard value. Consumers keep
+    /// their own cursor so one dashboard viewer cannot consume an event for
+    /// another, and a newly promoted size owner cannot replay an old copy.
+    clipboard_seq: Arc<AtomicU64>,
+    alive: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    reader: Mutex<Option<std::thread::JoinHandle<()>>>,
+    sock_dir: PathBuf,
+    sock_path: PathBuf,
+    last_owner_hb: Mutex<Instant>,
+}
+
+impl Osc52Channel {
+    /// Arm a read-only observer. `pipe-pane` is exclusive, so this uses the
+    /// same cross-process owner lease as a VT grid and only runs when the grid
+    /// transport is disabled for the displayed terminal pane.
+    pub(crate) fn acquire(name: &str) -> Option<Arc<Self>> {
+        if let Some(channel) = lookup_osc52(name).filter(|channel| channel.is_alive()) {
+            return Some(channel);
+        }
+        let arm_lock = OSC52_ARM_LOCKS
+            .lock()
+            .unwrap()
+            .entry(name.to_string())
+            .or_default()
+            .clone();
+        let result = {
+            let _armed = arm_lock.lock().unwrap();
+            if let Some(channel) = lookup_osc52(name).filter(|channel| channel.is_alive()) {
+                Some(channel)
+            } else {
+                Self::arm(name).map(|channel| {
+                    let channel = Arc::new(channel);
+                    OSC52_REGISTRY
+                        .lock()
+                        .unwrap()
+                        .insert(name.to_string(), Arc::downgrade(&channel));
+                    channel
+                })
+            }
+        };
+        OSC52_ARM_LOCKS
+            .lock()
+            .unwrap()
+            .retain(|_, lock| Arc::strong_count(lock) > 1);
+        result
+    }
+
+    fn arm(name: &str) -> Option<Self> {
+        if !tmux_supports_pipe_pane_io() {
+            return None;
+        }
+        let target = format!("{name}:^.0");
+        let session = crate::tmux::Session::from_name(name);
+        let owner = vt_owner_id();
+        if !session.claim_vt_owner(&owner, crate::tmux::session::VT_OWNER_TTL) {
+            return None;
+        }
+
+        let n = SOCK_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let sock_dir = std::env::temp_dir().join(format!("aoe-osc52-{}-{n}", std::process::id()));
+        let setup = || -> Option<(PathBuf, UnixListener)> {
+            std::fs::create_dir_all(&sock_dir).ok()?;
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&sock_dir, std::fs::Permissions::from_mode(0o700)).ok()?;
+            }
+            let sock_path = sock_dir.join("s.sock");
+            Some((sock_path.clone(), UnixListener::bind(sock_path).ok()?))
+        };
+        let Some((sock_path, listener)) = setup() else {
+            let _ = std::fs::remove_dir_all(&sock_dir);
+            session.release_vt_owner(&owner);
+            return None;
+        };
+        let Some(exe) = std::env::current_exe().ok() else {
+            let _ = std::fs::remove_dir_all(&sock_dir);
+            session.release_vt_owner(&owner);
+            return None;
+        };
+
+        let alive = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        let clipboard = Arc::new(Mutex::new(None));
+        let clipboard_seq = Arc::new(AtomicU64::new(0));
+        let reader = {
+            let alive = alive.clone();
+            let stop = stop.clone();
+            let clipboard = clipboard.clone();
+            let clipboard_seq = clipboard_seq.clone();
+            std::thread::spawn(move || {
+                run_osc52_reader(listener, stop, alive, clipboard, clipboard_seq)
+            })
+        };
+        let pipe_cmd = format!(
+            "{} __vt-pipe {}",
+            sh_quote(&exe.to_string_lossy()),
+            sh_quote(&sock_path.to_string_lossy())
+        );
+        let armed = crate::tmux::tmux_command()
+            .args(["pipe-pane", "-O", "-t", &target, &pipe_cmd])
+            .output()
+            .ok();
+        if !armed.map(|o| o.status.success()).unwrap_or(false) {
+            stop.store(true, Ordering::Relaxed);
+            let _ = UnixStream::connect(&sock_path);
+            let _ = reader.join();
+            let _ = std::fs::remove_dir_all(&sock_dir);
+            session.release_vt_owner(&owner);
+            return None;
+        }
+        let deadline = Instant::now() + Duration::from_millis(500);
+        while !alive.load(Ordering::Relaxed) {
+            if Instant::now() >= deadline {
+                stop.store(true, Ordering::Relaxed);
+                let _ = crate::tmux::tmux_command()
+                    .args(["pipe-pane", "-t", &target])
+                    .output();
+                let _ = UnixStream::connect(&sock_path);
+                let _ = reader.join();
+                let _ = std::fs::remove_dir_all(&sock_dir);
+                session.release_vt_owner(&owner);
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        Some(Self {
+            name: name.to_string(),
+            target,
+            clipboard,
+            clipboard_seq,
+            alive,
+            stop,
+            reader: Mutex::new(Some(reader)),
+            sock_dir,
+            sock_path,
+            last_owner_hb: Mutex::new(Instant::now()),
+        })
+    }
+
+    pub(crate) fn is_alive(&self) -> bool {
+        self.alive.load(Ordering::Relaxed)
+    }
+
+    /// Start a new consumer at the current event sequence. This intentionally
+    /// skips a value emitted before the consumer began observing, mirroring the
+    /// old per-WebSocket watch receiver's `borrow_and_update` baseline.
+    pub(crate) fn clipboard_sequence(&self) -> u64 {
+        self.clipboard_seq.load(Ordering::Acquire)
+    }
+
+    /// Return the latest clipboard write after `seen`, advancing only this
+    /// consumer's cursor. Unlike a destructive slot read, every WebSocket can
+    /// mark an event seen while only its size owner forwards it.
+    pub(crate) fn clipboard_after(&self, seen: &mut u64) -> Option<String> {
+        osc52_clipboard_after(&self.clipboard, &self.clipboard_seq, seen)
+    }
+
+    /// Keep the exclusive pipe owner lease alive while the terminal snapshot
+    /// worker still observes this pane.
+    pub(crate) fn refresh_owner_heartbeat(&self) {
+        let Ok(mut last) = self.last_owner_hb.lock() else {
+            return;
+        };
+        if last.elapsed() < Duration::from_millis(1500) {
+            return;
+        }
+        *last = Instant::now();
+        drop(last);
+        let _ = crate::tmux::Session::from_name(&self.name).refresh_vt_owner(&vt_owner_id());
+    }
+}
+
+fn osc52_clipboard_after(
+    clipboard: &Mutex<Option<String>>,
+    clipboard_seq: &AtomicU64,
+    seen: &mut u64,
+) -> Option<String> {
+    let seq = clipboard_seq.load(Ordering::Acquire);
+    if seq == *seen {
+        return None;
+    }
+    let text = clipboard.lock().ok().and_then(|slot| slot.clone())?;
+    *seen = seq;
+    Some(text)
+}
+
+fn run_osc52_reader(
+    listener: UnixListener,
+    stop: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
+    clipboard: Arc<Mutex<Option<String>>>,
+    clipboard_seq: Arc<AtomicU64>,
+) {
+    let Ok((mut conn, _)) = listener.accept() else {
+        return;
+    };
+    alive.store(true, Ordering::Relaxed);
+    let _ = conn.set_read_timeout(Some(Duration::from_millis(200)));
+    let mut scanner = Osc52Scanner::new();
+    let mut buf = [0u8; 8192];
+    while !stop.load(Ordering::Relaxed) {
+        match conn.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if let Some(text) = scanner.feed(&buf[..n]) {
+                    if let Ok(mut slot) = clipboard.lock() {
+                        *slot = Some(text);
+                        clipboard_seq.fetch_add(1, Ordering::Release);
+                    }
+                }
+            }
+            Err(ref e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut => {}
+            Err(_) => break,
+        }
+    }
+    alive.store(false, Ordering::Relaxed);
+}
+
+impl Drop for Osc52Channel {
+    fn drop(&mut self) {
+        {
+            let mut registry = OSC52_REGISTRY.lock().unwrap();
+            if registry
+                .get(&self.name)
+                .is_some_and(|channel| channel.upgrade().is_none())
+            {
+                registry.remove(&self.name);
+            }
+        }
+        self.stop.store(true, Ordering::Relaxed);
+        let _ = crate::tmux::tmux_command()
+            .args(["pipe-pane", "-t", &self.target])
+            .output();
+        let _ = UnixStream::connect(&self.sock_path);
+        if let Some(reader) = self.reader.lock().unwrap().take() {
+            let _ = reader.join();
+        }
+        let _ = std::fs::remove_dir_all(&self.sock_dir);
         crate::tmux::Session::from_name(&self.name).release_vt_owner(&vt_owner_id());
     }
 }
@@ -2271,12 +2433,8 @@ mod tests {
             stream: Arc::new(Mutex::new(None)),
             app_cursor: Arc::new(AtomicBool::new(false)),
             alive: alive.clone(),
-            #[cfg(feature = "serve")]
-            changed_tx: Arc::new(tokio::sync::watch::channel(()).0),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
-            #[cfg(feature = "serve")]
-            clipboard_tx: Arc::new(tokio::sync::watch::channel(None).0),
             chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
@@ -2498,14 +2656,10 @@ mod tests {
             alive: Arc::new(AtomicBool::new(false)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
-            #[cfg(feature = "serve")]
-            clipboard_tx: Arc::new(tokio::sync::watch::channel(None).0),
             chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
             grid_gen: grid_gen.clone(),
-            #[cfg(feature = "serve")]
-            changed_tx: Arc::new(tokio::sync::watch::channel(()).0),
         };
         let reader = std::thread::spawn(move || run_reader(listener, ctx));
         let mut conn = UnixStream::connect(&sock).expect("connect");
@@ -2583,14 +2737,10 @@ mod tests {
             alive: alive.clone(),
             wakeup: wakeup_slot.clone(),
             clipboard: Arc::new(Mutex::new(None)),
-            #[cfg(feature = "serve")]
-            clipboard_tx: Arc::new(tokio::sync::watch::channel(None).0),
             chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
             grid_gen: Arc::new(AtomicU64::new(0)),
-            #[cfg(feature = "serve")]
-            changed_tx: Arc::new(tokio::sync::watch::channel(()).0),
         };
         let reader = std::thread::spawn(move || run_reader(listener, ctx));
         let mut conn = UnixStream::connect(&sock).expect("connect");
@@ -2735,14 +2885,6 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let alive = Arc::new(AtomicBool::new(false));
         let clipboard: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        #[cfg(feature = "serve")]
-        let clipboard_tx = Arc::new(tokio::sync::watch::channel(None).0);
-        #[cfg(feature = "serve")]
-        let mut clipboard_rx = {
-            let mut rx = clipboard_tx.subscribe();
-            let _ = rx.borrow_and_update();
-            rx
-        };
         let ctx = ReaderCtx {
             parser: parser.clone(),
             stop: stop.clone(),
@@ -2752,14 +2894,10 @@ mod tests {
             alive: alive.clone(),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: clipboard.clone(),
-            #[cfg(feature = "serve")]
-            clipboard_tx,
             chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
             grid_gen: Arc::new(AtomicU64::new(0)),
-            #[cfg(feature = "serve")]
-            changed_tx: Arc::new(tokio::sync::watch::channel(()).0),
         };
         let reader = std::thread::spawn(move || run_reader(listener, ctx));
         let mut conn = UnixStream::connect(&sock).expect("connect");
@@ -2768,14 +2906,8 @@ mod tests {
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let copied = loop {
-            #[cfg(feature = "serve")]
-            let clipboard_published = clipboard_rx.has_changed().unwrap();
-            #[cfg(not(feature = "serve"))]
-            let clipboard_published = true;
-            if clipboard_published {
-                if let Some(text) = clipboard.lock().unwrap().take() {
-                    break Some(text);
-                }
+            if let Some(text) = clipboard.lock().unwrap().take() {
+                break Some(text);
             }
             if Instant::now() >= deadline {
                 break None;
@@ -2783,14 +2915,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(5));
         };
         assert_eq!(copied.as_deref(), Some("hello"));
-        #[cfg(feature = "serve")]
-        {
-            assert!(
-                clipboard_rx.has_changed().unwrap(),
-                "web clipboard subscribers must receive the OSC 52 event"
-            );
-            assert_eq!(clipboard_rx.borrow_and_update().as_deref(), Some("hello"));
-        }
         assert!(
             parser
                 .lock()
@@ -2800,6 +2924,74 @@ mod tests {
                 .contains("visible"),
             "non-clipboard bytes must still reach the grid"
         );
+
+        stop.store(true, Ordering::Relaxed);
+        drop(conn);
+        let _ = reader.join();
+    }
+
+    #[test]
+    fn osc52_observer_publishes_copy_without_a_vt_grid() {
+        use std::io::Write;
+
+        // Terminal fallback renders capture-pane cells, not a vt100 grid. Its
+        // raw observer must still extract a copy from pipe-pane's byte stream.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let sock = dir.path().join("s.sock");
+        let listener = UnixListener::bind(&sock).expect("bind");
+        let stop = Arc::new(AtomicBool::new(false));
+        let alive = Arc::new(AtomicBool::new(false));
+        let clipboard = Arc::new(Mutex::new(None));
+        let clipboard_seq = Arc::new(AtomicU64::new(0));
+        let reader = {
+            let stop = stop.clone();
+            let alive = alive.clone();
+            let clipboard = clipboard.clone();
+            let clipboard_seq = clipboard_seq.clone();
+            std::thread::spawn(move || {
+                run_osc52_reader(listener, stop, alive, clipboard, clipboard_seq)
+            })
+        };
+        let mut conn = UnixStream::connect(&sock).expect("connect");
+        conn.write_all(b"\x1b]52;c;aGVsbG8=\x07")
+            .expect("write pane output");
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while clipboard_seq.load(Ordering::Acquire) == 0 {
+            assert!(Instant::now() < deadline, "observer never received OSC 52");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        let mut existing_viewer = 0;
+        let mut newly_connected_viewer = clipboard_seq.load(Ordering::Acquire);
+        assert_eq!(
+            osc52_clipboard_after(&clipboard, &clipboard_seq, &mut existing_viewer).as_deref(),
+            Some("hello")
+        );
+        assert_eq!(
+            osc52_clipboard_after(&clipboard, &clipboard_seq, &mut newly_connected_viewer),
+            None,
+            "a new viewer must baseline rather than replay an old copy"
+        );
+        conn.write_all(b"\x1b]52;c;d29ybGQ=\x07")
+            .expect("write second pane output");
+        while clipboard_seq.load(Ordering::Acquire) < 2 {
+            assert!(
+                Instant::now() < deadline,
+                "observer never received second OSC 52"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            osc52_clipboard_after(&clipboard, &clipboard_seq, &mut existing_viewer).as_deref(),
+            Some("world")
+        );
+        assert_eq!(
+            osc52_clipboard_after(&clipboard, &clipboard_seq, &mut newly_connected_viewer)
+                .as_deref(),
+            Some("world"),
+            "each viewer must observe the new copy independently"
+        );
+        assert!(alive.load(Ordering::Relaxed), "observer never became live");
 
         stop.store(true, Ordering::Relaxed);
         drop(conn);
@@ -2835,14 +3027,10 @@ mod tests {
             alive: Arc::new(AtomicBool::new(false)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: Arc::new(Mutex::new(None)),
-            #[cfg(feature = "serve")]
-            clipboard_tx: Arc::new(tokio::sync::watch::channel(None).0),
             chunk_seq: chunk_seq.clone(),
             last_chunk_ms: last_chunk_ms.clone(),
             prev_gap_ms: prev_gap_ms.clone(),
             grid_gen: Arc::new(AtomicU64::new(0)),
-            #[cfg(feature = "serve")]
-            changed_tx: Arc::new(tokio::sync::watch::channel(()).0),
         };
         let reader = std::thread::spawn(move || run_reader(listener, ctx));
         let mut conn = UnixStream::connect(&sock).expect("connect");
@@ -2963,14 +3151,10 @@ mod tests {
             alive: Arc::new(AtomicBool::new(false)),
             wakeup: Arc::new(Mutex::new(None)),
             clipboard: clipboard.clone(),
-            #[cfg(feature = "serve")]
-            clipboard_tx: Arc::new(tokio::sync::watch::channel(None).0),
             chunk_seq: Arc::new(AtomicU64::new(0)),
             last_chunk_ms: Arc::new(AtomicU64::new(0)),
             prev_gap_ms: Arc::new(AtomicU64::new(u64::MAX)),
             grid_gen: grid_gen.clone(),
-            #[cfg(feature = "serve")]
-            changed_tx: Arc::new(tokio::sync::watch::channel(()).0),
         };
         let reader = std::thread::spawn(move || run_reader(listener, ctx));
         let mut conn = UnixStream::connect(&sock).expect("connect");

@@ -17,8 +17,8 @@ Two more events, **structured view approval** and **structured view question** (
 Status notifications are suppressed when you're already looking at aoe (approvals and questions ignore this):
 
 - **Dashboard focused (per-device):** if the PWA tab is visible and focused, that device shows an in-app toast instead of an OS notification.
-- **TUI active (all devices):** if the `aoe` TUI is running on the server machine, all pushes are suppressed.
-- **Web dashboard active (all devices):** if any browser has the dashboard open and making authenticated requests, all pushes are suppressed. So using the dashboard on your laptop prevents notifications on your phone.
+- **TUI interaction (all devices):** pushes are suppressed for 30 seconds after keyboard, paste, or mouse input in an `aoe` TUI. An unattended TUI does not silence your phone.
+- **Web dashboard foregrounded (all devices):** pushes are suppressed while any dashboard reports that it is visible and focused. Background polling and a backgrounded PWA do not count.
 
 ## Stable HTTPS for persistent PWA installs (read this first if using mobile)
 

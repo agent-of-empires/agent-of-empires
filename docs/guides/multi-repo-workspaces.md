@@ -41,9 +41,24 @@ TUI: open the new-session dialog (`n`), enter the worktree branch, focus the **E
 
 Web: `+ New session`, pick a primary repo, then click registered projects in the **Extra repos** picker (or paste a path with the free-text input).
 
+### 3. Give a repo its own base branch
+
+Each repo's branch is forked from `--base-branch` by default. `--repo-base <repo>=<branch>` overrides that for one repo, so a workspace can start with one repo on `develop` and others on their own epic branches:
+
+```bash
+aoe add /path/to/backend \
+  --project frontend \
+  --project shared-lib \
+  -w feat/auth-rewrite -b \
+  --base-branch develop \
+  --repo-base frontend=epic/checkout
+```
+
+`<repo>` is the repo's directory name or a path you passed to `--repo`; an unmatched name is an error rather than a silent fallback. The web wizard has the same thing as a base-branch field on each repo in the **Extra repos** picker. The base each repo was forked from is recorded, and it becomes that repo's default diff comparison ref (see [Base override](web/diff.md#base-override)); `aoe session set-base --repo <name>` changes it later, per repo.
+
 Worktree creation across the repos in a workspace runs concurrently, so wall-clock time is roughly that of the slowest single repo rather than the sum (network-bound `git fetch` and `git submodule update` dominate). If any repo's post-checkout hook fails after `git worktree add` has already checked out the branch, the workspace is still created and the hook output is surfaced as a warning. See [Post-Checkout Hooks](worktrees.md#post-checkout-hooks) for details.
 
-### 3. The agent sees one workspace
+### 4. The agent sees one workspace
 
 The session starts in the workspace root with all the worktrees as siblings:
 
@@ -56,7 +71,7 @@ The session starts in the workspace root with all the worktrees as siblings:
 
 The agent navigates between them like any normal multi-repo working tree. Use `cd` and standard git commands; AoE does not impose any cross-repo orchestration.
 
-### 4. Add a repo to a session that already exists
+### 5. Add a repo to a session that already exists
 
 When you get twenty minutes into a task and realize you also need another repo,
 attach it instead of recreating the session:

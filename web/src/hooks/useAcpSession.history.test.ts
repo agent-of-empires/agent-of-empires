@@ -7,11 +7,17 @@
 
 import { describe, expect, it } from "vitest";
 
-import { emptyAcpState, type AcpFrame } from "../lib/acpTypes";
+import { emptyAcpState, type AcpFrame, type ActivityRow } from "../lib/acpTypes";
 import { reducer } from "./useAcpSession";
 
 function prompt(seq: number, text: string): AcpFrame {
   return { session_id: "s", seq, event: { UserPromptSent: { text } } };
+}
+
+// Server-owned transcript rows (Tier 4): the `?view=rows` replay returns these
+// alongside the raw frames; the reducer merges them into `activity`.
+function promptRow(seq: number, text: string): ActivityRow {
+  return { id: `user-seq-${seq}`, kind: "user_prompt", text, at: "2026-01-01T00:00:00Z" };
 }
 
 describe("useAcpSession recent-first paging", () => {
@@ -31,23 +37,29 @@ describe("useAcpSession recent-first paging", () => {
     let s = reducer(emptyAcpState(), {
       kind: "frames",
       frames: [prompt(5, "e"), prompt(6, "f")],
+      rows: [promptRow(5, "e"), promptRow(6, "f")],
       oldestSeq: 5,
     });
-    s = reducer(s, { kind: "prepend", frames: [prompt(2, "b"), prompt(3, "c")], oldestSeq: 2 });
+    s = reducer(s, { kind: "prepend", rows: [promptRow(2, "b"), promptRow(3, "c")], oldestSeq: 2 });
     expect(s.oldestSeq).toBe(2);
     expect(s.activity.map((r) => r.id)).toEqual(["user-seq-2", "user-seq-3", "user-seq-5", "user-seq-6"]);
   });
 
   it("prepend preserves optimistic / queue / approval state", () => {
-    let s = reducer(emptyAcpState(), { kind: "frames", frames: [prompt(5, "e")], oldestSeq: 5 });
-    s = reducer(s, { kind: "enqueue_prompt", text: "queued" });
+    let s = reducer(emptyAcpState(), {
+      kind: "frames",
+      frames: [prompt(5, "e")],
+      rows: [promptRow(5, "e")],
+      oldestSeq: 5,
+    });
+    s = reducer(s, { kind: "enqueue_prompt", id: "q-1", text: "queued" });
     // A pending approval the server hasn't echoed a resolution for yet
     // (the #1821 optimistic case the prepend must not disturb). Only the
     // reference matters here, so a minimal stand-in is enough.
     const approvals = [{ nonce: "n1" } as unknown as (typeof s.pendingApprovals)[number]];
     s = { ...s, pendingApprovals: approvals };
 
-    s = reducer(s, { kind: "prepend", frames: [prompt(2, "b")], oldestSeq: 2 });
+    s = reducer(s, { kind: "prepend", rows: [promptRow(2, "b")], oldestSeq: 2 });
 
     expect(s.queuedPrompts).toHaveLength(1);
     expect(s.queuedPrompts[0]!.text).toBe("queued");

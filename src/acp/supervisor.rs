@@ -652,6 +652,82 @@ pub(crate) fn apply_agent_command_override(
     Ok(())
 }
 
+/// Which `(wrapper, base)` pair this launch substitutes, when an
+/// `agent_detect_as` wrapper resolves to its base adapter instead of
+/// running the wrapper itself (#3422). `None` when the wrapper's own
+/// command runs.
+///
+/// Three spawn shapes substitute silently, all funnelling through the same
+/// warn site: `pick_agent_for_tool` resolved the wrapper to its base key
+/// before the spawn (`agent` is the base, `tool` stays the wrapper); a
+/// caller passed the wrapper key directly (the attach respawn path), so
+/// `agent == tool` and `resolve_agent_spec` substitutes; and an explicit
+/// request-level agent override at create (or a persisted one on respawn)
+/// names a different wrapper than the session tool, whose own inheritance
+/// then applies. In every shape the wrapper never runs, so account,
+/// gateway, or env overrides it sets do not apply. `spec_from_registry`
+/// keeps a custom `agent_acp_cmd` spec, which does execute the wrapper's
+/// own command, silent.
+///
+/// `registry` is the supervisor's live registry, so a key added at runtime
+/// behaves exactly as `resolve_agent_spec` treated it. A built-in running
+/// its own adapter is not a substitution even when a mapping keys on it:
+/// the direct registry lookup won, so that pair is skipped up front. The
+/// map is the spawn's own resolved config snapshot; a config edit landing
+/// between the pick-time resolve and this one can miss the warning for
+/// that single launch, and the next launch warns normally.
+fn wrapper_substitution_for(
+    registry: &AgentRegistry,
+    tool: &str,
+    agent: &str,
+    spec_from_registry: bool,
+    agent_detect_as: &HashMap<String, String>,
+) -> Option<(String, String)> {
+    if !spec_from_registry || agent_detect_as.is_empty() {
+        return None;
+    }
+    let inherited = |name: &str| crate::acp::inherited_acp_base(name, agent_detect_as);
+    // Which key's adapter runs instead of its own binary, and that key's
+    // base. The pick path substitutes the session tool (agent became the
+    // base), the attach path passes the wrapper key as both tool and agent,
+    // and an explicit request-level override can name a different wrapper
+    // than the tool, whose own inheritance then applies.
+    let tool_base = inherited(tool);
+    let substituted = if agent == tool {
+        // A built-in executing itself is never a substitution, even when a
+        // mapping keys on it: the direct registry lookup already won.
+        (registry.get(tool).is_none()).then_some((tool, tool_base))
+    } else if tool_base.as_deref().is_some_and(|base| base == agent) && registry.get(tool).is_none()
+    {
+        Some((tool, tool_base))
+    } else if registry.get(agent).is_none() {
+        let agent_base = inherited(agent);
+        agent_base.is_some().then_some((agent, agent_base))
+    } else {
+        None
+    };
+    // An inner None is a wrapper mapped to a terminal-only base: resolution
+    // never substitutes it, so there is nothing to warn about.
+    let Some((wrapper, Some(base))) = substituted else {
+        return None;
+    };
+    Some((wrapper.to_string(), base))
+}
+
+/// Emit the #3422 substitution warning. Shared by the initial spawn site
+/// and the watchdog respawn path, which re-emits the pair stored in
+/// `SpawnConfig::wrapper_substitution`.
+fn log_wrapper_substitution(session_id: &str, tool: &str, wrapper: &str, base: &str) {
+    warn!(
+        target: "acp.supervisor",
+        session = %session_id,
+        tool = %tool,
+        wrapper = %wrapper,
+        base = %base,
+        "agent_detect_as resolved this wrapper to its base for structured view; the wrapper binary will not be executed, so account, gateway, or env overrides it sets do not apply; set [session.agent_acp_cmd] to run the wrapper itself"
+    );
+}
+
 impl<S: BroadcastSink> Supervisor<S> {
     /// Constructor with no concurrency cap. Used in tests; production
     /// callers should use [`Supervisor::with_capacity`] so the
@@ -837,6 +913,18 @@ impl<S: BroadcastSink> Supervisor<S> {
                 AgentSpec::from_acp_cmd(name, cmd).map_err(SupervisorError::InvalidAgentCommand)?;
             return Ok((spec, false));
         }
+        // A custom agent that inherits a registry-backed base via
+        // `agent_detect_as` resolves to the base agent's spec. The normal
+        // spawn path resolves to the base key up front (see
+        // `pick_agent_for_tool`), so this branch only fires when a caller
+        // passes the wrapper name directly (e.g. an explicit switch-agent
+        // target). `true` marks it registry-backed so the command-override
+        // overlay and the compatibility version gate still apply.
+        if let Some(base) = crate::acp::inherited_acp_base(name, &config.agent_detect_as) {
+            if let Some(spec) = self.registry.lock().await.get(&base).cloned() {
+                return Ok((spec, true));
+            }
+        }
         Err(SupervisorError::UnknownAgent(name.into()))
     }
 
@@ -847,7 +935,11 @@ impl<S: BroadcastSink> Supervisor<S> {
     ///      `opencode acp`, etc.)
     ///   3. custom agent declaring an ACP command via
     ///      `agent_acp_cmd` in the session's profile config
-    ///   4. legacy fallback: `claude` for the claude tool, otherwise
+    ///   4. custom agent inheriting a registry-backed base via
+    ///      `agent_detect_as` (e.g. a Claude wrapper); resolves to the *base*
+    ///      registry key so the base agent's adapter, version gate, env
+    ///      allowlist, and `AgentProfile` all apply
+    ///   5. legacy fallback: `claude` for the claude tool, otherwise
     ///      `aoe-agent` (our bundled multi-provider agent)
     ///
     /// `profile` is the session's source profile (`""` resolves the
@@ -882,12 +974,48 @@ impl<S: BroadcastSink> Supervisor<S> {
         {
             return tool.to_string();
         }
-        // Step 4: legacy fallbacks.
+        // Step 4: custom agent inheriting a registry-backed base. Resolve to
+        // the base key so the built-in adapter path serves it; the wrapper's
+        // identity stays on the session's `tool`.
+        if let Some(base) = self
+            .custom_agent_inherited_base(tool, profile, project_path)
+            .await
+        {
+            return base;
+        }
+        // Step 5: legacy fallbacks.
         if tool == "claude" {
             "claude".into()
         } else {
             "aoe-agent".into()
         }
+    }
+
+    /// The registry-backed base key `tool` inherits via `agent_detect_as` in
+    /// its profile + repo-resolved config, or `None`. See
+    /// [`crate::acp::inherited_acp_base`].
+    pub async fn custom_agent_inherited_base(
+        &self,
+        tool: &str,
+        profile: &str,
+        project_path: &std::path::Path,
+    ) -> Option<String> {
+        let tool = tool.to_string();
+        let profile = profile.to_string();
+        let project_path = project_path.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            crate::acp::inherited_acp_base(
+                &tool,
+                &crate::session::repo_config::resolve_config_with_repo_or_warn(
+                    &profile,
+                    &project_path,
+                )
+                .session
+                .agent_detect_as,
+            )
+        })
+        .await
+        .unwrap_or(None)
     }
 
     /// True iff `tool` is a custom agent that declares an
@@ -916,13 +1044,35 @@ impl<S: BroadcastSink> Supervisor<S> {
         self.registry.lock().await.clone()
     }
 
-    /// True iff `name` is registered as an ACP agent. Used by the
-    /// `/acp/switch-agent` endpoint to validate the target before
-    /// tearing down the current worker; otherwise an unknown agent
-    /// would only surface at spawn time, leaving the session without a
-    /// worker.
+    /// True iff `name` is a built-in registry ACP agent. This does NOT
+    /// include custom `agent_acp_cmd` agents; switch-agent validation
+    /// should call [`Self::agent_is_valid_switch_target`] instead.
     pub async fn registry_has_agent(&self, name: &str) -> bool {
         self.registry.lock().await.get(name).is_some()
+    }
+
+    /// True iff `name` is a valid structured-view switch target for a
+    /// session with the given profile and project path. Built-in registry
+    /// entries are accepted; so are custom agents that declare a valid
+    /// `agent_acp_cmd` in the profile-resolved config. A malformed or
+    /// empty `agent_acp_cmd` entry is treated as invalid and returns
+    /// false, so the switch endpoint surfaces the same "unknown
+    /// structured view agent" 400 as a truly unknown name.
+    pub async fn agent_is_valid_switch_target(
+        &self,
+        name: &str,
+        profile: &str,
+        project_path: &std::path::Path,
+    ) -> bool {
+        if self.registry_has_agent(name).await {
+            return true;
+        }
+        self.custom_agent_has_acp_cmd(name, profile, project_path)
+            .await
+            || self
+                .custom_agent_inherited_base(name, profile, project_path)
+                .await
+                .is_some()
     }
 
     /// Allocate the session's next seq and publish `event` on the sink in
@@ -1184,7 +1334,7 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// is text-based but routed through the session's `AgentProfile`
     /// so each agent's aliases match the right surface. See #1101.
     pub async fn publish_user_prompt(&self, session_id: &str, text: String) -> PromptDisposition {
-        self.publish_user_prompt_with_attachments(session_id, text, &[])
+        self.publish_user_prompt_with_attachments(session_id, text, &[], None)
             .await
     }
 
@@ -1198,6 +1348,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         session_id: &str,
         text: String,
         attachments: &[crate::acp::event_store::AttachmentBlob],
+        prompt_id: Option<String>,
     ) -> PromptDisposition {
         let agent_key = self.agent_key_for_session(session_id).await;
         let profile = super::agent_profiles::resolve(&agent_key);
@@ -1234,6 +1385,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             &Event::UserPromptSent {
                 text,
                 attachments: refs,
+                prompt_id,
             },
         );
         if !persisted {
@@ -1509,6 +1661,24 @@ impl<S: BroadcastSink> Supervisor<S> {
         if let Some(ref ovr) = agent_command_override {
             apply_agent_command_override(&agent, spec_from_registry, ovr, &mut spec)?;
         }
+        // #3422: say so when an agent_detect_as wrapper's base adapter is
+        // about to run in the wrapper's place; the wrapper's account,
+        // gateway, or env overrides would otherwise silently not apply.
+        // The pair rides SpawnConfig so watchdog respawns, which relaunch a
+        // clone of this config without re-resolving, re-emit it.
+        let wrapper_substitution = {
+            let registry = self.registry.lock().await;
+            wrapper_substitution_for(
+                &registry,
+                &tool,
+                &agent,
+                spec_from_registry,
+                &resolved_cfg.session.agent_detect_as,
+            )
+        };
+        if let Some((wrapper, base)) = &wrapper_substitution {
+            log_wrapper_substitution(&session_id, &tool, wrapper, base);
+        }
         // Apply ${aoe_data_dir} placeholder substitution against the
         // appropriate path; if the placeholder is not consumed it stays
         // as-is and the spawn will fail with a clear error.
@@ -1667,6 +1837,7 @@ impl<S: BroadcastSink> Supervisor<S> {
             mcp_servers,
             seed_history_replay,
             artifact_dir: crate::session::artifacts::session_artifact_dir(&session_id).ok(),
+            wrapper_substitution,
         };
 
         debug!(
@@ -2235,6 +2406,13 @@ impl<S: BroadcastSink> Supervisor<S> {
                     }
 
                     let acp_session_id = AcpSessionId(session_id.clone());
+                    // The respawn relaunches a clone of the original
+                    // SpawnConfig, so whatever substitution it recorded at
+                    // initial spawn still describes this launch exactly.
+                    if let Some((wrapper, base)) = &respawn_config.wrapper_substitution {
+                        log_wrapper_substitution(&session_id, &respawn_config.tool, wrapper, base);
+                    }
+
                     let mut new_client =
                         match AcpClient::spawn(respawn_config.clone(), acp_session_id).await {
                             Ok(c) => c,
@@ -2511,10 +2689,21 @@ impl<S: BroadcastSink> Supervisor<S> {
 
     /// Cancel the current turn for a running structured view worker. Best-effort:
     /// returns Ok if the worker exists even when no turn is in flight.
+    ///
+    /// A worker whose connection task has already ended counts as
+    /// cancelled rather than failed. That is the window a force stop
+    /// opens: the task exits, its command receiver drops, and the (now
+    /// dead) `WorkerHandle` stays in the map until the respawn swaps it,
+    /// so a cancel arriving in between fails to send instantly. There is
+    /// nothing left to cancel by then, and the resumed worker starts
+    /// idle, so answering the user's stop with an error was reporting a
+    /// fault for an outcome they got. See #3401.
     pub async fn cancel_prompt(&self, session_id: &str) -> Result<(), SupervisorError> {
         let client = self.ready_client(session_id).await?;
-        client.cancel_prompt().await?;
-        Ok(())
+        match client.cancel_prompt().await {
+            Ok(()) | Err(AcpError::AgentExited) => Ok(()),
+            Err(e) => Err(SupervisorError::Acp(e)),
+        }
     }
 
     /// User-initiated "Force stop". Two failure modes to cover:
@@ -3378,6 +3567,10 @@ pub struct ChannelSink {
     /// which is hydrated from this store at startup, so seqs survive
     /// `aoe serve` restart without coordination.
     pub event_store: Arc<crate::acp::event_store::EventStore>,
+    /// Live control-state projection, folded here so prompt dispatch can read
+    /// it without replaying the log (`crate::acp::control_cache`). Shared with
+    /// `AppState`, which is where the readers live.
+    pub control_cache: Arc<crate::acp::control_cache::ControlStateCache>,
 }
 
 /// Reset time a fresh rejection can inherit from the session's previous
@@ -3398,6 +3591,8 @@ impl BroadcastSink for ChannelSink {
 
     fn clear_session_events(&self, session_id: &str) {
         self.event_store.delete_session(session_id);
+        // The cached fold is a projection of the log we just deleted.
+        self.control_cache.forget(session_id);
     }
 
     fn publish_persisted(&self, session_id: &str, seq: u64, event: &Event) -> bool {
@@ -3474,6 +3669,18 @@ impl BroadcastSink for ChannelSink {
             }
         };
 
+        // Fold into the live control-state projection before broadcasting, in
+        // the same seq order the on-disk log is written in. On a failed
+        // persist drop the fold instead: the log is now missing this seq, and
+        // a projection that has an event its log does not is worse than no
+        // projection, since the next reader would trust it.
+        if persisted {
+            self.control_cache
+                .apply_if_cached(session_id, seq, event_ref);
+        } else {
+            self.control_cache.forget(session_id);
+        }
+
         let frame = crate::server::AcpBroadcastFrame {
             session_id: session_id.to_string(),
             seq,
@@ -3520,6 +3727,7 @@ impl BroadcastSink for ChannelSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tracing_test::traced_test;
 
     // #3152: the worker's captured reset dies with the worker, and a
     // rate-limited session's worker is dropped, so a retry inherits the
@@ -3687,6 +3895,10 @@ mod tests {
         let mut cfg = crate::session::config::SessionConfig::default();
         cfg.agent_acp_cmd
             .insert("oc-superpowers".into(), "ocp run sp acp".into());
+        // A custom agent that inherits a registry-backed base via
+        // `agent_detect_as` resolves to the base agent's registry spec.
+        cfg.agent_detect_as
+            .insert("lenovo-claude".into(), "claude".into());
 
         #[derive(Debug)]
         enum Want {
@@ -3696,11 +3908,13 @@ mod tests {
             Unknown,
         }
         let cases = [
-            // Unrestricted: both branches resolve as before.
+            // Unrestricted: all three branches resolve as before.
             (false, &[][..], "claude", Want::Registry),
             (false, &[][..], "oc-superpowers", Want::Custom),
+            // An inheriting wrapper resolves to the base's registry spec.
+            (false, &[][..], "lenovo-claude", Want::Registry),
             (false, &[][..], "no-such-agent", Want::Unknown),
-            // Restricted: only listed keys resolve, on either branch.
+            // Restricted: only listed keys resolve, on any branch.
             (true, &["claude"][..], "claude", Want::Registry),
             (true, &["claude"][..], "codex", Want::NotAllowed),
             (
@@ -3710,6 +3924,15 @@ mod tests {
                 Want::Custom,
             ),
             (true, &["claude"][..], "oc-superpowers", Want::NotAllowed),
+            // The allowlist is keyed on the name the caller passes: allowing the
+            // wrapper permits it, allowing only the base does not.
+            (
+                true,
+                &["lenovo-claude"][..],
+                "lenovo-claude",
+                Want::Registry,
+            ),
+            (true, &["claude"][..], "lenovo-claude", Want::NotAllowed),
             // Policy is checked before resolution, so an agent that is both
             // unlisted and unregistered reports the policy refusal. The
             // operator's list is the reason it will not run.
@@ -3741,6 +3964,259 @@ mod tests {
                 ),
             }
         }
+    }
+
+    /// #3422: a wrapper mapped to its base via `agent_detect_as` starts a
+    /// structured view session happily, but the base adapter binary runs, so
+    /// account, gateway, or env overrides the wrapper sets silently do not
+    /// apply. The spawn must say so instead of substituting silently. Every
+    /// substitution shape must produce its own pair, so a regression in one
+    /// arm cannot hide behind another's.
+    #[test]
+    fn spawn_warns_when_a_detect_as_wrapper_runs_its_base_adapter() {
+        let registry = AgentRegistry::with_defaults();
+        // Distinct wrapper/base pairs per row so the returned substitution
+        // discriminates a mislabeled shape instead of matching another row's.
+        let detect_as = [
+            ("claude-personal".to_string(), "claude".to_string()),
+            ("codex-personal".to_string(), "codex".to_string()),
+            ("kimi-personal".to_string(), "kimi".to_string()),
+        ]
+        .into();
+        // (tool, agent, expected wrapper, expected base), one row per shape.
+        let cases: [(&str, &str, &str, &str); 3] = [
+            // Normal create path: pick_agent_for_tool swapped the base key
+            // in before spawn, so agent is "claude" while the tool stays
+            // the wrapper.
+            ("claude-personal", "claude", "claude-personal", "claude"),
+            // Attach respawn path: the caller passes the wrapper key
+            // directly and resolve_agent_spec performs the substitution,
+            // so agent and tool are both the wrapper key.
+            (
+                "codex-personal",
+                "codex-personal",
+                "codex-personal",
+                "codex",
+            ),
+            // Explicit request-level agent override naming a different
+            // wrapper than an unmapped tool: the named wrapper's own
+            // inheritance applies inside resolve_agent_spec.
+            ("plain-tool", "kimi-personal", "kimi-personal", "kimi"),
+        ];
+        for (tool, agent, wrapper, base) in cases {
+            let got = super::wrapper_substitution_for(&registry, tool, agent, true, &detect_as);
+            assert_eq!(
+                got.as_ref().map(|(w, b)| (w.as_str(), b.as_str())),
+                Some((wrapper, base)),
+                "{tool:?} -> {agent:?}: wrong substitution pair"
+            );
+        }
+    }
+
+    /// Shapes where nothing was substituted must stay silent: a built-in
+    /// running its own adapter (mapped or not), a wrapper mapped to a
+    /// terminal-only base, an explicit switch to an unrelated agent, a
+    /// custom `agent_acp_cmd` spec that executes the wrapper itself, and
+    /// spawns with no `agent_detect_as` involvement.
+    #[test]
+    fn spawn_stays_silent_when_no_detect_as_substitution_happened() {
+        let registry = AgentRegistry::with_defaults();
+        let detect_as = [("claude-personal".to_string(), "claude".to_string())].into();
+        let mapped_builtin = [("claude".to_string(), "codex".to_string())].into();
+        let self_map = [("claude".to_string(), "claude".to_string())].into();
+        let codex_map = [("codex".to_string(), "claude".to_string())].into();
+        let cursor_map = [("claude-personal".to_string(), "cursor".to_string())].into();
+        // (tool, agent, from registry, detect_as map), one row per guard.
+        let cases: [(&str, &str, &str, bool, &HashMap<String, String>); 9] = [
+            // Built-in tool on its own registry spec.
+            ("s-builtin", "claude", "claude", true, &detect_as),
+            // A mapping whose key is itself a built-in changes nothing: the
+            // direct registry lookup already won, so its own adapter runs.
+            (
+                "s-mapped-builtin",
+                "claude",
+                "claude",
+                true,
+                &mapped_builtin,
+            ),
+            // Degenerate self-aliasing mapping: the key executes itself.
+            ("s-self-map", "claude", "claude", true, &self_map),
+            // Built-in tool explicitly overridden onto its mapped base: the
+            // named built-in still runs its own registry spec.
+            (
+                "s-mapped-builtin-target",
+                "claude",
+                "codex",
+                true,
+                &mapped_builtin,
+            ),
+            // Unmapped tool overridden onto a mapped built-in: the built-in
+            // executes itself regardless of any mapping keyed on it.
+            ("s-builtin-target", "plain-tool", "codex", true, &codex_map),
+            // Wrapper mapped to a terminal-only base: resolution never
+            // substitutes it, so the inner-None destructure stays silent.
+            (
+                "s-terminal-base",
+                "claude-personal",
+                "claude-personal",
+                true,
+                &cursor_map,
+            ),
+            // Switched to an unrelated built-in; nothing inherited ran.
+            ("s-unrelated", "claude-personal", "codex", true, &detect_as),
+            // Custom agent_acp_cmd spec: the wrapper's own command executes.
+            (
+                "s-acp-cmd",
+                "claude-personal",
+                "claude-personal",
+                false,
+                &detect_as,
+            ),
+            // No agent_detect_as mapping anywhere.
+            ("s-no-map", "plain-tool", "aoe-agent", true, &HashMap::new()),
+        ];
+        for (label, tool, agent, spec_from_registry, detect_as) in cases {
+            let got = super::wrapper_substitution_for(
+                &registry,
+                tool,
+                agent,
+                spec_from_registry,
+                detect_as,
+            );
+            assert_eq!(got, None, "{label}: expected silence");
+        }
+    }
+    /// `spawn_inner` would leave them green. Here a full `Supervisor::spawn`
+    /// runs a detect_as wrapper against the real claude adapter with an
+    /// unwritable working directory: the warning is emitted before any
+    /// subprocess work, then the exec fails fast and deterministically.
+    /// Needs HOME isolation for the config resolve.
+    #[traced_test]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn spawn_path_emits_the_wrapper_warning() {
+        let tmp = tempfile::TempDir::with_prefix_in("aoe-warn-wiring-", "/tmp").unwrap();
+        let _guard = crate::session::test_support::isolate_home(tmp.path());
+        tracing::callsite::rebuild_interest_cache();
+
+        let sup = Supervisor::new(VecSink::new());
+        let cfg_path = crate::session::get_app_dir().unwrap().join("config.toml");
+        std::fs::write(
+            &cfg_path,
+            "\n[session.agent_detect_as]\nclaude-personal = \"claude\"\n",
+        )
+        .unwrap();
+
+        let result = sup
+            .spawn(SpawnRequest {
+                session_id: "s-wire".into(),
+                // Attach shape: the caller passes the wrapper key as both
+                // agent and tool, so resolve_agent_spec performs the
+                // substitution against the real claude adapter.
+                agent: "claude-personal".into(),
+                tool: "claude-personal".into(),
+                // An unwritable working directory makes the agent exec fail
+                // right after the warn site, deterministically, whether or
+                // not the adapter binary exists on this machine.
+                cwd: tmp.path().join("does-not-exist"),
+                additional_dirs: vec![],
+                provider_env: vec![],
+                model: None,
+                effort: None,
+                stored_acp_session_id: None,
+                fork_from: None,
+                seed_history_replay: false,
+                sandbox_info: None,
+                source_profile: None,
+                yolo_mode: false,
+                acp_mode_id: None,
+                agent_command_override: None,
+            })
+            .await;
+        assert!(
+            result.is_err(),
+            "launch into a missing working directory must fail"
+        );
+        assert!(
+            logs_contain("s-wire") && logs_contain("will not be executed"),
+            "spawn path must emit the wrapper warning before the launch fails"
+        );
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn agent_is_valid_switch_target_accepts_builtin_and_custom() {
+        let tmp = tempfile::TempDir::with_prefix_in("aoe-switch-target-", "/tmp").unwrap();
+        let _guard = crate::session::test_support::isolate_home(tmp.path());
+
+        let sup = Supervisor::new(VecSink::new());
+        // Resolve the dir via the same call the resolver uses so the namespace
+        // (release vs dev) always matches.
+        let cfg_path = crate::session::get_app_dir().unwrap().join("config.toml");
+        std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &cfg_path,
+            r#"
+[session.agent_acp_cmd]
+cursor-acp-bridge = "agent acp"
+broken = ""
+
+[session.agent_detect_as]
+lenovo-claude = "claude"
+my-cursor = "cursor"
+"#,
+        )
+        .unwrap();
+
+        let cases = [
+            ("claude", true),
+            ("cursor-acp-bridge", true),
+            ("unknown-agent", false),
+            ("broken", false),
+            // Inherits a registry-backed base → valid structured target.
+            ("lenovo-claude", true),
+            // Inherits a terminal-only base (no ACP adapter) → not a target.
+            ("my-cursor", false),
+        ];
+        for (name, expected) in cases {
+            let got = sup.agent_is_valid_switch_target(name, "", tmp.path()).await;
+            assert_eq!(got, expected, "{name:?}");
+        }
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn agent_is_valid_switch_target_respects_profile() {
+        let tmp = tempfile::TempDir::with_prefix_in("aoe-switch-target-", "/tmp").unwrap();
+        let _guard = crate::session::test_support::isolate_home(tmp.path());
+
+        let sup = Supervisor::new(VecSink::new());
+        let profile_cfg_path = crate::session::get_profile_dir_path("cursor")
+            .unwrap()
+            .join("config.toml");
+        std::fs::create_dir_all(profile_cfg_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &profile_cfg_path,
+            r#"
+[session.agent_acp_cmd]
+cursor-acp-bridge = "agent acp"
+"#,
+        )
+        .unwrap();
+
+        assert!(
+            sup.agent_is_valid_switch_target("cursor-acp-bridge", "cursor", tmp.path())
+                .await,
+            "custom agent visible in its profile"
+        );
+        // A named profile, not `""`: an empty profile resolves through
+        // `resolve_default_profile`, which with no configured default returns
+        // the first profile that exists, i.e. `cursor` itself.
+        assert!(
+            !sup.agent_is_valid_switch_target("cursor-acp-bridge", "other", tmp.path())
+                .await,
+            "custom agent not visible outside its profile"
+        );
     }
 
     /// #3241: the reattach half of the enforcement. Workers are detached rather
@@ -4152,6 +4628,7 @@ mod tests {
         };
         let socket_path = tmp.path().join("budget.sock");
         let dummy_config = SpawnConfig {
+            wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
             spec: dummy_spec,
@@ -4249,6 +4726,7 @@ mod tests {
             env_allowlist: None,
         };
         let dummy_config = SpawnConfig {
+            wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
             spec: dummy_spec,
@@ -4292,6 +4770,43 @@ mod tests {
         );
     }
 
+    /// #3401: a force stop ends the connection task and leaves the dead
+    /// `WorkerHandle` in the map until the respawn swaps it, so requests
+    /// landing in that window fail their command send instantly. The
+    /// user's own stop must not read back as a failure, and a prompt
+    /// that raced it has to stay distinguishable as the transient the
+    /// REST layer answers with a retryable status.
+    #[tokio::test]
+    async fn requests_racing_a_force_stop_teardown_are_not_faults() {
+        let sup = Supervisor::new(VecSink::new());
+        {
+            let mut workers = sup.workers.lock().await;
+            workers.insert(
+                "s-3401".into(),
+                WorkerHandle {
+                    client: Arc::new(AcpClient::fake_for_test_dead_connection(AcpSessionId(
+                        "acp-3401".into(),
+                    ))),
+                    drain_task: tokio::spawn(async {}),
+                    restart_history: vec![],
+                    kind: WorkerKind::Stdio,
+                },
+            );
+        }
+
+        assert!(
+            sup.cancel_prompt("s-3401").await.is_ok(),
+            "the turn a cancel would have ended is already over"
+        );
+        assert!(
+            matches!(
+                sup.send_prompt("s-3401", "hi", &[]).await,
+                Err(SupervisorError::Acp(AcpError::AgentExited))
+            ),
+            "a prompt genuinely did not land, and the reason must stay typed"
+        );
+    }
+
     /// `reap_user_stopped` is the polling fallback that catches the
     /// `aoe acp stop|kill` case the drain task cannot detect on its
     /// own (idle connection task blocks on `cmd_rx.recv()`, so socket
@@ -4329,6 +4844,7 @@ mod tests {
             env_allowlist: None,
         };
         let dummy_config = SpawnConfig {
+            wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
             spec: dummy_spec,
@@ -4409,6 +4925,7 @@ mod tests {
             env_allowlist: None,
         };
         let dummy_config = SpawnConfig {
+            wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
             spec: dummy_spec,
@@ -4543,6 +5060,7 @@ mod tests {
             env_allowlist: None,
         };
         let dummy_config = SpawnConfig {
+            wrapper_substitution: None,
             agent_key: "claude".into(),
             tool: "claude".into(),
             spec: dummy_spec,
@@ -6060,12 +6578,14 @@ mod tests {
         let sink = Arc::new(ChannelSink {
             tx,
             event_store: event_store.clone(),
+            control_cache: Arc::new(crate::acp::control_cache::ControlStateCache::new()),
         });
 
         sink.publish(
             "s-42",
             1,
             &Event::UserPromptSent {
+                prompt_id: None,
                 text: "hello world".into(),
                 attachments: Vec::new(),
             },
@@ -6117,6 +6637,7 @@ mod tests {
         let sink = Arc::new(ChannelSink {
             tx,
             event_store: event_store.clone(),
+            control_cache: Arc::new(crate::acp::control_cache::ControlStateCache::new()),
         });
         let resets_at = chrono::Utc::now() + chrono::Duration::hours(3);
         let info = |resets_at| RateLimitInfo {
@@ -6162,6 +6683,7 @@ mod tests {
             let sink = Arc::new(ChannelSink {
                 tx,
                 event_store: event_store.clone(),
+                control_cache: Arc::new(crate::acp::control_cache::ControlStateCache::new()),
             });
             let sup = Supervisor::new(sink);
             sup.publish_user_prompt("s-99", "first".into()).await;
@@ -6180,6 +6702,7 @@ mod tests {
         let sink = Arc::new(ChannelSink {
             tx,
             event_store: event_store.clone(),
+            control_cache: Arc::new(crate::acp::control_cache::ControlStateCache::new()),
         });
         let sup = Supervisor::new(sink);
         sup.hydrate_seqs(event_store.all_session_seqs());

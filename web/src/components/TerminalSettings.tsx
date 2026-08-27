@@ -7,8 +7,7 @@ import {
   MIN_PERSISTENT_TERMINALS,
   normalizePersistentTerminalLimit,
 } from "../lib/persistentTerminals";
-
-const FONT_SIZES = Array.from({ length: 23 }, (_, i) => i + 6); // 6..28
+import { FontSizeControl } from "./settings/FontSizeControl";
 
 export function TerminalSettings() {
   const { settings, update } = useWebSettings();
@@ -22,65 +21,21 @@ export function TerminalSettings() {
       <h3 className="font-mono text-sm uppercase tracking-widest text-text-muted mb-4">Terminal</h3>
 
       <div className="space-y-4">
-        <div>
-          <label className="block text-[13px] text-text-secondary mb-2">Mobile font size</label>
-          <div className="flex items-center gap-3">
-            <input
-              type="range"
-              min={6}
-              max={28}
-              step={1}
-              value={settings.mobileFontSize}
-              onChange={(e) => update({ mobileFontSize: Number(e.target.value) })}
-              className="flex-1 accent-brand-600 h-1.5"
-            />
-            <select
-              value={settings.mobileFontSize}
-              onChange={(e) => update({ mobileFontSize: Number(e.target.value) })}
-              className="bg-surface-800 border border-surface-700 rounded-md px-2 py-1 text-sm text-text-primary font-mono w-16 text-center"
-            >
-              {FONT_SIZES.map((s) => (
-                <option key={s} value={s}>
-                  {s}px
-                </option>
-              ))}
-            </select>
-          </div>
-          <p className="text-[11px] text-text-muted mt-1">
-            Font size for web terminal sessions on mobile devices, including tmux-backed sessions. Pinch the terminal
-            with two fingers to zoom; the new size is saved here.
-          </p>
-        </div>
+        <FontSizeControl
+          label="Mobile font size"
+          testIdPrefix="terminal-mobile-font-size"
+          value={settings.mobileFontSize}
+          onChange={(value) => update({ mobileFontSize: value })}
+          description="Font size for web terminal sessions on mobile devices, including tmux-backed sessions. Pinch the terminal with two fingers to zoom; the new size is saved here."
+        />
 
-        <div>
-          <label className="block text-[13px] text-text-secondary mb-2">Desktop font size</label>
-          <div className="flex items-center gap-3">
-            <input
-              type="range"
-              min={6}
-              max={28}
-              step={1}
-              value={settings.desktopFontSize}
-              onChange={(e) => update({ desktopFontSize: Number(e.target.value) })}
-              className="flex-1 accent-brand-600 h-1.5"
-            />
-            <select
-              value={settings.desktopFontSize}
-              onChange={(e) => update({ desktopFontSize: Number(e.target.value) })}
-              className="bg-surface-800 border border-surface-700 rounded-md px-2 py-1 text-sm text-text-primary font-mono w-16 text-center"
-            >
-              {FONT_SIZES.map((s) => (
-                <option key={s} value={s}>
-                  {s}px
-                </option>
-              ))}
-            </select>
-          </div>
-          <p className="text-[11px] text-text-muted mt-1">
-            Font size for web terminal sessions on desktop, including tmux-backed sessions. Hold Ctrl and scroll over
-            the terminal (or pinch on a trackpad) to zoom; the new size is saved here.
-          </p>
-        </div>
+        <FontSizeControl
+          label="Desktop font size"
+          testIdPrefix="terminal-desktop-font-size"
+          value={settings.desktopFontSize}
+          onChange={(value) => update({ desktopFontSize: value })}
+          description="Font size for web terminal sessions on desktop, including tmux-backed sessions. Hold Ctrl and scroll over the terminal (or pinch on a trackpad) to zoom; the new size is saved here."
+        />
 
         <div>
           <label htmlFor="terminal-font-family" className="block text-[13px] text-text-secondary mb-2">

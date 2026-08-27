@@ -247,6 +247,12 @@ pub struct CleanupDefaultsCache {
 
 pub const CLEANUP_DEFAULTS_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long attachment bytes buffered for a queued prompt live before the
+/// hourly sweep reclaims them (Q5 in the server-side prompt queue design). A
+/// queued prompt normally drains within seconds; this only catches bytes
+/// stranded by a session that never becomes idle again.
+const PENDING_ATTACHMENT_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
 impl CleanupDefaultsCache {
     pub fn stale(&self) -> bool {
         self.refreshed_at.elapsed() >= CLEANUP_DEFAULTS_TTL
@@ -392,6 +398,20 @@ pub struct AppState {
     /// transitions to `Status::Error` for up to 8 seconds while the agent
     /// is still settling. Periodically GC'd by a background task.
     pub recently_restarted: crate::session::recovery::RecentlyRestarted,
+    /// Bumped once per committed membership change of the session set: a
+    /// removal, after the row is gone from both `sessions.json` and
+    /// `instances`, and a creation, after the row is in both. A reloader
+    /// reads it before its disk read and hands the value back to
+    /// `reload_state_instances_from_disk`, which drops the reload when the
+    /// value moved: the disk snapshot it is carrying predates the mutation,
+    /// so folding it in would resurrect a removed row or drop a created one.
+    /// See invariant 8 on that function.
+    ///
+    /// Membership only. A field edit on an existing row does not bump, because
+    /// the per-id merge already reconciles those; the epoch exists for the
+    /// two cases the merge cannot see, where the id itself is absent from one
+    /// side.
+    pub mutation_epoch: Arc<std::sync::atomic::AtomicU64>,
     /// Ids whose startup-recovery cascade is scheduled but not yet complete.
     /// Phase A seeds it; each Phase B worker drains its id on completion. The
     /// background refresher walks it to keep queued candidates' marks in
@@ -403,9 +423,12 @@ pub struct AppState {
     /// timestamp so we re-resolve after config changes (see
     /// `CLEANUP_DEFAULTS_TTL`).
     pub cleanup_defaults_cache: RwLock<CleanupDefaultsCache>,
-    /// Cached remote owner per repo path. Remote owners don't change, so
-    /// entries live for the lifetime of the process.
-    pub remote_owner_cache: RwLock<std::collections::HashMap<String, Option<String>>>,
+    /// Cached (owner, host-scoped key) per repo path. Remote owners don't
+    /// change, so entries live for the lifetime of the process. The key
+    /// ("owner@host") lets the web org axis bucket by host-scoped identity
+    /// without merging same-named owners on different hosts; `remote_owner`
+    /// stays the plain owner for display.
+    pub remote_owner_cache: RwLock<std::collections::HashMap<String, Option<(String, String)>>>,
     /// Short-TTL cache of `compute_changed_files` keyed by `(repo_path,
     /// base_branch)`, shared by the file-list and per-file diff endpoints so a
     /// burst of file switches reuses one branch scan. See `ChangedFilesEntry`.
@@ -441,6 +464,11 @@ pub struct AppState {
     /// rather than 1.
     #[cfg(feature = "serve")]
     pub acp_event_store: Arc<crate::acp::event_store::EventStore>,
+    /// Live control-state projection per session, folded at the publish choke
+    /// point and shared with `ChannelSink`. Prompt dispatch reads it instead
+    /// of replaying the log on every POST; see `crate::acp::control_cache`.
+    #[cfg(feature = "serve")]
+    pub acp_control_cache: Arc<crate::acp::control_cache::ControlStateCache>,
     /// Owns the per-session ACP agent subprocesses.
     #[cfg(feature = "serve")]
     pub acp_supervisor:
@@ -453,11 +481,12 @@ pub struct AppState {
     /// dashboard can tail their host-side log. In-memory; see
     /// `api::plugins::PluginJobRegistry`.
     pub plugin_jobs: Arc<crate::server::api::plugins::PluginJobRegistry>,
-    /// Epoch-millis timestamp of the most recent authenticated API request.
-    /// Updated by auth middleware on every successful auth. The push consumer
-    /// checks this to suppress notifications when someone is actively using
-    /// the web dashboard (on any device).
-    pub last_web_activity: std::sync::atomic::AtomicI64,
+    /// Per-browser foreground dashboard presence. Entries are keyed by a hash
+    /// of the device-binding secret and expire when the browser stops sending
+    /// its visibility heartbeat. Push suppression must not treat ordinary
+    /// polling or a backgrounded PWA as evidence that somebody is looking at
+    /// the dashboard.
+    pub web_presence: std::sync::Mutex<std::collections::HashMap<[u8; 32], i64>>,
     /// Packed sleep-inhibit reconciler snapshot for read-only status reporting:
     /// bit `SLEEP_INHIBIT_SNAPSHOT_ENABLED` is the
     /// `prevent_sleep_when_active` toggle as the reconciler last read it, bit
@@ -572,17 +601,7 @@ impl AppState {
     /// `RwLock` is only held long enough to insert/lookup the `Arc<Mutex>`;
     /// the caller awaits the inner mutex without holding the map lock.
     pub async fn instance_lock(&self, id: &str) -> Arc<tokio::sync::Mutex<()>> {
-        {
-            let guard = self.instance_locks.read().await;
-            if let Some(lock) = guard.get(id) {
-                return lock.clone();
-            }
-        }
-        let mut guard = self.instance_locks.write().await;
-        guard
-            .entry(id.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-            .clone()
+        instance_lock_in(&self.instance_locks, id).await
     }
 
     /// Get or create the per-idempotency-key serialization mutex. Same
@@ -611,24 +630,25 @@ impl AppState {
             .clone()
     }
 
-    /// Record that an authenticated web client just made a request.
-    pub fn touch_web_activity(&self) {
-        self.last_web_activity.store(
-            crate::util::now_ms() as i64,
-            std::sync::atomic::Ordering::Relaxed,
-        );
+    /// Record whether one browser is currently foregrounded. Browser identity
+    /// is derived from its device-binding secret, never retained in plaintext.
+    pub fn set_web_presence(&self, client: [u8; 32], active: bool) {
+        let mut presence = self.web_presence.lock().expect("web_presence poisoned");
+        if active {
+            presence.insert(client, crate::util::now_ms() as i64);
+        } else {
+            presence.remove(&client);
+        }
     }
 
-    /// Returns true if an authenticated web request arrived within `threshold`.
+    /// Returns true if any dashboard recently reported itself visible and
+    /// focused. Stale entries are swept here, on the only read path.
     pub fn web_active_within(&self, threshold: std::time::Duration) -> bool {
-        let last = self
-            .last_web_activity
-            .load(std::sync::atomic::Ordering::Relaxed);
-        if last == 0 {
-            return false;
-        }
-        let elapsed_ms = crate::util::now_ms() as i64 - last;
-        elapsed_ms >= 0 && (elapsed_ms as u64) < threshold.as_millis() as u64
+        let now = crate::util::now_ms() as i64;
+        let max_age = threshold.as_millis() as i64;
+        let mut presence = self.web_presence.lock().expect("web_presence poisoned");
+        presence.retain(|_, last| now.saturating_sub(*last) < max_age);
+        !presence.is_empty()
     }
 }
 
@@ -854,6 +874,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         )
     };
     #[cfg(feature = "serve")]
+    let acp_control_cache = Arc::new(crate::acp::control_cache::ControlStateCache::new());
+    #[cfg(feature = "serve")]
     let acp_supervisor = {
         // Approval pushes are dispatched from `acp_event_listener`,
         // which subscribes to the broadcast that ChannelSink::publish
@@ -862,6 +884,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         let sink = std::sync::Arc::new(crate::acp::supervisor::ChannelSink {
             tx: acp_events_tx.clone(),
             event_store: acp_event_store.clone(),
+            control_cache: acp_control_cache.clone(),
         });
         let supervisor = std::sync::Arc::new(crate::acp::supervisor::Supervisor::with_capacity(
             sink,
@@ -884,12 +907,14 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     let instance_locks = Arc::new(RwLock::new(std::collections::HashMap::new()));
     let idempotency_locks = Arc::new(RwLock::new(std::collections::HashMap::new()));
     let telemetry_session_creates = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    let mutation_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
     #[cfg(feature = "serve")]
     let session_service = Arc::new(session_service::SessionService::new(
         Arc::clone(&instances),
         Arc::clone(&instance_locks),
         Arc::clone(&file_watch),
         Arc::clone(&telemetry_session_creates),
+        Arc::clone(&mutation_epoch),
         acp_supervisor.clone(),
         acp_event_store.clone(),
     ));
@@ -899,6 +924,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         Arc::clone(&instance_locks),
         Arc::clone(&file_watch),
         Arc::clone(&telemetry_session_creates),
+        Arc::clone(&mutation_epoch),
     ));
 
     // the daemon serves fine without plugin workers.
@@ -1196,6 +1222,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
             crate::session::conversation_summary::MAX_CONCURRENT,
         ),
         recently_restarted: crate::session::recovery::new_recently_restarted(),
+        mutation_epoch: Arc::clone(&mutation_epoch),
         recovery_pending: crate::session::recovery::new_recovery_pending(),
         cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
             // Seed with an already-stale timestamp so the first request
@@ -1211,6 +1238,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         #[cfg(feature = "serve")]
         acp_event_store: acp_event_store.clone(),
         #[cfg(feature = "serve")]
+        acp_control_cache: acp_control_cache.clone(),
+        #[cfg(feature = "serve")]
         acp_supervisor: acp_supervisor.clone(),
         #[cfg(feature = "serve")]
         plugin_host: plugin_host.clone(),
@@ -1218,7 +1247,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         push: push_state,
         push_enabled,
         web_config: config.web.clone(),
-        last_web_activity: std::sync::atomic::AtomicI64::new(0),
+        web_presence: std::sync::Mutex::new(std::collections::HashMap::new()),
         sleep_inhibit_snapshot: std::sync::atomic::AtomicU8::new(0),
         telemetry_usage_seen: crate::telemetry::usage_signals::UsageSeenCounters::new(),
         telemetry_web_clients: FormFactorCounters::default(),
@@ -1308,12 +1337,28 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
                 // in the active dir (rows trashed before relocation existed)
                 // and heal any pointer a crash left stale. See #2522.
                 crate::server::api::reconcile_trashed_worktrees(&sweep_state).await;
+                // Same one-shot startup slot: repoint any managed worktree
+                // whose directory was moved outside aoe. See #2002.
+                crate::server::api::reconcile_worktree_paths(&sweep_state).await;
                 let mut interval = tokio::time::interval(std::time::Duration::from_secs(60 * 60));
                 interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
                 loop {
                     tokio::select! {
                         _ = interval.tick() => {
                             crate::server::api::purge_expired_trash(&sweep_state).await;
+                            // Q5: reclaim attachment bytes buffered for a queued
+                            // prompt that never drained (a session that never went
+                            // idle again). Removal/clear/drain/session-delete drop
+                            // these already, so this only catches the stranded tail.
+                            let store = sweep_state.acp_event_store.clone();
+                            let pruned = tokio::task::spawn_blocking(move || {
+                                store.prune_pending_attachments_older_than(PENDING_ATTACHMENT_TTL)
+                            })
+                            .await
+                            .unwrap_or(0);
+                            if pruned > 0 {
+                                tracing::info!(target: "acp.queue", pruned, "pruned stale queued-prompt attachments past TTL");
+                            }
                         }
                         _ = shutdown.cancelled() => break,
                     }
@@ -1650,6 +1695,9 @@ fn build_router(state: Arc<AppState>) -> Router {
     use axum::routing::{delete, get, patch, post, put};
 
     let app = Router::new()
+        // Explicit browser visibility heartbeat. Ordinary API requests do not
+        // imply the dashboard is foregrounded, so they must not suppress push.
+        .route("/api/presence", post(api::post_dashboard_presence))
         // Sessions
         .route(
             "/api/sessions",
@@ -1977,6 +2025,16 @@ fn build_router(state: Arc<AppState>) -> Router {
         .route("/api/sessions/{id}/acp/enable", post(api::acp_enable))
         .route("/api/sessions/{id}/acp/disable", post(api::acp_disable))
         .route(
+            "/api/sessions/{id}/queue",
+            post(api::queue_enqueue)
+                .get(api::queue_list)
+                .delete(api::queue_clear),
+        )
+        .route(
+            "/api/sessions/{id}/queue/{promptId}",
+            patch(api::queue_edit).delete(api::queue_remove),
+        )
+        .route(
             "/api/sessions/{id}/acp/approvals/{nonce}",
             post(api::resolve_approval),
         )
@@ -2015,11 +2073,68 @@ fn build_router(state: Arc<AppState>) -> Router {
         .with_state(state)
 }
 
+/// Placeholder logged in place of a route template when axum matched no
+/// route: the SPA fallback, and the 405 that fallback returns for a
+/// non-GET method. A request whose *path* matched a registered route still
+/// carries its template even when the method router rejects it, because
+/// axum matches on path before it dispatches on method. The raw URI is never
+/// substituted here: it is attacker- or user-controlled text, and the whole
+/// point of [`log_route`] is that only strings we wrote ourselves reach the
+/// log file.
+const UNMATCHED_ROUTE: &str = "<unmatched>";
+
+/// Route template for a request, for logging only.
+///
+/// Deliberately never the raw URI. `aoe serve` puts the auth token in the
+/// URL's query string, path segments carry session ids, and `debug.log` is a
+/// file users paste into issue reports. `MatchedPath` is the template we
+/// registered in [`build_router`] (`/api/sessions/{id}/acp/replay`), a
+/// compile-time constant with no request data in it, so logging it cannot
+/// leak a token or an id no matter what the client sent. Axum fills the
+/// extension during routing, before any `Router::layer` middleware runs.
+fn log_route(request: &axum::extract::Request) -> &str {
+    request
+        .extensions()
+        .get::<axum::extract::MatchedPath>()
+        .map_or(UNMATCHED_ROUTE, |m| m.as_str())
+}
+
+/// Longest client-supplied `X-Request-Id` we are willing to echo. A
+/// correlation token needs far less; anything longer is a caller padding
+/// every one of its log lines.
+const MAX_CLIENT_REQUEST_ID: usize = 64;
+
+/// Whether a client-supplied `X-Request-Id` can be reused verbatim.
+///
+/// Held to the same rule as [`log_route`]. `request_id` is a field of the
+/// completion event, so it renders under the default `show_spans = false`
+/// formatter, and `HeaderValue::to_str` accepts any visible ASCII, spaces
+/// and `=` included. An unfiltered value therefore lets an unauthenticated
+/// caller (the event fires outside the auth layer) forge `status=` and
+/// `path=` pairs on the very line #3402 added for triage, or pad every 4xx
+/// line to churn the file through rotation. Anything outside a bounded
+/// token charset is replaced by a generated uuid.
+fn is_log_safe_request_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_CLIENT_REQUEST_ID
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+}
+
 /// Middleware that wraps every request in an `http.request` span with a
 /// generated or echoed `X-Request-Id`, then emits one completion event at
 /// the level matching the response status. Logs fired inside the request
 /// (auth middleware, route handlers, downstream `tracing` events) inherit
 /// the span fields, so a single grep on `request_id` reconstructs the call.
+///
+/// The completion event repeats `request_id`, `method`, and `path` as its
+/// own fields rather than relying on the span: `[logging].show_spans` is
+/// `false` by default, which drops the span prefix from the rendered line
+/// and used to leave `completed status=500 latency_ms=0` with nothing to
+/// identify the request (#3402). For the same reason the event is emitted
+/// outside the span, so enabling `show_spans` prints each field once
+/// instead of twice.
 ///
 /// Successful completions (2xx/3xx) emit at `debug`, not `info`: the web
 /// UI polls `/api/sessions` every ~2s, so an info-level success log here
@@ -2034,30 +2149,44 @@ async fn http_request_span(
         .headers()
         .get("x-request-id")
         .and_then(|v| v.to_str().ok())
+        .filter(|v| is_log_safe_request_id(v))
         .map(str::to_string)
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
     let method = request.method().clone();
-    let path = request.uri().path().to_string();
+    let route = log_route(&request).to_string();
     let span = tracing::debug_span!(
         target: "http.request",
         "http_request",
         request_id = %rid,
         method = %method,
-        path = %path,
+        path = %route,
     );
     let start = std::time::Instant::now();
-    let mut response = next.run(request).instrument(span.clone()).await;
+    let mut response = next.run(request).instrument(span).await;
     let latency_ms = start.elapsed().as_millis() as u64;
     let status = response.status().as_u16();
-    span.in_scope(|| {
-        if status >= 500 {
-            tracing::error!(target: "http.request", status, latency_ms, "completed");
-        } else if status >= 400 {
-            tracing::warn!(target: "http.request", status, latency_ms, "completed");
-        } else {
-            tracing::debug!(target: "http.request", status, latency_ms, "completed");
-        }
-    });
+    // `tracing` resolves the level at compile time, so the branches cannot
+    // share one call site; the macro keeps the field list written once.
+    macro_rules! completed {
+        ($level:ident) => {
+            tracing::$level!(
+                target: "http.request",
+                request_id = %rid,
+                method = %method,
+                path = %route,
+                status,
+                latency_ms,
+                "completed"
+            )
+        };
+    }
+    if status >= 500 {
+        completed!(error);
+    } else if status >= 400 {
+        completed!(warn);
+    } else {
+        completed!(debug);
+    }
     if let Ok(value) = rid.parse() {
         response.headers_mut().insert("x-request-id", value);
     }
@@ -2413,6 +2542,12 @@ const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     ("POST", "/api/sessions/{id}/acp/force_end_turn"),
     ("POST", "/api/sessions/{id}/acp/approvals/{nonce}"),
     ("POST", "/api/sessions/{id}/acp/elicitations/{nonce}"),
+    // Server-owned prompt queue: deferred prompting into a session the caller
+    // already sees, so it is classified exactly like `acp/prompt` above.
+    ("POST", "/api/sessions/{id}/queue"),
+    ("DELETE", "/api/sessions/{id}/queue"),
+    ("PATCH", "/api/sessions/{id}/queue/{promptId}"),
+    ("DELETE", "/api/sessions/{id}/queue/{promptId}"),
     // Curated settings surfaces (the handlers field-filter / strip color-mode).
     ("PATCH", "/api/profiles/{name}/settings"),
     ("PATCH", "/api/theme"),
@@ -2421,6 +2556,8 @@ const CITYHALL_MUTATION_ALLOW: &[(&str, &str)] = &[
     ("POST", "/api/telemetry/consent"),
     ("POST", "/api/telemetry/seen"),
     ("POST", "/api/telemetry/structured-interaction"),
+    // Ephemeral foreground-presence heartbeat. Does not mutate user data.
+    ("POST", "/api/presence"),
     // Per-device UI preferences / client log.
     ("PATCH", "/api/app-state/web-ui-state"),
     ("POST", "/api/app-state/dismiss-update"),
@@ -2874,23 +3011,42 @@ fn is_valid_token_format(token: &str) -> bool {
             .all(|c| c.is_ascii_hexdigit() || c.is_ascii_lowercase())
 }
 
-/// Load an existing auth token from disk if it's less than 24 hours old,
-/// otherwise generate a fresh one and persist it.
+/// Load an existing auth token from disk if it was last used less than 24
+/// hours ago, otherwise generate a fresh one and persist it.
+///
+/// "Last used" is the file's mtime, which we refresh on every reuse. The age
+/// window is therefore idle-based: a server that is restarted at least once a
+/// day keeps the same token indefinitely, and only a token untouched for 24h
+/// rotates. This is deliberate. A token change forces the rotation-prune path
+/// (`retain_owners`) to drop push subscriptions bound to the now-stale hash,
+/// so if the window were measured from creation, every restart after the first
+/// day would rotate the token and silently kill push notifications until each
+/// device re-subscribed (#3386). Rotation while the server runs continuously
+/// is still driven by the scheduled rotation loop, not by this function.
 async fn load_or_generate_token() -> anyhow::Result<String> {
     let app_dir = crate::session::get_app_dir()?;
-    let token_path = app_dir.join("serve.token");
+    let max_age = std::time::Duration::from_secs(24 * 60 * 60);
+    Ok(load_or_generate_token_at(&app_dir.join("serve.token"), max_age).await)
+}
 
-    // Try to reuse existing token if fresh enough
+async fn load_or_generate_token_at(
+    token_path: &std::path::Path,
+    max_age: std::time::Duration,
+) -> String {
+    // Try to reuse existing token if it was used recently enough.
     if let Ok(metadata) = tokio::fs::metadata(&token_path).await {
         if let Ok(modified) = metadata.modified() {
             let age = std::time::SystemTime::now()
                 .duration_since(modified)
                 .unwrap_or_default();
-            if age < std::time::Duration::from_secs(24 * 60 * 60) {
+            if age < max_age {
                 if let Ok(token) = tokio::fs::read_to_string(&token_path).await {
                     let token = token.trim().to_string();
                     if !token.is_empty() && is_valid_token_format(&token) {
-                        return Ok(token);
+                        // Refresh the mtime so this reuse resets the idle
+                        // window; the token stays stable across restarts.
+                        write_secret_file(token_path, &token).await;
+                        return token;
                     }
                 }
             }
@@ -2898,8 +3054,8 @@ async fn load_or_generate_token() -> anyhow::Result<String> {
     }
 
     let token = generate_token();
-    write_secret_file(&token_path, &token).await;
-    Ok(token)
+    write_secret_file(token_path, &token).await;
+    token
 }
 
 /// Load sessions from all profiles, matching the TUI's "all profiles" view.
@@ -2996,7 +3152,7 @@ fn apply_tick_status_decisions(
     instances: &mut [Instance],
     prev: &std::collections::HashMap<String, crate::session::Status>,
     suppressed_ids: &std::collections::HashSet<String>,
-    pane_metadata: &std::collections::HashMap<String, crate::tmux::PaneMetadata>,
+    pane_metadata: Option<&std::collections::HashMap<String, crate::tmux::PaneMetadata>>,
 ) {
     for inst in instances.iter_mut() {
         if suppressed_ids.contains(&inst.id) {
@@ -3004,9 +3160,28 @@ fn apply_tick_status_decisions(
             continue;
         }
         inst.live_status_baseline = prev.get(&inst.id).copied();
+        // A trashed row remains in storage until its retention period ends,
+        // but it is no longer a live session. Do not turn its deliberately
+        // stopped pane into a synthetic Error, and do not emit a status event
+        // that the push consumer could notify about.
+        if inst.is_trashed() {
+            if let Some(live) = inst.live_status_baseline {
+                inst.status = live;
+            }
+            continue;
+        }
         if skip_tmux_decision_for_structured(inst) {
             continue;
         }
+        let Some(pane_metadata) = pane_metadata else {
+            // A failed batch probe says nothing about any individual pane.
+            // Keep the last live status instead of treating an empty metadata
+            // map as proof that every pane disappeared.
+            if let Some(live) = inst.live_status_baseline {
+                inst.status = live;
+            }
+            continue;
+        };
         let session_name = crate::tmux::resolve_agent_session_name_in(
             pane_metadata,
             &inst.id,
@@ -3123,6 +3298,23 @@ fn skip_tmux_decision_for_structured(inst: &mut Instance) -> bool {
 //    scrape can briefly carry the prior status; it self-corrects on
 //    the next 2s tick. Polling is canonical (invariant 6) so this is
 //    acceptable.
+// 8. Every caller must read `state.mutation_epoch` BEFORE its disk read and
+//    pass that value as `read_epoch`. `fresh` is a snapshot of
+//    `sessions.json`, and `*current = merged` below replaces
+//    `state.instances` wholesale, so a membership change that commits
+//    between the read and this call would otherwise be undone. It cuts both
+//    ways. A delete: the removed row is still in `fresh` and comes straight
+//    back. A create: the new row is absent from `fresh`, and since `merged`
+//    is built exclusively from `fresh`, the wholesale replace drops the row
+//    the create just put in `state.instances`, so `GET /api/sessions` loses
+//    it until the next tick re-reads disk. The epoch check drops such a
+//    reload rather than applying either. Dropping ids missing from
+//    `prior_by_id` is NOT an alternative; that is also how a session
+//    created by another process (the CLI, a peer daemon) legitimately
+//    enters `state.instances`. The comparison happens under the
+//    `state.instances` write lock, and both the delete and the create bump
+//    under that same lock, so they are ordered against each other; comparing
+//    before taking the lock reopens the race one lock acquisition later.
 
 /// Reload `state.instances` by merging caller-supplied `fresh` against the
 /// prior in-memory snapshot per id, then reapplying the acp overlay.
@@ -3159,6 +3351,7 @@ pub(crate) async fn reload_state_instances_from_disk(
     fresh: Vec<Instance>,
     #[cfg(feature = "serve")] live_worker_records: Vec<LiveStructuredWorkerRecord>,
     status_source: StatusSource,
+    read_epoch: u64,
 ) {
     // Snapshot suppression here so a worker that unmarks between the
     // caller's input build and the per-id decision cannot combine a
@@ -3170,6 +3363,35 @@ pub(crate) async fn reload_state_instances_from_disk(
         crate::session::recovery::snapshot_recently_restarted(&state.recently_restarted);
 
     let mut current = state.instances.write().await;
+
+    // Invariant 8: `fresh` predates a committed create or delete, so folding it
+    // in would put a removed row back, or drop a created one. Drop the whole
+    // reload rather than filter it: the next poll tick re-reads disk 2s from
+    // now and converges, and both mutations are rare enough (each one is a
+    // user action) that losing one tick of status updates costs nothing.
+    //
+    // Read under the `instances` write lock, and before `drain_from` empties
+    // `current`, so this is atomic against the mutation. Checking before
+    // taking the lock leaves a hole: a reload could pass the check, park on
+    // the lock, let a delete take the lock, remove the row and bump, then wake
+    // and write its stale snapshot over the removal. Symmetrically for a
+    // create, whose row is missing from the stale snapshot entirely. Both
+    // mutations bump inside the same lock scope for the same reason. No memory ordering closes that gap; it
+    // is a check-then-act race, so the check has to happen under the lock that
+    // orders the two writers.
+    let current_epoch = state
+        .mutation_epoch
+        .load(std::sync::atomic::Ordering::SeqCst);
+    if current_epoch != read_epoch {
+        tracing::debug!(
+            target: "server.file_watch",
+            read_epoch,
+            current_epoch,
+            "dropping a disk reload whose snapshot predates a session create or delete"
+        );
+        return;
+    }
+
     let prior_by_id = PriorById::drain_from(&mut current);
 
     let mut merged: Vec<Instance> = Vec::with_capacity(fresh.len());
@@ -3696,6 +3918,11 @@ async fn disk_watcher_consumer(state: Arc<AppState>) {
             _ = state.disk_changed.notified() => {}
         }
         let started = std::time::Instant::now();
+        // Invariant 8: read before the disk read, so a delete committing
+        // during it invalidates this snapshot.
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
         let file_watch_for_load = state.file_watch.clone();
         let loaded = match tokio::task::spawn_blocking(move || {
             load_all_instances(&file_watch_for_load)
@@ -3728,6 +3955,7 @@ async fn disk_watcher_consumer(state: Arc<AppState>) {
             fresh,
             live_worker_records,
             StatusSource::DiskOnly,
+            read_epoch,
         )
         .await;
         tracing::trace!(
@@ -4083,6 +4311,9 @@ struct PassiveTransitionDecision {
     /// intra-doc link that would degrade to literal text under
     /// `cargo doc`).
     patch: Option<crate::session::PassiveStatusPatch>,
+    /// Always `false` for structured / ACP sessions: `should_mark_acp_unread`,
+    /// driven off the live ACP turn-end event, is the sole producer of their
+    /// automatic mark. See the gate in `decide_passive_transition`.
     mark_unread: bool,
 }
 
@@ -4090,9 +4321,9 @@ struct PassiveTransitionDecision {
 /// `status` differs from the tick's `prev` snapshot. The full
 /// contract lives on the return type at [`PassiveTransitionDecision`]:
 /// `patch: None` for structured / ACP sessions (the ACP overlay is the
-/// sole authority), and `mark_unread: true` only on genuine
-/// Running -> Idle when unread is enabled and the row is not already
-/// unread.
+/// sole authority), and `mark_unread: true` only on a genuine
+/// Running -> Idle for a *terminal* session when unread is enabled and the
+/// row is not already unread.
 fn decide_passive_transition(
     inst: &Instance,
     old_status: Status,
@@ -4100,7 +4331,14 @@ fn decide_passive_transition(
 ) -> PassiveTransitionDecision {
     let patch =
         (!inst.is_structured()).then(|| crate::session::PassiveStatusPatch::from_instance(inst));
+    // Structured rows are excluded for the same reason as the patch: the poll
+    // loop has no authority over a paneless row, and since #3162 one never
+    // reaches here anyway (it compares equal to `prev`, so `observed_transitions`
+    // does not report it). `should_mark_acp_unread`, driven off the live ACP
+    // `Stopped` event, is the sole producer for them; the gate is what stops a
+    // later change to this loop from quietly re-marking from two daemon paths.
     let mark_unread = unread_enabled
+        && !inst.is_structured()
         && old_status == Status::Running
         && inst.status == Status::Idle
         && !inst.unread;
@@ -4345,18 +4583,32 @@ async fn status_poll_loop(state: Arc<AppState>) {
         // that finds disk out of sync with live reality (the common case,
         // since nothing persists a passive transition until the patch below
         // lands) misreads that mismatch as a brand new transition and
-        // restamps idle_entered_at/last_accessed_at. See #2690.
+        // restamps idle_entered_at. See #2690.
         let prev_for_poll = prev.clone();
+        // Invariant 8: read before `load_all_instances()` below. The tmux
+        // scrape that follows it can block for seconds when the tmux server is
+        // unreachable, which is exactly when a concurrent delete has time to
+        // land and this tick's snapshot goes stale.
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
         let updated = tokio::task::spawn_blocking(move || {
             let mut instances = load_all_instances(&file_watch_for_poll).unwrap_or_default();
             seed_unknown_tracking(&mut instances, &prev_unknown_tracking);
             crate::tmux::refresh_session_cache();
-            let pane_metadata = crate::tmux::batch_pane_metadata().unwrap_or_default();
+            let pane_metadata = crate::tmux::batch_pane_metadata();
+            if let Err(error) = &pane_metadata {
+                tracing::warn!(
+                    target: "server.status",
+                    %error,
+                    "holding tmux-backed statuses because pane metadata is unavailable",
+                );
+            }
             apply_tick_status_decisions(
                 &mut instances,
                 &prev_for_poll,
                 &suppressed_ids,
-                &pane_metadata,
+                pane_metadata.as_ref().ok(),
             );
             (instances, live_structured_worker_records())
         })
@@ -4420,6 +4672,7 @@ async fn status_poll_loop(state: Arc<AppState>) {
                 instances,
                 live_worker_records,
                 StatusSource::TmuxApplied,
+                read_epoch,
             )
             .await;
 
@@ -5104,12 +5357,34 @@ async fn acp_event_listener(state: Arc<AppState>) {
             // reconcile on the next event; a missed acp_session_id
             // means at most one restart loses context. Far better to
             // continue than to exit the listener entirely.
+            //
+            // The unread mark does NOT self-heal like status does: it is
+            // edge-triggered on `Running -> Idle`, so a dropped `Stopped` would
+            // lose it for good and no later event would reproduce it. The
+            // events are durable, recorded before broadcast, so replay the
+            // structured rows from the event log before continuing.
             Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
                 tracing::warn!(
                     target: "acp.event_listener",
                     skipped,
                     "broadcast lagged; status and acp_session_id may briefly desync"
                 );
+                let recovered = recover_structured_unread_after_lag(
+                    &state.instances,
+                    &state.acp_event_store,
+                    &state.instance_locks,
+                    state.file_watch.clone(),
+                    &state.status_tx,
+                )
+                .await;
+                if recovered > 0 {
+                    tracing::info!(
+                        target: "acp.event_listener",
+                        skipped,
+                        recovered,
+                        "replayed turn-end unread marks missed by the lagged frames"
+                    );
+                }
                 continue;
             }
             // Closed: AppState dropped (shutdown). Exit cleanly.
@@ -5392,7 +5667,7 @@ async fn acp_event_listener(state: Arc<AppState>) {
 
         // Acquire `instances` once for both branches. Releases before
         // the (potentially blocking) sessions.json save.
-        let profile_to_save = {
+        let (profile_to_save, unread_profile) = {
             let mut instances = state.instances.write().await;
             let Some(inst) = instances.iter_mut().find(|i| i.id == frame.session_id) else {
                 continue;
@@ -5401,9 +5676,59 @@ async fn acp_event_listener(state: Arc<AppState>) {
                 continue;
             }
 
+            // Snapshotting around the call is exactly "the transition
+            // `apply_status_intent` actually applied": it assigns `status` in
+            // one place and every rejected or no-op path (the trashed /
+            // Deleting / Creating guard, the Stopped guard, the ineligible
+            // HealError guard, `status == target`) leaves it untouched. We hold
+            // the write lock across both reads, so nothing else can move it in
+            // between. A future refactor that makes `apply_status_intent`
+            // assign `status` more than once has to revisit this.
+            let old_status = inst.status;
             apply_status_intent(inst, status_intent, &state.status_tx);
-            apply_acp_session_change(inst, &frame.session_id, acp_change.as_ref())
+            let unread_profile =
+                should_mark_acp_unread(inst, old_status, crate::session::unread_enabled())
+                    .then(|| inst.source_profile.clone());
+
+            (
+                apply_acp_session_change(inst, &frame.session_id, acp_change.as_ref()),
+                unread_profile,
+            )
         };
+
+        // The turn just finished, so the row takes the automatic unread mark.
+        // This is the sole producer of it for a structured row. The tmux poll
+        // loop has no authority over a paneless one, which is why #3162 stopped
+        // it reporting phantom transitions for them and so left this gap; the
+        // TUI's passive path is gated off them to keep the boolean single-writer.
+        //
+        // The write has to be durable. `reload_state_instances_from_disk` rebases
+        // every row on the disk row on each 2s tick and `merge_runtime_fields`
+        // does not carry `unread`, so an in-memory-only mark is gone within two
+        // seconds. Memory is mirrored only after the write lands, the same
+        // ordering `flush_passive_transition_writes` uses (#2755) and for the
+        // same reason: a mark that exists only in daemon memory is served over
+        // `/api/sessions`, mirrored into the TUI, and then silently dropped by
+        // the next reload.
+        //
+        // Deliberately not folded into the `profile_to_save` save below:
+        // `derive_acp_session_change` yields nothing for `Event::Stopped`, so an
+        // identity change and a turn-end can never arrive on the same event and
+        // there is no atomicity to win.
+        //
+        // `persist_and_mirror_unread` owns the lock and commit-check ordering;
+        // see its docstring for why both are load-bearing.
+        if let Some(profile) = unread_profile {
+            let lock = state.instance_lock(&frame.session_id).await;
+            persist_and_mirror_unread(
+                &state.instances,
+                &lock,
+                state.file_watch.clone(),
+                &frame.session_id,
+                profile,
+            )
+            .await;
+        }
 
         // Persist `acp_session_id` to disk if the field changed.
         // Sync FS (file copy + JSON write) goes through spawn_blocking
@@ -5509,7 +5834,7 @@ pub(crate) fn apply_status_intent(
 ) {
     let Some(intent) = intent else { return };
     // Genuine in-flight terminal states: never fight them.
-    if matches!(inst.status, Status::Deleting | Status::Creating) {
+    if inst.is_trashed() || matches!(inst.status, Status::Deleting | Status::Creating) {
         return;
     }
     let target = match intent {
@@ -5545,7 +5870,11 @@ pub(crate) fn apply_status_intent(
     let prev = inst.status;
     inst.status = target;
     let now = chrono::Utc::now();
-    inst.last_accessed_at = Some(now);
+    // last_accessed_at is deliberately NOT stamped here (#3465 residual):
+    // the value relays through DaemonStatusPoller into TUI memory, and
+    // save()'s merge_from_tui monotone max persists it ungated, so the
+    // touched arm of merge_user_action_diff wiped concurrent archives.
+    // Structured rows take real touches from user prompts instead.
     inst.idle_entered_at = if target == Status::Idle {
         Some(now)
     } else {
@@ -5558,6 +5887,196 @@ pub(crate) fn apply_status_intent(
         new: target,
         at: now,
     });
+}
+
+/// Get or create the per-instance serialization mutex in `locks`. Free function
+/// rather than only an [`AppState`] method so the ACP turn-end unread writers
+/// can take the *same* lock a REST handler takes without needing an `AppState`
+/// (which has no test constructor). See [`AppState::instance_lock`].
+async fn instance_lock_in(
+    locks: &RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    id: &str,
+) -> Arc<tokio::sync::Mutex<()>> {
+    {
+        let guard = locks.read().await;
+        if let Some(lock) = guard.get(id) {
+            return lock.clone();
+        }
+    }
+    let mut guard = locks.write().await;
+    guard
+        .entry(id.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
+}
+
+/// Whether a structured row whose ACP status just moved should take the
+/// automatic unread mark, i.e. whether its turn just finished.
+///
+/// `inst` is the row *after* [`apply_status_intent`] ran and `old_status` is
+/// the snapshot taken before it. The predicate is deliberately byte-identical
+/// to the one in [`decide_passive_transition`] and in the TUI's
+/// `apply_status_update`, so "a turn just finished" means the same thing on
+/// every surface.
+///
+/// `Running -> Idle` is the whole edge. An approval or elicitation excursion
+/// comes back through `Set(Running)` (`ApprovalResolved` /
+/// `ElicitationResolved`) before the turn's `Stopped`, so an answered-then-
+/// completed turn still ends on this edge and needs no case of its own. A
+/// direct `Waiting -> Idle` means the turn stopped while still blocked on the
+/// user, who is by construction present for it. Every `Stopped` reason maps to
+/// `Idle`, so a rate-limit park marks unread too; that is the same policy
+/// terminal sessions get, and a parked session does want attention.
+#[cfg(feature = "serve")]
+fn should_mark_acp_unread(inst: &Instance, old_status: Status, unread_enabled: bool) -> bool {
+    unread_enabled
+        && inst.is_structured()
+        && old_status == Status::Running
+        && inst.status == Status::Idle
+        && !inst.unread
+}
+
+/// Write the automatic unread mark for `id` to its profile store, then mirror it
+/// into daemon memory. Returns whether the mark actually landed.
+///
+/// Takes primitives rather than [`AppState`] so it is reachable from tests
+/// (`AppState` has no test constructor).
+///
+/// Ordering rules, both of which cost correctness if dropped:
+///
+/// 1. **Under `instance_lock`.** The same mutex `PATCH /api/sessions/:id/unread`
+///    takes, held across both the write and the mirror. Without it a clear can
+///    land between them and leave disk read while memory says unread, and the
+///    user's explicit mark-read loses to a mark it happened after. Holding it
+///    makes the two orderings the only ones possible, and both are correct: a
+///    clear before this marks (the turn genuinely finished afterwards), a clear
+///    after this wins (the user read it afterwards).
+/// 2. **Only mirror a committed mutation.** `persist_session_update` reports
+///    `Ok` for a write whose closure matched no row, so `profile` going stale
+///    (a concurrent profile move) would otherwise mark memory off a successful
+///    no-op on the *old* profile, and the next reload would drop the
+///    notification. The flag reports whether the owning row was really mutated.
+///
+/// A stale-profile write is not retried. The row is left read rather than
+/// half-marked, the turn's mark is simply lost, and the move is rare enough that
+/// a re-resolve loop is not worth the added failure surface here.
+#[cfg(feature = "serve")]
+async fn persist_and_mirror_unread(
+    instances: &RwLock<Vec<Instance>>,
+    instance_lock: &tokio::sync::Mutex<()>,
+    file_watch: Arc<crate::file_watch::FileWatchService>,
+    id: &str,
+    profile: String,
+) -> bool {
+    let _guard = instance_lock.lock().await;
+    let marked = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let marked_in_closure = marked.clone();
+    let persist_id = id.to_string();
+    let persisted = api::persist_session_update(
+        profile.clone(),
+        "acp turn-end unread",
+        file_watch,
+        move |instances| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == persist_id) {
+                inst.mark_unread();
+                marked_in_closure.store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        },
+    )
+    .await;
+    if persisted.is_err() {
+        return false;
+    }
+    if !marked.load(std::sync::atomic::Ordering::SeqCst) {
+        tracing::debug!(
+            target: "acp.event_listener",
+            session = %id,
+            profile = %profile,
+            "turn-end unread write found no row in that profile store (moved?); \
+             not mirroring so memory cannot disagree with disk"
+        );
+        return false;
+    }
+    let mut instances = instances.write().await;
+    if let Some(inst) = instances.iter_mut().find(|i| i.id == id) {
+        inst.mark_unread();
+    }
+    true
+}
+
+/// Re-derive every structured row's status from the durable event log after the
+/// ACP broadcast dropped frames, marking any row whose turn ended while we were
+/// not listening. Returns the number of rows marked.
+///
+/// `acp_events_tx` is a `broadcast` of [`ACP_CHANNEL_CAPACITY`], and a lagged
+/// receiver is told only *how many* frames it missed, never which. Status
+/// tolerated that because it is level-triggered: any later event re-derives the
+/// right value. The unread mark is edge-triggered, so a dropped `Stopped` loses
+/// it permanently, and nothing else would ever produce it.
+///
+/// The events themselves are durable (recorded before broadcast), so the log is
+/// the recovery source. `latest_seed_status_event` is the same query
+/// `seed_acp_statuses` uses at boot, and for the same reason: it returns the
+/// most recent *lifecycle* event, which is exactly the frame whose loss matters.
+///
+/// This deliberately does NOT reuse `seed_acp_statuses`, despite the shared
+/// shape, because the two differ on both points that matter:
+///
+/// - **Boot must not mark.** Its replay re-reads history, so a `Stopped` from
+///   before the restart would re-mark a row the user has already read, on every
+///   restart. Here a `Stopped` under a still-`Running` memory status is evidence
+///   of a turn that ended during this daemon's life and was missed.
+/// - **Boot lifts a stale `Stopped`**, because a persisted `Stopped` from a
+///   daemon that died mid-turn would otherwise trap the dot grey. Mid-run a
+///   `Stopped` in memory is a deliberate stop, so `apply_status_intent`'s guard
+///   should keep it.
+#[cfg(feature = "serve")]
+async fn recover_structured_unread_after_lag(
+    instances: &RwLock<Vec<Instance>>,
+    event_store: &crate::acp::event_store::EventStore,
+    instance_locks: &RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    file_watch: Arc<crate::file_watch::FileWatchService>,
+    status_tx: &broadcast::Sender<StatusChange>,
+) -> usize {
+    let ids: Vec<String> = instances
+        .read()
+        .await
+        .iter()
+        .filter(|i| i.is_structured())
+        .map(|i| i.id.clone())
+        .collect();
+    let unread_enabled = crate::session::unread_enabled();
+    let mut marked = 0usize;
+    for id in ids {
+        let Some(event) = event_store.latest_seed_status_event(&id) else {
+            continue;
+        };
+        let Some(intent) = derive_acp_status(&event) else {
+            continue;
+        };
+        // Same snapshot-around-apply as the live path, so "the transition that
+        // was actually applied" means the same thing in both.
+        let unread_profile = {
+            let mut guard = instances.write().await;
+            let Some(inst) = guard.iter_mut().find(|i| i.id == id) else {
+                continue;
+            };
+            if !inst.is_structured() {
+                continue;
+            }
+            let old_status = inst.status;
+            apply_status_intent(inst, Some(intent), status_tx);
+            should_mark_acp_unread(inst, old_status, unread_enabled)
+                .then(|| inst.source_profile.clone())
+        };
+        if let Some(profile) = unread_profile {
+            let lock = instance_lock_in(instance_locks, &id).await;
+            if persist_and_mirror_unread(instances, &lock, file_watch.clone(), &id, profile).await {
+                marked += 1;
+            }
+        }
+    }
+    marked
 }
 
 /// Fold a derived `AcpSessionChange` into an `Instance`. Returns the
@@ -5758,6 +6277,30 @@ pub(crate) fn derive_acp_status(event: &crate::acp::Event) -> Option<StatusInten
     }
 }
 
+type SessionIdentityBaseline = (Option<String>, Option<String>, Option<String>);
+
+/// Merge a drained instance's captured identity back into live state, but only
+/// the identity fields and only if they are unchanged since the baseline. The
+/// daemon needs this field-level, baseline-guarded merge because it drops the
+/// shared async lock across `spawn_blocking`, so the live instance may have
+/// been mutated meanwhile. The single-threaded TUI re-inserts the whole
+/// instance instead (see `apply_session_id_updates`); keep the two in sync.
+fn apply_drained_identity_if_unchanged(
+    live: &mut Instance,
+    drained: &Instance,
+    baseline: &SessionIdentityBaseline,
+) {
+    let (baseline_sid, baseline_marker, baseline_generation) = baseline;
+    if live.agent_session_id == *baseline_sid && live.omp_capture_generation == *baseline_generation
+    {
+        live.agent_session_id = drained.agent_session_id.clone();
+        live.omp_capture_generation = drained.omp_capture_generation.clone();
+        if live.resume_probe_failed_sid == *baseline_marker {
+            live.resume_probe_failed_sid = drained.resume_probe_failed_sid.clone();
+        }
+    }
+}
+
 async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
     // Drain poller observations into sessions.json so daemon-only sessions
     // persist post-`/clear` sids (#2291). Snapshot + spawn_blocking + reapply,
@@ -5765,30 +6308,64 @@ async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
     let snapshot = state.instances.read().await.clone();
     let file_watch = state.file_watch.clone();
     match tokio::task::spawn_blocking(move || {
+        let baseline: std::collections::HashMap<String, SessionIdentityBaseline> = snapshot
+            .iter()
+            .map(|inst| {
+                (
+                    inst.id.clone(),
+                    (
+                        inst.agent_session_id.clone(),
+                        inst.resume_probe_failed_sid.clone(),
+                        inst.omp_capture_generation.clone(),
+                    ),
+                )
+            })
+            .collect();
         let mut snapshot = snapshot;
+        // Preserve a final queued observation before replacing a stopped
+        // worker. Repair runs afterward and binds to any generation the drain
+        // just made durable.
         let outcome =
             crate::session::sync::drain_and_persist_session_ids(&mut snapshot, &file_watch);
-        (outcome, snapshot)
+        // One observation for the whole repair walk, as on the TUI side: this
+        // visits every instance, so a per-item `list-sessions` fork scales with
+        // the store.
+        let live = crate::tmux::LiveSessionSnapshot::new();
+        let repaired: std::collections::HashSet<String> = snapshot
+            .iter_mut()
+            .filter_map(|inst| {
+                inst.repair_session_id_poller_if_needed(&live)
+                    .then(|| inst.id.clone())
+            })
+            .collect();
+        (outcome, snapshot, baseline, repaired)
     })
     .await
     {
-        Ok((outcome, mutated)) if outcome.touched() => {
-            // Reapply only for ids the helper actually touched, so a peer that
-            // wrote `agent_session_id` on the live state during spawn_blocking
-            // is not silently reverted.
+        Ok((outcome, mutated, baseline, repaired)) if outcome.touched() || !repaired.is_empty() => {
             let touched: std::collections::HashSet<&str> = outcome
                 .applied
                 .iter()
                 .chain(outcome.rolled_back.iter())
                 .map(String::as_str)
                 .collect();
-            if !touched.is_empty() {
-                let mut guard = state.instances.write().await;
-                for src in mutated.iter().filter(|i| touched.contains(i.id.as_str())) {
-                    if let Some(dst) = guard.iter_mut().find(|i| i.id == src.id) {
-                        dst.agent_session_id = src.agent_session_id.clone();
-                        dst.resume_probe_failed_sid = src.resume_probe_failed_sid.clone();
-                    }
+            let mut guard = state.instances.write().await;
+            for src in &mutated {
+                let Some(dst) = guard.iter_mut().find(|i| i.id == src.id) else {
+                    continue;
+                };
+                let Some(identity_baseline) = baseline.get(&src.id) else {
+                    continue;
+                };
+                if touched.contains(src.id.as_str()) {
+                    apply_drained_identity_if_unchanged(dst, src, identity_baseline);
+                }
+                if repaired.contains(&src.id)
+                    && dst.omp_capture_generation == src.omp_capture_generation
+                    && !dst.session_id_poller_is_running()
+                    && src.session_id_poller_is_running()
+                {
+                    dst.session_id_poller = src.session_id_poller.clone();
                 }
             }
         }
@@ -5813,7 +6390,6 @@ async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
 pub mod test_support {
     use super::*;
     use std::collections::HashMap;
-    use std::sync::atomic::AtomicI64;
 
     /// Build a minimal `Arc<AppState>` for helper-equivalence tests. Most
     /// fields are seeded with empty / default values; only `instances`,
@@ -5853,9 +6429,11 @@ pub mod test_support {
         let event_store =
             Arc::new(crate::acp::event_store::EventStore::open(&acp_db, 100).expect("event store"));
         let acp_events_tx = broadcast::channel::<AcpBroadcastFrame>(8).0;
+        let acp_control_cache = Arc::new(crate::acp::control_cache::ControlStateCache::new());
         let sink = std::sync::Arc::new(crate::acp::supervisor::ChannelSink {
             tx: acp_events_tx.clone(),
             event_store: event_store.clone(),
+            control_cache: acp_control_cache.clone(),
         });
         let supervisor =
             std::sync::Arc::new(crate::acp::supervisor::Supervisor::with_capacity(sink, 1));
@@ -5863,12 +6441,14 @@ pub mod test_support {
         let instance_locks = Arc::new(RwLock::new(HashMap::new()));
         let idempotency_locks = Arc::new(RwLock::new(HashMap::new()));
         let telemetry_session_creates = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let mutation_epoch = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let file_watch = FileWatchService::noop();
         let session_service = Arc::new(session_service::SessionService::new(
             Arc::clone(&instances),
             Arc::clone(&instance_locks),
             Arc::clone(&file_watch),
             Arc::clone(&telemetry_session_creates),
+            Arc::clone(&mutation_epoch),
             supervisor.clone(),
             event_store.clone(),
         ));
@@ -5898,6 +6478,7 @@ pub mod test_support {
                 crate::session::conversation_summary::MAX_CONCURRENT,
             ),
             recently_restarted: crate::session::recovery::new_recently_restarted(),
+            mutation_epoch: Arc::clone(&mutation_epoch),
             recovery_pending: crate::session::recovery::new_recovery_pending(),
             cleanup_defaults_cache: RwLock::new(CleanupDefaultsCache {
                 refreshed_at: std::time::Instant::now(),
@@ -5908,13 +6489,14 @@ pub mod test_support {
             status_tx: broadcast::channel(STATUS_CHANNEL_CAPACITY).0,
             acp_events_tx,
             acp_event_store: event_store,
+            acp_control_cache,
             acp_supervisor: supervisor,
             plugin_host: None,
             plugin_jobs: Arc::new(api::plugins::PluginJobRegistry::new()),
             push: None,
             push_enabled: false,
             web_config: crate::session::config::WebConfig::default(),
-            last_web_activity: AtomicI64::new(0),
+            web_presence: std::sync::Mutex::new(HashMap::new()),
             sleep_inhibit_snapshot: std::sync::atomic::AtomicU8::new(0),
             telemetry_usage_seen: crate::telemetry::usage_signals::UsageSeenCounters::new(),
             telemetry_web_clients: FormFactorCounters::default(),
@@ -6003,11 +6585,15 @@ pub mod test_support {
         fresh: Vec<Instance>,
         live_worker_records: Vec<(crate::process::worker_registry::WorkerRecord, String)>,
     ) {
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
         super::reload_state_instances_from_disk(
             state,
             fresh,
             live_worker_records,
             super::StatusSource::DiskOnly,
+            read_epoch,
         )
         .await
     }
@@ -6017,11 +6603,15 @@ pub mod test_support {
         fresh: Vec<Instance>,
         live_worker_records: Vec<(crate::process::worker_registry::WorkerRecord, String)>,
     ) {
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
         super::reload_state_instances_from_disk(
             state,
             fresh,
             live_worker_records,
             super::StatusSource::TmuxApplied,
+            read_epoch,
         )
         .await
     }
@@ -6033,6 +6623,43 @@ mod tests {
 
     fn vecs(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
+    }
+    #[test]
+    fn drained_identity_reapply_honors_concurrent_generation_and_marker_writes() {
+        let baseline = (
+            Some("old-sid".to_string()),
+            Some("old-marker".to_string()),
+            Some("generation-a".to_string()),
+        );
+        let mut drained = Instance::new("session", "/tmp/project");
+        drained.agent_session_id = Some("captured-sid".to_string());
+        drained.resume_probe_failed_sid = None;
+        drained.omp_capture_generation = Some("generation-a".to_string());
+
+        let mut relaunched = Instance::new("session", "/tmp/project");
+        relaunched.agent_session_id = Some("old-sid".to_string());
+        relaunched.resume_probe_failed_sid = Some("old-marker".to_string());
+        relaunched.omp_capture_generation = Some("generation-b".to_string());
+        apply_drained_identity_if_unchanged(&mut relaunched, &drained, &baseline);
+        assert_eq!(
+            relaunched.omp_capture_generation.as_deref(),
+            Some("generation-b")
+        );
+        assert_eq!(relaunched.agent_session_id.as_deref(), Some("old-sid"));
+
+        let mut marker_changed = Instance::new("session", "/tmp/project");
+        marker_changed.agent_session_id = Some("old-sid".to_string());
+        marker_changed.resume_probe_failed_sid = Some("peer-marker".to_string());
+        marker_changed.omp_capture_generation = Some("generation-a".to_string());
+        apply_drained_identity_if_unchanged(&mut marker_changed, &drained, &baseline);
+        assert_eq!(
+            marker_changed.agent_session_id.as_deref(),
+            Some("captured-sid")
+        );
+        assert_eq!(
+            marker_changed.resume_probe_failed_sid.as_deref(),
+            Some("peer-marker")
+        );
     }
 
     /// `idempotency_locks` must not grow for the daemon's lifetime: keys are
@@ -6889,6 +7516,172 @@ mod tests {
         assert_eq!(resp.status(), axum::http::StatusCode::FORBIDDEN);
     }
 
+    /// `MakeWriter` sink so the request-log test can read back exactly the
+    /// bytes a daemon would have appended to `debug.log`.
+    #[derive(Clone)]
+    struct LogSink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for LogSink {
+        fn write(&mut self, src: &[u8]) -> std::io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(src);
+            Ok(src.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// #3402: the `http.request` completion line must identify the request.
+    /// It is rendered with the default `show_spans = false` formatter, which
+    /// drops span fields, so `request_id` / `method` / `path` have to be
+    /// fields of the event itself. `path` is the route template, never the
+    /// raw URI: `aoe serve` ships its auth token in the query string and
+    /// session ids sit in path segments, and neither may reach the log.
+    #[tokio::test]
+    async fn http_request_log_identifies_request_without_leaking_uri() {
+        use tower::ServiceExt;
+        const TOKEN: &str = "super-secret-token";
+        const SESSION: &str = "sess-9f3a";
+
+        let buf = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let sink = LogSink(buf.clone());
+        let subscriber = tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::TRACE)
+            .with_writer(move || sink.clone())
+            .with_ansi(false)
+            .event_format(crate::logging::NoSpanFormat)
+            .finish();
+        let _guard = tracing::subscriber::set_default(subscriber);
+
+        // (request URI, expected level, expected `path` field, expected status)
+        let cases = [
+            (
+                format!("/api/sessions/{SESSION}/acp/replay?token={TOKEN}"),
+                "ERROR",
+                "path=/api/sessions/{id}/acp/replay",
+                "status=500",
+            ),
+            (
+                format!("/api/sessions?token={TOKEN}"),
+                "DEBUG",
+                "path=/api/sessions",
+                "status=200",
+            ),
+            // No route matched, so there is no template to log and the raw
+            // URI must not be substituted for one.
+            (
+                format!("/nope/{SESSION}?token={TOKEN}"),
+                "WARN",
+                "path=<unmatched>",
+                "status=404",
+            ),
+        ];
+
+        // Drains the sink and returns the one `http.request` completion line,
+        // ignoring whatever else the request happened to log.
+        let take_line = || {
+            let mut sink = buf.lock().unwrap();
+            let log = String::from_utf8(sink.clone()).unwrap();
+            sink.clear();
+            log.lines()
+                .find(|l| l.contains("http.request"))
+                .unwrap_or_else(|| panic!("no http.request line in {log}"))
+                .to_string()
+        };
+
+        for (uri, level, path_field, status) in cases {
+            let app = axum::Router::new()
+                .route(
+                    "/api/sessions/{id}/acp/replay",
+                    axum::routing::get(|| async { axum::http::StatusCode::INTERNAL_SERVER_ERROR }),
+                )
+                .route("/api/sessions", axum::routing::get(|| async { "[]" }))
+                .fallback(|| async { axum::http::StatusCode::NOT_FOUND })
+                .layer(axum::middleware::from_fn(http_request_span));
+            let req = axum::http::Request::builder()
+                .uri(&uri)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            app.oneshot(req).await.unwrap();
+
+            let line = take_line();
+            for expected in [level, path_field, status, "method=GET", "request_id="] {
+                assert!(
+                    line.contains(expected),
+                    "{uri}: want {expected:?}, got {line}"
+                );
+            }
+            for secret in [TOKEN, SESSION] {
+                assert!(
+                    !line.contains(secret),
+                    "{uri}: leaked {secret:?} into {line}"
+                );
+            }
+        }
+
+        // The cases above pin the middleware itself; this pins its position in
+        // the real stack, where a template exists only because axum routes the
+        // request before any `Router::layer` middleware runs. The token in the
+        // query string is wrong, so auth rejects it: exactly the 4xx a triager
+        // greps for, and the one request shape that carries a secret.
+        let state = test_support::build_test_app_state_with_policy(
+            Vec::new(),
+            vecs(&["localhost"]),
+            vecs(&["http://localhost:8080"]),
+            Some("real-token".to_string()),
+        );
+        let req = axum::http::Request::builder()
+            .uri(format!("/api/sessions/{SESSION}/acp/replay?token={TOKEN}"))
+            .header("host", "localhost")
+            .body(axum::body::Body::empty())
+            .unwrap();
+        test_support::build_router_for_test(state)
+            .oneshot(req)
+            .await
+            .unwrap();
+        let line = take_line();
+        assert!(
+            line.contains("path=/api/sessions/{id}/acp/replay"),
+            "real router: got {line}"
+        );
+        for secret in [TOKEN, SESSION] {
+            assert!(
+                !line.contains(secret),
+                "real router leaked {secret:?}: {line}"
+            );
+        }
+
+        // `request_id` is client-supplied, and it lands on the same line as
+        // `path`, so it is held to the same rule. `HeaderValue::to_str`
+        // admits spaces and `=`, so an unfiltered header forges fields on
+        // the line #3402 added for triage. (header value, echoed verbatim?)
+        let overlong = "x".repeat(MAX_CLIENT_REQUEST_ID + 1);
+        let ids: [(&str, bool); 3] = [
+            ("forged status=200 path=/pwned", false),
+            (overlong.as_str(), false),
+            // A uuid, which is what the dashboard's fetch interceptor sends.
+            ("6f1c2b7e-0f2a-4a1e-9d3c-2b8f5a0c7d11", true),
+        ];
+        for (header, echoed) in ids {
+            let app = axum::Router::new()
+                .route("/api/sessions", axum::routing::get(|| async { "[]" }))
+                .layer(axum::middleware::from_fn(http_request_span));
+            let req = axum::http::Request::builder()
+                .uri("/api/sessions")
+                .header("x-request-id", header)
+                .body(axum::body::Body::empty())
+                .unwrap();
+            app.oneshot(req).await.unwrap();
+            let line = take_line();
+            assert_eq!(
+                line.contains(&format!("request_id={header}")),
+                echoed,
+                "{header:?}: got {line}"
+            );
+            assert!(line.contains("request_id="), "no request id at all: {line}");
+        }
+    }
+
     #[tokio::test]
     async fn access_policy_runs_before_auth() {
         use tower::ServiceExt;
@@ -7198,7 +7991,7 @@ mod tests {
             &mut instances,
             &prev,
             &std::collections::HashSet::new(),
-            &std::collections::HashMap::new(),
+            Some(&std::collections::HashMap::new()),
         );
 
         assert_eq!(
@@ -7228,7 +8021,7 @@ mod tests {
             &mut instances,
             &prev,
             &std::collections::HashSet::new(),
-            &std::collections::HashMap::new(),
+            Some(&std::collections::HashMap::new()),
         );
 
         assert_eq!(instances[0].status, Status::Idle, "disk status stands");
@@ -7254,7 +8047,7 @@ mod tests {
             &mut instances,
             &prev,
             &std::collections::HashSet::from([id]),
-            &std::collections::HashMap::new(),
+            Some(&std::collections::HashMap::new()),
         );
 
         assert_eq!(instances[0].status, Status::Starting);
@@ -7263,6 +8056,30 @@ mod tests {
             vec![(0, Status::Error)],
             "a transition the tick does own must still be reported"
         );
+    }
+
+    #[test]
+    fn tick_holds_tmux_statuses_when_the_batch_probe_fails() {
+        for (disk, live) in [
+            (Status::Idle, Status::Running),
+            (Status::Unknown, Status::Error),
+        ] {
+            let mut inst = Instance::new("tmux-session", "/tmp/test");
+            inst.status = disk;
+            let id = inst.id.clone();
+            let prev = std::collections::HashMap::from([(id, live)]);
+            let mut instances = vec![inst];
+
+            apply_tick_status_decisions(
+                &mut instances,
+                &prev,
+                &std::collections::HashSet::new(),
+                None,
+            );
+
+            assert_eq!(instances[0].status, live, "disk status was {disk:?}");
+            assert_eq!(observed_transitions(&instances, &prev), vec![]);
+        }
     }
 
     #[test]
@@ -7367,6 +8184,464 @@ mod tests {
             !decision.mark_unread,
             "already-unread sessions must not re-mark"
         );
+
+        // #3181: a structured row's turn-end mark belongs to the live ACP
+        // listener (`should_mark_acp_unread`), so the poll loop must not also
+        // produce it. Paired with
+        // `tick_reports_no_transition_for_a_structured_phantom` above, which
+        // covers the other half: the tick never even reports such a row, so a
+        // read structured session cannot be re-marked seconds after the user
+        // read it (the #3162 defect).
+        let mut structured = Instance::new("acp-session", "/tmp/test");
+        structured.view = crate::session::View::Structured;
+        structured.status = Status::Idle;
+        let decision = decide_passive_transition(&structured, Status::Running, true);
+        assert!(
+            !decision.mark_unread,
+            "structured turn-end unread is owned by the acp event listener"
+        );
+    }
+
+    /// #3181: the automatic mark's predicate for a structured row, driven off
+    /// the live ACP turn-end event. One table rather than a test per case, per
+    /// the repo's compile-cost rule.
+    #[cfg(feature = "serve")]
+    #[test]
+    fn should_mark_acp_unread_only_on_a_structured_running_to_idle_turn_end() {
+        // (name, structured, old_status, new_status, unread_enabled, already_unread, expected)
+        let cases = [
+            (
+                "turn finished",
+                true,
+                Status::Running,
+                Status::Idle,
+                true,
+                false,
+                true,
+            ),
+            // The turn stopped while still blocked on the user, who is by
+            // construction present for it; an answered approval comes back
+            // through Running first, so this is not the answered-then-completed
+            // path.
+            (
+                "still blocked on the user",
+                true,
+                Status::Waiting,
+                Status::Idle,
+                true,
+                false,
+                false,
+            ),
+            (
+                "crashed, not finished",
+                true,
+                Status::Running,
+                Status::Error,
+                true,
+                false,
+                false,
+            ),
+            (
+                "turn starting",
+                true,
+                Status::Idle,
+                Status::Running,
+                true,
+                false,
+                false,
+            ),
+            (
+                "no transition applied",
+                true,
+                Status::Running,
+                Status::Running,
+                true,
+                false,
+                false,
+            ),
+            (
+                "feature off",
+                true,
+                Status::Running,
+                Status::Idle,
+                false,
+                false,
+                false,
+            ),
+            // Re-marking would churn the flock once per turn, and would undo a
+            // read the user has not been given a new turn to earn.
+            (
+                "already unread",
+                true,
+                Status::Running,
+                Status::Idle,
+                true,
+                true,
+                false,
+            ),
+            // Terminal rows stay with the tmux poll loop's
+            // `decide_passive_transition`.
+            (
+                "terminal row, owned elsewhere",
+                false,
+                Status::Running,
+                Status::Idle,
+                true,
+                false,
+                false,
+            ),
+        ];
+        for (name, structured, old, new, enabled, already_unread, expected) in cases {
+            let mut inst = Instance::new(name, "/tmp/test");
+            if structured {
+                inst.view = crate::session::View::Structured;
+            }
+            // The helper reads the row *after* `apply_status_intent` ran.
+            inst.status = new;
+            inst.unread = already_unread;
+            assert_eq!(
+                should_mark_acp_unread(&inst, old, enabled),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    /// Seed `profile`'s store with `rows`, so a persist closure has a matching
+    /// id to mark. Mirrors the shape used by the `flush_passive_transition_*`
+    /// tests above.
+    #[cfg(feature = "serve")]
+    fn seed_profile_store(profile: &str, rows: Vec<Instance>) {
+        crate::session::Storage::new_unwatched(profile)
+            .expect("storage")
+            .update(move |instances, _groups| {
+                *instances = rows;
+                Ok(())
+            })
+            .expect("seed write");
+    }
+
+    #[cfg(feature = "serve")]
+    fn load_profile_row(profile: &str, id: &str) -> Option<Instance> {
+        crate::session::Storage::new_unwatched(profile)
+            .expect("storage")
+            .load()
+            .expect("load")
+            .into_iter()
+            .find(|i| i.id == id)
+    }
+
+    /// The commit-check half of `persist_and_mirror_unread`: memory is mirrored
+    /// only when the write actually mutated the owning row.
+    ///
+    /// The second call is the profile-move case a reviewer raised on #3530.
+    /// `persist_session_update` reports `Ok` for a write whose closure matched
+    /// nothing, so mirroring on `is_ok()` alone would mark memory off a
+    /// successful no-op against a profile the row no longer lives in, and the
+    /// next disk reload would silently drop the notification.
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn persist_and_mirror_unread_mirrors_only_a_committed_mutation() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+
+        let owning = "acp-unread-owner";
+        let mut inst = Instance::new("acp-session", "/tmp/acp");
+        inst.view = crate::session::View::Structured;
+        inst.source_profile = owning.to_string();
+        let id = inst.id.clone();
+        seed_profile_store(owning, vec![inst.clone()]);
+        // The profile the row is *not* in. Created empty, so the write there
+        // succeeds while matching nothing.
+        seed_profile_store("acp-unread-stale", Vec::new());
+
+        let instances = RwLock::new(vec![inst]);
+        let lock = tokio::sync::Mutex::new(());
+
+        // Stale profile: write succeeds, matches no row, so nothing is mirrored.
+        let landed = persist_and_mirror_unread(
+            &instances,
+            &lock,
+            crate::file_watch::FileWatchService::noop(),
+            &id,
+            "acp-unread-stale".to_string(),
+        )
+        .await;
+        assert!(!landed, "a no-op write must not report the mark as landed");
+        assert!(
+            !instances.read().await[0].unread,
+            "memory must not be marked off a write that matched no row"
+        );
+        assert!(
+            !load_profile_row(owning, &id).expect("row").unread,
+            "the owning profile's row must be untouched by a stale-profile write"
+        );
+
+        // Owning profile: the mark lands on disk first, then in memory.
+        let landed = persist_and_mirror_unread(
+            &instances,
+            &lock,
+            crate::file_watch::FileWatchService::noop(),
+            &id,
+            owning.to_string(),
+        )
+        .await;
+        assert!(landed);
+        assert!(
+            load_profile_row(owning, &id).expect("row").unread,
+            "the mark must be durable"
+        );
+        assert!(
+            instances.read().await[0].unread,
+            "memory must mirror the committed mark"
+        );
+    }
+
+    /// A failed write must not strand a memory-only mark, the #2755 rule that
+    /// `flush_passive_transition_defers_unread_until_persist_ok` locks for the
+    /// tmux poller. Separate test rather than a row in the one above because it
+    /// needs the store deliberately broken.
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn persist_and_mirror_unread_skips_the_mirror_on_a_failed_write() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+
+        let profile = "acp-unread-write-failure";
+        // Making `sessions.json` a directory makes the read-modify-write fail.
+        let dir = crate::session::get_profile_dir(profile).expect("profile dir");
+        std::fs::create_dir_all(dir.join("sessions.json")).expect("sessions.json dir");
+
+        let mut inst = Instance::new("acp-session", "/tmp/acp");
+        inst.view = crate::session::View::Structured;
+        inst.source_profile = profile.to_string();
+        let id = inst.id.clone();
+        let instances = RwLock::new(vec![inst]);
+        let lock = tokio::sync::Mutex::new(());
+
+        let landed = persist_and_mirror_unread(
+            &instances,
+            &lock,
+            crate::file_watch::FileWatchService::noop(),
+            &id,
+            profile.to_string(),
+        )
+        .await;
+
+        assert!(!landed);
+        assert!(
+            !instances.read().await[0].unread,
+            "a failed persist must not leave a phantom in-memory unread mark"
+        );
+    }
+
+    /// Lag replay, the other finding on #3530: the ACP broadcast tells a lagged
+    /// receiver only how many frames it missed, never which, so a dropped
+    /// `Stopped` would lose the turn-end mark permanently (unlike status, which
+    /// is level-triggered and re-derives from any later event). The events are
+    /// durable, so recovery reads the log.
+    ///
+    /// Three rows in one pass, all with a durable `Stopped` as their latest
+    /// lifecycle event, so the discriminator is the row rather than the event:
+    /// only the structured row still sitting at `Running` represents a turn that
+    /// ended unobserved.
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn recover_structured_unread_after_lag_marks_only_a_missed_turn_end() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+        crate::session::set_unread_enabled(true);
+
+        let profile = "acp-unread-lag-replay";
+
+        // The turn ended while the listener was lagged: memory still says
+        // Running, the log already has the Stopped we never saw.
+        let mut missed = Instance::new("acp-missed", "/tmp/acp");
+        missed.view = crate::session::View::Structured;
+        missed.source_profile = profile.to_string();
+        missed.status = Status::Running;
+
+        // Already reconciled: the Stopped was observed, so there is no
+        // transition left to apply and no second mark to make.
+        let mut already = Instance::new("acp-already-idle", "/tmp/acp");
+        already.view = crate::session::View::Structured;
+        already.source_profile = profile.to_string();
+        already.status = Status::Idle;
+
+        // A terminal row is not this producer's to touch at all.
+        let mut terminal = Instance::new("tmux-row", "/tmp/tmux");
+        terminal.source_profile = profile.to_string();
+        terminal.status = Status::Running;
+
+        let (missed_id, already_id, terminal_id) =
+            (missed.id.clone(), already.id.clone(), terminal.id.clone());
+        let rows = vec![missed.clone(), already.clone(), terminal.clone()];
+        seed_profile_store(profile, rows.clone());
+
+        let db = temp.path().join("acp-events.db");
+        let store = crate::acp::event_store::EventStore::open(&db, 1000).expect("event store");
+        for id in [&missed_id, &already_id, &terminal_id] {
+            store
+                .record(
+                    id,
+                    1,
+                    &crate::acp::Event::Stopped {
+                        reason: "prompt_complete".into(),
+                    },
+                )
+                .expect("record stopped");
+        }
+
+        let instances = RwLock::new(rows);
+        let locks = RwLock::new(std::collections::HashMap::new());
+        let (status_tx, _rx) = broadcast::channel(16);
+
+        let marked = recover_structured_unread_after_lag(
+            &instances,
+            &store,
+            &locks,
+            crate::file_watch::FileWatchService::noop(),
+            &status_tx,
+        )
+        .await;
+
+        assert_eq!(marked, 1, "only the missed turn-end is a fresh mark");
+
+        let guard = instances.read().await;
+        let row = |id: &str| guard.iter().find(|i| i.id == id).expect("row").clone();
+
+        let missed = row(&missed_id);
+        assert_eq!(
+            missed.status,
+            Status::Idle,
+            "replay applies the missed Stopped"
+        );
+        assert!(missed.unread, "and marks the turn that ended unobserved");
+        assert!(
+            load_profile_row(profile, &missed_id).expect("row").unread,
+            "the replayed mark must be durable, not memory-only"
+        );
+
+        assert!(
+            !row(&already_id).unread,
+            "an already-reconciled row has no transition left, so no second mark"
+        );
+        assert_eq!(
+            row(&terminal_id).status,
+            Status::Running,
+            "a terminal row is left entirely to the tmux poller"
+        );
+        assert!(!row(&terminal_id).unread);
+    }
+
+    /// End to end over `acp_event_listener` itself, the path that actually
+    /// closes #3181. The predicate table and the TUI ownership tests all pass
+    /// even if the snapshot is taken *after* `apply_status_intent`, the persist
+    /// is dropped, or the mirror is reordered, because none of them run the
+    /// listener. This one drives a real `Event::Stopped` frame through the
+    /// broadcast and asserts both halves of the write.
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn acp_event_listener_marks_a_finished_turn_unread_on_disk_and_in_memory() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: serialized test; no other test mutates HOME concurrently.
+        unsafe { std::env::set_var("HOME", temp.path()) };
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        unsafe {
+            std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
+        }
+        crate::session::set_unread_enabled(true);
+
+        let profile = "acp-listener-turn-end";
+        let mut inst = Instance::new("acp-session", "/tmp/acp");
+        inst.view = crate::session::View::Structured;
+        inst.source_profile = profile.to_string();
+        // Mid-turn, so the incoming Stopped is a real Running -> Idle edge.
+        inst.status = Status::Running;
+        let id = inst.id.clone();
+        seed_profile_store(profile, vec![inst.clone()]);
+
+        let state = test_support::build_test_app_state(vec![inst]);
+        let listener = tokio::spawn(acp_event_listener(state.clone()));
+
+        // A broadcast only reaches receivers that subscribed before the send,
+        // and the spawned listener subscribes as its first act. Wait for that
+        // rather than racing it; nothing else in this test subscribes, so the
+        // count reaching 1 is precisely "the listener is listening".
+        for _ in 0..500 {
+            if state.acp_events_tx.receiver_count() > 0 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        assert!(
+            state.acp_events_tx.receiver_count() > 0,
+            "listener never subscribed"
+        );
+
+        // The turn ends.
+        state
+            .acp_events_tx
+            .send(AcpBroadcastFrame {
+                session_id: id.clone(),
+                seq: 1,
+                event: Arc::new(crate::acp::Event::Stopped {
+                    reason: "prompt_complete".into(),
+                }),
+            })
+            .expect("listener is subscribed");
+
+        // The listener owns the write, so poll rather than sleeping a fixed
+        // interval: the persist is a real flock'd file write. Wait on the
+        // *mirror*, which is the last step, so this cannot abort the listener
+        // in between the disk write and the mirror and then blame the mirror.
+        let mut mirrored = false;
+        for _ in 0..500 {
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            if state
+                .instances
+                .read()
+                .await
+                .iter()
+                .any(|i| i.id == id && i.unread)
+            {
+                mirrored = true;
+                break;
+            }
+        }
+        listener.abort();
+
+        assert!(
+            mirrored,
+            "daemon memory must mirror the mark, so /api/sessions reports it"
+        );
+        assert!(
+            load_profile_row(profile, &id).is_some_and(|i| i.unread),
+            "and the mark must be durable, which is the #3181 fix; a memory-only \
+             mark is dropped by the next reload"
+        );
+        let instances = state.instances.read().await;
+        let row = instances.iter().find(|i| i.id == id).expect("row present");
+        assert_eq!(row.status, Status::Idle, "the Stopped applied");
     }
 
     // #2755 (follow-up to #2729): the poller must not strand an in-memory
@@ -7537,6 +8812,7 @@ mod tests {
             .insert(
                 a1_id.clone(),
                 crate::session::PassiveStatusPatch {
+                    lifecycle_generation: 0,
                     status: Status::Idle,
                     idle_entered_at: None,
                     last_accessed_at: Some(new_ts),
@@ -7549,6 +8825,7 @@ mod tests {
             .insert(
                 b1_id.clone(),
                 crate::session::PassiveStatusPatch {
+                    lifecycle_generation: 0,
                     status: Status::Running,
                     idle_entered_at: None,
                     last_accessed_at: Some(new_ts),
@@ -8351,12 +9628,24 @@ mod tests {
         .await
         .expect("bootstrap wake must fire after init returns");
 
+        // Invariant 8: capture the epoch BEFORE the disk read, the order every
+        // production caller uses.
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
         let file_watch = state.file_watch.clone();
         let fresh = tokio::task::spawn_blocking(move || load_all_instances(&file_watch))
             .await
             .expect("join")
             .expect("load");
-        reload_state_instances_from_disk(&state, fresh, Vec::new(), StatusSource::DiskOnly).await;
+        reload_state_instances_from_disk(
+            &state,
+            fresh,
+            Vec::new(),
+            StatusSource::DiskOnly,
+            read_epoch,
+        )
+        .await;
 
         let instances = state.instances.read().await;
         let titles: Vec<&str> = instances.iter().map(|i| i.title.as_str()).collect();
@@ -8369,6 +9658,221 @@ mod tests {
             titles.contains(&"p2-mid-init"),
             "writes DURING init's iteration (the gap window) must be reconciled by the bootstrap wake; titles: {:?}",
             titles
+        );
+    }
+
+    // A reloader reads `sessions.json`, then does slow work (the poll loop's
+    // tmux scrape, which blocks for seconds when the tmux server is
+    // unreachable) before folding the snapshot into `state.instances`. A
+    // delete committing inside that window used to come straight back, because
+    // the merge rebuilds `state.instances` wholesale from the stale snapshot.
+    // Observed as a live Playwright failure: DELETE returned 200, the sidebar
+    // row went away, and the very next `GET /api/sessions` listed the session
+    // again with its pre-delete status. See invariant 8.
+    #[tokio::test]
+    async fn a_reload_predating_a_delete_does_not_resurrect_the_removed_row() {
+        let doomed = Instance::new("doomed", "/tmp/doomed");
+        let survivor = Instance::new("survivor", "/tmp/survivor");
+        // What a reloader read from disk before the delete landed.
+        let stale_snapshot = vec![doomed.clone(), survivor.clone()];
+        let read_epoch = 0;
+
+        let state = test_support::build_test_app_state(vec![survivor.clone()]);
+        // The delete already committed: `doomed` is gone from memory, and the
+        // epoch moved to say so.
+        state
+            .mutation_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        reload_state_instances_from_disk(
+            &state,
+            stale_snapshot,
+            Vec::new(),
+            StatusSource::DiskOnly,
+            read_epoch,
+        )
+        .await;
+
+        let titles: Vec<String> = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .map(|i| i.title.clone())
+            .collect();
+        assert!(
+            !titles.contains(&"doomed".to_string()),
+            "a deleted session must not come back from a pre-delete snapshot: {titles:?}"
+        );
+        assert_eq!(titles, vec!["survivor".to_string()]);
+    }
+
+    // The mirror image of the delete case, and the reason `mutation_epoch` is
+    // not named `delete_epoch`. `create_session` persists the new row to
+    // `sessions.json` and only then upserts it into `state.instances`
+    // (`upsert_instance`). A poll tick whose disk read STARTED before that
+    // persist carries a `fresh` without the new row, and since the merge
+    // rebuilds `state.instances` exclusively from `fresh`, the wholesale
+    // replace drops the session the create just inserted. `GET /api/sessions`
+    // then loses it until the next tick re-reads disk 2s later. Observed as a
+    // live Playwright failure: `wizard-scratch-launch` polled until the
+    // session appeared, and the very next `GET /api/sessions` returned `[]`.
+    #[tokio::test]
+    async fn a_reload_predating_a_create_does_not_drop_the_new_row() {
+        let existing = Instance::new("existing", "/tmp/existing");
+        let created = Instance::new("created", "/tmp/created");
+        // What a reloader read from disk before the create persisted.
+        let stale_snapshot = vec![existing.clone()];
+
+        // The create already committed: `created` is in memory (and on disk),
+        // and the epoch moved to say so.
+        let state = test_support::build_test_app_state(vec![existing.clone(), created.clone()]);
+        state
+            .mutation_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+
+        reload_state_instances_from_disk(
+            &state,
+            stale_snapshot.clone(),
+            Vec::new(),
+            StatusSource::DiskOnly,
+            0,
+        )
+        .await;
+
+        let titles: Vec<String> = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .map(|i| i.title.clone())
+            .collect();
+        assert!(
+            titles.contains(&"created".to_string()),
+            "a created session must survive a pre-create snapshot: {titles:?}"
+        );
+
+        // And the converse, which is what the create path's bump buys: hand
+        // the same stale snapshot a matching epoch, as if the create had never
+        // bumped, and the row is gone. This is the pre-fix behaviour, pinned so
+        // the bump cannot be dropped as redundant.
+        let unbumped = test_support::build_test_app_state(vec![existing.clone(), created.clone()]);
+        reload_state_instances_from_disk(
+            &unbumped,
+            stale_snapshot,
+            Vec::new(),
+            StatusSource::DiskOnly,
+            0,
+        )
+        .await;
+        let titles: Vec<String> = unbumped
+            .instances
+            .read()
+            .await
+            .iter()
+            .map(|i| i.title.clone())
+            .collect();
+        assert_eq!(
+            titles,
+            vec!["existing".to_string()],
+            "without the epoch bump the reload drops the created row"
+        );
+    }
+
+    // The epoch comparison has to be atomic against the delete, not merely
+    // ordered by `SeqCst`. Comparing before taking the `instances` write lock
+    // leaves a check-then-act race: a reload passes the check, parks on the
+    // lock, a delete takes the lock and removes the row, and the reload then
+    // wakes and writes its stale snapshot over the removal.
+    //
+    // This drives that exact interleaving. The test holds the write lock so
+    // the spawned reload is guaranteed to be parked on it, bumps the epoch
+    // while it waits (standing in for the delete), then releases. On a
+    // current-thread runtime the ordering is deterministic, not timing
+    // dependent.
+    #[tokio::test]
+    async fn a_reload_parked_on_the_instances_lock_still_sees_a_delete_that_won_the_race() {
+        let doomed = Instance::new("doomed", "/tmp/doomed");
+        let survivor = Instance::new("survivor", "/tmp/survivor");
+        let stale_snapshot = vec![doomed.clone(), survivor.clone()];
+
+        let state = test_support::build_test_app_state(vec![survivor.clone()]);
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+
+        // Hold the lock the reload needs, so it cannot get past it.
+        let guard = state.instances.write().await;
+
+        let reload_state = Arc::clone(&state);
+        let reload = tokio::spawn(async move {
+            reload_state_instances_from_disk(
+                &reload_state,
+                stale_snapshot,
+                Vec::new(),
+                StatusSource::DiskOnly,
+                read_epoch,
+            )
+            .await;
+        });
+
+        // Let the spawned task run until it parks on the write lock.
+        tokio::task::yield_now().await;
+
+        // The delete commits while the reload is parked: row out, epoch up.
+        // Both happen before the lock is released, mirroring the real purge.
+        state
+            .mutation_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        drop(guard);
+
+        reload.await.expect("reload task");
+
+        let titles: Vec<String> = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .map(|i| i.title.clone())
+            .collect();
+        assert!(
+            !titles.contains(&"doomed".to_string()),
+            "a reload that was already waiting on the lock when the delete landed must still drop: {titles:?}"
+        );
+    }
+
+    // The guard must not be implemented by dropping ids missing from the prior
+    // in-memory map: that is also how a session created by another process
+    // (the CLI, a peer daemon) legitimately arrives. Only a moved epoch means
+    // "this snapshot predates a delete".
+    #[tokio::test]
+    async fn a_reload_at_the_current_epoch_still_adopts_externally_created_rows() {
+        let known = Instance::new("known", "/tmp/known");
+        let created_elsewhere = Instance::new("created-elsewhere", "/tmp/elsewhere");
+        let state = test_support::build_test_app_state(vec![known.clone()]);
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
+
+        reload_state_instances_from_disk(
+            &state,
+            vec![known, created_elsewhere],
+            Vec::new(),
+            StatusSource::DiskOnly,
+            read_epoch,
+        )
+        .await;
+
+        let titles: Vec<String> = state
+            .instances
+            .read()
+            .await
+            .iter()
+            .map(|i| i.title.clone())
+            .collect();
+        assert!(
+            titles.contains(&"created-elsewhere".to_string()),
+            "a row this daemon has never seen must still be adopted: {titles:?}"
         );
     }
 
@@ -8411,12 +9915,24 @@ mod tests {
         .await
         .expect("bootstrap wake must fire after init returns");
 
+        // Invariant 8: capture the epoch BEFORE the disk read, the order every
+        // production caller uses.
+        let read_epoch = state
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::SeqCst);
         let file_watch = state.file_watch.clone();
         let fresh = tokio::task::spawn_blocking(move || load_all_instances(&file_watch))
             .await
             .expect("join")
             .expect("load");
-        reload_state_instances_from_disk(&state, fresh, Vec::new(), StatusSource::DiskOnly).await;
+        reload_state_instances_from_disk(
+            &state,
+            fresh,
+            Vec::new(),
+            StatusSource::DiskOnly,
+            read_epoch,
+        )
+        .await;
 
         let instances = state.instances.read().await;
         assert!(
@@ -8532,6 +10048,7 @@ mod tests {
         };
         assert_eq!(
             derive_acp_status(&Event::UserPromptSent {
+                prompt_id: None,
                 text: "hi".into(),
                 attachments: Vec::new(),
             }),
@@ -8728,6 +10245,22 @@ mod tests {
 
     #[cfg(feature = "serve")]
     #[test]
+    fn trailing_acp_event_cannot_change_a_trashed_session_status() {
+        let mut inst = stopped_structured_instance();
+        inst.status = Status::Running;
+        inst.trash();
+
+        apply(&mut inst, StatusIntent::Set(Status::Error));
+
+        assert_eq!(
+            inst.status,
+            Status::Running,
+            "trash teardown must not become a user-facing error transition"
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
     fn agent_activity_wakes_an_idle_session_after_a_fired_wakeup() {
         // A session that paused on ScheduleWakeup sits Idle. When the wake
         // fires the turn resumes agent-side with activity events (no
@@ -8747,6 +10280,73 @@ mod tests {
         inst.status = Status::Error;
         apply(&mut inst, StatusIntent::HealError);
         assert_eq!(inst.status, Status::Idle);
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn status_intent_transitions_preserve_last_accessed_at() {
+        // #3465 residual: the intent applier used to restamp
+        // last_accessed_at on every transition. The value relays through
+        // DaemonStatusPoller into TUI memory and save()'s merge_from_tui
+        // monotone max persists it, so a phantom stamp here wiped
+        // concurrent archives through merge_user_action_diff's touched
+        // arm. Structured rows take real touches from user prompts
+        // (touch_on_prompt_and_wake_if_sunk), so the field stays gesture-only.
+        let mut inst = stopped_structured_instance();
+        inst.status = Status::Idle;
+        let user_touch = chrono::Utc::now() - chrono::Duration::seconds(60);
+        inst.last_accessed_at = Some(user_touch);
+
+        apply(&mut inst, StatusIntent::Set(Status::Running));
+        assert_eq!(inst.status, Status::Running);
+        assert_eq!(inst.idle_entered_at, None);
+        assert_eq!(
+            inst.last_accessed_at,
+            Some(user_touch),
+            "a worker-event transition must not fabricate a user-gesture stamp"
+        );
+
+        apply(&mut inst, StatusIntent::Set(Status::Idle));
+        assert_eq!(inst.status, Status::Idle);
+        assert!(inst.idle_entered_at.is_some());
+        assert_eq!(
+            inst.last_accessed_at,
+            Some(user_touch),
+            "entering Idle re-anchors idle bookkeeping, not the gesture stamp"
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn relayed_intent_stamp_wipes_concurrent_archive() {
+        // Full #3465 residual chain on structured rows:
+        // apply_status_intent stamps daemon memory, save()'s
+        // merge_from_tui folds that memory into disk with an ungated
+        // monotone max, and a writer holding a pre snapshot from before
+        // the stamp loses its archive to merge_user_action_diff's
+        // touched arm. Dropping the intent stamp breaks this chain.
+        let user_touch = chrono::Utc::now() - chrono::Duration::seconds(60);
+
+        let mut daemon_row = stopped_structured_instance();
+        daemon_row.status = Status::Idle;
+        daemon_row.last_accessed_at = Some(user_touch);
+        apply(&mut daemon_row, StatusIntent::Set(Status::Running));
+
+        let mut disk = stopped_structured_instance();
+        disk.status = Status::Idle;
+        disk.last_accessed_at = Some(user_touch);
+        let pre = disk.clone();
+
+        disk.merge_from_tui(&daemon_row);
+
+        let mut post = pre.clone();
+        post.archive();
+        disk.merge_user_action_diff(&pre, &post);
+
+        assert!(
+            disk.archived_at.is_some(),
+            "relayed intent stamp must not wipe a concurrent archive (#3465)"
+        );
     }
 
     #[cfg(feature = "serve")]
@@ -8796,6 +10396,7 @@ mod tests {
                 &id,
                 1,
                 &Event::UserPromptSent {
+                    prompt_id: None,
                     text: "go".into(),
                     attachments: Vec::new(),
                 },
@@ -9001,6 +10602,52 @@ mod tests {
         mgr.rotate().await;
         let after = mgr.current_token().await;
         assert_ne!(before, after);
+    }
+
+    #[tokio::test]
+    async fn load_or_generate_token_is_stable_across_restarts_but_rotates_when_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("serve.token");
+        let day = std::time::Duration::from_secs(24 * 60 * 60);
+
+        // First start generates and persists a token.
+        let first = load_or_generate_token_at(&path, day).await;
+        assert!(is_valid_token_format(&first));
+
+        // A restart within the window reuses the token AND refreshes its mtime,
+        // so the idle clock is measured from last use, not creation. Backdate
+        // the file to simulate a day-old server; the restart must reuse the
+        // token and reset its age near zero. Before #3386 the mtime was set
+        // only at creation, so a day-old token rotated on the very next restart
+        // and silently killed push. (Use a generous window here so the reuse
+        // path runs regardless of how precisely the sandbox fs honors the
+        // backdate; the rotation case below is asserted deterministically.)
+        let backdated = std::time::SystemTime::now() - std::time::Duration::from_secs(23 * 60 * 60);
+        std::fs::File::open(&path)
+            .unwrap()
+            .set_modified(backdated)
+            .unwrap();
+        let reused = load_or_generate_token_at(&path, day * 100).await;
+        assert_eq!(
+            reused, first,
+            "a restart within the window must reuse the token"
+        );
+        let age = std::fs::metadata(&path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            .elapsed()
+            .unwrap();
+        assert!(
+            age < std::time::Duration::from_secs(60),
+            "reuse must refresh the mtime, got age {age:?}"
+        );
+
+        // A token older than the window rotates. Drive this with a zero-length
+        // window so any existing file counts as stale, independent of the
+        // filesystem's mtime precision: the next start must generate a fresh one.
+        let rotated = load_or_generate_token_at(&path, std::time::Duration::ZERO).await;
+        assert_ne!(rotated, first, "a token idle past the window rotates");
     }
 
     #[tokio::test]

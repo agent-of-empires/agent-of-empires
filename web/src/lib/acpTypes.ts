@@ -5,7 +5,6 @@
 // component renders unknown frames gracefully.
 
 import type { DiffComment } from "../components/diff/comments/types";
-import { resolveAgentProfile } from "./agentProfiles";
 
 export type ApprovalDecision = "Allow" | "AllowAlways" | "Deny" | "Cancelled";
 
@@ -526,7 +525,14 @@ export type AcpEvent =
   | { PromptRuntimeError: { message: string } }
   | { IncompatibleAgent: { detail: IncompatibleAgentDetail } }
   | {
-      UserPromptSent: { text: string; attachments?: PromptAttachmentRefWire[] };
+      UserPromptSent: {
+        text: string;
+        attachments?: PromptAttachmentRefWire[];
+        /** Client-minted stable id echoed back so an optimistic overlay row
+         *  reconciles by id. Absent for CLI/TUI/drained-queue prompts and
+         *  events persisted before the field landed. See #3173 / Tier 4. */
+        prompt_id?: string | null;
+      };
     }
   | {
       UserDiffCommentsPrompt: {
@@ -611,6 +617,36 @@ export interface AcpFrame {
   event: AcpEvent;
 }
 
+/** The daemon's folded control state, carried by the WS `reduced_state`
+ *  frame on connect and after every event. Mirrors the Rust `AcpState`
+ *  (`src/acp/state.rs`), which is the single reducer for everything here:
+ *  the fields below are adopted verbatim by {@link applyReducedState} rather
+ *  than re-derived from raw events. Only the fields this client reads are
+ *  declared; the frame carries more.
+ *
+ *  Everything still folded client-side in `applyEvent` is state the server
+ *  does not model: the worker-lifecycle latches (`Stopped` reasons), the
+ *  monitor / wakeup badges, the usage cost baseline, rejected prompts, and
+ *  the optimistic turn counters. See
+ *  `docs/development/server-owned-sv-state.md`. */
+export interface ReducedState {
+  agent: string;
+  model: string | null;
+  mode: SessionMode;
+  current_plan: Plan | null;
+  in_flight_tool: ToolCall | null;
+  pending_approvals: Approval[];
+  pending_elicitations: Elicitation[];
+  thinking: { started_at: string } | null;
+  rate_limit: RateLimitInfo | null;
+  available_commands: AvailableCommand[];
+  available_modes: Array<{ id: string; name: string; description?: string | null }>;
+  current_mode_id: string | null;
+  turn_active: boolean;
+  cancelling: boolean;
+  compacting: boolean;
+}
+
 export interface AcpState {
   agent: string | null;
   model: string | null;
@@ -624,13 +660,10 @@ export interface AcpState {
   pendingApprovals: Approval[];
   /** Pending AskUserQuestion elicitations awaiting a user answer. */
   pendingElicitations: Elicitation[];
-  /** tool_call_ids that surfaced as an elicitation. The adapter emits an
-   *  AskUserQuestion tool call alongside the `elicitation/create`; the
-   *  elicitation card is the real UI, so its tool card is suppressed from
-   *  the transcript. Persisted across resolution so the completion frame
-   *  is dropped too. */
-  elicitationToolCallIds: string[];
-  recentDiffs: DiffPreview[];
+  /** Nonces of approvals / elicitations answered here, held until the
+   *  daemon's own pending list stops carrying them. See
+   *  {@link applyReducedState}. */
+  locallyResolved: string[];
   thinking: boolean;
   rateLimit: RateLimitInfo | null;
   /** Latest agent-reported context-window usage. Null until the agent
@@ -663,12 +696,21 @@ export interface AcpState {
    *  the reminder as soon as usage climbed back past the dismissed value.
    *  See #3253. */
   compactionReminderDismissed: SessionUsage | null;
-  /** Most recent assistant message chunks accumulated as a single
-   *  text body. Cleared each time a new prompt is sent. */
-  assistantMessage: string;
-  /** Activity rows (tool starts + completions + agent messages),
-   *  oldest first. Bounded for memory. */
+  /** Ordered transcript rows, oldest first. Server-owned (Tier 4): the
+   *  daemon folds the event stream into these rows and ships them via the
+   *  WS transcript channel (`transcript_snapshot` / `transcript_delta`) and
+   *  `GET /acp/replay?view=rows`. The client reconciles by the server's
+   *  deterministic row id rather than re-reducing frames. See
+   *  `docs/development/server-owned-sv-state.md`. */
   activity: ActivityRow[];
+  /** Client-only optimistic overlay rows (an in-flight `user_prompt` the
+   *  POST has not yet confirmed, or a just-answered elicitation), keyed by
+   *  the deterministic id the server will assign the confirmed row (the
+   *  minted `prompt_id`, or `elicitation-<nonce>`). Rendered on top of
+   *  `activity`; each entry is dropped the moment a server row with the same
+   *  id lands in `activity`, so this is a pure presentation layer and never a
+   *  second source of truth. Not persisted. */
+  optimisticRows: ActivityRow[];
   /** Last seen seq, for reconnect requests. Frames whose `seq` is
    *  not strictly greater than this are dropped by the reducer so
    *  reconnect-replay can deliver the same frames again without
@@ -707,24 +749,35 @@ export interface AcpState {
    *  "working" spinner so the UI feels alive even when the agent
    *  isn't streaming text or running a tool yet.
    *
-   *  Derived from `pendingUserPromptSeq > lastStoppedSeq`; never
-   *  written directly. Keeping it on the state shape (instead of
+   *  Derived from `serverTurnActive || inflightPromptIds.length > 0`;
+   *  never written directly. Keeping it on the state shape (instead of
    *  exporting a selector) lets all the existing `state.turnActive`
-   *  reads stay unchanged. The counter pair is the source of truth so
-   *  a late `Stopped` from a prior turn can't clobber a fresh
-   *  follow-up that's already incremented `pendingUserPromptSeq`.
-   *  See #1170. */
+   *  reads stay unchanged. See {@link deriveTurnActive} and #3417. */
   turnActive: boolean;
-  /** Monotonic count of user prompts the client has dispatched (either
-   *  via the optimistic `user_prompt` action or via a server-confirmed
-   *  `UserPromptSent` echo that didn't match an outstanding optimistic
-   *  row). Source of truth for `turnActive`; never decremented. */
-  pendingUserPromptSeq: number;
-  /** Snapshot of `pendingUserPromptSeq` at the moment the most recent
-   *  `Stopped` (or `AgentStartupError`) arrived. `turnActive` derives
-   *  to false only when no further prompt has bumped
-   *  `pendingUserPromptSeq` past this snapshot. */
-  lastStoppedSeq: number;
+  /** The daemon's `AcpState.turn_active`, adopted verbatim from the
+   *  `reduced_state` frame. Authoritative for the steady state: the
+   *  daemon is the only party that knows whether a mid-turn prompt was
+   *  steered into the running turn (one terminal `Stopped` for many
+   *  prompts) or opened a turn of its own. See #3417 / #2805. */
+  serverTurnActive: boolean;
+  /** Client-minted prompt ids POSTed but not yet acknowledged, either by
+   *  the server's `UserPromptSent` echo or by the POST settling with a
+   *  failure. The thin optimistic overlay that covers the POST-to-echo
+   *  gap so the composer flips to "working" instantly; correlated by id
+   *  so one prompt settling cannot retire another's turn. Request-local,
+   *  never persisted. */
+  inflightPromptIds: string[];
+  /** Monotonic count of user prompts dispatched, never decremented. Bumped
+   *  by the optimistic `user_prompt` action and by any `UserPromptSent` with
+   *  no matching outstanding optimistic id (a replay, another device, a
+   *  drained queue entry), so an echo of this client's own prompt counts once.
+   *
+   *  Two readers: `useCancelEscalation` tokenises "already pressed Stop for
+   *  this prompt" as `(sessionId, promptSeq)` so the next prompt's first Stop
+   *  is graceful again (#2237), and the `SessionContextReset` arm treats zero
+   *  as "this session never had a prompt to lose" and suppresses the re-prime
+   *  offer. Deliberately not turn truth: see {@link deriveTurnActive}. */
+  promptSeq: number;
   /** Real ACP-advertised modes from the agent's NewSessionResponse,
    *  plus the agent's currently-active mode id. Empty until the
    *  agent reports them; the picker falls back to the hard-coded
@@ -739,17 +792,6 @@ export interface AcpState {
    *  `AvailableCommandsUpdate`. Empty until the agent emits one; the
    *  composer's `/` picker reads from here. */
   availableCommands: AvailableCommand[];
-  /** Streaming output buffer keyed by tool_call_id. Populated by
-   *  ToolCallContent frames while the call is still running, drained
-   *  on ToolCallCompleted (used as a fallback when the completion
-   *  carries no content of its own). */
-  toolOutputs: Record<string, string>;
-  /** True iff the current turn has produced at least one piece of
-   *  visible output (assistant chunk, tool call, thinking signal).
-   *  Reset to false on every UserPromptSent. Used by the Stopped
-   *  handler to detect "no-op turn" without walking the full
-   *  activity array. */
-  turnHasOutput: boolean;
   /** Latest acp-side `session/set_mode` rejection from the adapter.
    *  Populated by the `ModeSwitchFailed` event so the UI can render a
    *  non-blocking notice ("Yolo / bypassPermissions requested but the
@@ -775,7 +817,7 @@ export interface AcpState {
    *  meaning the reconciler reaped the worker for inactivity
    *  (`acp.auto_stop_idle_secs`) and marked the session dormant. Unlike
    *  `workerStopped`, this is recoverable without any explicit reconnect:
-   *  the next prompt POST wakes it (the server's `touch_and_wake_if_sunk`
+   *  the next prompt POST wakes it (the server's `touch_on_prompt_and_wake_if_sunk`
    *  clears dormancy, the reconciler respawns, and `send_prompt`'s
    *  `wait_for_worker` holds the request until the fresh worker is ready).
    *  `sendPrompt` and the drain effect read this so a dormant worker does
@@ -966,12 +1008,20 @@ export interface QueuedPrompt {
   /** ISO-8601 client wall clock at enqueue time. Displayed as a
    *  relative age in the strip. */
   queuedAt: string;
-  /** Attachments staged with this queued prompt. EPHEMERAL: these carry
-   *  raw base64 bytes, so `persistState` drops any queued row that has
-   *  them rather than writing megabytes into the per-origin localStorage
-   *  quota. They survive a component remount (the in-memory `stateCache`
-   *  keeps the full row) but not a full page reload. See #1833 / #1000. */
+  /** Attachments staged with this queued prompt. The bytes now live
+   *  server-side (the pending-attachment store) and are delivered on drain;
+   *  a locally-queued row keeps the raw base64 in memory so the strip can
+   *  render a thumbnail until the server confirms. `persistState` still drops
+   *  any queued row that has them rather than writing megabytes into the
+   *  per-origin localStorage quota; a hydrate from the server repopulates the
+   *  metadata (id/kind/mime/name, no bytes) after reload. See #1833 / #1000. */
   attachments?: PromptAttachmentInput[];
+  /** True for an optimistic row whose server enqueue POST has not been
+   *  confirmed yet. A hydrate from the server keeps `pending` rows that are
+   *  not (yet) in the server snapshot, so an in-flight enqueue is not dropped
+   *  by a hydrate that races the POST. Cleared once the row appears in a
+   *  server snapshot. */
+  pending?: boolean;
 }
 
 export interface ActivityRow {
@@ -988,6 +1038,7 @@ export interface ActivityRow {
     | "elicitation_answered"
     | "empty_output"
     | "context_reset"
+    | "notice"
     | "session_cleared"
     | "compacted"
     | "summary";
@@ -1027,21 +1078,157 @@ export interface ActivityRow {
   at: string; // ISO-8601
 }
 
-/** Module-level mirror of `acp.replay_events`. Set by the
- *  `useAcpSession` hook from `useAcpPrefs` so the reducer (which
- *  can't read React context) sees the user's chosen retention cap.
- *  0 means unlimited. Default 0 matches `acp.replay_events`'
- *  default after #1065 made server-side retention unlimited; without
- *  this mirror, a frontend-only 200-row cap clipped the rendered
- *  transcript regardless of what the user set on the server side.
- *  See #1111. */
-let activityLimit = 0;
+/** Wire mirror of the Rust `TranscriptRow` (src/acp/transcript.rs), serde
+ *  snake_case. The server folds the event stream into these ordered rows and
+ *  ships them via the WS transcript channel and `GET /acp/replay?view=rows`;
+ *  the client maps each to an {@link ActivityRow} and renders it instead of
+ *  re-reducing frames. The `kind` set matches `ActivityRow["kind"]` minus
+ *  `thinking` (which is control-state, never a transcript row). */
+export interface TranscriptRow {
+  id: string;
+  group_id: string;
+  kind: Exclude<ActivityRow["kind"], "thinking">;
+  at: string;
+  text: string;
+  tool_call_id?: string;
+  tool?: ToolCall;
+  output?: ToolOutputBlock[];
+  attachments?: PromptAttachmentRefWire[];
+  diff_comments?: {
+    intro: string;
+    outro: string;
+    is_multi_repo: boolean;
+    comments: DiffComment[];
+  };
+  elicitation_answers?: ElicitationAnswer[];
+  async_subagent?: boolean;
+}
 
-/** Set the activity buffer cap. Called by `useStructuredView` whenever the
- *  resolved prefs change so the reducer's `pushActivity` honours
- *  the current setting. Visible for tests that need to pin the cap. */
-export function setActivityLimit(limit: number): void {
-  activityLimit = Math.max(0, Math.floor(limit));
+/** Wire mirror of the Rust `TranscriptDelta` (externally tagged enum). One
+ *  incremental change to the ordered row list, emitted per event on the WS
+ *  `transcript_delta` frame. */
+export type TranscriptDelta =
+  | { Append: TranscriptRow }
+  | { Patch: { id: string; row: TranscriptRow } }
+  | { Remove: string };
+
+/** Map a server {@link TranscriptRow} to the client {@link ActivityRow} shape
+ *  (snake_case -> camelCase) the renderers already consume, so `AcpRuntime` /
+ *  `ToolCards` / `Markdown` stay unchanged. `attachments` gain their lazy
+ *  replay-GET url from the session id. `raw_name` is not on the wire (the Rust
+ *  `ToolCall` has no such field, #3070), so it is best-effort seeded from
+ *  `name`. */
+/** Whether this client renders a given server row.
+ *
+ *  The daemon emits a `notice` row for a failed startup, a turn that died
+ *  mid-flight, a refused mode switch, or a rate-limit auto-resume, because the
+ *  native view shows those inline in the timeline. The web surfaces the same
+ *  information as dismissible banners driven by `startupError` / `lastError` /
+ *  `modeSwitchFailed`, which it still folds from raw frames, so rendering the
+ *  row too would say it twice. */
+export function webRendersServerRow(row: TranscriptRow): boolean {
+  return row.kind !== "notice";
+}
+
+export function transcriptRowToActivity(row: TranscriptRow, sessionId: string): ActivityRow {
+  const tool: ToolCall | undefined = row.tool
+    ? { ...row.tool, raw_name: row.tool.raw_name ?? row.tool.name }
+    : undefined;
+  const attachments: AcpAttachment[] | undefined =
+    row.attachments && row.attachments.length > 0
+      ? row.attachments.map((a) => ({
+          id: a.id,
+          kind: a.kind,
+          mimeType: a.mime_type,
+          name: a.name,
+          size: a.size,
+          url: `/api/sessions/${encodeURIComponent(sessionId)}/acp/attachments/${encodeURIComponent(a.id)}`,
+        }))
+      : undefined;
+  return {
+    id: row.id,
+    kind: row.kind,
+    text: row.text,
+    at: row.at,
+    ...(row.tool_call_id ? { toolCallId: row.tool_call_id } : {}),
+    ...(tool ? { tool } : {}),
+    ...(row.output && row.output.length > 0 ? { output: row.output } : {}),
+    ...(attachments ? { attachments } : {}),
+    ...(row.diff_comments
+      ? {
+          diffComments: {
+            intro: row.diff_comments.intro,
+            outro: row.diff_comments.outro,
+            isMultiRepo: row.diff_comments.is_multi_repo,
+            comments: row.diff_comments.comments,
+          },
+        }
+      : {}),
+    ...(row.elicitation_answers && row.elicitation_answers.length > 0
+      ? { elicitationAnswers: row.elicitation_answers }
+      : {}),
+    ...(row.async_subagent ? { asyncSubagent: true } : {}),
+  };
+}
+
+/** Append / merge a batch of server-folded rows onto the existing activity
+ *  tail, reconciling by the server's deterministic row id. A row whose id
+ *  already exists replaces it in place (the server is authoritative); two
+ *  `tool_start` rows for one id are merged so a sparse synth start folded on a
+ *  later replay page (the server's `?view=rows` folds each page in isolation)
+ *  cannot clobber a richer start already loaded (the #1713/#2711 seam). New
+ *  ids append in order. Idempotent, which absorbs the WS/replay overlap race
+ *  (#1100) without a seq gate. */
+export function mergeServerRows(existing: ActivityRow[], incoming: ActivityRow[]): ActivityRow[] {
+  if (incoming.length === 0) return existing;
+  const indexById = new Map<string, number>();
+  existing.forEach((r, i) => indexById.set(r.id, i));
+  let out = existing;
+  const ensureCopy = () => {
+    if (out === existing) out = existing.slice();
+  };
+  for (const row of incoming) {
+    const idx = indexById.get(row.id);
+    if (idx === undefined) {
+      ensureCopy();
+      indexById.set(row.id, out.length);
+      out.push(row);
+      continue;
+    }
+    ensureCopy();
+    const prev = out[idx]!;
+    if (prev.kind === "tool_start" && row.kind === "tool_start" && prev.tool && row.tool) {
+      const merged = mergeToolStart(prev.tool, row.tool);
+      // raw_name is the immutable ACP wire tool identity, but the server's
+      // ToolCall has no such field (#3070): the client derives it from the
+      // first-seen `name` in `transcriptRowToActivity`, so keep the earliest
+      // one across a retitling merge for subagent classification.
+      if (prev.tool.raw_name) merged.raw_name = prev.tool.raw_name;
+      out[idx] = { ...prev, tool: merged, text: merged.name, at: merged.started_at };
+    } else {
+      out[idx] = row;
+    }
+  }
+  return out;
+}
+
+/** Replace the row with `row.id` by the server's authoritative new row (a
+ *  `Patch` transcript delta carries the full row). Appends when the id is not
+ *  present, e.g. a Patch that lands before its Append after a reconnect.
+ *  Preserves the earliest-seen `raw_name` on a `tool_start` patch, since a
+ *  retitling `ToolCallUpdated` overwrites the server row's `name` and the wire
+ *  identity would otherwise be lost (#3070). */
+export function patchServerRow(existing: ActivityRow[], row: ActivityRow): ActivityRow[] {
+  const idx = existing.findIndex((r) => r.id === row.id);
+  if (idx === -1) return existing.concat(row);
+  const prev = existing[idx]!;
+  const next = existing.slice();
+  if (prev.tool?.raw_name && row.tool && row.tool.raw_name !== prev.tool.raw_name) {
+    next[idx] = { ...row, tool: { ...row.tool, raw_name: prev.tool.raw_name } };
+  } else {
+    next[idx] = row;
+  }
+  return next;
 }
 
 export function emptyAcpState(): AcpState {
@@ -1054,15 +1241,14 @@ export function emptyAcpState(): AcpState {
     inFlightTool: null,
     pendingApprovals: [],
     pendingElicitations: [],
-    elicitationToolCallIds: [],
-    recentDiffs: [],
+    locallyResolved: [],
     thinking: false,
     rateLimit: null,
     sessionUsage: null,
     usageBaseline: null,
     compactionReminderDismissed: null,
-    assistantMessage: "",
     activity: [],
+    optimisticRows: [],
     lastSeq: 0,
     oldestSeq: 0,
     lagged: false,
@@ -1070,13 +1256,12 @@ export function emptyAcpState(): AcpState {
     incompatibleAgent: null,
     lastError: null,
     turnActive: false,
-    pendingUserPromptSeq: 0,
-    lastStoppedSeq: 0,
+    serverTurnActive: false,
+    inflightPromptIds: [],
+    promptSeq: 0,
     availableModes: [],
     currentModeId: null,
     availableCommands: [],
-    toolOutputs: {},
-    turnHasOutput: false,
     workerStopped: false,
     workerRestarting: false,
     workerIdleStopped: false,
@@ -1102,10 +1287,6 @@ export function emptyAcpState(): AcpState {
   };
 }
 
-/** Per-turn state resets shared by every "a new user turn started"
- *  event (a plain `UserPromptSent` and a `UserDiffCommentsPrompt`).
- *  Mutates `next` in place; the caller has already appended the
- *  activity row and bumped `pendingUserPromptSeq`. */
 /** Whether a `UserPromptSent` is a message steered into the turn already
  *  running rather than the start of a new one (#2805).
  *
@@ -1116,25 +1297,28 @@ export function emptyAcpState(): AcpState {
  *  turn's single `Stopped` still has to see the output flag and the
  *  pending-cancel state the turn actually accumulated.
  *
- *  Takes the pre-event state, since the arms bump `pendingUserPromptSeq`
- *  (which feeds `isTurnActive`) before they reach the reset.
+ *  Takes the pre-event state, since the arms open the turn before they
+ *  reach the reset.
+ *
+ *  Reads `serverTurnActive`, not the rendered `turnActive`: since #3417 the
+ *  latter is also true through the POST-to-echo gap of this client's own
+ *  prompt, so an idle session's very first prompt would look steered to its
+ *  own echo and skip the resets it needs. Only the daemon's flag means "a
+ *  turn was already running".
  */
 function isSteeredContinuation(state: AcpState): boolean {
-  return state.turnActive && !!state.promptCapabilities?.steering;
+  return state.serverTurnActive && !!state.promptCapabilities?.steering;
 }
 
+/** Per-turn state resets shared by every "a new user turn started"
+ *  event (a plain `UserPromptSent` and a `UserDiffCommentsPrompt`).
+ *  Mutates `next` in place; the caller has already opened the turn. */
 function applyNewTurnResets(next: AcpState): void {
-  next.assistantMessage = "";
   next.startupError = null;
   next.lastError = null;
-  next.turnActive = isTurnActive(next);
-  // A fresh turn supersedes any stale "Stopping..." state from a prior
-  // turn's cancel. See #1727.
-  next.cancelling = false;
+  // The cancel phase itself is server-owned (a fresh non-steered turn clears
+  // it there); only the escalation deadline is ours to drop. See #1727.
   next.cancelEscalatesAt = null;
-  // New turn; reset the no-output detector so Stopped fires the
-  // empty-output notice if the agent produces nothing.
-  next.turnHasOutput = false;
   // A fresh prompt means the worker is alive again; clear the
   // user_stopped banner without waiting for AcpSessionAssigned.
   next.workerStopped = false;
@@ -1172,14 +1356,6 @@ function applyNewTurnResets(next: AcpState): void {
   // Any pending context-primer offer is consumed once the user submits
   // a new prompt; the recovery affordance is one-shot.
   next.contextPrimerAvailable = null;
-  // A fresh turn means the session is live again, so any rate-limit park
-  // is over. Clear the banner here (not only on the auto-resume
-  // `RateLimitAutoResumed` / `AgentSwitched` paths) so a session resumed
-  // by a plain prompt or a draining queued follow-up does not keep a
-  // stale "Rate-limited; resets at ..." banner, and so the dead
-  // `RESUME NOW` button it renders can no longer 409 against an
-  // already-running worker. See #3028.
-  next.rateLimit = null;
 }
 
 /** Pure reducer. Returns a new state; never mutates the input.
@@ -1194,367 +1370,49 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
   const next = { ...state, lastSeq: frame.seq };
   const event = frame.event;
   if (typeof event === "string") {
+    // The phases themselves (thinking, compacting) and the state a context
+    // boundary invalidates (plan, mode, pending cards) are server-owned since
+    // Tier 1.2. What stays is the cost baseline, which the server does not
+    // model: the agent reports session-lifetime cumulative cost, so each
+    // boundary snapshots it to keep the footer reading "since the most recent
+    // boundary". See #1354 / #1109.
     if (event === "ThinkingStarted") {
-      next.thinking = true;
-      next.turnHasOutput = true;
-    } else if (event === "ThinkingEnded") {
-      next.thinking = false;
-    } else if (event === "ConversationCompactionStarted") {
-      // The adapter is about to go silent for 90 to 170 seconds. No
-      // activity row: it already emitted a visible "Compacting..." chunk.
-      // This only latches the phase so the spinner stops reading the
-      // quiet as a wedge and the composer parks a follow-up. See #3219.
-      next.compacting = true;
-    } else if (event === "ConversationCompacted") {
-      // /compact replaced the model's context with a summary. The
-      // model still has continuity through the summary so no primer
-      // affordance is appropriate; just drop the now-stale usage
-      // snapshot and append a divider row. The renderer maps the
-      // `compacted` kind to a "Conversation compacted" divider that
-      // makes the boundary visible without nudging the user toward
-      // pre-filling duplicate context. See #1109.
-      // Capture the agent's cumulative cost snapshot as the new
-      // baseline so the next UsageUpdate reports cost-since-compact
-      // instead of session-lifetime cumulative. See #1354.
-      const compactPriorUsage = state.sessionUsage?.cost?.amount ?? 0;
-      const compactPriorBaseline = state.usageBaseline?.cost ?? 0;
-      const compactCumulative = compactPriorUsage + compactPriorBaseline;
-      next.usageBaseline = { cost: compactCumulative };
-      next.sessionUsage = null;
-      next.compacting = false;
-      next.activity = [
-        ...next.activity,
-        {
-          id: `compacted-${frame.seq}`,
-          kind: "compacted",
-          text: "Conversation compacted; earlier turns above are summarised in the model's context.",
-          at: new Date().toISOString(),
-        },
-      ];
-    } else if (event === "SessionCleared") {
-      // /clear wiped the model's memory. Append a divider row so the
-      // UI can fold pre-clear turns behind a disclosure (#1101), then
-      // drop only the per-turn / in-flight state that the cleared
-      // context invalidates: the active plan, the legacy mode enum,
-      // pending approvals, and the session usage snapshot.
-      //
-      // We deliberately preserve availableCommands, availableModes,
-      // and currentModeId. The prior over-clear (#1101 A.1) assumed a
-      // refill would follow, which it does not: emptying
-      // availableCommands made the slash palette stay empty forever
-      // after the first /clear because no AvailableCommandsUpdated
-      // event arrives to repopulate it (tracked upstream at
-      // agentclientprotocol/claude-agent-acp#657). See #1128.
-      //
-      // A driven reset (claude /clear, codex /new) DOES open a new
-      // session, so the preserved command list is no longer guaranteed
-      // authoritative for it: the fresh session could advertise a
-      // different surface. Preserving is still the better failure mode,
-      // since a possibly-stale palette beats a permanently empty one,
-      // and the reset path re-announces modes and config options so the
-      // pickers stay correct. Revisit if an adapter's command surface
-      // starts varying across sessions in the same process.
-      next.activity = [
-        ...next.activity,
-        {
-          id: `cleared-${frame.seq}`,
-          kind: "session_cleared",
-          text: "Conversation cleared, the model no longer remembers earlier turns.",
-          at: new Date().toISOString(),
-        },
-      ];
-      next.plan = null;
-      next.mode = "Default";
-      next.pendingApprovals = [];
-      next.pendingElicitations = [];
-      next.elicitationToolCallIds = [];
-      // Capture the agent's cumulative cost snapshot as the new
-      // baseline so the next UsageUpdate reports cost-since-clear
-      // instead of session-lifetime cumulative. `sessionUsage.cost`
-      // already stores the delta since the previous baseline, so the
-      // new baseline is the sum of both to track the true cumulative.
-      // See #1354.
-      const clearPriorUsage = state.sessionUsage?.cost?.amount ?? 0;
-      const clearPriorBaseline = state.usageBaseline?.cost ?? 0;
-      const clearCumulative = clearPriorUsage + clearPriorBaseline;
-      next.usageBaseline = { cost: clearCumulative };
+      // Agent-initiated work with no prompt behind it still opens a turn.
+      // Mirrors `AcpState::apply_event`; see closeTurn's note on why the raw
+      // fold tracks these edges at all.
+      next.serverTurnActive = true;
+      next.turnActive = true;
+    }
+    if (event === "ConversationCompacted" || event === "SessionCleared") {
+      const priorUsage = state.sessionUsage?.cost?.amount ?? 0;
+      const priorBaseline = state.usageBaseline?.cost ?? 0;
+      next.usageBaseline = { cost: priorUsage + priorBaseline };
       next.sessionUsage = null;
     }
-    return next;
-  }
-  if ("PlanUpdated" in event) {
-    next.plan = event.PlanUpdated.plan;
     return next;
   }
   if ("ToolCallStarted" in event) {
-    // Copy so the preserved `raw_name` (the immutable wire tool identity)
-    // stamped here can't leak back onto the shared event object. A later
-    // ToolCallUpdated overwrites `name` with the title but leaves
-    // `raw_name` intact for classification. See #3070.
-    const tc = { ...event.ToolCallStarted.tool_call };
-    tc.raw_name = tc.raw_name ?? tc.name;
-    // An AskUserQuestion tool call is rendered by its elicitation card, not
-    // a transcript tool card. If the elicitation arrived first, drop the
-    // redundant start frame entirely. See ElicitationRequested.
-    if (tc.id && next.elicitationToolCallIds.includes(tc.id)) {
-      return next;
-    }
-    // A duplicate start frame for the same id (e.g. once full args/content are
-    // known) must not clobber diffs a `ToolCallUpdated` already attached to the
-    // in-flight tool, if that update raced ahead of this frame.
-    next.inFlightTool =
-      next.inFlightTool && next.inFlightTool.id === tc.id ? mergeToolStart(next.inFlightTool, tc) : tc;
     // A tool call after the monitor armed means the monitor fired and the
-    // agent is acting on it; gate the badge clear on the next Stopped. The
-    // Monitor tool's own start precedes its MonitorArmed, so it never marks
-    // itself. See #2325.
+    // agent is acting on it; gate the badge clear on the next Stopped. See
+    // #2325. The in-flight pointer itself is server-owned (Tier 1.2).
     if (next.monitorArmed) {
       next.monitorWorkSeen = true;
     }
-    // The reasoning block produced output (a tool call), so the agent is
-    // no longer thinking. The adapter often skips ThinkingEnded when it
-    // transitions into tool calls, so clear it here. See #1213.
-    next.thinking = false;
-    // Skip duplicate tool_start rows. SQLite stores accumulated from
-    // pre-fix runs (where post-load history-replay leaked through) can
-    // contain the same tool_call_id twice; rendering both makes
-    // assistant-ui's tapResources throw "Duplicate key" and crash the
-    // panel. Patch the existing row in place instead.
-    const existing = next.activity.findIndex((r) => r.kind === "tool_start" && r.toolCallId === tc.id);
-    if (existing >= 0) {
-      const prev = next.activity[existing];
-      if (prev) {
-        // Merge rather than replace so a sparse permission start (#1713)
-        // never clobbers richer args/kind from a real start frame.
-        const merged = prev.tool ? mergeToolStart(prev.tool, tc) : tc;
-        const copy = next.activity.slice();
-        copy[existing] = {
-          ...prev,
-          tool: merged,
-          text: merged.name,
-          at: merged.started_at,
-        };
-        next.activity = copy;
-      }
-      return next;
-    }
-    next.activity = pushActivity(next.activity, {
-      id: `start-${tc.id}`,
-      kind: "tool_start",
-      text: tc.name,
-      toolCallId: tc.id,
-      tool: tc,
-      at: tc.started_at,
-    });
-    next.turnHasOutput = true;
-    return next;
-  }
-  if ("ToolCallCompleted" in event) {
-    const { tool_call_id, is_error, content, output, completed_at, async_subagent } = event.ToolCallCompleted;
-    // The AskUserQuestion tool's completion is owned by its elicitation
-    // card; drop it so no transcript tool card materializes. Clear the
-    // in-flight pointer if it still points at this suppressed tool.
-    if (next.elicitationToolCallIds.includes(tool_call_id)) {
-      if (next.inFlightTool && next.inFlightTool.id === tool_call_id) {
-        next.inFlightTool = null;
-      }
-      return next;
-    }
-    // #1713: a completion with no preceding start frame would render no
-    // card (the render layer only attaches results to an existing
-    // tool-call part). Synthesize a minimal start row first so the card
-    // appears.
-    if (!hasToolStart(next.activity, tool_call_id)) {
-      next.activity = pushActivity(next.activity, synthToolStartRow(tool_call_id, { started_at: completed_at }));
-      // A synthesized tool call is real turn output; without this the
-      // turn-end logic would append "Command produced no output."
-      next.turnHasOutput = true;
-    }
-    if (next.inFlightTool && next.inFlightTool.id === tool_call_id) {
-      next.inFlightTool = null;
-    }
-    // Prefer content shipped with the completion event itself; fall
-    // back to whatever streamed earlier via ToolCallContent. Only use
-    // the status word when neither carried text.
-    const buffered = next.toolOutputs[tool_call_id] ?? "";
-    const text =
-      content && content.length > 0 ? content : buffered.length > 0 ? buffered : is_error ? "tool failed" : "completed";
-    if (buffered) {
-      const { [tool_call_id]: _drop, ...rest } = next.toolOutputs;
-      void _drop;
-      next.toolOutputs = rest;
-    }
-    // Use the server-side completion timestamp when present so the
-    // duration label survives page reload. Events persisted before
-    // `completed_at` landed fall back to "now" (same bug as before for
-    // those specific rows only).
-    const baseId = `done-${tool_call_id}`;
-    // Some adapters reuse a tool_call_id after reconnecting. Keep the
-    // historical id for the first completion, but disambiguate later rows
-    // with the event seq. Otherwise separate assistant groups can inherit
-    // the same `assistant-done-<tool_call_id>` message id and assistant-ui's
-    // MessageRepository crashes the entire structured view.
-    const rowId = next.activity.some((row) => row.id === baseId) ? `${baseId}-${frame.seq}` : baseId;
-    next.activity = pushActivity(next.activity, {
-      id: rowId,
-      kind: is_error ? "tool_error" : "tool_complete",
-      text,
-      toolCallId: tool_call_id,
-      output: output && output.length > 0 ? output : undefined,
-      asyncSubagent: async_subagent || undefined,
-      at: completed_at ?? new Date().toISOString(),
-    });
-    return next;
-  }
-  if ("ToolCallContent" in event) {
-    const { tool_call_id, content } = event.ToolCallContent;
-    next.toolOutputs = { ...next.toolOutputs, [tool_call_id]: content };
-    return next;
-  }
-  if ("ToolCallUpdated" in event) {
-    const { tool_call_id, title, args_preview, started_at, diffs } = event.ToolCallUpdated;
-    // Ignore claude keepalive heartbeats persisted by older backends: they
-    // have no start and no completion, so the synth-on-missing-start path
-    // below would render a phantom titleless card that never resolves.
-    // Gated on the session agent's profile so another adapter that uses a
-    // `-heartbeat-N` id for a real tool is not dropped on replay. #3084.
-    if (isHeartbeatToolCallId(tool_call_id) && resolveAgentProfile(next.agent).capabilities.heartbeatKeepalives) {
-      return next;
-    }
-    // Per ACP, content is a replacement: a non-empty diff list overwrites
-    // the card's diffs; null/empty leaves an earlier frame's diffs intact
-    // so a text-only update can't blank the edit card. See #1721.
-    const incomingDiffs = diffs && diffs.length > 0 ? diffs : null;
-    // #1713: an update with no preceding start frame would be dropped
-    // (the patch loop below only touches an existing tool_start row).
-    // Synthesize one so the update lands and a card renders.
-    if (!hasToolStart(next.activity, tool_call_id)) {
-      next.activity = pushActivity(
-        next.activity,
-        synthToolStartRow(tool_call_id, {
-          name: title ?? undefined,
-          args_preview: args_preview ?? undefined,
-          started_at: started_at ?? undefined,
-        }),
-      );
-      next.turnHasOutput = true;
-    }
-    if (next.inFlightTool && next.inFlightTool.id === tool_call_id) {
-      next.inFlightTool = {
-        ...next.inFlightTool,
-        name: title ?? next.inFlightTool.name,
-        args_preview: args_preview ?? next.inFlightTool.args_preview,
-        started_at: started_at ?? next.inFlightTool.started_at,
-        diffs: incomingDiffs ?? next.inFlightTool.diffs,
-      };
-    }
-    // Walk activity backwards to find the matching tool_start row and
-    // patch its `tool` payload in place. AssistantBuilder reads from
-    // here at render time, so updating the row is enough to refresh
-    // the per-tool card.
-    let patched = false;
-    const updated = next.activity.map((row) => {
-      if (!patched && row.kind === "tool_start" && row.toolCallId === tool_call_id && row.tool) {
-        patched = true;
-        return {
-          ...row,
-          text: title ?? row.text,
-          tool: {
-            ...row.tool,
-            name: title ?? row.tool.name,
-            args_preview: args_preview ?? row.tool.args_preview,
-            started_at: started_at ?? row.tool.started_at,
-            diffs: incomingDiffs ?? row.tool.diffs,
-          },
-        };
-      }
-      return row;
-    });
-    if (patched) next.activity = updated;
-    return next;
-  }
-  if ("ApprovalRequested" in event) {
-    const a = event.ApprovalRequested.approval;
-    next.pendingApprovals = [...next.pendingApprovals, a];
-    return next;
-  }
-  if ("ApprovalResolved" in event) {
-    const { nonce } = event.ApprovalResolved;
-    next.pendingApprovals = next.pendingApprovals.filter((a) => a.nonce !== nonce);
-    return next;
-  }
-  if ("ElicitationRequested" in event) {
-    const e = event.ElicitationRequested.elicitation;
-    next.pendingElicitations = [...next.pendingElicitations, e];
-    // The adapter also emits an AskUserQuestion tool call for this
-    // elicitation. The card below replaces it, so remember the
-    // tool_call_id (to drop a later start/complete frame) and strip any
-    // tool row + in-flight pointer it already produced.
-    if (e.tool_call_id) {
-      const id = e.tool_call_id;
-      if (!next.elicitationToolCallIds.includes(id)) {
-        next.elicitationToolCallIds = [...next.elicitationToolCallIds, id];
-      }
-      next.activity = next.activity.filter((r) => r.toolCallId !== id);
-      if (next.inFlightTool && next.inFlightTool.id === id) {
-        next.inFlightTool = null;
-      }
-    }
-    return next;
-  }
-  if ("ElicitationResolved" in event) {
-    const { nonce, answers } = event.ElicitationResolved;
-    next.pendingElicitations = next.pendingElicitations.filter((e) => e.nonce !== nonce);
-    // Record the picked answer so it survives the card closing. Deduped by
-    // id, so this is a no-op if the optimistic local clear already added it
-    // (and the safety net when that clear never ran: cold replay, a second
-    // device). See #2209.
-    next.activity = appendElicitationAnswerRow(next.activity, nonce, answers ?? []);
-    return next;
-  }
-  if ("DiffEmitted" in event) {
-    next.recentDiffs = [...next.recentDiffs, event.DiffEmitted.diff].slice(-16);
-    return next;
-  }
-  if ("RateLimit" in event) {
-    next.rateLimit = event.RateLimit.info;
-    return next;
-  }
-  if ("RateLimitAutoResumed" in event) {
-    // The reconciler crossed the reset deadline and is respawning the
-    // worker (opt-in acp.rate_limit_auto_resume). Clear the parked
-    // banner so the composer unlocks; the imminent AcpSessionAssigned and
-    // the running worker let the drain effect dispatch any prompt the
-    // user queued during the wait. See #1722.
-    next.rateLimit = null;
     return next;
   }
   if ("UsageUpdated" in event) {
-    // claude-agent-acp keeps reporting session-lifetime cumulative
-    // cost via UsageUpdate; `/clear` and `/compact` don't rotate the
-    // ACP session id so the agent's cumulative carries pre-boundary
-    // spend. Subtract the baseline captured at the most recent
-    // SessionCleared / ConversationCompacted so the composer footer
-    // reads "since the most recent boundary." `used` already reflects
-    // the post-boundary context size from the agent's side and stays
-    // raw; only `cost` is rebased. clamp to zero defensively in case
-    // an upstream restart ever reports a smaller cumulative. See #1354.
+    // claude-agent-acp keeps reporting session-lifetime cumulative cost via
+    // UsageUpdate; subtract the baseline captured at the most recent
+    // boundary so the composer footer reads "since the most recent
+    // boundary." See #1354.
     const incoming = event.UsageUpdated.usage;
-    // Bandaid for upstream claude-agent-acp #596: mid-turn usage_update
-    // reports the 200k DEFAULT_CONTEXT_WINDOW for models whose real
-    // window is 1M (the `sonnet` / `default` aliases miss its `\b1m\b`
-    // heuristic), and only snaps to the authoritative window at the
-    // turn's `result`. Rendering each frame verbatim makes the footer
-    // flicker 200k <-> 1M every turn. Latch the largest window learned
-    // this session; a real context boundary (clear / compact /
-    // agent-switch / context-reset / model change) nulls sessionUsage,
-    // which resets the latch to the next raw value. Drop once upstream
-    // stops emitting the downgraded mid-turn guess.
+    // Bandaid for upstream claude-agent-acp #596: latch the largest window
+    // learned this session so the footer doesn't flicker 200k <-> 1M. See
+    // the note in the original reducer.
     const size = Math.max(incoming.size, next.sessionUsage?.size ?? 0);
     // Re-arm the compaction reminder on the first snapshot after a context
-    // boundary. Every boundary nulls sessionUsage (see the latch comment
-    // above), so a null previous snapshot IS the boundary signal and this
-    // needs no per-boundary bookkeeping in those five arms. See #3253.
+    // boundary. Every boundary nulls sessionUsage, so a null previous
+    // snapshot IS the boundary signal. See #3253.
     if (next.compactionReminderDismissed && next.sessionUsage === null) {
       next.compactionReminderDismissed = null;
     }
@@ -1574,22 +1432,9 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     }
     return next;
   }
-  if ("ModeChanged" in event) {
-    next.mode = event.ModeChanged.mode;
-    return next;
-  }
-  if ("ModesAvailable" in event) {
-    next.availableModes = event.ModesAvailable.modes.map((m) => ({
-      id: m.id,
-      name: m.name,
-      description: m.description ?? null,
-    }));
-    next.currentModeId = event.ModesAvailable.current_mode_id;
-    return next;
-  }
   if ("CurrentModeChanged" in event) {
-    next.currentModeId = event.CurrentModeChanged.current_mode_id;
-    // Mode actually switched, so any prior failure notice is stale.
+    // The mode itself is server-owned (Tier 1.2); the switch actually
+    // landing is what makes a prior failure notice stale.
     next.modeSwitchFailed = null;
     return next;
   }
@@ -1601,30 +1446,21 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     };
     return next;
   }
-  if ("AvailableCommandsUpdated" in event) {
-    next.availableCommands = event.AvailableCommandsUpdated.commands;
-    return next;
-  }
   if ("ConfigOptionsUpdated" in event) {
     const options = event.ConfigOptionsUpdated.options;
-    // A model change moves the context window, so drop the latched
-    // usage window (see the UsageUpdated arm) and relearn it for the
-    // new model instead of holding the prior model's larger window.
+    // A model change moves the context window, so drop the latched usage
+    // window and relearn it for the new model. See the UsageUpdated arm.
     const priorModel = next.configOptions.find((o) => o.category === "model")?.current_value;
     const nextModel = options.find((o) => o.category === "model")?.current_value;
     if (priorModel !== undefined && nextModel !== undefined && priorModel !== nextModel) {
       next.sessionUsage = null;
     }
     next.configOptions = options;
-    // The snapshot is authoritative, so any in-flight pending click
-    // resolves here regardless of whether the adapter applied the
-    // exact requested value. A rejected change comes through
-    // `ConfigOptionSwitchFailed` and clears pending on that path
-    // instead.
+    // The snapshot is authoritative, so any in-flight pending click resolves
+    // here. A rejected change comes through ConfigOptionSwitchFailed instead.
     next.pendingConfigOption = null;
-    // Auto-dismiss a stale switch-failed notice when this snapshot
-    // confirms the originally-requested value: user retried and won,
-    // or the adapter applied asynchronously after the rejection.
+    // Auto-dismiss a stale switch-failed notice when this snapshot confirms
+    // the originally-requested value.
     if (next.configOptionSwitchFailed) {
       const failure = next.configOptionSwitchFailed;
       const confirmed = options.some((opt) => opt.id === failure.configId && opt.current_value === failure.value);
@@ -1644,79 +1480,26 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     next.pendingConfigOption = null;
     return next;
   }
-  if ("AgentMessageChunk" in event) {
-    next.assistantMessage = next.assistantMessage + event.AgentMessageChunk.text;
-    // Visible assistant text means the agent is answering, not thinking.
-    // A later reasoning block re-sets `thinking` via ThinkingStarted. See
-    // #1213.
-    next.thinking = false;
-    next.activity = pushActivity(next.activity, {
-      id: `msg-${frame.seq}`,
-      kind: "message",
-      text: event.AgentMessageChunk.text,
-      at: new Date().toISOString(),
-    });
-    next.turnHasOutput = true;
-    return next;
-  }
   if ("Stopped" in event) {
-    // Final marker; nothing to mutate, but reset the inflight tool just
-    // in case the agent forgot to emit a completion.
-    //
-    // `turnActive` is derived from `pendingUserPromptSeq > lastStoppedSeq`;
-    // we advance `lastStoppedSeq` by one (capped at `pendingUserPromptSeq`)
-    // so this Stopped only retires ONE turn's worth of activity. If a
-    // fresh user prompt landed client-side between the turn this Stopped
-    // is closing and now, `pendingUserPromptSeq` was already bumped past
-    // the cap and `turnActive` stays true. Without this, a late Stopped
-    // would clobber the spinner mid follow-up and reorder the user's
-    // optimistic message above any still-arriving prior-turn agent
-    // chunks. See #1170.
-    next.inFlightTool = null;
-    // Belt-and-suspenders against a missed ThinkingEnded leaking the
-    // thinking state into the next turn (same defensive shape as the
-    // inFlightTool reset above). See #1213.
-    next.thinking = false;
-    sweepOpenToolCalls(next, frame.seq);
-    // The turn ended (cleanly, cancelled, force-stopped, or escalated):
-    // clear the "Stopping..." state regardless of reason. See #1727.
-    next.cancelling = false;
+    // Final marker. Every in-turn phase it used to clear (in-flight tool,
+    // thinking, cancelling, compacting) is server-owned since Tier 1.2, and
+    // closing the turn joined them in #3417: whether this `Stopped` ends the
+    // turn or only one of several prompts steered into it is the daemon's
+    // call, and the `reduced_state` frame that follows this event on the WS
+    // carries the answer. The raw edge is mirrored for the history fold; see
+    // closeTurn.
     next.cancelEscalatesAt = null;
-    // Same for any compaction the turn was running. This is the
-    // self-healing clear: a dropped completion marker, a killed worker
-    // and a user cancel all arrive here. See #3219.
-    next.compacting = false;
-    next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
-    next.turnActive = isTurnActive(next);
+    closeTurn(next);
     // Clear the "monitoring" badge once the monitor has fired and that turn
-    // ends. The monitor firing makes the agent act (a tool call after the
-    // arm, tracked by `monitorWorkSeen`); the badge then retires on the next
-    // Stopped. This covers both shapes: the agent ending the arming turn and
-    // resuming later between prompts (closed by `agent_idle`), and the
-    // monitor blocking the arming turn in-band (closed by `prompt_complete`).
-    // A Stopped with no post-arm work is the arming turn ending while the
-    // monitor is still pending, so it deliberately leaves the badge up. See
-    // #2325.
+    // ends. See #2325.
     if (next.monitorArmed && next.monitorWorkSeen) {
       next.monitorArmed = false;
       next.monitorWorkSeen = false;
       next.monitorDescription = null;
     }
-    // The "user_stopped" / "restart_pending" reasons are published by
-    // the supervisor's reap_user_stopped pass when it detects an
-    // out-of-band CLI teardown. Surface a distinct UI state for each:
-    //   - user_stopped: persistent "Stopped" banner with a Reconnect
-    //     button; the daemon will NOT auto-respawn.
-    //   - restart_pending: transient "Restarting…" banner without a
-    //     reconnect affordance; the reconciler will respawn within ~2s
-    //     and AcpSessionAssigned clears the flag.
     if (event.Stopped.reason === "user_stopped") {
       next.workerStopped = true;
       next.workerRestarting = false;
-      // Any prior unresponsive escalation has been superseded by the
-      // user explicitly stopping the worker; drop the stale banner
-      // flag so a future `restart_pending` doesn't accidentally
-      // render unresponsive copy. See #1196.
       next.agentUnresponsive = false;
       next.agentOrphaned = false;
     } else if (event.Stopped.reason === "restart_pending") {
@@ -1725,112 +1508,49 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
       next.agentUnresponsive = false;
       next.agentOrphaned = false;
     } else if (event.Stopped.reason === "agent_unresponsive") {
-      // Cancel-escalation watchdog in the daemon fired: claude-agent-acp
-      // ignored `session/cancel` for the grace window, the supervisor
-      // is SIGTERMing the runner and respawning via `session/load` to
-      // preserve transcript continuity. claude-agent-acp >=0.37.0
-      // (upstream #694) returns StopReason::Cancelled natively when it
-      // resolves the cancel; in that path the daemon surfaces
-      // `cancelled` instead and this branch only fires when the adapter
-      // does not respond at all (transport wedge, child hang). Reuse
-      // `workerRestarting`'s composer-lockdown semantics; the
-      // `agentUnresponsive` flag lets the banner render the specific
-      // cause. Cleared on `AcpSessionAssigned` (respawn finished) or
-      // `UserPromptSent`. See #1196.
+      // Cancel-escalation watchdog fired: reuse workerRestarting's composer
+      // lockdown; agentUnresponsive lets the banner render the cause. See
+      // #1196.
       next.workerRestarting = true;
       next.workerStopped = false;
       next.agentUnresponsive = true;
       next.agentOrphaned = false;
     } else if (event.Stopped.reason === "prompt_orphaned") {
-      // Silent-orphan watchdog in the daemon fired: the adapter
-      // finished streaming the turn but never sent the JSON-RPC
-      // `PromptResponse`, the supervisor is SIGTERMing the runner
-      // and respawning via `session/load` (transcript preserved).
-      // Distinct from `agent_unresponsive`: this is "adapter stopped
-      // talking" vs. "adapter ignored cancel"; both reuse the
-      // `workerRestarting` lockdown, but the banner copy differs so
-      // users can tell which failure happened. See #1240.
+      // Silent-orphan watchdog fired. Distinct banner copy from
+      // agent_unresponsive; both reuse the workerRestarting lockdown. See
+      // #1240.
       next.workerRestarting = true;
       next.workerStopped = false;
       next.agentUnresponsive = false;
       next.agentOrphaned = true;
     } else if (event.Stopped.reason === "idle_auto_stop") {
       // The reconciler reaped the worker for inactivity and marked the
-      // session dormant (#1689). This is NOT a user stop: no reconnect
-      // banner, no composer lockdown. The next prompt POST wakes the
-      // worker server-side (`touch_and_wake_if_sunk` clears dormancy,
-      // the reconciler respawns, `send_prompt` waits for it), so the
-      // composer stays usable and `sendPrompt` / the drain effect read
-      // `workerIdleStopped` to route a queued prompt through the POST
-      // wake path instead of parking it forever. Cleared on the next
-      // UserPromptSent or AcpSessionAssigned.
+      // session dormant (#1689). Recoverable without a reconnect: the next
+      // prompt POST wakes it.
       next.workerIdleStopped = true;
       next.workerStopped = false;
       next.workerRestarting = false;
-    }
-    // Some upstream slash commands (e.g. /usage, /status, /memory in
-    // claude-agent-acp) advertise via available_commands_update but
-    // produce no agent_message_chunk and no tool calls when invoked;
-    // see https://github.com/agentclientprotocol/claude-agent-acp/issues/642.
-    // Detect that case and append a notice row. The `turnHasOutput`
-    // flag is flipped by every output-producing handler and reset by
-    // UserPromptSent, so this check is O(1) instead of walking the
-    // full activity array on every Stopped.
-    //
-    // `state.turnActive` is read on the PRE-event state. Under the
-    // counter derivation it means "at least one outstanding prompt
-    // hasn't been retired yet," which is exactly what we want: it
-    // skips spurious Stopped frames (no open turn to attribute the
-    // notice to) and fires for the turn this Stopped is actually
-    // retiring. In the race case, `turnHasOutput` still reflects the
-    // turn being retired because UserPromptSent (which resets it) for
-    // the follow-up hasn't been applied yet.
-    if (state.turnActive && !state.turnHasOutput) {
-      next.activity = pushActivity(next.activity, {
-        id: `empty-${frame.seq}`,
-        kind: "empty_output",
-        text: "Command produced no output.",
-        at: new Date().toISOString(),
-      });
     }
     return next;
   }
   if ("IncompatibleAgent" in event) {
     // The structured view refused to enter the session because the adapter
-    // failed the per-adapter compatibility check (see
-    // src/acp/agent_compat.rs). The structured payload powers the
-    // dedicated StartupErrorScreen which short-circuits normal session
-    // rendering. The parallel AgentStartupError event populates
-    // `startupError` so legacy status logic still flips into Error.
+    // failed the per-adapter compatibility check. The structured payload
+    // powers the StartupErrorScreen.
     next.incompatibleAgent = event.IncompatibleAgent.detail;
-    next.inFlightTool = null;
-    sweepOpenToolCalls(next, frame.seq);
     next.agentUnresponsive = false;
-    next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
-    next.turnActive = isTurnActive(next);
     return next;
   }
   if ("AgentStartupError" in event) {
     next.startupError = event.AgentStartupError.message;
-    next.inFlightTool = null;
-    sweepOpenToolCalls(next, frame.seq);
-    // A failed respawn supersedes any in-progress unresponsive
-    // escalation; the user sees the startup error banner instead.
+    // A failed respawn supersedes any in-progress unresponsive escalation.
     next.agentUnresponsive = false;
-    // Same race-safe semantics as `Stopped`: advance `lastStoppedSeq`
-    // by one so a startup failure for the prior turn doesn't kill the
-    // spinner for a freshly-typed follow-up the user has already
-    // submitted. See #1170.
-    next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
-    next.turnActive = isTurnActive(next);
+    closeTurn(next);
     return next;
   }
   if ("PromptRuntimeError" in event) {
     next.lastError = event.PromptRuntimeError.message;
-    // A real turn-level failure was surfaced, so the generic
-    // "Command produced no output." fallback must stay suppressed when
-    // the terminal Stopped arrives for the same turn.
-    next.turnHasOutput = true;
+    closeTurn(next);
     return next;
   }
   if ("PromptCapabilities" in event) {
@@ -1844,206 +1564,71 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("UserPromptSent" in event) {
-    const text = event.UserPromptSent.text;
-    // Map server attachment refs to render-ready attachments backed by
-    // the replay GET endpoint. Used on the replay/no-optimistic path;
-    // the optimistic row already carries local preview URLs. See #1000.
-    const serverAttachments: AcpAttachment[] = (event.UserPromptSent.attachments ?? []).map((a) => ({
-      id: a.id,
-      kind: a.kind,
-      mimeType: a.mime_type,
-      name: a.name,
-      size: a.size,
-      url: `/api/sessions/${encodeURIComponent(frame.session_id)}/acp/attachments/${encodeURIComponent(a.id)}`,
-    }));
-    // Dedupe against the optimistic row that useStructuredView's sendPrompt
-    // dispatched a moment ago: find the OLDEST matching un-promoted
-    // user_prompt with the same text and promote it to the
-    // authoritative seq-based id. Walking oldest-first matters when
-    // the user submits the same text twice in quick succession; the
-    // first server echo must promote the first optimistic row, not
-    // the second, so the seq order matches the submission order.
-    const matchIdx = next.activity.findIndex(
-      (r) => r.kind === "user_prompt" && r.text === text && !r.id.startsWith("user-seq-"),
-    );
-    if (matchIdx >= 0) {
-      // Optimistic-match path: promote the placeholder's id. The
-      // client's `user_prompt` action already bumped
-      // `pendingUserPromptSeq`, so we don't bump again here. The
-      // per-turn resets below STILL apply: `turnHasOutput`, the
-      // worker banners, and the wakeup countdown all reset on every
-      // server-confirmed UserPromptSent regardless of which branch
-      // promoted the row. See #1170.
-      const match = next.activity[matchIdx];
-      if (match) {
-        const updated = next.activity.slice();
-        // Keep the optimistic local previews if present (no refetch);
-        // otherwise adopt the server refs so the bubble still renders.
-        updated[matchIdx] = {
-          ...match,
-          id: `user-seq-${frame.seq}`,
-          attachments:
-            match.attachments && match.attachments.length > 0
-              ? match.attachments
-              : serverAttachments.length > 0
-                ? serverAttachments
-                : undefined,
-        };
-        next.activity = updated;
-      }
+    // Control-only: the transcript row is server-owned. This is the daemon
+    // acknowledging the prompt, so it settles the matching optimistic id by
+    // the minted `prompt_id` (#3173) and opens the turn. Opening it here
+    // rather than waiting for the `reduced_state` frame that follows is the
+    // one place the client mirrors a daemon turn edge: without it, settling
+    // the id would drop `turnActive` for the single frame between the two.
+    // The following `reduced_state` stays authoritative.
+    const pid = event.UserPromptSent.prompt_id;
+    const wasInflight = pid != null && pid.length > 0 && next.inflightPromptIds.includes(pid);
+    if (wasInflight) {
+      next.inflightPromptIds = next.inflightPromptIds.filter((id) => id !== pid);
     } else {
-      // No optimistic row matched: this is a server-confirmed prompt
-      // the client didn't dispatch (replay path, server-initiated, or
-      // user action without optimistic local dispatch). Append a fresh
-      // row and bump the prompt counter so `turnActive` derives true.
-      // The optimistic-match branch above is reached when the client's
-      // `user_prompt` action already bumped the counter; bumping again
-      // here would double-count. See #1170.
-      next.activity = pushActivity(next.activity, {
-        id: `user-seq-${frame.seq}`,
-        kind: "user_prompt",
-        text,
-        attachments: serverAttachments.length > 0 ? serverAttachments : undefined,
-        at: new Date().toISOString(),
-      });
-      next.pendingUserPromptSeq = next.pendingUserPromptSeq + 1;
+      next.promptSeq += 1;
     }
+    next.serverTurnActive = true;
+    next.turnActive = true;
     if (!isSteeredContinuation(state)) {
       applyNewTurnResets(next);
     }
     return next;
   }
   if ("UserDiffCommentsPrompt" in event) {
-    // The "Send diff comments" dialog posts directly (no optimistic
-    // row), so there is never a placeholder to promote: always append a
-    // typed `user_diff_comments` row. `text` carries the assembled
-    // markdown (agent-visible body / fallback); `diffComments` carries
-    // the structured payload the runtime hands to the transcript card.
-    const p = event.UserDiffCommentsPrompt;
-    next.activity = pushActivity(next.activity, {
-      id: `user-seq-${frame.seq}`,
-      kind: "user_diff_comments",
-      text: p.assembledMarkdown,
-      diffComments: {
-        intro: p.intro,
-        outro: p.outro,
-        isMultiRepo: p.isMultiRepo,
-        comments: p.comments,
-      },
-      at: new Date().toISOString(),
-    });
-    next.pendingUserPromptSeq = next.pendingUserPromptSeq + 1;
+    // The "Send diff comments" dialog posts directly with no optimistic
+    // overlay, so there is no id to settle. The typed row is server-owned.
+    next.promptSeq += 1;
+    next.serverTurnActive = true;
+    next.turnActive = true;
     if (!isSteeredContinuation(state)) {
       applyNewTurnResets(next);
     }
     return next;
   }
   if ("AcpSessionAssigned" in event) {
-    // Primary purpose: persistence breadcrumb so the server-side
-    // listener can write the id to sessions.json for a subsequent
-    // session/load.
-    //
-    // Secondary purpose: signal that the agent connection is alive
-    // again. After a crash + respawn (e.g. the agent process was killed
-    // and the supervisor restarted it), the prior turn's
-    // AgentStartupError sat in SQLite and kept `startupError` set even
-    // though the agent had since recovered. Clear sticky error flags
-    // here so the red "Structured view agent failed to start" banner heals on
-    // its own once the respawn completes the handshake.
+    // Persistence breadcrumb plus "agent connection is alive again" signal.
+    // Clear sticky error / worker banners so the UI heals once a respawn
+    // completes the handshake.
     next.startupError = null;
     next.lastError = null;
-    // A fresh agent that passed the compatibility check has come
-    // online; the structured incompatibility banner heals so the
-    // session can resume.
     next.incompatibleAgent = null;
-    // A fresh agent (via POST /acp/spawn after `aoe acp stop`
-    // or via the reconciler's auto-respawn after `aoe acp restart`)
-    // is online; clear both transient worker banners.
     next.workerStopped = false;
     next.workerRestarting = false;
-    // The respawn may have been triggered by waking an idle-dormant
-    // worker; the fresh handshake means it is no longer dormant.
     next.workerIdleStopped = false;
-    // The respawn after an `agent_unresponsive` escalation completed;
-    // clear the banner so the user can interact again. See #1196.
     next.agentUnresponsive = false;
-    // Same shape for `prompt_orphaned`: the silent-orphan watchdog
-    // fired, the runner was SIGTERMed, and the respawn handshake has
-    // now landed. See #1240.
     next.agentOrphaned = false;
-    // A fresh worker healed the session, including a rate-limit park that
-    // was resumed without an explicit `RateLimitAutoResumed` (e.g. a
-    // manual respawn). Clear the banner so it does not outlive the park
-    // and leave a dead `RESUME NOW` button. See #3028.
-    next.rateLimit = null;
-    // A prompt sent to an idle-dormant worker gets a transient
-    // `worker_not_ready` 503 and is re-queued, but its optimistic dispatch
-    // left `pendingUserPromptSeq` bumped (turn pending) so the drain effect
-    // stays braked instead of hot-looping the wake. The respawn handshake is
-    // the worker-online signal: retire that phantom turn so the drain fires
-    // and delivers the queued prompt, instead of the session sitting stuck
-    // until the user hits Stop. Scoped to a non-empty queue so a normal
-    // (re)spawn without parked work never clears a legitimately active turn.
-    // See #3094 / #3087.
-    if (next.queuedPrompts.length > 0 && next.pendingUserPromptSeq > next.lastStoppedSeq) {
-      next.lastStoppedSeq = next.pendingUserPromptSeq;
-      next.turnActive = isTurnActive(next);
-    }
     return next;
   }
   if ("SessionContextReset" in event) {
     // session/load failed and the agent fell back to session/new; its
-    // context window is empty. Clear the now-stale token-usage hint so
-    // the composer footer doesn't keep showing the previous run's
-    // "75k / 200k" until the next UsageUpdate arrives.
+    // context window is empty. Clear the now-stale usage hint and baseline.
     next.sessionUsage = null;
-    // The new ACP session restarts the agent-side cumulative cost at
-    // zero, so any prior per-clear baseline no longer maps onto
-    // incoming UsageUpdate values. See #1354.
     next.usageBaseline = null;
-    // Suppress the visible notice on a session that never saw a user
-    // prompt: claude-agent-acp doesn't persist a 0-prompt session, so
-    // session/load failing on the next spawn is expected, not an
-    // incident the user needs to know about. Events arrive in seq
-    // order, so checking `activity` here captures "any prompt with a
-    // lower seq than this reset"; later prompts won't retroactively
-    // surface the suppressed row.
-    const hasPriorPrompt = next.activity.some((r) => r.kind === "user_prompt" || r.kind === "user_diff_comments");
-    if (!hasPriorPrompt) {
+    // Suppress the primer offer on a session that never saw a user prompt
+    // (a 0-prompt session's session/load failure is expected). The visible
+    // reset row is server-owned; here we only gate the primer affordance.
+    // `promptSeq` counts prompts applied before this event (frames are applied
+    // in seq order), so zero is the "never had a prompt" signal.
+    if (state.promptSeq <= 0) {
       return next;
     }
-    next.activity = pushActivity(next.activity, {
-      id: `reset-${frame.seq}`,
-      kind: "context_reset",
-      text: event.SessionContextReset.reason || "Conversation context reset; agent transcript was unavailable.",
-      at: new Date().toISOString(),
-    });
-    // The reset row is this turn's visible product. A server-driven
-    // conversation reset (codex `/new`, #2979) ends its turn with
-    // `Stopped(session_reset)` and no agent output; without this the
-    // empty-output fallback would stack "Command produced no output."
-    // under the reset boundary.
-    next.turnHasOutput = true;
-    // Offer the opt-in primer affordance. The banner only appears
-    // when there is a prior user prompt (we're already inside that
-    // branch), and stays one-shot: any UserPromptSent below clears
-    // it, even if the user typed something other than the primer.
+    // Offer the opt-in primer affordance; one-shot, cleared by the next
+    // UserPromptSent via applyNewTurnResets. See #1004 / #1110.
     next.contextPrimerAvailable = {
       resetSeq: frame.seq,
       reason: event.SessionContextReset.reason || "Conversation context reset; agent transcript was unavailable.",
     };
-    return next;
-  }
-  if ("ConversationSummary" in event) {
-    // aoe-generated recap of the conversation so far (see #2808). Not a
-    // model/session state change; append a callout row the renderer maps
-    // to a summary block.
-    next.activity = pushActivity(next.activity, {
-      id: `summary-${frame.seq}`,
-      kind: "summary",
-      text: event.ConversationSummary.text,
-      at: new Date().toISOString(),
-    });
     return next;
   }
   if ("WakeupScheduled" in event) {
@@ -2059,79 +1644,45 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     return next;
   }
   if ("CancelRequested" in event) {
-    // aoe sent session/cancel and armed the escalation watchdog; the
-    // turn is still active. Surface "Stopping..." and the escalation
-    // deadline so the user gets feedback instead of a silent spinner,
-    // and can reveal the Force-stop affordance. See #1727.
-    next.cancelling = true;
+    // aoe sent session/cancel and armed the escalation watchdog; the turn is
+    // still active. Surface "Stopping..." and the escalation deadline. See
+    // #1727.
+    // The phase is server-owned; the escalation deadline is not modelled
+    // there, so the honest countdown still comes off the event.
     next.cancelEscalatesAt = event.CancelRequested.escalates_at;
     return next;
   }
   if ("AgentSwitched" in event) {
-    // ACP backend handoff completed (e.g. claude -> codex after a
-    // rate-limit). Drop everything tied to the prior backend so the
-    // composer/footer don't keep showing Claude's usage bar, mode
-    // pills, or in-flight tool card while talking to Codex. The
-    // transcript stays intact on the event log; only the visible
-    // overlay state is dropped. Append a session-divider row so the
-    // UI shows where the handoff happened. See #1282.
+    // ACP backend handoff completed. Drop everything tied to the prior
+    // backend so the composer/footer don't keep showing stale usage, mode
+    // pills, or an in-flight tool while talking to the new agent. The
+    // transcript divider row is server-owned. See #1282.
     const { from, to, reason } = event.AgentSwitched;
     const now = new Date().toISOString();
-    next.agent = to;
-    next.rateLimit = null;
-    next.inFlightTool = null;
-    // Close any tool the prior backend left open before appending the
-    // divider, so the transcript order is start -> stopped -> divider.
-    sweepOpenToolCalls(next, frame.seq);
-    next.thinking = false;
-    next.pendingApprovals = [];
-    next.pendingElicitations = [];
-    next.elicitationToolCallIds = [];
+    // Everything the new backend re-advertises (agent, rate limit, in-flight
+    // tool, pending cards, commands, modes, plan, mode) is dropped
+    // server-side; what stays here is the client's own cost bookkeeping and
+    // the banners the server does not model.
     next.sessionUsage = null;
-    // The new backend reports its own cumulative cost starting from
-    // zero, so the prior agent's per-clear baseline does not apply.
-    // See #1354.
+    // The new backend reports its own cumulative cost from zero. See #1354.
     next.usageBaseline = null;
-    next.availableCommands = [];
-    next.availableModes = [];
-    next.currentModeId = null;
-    next.plan = null;
-    next.mode = "Default";
     next.startupError = null;
     next.lastAgentSwitch = { from, to, reason, at: now };
-    // The switch path emits Stopped { user_stopped } from the
-    // shutdown of the prior backend just before AgentSwitched, which
-    // flips workerStopped/agentUnresponsive on. Without an explicit
-    // clear here the user sees a "worker stopped / reconnecting"
-    // banner on top of a freshly switched session during the new
-    // agent's session/new handshake (until AcpSessionAssigned clears
-    // it). Clear them eagerly so the banner stays hidden.
+    // The switch path emits Stopped { user_stopped } just before this; clear
+    // the worker banners eagerly so they stay hidden through the new agent's
+    // handshake.
     next.workerStopped = false;
     next.workerRestarting = false;
     next.agentUnresponsive = false;
-    // Per-adapter selectors belong to the previous backend; the new
-    // backend will publish its own snapshot. See #1403.
+    // Per-adapter selectors belong to the previous backend. See #1403.
     next.configOptions = [];
     next.configOptionSwitchFailed = null;
     next.pendingConfigOption = null;
-    next.activity = [
-      ...next.activity,
-      {
-        id: `agent-switched-${frame.seq}`,
-        kind: "session_cleared",
-        text: `Switched structured view agent from ${from} to ${to} (${reason}).`,
-        at: now,
-      },
-    ];
     return next;
   }
   if ("PromptRejected" in event) {
-    // Daemon refused the follow-up prompt because another `session/prompt`
-    // was still in flight. The rejected text has already been persisted
-    // upstream as `UserPromptSent` by the REST handler; this event tells
-    // the UI the daemon never forwarded it to the agent. Show a Retry
-    // pill so the user can re-dispatch via the normal sendPrompt path
-    // instead of having their message vanish silently. See #1196.
+    // Daemon refused the follow-up prompt because another session/prompt was
+    // still in flight. Show a Retry pill. See #1196.
     const entry: RejectedPrompt = {
       id: `rejected-${frame.seq}`,
       text: event.PromptRejected.text,
@@ -2140,14 +1691,9 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     };
     const REJECTED_PROMPTS_CAP = 5;
     next.rejectedPrompts = [...next.rejectedPrompts, entry].slice(-REJECTED_PROMPTS_CAP);
-    // Retire the spinner for this rejected submission so the composer
-    // unlocks. `pendingUserPromptSeq` was bumped by the optimistic
-    // dispatch; advancing `lastStoppedSeq` by one (capped) gives this
-    // rejection the same turn-retirement semantics as a Stopped without
-    // letting it spill into a different turn's bookkeeping. See #1170
-    // for the cap rationale.
-    next.lastStoppedSeq = Math.min(next.lastStoppedSeq + 1, next.pendingUserPromptSeq);
-    next.turnActive = isTurnActive(next);
+    // The composer's own optimistic marker is settled by the POST that got
+    // the rejection; this closes the turn the daemon closed. See closeTurn.
+    closeTurn(next);
     return next;
   }
   if ("BackgroundAgentLaunched" in event) {
@@ -2185,9 +1731,6 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
         status: e.status,
         toolCount: e.tool_count,
         tools: e.tools && e.tools.length > 0 ? e.tools : a.tools,
-        // Freeze the elapsed timer once stalled (the agent stopped
-        // writing; the SDK likely dropped it). Clear it if it resumes.
-        // The terminal Completed event sets the authoritative ended time.
         endedAt: e.status === "stalled" ? (a.endedAt ?? e.at) : e.status === "running" ? null : a.endedAt,
         lastTool: e.last_tool ?? a.lastTool,
         lastText: e.last_text ?? a.lastText,
@@ -2211,9 +1754,9 @@ export function applyEvent(state: AcpState, frame: AcpFrame): AcpState {
     );
     return next;
   }
-  // RawAgentUpdate, TodoListUpdated, anything else: pass through with
-  // no state mutation. The activity feed shows the raw text where
-  // useful via the catch-all branch in the UI.
+  // DiffEmitted, RawAgentUpdate, TodoListUpdated, ConversationSummary,
+  // ToolCallContent, and anything else carry no control state (their
+  // transcript rows, where any, are server-owned): pass through unchanged.
   return next;
 }
 
@@ -2228,44 +1771,54 @@ export function reduceFrames(frames: AcpFrame[]): AcpState {
   return frames.reduce(applyEvent, emptyAcpState());
 }
 
-/** True when `rows` already carries a `tool_start` row for this id. */
-function hasToolStart(rows: ActivityRow[], toolCallId: string): boolean {
-  return rows.some((r) => r.kind === "tool_start" && r.toolCallId === toolCallId);
-}
-
-/** Claude Code keepalive pings for long-running tools arrive under a derived
- *  id `<baseToolId>-heartbeat-<N>` (no start, no completion). The backend now
- *  drops them at ingress (see `is_heartbeat_tool_call_id` in acp_client.rs),
- *  but historical session logs still hold the orphan `ToolCallUpdated` rows;
- *  this guard stops a replay from synthesizing a phantom card for them. See
- *  #3084. Mirror of the Rust predicate: trailing `-heartbeat-<digits>`. */
-function isHeartbeatToolCallId(toolCallId: string): boolean {
-  return /-heartbeat-\d+$/.test(toolCallId);
-}
-
-/** Build a minimal `tool_start` row for a tool call we never saw start.
- *  Some agents (Gemini's permission flow) emit updates/completions with
- *  no preceding start frame; synthesizing one keeps the card visible.
- *  See #1713. */
-function synthToolStartRow(
-  toolCallId: string,
-  opts: { name?: string; args_preview?: string; started_at?: string },
-): ActivityRow {
-  const startedAt = opts.started_at ?? new Date().toISOString();
-  const tool: ToolCall = {
-    id: toolCallId,
-    name: opts.name && opts.name.length > 0 ? opts.name : "tool call",
-    kind: "other",
-    args_preview: opts.args_preview ?? "",
-    started_at: startedAt,
-  };
+/** Adopt the daemon's folded control state (Tier 1.2). Every field here is
+ *  the server's verbatim, so a client derivation for any of them would be a
+ *  second source of truth; the arms that used to build them are gone.
+ *
+ *  Deliberately does NOT touch `lastSeq`: raw frames still drive the rest of
+ *  the reducer, and their seq dedupe is what keeps replay idempotent.
+ *
+ *  The one piece of optimism kept is approvals and elicitations the user just
+ *  answered: the card clears on the resolve POST rather than waiting for the
+ *  broadcast (#1821), and without the filter the very next frame would paint
+ *  it straight back. A nonce is forgotten once the server stops listing it,
+ *  so a later request reusing it is not swallowed. */
+export function applyReducedState(state: AcpState, reduced: ReducedState, unchanged: string[] = []): AcpState {
+  // Cold fields the server omitted because this socket already holds them
+  // (a ~30 KB command list re-sent after every event dominated the frame).
+  // They arrive as empty defaults, so adopting them would blank the pickers.
+  const holds = (field: string) => unchanged.includes(field);
+  const stillPending = new Set<string>([
+    ...reduced.pending_approvals.map((a) => a.nonce),
+    ...reduced.pending_elicitations.map((e) => e.nonce),
+  ]);
+  const locallyResolved = state.locallyResolved.filter((nonce) => stillPending.has(nonce));
+  const resolved = new Set(locallyResolved);
   return {
-    id: `start-${toolCallId}`,
-    kind: "tool_start",
-    text: tool.name,
-    toolCallId,
-    tool,
-    at: startedAt,
+    ...state,
+    agent: reduced.agent,
+    model: reduced.model,
+    mode: reduced.mode,
+    plan: reduced.current_plan,
+    inFlightTool: reduced.in_flight_tool,
+    pendingApprovals: reduced.pending_approvals.filter((a) => !resolved.has(a.nonce)),
+    pendingElicitations: reduced.pending_elicitations.filter((e) => !resolved.has(e.nonce)),
+    thinking: reduced.thinking != null,
+    rateLimit: reduced.rate_limit,
+    availableCommands: holds("available_commands") ? state.availableCommands : reduced.available_commands,
+    availableModes: holds("available_modes") ? state.availableModes : reduced.available_modes,
+    currentModeId: reduced.current_mode_id,
+    // Steady-state turn truth. A false frame cannot suppress a prompt whose
+    // POST is still unacknowledged, so an unrelated frame arriving in that
+    // window does not flicker the composer back to idle. See #3417.
+    serverTurnActive: reduced.turn_active,
+    turnActive: deriveTurnActive({
+      serverTurnActive: reduced.turn_active,
+      inflightPromptIds: state.inflightPromptIds,
+    }),
+    cancelling: reduced.cancelling,
+    compacting: reduced.compacting,
+    locallyResolved,
   };
 }
 
@@ -2337,21 +1890,12 @@ export function mergePrependedActivity(olderRows: ActivityRow[], tailRows: Activ
   return prepended.concat(tail);
 }
 
-function pushActivity(rows: ActivityRow[], row: ActivityRow): ActivityRow[] {
-  const next = rows.concat(row);
-  if (activityLimit > 0 && next.length > activityLimit) {
-    return next.slice(next.length - activityLimit);
-  }
-  return next;
-}
-
-/** Append an `elicitation_answered` row recording the user's answers,
- *  keyed by `elicitation-<nonce>` and deduped by id. Shared by the
- *  optimistic local clear (renders from the pending card) and the
- *  server-event handler (renders from the broadcast), so whichever lands
- *  first wins and the other is a no-op even when the broadcast survives
- *  seq dedupe. No row for empty answers (skip / cancel / teardown). See
- *  #2209. */
+/** Append an optimistic `elicitation_answered` overlay row recording the
+ *  user's just-picked answers, keyed by `elicitation-<nonce>` and deduped by
+ *  id. The authoritative row is server-owned (the daemon folds
+ *  `ElicitationResolved` into the same-id transcript row); this overlay gives
+ *  instant feedback and is dropped once that server row lands. No row for
+ *  empty answers (skip / cancel / teardown). See #2209. */
 export function appendElicitationAnswerRow(
   rows: ActivityRow[],
   nonce: string,
@@ -2359,7 +1903,7 @@ export function appendElicitationAnswerRow(
 ): ActivityRow[] {
   const id = `elicitation-${nonce}`;
   if (answers.length === 0 || rows.some((r) => r.id === id)) return rows;
-  return pushActivity(rows, {
+  return rows.concat({
     id,
     kind: "elicitation_answered",
     text: answers.map((a) => `${a.question}: ${a.answer}`).join("\n"),
@@ -2368,73 +1912,34 @@ export function appendElicitationAnswerRow(
   });
 }
 
-/** Close any `tool_start` rows that never received a matching terminal
- *  row by synthesizing a `tool_stopped` row for each. Called from the
- *  turn-ending reducer arms (`Stopped`, `AgentSwitched`,
- *  `IncompatibleAgent`, `AgentStartupError`): once the turn ends, no
- *  tool that was part of it can still be running, yet the card status
- *  is derived from the paired terminal row (see ToolCards `statusFor`),
- *  not from the `inFlightTool` pointer the arms already null. Without
- *  this sweep an interrupted tool's card sticks on "running" with a
- *  live-ticking timer forever, live and on reload (the trailing
- *  `Stopped` is persisted and replayed through this same reducer). The
- *  case is reason-independent: even a `prompt_complete` with a dangling
- *  open tool (the agent forgot to emit a completion) is "stopped", not
- *  "done" or "failed", because the tool's real outcome was never
- *  reported. Any text streamed via `ToolCallContent` before the stop is
- *  drained into the synthesized row so it is not lost. See #1646. */
-function sweepOpenToolCalls(next: AcpState, frameSeq: number): void {
-  const terminal = new Set<string>();
-  for (const row of next.activity) {
-    if ((row.kind === "tool_complete" || row.kind === "tool_error" || row.kind === "tool_stopped") && row.toolCallId) {
-      terminal.add(row.toolCallId);
-    }
-  }
-  const now = new Date().toISOString();
-  let activity = next.activity;
-  let outputs = next.toolOutputs;
-  let drained = false;
-  // Iterate the pre-sweep snapshot; `pushActivity` returns fresh arrays
-  // assigned to the local `activity`, so the loop never sees the rows it
-  // appends. Dedupe by `toolCallId` because pre-fix stores can carry
-  // duplicate `tool_start` rows for one call.
-  for (const row of next.activity) {
-    if (row.kind !== "tool_start" || !row.toolCallId) continue;
-    const id = row.toolCallId;
-    if (terminal.has(id)) continue;
-    terminal.add(id);
-    const buffered = outputs[id] ?? "";
-    if (buffered) {
-      const { [id]: _drop, ...rest } = outputs;
-      void _drop;
-      outputs = rest;
-      drained = true;
-    }
-    activity = pushActivity(activity, {
-      id: `stopped-${id}-${frameSeq}`,
-      kind: "tool_stopped",
-      text: buffered,
-      toolCallId: id,
-      at: now,
-    });
-  }
-  next.activity = activity;
-  if (drained) next.toolOutputs = outputs;
+/** Rendered `turnActive`: the daemon's steady-state truth, OR'd with the
+ *  client's own unacknowledged prompt POSTs.
+ *
+ *  This replaced a client-side `pendingUserPromptSeq > lastStoppedSeq`
+ *  counter pair, which assumed one terminal `Stopped` per prompt. Mid-turn
+ *  steering (#2805) breaks that cardinality: the daemon injects a prompt
+ *  into the running turn and deliberately emits no extra terminal event,
+ *  so N prompts closed with one `Stopped` left the counters permanently
+ *  apart and the composer stuck on Stop plus a spinner. The daemon already
+ *  models this correctly as a boolean and already ships it; the client now
+ *  adopts it. See #3417 and `docs/development/server-owned-sv-state.md`. */
+export function deriveTurnActive(state: Pick<AcpState, "serverTurnActive" | "inflightPromptIds">): boolean {
+  return state.serverTurnActive || state.inflightPromptIds.length > 0;
 }
 
-/** Derived `turnActive` from the prompt / stop seq counters. Exported
- *  so any new consumer can compute it from the counters directly; the
- *  reducer also calls this to keep `state.turnActive` in lockstep so
- *  existing `state.turnActive` reads stay correct. See #1170.
+/** Close the turn from a raw event, mirroring `AcpState::apply_event`'s own
+ *  `turn_active = false` edges (`src/acp/state.rs`).
  *
- *  Invariant: `lastStoppedSeq <= pendingUserPromptSeq` always holds.
- *  Both counters start at 0; `pendingUserPromptSeq` increments by one
- *  on every dispatched user prompt, and `lastStoppedSeq` advances by
- *  one per `Stopped` / `AgentStartupError` but is capped at
- *  `pendingUserPromptSeq` so spurious extra Stopped frames cannot
- *  poison a future turn. */
-export function isTurnActive(state: Pick<AcpState, "pendingUserPromptSeq" | "lastStoppedSeq">): boolean {
-  return state.pendingUserPromptSeq > state.lastStoppedSeq;
+ *  The `reduced_state` frame the daemon pushes after every event is still
+ *  authoritative, so this looks redundant on the WS path. It is not on the
+ *  history path: `GET /acp/replay` serves raw events with no `reduced_state`
+ *  alongside, so a cold open that folded only the opening edges would paint a
+ *  spinner over a session that finished hours ago until the WS connect
+ *  snapshot corrected it. Mirroring the same seven edges the daemon uses
+ *  keeps the raw fold self-consistent. See #3417. */
+function closeTurn(next: AcpState): void {
+  next.serverTurnActive = false;
+  next.turnActive = deriveTurnActive(next);
 }
 
 /** Whether the structured view should show the compaction reminder.
@@ -2461,16 +1966,18 @@ export function isCompactionReminderDue(
   return (usage.used / usage.size) * 100 >= prefs.compactionReminderPercent;
 }
 
-/** Normalise a partial AcpState so the turn counters are populated.
- *  Used by the localStorage loader after the #1170 schema change: pre-
- *  schema persisted entries have no counters, so we backfill from the
- *  cached `turnActive` boolean (true → one outstanding prompt, false →
- *  fully retired) and re-derive `turnActive` from the counters. */
-export function normaliseTurnCounters(
+/** Normalise a partial AcpState so the turn state is populated. Used by
+ *  the localStorage loader: an entry persisted before #3417 carries the
+ *  retired `pendingUserPromptSeq` / `lastStoppedSeq` counters and no
+ *  `serverTurnActive`, so we seed the latter from the cached `turnActive`
+ *  boolean as a warm hint. The WS connect snapshot replaces it with daemon
+ *  truth a moment later. In-flight prompt ids are request-local and always
+ *  start empty: after a reload there is no POST left to acknowledge them. */
+export function normaliseTurnState(
   state: AcpState & {
     oldestSeq?: number;
-    pendingUserPromptSeq?: number;
-    lastStoppedSeq?: number;
+    serverTurnActive?: boolean;
+    promptSeq?: number;
     rejectedPrompts?: RejectedPrompt[];
     agentUnresponsive?: boolean;
     agentOrphaned?: boolean;
@@ -2481,10 +1988,14 @@ export function normaliseTurnCounters(
     compactionReminderDismissed?: SessionUsage | null;
   },
 ): AcpState {
-  const pendingUserPromptSeq =
-    typeof state.pendingUserPromptSeq === "number" ? state.pendingUserPromptSeq : state.turnActive ? 1 : 0;
-  const lastStoppedSeq =
-    typeof state.lastStoppedSeq === "number" ? state.lastStoppedSeq : state.turnActive ? 0 : pendingUserPromptSeq;
+  const serverTurnActive =
+    typeof state.serverTurnActive === "boolean" ? state.serverTurnActive : state.turnActive === true;
+  // A hydrate that already has prompt rows already had prompts; a cold entry
+  // re-folds its history and counts them on the way through.
+  const promptSeq =
+    typeof state.promptSeq === "number" && Number.isFinite(state.promptSeq)
+      ? Math.max(0, Math.floor(state.promptSeq))
+      : (state.activity ?? []).filter((r) => r.kind === "user_prompt").length;
   // Pre-#1196 persisted entries lack rejectedPrompts / agentUnresponsive;
   // backfill so the reducer and renderers see well-typed values instead
   // of `undefined` (which crashes RejectedPromptsStrip's `.length` read).
@@ -2528,8 +2039,9 @@ export function normaliseTurnCounters(
     configOptionSwitchFailed,
     pendingConfigOption,
     compactionReminderDismissed,
-    pendingUserPromptSeq,
-    lastStoppedSeq,
-    turnActive: isTurnActive({ pendingUserPromptSeq, lastStoppedSeq }),
+    serverTurnActive,
+    promptSeq,
+    inflightPromptIds: [],
+    turnActive: serverTurnActive,
   };
 }

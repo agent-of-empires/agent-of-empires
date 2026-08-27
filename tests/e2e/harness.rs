@@ -417,6 +417,12 @@ last_seen_version = "{}"
         self.extra_env.push((key.to_string(), value.to_string()));
     }
 
+    /// Prepend `dir` to the PATH of every spawned process so a
+    /// test-specific fixture binary shadows anything on the system.
+    pub fn add_path_dir(&mut self, dir: &Path) {
+        self.extra_path_dirs.push(dir.to_path_buf());
+    }
+
     /// Make the fake ACP agent reject `session/fork` (for fork-failure tests).
     /// Must be called BEFORE `install_acp_shim` so the knob is baked into the
     /// shim: the daemon strips arbitrary env before spawning the worker, so a
@@ -514,6 +520,41 @@ last_seen_version = "{}"
         }
         self.extra_path_dirs.push(bin.clone());
         bin
+    }
+
+    /// Install a PATH stub that records the argv it was invoked with to
+    /// `<home>/<name>.argv`, then exits 0. Returns that record path. Unlike
+    /// `install_path_command`, this lets a test assert the command a launch
+    /// actually executed, which is the only observable point now that launches
+    /// run through an ephemeral env-file wrapper that keeps the command out of
+    /// tmux's `pane_start_command` argv.
+    pub fn install_recording_path_command(&mut self, name: &str) -> PathBuf {
+        let bin = self.home_dir.path().join("path-bin");
+        std::fs::create_dir_all(&bin).expect("create path-bin dir");
+        let record = self.home_dir.path().join(format!("{name}.argv"));
+        let path = bin.join(name);
+        // Embed the absolute record path directly: the stub runs inside the
+        // tmux pane, which does not inherit arbitrary harness env (tmux freezes
+        // the server env), so an env var would not reach it. Tempdir paths carry
+        // no shell metacharacters, so double-quoting is sufficient.
+        let record_str = record.to_string_lossy();
+        assert!(
+            !record_str.contains(['"', '$', '`', '\\']),
+            "record path has shell metacharacters: {record_str}"
+        );
+        std::fs::write(
+            &path,
+            format!("#!/bin/sh\nprintf '%s ' \"$0\" \"$@\" > \"{record_str}\"\nexit 0\n"),
+        )
+        .expect("write recording path command");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod path command");
+        }
+        self.extra_path_dirs.push(bin);
+        record
     }
 
     /// Make `Drop` tear down structured view workers and the serve daemon.
@@ -676,6 +717,38 @@ last_seen_version = "{}"
             String::from_utf8_lossy(&output.stderr)
         );
         std::thread::sleep(Duration::from_millis(100));
+    }
+
+    /// Deliver `text` to the TUI as a bracketed paste, the way a real
+    /// terminal does when the user hits Cmd/Ctrl+V. aoe enables bracketed
+    /// paste at startup, so crossterm turns this into one `Event::Paste`
+    /// rather than N key events, which is the only way to exercise the
+    /// paste path (`handle_paste`) rather than the keystroke path.
+    ///
+    /// Bytes go out as hex so an embedded newline or semicolon in `text`
+    /// cannot be reinterpreted by tmux's literal-mode argument parser.
+    pub fn send_paste(&self, text: &str) {
+        assert!(self.spawned, "must call spawn_tui() or spawn() first");
+        let mut bytes = b"\x1b[200~".to_vec();
+        bytes.extend_from_slice(text.as_bytes());
+        bytes.extend_from_slice(b"\x1b[201~");
+        let hex: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
+        let output = Command::new("tmux")
+            .arg("-S")
+            .arg(&self.socket_path)
+            .arg("send-keys")
+            .arg("-t")
+            .arg(&self.session_name)
+            .arg("-H")
+            .args(&hex)
+            .output()
+            .expect("failed to send paste");
+        assert!(
+            output.status.success(),
+            "send_paste failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        std::thread::sleep(Duration::from_millis(150));
     }
 
     /// Send literal text (prevents "Enter" in text from being interpreted as

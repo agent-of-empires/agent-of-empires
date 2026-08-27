@@ -30,6 +30,10 @@ async function mockApis(page: Page, sessions: MockSession[]) {
           status: "Idle",
           view: s.view,
           acp_capable: s.acp_capable,
+          // Server-computed context-preservation gate (the client mirror is
+          // gone). `claude` resumes its conversation in both directions, so
+          // the real daemon reports true for every session mocked here.
+          keeps_context: true,
           yolo_mode: false,
           created_at: new Date().toISOString(),
           last_accessed_at: null,

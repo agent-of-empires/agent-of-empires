@@ -14,19 +14,31 @@ use ratatui::widgets::*;
 use super::DialogResult;
 use crate::tui::styles::{has_min_contrast, Theme};
 
-/// WCAG AA-large threshold (matches `remote_home::render::selected_row_style`).
-const FOCUSED_CHOICE_CONTRAST_RATIO: f32 = 3.0;
+/// WCAG contrast floor for the focused choice's foreground against the
+/// dialog's background. `2.5` is the tightest a builtin clears
+/// (catppuccin-latte, at 2.64); a custom theme with a duller `accent` falls
+/// back to `theme.text` instead of rendering an illegible focused default.
+const MIN_FOCUSED_CONTRAST_RATIO: f32 = 2.5;
 
-/// Style for the focused choice, backed by `theme.selection` instead of a
-/// terminal-level `.reversed()` swap. Falls back to `theme.text` when
-/// `theme.accent` wouldn't be legible against the selection background.
+/// Style for the focused choice: `theme.accent` bold on the dialog's own
+/// background, the same fg-only treatment `components::buttons::render_yes_no`
+/// gives its focused button. `theme.selection` is a background surface token
+/// (see DESIGN.md); as a foreground it sits within ~1.7:1 of every builtin
+/// theme's background, so the focused choice would read as the dimmest item
+/// on the row. Unfocused choices drop to `theme.dimmed` so focus is carried
+/// by the brightness gap, not by a background block.
 fn focused_choice_style(theme: &Theme) -> Style {
-    let fg = if has_min_contrast(theme.accent, theme.selection, FOCUSED_CHOICE_CONTRAST_RATIO) {
+    let fg = if has_min_contrast(theme.accent, theme.background, MIN_FOCUSED_CONTRAST_RATIO) {
         theme.accent
     } else {
         theme.text
     };
-    Style::default().fg(fg).bg(theme.selection).bold()
+    Style::default().fg(fg).bold()
+}
+
+/// Style for the choices that are not focused.
+fn unfocused_choice_style(theme: &Theme) -> Style {
+    Style::default().fg(theme.dimmed)
 }
 
 /// Which choice the user picked; not every agent offers `AllowAlways`.
@@ -143,7 +155,7 @@ impl PermissionResponseDialog {
             let style = if i == self.focused {
                 focused_choice_style(theme)
             } else {
-                Style::default().fg(theme.text)
+                unfocused_choice_style(theme)
             };
             spans.push(Span::styled(format!("[{}]", label), style));
         }
@@ -252,6 +264,52 @@ mod tests {
         assert!(matches!(result, DialogResult::Cancel));
     }
 
+    /// The focused choice paints a foreground on the dialog's own background,
+    /// so its color has to be a foreground token. Every builtin's `accent`
+    /// clears 2.5:1 against that theme's background (catppuccin-latte is the
+    /// tightest at 2.64); a background surface token such as `theme.selection`
+    /// lands between 1.10:1 and 1.71:1 and would fail here.
+    #[test]
+    fn focused_choice_fg_stays_legible_on_every_builtin_background() {
+        for name in crate::tui::styles::builtin_theme_names() {
+            let theme = crate::tui::styles::load_theme(name);
+            let style = focused_choice_style(&theme);
+
+            let fg = style.fg.expect("focused choice must set a foreground");
+            assert!(
+                crate::tui::styles::has_min_contrast(
+                    fg,
+                    theme.background,
+                    MIN_FOCUSED_CONTRAST_RATIO
+                ),
+                "{name}: focused choice fg is illegible on the theme background"
+            );
+            assert_eq!(style.bg, None, "{name}: focused choice must not set a bg");
+            assert!(
+                style.add_modifier.contains(ratatui::style::Modifier::BOLD),
+                "{name}: focused choice must be bold"
+            );
+            assert_ne!(
+                unfocused_choice_style(&theme).fg,
+                style.fg,
+                "{name}: focused and unfocused choices must differ"
+            );
+        }
+    }
+
+    /// A custom theme's `accent` isn't validated for contrast on load; if
+    /// it's too close to the background, the focused choice falls back to
+    /// `theme.text` rather than rendering illegible.
+    #[test]
+    fn focused_choice_style_falls_back_to_text_for_low_contrast_accent() {
+        let mut theme = crate::tui::styles::load_theme_with_mode("empire", false);
+        theme.accent = theme.background;
+
+        let style = focused_choice_style(&theme);
+
+        assert_eq!(style.fg, Some(theme.text));
+    }
+
     #[test]
     fn allow_always_unsupported_is_skipped_and_shift_a_is_noop() {
         let mut dialog = PermissionResponseDialog::new("test", None);
@@ -264,36 +322,5 @@ mod tests {
             result,
             DialogResult::Submit(PermissionResponseChoice::Deny)
         ));
-    }
-
-    #[test]
-    fn focused_choice_style_uses_themed_background_not_reversed() {
-        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
-
-        let style = focused_choice_style(&theme);
-
-        assert_eq!(style.bg, Some(theme.selection));
-        assert!(!style
-            .add_modifier
-            .contains(ratatui::style::Modifier::REVERSED));
-    }
-
-    #[test]
-    fn focused_choice_style_keeps_accent_when_contrast_is_sufficient() {
-        let theme = crate::tui::styles::load_theme_with_mode("empire", false);
-
-        let style = focused_choice_style(&theme);
-
-        assert_eq!(style.fg, Some(theme.accent));
-    }
-
-    #[test]
-    fn focused_choice_style_falls_back_to_text_for_low_contrast_accent() {
-        let mut theme = crate::tui::styles::load_theme_with_mode("empire", false);
-        theme.accent = theme.selection;
-
-        let style = focused_choice_style(&theme);
-
-        assert_eq!(style.fg, Some(theme.text));
     }
 }

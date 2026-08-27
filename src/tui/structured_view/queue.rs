@@ -1,20 +1,24 @@
-//! Client-side prompt queue for the TUI structured view composer.
+//! Server-owned prompt-queue mirror for the TUI structured view.
 //!
-//! Mirrors the web composer's queue (`web/src/hooks/useAcp.ts`): the
-//! user can keep typing while a turn is in flight, the prompts park here,
-//! and they drain when the agent goes idle. Like the web, this is pure
-//! local state, never persisted and never round-tripped through the
-//! daemon. The view layer owns the busy-detection and the actual POST;
-//! this module is the pure data structure plus the drain-batching policy,
-//! so it can be unit-tested without a terminal or a daemon.
+//! The prompt queue's source of truth is the daemon
+//! (`/api/sessions/{id}/queue`, see
+//! `docs/development/server-side-prompt-queue.md`): a follow-up queued behind a
+//! busy turn survives a client reload and drains server-side even with no
+//! client attached. This module is the TUI's read model of that queue, a
+//! snapshot refreshed from the daemon at the turn edge and on (re)connect, plus
+//! optimistic edits that the next refresh reconciles. The batching and
+//! `/clear`-boundary split policy that used to live here moved server-side
+//! (`session_service::queue_drain_batch`), so the TUI no longer drains locally.
 
-/// FIFO of queued prompt strings awaiting a drain.
+use crate::acp::state::QueuedPromptEntry;
+
+/// Local mirror of the daemon-owned prompt queue, ordered by ascending `seq`.
 #[derive(Debug, Default)]
-pub struct PromptQueue {
-    items: Vec<String>,
+pub struct QueueMirror {
+    items: Vec<QueuedPromptEntry>,
 }
 
-impl PromptQueue {
+impl QueueMirror {
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
@@ -23,108 +27,72 @@ impl PromptQueue {
         self.items.len()
     }
 
-    #[cfg(test)]
-    pub fn iter(&self) -> impl Iterator<Item = &String> {
-        self.items.iter()
+    /// Text of the entry at `index` (0 = oldest / front), or `None` when out
+    /// of range. Used by the composer's ArrowUp/ArrowDown recall to load a
+    /// queued prompt back for editing.
+    pub fn text_at(&self, index: usize) -> Option<&str> {
+        self.items.get(index).map(|e| e.text.as_str())
     }
 
-    /// Append a prompt to the back of the queue.
-    pub fn push(&mut self, text: String) {
-        self.items.push(text);
+    /// Stable server id of the entry at `index`, for edit-by-id, or `None`
+    /// when out of range.
+    pub fn id_at(&self, index: usize) -> Option<&str> {
+        self.items.get(index).map(|e| e.id.as_str())
     }
 
-    /// Borrow the queued entry at `index` (0 = oldest / front), or `None`
-    /// when out of range. Used by the composer's ArrowUp/ArrowDown recall
-    /// to load a queued prompt back for editing.
-    pub fn get(&self, index: usize) -> Option<&String> {
-        self.items.get(index)
+    /// Position of the entry with `id`, or `None` if it is not in the mirror.
+    pub fn index_of(&self, id: &str) -> Option<usize> {
+        self.items.iter().position(|e| e.id == id)
     }
 
-    /// Replace the entry at `index` in place, preserving its queue
-    /// position. Returns `false` when the index is out of range, e.g. the
-    /// browsed entry drained between recall and submit; the caller then
-    /// treats the edited text as a fresh prompt.
-    pub fn replace(&mut self, index: usize, text: String) -> bool {
-        match self.items.get_mut(index) {
-            Some(slot) => {
-                *slot = text;
-                true
-            }
-            None => false,
+    /// Replace the whole mirror with a fresh daemon snapshot, keeping the
+    /// ascending-`seq` order the queue drains in.
+    pub fn set_snapshot(&mut self, mut entries: Vec<QueuedPromptEntry>) {
+        entries.sort_by_key(|e| e.seq);
+        self.items = entries;
+    }
+
+    /// Optimistically replace a queued entry's text after an edit POST; a
+    /// no-op if the id already drained out of the mirror.
+    pub fn set_text(&mut self, id: &str, text: &str) {
+        if let Some(slot) = self.items.iter_mut().find(|e| e.id == id) {
+            slot.text = text.to_string();
         }
     }
 
-    /// Drop the whole queue (the user hit the clear-queue hotkey).
+    /// Drop every entry (after a clear POST succeeds).
     pub fn clear(&mut self) {
         self.items.clear();
     }
 
-    /// Remove the first `n` entries. Called only after the drain POST for
-    /// those entries succeeds, so a failed send leaves the queue intact.
-    pub fn drop_front(&mut self, n: usize) {
-        let n = n.min(self.items.len());
-        self.items.drain(..n);
+    #[cfg(test)]
+    pub fn entries(&self) -> &[QueuedPromptEntry] {
+        &self.items
     }
 
-    /// Peek the next batch to drain, returning the prompt text to POST
-    /// and the number of queued entries it consumes. Does NOT mutate the
-    /// queue: the caller removes the consumed entries via [`drop_front`]
-    /// only once the POST succeeds, so a network failure never silently
-    /// drops prompts. `None` when the queue is empty.
-    ///
-    /// The leading run of non-boundary entries is joined with a blank
-    /// line into one follow-up. A leading clear-command entry (`/clear` /
-    /// `/new`) fires alone so it is never glued to adjacent prose, which
-    /// would corrupt slash-command parsing (matches the web's clear-alias
-    /// sub-batching, #1356).
-    pub fn next_batch(&self) -> Option<(String, usize)> {
-        let head = self.items.first()?;
-        if is_clear_boundary(head) {
-            return Some((head.clone(), 1));
-        }
-        let run: Vec<&String> = self
-            .items
-            .iter()
-            .take_while(|entry| !is_clear_boundary(entry))
-            .collect();
-        let count = run.len();
-        let text = run
-            .into_iter()
-            .map(String::as_str)
-            .collect::<Vec<_>>()
-            .join("\n\n");
-        Some((text, count))
+    /// Append a synthetic entry for tests, assigning a stable id/seq so
+    /// recall-by-id and snapshot reconciliation can be exercised without a
+    /// daemon.
+    #[cfg(test)]
+    pub fn push(&mut self, text: String) {
+        let seq = self.items.len() as u64;
+        self.items.push(QueuedPromptEntry {
+            id: format!("test-{seq}"),
+            seq,
+            text,
+            attachments: Vec::new(),
+            created_at: String::new(),
+            origin_device: None,
+        });
     }
-}
-
-/// Whether a queued entry is a context-clearing command that must drain
-/// alone rather than be joined into a combined batch. The TUI structured view can
-/// attach to any agent, so this is the union of the per-agent clear
-/// aliases (`/clear` for claude, `/new` for codex / opencode); the daemon
-/// `/about` surface does not carry the active agent's alias list, so the
-/// union is the safe v1 boundary. Leading whitespace is tolerated and a
-/// trailing argument (`/clear --hard`) still counts.
-fn is_clear_boundary(text: &str) -> bool {
-    let trimmed = text.trim_start();
-    for alias in ["/clear", "/new"] {
-        if trimmed == alias {
-            return true;
-        }
-        if let Some(rest) = trimmed.strip_prefix(alias) {
-            if rest.starts_with(char::is_whitespace) {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn queue(items: &[&str]) -> PromptQueue {
-        let mut q = PromptQueue::default();
+    fn mirror(items: &[&str]) -> QueueMirror {
+        let mut q = QueueMirror::default();
         for it in items {
             q.push((*it).to_string());
         }
@@ -132,91 +100,46 @@ mod tests {
     }
 
     #[test]
-    fn empty_queue_has_no_batch() {
-        let q = PromptQueue::default();
-        assert!(q.is_empty());
-        assert_eq!(q.next_batch(), None);
+    fn text_and_id_accessors_bound_check() {
+        let q = mirror(&["a", "b"]);
+        assert_eq!(q.len(), 2);
+        assert_eq!(q.text_at(0), Some("a"));
+        assert_eq!(q.text_at(1), Some("b"));
+        assert_eq!(q.text_at(2), None);
+        assert_eq!(q.id_at(0), Some("test-0"));
+        assert_eq!(q.index_of("test-1"), Some(1));
+        assert_eq!(q.index_of("nope"), None);
     }
 
     #[test]
-    fn batch_joins_the_whole_queue_with_blank_lines() {
-        let q = queue(&["alpha", "beta", "gamma"]);
-        let (text, count) = q.next_batch().expect("batch");
-        assert_eq!(text, "alpha\n\nbeta\n\ngamma");
-        assert_eq!(count, 3);
+    fn set_snapshot_sorts_by_seq() {
+        let mut q = QueueMirror::default();
+        let entry = |id: &str, seq: u64, text: &str| QueuedPromptEntry {
+            id: id.into(),
+            seq,
+            text: text.into(),
+            attachments: Vec::new(),
+            created_at: String::new(),
+            origin_device: None,
+        };
+        q.set_snapshot(vec![entry("b", 5, "second"), entry("a", 2, "first")]);
+        assert_eq!(q.text_at(0), Some("first"));
+        assert_eq!(q.text_at(1), Some("second"));
     }
 
     #[test]
-    fn batch_fires_a_leading_clear_alias_alone() {
-        let q = queue(&["/clear", "do the thing", "and this"]);
-        let (text, count) = q.next_batch().expect("batch");
-        assert_eq!(text, "/clear");
-        assert_eq!(count, 1);
+    fn set_text_edits_by_id_or_no_ops() {
+        let mut q = mirror(&["a", "b"]);
+        q.set_text("test-1", "B");
+        assert_eq!(q.text_at(1), Some("B"));
+        q.set_text("gone", "x"); // no-op, already drained
+        assert_eq!(q.len(), 2);
     }
 
     #[test]
-    fn batch_stops_at_a_clear_boundary() {
-        let q = queue(&["one", "two", "/new", "three"]);
-        let (text, count) = q.next_batch().expect("batch");
-        assert_eq!(text, "one\n\ntwo");
-        assert_eq!(count, 2);
-    }
-
-    #[test]
-    fn clear_boundary_tolerates_whitespace_and_arguments() {
-        assert!(is_clear_boundary("/clear"));
-        assert!(is_clear_boundary("  /clear  "));
-        assert!(is_clear_boundary("/clear --hard"));
-        assert!(is_clear_boundary("/new fresh"));
-        assert!(!is_clear_boundary("/cleart"));
-        assert!(!is_clear_boundary("clear"));
-        assert!(!is_clear_boundary("tell me about /clear"));
-        assert!(!is_clear_boundary(""));
-    }
-
-    #[test]
-    fn drop_front_removes_consumed_entries_only() {
-        let mut q = queue(&["a", "b", "c"]);
-        q.drop_front(2);
-        let remaining: Vec<&String> = q.iter().collect();
-        assert_eq!(remaining, vec!["c"]);
-    }
-
-    #[test]
-    fn drop_front_saturates_at_len() {
-        let mut q = queue(&["only"]);
-        q.drop_front(5);
-        assert!(q.is_empty());
-    }
-
-    #[test]
-    fn clear_empties_the_queue() {
-        let mut q = queue(&["x", "y"]);
+    fn clear_empties_the_mirror() {
+        let mut q = mirror(&["x", "y"]);
         q.clear();
         assert!(q.is_empty());
-    }
-
-    #[test]
-    fn get_borrows_by_index_or_none() {
-        let q = queue(&["a", "b"]);
-        assert_eq!(q.get(0).map(String::as_str), Some("a"));
-        assert_eq!(q.get(1).map(String::as_str), Some("b"));
-        assert_eq!(q.get(2), None);
-    }
-
-    #[test]
-    fn replace_edits_in_place_and_reports_hit() {
-        let mut q = queue(&["a", "b", "c"]);
-        assert!(q.replace(1, "B".to_string()));
-        let items: Vec<&String> = q.iter().collect();
-        assert_eq!(items, vec!["a", "B", "c"]);
-    }
-
-    #[test]
-    fn replace_out_of_range_is_a_miss() {
-        let mut q = queue(&["only"]);
-        assert!(!q.replace(3, "x".to_string()));
-        let items: Vec<&String> = q.iter().collect();
-        assert_eq!(items, vec!["only"]);
     }
 }

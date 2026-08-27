@@ -103,6 +103,26 @@ test.describe("Mobile keyboard detection and layout", () => {
     await openSession(page);
   }
 
+  test("mobile shell is fixed and rejects document-level scroll", async ({ page }) => {
+    await setupAndOpen(page);
+
+    const result = await page.evaluate(() => {
+      const calls: Array<[number, number]> = [];
+      const original = window.scrollTo;
+      Object.defineProperty(window, "scrollTo", {
+        configurable: true,
+        value: (x: number, y: number) => calls.push([x, y]),
+      });
+      Object.defineProperty(document.documentElement, "scrollTop", { configurable: true, value: 120 });
+      window.dispatchEvent(new Event("scroll"));
+      Object.defineProperty(window, "scrollTo", { configurable: true, value: original });
+      return { calls, rootPosition: getComputedStyle(document.getElementById("root")!).position };
+    });
+
+    expect(result.rootPosition).toBe("fixed");
+    expect(result.calls).toContainEqual([0, 0]);
+  });
+
   test("auto-resizes when keyboard opens in Safari browser mode (innerHeight constant)", async ({ page }) => {
     await setupAndOpen(page);
 
@@ -163,6 +183,19 @@ test.describe("Mobile keyboard detection and layout", () => {
 
   test("keyboard open button visible when keyboard closed", async ({ page }) => {
     await setupAndOpen(page);
+    await expect(page.getByRole("button", { name: "Open keyboard" })).toBeVisible();
+  });
+
+  test("Claude terminal selection keeps the keyboard closed", async ({ page }) => {
+    await mockTerminalApis(page);
+    await page.route("**/api/sessions/*/ensure", (r) => r.fulfill({ json: { ok: true } }));
+    await page.goto("/");
+    // The fixture's terminal session uses tool: "claude". Its alternate-screen
+    // startup still drops the first iOS keyboard input, so the selection must
+    // remain usable as a monitoring view until the user opens the keyboard.
+    await seedSettings(page, { mobileFontSize: 10, autoOpenKeyboard: true });
+    await page.reload();
+    await openSession(page);
     await expect(page.getByRole("button", { name: "Open keyboard" })).toBeVisible();
   });
 
@@ -297,6 +330,35 @@ test.describe("Mobile proxy input keydown handling", () => {
     await setupWithWsSpy(page);
     const sent = await sendKeyAndGetPtySent(page, "Backspace", "Backspace");
     expect(sent).toContain("\x7f");
+  });
+
+  test("reselecting the active session preserves keyboard-proxy input", async ({ page }) => {
+    const terminal = await mockTerminalApis(page, { tool: "codex" });
+    await page.goto("/");
+    await page.waitForTimeout(300);
+    await openSession(page);
+
+    await openMobileSidebar(page);
+    await clickSidebarSession(page, "pinch-test");
+    await page.locator("[data-live-terminal]").waitFor({ state: "visible", timeout: 10_000 });
+    await page.waitForTimeout(100);
+
+    const input = await page.evaluate(() => {
+      const proxy = document.querySelector<HTMLTextAreaElement>("[data-keyboard-proxy]");
+      if (!proxy) throw new Error("keyboard proxy not found");
+      const event = new InputEvent("beforeinput", {
+        bubbles: true,
+        cancelable: true,
+        inputType: "insertText",
+        data: "reselected",
+      });
+      const delivered = proxy.dispatchEvent(event);
+      return { data: event.data, delivered, inputType: event.inputType };
+    });
+    expect(input).toEqual({ data: "reselected", delivered: false, inputType: "insertText" });
+    await expect
+      .poll(() => terminal.liveMessages.map((message) => message.toString()).join("\n"))
+      .toContain("reselected");
   });
 });
 
