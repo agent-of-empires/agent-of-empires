@@ -19,6 +19,19 @@ use super::validate_display_label;
 use super::validate_no_shell_injection;
 use super::AppState;
 
+/// One unresolved structured (ACP) approval, projected for the home TUI's
+/// permission-response dialog. The TUI resolves the `nonce` through the ACP
+/// resolver and shows `tool_name` / `target` / `destructive` so the user
+/// sees what they are answering without entering the structured view. No
+/// dashboard surface renders this; the web client ignores the field.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct PendingApproval {
+    pub nonce: String,
+    pub tool_name: String,
+    pub target: String,
+    pub destructive: bool,
+}
+
 #[derive(Serialize)]
 pub struct SessionResponse {
     pub id: String,
@@ -179,12 +192,14 @@ pub struct SessionResponse {
     /// structured view. See #1088.
     #[cfg(feature = "serve")]
     pub acp_worker_state: crate::acp::supervisor::AcpWorkerState,
-    /// Unresolved structured approval nonces in request order. The TUI uses
-    /// these only to route the existing permission-response dialog through the
-    /// ACP resolver; no dashboard surface renders them.
+    /// Unresolved structured approvals in request order, projected only for
+    /// live (`running` worker) structured sessions. The TUI uses these to
+    /// route the existing permission-response dialog through the ACP
+    /// resolver and to show what is being approved; no dashboard surface
+    /// renders them.
     #[cfg(feature = "serve")]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub pending_approval_nonces: Vec<String>,
+    pub pending_approvals: Vec<PendingApproval>,
     /// True when this session's agent can run in structured view: a built-in
     /// with an ACP adapter, or a custom agent whose profile config
     /// declares a valid `agent_acp_cmd`. The web terminal view reads
@@ -418,7 +433,7 @@ impl SessionResponse {
             #[cfg(feature = "serve")]
             acp_worker_state,
             #[cfg(feature = "serve")]
-            pending_approval_nonces: Vec::new(),
+            pending_approvals: Vec::new(),
             // Built-in ACP capability is resolved here from a process-wide
             // registry (cheap, no IO). Custom agents depend on profile
             // config; the list and create handlers overlay that without a
@@ -687,12 +702,28 @@ pub async fn list_sessions(
                 active_monitor,
             );
             #[cfg(feature = "serve")]
-            if structured_live {
-                session.pending_approval_nonces = state
+            if structured_live
+                && acp_worker_state == crate::acp::supervisor::AcpWorkerState::Running
+            {
+                // Gate on a live worker: the invariant (supervisor.rs) is that
+                // a pending nonce only exists on a running worker, and
+                // `spawn`/`attach` sweep orphaned nonces out of the durable
+                // log. Projecting a non-running row would surface a phantom
+                // approval the resolver can only 404 on. Also skips the
+                // per-session SQLite scan for every non-running structured row.
+                session.pending_approvals = state
                     .acp_event_store
-                    .unresolved_approval_nonces(&inst.id)
+                    .pending_approval_requests(&inst.id)
                     .into_iter()
-                    .map(|nonce| nonce.0)
+                    .map(|approval| PendingApproval {
+                        nonce: approval.nonce.0,
+                        target: crate::acp::approvals::summarize_target(
+                            &approval.tool_call.kind,
+                            &approval.tool_call.args_preview,
+                        ),
+                        tool_name: approval.tool_call.name,
+                        destructive: approval.destructive,
+                    })
                     .collect();
             }
             session
@@ -7756,7 +7787,7 @@ mod tests {
     }
     #[cfg(feature = "serve")]
     #[tokio::test]
-    async fn list_sessions_includes_pending_structured_approval_nonces() {
+    async fn list_sessions_projects_pending_approvals_only_for_running_workers() {
         use crate::acp::permissions::build_approval;
         use crate::acp::state::ToolCall;
         use crate::acp::Event;
@@ -7770,7 +7801,7 @@ mod tests {
             id: "tool-1".to_string(),
             name: "shell".to_string(),
             kind: "execute".to_string(),
-            args_preview: "echo hello".to_string(),
+            args_preview: r#"{"command":"echo hello"}"#.to_string(),
             started_at: chrono::Utc::now(),
             parent_tool_call_id: None,
             memory_recall: None,
@@ -7782,13 +7813,37 @@ mod tests {
             .record(&id, 1, &Event::ApprovalRequested { approval })
             .expect("record pending approval");
 
+        // No live worker: the durable log has an unresolved nonce, but the
+        // invariant is that a pending nonce only exists on a running worker.
+        // Projecting it would surface a phantom approval the resolver can only
+        // 404 on, so the gate must keep it hidden.
+        let response = list_sessions(
+            axum::extract::State(state.clone()),
+            axum::extract::Query(ListSessionsQuery { state: None }),
+        )
+        .await;
+        assert!(
+            response.sessions[0].pending_approvals.is_empty(),
+            "a pending approval on a non-running worker must not be projected"
+        );
+
+        // A running worker is the authoritative source; now the approval is
+        // real and carries what the home dialog needs to render.
+        state.acp_supervisor.test_insert_worker(&id).await;
         let response = list_sessions(
             axum::extract::State(state),
             axum::extract::Query(ListSessionsQuery { state: None }),
         )
         .await;
-
-        assert_eq!(response.sessions[0].pending_approval_nonces, [nonce]);
+        assert_eq!(
+            response.sessions[0].pending_approvals,
+            vec![PendingApproval {
+                nonce,
+                tool_name: "shell".to_string(),
+                target: "echo hello".to_string(),
+                destructive: false,
+            }]
+        );
     }
 
     #[cfg(feature = "serve")]
@@ -10383,7 +10438,7 @@ mod workspace_ordering_tests {
             #[cfg(feature = "serve")]
             acp_worker_state: crate::acp::supervisor::AcpWorkerState::Absent,
             #[cfg(feature = "serve")]
-            pending_approval_nonces: Vec::new(),
+            pending_approvals: Vec::new(),
             #[cfg(feature = "serve")]
             acp_capable: false,
             #[cfg(feature = "serve")]

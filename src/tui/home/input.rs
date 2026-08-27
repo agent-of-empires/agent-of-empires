@@ -6405,8 +6405,20 @@ impl HomeView {
     }
 
     /// Open the shared permission-response dialog for the selected session.
-    /// Terminal sessions send agent-defined keystrokes. Structured sessions
-    /// resolve the first daemon-reported pending approval through ACP.
+    ///
+    /// Terminal sessions send the agent's own quick-response keystrokes. AoE
+    /// never parses pane content to detect or validate the prompt: the premise
+    /// is that the user has already seen the CLI's "Do you want to proceed?"
+    /// on the pane they are looking at, which is why there is no
+    /// `Status::Waiting` gate here.
+    ///
+    /// Structured (ACP) sessions have no pane to have looked at. The dialog
+    /// instead carries the tool name, target, and destructive flag from the
+    /// daemon's `pending_approvals` projection, so the user sees what they are
+    /// answering without entering the structured view. The nonce is captured
+    /// here, at open time, not re-read on the keypress: a poll tick landing
+    /// between open and submit must not retarget the answer at a different
+    /// approval (a stale nonce 404s instead).
     fn open_permission_response_dialog(&mut self) {
         let Some(id) = self.selected_session.clone() else {
             return;
@@ -6422,10 +6434,10 @@ impl HomeView {
         if inst.is_structured() {
             #[cfg(feature = "serve")]
             {
-                let Some(nonce) = self
+                let Some(approval) = self
                     .structured_pending_approvals
                     .get(&id)
-                    .and_then(|nonces| nonces.first())
+                    .and_then(|approvals| approvals.first())
                     .cloned()
                 else {
                     self.info_dialog = Some(InfoDialog::new(
@@ -6434,13 +6446,17 @@ impl HomeView {
                     ));
                     return;
                 };
+                self.permission_response_dialog =
+                    Some(crate::tui::dialogs::PermissionResponseDialog::structured(
+                        &title,
+                        &approval.tool_name,
+                        &approval.target,
+                        approval.destructive,
+                    ));
                 self.pending_permission_response = Some(PermissionResponseTarget::Structured {
                     session_id: id,
-                    nonce,
+                    nonce: approval.nonce,
                 });
-                self.permission_response_dialog = Some(
-                    crate::tui::dialogs::PermissionResponseDialog::structured(&title),
-                );
                 return;
             }
             #[cfg(not(feature = "serve"))]

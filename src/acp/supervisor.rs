@@ -1770,6 +1770,18 @@ impl<S: BroadcastSink> Supervisor<S> {
         // scheduler tick instead of on the next 50 ms poll.
         self.worker_notify.notify_waiters();
 
+        // Reconcile the durable log against reality, exactly as `attach` does
+        // (see its call site below the `workers.insert`). A fresh or respawned
+        // Runner starts with an empty `pending_responders`, so any
+        // `ApprovalRequested` in the log with no matching `ApprovalResolved`
+        // is orphaned: its responder oneshot died with the previous daemon or
+        // worker. Publish the synthetic `ApprovalResolved { Cancelled }` now so
+        // it never resurfaces as a dead 404 card, and so the home TUI's
+        // `running`-gated pending-approval projection only ever sees approvals
+        // this live worker can actually resolve. See #1099.
+        self.cancel_orphaned_approvals(&session_id);
+        self.cancel_orphaned_elicitations(&session_id);
+
         // Honor the wizard's "Auto-approve" / profile `yolo_mode_default`
         // by switching the ACP session to the adapter's bypass mode. The
         // tmux path achieves the same with `--dangerously-skip-permissions`

@@ -18219,6 +18219,8 @@ mod permission_response_dialog {
     #[cfg(feature = "serve")]
     use crate::tui::approval_poller::{ApprovalResolution, ApprovalResult};
     #[cfg(feature = "serve")]
+    use crate::tui::daemon_status_poller::PendingApproval;
+    #[cfg(feature = "serve")]
     use crate::tui::home::PermissionResponseTarget;
 
     fn add_session_with_tool(view: &mut HomeView, title: &str, tool: &str) -> String {
@@ -18227,6 +18229,16 @@ mod permission_response_dialog {
         let id = inst.id.clone();
         view.add_instance(inst);
         id
+    }
+
+    #[cfg(feature = "serve")]
+    fn pending(nonce: &str) -> Vec<PendingApproval> {
+        vec![PendingApproval {
+            nonce: nonce.to_string(),
+            tool_name: "Bash".to_string(),
+            target: "echo hi".to_string(),
+            destructive: false,
+        }]
     }
 
     #[test]
@@ -18296,7 +18308,7 @@ mod permission_response_dialog {
             .mutate_instance(&id, |inst| inst.view = crate::session::View::Structured);
         env.view
             .structured_pending_approvals
-            .insert(id.clone(), vec!["approval-1".to_string()]);
+            .insert(id.clone(), pending("approval-1"));
         env.view.selected_session = Some(id.clone());
 
         let _ = env.view.handle_key(key(KeyCode::Char('a')), None);
@@ -18320,7 +18332,7 @@ mod permission_response_dialog {
         let id = add_session_with_tool(&mut env.view, "session-one", "claude");
         env.view
             .structured_pending_approvals
-            .insert(id.clone(), vec!["approval-1".to_string()]);
+            .insert(id.clone(), pending("approval-1"));
 
         env.view.apply_structured_approval_result(ApprovalResult {
             session_id: id.clone(),
@@ -18331,6 +18343,79 @@ mod permission_response_dialog {
         assert!(
             !env.view.structured_pending_approvals.contains_key(&id),
             "a completed resolution must clear a nonce reintroduced by polling"
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    fn approval_choice_maps_to_the_correct_wire_decision() {
+        use crate::acp::protocol::ApprovalDecisionWire;
+        use crate::tui::dialogs::PermissionResponseChoice;
+        let cases = [
+            (PermissionResponseChoice::Allow, ApprovalDecisionWire::Allow),
+            (
+                PermissionResponseChoice::AllowAlways,
+                ApprovalDecisionWire::AllowAlways,
+            ),
+            (PermissionResponseChoice::Deny, ApprovalDecisionWire::Deny),
+        ];
+        for (choice, expected) in cases {
+            assert_eq!(
+                HomeView::approval_decision_wire(choice),
+                expected,
+                "{choice:?}"
+            );
+        }
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    #[serial]
+    fn gone_structured_approval_clears_and_informs() {
+        let mut env = create_test_env_empty();
+        let id = add_session_with_tool(&mut env.view, "session-one", "claude");
+        env.view
+            .structured_pending_approvals
+            .insert(id.clone(), pending("approval-1"));
+
+        env.view.apply_structured_approval_result(ApprovalResult {
+            session_id: id.clone(),
+            nonce: "approval-1".to_string(),
+            resolution: ApprovalResolution::Gone,
+        });
+
+        assert!(
+            !env.view.structured_pending_approvals.contains_key(&id),
+            "an already-resolved approval must be cleared"
+        );
+        assert!(
+            env.view.info_dialog.is_some(),
+            "the user must be told the approval was already answered elsewhere"
+        );
+    }
+
+    #[cfg(feature = "serve")]
+    #[test]
+    #[serial]
+    fn failed_structured_approval_informs_and_lets_polling_restore() {
+        let mut env = create_test_env_empty();
+        let id = add_session_with_tool(&mut env.view, "session-one", "claude");
+        // The optimistic removal already ran; the poll has not re-added it yet.
+        env.view.apply_structured_approval_result(ApprovalResult {
+            session_id: id.clone(),
+            nonce: "approval-1".to_string(),
+            resolution: ApprovalResolution::Failed("boom".to_string()),
+        });
+
+        // The failed arm does not re-insert: the still-pending approval is
+        // restored by the next daemon poll, not manual bookkeeping.
+        assert!(
+            !env.view.structured_pending_approvals.contains_key(&id),
+            "the failed arm must not manufacture a map entry"
+        );
+        assert!(
+            env.view.info_dialog.is_some(),
+            "a resolve failure must surface an error dialog"
         );
     }
 }
@@ -18471,7 +18556,7 @@ mod daemon_status_apply_tests {
             last_error: None,
             last_accessed_at: None,
             idle_entered_at: None,
-            pending_approval_nonces: Vec::new(),
+            pending_approvals: Vec::new(),
         }
     }
 

@@ -1311,12 +1311,12 @@ impl EventStore {
             "SELECT json_extract(event_json, '$.ApprovalRequested.approval.nonce') AS nonce
              FROM acp_events
              WHERE session_id = ?1
-               AND json_extract(event_json, '$.ApprovalRequested') IS NOT NULL
+               AND discriminant = 'ApprovalRequested'
                AND json_extract(event_json, '$.ApprovalRequested.approval.nonce') NOT IN (
                    SELECT json_extract(event_json, '$.ApprovalResolved.nonce')
                    FROM acp_events
                    WHERE session_id = ?1
-                     AND json_extract(event_json, '$.ApprovalResolved') IS NOT NULL
+                     AND discriminant = 'ApprovalResolved'
                )
              ORDER BY seq ASC",
         ) {
@@ -1337,6 +1337,53 @@ impl EventStore {
             }
         };
         rows.filter_map(|r| r.ok()).collect()
+    }
+
+    /// Full `Approval` payloads for the session's `ApprovalRequested` events
+    /// that lack a later `ApprovalResolved` with the same nonce, in request
+    /// order. Unlike [`Self::unresolved_approval_nonces`] (a bare-nonce
+    /// reattach-recovery query) this carries the tool call and destructive
+    /// flag so the home TUI's permission dialog can show what it is answering.
+    /// The `discriminant`-column predicates keep the outer scan and the
+    /// `NOT IN` subquery on `idx_acp_events_session_discriminant_seq` rather
+    /// than a full `json_extract` table scan on the 1 Hz `/api/sessions` path.
+    pub fn pending_approval_requests(&self, session_id: &str) -> Vec<super::approvals::Approval> {
+        let conn = match self.conn.lock() {
+            Ok(g) => g,
+            Err(p) => p.into_inner(),
+        };
+        let mut stmt = match conn.prepare(
+            "SELECT event_json
+             FROM acp_events
+             WHERE session_id = ?1
+               AND discriminant = 'ApprovalRequested'
+               AND json_extract(event_json, '$.ApprovalRequested.approval.nonce') NOT IN (
+                   SELECT json_extract(event_json, '$.ApprovalResolved.nonce')
+                   FROM acp_events
+                   WHERE session_id = ?1
+                     AND discriminant = 'ApprovalResolved'
+               )
+             ORDER BY seq ASC",
+        ) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(target: "acp.event_store", "prepare pending_approval_requests for {session_id}: {e}");
+                return Vec::new();
+            }
+        };
+        let rows = match stmt.query_map(params![session_id], |row| row.get::<_, String>(0)) {
+            Ok(r) => r,
+            Err(e) => {
+                warn!(target: "acp.event_store", "query pending_approval_requests for {session_id}: {e}");
+                return Vec::new();
+            }
+        };
+        rows.filter_map(|r| r.ok())
+            .filter_map(|json| match serde_json::from_str::<Event>(&json) {
+                Ok(Event::ApprovalRequested { approval }) => Some(approval),
+                _ => None,
+            })
+            .collect()
     }
 
     /// Elicitation nonces from `ElicitationRequested` events on disk with
