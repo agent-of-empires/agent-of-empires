@@ -27,6 +27,11 @@ fn group_membership<'a>(
             && profile.is_none_or(|p| i.source_profile == p)
     }
 }
+enum PersistGroupDelete {
+    Ready(Vec<Instance>),
+    Creating,
+    Restarting,
+}
 
 fn rekey_tmux_after_persist(id: &str, old_title: &str, new_title: &str) -> Option<String> {
     if old_title == new_title {
@@ -713,13 +718,29 @@ impl HomeView {
         &mut self,
         profile: &str,
         group_path: &str,
-    ) -> anyhow::Result<Vec<Instance>> {
+    ) -> anyhow::Result<PersistGroupDelete> {
         let prefix = format!("{group_path}/");
         let storage = self
             .storages
             .get(profile)
             .ok_or_else(|| anyhow::anyhow!("No storage registered for profile '{profile}'"))?;
-        let mut members = storage.update(|instances, groups| {
+        let restart_in_flight = &self.restart_in_flight;
+        let mut outcome = storage.update(|instances, groups| {
+            let mut has_creating = false;
+            let mut has_restarting = false;
+            for instance in instances.iter().filter(|instance| {
+                instance.group_path == group_path || instance.group_path.starts_with(&prefix)
+            }) {
+                has_creating |= instance.status == Status::Creating;
+                has_restarting |= restart_in_flight.contains(&instance.id);
+            }
+            if has_creating {
+                return Ok(PersistGroupDelete::Creating);
+            }
+            if has_restarting {
+                return Ok(PersistGroupDelete::Restarting);
+            }
+
             let mut members = Vec::new();
             for instance in instances.iter_mut() {
                 if instance.group_path == group_path || instance.group_path.starts_with(&prefix) {
@@ -728,16 +749,18 @@ impl HomeView {
                 }
             }
             groups.retain(|group| group.path != group_path && !group.path.starts_with(&prefix));
-            Ok(members)
+            Ok(PersistGroupDelete::Ready(members))
         })?;
-        for instance in &mut members {
-            instance.source_profile.clear();
-            instance.source_profile.push_str(profile);
+        if let PersistGroupDelete::Ready(members) = &mut outcome {
+            for instance in members {
+                instance.source_profile.clear();
+                instance.source_profile.push_str(profile);
+            }
+            if let Some(tree) = self.group_trees.get_mut(profile) {
+                tree.delete_group(group_path);
+            }
         }
-        if let Some(tree) = self.group_trees.get_mut(profile) {
-            tree.delete_group(group_path);
-        }
-        Ok(members)
+        Ok(outcome)
     }
 
     pub(super) fn delete_group_with_sessions(
@@ -746,14 +769,26 @@ impl HomeView {
     ) -> anyhow::Result<()> {
         if let Some(group_path) = self.selected_group.take() {
             let owning_profile = self.selected_group_profile.take();
-            let member_ids: Vec<String> = {
+            let (member_ids, has_creating) = {
                 let prefix = format!("{group_path}/");
                 let is_member = group_membership(&group_path, &prefix, owning_profile.as_deref());
-                self.instances()
-                    .filter(|instance| is_member(instance))
-                    .map(|instance| instance.id.clone())
-                    .collect()
+                let mut member_ids = Vec::new();
+                let mut has_creating = false;
+                for instance in self.instances().filter(|instance| is_member(instance)) {
+                    member_ids.push(instance.id.clone());
+                    has_creating |= instance.status == Status::Creating;
+                }
+                (member_ids, has_creating)
             };
+            if has_creating {
+                self.selected_group = Some(group_path);
+                self.selected_group_profile = owning_profile;
+                self.info_dialog = Some(InfoDialog::new(
+                    "Creation in progress",
+                    "A session in this group is still being created. Wait for it to finish before deleting the group.",
+                ));
+                return Ok(());
+            }
 
             if member_ids
                 .iter()
@@ -775,7 +810,27 @@ impl HomeView {
             let mut sessions_to_delete = Vec::new();
             for profile in profiles {
                 match self.persist_group_delete_with_sessions(&profile, &group_path) {
-                    Ok(mut members) => sessions_to_delete.append(&mut members),
+                    Ok(PersistGroupDelete::Ready(mut members)) => {
+                        sessions_to_delete.append(&mut members);
+                    }
+                    Ok(PersistGroupDelete::Creating) => {
+                        self.selected_group = Some(group_path);
+                        self.selected_group_profile = owning_profile;
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Creation in progress",
+                            "A session in this group is still being created. Wait for it to finish before deleting the group.",
+                        ));
+                        return Ok(());
+                    }
+                    Ok(PersistGroupDelete::Restarting) => {
+                        self.selected_group = Some(group_path);
+                        self.selected_group_profile = owning_profile;
+                        self.info_dialog = Some(InfoDialog::new(
+                            "Restart in progress",
+                            "A session in this group is still restarting. Wait for it to finish before deleting the group.",
+                        ));
+                        return Ok(());
+                    }
                     Err(error) => {
                         self.selected_group = Some(group_path);
                         self.selected_group_profile = owning_profile;

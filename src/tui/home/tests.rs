@@ -3517,6 +3517,14 @@ fn test_delete_group_with_sessions_updates_groups_field() {
         force_delete_worktrees: false,
     };
     view.delete_group_with_sessions(&options).unwrap();
+    view.save().unwrap();
+    let during_delete = storage.load().unwrap();
+    assert_eq!(during_delete.len(), 1);
+    assert_ne!(
+        during_delete[0].status,
+        Status::Deleting,
+        "save persisted the transient Deleting status"
+    );
 
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
     while !view.apply_deletion_results() && std::time::Instant::now() < deadline {
@@ -3554,6 +3562,33 @@ fn test_delete_group_with_sessions_updates_groups_field() {
     assert!(other_groups
         .iter()
         .any(|group| group.path == "work/projects"));
+    let mut creating = Instance::new("creating-member", "/tmp/creating");
+    creating.source_profile = "test".to_string();
+    creating.group_path = "creating".to_string();
+    creating.status = Status::Creating;
+    let creating_id = creating.id.clone();
+    view.add_instance(creating);
+    view.rebuild_group_trees();
+    view.selected_group = Some("creating".to_string());
+    view.selected_group_profile = Some("test".to_string());
+    view.info_dialog = None;
+
+    view.delete_group_with_sessions(&options).unwrap();
+    assert_eq!(view.selected_group.as_deref(), Some("creating"));
+    assert_eq!(
+        view.info_dialog.as_ref().map(InfoDialog::title),
+        Some("Creation in progress")
+    );
+
+    view.mutate_instance(&creating_id, |instance| {
+        instance.status = Status::Deleting;
+    });
+    view.save().unwrap();
+    assert!(!storage
+        .load()
+        .unwrap()
+        .iter()
+        .any(|instance| instance.id == creating_id));
 }
 
 #[test]
@@ -10944,7 +10979,7 @@ fn restart_selected_session_skips_when_already_in_flight() {
 #[test]
 #[serial]
 fn delete_selected_refused_during_restart() {
-    use crate::tui::dialogs::DeleteOptions;
+    use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions};
 
     let mut env = create_test_env_with_sessions(1);
     let id = env.view.instance_at(0).id.clone();
@@ -10962,6 +10997,46 @@ fn delete_selected_refused_during_restart() {
         env.view.info_dialog.is_some(),
         "the refused delete must surface a dialog, not silently no-op"
     );
+    {
+        let storage = env.view.storages.get("test").unwrap();
+        storage
+            .update(|instances, groups| {
+                instances
+                    .iter_mut()
+                    .find(|instance| instance.id == id)
+                    .unwrap()
+                    .group_path = "work".to_string();
+                groups.push(Group::new("work", "work"));
+                Ok(())
+            })
+            .unwrap();
+    }
+    env.view.selected_session = None;
+    env.view.selected_group = Some("work".to_string());
+    env.view.selected_group_profile = Some("test".to_string());
+    env.view.info_dialog = None;
+
+    env.view
+        .delete_group_with_sessions(&GroupDeleteOptions {
+            delete_sessions: true,
+            delete_worktrees: false,
+            delete_branches: false,
+            delete_containers: false,
+            force_delete_worktrees: false,
+        })
+        .unwrap();
+
+    assert_eq!(env.view.selected_group.as_deref(), Some("work"));
+    assert_eq!(
+        env.view.info_dialog.as_ref().map(InfoDialog::title),
+        Some("Restart in progress")
+    );
+    let (instances, groups) = Storage::open_unwatched("test")
+        .unwrap()
+        .load_with_groups()
+        .unwrap();
+    assert_eq!(instances[0].group_path, "work");
+    assert!(groups.iter().any(|group| group.path == "work"));
 }
 
 /// Build a HomeView seeded with two distinct projects, each containing
