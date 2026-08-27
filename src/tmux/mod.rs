@@ -2265,11 +2265,79 @@ fn login_shell_probe(agents: &[&crate::agents::AgentDef]) -> std::collections::H
         .unwrap_or_default()
 }
 
-pub(crate) fn is_agent_available(agent: &crate::agents::AgentDef) -> bool {
-    match agent_available_direct(agent) {
-        Some(available) => available,
-        None => login_shell_probe(&[agent]).contains(agent.name),
+/// Process-wide memo of agent availability, keyed by agent name. A probe costs
+/// a `which` fork and, when that misses, a share of a login shell (0.5-2.5s),
+/// so re-probing on every settings field rebuild made `Settings > Agents` and
+/// every keystroke in `Settings > Search` pay seconds. Startup's
+/// `AvailableTools::detect` warms every built-in agent, so later callers hit
+/// the memo. The Recheck action clears it via
+/// [`invalidate_agent_availability`].
+static AGENT_AVAILABILITY: RwLock<Option<HashMap<String, bool>>> = RwLock::new(None);
+
+/// Drop the memoized availability results so the next probe re-runs. Called
+/// when the user explicitly asks for a recheck (they just installed an agent).
+pub fn invalidate_agent_availability() {
+    if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
+        *cache = None;
     }
+}
+
+/// Availability for `agents`, memoized across calls and batched so the whole
+/// uncached set costs at most ONE login shell. Returns the subset of names
+/// that resolved.
+pub(crate) fn probe_agents_available(
+    agents: &[&crate::agents::AgentDef],
+) -> std::collections::HashSet<String> {
+    let mut found = HashSet::new();
+    let mut uncached: Vec<&crate::agents::AgentDef> = Vec::new();
+    {
+        let cache = AGENT_AVAILABILITY.read().ok();
+        let cached = cache.as_ref().and_then(|c| c.as_ref());
+        for agent in agents {
+            match cached.and_then(|c| c.get(agent.name)) {
+                Some(true) => {
+                    found.insert(agent.name.to_string());
+                }
+                Some(false) => {}
+                None => uncached.push(agent),
+            }
+        }
+    }
+    if uncached.is_empty() {
+        return found;
+    }
+
+    // Pass 1 is cheap per agent (`which` / a version run on the inherited
+    // PATH); only the inconclusive rest goes to the batched login-shell probe.
+    let mut results: Vec<(&str, bool)> = Vec::new();
+    let mut needs_shell: Vec<&crate::agents::AgentDef> = Vec::new();
+    for agent in uncached {
+        match agent_available_direct(agent) {
+            Some(ok) => results.push((agent.name, ok)),
+            None => needs_shell.push(agent),
+        }
+    }
+    let shell_found = login_shell_probe(&needs_shell);
+    for agent in needs_shell {
+        results.push((agent.name, shell_found.contains(agent.name)));
+    }
+
+    if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
+        let map = cache.get_or_insert_with(HashMap::new);
+        for (name, ok) in &results {
+            map.insert((*name).to_string(), *ok);
+        }
+    }
+    for (name, ok) in results {
+        if ok {
+            found.insert(name.to_string());
+        }
+    }
+    found
+}
+
+pub(crate) fn is_agent_available(agent: &crate::agents::AgentDef) -> bool {
+    probe_agents_available(&[agent]).contains(agent.name)
 }
 
 #[derive(Debug, Clone)]
@@ -2279,26 +2347,17 @@ pub struct AvailableTools {
 
 impl AvailableTools {
     pub fn detect() -> Self {
-        // Two passes so the whole roster costs at most ONE login shell.
-        // Pass 1 is cheap per agent (`which` / a version run on the
-        // inherited PATH); only the inconclusive rest goes to the batched
-        // login-shell probe. The previous per-agent login shells made TUI
-        // startup scale at ~1-2.5s per not-installed agent.
+        // One batched, memoized probe for the whole roster: at most one login
+        // shell, and every later per-agent caller (the settings pickers) reads
+        // the memo this warms. Per-agent login shells made TUI startup scale
+        // at ~1-2.5s per not-installed agent.
         let agents = crate::agents::AGENTS;
-        let mut direct_ok = vec![false; agents.len()];
-        let mut needs_shell: Vec<&crate::agents::AgentDef> = Vec::new();
-        for (i, agent) in agents.iter().enumerate() {
-            match agent_available_direct(agent) {
-                Some(ok) => direct_ok[i] = ok,
-                None => needs_shell.push(agent),
-            }
-        }
-        let shell_found = login_shell_probe(&needs_shell);
+        let refs: Vec<&crate::agents::AgentDef> = agents.iter().collect();
+        let found = probe_agents_available(&refs);
         let mut available: Vec<String> = agents
             .iter()
-            .enumerate()
-            .filter(|(i, a)| direct_ok[*i] || shell_found.contains(a.name))
-            .map(|(_, a)| a.name.to_string())
+            .filter(|a| found.contains(a.name))
+            .map(|a| a.name.to_string())
             .collect();
 
         // Append user-defined custom agents (always considered available since the
