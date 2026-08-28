@@ -2438,18 +2438,21 @@ mod tests {
     /// probe's pre-install results survive the clear, the following `detect`
     /// finds the memo populated, skips its own probe, and reports a freshly
     /// installed agent as still missing.
+    ///
+    /// Ordering is asserted through a channel rather than a sleep loop, so the
+    /// thread is known to have reached the call before anything is claimed
+    /// about it: an unscheduled thread blocks the first `recv` instead of
+    /// silently satisfying a "still populated" poll.
     #[test]
     #[serial_test::serial]
     fn invalidate_agent_availability_waits_for_an_in_flight_probe() {
         let name = crate::agents::AGENTS[0].name.to_string();
         let restore = AGENT_AVAILABILITY.read().ok().and_then(|c| c.clone());
 
-        let seed = || {
-            if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
-                let map = cache.get_or_insert_with(HashMap::new);
-                map.insert(name.clone(), false);
-            }
-        };
+        if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
+            let map = cache.get_or_insert_with(HashMap::new);
+            map.insert(name.clone(), false);
+        }
         let populated = || {
             AGENT_AVAILABILITY
                 .read()
@@ -2457,26 +2460,36 @@ mod tests {
                 .and_then(|c| c.as_ref().map(|m| !m.is_empty()))
                 .unwrap_or(false)
         };
-
-        seed();
         assert!(populated(), "seeded memo");
 
         // Stand in for a probe mid-login-shell: holds the probe lock, has not
-        // written yet.
+        // written its results yet.
         let probe_guard = AGENT_PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let invalidating = std::thread::spawn(invalidate_agent_availability);
+        let (tx, rx) = std::sync::mpsc::channel::<&'static str>();
+        let invalidating = std::thread::spawn(move || {
+            tx.send("entered").expect("test receiver alive");
+            invalidate_agent_availability();
+            tx.send("returned").expect("test receiver alive");
+        });
 
-        // While the probe holds the lock the memo must stand. Polled rather
-        // than slept once, so the thread has ample chance to reach the lock.
-        for _ in 0..25 {
-            assert!(
-                populated(),
-                "invalidate cleared the memo without waiting for the in-flight probe"
-            );
-            std::thread::sleep(std::time::Duration::from_millis(4));
-        }
+        // Blocks until the thread is definitely running, so the assertion
+        // below cannot pass merely because it never got scheduled.
+        assert_eq!(rx.recv().expect("thread started"), "entered");
+
+        // The probe still holds the lock, so invalidation cannot complete.
+        // This is the assertion: without the lock acquisition it returns
+        // immediately and "returned" arrives well inside the window.
+        assert!(
+            matches!(
+                rx.recv_timeout(std::time::Duration::from_millis(200)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ),
+            "invalidate completed without waiting for the in-flight probe"
+        );
+        assert!(populated(), "and the memo still stands while it waits");
 
         drop(probe_guard);
+        assert_eq!(rx.recv().expect("invalidate completes"), "returned");
         invalidating.join().expect("invalidate thread");
         assert!(
             !populated(),
