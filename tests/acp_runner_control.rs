@@ -84,7 +84,7 @@ fn wait_for_u32(path: &Path, what: &str) -> u32 {
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
         if let Ok(value) = std::fs::read_to_string(path) {
-            if let Ok(value) = value.parse() {
+            if let Ok(value) = value.trim().parse() {
                 return value;
             }
         }
