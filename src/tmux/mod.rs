@@ -1572,6 +1572,61 @@ impl Drop for PaneMetaCacheGuard {
     }
 }
 
+/// Test-only RAII guard for tests that seed [`AGENT_AVAILABILITY`] into a known
+/// state. Same shape and reason as [`SessionCacheGuard`]: the memo is
+/// process-global, so a mid-test panic must not leak a seeded entry into a
+/// later test and make it order-dependent. Pair with `#[serial_test::serial]`.
+#[cfg(test)]
+pub(crate) struct AgentAvailabilityGuard {
+    prev: Option<HashMap<String, bool>>,
+}
+
+#[cfg(test)]
+impl AgentAvailabilityGuard {
+    pub(crate) fn capture() -> Self {
+        Self {
+            prev: AGENT_AVAILABILITY
+                .read()
+                .expect("agent availability lock")
+                .clone(),
+        }
+    }
+
+    /// Seed one memoized answer, as a completed probe would have published it.
+    pub(crate) fn seed(&self, agent: &str, available: bool) {
+        if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
+            cache
+                .get_or_insert_with(HashMap::new)
+                .insert(agent.to_string(), available);
+        }
+    }
+
+    /// Clear the memo, as `invalidate_agent_availability` does.
+    pub(crate) fn clear(&self) {
+        if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
+            *cache = None;
+        }
+    }
+
+    /// Whether the memo currently holds any answer.
+    pub(crate) fn is_populated(&self) -> bool {
+        AGENT_AVAILABILITY
+            .read()
+            .ok()
+            .and_then(|c| c.as_ref().map(|m| !m.is_empty()))
+            .unwrap_or(false)
+    }
+}
+
+#[cfg(test)]
+impl Drop for AgentAvailabilityGuard {
+    fn drop(&mut self) {
+        if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
+            *cache = self.prev.take();
+        }
+    }
+}
+
 /// How long a [`SESSION_CACHE`] snapshot is trusted before a lookup must
 /// force a fresh `refresh_session_cache()` call.
 const CACHE_TTL: Duration = Duration::from_secs(2);
@@ -2446,21 +2501,9 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn invalidate_agent_availability_waits_for_an_in_flight_probe() {
-        let name = crate::agents::AGENTS[0].name.to_string();
-        let restore = AGENT_AVAILABILITY.read().ok().and_then(|c| c.clone());
-
-        if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
-            let map = cache.get_or_insert_with(HashMap::new);
-            map.insert(name.clone(), false);
-        }
-        let populated = || {
-            AGENT_AVAILABILITY
-                .read()
-                .ok()
-                .and_then(|c| c.as_ref().map(|m| !m.is_empty()))
-                .unwrap_or(false)
-        };
-        assert!(populated(), "seeded memo");
+        let memo = AgentAvailabilityGuard::capture();
+        memo.seed(crate::agents::AGENTS[0].name, false);
+        assert!(memo.is_populated(), "seeded memo");
 
         // Stand in for a probe mid-login-shell: holds the probe lock, has not
         // written its results yet.
@@ -2486,19 +2529,20 @@ mod tests {
             ),
             "invalidate completed without waiting for the in-flight probe"
         );
-        assert!(populated(), "and the memo still stands while it waits");
+        assert!(
+            memo.is_populated(),
+            "and the memo still stands while it waits"
+        );
 
+        // Released and joined before `memo` drops, so the worker cannot write
+        // the memo after the guard has restored it.
         drop(probe_guard);
         assert_eq!(rx.recv().expect("invalidate completes"), "returned");
         invalidating.join().expect("invalidate thread");
         assert!(
-            !populated(),
+            !memo.is_populated(),
             "invalidate must clear once the in-flight probe releases the lock"
         );
-
-        if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
-            *cache = restore;
-        }
     }
 
     /// The memo re-read that makes queueing behind another caller's login
@@ -2512,21 +2556,18 @@ mod tests {
         let defs: Vec<&crate::agents::AgentDef> = crate::agents::AGENTS.iter().take(2).collect();
         let (a, b) = (defs[0].name, defs[1].name);
 
-        let restore = AGENT_AVAILABILITY.read().ok().and_then(|c| c.clone());
-        invalidate_agent_availability();
+        let memo = AgentAvailabilityGuard::capture();
+        memo.clear();
 
         // Empty memo: nothing is answered, everything needs a probe.
         let (found, uncached) = partition_cached_agents(&defs);
         assert!(found.is_empty());
         assert_eq!(uncached.len(), 2);
 
-        // Stand in for the lock holder having just published its results,
-        // one available and one not, so both polarities are covered.
-        if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
-            let map = cache.get_or_insert_with(HashMap::new);
-            map.insert(a.to_string(), true);
-            map.insert(b.to_string(), false);
-        }
+        // Stand in for the lock holder having just published its results, one
+        // available and one not, so both polarities are covered.
+        memo.seed(a, true);
+        memo.seed(b, false);
 
         let (found, uncached) = partition_cached_agents(&defs);
         assert!(
@@ -2536,10 +2577,6 @@ mod tests {
         assert_eq!(found.len(), 1);
         assert!(found.contains(a), "an available agent is reported found");
         assert!(!found.contains(b), "an absent agent is answered, not found");
-
-        if let Ok(mut cache) = AGENT_AVAILABILITY.write() {
-            *cache = restore;
-        }
     }
 
     use super::test_helpers::TmuxTestSession;
