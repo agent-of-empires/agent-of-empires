@@ -251,27 +251,34 @@ pub struct PaneMetadata {
     pub pane_start_command_is_protected: bool,
 }
 
+static SESSION_REFRESH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static SESSION_CACHE: RwLock<SessionCache> = RwLock::new(SessionCache {
     data: None,
     time: None,
+    refresh_id: 0,
+    outcome: SessionCacheRefresh::Unknown,
 });
 
 struct SessionCache {
     data: Option<HashMap<String, i64>>,
     time: Option<Instant>,
+    refresh_id: u64,
+    outcome: SessionCacheRefresh,
 }
 
-/// Shared `tmux list-panes -a` snapshot behind [`pane_dead_for_display`],
-/// mirroring [`SESSION_CACHE`]'s TTL and its `data: None` "the server could
-/// not answer" state.
+/// Shared tmux list-panes snapshot behind pane_dead_for_display, mirroring
+/// SESSION_CACHE's TTL and its data: None "the server could not answer" state.
+static PANE_META_REFRESH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static PANE_META_CACHE: RwLock<PaneMetaCache> = RwLock::new(PaneMetaCache {
     data: None,
     time: None,
+    refresh_id: 0,
 });
 
 struct PaneMetaCache {
     data: Option<std::sync::Arc<HashMap<String, PaneMetadata>>>,
     time: Option<Instant>,
+    refresh_id: u64,
 }
 pub(crate) const TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -375,7 +382,29 @@ fn tmux_no_server_running(stderr: &[u8]) -> bool {
     })
 }
 
+fn next_refresh_id(counter: &std::sync::atomic::AtomicU64) -> u64 {
+    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+fn publish_session_cache(
+    refresh_id: u64,
+    data: Option<HashMap<String, i64>>,
+    outcome: SessionCacheRefresh,
+) -> SessionCacheRefresh {
+    let Ok(mut cache) = SESSION_CACHE.write() else {
+        return SessionCacheRefresh::Unknown;
+    };
+    if refresh_id <= cache.refresh_id {
+        return cache.outcome;
+    }
+    cache.data = data;
+    cache.time = Some(Instant::now());
+    cache.refresh_id = refresh_id;
+    cache.outcome = outcome;
+    outcome
+}
 pub fn refresh_session_cache() -> SessionCacheRefresh {
+    let refresh_id = next_refresh_id(&SESSION_REFRESH_ID);
     let start = Instant::now();
     let mut command = tmux_query_command();
     command.args(["list-sessions", "-F", "#{session_name}|#{session_activity}"]);
@@ -421,11 +450,7 @@ pub fn refresh_session_cache() -> SessionCacheRefresh {
         "session cache refreshed",
     );
 
-    if let Ok(mut cache) = SESSION_CACHE.write() {
-        cache.data = new_data;
-        cache.time = Some(Instant::now());
-    }
-    outcome
+    publish_session_cache(refresh_id, new_data, outcome)
 }
 
 /// Classify the currently selected agent session without letting an
@@ -1182,6 +1207,8 @@ pub(crate) mod fork_probe {
 pub(crate) struct SessionCacheGuard {
     prev_data: Option<HashMap<String, i64>>,
     prev_time: Option<Instant>,
+    prev_refresh_id: u64,
+    prev_outcome: SessionCacheRefresh,
 }
 
 #[cfg(test)]
@@ -1191,6 +1218,8 @@ impl SessionCacheGuard {
         Self {
             prev_data: cache.data.clone(),
             prev_time: cache.time,
+            prev_refresh_id: cache.refresh_id,
+            prev_outcome: cache.outcome,
         }
     }
 
@@ -1200,6 +1229,7 @@ impl SessionCacheGuard {
         if let Ok(mut cache) = SESSION_CACHE.write() {
             cache.data = None;
             cache.time = Some(Instant::now());
+            cache.outcome = SessionCacheRefresh::Unknown;
         }
     }
 
@@ -1208,6 +1238,7 @@ impl SessionCacheGuard {
         if let Ok(mut cache) = SESSION_CACHE.write() {
             cache.data = Some(names.iter().map(|n| (n.to_string(), 0)).collect());
             cache.time = Some(Instant::now());
+            cache.outcome = SessionCacheRefresh::Populated;
         }
     }
 
@@ -1227,6 +1258,8 @@ impl Drop for SessionCacheGuard {
         if let Ok(mut cache) = SESSION_CACHE.write() {
             cache.data = self.prev_data.take();
             cache.time = self.prev_time;
+            cache.refresh_id = self.prev_refresh_id;
+            cache.outcome = self.prev_outcome;
         }
     }
 }
@@ -1238,6 +1271,7 @@ impl Drop for SessionCacheGuard {
 pub(crate) struct PaneMetaCacheGuard {
     prev_data: Option<std::sync::Arc<HashMap<String, PaneMetadata>>>,
     prev_time: Option<Instant>,
+    prev_refresh_id: u64,
 }
 
 #[cfg(test)]
@@ -1247,6 +1281,7 @@ impl PaneMetaCacheGuard {
         Self {
             prev_data: cache.data.clone(),
             prev_time: cache.time,
+            prev_refresh_id: cache.refresh_id,
         }
     }
 
@@ -1272,6 +1307,7 @@ impl Drop for PaneMetaCacheGuard {
         if let Ok(mut cache) = PANE_META_CACHE.write() {
             cache.data = self.prev_data.take();
             cache.time = self.prev_time;
+            cache.refresh_id = self.prev_refresh_id;
         }
     }
 }
@@ -1446,14 +1482,34 @@ fn pane_dead_from_cache(name: &str) -> Option<bool> {
 /// Repopulate [`PANE_META_CACHE`]. The timestamp is stamped even when the
 /// query fails, so a tmux outage costs one fork per [`CACHE_TTL`] instead of
 /// one per row per frame.
+fn publish_pane_meta_cache(
+    refresh_id: u64,
+    data: Option<std::sync::Arc<HashMap<String, PaneMetadata>>>,
+) -> bool {
+    let Ok(mut cache) = PANE_META_CACHE.write() else {
+        return false;
+    };
+    if refresh_id <= cache.refresh_id {
+        return false;
+    }
+    cache.data = data;
+    cache.time = Some(Instant::now());
+    cache.refresh_id = refresh_id;
+    true
+}
+
 pub(crate) fn refresh_pane_meta_cache(
 ) -> anyhow::Result<std::sync::Arc<HashMap<String, PaneMetadata>>> {
+    let refresh_id = next_refresh_id(&PANE_META_REFRESH_ID);
     let result = batch_pane_metadata().map(std::sync::Arc::new);
-    if let Ok(mut cache) = PANE_META_CACHE.write() {
-        cache.data = result.as_ref().ok().cloned();
-        cache.time = Some(Instant::now());
+    if publish_pane_meta_cache(refresh_id, result.as_ref().ok().cloned()) {
+        return result;
     }
-    result
+    PANE_META_CACHE
+        .read()
+        .ok()
+        .and_then(|cache| cache.data.clone())
+        .ok_or_else(|| anyhow::anyhow!("a newer pane metadata refresh is unavailable"))
 }
 
 fn snapshot_refresh_due(last_refresh: Option<Instant>) -> bool {
@@ -2096,6 +2152,50 @@ mod tests {
         assert!(snapshot_refresh_due(Some(
             Instant::now() - CACHE_TTL / 2 - Duration::from_millis(1)
         )));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn later_started_snapshot_publication_wins() {
+        let _session_guard = SessionCacheGuard::capture();
+        let _pane_guard = PaneMetaCacheGuard::capture();
+
+        let session_older = next_refresh_id(&SESSION_REFRESH_ID);
+        let session_newer = next_refresh_id(&SESSION_REFRESH_ID);
+        assert_eq!(
+            publish_session_cache(
+                session_newer,
+                Some(HashMap::from([("new-session".to_string(), 0)])),
+                SessionCacheRefresh::Populated,
+            ),
+            SessionCacheRefresh::Populated,
+        );
+        assert_eq!(
+            publish_session_cache(session_older, None, SessionCacheRefresh::NoServer,),
+            SessionCacheRefresh::Populated,
+            "the superseded caller must observe the newer committed outcome",
+        );
+        assert_eq!(session_exists_from_cache("new-session"), Some(true));
+        assert_eq!(session_exists_from_cache("old-session"), Some(false));
+
+        let pane_older = next_refresh_id(&PANE_META_REFRESH_ID);
+        let pane_newer = next_refresh_id(&PANE_META_REFRESH_ID);
+        assert!(publish_pane_meta_cache(
+            pane_newer,
+            Some(std::sync::Arc::new(HashMap::from([(
+                "new-pane".to_string(),
+                dead_pane_meta(true),
+            )]))),
+        ));
+        assert!(!publish_pane_meta_cache(
+            pane_older,
+            Some(std::sync::Arc::new(HashMap::from([(
+                "old-pane".to_string(),
+                dead_pane_meta(true),
+            )]))),
+        ));
+        assert_eq!(pane_dead_from_cache("new-pane"), Some(true));
+        assert_eq!(pane_dead_from_cache("old-pane"), Some(false));
     }
 
     #[cfg(unix)]

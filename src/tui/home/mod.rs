@@ -677,6 +677,10 @@ pub struct HomeView {
     /// the current live-send session. Used to dedup the resize messages
     /// fired from the preview refresh path; cleared on live-send exit.
     pub(super) live_send_last_resize: Option<(u16, u16)>,
+    /// Earliest time the same live-send geometry may retry after a worker
+    /// failure. Keeps a dead or unreachable pane from turning the render
+    /// ticker into a tmux subprocess loop.
+    pub(super) live_send_resize_retry_at: Option<std::time::Instant>,
     /// True between a live-send leader press and the next key. While armed,
     /// the next key is interpreted as a live-send command (palette, sidebar
     /// toggle, exit) rather than forwarded to the agent, and the status bar
@@ -2359,6 +2363,7 @@ impl HomeView {
             preview_worker_pulse: None,
             preview_wake: std::sync::Arc::new(tokio::sync::Notify::new()),
             live_send_last_resize: None,
+            live_send_resize_retry_at: None,
             live_send_pending_leader: false,
             live_send_ctrl_c_flash_until: None,
             sidebar_collapsed: user_config
@@ -6509,6 +6514,7 @@ impl HomeView {
         // issues its sync resize, even if the cached geometry from a
         // prior session happens to match the current preview_pane_area.
         self.live_send_last_resize = None;
+        self.live_send_resize_retry_at = None;
         // Live mode takes over the pane's size from here; drop the non-live
         // preview dedup so exiting re-asserts the preview geometry cleanly.
         self.preview_pane_synced = None;

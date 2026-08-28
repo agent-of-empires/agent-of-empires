@@ -107,6 +107,24 @@ const CAPTURE_BUFFER: u16 = 20;
 /// Rows the compact system-health strip occupies.
 const DIAGNOSTICS_STRIP_HEIGHT: u16 = 1;
 
+const LIVE_SEND_RESIZE_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+fn live_resize_retry_due(
+    retry_at: &mut Option<Instant>,
+    resize_failed: bool,
+    now: Instant,
+) -> bool {
+    if resize_failed {
+        *retry_at = Some(now + LIVE_SEND_RESIZE_RETRY_DELAY);
+    }
+    if retry_at.is_some_and(|deadline| deadline <= now) {
+        *retry_at = None;
+        true
+    } else {
+        false
+    }
+}
+
 /// Window captured while the user is off the live edge (reading scrollback):
 /// the full scrollback in one shot, rather than a window that tracks the offset
 /// and re-anchors to the advancing live edge on every capture. Matches tmux's
@@ -1939,17 +1957,19 @@ impl HomeView {
         if !targets_this_pane || width == 0 || height == 0 {
             return;
         }
-        if self
+        let now = Instant::now();
+        let resize_failed = self
             .live_send_worker
             .as_ref()
-            .is_some_and(live_send::LiveSendWorker::take_resize_failed)
-        {
+            .is_some_and(live_send::LiveSendWorker::take_resize_failed);
+        if live_resize_retry_due(&mut self.live_send_resize_retry_at, resize_failed, now) {
             self.live_send_last_resize = None;
         }
         let next = (width, height);
         if self.live_send_last_resize != Some(next) {
             if let Some(worker) = &self.live_send_worker {
                 worker.resize(width, height);
+                self.live_send_resize_retry_at = None;
             }
             self.live_send_last_resize = Some(next);
         }
@@ -2275,6 +2295,7 @@ impl HomeView {
             }
             if invalidates_live {
                 self.live_send_last_resize = None;
+                self.live_send_resize_retry_at = None;
             }
         }
         // While in live-send mode, keep the agent's tmux pane sized to the
@@ -4087,6 +4108,26 @@ impl HomeView {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn live_resize_failure_retries_only_after_backoff() {
+        let now = Instant::now();
+        let mut retry_at = None;
+
+        assert!(!live_resize_retry_due(&mut retry_at, true, now));
+        assert_eq!(retry_at, Some(now + LIVE_SEND_RESIZE_RETRY_DELAY));
+        assert!(!live_resize_retry_due(
+            &mut retry_at,
+            false,
+            now + LIVE_SEND_RESIZE_RETRY_DELAY - Duration::from_millis(1),
+        ));
+        assert!(live_resize_retry_due(
+            &mut retry_at,
+            false,
+            now + LIVE_SEND_RESIZE_RETRY_DELAY,
+        ));
+        assert_eq!(retry_at, None);
+    }
 
     // The preview split geometry (header / banner / output rows) is now owned
     // by `preview::PreviewLayout`; its tests live alongside it in

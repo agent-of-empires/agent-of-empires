@@ -469,7 +469,7 @@ pub(in crate::tui) struct LiveSendWorker {
     /// after entry, so a web "take over" wins instead of ping-ponging.
     lock_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
     /// Set by the worker when resize-window fails or times out. Paint consumes
-    /// the flag and clears its geometry dedup so the same size retries.
+    /// the flag and schedules a bounded retry for the same geometry.
     resize_failed: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -594,8 +594,14 @@ impl LiveSendWorker {
                             }
                         }
                         if !batch.is_empty() {
-                            if dispatch_batch(&tmux_name, batch) {
-                                thread_resize_failed.store(true, Ordering::Relaxed);
+                            match dispatch_batch(&tmux_name, batch) {
+                                ResizeDispatchResult::Failed => {
+                                    thread_resize_failed.store(true, Ordering::Relaxed);
+                                }
+                                ResizeDispatchResult::Succeeded => {
+                                    thread_resize_failed.store(false, Ordering::Relaxed);
+                                }
+                                ResizeDispatchResult::None => {}
                             }
                             if let Some(wake) = &capture_wake {
                                 wake.wake();
@@ -636,8 +642,8 @@ impl LiveSendWorker {
         self.lock_lost.load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Consume the sticky resize failure so paint can clear its dedup and
-    /// retry the same geometry.
+    /// Consume the sticky resize failure so paint can schedule a bounded
+    /// retry for the same geometry.
     pub(super) fn take_resize_failed(&self) -> bool {
         self.resize_failed
             .swap(false, std::sync::atomic::Ordering::Relaxed)
@@ -1931,30 +1937,42 @@ impl LiveCaptureWorker {
         }
     }
 }
-/// Walk one drained batch and execute it as one-shot `tmux` subprocesses.
-/// `coalesce` merges literal-key runs into a single `send-keys -l` call;
-/// named keys and resizes dispatch individually. Tests verify the
-/// coalescing ordering via `coalesce` directly without needing a real
-/// session.
-fn dispatch_batch(tmux_name: &str, batch: Vec<WorkerMsg>) -> bool {
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResizeDispatchResult {
+    None,
+    Succeeded,
+    Failed,
+}
+
+/// Walk one drained batch and execute it as one-shot tmux subprocesses.
+/// Coalescing merges literal-key runs into a single send-keys call; named
+/// keys and resizes dispatch individually.
+fn dispatch_batch(tmux_name: &str, batch: Vec<WorkerMsg>) -> ResizeDispatchResult {
     let actions = coalesce(batch);
     // A Paste can only go through tmux (paste-buffer -p decides whether the
     // pane gets bracketed-paste markers), so pin the whole mixed batch to tmux
     // and preserve one ordered writer for the pty.
     let force_tmux = actions.iter().any(|a| matches!(a, TmuxAction::Paste(_)));
-    let mut resize_failed = false;
+    let mut resize_result = ResizeDispatchResult::None;
     for action in actions {
-        if let Err(err) = dispatch_via_fork(tmux_name, &action, force_tmux) {
-            resize_failed |= matches!(action, TmuxAction::Resize { .. });
-            tracing::warn!(
-                target: "tui.live_send",
-                error = %err,
-                action = ?action,
-                "live-send fork dispatch failed; action dropped",
-            );
+        let is_resize = matches!(action, TmuxAction::Resize { .. });
+        match dispatch_via_fork(tmux_name, &action, force_tmux) {
+            Ok(()) if is_resize => resize_result = ResizeDispatchResult::Succeeded,
+            Ok(()) => {}
+            Err(err) => {
+                if is_resize {
+                    resize_result = ResizeDispatchResult::Failed;
+                }
+                tracing::warn!(
+                    target: "tui.live_send",
+                    error = %err,
+                    action = ?action,
+                    "live-send fork dispatch failed; action dropped",
+                );
+            }
         }
     }
-    resize_failed
+    resize_result
 }
 
 /// Execute one `TmuxAction` as a one-shot `tmux` subprocess. Module-

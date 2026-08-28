@@ -764,10 +764,9 @@ impl App {
         // Keep the display snapshots (sessions, pane metadata) fresh off the
         // paint thread: every _for_display helper and the passive preview
         // resize executor answers from these snapshots and never forks in render.
-        // HomeView's authoritative startup liveness pass also warms this
-        // cache when it observes any stored sessions. Refresh only if that
-        // lazy pass did not run, then start the background owner.
-        crate::tmux::refresh_session_cache_if_due();
+        // The poller's first cycle runs immediately. Do not warm the cache
+        // here: tmux may consume the full command deadline, and startup must
+        // paint its conservative empty snapshot before any such wait.
         crate::tmux::spawn_snapshot_poller();
 
         // Initial render

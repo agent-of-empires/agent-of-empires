@@ -6363,6 +6363,7 @@ impl HomeView {
         // previewed after exit, just at the idle cadence. The render
         // reconcile retunes it (and retargets if the view later changes).
         self.live_send_last_resize = None;
+        self.live_send_resize_retry_at = None;
         // The leader menu is live-mode-only: drop any half-entered chord so
         // the home view is never left armed. The sidebar collapse is now a
         // general, persisted home-view state (the collapsed strip stays

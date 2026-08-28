@@ -1705,6 +1705,36 @@ impl Session {
         self.refresh_owner_at_with_deadline(VT_OWNER_OPT, VT_OWNER_HB_OPT, owner_id, deadline)
     }
 
+    fn tmux_format_literal(value: &str) -> String {
+        let mut escaped = String::with_capacity(value.len());
+        for ch in value.chars() {
+            if matches!(ch, ',' | '#' | '{' | '}' | ':') {
+                escaped.push('#');
+            }
+            escaped.push(ch);
+        }
+        escaped
+    }
+
+    fn release_owner_at_with_deadline(
+        &self,
+        opt: &str,
+        hb_opt: &str,
+        owner_id: &str,
+        restore_window_size: bool,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) {
+        let owner_id = Self::tmux_format_literal(owner_id);
+        let condition = format!("#{{==:#{{{opt}}},{owner_id}}}");
+        let mut release = format!("set-option -u {opt} ; set-option -u {hb_opt}");
+        if restore_window_size {
+            release.push_str(" ; set-option window-size latest");
+        }
+        let mut command = crate::tmux::tmux_command();
+        command.args(["if-shell", "-t", &self.name, "-F", &condition, &release]);
+        let _ = deadline.run(&mut command);
+    }
+
     pub fn release_vt_owner(&self, owner_id: &str) {
         let deadline = crate::tmux::TmuxCommandDeadline::new();
         self.release_vt_owner_with_deadline(owner_id, &deadline);
@@ -1715,15 +1745,14 @@ impl Session {
         owner_id: &str,
         deadline: &crate::tmux::TmuxCommandDeadline,
     ) {
-        if matches!(
-            self.owner_at_result_with_deadline(VT_OWNER_OPT, VT_OWNER_HB_OPT, deadline),
-            Ok(Some((id, _))) if id == owner_id
-        ) {
-            let _ = self.unset_user_option_with_deadline(VT_OWNER_OPT, deadline);
-            let _ = self.unset_user_option_with_deadline(VT_OWNER_HB_OPT, deadline);
-        }
+        self.release_owner_at_with_deadline(
+            VT_OWNER_OPT,
+            VT_OWNER_HB_OPT,
+            owner_id,
+            false,
+            deadline,
+        );
     }
-
     /// Force ownership to `owner_id`, even over a live holder. Used by the
     /// explicit "take over" action: a user tap is an intentional steal, not
     /// the passive flap the heartbeat guards against.
@@ -1828,13 +1857,14 @@ impl Session {
     /// lock is vacant so a later out-of-band `tmux attach` from a real terminal
     /// sizes the window to itself instead of staying pinned at our grid.
     pub fn release_size_owner(&self, owner_id: &str) {
-        if let Some((id, _)) = self.size_owner() {
-            if id == owner_id {
-                self.unset_user_option(SIZE_OWNER_OPT);
-                self.unset_user_option(SIZE_OWNER_HB_OPT);
-                self.reset_size_to_latest_client();
-            }
-        }
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        self.release_owner_at_with_deadline(
+            SIZE_OWNER_OPT,
+            SIZE_OWNER_HB_OPT,
+            owner_id,
+            true,
+            &deadline,
+        );
     }
 
     fn show_user_option_result_with_deadline(
@@ -1877,11 +1907,13 @@ impl Session {
             .unwrap_or(false)
     }
 
+    #[cfg(test)]
     fn unset_user_option(&self, opt: &str) {
         let deadline = crate::tmux::TmuxCommandDeadline::new();
         let _ = self.unset_user_option_with_deadline(opt, &deadline);
     }
 
+    #[cfg(test)]
     fn unset_user_option_with_deadline(
         &self,
         opt: &str,
@@ -2772,13 +2804,23 @@ mod tests {
         assert!(session.size_owner().is_none());
         assert!(session.steal_size_owner("d"));
 
-        // A non-owner release is a no-op; the owner's release clears the lock.
-        session.release_size_owner("not-d");
+        // A conditional release is one tmux command queue: a non-owner no-op
+        // cannot race a later takeover between a read and separate unsets.
+        let _ = crate::tmux::fork_probe::take();
+        {
+            let _probe = crate::tmux::fork_probe::arm();
+            session.release_size_owner("not-d");
+            assert_eq!(crate::tmux::fork_probe::take(), 1);
+        }
         assert_eq!(
             session.size_owner().map(|(id, _)| id),
             Some("d".to_string())
         );
-        session.release_size_owner("d");
+        {
+            let _probe = crate::tmux::fork_probe::arm();
+            session.release_size_owner("d");
+            assert_eq!(crate::tmux::fork_probe::take(), 1);
+        }
         assert!(session.size_owner().is_none());
 
         // A partial owner write is unknown to passive readers, but a later
