@@ -31,14 +31,19 @@ Survival across restart means a daemon on a new binary could re-adopt workers ru
 
 ## Who owns the state
 
-The daemon does, since the server-ownership arc (`../server-owned-sv-state.md`). It folds the event stream once per WS connection into two projections and pushes both, so neither client re-derives them:
+The daemon folds the event stream once per WebSocket connection into two
+projections, so clients do not re-derive them:
 
 - **Control state**: turn flags, pending approvals and elicitations, usage, plan, modes, slash commands. Shipped as `{"kind":"reduced_state","seq","state":<AcpState>,"unchanged":[...]}` on connect and after every event. `unchanged` names the cold fields (commands, modes, config options, recent diffs, background agents) the socket already holds, which the daemon omits rather than re-serializing; a client keeps what it has for those. The connect frame is folded over the WHOLE session even when the client dials with a `since` cursor, because it is a whole-state snapshot the clients adopt verbatim.
 - **Transcript rows**: `{"kind":"transcript_snapshot","rows":[...]}` on connect plus a `{"kind":"transcript_delta", ...}` (`Append` / `Patch` / `Remove`, reconciled by row id) per event, and `GET /api/sessions/{id}/acp/replay?view=rows` for history. Presentation stays client-side: markdown, tool cards, path shortening, diff rendering.
 
 Raw event frames still stream for what the daemon does not model (the worker-lifecycle latches, monitor and wakeup badges, the usage cost baseline, rejected prompts, the web's optimistic turn counters). A client that reads only the projections can pass `?frames=0` to skip them; the native view does, so reopening a long session no longer ships it the whole event log. A `notice` row carries a failed startup, a dead turn, a refused mode switch, or a rate-limit auto-resume; the native view renders it inline and the web skips it, since the web shows the same information as a dismissible banner.
 
-The daemon also owns the send / steer / queue decision (`../server-owned-prompt-dispatch.md`). `POST /acp/prompt` runs `acp::dispatch::decide` over its own control state and answers `{"disposition":"sent"|"steered"|"queued","reason":...,"queued_id":...}` instead of a bare 202; a parked prompt lands on the server-owned queue and the turn-end drain delivers it. Neither client predicts the outcome, so the four incidents that decision encodes (a steerable agent taking a mid-turn prompt #2805, a prompt mid-cancel restarting the runner #1727, `/compact` swallowing a steered message #3219, an idle-dormant worker woken by the POST itself #1689) are fixed once rather than per client.
+The daemon also owns prompt dispatch. `POST /acp/prompt` runs
+`acp::dispatch::decide` and returns `sent`, `steered`, or `queued`. A queued
+prompt lands on the [server-owned queue](../server-side-prompt-queue.md), whose
+turn-end drain delivers it. Cancelling and compacting turns are always queued;
+a dormant worker is sent the prompt so the request can wake it.
 
 ## Conversation persistence and context primer
 

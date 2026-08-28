@@ -241,17 +241,16 @@ pub struct SessionResponse {
     /// preserves the conversation (only claude pairings share one
     /// CLI-resumable transcript). Server-owned via
     /// `agents::acp_transcript_cli_resumable` so the dashboard and TUI stop
-    /// each recomputing it from `tool` + `acp_agent`. Omitted (read as false)
-    /// for non-preserving pairings. See docs/development/server-owned-sv-state.md.
+    /// each recomputing it from `tool` + `acp_agent`. Omitted for
+    /// non-preserving pairings.
     #[cfg(feature = "serve")]
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub keeps_context: bool,
     /// Slash-command aliases that reset the conversation for this session's
     /// agent (claude `/clear`, codex/opencode `/new`). Server-owned from
     /// `acp::agent_profiles::resolve(...).clear_aliases` so the composer's `/`
-    /// palette and the queued-prompt clear-boundary hint stop mirroring the
-    /// per-agent list client-side. Omitted (read as empty) for agents with no
-    /// clear alias. See docs/development/server-owned-sv-state.md.
+    /// palette and queued-prompt batching do not mirror the per-agent list.
+    /// Omitted for agents with no clear alias.
     #[cfg(feature = "serve")]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub clear_aliases: Vec<String>,

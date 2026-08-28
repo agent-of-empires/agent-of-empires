@@ -65,9 +65,7 @@ type PromptSendResult =
   /** The daemon started a fresh turn or steered the prompt into the running
    *  one. Either way the optimistic transcript row stands. */
   | { kind: "dispatched" }
-  /** The daemon parked it on the server queue and returned the row id, so the
-   *  optimistic transcript row becomes a queue row. See Tier 3 in
-   *  `docs/development/server-owned-prompt-dispatch.md`. */
+  /** The daemon parked it and returned the server queue row id. */
   | { kind: "queued"; queuedId: string }
   | { kind: "retryable_failure" }
   | { kind: "non_retryable_failure" };
@@ -141,25 +139,9 @@ export type Action =
     }
   | { kind: "dismiss_config_option_switch_failed" };
 
-// LRU-capped module cache keyed by structured view session id. Mirrors the
-// per-session AcpState into `localStorage` under
-// `aoe:acp-state:v1:<id>` so a full page reload (mobile OS evicts
-// the tab, user pulls down a Cloudflare re-auth, PWA cold start)
-// hydrates the reducer from the last-known state and only fetches
-// the seq-delta from the server instead of replaying the entire
-// transcript through the typewriter. See #1132.
-//
-// Versioned key prefix lets us invalidate stored entries when the
-// reducer schema changes meaningfully (bump to `v2:`); a TTL sweep
-// on first mount prunes entries older than STATE_TTL_MS so abandoned
-// sessions don't squat on the per-origin quota forever.
-//
-// The cap prevents long-running dashboards from accumulating state
-// for every structured view session ever opened (Map.set with an existing
-// key is a no-op for ordering, so we delete-then-set to refresh the
-// LRU position). `clearAcpCache(id?)` is exported so the
-// session-delete handler and logout flow can drop stale entries
-// instead of waiting for them to age out.
+// Per-session memory and localStorage cache. Versioned keys allow schema
+// invalidation; TTL and LRU limits bound abandoned session state. Refresh an
+// existing Map key with delete then set because Map.set preserves its order.
 const STATE_CACHE_CAP = 32;
 const stateCache = new Map<string, AcpState>();
 
@@ -1915,39 +1897,18 @@ export function useAcpSession(
     [sessionId],
   );
 
-  // Public sendPrompt. Posts unconditionally and renders whatever the daemon
-  // says it did (Tier 3, `docs/development/server-owned-prompt-dispatch.md`).
-  //
-  // This used to be a `shouldEnqueue` expression over turnActive, steering,
-  // cancelling, compacting, three worker latches, the REST worker-state poll
-  // and the socket state, each clause a fixed incident (#2805 / #1727 / #3219 /
-  // #1689) that the native TUI re-derived independently. The daemon knows all
-  // of it first-hand, so it decides and the client renders. The socket term is
-  // gone rather than moved: "can my socket reach the daemon" was always a proxy
-  // for a question the POST's own response answers.
+  // The daemon owns the send, steer, or queue decision.
   const sendPrompt = useCallback(
     async (text: string, attachments?: PromptAttachmentInput[]) => {
       if (!sessionId) return;
-      // Auto-wake an archived or actively-snoozed session before
-      // routing. The tmux send path runs this via
-      // `Instance::touch_last_accessed` on the server side, but the
-      // structured view composer enqueues locally while the worker is down
-      // (which is true precisely BECAUSE the row is sunk), so the
-      // server never sees the prompt and the flag stays set. Clear
-      // it client-side; the reconciler picks the session back up on
-      // its next ~2s tick and the queue drains as soon as a fresh
-      // `AcpSessionAssigned` lands. See #1581.
+      // Wake archived or snoozed sessions before posting; the reconciler skips
+      // them and therefore cannot drain a prompt queued while they remain sunk.
       if (archivedAtRef.current || snoozedUntilRef.current) {
         const wakeResult = archivedAtRef.current
           ? await setSessionArchive(sessionId, false)
           : await setSessionSnooze(sessionId, null);
         if (!wakeResult) {
-          // Wake PATCH failed (network drop / 5xx / 4xx). Surfacing
-          // an error is the only safe move: enqueueing locally would
-          // park the prompt in a queue that never drains, because
-          // the reconciler keeps skipping the still-sunk session.
-          // Route through the reducer's `error` action so the
-          // existing `InteractionErrorBanner` renders it. See #1581.
+          // Do not queue against a session the reconciler still skips.
           dispatch({
             kind: "error",
             message: "Could not wake this session. Please retry, or unarchive / unsnooze from the sidebar.",
@@ -2049,18 +2010,8 @@ export function useAcpSession(
   // render body right after `cancelPrompt` is created.
   const cancelPromptRef = useRef<() => Promise<void> | void>(() => {});
 
-  // Force-send a queued prompt now instead of waiting for the server's
-  // turn-end drain. Two cases:
-  //   - Idle / steerable / dormant worker: send this row immediately via the
-  //     live prompt path, and remove it from the server queue so the server
-  //     drain doesn't also deliver it (dedup). The optimistic dequeue keeps the
-  //     strip in sync; a hydrate reconciles.
-  //   - A live, non-steerable turn is blocking it: interrupt. Cancel the
-  //     current turn; the server then drains the queue (this row included) on
-  //     turn-end. We deliberately do NOT POST during the cancel: the daemon
-  //     treats a prompt arriving mid-cancel as a wedge and restarts the runner
-  //     (see `sendPrompt`). This is the destructive "interrupt and send" the
-  //     user opted into.
+  // Send directly when possible. For a non-steerable active turn, cancel and
+  // let the server drain rather than posting during cancellation.
   const sendQueuedNow = useCallback(
     async (prompt: QueuedPrompt) => {
       const sid = sessionIdRef.current;
@@ -2070,22 +2021,8 @@ export function useAcpSession(
         await cancelPromptRef.current();
         return;
       }
-      // A row this client did not queue itself carries attachment metadata
-      // with no bytes: `toPersistedState` strips attachment-carrying rows from
-      // localStorage, and `hydrate_server_queue` rebuilds them from the
-      // server's refs with `dataB64: ""`. So after any reload (or on a second
-      // device) the bytes live only in the daemon's pending-attachment store.
-      //
-      // Taking the remove-then-resend path with such a row destroyed it: the
-      // remove drops the server row AND its buffered bytes, the POST then ships
-      // empty base64, `validate_attachments` rejects it 400, and a 4xx is not
-      // `retryable_failure`, so nothing re-queues. Prompt, caption and image
-      // all gone with nothing sent.
-      //
-      // The daemon can still deliver it, so leave the row alone and let the
-      // turn-end drain do it. The session is idle by this point (the branch
-      // above handles a live turn), and the reconciler drains an idle session
-      // within a tick, so the row fires on its own in about a second.
+      // A hydrated attachment row has only server-side bytes. Removing it would
+      // delete those bytes before the direct POST, so leave it for the drain.
       if (prompt.attachments?.some((a) => !a.dataB64)) return;
       // Remove server-side first so the turn-end drain can't also deliver this
       // row, then send it directly. The optimistic dequeue hides it locally.
@@ -2270,11 +2207,7 @@ export function useAcpSession(
 
   // Whether the per-row "Send now" affordance can do something useful: the
   // socket is open, no worker-down banner is up, and the worker is either
-  // running (idle, steerable, or mid-turn, in which case Send now INTERRUPTS
-  // the turn) or dormant from idle-auto-stop (the send POST wakes it). A cold
-  // mid-resume worker or a disconnected socket disables it. Unlike the previous
-  // gate this stays enabled during an active turn, because that is exactly when
-  // the user wants to force a queued prompt through (see `sendQueuedNow`).
+  // Active turns remain eligible because Send now may intentionally interrupt.
   const canSendQueuedNow =
     status === "open" &&
     !state.workerStopped &&
@@ -2290,28 +2223,18 @@ export function useAcpSession(
   return {
     state,
     status,
-    /** True between an `onclose` and the next successful dial / failure
-     *  to exhaust the retry envelope. Drives the banner's "Reconnecting
-     *  (N/MAX) in Xs" copy. See #1130. */
+    /** True while retrying a closed socket. */
     reconnecting,
     /** Current attempt number; 0 while the live socket is healthy,
      *  1..MAX while backing off. */
     retryCount,
-    /** Seconds remaining before the next scheduled retry fires. The
-     *  banner reads this on each render to animate the countdown. */
+    /** Seconds until the next retry. */
     retryCountdown,
-    /** Maximum retries before falling back to the manual reconnect
-     *  affordance. Exposed so the banner can render "N/MAX" without
-     *  re-importing the constant. */
+    /** Retry limit exposed for banner copy. */
     maxRetries: ACP_MAX_RETRIES,
-    /** User-triggered reconnect. Resets the retry counter and dials a
-     *  fresh socket immediately. */
+    /** Reset retry state and dial immediately. */
     manualReconnect,
-    /** True once the WS has reached `onopen` at least once for the
-     *  current session. Lets banner copy distinguish "first dial
-     *  while the worker spawns" (no prior connection to recover) from
-     *  "we lost a live connection and are retrying" (cached
-     *  transcript and the recovery framing are honest). See #1106. */
+    /** Distinguishes initial connection from recovery. */
     hasEverOpened,
     resolveApproval,
     resolveElicitation,

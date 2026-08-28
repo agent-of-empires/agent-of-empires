@@ -1358,8 +1358,7 @@ pub async fn acp_prompt(
         let _serialized = inst_lock.lock().await;
         state.session_service.clear_pending_initial_turn(&id).await;
     }
-    // Tier 3: the daemon, not the client, decides whether this prompt can be
-    // sent now. See `docs/development/server-owned-prompt-dispatch.md`.
+    // Decide here so every client follows the same send, steer, or queue rules.
     let dispatch = {
         let control = crate::server::acp_ws::fold_control_state(&state, &id).await;
         let liveness = crate::acp::dispatch::WorkerLiveness {
