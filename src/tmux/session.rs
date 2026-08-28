@@ -1656,8 +1656,9 @@ impl Session {
     ) -> std::io::Result<bool> {
         let condition = Self::owner_pair_condition(opt, hb_opt, observed.0, observed.1);
         let owner_id = Self::tmux_command_string_literal(owner_id);
+        let target = Self::tmux_command_string_literal(&self.name);
         let replace = format!(
-            "set-option {opt} {owner_id} ; set-option {hb_opt} {heartbeat} ; display-message -p aoe-owner-replaced"
+            "set-option -t {target} {opt} {owner_id} ; set-option -t {target} {hb_opt} {heartbeat} ; display-message -p aoe-owner-replaced"
         );
         let mut command = crate::tmux::tmux_command();
         command.args(["if-shell", "-t", &self.name, "-F", &condition, &replace]);
@@ -1680,9 +1681,11 @@ impl Session {
         deadline: &crate::tmux::TmuxCommandDeadline,
     ) {
         let condition = Self::owner_pair_condition(opt, hb_opt, owner_id, &heartbeat.to_string());
-        let mut release = format!("set-option -u {opt} ; set-option -u {hb_opt}");
+        let target = Self::tmux_command_string_literal(&self.name);
+        let mut release =
+            format!("set-option -u -t {target} {opt} ; set-option -u -t {target} {hb_opt}");
         if restore_window_size {
-            release.push_str(" ; set-option window-size latest");
+            release.push_str(&format!(" ; set-option -t {target} window-size latest"));
         }
         let mut command = crate::tmux::tmux_command();
         command.args(["if-shell", "-t", &self.name, "-F", &condition, &release]);
@@ -1807,8 +1810,9 @@ impl Session {
     ) -> bool {
         let owner_id = Self::tmux_format_literal(owner_id);
         let condition = format!("#{{==:#{{{opt}}},{owner_id}}}");
+        let target = Self::tmux_command_string_literal(&self.name);
         let refresh = format!(
-            "set-option {hb_opt} {} ; display-message -p aoe-owner-refreshed",
+            "set-option -t {target} {hb_opt} {} ; display-message -p aoe-owner-refreshed",
             next_owner_heartbeat(0)
         );
         let mut command = crate::tmux::tmux_command();
@@ -1912,8 +1916,9 @@ impl Session {
         // if-shell -F evaluates the owner/attachment guard and inserts this
         // branch in the same tmux command queue. No other client can replace
         // the guarded state between the check and resize-window.
+        let target = Self::tmux_command_string_literal(&self.name);
         let resize = format!(
-            "resize-window -x {cols} -y {window_rows} ; display-message -p aoe-resize-applied"
+            "resize-window -t {target} -x {cols} -y {window_rows} ; display-message -p aoe-resize-applied"
         );
         let mut command = crate::tmux::tmux_command();
         command.args(["if-shell", "-t", &self.name, "-F", condition, &resize]);
@@ -1935,9 +1940,11 @@ impl Session {
     ) {
         let owner_id = Self::tmux_format_literal(owner_id);
         let condition = format!("#{{==:#{{{opt}}},{owner_id}}}");
-        let mut release = format!("set-option -u {opt} ; set-option -u {hb_opt}");
+        let target = Self::tmux_command_string_literal(&self.name);
+        let mut release =
+            format!("set-option -u -t {target} {opt} ; set-option -u -t {target} {hb_opt}");
         if restore_window_size {
-            release.push_str(" ; set-option window-size latest");
+            release.push_str(&format!(" ; set-option -t {target} window-size latest"));
         }
         let mut command = crate::tmux::tmux_command();
         command.args(["if-shell", "-t", &self.name, "-F", &condition, &release]);
@@ -1979,16 +1986,28 @@ impl Session {
         let pipe_command = Self::tmux_command_string_literal(pipe_command);
         let owner_command = Self::tmux_command_string_literal(owner_id);
         let arm = format!(
-            "pipe-pane {flags} -t {target} {pipe_command} ; set-option {VT_PIPE_OWNER_OPT} {owner_command} ; display-message -p aoe-pipe-armed"
+            "pipe-pane {flags} -t {target} {pipe_command} ; set-option -t {target} {VT_PIPE_OWNER_OPT} {owner_command} ; display-message -p aoe-pipe-armed"
         );
         let mut command = crate::tmux::tmux_command();
         command.args(["if-shell", "-t", &self.name, "-F", &condition, &arm]);
-        deadline.run(&mut command).is_ok_and(|output| {
-            output.status.success()
-                && String::from_utf8_lossy(&output.stdout)
-                    .lines()
-                    .any(|line| line.trim() == "aoe-pipe-armed")
-        })
+        let Ok(output) = deadline.run(&mut command) else {
+            return false;
+        };
+        let armed = output.status.success()
+            && String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .any(|line| line.trim() == "aoe-pipe-armed");
+        if !armed {
+            tracing::debug!(
+                session = %self.name,
+                expected_owner = owner_id,
+                status = ?output.status.code(),
+                stdout = %String::from_utf8_lossy(&output.stdout),
+                stderr = %String::from_utf8_lossy(&output.stderr),
+                "tmux pipe arm guard failed"
+            );
+        }
+        armed
     }
 
     /// Disable the pane pipe and release its lease iff this exact channel
@@ -2005,10 +2024,12 @@ impl Session {
             "#{{||:#{{==:#{{{VT_PIPE_OWNER_OPT}}},{owner_format}}},#{{==:#{{{VT_OWNER_OPT}}},{owner_format}}}}}"
         );
         let clear_lease_condition = format!("#{{==:#{{{VT_OWNER_OPT}}},{owner_format}}}");
-        let clear_lease = format!("set-option -u {VT_OWNER_OPT} ; set-option -u {VT_OWNER_HB_OPT}");
         let target = Self::tmux_command_string_literal(&format!("{}:^.0", self.name));
+        let clear_lease = format!(
+            "set-option -u -t {target} {VT_OWNER_OPT} ; set-option -u -t {target} {VT_OWNER_HB_OPT}"
+        );
         let release = format!(
-            "pipe-pane -t {target} ; set-option -u {VT_PIPE_OWNER_OPT} ; if-shell -F '{clear_lease_condition}' '{clear_lease}'"
+            "pipe-pane -t {target} ; set-option -u -t {target} {VT_PIPE_OWNER_OPT} ; if-shell -t {target} -F '{clear_lease_condition}' '{clear_lease}'"
         );
         let mut command = crate::tmux::tmux_command();
         command.args(["if-shell", "-t", &self.name, "-F", &condition, &release]);
@@ -3308,7 +3329,7 @@ mod tests {
         let deadline = crate::tmux::TmuxCommandDeadline::new();
         assert!(session.arm_vt_pipe_if_owner_with_deadline(
             "pid-3",
-            "-O",
+            "-IO",
             &pipe_command,
             &deadline,
         ));
