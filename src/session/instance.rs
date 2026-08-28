@@ -9348,6 +9348,18 @@ mod tests {
 
         assert_eq!(reserved.lifecycle_generation, 4);
         assert_eq!(reserved.status, Status::Deleting);
+
+        let mut launch_reserved = reserved.clone();
+        launch_reserved.status = Status::Stopped;
+        launch_reserved.lifecycle_reservation.as_mut().unwrap().op = LifecycleOperation::Launch;
+        launch_reserved.merge_runtime_from_reload(&deleting);
+
+        assert_eq!(launch_reserved.lifecycle_generation, 4);
+        assert_eq!(
+            launch_reserved.status,
+            Status::Stopped,
+            "only a Purge reservation may preserve the Deleting overlay"
+        );
     }
 
     #[test]
