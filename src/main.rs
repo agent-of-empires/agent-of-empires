@@ -174,9 +174,7 @@ async fn main() -> Result<()> {
     let mut debug_log_warning: Option<String> = None;
     // Subscriber installation. One resolver picks the sink based on
     // `ProcessContext` + `[logging]` config (see `logging::resolve_sink`).
-    // Filter precedence: env (AOE_LOG_LEVEL / AGENT_OF_EMPIRES_DEBUG /
-    // overlay vars) > `[logging]` config > info baseline. See
-    // `docs/development/logging.md` for the sink and filter matrix.
+    // Env and trace-overlay variables take precedence over config.
     let env_cfg = LogConfig::from_env();
     let env_filter = env_cfg.filter_string();
     let is_serve = is_serve_command(&cli);

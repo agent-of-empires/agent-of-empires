@@ -10,8 +10,6 @@
 // Playwright's `testInfo`). Port and TMUX_TMPDIR are derived deterministically
 // so parallel workers never collide. tmux is contained inside the test's
 // HOME tree, so cleanup is a simple `rm -rf home`.
-//
-// See `docs/development/playwright.md` for the full recipe.
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 import { existsSync, mkdtempSync, writeFileSync, chmodSync, mkdirSync, realpathSync, rmSync } from "node:fs";

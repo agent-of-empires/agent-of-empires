@@ -117,8 +117,7 @@ pub fn plugin_field_descriptors(
                 // Plugin settings are not host-execution surfaces; the settings
                 // PATCH endpoint is already elevation-gated by the auth layer.
                 web_write: WebWritePolicy::Allow,
-                // Global-only at Tier 0: a plugin setting has one value, stored
-                // in the global config, no per-profile override.
+                // Plugin settings are global, with no profile override.
                 profile_overridable: false,
                 validation,
                 advanced: s.advanced,
@@ -371,7 +370,7 @@ mod tests {
         assert!(matches!(descs[3].widget, WidgetKind::Select { .. }));
         // Label falls back to the key when unset.
         assert_eq!(descs[0].label, "on");
-        // Global-only at Tier 0.
+        // Plugin settings are global.
         assert!(!descs[0].profile_overridable);
     }
 

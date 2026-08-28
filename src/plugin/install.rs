@@ -18,19 +18,14 @@ use super::lockfile::{LockedPlugin, Lockfile};
 use super::registry::ValidationState;
 use super::source::PluginSource;
 
-/// Where install / update / uninstall progress and child build output are
-/// written. The CLI uses `Inherit` so the user watches build output on their
-/// terminal; the dashboard's host-side job path uses `File`, so a dashboard
-/// user with no terminal attached can tail the same output.
+/// Build output goes to the CLI terminal or a dashboard job log.
 pub enum OperationLog {
     Inherit,
     File(std::fs::File),
 }
 
 impl OperationLog {
-    /// Open a job log file in append mode, owner-only (0600 on Unix). Build
-    /// output is not secret, but the log lives beside other 0600 daemon state,
-    /// so keep the convention.
+    /// Open an append log; newly created Unix files use mode 0600.
     pub fn file(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -59,8 +54,7 @@ impl OperationLog {
         }
     }
 
-    /// stdout and stderr for a child build step: inherited for the CLI, or two
-    /// clones of the job log handle so the child's output lands in the tail.
+    /// Route child stdout and stderr to the selected destination.
     fn child_stdio(&self) -> Result<(Stdio, Stdio)> {
         match self {
             OperationLog::Inherit => Ok((Stdio::inherit(), Stdio::inherit())),

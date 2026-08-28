@@ -69,9 +69,7 @@ struct PluginCommandsEnvelope {
     commands: Vec<PluginCommandView>,
 }
 
-/// What the daemon did with a prompt, from the `/acp/prompt` 202 body. Wire
-/// mirror of the server's `PromptDispatchResponse`; see
-/// `docs/development/server-owned-prompt-dispatch.md`.
+/// Wire mirror of the daemon's `/acp/prompt` disposition.
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Deserialize)]
 pub struct PromptDispatchWire {
     /// `sent` / `steered` / `queued`. Defaults to `sent`, which is what the
@@ -296,11 +294,8 @@ impl HttpClient {
 
     /// `POST /api/sessions/{id}/acp/prompt`.
     ///
-    /// The daemon decides whether the prompt is sent, steered into the running
-    /// turn, or parked on the server queue, and the response says which (Tier
-    /// 3, `docs/development/server-owned-prompt-dispatch.md`). A body the
-    /// client cannot parse is read as `Sent`, which is what a pre-Tier-3
-    /// daemon's bare 202 meant.
+    /// The daemon returns whether it sent, steered, or queued the prompt. An
+    /// absent body is treated as `Sent` for older daemons.
     pub async fn prompt(
         &self,
         session_id: &str,
@@ -400,8 +395,7 @@ impl HttpClient {
 
     /// `GET /api/sessions/{id}/queue`: the server-owned prompt queue, ordered
     /// by ascending `seq`. The daemon owns and drains this queue, so the native
-    /// view mirrors it rather than keeping its own (the web client does the
-    /// same). See `docs/development/server-side-prompt-queue.md`.
+    /// view mirrors it rather than keeping its own.
     pub async fn queue_list(
         &self,
         session_id: &str,

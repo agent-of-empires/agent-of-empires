@@ -1,10 +1,7 @@
 //! Server-owned prompt-queue HTTP handlers.
 //!
-//! The structured-view prompt queue's source of truth is the daemon (see
-//! `docs/development/server-side-prompt-queue.md`), so a follow-up queued
-//! behind a busy turn survives a client reload / closed PWA and drains
-//! server-side. These handlers are the client's view/editor of that queue;
-//! the drain and force-send-now live in the reconciler / supervisor.
+//! The daemon persists and drains the queue, so follow-ups survive client
+//! reloads and closed PWAs. These handlers expose queue mutations to clients.
 //!
 //! Attachments ride with a queued prompt: the enqueue POST carries the same
 //! `PromptAttachmentUpload` shape as `/acp/prompt`, the bytes are validated and

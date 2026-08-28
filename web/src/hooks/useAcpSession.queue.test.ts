@@ -1,12 +1,4 @@
 // @vitest-environment jsdom
-//
-// Tests for the SERVER-owned prompt queue (see
-// docs/development/server-side-prompt-queue.md). The daemon owns the queue and
-// drains it; the client keeps an optimistic overlay, POSTs mutations to the
-// /queue endpoints, and reconciles against the server snapshot via
-// `hydrate_server_queue`. The old client-side drain (combined mode,
-// clear-boundary split, background drain coordinator) is gone, so its tests
-// are gone with it.
 
 import { act, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";

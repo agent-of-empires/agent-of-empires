@@ -1569,8 +1569,8 @@ async fn drain_pending_initial_turns(state: &Arc<AppState>) {
 }
 
 /// Deliver each session's server-owned prompt queue once its turn has ended,
-/// so a follow-up queued behind a busy turn drains with no client tab open
-/// (see `docs/development/server-side-prompt-queue.md`). Candidates are idle
+/// so a follow-up queued behind a busy turn drains with no client tab open.
+/// Candidates are idle
 /// (turn ended), structured, live sessions with a non-empty queue; the drain
 /// itself re-checks state under the per-instance lock and applies the
 /// `/clear`-boundary split. Gating on `is_running` here means the worker is
