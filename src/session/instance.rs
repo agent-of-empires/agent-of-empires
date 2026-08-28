@@ -3751,7 +3751,7 @@ impl Instance {
     /// Launch command including any agent `launch_subcommand` (e.g.
     /// `kiro-cli chat`). A user command override takes precedence verbatim and
     /// the subcommand is not applied to it. Used when assembling the launch
-    /// command so subcommand-scoped flags (yolo, resume) parse correctly.
+    /// command so subcommand-scoped flags (yolo, agent selection) parse correctly.
     fn get_launch_command(&self) -> String {
         if self.command.is_empty() {
             crate::agents::get_agent(&self.tool)
@@ -13131,8 +13131,8 @@ mod tests {
 
     mod resume_fallback {
         use super::super::{
-            should_attempt_resume, Instance, LaunchSidOutcome, ResumeAttemptPolicy, ResumeIntent,
-            SidPersistOutcome, StartOutcome, Status,
+            build_resume_flags, should_attempt_resume, Instance, LaunchSidOutcome,
+            ResumeAttemptPolicy, ResumeIntent, SidPersistOutcome, StartOutcome, Status,
         };
         use crate::session::test_support::EnvGuard;
         use serial_test::serial;
@@ -13213,11 +13213,55 @@ mod tests {
         }
 
         #[test]
-        fn unsupported_agent_does_not_attempt_resume() {
-            assert!(!should_attempt_resume(
-                Some("11111111-1111-1111-1111-111111111111"),
-                "cursor"
-            ));
+        fn resume_capability_controls_launch_poller_and_recovery() {
+            let sid = "11111111-1111-1111-1111-111111111111";
+            let cases = [
+                ("cursor", false),
+                ("qwen", false),
+                ("kiro", false),
+                ("claude", true),
+                ("opencode", true),
+            ];
+
+            for (tool, supported) in cases {
+                let mut inst = Instance::new("resume-contract", "/tmp/test");
+                inst.tool = tool.to_string();
+                inst.agent_session_id = Some(sid.to_string());
+                inst.resume_intent = ResumeIntent::Use(sid.to_string());
+
+                assert_eq!(
+                    should_attempt_resume(Some(sid), tool),
+                    supported,
+                    "{tool}: resume-probe decision"
+                );
+                assert_eq!(
+                    inst.supports_session_poller(),
+                    supported,
+                    "{tool}: poller capability"
+                );
+                assert_eq!(
+                    crate::session::recovery::is_recovery_candidate(&inst),
+                    supported,
+                    "{tool}: startup recovery eligibility"
+                );
+
+                let mut command = crate::agents::get_agent(tool)
+                    .unwrap()
+                    .launch_base_command();
+                let base_command = command.clone();
+                let resumed = inst.apply_session_flags(&mut command, "test");
+                assert_eq!(resumed, supported, "{tool}: launch resume decision");
+                assert_eq!(
+                    command != base_command,
+                    supported,
+                    "{tool}: resume argv emission: {command}"
+                );
+                assert_eq!(
+                    build_resume_flags(tool, sid, true).is_empty(),
+                    !supported,
+                    "{tool}: direct resume flags"
+                );
+            }
         }
 
         #[test]

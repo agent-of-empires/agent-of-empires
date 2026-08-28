@@ -47,8 +47,8 @@ pub enum SessionCommands {
     /// restarts the agent so it can see it; the conversation is kept. See #3103.
     AddProject(AddProjectArgs),
 
-    /// Set the resume target for a session (pin a conversation or force a
-    /// one-shot fresh start)
+    /// Set the resume target for a session; agents with resume disabled in AoE
+    /// store the ID but do not use it
     SetSessionId(SetSessionIdArgs),
 
     /// Set or clear the per-session diff base branch. The diff view
@@ -278,9 +278,9 @@ struct CaptureOutput {
 pub struct SetSessionIdArgs {
     /// Session ID or title
     identifier: String,
-    /// Resume target: a UUID/sid pins the next launches to that
-    /// conversation; an empty string forces a one-shot fresh start (after
-    /// which the system reverts to auto-resume).
+    /// Resume target: for resume-enabled agents, a UUID/sid pins subsequent
+    /// launches to that conversation; agents with resume disabled in AoE store
+    /// but do not use it. An empty string forces a one-shot fresh start.
     session_id: String,
 }
 
@@ -2373,7 +2373,10 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
                     agent.resume_strategy,
                     crate::agents::ResumeStrategy::Unsupported
                 ) {
-                    eprintln!("Warning: {} does not support session resume; this ID will be stored but not used.", tool);
+                    eprintln!(
+                        "Warning: session resume is disabled for {} in AoE; this ID will be stored but not used.",
+                        tool
+                    );
                 }
             }
         }
