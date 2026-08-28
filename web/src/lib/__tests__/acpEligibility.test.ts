@@ -23,6 +23,10 @@ describe("isAcpEligible", () => {
       // No agent record yet (the list is still loading): falls back to the
       // hardcoded tool set, same as isAcpCapable.
       ["claude", undefined, true],
+      // Hardcoded fallback set members: must stay eligible even when the
+      // agent list has not loaded yet.
+      ["kimi", undefined, true],
+      ["prime-agent", undefined, true],
       ["some-unknown-tool", undefined, false],
       // A policy denial wins even before the capability flag has arrived.
       ["claude", { acp_allowed: false }, false],

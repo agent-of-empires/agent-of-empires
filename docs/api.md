@@ -36,6 +36,7 @@ Physical source roots are stable ids:
 | `gemini-user` | `~/.gemini/skills` | Gemini |
 | `opencode-user` | `~/.config/opencode/skills` | OpenCode |
 | `kimi-legacy` | `~/.kimi-code/skills` | Kimi legacy installations |
+| `prime-agent-user` | `~/.prime/agent/skills` | Prime Agent |
 | `aoe-managed` | `<app-dir>/skills` | AoE-managed packages |
 
 ### GET /api/skills

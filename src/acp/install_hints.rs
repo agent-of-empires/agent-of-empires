@@ -27,6 +27,12 @@ pub fn install_hint_for(binary: &str) -> Option<&'static str> {
         }
         "kimi" => "curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash  (then `kimi acp`)",
         "omp" => "curl -fsSL https://omp.sh/install | sh",
+        // The official installer wraps a checksum-verified `npm install -g`
+        // of a release tarball, so the curl script is the supported path;
+        // the package is not on the npm registry.
+        "prime-agent" => {
+            "curl -fsSL https://app.primeintellect.ai/prime-agent/install.sh | sh  (then `/login` once)"
+        }
         _ => return None,
     })
 }
@@ -48,12 +54,13 @@ pub fn npm_package_for(binary: &str) -> Option<&'static str> {
 
 /// Operator env vars to forward to a given ACP binary, on top of the
 /// infrastructure-only `ALWAYS_FORWARD_ENV` in `acp_client.rs`. Empty slice
-/// means no ambient provider credentials. Four adapters (`pi-acp`, `omp`,
-/// `kimi`, `vibe-acp`) are intentionally deferred because their env-var names
-/// could not be source-verified for #3238 and shipping a guess that never
-/// matches would silently no-op the fix. Follow-up: verify each adapter's real
-/// reads from its own package/binary and add its arm. Every arm below cites the
-/// artifact its names came from; do not add one on convention alone.
+/// means no ambient provider credentials. Five adapters (`pi-acp`, `omp`,
+/// `kimi`, `vibe-acp`, `prime-agent`) are intentionally deferred because
+/// their env-var names could not be source-verified for #3238 and shipping a
+/// guess that never matches would silently no-op the fix. Follow-up: verify
+/// each adapter's real reads from its own package/binary and add its arm.
+/// Every arm below cites the artifact its names came from; do not add one on
+/// convention alone.
 ///
 /// The key is the friendly binary token used at registration time (e.g.
 /// [`AOE_AGENT_BINARY`]), NOT `AgentSpec.command`. `command` for `aoe-agent`
@@ -163,6 +170,7 @@ mod tests {
             "pi-acp",
             "kimi",
             "omp",
+            "prime-agent",
         ] {
             assert!(
                 install_hint_for(binary).is_some(),

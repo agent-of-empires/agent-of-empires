@@ -23,12 +23,13 @@ use crate::session::capture::{
     capture_claude_session_id, capture_claude_session_id_in_container, capture_codex_session_id,
     capture_copilot_session_id, capture_gemini_session_id, capture_hermes_session_id,
     capture_kimi_session_id, capture_omp_session_id, capture_pi_session_id,
-    capture_vibe_session_id, claude_poll_fn, claude_poll_fn_sandboxed, codex_poll_fn,
-    codex_poll_fn_sandboxed, copilot_poll_fn, gemini_poll_fn, gemini_poll_fn_sandboxed,
-    generate_claude_session_id, hermes_poll_fn, hermes_poll_fn_sandboxed, is_valid_session_id,
-    kimi_poll_fn, omp_host_routing_environment, omp_poll_fn, omp_poll_fn_sandboxed,
-    omp_sandbox_launch_marker, opencode_poll_fn, opencode_poll_fn_sandboxed, pi_poll_fn,
-    pi_poll_fn_sandboxed, reject_omp_secret_args, resolve_omp_store_layout,
+    capture_prime_agent_session_id, capture_vibe_session_id, claude_poll_fn,
+    claude_poll_fn_sandboxed, codex_poll_fn, codex_poll_fn_sandboxed, copilot_poll_fn,
+    gemini_poll_fn, gemini_poll_fn_sandboxed, generate_claude_session_id, hermes_poll_fn,
+    hermes_poll_fn_sandboxed, is_valid_session_id, kimi_poll_fn, omp_host_routing_environment,
+    omp_poll_fn, omp_poll_fn_sandboxed, omp_sandbox_launch_marker, opencode_poll_fn,
+    opencode_poll_fn_sandboxed, pi_poll_fn, pi_poll_fn_sandboxed, prime_agent_poll_fn,
+    reject_omp_secret_args, resolve_omp_store_layout,
     resolve_omp_store_layout_in_container_with_environment,
     resolve_omp_store_layout_with_environment, try_capture_codex_session_id_in_container,
     try_capture_gemini_session_id_in_container, try_capture_hermes_session_id_in_container,
@@ -3421,6 +3422,22 @@ impl Instance {
                     .ok()
                 }
             }
+            "prime-agent" => {
+                // Prime Agent writes one JSONL per session under
+                // `~/.prime/agent/sessions`, header line keyed by cwd. Host
+                // capture reads it directly; sandbox resume is a follow-up
+                // (the container's sessions dir is not read over `docker
+                // exec`), so a sandboxed Prime Agent session starts fresh on
+                // restart, mirroring Copilot and Kimi.
+                if self.is_sandboxed() {
+                    None
+                } else {
+                    let exclusion = self.retroactive_capture_exclusion_set();
+                    // Retroactive recovery is unrestricted (no launch floor):
+                    // resuming an older session on restart is the goal here.
+                    capture_prime_agent_session_id(&self.project_path, &exclusion, None).ok()
+                }
+            }
             _ => None,
         };
         result.and_then(validated_session_id)
@@ -3669,13 +3686,14 @@ impl Instance {
             return false;
         }
         let (mut session_id, is_existing) = self.acquire_session_id();
-        // Sandboxed Copilot and Kimi start fresh: their session stores live
-        // inside the container (Copilot's SQLite db, Kimi's
-        // `~/.kimi-code/session_index.jsonl`), so a host-captured or manually
-        // pinned sid would launch `--session[-id] <id>` against an id that does
+        // Sandboxed Copilot, Kimi, and Prime Agent start fresh: their session
+        // stores live inside the container (Copilot's SQLite db, Kimi's
+        // `~/.kimi-code/session_index.jsonl`, Prime Agent's
+        // `~/.prime/agent/sessions/*.jsonl`), so a host-captured or manually
+        // pinned sid would launch `--resume <id>` against an id that does
         // not resolve there. Capture is already host-only above; drop the sid
         // to gate emission too.
-        if matches!(self.tool.as_str(), "copilot" | "kimi") && self.is_sandboxed() {
+        if matches!(self.tool.as_str(), "copilot" | "kimi" | "prime-agent") && self.is_sandboxed() {
             session_id = None;
         }
         let emitted =
@@ -5979,6 +5997,22 @@ impl Instance {
                     launch_time_ms,
                     extra_excludes,
                     self.resolved_host_environment(),
+                ))
+            }
+            "prime-agent" => {
+                // Host-only, mirroring Copilot and Kimi: the Prime Agent
+                // sessions directory is read from the host `~/.prime/agent`.
+                // Sandboxed sessions have no poller and start fresh on
+                // restart (sandbox resume is a follow-up).
+                if self.is_sandboxed() {
+                    return;
+                }
+                let launch_time_ms = crate::util::now_ms() as f64;
+                Box::new(prime_agent_poll_fn(
+                    self.project_path.clone(),
+                    self.id.clone(),
+                    launch_time_ms,
+                    extra_excludes,
                 ))
             }
             _ => return,
@@ -11821,6 +11855,101 @@ mod tests {
         assert_eq!(
             inst.agent_session_id.as_deref(),
             Some("child-5555-6666-7777-888888888888")
+        );
+    }
+
+    #[test]
+    fn sandboxed_host_only_capture_agents_drop_pinned_sid_at_emission() {
+        // The apply_session_flags gate exists so a pinned or host-captured
+        // resume id is never launched inside a container whose own sessions
+        // store starts empty (copilot | kimi | prime-agent). Pin the
+        // prime-agent arm: deleting it from the matches! must fail here.
+        let sid = "11111111-2222-3333-4444-555555555555";
+        for tool in ["copilot", "kimi", "prime-agent"] {
+            let mut inst = Instance::new("test", "/tmp/test");
+            inst.tool = tool.to_string();
+            inst.agent_session_id = Some(sid.to_string());
+            inst.resume_intent = ResumeIntent::Use(sid.to_string());
+            inst.sandbox_info = Some(SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "test-image".to_string(),
+                container_name: "test".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: None,
+            });
+            let mut cmd = tool.to_string();
+            let resumed = inst.apply_session_flags(&mut cmd, "test");
+            assert_eq!(
+                cmd, tool,
+                "{tool}: sandboxed launch must not emit resume flags"
+            );
+            // The sid stays pinned in agent_session_id; only its emission
+            // into the container command is suppressed, so the method reports
+            // "no resume flags applied" (is_existing && emitted == false).
+            assert!(!resumed, "{tool}");
+            assert_eq!(
+                inst.agent_session_id.as_deref(),
+                Some(sid),
+                "{tool}: suppression must not clear the stored sid"
+            );
+        }
+        // Host control: without a sandbox the same pinned sid IS emitted.
+        let mut host_inst = Instance::new("test", "/tmp/test");
+        host_inst.tool = "prime-agent".to_string();
+        host_inst.agent_session_id = Some(sid.to_string());
+        host_inst.resume_intent = ResumeIntent::Use(sid.to_string());
+        let mut cmd = "prime-agent".to_string();
+        assert!(host_inst.apply_session_flags(&mut cmd, "test"));
+        assert_eq!(cmd, format!("prime-agent --resume {sid}"));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn sandboxed_prime_agent_capture_and_poller_stay_host_only() {
+        // Both host-only dispatch points must decline before doing any work:
+        // retroactive capture would otherwise read the HOST sessions dir for
+        // a container session, and the poller would adopt a host peer's sid.
+        // A matching host session is seeded so the capture assertion cannot
+        // pass vacuously: only the sandbox gate keeps it None.
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir(&sessions_dir).unwrap();
+        std::fs::write(
+            sessions_dir.join("seed.jsonl"),
+            "{\"type\":\"session\",\"version\":3,\
+              \"id\":\"11111111-2222-3333-4444-555555555555\",\
+              \"timestamp\":\"2026-08-23T00:00:00.000Z\",\
+              \"cwd\":\"/tmp/test\",\"rlmDepth\":0}\n",
+        )
+        .unwrap();
+        let _env = EnvGuard::set(&[("PRIME_AGENT_CODING_AGENT_DIR", tmp.path())]);
+        let _app = crate::session::test_support::isolate_app_dir_at(&tmp.path().join("app"));
+
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.tool = "prime-agent".to_string();
+        inst.sandbox_info = Some(SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test-image".to_string(),
+            container_name: "test".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        });
+        assert_eq!(inst.try_retroactive_capture(), None);
+        inst.maybe_start_poller_since(None);
+        assert!(inst.session_id_poller.is_none());
+
+        // Host control: the same store yields the matching sid once the
+        // session is not sandboxed, proving the seed was loadable at all.
+        inst.sandbox_info = None;
+        assert_eq!(
+            inst.try_retroactive_capture().as_deref(),
+            Some("11111111-2222-3333-4444-555555555555")
         );
     }
 

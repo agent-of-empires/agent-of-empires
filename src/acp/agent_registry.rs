@@ -85,6 +85,8 @@ impl AgentRegistry {
     ///   vibe     → vibe-acp             (native, Mistral)
     ///   pi       → pi-acp               (adapter, Pi coding agent)
     ///   omp      → `omp acp`            (native, Oh My Pi)
+    ///   kimi     → `kimi acp`           (native, Kimi Code)
+    ///   prime-agent → `prime-agent --mode acp` (native, PrimeIntellect)
     ///
     /// We deliberately don't use `npx -y` for these. First-run
     /// downloads can hang for tens of seconds with no output, which
@@ -181,6 +183,16 @@ impl AgentRegistry {
                 args: vec!["acp".into()],
                 description: "Kimi Code (Moonshot AI), native ACP via `kimi acp`".into(),
                 env_allowlist: default_env_allowlist("kimi"),
+            },
+        );
+        reg.agents.insert(
+            "prime-agent".into(),
+            AgentSpec {
+                command: "prime-agent".into(),
+                args: vec!["--mode".into(), "acp".into()],
+                description: "PrimeIntellect Prime Agent, native ACP via `prime-agent --mode acp`"
+                    .into(),
+                env_allowlist: default_env_allowlist("prime-agent"),
             },
         );
         reg.agents.insert(
@@ -284,7 +296,8 @@ mod tests {
     /// #3238: verified adapters (`claude`, `codex`, `opencode`, `gemini`,
     /// `aoe-agent`)
     /// forward the operator's provider-auth env; adapters whose real env
-    /// vars couldn't be source-verified (pi, omp, kimi, vibe) stay `None`.
+    /// vars couldn't be source-verified (pi, omp, kimi, vibe, prime-agent)
+    /// stay `None`.
     /// One row asserts a specific negative for `aoe-agent`: it must NOT
     /// receive `GEMINI_API_KEY` (that's the CLI-native name; the bundled
     /// AI-SDK agent reads `GOOGLE_GENERATIVE_AI_API_KEY` instead). The
@@ -373,7 +386,7 @@ mod tests {
 
         // Deferred adapters stay None until each adapter's env reads are
         // verified from its own source.
-        for name in ["pi", "omp", "kimi", "vibe"] {
+        for name in ["pi", "omp", "kimi", "vibe", "prime-agent"] {
             assert!(
                 al(name).is_none(),
                 "{name} must have None env_allowlist until source-verified"
@@ -405,6 +418,38 @@ mod tests {
                 .collect::<std::collections::BTreeSet<_>>(),
             "the set of adapters with an env_allowlist changed; update env_allowlist_for and this assertion together"
         );
+    }
+
+    #[test]
+    fn defaults_spawn_commands_match_expected() {
+        // The structured view runner executes each spec's command+args
+        // verbatim; a typo'd or reordered argv only breaks at handshake time,
+        // so pin every default adapter's exact spawn contract here.
+        let reg = AgentRegistry::with_defaults();
+        let expected: &[(&str, &str, &[&str])] = &[
+            ("claude", "claude-agent-acp", &[]),
+            ("claude-code", "claude-agent-acp", &[]),
+            ("opencode", "opencode", &["acp"]),
+            ("gemini", "gemini", &["--acp"]),
+            ("codex", "codex-acp", &[]),
+            ("vibe", "vibe-acp", &[]),
+            ("pi", "pi-acp", &[]),
+            ("omp", "omp", &["acp"]),
+            ("kimi", "kimi", &["acp"]),
+            ("prime-agent", "prime-agent", &["--mode", "acp"]),
+            (
+                "aoe-agent",
+                "${aoe_data_dir}/acp-worker/dist/aoe-agent",
+                &[],
+            ),
+        ];
+        for (name, command, args) in expected {
+            let spec = reg
+                .get(name)
+                .unwrap_or_else(|| panic!("missing adapter {name}"));
+            assert_eq!(spec.command, *command, "{name} command drifted");
+            assert_eq!(spec.args, *args, "{name} args drifted");
+        }
     }
 
     #[test]

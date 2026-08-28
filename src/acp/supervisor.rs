@@ -4360,6 +4360,7 @@ cursor-acp-bridge = "agent acp"
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn spawn_unknown_agent_errors_cleanly() {
         let sink = VecSink::new();
         let sup = Supervisor::new(sink);

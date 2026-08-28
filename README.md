@@ -47,7 +47,7 @@ A session manager for AI coding agents on Linux and macOS, driven from the termi
 
 ## Features
 
-- **Multi-agent support**: Claude Code, OpenCode, Mistral Vibe, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi.dev, Oh My Pi (OMP), Factory Droid, Hermes, Kiro CLI, Qwen Code, and Kimi Code
+- **Multi-agent support**: Claude Code, OpenCode, Mistral Vibe, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi.dev, Oh My Pi (OMP), Factory Droid, Hermes, Kiro CLI, Qwen Code, Kimi Code, and Prime Agent
 - **TUI dashboard**: visual interface to create, monitor, and manage sessions
 - **Web dashboard**: create, monitor, and control your agents from any browser, installable as a PWA
 - **Structured view** (web dashboard default): mobile-first native rendering of agent state via the Agent Client Protocol, with plan panels, tool-call cards, and swipe-to-approve. Flip a session to the terminal view for raw tmux rendering
@@ -142,7 +142,7 @@ Nothing. Sessions are tmux sessions running in the background. Open and close `a
 
 ### Which AI tools are supported?
 
-Claude Code, OpenCode, Mistral Vibe, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi.dev, Oh My Pi (OMP), Factory Droid, Hermes, Kiro CLI, Qwen Code, and Kimi Code. AoE auto-detects which are installed on your system.
+Claude Code, OpenCode, Mistral Vibe, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi.dev, Oh My Pi (OMP), Factory Droid, Hermes, Kiro CLI, Qwen Code, Kimi Code, and Prime Agent. AoE auto-detects which are installed on your system.
 
 Agents carry a lifecycle state in AoE's registry. When an upstream vendor
 deprecates a CLI, AoE keeps supporting it but marks it everywhere it appears

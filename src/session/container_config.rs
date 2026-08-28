@@ -303,6 +303,23 @@ const AGENT_CONFIG_MOUNTS: &[AgentConfigMount] = &[
         preserve_files: &[],
         clean_files: &[],
     },
+    AgentConfigMount {
+        tool_name: "prime-agent",
+        host_rel: ".prime/agent",
+        container_suffix: ".prime/agent",
+        // Skip AoE's sandbox staging dir, the per-instance session
+        // transcripts, and the bootstrapped IPython kernel venv
+        // (machine-specific, and the container rebuilds it on first run).
+        // skills/ stays un-skipped and is copied below so user-authored
+        // host skills reach the container, like Kimi's mount.
+        skip_entries: &["sandbox", "sessions", "kernel-venv"],
+        seed_files: &[],
+        copy_dirs: &["skills"],
+        keychain_credential: None,
+        home_seed_files: &[],
+        preserve_files: &[],
+        clean_files: &[],
+    },
 ];
 
 /// Sync host agent config into the shared sandbox directory. Copies top-level files
@@ -3076,6 +3093,27 @@ mod tests {
         assert!(!sandbox.join("subdir").exists());
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn test_prime_agent_mount_copies_user_skills() {
+        let home = TempDir::new().unwrap();
+        let _app_dir = crate::session::test_support::isolate_app_dir_at(home.path());
+        let skill_dir = home.path().join(".prime/agent/skills/reviewing");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(skill_dir.join("SKILL.md"), "review instructions").unwrap();
+
+        let prime_mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|m| m.tool_name == "prime-agent")
+            .expect("prime-agent mount must exist");
+        let sandbox = prepare_sandbox_dir(prime_mount, home.path(), None).unwrap();
+
+        assert_eq!(
+            fs::read_to_string(sandbox.join("skills/reviewing/SKILL.md")).unwrap(),
+            "review instructions"
+        );
+    }
+
     // Regression for #3014: settings.json (a top-level file) referenced a hook
     // script under ~/.claude/hooks/, but `hooks` was absent from Claude's
     // copy_dirs, so the config was carried into the sandbox without the script
@@ -3445,6 +3483,9 @@ mod tests {
             ("gemini", Some("skills")),
             ("opencode", Some("skills")),
             ("kimi", Some("skills")),
+            // Prime Agent reads ~/.prime/agent/skills, under its .prime/agent
+            // mount.
+            ("prime-agent", Some("skills")),
             // Codex reads ~/.agents/skills, which is not under its .codex mount.
             ("codex", None),
         ];
