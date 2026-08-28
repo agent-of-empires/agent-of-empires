@@ -25,7 +25,7 @@ pub enum OperationLog {
 }
 
 impl OperationLog {
-    /// Open an owner-only append log, matching adjacent daemon state.
+    /// Open an append log; newly created Unix files use mode 0600.
     pub fn file(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
