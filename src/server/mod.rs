@@ -1272,17 +1272,10 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // Legacy Qwen/Kiro ownership must be gone before terminal recovery can
     // inspect the global tmux environment.
     let legacy_env_instances = state.instances.read().await.clone();
-    if let Err(error) = tokio::task::spawn_blocking(move || {
-        let live = crate::tmux::LiveSessionSnapshot::new();
-        crate::session::sync::clear_unsupported_tmux_session_id_env(
-            legacy_env_instances.iter(),
-            &live,
-        );
+    tokio::task::spawn_blocking(move || {
+        crate::session::sync::reconcile_tmux_session_id_ownership_env(&legacy_env_instances)
     })
-    .await
-    {
-        tracing::warn!(target: "session.sync", "Daemon startup env cleanup task failed: {error}");
-    }
+    .await??;
 
     // Seed acp sessions' status from the on-disk event log before
     // any background task runs. The status_poll_loop overlay reads
@@ -6346,14 +6339,20 @@ async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
         // visits every instance, so a per-item `list-sessions` fork scales with
         // the store.
         let live = crate::tmux::LiveSessionSnapshot::new();
-        crate::session::sync::sync_tmux_session_id_env(snapshot.iter(), &live);
-        let repaired: std::collections::HashSet<String> = snapshot
-            .iter_mut()
-            .filter_map(|inst| {
-                inst.repair_session_id_poller_if_needed(&live)
-                    .then(|| inst.id.clone())
-            })
-            .collect();
+        let repaired: std::collections::HashSet<String> = if let Err(error) =
+            crate::session::sync::sync_tmux_session_id_env(snapshot.iter(), &live)
+        {
+            tracing::warn!(target: "session.sync", "Daemon env reconcile failed: {error}");
+            std::collections::HashSet::new()
+        } else {
+            snapshot
+                .iter_mut()
+                .filter_map(|inst| {
+                    inst.repair_session_id_poller_if_needed(&live)
+                        .then(|| inst.id.clone())
+                })
+                .collect()
+        };
         (outcome, snapshot, baseline, repaired)
     })
     .await

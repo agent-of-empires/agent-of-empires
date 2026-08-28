@@ -101,6 +101,26 @@ pub(crate) fn get_hidden_env_uncached(session_name: &str, key: &str) -> Option<S
     fetch_env_uncached(session_name, key, true)
 }
 
+/// Read a hidden value without collapsing tmux failures into a missing key.
+pub(crate) fn get_hidden_env_strict(
+    session_name: &str,
+    key: &str,
+) -> anyhow::Result<Option<String>> {
+    let output = crate::tmux::tmux_command()
+        .args(["show-environment", "-h", "-t", session_name, key])
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        bail!("Failed to read hidden env var from {session_name}: {stderr}");
+    }
+    let line = String::from_utf8_lossy(&output.stdout);
+    let line = line.trim();
+    if line.starts_with('-') {
+        return Ok(None);
+    }
+    Ok(line.split_once('=').map(|(_, value)| value.to_string()))
+}
+
 pub(crate) fn get_env_uncached(session_name: &str, key: &str) -> Option<String> {
     fetch_env_uncached(session_name, key, false)
 }
@@ -141,10 +161,8 @@ pub fn remove_hidden_env(session_name: &str, key: &str) -> anyhow::Result<()> {
 }
 
 /// Remove hidden environment variables from multiple sessions with a single tmux command.
-///
 /// Each tuple is `(session_name, key)`. Falls back to per-entry calls on
-/// batch failure; per-entry failures are logged but do not abort subsequent
-/// entries (best-effort cleanup).
+/// batch failure, attempts every entry, and reports any fallback failure.
 pub fn remove_hidden_env_batch(entries: &[(&str, &str)]) -> anyhow::Result<()> {
     if entries.is_empty() {
         return Ok(());
@@ -178,30 +196,33 @@ pub fn remove_hidden_env_batch(entries: &[(&str, &str)]) -> anyhow::Result<()> {
                 "Batch tmux set-environment -u failed (exit {}), falling back to sequential unsets",
                 out.status
             );
-            sequential_remove_fallback(entries);
-            Ok(())
+            sequential_remove_fallback(entries)
         }
         Err(e) => {
             tracing::debug!(target: "tmux.command",
                 "Batch tmux set-environment -u error: {}, falling back to sequential unsets",
                 e
             );
-            sequential_remove_fallback(entries);
-            Ok(())
+            sequential_remove_fallback(entries)
         }
     }
 }
 
-fn sequential_remove_fallback(entries: &[(&str, &str)]) {
+fn sequential_remove_fallback(entries: &[(&str, &str)]) -> anyhow::Result<()> {
+    let mut failures = Vec::new();
     for (session_name, key) in entries {
-        if let Err(e) = remove_hidden_env(session_name, key) {
-            tracing::debug!(target: "tmux.command",
-                "Sequential unset of {} on {} failed: {}",
-                key,
-                session_name,
-                e
-            );
+        if let Err(error) = remove_hidden_env(session_name, key) {
+            failures.push(format!("{session_name}:{key}: {error}"));
         }
+    }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "Failed to remove {} hidden env vars: {}",
+            failures.len(),
+            failures.join("; ")
+        )
     }
 }
 
@@ -544,5 +565,16 @@ mod tests {
     fn test_get_hidden_env_batch_empty_input() {
         let result = get_hidden_env_batch(&[], "KEY");
         assert_eq!(result.len(), 0);
+    }
+
+    #[test]
+    fn strict_hidden_env_operations_report_missing_session() {
+        let missing = format!(
+            "{}missing_{}",
+            crate::tmux::SESSION_PREFIX,
+            uuid::Uuid::new_v4().simple()
+        );
+        assert!(get_hidden_env_strict(&missing, AOE_INSTANCE_ID_KEY).is_err());
+        assert!(remove_hidden_env_batch(&[(&missing, AOE_CAPTURED_SESSION_ID_KEY)]).is_err());
     }
 }

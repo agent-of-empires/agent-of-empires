@@ -2546,9 +2546,9 @@ impl HomeView {
 
         // Reconcile durable IDs into every live tmux session. Unsupported
         // agents retain IDs on disk but must not publish them as ownership.
-        crate::session::sync::clear_all_profiles_unsupported_tmux_session_id_env();
+        crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env()?;
         let live = crate::tmux::LiveSessionSnapshot::new();
-        crate::session::sync::sync_tmux_session_id_env(view.instances.values(), &live);
+        crate::session::sync::sync_tmux_session_id_env(view.instances.values(), &live)?;
 
         // Recover session IDs for pre-existing sessions via pollers.
         for inst in view.instances.values_mut() {

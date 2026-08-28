@@ -110,7 +110,7 @@ fn tmux_session_id_env_names(
 pub(crate) fn sync_tmux_session_id_env<'a>(
     instances: impl IntoIterator<Item = &'a Instance>,
     live: &crate::tmux::LiveSessionSnapshot,
-) {
+) -> anyhow::Result<()> {
     let (set_batch, unset_batch) = tmux_session_id_env_updates(instances, |instance| {
         tmux_session_id_env_names(instance, live)
     });
@@ -119,79 +119,100 @@ pub(crate) fn sync_tmux_session_id_env<'a>(
             .iter()
             .map(|(session, key, value)| (session.as_str(), key.as_str(), value.as_str()))
             .collect();
-        if let Err(error) = crate::tmux::env::set_hidden_env_batch(&refs) {
-            tracing::warn!(target: "session.sync", "Session env reconcile failed: {error}");
-        }
+        crate::tmux::env::set_hidden_env_batch(&refs)?;
     }
     if !unset_batch.is_empty() {
         let refs: Vec<(&str, &str)> = unset_batch
             .iter()
             .map(|(session, key)| (session.as_str(), key.as_str()))
             .collect();
-        if let Err(error) = crate::tmux::env::remove_hidden_env_batch(&refs) {
-            tracing::warn!(target: "session.sync", "Session env cleanup failed: {error}");
-        }
+        crate::tmux::env::remove_hidden_env_batch(&refs)?;
     }
+    Ok(())
 }
 
-/// Clear legacy ownership signals for unsupported agents in the supplied rows.
-pub(crate) fn clear_unsupported_tmux_session_id_env<'a>(
-    instances: impl IntoIterator<Item = &'a Instance>,
-    live: &crate::tmux::LiveSessionSnapshot,
-) {
-    let mut unset_batch = Vec::new();
-    for instance in instances {
-        if instance.supports_terminal_resume() {
+type TmuxOwnershipObservation = (String, Option<String>, Option<String>);
+
+fn stale_tmux_ownership_targets(
+    instances: &[Instance],
+    observations: impl IntoIterator<Item = TmuxOwnershipObservation>,
+) -> Vec<String> {
+    let operational: HashMap<&str, &str> = instances
+        .iter()
+        .filter_map(|instance| {
+            instance
+                .operational_agent_session_id()
+                .map(|sid| (instance.id.as_str(), sid))
+        })
+        .collect();
+    observations
+        .into_iter()
+        .filter_map(|(session, owner, captured)| {
+            let captured = captured?;
+            let valid = owner
+                .as_deref()
+                .is_some_and(|owner| operational.get(owner).is_some_and(|sid| **sid == captured));
+            (!valid).then_some(session)
+        })
+        .collect()
+}
+
+fn read_tmux_ownership_observations() -> anyhow::Result<Vec<TmuxOwnershipObservation>> {
+    let names = crate::tmux::session_names_strict()?;
+    let mut observations = Vec::new();
+    for name in names
+        .iter()
+        .filter(|name| crate::tmux::is_aoe_session(name))
+    {
+        let captured = crate::tmux::env::get_hidden_env_strict(
+            name,
+            crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+        )?;
+        if captured.is_none() {
             continue;
         }
-        unset_batch.extend(
-            tmux_session_id_env_names(instance, live)
-                .into_iter()
-                .map(|session| {
-                    (
-                        session,
-                        crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
-                    )
-                }),
-        );
+        let owner =
+            crate::tmux::env::get_hidden_env_strict(name, crate::tmux::env::AOE_INSTANCE_ID_KEY)?;
+        observations.push((name.clone(), owner, captured));
     }
-    if !unset_batch.is_empty() {
-        let refs: Vec<(&str, &str)> = unset_batch
-            .iter()
-            .map(|(session, key)| (session.as_str(), key.as_str()))
-            .collect();
-        if let Err(error) = crate::tmux::env::remove_hidden_env_batch(&refs) {
-            tracing::warn!(target: "session.sync", "Legacy session env cleanup failed: {error}");
-        }
-    }
+    Ok(observations)
+}
+
+/// Remove ownership that does not match a durable, resume-capable row.
+pub(crate) fn reconcile_tmux_session_id_ownership_env(
+    instances: &[Instance],
+) -> anyhow::Result<()> {
+    let observations = read_tmux_ownership_observations()?;
+    let targets = stale_tmux_ownership_targets(instances, observations);
+    let refs: Vec<(&str, &str)> = targets
+        .iter()
+        .map(|session| {
+            (
+                session.as_str(),
+                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+            )
+        })
+        .collect();
+    crate::tmux::env::remove_hidden_env_batch(&refs)
 }
 
 fn load_all_profile_instances() -> anyhow::Result<Vec<Instance>> {
     let mut instances = Vec::new();
     for profile in crate::session::list_profiles()? {
-        match Storage::open_unwatched(&profile).and_then(|storage| storage.load()) {
-            Ok(mut rows) => instances.append(&mut rows),
-            Err(error) => tracing::warn!(
-                target: "session.sync",
-                %profile,
-                "Legacy session env profile load failed: {error}"
-            ),
-        }
+        let storage = Storage::open_unwatched(&profile)
+            .map_err(|error| anyhow::anyhow!("open profile {profile}: {error}"))?;
+        let mut rows = storage
+            .load()
+            .map_err(|error| anyhow::anyhow!("load profile {profile}: {error}"))?;
+        instances.append(&mut rows);
     }
     Ok(instances)
 }
 
-/// Best-effort cleanup across every profile for one-shot and scoped frontends.
-pub(crate) fn clear_all_profiles_unsupported_tmux_session_id_env() {
-    let instances = match load_all_profile_instances() {
-        Ok(instances) => instances,
-        Err(error) => {
-            tracing::warn!(target: "session.sync", "Legacy session env profile discovery failed: {error}");
-            return;
-        }
-    };
-    let live = crate::tmux::LiveSessionSnapshot::new();
-    clear_unsupported_tmux_session_id_env(instances.iter(), &live);
+/// Strict ownership reconciliation across every profile.
+pub(crate) fn reconcile_all_profiles_tmux_session_id_ownership_env() -> anyhow::Result<()> {
+    let instances = load_all_profile_instances()?;
+    reconcile_tmux_session_id_ownership_env(&instances)
 }
 
 struct Update {
@@ -823,6 +844,52 @@ mod tests {
                 "{tool}: unset"
             );
         }
+    }
+
+    #[test]
+    fn stale_ownership_plan_clears_unsupported_and_orphaned_env() {
+        let mut supported = Instance::new("supported", "/tmp/x");
+        supported.tool = "claude".to_string();
+        supported.agent_session_id = Some("supported-sid".to_string());
+        let mut unsupported = Instance::new("unsupported", "/tmp/x");
+        unsupported.tool = "qwen".to_string();
+        unsupported.agent_session_id = Some("retained-sid".to_string());
+
+        let targets = stale_tmux_ownership_targets(
+            &[supported.clone(), unsupported.clone()],
+            [
+                (
+                    "valid".to_string(),
+                    Some(supported.id.clone()),
+                    Some("supported-sid".to_string()),
+                ),
+                (
+                    "mismatched".to_string(),
+                    Some(supported.id),
+                    Some("stale-sid".to_string()),
+                ),
+                (
+                    "unsupported".to_string(),
+                    Some(unsupported.id),
+                    Some("retained-sid".to_string()),
+                ),
+                (
+                    "orphan".to_string(),
+                    Some("missing-row".to_string()),
+                    Some("orphan-sid".to_string()),
+                ),
+                (
+                    "missing-owner".to_string(),
+                    None,
+                    Some("orphan-sid".to_string()),
+                ),
+                ("empty".to_string(), None, None),
+            ],
+        );
+        assert_eq!(
+            targets,
+            vec!["mismatched", "unsupported", "orphan", "missing-owner"]
+        );
     }
 
     #[test]

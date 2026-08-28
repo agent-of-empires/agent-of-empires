@@ -499,7 +499,7 @@ pub(crate) fn rekey_session(id: &str, old_title: &str, new_title: &str) -> anyho
 /// `SESSION_PREFIX` (`aoe_` in release, `aoe_dev_` in debug), so the single
 /// root prefix matches all of them and never a release session from a debug
 /// build (or vice versa).
-fn is_aoe_session(name: &str) -> bool {
+pub(crate) fn is_aoe_session(name: &str) -> bool {
     name.starts_with(SESSION_PREFIX)
 }
 
@@ -581,6 +581,28 @@ impl NameShape<'_> {
 /// against the freshly derived name misses the very session it is looking for.
 pub fn agent_session_belongs_to(tmux_name: &str, session_id: &str) -> bool {
     NameShape::agent(&id_suffix(session_id)).matches(tmux_name)
+}
+
+pub(crate) fn session_names_strict() -> anyhow::Result<Vec<String>> {
+    let output = tmux_query_command()
+        .args(["list-sessions", "-F", "#{session_name}"])
+        .output()
+        .map_err(|error| anyhow::anyhow!("failed to enumerate tmux sessions: {error}"))?;
+    if output.status.success() {
+        return Ok(String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+            .map(String::from)
+            .collect());
+    }
+    if tmux_no_server_running(&output.stderr) {
+        return Ok(Vec::new());
+    }
+    anyhow::bail!(
+        "failed to enumerate tmux sessions: {}",
+        String::from_utf8_lossy(&output.stderr).trim()
+    )
 }
 
 /// One tmux observation shared by a batch of per-instance liveness lookups.

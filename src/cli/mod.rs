@@ -52,14 +52,17 @@ fn command_reconciles_session_id_env(command: &Commands) -> bool {
             | Commands::Status(_)
             | Commands::Session { .. }
             | Commands::Group { .. }
+            | Commands::Profile { .. }
+            | Commands::Worktree { .. }
     )
 }
 
 /// Remove legacy terminal ownership signals before a one-shot session command.
-pub fn reconcile_session_id_env_for_command(command: Option<&Commands>) {
+pub fn reconcile_session_id_env_for_command(command: Option<&Commands>) -> anyhow::Result<()> {
     if command.is_some_and(command_reconciles_session_id_env) {
-        crate::session::sync::clear_all_profiles_unsupported_tmux_session_id_env();
+        crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env()?;
     }
+    Ok(())
 }
 
 /// Whether CLI stdout should contain ANSI color. Color is terminal-only and
@@ -262,6 +265,8 @@ mod tests {
             (&["aoe", "session", "show", "session"], true),
             (&["aoe", "group", "list"], true),
             (&["aoe", "agents"], false),
+            (&["aoe", "profile", "delete", "doomed"], true),
+            (&["aoe", "worktree", "cleanup", "--force"], true),
         ];
         for (args, expected) in cases {
             let cli = Cli::try_parse_from(*args).unwrap_or_else(|error| {
