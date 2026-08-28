@@ -33,7 +33,7 @@ For web commands and tests, read `web/AGENTS.md`.
 
 - Let `cargo fmt` and `cargo clippy` decide style; fix warnings.
 - Do not add dead code or `#[allow(dead_code)]`.
-- Keep comments short. Add one only when the code cannot clearly express a
+- Keep comments short and precise. Add one only when the code cannot clearly express a
   non-obvious reason or invariant; do not restate code or preserve
   implementation history.
 - Add standalone documentation only for a durable user workflow, public
