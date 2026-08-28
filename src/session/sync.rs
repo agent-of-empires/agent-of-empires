@@ -134,24 +134,64 @@ pub(crate) fn sync_tmux_session_id_env<'a>(
     }
 }
 
-/// Best-effort reconciliation for one-shot CLI entry points.
-pub(crate) fn sync_profile_tmux_session_id_env(profile: &str) {
-    let storage = match Storage::new_unwatched(profile) {
-        Ok(storage) => storage,
-        Err(error) => {
-            tracing::warn!(target: "session.sync", %profile, "Session env storage open failed: {error}");
-            return;
+/// Clear legacy ownership signals for unsupported agents in the supplied rows.
+pub(crate) fn clear_unsupported_tmux_session_id_env<'a>(
+    instances: impl IntoIterator<Item = &'a Instance>,
+    live: &crate::tmux::LiveSessionSnapshot,
+) {
+    let mut unset_batch = Vec::new();
+    for instance in instances {
+        if instance.supports_terminal_resume() {
+            continue;
         }
-    };
-    let instances = match storage.load() {
+        unset_batch.extend(
+            tmux_session_id_env_names(instance, live)
+                .into_iter()
+                .map(|session| {
+                    (
+                        session,
+                        crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
+                    )
+                }),
+        );
+    }
+    if !unset_batch.is_empty() {
+        let refs: Vec<(&str, &str)> = unset_batch
+            .iter()
+            .map(|(session, key)| (session.as_str(), key.as_str()))
+            .collect();
+        if let Err(error) = crate::tmux::env::remove_hidden_env_batch(&refs) {
+            tracing::warn!(target: "session.sync", "Legacy session env cleanup failed: {error}");
+        }
+    }
+}
+
+fn load_all_profile_instances() -> anyhow::Result<Vec<Instance>> {
+    let mut instances = Vec::new();
+    for profile in crate::session::list_profiles()? {
+        match Storage::open_unwatched(&profile).and_then(|storage| storage.load()) {
+            Ok(mut rows) => instances.append(&mut rows),
+            Err(error) => tracing::warn!(
+                target: "session.sync",
+                %profile,
+                "Legacy session env profile load failed: {error}"
+            ),
+        }
+    }
+    Ok(instances)
+}
+
+/// Best-effort cleanup across every profile for one-shot and scoped frontends.
+pub(crate) fn clear_all_profiles_unsupported_tmux_session_id_env() {
+    let instances = match load_all_profile_instances() {
         Ok(instances) => instances,
         Err(error) => {
-            tracing::warn!(target: "session.sync", %profile, "Session env storage load failed: {error}");
+            tracing::warn!(target: "session.sync", "Legacy session env profile discovery failed: {error}");
             return;
         }
     };
     let live = crate::tmux::LiveSessionSnapshot::new();
-    sync_tmux_session_id_env(instances.iter(), &live);
+    clear_unsupported_tmux_session_id_env(instances.iter(), &live);
 }
 
 struct Update {
@@ -852,6 +892,34 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn legacy_env_cleanup_loads_unsupported_rows_from_every_profile() {
+        let temp = tempdir().unwrap();
+        let _guard = storage_home_guard(&temp);
+        for (profile, tool) in [("cleanup-alpha", "qwen"), ("cleanup-beta", "kiro")] {
+            let mut instance = Instance::new(profile, "/tmp/x");
+            instance.tool = tool.to_string();
+            instance.source_profile = profile.to_string();
+            instance.agent_session_id = Some(format!("{tool}-retained"));
+            seed_instance_on_disk(profile, &instance);
+        }
+
+        let mut loaded = load_all_profile_instances()
+            .unwrap()
+            .into_iter()
+            .map(|instance| (instance.title, instance.tool))
+            .collect::<Vec<_>>();
+        loaded.sort();
+        assert_eq!(
+            loaded,
+            vec![
+                ("cleanup-alpha".to_string(), "qwen".to_string()),
+                ("cleanup-beta".to_string(), "kiro".to_string()),
+            ]
+        );
     }
 
     fn attach_poller_with_update(inst: &mut Instance, sid: &str) {

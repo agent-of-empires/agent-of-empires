@@ -1269,6 +1269,21 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // old in-place loop here, while also covering sessions added via
     // `aoe add --acp` while serve is already running.
 
+    // Legacy Qwen/Kiro ownership must be gone before terminal recovery can
+    // inspect the global tmux environment.
+    let legacy_env_instances = state.instances.read().await.clone();
+    if let Err(error) = tokio::task::spawn_blocking(move || {
+        let live = crate::tmux::LiveSessionSnapshot::new();
+        crate::session::sync::clear_unsupported_tmux_session_id_env(
+            legacy_env_instances.iter(),
+            &live,
+        );
+    })
+    .await
+    {
+        tracing::warn!(target: "session.sync", "Daemon startup env cleanup task failed: {error}");
+    }
+
     // Seed acp sessions' status from the on-disk event log before
     // any background task runs. The status_poll_loop overlay reads
     // `state.instances` and the acp_event_listener only sees

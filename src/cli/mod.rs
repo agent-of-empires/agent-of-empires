@@ -56,9 +56,9 @@ fn command_reconciles_session_id_env(command: &Commands) -> bool {
 }
 
 /// Remove legacy terminal ownership signals before a one-shot session command.
-pub fn reconcile_session_id_env_for_command(profile: &str, command: Option<&Commands>) {
+pub fn reconcile_session_id_env_for_command(command: Option<&Commands>) {
     if command.is_some_and(command_reconciles_session_id_env) {
-        crate::session::sync::sync_profile_tmux_session_id_env(profile);
+        crate::session::sync::clear_all_profiles_unsupported_tmux_session_id_env();
     }
 }
 
