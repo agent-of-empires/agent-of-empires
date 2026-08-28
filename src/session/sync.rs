@@ -178,12 +178,7 @@ fn read_tmux_ownership_observations() -> anyhow::Result<Vec<TmuxOwnershipObserva
     Ok(observations)
 }
 
-/// Remove ownership that does not match a durable, resume-capable row.
-pub(crate) fn reconcile_tmux_session_id_ownership_env(
-    instances: &[Instance],
-) -> anyhow::Result<()> {
-    let observations = read_tmux_ownership_observations()?;
-    let targets = stale_tmux_ownership_targets(instances, observations);
+fn remove_tmux_session_id_ownership(targets: &[String]) -> anyhow::Result<()> {
     let refs: Vec<(&str, &str)> = targets
         .iter()
         .map(|session| {
@@ -196,9 +191,49 @@ pub(crate) fn reconcile_tmux_session_id_ownership_env(
     crate::tmux::env::remove_hidden_env_batch(&refs)
 }
 
-fn load_all_profile_instances() -> anyhow::Result<Vec<Instance>> {
+/// Remove ownership that does not match a durable, resume-capable row.
+pub(crate) fn reconcile_tmux_session_id_ownership_env(
+    instances: &[Instance],
+) -> anyhow::Result<()> {
+    let observations = read_tmux_ownership_observations()?;
+    let targets = stale_tmux_ownership_targets(instances, observations);
+    remove_tmux_session_id_ownership(&targets)
+}
+
+fn owned_tmux_ownership_targets(
+    instance_ids: &HashSet<&str>,
+    observations: impl IntoIterator<Item = TmuxOwnershipObservation>,
+) -> Vec<String> {
+    observations
+        .into_iter()
+        .filter_map(|(session, owner, captured)| {
+            (captured.is_some()
+                && owner
+                    .as_deref()
+                    .is_some_and(|owner| instance_ids.contains(owner)))
+            .then_some(session)
+        })
+        .collect()
+}
+
+/// Remove ownership for rows immediately before deleting them.
+pub(crate) fn clear_tmux_session_id_ownership_for_instances(
+    instances: &[Instance],
+) -> anyhow::Result<()> {
+    let instance_ids: HashSet<&str> = instances
+        .iter()
+        .map(|instance| instance.id.as_str())
+        .collect();
+    let targets = owned_tmux_ownership_targets(&instance_ids, read_tmux_ownership_observations()?);
+    remove_tmux_session_id_ownership(&targets)
+}
+
+fn load_profile_instances_excluding(excluded: Option<&str>) -> anyhow::Result<Vec<Instance>> {
     let mut instances = Vec::new();
     for profile in crate::session::list_profiles()? {
+        if excluded.is_some_and(|excluded| profile == excluded) {
+            continue;
+        }
         let storage = Storage::open_unwatched(&profile)
             .map_err(|error| anyhow::anyhow!("open profile {profile}: {error}"))?;
         let mut rows = storage
@@ -211,7 +246,15 @@ fn load_all_profile_instances() -> anyhow::Result<Vec<Instance>> {
 
 /// Strict ownership reconciliation across every profile.
 pub(crate) fn reconcile_all_profiles_tmux_session_id_ownership_env() -> anyhow::Result<()> {
-    let instances = load_all_profile_instances()?;
+    let instances = load_profile_instances_excluding(None)?;
+    reconcile_tmux_session_id_ownership_env(&instances)
+}
+
+/// Clear ownership from one profile before deleting its durable rows.
+pub(crate) fn reconcile_tmux_session_id_ownership_excluding_profile(
+    excluded: &str,
+) -> anyhow::Result<()> {
+    let instances = load_profile_instances_excluding(Some(excluded))?;
     reconcile_tmux_session_id_ownership_env(&instances)
 }
 
@@ -893,6 +936,33 @@ mod tests {
     }
 
     #[test]
+    fn deletion_plan_clears_only_removed_instance_ownership() {
+        let instance_ids = HashSet::from(["deleted"]);
+        let targets = owned_tmux_ownership_targets(
+            &instance_ids,
+            [
+                (
+                    "deleted-session".to_string(),
+                    Some("deleted".to_string()),
+                    Some("captured".to_string()),
+                ),
+                (
+                    "survivor".to_string(),
+                    Some("surviving".to_string()),
+                    Some("captured".to_string()),
+                ),
+                (
+                    "deleted-without-capture".to_string(),
+                    Some("deleted".to_string()),
+                    None,
+                ),
+                ("ownerless".to_string(), None, Some("captured".to_string())),
+            ],
+        );
+        assert_eq!(targets, vec!["deleted-session"]);
+    }
+
+    #[test]
     fn unsupported_env_cleanup_targets_dead_and_live_matching_panes() {
         for tool in ["qwen", "kiro"] {
             let mut instance = Instance::new("owner", "/tmp/x");
@@ -974,7 +1044,7 @@ mod tests {
             seed_instance_on_disk(profile, &instance);
         }
 
-        let mut loaded = load_all_profile_instances()
+        let mut loaded = load_profile_instances_excluding(None)
             .unwrap()
             .into_iter()
             .map(|instance| (instance.title, instance.tool))

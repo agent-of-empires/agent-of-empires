@@ -52,8 +52,6 @@ fn command_reconciles_session_id_env(command: &Commands) -> bool {
             | Commands::Status(_)
             | Commands::Session { .. }
             | Commands::Group { .. }
-            | Commands::Profile { .. }
-            | Commands::Worktree { .. }
     )
 }
 
@@ -265,8 +263,8 @@ mod tests {
             (&["aoe", "session", "show", "session"], true),
             (&["aoe", "group", "list"], true),
             (&["aoe", "agents"], false),
-            (&["aoe", "profile", "delete", "doomed"], true),
-            (&["aoe", "worktree", "cleanup", "--force"], true),
+            (&["aoe", "profile", "delete", "doomed"], false),
+            (&["aoe", "worktree", "cleanup", "--force"], false),
         ];
         for (args, expected) in cases {
             let cli = Cli::try_parse_from(*args).unwrap_or_else(|error| {

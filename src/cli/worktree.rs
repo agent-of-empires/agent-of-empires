@@ -294,6 +294,7 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
 
     // Remove orphaned sessions
     if !orphaned_sessions.is_empty() {
+        crate::session::sync::clear_tmux_session_id_ownership_for_instances(&orphaned_sessions)?;
         let orphan_ids: HashSet<String> = orphaned_sessions.iter().map(|o| o.id.clone()).collect();
         storage.update(|all_instances, _groups| {
             all_instances.retain(|inst| !orphan_ids.contains(&inst.id));

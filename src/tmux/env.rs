@@ -106,11 +106,15 @@ pub(crate) fn get_hidden_env_strict(
     session_name: &str,
     key: &str,
 ) -> anyhow::Result<Option<String>> {
-    let output = crate::tmux::tmux_command()
+    let output = crate::tmux::tmux_query_command()
         .args(["show-environment", "-h", "-t", session_name, key])
         .output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        let missing = format!("unknown variable: {key}");
+        if stderr.lines().any(|line| line.trim() == missing) {
+            return Ok(None);
+        }
         bail!("Failed to read hidden env var from {session_name}: {stderr}");
     }
     let line = String::from_utf8_lossy(&output.stdout);
@@ -576,5 +580,48 @@ mod tests {
         );
         assert!(get_hidden_env_strict(&missing, AOE_INSTANCE_ID_KEY).is_err());
         assert!(remove_hidden_env_batch(&[(&missing, AOE_CAPTURED_SESSION_ID_KEY)]).is_err());
+    }
+
+    #[test]
+    fn strict_hidden_env_read_treats_absent_key_as_none() {
+        if !crate::tmux::is_tmux_available() {
+            eprintln!("Skipping: tmux not available");
+            return;
+        }
+
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = crate::tmux::tmux_command()
+                    .args(["kill-session", "-t", &self.0])
+                    .output();
+            }
+        }
+
+        let name = format!(
+            "{}env_absent_{}",
+            crate::tmux::SESSION_PREFIX,
+            uuid::Uuid::new_v4().simple()
+        );
+        let created = crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", &name])
+            .output()
+            .expect("create tmux session");
+        assert!(
+            created.status.success(),
+            "{}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+        let _cleanup = Cleanup(name.clone());
+
+        assert_eq!(
+            get_hidden_env_strict(&name, AOE_CAPTURED_SESSION_ID_KEY).unwrap(),
+            None
+        );
+        remove_hidden_env_batch(&[(&name, AOE_CAPTURED_SESSION_ID_KEY)]).unwrap();
+        assert_eq!(
+            get_hidden_env_strict(&name, AOE_CAPTURED_SESSION_ID_KEY).unwrap(),
+            None
+        );
     }
 }

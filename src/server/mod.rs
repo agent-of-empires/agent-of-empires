@@ -1271,10 +1271,9 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
 
     // Legacy Qwen/Kiro ownership must be gone before terminal recovery can
     // inspect the global tmux environment.
-    let legacy_env_instances = state.instances.read().await.clone();
-    tokio::task::spawn_blocking(move || {
-        crate::session::sync::reconcile_tmux_session_id_ownership_env(&legacy_env_instances)
-    })
+    tokio::task::spawn_blocking(
+        crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env,
+    )
     .await??;
 
     // Seed acp sessions' status from the on-disk event log before

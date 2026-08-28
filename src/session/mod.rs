@@ -629,6 +629,7 @@ pub fn delete_profile(name: &str) -> Result<()> {
         anyhow::bail!("Cannot delete '{}': at least one profile must exist", name);
     }
 
+    sync::reconcile_tmux_session_id_ownership_excluding_profile(name)?;
     fs::remove_dir_all(&profile_dir)?;
     Ok(())
 }
@@ -1421,6 +1422,13 @@ mod tests {
 
         delete_profile("default").expect("a non-last profile named default is deletable");
         assert!(!dir.join("profiles").join("default").exists());
+        assert!(dir.join("profiles").join("work").exists());
+
+        let corrupt = dir.join("profiles").join("corrupt");
+        fs::create_dir_all(&corrupt).unwrap();
+        fs::write(corrupt.join("sessions.json"), b"not json").unwrap();
+        delete_profile("corrupt").expect("the target profile need not be readable");
+        assert!(!corrupt.exists());
         assert!(dir.join("profiles").join("work").exists());
     }
 
