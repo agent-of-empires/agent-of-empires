@@ -386,7 +386,6 @@ fn session_details(inst: &Instance, profile: &str) -> SessionDetails {
 
 #[tracing::instrument(target = "cli.session", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
-    crate::session::sync::sync_profile_tmux_session_id_env(profile);
     match command {
         SessionCommands::Start(args) => start_session(profile, args).await,
         SessionCommands::Stop(args) => stop_session(profile, args).await,

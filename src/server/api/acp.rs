@@ -2822,6 +2822,22 @@ pub async fn acp_replay(
     .into_response()
 }
 
+fn managed_claude_session_ids(
+    instances: &[crate::session::Instance],
+) -> std::collections::HashSet<String> {
+    instances
+        .iter()
+        .flat_map(|instance| {
+            instance
+                .acp_session_id
+                .as_deref()
+                .into_iter()
+                .chain(instance.operational_agent_session_id())
+        })
+        .map(str::to_owned)
+        .collect()
+}
+
 /// List existing Claude Code sessions on disk, newest first, for the import
 /// picker. Gated behind `read_only_block`: this exposes external Claude session
 /// titles and working directories from outside AoE-managed state, and import
@@ -2847,15 +2863,7 @@ pub async fn list_claude_sessions(State(state): State<Arc<AppState>>) -> impl In
     //     and is only filtered by id match.
     let (managed_ids, managed_dirs): (std::collections::HashSet<String>, Vec<PathBuf>) = {
         let instances = state.instances.read().await;
-        let ids = instances
-            .iter()
-            .flat_map(|i| {
-                i.acp_session_id
-                    .iter()
-                    .chain(i.agent_session_id.iter())
-                    .cloned()
-            })
-            .collect();
+        let ids = managed_claude_session_ids(&instances);
         let dirs = instances
             .iter()
             .filter(|i| {
@@ -2885,6 +2893,21 @@ pub async fn list_claude_sessions(State(state): State<Arc<AppState>>) -> impl In
 mod tests {
     use super::*;
     use std::io::Write;
+
+    #[test]
+    fn managed_claude_ids_ignore_inert_terminal_ids() {
+        for (tool, managed) in [("claude", true), ("qwen", false), ("kiro", false)] {
+            let mut instance = crate::session::Instance::new("terminal", "/tmp/x");
+            instance.tool = tool.to_string();
+            instance.agent_session_id = Some("terminal-id".to_string());
+            let ids = managed_claude_session_ids(&[instance]);
+            assert_eq!(ids.contains("terminal-id"), managed, "{tool}");
+        }
+
+        let mut structured = crate::session::Instance::new("structured", "/tmp/x");
+        structured.acp_session_id = Some("acp-id".to_string());
+        assert!(managed_claude_session_ids(&[structured]).contains("acp-id"));
+    }
 
     fn utc_ts(raw: &str) -> DateTime<Utc> {
         DateTime::parse_from_rfc3339(raw)

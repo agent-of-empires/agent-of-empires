@@ -671,6 +671,27 @@ impl LiveSessionSnapshot {
     }
 }
 
+/// Every extant AoE tmux session carrying `session_id`'s suffix, including
+/// remain-on-exit panes. Cleanup callers need dead panes; liveness callers use
+/// [`live_any_kind_name_for_id_in`] instead.
+pub(crate) fn existing_any_kind_names_for_id_in(
+    snapshot: &LiveSessionSnapshot,
+    session_id: &str,
+) -> Option<Vec<String>> {
+    let suffix = id_suffix(session_id);
+    let agent = NameShape::agent(&suffix);
+    let terminal = NameShape::terminal(&suffix);
+    let container = NameShape::container(&suffix);
+    Some(
+        snapshot
+            .names()?
+            .iter()
+            .filter(|name| agent.matches(name) || terminal.matches(name) || container.matches(name))
+            .cloned()
+            .collect(),
+    )
+}
+
 /// [`live_any_kind_name_for_id`] against an already-taken snapshot, so a batch
 /// of lookups costs one observation instead of one per instance.
 pub(crate) fn live_any_kind_name_for_id_in(
@@ -1904,9 +1925,32 @@ mod tests {
                 expected,
                 "pane_dead = {pane_dead}"
             );
+            assert_eq!(
+                existing_any_kind_names_for_id_in(&snapshot, ID),
+                Some(vec![agent.clone()]),
+                "dead panes remain cleanup targets"
+            );
         }
-    }
 
+        let terminal = format!("{TERMINAL_PREFIX}Refactor_{ID8}");
+        let snapshot = LiveSessionSnapshot::from_parts(
+            Some(vec![agent.clone(), terminal.clone()]),
+            Some(HashMap::from([
+                (agent.clone(), dead_pane_meta(true)),
+                (terminal.clone(), dead_pane_meta(false)),
+            ])),
+        );
+        assert_eq!(
+            live_any_kind_name_for_id_in(&snapshot, ID),
+            Some(terminal.clone()),
+            "live lookup skips the dead agent pane"
+        );
+        assert_eq!(
+            existing_any_kind_names_for_id_in(&snapshot, ID),
+            Some(vec![agent, terminal]),
+            "cleanup targets both dead and live matching sessions"
+        );
+    }
     #[test]
     fn snapshot_lookup_reports_not_live_when_server_unreachable() {
         // Unknown collapses to "not live" for the exclusion walk, which is what

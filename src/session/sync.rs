@@ -57,35 +57,53 @@ type TmuxEnvUnset = (String, String);
 
 fn tmux_session_id_env_updates<'a>(
     instances: impl IntoIterator<Item = &'a Instance>,
-    mut session_name: impl FnMut(&Instance) -> Option<String>,
+    mut session_names: impl FnMut(&Instance) -> Vec<String>,
 ) -> (Vec<TmuxEnvSet>, Vec<TmuxEnvUnset>) {
     let mut set_batch = Vec::new();
     let mut unset_batch = Vec::new();
     for instance in instances {
-        let Some(tmux_name) = session_name(instance) else {
-            continue;
-        };
-        set_batch.push((
-            tmux_name.clone(),
-            crate::tmux::env::AOE_INSTANCE_ID_KEY.to_string(),
-            instance.id.clone(),
-        ));
-        match instance.operational_agent_session_id() {
-            Some(sid) => set_batch.push((
-                tmux_name,
-                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
-                sid.to_string(),
-            )),
-            None => unset_batch.push((
-                tmux_name,
-                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
-            )),
+        for tmux_name in session_names(instance) {
+            set_batch.push((
+                tmux_name.clone(),
+                crate::tmux::env::AOE_INSTANCE_ID_KEY.to_string(),
+                instance.id.clone(),
+            ));
+            match instance.operational_agent_session_id() {
+                Some(sid) => set_batch.push((
+                    tmux_name,
+                    crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
+                    sid.to_string(),
+                )),
+                None => unset_batch.push((
+                    tmux_name,
+                    crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
+                )),
+            }
         }
     }
     (set_batch, unset_batch)
 }
 
-/// Reconcile durable session IDs into every live tmux session.
+fn tmux_session_id_env_names(
+    instance: &Instance,
+    live: &crate::tmux::LiveSessionSnapshot,
+) -> Vec<String> {
+    if instance.supports_terminal_resume() {
+        instance
+            .tmux_env_session_name_in_or_probe(live)
+            .into_iter()
+            .collect()
+    } else {
+        crate::tmux::existing_any_kind_names_for_id_in(live, &instance.id).unwrap_or_else(|| {
+            instance
+                .tmux_env_session_name_in_or_probe(live)
+                .into_iter()
+                .collect()
+        })
+    }
+}
+
+/// Reconcile durable session IDs across extant tmux sessions.
 ///
 /// Unsupported terminal agents retain their stored ID on disk, but their tmux
 /// environment must not expose it as operational ownership after an upgrade.
@@ -94,7 +112,7 @@ pub(crate) fn sync_tmux_session_id_env<'a>(
     live: &crate::tmux::LiveSessionSnapshot,
 ) {
     let (set_batch, unset_batch) = tmux_session_id_env_updates(instances, |instance| {
-        instance.tmux_env_session_name_in_or_probe(live)
+        tmux_session_id_env_names(instance, live)
     });
     if !set_batch.is_empty() {
         let refs: Vec<(&str, &str, &str)> = set_batch
@@ -745,7 +763,7 @@ mod tests {
             instance.agent_session_id = Some(stale.to_string());
 
             let (set_batch, unset_batch) =
-                tmux_session_id_env_updates([&instance], |row| Some(format!("tmux-{}", row.id)));
+                tmux_session_id_env_updates([&instance], |row| vec![format!("tmux-{}", row.id)]);
             assert!(set_batch.iter().any(|(_, key, value)| {
                 key == crate::tmux::env::AOE_INSTANCE_ID_KEY && value == &instance.id
             }));
@@ -763,6 +781,50 @@ mod tests {
                     .any(|(_, key)| { key == crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY }),
                 !publishes,
                 "{tool}: unset"
+            );
+        }
+    }
+
+    #[test]
+    fn unsupported_env_cleanup_targets_dead_and_live_matching_panes() {
+        for tool in ["qwen", "kiro"] {
+            let mut instance = Instance::new("owner", "/tmp/x");
+            instance.tool = tool.to_string();
+            let suffix = &instance.id[..8];
+            let agent = format!("{}Dead_{suffix}", crate::tmux::SESSION_PREFIX);
+            let terminal = format!("{}Live_{suffix}", crate::tmux::TERMINAL_PREFIX);
+            let live = crate::tmux::LiveSessionSnapshot::from_parts(
+                Some(vec![agent.clone(), terminal.clone()]),
+                Some(HashMap::from([
+                    (
+                        agent.clone(),
+                        crate::tmux::PaneMetadata {
+                            pane_dead: true,
+                            pane_current_command: None,
+                            pane_start_command_is_protected: false,
+                        },
+                    ),
+                    (
+                        terminal.clone(),
+                        crate::tmux::PaneMetadata {
+                            pane_dead: false,
+                            pane_current_command: None,
+                            pane_start_command_is_protected: false,
+                        },
+                    ),
+                ])),
+            );
+
+            assert_eq!(
+                tmux_session_id_env_names(&instance, &live),
+                vec![agent, terminal.clone()],
+                "{tool}: unsupported cleanup"
+            );
+            instance.tool = "claude".to_string();
+            assert_eq!(
+                tmux_session_id_env_names(&instance, &live),
+                vec![terminal],
+                "supported publication stays live-only"
             );
         }
     }

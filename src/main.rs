@@ -451,6 +451,8 @@ async fn run(
         }
     }
 
+    cli::reconcile_session_id_env_for_command(&profile, cli.command.as_ref());
+
     let result = match cli.command {
         Some(Commands::Add(args)) => cli::add::run(&profile, *args).await,
         Some(Commands::List(args)) => cli::list::run(&profile, args).await,

@@ -41,6 +41,27 @@ pub mod worktree;
 
 pub use definition::{command_name, Cli, Commands, CLI_COMMAND_NAMES};
 
+fn command_reconciles_session_id_env(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Add(_)
+            | Commands::List(_)
+            | Commands::Ps(_)
+            | Commands::Remove(_)
+            | Commands::Send(_)
+            | Commands::Status(_)
+            | Commands::Session { .. }
+            | Commands::Group { .. }
+    )
+}
+
+/// Remove legacy terminal ownership signals before a one-shot session command.
+pub fn reconcile_session_id_env_for_command(profile: &str, command: Option<&Commands>) {
+    if command.is_some_and(command_reconciles_session_id_env) {
+        crate::session::sync::sync_profile_tmux_session_id_env(profile);
+    }
+}
+
 /// Whether CLI stdout should contain ANSI color. Color is terminal-only and
 /// follows the NO_COLOR convention (only a non-empty value disables it).
 pub(crate) fn color_enabled() -> bool {
@@ -226,6 +247,35 @@ where
 mod tests {
     use super::*;
     use crate::session::claim::purge_restored_row_must_be_kept;
+
+    #[test]
+    fn session_aware_top_level_commands_reconcile_legacy_env() {
+        use clap::Parser;
+
+        let cases: &[(&[&str], bool)] = &[
+            (&["aoe", "add", "/tmp/x"], true),
+            (&["aoe", "list"], true),
+            (&["aoe", "ps"], true),
+            (&["aoe", "remove", "session"], true),
+            (&["aoe", "send", "session", "message"], true),
+            (&["aoe", "status"], true),
+            (&["aoe", "session", "show", "session"], true),
+            (&["aoe", "group", "list"], true),
+            (&["aoe", "agents"], false),
+        ];
+        for (args, expected) in cases {
+            let cli = Cli::try_parse_from(*args).unwrap_or_else(|error| {
+                panic!("failed to parse {args:?}: {error}");
+            });
+            assert_eq!(
+                cli.command
+                    .as_ref()
+                    .is_some_and(command_reconciles_session_id_env),
+                *expected,
+                "{args:?}"
+            );
+        }
+    }
 
     #[test]
     fn truncate_id_shorter_than_max_returns_input() {
