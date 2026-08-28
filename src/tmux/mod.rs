@@ -642,6 +642,12 @@ impl LiveSessionSnapshot {
     pub(crate) fn new() -> Self {
         Self::default()
     }
+    /// Build a snapshot from a strict session enumeration.
+    pub(crate) fn from_names(names: Vec<String>) -> Self {
+        let snapshot = Self::new();
+        let _ = snapshot.names.set(Some(names));
+        snapshot
+    }
 
     /// Build a snapshot from already-known parts, for tests that must not
     /// depend on a live tmux server.

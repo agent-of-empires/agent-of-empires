@@ -629,21 +629,19 @@ pub fn delete_profile(name: &str) -> Result<()> {
         anyhow::bail!("Cannot delete '{}': at least one profile must exist", name);
     }
 
-    let target_instances = Storage::open_unwatched(name)
-        .and_then(|storage| storage.load())
-        .unwrap_or_default();
-    sync::reconcile_tmux_session_id_ownership_excluding_profile(name)?;
-    if let Err(delete_error) = fs::remove_dir_all(&profile_dir) {
-        if let Err(restore_error) = sync::publish_operational_tmux_session_id_env(&target_instances)
-        {
-            anyhow::bail!(
-                "Failed to delete profile '{name}': {delete_error}; ownership restore failed: {restore_error}"
-            );
+    sync::with_tmux_ownership_lock(|| {
+        let cleared = sync::reconcile_tmux_session_id_ownership_excluding_profile_locked(name)?;
+        if let Err(delete_error) = fs::remove_dir_all(&profile_dir) {
+            if let Err(restore_error) = sync::restore_tmux_session_id_ownership_locked(&cleared) {
+                anyhow::bail!(
+                    "Failed to delete profile '{name}': {delete_error}; ownership restore failed: {restore_error}"
+                );
+            }
+            return Err(delete_error.into());
         }
-        return Err(delete_error.into());
-    }
-    sync::reconcile_all_profiles_tmux_session_id_ownership_env()?;
-    Ok(())
+        sync::reconcile_all_profiles_tmux_session_id_ownership_env_locked()?;
+        Ok(())
+    })
 }
 
 pub fn rename_profile(old_name: &str, new_name: &str) -> Result<()> {

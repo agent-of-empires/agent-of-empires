@@ -5068,42 +5068,17 @@ impl Instance {
         }
 
         let outcome = self.persist_session_id(profile, expected_prior_sid, expected_prior_intent);
-
-        // Published refreshes live ownership from disk. Inert clears any stale
-        // ownership signal while retaining the unsupported agent's stored ID.
-        // Skip leaves the environment untouched because persistence failed.
-        let refresh_sid_env = !matches!(outcome, SidPersistOutcome::Skip);
-        let captured_sid = match outcome {
-            SidPersistOutcome::Published => self.operational_agent_session_id().map(str::to_string),
-            SidPersistOutcome::Inert | SidPersistOutcome::Skip => None,
-        };
-
-        let mut entries: Vec<(&str, &str, &str)> = vec![(
-            session_name,
-            crate::tmux::env::AOE_INSTANCE_ID_KEY,
-            &self.id,
-        )];
-        if let Some(sid) = &captured_sid {
-            entries.push((
-                session_name,
-                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
-                sid.as_str(),
-            ));
-        }
-        if let Err(e) = crate::tmux::env::set_hidden_env_batch(&entries) {
-            let keys: Vec<&str> = entries.iter().map(|(_, k, _)| *k).collect();
-            tracing::warn!(target: "session.store",
-                "Failed to set tmux env keys [{}] at finalize_launch: {}", keys.join(", "), e);
-        }
-
-        if refresh_sid_env && captured_sid.is_none() {
-            if let Err(e) = crate::tmux::env::remove_hidden_env(
-                session_name,
-                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
-            ) {
-                tracing::warn!(target: "session.store",
+        // Re-read durable rows under the ownership lock before touching tmux.
+        // This keeps a stale launcher from publishing after a tool swap or delete.
+        if !matches!(outcome, SidPersistOutcome::Skip) {
+            if let Err(error) =
+                crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env()
+            {
+                tracing::warn!(
+                    target: "session.store",
                     instance = %self.id,
-                    "Failed to clear captured sid in tmux env: {}", e);
+                    "Failed to reconcile tmux ownership after launch: {error}"
+                );
             }
         }
 

@@ -136,6 +136,7 @@ const SESSION_IDENTITY_LOCK_FILENAME: &str = ".title-mutation.lock";
 /// Sidecar lock prefix for one session's title persistence plus tmux rekey.
 /// Lives at the app-data root so it remains stable across profile moves.
 const SESSION_TITLE_LOCK_PREFIX: &str = ".session-title-";
+const TMUX_OWNERSHIP_LOCK_FILENAME: &str = ".tmux-ownership.lock";
 
 /// Emit a tracing warn if the cross-process `flock` is held by a peer for
 /// longer than this. Surfaces a wedged peer in `aoe logs` instead of a
@@ -452,6 +453,11 @@ fn acquire_open_storage_flock(file: fs::File, path: &Path) -> Result<StorageFloc
 /// writers from introducing a duplicate; it does not repair existing rows.
 pub(crate) fn acquire_session_identity_lock() -> Result<StorageFlock> {
     acquire_storage_flock(&get_app_dir()?, SESSION_IDENTITY_LOCK_FILENAME)
+}
+
+/// Serialize durable ownership reads with tmux ownership mutation.
+pub(crate) fn acquire_tmux_ownership_lock() -> Result<StorageFlock> {
+    acquire_storage_flock(&get_app_dir()?, TMUX_OWNERSHIP_LOCK_FILENAME)
 }
 
 /// Serialize one session's title commit and post-commit tmux rekey across

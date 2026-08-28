@@ -103,49 +103,38 @@ fn tmux_session_id_env_names(
     }
 }
 
-/// Reconcile durable session IDs across extant tmux sessions.
-///
-/// Unsupported terminal agents retain their stored ID on disk, but their tmux
-/// environment must not expose it as operational ownership after an upgrade.
-pub(crate) fn sync_tmux_session_id_env<'a>(
-    instances: impl IntoIterator<Item = &'a Instance>,
-    live: &crate::tmux::LiveSessionSnapshot,
-) -> anyhow::Result<()> {
-    let mut targets = Vec::new();
-    for instance in instances {
-        if instance.operational_agent_session_id().is_none() {
-            targets.extend(tmux_session_id_env_names(instance, live));
-        }
-    }
-    let refs: Vec<(&str, &str)> = targets
-        .iter()
-        .map(|session| {
-            (
-                session.as_str(),
-                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
-            )
-        })
-        .collect();
-    crate::tmux::env::remove_hidden_env_batch(&refs)
+type TmuxOwnershipObservation = (String, Option<String>, Option<String>);
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ClearedTmuxOwnership {
+    entries: Vec<(String, String)>,
 }
 
-pub(crate) fn publish_operational_tmux_session_id_env(
-    instances: &[Instance],
-) -> anyhow::Result<()> {
-    let live = crate::tmux::LiveSessionSnapshot::new();
-    let (set_batch, _) = tmux_session_id_env_updates(
-        instances
-            .iter()
-            .filter(|instance| instance.operational_agent_session_id().is_some()),
-        |instance| tmux_session_id_env_names(instance, &live),
-    );
-    let refs: Vec<(&str, &str, &str)> = set_batch
-        .iter()
-        .map(|(session, key, value)| (session.as_str(), key.as_str(), value.as_str()))
-        .collect();
-    crate::tmux::env::set_hidden_env_batch(&refs)
+pub(crate) fn with_tmux_ownership_lock<T>(
+    operation: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let _lock = crate::session::storage::acquire_tmux_ownership_lock()?;
+    operation()
 }
-type TmuxOwnershipObservation = (String, Option<String>, Option<String>);
+
+fn read_tmux_ownership_observations(
+    names: &[String],
+) -> anyhow::Result<Vec<TmuxOwnershipObservation>> {
+    let mut observations = Vec::new();
+    for name in names
+        .iter()
+        .filter(|name| crate::tmux::is_aoe_session(name))
+    {
+        let captured = crate::tmux::env::get_hidden_env_strict(
+            name,
+            crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+        )?;
+        let owner =
+            crate::tmux::env::get_hidden_env_strict(name, crate::tmux::env::AOE_INSTANCE_ID_KEY)?;
+        observations.push((name.clone(), owner, captured));
+    }
+    Ok(observations)
+}
 
 fn stale_tmux_ownership_targets(
     instances: &[Instance],
@@ -171,28 +160,29 @@ fn stale_tmux_ownership_targets(
         .collect()
 }
 
-fn read_tmux_ownership_observations() -> anyhow::Result<Vec<TmuxOwnershipObservation>> {
-    let names = crate::tmux::session_names_strict()?;
-    let mut observations = Vec::new();
-    for name in names
+fn cleared_tmux_ownership(
+    targets: &[String],
+    observations: &[TmuxOwnershipObservation],
+) -> ClearedTmuxOwnership {
+    let target_set: HashSet<&str> = targets.iter().map(String::as_str).collect();
+    let entries = observations
         .iter()
-        .filter(|name| crate::tmux::is_aoe_session(name))
-    {
-        let captured = crate::tmux::env::get_hidden_env_strict(
-            name,
-            crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
-        )?;
-        if captured.is_none() {
-            continue;
-        }
-        let owner =
-            crate::tmux::env::get_hidden_env_strict(name, crate::tmux::env::AOE_INSTANCE_ID_KEY)?;
-        observations.push((name.clone(), owner, captured));
-    }
-    Ok(observations)
+        .filter_map(|(session, _, captured)| {
+            target_set
+                .contains(session.as_str())
+                .then(|| captured.clone())
+                .flatten()
+                .map(|value| (session.clone(), value))
+        })
+        .collect();
+    ClearedTmuxOwnership { entries }
 }
 
-fn remove_tmux_session_id_ownership(targets: &[String]) -> anyhow::Result<()> {
+fn remove_tmux_session_id_ownership(
+    targets: &[String],
+    observations: &[TmuxOwnershipObservation],
+) -> anyhow::Result<ClearedTmuxOwnership> {
+    let cleared = cleared_tmux_ownership(targets, observations);
     let refs: Vec<(&str, &str)> = targets
         .iter()
         .map(|session| {
@@ -202,16 +192,45 @@ fn remove_tmux_session_id_ownership(targets: &[String]) -> anyhow::Result<()> {
             )
         })
         .collect();
-    crate::tmux::env::remove_hidden_env_batch(&refs)
+    crate::tmux::env::remove_hidden_env_batch(&refs)?;
+    Ok(cleared)
 }
 
-/// Remove ownership that does not match a durable, resume-capable row.
-pub(crate) fn reconcile_tmux_session_id_ownership_env(
+fn reconcile_tmux_session_id_ownership_env_locked(
     instances: &[Instance],
+) -> anyhow::Result<ClearedTmuxOwnership> {
+    let names = crate::tmux::session_names_strict()?;
+    let live = crate::tmux::LiveSessionSnapshot::from_names(names.clone());
+    let observations = read_tmux_ownership_observations(&names)?;
+    let (set_batch, unset_batch) = tmux_session_id_env_updates(instances, |instance| {
+        tmux_session_id_env_names(instance, &live)
+    });
+    let desired: HashSet<&str> = set_batch
+        .iter()
+        .filter(|(_, key, _)| key == crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY)
+        .map(|(session, _, _)| session.as_str())
+        .collect();
+    let mut targets = stale_tmux_ownership_targets(instances, observations.iter().cloned());
+    targets.retain(|session| !desired.contains(session.as_str()));
+    targets.extend(unset_batch.iter().map(|(session, _)| session.clone()));
+    targets.sort();
+    targets.dedup();
+
+    let cleared = remove_tmux_session_id_ownership(&targets, &observations)?;
+    let refs: Vec<(&str, &str, &str)> = set_batch
+        .iter()
+        .map(|(session, key, value)| (session.as_str(), key.as_str(), value.as_str()))
+        .collect();
+    crate::tmux::env::set_hidden_env_batch(&refs)?;
+    Ok(cleared)
+}
+
+/// Reconcile durable session IDs across extant tmux sessions.
+pub(crate) fn sync_tmux_session_id_env<'a>(
+    _instances: impl IntoIterator<Item = &'a Instance>,
+    _live: &crate::tmux::LiveSessionSnapshot,
 ) -> anyhow::Result<()> {
-    let observations = read_tmux_ownership_observations()?;
-    let targets = stale_tmux_ownership_targets(instances, observations);
-    remove_tmux_session_id_ownership(&targets)
+    reconcile_all_profiles_tmux_session_id_ownership_env()
 }
 
 fn owned_tmux_ownership_targets(
@@ -231,15 +250,34 @@ fn owned_tmux_ownership_targets(
 }
 
 /// Remove ownership for rows immediately before deleting them.
-pub(crate) fn clear_tmux_session_id_ownership_for_instances(
+pub(crate) fn clear_tmux_session_id_ownership_for_instances_locked(
     instances: &[Instance],
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ClearedTmuxOwnership> {
+    let names = crate::tmux::session_names_strict()?;
+    let observations = read_tmux_ownership_observations(&names)?;
     let instance_ids: HashSet<&str> = instances
         .iter()
         .map(|instance| instance.id.as_str())
         .collect();
-    let targets = owned_tmux_ownership_targets(&instance_ids, read_tmux_ownership_observations()?);
-    remove_tmux_session_id_ownership(&targets)
+    let targets = owned_tmux_ownership_targets(&instance_ids, observations.iter().cloned());
+    remove_tmux_session_id_ownership(&targets, &observations)
+}
+
+pub(crate) fn restore_tmux_session_id_ownership_locked(
+    cleared: &ClearedTmuxOwnership,
+) -> anyhow::Result<()> {
+    let refs: Vec<(&str, &str, &str)> = cleared
+        .entries
+        .iter()
+        .map(|(session, value)| {
+            (
+                session.as_str(),
+                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+                value.as_str(),
+            )
+        })
+        .collect();
+    crate::tmux::env::set_hidden_env_batch(&refs)
 }
 
 fn load_profile_instances_excluding(excluded: Option<&str>) -> anyhow::Result<Vec<Instance>> {
@@ -258,18 +296,26 @@ fn load_profile_instances_excluding(excluded: Option<&str>) -> anyhow::Result<Ve
     Ok(instances)
 }
 
-/// Strict ownership reconciliation across every profile.
-pub(crate) fn reconcile_all_profiles_tmux_session_id_ownership_env() -> anyhow::Result<()> {
+pub(crate) fn reconcile_all_profiles_tmux_session_id_ownership_env_locked(
+) -> anyhow::Result<ClearedTmuxOwnership> {
     let instances = load_profile_instances_excluding(None)?;
-    reconcile_tmux_session_id_ownership_env(&instances)
+    reconcile_tmux_session_id_ownership_env_locked(&instances)
 }
 
-/// Clear ownership from one profile before deleting its durable rows.
-pub(crate) fn reconcile_tmux_session_id_ownership_excluding_profile(
+/// Strict ownership reconciliation across every profile.
+pub(crate) fn reconcile_all_profiles_tmux_session_id_ownership_env() -> anyhow::Result<()> {
+    with_tmux_ownership_lock(|| {
+        reconcile_all_profiles_tmux_session_id_ownership_env_locked()?;
+        Ok(())
+    })
+}
+
+/// Clear ownership from one profile while its deletion transaction owns the lock.
+pub(crate) fn reconcile_tmux_session_id_ownership_excluding_profile_locked(
     excluded: &str,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<ClearedTmuxOwnership> {
     let instances = load_profile_instances_excluding(Some(excluded))?;
-    reconcile_tmux_session_id_ownership_env(&instances)
+    reconcile_tmux_session_id_ownership_env_locked(&instances)
 }
 
 struct Update {
@@ -781,68 +827,61 @@ fn reload_skipped_from_disk(
 }
 
 fn publish_tmux_env(
-    instances: &[Instance],
+    _instances: &[Instance],
     to_apply: &[(String, String)],
     to_rollback: &[Rollback],
     filtered_ids: &HashSet<String>,
 ) {
-    let touched_count = to_apply.len() + to_rollback.len() + filtered_ids.len();
-    let mut set_batch: Vec<(String, String, String)> = Vec::with_capacity(touched_count);
-    let mut unset_batch: Vec<(String, String)> = Vec::with_capacity(touched_count);
+    let result = with_tmux_ownership_lock(|| {
+        let instances = load_profile_instances_excluding(None)?;
+        let touched_count = to_apply.len() + to_rollback.len() + filtered_ids.len();
+        let mut set_batch: Vec<(String, String, String)> = Vec::with_capacity(touched_count);
+        let mut unset_batch: Vec<(String, String)> = Vec::with_capacity(touched_count);
 
-    let touched_ids = to_apply
-        .iter()
-        .map(|(id, _)| id.as_str())
-        .chain(to_rollback.iter().map(|r| r.id.as_str()))
-        .chain(filtered_ids.iter().map(|s| s.as_str()));
-
-    for id in touched_ids {
-        let Some(inst) = instances.iter().find(|i| i.id == id) else {
-            continue;
-        };
-        let tmux_name = match inst.tmux_env_session_name() {
-            Some(name) => name,
-            None => continue,
-        };
-        // Re-assert the instance-id alongside the captured sid: this publish
-        // replaced the poller's on_change pre-CAS publish (which wrote both
-        // keys), and `build_exclusion_set` can only attribute a captured sid
-        // to its owner when AOE_INSTANCE_ID is present on the same session.
-        set_batch.push((
-            tmux_name.clone(),
-            crate::tmux::env::AOE_INSTANCE_ID_KEY.to_string(),
-            inst.id.clone(),
-        ));
-        match inst.operational_agent_session_id() {
-            Some(sid) => set_batch.push((
-                tmux_name,
-                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
-                sid.to_string(),
-            )),
-            None => unset_batch.push((
-                tmux_name,
-                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
-            )),
-        }
-    }
-
-    if !set_batch.is_empty() {
-        let refs: Vec<(&str, &str, &str)> = set_batch
+        let touched_ids = to_apply
             .iter()
-            .map(|(s, k, v)| (s.as_str(), k.as_str(), v.as_str()))
-            .collect();
-        if let Err(e) = crate::tmux::env::set_hidden_env_batch(&refs) {
-            tracing::warn!(target: "session.sync", "Post-CAS env publish failed: {e}");
+            .map(|(id, _)| id.as_str())
+            .chain(to_rollback.iter().map(|r| r.id.as_str()))
+            .chain(filtered_ids.iter().map(String::as_str));
+
+        for id in touched_ids {
+            let Some(inst) = instances.iter().find(|instance| instance.id == id) else {
+                continue;
+            };
+            let Some(tmux_name) = inst.tmux_env_session_name() else {
+                continue;
+            };
+            set_batch.push((
+                tmux_name.clone(),
+                crate::tmux::env::AOE_INSTANCE_ID_KEY.to_string(),
+                inst.id.clone(),
+            ));
+            match inst.operational_agent_session_id() {
+                Some(sid) => set_batch.push((
+                    tmux_name,
+                    crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
+                    sid.to_string(),
+                )),
+                None => unset_batch.push((
+                    tmux_name,
+                    crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
+                )),
+            }
         }
-    }
-    if !unset_batch.is_empty() {
-        let refs: Vec<(&str, &str)> = unset_batch
+
+        let set_refs: Vec<(&str, &str, &str)> = set_batch
             .iter()
-            .map(|(s, k)| (s.as_str(), k.as_str()))
+            .map(|(session, key, value)| (session.as_str(), key.as_str(), value.as_str()))
             .collect();
-        if let Err(e) = crate::tmux::env::remove_hidden_env_batch(&refs) {
-            tracing::warn!(target: "session.sync", "Post-CAS env unset failed: {e}");
-        }
+        crate::tmux::env::set_hidden_env_batch(&set_refs)?;
+        let unset_refs: Vec<(&str, &str)> = unset_batch
+            .iter()
+            .map(|(session, key)| (session.as_str(), key.as_str()))
+            .collect();
+        crate::tmux::env::remove_hidden_env_batch(&unset_refs)
+    });
+    if let Err(error) = result {
+        tracing::warn!(target: "session.sync", "Post-CAS env reconcile failed: {error}");
     }
 }
 
@@ -952,28 +991,115 @@ mod tests {
     #[test]
     fn deletion_plan_clears_only_removed_instance_ownership() {
         let instance_ids = HashSet::from(["deleted"]);
-        let targets = owned_tmux_ownership_targets(
-            &instance_ids,
-            [
-                (
-                    "deleted-session".to_string(),
-                    Some("deleted".to_string()),
-                    Some("captured".to_string()),
-                ),
-                (
-                    "survivor".to_string(),
-                    Some("surviving".to_string()),
-                    Some("captured".to_string()),
-                ),
-                (
-                    "deleted-without-capture".to_string(),
-                    Some("deleted".to_string()),
-                    None,
-                ),
-                ("ownerless".to_string(), None, Some("captured".to_string())),
-            ],
-        );
+        let observations = [
+            (
+                "deleted-session".to_string(),
+                Some("deleted".to_string()),
+                Some("captured".to_string()),
+            ),
+            (
+                "survivor".to_string(),
+                Some("surviving".to_string()),
+                Some("other".to_string()),
+            ),
+            (
+                "deleted-without-capture".to_string(),
+                Some("deleted".to_string()),
+                None,
+            ),
+            ("ownerless".to_string(), None, Some("orphan".to_string())),
+        ];
+        let targets = owned_tmux_ownership_targets(&instance_ids, observations.iter().cloned());
         assert_eq!(targets, vec!["deleted-session"]);
+        assert_eq!(
+            cleared_tmux_ownership(&targets, &observations).entries,
+            vec![("deleted-session".to_string(), "captured".to_string())]
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn global_reconcile_publishes_supported_and_clears_unsupported() {
+        if !crate::tmux::is_tmux_available() {
+            eprintln!("Skipping: tmux not available");
+            return;
+        }
+
+        struct Cleanup(Vec<String>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for name in &self.0 {
+                    let _ = crate::tmux::tmux_command()
+                        .args(["kill-session", "-t", name])
+                        .output();
+                }
+            }
+        }
+
+        let temp = tempdir().unwrap();
+        let _home = storage_home_guard(&temp);
+        let profile = "ownership-reconcile";
+        let sid = "019342ab-1234-7def-8901-dddddddddddd";
+        let mut supported = Instance::new("supported", "/tmp/x");
+        supported.tool = "claude".to_string();
+        supported.agent_session_id = Some(sid.to_string());
+        let mut unsupported = Instance::new("unsupported", "/tmp/y");
+        unsupported.tool = "qwen".to_string();
+        unsupported.agent_session_id = Some("retained".to_string());
+        let storage = Storage::new_unwatched(profile).unwrap();
+        storage
+            .update(|instances, _groups| {
+                *instances = vec![supported.clone(), unsupported.clone()];
+                Ok(())
+            })
+            .unwrap();
+
+        let supported_name = crate::tmux::Session::generate_name(&supported.id, &supported.title);
+        let unsupported_name =
+            crate::tmux::Session::generate_name(&unsupported.id, &unsupported.title);
+        for name in [&supported_name, &unsupported_name] {
+            let output = crate::tmux::tmux_command()
+                .args(["new-session", "-d", "-s", name])
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        let _cleanup = Cleanup(vec![supported_name.clone(), unsupported_name.clone()]);
+        crate::tmux::env::set_hidden_env(
+            &unsupported_name,
+            crate::tmux::env::AOE_INSTANCE_ID_KEY,
+            &unsupported.id,
+        )
+        .unwrap();
+        crate::tmux::env::set_hidden_env(
+            &unsupported_name,
+            crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+            "retained",
+        )
+        .unwrap();
+
+        reconcile_all_profiles_tmux_session_id_ownership_env().unwrap();
+        assert_eq!(
+            crate::tmux::env::get_hidden_env_strict(
+                &supported_name,
+                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+            )
+            .unwrap()
+            .as_deref(),
+            Some(sid)
+        );
+        assert_eq!(
+            crate::tmux::env::get_hidden_env_strict(
+                &unsupported_name,
+                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+            )
+            .unwrap(),
+            None
+        );
     }
 
     #[test]
