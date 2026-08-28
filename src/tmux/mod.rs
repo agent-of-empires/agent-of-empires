@@ -1533,7 +1533,6 @@ fn pane_snapshot_refresh_due() -> bool {
         .read()
         .map_or(true, |cache| snapshot_refresh_due(cache.time))
 }
-
 /// One queued passive preview resize, pushed by the render thread when its
 /// debounce fires and executed by the dedicated passive-resize worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1544,6 +1543,12 @@ pub(crate) struct PassiveResizeIntent {
     pub rows: u16,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PassiveResizeWork {
+    intent: PassiveResizeIntent,
+    generation: u64,
+}
+
 /// A passive resize the worker completed. The render thread consumes these to
 /// adopt the (session, cols, rows) dedup exactly as the old in-paint path did
 /// on success.
@@ -1552,11 +1557,14 @@ pub(crate) struct PassiveResizeDone {
     pub session_id: String,
     pub cols: u16,
     pub rows: u16,
+    generation: u64,
 }
 
-static PASSIVE_RESIZE_INTENTS: Mutex<Vec<PassiveResizeIntent>> = Mutex::new(Vec::new());
+static PASSIVE_RESIZE_INTENTS: Mutex<Vec<PassiveResizeWork>> = Mutex::new(Vec::new());
 static PASSIVE_RESIZE_DONES: Mutex<Vec<PassiveResizeDone>> = Mutex::new(Vec::new());
 static PASSIVE_RESIZE_IN_FLIGHT: Mutex<Vec<PassiveResizeDone>> = Mutex::new(Vec::new());
+static PASSIVE_RESIZE_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(1);
 static PASSIVE_RESIZE_WORKER_THREAD: OnceLock<std::thread::Thread> = OnceLock::new();
 #[cfg(test)]
 thread_local! {
@@ -1569,13 +1577,14 @@ thread_local! {
 /// different geometry supersedes the pending slot. This bounds the queue by
 /// the number of sessions even if the worker is delayed or restarts.
 fn queue_latest_passive_resize(
-    queue: &mut Vec<PassiveResizeIntent>,
+    queue: &mut Vec<PassiveResizeWork>,
     in_flight: &[PassiveResizeDone],
-    intent: PassiveResizeIntent,
+    work: PassiveResizeWork,
 ) {
     // Any newly wanted geometry supersedes the queued one for this session,
     // even when it returns to the currently in-flight geometry.
-    queue.retain(|prev| prev.session_id != intent.session_id);
+    let intent = &work.intent;
+    queue.retain(|prev| prev.intent.session_id != intent.session_id);
     if in_flight.iter().any(|active| {
         active.session_id == intent.session_id
             && active.cols == intent.cols
@@ -1583,7 +1592,7 @@ fn queue_latest_passive_resize(
     }) {
         return;
     }
-    queue.push(intent);
+    queue.push(work);
 }
 
 /// Queue a passive preview resize for its worker. Non-blocking by contract:
@@ -1593,18 +1602,23 @@ pub(crate) fn queue_passive_resize(intent: PassiveResizeIntent) {
         let mut queue = PASSIVE_RESIZE_INTENTS
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let work = PassiveResizeWork {
+            intent,
+            generation: PASSIVE_RESIZE_GENERATION
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+        };
         let in_flight = PASSIVE_RESIZE_IN_FLIGHT
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        queue_latest_passive_resize(&mut queue, &in_flight, intent);
+        queue_latest_passive_resize(&mut queue, &in_flight, work);
     }
     if let Some(thread) = PASSIVE_RESIZE_WORKER_THREAD.get() {
         thread.unpark();
     }
 }
 
-fn remove_pending_passive_resize(queue: &mut Vec<PassiveResizeIntent>, session_id: &str) {
-    queue.retain(|intent| intent.session_id != session_id);
+fn remove_pending_passive_resize(queue: &mut Vec<PassiveResizeWork>, session_id: &str) {
+    queue.retain(|work| work.intent.session_id != session_id);
 }
 
 /// Cancel queued geometry once render observes that the completed geometry is
@@ -1618,6 +1632,26 @@ pub(crate) fn cancel_pending_passive_resize(session_id: &str) {
 
 /// Drain completions and release matching in-flight geometry only when render
 /// can adopt the dedup. A newer geometry for the same session remains active.
+fn take_current_passive_completions(
+    in_flight: &mut Vec<PassiveResizeDone>,
+    dones: Vec<PassiveResizeDone>,
+) -> Vec<PassiveResizeDone> {
+    let current: Vec<_> = dones
+        .into_iter()
+        .filter(|done| {
+            in_flight
+                .iter()
+                .any(|active| active.generation == done.generation)
+        })
+        .collect();
+    in_flight.retain(|active| {
+        !current
+            .iter()
+            .any(|done| active.generation == done.generation)
+    });
+    current
+}
+
 pub(crate) fn take_passive_resize_dones() -> Vec<PassiveResizeDone> {
     let dones = {
         let mut slot = PASSIVE_RESIZE_DONES
@@ -1628,65 +1662,43 @@ pub(crate) fn take_passive_resize_dones() -> Vec<PassiveResizeDone> {
     let mut in_flight = PASSIVE_RESIZE_IN_FLIGHT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    in_flight.retain(|active| {
-        !dones.iter().any(|done| {
-            active.session_id == done.session_id
-                && active.cols == done.cols
-                && active.rows == done.rows
-        })
-    });
-    dones
+    take_current_passive_completions(&mut in_flight, dones)
 }
 
-fn clear_passive_resize_in_flight(intent: &PassiveResizeIntent) {
+fn clear_passive_resize_in_flight(work: &PassiveResizeWork) {
     let mut in_flight = PASSIVE_RESIZE_IN_FLIGHT
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    in_flight.retain(|active| {
-        active.session_id != intent.session_id
-            || active.cols != intent.cols
-            || active.rows != intent.rows
-    });
+    in_flight.retain(|active| active.generation != work.generation);
 }
 
-/// Execute one queued passive resize with EXACTLY the authoritative checks the
-/// in-paint path used before it moved off the render thread (#3071): skip a
-/// session that no longer exists (the intent is dropped here; the render
-/// thread re-queues every frame because its pending slot stays armed until a
-/// completion adopts the dedup), defer to an attached client or an active
-/// size owner, and only then `resize-window`. Publishes a completion on
-/// success so the render thread can record the dedup.
-fn execute_passive_resize(intent: &PassiveResizeIntent) -> Option<PassiveResizeDone> {
+/// Execute one queued passive resize under an atomic final tmux guard. The
+/// worker first rejects a missing session; the Session helper then fences both
+/// a newly attached client and a size-owner takeover at resize execution.
+fn execute_passive_resize(work: &PassiveResizeWork) -> Option<PassiveResizeDone> {
+    let intent = &work.intent;
     let deadline = TmuxCommandDeadline::new();
     let session = Session::from_name(&intent.session_name);
     if !session.exists_with_deadline(&deadline) {
         return None;
     }
-    let attached = session.is_attached_with_deadline(&deadline);
-    if attached != Some(false) {
-        return None;
-    }
-    if !passive_resize_authorized(
-        true,
-        attached,
-        session.has_active_size_owner_with_deadline(&deadline),
-    ) {
-        return None;
-    }
     session
-        .resize_window_after_exists_with_deadline(intent.cols, intent.rows, &deadline)
+        .resize_window_if_detached_without_active_owner_after_exists_with_deadline(
+            intent.cols,
+            intent.rows,
+            &deadline,
+        )
         .then(|| PassiveResizeDone {
             session_id: intent.session_id.clone(),
             cols: intent.cols,
             rows: intent.rows,
+            generation: work.generation,
         })
 }
-fn passive_resize_authorized(
-    exists: bool,
-    attached: Option<bool>,
-    active_size_owner: Option<bool>,
-) -> bool {
-    exists && attached == Some(false) && active_size_owner == Some(false)
+
+fn publish_latest_passive_resize_done(dones: &mut Vec<PassiveResizeDone>, done: PassiveResizeDone) {
+    dones.retain(|previous| previous.session_id != done.session_id);
+    dones.push(done);
 }
 
 fn execute_passive_resizes() {
@@ -1700,26 +1712,28 @@ fn execute_passive_resizes() {
         let mut in_flight = PASSIVE_RESIZE_IN_FLIGHT
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        for intent in &intents {
+        for work in &intents {
+            let intent = &work.intent;
             in_flight.retain(|active| active.session_id != intent.session_id);
             in_flight.push(PassiveResizeDone {
                 session_id: intent.session_id.clone(),
                 cols: intent.cols,
                 rows: intent.rows,
+                generation: work.generation,
             });
         }
         intents
     };
 
-    for intent in intents {
-        let Some(done) = execute_passive_resize(&intent) else {
-            clear_passive_resize_in_flight(&intent);
+    for work in intents {
+        let Some(done) = execute_passive_resize(&work) else {
+            clear_passive_resize_in_flight(&work);
             continue;
         };
         let mut dones = PASSIVE_RESIZE_DONES
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        dones.push(done);
+        publish_latest_passive_resize_done(&mut dones, done);
     }
 }
 fn clear_all_passive_resizes_in_flight() {
@@ -2042,29 +2056,39 @@ mod tests {
     }
     #[test]
     fn passive_resize_queue_keeps_latest_intent_per_session() {
-        let intent = |session_id: &str, cols, rows| PassiveResizeIntent {
-            session_id: session_id.to_string(),
-            session_name: format!("aoe_test_{session_id}"),
-            cols,
-            rows,
+        let work = |generation, session_id: &str, cols, rows| PassiveResizeWork {
+            intent: PassiveResizeIntent {
+                session_id: session_id.to_string(),
+                session_name: format!("aoe_test_{session_id}"),
+                cols,
+                rows,
+            },
+            generation,
         };
         let mut queue = Vec::new();
-        queue_latest_passive_resize(&mut queue, &[], intent("a", 80, 24));
-        queue_latest_passive_resize(&mut queue, &[], intent("b", 90, 30));
-        queue_latest_passive_resize(&mut queue, &[], intent("a", 120, 40));
+        queue_latest_passive_resize(&mut queue, &[], work(1, "a", 80, 24));
+        queue_latest_passive_resize(&mut queue, &[], work(2, "b", 90, 30));
+        queue_latest_passive_resize(&mut queue, &[], work(3, "a", 120, 40));
 
         assert_eq!(queue.len(), 2, "one bounded slot per session");
-        assert_eq!((queue[0].session_id.as_str(), queue[0].cols), ("b", 90));
-        assert_eq!((queue[1].session_id.as_str(), queue[1].cols), ("a", 120));
+        assert_eq!(
+            (queue[0].intent.session_id.as_str(), queue[0].intent.cols),
+            ("b", 90)
+        );
+        assert_eq!(
+            (queue[1].intent.session_id.as_str(), queue[1].intent.cols),
+            ("a", 120)
+        );
 
         let in_flight = vec![PassiveResizeDone {
             session_id: "a".to_string(),
             cols: 120,
             rows: 40,
+            generation: 4,
         }];
         let mut while_running = Vec::new();
-        queue_latest_passive_resize(&mut while_running, &in_flight, intent("a", 120, 40));
-        let mut completed_then_in_sync = vec![intent("a", 140, 50)];
+        queue_latest_passive_resize(&mut while_running, &in_flight, work(5, "a", 120, 40));
+        let mut completed_then_in_sync = vec![work(6, "a", 140, 50)];
         remove_pending_passive_resize(&mut completed_then_in_sync, "a");
         assert!(
             completed_then_in_sync.is_empty(),
@@ -2074,15 +2098,61 @@ mod tests {
             while_running.is_empty(),
             "identical in-flight resize is suppressed"
         );
-        queue_latest_passive_resize(&mut while_running, &in_flight, intent("a", 140, 50));
-        assert_eq!((while_running[0].cols, while_running[0].rows), (140, 50));
+        queue_latest_passive_resize(&mut while_running, &in_flight, work(7, "a", 140, 50));
+        assert_eq!(
+            (while_running[0].intent.cols, while_running[0].intent.rows),
+            (140, 50)
+        );
         // If the desired geometry returns to the in-flight one before G2 is
         // drained, the now-stale queued G2 must be removed as well.
-        queue_latest_passive_resize(&mut while_running, &in_flight, intent("a", 120, 40));
+        queue_latest_passive_resize(&mut while_running, &in_flight, work(8, "a", 120, 40));
         assert!(
             while_running.is_empty(),
             "returning to the in-flight geometry drops stale queued geometry"
         );
+
+        let old_done = PassiveResizeDone {
+            session_id: "a".to_string(),
+            cols: 120,
+            rows: 40,
+            generation: 9,
+        };
+        let mut newer_same_geometry = vec![PassiveResizeDone {
+            generation: 10,
+            ..old_done.clone()
+        }];
+        let stale = take_current_passive_completions(&mut newer_same_geometry, vec![old_done]);
+        assert!(stale.is_empty(), "stale completion must not reach render");
+        assert_eq!(
+            newer_same_geometry[0].generation, 10,
+            "an old identical completion must not clear newer in-flight work"
+        );
+        let current_done = newer_same_geometry[0].clone();
+        let current =
+            take_current_passive_completions(&mut newer_same_geometry, vec![current_done]);
+        assert_eq!(current[0].generation, 10);
+        assert!(newer_same_geometry.is_empty());
+
+        let mut published = Vec::new();
+        publish_latest_passive_resize_done(&mut published, current[0].clone());
+        publish_latest_passive_resize_done(
+            &mut published,
+            PassiveResizeDone {
+                generation: 11,
+                ..current[0].clone()
+            },
+        );
+        publish_latest_passive_resize_done(
+            &mut published,
+            PassiveResizeDone {
+                session_id: "b".to_string(),
+                cols: 90,
+                rows: 30,
+                generation: 12,
+            },
+        );
+        assert_eq!(published.len(), 2, "one completion slot per session");
+        assert_eq!(published[0].generation, 11);
     }
 
     #[test]
@@ -2093,11 +2163,14 @@ mod tests {
         let name = Session::generate_name(ID, TITLE);
         let cache = SessionCacheGuard::capture();
         cache.force_stale();
-        let intent = PassiveResizeIntent {
-            session_id: ID.to_string(),
-            session_name: name.clone(),
-            cols: 100,
-            rows: 30,
+        let intent = PassiveResizeWork {
+            intent: PassiveResizeIntent {
+                session_id: ID.to_string(),
+                session_name: name.clone(),
+                cols: 100,
+                rows: 30,
+            },
+            generation: 1,
         };
         let _ = fork_probe::take();
         let probe = fork_probe::arm();
@@ -2124,25 +2197,6 @@ mod tests {
         assert_eq!(args.first().map(|a| a.to_str().unwrap()), Some("-S"));
         assert!(args.get(1).is_some(), "socket path arg present");
         assert_eq!(cmd.get_program().to_str(), Some("tmux"));
-    }
-
-    #[test]
-    fn passive_resize_fails_closed_on_unknown_authority() {
-        let cases = [
-            ("authoritative", true, Some(false), Some(false), true),
-            ("missing", false, Some(false), Some(false), false),
-            ("attached unknown", true, None, Some(false), false),
-            ("owner unknown", true, Some(false), None, false),
-            ("attached", true, Some(true), Some(false), false),
-            ("owned", true, Some(false), Some(true), false),
-        ];
-        for (name, exists, attached, owner, expected) in cases {
-            assert_eq!(
-                passive_resize_authorized(exists, attached, owner),
-                expected,
-                "{name}",
-            );
-        }
     }
 
     #[test]

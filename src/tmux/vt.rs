@@ -247,21 +247,26 @@ static OSC52_ARM_LOCKS: LazyLock<Mutex<HashMap<String, Arc<Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
 static SOCK_COUNTER: AtomicU64 = AtomicU64::new(0);
+static PIPE_OWNER_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Monotonic base for chunk-arrival timestamps. The reader stamps each chunk's
 /// arrival against this (millis), and the TUI capture worker reads the deltas
-/// via [`VtChannel::chunk_timing`] to drive its repaint-quiescence debounce.
+/// via VtChannel::chunk_timing to drive its repaint-quiescence debounce.
 static CHUNK_CLOCK: LazyLock<Instant> = LazyLock::new(Instant::now);
 
 fn chunk_now_ms() -> u64 {
     CHUNK_CLOCK.elapsed().as_millis() as u64
 }
 
-/// This process's identity in the cross-process VT-owner lock. Per-process
-/// (not per-channel): one process never fights itself (the registry dedups),
-/// so the lock only needs to distinguish processes.
-fn vt_owner_id() -> String {
-    format!("pid-{}", std::process::id())
+/// Unique lease identity for one armed pipe generation. A process can retain
+/// a dead channel while its replacement arms under the same session name, so
+/// process identity alone cannot fence stale shutdown and heartbeat calls.
+fn new_pipe_owner_id() -> String {
+    format!(
+        "pipe-{}-{}",
+        std::process::id(),
+        PIPE_OWNER_COUNTER.fetch_add(1, Ordering::Relaxed)
+    )
 }
 
 /// A `(Mutex, Condvar)` pair an in-process poller parks on. Registered via
@@ -1298,6 +1303,8 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
 pub(crate) struct VtChannel {
     /// tmux session name; the registry key.
     name: String,
+    /// Fencing token for this exact pipe generation.
+    owner_id: String,
     /// `name:^.0`, the pane target for tmux commands.
     target: String,
     parser: Arc<Mutex<vt100::Parser>>,
@@ -1432,6 +1439,7 @@ impl VtChannel {
         // Drop finished arm locks so the map tracks in-flight arms only. Our
         // own entry survives while another acquire holds a clone (count > 1
         // besides the map's).
+        drop(arm_lock);
         ARM_LOCKS
             .lock()
             .unwrap()
@@ -1457,7 +1465,7 @@ impl VtChannel {
         // re-checks the lock so ownership transfers once the holder releases
         // (or its heartbeat goes stale: crash, kill -9).
         let session = crate::tmux::Session::from_name(name);
-        let owner = vt_owner_id();
+        let owner = new_pipe_owner_id();
         if !session.claim_vt_owner_with_deadline(
             &owner,
             crate::tmux::session::VT_OWNER_TTL,
@@ -1487,14 +1495,27 @@ impl VtChannel {
         let n = SOCK_COUNTER.fetch_add(1, Ordering::Relaxed);
         let sock_dir = std::env::temp_dir().join(format!("aoe-vt-{}-{n}", std::process::id()));
         let _ = std::fs::remove_dir_all(&sock_dir);
-        std::fs::create_dir_all(&sock_dir).ok()?;
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&sock_dir, std::fs::Permissions::from_mode(0o700)).ok()?;
-        }
-        let sock_path = sock_dir.join("s.sock");
-        let listener = UnixListener::bind(&sock_path).ok()?;
-
+        let setup = || -> Option<(PathBuf, UnixListener)> {
+            std::fs::create_dir_all(&sock_dir).ok()?;
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&sock_dir, std::fs::Permissions::from_mode(0o700)).ok()?;
+            }
+            let sock_path = sock_dir.join("s.sock");
+            Some((sock_path.clone(), UnixListener::bind(sock_path).ok()?))
+        };
+        let Some((sock_path, listener)) = setup() else {
+            let _ = std::fs::remove_dir_all(&sock_dir);
+            let cleanup_deadline = crate::tmux::TmuxCommandDeadline::new();
+            session.release_vt_pipe_owner_with_deadline(&owner, &cleanup_deadline);
+            return None;
+        };
+        let Some(exe) = std::env::current_exe().ok() else {
+            let _ = std::fs::remove_dir_all(&sock_dir);
+            let cleanup_deadline = crate::tmux::TmuxCommandDeadline::new();
+            session.release_vt_pipe_owner_with_deadline(&owner, &cleanup_deadline);
+            return None;
+        };
         let wakeup: Arc<Mutex<Option<ChangeWakeup>>> = Arc::new(Mutex::new(None));
         let chunk_seq = Arc::new(AtomicU64::new(0));
         let last_chunk_ms = Arc::new(AtomicU64::new(0));
@@ -1518,23 +1539,20 @@ impl VtChannel {
             std::thread::spawn(move || run_reader(listener, ctx))
         };
 
-        let exe = std::env::current_exe().ok()?;
         let pipe_cmd = format!(
             "{} __vt-pipe {}",
             sh_quote(&exe.to_string_lossy()),
             sh_quote(&sock_path.to_string_lossy())
         );
-        let mut command = crate::tmux::tmux_command();
-        command.args(["pipe-pane", "-IO", "-t", &target, &pipe_cmd]);
-        let armed = deadline.run(&mut command).ok();
-        if !armed.map(|o| o.status.success()).unwrap_or(false) {
+        let armed = session.arm_vt_pipe_if_owner_with_deadline(&owner, "-IO", &pipe_cmd, deadline);
+        if !armed {
             tracing::warn!(%target, "vt: tmux pipe-pane failed; falling back to capture");
             stop_and_wake_reader(&stop, &sock_path);
-            let _ = reader.join();
-            let _ = std::fs::remove_dir_all(&sock_dir);
             // Free the owner lock we claimed above so another process can arm
             // right away instead of waiting out the TTL on our failed attempt.
-            session.release_vt_owner_with_deadline(&owner, deadline);
+            session.release_vt_pipe_owner(&owner);
+            let _ = reader.join();
+            let _ = std::fs::remove_dir_all(&sock_dir);
             return None;
         }
 
@@ -1549,12 +1567,9 @@ impl VtChannel {
             if Instant::now() >= connect_deadline {
                 tracing::warn!(%target, "vt: forwarder did not connect; falling back to capture");
                 stop_and_wake_reader(&stop, &sock_path);
-                let mut command = crate::tmux::tmux_command();
-                command.args(["pipe-pane", "-t", &target]);
-                let _ = deadline.run(&mut command);
+                session.release_vt_pipe_owner(&owner);
                 let _ = reader.join();
                 let _ = std::fs::remove_dir_all(&sock_dir);
-                session.release_vt_owner_with_deadline(&owner, deadline);
                 return None;
             }
             std::thread::sleep(Duration::from_millis(2));
@@ -1567,12 +1582,9 @@ impl VtChannel {
         {
             tracing::warn!(%target, "vt: initial seed failed; falling back to capture");
             stop_and_wake_reader(&stop, &sock_path);
-            let mut command = crate::tmux::tmux_command();
-            command.args(["pipe-pane", "-t", &target]);
-            let _ = deadline.run(&mut command);
+            session.release_vt_pipe_owner(&owner);
             let _ = reader.join();
             let _ = std::fs::remove_dir_all(&sock_dir);
-            session.release_vt_owner_with_deadline(&owner, deadline);
             return None;
         }
         grid_gen.fetch_add(1, Ordering::Relaxed);
@@ -1587,6 +1599,7 @@ impl VtChannel {
 
         Some(Self {
             name: name.to_string(),
+            owner_id: owner,
             target,
             parser,
             stream,
@@ -1628,7 +1641,7 @@ impl VtChannel {
         *guard = Instant::now();
         drop(guard);
         let _ = crate::tmux::Session::from_name(&self.name)
-            .refresh_vt_owner_with_deadline(&vt_owner_id(), deadline);
+            .refresh_vt_owner_with_deadline(&self.owner_id, deadline);
     }
 
     /// Reconcile the parser with the pane at most once a second (one
@@ -1913,16 +1926,13 @@ impl VtChannel {
         if self.stop.swap(true, Ordering::Relaxed) {
             return;
         }
-        let mut command = crate::tmux::tmux_command();
-        command.args(["pipe-pane", "-t", &self.target]);
-        let _ = deadline.run(&mut command);
+        crate::tmux::Session::from_name(&self.name)
+            .release_vt_pipe_owner_with_deadline(&self.owner_id, deadline);
         let _ = UnixStream::connect(&self.sock_path);
         if let Some(reader) = self.reader.lock().unwrap().take() {
             let _ = reader.join();
         }
         let _ = std::fs::remove_dir_all(&self.sock_dir);
-        crate::tmux::Session::from_name(&self.name)
-            .release_vt_owner_with_deadline(&vt_owner_id(), deadline);
     }
 }
 impl Drop for VtChannel {
@@ -1946,7 +1956,8 @@ impl Drop for VtChannel {
 /// grid, so prompt redraws cannot affect the displayed frame.
 pub(crate) struct Osc52Channel {
     name: String,
-    target: String,
+    /// Fencing token for this exact pipe generation.
+    owner_id: String,
     clipboard: Arc<Mutex<Option<String>>>,
     /// Monotonically bumps after publishing a clipboard value. Consumers keep
     /// their own cursor so one dashboard viewer cannot consume an event for
@@ -1998,6 +2009,7 @@ impl Osc52Channel {
                 })
             }
         };
+        drop(arm_lock);
         OSC52_ARM_LOCKS
             .lock()
             .unwrap()
@@ -2009,9 +2021,8 @@ impl Osc52Channel {
         if !tmux_supports_pipe_pane_io(deadline) {
             return None;
         }
-        let target = format!("{name}:^.0");
         let session = crate::tmux::Session::from_name(name);
-        let owner = vt_owner_id();
+        let owner = new_pipe_owner_id();
         if !session.claim_vt_owner_with_deadline(
             &owner,
             crate::tmux::session::VT_OWNER_TTL,
@@ -2033,12 +2044,12 @@ impl Osc52Channel {
         };
         let Some((sock_path, listener)) = setup() else {
             let _ = std::fs::remove_dir_all(&sock_dir);
-            session.release_vt_owner_with_deadline(&owner, deadline);
+            session.release_vt_pipe_owner(&owner);
             return None;
         };
         let Some(exe) = std::env::current_exe().ok() else {
             let _ = std::fs::remove_dir_all(&sock_dir);
-            session.release_vt_owner_with_deadline(&owner, deadline);
+            session.release_vt_pipe_owner(&owner);
             return None;
         };
 
@@ -2060,35 +2071,30 @@ impl Osc52Channel {
             sh_quote(&exe.to_string_lossy()),
             sh_quote(&sock_path.to_string_lossy())
         );
-        let mut command = crate::tmux::tmux_command();
-        command.args(["pipe-pane", "-O", "-t", &target, &pipe_cmd]);
-        let armed = deadline.run(&mut command).ok();
-        if !armed.map(|o| o.status.success()).unwrap_or(false) {
+        let armed = session.arm_vt_pipe_if_owner_with_deadline(&owner, "-O", &pipe_cmd, deadline);
+        if !armed {
             stop.store(true, Ordering::Relaxed);
+            session.release_vt_pipe_owner(&owner);
             let _ = UnixStream::connect(&sock_path);
             let _ = reader.join();
             let _ = std::fs::remove_dir_all(&sock_dir);
-            session.release_vt_owner_with_deadline(&owner, deadline);
             return None;
         }
         let connect_deadline = Instant::now() + Duration::from_millis(500);
         while !alive.load(Ordering::Relaxed) {
             if Instant::now() >= connect_deadline {
                 stop.store(true, Ordering::Relaxed);
-                let mut command = crate::tmux::tmux_command();
-                command.args(["pipe-pane", "-t", &target]);
-                let _ = deadline.run(&mut command);
+                session.release_vt_pipe_owner(&owner);
                 let _ = UnixStream::connect(&sock_path);
                 let _ = reader.join();
                 let _ = std::fs::remove_dir_all(&sock_dir);
-                session.release_vt_owner_with_deadline(&owner, deadline);
                 return None;
             }
             std::thread::sleep(Duration::from_millis(2));
         }
         Some(Self {
             name: name.to_string(),
-            target,
+            owner_id: owner,
             clipboard,
             clipboard_seq,
             alive,
@@ -2139,22 +2145,19 @@ impl Osc52Channel {
         *last = Instant::now();
         drop(last);
         let _ = crate::tmux::Session::from_name(&self.name)
-            .refresh_vt_owner_with_deadline(&vt_owner_id(), deadline);
+            .refresh_vt_owner_with_deadline(&self.owner_id, deadline);
     }
     pub(crate) fn shutdown_with_deadline(&self, deadline: &crate::tmux::TmuxCommandDeadline) {
         if self.stop.swap(true, Ordering::Relaxed) {
             return;
         }
-        let mut command = crate::tmux::tmux_command();
-        command.args(["pipe-pane", "-t", &self.target]);
-        let _ = deadline.run(&mut command);
+        crate::tmux::Session::from_name(&self.name)
+            .release_vt_pipe_owner_with_deadline(&self.owner_id, deadline);
         let _ = UnixStream::connect(&self.sock_path);
         if let Some(reader) = self.reader.lock().unwrap().take() {
             let _ = reader.join();
         }
         let _ = std::fs::remove_dir_all(&self.sock_dir);
-        crate::tmux::Session::from_name(&self.name)
-            .release_vt_owner_with_deadline(&vt_owner_id(), deadline);
     }
 }
 
@@ -2225,6 +2228,11 @@ impl Drop for Osc52Channel {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pipe_owner_ids_are_unique_per_channel_generation() {
+        assert_ne!(new_pipe_owner_id(), new_pipe_owner_id());
+    }
 
     #[test]
     fn transient_version_failure_is_not_cached() {
@@ -2654,6 +2662,7 @@ mod tests {
         let alive = Arc::new(AtomicBool::new(false));
         let ch = Arc::new(VtChannel {
             name: name.to_string(),
+            owner_id: new_pipe_owner_id(),
             target: format!("{name}:^.0"),
             parser: Arc::new(Mutex::new(vt100::Parser::new(4, 20, SCROLLBACK_LINES))),
             stream: Arc::new(Mutex::new(None)),

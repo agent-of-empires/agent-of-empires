@@ -118,8 +118,8 @@ fn test_session_name_format() {
 }
 
 /// The TUI live-send resize path must size the pane through
-/// `Session::resize_window` (which adds the status-bar chrome back so the pane
-/// lands at exactly the requested rows, #2766), not a raw `resize-window` that
+/// `Session::resize_window_if_owner` (which preserves the chrome-aware resize
+/// path while fencing ownership in tmux's command queue, #2766), not a raw `resize-window` that
 /// ignores chrome. A raw resize leaves the live pane a row short of the preview
 /// output area whenever a client reserves the status row, desyncing the live
 /// preview by a row (#2742). Behavioral coverage is unreliable here because
@@ -134,8 +134,8 @@ fn test_live_send_resize_uses_chrome_aware_resize_window() {
         std::fs::read_to_string("src/tui/home/live_send.rs").expect("Failed to read live_send.rs");
     let body = app_method_body(&dispatch, "dispatch_via_fork");
     assert!(
-        body.contains("resize_window("),
-        "dispatch_via_fork must resize through Session::resize_window (chrome-aware, #2766)"
+        body.contains("resize_window_if_owner("),
+        "dispatch_via_fork must use the guarded chrome-aware resize path (#2766)"
     );
     assert!(
         !body.contains("\"resize-window\""),

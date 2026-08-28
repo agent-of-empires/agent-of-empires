@@ -622,7 +622,7 @@ async fn handle_live_ws(
                             let claimed = tokio::task::spawn_blocking(move || {
                                 let session = crate::tmux::Session::from_name(&name);
                                 if session.claim_size_owner(&who, SIZE_OWNER_TTL) {
-                                    let resized = session.resize_window(cols, rows);
+                                    let resized = session.resize_window_if_owner(&who, cols, rows);
                                     if !resized {
                                         session.release_size_owner(&who);
                                     }
@@ -905,7 +905,8 @@ async fn handle_live_ws(
                                 let owned = tokio::task::spawn_blocking(move || {
                                     let session = crate::tmux::Session::from_name(&name);
                                     if session.claim_size_owner(&who, SIZE_OWNER_TTL) {
-                                        let resized = session.resize_window(cols, rows);
+                                        let resized =
+                                            session.resize_window_if_owner(&who, cols, rows);
                                         if !resized {
                                             session.release_size_owner(&who);
                                         }
@@ -971,7 +972,8 @@ async fn handle_live_ws(
                                     let session = crate::tmux::Session::from_name(&name);
                                     if session.steal_size_owner(&who) {
                                         if cols > 0 && rows > 0 {
-                                            let resized = session.resize_window(cols, rows);
+                                            let resized =
+                                                session.resize_window_if_owner(&who, cols, rows);
                                             if !resized {
                                                 session.release_size_owner(&who);
                                             }

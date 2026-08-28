@@ -594,8 +594,10 @@ impl LiveSendWorker {
                             }
                         }
                         if !batch.is_empty() {
-                            match dispatch_batch(&tmux_name, batch) {
+                            match dispatch_batch(&tmux_name, &owner_id, batch) {
                                 ResizeDispatchResult::Failed => {
+                                    session.release_size_owner(&owner_id);
+                                    owned = false;
                                     thread_resize_failed.store(true, Ordering::Relaxed);
                                 }
                                 ResizeDispatchResult::Succeeded => {
@@ -1947,7 +1949,11 @@ enum ResizeDispatchResult {
 /// Walk one drained batch and execute it as one-shot tmux subprocesses.
 /// Coalescing merges literal-key runs into a single send-keys call; named
 /// keys and resizes dispatch individually.
-fn dispatch_batch(tmux_name: &str, batch: Vec<WorkerMsg>) -> ResizeDispatchResult {
+fn dispatch_batch(
+    tmux_name: &str,
+    resize_owner: &str,
+    batch: Vec<WorkerMsg>,
+) -> ResizeDispatchResult {
     let actions = coalesce(batch);
     // A Paste can only go through tmux (paste-buffer -p decides whether the
     // pane gets bracketed-paste markers), so pin the whole mixed batch to tmux
@@ -1956,7 +1962,7 @@ fn dispatch_batch(tmux_name: &str, batch: Vec<WorkerMsg>) -> ResizeDispatchResul
     let mut resize_result = ResizeDispatchResult::None;
     for action in actions {
         let is_resize = matches!(action, TmuxAction::Resize { .. });
-        match dispatch_via_fork(tmux_name, &action, force_tmux) {
+        match dispatch_via_fork(tmux_name, &action, force_tmux, Some(resize_owner)) {
             Ok(()) if is_resize => resize_result = ResizeDispatchResult::Succeeded,
             Ok(()) => {}
             Err(err) => {
@@ -1975,10 +1981,15 @@ fn dispatch_batch(tmux_name: &str, batch: Vec<WorkerMsg>) -> ResizeDispatchResul
     resize_result
 }
 
-/// Execute one `TmuxAction` as a one-shot `tmux` subprocess. Module-
-/// level fn (rather than a method on the worker) so it stays callable
-/// from the spawned thread without holding a worker reference.
-fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction, force_tmux: bool) -> anyhow::Result<()> {
+/// Execute one TmuxAction as a one-shot tmux subprocess. Module-level fn
+/// (rather than a method on the worker) so it stays callable from the spawned
+/// thread without holding a worker reference.
+fn dispatch_via_fork(
+    tmux_name: &str,
+    action: &TmuxAction,
+    force_tmux: bool,
+    resize_owner: Option<&str>,
+) -> anyhow::Result<()> {
     use std::process::Stdio;
 
     // Fast path (`[tmux] vt_live`): when a *live* input channel is armed for this
@@ -2077,11 +2088,15 @@ fn dispatch_via_fork(tmux_name: &str, action: &TmuxAction, force_tmux: bool) -> 
             return crate::tmux::Session::from_name(tmux_name).paste_text(text);
         }
         TmuxAction::Resize { cols, rows } => {
-            // Use the shared chrome-aware and timeout-bounded resize path. A
-            // failure is reported to the worker so paint clears its dedup and
-            // retries the same geometry on the next frame.
-            if !crate::tmux::Session::from_name(tmux_name).resize_window(*cols, *rows) {
-                anyhow::bail!("live-send resize-window failed or timed out");
+            // Ownership is checked by tmux in the same command queue as the
+            // resize. The worker's earlier heartbeat check only filters stale
+            // batches; it cannot authorize a later subprocess safely.
+            let owner = resize_owner
+                .ok_or_else(|| anyhow::anyhow!("live-send resize has no owner token"))?;
+            if !crate::tmux::Session::from_name(tmux_name)
+                .resize_window_if_owner(owner, *cols, *rows)
+            {
+                anyhow::bail!("live-send resize lost ownership, failed, or timed out");
             }
             return Ok(());
         }
@@ -2401,7 +2416,7 @@ pub(super) fn send_key_oneshot(tmux_name: &str, key: TmuxKey) {
         .spawn(move || {
             let _slot = OneshotSlot;
             // A wheel notch is never a paste, so the vt fast path stays open.
-            if let Err(err) = dispatch_via_fork(&tmux_name, &action, false) {
+            if let Err(err) = dispatch_via_fork(&tmux_name, &action, false, None) {
                 tracing::warn!(
                     target: "tui.live_send",
                     error = %err,
@@ -3698,7 +3713,7 @@ mod tests {
         let name = "aoe_test_missing_live_resize";
         let action = TmuxAction::Resize { cols: 80, rows: 24 };
         assert!(
-            dispatch_via_fork(name, &action, false).is_err(),
+            dispatch_via_fork(name, &action, false, Some("test-owner")).is_err(),
             "the bounded resize path must expose failure"
         );
 
