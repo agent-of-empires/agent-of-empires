@@ -35,6 +35,11 @@ For web commands and tests, read `web/AGENTS.md`.
 - Do not add dead code or `#[allow(dead_code)]`.
 - Comments should explain non-obvious reasons or invariants, not restate code or
   preserve implementation history.
+- Add standalone documentation only for a durable user workflow, public
+  contract, or cross-cutting invariant. Keep implementation details with the
+  code; do not add feature inventories, rollout history, or duplicate guides.
+- Link to one canonical source instead of restating it. Delete or update stale
+  documentation in the same change that makes it stale.
 - Do not use em dashes or `--` as prose separators in hand-written docs and
   comments.
 - Keep OS-specific behavior in `src/process/{macos,linux}.rs`.
@@ -100,8 +105,7 @@ Every non-Rust, non-TOML asset embedded with `include_*` must be added to
 `scripts/check-nix-embedded-assets.py`.
 
 Runtime state belongs in the platform app directory, never in commits. Use
-ignored paths for experiments. Logging behavior is documented in
-`docs/development/logging.md`.
+ignored paths for experiments.
 
 Read `DESIGN.md` before visual changes.
 

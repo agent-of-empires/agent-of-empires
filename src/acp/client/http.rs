@@ -395,8 +395,7 @@ impl HttpClient {
 
     /// `GET /api/sessions/{id}/queue`: the server-owned prompt queue, ordered
     /// by ascending `seq`. The daemon owns and drains this queue, so the native
-    /// view mirrors it rather than keeping its own (the web client does the
-    /// same). See `docs/development/server-side-prompt-queue.md`.
+    /// view mirrors it rather than keeping its own.
     pub async fn queue_list(
         &self,
         session_id: &str,

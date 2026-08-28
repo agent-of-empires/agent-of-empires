@@ -879,13 +879,8 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub pending_initial_turn_attachments: Vec<crate::acp::state::PromptAttachmentRef>,
 
-    /// Server-owned prompt queue: follow-ups the user lined up while a turn
-    /// was busy. The daemon is the source of truth, so the queue survives a
-    /// client reload / closed PWA and drains on turn-end with no tab open
-    /// (see `docs/development/server-side-prompt-queue.md`). Ordered by
-    /// `QueuedPromptEntry::seq`. Serve-only: the queue exists only for the
-    /// web dashboard's structured view. `#[serde(default)]` + skip-when-empty
-    /// keeps pre-existing rows deserialising unchanged, so no migration.
+    /// Server-owned follow-ups, ordered by `QueuedPromptEntry::seq`. Persisted
+    /// here so the daemon can drain them without a connected client.
     #[cfg(feature = "serve")]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued_prompts: Vec<crate::acp::state::QueuedPromptEntry>,

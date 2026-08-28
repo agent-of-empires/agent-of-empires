@@ -14,8 +14,8 @@ cargo fmt
 cargo clippy
 ```
 
-The binary is `target/{profile}/aoe`. Dashboard development details live in
-[Web dashboard development](development/web-dashboard.md).
+The binary is `target/{profile}/aoe`. Web commands and test selection are in
+`web/AGENTS.md`.
 
 ## Run and inspect logs
 
@@ -27,8 +27,6 @@ AOE_ACP_TRACE=1 cargo run
 AOE_TERMINAL_TRACE=1 cargo run
 aoe logs
 ```
-
-See [Logging](development/logging.md) for sinks, filters, traces, and rotation.
 
 For the dashboard, `cargo xtask dev` runs a serve-enabled debug backend on 8081
 and Vite with HMR on 5173. Add `--watch` to rebuild and restart the backend when

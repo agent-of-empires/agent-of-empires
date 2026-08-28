@@ -165,13 +165,13 @@ pub struct StructuredInteractionRequest {
     kind: String,
 }
 
-/// Report an acp interaction that only the browser can observe, so the
-/// daemon can fold it into its next opt-in snapshot. The four other
+/// Report a browser acp interaction so the daemon can fold it into its next
+/// opt-in snapshot. The four other
 /// interaction signals (approvals, agent switch, substrate toggle, plan mode)
 /// are tallied daemon-side in their REST handlers and never come through here;
-/// queued prompts are the exception because the prompt queue lives entirely in
-/// the web structured view's client state. Returns 204 on success; the client need not
-/// branch on consent state (the daemon only sends counts when opted in).
+/// queued prompts are reported here. Returns 204 on success; the client need
+/// not branch on consent state because the daemon only sends counts when opted
+/// in.
 pub async fn post_telemetry_structured_interaction(
     State(state): State<Arc<AppState>>,
     body: Result<Json<StructuredInteractionRequest>, axum::extract::rejection::JsonRejection>,

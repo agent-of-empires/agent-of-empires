@@ -2,8 +2,6 @@
 
 Reference documentation for git worktree commands and configuration in `aoe`.
 
-For workflow guidance, see the [Workflow Guide](workflow.md).
-
 ## CLI vs TUI Behavior
 
 | Feature | CLI | TUI |
@@ -210,7 +208,7 @@ The session is still created when the fetch fails. The worktree branches off wha
 
 ## Bare Repos
 
-AOE auto-detects bare repos and uses `bare_repo_path_template` (default `./{branch}`) instead of `path_template`, creating worktrees as siblings within the project directory. See [Workflow](workflow.md) for the bare-repo setup.
+AOE auto-detects bare repos and uses `bare_repo_path_template` (default `./{branch}`) instead of `path_template`, creating worktrees as siblings within the project directory.
 
 ## File Locations
 

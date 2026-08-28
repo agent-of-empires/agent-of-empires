@@ -200,8 +200,7 @@ pub struct SessionResponse {
     /// The session's server-owned prompt queue (follow-ups the user lined up
     /// while a turn was busy), ordered by `seq`. The daemon owns it, so it is
     /// visible across the user's devices and survives a client reload; the
-    /// structured view renders it and drains happen server-side. See
-    /// `docs/development/server-side-prompt-queue.md`.
+    /// structured view renders it and drains happen server-side.
     #[cfg(feature = "serve")]
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub queued_prompts: Vec<crate::acp::state::QueuedPromptEntry>,

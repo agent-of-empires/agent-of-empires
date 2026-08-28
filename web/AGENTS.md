@@ -25,8 +25,12 @@ Prettier is not used.
 - Live Playwright: backend persistence, auth, sessions, tmux, git, read-only
   behavior, and structured-view round trips.
 
-Commands, harness details, and mobile recipes live in
-`../docs/development/playwright.md`.
+Run `npm run test:unit` for Vitest,
+`npx playwright test --config=playwright.config.ts` for mocked browser tests,
+and `npx playwright test --config=playwright.live.config.ts` for live tests.
+Live tests use `tests/helpers/aoeServe.ts`, which gives each test an isolated
+home, tmux socket, and port. Use its existing fixtures instead of launching a
+shared server.
 
 Any user-facing change to auth, session creation, settings, profiles, sessions,
 sidebar, diff, notifications, directory browsing, devices, git clone,
