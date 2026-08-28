@@ -664,6 +664,11 @@ pub struct HomeView {
     /// at, so the reconcile can tell when the displayed pane changed and
     /// retarget. `None` before the first preview or when nothing is selected.
     pub(super) preview_capture_target: Option<String>,
+    /// Last observed `LiveCaptureWorker::cycles` value and when it advanced.
+    /// `None` before the first observation and after every retarget. If it
+    /// remains unchanged beyond the shared tmux operation deadline plus grace,
+    /// render replaces the worker without executing tmux synchronously.
+    pub(super) preview_worker_pulse: Option<(u64, std::time::Instant)>,
     /// Notified by the capture worker thread when it has fresh, changed
     /// content. The event loop selects on this to repaint without
     /// busy-polling; an idle pane (no new content) never wakes it.
@@ -2351,6 +2356,7 @@ impl HomeView {
             live_send_worker: None,
             preview_capture_worker: None,
             preview_capture_target: None,
+            preview_worker_pulse: None,
             preview_wake: std::sync::Arc::new(tokio::sync::Notify::new()),
             live_send_last_resize: None,
             live_send_pending_leader: false,

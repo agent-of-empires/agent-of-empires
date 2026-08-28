@@ -50,6 +50,9 @@ use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 /// uniqueness.
 static LIVE_SEND_WORKER_COUNTER: std::sync::atomic::AtomicU64 =
     std::sync::atomic::AtomicU64::new(0);
+#[cfg(test)]
+static LIVE_CAPTURE_WORKER_TEST_COUNTER: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
 
 /// Default exit chord set when the user hasn't configured one.
 /// `Ctrl+q` is the sole default: works on mobile / restrictive SSH
@@ -742,7 +745,48 @@ pub(super) fn sample_debounce_wait_ms(
 /// (no live-send). Matches the old render-driven `PREVIEW_REFRESH_MS` throttle
 /// so moving the fork off the render thread doesn't raise the idle fork rate.
 const LIVE_CAPTURE_INTERVAL_IDLE_MS: u64 = 250;
+/// Maximum interval between authoritative snapshots while a live VT grid is
+/// otherwise supplying preview frames. This preserves upstream's bounded
+/// self-heal for a grid whose cells diverge while cursor and geometry agree,
+/// without moving `capture-pane` back onto paint.
+const AUTHORITATIVE_CAPTURE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+const AUTHORITATIVE_REFRESH_QUIESCENCE_MS: u64 = LIVE_CAPTURE_INTERVAL_FAST_MS * 2;
 
+fn authoritative_capture_due(
+    last_attempt: Option<std::time::Instant>,
+    now: std::time::Instant,
+) -> bool {
+    last_attempt
+        .is_none_or(|at| now.saturating_duration_since(at) >= AUTHORITATIVE_CAPTURE_INTERVAL)
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AuthoritativeRefreshAction {
+    None,
+    Stamp,
+    DropToCapture,
+}
+
+fn authoritative_refresh_action(
+    due: bool,
+    result: Option<crate::tmux::vt::VtRefreshResult>,
+) -> AuthoritativeRefreshAction {
+    match (due, result) {
+        (false, _) | (true, Some(crate::tmux::vt::VtRefreshResult::Busy)) => {
+            AuthoritativeRefreshAction::None
+        }
+        (true, Some(crate::tmux::vt::VtRefreshResult::Refreshed)) => {
+            AuthoritativeRefreshAction::Stamp
+        }
+        (true, Some(crate::tmux::vt::VtRefreshResult::Failed) | None) => {
+            AuthoritativeRefreshAction::DropToCapture
+        }
+    }
+}
+
+fn authoritative_refresh_is_quiet(chunk_timing: Option<(u64, u64)>) -> bool {
+    chunk_timing
+        .is_none_or(|(since_last_ms, _)| since_last_ms >= AUTHORITATIVE_REFRESH_QUIESCENCE_MS)
+}
 /// Minimum wait between VT arm attempts for one target. A dead channel (the
 /// pane was killed and its tmux session recreated under the same name, e.g. a
 /// session restart) heals within this window instead of stranding the pane on
@@ -884,6 +928,12 @@ pub(in crate::tui) struct LiveCaptureWorker {
     /// capture-pane. Mirrors the Clipboard Pass-through setting, so disabled
     /// mode does not keep a second pipe-pane connection open.
     clipboard_capture_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Cycle counter, bumped before every deadline-bounded sample. Changed
+    /// frames cannot serve as a heartbeat because idle content is deduplicated;
+    /// render observes this counter and replaces a worker that stops advancing.
+    cycles: std::sync::Arc<std::sync::atomic::AtomicU64>,
+    #[cfg(test)]
+    test_id: u64,
 }
 
 impl Drop for LiveCaptureWorker {
@@ -1113,6 +1163,8 @@ impl LiveCaptureWorker {
         // Pass-through setting, avoiding an observer before configuration is
         // available for a newly created worker.
         let clipboard_capture_enabled = Arc::new(AtomicBool::new(false));
+        let cycles = Arc::new(AtomicU64::new(0));
+        let cycles_cell = cycles.clone();
         let lines_cell = capture_lines.clone();
         let target_cell = target.clone();
         let slot = latest.clone();
@@ -1131,6 +1183,8 @@ impl LiveCaptureWorker {
             let mut last_target = String::new();
             let mut last_generation = 0;
 
+            #[cfg(unix)]
+            let mut last_authoritative_capture: Option<std::time::Instant> = None;
             let mut last_captured: Option<String> = None;
             // Budget the currently-held capture was published at. A budget
             // change alone (scroll depth, viewport resize over a quiet pane)
@@ -1192,6 +1246,7 @@ impl LiveCaptureWorker {
                 crate::tmux::composite::WindowLayout,
             )> = None;
             while !stop_flag.load(Ordering::Relaxed) {
+                cycles_cell.fetch_add(1, Ordering::Relaxed);
                 let lines = lines_cell.load(Ordering::Relaxed);
                 // Read the target without holding the lock across the fork:
                 // `set_target` must never wait on a `capture-pane`.
@@ -1234,6 +1289,7 @@ impl LiveCaptureWorker {
                     {
                         shutdown_vt_source(&mut vt_source, &command_deadline);
                         last_vt_arm = None;
+                        last_authoritative_capture = None;
                         shutdown_osc52_source(&mut osc52_source, &command_deadline);
                         osc52_seen = 0;
                         last_osc52_arm = None;
@@ -1257,6 +1313,7 @@ impl LiveCaptureWorker {
                 if !vt_enabled {
                     shutdown_vt_source(&mut vt_source, &command_deadline);
                     last_vt_arm = None;
+                    last_authoritative_capture = None;
                 }
                 #[cfg(unix)]
                 if !clipboard_capture_enabled {
@@ -1355,6 +1412,7 @@ impl LiveCaptureWorker {
                             // the remainder of a poll interval.
                             if let Some(v) = vt_source.as_ref() {
                                 v.set_change_wakeup(nudge_thread.clone());
+                                last_authoritative_capture = Some(std::time::Instant::now());
                             }
                         }
                         // A channel whose forwarder has disconnected stops
@@ -1365,6 +1423,33 @@ impl LiveCaptureWorker {
                         // without thrashing on a permanently broken pane.
                         if vt_source.as_ref().is_some_and(|v| !v.is_alive()) {
                             shutdown_vt_source(&mut vt_source, &command_deadline);
+                            last_authoritative_capture = None;
+                        }
+                        let authoritative_due = vt_source.is_some()
+                            && authoritative_capture_due(
+                                last_authoritative_capture,
+                                std::time::Instant::now(),
+                            );
+                        let refresh_result = authoritative_due.then(|| match vt_source.as_ref() {
+                            Some(source)
+                                if !authoritative_refresh_is_quiet(source.chunk_timing()) =>
+                            {
+                                crate::tmux::vt::VtRefreshResult::Busy
+                            }
+                            Some(source) => source.refresh_authoritatively(&command_deadline),
+                            None => crate::tmux::vt::VtRefreshResult::Failed,
+                        });
+                        match authoritative_refresh_action(authoritative_due, refresh_result) {
+                            AuthoritativeRefreshAction::None => {}
+                            AuthoritativeRefreshAction::Stamp => {
+                                last_authoritative_capture = Some(std::time::Instant::now());
+                            }
+                            AuthoritativeRefreshAction::DropToCapture => {
+                                let failed_at = std::time::Instant::now();
+                                shutdown_vt_source(&mut vt_source, &command_deadline);
+                                last_authoritative_capture = None;
+                                last_vt_arm = Some(failed_at);
+                            }
                         }
                         match vt_source.as_ref() {
                             Some(v) => {
@@ -1580,6 +1665,10 @@ impl LiveCaptureWorker {
             clipboard,
             vt_enabled,
             clipboard_capture_enabled,
+            cycles,
+            #[cfg(test)]
+            test_id: LIVE_CAPTURE_WORKER_TEST_COUNTER
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
         }
     }
 
@@ -1735,6 +1824,13 @@ impl LiveCaptureWorker {
         self.latest.lock().ok().and_then(|mut guard| guard.take())
     }
 
+    /// Snapshot of the worker's cycle counter for render-side stall detection.
+    /// Publication is deliberately not used because unchanged panes publish
+    /// nothing while a healthy worker continues sampling.
+    pub(in crate::tui) fn cycles(&self) -> u64 {
+        self.cycles.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Whether `frame` belongs to the worker's CURRENT target generation.
     /// A frame captured before the last set_target must be dropped, never
     /// applied or restored under the new target.
@@ -1789,6 +1885,21 @@ impl LiveCaptureWorker {
     #[cfg(test)]
     pub(in crate::tui) fn current_generation_for_test(&self) -> u64 {
         self.generation.load(std::sync::atomic::Ordering::Relaxed)
+    }
+    #[cfg(test)]
+    pub(in crate::tui) fn stop_for_test(&self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.nudge();
+    }
+
+    #[cfg(test)]
+    pub(in crate::tui) fn id_for_test(&self) -> u64 {
+        self.test_id
+    }
+    #[cfg(test)]
+    pub(in crate::tui) fn set_cycles_for_test(&self, cycles: u64) {
+        self.cycles
+            .store(cycles, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Hand-publish a frame into the mailbox for consumer-side tests.
@@ -3311,6 +3422,51 @@ mod tests {
             worker.take_agent_clipboard().as_deref(),
             Some("current copy"),
         );
+    }
+    #[test]
+    fn authoritative_capture_reopens_at_trust_ceiling() {
+        let t0 = std::time::Instant::now();
+        assert!(authoritative_capture_due(None, t0));
+        assert!(!authoritative_capture_due(
+            Some(t0),
+            t0 + AUTHORITATIVE_CAPTURE_INTERVAL - std::time::Duration::from_millis(1)
+        ));
+        assert!(authoritative_capture_due(
+            Some(t0),
+            t0 + AUTHORITATIVE_CAPTURE_INTERVAL
+        ));
+        assert!(authoritative_refresh_is_quiet(None));
+        assert!(!authoritative_refresh_is_quiet(Some((
+            AUTHORITATIVE_REFRESH_QUIESCENCE_MS - 1,
+            u64::MAX,
+        ))));
+        assert!(authoritative_refresh_is_quiet(Some((
+            AUTHORITATIVE_REFRESH_QUIESCENCE_MS,
+            0,
+        ))));
+        use crate::tmux::vt::VtRefreshResult;
+        let cases = [
+            (false, None, AuthoritativeRefreshAction::None),
+            (
+                true,
+                Some(VtRefreshResult::Busy),
+                AuthoritativeRefreshAction::None,
+            ),
+            (
+                true,
+                Some(VtRefreshResult::Refreshed),
+                AuthoritativeRefreshAction::Stamp,
+            ),
+            (
+                true,
+                Some(VtRefreshResult::Failed),
+                AuthoritativeRefreshAction::DropToCapture,
+            ),
+            (true, None, AuthoritativeRefreshAction::DropToCapture),
+        ];
+        for (due, result, expected) in cases {
+            assert_eq!(authoritative_refresh_action(due, result), expected);
+        }
     }
     #[test]
     fn publish_floor_first_change_after_quiet_publishes_immediately() {

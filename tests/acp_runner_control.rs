@@ -22,6 +22,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
 
+use agent_of_empires::acp::acp_client::AcpClient;
+use agent_of_empires::acp::state::AcpSessionId;
+
 /// App data dir for the debug binary under this test's env, mirroring the
 /// XDG resolution the runner uses.
 fn app_dir(home: &Path, xdg: &Path) -> PathBuf {
@@ -73,6 +76,51 @@ fn wait_for(path: &Path, what: &str) {
         if Instant::now() > deadline {
             panic!("{what} never appeared at {}", path.display());
         }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_for_u32(path: &Path, what: &str) -> u32 {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Ok(value) = std::fs::read_to_string(path) {
+            if let Ok(value) = value.trim().parse() {
+                return value;
+            }
+        }
+        if Instant::now() > deadline {
+            panic!("{what} never became a u32 at {}", path.display());
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_for_runner_exit(child: &mut Child) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if child.try_wait().expect("inspect runner").is_some() {
+            return;
+        }
+        assert!(Instant::now() < deadline, "timed-out runner stayed live");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn wait_for_record_pid(path: &Path, pid: u32) {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if std::fs::read(path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<serde_json::Value>(&bytes).ok())
+            .and_then(|record| record["pid"].as_u64())
+            == Some(u64::from(pid))
+        {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "replacement record never appeared"
+        );
         std::thread::sleep(Duration::from_millis(50));
     }
 }
@@ -177,11 +225,14 @@ fn runner_reports_native_prompt_complete_over_control_socket() {
 
 /// Write a length-prefixed control frame (4-byte big-endian length, then
 /// the JSON body).
-fn write_frame(stream: &mut UnixStream, body: &serde_json::Value) {
+fn encode_frame(body: &serde_json::Value) -> Vec<u8> {
     let json = serde_json::to_vec(body).expect("serialize frame");
     let len = (json.len() as u32).to_be_bytes();
-    stream.write_all(&len).expect("write frame length");
-    stream.write_all(&json).expect("write frame body");
+    [len.as_slice(), &json].concat()
+}
+
+fn write_frame(stream: &mut UnixStream, body: &serde_json::Value) {
+    stream.write_all(&encode_frame(body)).expect("write frame");
     stream.flush().expect("flush frame");
 }
 
@@ -198,6 +249,217 @@ fn find_python3() -> Option<PathBuf> {
         }
     }
     None
+}
+
+#[tokio::test]
+async fn cancelled_attach_reaps_runner_and_replacement_survives_load_fallback() {
+    if cfg!(not(unix)) {
+        return;
+    }
+    let Some(python3) = find_python3() else {
+        eprintln!("skipping: python3 not found for fake ACP agent");
+        return;
+    };
+
+    let scratch = Scratch::new("latehs");
+    let home = scratch.0.join("home");
+    let xdg = scratch.0.join("xdg");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&xdg).unwrap();
+
+    let agent_log = scratch.0.join("agent-methods.log");
+    let agent_pid_file = scratch.0.join("agent.pid");
+    let agent_py = scratch.0.join("delayed_agent.py");
+    std::fs::write(
+        &agent_py,
+        r#"
+import json, os, sys, time
+with open(os.environ["AOE_FAKE_AGENT_PID"], "w") as f:
+    f.write(str(os.getpid()))
+for line in sys.stdin:
+    try:
+        msg = json.loads(line)
+    except Exception:
+        continue
+    method = msg.get("method")
+    mid = msg.get("id")
+    if method is None or mid is None:
+        continue
+    with open(os.environ["AOE_FAKE_AGENT_LOG"], "a") as f:
+        f.write(method + "\n")
+    if method == "initialize":
+        time.sleep(int(os.environ["AOE_FAKE_INIT_DELAY_MS"]) / 1000)
+        result = {"protocolVersion": 1, "agentCapabilities": {"loadSession": True, "promptCapabilities": {}}}
+    elif method == "session/load" and os.environ["AOE_FAKE_LOAD_ERROR"] == "1":
+        error = {"code": -32000, "message": "stored session unavailable"}
+        sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "error": error}) + "\n")
+        sys.stdout.flush()
+        continue
+    elif method == "session/new":
+        result = {"sessionId": "fresh-thread"}
+    else:
+        result = {}
+    sys.stdout.write(json.dumps({"jsonrpc": "2.0", "id": mid, "result": result}) + "\n")
+    sys.stdout.flush()
+"#,
+    )
+    .unwrap();
+
+    let session_id = "slate001";
+    let workers = app_dir(&home, &xdg).join("acp-workers");
+    let socket = workers.join(format!("{session_id}.sock"));
+    let control = workers.join(format!("{session_id}.control.sock"));
+    let record = workers.join(format!("{session_id}.json"));
+    let bin = env!("CARGO_BIN_EXE_aoe");
+    let spawn_runner = |delay: &str, fail_load: bool| {
+        Command::new(bin)
+            .args([
+                "__acp-runner",
+                "--socket",
+                socket.to_str().unwrap(),
+                "--session-id",
+                session_id,
+                "--agent-name",
+                "fake-agent",
+                "--cwd",
+                home.to_str().unwrap(),
+                "--",
+                python3.to_str().unwrap(),
+                agent_py.to_str().unwrap(),
+            ])
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("AOE_FAKE_AGENT_LOG", &agent_log)
+            .env("AOE_FAKE_AGENT_PID", &agent_pid_file)
+            .env("AOE_FAKE_INIT_DELAY_MS", delay)
+            .env("AOE_FAKE_LOAD_ERROR", if fail_load { "1" } else { "0" })
+            .env("AOE_ACP_WATCHDOG_POLL_MS", "5000")
+            .spawn()
+            .expect("spawn acp runner")
+    };
+
+    let mut old = KillOnDrop(spawn_runner("2000", false));
+    wait_for(&record, "old registry record");
+    wait_for(&control, "old control socket");
+    wait_for(&socket, "old relay socket");
+    let old_agent_pid = wait_for_u32(&agent_pid_file, "old agent pid");
+
+    let attach = async {
+        tokio::time::timeout(
+            Duration::from_millis(500),
+            AcpClient::attach(
+                socket.clone(),
+                home.clone(),
+                vec![],
+                "stored-codex-thread".into(),
+                false,
+                AcpSessionId(session_id.into()),
+                None,
+                "fake-agent".into(),
+                None,
+            ),
+        )
+        .await
+    };
+    let spawn_replacement = async {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while !std::fs::read_to_string(&agent_log)
+            .unwrap_or_default()
+            .lines()
+            .any(|method| method == "initialize")
+        {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "old runner never began initialize"
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let replacement = KillOnDrop(spawn_runner("750", true));
+        wait_for_record_pid(&record, replacement.0.id());
+        replacement
+    };
+    let (attach, mut replacement) = tokio::join!(attach, spawn_replacement);
+    assert!(
+        attach.is_err(),
+        "delayed initialize must exceed the attach budget"
+    );
+    wait_for_runner_exit(&mut old.0);
+    assert!(
+        !agent_of_empires::process::worker_registry::is_pid_alive(old_agent_pid),
+        "timed-out agent {old_agent_pid} stayed live"
+    );
+    assert!(
+        replacement
+            .0
+            .try_wait()
+            .expect("inspect replacement")
+            .is_none()
+            && record.exists()
+            && socket.exists()
+            && control.exists(),
+        "old runner teardown removed the replacement runner's files"
+    );
+
+    let baseline = std::fs::read_to_string(&agent_log)
+        .unwrap_or_default()
+        .lines()
+        .filter(|method| *method == "initialize")
+        .count();
+    let mut ctl = UnixStream::connect(&control).expect("connect replacement control");
+    ctl.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+    assert_eq!(read_frame(&mut ctl)["kind"], "hello");
+    write_frame(
+        &mut ctl,
+        &serde_json::json!({"kind": "attach", "control_protocol_version": 2}),
+    );
+    write_frame(
+        &mut ctl,
+        &serde_json::json!({"kind": "initialize", "request": {"protocolVersion": 1}}),
+    );
+    let load = encode_frame(&serde_json::json!({
+        "kind": "establish_session",
+        "method": "session/load",
+        "request": {"sessionId": "stored-codex-thread", "cwd": home.to_str().unwrap()}
+    }));
+    ctl.write_all(&load[..2]).expect("write partial frame");
+    ctl.flush().expect("flush partial frame");
+    std::thread::sleep(Duration::from_millis(150));
+    assert_eq!(read_frame(&mut ctl)["kind"], "initialized");
+    ctl.write_all(&load[2..]).expect("finish partial frame");
+    ctl.flush().expect("flush completed frame");
+    assert_eq!(read_frame(&mut ctl)["kind"], "handshake_failed");
+    assert!(
+        replacement
+            .0
+            .try_wait()
+            .expect("inspect replacement")
+            .is_none()
+            && record.exists()
+            && socket.exists()
+            && control.exists(),
+        "recoverable session/load error tore down the replacement runner"
+    );
+    write_frame(
+        &mut ctl,
+        &serde_json::json!({
+            "kind": "establish_session",
+            "method": "session/new",
+            "request": {"cwd": home.to_str().unwrap()}
+        }),
+    );
+    let ready = read_frame(&mut ctl);
+    assert_eq!(ready["kind"], "session_ready");
+    assert_eq!(ready["acp_session_id"], "fresh-thread");
+
+    let methods = std::fs::read_to_string(&agent_log).unwrap_or_default();
+    assert_eq!(
+        methods.lines().filter(|m| *m == "initialize").count(),
+        baseline + 1
+    );
+    assert_eq!(methods.lines().filter(|m| *m == "session/load").count(), 1);
+    assert_eq!(methods.lines().filter(|m| *m == "session/new").count(), 1);
+
+    drop(replacement);
 }
 
 /// #2976 Phase B: the runner owns the ACP handshake. Drive it as a v2

@@ -568,6 +568,16 @@ fn lf_to_crlf(raw: &[u8]) -> Vec<u8> {
 /// private-mode SETs, no cursor position, and no DECTCEM state. The pane's
 /// modes, cursor, and hide flag come from [`capture_seed_snapshot`] and are
 /// woven into the byte stream by [`assemble_seed_stream`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VtRefreshResult {
+    Refreshed,
+    Busy,
+    Failed,
+}
+fn refresh_commits_geometry(result: VtRefreshResult) -> bool {
+    result == VtRefreshResult::Refreshed
+}
+
 fn seed_parser(
     target: &str,
     parser: &Mutex<vt100::Parser>,
@@ -575,16 +585,33 @@ fn seed_parser(
     cols: u16,
     rows: u16,
     deadline: &crate::tmux::TmuxCommandDeadline,
-) {
+    chunk_guard: Option<(&AtomicU64, u64)>,
+) -> VtRefreshResult {
     let Some((body, state)) = capture_seed_snapshot(target, deadline) else {
-        return;
+        return VtRefreshResult::Failed;
     };
     let stream = assemble_seed_stream(&body, &state, rows);
-    if let Ok(mut p) = parser.lock() {
-        *p = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
-        p.process(&stream);
-        app_cursor.store(p.screen().application_cursor(), Ordering::Relaxed);
+    install_seed_stream(parser, app_cursor, cols, rows, &stream, chunk_guard)
+}
+
+fn install_seed_stream(
+    parser: &Mutex<vt100::Parser>,
+    app_cursor: &AtomicBool,
+    cols: u16,
+    rows: u16,
+    stream: &[u8],
+    chunk_guard: Option<(&AtomicU64, u64)>,
+) -> VtRefreshResult {
+    let Ok(mut parser) = parser.lock() else {
+        return VtRefreshResult::Failed;
+    };
+    if chunk_guard.is_some_and(|(seq, expected)| seq.load(Ordering::Acquire) != expected) {
+        return VtRefreshResult::Busy;
     }
+    *parser = vt100::Parser::new(rows, cols, SCROLLBACK_LINES);
+    parser.process(stream);
+    app_cursor.store(parser.screen().application_cursor(), Ordering::Relaxed);
+    VtRefreshResult::Refreshed
 }
 
 /// How many times [`capture_seed_snapshot`] re-runs the probe/capture/probe
@@ -1218,33 +1245,37 @@ fn run_reader(listener: UnixListener, ctx: ReaderCtx) {
                     continue;
                 }
                 if let Ok(mut p) = ctx.parser.lock() {
+                    // Claim the sequence while holding the parser lock. A
+                    // concurrent authoritative reseed can then compare this
+                    // counter under the same lock and never erase a chunk that
+                    // was accepted after its snapshot began.
+                    let seq = ctx.chunk_seq.fetch_add(1, Ordering::AcqRel);
                     p.process(&buf[..n]);
                     ctx.app_cursor
                         .store(p.screen().application_cursor(), Ordering::Relaxed);
+                    // Invalidate cached sample assemblies BEFORE the wakeup, so a
+                    // woken sampler always sees the new generation.
+                    ctx.grid_gen.fetch_add(1, Ordering::Relaxed);
+                    // Stamp this chunk's arrival so the capture worker can tell a
+                    // lone chunk (keystroke echo) from a back-to-back stream (a
+                    // multi-chunk repaint) and hold the sample until the stream
+                    // settles. Recorded before the wakeup so the woken worker reads
+                    // fresh timing.
+                    let now = chunk_now_ms();
+                    let prev = ctx.last_chunk_ms.swap(now, Ordering::Relaxed);
+                    ctx.prev_gap_ms.store(
+                        if seq == 0 {
+                            u64::MAX
+                        } else {
+                            now.saturating_sub(prev)
+                        },
+                        Ordering::Relaxed,
+                    );
+                    // Wake the in-process poller (the TUI capture worker) so the
+                    // just-landed output samples now, not after the remainder of
+                    // its poll interval. This is the echo-latency path.
+                    notify_change_wakeup(&ctx.wakeup);
                 }
-                // Invalidate cached sample assemblies BEFORE the wakeup, so a
-                // woken sampler always sees the new generation.
-                ctx.grid_gen.fetch_add(1, Ordering::Relaxed);
-                // Stamp this chunk's arrival so the capture worker can tell a
-                // lone chunk (keystroke echo) from a back-to-back stream (a
-                // multi-chunk repaint) and hold the sample until the stream
-                // settles. Recorded before the wakeup so the woken worker reads
-                // fresh timing.
-                let seq = ctx.chunk_seq.fetch_add(1, Ordering::Relaxed);
-                let now = chunk_now_ms();
-                let prev = ctx.last_chunk_ms.swap(now, Ordering::Relaxed);
-                ctx.prev_gap_ms.store(
-                    if seq == 0 {
-                        u64::MAX
-                    } else {
-                        now.saturating_sub(prev)
-                    },
-                    Ordering::Relaxed,
-                );
-                // Wake the in-process poller (the TUI capture worker) so the
-                // just-landed output samples now, not after the remainder of
-                // its poll interval. This is the echo-latency path.
-                notify_change_wakeup(&ctx.wakeup);
             }
             Err(ref e)
                 if e.kind() == std::io::ErrorKind::WouldBlock
@@ -1531,7 +1562,19 @@ impl VtChannel {
 
         // Seed the current screen so an already-running agent shows up
         // immediately instead of starting blank (pipe-pane has no backlog).
-        seed_parser(&target, &parser, &app_cursor, cols, rows, deadline);
+        if seed_parser(&target, &parser, &app_cursor, cols, rows, deadline, None)
+            != VtRefreshResult::Refreshed
+        {
+            tracing::warn!(%target, "vt: initial seed failed; falling back to capture");
+            stop_and_wake_reader(&stop, &sock_path);
+            let mut command = crate::tmux::tmux_command();
+            command.args(["pipe-pane", "-t", &target]);
+            let _ = deadline.run(&mut command);
+            let _ = reader.join();
+            let _ = std::fs::remove_dir_all(&sock_dir);
+            session.release_vt_owner_with_deadline(&owner, deadline);
+            return None;
+        }
         grid_gen.fetch_add(1, Ordering::Relaxed);
         seeded.store(true, Ordering::Relaxed);
         tracing::info!(
@@ -1620,16 +1663,11 @@ impl VtChannel {
             Ok(p) => p.screen().cursor_position(),
             Err(_) => return,
         };
-        // Read the generation AFTER the cursor. `run_reader` bumps `grid_gen`
-        // only once it has released the parser lock, so a cursor read can
-        // already reflect a chunk whose bump has not landed yet. This order
-        // NARROWS that window (a chunk that slipped in usually shows up as a
-        // bumped generation, which `reconcile_step` reads as "output arrived"
-        // and re-arms) but it does not close it: a reader preempted between the
-        // unlock and the bump still presents a cursor newer than the generation
-        // either way. The residual cost is a rare extra reseed, which is
-        // idempotent, so this is a bias not a guarantee. Closing it properly
-        // would mean bumping `grid_gen` while still holding the parser lock.
+        // Read generation after cursor. The reader increments chunk_seq and
+        // grid_gen while holding the parser lock, so a processed cursor can
+        // never be observed without its generation bump. A chunk that lands
+        // after this cursor read either bumps before this load or invalidates
+        // the armed generation on the next reconcile pass.
         let grid_gen = self.grid_gen.load(Ordering::Relaxed);
         let pending = self.pending_drift.lock().ok().and_then(|g| *g);
         match reconcile_step((c, r, cx, cy), (gc, gr, gcx, gcy), pending, grid_gen) {
@@ -1640,9 +1678,10 @@ impl VtChannel {
                 }
             }
             GridReconcile::Resize => {
-                self.cols.store(c, Ordering::Relaxed);
-                self.rows.store(r, Ordering::Relaxed);
-                self.reseed(c, r, deadline);
+                if refresh_commits_geometry(self.reseed(c, r, deadline)) {
+                    self.cols.store(c, Ordering::Relaxed);
+                    self.rows.store(r, Ordering::Relaxed);
+                }
             }
             GridReconcile::Reseed => {
                 tracing::debug!(
@@ -1669,21 +1708,43 @@ impl VtChannel {
     /// Rebuild the grid from `capture-pane` and clear any armed drift, so the
     /// freshly seeded cursor is not immediately re-judged against a stale
     /// generation.
-    fn reseed(&self, cols: u16, rows: u16, deadline: &crate::tmux::TmuxCommandDeadline) {
-        seed_parser(
+    fn reseed(
+        &self,
+        cols: u16,
+        rows: u16,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> VtRefreshResult {
+        let expected_chunk_seq = self.chunk_seq.load(Ordering::Acquire);
+        let result = seed_parser(
             &self.target,
             &self.parser,
             &self.app_cursor,
             cols,
             rows,
             deadline,
+            Some((&self.chunk_seq, expected_chunk_seq)),
         );
-        self.grid_gen.fetch_add(1, Ordering::Relaxed);
-        self.clear_drift();
+        if result == VtRefreshResult::Refreshed {
+            self.grid_gen.fetch_add(1, Ordering::Relaxed);
+            self.clear_drift();
+        }
+        result
     }
 
-    /// Serialise up to `max_lines` of (scrollback + screen) to per-row ANSI,
-    /// plus the authoritative cursor (with `history_size` set to the full
+    /// Rebuild from an authoritative tmux snapshot even when cursor and
+    /// geometry probes agree, healing cell drift that those probes cannot see.
+    pub(crate) fn refresh_authoritatively(
+        &self,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> VtRefreshResult {
+        self.reseed(
+            self.cols.load(Ordering::Relaxed),
+            self.rows.load(Ordering::Relaxed),
+            deadline,
+        )
+    }
+    /// Serialise up to max_lines of (scrollback + screen) to per-row ANSI,
+    /// plus the authoritative cursor (with history_size set to the full
     /// scrollback depth). `max_lines` mirrors the capture path's window: both
     /// the TUI scroll and the web's virtual scroll spacer need real history
     /// here, not just the visible screen.
@@ -2308,6 +2369,46 @@ mod tests {
         assert_eq!(visible_width(&rows[1]), 4);
     }
 
+    #[test]
+    fn seed_install_reports_failure_and_preserves_newer_chunks() {
+        let parser = Mutex::new(vt100::Parser::new(24, 80, SCROLLBACK_LINES));
+        parser.lock().unwrap().process(b"LIVE-CHUNK");
+        let app_cursor = AtomicBool::new(false);
+        let chunk_seq = AtomicU64::new(1);
+
+        assert_eq!(
+            install_seed_stream(
+                &parser,
+                &app_cursor,
+                80,
+                24,
+                b"STALE-SNAPSHOT",
+                Some((&chunk_seq, 0)),
+            ),
+            VtRefreshResult::Busy,
+        );
+        let contents = parser.lock().unwrap().screen().contents();
+        assert!(contents.contains("LIVE-CHUNK"));
+        assert!(!contents.contains("STALE-SNAPSHOT"));
+
+        let deadline = crate::tmux::TmuxCommandDeadline::with_timeout(Duration::from_millis(1));
+        std::thread::sleep(Duration::from_millis(5));
+        assert_eq!(
+            seed_parser(
+                "aoe_test_missing_seed",
+                &parser,
+                &app_cursor,
+                80,
+                24,
+                &deadline,
+                None,
+            ),
+            VtRefreshResult::Failed,
+        );
+        assert!(refresh_commits_geometry(VtRefreshResult::Refreshed));
+        assert!(!refresh_commits_geometry(VtRefreshResult::Busy));
+        assert!(!refresh_commits_geometry(VtRefreshResult::Failed));
+    }
     #[test]
     fn lf_to_crlf_unstaircases_seed_rows() {
         // capture-pane joins rows with bare LF; fed raw, the vt100 parser

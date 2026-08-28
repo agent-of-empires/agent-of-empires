@@ -21348,3 +21348,90 @@ fn preview_revalidates_empty_policy_across_live_transition() {
         "the restored empty frame must clear stale content after live exit"
     );
 }
+/// A passive completion that lands after live ownership must invalidate the
+/// matching agent resize dedup, but never another session or target.
+#[test]
+fn passive_completion_invalidates_only_matching_agent_live_geometry() {
+    use super::live_send::LiveSendTarget;
+    use super::render::passive_resize_invalidates_live_geometry;
+
+    let cases = [
+        (
+            Some(&LiveSendTarget::Agent),
+            Some("selected"),
+            "selected",
+            true,
+        ),
+        (
+            Some(&LiveSendTarget::Agent),
+            Some("selected"),
+            "other",
+            false,
+        ),
+        (
+            Some(&LiveSendTarget::Terminal),
+            Some("selected"),
+            "selected",
+            false,
+        ),
+        (None, Some("selected"), "selected", false),
+    ];
+    for (target, selected, completed, expected) in cases {
+        assert_eq!(
+            passive_resize_invalidates_live_geometry(target, selected, completed),
+            expected,
+        );
+    }
+}
+/// A worker that stops advancing is replaced after the tmux deadline, while a
+/// normal retarget clears heartbeat history. Removing either reset leaves the
+/// old worker or old target's liveness attached to the displayed pane.
+#[test]
+fn stalled_preview_worker_restarts_and_retarget_resets_heartbeat() {
+    let mut env = create_test_env_empty();
+    let first_target = "aoe_test_stalled_worker".to_string();
+    env.view
+        .sync_preview_capture_worker(Some(first_target.clone()));
+
+    let worker = env
+        .view
+        .preview_capture_worker
+        .as_ref()
+        .expect("worker spawned");
+    let old_worker_id = worker.id_for_test();
+    worker.stop_for_test();
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    worker.set_cycles_for_test(17);
+    env.view.preview_worker_pulse = Some((
+        17,
+        std::time::Instant::now()
+            - crate::tmux::TMUX_COMMAND_TIMEOUT
+            - std::time::Duration::from_secs(3),
+    ));
+
+    env.view
+        .sync_preview_capture_worker(Some(first_target.clone()));
+    let replacement = env
+        .view
+        .preview_capture_worker
+        .as_ref()
+        .expect("stalled worker replaced");
+    assert_ne!(
+        replacement.id_for_test(),
+        old_worker_id,
+        "a stalled capture worker must be replaced"
+    );
+    assert_eq!(
+        env.view.preview_capture_target.as_deref(),
+        Some(first_target.as_str()),
+        "replacement must retain the displayed target"
+    );
+
+    env.view.preview_worker_pulse = Some((replacement.cycles(), std::time::Instant::now()));
+    env.view
+        .sync_preview_capture_worker(Some("aoe_test_retarget".to_string()));
+    assert!(
+        env.view.preview_worker_pulse.is_none(),
+        "a retarget must start a fresh heartbeat window"
+    );
+}

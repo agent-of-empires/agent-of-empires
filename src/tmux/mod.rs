@@ -273,7 +273,7 @@ struct PaneMetaCache {
     data: Option<std::sync::Arc<HashMap<String, PaneMetadata>>>,
     time: Option<Instant>,
 }
-const TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+pub(crate) const TMUX_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// One wall-clock budget shared by every tmux subprocess in a logical
 /// operation. Composite capture uses this so its layout fallback cannot turn
@@ -1479,16 +1479,16 @@ fn pane_snapshot_refresh_due() -> bool {
 }
 
 /// One queued passive preview resize, pushed by the render thread when its
-/// debounce fires and executed here on the snapshot poller's thread.
+/// debounce fires and executed by the dedicated passive-resize worker.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct PassiveResizeIntent {
     pub session_id: String,
-    pub title: String,
+    pub session_name: String,
     pub cols: u16,
     pub rows: u16,
 }
 
-/// A passive resize the poller completed. The render thread consumes these to
+/// A passive resize the worker completed. The render thread consumes these to
 /// adopt the (session, cols, rows) dedup exactly as the old in-paint path did
 /// on success.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1501,13 +1501,17 @@ pub(crate) struct PassiveResizeDone {
 static PASSIVE_RESIZE_INTENTS: Mutex<Vec<PassiveResizeIntent>> = Mutex::new(Vec::new());
 static PASSIVE_RESIZE_DONES: Mutex<Vec<PassiveResizeDone>> = Mutex::new(Vec::new());
 static PASSIVE_RESIZE_IN_FLIGHT: Mutex<Vec<PassiveResizeDone>> = Mutex::new(Vec::new());
-static SNAPSHOT_POLLER_THREAD: OnceLock<std::thread::Thread> = OnceLock::new();
+static PASSIVE_RESIZE_WORKER_THREAD: OnceLock<std::thread::Thread> = OnceLock::new();
+#[cfg(test)]
+thread_local! {
+    static PASSIVE_RESIZE_EXECUTION_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
 
 /// Replace any queued resize for the same session with the latest geometry.
 /// Paint can queue every frame while the pending slot stays armed; an exact
 /// in-flight geometry is ignored until render consumes its completion. A
 /// different geometry supersedes the pending slot. This bounds the queue by
-/// the number of sessions even if the poller is delayed or restarts.
+/// the number of sessions even if the worker is delayed or restarts.
 fn queue_latest_passive_resize(
     queue: &mut Vec<PassiveResizeIntent>,
     in_flight: &[PassiveResizeDone],
@@ -1526,7 +1530,7 @@ fn queue_latest_passive_resize(
     queue.push(intent);
 }
 
-/// Queue a passive preview resize for the poller. Non-blocking by contract:
+/// Queue a passive preview resize for its worker. Non-blocking by contract:
 /// this is called from paint.
 pub(crate) fn queue_passive_resize(intent: PassiveResizeIntent) {
     {
@@ -1538,7 +1542,7 @@ pub(crate) fn queue_passive_resize(intent: PassiveResizeIntent) {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         queue_latest_passive_resize(&mut queue, &in_flight, intent);
     }
-    if let Some(thread) = SNAPSHOT_POLLER_THREAD.get() {
+    if let Some(thread) = PASSIVE_RESIZE_WORKER_THREAD.get() {
         thread.unpark();
     }
 }
@@ -1597,23 +1601,30 @@ fn clear_passive_resize_in_flight(intent: &PassiveResizeIntent) {
 /// size owner, and only then `resize-window`. Publishes a completion on
 /// success so the render thread can record the dedup.
 fn execute_passive_resize(intent: &PassiveResizeIntent) -> Option<PassiveResizeDone> {
-    let session = Session::new(&intent.session_id, &intent.title).ok()?;
+    let deadline = TmuxCommandDeadline::new();
+    let session = Session::from_name(&intent.session_name);
+    if !session.exists_with_deadline(&deadline) {
+        return None;
+    }
+    let attached = session.is_attached_with_deadline(&deadline);
+    if attached != Some(false) {
+        return None;
+    }
     if !passive_resize_authorized(
-        session.exists(),
-        session.is_attached(),
-        session.has_active_size_owner(),
+        true,
+        attached,
+        session.has_active_size_owner_with_deadline(&deadline),
     ) {
         return None;
     }
     session
-        .resize_window(intent.cols, intent.rows)
+        .resize_window_after_exists_with_deadline(intent.cols, intent.rows, &deadline)
         .then(|| PassiveResizeDone {
             session_id: intent.session_id.clone(),
             cols: intent.cols,
             rows: intent.rows,
         })
 }
-
 fn passive_resize_authorized(
     exists: bool,
     attached: Option<bool>,
@@ -1623,6 +1634,8 @@ fn passive_resize_authorized(
 }
 
 fn execute_passive_resizes() {
+    #[cfg(test)]
+    PASSIVE_RESIZE_EXECUTION_COUNT.with(|count| count.set(count.get() + 1));
     let intents = {
         let mut queue = PASSIVE_RESIZE_INTENTS
             .lock()
@@ -1653,48 +1666,80 @@ fn execute_passive_resizes() {
         dones.push(done);
     }
 }
+fn clear_all_passive_resizes_in_flight() {
+    PASSIVE_RESIZE_IN_FLIGHT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+}
 
+fn spawn_passive_resize_worker() {
+    static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if STARTED.swap(true, std::sync::atomic::Ordering::AcqRel) {
+        return;
+    }
+    let spawn_result = std::thread::Builder::new()
+        .name("aoe-passive-resize".to_string())
+        .spawn(|| {
+            let _ = PASSIVE_RESIZE_WORKER_THREAD.set(std::thread::current());
+            loop {
+                if std::panic::catch_unwind(execute_passive_resizes).is_err() {
+                    clear_all_passive_resizes_in_flight();
+                    tracing::error!(
+                        target: "tmux.cache",
+                        "passive resize worker cycle panicked; retrying"
+                    );
+                }
+                std::thread::park();
+            }
+        });
+    if let Err(error) = spawn_result {
+        STARTED.store(false, std::sync::atomic::Ordering::Release);
+        tracing::warn!(
+            target: "tmux.cache",
+            %error,
+            "failed to spawn passive resize worker; a later call may retry"
+        );
+    }
+}
+
+fn refresh_display_snapshots() {
+    refresh_session_cache_if_due();
+    if pane_snapshot_refresh_due() {
+        let _ = refresh_pane_meta_cache();
+    }
+}
 /// Background poller that keeps the session and pane metadata snapshots fresh
-/// so every cache-only display helper can answer without forking from paint,
-/// and that executes queued passive preview resizes off paint. Commands run
-/// under the shared timeout; a tmux outage costs two bounded forks per cycle,
-/// never per row or per frame. A panicking cycle is logged and retried by the
-/// same thread; a failed thread spawn clears the latch so a later call retries.
+/// so every cache-only display helper can answer without forking from paint.
+/// Commands run under the shared timeout; a tmux outage costs two bounded forks
+/// per cycle, never per row or per frame. A panicking cycle is logged and
+/// retried by the same thread; a failed thread spawn clears the latch so a
+/// later call retries.
 ///
 /// Idempotent while the poller is running. The daemon thread dies with the
 /// process.
 pub fn spawn_snapshot_poller() {
+    spawn_passive_resize_worker();
     static STARTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
     if STARTED.swap(true, std::sync::atomic::Ordering::AcqRel) {
         return;
     }
     let spawn_result = std::thread::Builder::new()
         .name("aoe-display-snapshot".to_string())
-        .spawn(|| {
-            let _ = SNAPSHOT_POLLER_THREAD.set(std::thread::current());
-            loop {
-                let cycle = std::panic::catch_unwind(|| {
-                    execute_passive_resizes();
-                    refresh_session_cache_if_due();
-                    if pane_snapshot_refresh_due() {
-                        let _ = refresh_pane_meta_cache();
-                    }
-                });
-                if cycle.is_err() {
-                    tracing::error!(
-                        target: "tmux.cache",
-                        "display snapshot poller cycle panicked; retrying"
-                    );
-                }
-                // Half the TTL, not the TTL: the refresh work itself takes time
-                // and the timestamps are stamped when each query lands, so a
-                // full-TTL period would guarantee an expired-snapshot window
-                // every cycle (cache-only display answers would flicker to
-                // "absent" inside it). Half keeps each snapshot fresh across the
-                // whole cycle at one extra bounded fork pair per ~1s. A queued
-                // resize unparks this wait and runs before the snapshot probes.
-                std::thread::park_timeout(CACHE_TTL / 2);
+        .spawn(|| loop {
+            let cycle = std::panic::catch_unwind(refresh_display_snapshots);
+            if cycle.is_err() {
+                tracing::error!(
+                    target: "tmux.cache",
+                    "display snapshot poller cycle panicked; retrying"
+                );
             }
+            // Half the TTL, not the TTL: the refresh work itself takes time
+            // and the timestamps are stamped when each query lands, so a
+            // full-TTL period would guarantee an expired-snapshot window
+            // every cycle. Half keeps each snapshot fresh across the whole
+            // cycle at one extra bounded fork pair per ~1s.
+            std::thread::park_timeout(CACHE_TTL / 2);
         });
     if let Err(error) = spawn_result {
         STARTED.store(false, std::sync::atomic::Ordering::Release);
@@ -1705,7 +1750,6 @@ pub fn spawn_snapshot_poller() {
         );
     }
 }
-
 pub fn get_current_session_name() -> Option<String> {
     let output = tmux_command()
         .args(["display-message", "-p", "#{session_name}"])
@@ -1930,10 +1974,21 @@ mod tests {
     const P: &str = SESSION_PREFIX;
 
     #[test]
+    #[serial_test::serial]
+    fn snapshot_refresh_cycle_excludes_passive_resizes() {
+        let before = PASSIVE_RESIZE_EXECUTION_COUNT.with(std::cell::Cell::get);
+        refresh_display_snapshots();
+        let after = PASSIVE_RESIZE_EXECUTION_COUNT.with(std::cell::Cell::get);
+        assert_eq!(
+            after, before,
+            "snapshot refresh must not execute deadline-bound passive work",
+        );
+    }
+    #[test]
     fn passive_resize_queue_keeps_latest_intent_per_session() {
         let intent = |session_id: &str, cols, rows| PassiveResizeIntent {
             session_id: session_id.to_string(),
-            title: "title".to_string(),
+            session_name: format!("aoe_test_{session_id}"),
             cols,
             rows,
         };
@@ -1981,20 +2036,27 @@ mod tests {
         const TITLE: &str = "Missing resize target";
         let name = Session::generate_name(ID, TITLE);
         let cache = SessionCacheGuard::capture();
-        cache.force_present(&[&name]);
+        cache.force_stale();
         let intent = PassiveResizeIntent {
             session_id: ID.to_string(),
-            title: TITLE.to_string(),
+            session_name: name.clone(),
             cols: 100,
             rows: 30,
         };
+        let _ = fork_probe::take();
+        let probe = fork_probe::arm();
 
         assert!(
             execute_passive_resize(&intent).is_none(),
             "a failed or timed-out resize must not publish a completion"
         );
+        drop(probe);
+        assert_eq!(
+            fork_probe::take(),
+            1,
+            "a missing session must short-circuit before attachment and ownership probes",
+        );
     }
-
     #[test]
     fn test_tmux_command_carries_socket_flag() {
         // Under `cfg(test)` the socket resolves to a shared temp path, so the

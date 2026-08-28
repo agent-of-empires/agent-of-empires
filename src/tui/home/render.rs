@@ -186,6 +186,42 @@ fn preview_frozen(scroll_offset: u16, has_selection: bool) -> bool {
     scroll_offset > 0 || has_selection
 }
 
+/// Grace beyond the shared tmux operation deadline before a preview worker is
+/// considered stalled. A healthy capture may spend the full deadline inside
+/// one logical multi-command sample, so restarting earlier would overlap
+/// legitimate workers and multiply tmux load.
+const WORKER_STALL_GRACE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Fold one capture-worker cycle observation into a stall verdict.
+///
+/// The worker deduplicates unchanged frames, so publication cannot prove
+/// liveness. Its cycle counter advances before each deadline-bounded sample.
+/// An unchanged counter is tolerated through the operation deadline plus
+/// grace; after that the caller replaces the worker off the tmux hot path.
+fn worker_stalled_step(
+    cycles: u64,
+    prior: Option<(u64, std::time::Instant)>,
+    now: std::time::Instant,
+) -> (bool, Option<(u64, std::time::Instant)>) {
+    match prior {
+        None => (false, Some((cycles, now))),
+        Some((seen, _)) if cycles != seen => (false, Some((cycles, now))),
+        Some((seen, at)) => (
+            now.saturating_duration_since(at)
+                >= crate::tmux::TMUX_COMMAND_TIMEOUT.saturating_add(WORKER_STALL_GRACE),
+            Some((seen, at)),
+        ),
+    }
+}
+
+pub(super) fn passive_resize_invalidates_live_geometry(
+    live_target: Option<&live_send::LiveSendTarget>,
+    selected_session: Option<&str>,
+    completed_session: &str,
+) -> bool {
+    live_target == Some(&live_send::LiveSendTarget::Agent)
+        && selected_session == Some(completed_session)
+}
 /// Decide whether the cached capture window still covers the requested scroll.
 /// Returns true when the cache must be re-captured because the visible window
 /// (plus BUFFER headroom) would run past the end of the captured content.
@@ -1958,6 +1994,20 @@ impl HomeView {
         Some(name)
     }
 
+    /// Observe worker progress without relying on changed-frame publication.
+    /// A stalled worker is replaced only after its shared tmux operation
+    /// deadline and grace have elapsed, so a legitimate slow sample is never
+    /// overlapped by another worker.
+    fn preview_worker_stalled_at(&mut self, now: std::time::Instant) -> bool {
+        let Some(worker) = self.preview_capture_worker.as_ref() else {
+            self.preview_worker_pulse = None;
+            return false;
+        };
+        let (stalled, observation) =
+            worker_stalled_step(worker.cycles(), self.preview_worker_pulse, now);
+        self.preview_worker_pulse = observation;
+        stalled
+    }
     /// Point the off-thread capture worker at `desired` (the displayed
     /// pane's tmux session), then retune its cadence to live-send vs. idle.
     /// One long-lived worker is spawned lazily on first use and retargeted
@@ -1966,6 +2016,11 @@ impl HomeView {
     /// frame. This is what keeps the worker tracking whatever the user is
     /// looking at instead of only the agent during live-send.
     pub(super) fn sync_preview_capture_worker(&mut self, desired: Option<String>) {
+        if desired.is_some() && self.preview_worker_stalled_at(std::time::Instant::now()) {
+            self.preview_capture_worker = None;
+            self.preview_capture_target = None;
+            self.preview_worker_pulse = None;
+        }
         // Don't spawn the worker until there's actually something to show.
         if desired.is_none() && self.preview_capture_worker.is_none() {
             self.preview_capture_target = None;
@@ -2017,6 +2072,9 @@ impl HomeView {
                 cache.cursor = None;
             }
             self.preview_capture_target = desired;
+            // A new target starts a fresh heartbeat window; progress from the
+            // previous pane must not mask a stall on this one.
+            self.preview_worker_pulse = None;
             // New pane under the pointer: drop the hover dedup cell so a
             // stationary pointer still reports its cell to the new agent.
             self.hover_forward_cell = None;
@@ -2199,19 +2257,29 @@ impl HomeView {
         // the cache; tui.render preview_apply_us measures that paint-side work,
         // not tmux capture latency.
         let in_live = self.live_send.is_some();
-        // While in live-send mode, keep the agent's tmux pane sized to the
-        // preview's visible output area so it renders directly into view.
-        self.resize_live_pane_if_target(live_send::LiveSendTarget::Agent, width, height);
-        // Adopt resizes the snapshot poller completed since the last frame, so
-        // the dedup records only geometry the poller actually set.
+        // Adopt passive completions before live sizing. A passive resize can
+        // have passed its detached/no-owner checks just before live-send took
+        // ownership, then land after the live worker's first resize. Clear the
+        // live dedup for that active agent so the call below reasserts current
+        // geometry in this same frame.
         for done in crate::tmux::take_passive_resize_dones() {
+            let invalidates_live = passive_resize_invalidates_live_geometry(
+                self.live_send.as_ref().map(|live| &live.target),
+                self.selected_session.as_deref(),
+                &done.session_id,
+            );
             self.preview_pane_synced = Some((done.session_id.clone(), done.cols, done.rows));
             if self.preview_pane_pending.as_ref() == Some(&(done.session_id, done.cols, done.rows))
             {
                 self.preview_pane_pending = None;
             }
+            if invalidates_live {
+                self.live_send_last_resize = None;
+            }
         }
-
+        // While in live-send mode, keep the agent's tmux pane sized to the
+        // preview's visible output area so it renders directly into view.
+        self.resize_live_pane_if_target(live_send::LiveSendTarget::Agent, width, height);
         // Outside live-send nothing keeps the agent's pane sized to the
         // preview's output area. A full-screen agent is sized to whatever
         // terminal it was last attached from (usually the full window), so it
@@ -2247,19 +2315,19 @@ impl HomeView {
                         self.preview_wake.notify_one();
                     }
                     PassiveResizeStep::Fire => {
-                        // The tmux work runs on the snapshot poller, never
-                        // paint: it re-runs the exact authoritative chain this
-                        // arm used to run inline (#3071 attach deference, size
-                        // owners, exists gate) before resizing. The pending
-                        // slot stays armed until the poller's completion above
-                        // adopts the dedup, so a session that does not exist
-                        // yet retries once started (by a peer or the web
-                        // structured view) instead of pinning a stale synced
-                        // geometry.
+                        // The tmux work runs on the dedicated resize worker,
+                        // never paint. It re-runs the authoritative attach,
+                        // size-owner, and existence gates before resizing. The
+                        // pending slot stays armed until completion adopts the
+                        // dedup, so a session that does not exist yet retries
+                        // once started instead of pinning stale geometry.
                         if let Some(inst) = self.get_instance(&want.0) {
                             crate::tmux::queue_passive_resize(crate::tmux::PassiveResizeIntent {
                                 session_id: want.0.clone(),
-                                title: inst.title.clone(),
+                                session_name: crate::tmux::Session::resolve_name_for_display(
+                                    &want.0,
+                                    &inst.title,
+                                ),
                                 cols: want.1,
                                 rows: want.2,
                             });
@@ -4027,6 +4095,30 @@ mod tests {
     // `home/tests.rs`, which renders a real frame and asserts
     // `preview_visible_rows == preview_pane_area.height`.
 
+    /// A preview worker gets the full shared tmux deadline plus grace before
+    /// replacement. The unchanged observation timestamp must not slide on each
+    /// render, or a stalled worker would remain trusted forever.
+    #[test]
+    fn worker_stall_detection_honors_deadline_and_progress() {
+        let t0 = std::time::Instant::now();
+        let timeout = crate::tmux::TMUX_COMMAND_TIMEOUT.saturating_add(WORKER_STALL_GRACE);
+        let before = t0 + timeout - std::time::Duration::from_millis(1);
+        let at = t0 + timeout;
+
+        assert_eq!(worker_stalled_step(7, None, t0), (false, Some((7, t0))));
+        assert_eq!(
+            worker_stalled_step(8, Some((7, t0)), before),
+            (false, Some((8, before)))
+        );
+        assert_eq!(
+            worker_stalled_step(7, Some((7, t0)), before),
+            (false, Some((7, t0)))
+        );
+        assert_eq!(
+            worker_stalled_step(7, Some((7, t0)), at),
+            (true, Some((7, t0)))
+        );
+    }
     fn pane_cursor(x: u16, y: u16, visible: bool, pane_height: u16) -> crate::tmux::PaneCursor {
         crate::tmux::PaneCursor {
             x,

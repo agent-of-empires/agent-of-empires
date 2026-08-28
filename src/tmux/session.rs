@@ -340,6 +340,14 @@ impl Session {
     pub fn exists(&self) -> bool {
         crate::tmux::session_exists(&self.name)
     }
+    pub(crate) fn exists_with_deadline(&self, deadline: &crate::tmux::TmuxCommandDeadline) -> bool {
+        let mut command = crate::tmux::tmux_command();
+        command.args(["has-session", "-t", &self.name]);
+        deadline
+            .run(&mut command)
+            .map(|output| output.status.success())
+            .unwrap_or(false)
+    }
 
     /// Tri-state existence probe that distinguishes "the tmux server
     /// confirmed this session is gone" from "the tmux server was
@@ -1473,14 +1481,36 @@ impl Session {
     /// [`reset_size_to_latest_client`](Self::reset_size_to_latest_client) first
     /// or the window stays pinned at these preview dimensions.
     pub fn resize_window(&self, cols: u16, rows: u16) -> bool {
-        if cols == 0 || rows == 0 || !self.exists() {
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        self.resize_window_with_deadline(cols, rows, &deadline)
+    }
+
+    pub(crate) fn resize_window_with_deadline(
+        &self,
+        cols: u16,
+        rows: u16,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> bool {
+        if cols == 0 || rows == 0 || !self.exists_with_deadline(deadline) {
+            return false;
+        }
+        self.resize_window_after_exists_with_deadline(cols, rows, deadline)
+    }
+
+    pub(crate) fn resize_window_after_exists_with_deadline(
+        &self,
+        cols: u16,
+        rows: u16,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> bool {
+        if cols == 0 || rows == 0 {
             return false;
         }
         // Query the same window/pane the capture streams (:^.0), so the
         // measured chrome matches the pane whose height the owner loop checks.
         let pane_target = format!("{}:^.0", self.name);
         let window_rows = self
-            .pane_chrome_rows(&pane_target)
+            .pane_chrome_rows_with_deadline(&pane_target, deadline)
             .map(|chrome| rows.saturating_add(chrome))
             .unwrap_or(rows);
         let window_target = format!("{}:^", self.name);
@@ -1494,7 +1524,8 @@ impl Session {
             "-y",
             &window_rows.to_string(),
         ]);
-        crate::tmux::run_tmux_command_with_timeout(&mut command)
+        deadline
+            .run(&mut command)
             .map(|output| output.status.success())
             .unwrap_or(false)
     }
@@ -1502,7 +1533,11 @@ impl Session {
     /// Read the live vertical chrome (status-bar rows) for pane_target from
     /// tmux. None when the geometry cannot be read; callers then size the
     /// window with no chrome adjustment (the pre-#2766 behavior).
-    fn pane_chrome_rows(&self, pane_target: &str) -> Option<u16> {
+    fn pane_chrome_rows_with_deadline(
+        &self,
+        pane_target: &str,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> Option<u16> {
         let mut command = crate::tmux::tmux_command();
         command.args([
             "display-message",
@@ -1512,8 +1547,7 @@ impl Session {
             "-F",
             "#{window_height} #{pane_height}",
         ]);
-        let output = crate::tmux::run_tmux_command_with_timeout(&mut command).ok()?;
-
+        let output = deadline.run(&mut command).ok()?;
         if !output.status.success() {
             return None;
         }
@@ -1523,7 +1557,6 @@ impl Session {
         let pane_height: u16 = fields.next()?.parse().ok()?;
         Some(chrome_rows(window_height, pane_height))
     }
-
     /// Try to become the sole size owner of this session. Returns true if we
     /// hold the lock afterward.
     ///
@@ -1738,6 +1771,14 @@ impl Session {
     /// count. Passive resize must fail closed on timeout, non-zero exit, or
     /// malformed output instead of treating an unknown state as detached.
     pub fn is_attached(&self) -> Option<bool> {
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        self.is_attached_with_deadline(&deadline)
+    }
+
+    pub(crate) fn is_attached_with_deadline(
+        &self,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> Option<bool> {
         let mut command = crate::tmux::tmux_command();
         command.args([
             "display-message",
@@ -1746,7 +1787,7 @@ impl Session {
             "-p",
             "#{session_attached}",
         ]);
-        let out = crate::tmux::run_tmux_command_with_timeout(&mut command).ok()?;
+        let out = deadline.run(&mut command).ok()?;
         if !out.status.success() {
             return None;
         }
@@ -1761,7 +1802,15 @@ impl Session {
     /// writer (the TUI's detached preview sync) checks this to defer to an
     /// active owner without claiming the lock itself.
     pub fn has_active_size_owner(&self) -> Option<bool> {
-        self.owner_at_result(SIZE_OWNER_OPT, SIZE_OWNER_HB_OPT)
+        let deadline = crate::tmux::TmuxCommandDeadline::new();
+        self.has_active_size_owner_with_deadline(&deadline)
+    }
+
+    pub(crate) fn has_active_size_owner_with_deadline(
+        &self,
+        deadline: &crate::tmux::TmuxCommandDeadline,
+    ) -> Option<bool> {
+        self.owner_at_result_with_deadline(SIZE_OWNER_OPT, SIZE_OWNER_HB_OPT, deadline)
             .ok()
             .map(|owner| {
                 owner.is_some_and(|(_, hb)| {
@@ -1769,7 +1818,6 @@ impl Session {
                 })
             })
     }
-
     /// Read the current size owner and its last heartbeat (unix millis), if a
     /// lock is held.
     pub fn size_owner(&self) -> Option<(String, u64)> {

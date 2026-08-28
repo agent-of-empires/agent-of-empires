@@ -12,6 +12,7 @@
 //! mpsc channel into ACP requests until shutdown.
 
 use std::collections::{HashMap, VecDeque};
+use std::os::fd::{AsRawFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -2767,6 +2768,7 @@ impl AcpClient {
         .await;
         let external_terminal_guard = control_client.as_ref().map(|_| guard);
         let external_prompt_in_flight = control_client.as_ref().map(|_| prompt_in_flight);
+        let mut handshake_control = ShutdownControlOnDrop(control_client.clone());
 
         let (ready_tx, ready_rx) = oneshot::channel::<Result<(), AcpError>>();
 
@@ -2799,8 +2801,8 @@ impl AcpClient {
             )
             .instrument(conn_span),
         );
-
         wait_for_handshake(&session_label, ready_rx, None, &install_binary).await?;
+        handshake_control.0.take();
 
         Ok(Self {
             session_id,
@@ -3200,6 +3202,19 @@ impl AcpClient {
     /// mutex (which would deadlock send_prompt).
     pub fn take_inbound(&mut self) -> Option<mpsc::Receiver<Event>> {
         self.inbound.take()
+    }
+}
+
+/// Cancel a socket handshake if its constructor is dropped before completion.
+/// Closing the exact runner control channel cancels only that runner.
+struct ShutdownControlOnDrop(Option<Arc<DaemonControlClient>>);
+
+impl Drop for ShutdownControlOnDrop {
+    fn drop(&mut self) {
+        if let Some(control) = self.0.take() {
+            // SAFETY: `control` keeps this exact socket alive for the call.
+            unsafe { libc::shutdown(control.raw_fd, libc::SHUT_RDWR) };
+        }
     }
 }
 
@@ -4043,6 +4058,7 @@ struct DaemonControlClient {
     write: Mutex<tokio::net::unix::OwnedWriteHalf>,
     handshake_rx: Mutex<mpsc::Receiver<ControlBody>>,
     completion: Arc<std::sync::Mutex<Option<oneshot::Sender<control_protocol::PromptOutcome>>>>,
+    raw_fd: RawFd,
 }
 
 impl DaemonControlClient {
@@ -4286,10 +4302,12 @@ async fn connect_runner_control_v2(
         }
     });
 
+    let raw_fd = write_half.as_ref().as_raw_fd();
     Some(Arc::new(DaemonControlClient {
         write: Mutex::new(write_half),
         handshake_rx: Mutex::new(hs_rx),
         completion,
+        raw_fd,
     }))
 }
 
