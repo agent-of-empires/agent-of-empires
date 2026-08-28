@@ -341,19 +341,18 @@ const RESUME_PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(
 /// fully attachable for the duration so the cost is purely in the synchronous
 /// restart path's latency, not in agent responsiveness afterward.
 const RESUME_PROBE_POST_SHELL_GRACE: std::time::Duration = std::time::Duration::from_millis(2000);
+fn supports_terminal_resume(tool: &str) -> bool {
+    !matches!(
+        crate::agents::get_agent(tool).map(|agent| &agent.resume_strategy),
+        Some(crate::agents::ResumeStrategy::Unsupported) | None,
+    )
+}
 
 /// Pure decision: should a launch with this sid/tool use the resume probe?
 /// Extracted for unit-testability: the probe path itself needs a real tmux
 /// session to test end-to-end.
 pub(crate) fn should_attempt_resume(agent_session_id: Option<&str>, tool: &str) -> bool {
-    let valid = agent_session_id.map(is_valid_session_id).unwrap_or(false);
-    if !valid {
-        return false;
-    }
-    !matches!(
-        crate::agents::get_agent(tool).map(|a| &a.resume_strategy),
-        Some(crate::agents::ResumeStrategy::Unsupported) | None,
-    )
+    agent_session_id.is_some_and(is_valid_session_id) && supports_terminal_resume(tool)
 }
 
 /// Outcome of `Instance::ensure_pane_ready`. Callers surface this so the user
@@ -1356,17 +1355,17 @@ pub(crate) enum SidWrite {
     Failed,
 }
 
-/// Caller contract for `persist_session_id`: whether to publish the
-/// post-CAS `agent_session_id` to the tmux hidden env.
+/// Caller contract for persist_session_id: how to update the tmux hidden env.
 ///
-/// `Published`: memory reflects disk (Applied: just committed; Skipped:
-/// reloaded). Caller publishes.
-/// `Skip`: memory unchanged on invalid sid, storage error, or row gone.
-/// Caller must not touch env.
+/// Published means memory reflects disk and the operational SID may be published.
+/// Inert means a stored SID is retained for an unsupported agent but must be
+/// removed from live ownership signals. Skip means memory is unchanged after an
+/// invalid SID, storage error, or missing row, so the caller must not touch env.
 #[must_use]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum SidPersistOutcome {
     Published,
+    Inert,
     Skip,
 }
 
@@ -1386,9 +1385,9 @@ fn foreign_sid_holder<'a>(
     instance_id: &str,
     sid: &str,
 ) -> Option<&'a Instance> {
-    instances
-        .iter()
-        .find(|i| i.id != instance_id && i.agent_session_id.as_deref() == Some(sid))
+    instances.iter().find(|instance| {
+        instance.id != instance_id && instance.operational_agent_session_id() == Some(sid)
+    })
 }
 
 /// CAS-write `agent_session_id` to disk. Caller passes the value the
@@ -1467,8 +1466,11 @@ fn persist_session_to_storage_guarded(
     };
 
     let outcome = storage.update(|instances, _groups| {
-        if !instances.iter().any(|i| i.id == instance_id) {
+        let Some(target) = instances.iter().find(|instance| instance.id == instance_id) else {
             return Ok(SidWrite::Failed);
+        };
+        if !supports_terminal_resume(&target.tool) {
+            return Ok(SidWrite::Skipped);
         }
         if let Some(holder) = foreign_sid_holder(instances, instance_id, session_id) {
             tracing::warn!(target: "session.store",
@@ -3025,14 +3027,19 @@ impl Instance {
         self.view == View::Structured
     }
 
+    /// Session ID only when this terminal agent can operationally resume it.
+    /// Unsupported agents retain stored IDs as inert data, never ownership.
+    pub(crate) fn operational_agent_session_id(&self) -> Option<&str> {
+        if supports_terminal_resume(&self.tool) {
+            self.agent_session_id.as_deref()
+        } else {
+            None
+        }
+    }
+
     /// Whether this agent uses a session ID poller for live tracking.
     pub fn supports_session_poller(&self) -> bool {
-        crate::agents::get_agent(&self.tool).is_some_and(|a| {
-            !matches!(
-                a.resume_strategy,
-                crate::agents::ResumeStrategy::Unsupported
-            )
-        })
+        supports_terminal_resume(&self.tool)
     }
 
     /// Switch this structured-view session to terminal mode while keeping the
@@ -5059,13 +5066,13 @@ impl Instance {
 
         let outcome = self.persist_session_id(profile, expected_prior_sid, expected_prior_intent);
 
-        // Skip outcomes leave AOE_CAPTURED_SESSION_ID untouched: this path
-        // runs before any poller publish, so env is empty for fresh sessions.
-        let publish_sid = matches!(outcome, SidPersistOutcome::Published);
-        let captured_sid: Option<String> = if publish_sid {
-            self.agent_session_id.clone()
-        } else {
-            None
+        // Published refreshes live ownership from disk. Inert clears any stale
+        // ownership signal while retaining the unsupported agent's stored ID.
+        // Skip leaves the environment untouched because persistence failed.
+        let refresh_sid_env = !matches!(outcome, SidPersistOutcome::Skip);
+        let captured_sid = match outcome {
+            SidPersistOutcome::Published => self.operational_agent_session_id().map(str::to_string),
+            SidPersistOutcome::Inert | SidPersistOutcome::Skip => None,
         };
 
         let mut entries: Vec<(&str, &str, &str)> = vec![(
@@ -5086,7 +5093,7 @@ impl Instance {
                 "Failed to set tmux env keys [{}] at finalize_launch: {}", keys.join(", "), e);
         }
 
-        if publish_sid && self.agent_session_id.is_none() {
+        if refresh_sid_env && captured_sid.is_none() {
             if let Err(e) = crate::tmux::env::remove_hidden_env(
                 session_name,
                 crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
@@ -5218,13 +5225,12 @@ impl Instance {
     ) -> SidPersistOutcome {
         let new_sid = self.agent_session_id.clone();
 
-        // A manual pin is one-shot only when this launch can emit it. Resume-disabled
-        // agents retain the intent as inert stored state and must not claim SID ownership.
-        if matches!(
-            &expected_prior_intent,
-            ResumeIntent::Use(sid) if !should_attempt_resume(Some(sid), &self.tool)
-        ) {
-            return SidPersistOutcome::Skip;
+        // Unsupported agents retain their stored ID and intent as inert data.
+        // Cleared remains actionable so users can delete that retained state.
+        if !supports_terminal_resume(&self.tool)
+            && !matches!(&expected_prior_intent, ResumeIntent::Cleared)
+        {
+            return SidPersistOutcome::Inert;
         }
 
         if let Some(ref sid) = new_sid {
@@ -5318,8 +5324,11 @@ impl Instance {
                 );
                 let holder_ids: Vec<String> = instances
                     .iter()
-                    .filter(|i| i.id != instance_id && i.agent_session_id.as_deref() == Some(sid))
-                    .map(|i| i.id.clone())
+                    .filter(|instance| {
+                        instance.id != instance_id
+                            && instance.operational_agent_session_id() == Some(sid)
+                    })
+                    .map(|instance| instance.id.clone())
                     .collect();
                 if !holder_ids.is_empty() {
                     if consumed_pin {
@@ -16041,7 +16050,17 @@ mod tests {
                 let expected_prior = inst.resume_intent.clone();
                 let expected_sid = inst.agent_session_id.clone();
                 let (acquired, is_existing) = inst.acquire_session_id_with(&|_| None);
-                let _ = inst.persist_session_id(&profile, expected_sid.as_deref(), expected_prior);
+                let persistence =
+                    inst.persist_session_id(&profile, expected_sid.as_deref(), expected_prior);
+                assert_eq!(
+                    persistence,
+                    if consumes_pin {
+                        SidPersistOutcome::Published
+                    } else {
+                        SidPersistOutcome::Inert
+                    },
+                    "{tool}: persistence outcome"
+                );
 
                 let reloaded = storage.load().unwrap();
                 let disk = reloaded.iter().find(|i| i.id == inst.id).unwrap();
@@ -17373,29 +17392,54 @@ mod tests {
 
         #[test]
         #[serial]
-        fn finalize_publish_applied_writes_env_for_non_claude_tool() {
+        fn finalize_publishes_only_operational_session_ids() {
             if skip_if_no_tmux() {
                 return;
             }
             let temp = tempdir().unwrap();
             isolate_home(&temp);
 
-            let profile = "publish-applied-opencode";
-            let mut inst = make_inst(profile, "fpaw-oc");
-            inst.tool = "opencode".to_string();
-            inst.agent_session_id = None;
-            seed_disk_row(profile, &inst);
+            for (tool, publishes) in [("opencode", true), ("qwen", false), ("kiro", false)] {
+                let profile = format!("publish-operational-{tool}");
+                let mut inst = make_inst(&profile, &format!("publish-{tool}"));
+                inst.tool = tool.to_string();
+                inst.agent_session_id = (!publishes).then(|| VALID_SID.to_string());
+                seed_disk_row(&profile, &inst);
+                let expected_prior_sid = inst.agent_session_id.clone();
 
-            let tmux = TmuxSession::create(&inst.id, &inst.title);
+                let tmux = TmuxSession::create(&inst.id, &inst.title);
+                crate::tmux::env::set_hidden_env(
+                    tmux.name(),
+                    crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+                    "stale-leftover",
+                )
+                .unwrap();
 
-            inst.agent_session_id = Some(VALID_SID.to_string());
-            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Default, None);
+                inst.agent_session_id = Some(VALID_SID.to_string());
+                inst.finalize_launch(
+                    tmux.name(),
+                    &profile,
+                    expected_prior_sid.as_deref(),
+                    ResumeIntent::Default,
+                    None,
+                );
 
-            assert_eq!(
-                captured_env(tmux.name()).as_deref(),
-                Some(VALID_SID),
-                "non-claude tools must also publish AOE_CAPTURED_SESSION_ID at finalize"
-            );
+                assert_eq!(
+                    captured_env(tmux.name()).as_deref(),
+                    publishes.then_some(VALID_SID),
+                    "{tool}"
+                );
+                assert_eq!(inst.agent_session_id.as_deref(), Some(VALID_SID), "{tool}");
+                let stored = crate::session::storage::Storage::new_unwatched(&profile)
+                    .unwrap()
+                    .load()
+                    .unwrap();
+                assert_eq!(
+                    stored[0].agent_session_id.as_deref(),
+                    Some(VALID_SID),
+                    "{tool}: disk"
+                );
+            }
         }
 
         #[test]

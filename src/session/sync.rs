@@ -101,7 +101,7 @@ fn drain_and_persist_session_ids_inner(
     // cross-claim deterministically (see #2708).
     let mut sid_owners: HashMap<String, String> = HashMap::with_capacity(instances.len());
     for inst in instances.iter() {
-        if let Some(sid) = inst.agent_session_id.as_deref() {
+        if let Some(sid) = inst.operational_agent_session_id() {
             sid_owners
                 .entry(sid.to_string())
                 .or_insert_with(|| inst.id.clone());
@@ -593,11 +593,11 @@ fn publish_tmux_env(
             crate::tmux::env::AOE_INSTANCE_ID_KEY.to_string(),
             inst.id.clone(),
         ));
-        match &inst.agent_session_id {
+        match inst.operational_agent_session_id() {
             Some(sid) => set_batch.push((
                 tmux_name,
                 crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
-                sid.clone(),
+                sid.to_string(),
             )),
             None => unset_batch.push((
                 tmux_name,
@@ -955,29 +955,62 @@ mod tests {
 
     #[test]
     #[serial]
-    fn drain_rejects_sid_owned_by_another_instance() {
+    fn drain_respects_only_operational_sid_owners() {
         let temp = tempdir().unwrap();
         let _guard = storage_home_guard(&temp);
-
         let owned = "019342ab-1234-7def-8901-cccccccccccc";
-        let mut owner = Instance::new("owner-title", "/tmp/x");
-        owner.source_profile = "sync-collision".to_string();
-        owner.agent_session_id = Some(owned.to_string());
 
-        let mut thief = Instance::new("thief-title", "/tmp/x");
-        thief.source_profile = "sync-collision".to_string();
-        thief.agent_session_id = None;
-        seed_instances_on_disk("sync-collision", &[&owner, &thief]);
-        attach_poller_with_update(&mut thief, owned);
+        for (owner_tool, blocks_claim) in [("claude", true), ("qwen", false), ("kiro", false)] {
+            let profile = format!("sync-collision-{owner_tool}");
+            let mut owner = Instance::new("owner-title", "/tmp/x");
+            owner.tool = owner_tool.to_string();
+            owner.source_profile = profile.clone();
+            owner.agent_session_id = Some(owned.to_string());
 
-        let file_watch = FileWatchService::noop();
-        let mut instances = vec![owner, thief];
-        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
+            let mut claimant = Instance::new("claimant-title", "/tmp/x");
+            claimant.source_profile = profile.clone();
+            seed_instances_on_disk(&profile, &[&owner, &claimant]);
+            attach_poller_with_update(&mut claimant, owned);
 
-        assert_eq!(outcome.filtered, vec![instances[1].id.clone()]);
-        assert!(outcome.applied.is_empty());
-        assert_eq!(instances[0].agent_session_id.as_deref(), Some(owned));
-        assert_eq!(instances[1].agent_session_id, None);
+            let file_watch = FileWatchService::noop();
+            let mut instances = vec![owner, claimant];
+            let claimant_id = instances[1].id.clone();
+            let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
+
+            assert_eq!(
+                outcome.filtered,
+                blocks_claim
+                    .then(|| claimant_id.clone())
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                "{owner_tool}"
+            );
+            assert_eq!(
+                outcome.applied,
+                (!blocks_claim)
+                    .then_some(claimant_id)
+                    .into_iter()
+                    .collect::<Vec<_>>(),
+                "{owner_tool}"
+            );
+            assert_eq!(instances[0].agent_session_id.as_deref(), Some(owned));
+            assert_eq!(
+                instances[1].agent_session_id.as_deref(),
+                (!blocks_claim).then_some(owned),
+                "{owner_tool}"
+            );
+
+            let stored = Storage::new_unwatched(&profile).unwrap().load().unwrap();
+            let disk_claimant = stored
+                .iter()
+                .find(|instance| instance.title == "claimant-title")
+                .unwrap();
+            assert_eq!(
+                disk_claimant.agent_session_id.as_deref(),
+                (!blocks_claim).then_some(owned),
+                "{owner_tool}: disk"
+            );
+        }
     }
 
     #[test]

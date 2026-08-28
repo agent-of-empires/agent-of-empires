@@ -2569,17 +2569,16 @@ impl HomeView {
                     crate::tmux::env::AOE_INSTANCE_ID_KEY.to_string(),
                     inst.id.clone(),
                 ));
-                if let Some(ref sid) = inst.agent_session_id {
-                    set_batch.push((
+                match inst.operational_agent_session_id() {
+                    Some(sid) => set_batch.push((
                         tmux_name,
                         crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
-                        sid.clone(),
-                    ));
-                } else {
-                    unset_batch.push((
+                        sid.to_string(),
+                    )),
+                    None => unset_batch.push((
                         tmux_name,
                         crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
-                    ));
+                    )),
                 }
             }
             if !set_batch.is_empty() {
