@@ -3062,6 +3062,9 @@ impl Instance {
     ) -> (Option<String>, bool) {
         match self.resume_intent.clone() {
             ResumeIntent::Use(sid) => {
+                if !should_attempt_resume(Some(&sid), &self.tool) {
+                    return (None, false);
+                }
                 self.agent_session_id = Some(sid.clone());
                 return (Some(sid), true);
             }
@@ -5191,6 +5194,15 @@ impl Instance {
         expected_prior_intent: ResumeIntent,
     ) -> SidPersistOutcome {
         let new_sid = self.agent_session_id.clone();
+
+        // A manual pin is one-shot only when this launch can emit it. Resume-disabled
+        // agents retain the intent as inert stored state and must not claim SID ownership.
+        if matches!(
+            &expected_prior_intent,
+            ResumeIntent::Use(sid) if !should_attempt_resume(Some(sid), &self.tool)
+        ) {
+            return SidPersistOutcome::Skip;
+        }
 
         if let Some(ref sid) = new_sid {
             if !is_valid_session_id(sid) {
@@ -15913,54 +15925,76 @@ mod tests {
 
         #[test]
         #[serial]
-        fn use_intent_promotes_to_default_after_launch() {
+        fn use_intent_promotes_only_after_launch_consumes_pin() {
             let temp = tempdir().unwrap();
             std::env::set_var("HOME", temp.path());
             #[cfg(any(target_os = "linux", target_os = "macos"))]
             std::env::set_var("XDG_CONFIG_HOME", temp.path().join(".config"));
 
-            let profile = "use-promote";
-            let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
             let pinned = "019342ab-1234-7def-8901-abcdef012345";
+            let cases = [("claude", true), ("qwen", false), ("kiro", false)];
 
-            let mut inst = Instance::new("Pinned", "/tmp/x");
-            inst.tool = "claude".into();
-            inst.source_profile = profile.into();
-            inst.agent_session_id = Some(pinned.into());
-            inst.resume_intent = ResumeIntent::Use(pinned.into());
+            for (tool, consumes_pin) in cases {
+                let profile = format!("use-promote-{tool}");
+                let storage = crate::session::storage::Storage::new_unwatched(&profile).unwrap();
 
-            let on_disk = inst.clone();
-            storage
-                .update(|i, g| {
-                    *i = vec![on_disk.clone()];
-                    *g = crate::session::GroupTree::new_with_groups(
-                        std::slice::from_ref(&on_disk),
-                        &[],
-                    )
-                    .get_all_groups();
-                    Ok(())
-                })
-                .unwrap();
+                let mut owner = Instance::new("Owner", "/tmp/owner");
+                owner.source_profile = profile.clone();
+                owner.agent_session_id = Some(pinned.into());
 
-            // Simulate the post-launch persist: expected_prior_intent is the Use
-            // we launched with; the pinned id is already in agent_session_id.
-            let expected_prior = inst.resume_intent.clone();
-            let expected_sid = inst.agent_session_id.clone();
-            let _ = inst.persist_session_id(profile, expected_sid.as_deref(), expected_prior);
+                let mut inst = Instance::new("Pinned", "/tmp/pinned");
+                inst.tool = tool.into();
+                inst.source_profile = profile.clone();
+                inst.resume_intent = ResumeIntent::Use(pinned.into());
 
-            let reloaded = storage.load().unwrap();
-            let disk = reloaded.iter().find(|i| i.id == inst.id).unwrap();
-            assert_eq!(
-                disk.resume_intent,
-                ResumeIntent::Default,
-                "Use must auto-promote to Default after the launch consumes the pin so the drain adopts subsequent post-launch captures (#2708)",
-            );
-            assert_eq!(
-                inst.resume_intent,
-                ResumeIntent::Default,
-                "In-memory resume_intent must also promote so the drain PIN guard stops firing on the same tick",
-            );
-            assert_eq!(disk.agent_session_id.as_deref(), Some(pinned));
+                let rows = vec![owner.clone(), inst.clone()];
+                storage
+                    .update(|instances, groups| {
+                        *instances = rows.clone();
+                        *groups =
+                            crate::session::GroupTree::new_with_groups(&rows, &[]).get_all_groups();
+                        Ok(())
+                    })
+                    .unwrap();
+
+                let expected_prior = inst.resume_intent.clone();
+                let expected_sid = inst.agent_session_id.clone();
+                let (acquired, is_existing) = inst.acquire_session_id_with(&|_| None);
+                let _ = inst.persist_session_id(&profile, expected_sid.as_deref(), expected_prior);
+
+                let reloaded = storage.load().unwrap();
+                let disk = reloaded.iter().find(|i| i.id == inst.id).unwrap();
+                let owner_disk = reloaded.iter().find(|i| i.id == owner.id).unwrap();
+                assert_eq!(is_existing, consumes_pin, "{tool}: acquisition mode");
+                assert_eq!(
+                    acquired.as_deref(),
+                    consumes_pin.then_some(pinned),
+                    "{tool}: acquired pin"
+                );
+                assert_eq!(
+                    disk.resume_intent,
+                    if consumes_pin {
+                        ResumeIntent::Default
+                    } else {
+                        ResumeIntent::Use(pinned.into())
+                    },
+                    "{tool}: durable intent"
+                );
+                assert_eq!(
+                    inst.resume_intent, disk.resume_intent,
+                    "{tool}: memory intent"
+                );
+                assert_eq!(
+                    disk.agent_session_id.as_deref(),
+                    consumes_pin.then_some(pinned),
+                    "{tool}: published sid"
+                );
+                assert_eq!(
+                    owner_disk.agent_session_id.as_deref(),
+                    (!consumes_pin).then_some(pinned),
+                    "{tool}: prior owner"
+                );
+            }
         }
 
         #[test]

@@ -41,10 +41,10 @@ pub enum SessionCommands {
     /// Auto-detect current session
     Current(CurrentArgs),
 
-    /// Attach another repo to an existing session, so an agent that turns out
-    /// to need a second repo can keep working in the same conversation instead
-    /// of the session being recreated. Creates a worktree for the repo and
-    /// restarts the agent so it can see it; the conversation is kept. See #3103.
+    /// Attach another repo to an existing session. Agents with resume enabled
+    /// in AoE can continue in the same conversation after the required restart;
+    /// agents with resume disabled in AoE restart with a fresh conversation.
+    /// Creates a worktree for the repo. See #3103.
     AddProject(AddProjectArgs),
 
     /// Set the resume target for a session; agents with resume disabled in AoE
@@ -2631,7 +2631,7 @@ fn resolve_base_target(inst: &crate::session::Instance, repo: Option<&str>) -> R
 #[cfg(test)]
 mod restart_args_tests {
     use super::SessionCommands;
-    use clap::Parser;
+    use clap::{CommandFactory, Parser};
 
     #[derive(Parser)]
     struct Cli {
@@ -2681,6 +2681,21 @@ mod restart_args_tests {
                 _ => panic!("wrong subcommand"),
             }
         }
+
+        let mut command = Cli::command();
+        let help = command
+            .find_subcommand_mut("add-project")
+            .unwrap()
+            .render_long_help()
+            .to_string();
+        assert!(
+            help.contains("resume disabled in AoE"),
+            "add-project help must qualify conversation continuity: {help}"
+        );
+        assert!(
+            !help.contains("the conversation is kept"),
+            "add-project help must not promise unconditional continuity: {help}"
+        );
     }
 
     #[test]
