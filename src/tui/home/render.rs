@@ -2026,8 +2026,8 @@ impl HomeView {
     /// Shared core for the four `refresh_*_preview_cache_if_needed` methods.
     /// They all run the same needs-refresh gate (session id / dimensions /
     /// scroll-exceeds / 250ms timer) and the same capture, cache-update, and
-    /// scroll-clamp body; they differ only in which cache field they target,
-    /// where the capture comes from, and whether live-send forces a refresh.
+    /// scroll-clamp body; they differ only in which cache field they target
+    /// and where the capture comes from.
     ///
     /// `select` is called twice: once for the gate, once to write the result.
     /// `capture` runs between those two borrows so it can take a shared `&self`
@@ -2035,18 +2035,10 @@ impl HomeView {
     /// the agent uses that for its live-send preserve-last-good kill switch
     /// (#1501); the terminal/tool wrappers use it when the instance has gone
     /// away, matching the original "only write inside `if let Some(inst)`".
-    ///
-    /// `force` bypasses the idle throttle. All four wrappers pass `false`
-    /// today, so it is inert defensive code; the doc used to claim the agent
-    /// passed `in_live` here to refresh every render in live-send mode, which
-    /// has not been true at any call site. Live-send does not need it: on the
-    /// fast cadence `apply_worker_capture` has a fresh frame nearly every
-    /// render and returns before this is reached.
     fn refresh_preview_cache_core(
         &mut self,
         width: u16,
         height: u16,
-        force: bool,
         select: fn(&mut Self) -> &mut super::PreviewCache,
         capture: impl FnOnce(&Self, &str, usize) -> Option<String>,
     ) {
@@ -2059,17 +2051,15 @@ impl HomeView {
         // Only the idle timer is suppressed by a pulsing worker. A session
         // change, a resize, and a scroll that outgrew the cache all still
         // fork, because none of those are answered by "the worker had no new
-        // frame". `force` is inert defensive code: every caller passes
-        // `false`, so live-send is covered by the suppression rather than
-        // exempt from it, and it does not need an exemption because on the
-        // fast cadence `apply_worker_capture` almost always has a fresh frame
-        // to hand over and returns before this.
-        let worker_covers_idle = !force && self.observe_worker_pulse();
+        // frame". Live-send is covered by the suppression rather than exempt
+        // from it, and needs no exemption: on the fast cadence
+        // `apply_worker_capture` almost always has a fresh frame to hand over
+        // and returns before this.
+        let worker_covers_idle = self.observe_worker_pulse();
 
         let cache = select(self);
         let idle_elapsed = cache.last_refresh.elapsed().as_millis();
-        let needs_refresh = force
-            || cache.session_id.as_ref() != Some(&id)
+        let needs_refresh = cache.session_id.as_ref() != Some(&id)
             || cache.dimensions != (width, height)
             || capture_window_stale(
                 frozen,
@@ -2411,7 +2401,6 @@ impl HomeView {
         self.refresh_preview_cache_core(
             width,
             height,
-            false,
             |s| &mut s.preview_cache,
             |s, id, capture_lines| {
                 let in_live = s
@@ -2465,7 +2454,6 @@ impl HomeView {
         self.refresh_preview_cache_core(
             width,
             height,
-            false,
             |s| &mut s.terminal_preview_cache,
             |s, id, capture_lines| {
                 s.get_instance(id).map(|inst| {
@@ -2494,7 +2482,6 @@ impl HomeView {
         self.refresh_preview_cache_core(
             width,
             height,
-            false,
             |s| &mut s.container_terminal_preview_cache,
             |s, id, capture_lines| {
                 s.get_instance(id).map(|inst| {
@@ -2528,7 +2515,6 @@ impl HomeView {
         self.refresh_preview_cache_core(
             width,
             height,
-            false,
             |s| &mut s.tool_preview_cache,
             |s, id, capture_lines| {
                 s.get_instance(id).map(|inst| {
