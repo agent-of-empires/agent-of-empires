@@ -33,8 +33,9 @@ For web commands and tests, read `web/AGENTS.md`.
 
 - Let `cargo fmt` and `cargo clippy` decide style; fix warnings.
 - Do not add dead code or `#[allow(dead_code)]`.
-- Comments should explain non-obvious reasons or invariants, not restate code or
-  preserve implementation history.
+- Keep comments short. Add one only when the code cannot clearly express a
+  non-obvious reason or invariant; do not restate code or preserve
+  implementation history.
 - Add standalone documentation only for a durable user workflow, public
   contract, or cross-cutting invariant. Keep implementation details with the
   code; do not add feature inventories, rollout history, or duplicate guides.
