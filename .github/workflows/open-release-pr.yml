@@ -121,6 +121,13 @@ jobs:
       - name: Update CHANGELOG.md
         env:
           VERSION: ${{ steps.next.outputs.version }}
+          # cliff.toml enables [remote.github], so git-cliff pages the closed-PR
+          # list to resolve commit -> PR -> author. Unauthenticated that is
+          # capped at 60/hr on a shared runner IP, and the repo is now past 2100
+          # closed PRs (22 pages), so the walk 403s and panics partway through.
+          # release.yml and prepare-release.yml already pass this token; this
+          # step was the one that missed it.
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git cliff --config cliff.toml --tag "v$VERSION" --output CHANGELOG.md
           echo "=== CHANGELOG.md head ==="
