@@ -41,7 +41,7 @@ use crate::session::capture::{
 };
 type LaunchCommandParts = (
     Option<String>,
-    bool,
+    AppliedSessionFlags,
     Option<OmpCapturePlan>,
     LaunchEnvironment,
 );
@@ -53,12 +53,40 @@ struct LaunchEnvironment {
 
 struct PreparedLaunch {
     command: Option<String>,
-    is_existing: bool,
+    session_flags: AppliedSessionFlags,
     omp_capture_plan: Option<OmpCapturePlan>,
     launch_env: LaunchEnvironment,
     expected_prior_sid: Option<String>,
     expected_prior_intent: ResumeIntent,
     expected_prior_omp_generation: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppliedSessionFlags {
+    None,
+    Fresh,
+    Existing,
+}
+fn classify_launch_sid_outcome(
+    session_flags: AppliedSessionFlags,
+    current_sid: Option<&str>,
+    expected_prior_sid: Option<&str>,
+) -> LaunchSidOutcome {
+    match session_flags {
+        AppliedSessionFlags::Existing => LaunchSidOutcome::Existing {
+            sid: current_sid
+                .expect("existing launch command carries agent_session_id")
+                .to_string(),
+        },
+        AppliedSessionFlags::Fresh => LaunchSidOutcome::Fresh {
+            pinned_prior_sid: current_sid
+                .filter(|sid| expected_prior_sid == Some(*sid))
+                .map(str::to_string),
+        },
+        AppliedSessionFlags::None => LaunchSidOutcome::Fresh {
+            pinned_prior_sid: None,
+        },
+    }
 }
 
 fn is_zero_u64(value: &u64) -> bool {
@@ -3669,7 +3697,7 @@ impl Instance {
         override_if_distinct(self.agent_session_id.as_deref(), live)
     }
 
-    fn apply_session_flags(&mut self, cmd: &mut String, context: &str) -> bool {
+    fn apply_session_flags(&mut self, cmd: &mut String, context: &str) -> AppliedSessionFlags {
         if let ResumeIntent::Fork { from } = self.resume_intent.clone() {
             let child = self.agent_session_id.clone();
             if let Some(child_id) = child.as_deref() {
@@ -3683,10 +3711,10 @@ impl Instance {
                         Some(crate::agents::ForkStrategy::CodexFork)
                     );
                     splice_subcommand_or_append(cmd, &fork_part, is_subcommand);
+                    return AppliedSessionFlags::Fresh;
                 }
             }
-            // A fork is a fresh session, not an in-place resume.
-            return false;
+            return AppliedSessionFlags::None;
         }
         let (mut session_id, is_existing) = self.acquire_session_id();
         // Sandboxed Copilot, Kimi, and Prime Agent start fresh: their session
@@ -3699,9 +3727,14 @@ impl Instance {
         if matches!(self.tool.as_str(), "copilot" | "kimi" | "prime-agent") && self.is_sandboxed() {
             session_id = None;
         }
-        let emitted =
-            append_resume_flags(&self.tool, session_id.as_deref(), is_existing, cmd, context);
-        is_existing && emitted
+        match (
+            append_resume_flags(&self.tool, session_id.as_deref(), is_existing, cmd, context),
+            is_existing,
+        ) {
+            (false, _) => AppliedSessionFlags::None,
+            (true, false) => AppliedSessionFlags::Fresh,
+            (true, true) => AppliedSessionFlags::Existing,
+        }
     }
 
     pub fn has_custom_command(&self) -> bool {
@@ -4366,10 +4399,10 @@ impl Instance {
         let expected_prior_sid = self.agent_session_id.clone();
         let expected_prior_intent = self.resume_intent.clone();
         let expected_prior_omp_generation = self.omp_capture_generation.clone();
-        let (command, is_existing, omp_capture_plan, launch_env) = self.build_launch_command()?;
+        let (command, session_flags, omp_capture_plan, launch_env) = self.build_launch_command()?;
         Ok(PreparedLaunch {
             command,
-            is_existing,
+            session_flags,
             omp_capture_plan,
             launch_env,
             expected_prior_sid,
@@ -4391,20 +4424,13 @@ impl Instance {
                 self.id
             );
         }
-        let launch_sid = if prepared.is_existing {
-            Some(
-                self.agent_session_id
-                    .clone()
-                    .expect("existing launch command carries agent_session_id"),
-            )
-        } else {
-            None
-        };
-        // Read before `finalize_launch`, which may replace `agent_session_id`.
-        let pinned_prior_sid = self
-            .agent_session_id
-            .clone()
-            .filter(|sid| prepared.expected_prior_sid.as_deref() == Some(sid.as_str()));
+        // Classify before finalize_launch, which may replace agent_session_id.
+        // A stored ID is probe-worthy only when this command emitted it.
+        let launch_sid_outcome = classify_launch_sid_outcome(
+            prepared.session_flags,
+            self.agent_session_id.as_deref(),
+            prepared.expected_prior_sid.as_deref(),
+        );
 
         tracing::debug!(
             target: "session.store",
@@ -4491,10 +4517,7 @@ impl Instance {
             omp_capture_metadata,
         );
 
-        Ok(match launch_sid {
-            Some(sid) => LaunchSidOutcome::Existing { sid },
-            None => LaunchSidOutcome::Fresh { pinned_prior_sid },
-        })
+        Ok(launch_sid_outcome)
     }
 
     fn run_launch_hooks(&mut self, skip_on_launch: bool, profile: &str) -> Result<()> {
@@ -4563,7 +4586,7 @@ impl Instance {
         let agent = self.resolved_agent();
         let detect_as = self.effective_detect_as().into_owned();
 
-        let (cmd, is_existing, omp_capture_plan, launch_env) = if self.is_sandboxed() {
+        let (cmd, session_flags, omp_capture_plan, launch_env) = if self.is_sandboxed() {
             let image = self
                 .sandbox_info
                 .as_ref()
@@ -4623,7 +4646,7 @@ impl Instance {
                 }
             }
 
-            let is_existing = self.apply_session_flags(&mut tool_cmd, "sandboxed");
+            let session_flags = self.apply_session_flags(&mut tool_cmd, "sandboxed");
             apply_agent_launch_env(&mut tool_cmd, agent);
 
             let sandbox = self
@@ -4663,7 +4686,7 @@ impl Instance {
             let wrapped = wrap_command_ignore_suspend(&launch_command, &self.project_path);
             (
                 Some(wrapped),
-                is_existing,
+                session_flags,
                 omp_capture_plan,
                 LaunchEnvironment {
                     pane: Vec::new(),
@@ -4706,7 +4729,7 @@ impl Instance {
             )
         };
 
-        Ok((cmd, is_existing, omp_capture_plan, launch_env))
+        Ok((cmd, session_flags, omp_capture_plan, launch_env))
     }
 
     /// Resolve on_launch hooks from the full config chain (global > profile > repo).
@@ -4930,7 +4953,7 @@ impl Instance {
     fn build_host_command(
         &mut self,
         agent: Option<&'static crate::agents::AgentDef>,
-    ) -> Result<(Option<String>, bool, Option<OmpCapturePlan>)> {
+    ) -> Result<(Option<String>, AppliedSessionFlags, Option<OmpCapturePlan>)> {
         // Resolve after `on_launch`. The snapshot is checked inside the
         // profile environment assignment scope executed by the login shell;
         // startup-file routing drift therefore disables capture.
@@ -4960,7 +4983,7 @@ impl Instance {
                             apply_yolo_mode(&mut cmd, yolo, false);
                         }
                     }
-                    let is_existing = self.apply_session_flags(&mut cmd, "host agent");
+                    let session_flags = self.apply_session_flags(&mut cmd, "host agent");
                     apply_agent_launch_env(&mut cmd, agent);
                     let raw_command = format!("{}{}", env_prefix, cmd);
                     let command = if let Some(plan) = omp_capture_plan.as_ref() {
@@ -4971,11 +4994,11 @@ impl Instance {
                     };
                     Ok((
                         Some(wrap_command_ignore_suspend(&command, &self.project_path)),
-                        is_existing,
+                        session_flags,
                         omp_capture_plan,
                     ))
                 }
-                None => Ok((None, false, omp_capture_plan)),
+                None => Ok((None, AppliedSessionFlags::None, omp_capture_plan)),
             }
         } else {
             let mut cmd = self.command.clone();
@@ -4987,7 +5010,7 @@ impl Instance {
                     apply_yolo_mode(&mut cmd, yolo, false);
                 }
             }
-            let is_existing = self.apply_session_flags(&mut cmd, "host custom");
+            let session_flags = self.apply_session_flags(&mut cmd, "host custom");
             apply_agent_launch_env(&mut cmd, agent);
             let raw_command = format!("{}{}", env_prefix, cmd);
             let command = if let Some(plan) = omp_capture_plan.as_ref() {
@@ -4998,7 +5021,7 @@ impl Instance {
             };
             Ok((
                 Some(wrap_command_ignore_suspend(&command, &self.project_path)),
-                is_existing,
+                session_flags,
                 omp_capture_plan,
             ))
         }
@@ -11863,13 +11886,12 @@ mod tests {
             from: "parent-1111-2222-3333-444444444444".to_string(),
         };
         let mut cmd = "claude".to_string();
-        let is_existing = inst.apply_session_flags(&mut cmd, "test");
+        let session_flags = inst.apply_session_flags(&mut cmd, "test");
         assert_eq!(
             cmd,
             "claude --resume parent-1111-2222-3333-444444444444 --fork-session --session-id child-5555-6666-7777-888888888888"
         );
-        // A fork is a NEW session (not a resume-in-place), so report not-existing.
-        assert!(!is_existing);
+        assert_eq!(session_flags, AppliedSessionFlags::Fresh);
         // The child id we will resume from here on stays pinned in agent_session_id.
         assert_eq!(
             inst.agent_session_id.as_deref(),
@@ -11900,15 +11922,13 @@ mod tests {
                 container_workdir: None,
             });
             let mut cmd = tool.to_string();
-            let resumed = inst.apply_session_flags(&mut cmd, "test");
+            let session_flags = inst.apply_session_flags(&mut cmd, "test");
             assert_eq!(
                 cmd, tool,
                 "{tool}: sandboxed launch must not emit resume flags"
             );
-            // The sid stays pinned in agent_session_id; only its emission
-            // into the container command is suppressed, so the method reports
-            // "no resume flags applied" (is_existing && emitted == false).
-            assert!(!resumed, "{tool}");
+            // The stored ID remains, but no session flag was emitted.
+            assert_eq!(session_flags, AppliedSessionFlags::None, "{tool}");
             assert_eq!(
                 inst.agent_session_id.as_deref(),
                 Some(sid),
@@ -11921,7 +11941,10 @@ mod tests {
         host_inst.agent_session_id = Some(sid.to_string());
         host_inst.resume_intent = ResumeIntent::Use(sid.to_string());
         let mut cmd = "prime-agent".to_string();
-        assert!(host_inst.apply_session_flags(&mut cmd, "test"));
+        assert_eq!(
+            host_inst.apply_session_flags(&mut cmd, "test"),
+            AppliedSessionFlags::Existing
+        );
         assert_eq!(cmd, format!("prime-agent --resume {sid}"));
     }
 
@@ -12158,18 +12181,21 @@ mod tests {
     }
 
     #[test]
-    fn apply_session_flags_returns_acquire_is_existing() {
+    fn apply_session_flags_reports_emitted_flag_kind() {
         let mut inst = Instance::new("Test", "/tmp/test");
         inst.tool = "claude".to_string();
-        // Fresh mint (no prior transcript): acquire reports a new session
-        // (`--session-id`), so apply_session_flags returns false.
         let mut cmd = String::from("claude");
-        assert!(!inst.apply_session_flags(&mut cmd, "test"));
-        // A user-pinned resume intent reports an existing session
-        // unconditionally, so apply_session_flags returns true.
+        assert_eq!(
+            inst.apply_session_flags(&mut cmd, "test"),
+            AppliedSessionFlags::Fresh
+        );
+
         inst.resume_intent = ResumeIntent::Use("019342ab-1234-7def-8901-abcdef012345".to_string());
         let mut cmd2 = String::from("claude");
-        assert!(inst.apply_session_flags(&mut cmd2, "test"));
+        assert_eq!(
+            inst.apply_session_flags(&mut cmd2, "test"),
+            AppliedSessionFlags::Existing
+        );
     }
 
     #[test]
@@ -13143,8 +13169,9 @@ mod tests {
 
     mod resume_fallback {
         use super::super::{
-            build_resume_flags, should_attempt_resume, Instance, LaunchSidOutcome,
-            ResumeAttemptPolicy, ResumeIntent, SidPersistOutcome, StartOutcome, Status,
+            build_resume_flags, classify_launch_sid_outcome, should_attempt_resume,
+            AppliedSessionFlags, Instance, LaunchSidOutcome, ResumeAttemptPolicy, ResumeIntent,
+            SidPersistOutcome, StartOutcome, Status,
         };
         use crate::session::test_support::EnvGuard;
         use serial_test::serial;
@@ -13261,8 +13288,16 @@ mod tests {
                     .unwrap()
                     .launch_base_command();
                 let base_command = command.clone();
-                let resumed = inst.apply_session_flags(&mut command, "test");
-                assert_eq!(resumed, supported, "{tool}: launch resume decision");
+                let session_flags = inst.apply_session_flags(&mut command, "test");
+                assert_eq!(
+                    session_flags,
+                    if supported {
+                        AppliedSessionFlags::Existing
+                    } else {
+                        AppliedSessionFlags::None
+                    },
+                    "{tool}: launch resume decision"
+                );
                 assert_eq!(
                     command != base_command,
                     supported,
@@ -13273,6 +13308,52 @@ mod tests {
                     !supported,
                     "{tool}: direct resume flags"
                 );
+            }
+        }
+
+        #[test]
+        fn unsupported_stored_sids_do_not_trigger_launch_probe() {
+            let old_sid = "11111111-1111-1111-1111-111111111111";
+            let new_sid = "22222222-2222-2222-2222-222222222222";
+
+            for tool in ["qwen", "kiro"] {
+                for intent in [
+                    ResumeIntent::Default,
+                    ResumeIntent::Use(new_sid.to_string()),
+                    ResumeIntent::Fork {
+                        from: new_sid.to_string(),
+                    },
+                ] {
+                    let mut inst = Instance::new("stale-sid", "/tmp/test");
+                    inst.tool = tool.to_string();
+                    inst.agent_session_id = Some(old_sid.to_string());
+                    inst.resume_intent = intent.clone();
+                    let expected_prior_sid = inst.agent_session_id.clone();
+                    let mut command = crate::agents::get_agent(tool)
+                        .unwrap()
+                        .launch_base_command();
+                    let base_command = command.clone();
+
+                    let session_flags = inst.apply_session_flags(&mut command, "test");
+
+                    assert_eq!(
+                        session_flags,
+                        AppliedSessionFlags::None,
+                        "{tool}: {intent:?}"
+                    );
+                    assert_eq!(command, base_command, "{tool}: {intent:?}");
+                    assert_eq!(
+                        classify_launch_sid_outcome(
+                            session_flags,
+                            inst.agent_session_id.as_deref(),
+                            expected_prior_sid.as_deref(),
+                        ),
+                        LaunchSidOutcome::Fresh {
+                            pinned_prior_sid: None
+                        },
+                        "{tool}: {intent:?}"
+                    );
+                }
             }
         }
 
