@@ -11037,6 +11037,44 @@ fn delete_selected_refused_during_restart() {
         .unwrap();
     assert_eq!(instances[0].group_path, "work");
     assert!(groups.iter().any(|group| group.path == "work"));
+    env.view.restart_in_flight.remove(&id);
+    {
+        let storage = env.view.storages.get("test").unwrap();
+        storage
+            .update(|instances, _groups| {
+                instances
+                    .iter_mut()
+                    .find(|instance| instance.id == id)
+                    .unwrap()
+                    .status = crate::session::Status::Creating;
+                Ok(())
+            })
+            .unwrap();
+    }
+    env.view.info_dialog = None;
+
+    env.view
+        .delete_group_with_sessions(&GroupDeleteOptions {
+            delete_sessions: true,
+            delete_worktrees: false,
+            delete_branches: false,
+            delete_containers: false,
+            force_delete_worktrees: false,
+        })
+        .unwrap();
+
+    assert_eq!(env.view.selected_group.as_deref(), Some("work"));
+    assert_eq!(
+        env.view.info_dialog.as_ref().map(InfoDialog::title),
+        Some("Creation in progress")
+    );
+    let (instances, groups) = Storage::open_unwatched("test")
+        .unwrap()
+        .load_with_groups()
+        .unwrap();
+    assert_eq!(instances[0].group_path, "work");
+    assert_eq!(instances[0].status, crate::session::Status::Creating);
+    assert!(groups.iter().any(|group| group.path == "work"));
 }
 
 /// Build a HomeView seeded with two distinct projects, each containing
