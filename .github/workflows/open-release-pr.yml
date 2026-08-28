@@ -129,9 +129,39 @@ jobs:
           # step was the one that missed it.
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          git cliff --config cliff.toml --tag "v$VERSION" --output CHANGELOG.md
+          set -uo pipefail
+          # git-cliff panics on ANY http error from that metadata walk,
+          # transient 5xx included, and has no internal retry. One blip loses
+          # the whole weekly run and the miss is silent until someone notices
+          # the PR never showed up. Observed 2026-08-28: a 502 on
+          # /commits?page=15 killed an otherwise healthy run, and an immediate
+          # re-dispatch succeeded.
+          for attempt in 1 2 3; do
+            if git cliff --config cliff.toml --tag "v$VERSION" \
+                 --output CHANGELOG.md 2> cliff-stderr.log; then
+              break
+            fi
+            echo "=== git-cliff attempt $attempt failed ==="
+            cat cliff-stderr.log
+            if [ "$attempt" = 3 ]; then
+              echo "::error::git-cliff failed 3 times; see the stderr dumps above"
+              exit 1
+            fi
+            sleep $((attempt * 15))
+          done
           echo "=== CHANGELOG.md head ==="
           head -40 CHANGELOG.md
+          echo "=== cliff stderr ==="
+          cat cliff-stderr.log
+          # Mirror the guard release.yml and prepare-release.yml already carry.
+          # cliff.toml's catch-all parser routes unmatched commits to "Other",
+          # so a parse-error skip means something fell through the safety net.
+          # Without this the weekly PR can open with commits silently missing
+          # from the changelog diff the maintainer is reviewing.
+          if grep -q "skipped due to parse error" cliff-stderr.log; then
+            echo "::error::git-cliff skipped commits due to parse errors. Either fix the offending commit messages or extend cliff.toml's catch-all parser."
+            exit 1
+          fi
 
       - name: Compute changelog since last tag
         id: changelog
@@ -222,3 +252,67 @@ jobs:
             --title "chore: release v${VERSION}" \
             --body-file /tmp/pr-body.md \
             --label release-staging
+
+  notify-on-failure:
+    name: Report a failed weekly run
+    needs: open-release-pr
+    # Only for the scheduled trigger. A workflow_dispatch failure is already in
+    # front of the person who clicked it; a schedule failure is what goes
+    # unnoticed, which is how 2026-08-19 and 08-26 both passed without anyone
+    # spotting that no release PR had opened.
+    if: failure() && github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    steps:
+      - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        with:
+          script: |
+            const label = 'release-automation';
+            const { owner, repo } = context.repo;
+            const runUrl = `${context.serverUrl}/${owner}/${repo}/actions/runs/${context.runId}`;
+
+            try {
+              await github.rest.issues.createLabel({
+                owner,
+                repo,
+                name: label,
+                color: 'd93f0b',
+                description: 'Failures in the release automation workflows',
+              });
+            } catch (e) {
+              // Already exists, which is the normal case after the first run.
+            }
+
+            // One open issue at a time. Later failures comment on it rather
+            // than opening a duplicate every Wednesday, so a persistent break
+            // stays a single thread instead of a weekly pile.
+            const { data: open } = await github.rest.issues.listForRepo({
+              owner,
+              repo,
+              state: 'open',
+              labels: label,
+            });
+
+            if (open.length > 0) {
+              await github.rest.issues.createComment({
+                owner,
+                repo,
+                issue_number: open[0].number,
+                body: `The weekly release PR failed again: ${runUrl}`,
+              });
+            } else {
+              await github.rest.issues.create({
+                owner,
+                repo,
+                title: 'Weekly release PR did not open',
+                labels: [label],
+                body: [
+                  `The scheduled \`open-release-pr\` run failed, so no release-staging PR was opened this week.`,
+                  ``,
+                  `Failed run: ${runUrl}`,
+                  ``,
+                  `Re-run it with \`gh workflow run open-release-pr.yml --ref main -f bump=patch\` once the cause is addressed.`,
+                ].join('\n'),
+              });
+            }
