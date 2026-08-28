@@ -386,6 +386,7 @@ fn session_details(inst: &Instance, profile: &str) -> SessionDetails {
 
 #[tracing::instrument(target = "cli.session", skip_all, fields(profile = %profile))]
 pub async fn run(profile: &str, command: SessionCommands) -> Result<()> {
+    crate::session::sync::sync_profile_tmux_session_id_env(profile);
     match command {
         SessionCommands::Start(args) => start_session(profile, args).await,
         SessionCommands::Stop(args) => stop_session(profile, args).await,
@@ -923,10 +924,12 @@ fn resolve_import_roots(paths: &[String]) -> Result<Vec<std::path::PathBuf>> {
 /// id, and (serve builds) the structured-view id.
 fn already_imported(instances: &[Instance], id: &str) -> bool {
     instances.iter().any(|inst| {
-        if inst.agent_session_id.as_deref() == Some(id) {
+        if inst.operational_agent_session_id() == Some(id) {
             return true;
         }
-        if matches!(&inst.resume_intent, ResumeIntent::Use(s) if s == id) {
+        if inst.supports_terminal_resume()
+            && matches!(&inst.resume_intent, ResumeIntent::Use(s) if s == id)
+        {
             return true;
         }
         #[cfg(feature = "serve")]
@@ -3139,17 +3142,31 @@ mod import_tests {
     }
 
     #[test]
-    fn already_imported_matches_resume_and_observed_ids() {
-        let mut by_resume = Instance::new("a", "/p");
-        by_resume.resume_intent = ResumeIntent::Use("id-1".to_string());
-        let mut by_observed = Instance::new("b", "/p");
-        by_observed.agent_session_id = Some("id-2".to_string());
-        let fresh = Instance::new("c", "/p");
-        let instances = vec![by_resume, by_observed, fresh];
+    fn already_imported_matches_only_operational_ids() {
+        for (tool, expected) in [("claude", true), ("qwen", false), ("kiro", false)] {
+            let mut by_resume = Instance::new("resume", "/p");
+            by_resume.tool = tool.to_string();
+            by_resume.resume_intent = ResumeIntent::Use("id-1".to_string());
+            let mut by_observed = Instance::new("observed", "/p");
+            by_observed.tool = tool.to_string();
+            by_observed.agent_session_id = Some("id-2".to_string());
+            let instances = vec![by_resume, by_observed];
 
-        assert!(already_imported(&instances, "id-1"));
-        assert!(already_imported(&instances, "id-2"));
-        assert!(!already_imported(&instances, "id-3"));
+            assert_eq!(already_imported(&instances, "id-1"), expected, "{tool} Use");
+            assert_eq!(
+                already_imported(&instances, "id-2"),
+                expected,
+                "{tool} observed"
+            );
+            assert!(!already_imported(&instances, "id-3"), "{tool} fresh");
+        }
+
+        #[cfg(feature = "serve")]
+        {
+            let mut structured = Instance::new("structured", "/p");
+            structured.acp_session_id = Some("id-acp".to_string());
+            assert!(already_imported(&[structured], "id-acp"));
+        }
     }
 }
 

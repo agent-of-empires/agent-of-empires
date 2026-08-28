@@ -341,7 +341,7 @@ const RESUME_PROBE_POLL: std::time::Duration = std::time::Duration::from_millis(
 /// fully attachable for the duration so the cost is purely in the synchronous
 /// restart path's latency, not in agent responsiveness afterward.
 const RESUME_PROBE_POST_SHELL_GRACE: std::time::Duration = std::time::Duration::from_millis(2000);
-fn supports_terminal_resume(tool: &str) -> bool {
+fn tool_supports_terminal_resume(tool: &str) -> bool {
     !matches!(
         crate::agents::get_agent(tool).map(|agent| &agent.resume_strategy),
         Some(crate::agents::ResumeStrategy::Unsupported) | None,
@@ -352,7 +352,7 @@ fn supports_terminal_resume(tool: &str) -> bool {
 /// Extracted for unit-testability: the probe path itself needs a real tmux
 /// session to test end-to-end.
 pub(crate) fn should_attempt_resume(agent_session_id: Option<&str>, tool: &str) -> bool {
-    agent_session_id.is_some_and(is_valid_session_id) && supports_terminal_resume(tool)
+    agent_session_id.is_some_and(is_valid_session_id) && tool_supports_terminal_resume(tool)
 }
 
 /// Outcome of `Instance::ensure_pane_ready`. Callers surface this so the user
@@ -1469,7 +1469,7 @@ fn persist_session_to_storage_guarded(
         let Some(target) = instances.iter().find(|instance| instance.id == instance_id) else {
             return Ok(SidWrite::Failed);
         };
-        if !supports_terminal_resume(&target.tool) {
+        if !target.supports_terminal_resume() {
             return Ok(SidWrite::Skipped);
         }
         if let Some(holder) = foreign_sid_holder(instances, instance_id, session_id) {
@@ -3027,19 +3027,22 @@ impl Instance {
         self.view == View::Structured
     }
 
+    /// Whether this terminal agent can operationally resume a stored ID.
+    pub(crate) fn supports_terminal_resume(&self) -> bool {
+        tool_supports_terminal_resume(&self.tool)
+    }
+
     /// Session ID only when this terminal agent can operationally resume it.
     /// Unsupported agents retain stored IDs as inert data, never ownership.
     pub(crate) fn operational_agent_session_id(&self) -> Option<&str> {
-        if supports_terminal_resume(&self.tool) {
-            self.agent_session_id.as_deref()
-        } else {
-            None
-        }
+        self.supports_terminal_resume()
+            .then_some(self.agent_session_id.as_deref())
+            .flatten()
     }
 
     /// Whether this agent uses a session ID poller for live tracking.
     pub fn supports_session_poller(&self) -> bool {
-        supports_terminal_resume(&self.tool)
+        self.supports_terminal_resume()
     }
 
     /// Switch this structured-view session to terminal mode while keeping the
@@ -5227,7 +5230,7 @@ impl Instance {
 
         // Unsupported agents retain their stored ID and intent as inert data.
         // Cleared remains actionable so users can delete that retained state.
-        if !supports_terminal_resume(&self.tool)
+        if !self.supports_terminal_resume()
             && !matches!(&expected_prior_intent, ResumeIntent::Cleared)
         {
             return SidPersistOutcome::Inert;

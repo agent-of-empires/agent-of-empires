@@ -52,6 +52,90 @@ impl SessionIdSyncOutcome {
     }
 }
 
+type TmuxEnvSet = (String, String, String);
+type TmuxEnvUnset = (String, String);
+
+fn tmux_session_id_env_updates<'a>(
+    instances: impl IntoIterator<Item = &'a Instance>,
+    mut session_name: impl FnMut(&Instance) -> Option<String>,
+) -> (Vec<TmuxEnvSet>, Vec<TmuxEnvUnset>) {
+    let mut set_batch = Vec::new();
+    let mut unset_batch = Vec::new();
+    for instance in instances {
+        let Some(tmux_name) = session_name(instance) else {
+            continue;
+        };
+        set_batch.push((
+            tmux_name.clone(),
+            crate::tmux::env::AOE_INSTANCE_ID_KEY.to_string(),
+            instance.id.clone(),
+        ));
+        match instance.operational_agent_session_id() {
+            Some(sid) => set_batch.push((
+                tmux_name,
+                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
+                sid.to_string(),
+            )),
+            None => unset_batch.push((
+                tmux_name,
+                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
+            )),
+        }
+    }
+    (set_batch, unset_batch)
+}
+
+/// Reconcile durable session IDs into every live tmux session.
+///
+/// Unsupported terminal agents retain their stored ID on disk, but their tmux
+/// environment must not expose it as operational ownership after an upgrade.
+pub(crate) fn sync_tmux_session_id_env<'a>(
+    instances: impl IntoIterator<Item = &'a Instance>,
+    live: &crate::tmux::LiveSessionSnapshot,
+) {
+    let (set_batch, unset_batch) = tmux_session_id_env_updates(instances, |instance| {
+        instance.tmux_env_session_name_in_or_probe(live)
+    });
+    if !set_batch.is_empty() {
+        let refs: Vec<(&str, &str, &str)> = set_batch
+            .iter()
+            .map(|(session, key, value)| (session.as_str(), key.as_str(), value.as_str()))
+            .collect();
+        if let Err(error) = crate::tmux::env::set_hidden_env_batch(&refs) {
+            tracing::warn!(target: "session.sync", "Session env reconcile failed: {error}");
+        }
+    }
+    if !unset_batch.is_empty() {
+        let refs: Vec<(&str, &str)> = unset_batch
+            .iter()
+            .map(|(session, key)| (session.as_str(), key.as_str()))
+            .collect();
+        if let Err(error) = crate::tmux::env::remove_hidden_env_batch(&refs) {
+            tracing::warn!(target: "session.sync", "Session env cleanup failed: {error}");
+        }
+    }
+}
+
+/// Best-effort reconciliation for one-shot CLI entry points.
+pub(crate) fn sync_profile_tmux_session_id_env(profile: &str) {
+    let storage = match Storage::new_unwatched(profile) {
+        Ok(storage) => storage,
+        Err(error) => {
+            tracing::warn!(target: "session.sync", %profile, "Session env storage open failed: {error}");
+            return;
+        }
+    };
+    let instances = match storage.load() {
+        Ok(instances) => instances,
+        Err(error) => {
+            tracing::warn!(target: "session.sync", %profile, "Session env storage load failed: {error}");
+            return;
+        }
+    };
+    let live = crate::tmux::LiveSessionSnapshot::new();
+    sync_tmux_session_id_env(instances.iter(), &live);
+}
+
 struct Update {
     id: String,
     sid: String,
@@ -652,6 +736,37 @@ mod tests {
         EnvGuard::set(&pairs)
     }
 
+    #[test]
+    fn tmux_env_plan_publishes_only_operational_session_ids() {
+        let stale = "019342ab-1234-7def-8901-dddddddddddd";
+        for (tool, publishes) in [("claude", true), ("qwen", false), ("kiro", false)] {
+            let mut instance = Instance::new("owner", "/tmp/x");
+            instance.tool = tool.to_string();
+            instance.agent_session_id = Some(stale.to_string());
+
+            let (set_batch, unset_batch) =
+                tmux_session_id_env_updates([&instance], |row| Some(format!("tmux-{}", row.id)));
+            assert!(set_batch.iter().any(|(_, key, value)| {
+                key == crate::tmux::env::AOE_INSTANCE_ID_KEY && value == &instance.id
+            }));
+            assert_eq!(
+                set_batch
+                    .iter()
+                    .find(|(_, key, _)| key == crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY)
+                    .map(|(_, _, value)| value.as_str()),
+                publishes.then_some(stale),
+                "{tool}: publish"
+            );
+            assert_eq!(
+                unset_batch
+                    .iter()
+                    .any(|(_, key)| { key == crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY }),
+                !publishes,
+                "{tool}: unset"
+            );
+        }
+    }
+
     fn seed_instance_on_disk(profile: &str, inst: &Instance) {
         let storage = Storage::new_unwatched(profile).unwrap();
         let on_disk = inst.clone();
@@ -966,6 +1081,7 @@ mod tests {
             owner.tool = owner_tool.to_string();
             owner.source_profile = profile.clone();
             owner.agent_session_id = Some(owned.to_string());
+            let owner_id = owner.id.clone();
 
             let mut claimant = Instance::new("claimant-title", "/tmp/x");
             claimant.source_profile = profile.clone();
@@ -1009,6 +1125,34 @@ mod tests {
                 disk_claimant.agent_session_id.as_deref(),
                 (!blocks_claim).then_some(owned),
                 "{owner_tool}: disk"
+            );
+
+            let replacement = "019342ab-1234-7def-8901-bbbbbbbbbbbb";
+            let write = persist_session_to_storage(
+                &profile,
+                &owner_id,
+                replacement,
+                Some(owned),
+                &file_watch,
+            );
+            assert_eq!(
+                write,
+                if blocks_claim {
+                    SidWrite::Applied
+                } else {
+                    SidWrite::Skipped
+                },
+                "{owner_tool}: persistence target"
+            );
+            let stored = Storage::new_unwatched(&profile).unwrap().load().unwrap();
+            let disk_owner = stored
+                .iter()
+                .find(|instance| instance.id == owner_id)
+                .unwrap();
+            assert_eq!(
+                disk_owner.agent_session_id.as_deref(),
+                Some(if blocks_claim { replacement } else { owned }),
+                "{owner_tool}: persistence target disk"
             );
         }
     }

@@ -2544,62 +2544,10 @@ impl HomeView {
             }
         }
 
-        // Batch-sync instance IDs and captured session IDs to tmux hidden env
-        // so that build_exclusion_set() on other AoE instances can see them.
-        // One observation for both per-instance walks below. They visit every
-        // instance in the view, so a per-item `list-sessions` fork scales with
-        // the whole store, measured as the dominant tmux cost of this pass on
-        // a store of a few hundred sessions.
+        // Reconcile durable IDs into every live tmux session. Unsupported
+        // agents retain IDs on disk but must not publish them as ownership.
         let live = crate::tmux::LiveSessionSnapshot::new();
-        {
-            let mut set_batch: Vec<(String, String, String)> = Vec::new();
-            let mut unset_batch: Vec<(String, String)> = Vec::new();
-            for inst in view.instances.values() {
-                // This publication is one-shot: no reload re-runs it and a
-                // poller does not re-emit an unchanged sid, so a row dropped
-                // here stays unpublished until an unrelated sid change or a
-                // relaunch. A snapshot that could not reach the server is
-                // therefore probed per row rather than read as "no live pane".
-                let Some(tmux_name) = inst.tmux_env_session_name_in_or_probe(&live) else {
-                    continue;
-                };
-
-                set_batch.push((
-                    tmux_name.clone(),
-                    crate::tmux::env::AOE_INSTANCE_ID_KEY.to_string(),
-                    inst.id.clone(),
-                ));
-                match inst.operational_agent_session_id() {
-                    Some(sid) => set_batch.push((
-                        tmux_name,
-                        crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
-                        sid.to_string(),
-                    )),
-                    None => unset_batch.push((
-                        tmux_name,
-                        crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
-                    )),
-                }
-            }
-            if !set_batch.is_empty() {
-                let batch_refs: Vec<(&str, &str, &str)> = set_batch
-                    .iter()
-                    .map(|(s, k, v)| (s.as_str(), k.as_str(), v.as_str()))
-                    .collect();
-                if let Err(e) = crate::tmux::env::set_hidden_env_batch(&batch_refs) {
-                    tracing::warn!(target: "tui.home", "Batch env sync failed: {}", e);
-                }
-            }
-            if !unset_batch.is_empty() {
-                let batch_refs: Vec<(&str, &str)> = unset_batch
-                    .iter()
-                    .map(|(s, k)| (s.as_str(), k.as_str()))
-                    .collect();
-                if let Err(e) = crate::tmux::env::remove_hidden_env_batch(&batch_refs) {
-                    tracing::warn!(target: "tui.home", "Batch env unset failed: {}", e);
-                }
-            }
-        }
+        crate::session::sync::sync_tmux_session_id_env(view.instances.values(), &live);
 
         // Recover session IDs for pre-existing sessions via pollers.
         for inst in view.instances.values_mut() {

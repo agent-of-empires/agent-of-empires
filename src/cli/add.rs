@@ -1247,6 +1247,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         // Persist Status::Error + last_error on launch failure rather than
         // cleanup_partial_session: row is committed; surface as broken.
         let id = instance.id.clone();
+        crate::session::sync::sync_profile_tmux_session_id_env(profile);
         match instance.start_with_size(crate::terminal::get_size()) {
             Ok(()) => {
                 let landed = storage.update(|all_instances, _groups| {

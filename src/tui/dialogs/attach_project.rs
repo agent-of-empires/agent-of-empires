@@ -118,8 +118,8 @@ impl AttachProjectDialog {
             .max()
             .unwrap_or(0) as u16;
         let dialog_width: u16 = (widest + 10).clamp(40, 72);
-        // Two extra rows over the list: the restart warning and the key hint.
-        let dialog_height: u16 = (self.options.len().max(3) as u16 + 6).min(20);
+        // Three extra rows over the list: the restart warning and the key hint.
+        let dialog_height: u16 = (self.options.len().max(3) as u16 + 7).min(20);
 
         let dialog_area = super::centered_rect(area, dialog_width, dialog_height);
         self.dialog_area = dialog_area;
@@ -140,7 +140,7 @@ impl AttachProjectDialog {
             .margin(1)
             .constraints([
                 Constraint::Min(1),
-                Constraint::Length(1),
+                Constraint::Length(2),
                 Constraint::Length(1),
             ])
             .split(inner);
@@ -177,12 +177,12 @@ impl AttachProjectDialog {
             frame.render_widget(Paragraph::new(lines), chunks[0]);
         }
 
-        // The agent has to be respawned to see the new root, so say so before the
-        // key that does it: attaching stops the session's ACP worker and starts a
-        // fresh one on the same conversation.
+        // The agent has to restart to see the new root. Whether the conversation
+        // continues depends on that agent's terminal resume capability.
         frame.render_widget(
-            Paragraph::new("Stops and restarts the agent (conversation is kept)")
-                .style(Style::default().fg(theme.waiting)),
+            Paragraph::new("Restarts agent. Resume support can continue chat; others start fresh.")
+                .style(Style::default().fg(theme.waiting))
+                .wrap(Wrap { trim: true }),
             chunks[1],
         );
 
@@ -193,5 +193,39 @@ impl AttachProjectDialog {
             Span::raw(" close"),
         ]);
         frame.render_widget(Paragraph::new(hint), chunks[2]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn restart_copy_does_not_promise_conversation_continuity() {
+        use ratatui::{backend::TestBackend, Terminal};
+
+        let mut dialog = AttachProjectDialog::new(
+            "session-id".to_string(),
+            "session-title".to_string(),
+            Vec::new(),
+        );
+        let mut terminal = Terminal::new(TestBackend::new(80, 20)).unwrap();
+        let theme = crate::tui::styles::Theme::default();
+        terminal
+            .draw(|frame| dialog.render(frame, frame.area(), &theme))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let screen = (0..buffer.area.height)
+            .map(|row| {
+                (0..buffer.area.width)
+                    .map(|column| buffer[(column, row)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(screen.contains("Resume support can"));
+        assert!(screen.contains("others start fresh"));
+        assert!(!screen.contains("conversation is kept"));
     }
 }
