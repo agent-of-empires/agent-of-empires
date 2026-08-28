@@ -1462,7 +1462,14 @@ impl AgentDef {
     /// `type: string, nargs: 1`; kimi `-p` is a `typer.Option(str)`; copilot
     /// `-p <text>` takes a value; claude `-p`/`--print` is boolean. Verified
     /// 2026-08-23 for prime-agent from `packages/coding-agent/src/cli/args.ts`:
-    /// its `-p` sets boolean print mode and the prompt stays positional.
+    /// its `-p`/`--print` sets a boolean print mode and then opportunistically
+    /// pushes the next token into `messages` only when that token is not a
+    /// flag, which is the same slot a positional prompt lands in. Classifying
+    /// it as positional is therefore correct for both argv shapes we emit:
+    /// `-p --model <m> <prompt>` leaves `--model` for its own arm, and
+    /// `-p <prompt>` (no title model configured) binds the prompt into the
+    /// same `messages` array. It is NOT a value-binding flag in the copilot /
+    /// gemini / kimi sense, where the model args must trail the prompt.
     pub fn oneshot_flag_binds_prompt(&self) -> bool {
         matches!(self.name, "copilot" | "gemini" | "kimi")
     }
