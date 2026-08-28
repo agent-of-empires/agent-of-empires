@@ -111,26 +111,40 @@ pub(crate) fn sync_tmux_session_id_env<'a>(
     instances: impl IntoIterator<Item = &'a Instance>,
     live: &crate::tmux::LiveSessionSnapshot,
 ) -> anyhow::Result<()> {
-    let (set_batch, unset_batch) = tmux_session_id_env_updates(instances, |instance| {
-        tmux_session_id_env_names(instance, live)
-    });
-    if !set_batch.is_empty() {
-        let refs: Vec<(&str, &str, &str)> = set_batch
-            .iter()
-            .map(|(session, key, value)| (session.as_str(), key.as_str(), value.as_str()))
-            .collect();
-        crate::tmux::env::set_hidden_env_batch(&refs)?;
+    let mut targets = Vec::new();
+    for instance in instances {
+        if instance.operational_agent_session_id().is_none() {
+            targets.extend(tmux_session_id_env_names(instance, live));
+        }
     }
-    if !unset_batch.is_empty() {
-        let refs: Vec<(&str, &str)> = unset_batch
-            .iter()
-            .map(|(session, key)| (session.as_str(), key.as_str()))
-            .collect();
-        crate::tmux::env::remove_hidden_env_batch(&refs)?;
-    }
-    Ok(())
+    let refs: Vec<(&str, &str)> = targets
+        .iter()
+        .map(|session| {
+            (
+                session.as_str(),
+                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+            )
+        })
+        .collect();
+    crate::tmux::env::remove_hidden_env_batch(&refs)
 }
 
+pub(crate) fn publish_operational_tmux_session_id_env(
+    instances: &[Instance],
+) -> anyhow::Result<()> {
+    let live = crate::tmux::LiveSessionSnapshot::new();
+    let (set_batch, _) = tmux_session_id_env_updates(
+        instances
+            .iter()
+            .filter(|instance| instance.operational_agent_session_id().is_some()),
+        |instance| tmux_session_id_env_names(instance, &live),
+    );
+    let refs: Vec<(&str, &str, &str)> = set_batch
+        .iter()
+        .map(|(session, key, value)| (session.as_str(), key.as_str(), value.as_str()))
+        .collect();
+    crate::tmux::env::set_hidden_env_batch(&refs)
+}
 type TmuxOwnershipObservation = (String, Option<String>, Option<String>);
 
 fn stale_tmux_ownership_targets(

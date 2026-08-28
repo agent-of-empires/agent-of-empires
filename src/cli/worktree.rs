@@ -296,10 +296,20 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
     if !orphaned_sessions.is_empty() {
         crate::session::sync::clear_tmux_session_id_ownership_for_instances(&orphaned_sessions)?;
         let orphan_ids: HashSet<String> = orphaned_sessions.iter().map(|o| o.id.clone()).collect();
-        storage.update(|all_instances, _groups| {
+        if let Err(delete_error) = storage.update(|all_instances, _groups| {
             all_instances.retain(|inst| !orphan_ids.contains(&inst.id));
             Ok(())
-        })?;
+        }) {
+            if let Err(restore_error) =
+                crate::session::sync::publish_operational_tmux_session_id_env(&orphaned_sessions)
+            {
+                bail!(
+                    "Failed to remove orphaned sessions: {delete_error}; ownership restore failed: {restore_error}"
+                );
+            }
+            return Err(delete_error);
+        }
+        crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env()?;
 
         removed_count += orphaned_sessions.len();
         println!("✓ Removed {} orphaned sessions", orphaned_sessions.len());

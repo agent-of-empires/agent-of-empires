@@ -629,8 +629,20 @@ pub fn delete_profile(name: &str) -> Result<()> {
         anyhow::bail!("Cannot delete '{}': at least one profile must exist", name);
     }
 
+    let target_instances = Storage::open_unwatched(name)
+        .and_then(|storage| storage.load())
+        .unwrap_or_default();
     sync::reconcile_tmux_session_id_ownership_excluding_profile(name)?;
-    fs::remove_dir_all(&profile_dir)?;
+    if let Err(delete_error) = fs::remove_dir_all(&profile_dir) {
+        if let Err(restore_error) = sync::publish_operational_tmux_session_id_env(&target_instances)
+        {
+            anyhow::bail!(
+                "Failed to delete profile '{name}': {delete_error}; ownership restore failed: {restore_error}"
+            );
+        }
+        return Err(delete_error.into());
+    }
+    sync::reconcile_all_profiles_tmux_session_id_ownership_env()?;
     Ok(())
 }
 

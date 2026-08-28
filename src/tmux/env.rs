@@ -268,33 +268,35 @@ pub fn set_hidden_env_batch(entries: &[(&str, &str, &str)]) -> anyhow::Result<()
                 "Batch tmux set-environment failed (exit {}), falling back to sequential writes",
                 out.status
             );
-            sequential_set_fallback(entries);
-            Ok(())
+            sequential_set_fallback(entries)
         }
         Err(e) => {
             tracing::debug!(target: "tmux.command",
                 "Batch tmux set-environment error: {}, falling back to sequential writes",
                 e
             );
-            sequential_set_fallback(entries);
-            Ok(())
+            sequential_set_fallback(entries)
         }
     }
 }
 
-fn sequential_set_fallback(entries: &[(&str, &str, &str)]) {
+fn sequential_set_fallback(entries: &[(&str, &str, &str)]) -> anyhow::Result<()> {
+    let mut failures = Vec::new();
     for (session_name, key, value) in entries {
-        if let Err(e) = set_hidden_env(session_name, key, value) {
-            tracing::debug!(target: "tmux.command",
-                "Sequential set of {} on {} failed: {}",
-                key,
-                session_name,
-                e
-            );
+        if let Err(error) = set_hidden_env(session_name, key, value) {
+            failures.push(format!("{session_name}:{key}: {error}"));
         }
     }
+    if failures.is_empty() {
+        Ok(())
+    } else {
+        bail!(
+            "Failed to set {} hidden env vars: {}",
+            failures.len(),
+            failures.join("; ")
+        )
+    }
 }
-
 fn invalidate_cache_entry(session_name: &str, key: &str) {
     if let Ok(mut cache) = ENV_CACHE.write() {
         if let Some(entries) = &mut cache.entries {
@@ -580,6 +582,9 @@ mod tests {
         );
         assert!(get_hidden_env_strict(&missing, AOE_INSTANCE_ID_KEY).is_err());
         assert!(remove_hidden_env_batch(&[(&missing, AOE_CAPTURED_SESSION_ID_KEY)]).is_err());
+        assert!(
+            set_hidden_env_batch(&[(&missing, AOE_CAPTURED_SESSION_ID_KEY, "captured")]).is_err()
+        );
     }
 
     #[test]
