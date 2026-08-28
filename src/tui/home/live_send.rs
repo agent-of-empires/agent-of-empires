@@ -806,6 +806,13 @@ pub(in crate::tui) struct LiveCaptureWorker {
     /// capture-pane. Mirrors the Clipboard Pass-through setting, so disabled
     /// mode does not keep a second pipe-pane connection open.
     clipboard_capture_enabled: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Cycle counter, bumped at the top of every worker iteration. The render
+    /// thread reads it to tell "the worker is running and has nothing new"
+    /// (an idle pane: no fork needed) from "the worker is wedged" (fall back
+    /// to the synchronous fork). Publishes cannot answer that on their own:
+    /// the worker dedups unchanged frames, so an idle pane publishes nothing
+    /// for minutes while still cycling.
+    cycles: std::sync::Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Drop for LiveCaptureWorker {
@@ -1000,6 +1007,8 @@ impl LiveCaptureWorker {
         // Pass-through setting, avoiding an observer before configuration is
         // available for a newly created worker.
         let clipboard_capture_enabled = Arc::new(AtomicBool::new(false));
+        let cycles = Arc::new(AtomicU64::new(0));
+        let cycles_cell = cycles.clone();
         let lines_cell = capture_lines.clone();
         let target_cell = target.clone();
         let slot = latest.clone();
@@ -1070,6 +1079,7 @@ impl LiveCaptureWorker {
                 crate::tmux::composite::WindowLayout,
             )> = None;
             while !stop_flag.load(Ordering::Relaxed) {
+                cycles_cell.fetch_add(1, Ordering::Relaxed);
                 let lines = lines_cell.load(Ordering::Relaxed);
                 // Read the target without holding the lock across the fork:
                 // `set_target` must never wait on a `capture-pane`.
@@ -1407,6 +1417,7 @@ impl LiveCaptureWorker {
             clipboard,
             vt_enabled,
             clipboard_capture_enabled,
+            cycles,
         }
     }
 
@@ -1536,6 +1547,15 @@ impl LiveCaptureWorker {
     /// render loop then keeps the current preview).
     pub(in crate::tui) fn take_latest(&self) -> Option<String> {
         self.latest.lock().ok().and_then(|mut guard| guard.take())
+    }
+
+    /// Snapshot of the worker's cycle counter. Two reads a moment apart that
+    /// differ mean the capture loop is running; identical reads across more
+    /// than a cycle's worth of time mean it is wedged (or stopped). The render
+    /// thread uses this to decide whether "no new frame" can be trusted as
+    /// "nothing changed".
+    pub(in crate::tui) fn cycles(&self) -> u64 {
+        self.cycles.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// The newest cursor for the worker's CURRENT target pane, or `None`

@@ -21231,3 +21231,57 @@ mod profile_duplicate_reconciliation {
         );
     }
 }
+
+/// The two guards on the idle-fork suppression that survived deletion with a
+/// green suite (njbrake on #3559). Driven against a REAL spawned worker
+/// because the mutants that matter are in the wiring, not in the pure
+/// `worker_pulse_step` helper: deleting the retarget reset, which is the one
+/// place a missed path leaves a genuinely stale preview, and deleting the
+/// pulse plumbing entirely.
+#[test]
+fn observe_worker_pulse_needs_a_moving_counter_and_resets_on_retarget() {
+    let mut env = create_test_env_empty();
+
+    // No worker: nothing can be trusted, and the observation stays cleared.
+    assert!(!env.view.observe_worker_pulse());
+    assert!(env.view.preview_worker_pulse.is_none());
+
+    env.view.preview_capture_worker = Some(crate::tui::home::live_send::LiveCaptureWorker::spawn(
+        std::sync::Arc::new(tokio::sync::Notify::new()),
+    ));
+
+    // First observation has no history to compare, so a cold start forks.
+    assert!(
+        !env.view.observe_worker_pulse(),
+        "the first observation must not suppress the cold-start fork"
+    );
+    assert!(env.view.preview_worker_pulse.is_some());
+
+    // The loop cycles on its own; wait for the counter to move rather than
+    // sleeping a fixed window, since the first iteration forks tmux.
+    let mut pulsing = false;
+    for _ in 0..100 {
+        if env.view.observe_worker_pulse() {
+            pulsing = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        pulsing,
+        "a running worker must be observed pulsing, so the idle fork is suppressed"
+    );
+
+    // Retarget: the new pane has no observed history, so its cold-start fork
+    // must not be suppressed by the previous pane's pulse.
+    env.view
+        .sync_preview_capture_worker(Some("aoe_test_pulse_retarget".to_string()));
+    assert!(
+        env.view.preview_worker_pulse.is_none(),
+        "a retarget must clear the pulse observation"
+    );
+    assert!(
+        !env.view.observe_worker_pulse(),
+        "the retargeted pane must fork once before the pulse is trusted again"
+    );
+}

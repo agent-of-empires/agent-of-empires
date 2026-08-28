@@ -668,6 +668,17 @@ pub struct HomeView {
     /// at, so the reconcile can tell when the displayed pane changed and
     /// retarget. `None` before the first preview or when nothing is selected.
     pub(super) preview_capture_target: Option<String>,
+    /// Last observed `LiveCaptureWorker::cycles` value and when it was seen,
+    /// so the render thread can tell a running worker with nothing new (an
+    /// idle pane) from a wedged one. `None` before the first observation and
+    /// after every retarget.
+    ///
+    /// This gates the synchronous fallback fork. Without it the 250ms idle
+    /// poll re-forked `capture-pane` on the render thread to re-read content
+    /// the worker had already reported unchanged: measured at 10-50ms per
+    /// fork against a 429x113 terminal, one to three whole frame budgets
+    /// burned every 250ms of simply looking at an idle session.
+    pub(super) preview_worker_pulse: Option<(u64, std::time::Instant)>,
     /// Notified by the capture worker thread when it has fresh, changed
     /// content. The event loop selects on this to repaint without
     /// busy-polling; an idle pane (no new content) never wakes it.
@@ -2363,6 +2374,7 @@ impl HomeView {
             live_send_worker: None,
             preview_capture_worker: None,
             preview_capture_target: None,
+            preview_worker_pulse: None,
             preview_wake: std::sync::Arc::new(tokio::sync::Notify::new()),
             live_send_last_resize: None,
             live_send_pending_leader: false,

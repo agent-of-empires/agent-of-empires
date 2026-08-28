@@ -186,6 +186,74 @@ fn preview_frozen(scroll_offset: u16, has_selection: bool) -> bool {
     scroll_offset > 0 || has_selection
 }
 
+/// Idle-poll cadence for the preview cache, in ms. The synchronous
+/// `capture-pane` fallback fires no more often than this.
+const PREVIEW_REFRESH_MS: u128 = 250;
+
+/// Ceiling on how long the capture worker may be the sole source of truth.
+///
+/// The 250ms poll was incidentally a self-healing authoritative refresh: it
+/// overwrote the cache with real `capture-pane` output four times a second, so
+/// any divergence between the worker's picture of the pane and tmux's was
+/// repaired before anyone saw it. Suppressing it removes that net for the one
+/// failure a cycle counter cannot see, a worker that cycles at full rate while
+/// being confidently wrong (its VT grid stably diverged, so `last_captured`
+/// matches every cycle and nothing publishes). This restores the self-heal at
+/// one fortieth of the old fork rate, which keeps essentially all of the win.
+const WORKER_TRUST_CEILING_MS: u128 = 10_000;
+
+/// Whether the idle poll should pay for a synchronous `capture-pane`.
+///
+/// Three ways it does not:
+/// - inside the cadence, which is the pre-existing throttle;
+/// - while frozen (reading scrollback or holding a selection), because a fresh
+///   bottom-anchored snapshot would shift the held content out from under the
+///   reader or the drag. Session change, resize, and the reading grow refresh
+///   through their own clauses regardless;
+/// - while the capture worker is pulsing, because it publishes every change,
+///   so a fork here could only re-read identical bytes at 10-50ms on the
+///   render thread. That suppression expires at [`WORKER_TRUST_CEILING_MS`],
+///   so a worker that is wrong rather than wedged still gets corrected.
+fn idle_poll_due(frozen: bool, idle_elapsed_ms: u128, worker_covers_idle: bool) -> bool {
+    if frozen || idle_elapsed_ms <= PREVIEW_REFRESH_MS {
+        return false;
+    }
+    !worker_covers_idle || idle_elapsed_ms > WORKER_TRUST_CEILING_MS
+}
+
+/// How an observed capture-worker cycle counter folds into a liveness verdict,
+/// given the previous observation. Returns `(is_pulsing, new_observation)`.
+///
+/// A counter that advanced proves the loop is running. An unchanged counter is
+/// inconclusive rather than dead: a render can easily land between two worker
+/// cycles, so the previous observation stays trusted until
+/// [`WORKER_PULSE_TIMEOUT`] has passed with no movement, at which point the
+/// worker is treated as wedged and the caller falls back to the synchronous
+/// fork.
+///
+/// With no prior observation there is nothing to compare, so the first call
+/// records one and reports not-pulsing: a cold start should fork once anyway.
+fn worker_pulse_step(
+    cycles: u64,
+    prior: Option<(u64, std::time::Instant)>,
+    now: std::time::Instant,
+) -> (bool, Option<(u64, std::time::Instant)>) {
+    match prior {
+        None => (false, Some((cycles, now))),
+        Some((seen, _)) if cycles != seen => (true, Some((cycles, now))),
+        Some((seen, at)) => (
+            now.saturating_duration_since(at) < WORKER_PULSE_TIMEOUT,
+            Some((seen, at)),
+        ),
+    }
+}
+
+/// How long an unmoved worker cycle counter stays trusted. Generous against
+/// the worker's own cadence: it cycles at most every 250ms when idle, and a
+/// capture fork inside a cycle can add tens of ms, so one slow cycle must not
+/// trip this.
+const WORKER_PULSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// Decide whether the cached capture window still covers the requested scroll.
 /// Returns true when the cache must be re-captured because the visible window
 /// (plus BUFFER headroom) would run past the end of the captured content.
@@ -1958,8 +2026,8 @@ impl HomeView {
     /// Shared core for the four `refresh_*_preview_cache_if_needed` methods.
     /// They all run the same needs-refresh gate (session id / dimensions /
     /// scroll-exceeds / 250ms timer) and the same capture, cache-update, and
-    /// scroll-clamp body; they differ only in which cache field they target,
-    /// where the capture comes from, and whether live-send forces a refresh.
+    /// scroll-clamp body; they differ only in which cache field they target
+    /// and where the capture comes from.
     ///
     /// `select` is called twice: once for the gate, once to write the result.
     /// `capture` runs between those two borrows so it can take a shared `&self`
@@ -1967,36 +2035,40 @@ impl HomeView {
     /// the agent uses that for its live-send preserve-last-good kill switch
     /// (#1501); the terminal/tool wrappers use it when the instance has gone
     /// away, matching the original "only write inside `if let Some(inst)`".
-    ///
-    /// `force` bypasses the idle throttle; the agent passes `in_live` here so
-    /// every render refreshes the preview in live-send mode (see the throttle
-    /// note in `refresh_preview_cache_if_needed`), the others pass `false`.
     fn refresh_preview_cache_core(
         &mut self,
         width: u16,
         height: u16,
-        force: bool,
         select: fn(&mut Self) -> &mut super::PreviewCache,
         capture: impl FnOnce(&Self, &str, usize) -> Option<String>,
     ) {
-        const PREVIEW_REFRESH_MS: u128 = 250;
         let Some(id) = self.selected_session.clone() else {
             return;
         };
         let scroll_offset = self.preview_scroll_offset;
         let frozen = self.preview_is_frozen();
         let visible_rows = self.preview_visible_rows;
+        // Only the idle timer is suppressed by a pulsing worker. A session
+        // change, a resize, and a scroll that outgrew the cache all still
+        // fork, because none of those are answered by "the worker had no new
+        // frame". Live-send is covered by the suppression rather than exempt
+        // from it, and needs no exemption: on the fast cadence
+        // `apply_worker_capture` almost always has a fresh frame to hand over
+        // and returns before this.
+        let worker_covers_idle = self.observe_worker_pulse();
 
         let cache = select(self);
-        let needs_refresh = force
-            || cache.session_id.as_ref() != Some(&id)
+        let idle_elapsed = cache.last_refresh.elapsed().as_millis();
+        let needs_refresh = cache.session_id.as_ref() != Some(&id)
             || cache.dimensions != (width, height)
-            || capture_window_stale(frozen, cache.captured_lines, height, visible_rows, scroll_offset)
-            // While frozen (reading scrollback or holding a selection) the idle
-            // poll must not re-capture: a fresh bottom-anchored snapshot would
-            // shift the held content out from under the reader or the drag.
-            // Session change, resize, and the reading grow still refresh.
-            || (!frozen && cache.last_refresh.elapsed().as_millis() > PREVIEW_REFRESH_MS);
+            || capture_window_stale(
+                frozen,
+                cache.captured_lines,
+                height,
+                visible_rows,
+                scroll_offset,
+            )
+            || idle_poll_due(frozen, idle_elapsed, worker_covers_idle);
         if !needs_refresh {
             return;
         }
@@ -2077,6 +2149,9 @@ impl HomeView {
                 worker.set_target(desired.clone().unwrap_or_default());
             }
             self.preview_capture_target = desired;
+            // The new pane has no observed cycle history, so the first refresh
+            // for it goes through the synchronous cold-start fork.
+            self.preview_worker_pulse = None;
             // New pane under the pointer: drop the hover dedup cell so a
             // stationary pointer still reports its cell to the new agent.
             self.hover_forward_cell = None;
@@ -2115,6 +2190,31 @@ impl HomeView {
     /// is unit-tested away from a live `HomeView`.
     fn preview_is_frozen(&self) -> bool {
         preview_frozen(self.preview_scroll_offset, self.preview_selection.is_some())
+    }
+
+    /// Fold this frame's observation of the capture worker's cycle counter in,
+    /// and report whether the worker is demonstrably running for the pane on
+    /// screen, so "the worker handed over nothing" can be read as "nothing
+    /// changed" rather than "nobody is capturing". Takes `&mut self` because
+    /// the observation it compares against is the state it updates.
+    ///
+    /// Liveness comes from the worker's cycle counter, not from its publishes:
+    /// it dedups unchanged frames, so an idle pane publishes nothing for
+    /// minutes while the loop keeps running. Decision lives in the pure
+    /// [`worker_pulse_step`] helper so it is unit-tested away from a live
+    /// worker thread.
+    pub(super) fn observe_worker_pulse(&mut self) -> bool {
+        let Some(worker) = self.preview_capture_worker.as_ref() else {
+            self.preview_worker_pulse = None;
+            return false;
+        };
+        let (pulsing, observation) = worker_pulse_step(
+            worker.cycles(),
+            self.preview_worker_pulse,
+            std::time::Instant::now(),
+        );
+        self.preview_worker_pulse = observation;
+        pulsing
     }
 
     fn apply_worker_capture(
@@ -2190,8 +2290,9 @@ impl HomeView {
         // `sync_preview_capture_worker` in `render_preview`) keeps fresh
         // content flowing on its own thread; `apply_worker_capture` below
         // just applies the newest it has produced. The synchronous fork via
-        // `refresh_preview_cache_core` remains only as the cold-start /
-        // worker-empty fallback (its 250ms gate still applies there). This
+        // `refresh_preview_cache_core` remains as the cold-start fallback,
+        // plus the wedged-worker and trust-ceiling paths in `idle_poll_due`;
+        // a worker that is merely idle no longer trips it. This
         // moves the per-frame capture cost (~8.5ms on macOS, ~90% of a
         // frame; the `tui.render` `capture_us` trace measures it) off the
         // render thread for every view, not just agent live-send.
@@ -2300,7 +2401,6 @@ impl HomeView {
         self.refresh_preview_cache_core(
             width,
             height,
-            false,
             |s| &mut s.preview_cache,
             |s, id, capture_lines| {
                 let in_live = s
@@ -2316,8 +2416,8 @@ impl HomeView {
                 // "session looks gone" signal the non-live path uses).
                 let same_session = s.preview_cache.session_id.as_deref() == Some(id);
                 // Composited in BOTH modes, matching what the worker publishes.
-                // This fallback also runs on every idle refresh (the worker
-                // dedups unchanged frames, so it has nothing to hand over), so a
+                // This fallback still runs behind a live worker (the trust
+                // ceiling, and any stall past `WORKER_PULSE_TIMEOUT`), so a
                 // pane-0-only capture here would clobber the worker's composite
                 // a beat after each keystroke and leave the split visible for
                 // only one frame at a time. On an unsplit window this returns
@@ -2354,7 +2454,6 @@ impl HomeView {
         self.refresh_preview_cache_core(
             width,
             height,
-            false,
             |s| &mut s.terminal_preview_cache,
             |s, id, capture_lines| {
                 s.get_instance(id).map(|inst| {
@@ -2383,7 +2482,6 @@ impl HomeView {
         self.refresh_preview_cache_core(
             width,
             height,
-            false,
             |s| &mut s.container_terminal_preview_cache,
             |s, id, capture_lines| {
                 s.get_instance(id).map(|inst| {
@@ -2417,7 +2515,6 @@ impl HomeView {
         self.refresh_preview_cache_core(
             width,
             height,
-            false,
             |s| &mut s.tool_preview_cache,
             |s, id, capture_lines| {
                 s.get_instance(id).map(|inst| {
@@ -4115,6 +4212,72 @@ mod tests {
     // by `preview_visible_rows_equal_output_area_with_info_shown` in
     // `home/tests.rs`, which renders a real frame and asserts
     // `preview_visible_rows == preview_pane_area.height`.
+
+    /// The idle-poll gate itself. A pulsing worker suppresses the fork, but
+    /// only up to the trust ceiling, so a worker that is confidently wrong
+    /// rather than wedged still gets corrected (njbrake on #3559).
+    #[test]
+    fn idle_poll_due_suppresses_a_pulsing_worker_only_until_the_trust_ceiling() {
+        let past_cadence = PREVIEW_REFRESH_MS + 1;
+        let past_ceiling = WORKER_TRUST_CEILING_MS + 1;
+        // (frozen, elapsed_ms, worker_covers_idle, expected)
+        let cases = [
+            // Inside the cadence: the pre-existing throttle, worker or not.
+            (false, PREVIEW_REFRESH_MS, false, false),
+            (false, PREVIEW_REFRESH_MS, true, false),
+            // Past the cadence with no trustworthy worker: fork, as before.
+            (false, past_cadence, false, true),
+            // Past the cadence with a pulsing worker: this is the whole fix.
+            (false, past_cadence, true, false),
+            // Past the ceiling: the self-heal fires even while pulsing.
+            (false, past_ceiling, true, true),
+            // Frozen wins over everything; the reader's content must not move.
+            (true, past_cadence, false, false),
+            (true, past_ceiling, false, false),
+        ];
+        for (frozen, elapsed, covered, expected) in cases {
+            assert_eq!(
+                idle_poll_due(frozen, elapsed, covered),
+                expected,
+                "frozen={frozen} elapsed={elapsed} covered={covered}"
+            );
+        }
+    }
+
+    /// The gate that keeps `capture-pane` off the render thread on an idle
+    /// pane. Advancing cycles prove the worker is running, an unmoved
+    /// counter is trusted until the timeout, and no prior observation forks
+    /// once by design.
+    #[test]
+    fn worker_pulse_step_trusts_a_running_worker_and_gives_up_on_a_wedged_one() {
+        let t0 = std::time::Instant::now();
+        let within = t0 + WORKER_PULSE_TIMEOUT - std::time::Duration::from_millis(1);
+        let past = t0 + WORKER_PULSE_TIMEOUT;
+
+        // Cold start: nothing to compare against, so fork once and record.
+        assert_eq!(worker_pulse_step(7, None, t0), (false, Some((7, t0))));
+
+        // Counter moved: the loop is running, so an empty handover means
+        // "unchanged" and the idle fork is suppressed.
+        assert_eq!(
+            worker_pulse_step(8, Some((7, t0)), within),
+            (true, Some((8, within)))
+        );
+
+        // Unmoved but recent: a render landed between two worker cycles. The
+        // observation must NOT be re-stamped, or repeated renders would keep
+        // pushing the deadline out and a wedged worker would never be caught.
+        assert_eq!(
+            worker_pulse_step(7, Some((7, t0)), within),
+            (true, Some((7, t0)))
+        );
+
+        // Unmoved past the timeout: treat as wedged and fall back to the fork.
+        assert_eq!(
+            worker_pulse_step(7, Some((7, t0)), past),
+            (false, Some((7, t0)))
+        );
+    }
 
     fn pane_cursor(x: u16, y: u16, visible: bool, pane_height: u16) -> crate::tmux::PaneCursor {
         crate::tmux::PaneCursor {
