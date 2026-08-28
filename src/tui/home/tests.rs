@@ -21396,11 +21396,10 @@ fn stalled_preview_worker_restarts_and_retarget_resets_heartbeat() {
     let worker = env
         .view
         .preview_capture_worker
-        .as_ref()
+        .as_mut()
         .expect("worker spawned");
     let old_worker_id = worker.id_for_test();
     worker.stop_for_test();
-    std::thread::sleep(std::time::Duration::from_millis(300));
     worker.set_cycles_for_test(17);
     env.view.preview_worker_pulse = Some((
         17,

@@ -942,6 +942,8 @@ pub(in crate::tui) struct LiveCaptureWorker {
     cycles: std::sync::Arc<std::sync::atomic::AtomicU64>,
     #[cfg(test)]
     test_id: u64,
+    #[cfg(test)]
+    thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl Drop for LiveCaptureWorker {
@@ -1187,7 +1189,7 @@ impl LiveCaptureWorker {
         let vt_enabled_cell = vt_enabled.clone();
         #[cfg(unix)]
         let clipboard_capture_enabled_cell = clipboard_capture_enabled.clone();
-        std::thread::spawn(move || {
+        let thread = std::thread::spawn(move || {
             let mut last_target = String::new();
             let mut last_generation = 0;
 
@@ -1330,7 +1332,7 @@ impl LiveCaptureWorker {
                     last_osc52_arm = None;
                 }
                 if lines > 0 && !name.is_empty() {
-                    let forward_empty = forward_empty_cell.load(Ordering::Relaxed);
+                    let forward_empty_policy = forward_empty_cell.load(Ordering::Relaxed);
                     // Keep a lazy count of the target window's panes so a
                     // hand-made split stops being invisible. One tiny fork
                     // every couple of seconds on the single previewed pane.
@@ -1356,7 +1358,8 @@ impl LiveCaptureWorker {
                     // since the last cycle. Published below under the same
                     // retarget guard as the cursor.
                     #[cfg(unix)]
-                    let observe_osc52 = !vt_enabled && forward_empty && clipboard_capture_enabled;
+                    let observe_osc52 =
+                        !vt_enabled && forward_empty_policy && clipboard_capture_enabled;
                     #[cfg(unix)]
                     if !observe_osc52 {
                         shutdown_osc52_source(&mut osc52_source, &command_deadline);
@@ -1402,8 +1405,7 @@ impl LiveCaptureWorker {
                     // as "No output available", not stale bytes); during
                     // live-send the #1501 kill switch preserves the
                     // last-good frame against transient tmux errors.
-                    let forward_empty = forward_empty_cell.load(Ordering::Relaxed)
-                        || !live_cell.load(Ordering::Relaxed);
+                    let forward_empty = forward_empty_policy || !live_cell.load(Ordering::Relaxed);
                     #[cfg(unix)]
                     let (capture, cursor_now) = if vt_enabled {
                         if vt_source.is_none()
@@ -1660,6 +1662,8 @@ impl LiveCaptureWorker {
                 shutdown_osc52_source(&mut osc52_source, &deadline);
             }
         });
+        #[cfg(not(test))]
+        drop(thread);
         Self {
             capture_lines,
             target,
@@ -1677,6 +1681,8 @@ impl LiveCaptureWorker {
             #[cfg(test)]
             test_id: LIVE_CAPTURE_WORKER_TEST_COUNTER
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            #[cfg(test)]
+            thread: Some(thread),
         }
     }
 
@@ -1895,9 +1901,12 @@ impl LiveCaptureWorker {
         self.generation.load(std::sync::atomic::Ordering::Relaxed)
     }
     #[cfg(test)]
-    pub(in crate::tui) fn stop_for_test(&self) {
+    pub(in crate::tui) fn stop_for_test(&mut self) {
         self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
         self.nudge();
+        if let Some(thread) = self.thread.take() {
+            thread.join().expect("capture worker must stop cleanly");
+        }
     }
 
     #[cfg(test)]
