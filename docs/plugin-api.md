@@ -30,7 +30,7 @@ Schema additions by `api_version`: `2` added contributions (commands, keybinds, 
 id = "dev.example.my-plugin"
 name = "My Plugin"
 version = "0.1.0"
-api_version = 8
+api_version = 13
 aoe_version = ">=1.11.0, <2.0.0"
 description = "What the plugin does."
 capabilities = ["runtime.worker"]

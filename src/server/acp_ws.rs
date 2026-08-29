@@ -135,26 +135,14 @@ async fn handle(
     // events get dropped.
     let mut rx = state.acp_events_tx.subscribe();
 
-    // Server-side reduced control state for this connection (Tier 1, see
-    // docs/development/server-owned-sv-state.md). The daemon reduces the event
-    // stream through `AcpState::apply_event` and pushes the result as a
-    // `reduced_state` frame, so clients render control state (turn/steering/
-    // approvals/usage/modes) instead of re-deriving it. Reduction is
-    // per-connection but deterministic (same reducer over the same ordered
-    // stream), so every client converges. Agent/model seed the frame's identity
-    // fields; the reducer corrects `agent` on any `AgentSwitched`.
+    // Each connection deterministically reduces the ordered event stream into
+    // control state. Agent and model seed identity until an event changes it.
     let (agent, model) = seed_identity(&state, &session_id).await;
     // Kept so a lag can rebuild the fold from the same identity seed.
     let seed = (agent.clone(), model.clone());
     let mut reduced = AcpState::new(AcpSessionId(session_id.clone()), agent, model);
 
-    // Server-side transcript render model for this connection (Tier 4, see
-    // docs/development/server-owned-sv-state.md). Alongside the reduced control
-    // state, the daemon folds the event stream into ordered transcript rows and
-    // streams them as a `transcript_snapshot` on connect plus per-event
-    // `transcript_delta` frames, so clients render the activity stream from the
-    // server model instead of re-reducing it. Same deterministic-reducer,
-    // per-connection story as `reduced`.
+    // Fold the same stream into the transcript snapshot and deltas.
     let mut transcript = TranscriptModel::new();
     // Per-connection memory of the cold state fields already delivered.
     let mut cold = ColdFieldCache::default();
@@ -520,12 +508,8 @@ async fn seed_identity(state: &AppState, session_id: &str) -> (AgentName, Option
 
 /// The daemon's current control state for a session.
 ///
-/// The WS folds are per-connection (see `handle`), so an HTTP handler has no
-/// `AcpState` to read. This serves one from the live projection
-/// (`crate::acp::control_cache`), which the publish choke point keeps folded,
-/// and rebuilds it from the durable log on a miss. Used by prompt dispatch
-/// (Tier 3, `docs/development/server-owned-prompt-dispatch.md`), where the
-/// alternative is asking the client what the daemon's own state is.
+/// HTTP handlers read the live control projection, hydrating it from the log on
+/// a cache miss because WebSocket folds are per connection.
 ///
 /// The rebuild is the reason this is cached rather than folded per call. It
 /// measured 68ms at 20k events and 342ms at 100k, on a store whose retention

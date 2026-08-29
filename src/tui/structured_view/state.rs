@@ -597,11 +597,6 @@ impl StructuredViewState {
     }
 }
 
-// The send / steer / queue decision that used to live here as
-// `should_queue_prompt_for` is the daemon's now: `crate::acp::dispatch::decide`
-// makes it once for every client and the endpoint reports what it did. See
-// `docs/development/server-owned-prompt-dispatch.md`.
-
 #[cfg(test)]
 mod tests {
     use super::*;

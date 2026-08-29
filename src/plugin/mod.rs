@@ -1,10 +1,4 @@
-//! Plugin core: load the compiled-in first-party plugins and expose their
-//! enabled/disabled state to every surface (CLI, TUI, web).
-//!
-//! This is the minimal core: a registry of builtin plugins you can enable or
-//! disable. The manifest types live in the `aoe-plugin-api` crate. External
-//! installs, capability grants, and the Tier 0 / Tier 1 contribution surface
-//! return in follow-up PRs.
+//! Plugin registry, installation, contributions, discovery, and worker host.
 
 pub mod auto_update;
 pub mod changelog;
@@ -20,9 +14,7 @@ pub mod source;
 pub mod update_check;
 pub mod view;
 
-// The Tier 1 worker host runs only in the `aoe serve` daemon, where the event
-// store and session storage it serves over the capability-gated API live. A
-// TUI-only build has no host, so these modules are gated with it.
+// Worker modules need the event and session stores owned by `aoe serve`.
 #[cfg(feature = "serve")]
 pub(crate) mod automation_policy;
 #[cfg(feature = "serve")]
@@ -38,10 +30,7 @@ pub mod session_api;
 #[cfg(feature = "serve")]
 pub mod ui_state;
 
-// Launch resolution is pure (PATH / filesystem probing) and is shared by the
-// serve-only host and the always-present installer, which runs a plugin's
-// build steps with the same argv-resolution policy. It carries no host state,
-// so it is not gated.
+// Launch resolution is also used by the installer, so it is not serve-gated.
 pub mod launch;
 
 use std::path::PathBuf;

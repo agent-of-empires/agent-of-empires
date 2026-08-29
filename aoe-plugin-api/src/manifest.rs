@@ -5,13 +5,7 @@ use sha2::{Digest, Sha256};
 
 use crate::{CapabilityId, PluginId, API_VERSION};
 
-/// Parsed `aoe-plugin.toml`.
-///
-/// Identity (`id`, `name`, `version`, `api_version`, `description`) plus the
-/// contribution sections a plugin declares. The contribution sections are
-/// defined here but consumed by later issues: the settings registry (#2094),
-/// the runtime host (#2095), and the command/keybind/UI surfaces (#2366). This
-/// host parses and validates them; it does not yet act on them.
+/// Parsed and validated `aoe-plugin.toml`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 #[non_exhaustive]
@@ -53,11 +47,11 @@ pub struct PluginManifest {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub capabilities: Vec<CapabilityId>,
 
-    /// Commands the plugin contributes (palette / CLI). Consumed by #2366.
+    /// Commands the plugin contributes to the palette and CLI.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub commands: Vec<CommandContribution>,
 
-    /// Keybinds the plugin contributes. Consumed by #2366.
+    /// Keybinds the plugin contributes.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub keybinds: Vec<KeybindContribution>,
 
@@ -70,29 +64,25 @@ pub struct PluginManifest {
     /// Default overrides the plugin applies to *core* settings, keyed by the
     /// core canonical path (`"theme.idle_decay_minutes"`). Resolution layers a
     /// user value over the highest-priority active plugin override over the core
-    /// schema default; see the host's settings resolution (#2094). A plugin
-    /// cannot override another plugin's settings at Tier 0.
+    /// schema default. A plugin cannot override another plugin's settings.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub setting_defaults: BTreeMap<String, toml::Value>,
 
     /// Color themes the plugin ships. Each `path` is a theme TOML relative to
-    /// the plugin's install directory; the host adds them to the theme picker
-    /// (#2094).
+    /// the plugin's install directory; the host adds them to the theme picker.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub themes: Vec<ThemeContribution>,
 
-    /// Status segments the plugin contributes. Each is a labelled id the host
-    /// renders in a status surface; consumed by the status reference plugin
-    /// (#2096). Requires `api_version >= 4`.
+    /// Labelled status ids rendered by host surfaces. Requires
+    /// `api_version >= 4`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub status: Vec<StatusContribution>,
 
-    /// UI slots the plugin renders into. Consumed by #2366.
+    /// Host-rendered UI slots the plugin may populate.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ui: Vec<UiContribution>,
 
-    /// The worker entrypoint. Defined here so installation can fetch a
-    /// release-binary worker; actually launching it is #2095.
+    /// The worker entrypoint.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub runtime: Option<RuntimeSpec>,
 
@@ -117,7 +107,7 @@ pub struct CommandContribution {
     #[serde(default)]
     pub description: String,
     /// How invoking the command behaves. Absent means a fire-and-forget worker
-    /// notification (deferred). When present, the host surface executes the
+    /// notification. When present, the host surface executes the
     /// action directly, synchronously inside the user's gesture, so it works on
     /// a remote web dashboard where an async round-trip would be popup-blocked.
     /// Requires `api_version >= 6` and the `browser_open` capability.
@@ -143,7 +133,7 @@ pub enum ClientAction {
 pub struct KeybindContribution {
     /// Command id this binds to (a plugin command or a core command).
     pub command: String,
-    /// Key chord, e.g. `Ctrl+K`. Parsed by the consuming surface (#2366).
+    /// Key chord, e.g. `Ctrl+K`.
     pub key: String,
 }
 
@@ -695,7 +685,7 @@ pub fn lucide_icon_name_ok(name: &str) -> bool {
     })
 }
 
-/// A host-rendered UI slot a plugin may push state into (#2366). A closed set,
+/// A host-rendered UI slot a plugin may push state into. A closed set,
 /// unlike the open-string capabilities: the host must know how to render each
 /// slot, so an unknown slot is unrenderable and rejected at parse time rather
 /// than carried forward. The worker pushes typed state into a declared slot
@@ -780,7 +770,7 @@ pub struct UiContribution {
     pub id: String,
 }
 
-/// How the plugin's worker is launched. Defined here; executed by #2095.
+/// How the plugin's worker is launched.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum RuntimeSpec {
