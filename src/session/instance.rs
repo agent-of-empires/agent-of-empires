@@ -3859,6 +3859,11 @@ impl Instance {
         let is_new = !session.exists();
         if is_new {
             session.create_with_size(&self.project_path, None, size, &self.effective_profile())?;
+            crate::tmux::env::set_hidden_env(
+                session.name(),
+                crate::tmux::env::AOE_INSTANCE_ID_KEY,
+                &self.id,
+            )?;
             // Apply all configured tmux options to terminal sessions too
             self.apply_terminal_tmux_options(index);
         }
@@ -3999,6 +4004,11 @@ impl Instance {
                 &self.effective_profile(),
                 &[],
                 &env_info.env,
+            )?;
+            crate::tmux::env::set_hidden_env(
+                session.name(),
+                crate::tmux::env::AOE_INSTANCE_ID_KEY,
+                &self.id,
             )?;
             self.apply_container_terminal_tmux_options(index);
         }
@@ -17038,6 +17048,35 @@ mod tests {
                 })
                 .unwrap();
         }
+
+        #[test]
+        #[serial]
+        fn terminal_creation_stamps_owner_without_reclaiming_existing_pane() {
+            if skip_if_no_tmux() {
+                return;
+            }
+            let temp = tempdir().unwrap();
+            let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+            let mut inst = make_inst("terminal-owner", "owned-terminal");
+            let name = crate::tmux::TerminalSession::generate_name(&inst.id, &inst.title);
+            let _ = crate::tmux::tmux_command()
+                .args(["kill-session", "-t", &name])
+                .output();
+            let _cleanup = TmuxSession(name.clone());
+
+            inst.start_terminal_with_size(None).unwrap();
+            assert_eq!(instance_env(&name).as_deref(), Some(inst.id.as_str()));
+
+            crate::tmux::env::set_hidden_env(
+                &name,
+                crate::tmux::env::AOE_INSTANCE_ID_KEY,
+                "foreign-owner",
+            )
+            .unwrap();
+            inst.start_terminal_with_size(None).unwrap();
+            assert_eq!(instance_env(&name).as_deref(), Some("foreign-owner"));
+        }
+
         #[test]
         #[serial]
         fn omp_launch_without_capture_plan_publishes_tombstone_generation() {

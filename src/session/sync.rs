@@ -96,32 +96,39 @@ fn tmux_session_id_env_names(
         return Vec::new();
     }
 
-    let exact: Vec<String> = observations
+    let mut targets: Vec<String> = observations
         .iter()
         .filter(|(name, owner, _)| {
             owner.as_deref() == Some(instance.id.as_str()) && !live.pane_dead(name)
         })
         .map(|(name, _, _)| name.clone())
         .collect();
-    if !exact.is_empty() {
-        return exact;
-    }
     if !allow_ownerless_fallback {
-        return Vec::new();
+        return targets;
     }
 
-    let Some(candidates) = crate::tmux::live_any_kind_names_for_id_in(live, &instance.id) else {
-        return Vec::new();
-    };
-    candidates
-        .into_iter()
-        .filter(|candidate| {
-            observations
-                .iter()
-                .find(|(name, _, _)| name == candidate)
-                .is_some_and(|(_, owner, _)| owner.is_none())
-        })
-        .collect()
+    if let Some(candidates) = crate::tmux::live_any_kind_names_for_id_in(live, &instance.id) {
+        let mut ownerless = None;
+        let mut ambiguous = false;
+        for candidate in candidates {
+            match observations.iter().find(|(name, _, _)| name == &candidate) {
+                Some((_, Some(owner), _)) if owner == &instance.id => {}
+                Some((_, None, _)) if ownerless.is_none() => ownerless = Some(candidate),
+                _ => {
+                    ambiguous = true;
+                    break;
+                }
+            }
+        }
+        if !ambiguous {
+            if let Some(candidate) = ownerless {
+                targets.push(candidate);
+            }
+        }
+    }
+    targets.sort();
+    targets.dedup();
+    targets
 }
 
 fn partition_unambiguous_instances(instances: &[Instance]) -> (Vec<&Instance>, HashSet<&str>) {
@@ -244,22 +251,19 @@ fn cleared_tmux_ownership(
     observations: &[TmuxOwnershipObservation],
 ) -> ClearedTmuxOwnership {
     let target_set: HashSet<&str> = targets.iter().map(String::as_str).collect();
-    let operational: HashMap<&str, &str> = instances
-        .iter()
-        .filter_map(|instance| {
-            instance
-                .operational_agent_session_id()
-                .map(|sid| (instance.id.as_str(), sid))
-        })
+    let (trusted, _) = partition_unambiguous_instances(instances);
+    let operational_ids: HashSet<&str> = trusted
+        .into_iter()
+        .filter(|instance| instance.operational_agent_session_id().is_some())
+        .map(|instance| instance.id.as_str())
         .collect();
     let entries = observations
         .iter()
-        .filter_map(|(session, owner, _)| {
+        .filter_map(|(session, owner, captured)| {
             let owner = owner.as_deref()?;
-            let sid = operational.get(owner)?;
-            target_set
-                .contains(session.as_str())
-                .then(|| (session.clone(), (*sid).to_string()))
+            let captured = captured.as_ref()?;
+            (target_set.contains(session.as_str()) && operational_ids.contains(owner))
+                .then(|| (session.clone(), captured.clone()))
         })
         .collect();
     ClearedTmuxOwnership { entries }
@@ -1044,7 +1048,7 @@ mod tests {
     }
 
     #[test]
-    fn deletion_plan_restores_only_operational_ownership() {
+    fn deletion_plan_restores_only_proven_operational_ownership() {
         let mut supported = Instance::new("supported", "/tmp/x");
         supported.id = "deleted".to_string();
         supported.tool = "claude".to_string();
@@ -1053,13 +1057,18 @@ mod tests {
         unsupported.id = "inert".to_string();
         unsupported.tool = "qwen".to_string();
         unsupported.agent_session_id = Some("retained".to_string());
-        let instances = [supported, unsupported];
-        let instance_ids = HashSet::from(["deleted", "inert"]);
+        let mut duplicate_a = supported.clone();
+        duplicate_a.id = "duplicate".to_string();
+        duplicate_a.agent_session_id = Some("duplicate-a".to_string());
+        let mut duplicate_b = duplicate_a.clone();
+        duplicate_b.agent_session_id = Some("duplicate-b".to_string());
+        let instances = [supported, unsupported, duplicate_a, duplicate_b];
+        let instance_ids = HashSet::from(["deleted", "inert", "duplicate"]);
         let observations = [
             (
                 "deleted-session".to_string(),
                 Some("deleted".to_string()),
-                Some("stale".to_string()),
+                Some("newer-than-disk".to_string()),
             ),
             (
                 "inert-session".to_string(),
@@ -1067,17 +1076,19 @@ mod tests {
                 Some("retained".to_string()),
             ),
             (
-                "deleted-without-capture".to_string(),
-                Some("deleted".to_string()),
-                None,
+                "duplicate-session".to_string(),
+                Some("duplicate".to_string()),
+                Some("duplicate-a".to_string()),
             ),
-            ("ownerless".to_string(), None, Some("orphan".to_string())),
         ];
         let targets = owned_tmux_ownership_targets(&instance_ids, observations.iter().cloned());
-        assert_eq!(targets, vec!["deleted-session", "inert-session"]);
+        assert_eq!(
+            targets,
+            vec!["deleted-session", "inert-session", "duplicate-session"]
+        );
         assert_eq!(
             cleared_tmux_ownership(&instances, &targets, &observations).entries,
-            vec![("deleted-session".to_string(), "durable".to_string())]
+            vec![("deleted-session".to_string(), "newer-than-disk".to_string())]
         );
     }
     #[test]
@@ -1201,7 +1212,10 @@ mod tests {
                     ),
                 ])),
             );
-            let observations = vec![(agent.clone(), None, None), (terminal.clone(), None, None)];
+            let observations = vec![
+                (agent.clone(), Some(instance.id.clone()), None),
+                (terminal.clone(), None, None),
+            ];
             assert_eq!(
                 tmux_session_id_env_names(&instance, &live, &observations, false),
                 Vec::<String>::new(),
@@ -1210,8 +1224,23 @@ mod tests {
             instance.tool = "claude".to_string();
             assert_eq!(
                 tmux_session_id_env_names(&instance, &live, &observations, true),
-                vec![agent, terminal],
-                "paired ownerless panes share unambiguous ownership"
+                vec![agent.clone(), terminal.clone()],
+                "one ownerless pane joins its exact-stamped peer"
+            );
+            let orphan = format!("{}Orphan_{suffix}", crate::tmux::CONTAINER_TERMINAL_PREFIX);
+            let crowded_live = crate::tmux::LiveSessionSnapshot::from_parts(
+                Some(vec![agent.clone(), terminal.clone(), orphan.clone()]),
+                None,
+            );
+            let crowded_observations = vec![
+                (agent.clone(), Some(instance.id.clone()), None),
+                (terminal, None, None),
+                (orphan, None, None),
+            ];
+            assert_eq!(
+                tmux_session_id_env_names(&instance, &crowded_live, &crowded_observations, true,),
+                vec![agent],
+                "multiple ownerless suffix matches remain unclaimed"
             );
         }
 

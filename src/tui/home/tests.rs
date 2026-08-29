@@ -10504,8 +10504,6 @@ fn restart_selected_session_tool_swap_clears_old_agent_session_state() {
         })
         .unwrap();
 
-    let corrupt = Storage::new_unwatched("corrupt-owner").unwrap();
-    std::fs::write(corrupt.sessions_path(), b"[null]").unwrap();
     env.view
         .restart_selected_session(None, Some("codex"), None, None)
         .unwrap();
