@@ -1122,6 +1122,9 @@ impl Storage {
     where
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
+        // A typed rewrite cannot preserve an unreadable ownership-bearing row.
+        // Refuse every mutation before the tolerant loader could omit it.
+        self.load_ownership_strict()?;
         let (mut instances, mut groups) = self.load_with_groups()?;
         let groups_before = groups.clone();
         let result = f(&mut instances, &mut groups)?;

@@ -19982,6 +19982,15 @@ mod apply_session_id_updates {
         let resolved_namespace = view.instances[&terminal.id]
             .resolved_terminal_session_store_namespace()
             .unwrap();
+        view.repair_session_id_pollers();
+        assert!(Arc::ptr_eq(
+            &view
+                .instances
+                .get(&terminal.id)
+                .and_then(|i| i.session_id_poller.clone())
+                .expect("legacy row must retain the stopped poller"),
+            &terminal_stopped,
+        ));
         view.instances
             .get_mut(&terminal.id)
             .unwrap()

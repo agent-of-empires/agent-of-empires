@@ -3385,13 +3385,27 @@ impl Instance {
                 return true;
             }
         }
+        if self.is_structured()
+            && self.tool == "claude"
+            && self.acp_session_id.as_deref() == Some(sid)
+        {
+            let acp_namespace = self
+                .agent_session_store_namespace
+                .clone()
+                .or_else(|| self.terminal_session_store_namespace());
+            if acp_namespace.as_deref() == Some(namespace) {
+                return true;
+            }
+        }
         self.prior_tool_session_ids.iter().any(|(tool, prior)| {
-            tool_supports_terminal_resume(tool)
-                && prior.agent_session_id.as_deref() == Some(sid)
-                && self
-                    .terminal_session_store_namespace_for_tool(tool)
-                    .as_deref()
-                    == Some(namespace)
+            let same_namespace = self
+                .terminal_session_store_namespace_for_tool(tool)
+                .as_deref()
+                == Some(namespace);
+            same_namespace
+                && ((tool_supports_terminal_resume(tool)
+                    && prior.agent_session_id.as_deref() == Some(sid))
+                    || (tool == "claude" && prior.acp_session_id.as_deref() == Some(sid)))
         })
     }
     pub(crate) fn reserves_claude_import_id_in_namespace(
@@ -6796,10 +6810,15 @@ impl Instance {
         if !self.needs_session_id_poller_repair(snapshot) {
             return false;
         }
+        let Some(durable_namespace) = self.agent_session_store_namespace.as_deref() else {
+            tracing::warn!(target: "session.store",
+                instance_id = %self.id,
+                "refusing to repair session poller without a durable conversation store"
+            );
+            return false;
+        };
         let resolved_namespace = self.resolved_terminal_session_store_namespace();
-        if self.agent_session_store_namespace.is_some()
-            && self.agent_session_store_namespace != resolved_namespace
-        {
+        if Some(durable_namespace) != resolved_namespace.as_deref() {
             tracing::warn!(target: "session.store",
                 instance_id = %self.id,
                 durable_namespace = ?self.agent_session_store_namespace,
@@ -17880,6 +17899,15 @@ mod tests {
                 serde_json::to_vec(&rows).unwrap(),
             )
             .unwrap();
+            let corrupt_before = std::fs::read(corrupt_ownership_storage.sessions_path()).unwrap();
+            assert!(
+                corrupt_ownership_storage.update(|_, _| Ok(())).is_err(),
+                "a mutation must not rewrite away a corrupt ownership row"
+            );
+            assert_eq!(
+                std::fs::read(corrupt_ownership_storage.sessions_path()).unwrap(),
+                corrupt_before
+            );
             assert_eq!(
                 crate::session::sync::reserved_sid_holder_excluding_profile_for_capture(
                     independent_profile,

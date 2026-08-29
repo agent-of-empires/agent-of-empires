@@ -958,6 +958,28 @@ fn build_import_instance(
 }
 
 #[cfg(feature = "serve")]
+fn validate_structured_import_profile_store(
+    profile: &str,
+    sessions: &[crate::session::claude_import::ClaudeSessionSummary],
+    group: &str,
+    scanned_namespace: &str,
+) -> Result<()> {
+    for session in sessions {
+        let mut candidate = build_import_instance(session, true, group, Some(scanned_namespace));
+        candidate.source_profile = profile.to_string();
+        let resolved_namespace = candidate
+            .resolved_terminal_session_store_namespace()
+            .ok_or_else(|| anyhow::anyhow!("cannot resolve profile Claude store"))?;
+        if resolved_namespace != scanned_namespace {
+            anyhow::bail!(
+                "profile '{profile}' resolves Claude store '{resolved_namespace}', but imported sessions were scanned from '{scanned_namespace}'"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "serve")]
 fn apply_import_mode(
     inst: &mut Instance,
     s: &crate::session::claude_import::ClaudeSessionSummary,
@@ -1074,6 +1096,10 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
     }
     let group = args.group.clone().unwrap_or_default();
     let namespace = namespace.expect("nonempty Claude imports have a resolved namespace");
+    #[cfg(feature = "serve")]
+    if structured {
+        validate_structured_import_profile_store(profile, &to_import, &group, namespace.as_str())?;
+    }
     let storage = Storage::open_unwatched(profile)?;
     let created_ids = crate::session::sync::with_tmux_ownership_lock(|| {
         let foreign = crate::session::sync::load_profile_instances_excluding(Some(profile))?;
@@ -2358,18 +2384,42 @@ async fn set_session_id(profile: &str, args: SetSessionIdArgs) -> Result<()> {
     let lifecycle_lock = storage
         .acquire_instance_lifecycle_lock(&target_id)
         .context("failed to acquire instance resume-target lock")?;
-    let (title, tool) = storage.update(|instances, _groups| {
-        super::patch_instance(instances, &target_id, |inst| {
-            #[cfg(feature = "serve")]
-            if inst.is_structured() {
-                anyhow::bail!(
-                    "cannot set resume target on structured view-mode session '{}'; structured view manages its own conversation lifecycle via ACP",
-                    inst.title
-                );
+    let (title, tool) = crate::session::sync::with_tmux_ownership_lock(|| {
+        let foreign = match &new_intent {
+            crate::session::ResumeIntent::Use(_) => {
+                crate::session::sync::load_profile_instances_excluding(Some(profile))?
             }
-            inst.resume_intent = new_intent.clone();
-            inst.resume_probe_failed_sid = None;
-            Ok((inst.title.clone(), inst.tool.clone()))
+            _ => Vec::new(),
+        };
+        storage.update_with_tmux_ownership_lock(|instances, _groups| {
+            super::patch_instance(instances, &target_id, |inst| {
+                #[cfg(feature = "serve")]
+                if inst.is_structured() {
+                    anyhow::bail!(
+                        "cannot set resume target on structured view-mode session '{}'; structured view manages its own conversation lifecycle via ACP",
+                        inst.title
+                    );
+                }
+                if inst.supports_terminal_resume() {
+                    if let crate::session::ResumeIntent::Use(id) = &new_intent {
+                        let namespace = inst
+                            .terminal_session_store_namespace()
+                            .ok_or_else(|| anyhow::anyhow!("cannot resolve conversation store"))?;
+                        if let Some(holder) = foreign.iter().find(|candidate| {
+                            candidate.reserves_agent_session_id_in_namespace(id, &namespace)
+                        }) {
+                            anyhow::bail!(
+                                "cannot pin conversation '{id}': owned by session '{}' in profile '{}'",
+                                holder.id,
+                                holder.source_profile
+                            );
+                        }
+                    }
+                }
+                inst.resume_intent = new_intent.clone();
+                inst.resume_probe_failed_sid = None;
+                Ok((inst.title.clone(), inst.tool.clone()))
+            })
         })
     })?;
     drop(lifecycle_lock);
@@ -2909,7 +2959,7 @@ mod set_session_id_tests {
 
     #[tokio::test]
     #[serial]
-    async fn set_session_id_clears_resume_probe_failed_marker() {
+    async fn set_session_id_clears_marker_and_rejects_foreign_owner() {
         let temp = tempdir().unwrap();
         std::env::set_var("HOME", temp.path());
         #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -2948,6 +2998,38 @@ mod set_session_id_tests {
             ResumeIntent::Use("22222222-2222-2222-2222-222222222222".to_string())
         );
         assert_eq!(inst_disk.resume_probe_failed_sid, None);
+
+        let foreign_storage = Storage::new_unwatched("set-sid-foreign-owner").unwrap();
+        let mut foreign_owner = Instance::new("foreign-owner", "/tmp/x");
+        foreign_owner.agent_session_id = Some("33333333-3333-3333-3333-333333333333".to_string());
+        foreign_storage
+            .update(|instances, _| {
+                instances.push(foreign_owner.clone());
+                Ok(())
+            })
+            .unwrap();
+        assert!(
+            set_session_id(
+                "set-sid-clear-marker",
+                SetSessionIdArgs {
+                    identifier: id.clone(),
+                    session_id: "33333333-3333-3333-3333-333333333333".to_string(),
+                },
+            )
+            .await
+            .is_err(),
+            "a foreign profile owner must reject the pin"
+        );
+        assert_eq!(
+            storage
+                .load()
+                .unwrap()
+                .into_iter()
+                .find(|candidate| candidate.id == id)
+                .unwrap()
+                .resume_intent,
+            ResumeIntent::Use("22222222-2222-2222-2222-222222222222".to_string())
+        );
     }
 }
 
@@ -3144,6 +3226,22 @@ mod import_tests {
     fn structured_import_seeds_replay_fields() {
         let s = summary("sid-1", "/home/me/proj", Some("x"));
         let inst = build_import_instance(&s, true, "", Some("claude-store"));
+        assert!(inst.reserves_agent_session_id_in_namespace("sid-1", "claude-store"));
+        let resolved_namespace = inst.resolved_terminal_session_store_namespace().unwrap();
+        assert!(validate_structured_import_profile_store(
+            "import-profile-store",
+            std::slice::from_ref(&s),
+            "",
+            &resolved_namespace,
+        )
+        .is_ok());
+        assert!(validate_structured_import_profile_store(
+            "import-profile-store",
+            std::slice::from_ref(&s),
+            "",
+            "host:claude:/different-store",
+        )
+        .is_err());
         assert!(inst.is_structured());
         assert_eq!(inst.acp_session_id.as_deref(), Some("sid-1"));
         assert_eq!(inst.import_pending, Some(true));
