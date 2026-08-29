@@ -6513,7 +6513,11 @@ impl Instance {
             LaunchSidOutcome::Existing { sid } if should_attempt_resume(Some(&sid), &self.tool) => {
                 (Some(sid), None)
             }
-            LaunchSidOutcome::Fresh { pinned_prior_sid } => (None, pinned_prior_sid),
+            LaunchSidOutcome::Fresh { pinned_prior_sid }
+                if should_attempt_resume(pinned_prior_sid.as_deref(), &self.tool) =>
+            {
+                (None, pinned_prior_sid)
+            }
             _ => (None, None),
         };
         let Some(stale_sid) = attempted_sid else {
@@ -13261,6 +13265,20 @@ mod tests {
                     !supported,
                     "{tool}: direct resume flags"
                 );
+                if matches!(tool, "qwen" | "kiro") {
+                    assert_eq!(
+                        inst.finish_resume_launch(
+                            LaunchSidOutcome::Fresh {
+                                pinned_prior_sid: Some(sid.to_string()),
+                            },
+                            None,
+                            "test",
+                        )
+                        .unwrap(),
+                        StartOutcome::Fresh,
+                        "{tool}: inert stored ID must not trigger the pinned launch probe"
+                    );
+                }
             }
         }
 
