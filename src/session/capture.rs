@@ -1983,17 +1983,20 @@ pub(crate) fn opencode_poll_fn_sandboxed(
 
 const CODEX_COMMAND_TIMEOUT_SECS: u64 = 5;
 
-/// Shell snippet executed via `docker exec` to enumerate Codex `.jsonl` session
-/// files inside the container. Each file is emitted as a
+/// Shell snippet executed via `docker exec` to enumerate Codex `.jsonl` and
+/// `.jsonl.zst` session files inside the container. Each file is emitted as a
 /// `===CODEX:<unix-mtime>:<basename>===` header followed by the first line of the
 /// file and a `===END===` trailer.
 const CODEX_CONTAINER_LIST_SCRIPT: &str = r#"SESS_DIR="${CODEX_HOME:-$HOME/.codex}/sessions"
 [ -d "$SESS_DIR" ] || exit 0
-find "$SESS_DIR" -name '*.jsonl' -type f | while read -r f; do
+find "$SESS_DIR" -type f \( -name '*.jsonl' -o -name '*.jsonl.zst' \) | while read -r f; do
   ts=$(stat -c %Y "$f" 2>/dev/null || stat -f %m "$f" 2>/dev/null || echo 0)
   bn=$(basename "$f")
   printf '===CODEX:%s:%s===\n' "$ts" "$bn"
-  head -n 1 "$f"
+  case "$f" in
+    *.jsonl.zst) zstd -dc "$f" 2>/dev/null | head -n 1 ;;
+    *) head -n 1 "$f" ;;
+  esac
   printf '\n===END===\n'
 done
 "#;
@@ -5172,10 +5175,11 @@ mod tests {
         let uuid = "cccccccc-cccc-cccc-cccc-cccccccccccc";
         let project_dir = tmp.path().join("test-project");
         std::fs::create_dir_all(&project_dir).unwrap();
-        let jsonl_content = format!(
-            r#"{{"type":"session_meta","payload":{{"cwd":"{}"}}}}"#,
-            project_dir.display()
-        );
+        let jsonl_content = serde_json::json!({
+            "type": "session_meta",
+            "payload": {"cwd": project_dir},
+        })
+        .to_string();
         std::fs::write(
             sessions_dir.join(format!("rollout-2025-03-06T10-30-00-{}.jsonl", uuid)),
             jsonl_content,
@@ -5199,10 +5203,11 @@ mod tests {
         let uuid = "dddddddd-dddd-dddd-dddd-dddddddddddd";
         let project_dir = tmp.path().join("test-project");
         std::fs::create_dir_all(&project_dir).unwrap();
-        let jsonl_content = format!(
-            r#"{{"type":"session_meta","payload":{{"cwd":"{}"}}}}"#,
-            project_dir.display()
-        );
+        let jsonl_content = serde_json::json!({
+            "type": "session_meta",
+            "payload": {"cwd": project_dir},
+        })
+        .to_string();
         let compressed = zstd::stream::encode_all(jsonl_content.as_bytes(), 0).unwrap();
         std::fs::write(
             sessions_dir.join(format!("rollout-2025-03-06T10-30-00-{uuid}.jsonl.zst")),
