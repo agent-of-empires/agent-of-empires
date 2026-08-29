@@ -952,9 +952,18 @@ impl Drop for LiveCaptureWorker {
         // Wake the worker so it sees `stop` and exits now rather than after
         // its current inter-capture sleep.
         self.nudge();
+        #[cfg(test)]
+        if let Some(thread) = self.thread.take() {
+            if let Err(panic) = thread.join() {
+                // Preserve the original test panic instead of aborting on a
+                // second panic from cleanup.
+                if !std::thread::panicking() {
+                    std::panic::resume_unwind(panic);
+                }
+            }
+        }
     }
 }
-
 /// How often the worker re-asks how many panes its target window has, and
 /// whether one is zoomed. The answer only changes when the user splits, closes,
 /// or zooms a pane by hand, so a lazy cadence is enough; it costs one tiny
