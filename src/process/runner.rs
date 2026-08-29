@@ -972,10 +972,12 @@ impl RunnerShared {
         }
         pending.push_back(line.to_vec());
         drop(pending);
-        drop(guard);
+        // Keep replacement attach behind the completion decision so it cannot
+        // set `main_attached` and make `emit_control` discard this completion.
         if let Some(body) = prompt_completed {
             self.emit_control(body).await;
         }
+        drop(guard);
         false
     }
 
@@ -2501,6 +2503,97 @@ mod tests {
             shared.control.lock().await.pending,
             Some(ControlBody::PromptCompleted {
                 prompt_req_id: 9,
+                outcome: PromptOutcome::Completed {
+                    stop_reason: Some("end_turn".into()),
+                },
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn replacement_attach_cannot_overtake_failed_prompt_completion() {
+        use std::sync::atomic::Ordering;
+        use tokio::io::AsyncReadExt;
+
+        let shared = Arc::new(RunnerShared::new());
+        let (closed_daemon, failed_runner) = UnixStream::pair().expect("failed relay pair");
+        drop(closed_daemon);
+        let (_failed_read, failed_write) = failed_runner.into_split();
+        *shared.active_outbound.lock().await = Some(failed_write);
+        shared.main_attached.store(true, Ordering::Relaxed);
+        shared
+            .note_prompt_request(
+                br#"{"jsonrpc":"2.0","id":10,"method":"session/prompt","params":{}}"#,
+            )
+            .await;
+
+        let control = shared.control.lock().await;
+        let mut failures = shared.relay_failures.subscribe();
+        let response = br#"{"jsonrpc":"2.0","id":10,"result":{"stopReason":"end_turn"}}
+"#;
+        let delivery = {
+            let shared = Arc::clone(&shared);
+            tokio::spawn(async move { shared.deliver_line(response).await })
+        };
+        failures.changed().await.expect("relay failure signal");
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if shared
+                    .pending
+                    .lock()
+                    .await
+                    .back()
+                    .is_some_and(|line| line == response)
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("failed response buffered");
+
+        let (replacement_daemon, replacement_runner) =
+            UnixStream::pair().expect("replacement relay pair");
+        let (mut replacement_read, _replacement_write) = replacement_daemon.into_split();
+        let (_runner_read, replacement_write) = replacement_runner.into_split();
+        let (replacement_started_tx, replacement_started_rx) = tokio::sync::oneshot::channel();
+        let replacement = {
+            let shared = Arc::clone(&shared);
+            tokio::spawn(async move {
+                replacement_started_tx
+                    .send(())
+                    .expect("replacement start receiver");
+                shared.install_outbound(replacement_write).await
+            })
+        };
+        replacement_started_rx
+            .await
+            .expect("replacement install task starts");
+        assert!(
+            !replacement.is_finished(),
+            "replacement attach must wait for completion preservation"
+        );
+        assert!(!shared.main_attached.load(Ordering::Relaxed));
+
+        drop(control);
+        assert!(!delivery.await.expect("failed response delivery task"));
+        assert!(replacement
+            .await
+            .expect("replacement install task")
+            .expect("replacement relay installs")
+            .is_none());
+        let mut replayed = vec![0; response.len()];
+        replacement_read
+            .read_exact(&mut replayed)
+            .await
+            .expect("read buffered response");
+        assert_eq!(replayed, response);
+        assert!(shared.main_attached.load(Ordering::Relaxed));
+        assert_eq!(
+            shared.control.lock().await.pending,
+            Some(ControlBody::PromptCompleted {
+                prompt_req_id: 10,
                 outcome: PromptOutcome::Completed {
                     stop_reason: Some("end_turn".into()),
                 },
