@@ -1400,6 +1400,12 @@ fn spec_payload_hash(spec: &StructuredSessionSpec) -> String {
             "import_acp_session_id",
             spec.import_acp_session_id.as_deref().unwrap_or_default(),
         );
+        field(
+            "import_acp_store_namespace",
+            spec.import_acp_store_namespace
+                .as_deref()
+                .unwrap_or_default(),
+        );
     }
     use std::fmt::Write;
     let digest = hasher.finalize();
@@ -1462,6 +1468,8 @@ mod tests {
             agent_effort: None,
             #[cfg(feature = "serve")]
             import_acp_session_id: None,
+            #[cfg(feature = "serve")]
+            import_acp_store_namespace: None,
             #[cfg(feature = "serve")]
             fork_seed: None,
         }

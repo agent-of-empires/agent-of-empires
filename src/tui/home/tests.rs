@@ -19979,6 +19979,27 @@ mod apply_session_id_updates {
         ));
 
         std::fs::write(&sessions_path, original_sessions).unwrap();
+        let resolved_namespace = view.instances[&terminal.id]
+            .resolved_terminal_session_store_namespace()
+            .unwrap();
+        view.instances
+            .get_mut(&terminal.id)
+            .unwrap()
+            .agent_session_store_namespace = Some("host:claude:/changed-store".to_string());
+        view.repair_session_id_pollers();
+        assert!(Arc::ptr_eq(
+            &view
+                .instances
+                .get(&terminal.id)
+                .and_then(|i| i.session_id_poller.clone())
+                .expect("changed store must retain the stopped poller"),
+            &terminal_stopped,
+        ));
+
+        view.instances
+            .get_mut(&terminal.id)
+            .unwrap()
+            .agent_session_store_namespace = Some(resolved_namespace);
         view.repair_session_id_pollers();
         let repaired = view
             .instances

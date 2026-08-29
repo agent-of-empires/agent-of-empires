@@ -5990,7 +5990,7 @@ pub async fn create_session(
     // wrong place. Runs after tool-identity validation so it sits ahead of
     // the build's spawn_blocking but behind the agent check.
     #[cfg(feature = "serve")]
-    if let Some(import_id) = body
+    let import_acp_store_namespace = if let Some(import_id) = body
         .import_acp_session_id
         .as_deref()
         .map(str::trim)
@@ -6016,6 +6016,9 @@ pub async fn create_session(
                 "Importing a Claude session cannot use scratch, a worktree, or extra repos",
             );
         }
+        let Some(namespace) = crate::session::claude_import::claude_store_namespace() else {
+            return bad("Cannot resolve the Claude store for imported sessions");
+        };
         let import_cwd = body.path.trim().to_string();
         let import_id_owned = import_id.to_string();
         let belongs = tokio::task::spawn_blocking(move || {
@@ -6028,7 +6031,10 @@ pub async fn create_session(
         if !belongs {
             return bad("Unknown Claude session for this directory");
         }
-    }
+        Some(namespace)
+    } else {
+        None
+    };
 
     // Forking an existing session: `fork_from` carries the source session's
     // captured session id. A structured request (`view == Structured`) forks
@@ -6186,6 +6192,8 @@ pub async fn create_session(
         agent_effort: body.agent_effort,
         #[cfg(feature = "serve")]
         import_acp_session_id: body.import_acp_session_id,
+        #[cfg(feature = "serve")]
+        import_acp_store_namespace,
         #[cfg(feature = "serve")]
         fork_seed,
     };

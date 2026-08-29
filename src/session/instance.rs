@@ -3196,6 +3196,12 @@ impl Instance {
             .or_else(|| self.resolve_terminal_session_store_namespace_for_tool(&self.tool))
     }
 
+    /// Resolve the store selected by the current launch configuration without
+    /// trusting the namespace persisted for an earlier launch.
+    pub(crate) fn resolved_terminal_session_store_namespace(&self) -> Option<String> {
+        self.resolve_terminal_session_store_namespace_for_tool(&self.tool)
+    }
+
     fn terminal_session_store_namespace_for_tool(&self, tool: &str) -> Option<String> {
         if tool == self.tool {
             return self.terminal_session_store_namespace();
@@ -5988,6 +5994,12 @@ impl Instance {
                                     holder.agent_session_id = None;
                                     holder.resume_probe_failed_sid = None;
                                 }
+                                if matches!(
+                                    &holder.resume_intent,
+                                    ResumeIntent::Use(pinned) if pinned == sid
+                                ) {
+                                    holder.resume_intent = ResumeIntent::Default;
+                                }
                                 for tool in parked_tools {
                                     holder.prior_tool_session_ids.remove(&tool);
                                     holder.prior_tool_store_namespaces.remove(&tool);
@@ -6782,6 +6794,18 @@ impl Instance {
         snapshot: &crate::tmux::LiveSessionSnapshot,
     ) -> bool {
         if !self.needs_session_id_poller_repair(snapshot) {
+            return false;
+        }
+        let resolved_namespace = self.resolved_terminal_session_store_namespace();
+        if self.agent_session_store_namespace.is_some()
+            && self.agent_session_store_namespace != resolved_namespace
+        {
+            tracing::warn!(target: "session.store",
+                instance_id = %self.id,
+                durable_namespace = ?self.agent_session_store_namespace,
+                resolved_namespace = ?resolved_namespace,
+                "refusing to repair session poller across a changed conversation store"
+            );
             return false;
         }
         self.session_id_poller = None;
@@ -17849,7 +17873,7 @@ mod tests {
             valid_foreign.resume_intent = ResumeIntent::Default;
             let rows = serde_json::json!([
                 serde_json::to_value(&valid_foreign).unwrap(),
-                {"id": 42, "agent_session_id": SID_X}
+                {"id": 42, "acp_session_id": SID_X}
             ]);
             std::fs::write(
                 corrupt_ownership_storage.sessions_path(),
@@ -18056,6 +18080,7 @@ mod tests {
             live_handoff.tmux_ownership_handoff_pending = true;
             let mut plain_holder = make_inst(profile, "plain-holder");
             plain_holder.agent_session_id = Some(SID_X.to_string());
+            plain_holder.resume_intent = ResumeIntent::Use(SID_X.to_string());
             let mut incoming_holder = make_inst(profile, "incoming-holder");
             incoming_holder.tool = "qwen".to_string();
             incoming_holder.prior_tool_session_ids.insert(
@@ -18130,13 +18155,16 @@ mod tests {
             assert_eq!(takeover.agent_session_id.as_deref(), Some(SID_X));
             assert_eq!(takeover.resume_intent, ResumeIntent::Default);
             let disk = load(profile);
-            assert_eq!(
-                disk.iter()
-                    .find(|instance| instance.id == plain_holder.id)
-                    .unwrap()
-                    .agent_session_id,
-                None
-            );
+            let plain_disk = disk
+                .iter()
+                .find(|instance| instance.id == plain_holder.id)
+                .unwrap();
+            assert_eq!(plain_disk.agent_session_id, None);
+            assert_eq!(plain_disk.resume_intent, ResumeIntent::Default);
+            assert!(!plain_disk.reserves_agent_session_id_in_namespace(
+                SID_X,
+                &takeover.terminal_session_store_namespace().unwrap(),
+            ));
             let incoming_disk = disk
                 .iter()
                 .find(|instance| instance.id == incoming_holder.id)
