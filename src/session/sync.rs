@@ -92,7 +92,7 @@ fn tmux_session_id_env_names(
     observations: &[TmuxOwnershipObservation],
     allow_ownerless_fallback: bool,
 ) -> Vec<String> {
-    if !instance.supports_terminal_resume() {
+    if instance.operational_agent_session_id().is_none() {
         return Vec::new();
     }
 
@@ -188,30 +188,27 @@ pub(crate) fn with_tmux_ownership_lock<T>(
 fn read_tmux_ownership_observations(
     names: &[String],
 ) -> anyhow::Result<Vec<TmuxOwnershipObservation>> {
-    let mut observations = Vec::new();
-    for name in names
+    let names: Vec<&str> = names
         .iter()
         .filter(|name| crate::tmux::is_aoe_session(name))
-    {
-        let captured = match crate::tmux::env::get_hidden_env_strict(
-            name,
+        .map(String::as_str)
+        .collect();
+    let rows = crate::tmux::env::get_hidden_env_keys_batch_strict(
+        &names,
+        &[
             crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
-        ) {
-            Ok(value) => value,
-            Err(error) if crate::tmux::env::is_missing_session_error(&error) => continue,
-            Err(error) => return Err(error),
-        };
-        let owner = match crate::tmux::env::get_hidden_env_strict(
-            name,
             crate::tmux::env::AOE_INSTANCE_ID_KEY,
-        ) {
-            Ok(value) => value,
-            Err(error) if crate::tmux::env::is_missing_session_error(&error) => continue,
-            Err(error) => return Err(error),
-        };
-        observations.push((name.clone(), owner, captured));
-    }
-    Ok(observations)
+        ],
+    )?;
+    Ok(rows
+        .into_iter()
+        .map(|(name, values)| {
+            let mut values = values.into_iter();
+            let captured = values.next().flatten();
+            let owner = values.next().flatten();
+            (name, owner, captured)
+        })
+        .collect())
 }
 
 fn stale_tmux_ownership_targets(
@@ -1221,6 +1218,14 @@ mod tests {
                 Vec::<String>::new(),
                 "{tool}: unsupported rows do not claim suffix matches"
             );
+            instance.pending_tmux_ownership_session_id = Some("outgoing-sid".to_string());
+            assert_eq!(
+                tmux_session_id_env_names(&instance, &live, &observations, true),
+                vec![agent.clone(), terminal.clone()],
+                "{tool}: a pending outgoing handoff retains live pane ownership"
+            );
+            instance.pending_tmux_ownership_session_id = None;
+            instance.agent_session_id = Some("supported-sid".to_string());
             instance.tool = "claude".to_string();
             assert_eq!(
                 tmux_session_id_env_names(&instance, &live, &observations, true),

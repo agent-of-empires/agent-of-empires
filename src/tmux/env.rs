@@ -47,9 +47,9 @@ static ENV_CACHE: RwLock<EnvCache> = RwLock::new(EnvCache { entries: None });
 ///
 /// Hidden variables (set with `-h`) are not inherited by child processes.
 pub fn set_hidden_env(session_name: &str, key: &str, value: &str) -> anyhow::Result<()> {
-    let output = crate::tmux::tmux_command()
-        .args(["set-environment", "-h", "-t", session_name, key, value])
-        .output()?;
+    let mut command = crate::tmux::tmux_command();
+    command.args(["set-environment", "-h", "-t", session_name, key, value]);
+    let output = crate::tmux::run_tmux_command_with_timeout(&mut command)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -123,9 +123,9 @@ pub(crate) fn get_hidden_env_strict(
     session_name: &str,
     key: &str,
 ) -> anyhow::Result<Option<String>> {
-    let output = crate::tmux::tmux_query_command()
-        .args(["show-environment", "-h", "-t", session_name, key])
-        .output()?;
+    let mut command = crate::tmux::tmux_query_command();
+    command.args(["show-environment", "-h", "-t", session_name, key]);
+    let output = crate::tmux::run_tmux_command_with_timeout(&mut command)?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if missing_session_stderr(&stderr) {
@@ -171,9 +171,9 @@ fn fetch_env_uncached(session_name: &str, key: &str, hidden: bool) -> Option<Str
 
 /// Remove a hidden environment variable from a tmux session
 pub fn remove_hidden_env(session_name: &str, key: &str) -> anyhow::Result<()> {
-    let output = crate::tmux::tmux_command()
-        .args(["set-environment", "-h", "-u", "-t", session_name, key])
-        .output()?;
+    let mut command = crate::tmux::tmux_command();
+    command.args(["set-environment", "-h", "-u", "-t", session_name, key]);
+    let output = crate::tmux::run_tmux_command_with_timeout(&mut command)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -209,7 +209,9 @@ pub fn remove_hidden_env_batch(entries: &[(&str, &str)]) -> anyhow::Result<()> {
     }
 
     let str_args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    let output = crate::tmux::tmux_command().args(&str_args).output();
+    let mut command = crate::tmux::tmux_command();
+    command.args(&str_args);
+    let output = crate::tmux::run_tmux_command_with_timeout(&mut command);
 
     match output {
         Ok(out) if out.status.success() => {
@@ -279,7 +281,9 @@ pub fn set_hidden_env_batch(entries: &[(&str, &str, &str)]) -> anyhow::Result<()
     }
 
     let str_args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    let output = crate::tmux::tmux_command().args(&str_args).output();
+    let mut command = crate::tmux::tmux_command();
+    command.args(&str_args);
+    let output = crate::tmux::run_tmux_command_with_timeout(&mut command);
 
     match output {
         Ok(out) if out.status.success() => {
@@ -330,6 +334,99 @@ fn invalidate_cache_entry(session_name: &str, key: &str) {
             entries.remove(&(session_name.to_string(), key.to_string()));
         }
     }
+}
+
+/// Strictly read several hidden keys for several sessions with one tmux client.
+/// A session that disappears during the batch is retried and omitted; every
+/// other tmux failure remains visible to the caller.
+pub(crate) fn get_hidden_env_keys_batch_strict(
+    session_names: &[&str],
+    keys: &[&str],
+) -> anyhow::Result<Vec<(String, Vec<Option<String>>)>> {
+    if session_names.is_empty() || keys.is_empty() {
+        return Ok(session_names
+            .iter()
+            .map(|name| ((*name).to_string(), Vec::new()))
+            .collect());
+    }
+
+    let mut args = Vec::new();
+    for (index, session_name) in session_names.iter().enumerate() {
+        if !args.is_empty() {
+            args.push(";".to_string());
+        }
+        args.extend([
+            "show-environment".to_string(),
+            "-h".to_string(),
+            "-t".to_string(),
+            (*session_name).to_string(),
+            ";".to_string(),
+            "display-message".to_string(),
+            "-p".to_string(),
+            "-t".to_string(),
+            (*session_name).to_string(),
+            format!("__AOE_ENV_END_{index}__"),
+        ]);
+    }
+    let str_args: Vec<&str> = args.iter().map(String::as_str).collect();
+    let mut command = crate::tmux::tmux_query_command();
+    command.args(&str_args);
+    let output = crate::tmux::run_tmux_command_with_timeout(&mut command)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if missing_session_stderr(&stderr) {
+            let mut results = Vec::new();
+            for session_name in session_names {
+                let mut values = Vec::with_capacity(keys.len());
+                let mut vanished = false;
+                for key in keys {
+                    match get_hidden_env_strict(session_name, key) {
+                        Ok(value) => values.push(value),
+                        Err(error) if is_missing_session_error(&error) => {
+                            vanished = true;
+                            break;
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+                if !vanished {
+                    results.push(((*session_name).to_string(), values));
+                }
+            }
+            return Ok(results);
+        }
+        bail!(
+            "Failed to batch-read hidden tmux environment: {}",
+            stderr.trim()
+        );
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let mut lines = stdout.lines();
+    let mut results = Vec::with_capacity(session_names.len());
+    for (index, session_name) in session_names.iter().enumerate() {
+        let marker = format!("__AOE_ENV_END_{index}__");
+        let mut values = vec![None; keys.len()];
+        loop {
+            let line = lines.next().ok_or_else(|| {
+                anyhow::anyhow!("tmux hidden environment batch returned too few sections")
+            })?;
+            let line = line.trim();
+            if line == marker {
+                break;
+            }
+            if let Some((actual, value)) = line.split_once('=') {
+                if let Some(position) = keys.iter().position(|key| *key == actual) {
+                    values[position] = Some(value.to_string());
+                }
+            }
+        }
+        results.push(((*session_name).to_string(), values));
+    }
+    if lines.next().is_some() {
+        anyhow::bail!("tmux hidden environment batch returned too many sections");
+    }
+    Ok(results)
 }
 
 /// Get hidden environment variables from multiple sessions in a single tmux command

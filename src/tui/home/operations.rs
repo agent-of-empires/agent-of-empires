@@ -489,7 +489,7 @@ impl HomeView {
             }
             if let Some(target_tool) = new_tool {
                 if target_tool != restart_edit_authoritative.tool.as_str() {
-                    requested.swap_tool(target_tool);
+                    requested.swap_tool_for_restart(target_tool);
                 }
             }
             if let Some(command) = new_command_override {
@@ -519,7 +519,7 @@ impl HomeView {
                     .unwrap_or_default();
                 if target_tool != current_tool {
                     self.persist_tool_swap(&id, target_tool)?;
-                    self.mutate_instance(&id, |inst| inst.swap_tool(target_tool));
+                    self.mutate_instance(&id, |inst| inst.swap_tool_for_restart(target_tool));
                 }
             }
             if let Some(command) = new_command_override {
@@ -597,10 +597,10 @@ impl HomeView {
     /// `reconcile_from_disk` restores the old engine's sid on the launch that
     /// follows and the new engine spawns with `--resume <foreign-sid>`.
     ///
-    /// `swap_tool` runs against the disk row rather than copying the in-memory
-    /// result over it, because the capture pollers may have written a fresher
-    /// sid to disk than this snapshot carries; parking whatever disk holds is
-    /// what makes the swap-back restore the real conversation.
+    /// `swap_tool_for_restart` runs against the disk row rather than copying the
+    /// in-memory result over it, because the capture pollers may have written a
+    /// fresher sid to disk than this snapshot carries; parking whatever disk
+    /// holds is what makes the swap-back restore the real conversation.
     /// Failure aborts the restart before the in-memory tool changes, because a
     /// later save would otherwise publish the old engine's session ID under the
     /// new engine's namespace.
@@ -626,7 +626,7 @@ impl HomeView {
             // Storage-loaded rows omit source_profile. Restore it before
             // resolving a profile-scoped agent alias during the swap.
             disk.source_profile = row_profile.clone();
-            disk.swap_tool(&new_tool);
+            disk.swap_tool_for_restart(&new_tool);
             Ok(())
         })?;
         Ok(())

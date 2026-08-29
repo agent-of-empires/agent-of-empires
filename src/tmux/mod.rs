@@ -584,9 +584,9 @@ pub fn agent_session_belongs_to(tmux_name: &str, session_id: &str) -> bool {
 }
 
 pub(crate) fn session_names_strict() -> anyhow::Result<Vec<String>> {
-    let output = tmux_query_command()
-        .args(["list-sessions", "-F", "#{session_name}"])
-        .output()
+    let mut command = tmux_query_command();
+    command.args(["list-sessions", "-F", "#{session_name}"]);
+    let output = run_tmux_command_with_timeout(&mut command)
         .map_err(|error| anyhow::anyhow!("failed to enumerate tmux sessions: {error}"))?;
     if output.status.success() {
         return Ok(String::from_utf8_lossy(&output.stdout)
@@ -948,14 +948,14 @@ pub fn stop_all_sessions() -> anyhow::Result<usize> {
 /// successful empty map is authoritative and means there are no panes.
 pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
     let start = Instant::now();
-    let output = tmux_query_command()
-        .args([
-            "list-panes",
-            "-a",
-            "-F",
-            "#{session_name}|#{pane_index}|#{pane_dead}|#{pane_current_command}|#{pane_start_command}",
-        ])
-        .output();
+    let mut command = tmux_query_command();
+    command.args([
+        "list-panes",
+        "-a",
+        "-F",
+        "#{session_name}|#{pane_index}|#{pane_dead}|#{pane_current_command}|#{pane_start_command}",
+    ]);
+    let output = run_tmux_command_with_timeout(&mut command);
 
     let result: anyhow::Result<HashMap<String, PaneMetadata>> = match output {
         Ok(out) if out.status.success() => {

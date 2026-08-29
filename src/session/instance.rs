@@ -965,6 +965,15 @@ pub struct Instance {
         deserialize_with = "deserialize_session_id"
     )]
     pub agent_session_id: Option<String>,
+    /// Outgoing conversation ownership retained while a tool-swap restart
+    /// quiesces the old pane. Global reconciliation publishes this value in
+    /// preference to the incoming tool's ID until launch clears the handoff.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "deserialize_session_id"
+    )]
+    pub(crate) pending_tmux_ownership_session_id: Option<String>,
     /// Active OMP launch generation. Poller observations must carry this
     /// value through the storage CAS before they may update the durable sid.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1658,6 +1667,7 @@ impl Instance {
             sandbox_info: None,
             terminal_info: None,
             agent_session_id: None,
+            pending_tmux_ownership_session_id: None,
             omp_capture_generation: None,
             lifecycle_generation: 0,
             resume_probe_failed_sid: None,
@@ -2139,6 +2149,17 @@ impl Instance {
         // lets the spawn path pick the new tool's default agent instead of
         // silently keeping the old backend alive across the swap.
         self.agent_name = None;
+    }
+
+    /// Swap tools while retaining the outgoing pane's conversation ownership
+    /// until the restart cascade has stopped that pane.
+    pub(crate) fn swap_tool_for_restart(&mut self, new_tool: &str) {
+        if new_tool == self.tool {
+            return;
+        }
+        let outgoing_ownership = self.operational_agent_session_id().map(str::to_string);
+        self.swap_tool(new_tool);
+        self.pending_tmux_ownership_session_id = outgoing_ownership;
     }
 
     /// Apply a passively-detected status transition to a disk row. Touches
@@ -3039,12 +3060,17 @@ impl Instance {
         tool_supports_terminal_resume(&self.tool)
     }
 
-    /// Session ID only when this terminal agent can operationally resume it.
-    /// Unsupported agents retain stored IDs as inert data, never ownership.
+    /// Conversation ID that currently owns this row's tmux pane. A pending
+    /// tool-swap handoff wins; otherwise unsupported agents' stored IDs remain
+    /// inert and never become operational ownership.
     pub(crate) fn operational_agent_session_id(&self) -> Option<&str> {
-        self.supports_terminal_resume()
-            .then_some(self.agent_session_id.as_deref())
-            .flatten()
+        self.pending_tmux_ownership_session_id
+            .as_deref()
+            .or_else(|| {
+                self.supports_terminal_resume()
+                    .then_some(self.agent_session_id.as_deref())
+                    .flatten()
+            })
     }
 
     /// Whether this agent uses a session ID poller for live tracking.
@@ -5067,7 +5093,11 @@ impl Instance {
         // Re-read durable rows under the ownership lock before touching tmux.
         // This keeps a stale launcher from publishing after a tool swap or delete.
         if !matches!(outcome, SidPersistOutcome::Skip) {
-            crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env()?;
+            if let Err(error) =
+                crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env()
+            {
+                tracing::warn!(target: "session.sync", session = %self.id, "Launch committed; deferred tmux ownership reconciliation: {error}");
+            }
         }
         self.maybe_start_poller_since(omp_capture_metadata);
 
@@ -6067,18 +6097,21 @@ impl Instance {
     ///
     /// OMP pollers reload pane metadata on every tick, so a replacement binds
     /// to the durable generation that won any concurrent restart race.
+    pub(crate) fn needs_session_id_poller_repair(
+        &self,
+        snapshot: &crate::tmux::LiveSessionSnapshot,
+    ) -> bool {
+        !self.is_structured()
+            && self.supports_session_poller()
+            && !self.session_id_poller_is_running()
+            && self.has_live_tmux_pane_in(snapshot)
+    }
+
     pub(crate) fn repair_session_id_poller_if_needed(
         &mut self,
         snapshot: &crate::tmux::LiveSessionSnapshot,
     ) -> bool {
-        // Structured sessions have ACP workers rather than tmux panes. Their
-        // lifecycle is reconciled by the daemon, so probing tmux here can only
-        // fail and is especially costly from the native TUI's refresh loop.
-        if self.is_structured()
-            || !self.supports_session_poller()
-            || self.session_id_poller_is_running()
-            || !self.has_live_tmux_pane_in(snapshot)
-        {
+        if !self.needs_session_id_poller_repair(snapshot) {
             return false;
         }
         self.session_id_poller = None;
@@ -6161,6 +6194,26 @@ impl Instance {
             SidWrite::Skipped => self.reconcile_from_disk(),
             SidWrite::Failed => {}
         }
+    }
+
+    fn clear_pending_tmux_ownership(&mut self, storage: &super::storage::Storage) -> Result<()> {
+        let Some(expected) = self.pending_tmux_ownership_session_id.clone() else {
+            return Ok(());
+        };
+        let id = self.id.clone();
+        storage.update(|instances, _groups| {
+            let row = instances
+                .iter_mut()
+                .find(|instance| instance.id == id)
+                .ok_or_else(|| anyhow::anyhow!("session '{id}' disappeared during tool swap"))?;
+            if row.pending_tmux_ownership_session_id.as_deref() != Some(expected.as_str()) {
+                anyhow::bail!("session '{id}' tool-swap ownership changed concurrently");
+            }
+            row.pending_tmux_ownership_session_id = None;
+            Ok(())
+        })?;
+        self.pending_tmux_ownership_session_id = None;
+        Ok(())
     }
 
     pub fn restart_with_size(&mut self, size: Option<(u16, u16)>) -> Result<StartOutcome> {
@@ -6382,6 +6435,9 @@ impl Instance {
         if !restart && self.tmux_session()?.exists() {
             return Ok(StartOutcome::Fresh);
         }
+        if !restart {
+            self.clear_pending_tmux_ownership(&storage)?;
+        }
         if self.status == Status::Error {
             self.status = Status::Idle;
             self.last_error = None;
@@ -6421,6 +6477,7 @@ impl Instance {
         let result = (|| {
             if restart {
                 self.kill_clean_locked()?;
+                self.clear_pending_tmux_ownership(&storage)?;
             }
             let launch_outcome = self.spawn_prepared_launch(size, &profile, prepared)?;
             let outcome =
@@ -11722,6 +11779,42 @@ mod tests {
         inst.swap_tool("claude");
         assert_eq!(inst.agent_session_id.as_deref(), Some("claude-session-123"));
         assert!(!inst.prior_tool_session_ids.contains_key("claude"));
+
+        let mut handoff = Instance::new("Handoff", "/tmp/handoff");
+        handoff.tool = "claude".to_string();
+        handoff.agent_session_id = Some("outgoing-claude-session".to_string());
+        handoff.swap_tool_for_restart("qwen");
+        assert_eq!(handoff.agent_session_id, None);
+        assert_eq!(
+            handoff.pending_tmux_ownership_session_id.as_deref(),
+            Some("outgoing-claude-session")
+        );
+        assert_eq!(
+            handoff.operational_agent_session_id(),
+            Some("outgoing-claude-session"),
+            "unsupported incoming tool must retain the live outgoing ownership"
+        );
+
+        let temp = tempfile::tempdir().unwrap();
+        let storage = crate::session::storage::Storage::new_for_test_path(
+            "handoff",
+            temp.path().join("sessions.json"),
+        );
+        let persisted = handoff.clone();
+        storage
+            .update(|instances, _groups| {
+                *instances = vec![persisted.clone()];
+                Ok(())
+            })
+            .unwrap();
+        handoff.clear_pending_tmux_ownership(&storage).unwrap();
+        assert!(handoff.pending_tmux_ownership_session_id.is_none());
+        assert!(
+            storage.load().unwrap()[0]
+                .pending_tmux_ownership_session_id
+                .is_none(),
+            "quiescence must clear the durable handoff before the incoming launch"
+        );
     }
 
     #[test]
