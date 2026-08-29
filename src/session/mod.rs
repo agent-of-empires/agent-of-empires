@@ -613,127 +613,48 @@ pub fn create_profile(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn lock_profile_lifecycle(
-    storage: &storage::Storage,
-    instances: &[Instance],
-) -> Result<(Vec<String>, Vec<storage::StorageFlock>)> {
-    let mut expected_ids: Vec<_> = instances
-        .iter()
-        .map(|instance| instance.id.clone())
-        .collect();
-    expected_ids.sort();
-    let mut lock_ids = expected_ids.clone();
-    lock_ids.dedup();
-    let locks = lock_ids
-        .iter()
-        .map(|id| storage.acquire_instance_lifecycle_lock(id))
-        .collect::<Result<Vec<_>>>()?;
-    Ok((expected_ids, locks))
-}
-
-fn ensure_profile_membership_unchanged(
-    instances: &[Instance],
-    expected_ids: &[String],
-) -> Result<()> {
-    let mut current_ids: Vec<_> = instances
-        .iter()
-        .map(|instance| instance.id.clone())
-        .collect();
-    current_ids.sort();
-    if current_ids != expected_ids {
-        anyhow::bail!(
-            "Profile changed while lifecycle locks were being acquired; retry the operation"
-        );
-    }
-    Ok(())
-}
-
 pub fn delete_profile(name: &str) -> Result<()> {
     validate_profile_name(name)?;
 
     let base = get_app_dir()?;
     let profile_dir = base.join("profiles").join(name);
+
     if !profile_dir.exists() {
         anyhow::bail!("Profile '{}' does not exist", name);
     }
-    let storage = storage::Storage::open_unwatched(name)?;
-    let initial_instances = storage.load_strict()?;
-    let (expected_ids, _lifecycle_locks) = lock_profile_lifecycle(&storage, &initial_instances)?;
 
-    sync::with_tmux_ownership_lock(|| {
-        if !profile_dir.exists() {
-            anyhow::bail!("Profile '{}' does not exist", name);
-        }
-        // Re-check inside the same ownership critical section as removal.
-        if list_profiles()?.len() <= 1 {
-            anyhow::bail!("Cannot delete '{}': at least one profile must exist", name);
-        }
+    // The invariant is "at least one profile must exist", a count, not a name.
+    // Any profile is deletable as long as deleting it would not leave zero.
+    if list_profiles()?.len() <= 1 {
+        anyhow::bail!("Cannot delete '{}': at least one profile must exist", name);
+    }
 
-        let target_instances = storage.load_strict()?;
-        ensure_profile_membership_unchanged(&target_instances, &expected_ids)?;
-        let survivor_ids = sync::instance_ids_excluding_profile(name)?;
-        if let Some(duplicate) = target_instances
-            .iter()
-            .find(|instance| survivor_ids.contains(&instance.id))
-        {
-            anyhow::bail!(
-                "Cannot delete profile '{name}': session id '{}' also exists in another profile",
-                duplicate.id
-            );
-        }
-        sync::ensure_instances_quiescent(&target_instances, &format!("delete profile '{name}'"))?;
-        sync::clear_tmux_session_id_ownership_for_instances_locked(&target_instances)?;
-        if let Err(delete_error) = fs::remove_dir_all(&profile_dir) {
-            if let Err(reconcile_error) =
-                sync::reconcile_all_profiles_tmux_session_id_ownership_env_locked()
-            {
-                anyhow::bail!(
-                    "Failed to delete profile '{name}': {delete_error}; ownership reconciliation failed: {reconcile_error}"
-                );
-            }
-            return Err(delete_error.into());
-        }
-        if let Err(error) = sync::reconcile_all_profiles_tmux_session_id_ownership_env_locked() {
-            tracing::warn!(target: "session.store", profile = name, "Profile deleted; deferred tmux ownership cleanup: {error}");
-        }
-        Ok(())
-    })
+    fs::remove_dir_all(&profile_dir)?;
+    Ok(())
 }
 
 pub fn rename_profile(old_name: &str, new_name: &str) -> Result<()> {
-    validate_profile_name(old_name)?;
-    validate_profile_name(new_name)?;
+    if new_name.is_empty() {
+        anyhow::bail!("New profile name cannot be empty");
+    }
+    if new_name.contains('/') || new_name.contains('\\') {
+        anyhow::bail!("Profile name cannot contain path separators");
+    }
 
     let base = get_app_dir()?;
     let old_dir = base.join("profiles").join(old_name);
     let new_dir = base.join("profiles").join(new_name);
+
     if !old_dir.exists() {
         anyhow::bail!("Profile '{}' does not exist", old_name);
     }
     if new_dir.exists() {
         anyhow::bail!("Profile '{}' already exists", new_name);
     }
-    let storage = storage::Storage::open_unwatched(old_name)?;
-    let initial_instances = storage.load_strict()?;
-    let (expected_ids, _lifecycle_locks) = lock_profile_lifecycle(&storage, &initial_instances)?;
 
-    sync::with_tmux_ownership_lock(|| {
-        if !old_dir.exists() {
-            anyhow::bail!("Profile '{}' does not exist", old_name);
-        }
-        if new_dir.exists() {
-            anyhow::bail!("Profile '{}' already exists", new_name);
-        }
-        let current_instances = storage.load_strict()?;
-        ensure_profile_membership_unchanged(&current_instances, &expected_ids)?;
-        sync::ensure_instances_quiescent(
-            &current_instances,
-            &format!("rename profile '{old_name}'"),
-        )?;
-        fs::rename(&old_dir, &new_dir)?;
-        Ok(())
-    })?;
+    fs::rename(&old_dir, &new_dir)?;
 
+    // Update default profile if the renamed profile was the default
     if let Some(config) = load_config()? {
         if config.default_profile == old_name {
             set_default_profile(new_name)?;
@@ -1491,74 +1412,18 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_delete_profile_named_default_allowed_when_others_exist() {
+        // A profile literally named "default" carries no protection once
+        // other profiles exist; only the count invariant applies.
         let temp = isolate_app_dir();
         let dir = app_dir(&temp);
         fs::create_dir_all(dir.join("profiles").join("default")).unwrap();
         fs::create_dir_all(dir.join("profiles").join("work")).unwrap();
 
-        if crate::tmux::is_tmux_available() {
-            let mut instance = Instance::new("live-profile-delete", "/tmp");
-            instance.source_profile = "default".to_string();
-            storage::Storage::new_unwatched("default")
-                .unwrap()
-                .update(|instances, _groups| {
-                    instances.push(instance.clone());
-                    Ok(())
-                })
-                .unwrap();
-            let tmux = instance.tmux_session().unwrap();
-            let _guard = crate::tmux::test_helpers::TmuxTestSession::from_name(tmux.name());
-            tmux.create("/tmp", Some("sleep 30"), "default").unwrap();
-
-            let error = delete_profile("default")
-                .expect_err("a profile with a live agent pane must remain intact");
-            assert!(error.to_string().contains("live tmux pane"));
-            assert!(dir.join("profiles").join("default").exists());
-            tmux.kill().unwrap();
-        }
-
-        delete_profile("default").expect("a quiescent non-last profile is deletable");
+        delete_profile("default").expect("a non-last profile named default is deletable");
         assert!(!dir.join("profiles").join("default").exists());
         assert!(dir.join("profiles").join("work").exists());
     }
 
-    #[test]
-    #[serial_test::serial]
-    fn test_delete_profile_preserves_unclassifiable_ownership() {
-        let temp = isolate_app_dir();
-        let dir = app_dir(&temp);
-
-        let target_storage = storage::Storage::new_unwatched("duplicate-target").unwrap();
-        let survivor_storage = storage::Storage::new_unwatched("duplicate-survivor").unwrap();
-        let duplicate = Instance::new("duplicate", "/tmp/duplicate");
-        target_storage
-            .update(|instances, _groups| {
-                *instances = vec![duplicate.clone()];
-                Ok(())
-            })
-            .unwrap();
-        survivor_storage
-            .update(|instances, _groups| {
-                *instances = vec![duplicate.clone()];
-                Ok(())
-            })
-            .unwrap();
-        delete_profile("duplicate-target")
-            .expect_err("a duplicate id must make profile ownership unclassifiable");
-        assert!(dir.join("profiles").join("duplicate-target").exists());
-
-        let work = dir.join("profiles").join("work");
-        let corrupt = dir.join("profiles").join("corrupt");
-        fs::create_dir_all(&work).unwrap();
-        fs::create_dir_all(&corrupt).unwrap();
-        fs::write(corrupt.join("sessions.json"), b"not json").unwrap();
-
-        delete_profile("corrupt").expect_err("an unreadable target must remain intact");
-        assert!(corrupt.exists());
-
-        delete_profile("work").expect_err("an unreadable survivor must block deletion");
-        assert!(work.exists());
-    }
     #[test]
     #[serial_test::serial]
     fn test_delete_profile_rejects_path_traversal() {

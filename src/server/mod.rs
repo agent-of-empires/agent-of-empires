@@ -1269,59 +1269,6 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // old in-place loop here, while also covering sessions added via
     // `aoe add --acp` while serve is already running.
 
-    // Legacy Qwen/Kiro ownership must be gone before terminal recovery can
-    // inspect the global tmux environment. Failure defers terminal recovery;
-    // structured sessions and the daemon stay live while reconciliation retries.
-    let ownership_reconciled = match tokio::task::spawn_blocking(
-        crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env,
-    )
-    .await
-    {
-        Ok(Ok(())) => true,
-        Ok(Err(error)) => {
-            tracing::warn!(target: "session.sync", "Deferring daemon tmux ownership reconciliation: {error}");
-            false
-        }
-        Err(error) => {
-            tracing::warn!(target: "session.sync", "Daemon tmux ownership reconciliation task failed: {error}");
-            false
-        }
-    };
-    if !ownership_reconciled {
-        let shutdown = state.shutdown.clone();
-        let recovery_state = state.clone();
-        crate::task_util::spawn_supervised(
-            "server.tmux_ownership_reconcile",
-            crate::task_util::PanicPolicy::Log,
-            async move {
-                loop {
-                    tokio::select! {
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
-                        _ = shutdown.cancelled() => break,
-                    }
-                    match tokio::task::spawn_blocking(
-                        crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env,
-                    )
-                    .await
-                    {
-                        Ok(Ok(())) => {
-                            let recovery_inputs =
-                                daemon_startup_recovery_mark(recovery_state.clone()).await;
-                            spawn_daemon_startup_recovery(recovery_state.clone(), recovery_inputs);
-                            break;
-                        }
-                        Ok(Err(error)) => {
-                            tracing::warn!(target: "session.sync", "Retrying daemon tmux ownership reconciliation: {error}")
-                        }
-                        Err(error) => {
-                            tracing::warn!(target: "session.sync", "Daemon tmux ownership reconciliation retry task failed: {error}")
-                        }
-                    }
-                }
-            },
-        );
-    }
-
     // Seed acp sessions' status from the on-disk event log before
     // any background task runs. The status_poll_loop overlay reads
     // `state.instances` and the acp_event_listener only sees
@@ -1337,11 +1284,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // missing tmux state and broadcast a phantom Idle->Error transition.
     // Phase B (the cascade workers) runs in a spawned task and holds
     // the lock until done.
-    let recovery_inputs = if ownership_reconciled {
-        daemon_startup_recovery_mark(state.clone()).await
-    } else {
-        None
-    };
+    let recovery_inputs = daemon_startup_recovery_mark(state.clone()).await;
 
     // Periodic opt-in `usage_snapshot` loop. Spawned after the transport is
     // resolved (so the first, immediate tick reports the real `serve_mode` and a
@@ -1424,7 +1367,52 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         );
     }
 
-    spawn_daemon_startup_recovery(state.clone(), recovery_inputs);
+    if let Some((lock, candidates)) = recovery_inputs {
+        // Background mark-refresher (#1264). Re-stamps every still-pending
+        // candidate in `recently_restarted` every RECENTLY_RESTARTED_TTL / 2
+        // so a candidate queued past the TTL behind a
+        // STARTUP_RECOVERY_CONCURRENCY permit does not age out of suppression
+        // and trip a phantom Status::Error in status_poll_loop. Exits once the
+        // pending set drains (every worker finished) or on shutdown.
+        {
+            let pending = state.recovery_pending.clone();
+            let recently = state.recently_restarted.clone();
+            let shutdown = state.shutdown.clone();
+            crate::task_util::spawn_supervised(
+                "server.startup_recovery_refresher",
+                crate::task_util::PanicPolicy::Log,
+                async move {
+                    let mut interval =
+                        tokio::time::interval(crate::session::recovery::RECENTLY_RESTARTED_TTL / 2);
+                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                    // First tick fires immediately; skip past it so we don't
+                    // redundantly re-stamp the marks Phase A just wrote.
+                    interval.tick().await;
+                    loop {
+                        tokio::select! {
+                            _ = interval.tick() => {
+                                if !crate::session::recovery::refresh_recovery_pending(
+                                    &pending, &recently,
+                                ) {
+                                    break;
+                                }
+                            }
+                            _ = shutdown.cancelled() => break,
+                        }
+                    }
+                },
+            );
+        }
+
+        let cascade_state = state.clone();
+        crate::task_util::spawn_supervised(
+            "server.startup_recovery_cascade",
+            crate::task_util::PanicPolicy::Log,
+            async move {
+                daemon_startup_recovery_cascade(cascade_state, lock, candidates).await;
+            },
+        );
+    }
 
     // Spawn background tasks
     let poll_state = state.clone();
@@ -3113,7 +3101,6 @@ fn load_all_instances(file_watch: &Arc<FileWatchService>) -> anyhow::Result<Vec<
 /// field on `Instance` requires extending this function or the field is
 /// silently wiped on every poll tick.
 fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
-    let same_poller_identity = fresh.has_same_poller_identity(&prior);
     fresh.last_error_check = prior.last_error_check;
     fresh.last_start_time = prior.last_start_time;
     // Only preserve `last_error` while the session is still in Error. A healthy
@@ -3124,10 +3111,8 @@ fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
     if fresh.status == Status::Error {
         fresh.last_error = prior.last_error;
     }
-    if same_poller_identity {
-        fresh.session_id_poller = prior.session_id_poller;
-        fresh.retroactive_capture_excludes = prior.retroactive_capture_excludes;
-    }
+    fresh.session_id_poller = prior.session_id_poller;
+    fresh.retroactive_capture_excludes = prior.retroactive_capture_excludes;
     fresh
 }
 
@@ -3593,52 +3578,6 @@ fn repair_structured_rows_from_live_workers(
 }
 
 #[cfg(feature = "serve")]
-fn acp_assignment_namespace(instance: &Instance) -> String {
-    instance
-        .agent_session_store_namespace
-        .clone()
-        .or_else(|| instance.terminal_session_store_namespace())
-        .unwrap_or_else(|| {
-            let adapter = instance
-                .agent_name
-                .as_deref()
-                .filter(|name| !name.trim().is_empty())
-                .unwrap_or(&instance.tool);
-            format!("acp:{adapter}")
-        })
-}
-
-#[cfg(feature = "serve")]
-fn validate_acp_session_assignment(
-    instance: &Instance,
-    local: &[Instance],
-    foreign: &[Instance],
-    session_id: &str,
-) -> anyhow::Result<()> {
-    let namespace = acp_assignment_namespace(instance);
-    if local
-        .iter()
-        .filter(|candidate| !std::ptr::eq(*candidate, instance))
-        .chain(foreign)
-        .any(|candidate| {
-            (candidate.acp_session_id.as_deref() == Some(session_id)
-                && acp_assignment_namespace(candidate) == namespace)
-                || candidate.reserves_claude_import_id_in_namespace(session_id, &namespace)
-                || candidate
-                    .prior_tool_session_ids
-                    .iter()
-                    .any(|(tool, prior)| {
-                        prior.acp_session_id.as_deref() == Some(session_id)
-                            && format!("acp:{tool}") == namespace
-                    })
-        })
-    {
-        anyhow::bail!("ACP session '{session_id}' is already owned in store '{namespace}'");
-    }
-    Ok(())
-}
-
-#[cfg(feature = "serve")]
 fn persist_structured_row_repairs(state: &Arc<AppState>, repairs: Vec<StructuredRowRepair>) {
     if repairs.is_empty() {
         return;
@@ -3669,29 +3608,9 @@ fn persist_structured_row_repairs(state: &Arc<AppState>, repairs: Vec<Structured
                     .collect();
                 let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                     let storage = crate::session::Storage::new(&profile, file_watch)?;
-                    crate::session::sync::with_tmux_ownership_lock(|| {
-                        let foreign = crate::session::sync::load_profile_instances_excluding(
-                            Some(storage.profile()),
-                        )?;
-                        storage.update_with_tmux_ownership_lock(|all, _groups| {
-                            for repair in repairs {
-                                let Some(index) =
-                                    all.iter().position(|i| i.id == repair.session_id)
-                                else {
-                                    tracing::debug!(
-                                        target: "server.file_watch",
-                                        session = %repair.session_id,
-                                        "repair target not found on disk; skipping"
-                                    );
-                                    continue;
-                                };
-                                validate_acp_session_assignment(
-                                    &all[index],
-                                    all,
-                                    &foreign,
-                                    &repair.acp_session_id,
-                                )?;
-                                let inst = &mut all[index];
+                    storage.update(|all, _groups| {
+                        for repair in repairs {
+                            if let Some(inst) = all.iter_mut().find(|i| i.id == repair.session_id) {
                                 inst.view = crate::session::View::Structured;
                                 if inst.agent_name.is_none() {
                                     inst.agent_name = repair.agent_name;
@@ -3700,10 +3619,17 @@ fn persist_structured_row_repairs(state: &Arc<AppState>, repairs: Vec<Structured
                                     inst.agent_model = repair.agent_model;
                                 }
                                 inst.acp_session_id = Some(repair.acp_session_id);
+                            } else {
+                                tracing::debug!(
+                                    target: "server.file_watch",
+                                    session = %repair.session_id,
+                                    "repair target not found on disk; skipping"
+                                );
                             }
-                            Ok(())
-                        })
-                    })
+                        }
+                        Ok(())
+                    })?;
+                    Ok(())
                 })
                 .await;
                 match save_result {
@@ -5183,52 +5109,6 @@ async fn daemon_startup_recovery_mark(
 
     Some((lock, candidates))
 }
-fn spawn_daemon_startup_recovery(
-    state: Arc<AppState>,
-    recovery_inputs: Option<(
-        crate::session::recovery::RecoveryLock,
-        Vec<crate::session::Instance>,
-    )>,
-) {
-    let Some((lock, candidates)) = recovery_inputs else {
-        return;
-    };
-
-    let pending = state.recovery_pending.clone();
-    let recently = state.recently_restarted.clone();
-    let shutdown = state.shutdown.clone();
-    crate::task_util::spawn_supervised(
-        "server.startup_recovery_refresher",
-        crate::task_util::PanicPolicy::Log,
-        async move {
-            let mut interval =
-                tokio::time::interval(crate::session::recovery::RECENTLY_RESTARTED_TTL / 2);
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            interval.tick().await;
-            loop {
-                tokio::select! {
-                    _ = interval.tick() => {
-                        if !crate::session::recovery::refresh_recovery_pending(
-                            &pending, &recently,
-                        ) {
-                            break;
-                        }
-                    }
-                    _ = shutdown.cancelled() => break,
-                }
-            }
-        },
-    );
-
-    let cascade_state = state.clone();
-    crate::task_util::spawn_supervised(
-        "server.startup_recovery_cascade",
-        crate::task_util::PanicPolicy::Log,
-        async move {
-            daemon_startup_recovery_cascade(cascade_state, lock, candidates).await;
-        },
-    );
-}
 
 /// Phase B: drive the cascade workers for the pre-marked candidates.
 async fn daemon_startup_recovery_cascade(
@@ -5787,7 +5667,7 @@ async fn acp_event_listener(state: Arc<AppState>) {
 
         // Acquire `instances` once for both branches. Releases before
         // the (potentially blocking) sessions.json save.
-        let (profile_to_save, assignment_profile, unread_profile) = {
+        let (profile_to_save, unread_profile) = {
             let mut instances = state.instances.write().await;
             let Some(inst) = instances.iter_mut().find(|i| i.id == frame.session_id) else {
                 continue;
@@ -5811,16 +5691,7 @@ async fn acp_event_listener(state: Arc<AppState>) {
                     .then(|| inst.source_profile.clone());
 
             (
-                {
-                    let mut identity_probe = inst.clone();
-                    apply_acp_session_change(
-                        &mut identity_probe,
-                        &frame.session_id,
-                        acp_change.as_ref(),
-                    )
-                },
-                matches!(acp_change.as_ref(), Some(AcpSessionChange::Assigned(_)))
-                    .then(|| inst.source_profile.clone()),
+                apply_acp_session_change(inst, &frame.session_id, acp_change.as_ref()),
                 unread_profile,
             )
         };
@@ -5859,78 +5730,38 @@ async fn acp_event_listener(state: Arc<AppState>) {
             .await;
         }
 
-        // Validate every assigned identity; persist only when durable fields changed.
+        // Persist `acp_session_id` to disk if the field changed.
         // Sync FS (file copy + JSON write) goes through spawn_blocking
         // so the runtime stays responsive under large session lists.
-        let should_persist = profile_to_save.is_some();
-        if let Some(profile) = profile_to_save.or(assignment_profile) {
+        if let Some(profile) = profile_to_save {
             let session_id_for_log = frame.session_id.clone();
             let session_id_for_save = frame.session_id.clone();
             let profile_for_save = profile.clone();
             let acp_change_for_save = acp_change.clone();
-            let rejected_assignment = match acp_change.as_ref() {
-                Some(AcpSessionChange::Assigned(id)) => Some(id.clone()),
-                _ => None,
-            };
             let file_watch = state.file_watch.clone();
             let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                 let storage = crate::session::Storage::new(&profile_for_save, file_watch)?;
-                crate::session::sync::with_tmux_ownership_lock(|| {
-                    let foreign = crate::session::sync::load_profile_instances_excluding(Some(
-                        storage.profile(),
-                    ))?;
-                    if !should_persist {
-                        let all = storage.load_ownership_strict()?;
-                        let index = all
-                            .iter()
-                            .position(|i| i.id == session_id_for_save)
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "session {} disappeared before ACP identity validation",
-                                    session_id_for_save
-                                )
-                            })?;
-                        let Some(AcpSessionChange::Assigned(new_id)) = acp_change_for_save.as_ref()
-                        else {
-                            return Ok(());
-                        };
-                        validate_acp_session_assignment(&all[index], &all, &foreign, new_id)?;
-                        return Ok(());
-                    }
-                    storage.update_with_tmux_ownership_lock(|all, _groups| {
-                        let index = all
-                            .iter()
-                            .position(|i| i.id == session_id_for_save)
-                            .ok_or_else(|| {
-                                anyhow::anyhow!(
-                                    "session {} disappeared before ACP identity persistence",
-                                    session_id_for_save
-                                )
-                            })?;
-                        if let Some(AcpSessionChange::Assigned(new_id)) =
-                            acp_change_for_save.as_ref()
-                        {
-                            validate_acp_session_assignment(&all[index], all, &foreign, new_id)?;
-                        }
+                storage.update(|all, _groups| {
+                    if let Some(inst) = all.iter_mut().find(|i| i.id == session_id_for_save) {
                         apply_acp_session_change(
-                            &mut all[index],
+                            inst,
                             &session_id_for_save,
                             acp_change_for_save.as_ref(),
                         );
-                        Ok(())
-                    })
-                })
+                    }
+                    Ok(())
+                })?;
+                Ok(())
             })
             .await;
-            let persisted = match save_result {
-                Ok(Ok(())) => true,
+            match save_result {
+                Ok(Ok(())) => {}
                 Ok(Err(e)) => {
                     tracing::warn!(
                         target: "acp.event_listener",
                         session = %session_id_for_log,
                         "save after acp_session_id update: {e}"
                     );
-                    false
                 }
                 Err(join_err) => {
                     tracing::warn!(
@@ -5938,19 +5769,7 @@ async fn acp_event_listener(state: Arc<AppState>) {
                         session = %session_id_for_log,
                         "spawn_blocking join error during acp_session_id save: {join_err}"
                     );
-                    false
                 }
-            };
-            if persisted {
-                let mut instances = state.instances.write().await;
-                if let Some(inst) = instances.iter_mut().find(|i| i.id == session_id_for_log) {
-                    apply_acp_session_change(inst, &session_id_for_log, acp_change.as_ref());
-                }
-            } else if let Some(rejected_id) = rejected_assignment {
-                state
-                    .acp_supervisor
-                    .reject_session_assignment(&session_id_for_log, &rejected_id)
-                    .await;
             }
         }
     }
@@ -6458,25 +6277,7 @@ pub(crate) fn derive_acp_status(event: &crate::acp::Event) -> Option<StatusInten
     }
 }
 
-type SessionIdentityBaseline = (
-    Option<String>,
-    Option<String>,
-    Option<String>,
-    String,
-    Option<String>,
-    u64,
-);
-
-fn session_identity_baseline(instance: &Instance) -> SessionIdentityBaseline {
-    (
-        instance.agent_session_id.clone(),
-        instance.resume_probe_failed_sid.clone(),
-        instance.omp_capture_generation.clone(),
-        instance.tool.clone(),
-        instance.terminal_session_store_namespace(),
-        instance.lifecycle_generation,
-    )
-}
+type SessionIdentityBaseline = (Option<String>, Option<String>, Option<String>);
 
 /// Merge a drained instance's captured identity back into live state, but only
 /// the identity fields and only if they are unchanged since the baseline. The
@@ -6489,24 +6290,11 @@ fn apply_drained_identity_if_unchanged(
     drained: &Instance,
     baseline: &SessionIdentityBaseline,
 ) {
-    let (
-        baseline_sid,
-        baseline_marker,
-        baseline_omp_generation,
-        baseline_tool,
-        baseline_namespace,
-        baseline_lifecycle_generation,
-    ) = baseline;
-    if live.agent_session_id == *baseline_sid
-        && live.omp_capture_generation == *baseline_omp_generation
-        && live.tool == *baseline_tool
-        && live.terminal_session_store_namespace() == *baseline_namespace
-        && live.lifecycle_generation == *baseline_lifecycle_generation
+    let (baseline_sid, baseline_marker, baseline_generation) = baseline;
+    if live.agent_session_id == *baseline_sid && live.omp_capture_generation == *baseline_generation
     {
         live.agent_session_id = drained.agent_session_id.clone();
         live.omp_capture_generation = drained.omp_capture_generation.clone();
-        live.lifecycle_generation = drained.lifecycle_generation;
-        live.lifecycle_reservation = drained.lifecycle_reservation.clone();
         if live.resume_probe_failed_sid == *baseline_marker {
             live.resume_probe_failed_sid = drained.resume_probe_failed_sid.clone();
         }
@@ -6522,7 +6310,16 @@ async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
     match tokio::task::spawn_blocking(move || {
         let baseline: std::collections::HashMap<String, SessionIdentityBaseline> = snapshot
             .iter()
-            .map(|inst| (inst.id.clone(), session_identity_baseline(inst)))
+            .map(|inst| {
+                (
+                    inst.id.clone(),
+                    (
+                        inst.agent_session_id.clone(),
+                        inst.resume_probe_failed_sid.clone(),
+                        inst.omp_capture_generation.clone(),
+                    ),
+                )
+            })
             .collect();
         let mut snapshot = snapshot;
         // Preserve a final queued observation before replacing a stopped
@@ -6534,31 +6331,13 @@ async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
         // visits every instance, so a per-item `list-sessions` fork scales with
         // the store.
         let live = crate::tmux::LiveSessionSnapshot::new();
-        let needs_poller_repair = snapshot
-            .iter()
-            .any(|instance| instance.needs_session_id_poller_repair(&live));
-        let ownership_reconciled = if outcome.touched() || needs_poller_repair {
-            match crate::session::sync::sync_tmux_session_id_env(snapshot.iter(), &live) {
-                Ok(()) => true,
-                Err(error) => {
-                    tracing::warn!(target: "session.sync", "Daemon env reconcile failed: {error}");
-                    false
-                }
-            }
-        } else {
-            true
-        };
-        let repaired: std::collections::HashSet<String> = if ownership_reconciled {
-            snapshot
-                .iter_mut()
-                .filter_map(|inst| {
-                    inst.repair_session_id_poller_if_needed(&live)
-                        .then(|| inst.id.clone())
-                })
-                .collect()
-        } else {
-            std::collections::HashSet::new()
-        };
+        let repaired: std::collections::HashSet<String> = snapshot
+            .iter_mut()
+            .filter_map(|inst| {
+                inst.repair_session_id_poller_if_needed(&live)
+                    .then(|| inst.id.clone())
+            })
+            .collect();
         (outcome, snapshot, baseline, repaired)
     })
     .await
@@ -6582,10 +6361,6 @@ async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
                     apply_drained_identity_if_unchanged(dst, src, identity_baseline);
                 }
                 if repaired.contains(&src.id)
-                    && dst.tool == src.tool
-                    && dst.terminal_session_store_namespace()
-                        == src.terminal_session_store_namespace()
-                    && dst.lifecycle_generation == src.lifecycle_generation
                     && dst.omp_capture_generation == src.omp_capture_generation
                     && !dst.session_id_poller_is_running()
                     && src.session_id_poller_is_running()
@@ -6850,103 +6625,20 @@ mod tests {
         v.iter().map(|s| s.to_string()).collect()
     }
     #[test]
-    fn acp_assignment_rejects_local_and_foreign_owners() {
-        let mut target = Instance::new("target", "/tmp/project");
-        target.tool = "claude".into();
-        target.view = crate::session::View::Structured;
-        target.agent_session_store_namespace = Some("claude-store".into());
-
-        let mut owner = Instance::new("owner", "/tmp/project");
-        owner.tool = "claude".into();
-        owner.view = crate::session::View::Structured;
-        owner.agent_session_store_namespace = Some("claude-store".into());
-        owner.acp_session_id = Some("contested".into());
-
-        assert!(validate_acp_session_assignment(&target, &[], &[], "free").is_ok());
-        let mut persisted_target = target.clone();
-        persisted_target.acp_session_id = Some("contested".into());
-        assert!(
-            validate_acp_session_assignment(
-                &persisted_target,
-                std::slice::from_ref(&persisted_target),
-                &[],
-                "contested"
-            )
-            .is_ok(),
-            "the target row itself is not a competing owner"
-        );
-        let duplicate_id_owner = persisted_target.clone();
-        assert!(
-            validate_acp_session_assignment(
-                &persisted_target,
-                std::slice::from_ref(&persisted_target),
-                std::slice::from_ref(&duplicate_id_owner),
-                "contested"
-            )
-            .is_err(),
-            "a distinct foreign row with the target ID remains a competing owner"
-        );
-        for foreign in [false, true] {
-            let (local, remote) = if foreign {
-                (Vec::new(), vec![owner.clone()])
-            } else {
-                (vec![owner.clone()], Vec::new())
-            };
-            assert!(
-                validate_acp_session_assignment(&target, &local, &remote, "contested").is_err(),
-                "foreign={foreign}"
-            );
-        }
-
-        for tool in ["qwen", "kiro"] {
-            let mut unsupported = Instance::new(tool, "/tmp/project");
-            unsupported.tool = tool.into();
-            unsupported.view = crate::session::View::Structured;
-            let mut same_adapter_owner = unsupported.clone();
-            same_adapter_owner.id = format!("{tool}-owner");
-            same_adapter_owner.acp_session_id = Some("contested".into());
-
-            assert!(
-                validate_acp_session_assignment(&unsupported, &[], &[], "acp-only").is_ok(),
-                "{tool}"
-            );
-            assert!(
-                validate_acp_session_assignment(
-                    &unsupported,
-                    std::slice::from_ref(&owner),
-                    &[],
-                    "contested"
-                )
-                .is_ok(),
-                "ACP identities from different adapters may share the same opaque token: {tool}"
-            );
-            assert!(
-                validate_acp_session_assignment(
-                    &unsupported,
-                    std::slice::from_ref(&same_adapter_owner),
-                    &[],
-                    "contested"
-                )
-                .is_err(),
-                "same-adapter ownership must remain exclusive: {tool}"
-            );
-        }
-    }
-
-    #[test]
     fn drained_identity_reapply_honors_concurrent_generation_and_marker_writes() {
-        let mut baseline_instance = Instance::new("session", "/tmp/project");
-        baseline_instance.agent_session_id = Some("old-sid".to_string());
-        baseline_instance.resume_probe_failed_sid = Some("old-marker".to_string());
-        baseline_instance.omp_capture_generation = Some("generation-a".to_string());
-        let baseline = session_identity_baseline(&baseline_instance);
-
-        let mut drained = baseline_instance.clone();
+        let baseline = (
+            Some("old-sid".to_string()),
+            Some("old-marker".to_string()),
+            Some("generation-a".to_string()),
+        );
+        let mut drained = Instance::new("session", "/tmp/project");
         drained.agent_session_id = Some("captured-sid".to_string());
         drained.resume_probe_failed_sid = None;
-        drained.lifecycle_generation += 1;
+        drained.omp_capture_generation = Some("generation-a".to_string());
 
-        let mut relaunched = baseline_instance.clone();
+        let mut relaunched = Instance::new("session", "/tmp/project");
+        relaunched.agent_session_id = Some("old-sid".to_string());
+        relaunched.resume_probe_failed_sid = Some("old-marker".to_string());
         relaunched.omp_capture_generation = Some("generation-b".to_string());
         apply_drained_identity_if_unchanged(&mut relaunched, &drained, &baseline);
         assert_eq!(
@@ -6955,8 +6647,10 @@ mod tests {
         );
         assert_eq!(relaunched.agent_session_id.as_deref(), Some("old-sid"));
 
-        let mut marker_changed = baseline_instance.clone();
+        let mut marker_changed = Instance::new("session", "/tmp/project");
+        marker_changed.agent_session_id = Some("old-sid".to_string());
         marker_changed.resume_probe_failed_sid = Some("peer-marker".to_string());
+        marker_changed.omp_capture_generation = Some("generation-a".to_string());
         apply_drained_identity_if_unchanged(&mut marker_changed, &drained, &baseline);
         assert_eq!(
             marker_changed.agent_session_id.as_deref(),
@@ -6966,14 +6660,8 @@ mod tests {
             marker_changed.resume_probe_failed_sid.as_deref(),
             Some("peer-marker")
         );
-        assert_eq!(marker_changed.lifecycle_generation, 1);
-
-        let mut tool_changed = baseline_instance;
-        tool_changed.tool = "codex".to_string();
-        apply_drained_identity_if_unchanged(&mut tool_changed, &drained, &baseline);
-        assert_eq!(tool_changed.agent_session_id.as_deref(), Some("old-sid"));
-        assert_eq!(tool_changed.tool, "codex");
     }
+
     /// `idempotency_locks` must not grow for the daemon's lifetime: keys are
     /// caller-supplied and unbounded, so an entry nobody holds is pruned on
     /// the next miss. A key whose lock is still held must survive. See #3156.
@@ -9287,24 +8975,6 @@ mod tests {
 
         let merged = merge_runtime_fields(prior, fresh);
         assert_eq!(merged.last_error.as_deref(), Some("recovery cascade: foo"));
-    }
-
-    #[test]
-    fn merge_runtime_fields_drops_capture_state_after_tool_change() {
-        let mut prior = Instance::new("seed", "/tmp/seed");
-        prior.tool = "codex".into();
-        prior.agent_session_store_namespace = Some("codex:/tmp/seed/.codex".into());
-        prior
-            .retroactive_capture_excludes
-            .insert("old-session".into());
-
-        let mut fresh = prior.clone();
-        fresh.tool = "qwen".into();
-        fresh.agent_session_store_namespace = None;
-        fresh.retroactive_capture_excludes.clear();
-
-        let merged = merge_runtime_fields(prior, fresh);
-        assert!(merged.retroactive_capture_excludes.is_empty());
     }
 
     // #2237: a worker coming live (AcpSessionAssigned) must clear a stale

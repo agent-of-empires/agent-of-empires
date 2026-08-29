@@ -389,7 +389,7 @@ Manage session lifecycle (start, stop, attach, etc.)
 * `set-worktree-name` — Edit a managed worktree session's workdir directory name (and, optionally, its git branch). Moves the worktree directory in place; the session must not be running. See #1723
 * `capture` — Capture tmux pane output
 * `current` — Auto-detect current session
-* `add-project` — Attach another repo to an existing session. Agents with resume enabled in AoE can continue in the same conversation after the required restart; agents with resume disabled in AoE restart with a fresh conversation. Creates a worktree for the repo. See #3103
+* `add-project` — Attach another repo to an existing session, so an agent that turns out to need a second repo can keep working in the same conversation instead of the session being recreated. Creates a worktree for the repo and restarts the agent so it can see it; the conversation is kept. See #3103
 * `set-session-id` — Set the resume target for a session; agents with resume disabled in AoE store the ID but do not use it
 * `set-base` — Set or clear the per-session diff base branch. The diff view compares the worktree against this ref instead of the auto-detected default. Useful when the PR target differs from the project default (stacked PRs, hotfix off `release/*`, renamed default branch). See #970
 * `snooze` — Snooze a session for a duration (temporary archive, auto wakes)
@@ -547,7 +547,7 @@ Auto-detect current session
 
 ## `aoe session add-project`
 
-Attach another repo to an existing session. Agents with resume enabled in AoE can continue in the same conversation after the required restart; agents with resume disabled in AoE restart with a fresh conversation. Creates a worktree for the repo. See #3103
+Attach another repo to an existing session, so an agent that turns out to need a second repo can keep working in the same conversation instead of the session being recreated. Creates a worktree for the repo and restarts the agent so it can see it; the conversation is kept. See #3103
 
 **Usage:** `aoe session add-project [OPTIONS] <IDENTIFIER> <PROJECT>`
 

@@ -44,35 +44,6 @@ fn resolve_agent_home(env_var: Option<&str>, default_subdir: &str) -> Result<Pat
         .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
         .join(default_subdir))
 }
-/// Resolve a host store from the concrete environment snapshot transported to
-/// the launched pane. An empty slice preserves ambient behavior for one-shot
-/// retroactive capture outside a launch.
-fn resolve_agent_home_for_host_environment(
-    project_path: &str,
-    host_env: &[String],
-    env_var: Option<&str>,
-    default_subdir: &str,
-) -> Result<PathBuf> {
-    let value = |key: &str| {
-        crate::session::environment::resolve_host_environment_value(host_env, key)
-            .or_else(|| std::env::var(key).ok())
-    };
-    if let Some(value) = env_var.and_then(value) {
-        anyhow::ensure!(!value.is_empty(), "agent store override is empty");
-        let path = PathBuf::from(value);
-        return Ok(if path.is_absolute() {
-            path
-        } else {
-            Path::new(project_path).join(path)
-        });
-    }
-    value("HOME")
-        .filter(|value| !value.is_empty())
-        .map(PathBuf::from)
-        .or_else(dirs::home_dir)
-        .map(|home| home.join(default_subdir))
-        .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))
-}
 
 /// Resolve the Claude config dir the *launched pane* will see.
 ///
@@ -87,16 +58,9 @@ fn resolve_agent_home_for_host_environment(
 /// Precedence mirrors [`crate::hooks::agent_settings_path_in`]: the session's
 /// host environment first, then AoE's own env (a var exported in the shell that
 /// launched `aoe` is inherited by the agent too), then `~/.claude`.
-fn claude_home_for_host_environment(project_path: &str, host_env: &[String]) -> Result<PathBuf> {
+fn claude_home_for_host_environment(host_env: &[String]) -> Result<PathBuf> {
     match claude_config_dir_override(host_env) {
-        Some(dir) => {
-            let path = PathBuf::from(dir);
-            Ok(if path.is_absolute() {
-                path
-            } else {
-                Path::new(project_path).join(path)
-            })
-        }
+        Some(dir) => Ok(PathBuf::from(dir)),
         None => resolve_agent_home(None, ".claude"),
     }
 }
@@ -174,7 +138,7 @@ pub(crate) fn capture_claude_session_id(
     exclusion: &HashSet<String>,
     host_env: &[String],
 ) -> Result<String> {
-    let claude_home = claude_home_for_host_environment(project_path, host_env)?;
+    let claude_home = claude_home_for_host_environment(host_env)?;
     let canonical = canonicalize_or_raw(project_path);
 
     if let Some((id, modified)) =
@@ -253,7 +217,7 @@ pub(crate) fn claude_host_transcript_confirmed_absent(
     session_id: &str,
     host_env: &[String],
 ) -> bool {
-    let Ok(claude_home) = claude_home_for_host_environment(project_path, host_env) else {
+    let Ok(claude_home) = claude_home_for_host_environment(host_env) else {
         return false;
     };
     let canonical = canonicalize_or_raw(project_path);
@@ -428,7 +392,7 @@ pub(crate) fn claude_poll_fn(
         }
 
         let current_known = last_known.lock().ok().and_then(|g| g.clone());
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
         let captured = capture_claude_session_id(
             &project_path,
             current_known.as_deref(),
@@ -562,7 +526,7 @@ pub(crate) fn claude_poll_fn_sandboxed(
     let last_known = std::sync::Mutex::new(known_session_id);
     move || {
         let current_known = last_known.lock().ok().and_then(|g| g.clone());
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
         let captured = capture_claude_session_id_in_container(
             &container_name,
             &container_cwd,
@@ -695,7 +659,7 @@ pub(crate) fn capture_pi_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
 ) -> Result<String> {
-    capture_pi_family_session_id(project_path, exclusion, ".pi/agent", &[])
+    capture_pi_family_session_id(project_path, exclusion, ".pi/agent")
 }
 
 /// Scan Pi's on-disk session store.
@@ -707,14 +671,8 @@ fn capture_pi_family_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
     default_subdir: &str,
-    host_environment: &[String],
 ) -> Result<String> {
-    let pi_home = resolve_agent_home_for_host_environment(
-        project_path,
-        host_environment,
-        Some("PI_CODING_AGENT_DIR"),
-        default_subdir,
-    )?;
+    let pi_home = resolve_agent_home(Some("PI_CODING_AGENT_DIR"), default_subdir)?;
     let sessions_dir = pi_home.join("sessions");
 
     if !sessions_dir.exists() {
@@ -868,11 +826,10 @@ pub(crate) fn pi_poll_fn(
     project_path: String,
     instance_id: String,
     extra_excludes: HashSet<String>,
-    host_environment: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
-        capture_pi_family_session_id(&project_path, &exclusion, ".pi/agent", &host_environment)
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        capture_pi_session_id(&project_path, &exclusion)
             .map_err(
                 |e| tracing::debug!(target: "session.capture", "Pi poll capture failed: {}", e),
             )
@@ -991,7 +948,7 @@ pub(crate) fn pi_poll_fn_sandboxed(
     extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
         try_capture_pi_session_id_in_container(&container_name, &container_cwd, &exclusion)
             .map_err(|e| tracing::debug!(target: "session.capture", "Pi container poll capture failed: {}", e))
             .ok()
@@ -1018,35 +975,25 @@ pub(crate) fn is_valid_session_id(id: &str) -> bool {
 pub(crate) fn compose_exclusion(
     current_instance_id: &str,
     extra: &HashSet<String>,
-) -> anyhow::Result<HashSet<String>> {
-    let live = capture_live_snapshot();
-    compose_exclusion_in(current_instance_id, None, extra, &live)
+) -> HashSet<String> {
+    compose_exclusion_in(
+        current_instance_id,
+        extra,
+        &crate::tmux::LiveSessionSnapshot::new(),
+    )
 }
 
-fn capture_live_snapshot() -> crate::tmux::LiveSessionSnapshot {
-    let live = crate::tmux::LiveSessionSnapshot::new();
-    #[cfg(test)]
-    if live.names().is_none() {
-        // Capture algorithm tests intentionally run without a tmux server.
-        // Production still treats the same observation as uncertain.
-        return crate::tmux::LiveSessionSnapshot::from_names(Vec::new());
-    }
-    live
-}
-
-/// compose_exclusion against a snapshot the caller already holds, so a pass
-/// that also probes per-instance liveness observes tmux once instead of twice.
-/// A supplied namespace comes from the same launch snapshot as the poller;
-/// otherwise it is resolved from the current pane's stamped environment.
+/// [`compose_exclusion`] against a snapshot the caller already holds, so a
+/// pass that also probes per-instance liveness observes tmux once instead of
+/// twice.
 fn compose_exclusion_in(
     current_instance_id: &str,
-    current_namespace: Option<&str>,
     extra: &HashSet<String>,
     live: &crate::tmux::LiveSessionSnapshot,
-) -> anyhow::Result<HashSet<String>> {
-    let mut set = build_exclusion_set(current_instance_id, current_namespace, live)?;
+) -> HashSet<String> {
+    let mut set = build_exclusion_set(current_instance_id, live);
     set.extend(extra.iter().cloned());
-    Ok(set)
+    set
 }
 
 /// Extend [`compose_exclusion`] with conversations same-project peers parked
@@ -1065,134 +1012,74 @@ fn compose_exclusion_in(
 /// omit that protection because their stores are instance-private or are not
 /// captured from the host (#3317).
 ///
-/// Scope: parked and inactive-peer exclusions require the current store
-/// namespace. Incoming handoff IDs are loaded from every profile under the
-/// same rule. Corruption in the current profile aborts capture; corrupt
-/// foreign profiles are skipped because capture must remain available.
+/// Scope: host stores are keyed by each agent's effective home, not by AoE
+/// profile, but this helper inspects only `sessions.json` for the caller's
+/// effective profile. A stopped peer in another profile against the same
+/// agent home will not be excluded; callers needing global ownership must
+/// compose their own cross-profile check.
 pub(crate) fn compose_exclusion_with_persisted_peers(
     current_instance_id: &str,
     current_project_path: &str,
     current_tool: &str,
-    current_namespace: &str,
     include_inactive_same_tool: bool,
     profile: &str,
     retroactive_capture_excludes: &HashSet<String>,
-) -> anyhow::Result<HashSet<String>> {
+) -> HashSet<String> {
     // One observation for the whole pass. Both halves consult tmux: the
     // cross-instance scan needs the live session names, and the walk below
     // visits every stored session sharing the project path, trashed ones
-    // included, so a per-instance liveness probe costs a fork each.
-    let live = capture_live_snapshot();
-    let mut set = compose_exclusion_in(
-        current_instance_id,
-        Some(current_namespace),
-        retroactive_capture_excludes,
-        &live,
-    )?;
-    // Canonical paths keep equivalent `..` and symlink spellings in one
-    // ownership domain; raw comparison reopened cross-session capture (#2858).
+    // included, so a per-instance liveness probe costs a fork each. A store of
+    // a few hundred sessions made that the dominant cost of the pass.
+    // `names() == None` (server unreachable) reads as "no live pane" here,
+    // which is what the per-item probe already did when its own
+    // `list-sessions` failed, and this pass re-runs.
+    let live = crate::tmux::LiveSessionSnapshot::new();
+    let mut set = compose_exclusion_in(current_instance_id, retroactive_capture_excludes, &live);
+    let Ok(storage) = crate::session::storage::Storage::new_unwatched(profile) else {
+        return set;
+    };
+    let Ok(instances) = storage.load() else {
+        return set;
+    };
+    // Compare canonicalized paths, not raw strings: worktree sessions created
+    // from `../`-style templates historically stored an unnormalized
+    // `project_path` (e.g. `/repos/x/../x-worktrees/b`), and a raw comparison
+    // silently drops them from this exclusion even though they share the
+    // directory — re-opening the #2355 steal for exactly those peers (#2858).
     let canonical_current = canonicalize_or_raw(current_project_path);
-
-    crate::session::sync::with_tmux_ownership_lock(|| {
-        let current_storage = crate::session::storage::Storage::new_unwatched(profile)
-            .map_err(|error| anyhow::anyhow!("open profile {profile}: {error}"))?;
-        let current_directory = current_storage.sessions_path().parent().ok_or_else(|| {
-            anyhow::anyhow!(
-                "sessions path has no profile directory: {}",
-                current_storage.sessions_path().display()
-            )
-        })?;
-        let current_identity = current_directory
-            .canonicalize()
-            .map_err(|error| anyhow::anyhow!("resolve profile {profile}: {error}"))?;
-        let mut profiles = crate::session::list_profiles()?;
-        if !profiles.iter().any(|candidate| candidate == profile) {
-            profiles.push(profile.to_string());
+    for inst in instances {
+        if inst.id == current_instance_id {
+            continue;
         }
-        let mut visited = HashSet::new();
-        for peer_profile in profiles {
-            let storage = crate::session::storage::Storage::new_unwatched(&peer_profile)
-                .map_err(|error| anyhow::anyhow!("open profile {peer_profile}: {error}"))?;
-            let directory = storage.sessions_path().parent().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "sessions path has no profile directory: {}",
-                    storage.sessions_path().display()
-                )
-            })?;
-            let identity = directory
-                .canonicalize()
-                .map_err(|error| anyhow::anyhow!("resolve profile {peer_profile}: {error}"))?;
-            if !visited.insert(identity.clone()) {
-                continue;
-            }
-            let is_current_profile = identity == current_identity;
-            let load_result = if is_current_profile {
-                storage.load_ownership_strict()
-            } else {
-                storage.load_ownership_for_capture()
-            };
-            let instances = match load_result {
-                Ok(instances) => instances,
-                Err(error) if !is_current_profile => {
-                    tracing::warn!(
-                        profile = %peer_profile,
-                        error = %error,
-                        "skipping corrupt foreign ownership profile during capture exclusion"
-                    );
-                    continue;
-                }
-                Err(error) => {
-                    return Err(anyhow::anyhow!("load profile {peer_profile}: {error}"));
-                }
-            };
-            for inst in instances {
-                if is_current_profile && inst.id == current_instance_id {
-                    continue;
-                }
-                if canonicalize_or_raw(&inst.project_path) != canonical_current {
-                    continue;
-                }
-                if let Some(incoming) = inst.incoming_handoff_agent_session_id() {
-                    if inst.reserves_agent_session_id_in_namespace(incoming, current_namespace) {
-                        set.insert(incoming.to_string());
-                    }
-                }
-                if !is_current_profile {
-                    continue;
-                }
-                if let Some(parked) = inst
-                    .prior_tool_session_ids
-                    .get(current_tool)
-                    .and_then(|prior| prior.agent_session_id.as_deref())
-                    .filter(|sid| !sid.is_empty())
-                    .filter(|sid| {
-                        inst.reserves_agent_session_id_in_namespace(sid, current_namespace)
-                    })
-                {
-                    set.insert(parked.to_string());
-                }
-                if !include_inactive_same_tool || inst.tool != current_tool {
-                    continue;
-                }
-                let should_exclude = matches!(inst.status, crate::session::Status::Stopped)
-                    || inst.is_archived()
-                    || !inst.has_live_tmux_pane_in(&live);
-                if should_exclude {
-                    if let Some(sid) = inst
-                        .agent_session_id
-                        .as_deref()
-                        .filter(|sid| !sid.is_empty())
-                        .filter(|sid| {
-                            inst.reserves_agent_session_id_in_namespace(sid, current_namespace)
-                        })
-                    {
-                        set.insert(sid.to_string());
-                    }
-                }
-            }
+        if canonicalize_or_raw(&inst.project_path) != canonical_current {
+            continue;
         }
-        Ok(set)
-    })
+        // A peer that swapped away still owns the conversation it parked and
+        // intends to resume it on a swap back. It is excluded regardless of the
+        // peer's current tool or liveness: its pane is running another engine,
+        // so the live tmux ownership scan cannot discover this id.
+        if let Some(parked) = inst
+            .prior_tool_session_ids
+            .get(current_tool)
+            .and_then(|p| p.agent_session_id.as_deref())
+            .filter(|s| !s.is_empty())
+        {
+            set.insert(parked.to_string());
+        }
+        if !include_inactive_same_tool || inst.tool != current_tool {
+            continue;
+        }
+        let should_exclude = matches!(inst.status, crate::session::Status::Stopped)
+            || inst.is_archived()
+            || !inst.has_live_tmux_pane_in(&live);
+        if !should_exclude {
+            continue;
+        }
+        if let Some(sid) = inst.agent_session_id.as_deref().filter(|s| !s.is_empty()) {
+            set.insert(sid.to_string());
+        }
+    }
+    set
 }
 
 /// Build the set of session IDs already claimed by other live AoE instances.
@@ -1209,12 +1096,12 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
 /// per-instance exclusion list.
 fn build_exclusion_set(
     current_instance_id: &str,
-    current_namespace: Option<&str>,
     live: &crate::tmux::LiveSessionSnapshot,
-) -> anyhow::Result<HashSet<String>> {
-    let names = live
-        .names()
-        .ok_or_else(|| anyhow::anyhow!("cannot list live tmux sessions"))?;
+) -> HashSet<String> {
+    let Some(names) = live.names() else {
+        return HashSet::new();
+    };
+
     let aoe_sessions: Vec<&str> = names
         .iter()
         .map(String::as_str)
@@ -1223,58 +1110,36 @@ fn build_exclusion_set(
                 && !name.starts_with(crate::tmux::TOOL_PREFIX)
         })
         .collect();
+
     if aoe_sessions.is_empty() {
-        return Ok(HashSet::new());
+        return HashSet::new();
     }
 
-    let rows = crate::tmux::env::get_hidden_env_keys_batch_strict(
+    let instance_ids = crate::tmux::env::get_hidden_env_batch(
         &aoe_sessions,
-        &[
-            crate::tmux::env::AOE_INSTANCE_ID_KEY,
-            crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
-            crate::tmux::env::AOE_SESSION_STORE_NAMESPACE_KEY,
-        ],
-    )
-    .map_err(|error| {
-        tracing::warn!(target: "session.capture", "live ownership scan failed: {error}");
-        anyhow::anyhow!("live ownership scan failed: {error}")
-    })?;
-    let rows: Vec<(Option<String>, Option<String>, Option<String>)> = rows
-        .into_iter()
-        .map(|(_, values)| {
-            let mut values = values.into_iter();
-            (
-                values.next().flatten(),
-                values.next().flatten(),
-                values.next().flatten(),
-            )
-        })
-        .collect();
-    let derived_namespace = if current_namespace.is_none() {
-        let namespaces: HashSet<String> = rows
-            .iter()
-            .filter(|(owner, _, _)| owner.as_deref() == Some(current_instance_id))
-            .filter_map(|(_, _, namespace)| namespace.clone())
-            .collect();
-        (namespaces.len() == 1).then(|| namespaces.into_iter().next().expect("one namespace"))
-    } else {
-        None
-    };
-    let current_namespace = current_namespace.or(derived_namespace.as_deref());
+        crate::tmux::env::AOE_INSTANCE_ID_KEY,
+    );
 
-    Ok(rows
-        .into_iter()
-        .filter_map(|(owner, captured, namespace)| {
-            if owner.as_deref() == Some(current_instance_id) {
-                return None;
-            }
-            let captured = captured?;
-            match current_namespace {
-                Some(current) if namespace.as_deref().is_some_and(|peer| peer != current) => None,
-                _ => Some(captured),
-            }
+    let other_sessions: Vec<&str> = instance_ids
+        .iter()
+        .filter(|(_, owner)| {
+            owner
+                .as_deref()
+                .is_some_and(|owner| owner != current_instance_id)
         })
-        .collect())
+        .map(|(name, _)| name.as_str())
+        .collect();
+
+    if other_sessions.is_empty() {
+        return HashSet::new();
+    }
+
+    let captured_ids = crate::tmux::env::get_hidden_env_batch(
+        &other_sessions,
+        crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+    );
+
+    captured_ids.into_iter().filter_map(|(_, id)| id).collect()
 }
 
 /// Capture Vibe session ID from `meta.json` files in the session log directory.
@@ -1287,20 +1152,7 @@ pub(crate) fn capture_vibe_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
 ) -> Result<String> {
-    capture_vibe_session_id_in_environment(project_path, exclusion, &[])
-}
-
-fn capture_vibe_session_id_in_environment(
-    project_path: &str,
-    exclusion: &HashSet<String>,
-    host_environment: &[String],
-) -> Result<String> {
-    let vibe_home = resolve_agent_home_for_host_environment(
-        project_path,
-        host_environment,
-        Some("VIBE_HOME"),
-        ".vibe",
-    )?;
+    let vibe_home = resolve_agent_home(Some("VIBE_HOME"), ".vibe")?;
     let sessions_dir = vibe_home.join("logs").join("session");
 
     if !sessions_dir.exists() {
@@ -1387,11 +1239,10 @@ pub(crate) fn vibe_poll_fn(
     project_path: String,
     instance_id: String,
     extra_excludes: HashSet<String>,
-    host_environment: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
-        capture_vibe_session_id_in_environment(&project_path, &exclusion, &host_environment)
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        capture_vibe_session_id(&project_path, &exclusion)
             .map_err(
                 |e| tracing::debug!(target: "session.capture", "Vibe poll capture failed: {}", e),
             )
@@ -1496,7 +1347,7 @@ pub(crate) fn vibe_poll_fn_sandboxed(
     extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
         try_capture_vibe_session_id_in_container(&container_name, &container_cwd, &exclusion)
             .map_err(|e| tracing::debug!(target: "session.capture", "Vibe container poll capture failed: {}", e))
             .ok()
@@ -1700,40 +1551,38 @@ fn select_opencode_session_from_values(
 ///      joined to data dir, `:memory:` is unsupported (bail).
 ///   2. Most recently modified `opencode*.db` in the data dir (covers both
 ///      the standard `opencode.db` and channel variants like `opencode-dev.db`).
-#[cfg(test)]
 fn opencode_db_path() -> Result<PathBuf> {
-    opencode_db_path_in_environment(&[])
-}
-
-fn opencode_db_path_in_environment(host_environment: &[String]) -> Result<PathBuf> {
-    let value = |key: &str| {
-        crate::session::environment::resolve_host_environment_value(host_environment, key)
-            .or_else(|| std::env::var(key).ok())
-            .filter(|value| !value.is_empty())
-    };
-    if let Some(db_env) = value("OPENCODE_DB") {
-        if db_env == ":memory:" {
-            anyhow::bail!("opencode is using an in-memory DB; cannot read sessions via SQLite");
+    // 1. Explicit override via OPENCODE_DB (same env var opencode reads).
+    if let Ok(db_env) = std::env::var("OPENCODE_DB") {
+        if !db_env.is_empty() {
+            if db_env == ":memory:" {
+                anyhow::bail!("opencode is using an in-memory DB; cannot read sessions via SQLite");
+            }
+            let p = PathBuf::from(&db_env);
+            if p.is_absolute() {
+                return Ok(p);
+            }
+            return Ok(opencode_data_dir()?.join(p));
         }
-        let path = PathBuf::from(db_env);
-        if path.is_absolute() {
-            return Ok(path);
-        }
-        return Ok(opencode_data_dir_in_environment(host_environment)?.join(path));
     }
 
-    let data_dir = opencode_data_dir_in_environment(host_environment)?;
+    let data_dir = opencode_data_dir()?;
+
+    // 2. Find the most recently modified opencode DB in data_dir.
+    //    Covers both the standard filename (latest/beta/prod) and channel
+    //    variants (opencode-{channel}.db). Picking by mtime ensures we read
+    //    the DB the running opencode instance is actively writing to.
     if let Ok(entries) = std::fs::read_dir(&data_dir) {
         let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
         for entry in entries.flatten() {
             let name = entry.file_name();
-            let name = name.to_string_lossy();
-            let is_candidate =
-                name == "opencode.db" || (name.starts_with("opencode-") && name.ends_with(".db"));
+            let name_str = name.to_string_lossy();
+            let is_candidate = name_str == "opencode.db"
+                || (name_str.starts_with("opencode-") && name_str.ends_with(".db"));
             if is_candidate {
                 if let Ok(meta) = entry.metadata() {
                     let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-                    if best.as_ref().is_none_or(|(_, prior)| mtime > *prior) {
+                    if best.as_ref().is_none_or(|(_, t)| mtime > *t) {
                         best = Some((entry.path(), mtime));
                     }
                 }
@@ -1743,21 +1592,24 @@ fn opencode_db_path_in_environment(host_environment: &[String]) -> Result<PathBu
             return Ok(path);
         }
     }
+
+    // Nothing found; return standard path so the caller gets a clear
+    // "not found" error and falls back to the subprocess path.
     Ok(data_dir.join("opencode.db"))
 }
 
-/// Resolve opencode's data directory from the launch environment, matching
-/// XDG precedence before falling back to the launch user's home directory.
-fn opencode_data_dir_in_environment(host_environment: &[String]) -> Result<PathBuf> {
-    let value = |key: &str| {
-        crate::session::environment::resolve_host_environment_value(host_environment, key)
-            .or_else(|| std::env::var(key).ok())
-            .filter(|value| !value.is_empty())
-    };
-    if let Some(xdg) = value("XDG_DATA_HOME") {
-        return Ok(PathBuf::from(xdg).join("opencode"));
+/// Resolve opencode's data directory.
+///
+/// Uses `XDG_DATA_HOME` if set (same `xdg-basedir` npm package opencode uses),
+/// otherwise `$HOME/.local/share`. Both Linux and macOS use this path.
+fn opencode_data_dir() -> Result<PathBuf> {
+    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
+        if !xdg.is_empty() {
+            return Ok(PathBuf::from(xdg).join("opencode"));
+        }
     }
-    let home = value("HOME").context("HOME is not set; cannot resolve opencode data dir")?;
+    let home =
+        std::env::var("HOME").context("HOME is not set; cannot resolve opencode data dir")?;
     Ok(PathBuf::from(home)
         .join(".local")
         .join("share")
@@ -1843,17 +1695,8 @@ pub(crate) fn try_capture_opencode_session_id(
     exclusion: &HashSet<String>,
     launch_time_ms: Option<f64>,
 ) -> Result<String> {
-    try_capture_opencode_session_id_in_environment(project_path, exclusion, launch_time_ms, &[])
-}
-
-fn try_capture_opencode_session_id_in_environment(
-    project_path: &str,
-    exclusion: &HashSet<String>,
-    launch_time_ms: Option<f64>,
-    host_environment: &[String],
-) -> Result<String> {
-    let entries_or_fallback = opencode_db_path_in_environment(host_environment)
-        .and_then(|path| read_opencode_sessions_from_sqlite_at(&path));
+    let entries_or_fallback =
+        opencode_db_path().and_then(|p| read_opencode_sessions_from_sqlite_at(&p));
 
     match entries_or_fallback {
         Ok(entries) => {
@@ -1864,15 +1707,12 @@ fn try_capture_opencode_session_id_in_environment(
                 launch_time_ms,
             );
         }
-        Err(error) => log_opencode_sqlite_fallback_once(&error),
+        Err(e) => log_opencode_sqlite_fallback_once(&e),
     }
 
     let mut cmd = std::process::Command::new("opencode");
     cmd.args(["session", "list", "--format", "json"])
-        .current_dir(project_path)
-        .envs(super::environment::resolve_host_environment_pairs(
-            host_environment,
-        ));
+        .current_dir(project_path);
 
     let stdout_bytes = run_with_timeout(
         cmd,
@@ -1881,10 +1721,11 @@ fn try_capture_opencode_session_id_in_environment(
     )?;
     select_opencode_session(&stdout_bytes, project_path, exclusion, launch_time_ms)
 }
+
 /// Total wall-clock budget for the whole preassign dance (serve boot + POST).
-/// opencode's headless server boots in about 1.8s measured; 6s leaves slack on
-/// a loaded machine while keeping the opt-in launch stall bounded before we
-/// give up and let the poller take over.
+/// opencode's headless server boots in ~1.8s measured; 6s leaves slack on a
+/// loaded machine while keeping the opt-in launch stall bounded before we give
+/// up and let the poller take over.
 const OPENCODE_PREASSIGN_DEADLINE: Duration = Duration::from_secs(6);
 
 /// RAII guard that force-reaps an ephemeral `opencode serve` child, and its
@@ -2106,21 +1947,13 @@ pub(crate) fn opencode_poll_fn(
     instance_id: String,
     launch_time_ms: f64,
     extra_excludes: HashSet<String>,
-    host_environment: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
-        try_capture_opencode_session_id_in_environment(
-            &project_path,
-            &exclusion,
-            Some(launch_time_ms),
-            &host_environment,
-        )
-        .map_err(
-            |e| tracing::debug!(target: "session.capture", "OpenCode poll capture failed: {}", e),
-        )
-        .ok()
-        .and_then(validated_session_id)
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        try_capture_opencode_session_id(&project_path, &exclusion, Some(launch_time_ms))
+            .map_err(|e| tracing::debug!(target: "session.capture", "OpenCode poll capture failed: {}", e))
+            .ok()
+            .and_then(validated_session_id)
     }
 }
 
@@ -2133,7 +1966,7 @@ pub(crate) fn opencode_poll_fn_sandboxed(
     extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
         try_capture_opencode_session_id_in_container(
             &container_name,
             &container_cwd,
@@ -2175,20 +2008,7 @@ pub(crate) fn capture_codex_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
 ) -> Result<String> {
-    capture_codex_session_id_in_environment(project_path, exclusion, &[])
-}
-
-fn capture_codex_session_id_in_environment(
-    project_path: &str,
-    exclusion: &HashSet<String>,
-    host_environment: &[String],
-) -> Result<String> {
-    let codex_home = resolve_agent_home_for_host_environment(
-        project_path,
-        host_environment,
-        Some("CODEX_HOME"),
-        ".codex",
-    )?;
+    let codex_home = resolve_agent_home(Some("CODEX_HOME"), ".codex")?;
     let sessions_dir = codex_home.join("sessions");
 
     if !sessions_dir.exists() {
@@ -2383,11 +2203,10 @@ pub(crate) fn codex_poll_fn(
     project_path: String,
     instance_id: String,
     extra_excludes: HashSet<String>,
-    host_environment: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
-        capture_codex_session_id_in_environment(&project_path, &exclusion, &host_environment)
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        capture_codex_session_id(&project_path, &exclusion)
             .map_err(
                 |e| tracing::debug!(target: "session.capture", "Codex poll capture failed: {}", e),
             )
@@ -2404,7 +2223,7 @@ pub(crate) fn codex_poll_fn_sandboxed(
     extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
         try_capture_codex_session_id_in_container(&container_name, &container_cwd, &exclusion)
             .map_err(|e| tracing::debug!(target: "session.capture", "Codex container poll capture failed: {}", e))
             .ok()
@@ -2419,11 +2238,10 @@ pub(crate) fn gemini_poll_fn(
     project_path: String,
     instance_id: String,
     extra_excludes: HashSet<String>,
-    host_environment: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
-        capture_gemini_session_id_in_environment(&project_path, &exclusion, &host_environment)
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        capture_gemini_session_id(&project_path, &exclusion)
             .map_err(
                 |e| tracing::debug!(target: "session.capture", "Gemini poll capture failed: {}", e),
             )
@@ -2533,7 +2351,7 @@ pub(crate) fn gemini_poll_fn_sandboxed(
     extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
         try_capture_gemini_session_id_in_container(&container_name, &container_cwd, &exclusion)
             .map_err(|e| tracing::debug!(target: "session.capture", "Gemini container poll capture failed: {}", e))
             .ok()
@@ -2550,22 +2368,9 @@ pub(crate) fn capture_gemini_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
 ) -> Result<String> {
-    capture_gemini_session_id_in_environment(project_path, exclusion, &[])
-}
-
-fn capture_gemini_session_id_in_environment(
-    project_path: &str,
-    exclusion: &HashSet<String>,
-    host_environment: &[String],
-) -> Result<String> {
     use sha2::{Digest, Sha256};
 
-    let gemini_home = resolve_agent_home_for_host_environment(
-        project_path,
-        host_environment,
-        Some("GEMINI_CLI_HOME"),
-        ".gemini",
-    )?;
+    let gemini_home = resolve_agent_home(Some("GEMINI_CLI_HOME"), ".gemini")?;
     let tmp_dir = gemini_home.join("tmp");
 
     if !tmp_dir.exists() {
@@ -2717,17 +2522,8 @@ fn extract_gemini_fields(path: &std::path::Path) -> Option<(Option<String>, Opti
 /// under its config dir (`$COPILOT_CONFIG_DIR`, default `~/.copilot`). Each row
 /// carries the session UUID (`id`), the working directory (`cwd`), and an RFC
 /// 3339 `updated_at` timestamp.
-fn copilot_db_path_in_environment(
-    project_path: &str,
-    host_environment: &[String],
-) -> Result<PathBuf> {
-    Ok(resolve_agent_home_for_host_environment(
-        project_path,
-        host_environment,
-        Some("COPILOT_CONFIG_DIR"),
-        ".copilot",
-    )?
-    .join("session-store.db"))
+fn copilot_db_path() -> Result<PathBuf> {
+    Ok(resolve_agent_home(Some("COPILOT_CONFIG_DIR"), ".copilot")?.join("session-store.db"))
 }
 
 /// Load Copilot's session rows from its SQLite store at `db_path`, newest
@@ -2803,15 +2599,7 @@ pub(crate) fn capture_copilot_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
 ) -> Result<String> {
-    capture_copilot_session_id_in_environment(project_path, exclusion, &[])
-}
-
-fn capture_copilot_session_id_in_environment(
-    project_path: &str,
-    exclusion: &HashSet<String>,
-    host_environment: &[String],
-) -> Result<String> {
-    let db_path = copilot_db_path_in_environment(project_path, host_environment)?;
+    let db_path = copilot_db_path()?;
     let entries = read_copilot_sessions_from_sqlite_at(&db_path)?;
     select_copilot_session(&entries, project_path, exclusion)
 }
@@ -2821,18 +2609,15 @@ pub(crate) fn copilot_poll_fn(
     project_path: String,
     instance_id: String,
     extra_excludes: HashSet<String>,
-    host_environment: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
-        capture_copilot_session_id_in_environment(
-            &project_path,
-            &exclusion,
-            &host_environment,
-        )
-        .map_err(|e| tracing::debug!(target: "session.capture", "Copilot poll capture failed: {}", e))
-        .ok()
-        .and_then(validated_session_id)
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        capture_copilot_session_id(&project_path, &exclusion)
+            .map_err(
+                |e| tracing::debug!(target: "session.capture", "Copilot poll capture failed: {}", e),
+            )
+            .ok()
+            .and_then(validated_session_id)
     }
 }
 
@@ -2968,7 +2753,7 @@ pub(crate) fn capture_kimi_session_id(
     launch_time_ms: Option<f64>,
     environment: &[String],
 ) -> Result<String> {
-    let home = kimi_home_for_environment(project_path, environment)
+    let home = kimi_home_for_environment(environment)
         .ok_or_else(|| anyhow::anyhow!("could not resolve the Kimi home"))?;
     let sessions = read_kimi_session_index(&home.join("session_index.jsonl"))?;
     select_kimi_session(&sessions, project_path, exclusion, launch_time_ms)
@@ -2986,7 +2771,7 @@ pub(crate) fn kimi_poll_fn(
     environment: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
         capture_kimi_session_id(
             &project_path,
             &exclusion,
@@ -3125,57 +2910,35 @@ fn select_prime_agent_session(
 /// `PRIME_AGENT_CODING_AGENT_SESSION_DIR`, then `<coding agent
 /// home>/sessions`. The `--session-dir` flag and `settings.json.sessionDir`
 /// are invisible to this host-side scan (they are tracked separately).
-fn prime_agent_sessions_dir_in_environment(
-    coding_agent_home: &Path,
-    host_environment: &[String],
-) -> PathBuf {
+fn prime_agent_sessions_dir(coding_agent_home: &Path) -> PathBuf {
     for var in [
         "PRIME_AGENT_SESSION_DIR",
         "PRIME_AGENT_CODING_AGENT_SESSION_DIR",
     ] {
-        let dir =
-            crate::session::environment::resolve_host_environment_value(host_environment, var)
-                .or_else(|| std::env::var(var).ok())
-                .filter(|dir| !dir.is_empty());
-        if let Some(dir) = dir {
+        if let Ok(dir) = std::env::var(var) {
             return PathBuf::from(dir);
         }
     }
     coding_agent_home.join("sessions")
 }
-/// Capture a Prime Agent session ID for project_path.
+
+/// Capture a Prime Agent session ID for `project_path`.
 ///
 /// Reads the first line of every JSONL file in Prime Agent's resolved
-/// session directory (PRIME_AGENT_SESSION_DIR, then the legacy alias,
-/// else the sessions directory below the coding agent home) and returns
-/// the id of the newest session whose header cwd matches project_path,
-/// skipping any ids in exclusion. launch_time_ms gates live polling to
-/// sessions touched after this run started (None for retroactive recovery).
-/// Prime Agent resumes the returned id with prime-agent --resume <id>.
+/// session directory (`PRIME_AGENT_SESSION_DIR`, then the legacy alias,
+/// else `<home>/sessions` where the home resolves from
+/// `PRIME_AGENT_CODING_AGENT_DIR`, default `~/.prime/agent`) and returns
+/// the id of the newest session whose header `cwd` matches `project_path`,
+/// skipping any ids in `exclusion`. `launch_time_ms` gates live polling to
+/// sessions touched after this run started (`None` for retroactive recovery).
+/// Prime Agent resumes the returned id with `prime-agent --resume <id>`.
 pub(crate) fn capture_prime_agent_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
     launch_time_ms: Option<f64>,
 ) -> Result<String> {
-    capture_prime_agent_session_id_in_environment(project_path, exclusion, launch_time_ms, &[])
-}
-
-fn capture_prime_agent_session_id_in_environment(
-    project_path: &str,
-    exclusion: &HashSet<String>,
-    launch_time_ms: Option<f64>,
-    host_environment: &[String],
-) -> Result<String> {
-    let home = resolve_agent_home_for_host_environment(
-        project_path,
-        host_environment,
-        Some("PRIME_AGENT_CODING_AGENT_DIR"),
-        ".prime/agent",
-    )?;
-    let sessions = scan_prime_agent_sessions(&prime_agent_sessions_dir_in_environment(
-        &home,
-        host_environment,
-    ));
+    let home = resolve_agent_home(Some("PRIME_AGENT_CODING_AGENT_DIR"), ".prime/agent")?;
+    let sessions = scan_prime_agent_sessions(&prime_agent_sessions_dir(&home));
     select_prime_agent_session(sessions, project_path, exclusion, launch_time_ms)
 }
 
@@ -3187,35 +2950,30 @@ pub(crate) fn prime_agent_poll_fn(
     instance_id: String,
     launch_time_ms: f64,
     extra_excludes: HashSet<String>,
-    host_environment: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
-        capture_prime_agent_session_id_in_environment(
-            &project_path,
-            &exclusion,
-            Some(launch_time_ms),
-            &host_environment,
-        )
-        .map_err(|e| tracing::debug!(target: "session.capture", "Prime Agent poll capture failed: {}", e))
-        .ok()
-        .and_then(validated_session_id)
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        capture_prime_agent_session_id(&project_path, &exclusion, Some(launch_time_ms))
+            .map_err(|e| {
+                tracing::debug!(target: "session.capture", "Prime Agent poll capture failed: {}", e)
+            })
+            .ok()
+            .and_then(validated_session_id)
     }
 }
+
 /// Effective Kimi home for one environment list: `KIMI_CODE_HOME` resolved
 /// through the same `$VAR` / bare-key grammar launch applies
 /// ([`crate::session::environment::resolve_host_environment_value`]), else the
-/// ambient default resolution. An explicit empty override or missing default
-/// returns `None`; the sharing predicate fails closed on either.
-fn kimi_home_for_environment(project_path: &str, environment: &[String]) -> Option<PathBuf> {
-    resolve_agent_home_for_host_environment(
-        project_path,
-        environment,
-        Some("KIMI_CODE_HOME"),
-        ".kimi-code",
-    )
-    .ok()
-    .filter(|home| !home.as_os_str().is_empty())
+/// ambient default resolution. An empty resolved value counts as unset; `None`
+/// when even the default cannot be resolved (the sharing predicate fails
+/// closed on `None`).
+fn kimi_home_for_environment(environment: &[String]) -> Option<PathBuf> {
+    crate::session::environment::resolve_host_environment_value(environment, "KIMI_CODE_HOME")
+        .map(PathBuf::from)
+        .filter(|home| !home.as_os_str().is_empty())
+        .or_else(|| resolve_agent_home(Some("KIMI_CODE_HOME"), ".kimi-code").ok())
+        .filter(|home| !home.as_os_str().is_empty())
 }
 
 /// Whether another persisted host AoE session shares this one's Kimi store: a
@@ -3252,7 +3010,7 @@ pub(crate) fn kimi_store_is_shared(
     let canonical_current = canonicalize_or_raw(current_project_path);
     let own_homes = [own_resolved_environment, own_profile_environment]
         .iter()
-        .filter_map(|env| kimi_home_for_environment(current_project_path, env))
+        .filter_map(|env| kimi_home_for_environment(env))
         .map(|home| canonicalize_or_raw(home.to_string_lossy().as_ref()))
         .collect::<Vec<_>>();
     if own_homes.is_empty() {
@@ -3262,9 +3020,21 @@ pub(crate) fn kimi_store_is_shared(
         return true;
     };
     for peer_profile in profiles {
+        // Judge the namespace before paying for the store read: a peer whose
+        // resolved home differs cannot share this store however many rows its
+        // sessions.json holds. A successful resolve idempotently reinstalls
+        // that profile's status rules; a failed resolve returns shared without
+        // installing fallback rules or clearing the prior registry state.
         let Ok(peer_config) = super::profile_config::resolve_config(&peer_profile) else {
             return true;
         };
+        let Some(peer_home) = kimi_home_for_environment(&peer_config.environment) else {
+            return true;
+        };
+        let peer_home = canonicalize_or_raw(peer_home.to_string_lossy().as_ref());
+        if !own_homes.contains(&peer_home) {
+            continue;
+        }
         let Ok(storage) = crate::session::storage::Storage::new_unwatched(&peer_profile) else {
             return true;
         };
@@ -3281,16 +3051,10 @@ pub(crate) fn kimi_store_is_shared(
                     .get("kimi")
                     .and_then(|prior| prior.agent_session_id.as_deref())
                     .is_some_and(|sid| !sid.is_empty());
-            if !owns_kimi || canonicalize_or_raw(&inst.project_path) != canonical_current {
+            if !owns_kimi {
                 continue;
             }
-            let Some(peer_home) =
-                kimi_home_for_environment(&inst.project_path, &peer_config.environment)
-            else {
-                return true;
-            };
-            let peer_home = canonicalize_or_raw(peer_home.to_string_lossy().as_ref());
-            if own_homes.contains(&peer_home) {
+            if canonicalize_or_raw(&inst.project_path) == canonical_current {
                 return true;
             }
         }
@@ -3506,20 +3270,7 @@ pub(crate) fn capture_hermes_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
 ) -> Result<String> {
-    capture_hermes_session_id_in_environment(project_path, exclusion, &[])
-}
-
-fn capture_hermes_session_id_in_environment(
-    project_path: &str,
-    exclusion: &HashSet<String>,
-    host_environment: &[String],
-) -> Result<String> {
-    let hermes_home = resolve_agent_home_for_host_environment(
-        project_path,
-        host_environment,
-        Some("HERMES_HOME"),
-        ".hermes",
-    )?;
+    let hermes_home = resolve_agent_home(Some("HERMES_HOME"), ".hermes")?;
     let db_path = hermes_home.join("state.db");
 
     let scan = read_hermes_sessions_from_sqlite(&db_path)?;
@@ -3642,11 +3393,10 @@ pub(crate) fn hermes_poll_fn(
     project_path: String,
     instance_id: String,
     extra_excludes: HashSet<String>,
-    host_environment: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
-        capture_hermes_session_id_in_environment(&project_path, &exclusion, &host_environment)
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        capture_hermes_session_id(&project_path, &exclusion)
             .map_err(
                 |e| tracing::debug!(target: "session.capture", "Hermes poll capture failed: {}", e),
             )
@@ -3663,7 +3413,7 @@ pub(crate) fn hermes_poll_fn_sandboxed(
     extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
         try_capture_hermes_session_id_in_container(&container_name, &container_cwd, &exclusion)
             .map_err(|e| tracing::debug!(target: "session.capture", "Hermes container poll capture failed: {}", e))
             .ok()
@@ -4975,7 +4725,6 @@ mod tests {
             project_dir.to_string_lossy().into_owned(),
             "test-instance".to_string(),
             extra,
-            Vec::new(),
         );
         assert_eq!(
             poll(),
@@ -4987,7 +4736,6 @@ mod tests {
             project_dir.to_string_lossy().into_owned(),
             "test-instance".to_string(),
             HashSet::new(),
-            Vec::new(),
         );
         assert_eq!(
             poll_no_excludes(),
@@ -5213,14 +4961,16 @@ mod tests {
     }
 
     #[test]
-    fn live_exclusion_distinguishes_empty_from_unreachable() {
-        let unavailable = crate::tmux::LiveSessionSnapshot::from_parts(None, None);
-        assert!(build_exclusion_set("instance", None, &unavailable).is_err());
-
-        let empty = crate::tmux::LiveSessionSnapshot::from_parts(Some(Vec::new()), None);
-        assert!(build_exclusion_set("instance", None, &empty)
-            .unwrap()
-            .is_empty());
+    fn test_build_exclusion_set_empty() {
+        let result = build_exclusion_set(
+            "nonexistent-instance-id-12345",
+            &crate::tmux::LiveSessionSnapshot::new(),
+        );
+        // The exclusion set should never contain our own instance ID
+        // (it collects OTHER instances' captured session IDs).
+        // On a machine with active AoE tmux sessions, the set may be
+        // non-empty, so we verify our own ID isn't self-excluded.
+        assert!(!result.contains("nonexistent-instance-id-12345"));
     }
 
     #[test]
@@ -6449,12 +6199,7 @@ mod tests {
             true,
         );
 
-        let poll = hermes_poll_fn(
-            project_str,
-            "test-instance".to_string(),
-            HashSet::new(),
-            Vec::new(),
-        );
+        let poll = hermes_poll_fn(project_str, "test-instance".to_string(), HashSet::new());
         assert_eq!(poll(), Some("20260429_193246_aaa".to_string()));
     }
 
@@ -6479,7 +6224,6 @@ mod tests {
             "/tmp/hermes-proj".to_string(),
             "test-instance".to_string(),
             HashSet::new(),
-            Vec::new(),
         );
         assert_eq!(poll(), None);
     }
@@ -6710,15 +6454,11 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_kimi_home_resolves_environment_from_project() {
+    fn test_kimi_home_rejects_empty_ambient_fallback() {
         let _env = EnvGuard::set(&[("KIMI_CODE_HOME", "")]);
         assert!(
-            kimi_home_for_environment("/tmp/project", &[]).is_none(),
+            kimi_home_for_environment(&[]).is_none(),
             "an explicitly empty ambient home must not become a relative store path"
-        );
-        assert_eq!(
-            kimi_home_for_environment("/tmp/project", &["KIMI_CODE_HOME=.kimi".to_string()],),
-            Some(PathBuf::from("/tmp/project/.kimi"))
         );
     }
 

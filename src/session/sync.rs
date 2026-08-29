@@ -52,611 +52,13 @@ impl SessionIdSyncOutcome {
     }
 }
 
-type TmuxEnvSet = (String, String, String);
-type TmuxEnvUnset = (String, String);
-
-fn tmux_session_id_env_updates<'a>(
-    instances: impl IntoIterator<Item = &'a Instance>,
-    mut session_names: impl FnMut(&Instance) -> Vec<String>,
-) -> (Vec<TmuxEnvSet>, Vec<TmuxEnvUnset>) {
-    let mut set_batch = Vec::new();
-    let mut unset_batch = Vec::new();
-    for instance in instances {
-        let ownership = instance
-            .operational_agent_session_id()
-            .zip(instance.operational_agent_session_store_namespace());
-        for tmux_name in session_names(instance) {
-            match ownership.as_ref() {
-                Some((sid, namespace)) => {
-                    set_batch.push((
-                        tmux_name.clone(),
-                        crate::tmux::env::AOE_INSTANCE_ID_KEY.to_string(),
-                        instance.id.clone(),
-                    ));
-                    set_batch.push((
-                        tmux_name.clone(),
-                        crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
-                        (*sid).to_string(),
-                    ));
-                    set_batch.push((
-                        tmux_name,
-                        crate::tmux::env::AOE_SESSION_STORE_NAMESPACE_KEY.to_string(),
-                        namespace.clone(),
-                    ));
-                }
-                None => unset_batch.push((
-                    tmux_name,
-                    crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
-                )),
-            }
-        }
-    }
-    (set_batch, unset_batch)
-}
-
-fn live_tmux_names_for_instance(
-    instance: &Instance,
-    live: &crate::tmux::LiveSessionSnapshot,
-    observations: &[TmuxOwnershipObservation],
-    allow_ownerless_fallback: bool,
-) -> Vec<String> {
-    let mut targets: Vec<String> = observations
-        .iter()
-        .filter(|(name, owner, _)| {
-            owner.as_deref() == Some(instance.id.as_str()) && !live.pane_dead(name)
-        })
-        .map(|(name, _, _)| name.clone())
-        .collect();
-    if !allow_ownerless_fallback {
-        return targets;
-    }
-
-    if let Some(candidates) = crate::tmux::live_any_kind_names_for_id_in(live, &instance.id) {
-        let mut ownerless = None;
-        let mut ambiguous = false;
-        for candidate in candidates {
-            match observations.iter().find(|(name, _, _)| name == &candidate) {
-                Some((_, Some(owner), _)) if owner == &instance.id => {}
-                Some((_, None, _)) if ownerless.is_none() => ownerless = Some(candidate),
-                _ => {
-                    ambiguous = true;
-                    break;
-                }
-            }
-        }
-        if !ambiguous {
-            if let Some(candidate) = ownerless {
-                targets.push(candidate);
-            }
-        }
-    }
-    targets.sort();
-    targets.dedup();
-    targets
-}
-
-fn tmux_session_id_env_names(
-    instance: &Instance,
-    live: &crate::tmux::LiveSessionSnapshot,
-    observations: &[TmuxOwnershipObservation],
-    allow_ownerless_fallback: bool,
-) -> Vec<String> {
-    if instance.operational_agent_session_id().is_none() {
-        return Vec::new();
-    }
-    live_tmux_names_for_instance(instance, live, observations, allow_ownerless_fallback)
-}
-
-fn partition_unambiguous_instances(instances: &[Instance]) -> (Vec<&Instance>, HashSet<&str>) {
-    let mut id_counts: HashMap<&str, usize> = HashMap::new();
-    let mut sid_owners: HashMap<(String, String), &str> = HashMap::new();
-    let mut ambiguous_sid_owners = HashSet::new();
-    for instance in instances {
-        let id = instance.id.as_str();
-        *id_counts.entry(id).or_default() += 1;
-        if instance.operational_agent_session_id().is_some()
-            && instance
-                .operational_agent_session_store_namespace()
-                .is_none()
-        {
-            ambiguous_sid_owners.insert(id);
-        }
-        for (sid, namespace) in instance.reserved_agent_session_ownerships() {
-            if let Some(previous) = sid_owners.insert((namespace, sid.to_string()), id) {
-                if previous != id {
-                    ambiguous_sid_owners.insert(previous);
-                    ambiguous_sid_owners.insert(id);
-                }
-            }
-        }
-    }
-    let mut ambiguous_ids: HashSet<&str> = id_counts
-        .iter()
-        .filter_map(|(id, count)| (*count > 1).then_some(*id))
-        .collect();
-    ambiguous_ids.extend(ambiguous_sid_owners);
-    let trusted = instances
-        .iter()
-        .filter(|instance| !ambiguous_ids.contains(instance.id.as_str()))
-        .collect();
-    (trusted, ambiguous_ids)
-}
-
-type TmuxOwnershipObservation = (String, Option<String>, Option<String>);
-
-fn tmux_id_suffix(id: &str) -> &str {
-    id.get(..8).unwrap_or(id)
-}
-
-fn ambiguous_tmux_id_suffixes(instances: &[Instance]) -> HashSet<&str> {
-    let mut counts: HashMap<&str, usize> = HashMap::new();
-    for instance in instances {
-        *counts.entry(tmux_id_suffix(&instance.id)).or_default() += 1;
-    }
-    counts
-        .into_iter()
-        .filter_map(|(suffix, count)| (count > 1).then_some(suffix))
-        .collect()
-}
-
-#[derive(Debug, Default, PartialEq, Eq)]
-pub(crate) struct ClearedTmuxOwnership {
-    entries: Vec<(String, String)>,
-}
-
-pub(crate) fn with_tmux_ownership_lock<T>(
-    operation: impl FnOnce() -> anyhow::Result<T>,
-) -> anyhow::Result<T> {
-    let _lock = crate::session::storage::acquire_tmux_ownership_lock()?;
-    operation()
-}
-
-fn read_tmux_ownership_observations(
-    names: &[String],
-) -> anyhow::Result<Vec<TmuxOwnershipObservation>> {
-    let names: Vec<&str> = names
-        .iter()
-        .filter(|name| crate::tmux::is_aoe_session(name))
-        .map(String::as_str)
-        .collect();
-    let rows = crate::tmux::env::get_hidden_env_keys_batch_strict(
-        &names,
-        &[
-            crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
-            crate::tmux::env::AOE_INSTANCE_ID_KEY,
-        ],
-    )?;
-    Ok(rows
-        .into_iter()
-        .map(|(name, values)| {
-            let mut values = values.into_iter();
-            let captured = values.next().flatten();
-            let owner = values.next().flatten();
-            (name, owner, captured)
-        })
-        .collect())
-}
-
-fn stale_tmux_ownership_targets<'a>(
-    trusted_instances: impl IntoIterator<Item = &'a Instance>,
-    observations: impl IntoIterator<Item = TmuxOwnershipObservation>,
-) -> Vec<String> {
-    let operational: HashSet<(&str, &str)> = trusted_instances
-        .into_iter()
-        .filter_map(|instance| {
-            instance
-                .operational_agent_session_id()
-                .map(|sid| (instance.id.as_str(), sid))
-        })
-        .collect();
-    observations
-        .into_iter()
-        .filter_map(|(session, owner, captured)| {
-            let captured = captured?;
-            let valid = owner
-                .as_deref()
-                .is_some_and(|owner| operational.contains(&(owner, captured.as_str())));
-            (!valid).then_some(session)
-        })
-        .collect()
-}
-
-fn cleared_tmux_ownership(
-    instances: &[Instance],
-    targets: &[String],
-    observations: &[TmuxOwnershipObservation],
-) -> ClearedTmuxOwnership {
-    let target_set: HashSet<&str> = targets.iter().map(String::as_str).collect();
-    let (trusted, _) = partition_unambiguous_instances(instances);
-    let operational_ids: HashSet<&str> = trusted
-        .into_iter()
-        .filter(|instance| instance.operational_agent_session_id().is_some())
-        .map(|instance| instance.id.as_str())
-        .collect();
-    let entries = observations
-        .iter()
-        .filter_map(|(session, owner, captured)| {
-            let owner = owner.as_deref()?;
-            let captured = captured.as_ref()?;
-            (target_set.contains(session.as_str()) && operational_ids.contains(owner))
-                .then(|| (session.clone(), captured.clone()))
-        })
-        .collect();
-    ClearedTmuxOwnership { entries }
-}
-
-fn remove_tmux_session_id_ownership(
-    instances: &[Instance],
-    targets: &[String],
-    observations: &[TmuxOwnershipObservation],
-) -> anyhow::Result<ClearedTmuxOwnership> {
-    let cleared = cleared_tmux_ownership(instances, targets, observations);
-    let refs: Vec<(&str, &str)> = targets
-        .iter()
-        .map(|session| {
-            (
-                session.as_str(),
-                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
-            )
-        })
-        .collect();
-    if let Err(error) = crate::tmux::env::remove_hidden_env_batch(&refs) {
-        if let Err(repair_error) = restore_tmux_session_id_ownership_locked(&cleared) {
-            anyhow::bail!("{error}; ownership repair failed: {repair_error}");
-        }
-        return Err(error);
-    }
-    Ok(cleared)
-}
-
-fn clear_unsupported_tmux_session_ids_locked(instances: &[Instance]) -> anyhow::Result<()> {
-    let unsupported: Vec<&Instance> = instances
-        .iter()
-        .filter(|instance| !instance.supports_terminal_resume())
-        .collect();
-    if unsupported.is_empty() {
-        return Ok(());
-    }
-
-    let names = crate::tmux::session_names_strict()?;
-    let live = crate::tmux::LiveSessionSnapshot::from_names(names.clone());
-    let observations = read_tmux_ownership_observations(&names)?;
-    let captured_names: HashSet<&str> = observations
-        .iter()
-        .filter_map(|(name, _, captured)| captured.as_ref().map(|_| name.as_str()))
-        .collect();
-    let ambiguous_suffixes = ambiguous_tmux_id_suffixes(instances);
-    let mut targets: Vec<String> = unsupported
-        .into_iter()
-        .flat_map(|instance| {
-            live_tmux_names_for_instance(
-                instance,
-                &live,
-                &observations,
-                !ambiguous_suffixes.contains(tmux_id_suffix(&instance.id)),
-            )
-        })
-        .filter(|name| captured_names.contains(name.as_str()))
-        .collect();
-    targets.sort();
-    targets.dedup();
-    remove_tmux_session_id_ownership(instances, &targets, &observations)?;
-    Ok(())
-}
-fn clear_all_tmux_session_ids_locked(instances: &[Instance]) -> anyhow::Result<()> {
-    let names = crate::tmux::session_names_strict()?;
-    let observations = read_tmux_ownership_observations(&names)?;
-    let targets: Vec<String> = observations
-        .iter()
-        .filter_map(|(name, _, captured)| captured.as_ref().map(|_| name.clone()))
-        .collect();
-    remove_tmux_session_id_ownership(instances, &targets, &observations)?;
-    Ok(())
-}
-fn reconcile_tmux_session_id_ownership_env_locked(
-    instances: &[Instance],
-) -> anyhow::Result<ClearedTmuxOwnership> {
-    let names = crate::tmux::session_names_strict()?;
-    let live = crate::tmux::LiveSessionSnapshot::from_names(names.clone());
-    let observations = read_tmux_ownership_observations(&names)?;
-    let (trusted, _) = partition_unambiguous_instances(instances);
-    let ambiguous_suffixes = ambiguous_tmux_id_suffixes(instances);
-    let (set_batch, unset_batch) =
-        tmux_session_id_env_updates(trusted.iter().copied(), |instance| {
-            tmux_session_id_env_names(
-                instance,
-                &live,
-                &observations,
-                !ambiguous_suffixes.contains(tmux_id_suffix(&instance.id)),
-            )
-        });
-    let desired: HashSet<&str> = set_batch
-        .iter()
-        .filter(|(_, key, _)| key == crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY)
-        .map(|(session, _, _)| session.as_str())
-        .collect();
-    let mut targets =
-        stale_tmux_ownership_targets(trusted.iter().copied(), observations.iter().cloned());
-    targets.retain(|session| !desired.contains(session.as_str()));
-    targets.extend(unset_batch.iter().map(|(session, _)| session.clone()));
-    targets.sort();
-    targets.dedup();
-
-    let cleared = remove_tmux_session_id_ownership(instances, &targets, &observations)?;
-    let refs: Vec<(&str, &str, &str)> = set_batch
-        .iter()
-        .map(|(session, key, value)| (session.as_str(), key.as_str(), value.as_str()))
-        .collect();
-    if let Err(error) = crate::tmux::env::set_hidden_env_batch(&refs) {
-        if let Err(repair_error) = restore_tmux_session_id_ownership_locked(&cleared) {
-            anyhow::bail!("{error}; ownership repair failed: {repair_error}");
-        }
-        return Err(error);
-    }
-    Ok(cleared)
-}
-
-/// Reconcile durable session IDs across extant tmux sessions.
-pub(crate) fn sync_tmux_session_id_env<'a>(
-    _instances: impl IntoIterator<Item = &'a Instance>,
-    _live: &crate::tmux::LiveSessionSnapshot,
-) -> anyhow::Result<()> {
-    reconcile_all_profiles_tmux_session_id_ownership_env()
-}
-
-fn owned_tmux_ownership_targets(
-    instance_ids: &HashSet<&str>,
-    observations: impl IntoIterator<Item = TmuxOwnershipObservation>,
-) -> Vec<String> {
-    observations
-        .into_iter()
-        .filter_map(|(session, owner, captured)| {
-            (captured.is_some()
-                && owner
-                    .as_deref()
-                    .is_some_and(|owner| instance_ids.contains(owner)))
-            .then_some(session)
-        })
-        .collect()
-}
-
-/// Refuse destructive metadata removal while any target agent pane is live.
-pub(crate) fn ensure_instances_quiescent(
-    instances: &[Instance],
-    action: &str,
-) -> anyhow::Result<()> {
-    let names = crate::tmux::session_names_strict()?;
-    let live = crate::tmux::LiveSessionSnapshot::from_names(names.clone());
-    let observations = read_tmux_ownership_observations(&names)?;
-    for instance in instances {
-        let stamped_live = observations
-            .iter()
-            .any(|(_, owner, _)| owner.as_deref() == Some(instance.id.as_str()));
-        let legacy_live = crate::tmux::live_any_kind_names_for_id_in(&live, &instance.id)
-            .into_iter()
-            .flatten()
-            .any(|candidate| {
-                observations
-                    .iter()
-                    .find(|(name, _, _)| name == &candidate)
-                    .is_none_or(|(_, owner, _)| owner.is_none())
-            });
-        if stamped_live || legacy_live {
-            anyhow::bail!(
-                "Cannot {action}: session '{}' still has a live tmux pane",
-                instance.id
-            );
-        }
-    }
-    Ok(())
-}
-
-/// Remove ownership for rows immediately before deleting them.
-pub(crate) fn clear_tmux_session_id_ownership_for_instances_locked(
-    instances: &[Instance],
-) -> anyhow::Result<ClearedTmuxOwnership> {
-    let names = crate::tmux::session_names_strict()?;
-    let observations = read_tmux_ownership_observations(&names)?;
-    let instance_ids: HashSet<&str> = instances
-        .iter()
-        .map(|instance| instance.id.as_str())
-        .collect();
-    let targets = owned_tmux_ownership_targets(&instance_ids, observations.iter().cloned());
-    remove_tmux_session_id_ownership(instances, &targets, &observations)
-}
-
-pub(crate) fn restore_tmux_session_id_ownership_locked(
-    cleared: &ClearedTmuxOwnership,
-) -> anyhow::Result<()> {
-    let refs: Vec<(&str, &str, &str)> = cleared
-        .entries
-        .iter()
-        .map(|(session, value)| {
-            (
-                session.as_str(),
-                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
-                value.as_str(),
-            )
-        })
-        .collect();
-    crate::tmux::env::set_hidden_env_batch(&refs)
-}
-pub(crate) fn load_profile_instances_excluding(
-    excluded: Option<&str>,
-) -> anyhow::Result<Vec<Instance>> {
-    load_profile_instances_excluding_with_policy(excluded, false)
-}
-
-fn load_profile_instances_excluding_with_policy(
-    excluded: Option<&str>,
-    tolerate_corrupt_profiles: bool,
-) -> anyhow::Result<Vec<Instance>> {
-    let excluded_identity = excluded
-        .map(|profile| {
-            let storage = Storage::open_unwatched(profile)
-                .map_err(|error| anyhow::anyhow!("open profile {profile}: {error}"))?;
-            let directory = storage.sessions_path().parent().ok_or_else(|| {
-                anyhow::anyhow!(
-                    "sessions path has no profile directory: {}",
-                    storage.sessions_path().display()
-                )
-            })?;
-            directory
-                .canonicalize()
-                .map_err(|error| anyhow::anyhow!("resolve profile {profile}: {error}"))
-        })
-        .transpose()?;
-
-    let mut instances = Vec::new();
-    let mut visited = HashSet::new();
-    for profile in crate::session::list_profiles()? {
-        let storage = Storage::open_unwatched(&profile)
-            .map_err(|error| anyhow::anyhow!("open profile {profile}: {error}"))?;
-        let directory = storage.sessions_path().parent().ok_or_else(|| {
-            anyhow::anyhow!(
-                "sessions path has no profile directory: {}",
-                storage.sessions_path().display()
-            )
-        })?;
-        let identity = directory
-            .canonicalize()
-            .map_err(|error| anyhow::anyhow!("resolve profile {profile}: {error}"))?;
-        if !visited.insert(identity.clone()) {
-            continue;
-        }
-        if excluded_identity.as_ref() == Some(&identity) {
-            continue;
-        }
-        let load_result = if tolerate_corrupt_profiles {
-            storage.load_ownership_for_capture()
-        } else {
-            storage.load_ownership_strict()
-        };
-        let mut rows = match load_result {
-            Ok(rows) => rows,
-            Err(error) if tolerate_corrupt_profiles => {
-                tracing::warn!(
-                    profile = %profile,
-                    error = %error,
-                    "skipping corrupt foreign ownership profile during capture"
-                );
-                continue;
-            }
-            Err(error) => return Err(anyhow::anyhow!("load profile {profile}: {error}")),
-        };
-        instances.append(&mut rows);
-    }
-    Ok(instances)
-}
-pub(crate) fn instance_ids_excluding_profile(excluded: &str) -> anyhow::Result<HashSet<String>> {
-    Ok(load_profile_instances_excluding(Some(excluded))?
-        .into_iter()
-        .map(|instance| instance.id)
-        .collect())
-}
-
-/// Find a durable SID reservation outside `excluded` while the caller holds
-/// the app-global ownership lock. Strict loads make unreadable ownership state
-/// an error rather than licensing a cross-profile capture or launch.
-pub(crate) fn reserved_sid_holder_excluding_profile(
-    excluded: &str,
-    namespace: &str,
-    sid: &str,
-) -> anyhow::Result<Option<String>> {
-    Ok(load_profile_instances_excluding(Some(excluded))?
-        .into_iter()
-        .find(|instance| instance.reserves_agent_session_id_in_namespace(sid, namespace))
-        .map(|instance| instance.id))
-}
-
-/// Best-effort capture guard. A corrupt foreign profile must not disable
-/// capture for healthy sessions; launch and destructive paths keep using the
-/// strict variant above.
-#[cfg(test)]
-pub(crate) fn reserved_sid_holder_excluding_profile_for_capture(
-    excluded: &str,
-    namespace: &str,
-    sid: &str,
-) -> anyhow::Result<Option<String>> {
-    Ok(
-        load_profile_instances_excluding_with_policy(Some(excluded), true)?
-            .into_iter()
-            .find(|instance| instance.reserves_agent_session_id_in_namespace(sid, namespace))
-            .map(|instance| instance.id),
-    )
-}
-pub(crate) fn reconcile_all_profiles_tmux_session_id_ownership_env_locked(
-) -> anyhow::Result<ClearedTmuxOwnership> {
-    let cleanup_instances = load_profile_instances_excluding_with_policy(None, true)?;
-    clear_unsupported_tmux_session_ids_locked(&cleanup_instances)?;
-    let instances = match load_profile_instances_excluding(None) {
-        Ok(instances) => instances,
-        Err(error) => {
-            clear_all_tmux_session_ids_locked(&cleanup_instances).map_err(|cleanup_error| {
-                anyhow::anyhow!(
-                    "{error}; fail-closed tmux ownership cleanup failed: {cleanup_error}"
-                )
-            })?;
-            return Err(error);
-        }
-    };
-    reconcile_tmux_session_id_ownership_env_locked(&instances)
-}
-
-/// Strict ownership reconciliation across every profile.
-pub(crate) fn reconcile_all_profiles_tmux_session_id_ownership_env() -> anyhow::Result<()> {
-    with_tmux_ownership_lock(|| {
-        reconcile_all_profiles_tmux_session_id_ownership_env_locked()?;
-        Ok(())
-    })
-}
-
 struct Update {
     id: String,
     sid: String,
-    namespace: String,
-    tool: String,
-    lifecycle_generation: u64,
     expected_prior: Option<String>,
     profile: String,
     guard: SessionIdGuard,
     observation: SessionIdObservation,
-}
-
-fn poller_update_matches_instance(update: &Update, instance: &Instance) -> bool {
-    instance.tool == update.tool
-        && instance.lifecycle_generation == update.lifecycle_generation
-        && instance.terminal_session_store_namespace().as_deref() == Some(update.namespace.as_str())
-}
-
-fn claude_sidecar_session_id(instance: &Instance) -> Option<String> {
-    let detected = crate::tmux::status_rules::effective_detect_as(
-        &instance.source_profile,
-        &instance.tool,
-        &instance.detect_as,
-    );
-    let is_claude = crate::agents::get_agent(&instance.tool)
-        .or_else(|| crate::agents::get_agent(&detected))
-        .is_some_and(|agent| agent.name == "claude");
-    is_claude
-        .then(|| crate::hooks::read_hook_session_id(&instance.id))
-        .flatten()
-}
-
-fn register_authoritative_owner(
-    owners: &mut HashMap<(String, String), Option<String>>,
-    namespace: String,
-    sid: String,
-    instance_id: &str,
-) {
-    owners
-        .entry((namespace, sid))
-        .and_modify(|owner| {
-            if owner.as_deref() != Some(instance_id) {
-                *owner = None;
-            }
-        })
-        .or_insert_with(|| Some(instance_id.to_string()));
 }
 
 struct Rollback {
@@ -697,11 +99,11 @@ fn drain_and_persist_session_ids_inner(
     // streams (A reports B's id while B reports A's), a dynamic map would
     // accept or reject by slice iteration order. The snapshot rejects every
     // cross-claim deterministically (see #2708).
-    let mut sid_owners: HashMap<(String, String), String> = HashMap::with_capacity(instances.len());
+    let mut sid_owners: HashMap<String, String> = HashMap::with_capacity(instances.len());
     for inst in instances.iter() {
-        for (sid, namespace) in inst.reserved_agent_session_ownerships() {
+        if let Some(sid) = inst.agent_session_id.as_deref() {
             sid_owners
-                .entry((namespace, sid.to_string()))
+                .entry(sid.to_string())
                 .or_insert_with(|| inst.id.clone());
         }
     }
@@ -717,11 +119,6 @@ fn drain_and_persist_session_ids_inner(
         };
         // Unguarded and legacy filesystem scans from a stopped session can
         // belong to a peer sharing the cwd. A generation-typed OMP result is
-        let Some(namespace) = inst.terminal_session_store_namespace() else {
-            acknowledge_poller_observation(inst, &observation);
-            filtered_ids.insert(inst.id.clone());
-            continue;
-        };
         // bound to the exact old pane and must remain eligible for the
         // restart's post-join final flush.
         if matches!(inst.status, Status::Stopped)
@@ -758,7 +155,7 @@ fn drain_and_persist_session_ids_inner(
         }
         // Never adopt an id another instance already owns: that is the
         // same-cwd cross-assignment drift itself (#2708 symptom 1).
-        if let Some(owner) = sid_owners.get(&(namespace.clone(), sid.clone())) {
+        if let Some(owner) = sid_owners.get(sid.as_str()) {
             if owner != &inst.id {
                 tracing::warn!(
                     target: "session.sync",
@@ -790,93 +187,31 @@ fn drain_and_persist_session_ids_inner(
         updates.push(Update {
             id: inst.id.clone(),
             sid,
-            namespace,
-            tool: inst.tool.clone(),
-            lifecycle_generation: inst.lifecycle_generation,
             expected_prior: inst.agent_session_id.clone(),
             profile: inst.source_profile.clone(),
             guard: observation.guard.clone(),
             observation,
         });
     }
-    // Per-instance hook sidecars are authoritative; shared-store filesystem
-    // scans are heuristic. Read every live candidate, including instances
-    // without a queued update, so split daemon/TUI drains cannot let a
-    // heuristic claimant persist before the sidecar owner reports.
-    let mut authoritative_owners: HashMap<(String, String), Option<String>> = HashMap::new();
-    for instance in instances.iter() {
-        let Some(sid) = claude_sidecar_session_id(instance) else {
-            continue;
-        };
-        let Some(namespace) = instance.terminal_session_store_namespace() else {
-            continue;
-        };
-        register_authoritative_owner(&mut authoritative_owners, namespace, sid, &instance.id);
-    }
+
+    // Reject, don't arbitrate: if two same-cwd peers both claim the same
+    // currently-unowned sid in one tick (neither is in the frozen snapshot, so
+    // the collision guard passed both), picking a winner by iteration order is
+    // silent misassignment. Drop every claimant and defer; the next tick sees
+    // the real owner's anchor advance and the collision guard resolves it (#2708).
+    let mut sid_claim_counts: HashMap<String, usize> = HashMap::with_capacity(updates.len());
     for update in &updates {
-        if matches!(update.guard, SessionIdGuard::OmpGeneration(_)) {
-            register_authoritative_owner(
-                &mut authoritative_owners,
-                update.namespace.clone(),
-                update.sid.clone(),
-                &update.id,
-            );
-        }
+        *sid_claim_counts.entry(update.sid.clone()).or_insert(0) += 1;
     }
     updates.retain(|update| {
-        let key = (update.namespace.clone(), update.sid.clone());
-        match authoritative_owners.get(&key) {
-            Some(None) => {
-                tracing::warn!(
-                    target: "session.sync",
-                    instance = %update.id,
-                    sid = %update.sid,
-                    "Ignoring poller sid with ambiguous authoritative ownership",
-                );
-                acknowledge_poller_observation_for(instances, &update.id, &update.observation);
-                filtered_ids.insert(update.id.clone());
-                false
-            }
-            Some(Some(owner)) if owner != &update.id => {
-                tracing::warn!(
-                    target: "session.sync",
-                    instance = %update.id,
-                    sid = %update.sid,
-                    owner = %owner,
-                    "Ignoring heuristic poller sid claimed by an authoritative instance sidecar",
-                );
-                acknowledge_poller_observation_for(instances, &update.id, &update.observation);
-                filtered_ids.insert(update.id.clone());
-                false
-            }
-            _ => true,
-        }
-    });
-    // Multiple remaining heuristic claimants are ambiguous. Keep every sticky
-    // observation pending until an authoritative sidecar or generation claim
-    // identifies the owner; choosing by iteration order silently misassigns
-    // the conversation (#2708).
-    let mut sid_claim_counts: HashMap<(String, String), usize> =
-        HashMap::with_capacity(updates.len());
-    for update in &updates {
-        *sid_claim_counts
-            .entry((update.namespace.clone(), update.sid.clone()))
-            .or_insert(0) += 1;
-    }
-    updates.retain(|update| {
-        if sid_claim_counts
-            .get(&(update.namespace.clone(), update.sid.clone()))
-            .copied()
-            .unwrap_or(0)
-            > 1
-        {
+        if sid_claim_counts.get(&update.sid).copied().unwrap_or(0) > 1 {
             tracing::warn!(
                 target: "session.sync",
                 instance = %update.id,
                 sid = %update.sid,
                 "Ignoring poller-reported sid claimed by multiple instances this tick",
             );
-            request_poller_retry(instances, &update.id);
+            acknowledge_poller_observation_for(instances, &update.id, &update.observation);
             filtered_ids.insert(update.id.clone());
             false
         } else {
@@ -893,40 +228,30 @@ fn drain_and_persist_session_ids_inner(
 
     let mut capture_generations: Vec<(String, u64)> = Vec::with_capacity(updates.len());
     for update in &updates {
-        let ownership: anyhow::Result<_> = (|| {
-            let storage = Storage::new(&update.profile, file_watch.clone())?;
-            if lifecycle_already_locked {
-                let stored = storage.load_strict()?;
-                let Some(instance) = stored.iter().find(|instance| instance.id == update.id) else {
-                    anyhow::bail!("session disappeared before capture");
-                };
-                if !poller_update_matches_instance(update, instance) {
-                    anyhow::bail!("poller observation belongs to a superseded launch");
-                }
-                return Ok(None);
-            }
-
-            let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&update.id)?;
-            let generation = storage.update(|instances, _groups| {
-                let Some(instance) = instances
-                    .iter_mut()
-                    .find(|instance| instance.id == update.id)
-                else {
-                    anyhow::bail!("session disappeared before capture");
-                };
-                if !poller_update_matches_instance(update, instance) {
-                    anyhow::bail!("poller observation belongs to a superseded launch");
-                }
-                instance
-                    .try_acquire_lifecycle_reservation(
-                        crate::session::LifecycleOperation::Capture,
-                        Instance::LIFECYCLE_RESERVATION_TTL,
-                        chrono::Utc::now(),
-                    )
-                    .map_err(|error| anyhow::anyhow!("capture blocked: {error}"))
-            })?;
-            Ok(Some((storage, lifecycle_lock, generation)))
-        })();
+        let ownership: anyhow::Result<_> = if lifecycle_already_locked {
+            Ok(None)
+        } else {
+            (|| {
+                let storage = Storage::new(&update.profile, file_watch.clone())?;
+                let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&update.id)?;
+                let generation = storage.update(|instances, _groups| {
+                    let Some(instance) = instances
+                        .iter_mut()
+                        .find(|instance| instance.id == update.id)
+                    else {
+                        anyhow::bail!("session disappeared before capture");
+                    };
+                    instance
+                        .try_acquire_lifecycle_reservation(
+                            crate::session::LifecycleOperation::Capture,
+                            Instance::LIFECYCLE_RESERVATION_TTL,
+                            chrono::Utc::now(),
+                        )
+                        .map_err(|error| anyhow::anyhow!("capture blocked: {error}"))
+                })?;
+                Ok(Some((storage, lifecycle_lock, generation)))
+            })()
+        };
         let mut outcome = match &ownership {
             Err(error) => {
                 tracing::warn!(
@@ -1047,7 +372,7 @@ fn drain_and_persist_session_ids_inner(
         }
     }
 
-    publish_tmux_env();
+    publish_tmux_env(instances, &to_apply, &to_rollback, &filtered_ids);
 
     SessionIdSyncOutcome {
         applied: to_apply.into_iter().map(|(id, _)| id).collect(),
@@ -1235,9 +560,69 @@ fn reload_skipped_from_disk(
     })
 }
 
-fn publish_tmux_env() {
-    if let Err(error) = reconcile_all_profiles_tmux_session_id_ownership_env() {
-        tracing::warn!(target: "session.sync", "Post-CAS env reconcile failed: {error}");
+fn publish_tmux_env(
+    instances: &[Instance],
+    to_apply: &[(String, String)],
+    to_rollback: &[Rollback],
+    filtered_ids: &HashSet<String>,
+) {
+    let touched_count = to_apply.len() + to_rollback.len() + filtered_ids.len();
+    let mut set_batch: Vec<(String, String, String)> = Vec::with_capacity(touched_count);
+    let mut unset_batch: Vec<(String, String)> = Vec::with_capacity(touched_count);
+
+    let touched_ids = to_apply
+        .iter()
+        .map(|(id, _)| id.as_str())
+        .chain(to_rollback.iter().map(|r| r.id.as_str()))
+        .chain(filtered_ids.iter().map(|s| s.as_str()));
+
+    for id in touched_ids {
+        let Some(inst) = instances.iter().find(|i| i.id == id) else {
+            continue;
+        };
+        let tmux_name = match inst.tmux_env_session_name() {
+            Some(name) => name,
+            None => continue,
+        };
+        // Re-assert the instance-id alongside the captured sid: this publish
+        // replaced the poller's on_change pre-CAS publish (which wrote both
+        // keys), and `build_exclusion_set` can only attribute a captured sid
+        // to its owner when AOE_INSTANCE_ID is present on the same session.
+        set_batch.push((
+            tmux_name.clone(),
+            crate::tmux::env::AOE_INSTANCE_ID_KEY.to_string(),
+            inst.id.clone(),
+        ));
+        match &inst.agent_session_id {
+            Some(sid) => set_batch.push((
+                tmux_name,
+                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
+                sid.clone(),
+            )),
+            None => unset_batch.push((
+                tmux_name,
+                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
+            )),
+        }
+    }
+
+    if !set_batch.is_empty() {
+        let refs: Vec<(&str, &str, &str)> = set_batch
+            .iter()
+            .map(|(s, k, v)| (s.as_str(), k.as_str(), v.as_str()))
+            .collect();
+        if let Err(e) = crate::tmux::env::set_hidden_env_batch(&refs) {
+            tracing::warn!(target: "session.sync", "Post-CAS env publish failed: {e}");
+        }
+    }
+    if !unset_batch.is_empty() {
+        let refs: Vec<(&str, &str)> = unset_batch
+            .iter()
+            .map(|(s, k)| (s.as_str(), k.as_str()))
+            .collect();
+        if let Err(e) = crate::tmux::env::remove_hidden_env_batch(&refs) {
+            tracing::warn!(target: "session.sync", "Post-CAS env unset failed: {e}");
+        }
     }
 }
 
@@ -1245,7 +630,6 @@ fn publish_tmux_env() {
 mod tests {
     use super::*;
     use crate::file_watch::FileWatchService;
-    use crate::session::instance::PriorToolSession;
     use crate::session::poller::SessionPoller;
     use crate::session::storage::Storage;
     use crate::session::test_support::EnvGuard;
@@ -1266,491 +650,6 @@ mod tests {
             ("XDG_CONFIG_HOME", temp.path().join(".config")),
         ];
         EnvGuard::set(&pairs)
-    }
-
-    #[test]
-    fn tmux_env_plan_publishes_only_operational_session_ids() {
-        let stale = "019342ab-1234-7def-8901-dddddddddddd";
-        for (tool, publishes) in [("claude", true), ("qwen", false), ("kiro", false)] {
-            let mut instance = Instance::new("owner", "/tmp/x");
-            instance.tool = tool.to_string();
-            instance.agent_session_id = Some(stale.to_string());
-
-            let (set_batch, unset_batch) =
-                tmux_session_id_env_updates([&instance], |row| vec![format!("tmux-{}", row.id)]);
-            assert_eq!(
-                set_batch.iter().any(|(_, key, value)| {
-                    key == crate::tmux::env::AOE_INSTANCE_ID_KEY && value == &instance.id
-                }),
-                publishes,
-                "{tool}: ownership publication"
-            );
-            assert_eq!(
-                set_batch
-                    .iter()
-                    .find(|(_, key, _)| key == crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY)
-                    .map(|(_, _, value)| value.as_str()),
-                publishes.then_some(stale),
-                "{tool}: publish"
-            );
-            assert_eq!(
-                unset_batch
-                    .iter()
-                    .any(|(_, key)| key == crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY),
-                !publishes,
-                "{tool}: unset"
-            );
-        }
-    }
-
-    #[test]
-    fn stale_ownership_plan_clears_unsupported_and_orphaned_env() {
-        let mut supported = Instance::new("supported", "/tmp/x");
-        supported.tool = "claude".to_string();
-        supported.agent_session_id = Some("supported-sid".to_string());
-        let mut unsupported = Instance::new("unsupported", "/tmp/x");
-        unsupported.tool = "qwen".to_string();
-        unsupported.agent_session_id = Some("retained-sid".to_string());
-
-        let targets = stale_tmux_ownership_targets(
-            &[supported.clone(), unsupported.clone()],
-            [
-                (
-                    "valid".to_string(),
-                    Some(supported.id.clone()),
-                    Some("supported-sid".to_string()),
-                ),
-                (
-                    "mismatched".to_string(),
-                    Some(supported.id.clone()),
-                    Some("stale-sid".to_string()),
-                ),
-                (
-                    "unsupported".to_string(),
-                    Some(unsupported.id.clone()),
-                    Some("retained-sid".to_string()),
-                ),
-                (
-                    "orphan".to_string(),
-                    Some("missing-row".to_string()),
-                    Some("orphan-sid".to_string()),
-                ),
-                (
-                    "missing-owner".to_string(),
-                    None,
-                    Some("orphan-sid".to_string()),
-                ),
-                ("empty".to_string(), None, None),
-            ],
-        );
-        assert_eq!(
-            targets,
-            vec!["mismatched", "unsupported", "orphan", "missing-owner"]
-        );
-
-        let duplicate = supported.clone();
-        let ambiguous = [supported, duplicate];
-        let (trusted, _) = partition_unambiguous_instances(&ambiguous);
-        assert!(trusted.is_empty());
-        let targets = stale_tmux_ownership_targets(
-            trusted,
-            [(
-                "ambiguous".to_string(),
-                Some(ambiguous[0].id.clone()),
-                Some("supported-sid".to_string()),
-            )],
-        );
-        assert_eq!(targets, vec!["ambiguous"]);
-    }
-
-    #[test]
-    fn deletion_plan_restores_only_proven_operational_ownership() {
-        let mut supported = Instance::new("supported", "/tmp/x");
-        supported.id = "deleted".to_string();
-        supported.tool = "claude".to_string();
-        supported.agent_session_id = Some("durable".to_string());
-        let mut unsupported = Instance::new("unsupported", "/tmp/y");
-        unsupported.id = "inert".to_string();
-        unsupported.tool = "qwen".to_string();
-        unsupported.agent_session_id = Some("retained".to_string());
-        let mut duplicate_a = supported.clone();
-        duplicate_a.id = "duplicate".to_string();
-        duplicate_a.agent_session_id = Some("duplicate-a".to_string());
-        let mut duplicate_b = duplicate_a.clone();
-        duplicate_b.agent_session_id = Some("duplicate-b".to_string());
-        let instances = [supported, unsupported, duplicate_a, duplicate_b];
-        let instance_ids = HashSet::from(["deleted", "inert", "duplicate"]);
-        let observations = [
-            (
-                "deleted-session".to_string(),
-                Some("deleted".to_string()),
-                Some("newer-than-disk".to_string()),
-            ),
-            (
-                "inert-session".to_string(),
-                Some("inert".to_string()),
-                Some("retained".to_string()),
-            ),
-            (
-                "duplicate-session".to_string(),
-                Some("duplicate".to_string()),
-                Some("duplicate-a".to_string()),
-            ),
-        ];
-        let targets = owned_tmux_ownership_targets(&instance_ids, observations.iter().cloned());
-        assert_eq!(
-            targets,
-            vec!["deleted-session", "inert-session", "duplicate-session"]
-        );
-        assert_eq!(
-            cleared_tmux_ownership(&instances, &targets, &observations).entries,
-            vec![("deleted-session".to_string(), "newer-than-disk".to_string())]
-        );
-    }
-    #[test]
-    #[serial]
-    fn global_reconcile_publishes_supported_and_clears_unsupported() {
-        if !crate::tmux::is_tmux_available() {
-            eprintln!("Skipping: tmux not available");
-            return;
-        }
-
-        struct Cleanup(Vec<String>);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                for name in &self.0 {
-                    let _ = crate::tmux::tmux_command()
-                        .args(["kill-session", "-t", name])
-                        .output();
-                }
-            }
-        }
-
-        let temp = tempdir().unwrap();
-        let _home = storage_home_guard(&temp);
-        let profile = "ownership-reconcile";
-        let sid = "019342ab-1234-7def-8901-dddddddddddd";
-        let mut supported = Instance::new("supported", "/tmp/x");
-        supported.tool = "claude".to_string();
-        supported.agent_session_id = Some(sid.to_string());
-        let mut unsupported = Instance::new("unsupported", "/tmp/y");
-        unsupported.tool = "qwen".to_string();
-        unsupported.agent_session_id = Some("retained".to_string());
-        let mut unsupported_duplicate = unsupported.clone();
-        unsupported_duplicate.title = "unsupported duplicate".to_string();
-        let mut ambiguous = Instance::new("ambiguous", "/tmp/z");
-        ambiguous.tool = "claude".to_string();
-        ambiguous.agent_session_id = Some("019342ab-1234-7def-8901-eeeeeeeeeeee".to_string());
-        let mut ambiguous_duplicate = ambiguous.clone();
-        ambiguous_duplicate.title = "ambiguous duplicate".to_string();
-        let storage = Storage::new_unwatched(profile).unwrap();
-        storage
-            .update(|instances, _groups| {
-                *instances = vec![
-                    supported.clone(),
-                    unsupported.clone(),
-                    unsupported_duplicate.clone(),
-                    ambiguous.clone(),
-                    ambiguous_duplicate.clone(),
-                ];
-                Ok(())
-            })
-            .unwrap();
-
-        let supported_name = crate::tmux::Session::generate_name(&supported.id, &supported.title);
-        let unsupported_name =
-            crate::tmux::Session::generate_name(&unsupported.id, &unsupported.title);
-        let ambiguous_name = crate::tmux::Session::generate_name(&ambiguous.id, &ambiguous.title);
-        for name in [&supported_name, &unsupported_name, &ambiguous_name] {
-            let output = crate::tmux::tmux_command()
-                .args(["new-session", "-d", "-s", name])
-                .output()
-                .unwrap();
-            assert!(
-                output.status.success(),
-                "{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-        let _cleanup = Cleanup(vec![
-            supported_name.clone(),
-            unsupported_name.clone(),
-            ambiguous_name.clone(),
-        ]);
-        crate::tmux::env::set_hidden_env(
-            &unsupported_name,
-            crate::tmux::env::AOE_INSTANCE_ID_KEY,
-            &unsupported.id,
-        )
-        .unwrap();
-        crate::tmux::env::set_hidden_env(
-            &unsupported_name,
-            crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
-            "retained",
-        )
-        .unwrap();
-
-        crate::tmux::env::set_hidden_env(
-            &ambiguous_name,
-            crate::tmux::env::AOE_INSTANCE_ID_KEY,
-            &ambiguous.id,
-        )
-        .unwrap();
-        crate::tmux::env::set_hidden_env(
-            &ambiguous_name,
-            crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
-            ambiguous.agent_session_id.as_deref().unwrap(),
-        )
-        .unwrap();
-
-        storage
-            .update(|instances, _groups| {
-                instances.retain(|instance| instance.id != unsupported.id);
-                Ok(())
-            })
-            .unwrap();
-        let corrupt_storage = Storage::new_unwatched("ownership-corrupt").unwrap();
-        std::fs::write(
-            corrupt_storage.sessions_path(),
-            format!(
-                r#"[{{"id":"{}","title":"corrupt-qwen","project_path":"/tmp/corrupt","tool":"qwen","status":"invalid-status","agent_session_id":"retained"}}]"#,
-                unsupported.id
-            ),
-        )
-        .unwrap();
-        assert!(reconcile_all_profiles_tmux_session_id_ownership_env().is_err());
-        assert_eq!(
-            crate::tmux::env::get_hidden_env_strict(
-                &unsupported_name,
-                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
-            )
-            .unwrap(),
-            None,
-            "unsupported IDs must be removed before strict foreign parsing"
-        );
-        std::fs::remove_file(corrupt_storage.sessions_path()).unwrap();
-        reconcile_all_profiles_tmux_session_id_ownership_env().unwrap();
-        assert_eq!(
-            crate::tmux::env::get_hidden_env_strict(
-                &supported_name,
-                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
-            )
-            .unwrap()
-            .as_deref(),
-            Some(sid)
-        );
-        assert_eq!(
-            crate::tmux::env::get_hidden_env_strict(
-                &unsupported_name,
-                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
-            )
-            .unwrap(),
-            None
-        );
-        assert_eq!(
-            crate::tmux::env::get_hidden_env_strict(
-                &ambiguous_name,
-                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
-            )
-            .unwrap(),
-            None
-        );
-        let vanished = format!(
-            "{}vanished_{}",
-            crate::tmux::SESSION_PREFIX,
-            uuid::Uuid::new_v4().simple()
-        );
-        let observations =
-            read_tmux_ownership_observations(&[supported_name.clone(), vanished]).unwrap();
-        assert_eq!(observations.len(), 1);
-    }
-    #[test]
-    fn ownership_planner_rejects_ambiguous_ids_and_suffixes() {
-        for tool in ["qwen", "kiro"] {
-            let mut instance = Instance::new("owner", "/tmp/x");
-            instance.tool = tool.to_string();
-            let suffix = &instance.id[..8];
-            let agent = format!("{}Dead_{suffix}", crate::tmux::SESSION_PREFIX);
-            let terminal = format!("{}Live_{suffix}", crate::tmux::TERMINAL_PREFIX);
-            let live = crate::tmux::LiveSessionSnapshot::from_parts(
-                Some(vec![agent.clone(), terminal.clone()]),
-                Some(HashMap::from([
-                    (
-                        agent.clone(),
-                        crate::tmux::PaneMetadata {
-                            pane_dead: false,
-                            pane_current_command: None,
-                            pane_start_command_is_protected: false,
-                        },
-                    ),
-                    (
-                        terminal.clone(),
-                        crate::tmux::PaneMetadata {
-                            pane_dead: false,
-                            pane_current_command: None,
-                            pane_start_command_is_protected: false,
-                        },
-                    ),
-                ])),
-            );
-            let observations = vec![
-                (agent.clone(), Some(instance.id.clone()), None),
-                (terminal.clone(), None, None),
-            ];
-            assert_eq!(
-                tmux_session_id_env_names(&instance, &live, &observations, false),
-                Vec::<String>::new(),
-                "{tool}: unsupported rows do not claim suffix matches"
-            );
-            instance.pending_tmux_ownership_session_id = Some("outgoing-sid".to_string());
-            assert_eq!(
-                tmux_session_id_env_names(&instance, &live, &observations, true),
-                vec![agent.clone(), terminal.clone()],
-                "{tool}: a pending outgoing handoff retains live pane ownership"
-            );
-            instance.pending_tmux_ownership_session_id = None;
-            instance.agent_session_id = Some("supported-sid".to_string());
-            instance.tool = "claude".to_string();
-            assert_eq!(
-                tmux_session_id_env_names(&instance, &live, &observations, true),
-                vec![agent.clone(), terminal.clone()],
-                "one ownerless pane joins its exact-stamped peer"
-            );
-            let orphan = format!("{}Orphan_{suffix}", crate::tmux::CONTAINER_TERMINAL_PREFIX);
-            let crowded_live = crate::tmux::LiveSessionSnapshot::from_parts(
-                Some(vec![agent.clone(), terminal.clone(), orphan.clone()]),
-                None,
-            );
-            let crowded_observations = vec![
-                (agent.clone(), Some(instance.id.clone()), None),
-                (terminal, None, None),
-                (orphan, None, None),
-            ];
-            assert_eq!(
-                tmux_session_id_env_names(&instance, &crowded_live, &crowded_observations, true,),
-                vec![agent],
-                "multiple ownerless suffix matches remain unclaimed"
-            );
-        }
-
-        let mut first = Instance::new("first", "/tmp/x");
-        first.tool = "claude".to_string();
-        first.agent_session_store_namespace = Some("claude-store".to_string());
-        first.id = "12345678-0000-0000-0000-000000000001".to_string();
-        first.agent_session_id = Some("first-sid".to_string());
-        let mut second = first.clone();
-        second.id = "12345678-0000-0000-0000-000000000002".to_string();
-        second.agent_session_id = Some("second-sid".to_string());
-        let first_name = format!("{}First_12345678", crate::tmux::SESSION_PREFIX);
-        let second_name = format!("{}Second_12345678", crate::tmux::SESSION_PREFIX);
-        let live = crate::tmux::LiveSessionSnapshot::from_parts(
-            Some(vec![first_name.clone(), second_name.clone()]),
-            Some(HashMap::from([
-                (
-                    first_name.clone(),
-                    crate::tmux::PaneMetadata {
-                        pane_dead: false,
-                        pane_current_command: None,
-                        pane_start_command_is_protected: false,
-                    },
-                ),
-                (
-                    second_name.clone(),
-                    crate::tmux::PaneMetadata {
-                        pane_dead: false,
-                        pane_current_command: None,
-                        pane_start_command_is_protected: false,
-                    },
-                ),
-            ])),
-        );
-        let observations = vec![
-            (first_name.clone(), Some(first.id.clone()), None),
-            (second_name.clone(), Some(second.id.clone()), None),
-        ];
-        assert_eq!(
-            tmux_session_id_env_names(&first, &live, &observations, false),
-            vec![first_name.clone()]
-        );
-        assert_eq!(
-            tmux_session_id_env_names(&second, &live, &observations, false),
-            vec![second_name]
-        );
-
-        let ownerless_live = crate::tmux::LiveSessionSnapshot::from_parts(
-            Some(vec![first_name.clone()]),
-            Some(HashMap::from([(
-                first_name.clone(),
-                crate::tmux::PaneMetadata {
-                    pane_dead: false,
-                    pane_current_command: None,
-                    pane_start_command_is_protected: false,
-                },
-            )])),
-        );
-        let ownerless = vec![(first_name, None, None)];
-        assert!(tmux_session_id_env_names(&first, &ownerless_live, &ownerless, false).is_empty());
-
-        let mut shared_conversation = second.clone();
-        shared_conversation.id = "87654321-0000-0000-0000-000000000003".to_string();
-        shared_conversation.agent_session_id = first.agent_session_id.clone();
-        let mut independent_store = shared_conversation.clone();
-        independent_store.tool = "codex".to_string();
-        independent_store.agent_session_store_namespace = Some("codex-store".to_string());
-        let mut outgoing_handoff = first.clone();
-        outgoing_handoff.swap_tool_for_restart("codex");
-        let independent_rows = [outgoing_handoff, independent_store];
-        let (trusted, ambiguous) = partition_unambiguous_instances(&independent_rows);
-        assert_eq!(trusted.len(), 2);
-        assert!(ambiguous.is_empty());
-        let mut stale_qwen_first = first.clone();
-        stale_qwen_first.prior_tool_session_ids.insert(
-            "qwen".to_string(),
-            PriorToolSession {
-                agent_session_id: Some("stale-qwen-sid".to_string()),
-                ..PriorToolSession::default()
-            },
-        );
-        stale_qwen_first
-            .prior_tool_store_namespaces
-            .insert("qwen".to_string(), "qwen-store".to_string());
-        let mut stale_qwen_second = second.clone();
-        stale_qwen_second.prior_tool_session_ids.insert(
-            "qwen".to_string(),
-            PriorToolSession {
-                agent_session_id: Some("stale-qwen-sid".to_string()),
-                ..PriorToolSession::default()
-            },
-        );
-        stale_qwen_second
-            .prior_tool_store_namespaces
-            .insert("qwen".to_string(), "qwen-store".to_string());
-        let stale_qwen_rows = [stale_qwen_first, stale_qwen_second];
-        let (trusted, ambiguous) = partition_unambiguous_instances(&stale_qwen_rows);
-        assert_eq!(trusted.len(), 2);
-        assert!(ambiguous.is_empty());
-        let shared_rows = [first.clone(), shared_conversation];
-        let (trusted, ambiguous) = partition_unambiguous_instances(&shared_rows);
-        assert!(trusted.is_empty());
-        assert!(ambiguous.contains(first.id.as_str()));
-        assert!(ambiguous.contains("87654321-0000-0000-0000-000000000003"));
-        let mut parked_conversation = first.clone();
-        parked_conversation.id = "87654321-0000-0000-0000-000000000004".to_string();
-        parked_conversation.swap_tool("codex");
-        let parked_rows = [first.clone(), parked_conversation];
-        let (trusted, ambiguous) = partition_unambiguous_instances(&parked_rows);
-        assert!(trusted.is_empty());
-        assert!(ambiguous.contains(first.id.as_str()));
-        assert!(ambiguous.contains("87654321-0000-0000-0000-000000000004"));
-        assert!(tmux_session_id_env_names(&second, &ownerless_live, &ownerless, false).is_empty());
-        let colliding_rows = [first.clone(), second];
-        assert!(ambiguous_tmux_id_suffixes(&colliding_rows).contains("12345678"));
-
-        let duplicate = first.clone();
-        let rows = [first, duplicate];
-        let (trusted, ambiguous) = partition_unambiguous_instances(&rows);
-        assert!(trusted.is_empty());
-        assert!(ambiguous.contains("12345678-0000-0000-0000-000000000001"));
     }
 
     fn seed_instance_on_disk(profile: &str, inst: &Instance) {
@@ -1776,78 +675,6 @@ mod tests {
                 Ok(())
             })
             .unwrap();
-    }
-
-    #[test]
-    #[serial]
-    fn survivor_lookup_preserves_duplicates_and_rejects_unreadable_profiles() {
-        let temp = tempdir().unwrap();
-        let _guard = storage_home_guard(&temp);
-        let shared = Instance::new("shared", "/tmp/x");
-        seed_instance_on_disk("deleted", &shared);
-        seed_instance_on_disk("survivor", &shared);
-
-        let survivor_ids = instance_ids_excluding_profile("deleted").unwrap();
-        assert!(survivor_ids.contains(&shared.id));
-
-        #[cfg(unix)]
-        {
-            let alias_only = Instance::new("alias-only", "/tmp/alias");
-            seed_instances_on_disk("deleted", &[&shared, &alias_only]);
-            let profiles = crate::session::get_app_dir().unwrap().join("profiles");
-            std::os::unix::fs::symlink("deleted", profiles.join("deleted-alias")).unwrap();
-            let alias_survivors = instance_ids_excluding_profile("deleted-alias").unwrap();
-            assert!(alias_survivors.contains(&shared.id));
-            assert!(!alias_survivors.contains(&alias_only.id));
-        }
-
-        let corrupt = Instance::new("corrupt", "/tmp/x");
-        seed_instance_on_disk("corrupt", &corrupt);
-        let corrupt_path = crate::session::get_app_dir()
-            .unwrap()
-            .join("profiles/corrupt/sessions.json");
-        std::fs::write(
-            corrupt_path,
-            br#"[{"agent_session_id":"019342ab-1234-7def-8901-deadbeefdead"}]"#,
-        )
-        .unwrap();
-        assert!(instance_ids_excluding_profile("deleted").is_err());
-    }
-
-    #[test]
-    #[serial]
-    fn legacy_env_cleanup_loads_unsupported_rows_from_every_profile() {
-        let temp = tempdir().unwrap();
-        let _guard = storage_home_guard(&temp);
-        for (profile, tool) in [("cleanup-alpha", "qwen"), ("cleanup-beta", "kiro")] {
-            let mut instance = Instance::new(profile, "/tmp/x");
-            instance.tool = tool.to_string();
-            instance.source_profile = profile.to_string();
-            instance.agent_session_id = Some(format!("{tool}-retained"));
-            seed_instance_on_disk(profile, &instance);
-        }
-
-        let mut loaded = load_profile_instances_excluding(None)
-            .unwrap()
-            .into_iter()
-            .map(|instance| (instance.title, instance.tool, instance.source_profile))
-            .collect::<Vec<_>>();
-        loaded.sort();
-        assert_eq!(
-            loaded,
-            vec![
-                (
-                    "cleanup-alpha".to_string(),
-                    "qwen".to_string(),
-                    "cleanup-alpha".to_string(),
-                ),
-                (
-                    "cleanup-beta".to_string(),
-                    "kiro".to_string(),
-                    "cleanup-beta".to_string(),
-                ),
-            ]
-        );
     }
 
     fn attach_poller_with_update(inst: &mut Instance, sid: &str) {
@@ -2101,36 +928,6 @@ mod tests {
 
     #[test]
     #[serial]
-    fn drain_rejects_capture_from_superseded_launch() {
-        let temp = tempdir().unwrap();
-        let _guard = storage_home_guard(&temp);
-        let profile = "sync-superseded-launch";
-        let captured = "019342ab-1234-7def-8901-bbbbbbbbbbbb";
-
-        let mut stale = Instance::new("superseded-title", "/tmp/x");
-        stale.source_profile = profile.to_string();
-        stale.tool = "claude".to_string();
-        stale.lifecycle_generation = 4;
-        let mut current = stale.clone();
-        current.tool = "codex".to_string();
-        current.lifecycle_generation = 5;
-        seed_instance_on_disk(profile, &current);
-        attach_poller_with_update(&mut stale, captured);
-
-        let file_watch = FileWatchService::noop();
-        let mut instances = vec![stale];
-        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
-
-        assert_eq!(outcome.filtered, vec![instances[0].id.clone()]);
-        assert!(outcome.applied.is_empty());
-        assert_eq!(instances[0].agent_session_id, None);
-        let stored = Storage::new_unwatched(profile).unwrap().load().unwrap();
-        assert_eq!(stored[0].tool, "codex");
-        assert_eq!(stored[0].agent_session_id, None);
-    }
-
-    #[test]
-    #[serial]
     fn drain_rejects_observed_sid_contradicting_use_pin() {
         let temp = tempdir().unwrap();
         let _guard = storage_home_guard(&temp);
@@ -2158,93 +955,29 @@ mod tests {
 
     #[test]
     #[serial]
-    fn drain_respects_only_operational_sid_owners() {
+    fn drain_rejects_sid_owned_by_another_instance() {
         let temp = tempdir().unwrap();
         let _guard = storage_home_guard(&temp);
-        for (owner_tool, owned, blocks_claim) in [
-            ("claude", "019342ab-1234-7def-8901-cccccccccccc", true),
-            ("qwen", "019342ab-1234-7def-8901-dddddddddddd", false),
-            ("kiro", "019342ab-1234-7def-8901-eeeeeeeeeeee", false),
-        ] {
-            let profile = format!("sync-collision-{owner_tool}");
-            let mut owner = Instance::new("owner-title", "/tmp/x");
-            owner.tool = owner_tool.to_string();
-            owner.source_profile = profile.clone();
-            owner.agent_session_id = Some(owned.to_string());
-            let owner_id = owner.id.clone();
 
-            let mut claimant = Instance::new("claimant-title", "/tmp/x");
-            claimant.source_profile = profile.clone();
-            seed_instances_on_disk(&profile, &[&owner, &claimant]);
-            attach_poller_with_update(&mut claimant, owned);
+        let owned = "019342ab-1234-7def-8901-cccccccccccc";
+        let mut owner = Instance::new("owner-title", "/tmp/x");
+        owner.source_profile = "sync-collision".to_string();
+        owner.agent_session_id = Some(owned.to_string());
 
-            let file_watch = FileWatchService::noop();
-            let mut instances = vec![owner, claimant];
-            let claimant_id = instances[1].id.clone();
-            let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
+        let mut thief = Instance::new("thief-title", "/tmp/x");
+        thief.source_profile = "sync-collision".to_string();
+        thief.agent_session_id = None;
+        seed_instances_on_disk("sync-collision", &[&owner, &thief]);
+        attach_poller_with_update(&mut thief, owned);
 
-            assert_eq!(
-                outcome.filtered,
-                blocks_claim
-                    .then(|| claimant_id.clone())
-                    .into_iter()
-                    .collect::<Vec<_>>(),
-                "{owner_tool}"
-            );
-            assert_eq!(
-                outcome.applied,
-                (!blocks_claim)
-                    .then_some(claimant_id)
-                    .into_iter()
-                    .collect::<Vec<_>>(),
-                "{owner_tool}"
-            );
-            assert_eq!(instances[0].agent_session_id.as_deref(), Some(owned));
-            assert_eq!(
-                instances[1].agent_session_id.as_deref(),
-                (!blocks_claim).then_some(owned),
-                "{owner_tool}"
-            );
+        let file_watch = FileWatchService::noop();
+        let mut instances = vec![owner, thief];
+        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
 
-            let stored = Storage::new_unwatched(&profile).unwrap().load().unwrap();
-            let disk_claimant = stored
-                .iter()
-                .find(|instance| instance.title == "claimant-title")
-                .unwrap();
-            assert_eq!(
-                disk_claimant.agent_session_id.as_deref(),
-                (!blocks_claim).then_some(owned),
-                "{owner_tool}: disk"
-            );
-
-            let replacement = "019342ab-1234-7def-8901-bbbbbbbbbbbb";
-            let write = persist_session_to_storage(
-                &profile,
-                &owner_id,
-                replacement,
-                Some(owned),
-                &file_watch,
-            );
-            assert_eq!(
-                write,
-                if blocks_claim {
-                    SidWrite::Applied
-                } else {
-                    SidWrite::Skipped
-                },
-                "{owner_tool}: persistence target"
-            );
-            let stored = Storage::new_unwatched(&profile).unwrap().load().unwrap();
-            let disk_owner = stored
-                .iter()
-                .find(|instance| instance.id == owner_id)
-                .unwrap();
-            assert_eq!(
-                disk_owner.agent_session_id.as_deref(),
-                Some(if blocks_claim { replacement } else { owned }),
-                "{owner_tool}: persistence target disk"
-            );
-        }
+        assert_eq!(outcome.filtered, vec![instances[1].id.clone()]);
+        assert!(outcome.applied.is_empty());
+        assert_eq!(instances[0].agent_session_id.as_deref(), Some(owned));
+        assert_eq!(instances[1].agent_session_id, None);
     }
 
     #[test]
@@ -2300,7 +1033,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn drain_converges_duplicate_sid_claims_by_authoritative_provenance() {
+    fn drain_rejects_all_claimants_of_same_batch_duplicate_sid() {
         let temp = tempdir().unwrap();
         let _guard = storage_home_guard(&temp);
 
@@ -2325,111 +1058,6 @@ mod tests {
         assert!(outcome.filtered.contains(&instances[1].id));
         assert_eq!(instances[0].agent_session_id, None);
         assert_eq!(instances[1].agent_session_id, None);
-        assert!(drain_poller(&instances[0]).is_some());
-        assert!(drain_poller(&instances[1]).is_some());
-
-        let same_profile = "sync-authoritative-samebatch";
-        let mut authoritative = Instance::new("authoritative-title", "/tmp/x");
-        authoritative.source_profile = same_profile.to_string();
-        let mut heuristic = Instance::new("heuristic-title", "/tmp/x");
-        heuristic.source_profile = same_profile.to_string();
-        seed_instances_on_disk(same_profile, &[&authoritative, &heuristic]);
-        crate::hooks::ensure_instance_dir_path(&authoritative.id).unwrap();
-        crate::hooks::write_session_id_via_guard(&authoritative.id, contested).unwrap();
-        attach_poller_with_update(&mut authoritative, contested);
-        attach_poller_with_update(&mut heuristic, contested);
-        let mut same_batch = vec![authoritative, heuristic];
-        let outcome = drain_and_persist_session_ids(&mut same_batch, &file_watch);
-        assert_eq!(outcome.applied, vec![same_batch[0].id.clone()]);
-        assert!(outcome.filtered.contains(&same_batch[1].id));
-        assert_eq!(same_batch[0].agent_session_id.as_deref(), Some(contested));
-        assert_eq!(same_batch[1].agent_session_id, None);
-        crate::hooks::cleanup_hook_status_dir(&same_batch[0].id);
-
-        let split_contested = "019342ab-1234-7def-8901-eeeeeeeeeeee";
-        let split_profile = "sync-authoritative-split";
-        let mut split_owner = Instance::new("split-owner-title", "/tmp/x");
-        split_owner.source_profile = split_profile.to_string();
-        let mut split_heuristic = Instance::new("split-heuristic-title", "/tmp/x");
-        split_heuristic.source_profile = split_profile.to_string();
-        seed_instances_on_disk(split_profile, &[&split_owner, &split_heuristic]);
-        crate::hooks::ensure_instance_dir_path(&split_owner.id).unwrap();
-        crate::hooks::write_session_id_via_guard(&split_owner.id, split_contested).unwrap();
-        attach_poller_with_update(&mut split_heuristic, split_contested);
-        let mut split = vec![split_owner, split_heuristic];
-        let first = drain_and_persist_session_ids(&mut split, &file_watch);
-        assert!(first.applied.is_empty());
-        let split_disk = Storage::new_unwatched(split_profile)
-            .unwrap()
-            .load()
-            .unwrap();
-        let split_disk_owner = split_disk
-            .iter()
-            .find(|instance| instance.id == split[0].id)
-            .unwrap();
-        assert_eq!(
-            split[0].agent_session_id, split_disk_owner.agent_session_id,
-            "owner drifted before its authoritative observation"
-        );
-        assert!(first.filtered.contains(&split[1].id));
-        attach_poller_with_update(&mut split[0], split_contested);
-        let second = drain_and_persist_session_ids(&mut split, &file_watch);
-        assert_eq!(
-            second.applied,
-            vec![split[0].id.clone()],
-            "second outcome: {second:?}"
-        );
-        assert_eq!(split[0].agent_session_id.as_deref(), Some(split_contested));
-        assert_eq!(split[1].agent_session_id, None);
-        crate::hooks::cleanup_hook_status_dir(&split[0].id);
-
-        let ambiguous_sid = "019342ab-1234-7def-8901-ffffffffffff";
-        let ambiguous_profile = "sync-authoritative-ambiguous";
-        let mut sidecar_a = Instance::new("sidecar-a", "/tmp/x");
-        sidecar_a.source_profile = ambiguous_profile.to_string();
-        let mut sidecar_b = Instance::new("sidecar-b", "/tmp/x");
-        sidecar_b.source_profile = ambiguous_profile.to_string();
-        let mut lone_heuristic = Instance::new("lone-heuristic", "/tmp/x");
-        lone_heuristic.source_profile = ambiguous_profile.to_string();
-        seed_instances_on_disk(
-            ambiguous_profile,
-            &[&sidecar_a, &sidecar_b, &lone_heuristic],
-        );
-        for owner in [&sidecar_a, &sidecar_b] {
-            crate::hooks::ensure_instance_dir_path(&owner.id).unwrap();
-            crate::hooks::write_session_id_via_guard(&owner.id, ambiguous_sid).unwrap();
-        }
-        attach_poller_with_update(&mut lone_heuristic, ambiguous_sid);
-        let mut ambiguous = vec![sidecar_a, sidecar_b, lone_heuristic];
-        let outcome = drain_and_persist_session_ids(&mut ambiguous, &file_watch);
-        assert!(outcome.applied.is_empty());
-        assert!(outcome.filtered.contains(&ambiguous[2].id));
-        assert_eq!(ambiguous[2].agent_session_id, None);
-        for owner in &ambiguous[..2] {
-            crate::hooks::cleanup_hook_status_dir(&owner.id);
-        }
-
-        let mut c = Instance::new("peer-c-title", "/tmp/x");
-        c.source_profile = "sync-samebatch-c".to_string();
-        c.agent_session_store_namespace = Some("host:claude:/store-c".to_string());
-        let mut d = Instance::new("peer-d-title", "/tmp/x");
-        d.source_profile = "sync-samebatch-d".to_string();
-        d.agent_session_store_namespace = Some("host:claude:/store-d".to_string());
-        seed_instances_on_disk(&c.source_profile, &[&c]);
-        seed_instances_on_disk(&d.source_profile, &[&d]);
-        attach_poller_with_update(&mut c, contested);
-        attach_poller_with_update(&mut d, contested);
-
-        let mut distinct_stores = vec![c, d];
-        let outcome = drain_and_persist_session_ids(&mut distinct_stores, &file_watch);
-        assert!(outcome.filtered.is_empty());
-        assert_eq!(outcome.applied.len(), 2);
-        assert!(
-            distinct_stores
-                .iter()
-                .all(|instance| instance.agent_session_id.as_deref() == Some(contested)),
-            "equal tokens in distinct stores identify different conversations"
-        );
     }
 
     #[test]

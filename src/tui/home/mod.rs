@@ -1111,8 +1111,6 @@ pub struct HomeView {
     /// owns recovery, lock contended, or no candidates). Drained on every
     /// tick by `apply_recovery_updates`.
     recovery_rx: Option<std::sync::mpsc::Receiver<RecoveryUpdate>>,
-    /// Pollers may start only after stale tmux ownership has been reconciled.
-    tmux_ownership_reconciled: bool,
     /// Lock guard kept alive for the recovery pass so a peer (a daemon
     /// that starts after the TUI) cannot duplicate cascades. Released
     /// when the field is set to `None` after the last worker has
@@ -2502,7 +2500,6 @@ impl HomeView {
                 .unwrap_or(true),
             trashed_section_collapsed: true,
             recovery_rx: None,
-            tmux_ownership_reconciled: false,
             recovery_lock: None,
             recovery_in_flight: std::collections::HashSet::new(),
             restart_cooldown_at: std::collections::HashMap::new(),
@@ -2547,30 +2544,82 @@ impl HomeView {
             }
         }
 
-        // Reconcile durable IDs into every live tmux session. Unsupported
-        // agents retain IDs on disk but must not publish them as ownership.
+        // Batch-sync instance IDs and captured session IDs to tmux hidden env
+        // so that build_exclusion_set() on other AoE instances can see them.
+        // One observation for both per-instance walks below. They visit every
+        // instance in the view, so a per-item `list-sessions` fork scales with
+        // the whole store, measured as the dominant tmux cost of this pass on
+        // a store of a few hundred sessions.
         let live = crate::tmux::LiveSessionSnapshot::new();
-        match crate::session::sync::sync_tmux_session_id_env(view.instances.values(), &live) {
-            Ok(()) => {
-                view.tmux_ownership_reconciled = true;
-                // Recover session IDs for pre-existing sessions via pollers.
-                for inst in view.instances.values_mut() {
-                    let has_live_tmux = inst.has_live_tmux_pane_in(&live);
-                    if has_live_tmux {
-                        inst.repair_session_id_poller_if_needed(&live);
-                    }
-                }
+        {
+            let mut set_batch: Vec<(String, String, String)> = Vec::new();
+            let mut unset_batch: Vec<(String, String)> = Vec::new();
+            for inst in view.instances.values() {
+                // This publication is one-shot: no reload re-runs it and a
+                // poller does not re-emit an unchanged sid, so a row dropped
+                // here stays unpublished until an unrelated sid change or a
+                // relaunch. A snapshot that could not reach the server is
+                // therefore probed per row rather than read as "no live pane".
+                let Some(tmux_name) = inst.tmux_env_session_name_in_or_probe(&live) else {
+                    continue;
+                };
 
-                // Startup auto-recovery runs only after ownership reconciliation.
-                // Otherwise a restart could consume ambiguous durable state.
-                view.maybe_start_startup_recovery();
+                set_batch.push((
+                    tmux_name.clone(),
+                    crate::tmux::env::AOE_INSTANCE_ID_KEY.to_string(),
+                    inst.id.clone(),
+                ));
+                if let Some(ref sid) = inst.agent_session_id {
+                    set_batch.push((
+                        tmux_name,
+                        crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
+                        sid.clone(),
+                    ));
+                } else {
+                    unset_batch.push((
+                        tmux_name,
+                        crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
+                    ));
+                }
             }
-            Err(error) => {
-                tracing::warn!(target: "tui.home",
-                    "Tmux ownership reconciliation failed; startup recovery and capture repair remain disabled until reconciliation succeeds: {error}"
-                );
+            if !set_batch.is_empty() {
+                let batch_refs: Vec<(&str, &str, &str)> = set_batch
+                    .iter()
+                    .map(|(s, k, v)| (s.as_str(), k.as_str(), v.as_str()))
+                    .collect();
+                if let Err(e) = crate::tmux::env::set_hidden_env_batch(&batch_refs) {
+                    tracing::warn!(target: "tui.home", "Batch env sync failed: {}", e);
+                }
+            }
+            if !unset_batch.is_empty() {
+                let batch_refs: Vec<(&str, &str)> = unset_batch
+                    .iter()
+                    .map(|(s, k)| (s.as_str(), k.as_str()))
+                    .collect();
+                if let Err(e) = crate::tmux::env::remove_hidden_env_batch(&batch_refs) {
+                    tracing::warn!(target: "tui.home", "Batch env unset failed: {}", e);
+                }
             }
         }
+
+        // Recover session IDs for pre-existing sessions via pollers.
+        for inst in view.instances.values_mut() {
+            let has_live_tmux = inst.has_live_tmux_pane_in(&live);
+            if !has_live_tmux {
+                continue;
+            }
+
+            inst.repair_session_id_poller_if_needed(&live);
+        }
+
+        // Startup auto-recovery: kick off a worker pool to restart any
+        // resume-capable sessions whose tmux pane is missing. The TUI defers
+        // to the daemon when one is running (the daemon owns recovery in
+        // that case); when the TUI is standalone, it acquires the
+        // cross-process recovery lock to keep a late-starting daemon from
+        // duplicating cascades. See `crate::session::recovery` for the full
+        // exclusion rationale.
+        view.maybe_start_startup_recovery();
 
         view.refresh_registered_projects();
         view.flat_items = view.build_flat_items();
@@ -3738,36 +3787,19 @@ impl HomeView {
     /// [`Self::apply_session_id_updates`], which runs on every input/render
     /// wake while live views are open.
     pub fn repair_session_id_pollers(&mut self) {
-        // One observation for the whole walk. This runs on the App::run tick
-        // over every instance, so a per-item list-sessions fork scales with
+        // One observation for the whole walk. This runs on the `App::run` tick
+        // over every instance, so a per-item `list-sessions` fork scales with
         // the store and lands on the thread that also serves keystrokes.
         // Profiling a store of a few hundred sessions put this path at the top
         // of the main thread.
         let live = crate::tmux::LiveSessionSnapshot::new();
-        let mut reconciled_now = false;
-        if !self.tmux_ownership_reconciled {
-            match crate::session::sync::sync_tmux_session_id_env(self.instances.values(), &live) {
-                Ok(()) => {
-                    self.tmux_ownership_reconciled = true;
-                    reconciled_now = true;
-                }
-                Err(error) => {
-                    tracing::warn!(target: "tui.home",
-                        "Tmux ownership reconciliation retry failed; capture repair remains disabled: {error}"
-                    );
-                    return;
-                }
-            }
-        }
         for instance in self.instances.values_mut() {
             instance.repair_session_id_poller_if_needed(&live);
         }
-        if reconciled_now {
-            self.maybe_start_startup_recovery();
-        }
     }
-    /// Drain the startup-recovery channel and apply each recovery update
-    /// to the in-memory Instance snapshot. Releases the recovery lock
+
+    /// Drain the startup-recovery channel and apply each `RecoveryUpdate`
+    /// to the in-memory `Instance` snapshot. Released the recovery lock
     /// (and the receiver) when all workers have completed.
     ///
     /// Called from the `App::run` event-loop tick alongside
@@ -6852,7 +6884,7 @@ impl HomeView {
             .load()?
             .into_iter()
             .find(|instance| instance.id == id)
-            .ok_or_else(|| anyhow::anyhow!("session '{id}' disappeared from storage"))?;
+            .ok_or_else(|| anyhow::anyhow!("Session not found in source profile: {id}"))?;
         let authoritative_generation = authoritative.lifecycle_generation;
         let authoritative_status = authoritative.status;
         let authoritative_idle_entered_at = authoritative.idle_entered_at;

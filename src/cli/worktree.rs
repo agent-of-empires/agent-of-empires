@@ -294,50 +294,9 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
 
     // Remove orphaned sessions
     if !orphaned_sessions.is_empty() {
-        let orphan_ids: HashSet<String> = orphaned_sessions
-            .iter()
-            .map(|orphan| orphan.id.clone())
-            .collect();
-        crate::session::sync::with_tmux_ownership_lock(|| {
-            let authoritative: Vec<_> = storage
-                .load_strict()?
-                .into_iter()
-                .filter(|instance| orphan_ids.contains(&instance.id))
-                .collect();
-            let survivor_ids = crate::session::sync::instance_ids_excluding_profile(profile)?;
-            if let Some(duplicate) = authoritative
-                .iter()
-                .find(|instance| survivor_ids.contains(&instance.id))
-            {
-                bail!(
-                    "Cannot remove orphaned session '{}': the same id exists in another profile",
-                    duplicate.id
-                );
-            }
-            crate::session::sync::ensure_instances_quiescent(
-                &authoritative,
-                "remove orphaned sessions",
-            )?;
-            let cleared =
-                crate::session::sync::clear_tmux_session_id_ownership_for_instances_locked(
-                    &authoritative,
-                )?;
-            if let Err(delete_error) =
-                storage.update_with_tmux_ownership_lock(|all_instances, _groups| {
-                    all_instances.retain(|inst| !orphan_ids.contains(&inst.id));
-                    Ok(())
-                })
-            {
-                if let Err(restore_error) =
-                    crate::session::sync::restore_tmux_session_id_ownership_locked(&cleared)
-                {
-                    bail!(
-                        "Failed to remove orphaned sessions: {delete_error}; ownership restore failed: {restore_error}"
-                    );
-                }
-                return Err(delete_error);
-            }
-            crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env_locked()?;
+        let orphan_ids: HashSet<String> = orphaned_sessions.iter().map(|o| o.id.clone()).collect();
+        storage.update(|all_instances, _groups| {
+            all_instances.retain(|inst| !orphan_ids.contains(&inst.id));
             Ok(())
         })?;
 

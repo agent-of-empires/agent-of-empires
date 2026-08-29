@@ -2776,68 +2776,17 @@ impl<S: BroadcastSink> Supervisor<S> {
         client.resolve_elicitation(nonce, resolution).await?;
         Ok(())
     }
-    /// Stop a worker whose adapter assigned an ownership-conflicting identity,
-    /// and clear that rejected identity from every respawn source.
-    pub async fn reject_session_assignment(&self, session_id: &str, rejected_id: &str) {
-        let rejected_handle = {
-            let mut guard = self.workers.lock().await;
-            let registry_matches = crate::process::worker_registry::load(session_id)
-                .ok()
-                .flatten()
-                .and_then(|record| record.stored_acp_session_id)
-                .as_deref()
-                == Some(rejected_id);
-            let matches_current = guard
-                .get(session_id)
-                .is_some_and(|handle| match &handle.kind {
-                    WorkerKind::Runner { spawn_config } => {
-                        registry_matches
-                            || spawn_config.stored_acp_session_id.as_deref() == Some(rejected_id)
-                    }
-                    WorkerKind::Attached => registry_matches,
-                    #[cfg(test)]
-                    WorkerKind::Stdio => registry_matches,
-                });
-            if matches_current {
-                let handle = guard.remove(session_id);
-                if let Some(handle) = &handle {
-                    handle.drain_task.abort();
-                }
-                handle
-            } else {
-                None
-            }
-        };
-        if let Some(handle) = rejected_handle {
-            let _ = handle.client.shutdown().await;
-            terminate_runner_for_session(session_id);
-            let should_publish = match &handle.kind {
-                WorkerKind::Runner { .. } | WorkerKind::Attached => true,
-                #[cfg(test)]
-                WorkerKind::Stdio => false,
-            };
-            if should_publish {
-                self.publish_next(
-                    session_id,
-                    &Event::Stopped {
-                        reason: "ownership_rejected".into(),
-                    },
-                );
-            }
-        }
-        if crate::process::worker_registry::load(session_id)
-            .ok()
-            .flatten()
-            .and_then(|record| record.stored_acp_session_id)
-            .as_deref()
-            == Some(rejected_id)
-        {
-            crate::process::worker_registry::update_stored_acp_session_id(session_id, None);
-        }
-    }
 
-    /// Shutdown one structured worker while preserving its agent-side transcript.
-    /// For permanent removal use [`Self::shutdown_and_delete`].
+    /// Shutdown a single structured view worker, preserving its agent-side
+    /// transcript so the next respawn can resume it via `session/load`.
+    ///
+    /// This is the temporary-teardown path: structured view stop, snooze,
+    /// archive, idle auto-stop, and supersede all funnel here. They are
+    /// reversible, so we must NOT fire `session/delete` (which deletes
+    /// the agent's on-disk transcript); doing so left every snooze /
+    /// archive / idle-stop unable to resume, resetting context on the
+    /// next prompt (#1710). For permanent removal use
+    /// [`Self::shutdown_and_delete`].
     pub async fn shutdown(&self, session_id: &str) -> Result<(), SupervisorError> {
         self.shutdown_with_reason(session_id, "user_stopped", false)
             .await

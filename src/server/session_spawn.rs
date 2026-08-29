@@ -71,8 +71,6 @@ pub(crate) struct StructuredSessionSpec {
     #[cfg(feature = "serve")]
     pub import_acp_session_id: Option<String>,
     #[cfg(feature = "serve")]
-    pub import_acp_store_namespace: Option<String>,
-    #[cfg(feature = "serve")]
     pub fork_seed: Option<crate::session::ForkSeed>,
 }
 
@@ -98,30 +96,6 @@ impl std::fmt::Display for SessionBuildPanicked {
 }
 
 impl std::error::Error for SessionBuildPanicked {}
-
-#[cfg(feature = "serve")]
-fn validate_structured_import_ownership(
-    instance: &Instance,
-    local: &[Instance],
-    foreign: &[Instance],
-    import_id: &str,
-    import_namespace: &str,
-) -> anyhow::Result<()> {
-    let resolved_namespace = instance
-        .resolved_terminal_session_store_namespace()
-        .ok_or_else(|| anyhow::anyhow!("cannot resolve the profile Claude store"))?;
-    if resolved_namespace != import_namespace {
-        anyhow::bail!(
-            "selected profile resolves Claude store '{resolved_namespace}', but the imported session was scanned from '{import_namespace}'"
-        );
-    }
-    if local.iter().chain(foreign).any(|candidate| {
-        candidate.reserves_claude_import_id_in_namespace(import_id, import_namespace)
-    }) {
-        anyhow::bail!("Claude session '{import_id}' is already imported from this store");
-    }
-    Ok(())
-}
 
 /// Build, persist, and register a session, spawning its ACP worker when the
 /// resolved view is structured. Returns the created instance and any build
@@ -183,8 +157,6 @@ pub(crate) async fn spawn_structured_session(
             agent_effort,
             #[cfg(feature = "serve")]
             import_acp_session_id,
-            #[cfg(feature = "serve")]
-            import_acp_store_namespace,
             #[cfg(feature = "serve")]
             fork_seed,
         } = spec;
@@ -300,7 +272,6 @@ pub(crate) async fn spawn_structured_session(
                 instance.view = crate::session::View::Structured;
                 instance.acp_session_id = Some(import_id);
                 instance.import_pending = Some(true);
-                instance.agent_session_store_namespace = import_acp_store_namespace.clone();
             }
             instance.agent_name = agent_name;
             let agent_key = instance
@@ -438,35 +409,6 @@ pub(crate) async fn spawn_structured_session(
         let mut persist_and_start = || -> anyhow::Result<()> {
             let storage = Storage::new(&profile, file_watch_for_create.clone())?;
             let to_persist = instance.clone();
-            #[cfg(feature = "serve")]
-            if let Some(import_id) = import_acp_session_id.as_deref() {
-                let import_namespace = import_acp_store_namespace.as_deref().ok_or_else(|| {
-                    anyhow::anyhow!("cannot resolve the Claude store namespace for import")
-                })?;
-                crate::session::sync::with_tmux_ownership_lock(|| {
-                    let foreign = crate::session::sync::load_profile_instances_excluding(Some(
-                        storage.profile(),
-                    ))?;
-                    storage.update_with_tmux_ownership_lock(|all, _groups| {
-                        validate_structured_import_ownership(
-                            &instance,
-                            all,
-                            &foreign,
-                            import_id,
-                            import_namespace,
-                        )?;
-                        all.push(to_persist);
-                        Ok(())
-                    })
-                })?;
-            } else {
-                storage.update(|all, _groups| {
-                    all.push(to_persist);
-                    Ok(())
-                })?;
-            }
-
-            #[cfg(not(feature = "serve"))]
             storage.update(|all, _groups| {
                 all.push(to_persist);
                 Ok(())
@@ -712,47 +654,6 @@ pub(crate) async fn spawn_structured_session(
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "serve")]
-    use super::*;
-
-    #[cfg(feature = "serve")]
-    #[test]
-    fn structured_import_requires_matching_store_and_unique_owner() {
-        let import_id = "019342ab-1234-7def-8901-333333333333";
-        let mut incoming = Instance::new("incoming", "/tmp/project");
-        incoming.tool = "claude".to_string();
-        let namespace = incoming
-            .resolved_terminal_session_store_namespace()
-            .unwrap();
-
-        assert!(
-            validate_structured_import_ownership(&incoming, &[], &[], import_id, &namespace,)
-                .is_ok()
-        );
-        assert!(validate_structured_import_ownership(
-            &incoming,
-            &[],
-            &[],
-            import_id,
-            "host:claude:/different-store",
-        )
-        .is_err());
-
-        let mut owner = Instance::new("owner", "/tmp/project");
-        owner.tool = "claude".to_string();
-        owner.view = crate::session::View::Structured;
-        owner.acp_session_id = Some(import_id.to_string());
-        owner.agent_session_store_namespace = Some(namespace.clone());
-        assert!(validate_structured_import_ownership(
-            &incoming,
-            &[],
-            &[owner],
-            import_id,
-            &namespace,
-        )
-        .is_err());
-    }
-
     /// The create path must bump `mutation_epoch` while it still holds the
     /// `instances` write lock. A reloader compares the epoch under that same
     /// lock, so the insert and the bump have to land as one step; bumping

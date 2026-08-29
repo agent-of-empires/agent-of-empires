@@ -10547,32 +10547,6 @@ fn restart_selected_session_tool_swap_clears_old_agent_session_state() {
     assert_eq!(parked.acp_session_id.as_deref(), Some("acp-sess-1"));
 }
 
-#[test]
-#[serial]
-fn restart_tool_swap_aborts_when_durable_row_disappears() {
-    let mut env = create_test_env_with_sessions(1);
-    let id = env.view.instance_at(0).id.clone();
-    let original_tool = env.view.instance_at(0).tool.clone();
-    env.view.selected_session = Some(id.clone());
-    env.view
-        .storages
-        .get("test")
-        .unwrap()
-        .update(|instances, groups| {
-            instances.retain(|instance| instance.id != id);
-            groups.clear();
-            Ok(())
-        })
-        .unwrap();
-
-    let error = env
-        .view
-        .restart_selected_session(None, Some("codex"), None, None)
-        .expect_err("a tool swap without a durable row must abort");
-    assert!(error.to_string().contains("disappeared from storage"));
-    assert_eq!(env.view.instance_at(0).tool, original_tool);
-}
-
 /// The disk row a tool swap writes must resolve `agent_detect_as` against the
 /// session's own profile. `source_profile` is `skip_serializing`, so a
 /// storage-loaded row comes back blank and would key the default profile's
@@ -10597,15 +10571,6 @@ fn restart_selected_session_tool_swap_resolves_detect_as_for_the_row_profile() {
     std::fs::create_dir_all(app_dir.join("profiles").join("other")).expect("other profile");
     std::fs::write(app_dir.join("config.toml"), "default_profile = \"other\"\n")
         .expect("global config");
-    let test_profile_dir = app_dir.join("profiles").join("test");
-    std::fs::create_dir_all(&test_profile_dir).expect("test profile");
-    std::fs::write(
-        test_profile_dir.join("config.toml"),
-        "[session.agent_detect_as]
-gjc = \"claude\"
-",
-    )
-    .expect("test profile config");
 
     let mut config = crate::session::Config::default();
     config
@@ -19969,76 +19934,13 @@ mod apply_session_id_updates {
             "the hot drain path must not repair pollers"
         );
 
-        let sessions_path = view.storages[profile].sessions_path().to_path_buf();
-        let original_sessions = std::fs::read(&sessions_path).unwrap();
-        std::fs::write(
-            &sessions_path,
-            r#"[{"id":42,"agent_session_id":"ambiguous"}]"#,
-        )
-        .unwrap();
-        view.tmux_ownership_reconciled = false;
-        view.repair_session_id_pollers();
-        assert!(Arc::ptr_eq(
-            &view
-                .instances
-                .get(&terminal.id)
-                .and_then(|i| i.session_id_poller.clone())
-                .expect("failed reconciliation must retain the stopped poller"),
-            &terminal_stopped,
-        ));
-
-        std::fs::write(&sessions_path, original_sessions).unwrap();
-        let resolved_namespace = view.instances[&terminal.id]
-            .resolved_terminal_session_store_namespace()
-            .unwrap();
-        view.repair_session_id_pollers();
-        let backfilled = view
-            .instances
-            .get(&terminal.id)
-            .and_then(|i| i.session_id_poller.clone())
-            .expect("legacy row should receive a replacement poller after namespace backfill");
-        assert!(!Arc::ptr_eq(&backfilled, &terminal_stopped));
-        assert!(backfilled
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_running());
-        let disk = view.storages[profile].load().unwrap();
-        assert_eq!(
-            disk.iter()
-                .find(|instance| instance.id == terminal.id)
-                .and_then(|instance| instance.agent_session_store_namespace.as_deref()),
-            Some(resolved_namespace.as_str())
-        );
-        backfilled
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .stop();
-
-        view.instances
-            .get_mut(&terminal.id)
-            .unwrap()
-            .agent_session_store_namespace = Some("host:claude:/changed-store".to_string());
-        view.repair_session_id_pollers();
-        assert!(Arc::ptr_eq(
-            &view
-                .instances
-                .get(&terminal.id)
-                .and_then(|i| i.session_id_poller.clone())
-                .expect("changed store must retain the stopped poller"),
-            &backfilled,
-        ));
-
-        view.instances
-            .get_mut(&terminal.id)
-            .unwrap()
-            .agent_session_store_namespace = Some(resolved_namespace);
         view.repair_session_id_pollers();
         let repaired = view
             .instances
             .get(&terminal.id)
             .and_then(|i| i.session_id_poller.clone())
             .expect("live pane should receive a replacement poller");
-        assert!(!Arc::ptr_eq(&repaired, &backfilled));
+        assert!(!Arc::ptr_eq(&repaired, &terminal_stopped));
         assert!(repaired
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

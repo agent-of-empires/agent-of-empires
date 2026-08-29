@@ -1717,7 +1717,7 @@ pub(crate) fn omp_poll_fn(
                 tracing::debug!(target: "session.capture", "OMP poll identity refresh failed: {}", error)
             })
             .ok()?;
-        let exclusion = super::compose_exclusion(&instance_id, &extra_excludes).ok()?;
+        let exclusion = super::compose_exclusion(&instance_id, &extra_excludes);
         let captured = capture_omp_session_id_from_terminal(
             &identity.metadata,
             &exclusion,
@@ -1983,7 +1983,7 @@ pub(crate) fn omp_poll_fn_sandboxed(
             })
             .ok()?;
         let marker = launch_marker.as_deref()?;
-        let exclusion = super::compose_exclusion(&instance_id, &extra_excludes).ok()?;
+        let exclusion = super::compose_exclusion(&instance_id, &extra_excludes);
         let captured =
             capture_omp_session_in_container(&container_name, &metadata, &exclusion, marker)
                 .map_err(|error| {

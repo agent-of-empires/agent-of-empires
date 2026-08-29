@@ -328,7 +328,7 @@ const FIELD_SEP: char = '|';
 /// so a socket path that happens to contain either phrase cannot fake the
 /// empty case on a different errno. Callers MUST use [`tmux_query_command`] so
 /// the `strerror` text is stable English (see #3327/#3328).
-pub(crate) fn tmux_no_server_running(stderr: &[u8]) -> bool {
+fn tmux_no_server_running(stderr: &[u8]) -> bool {
     let s = String::from_utf8_lossy(stderr);
     // tmux (`client.c`) prints both markers at the start of their own line
     // (`no server running on <socket>` / `error connecting to <socket>
@@ -499,7 +499,7 @@ pub(crate) fn rekey_session(id: &str, old_title: &str, new_title: &str) -> anyho
 /// `SESSION_PREFIX` (`aoe_` in release, `aoe_dev_` in debug), so the single
 /// root prefix matches all of them and never a release session from a debug
 /// build (or vice versa).
-pub(crate) fn is_aoe_session(name: &str) -> bool {
+fn is_aoe_session(name: &str) -> bool {
     name.starts_with(SESSION_PREFIX)
 }
 
@@ -583,28 +583,6 @@ pub fn agent_session_belongs_to(tmux_name: &str, session_id: &str) -> bool {
     NameShape::agent(&id_suffix(session_id)).matches(tmux_name)
 }
 
-pub(crate) fn session_names_strict() -> anyhow::Result<Vec<String>> {
-    let mut command = tmux_query_command();
-    command.args(["list-sessions", "-F", "#{session_name}"]);
-    let output = run_tmux_command_with_timeout(&mut command)
-        .map_err(|error| anyhow::anyhow!("failed to enumerate tmux sessions: {error}"))?;
-    if output.status.success() {
-        return Ok(String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(str::trim)
-            .filter(|line| !line.is_empty())
-            .map(String::from)
-            .collect());
-    }
-    if tmux_no_server_running(&output.stderr) {
-        return Ok(Vec::new());
-    }
-    anyhow::bail!(
-        "failed to enumerate tmux sessions: {}",
-        String::from_utf8_lossy(&output.stderr).trim()
-    )
-}
-
 /// One tmux observation shared by a batch of per-instance liveness lookups.
 ///
 /// A pass that asks "is this instance's pane live?" once per stored session
@@ -641,12 +619,6 @@ impl LiveSessionSnapshot {
     /// `list-panes -a`, however many instances are then looked up.
     pub(crate) fn new() -> Self {
         Self::default()
-    }
-    /// Build a snapshot from a strict session enumeration.
-    pub(crate) fn from_names(names: Vec<String>) -> Self {
-        let snapshot = Self::new();
-        let _ = snapshot.names.set(Some(names));
-        snapshot
     }
 
     /// Build a snapshot from already-known parts, for tests that must not
@@ -699,46 +671,34 @@ impl LiveSessionSnapshot {
     }
 }
 
-/// Every live AoE tmux session carrying the ID suffix, ordered by agent,
-/// terminal, then container panes.
-pub(crate) fn live_any_kind_names_for_id_in(
+/// [`live_any_kind_name_for_id`] against an already-taken snapshot, so a batch
+/// of lookups costs one observation instead of one per instance.
+pub(crate) fn live_any_kind_name_for_id_in(
     snapshot: &LiveSessionSnapshot,
     session_id: &str,
-) -> Option<Vec<String>> {
+) -> Option<String> {
     let names = snapshot.names()?;
     let suffix = id_suffix(session_id);
     let agent = NameShape::agent(&suffix);
     let terminal = NameShape::terminal(&suffix);
     let container = NameShape::container(&suffix);
-    let (mut agent_hits, mut terminal_hits, mut container_hits) =
-        (Vec::new(), Vec::new(), Vec::new());
+    let (mut agent_hit, mut terminal_hit, mut container_hit) = (None, None, None);
     for name in names {
+        let name = name.as_str();
         let bucket = if agent.matches(name) {
-            &mut agent_hits
+            &mut agent_hit
         } else if terminal.matches(name) {
-            &mut terminal_hits
+            &mut terminal_hit
         } else if container.matches(name) {
-            &mut container_hits
+            &mut container_hit
         } else {
             continue;
         };
-        if !snapshot.pane_dead(name) {
-            bucket.push(name.clone());
+        if bucket.is_none() && !snapshot.pane_dead(name) {
+            *bucket = Some(name.to_string());
         }
     }
-    agent_hits.extend(terminal_hits);
-    agent_hits.extend(container_hits);
-    Some(agent_hits)
-}
-
-/// Snapshot-backed form of the single live-session lookup.
-pub(crate) fn live_any_kind_name_for_id_in(
-    snapshot: &LiveSessionSnapshot,
-    session_id: &str,
-) -> Option<String> {
-    live_any_kind_names_for_id_in(snapshot, session_id)?
-        .into_iter()
-        .next()
+    agent_hit.or(terminal_hit).or(container_hit)
 }
 
 /// The live tmux session name carrying `session_id`'s `_<id8>` tail, preferring
@@ -948,14 +908,14 @@ pub fn stop_all_sessions() -> anyhow::Result<usize> {
 /// successful empty map is authoritative and means there are no panes.
 pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
     let start = Instant::now();
-    let mut command = tmux_query_command();
-    command.args([
-        "list-panes",
-        "-a",
-        "-F",
-        "#{session_name}|#{pane_index}|#{pane_dead}|#{pane_current_command}|#{pane_start_command}",
-    ]);
-    let output = run_tmux_command_with_timeout(&mut command);
+    let output = tmux_query_command()
+        .args([
+            "list-panes",
+            "-a",
+            "-F",
+            "#{session_name}|#{pane_index}|#{pane_dead}|#{pane_current_command}|#{pane_start_command}",
+        ])
+        .output();
 
     let result: anyhow::Result<HashMap<String, PaneMetadata>> = match output {
         Ok(out) if out.status.success() => {
@@ -1942,22 +1902,11 @@ mod tests {
             assert_eq!(
                 live_any_kind_name_for_id_in(&snapshot, ID).as_deref(),
                 expected,
+                "pane_dead = {pane_dead}"
             );
         }
-
-        let terminal = format!("{TERMINAL_PREFIX}Refactor_{ID8}");
-        let snapshot = LiveSessionSnapshot::from_parts(
-            Some(vec![agent.clone(), terminal.clone()]),
-            Some(HashMap::from([
-                (agent.clone(), dead_pane_meta(true)),
-                (terminal.clone(), dead_pane_meta(false)),
-            ])),
-        );
-        assert_eq!(
-            live_any_kind_name_for_id_in(&snapshot, ID),
-            Some(terminal.clone()),
-        );
     }
+
     #[test]
     fn snapshot_lookup_reports_not_live_when_server_unreachable() {
         // Unknown collapses to "not live" for the exclusion walk, which is what

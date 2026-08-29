@@ -1,9 +1,7 @@
 //! Session storage - JSON file persistence with in-process and cross-process
 //! locking.
 //!
-//! Storage serialises ordinary read-modify-write cycles with the two per-profile
-//! layers below. Ownership-sensitive callers additionally take the app-global
-//! tmux ownership flock before using `update_with_tmux_ownership_lock`.
+//! `Storage` serialises read-modify-write cycles via two layers:
 //!
 //! 1. **In-process per-profile mutex** (one `Arc<Mutex<()>>` per profile name,
 //!    registered process-wide). Performance + observability layer, not a
@@ -46,10 +44,10 @@
 //! source profile's per-instance lifecycle flock before any profile Storage
 //! mutex/flock: session title -> lifecycle -> Storage.
 //!
-//! All profile mutation goes through Storage::update (ownership flock, then
-//! load, mutate, and save under the per-profile locks). save_workspace_ordering
-//! is private and only consumed by update_workspace_ordering internally; the
-//! per-profile save helpers were removed entirely. This keeps it structurally
+//! All mutation goes through `update` (load -> mutate -> save under both
+//! locks). `save_workspace_ordering` is private and only consumed by
+//! `update_workspace_ordering` internally; the per-profile `save` /
+//! `save_groups` helpers were removed entirely. This keeps it structurally
 //! impossible to bypass the locks.
 //!
 //! Lock-ordering rule across the process: a mutation that can change or create
@@ -138,7 +136,6 @@ const SESSION_IDENTITY_LOCK_FILENAME: &str = ".title-mutation.lock";
 /// Sidecar lock prefix for one session's title persistence plus tmux rekey.
 /// Lives at the app-data root so it remains stable across profile moves.
 const SESSION_TITLE_LOCK_PREFIX: &str = ".session-title-";
-const TMUX_OWNERSHIP_LOCK_FILENAME: &str = ".tmux-ownership.lock";
 
 /// Emit a tracing warn if the cross-process `flock` is held by a peer for
 /// longer than this. Surfaces a wedged peer in `aoe logs` instead of a
@@ -455,11 +452,6 @@ fn acquire_open_storage_flock(file: fs::File, path: &Path) -> Result<StorageFloc
 /// writers from introducing a duplicate; it does not repair existing rows.
 pub(crate) fn acquire_session_identity_lock() -> Result<StorageFlock> {
     acquire_storage_flock(&get_app_dir()?, SESSION_IDENTITY_LOCK_FILENAME)
-}
-
-/// Serialize durable ownership reads with tmux ownership mutation.
-pub(crate) fn acquire_tmux_ownership_lock() -> Result<StorageFlock> {
-    acquire_storage_flock(&get_app_dir()?, TMUX_OWNERSHIP_LOCK_FILENAME)
 }
 
 /// Serialize one session's title commit and post-commit tmux rekey across
@@ -868,7 +860,6 @@ impl Storage {
         for (idx, row) in rows.into_iter().enumerate() {
             match <Instance as serde::Deserialize>::deserialize(&row) {
                 Ok(mut inst) => {
-                    inst.source_profile = self.profile.clone();
                     inst.set_file_watch(self.file_watch.clone());
                     instances.push(inst);
                 }
@@ -889,85 +880,6 @@ impl Storage {
             self.quarantine_corrupt_rows(&corrupt);
         }
 
-        Ok(instances)
-    }
-
-    /// Load every session row or fail without interpreting an unreadable row
-    /// as a deleted session. Ownership reconciliation uses this conservative
-    /// view because a skipped row may still own a live tmux pane.
-    pub(crate) fn load_strict(&self) -> Result<Vec<Instance>> {
-        if !self.sessions_path.exists() {
-            return Ok(Vec::new());
-        }
-        let content = fs::read_to_string(&self.sessions_path)?;
-        if content.trim().is_empty() {
-            return Ok(Vec::new());
-        }
-        let mut instances: Vec<Instance> = serde_json::from_str(&content)?;
-        for instance in &mut instances {
-            instance.source_profile = self.profile.clone();
-            instance.set_file_watch(self.file_watch.clone());
-        }
-        Ok(instances)
-    }
-    /// Load rows needed for conversation ownership decisions. Corrupt values
-    /// that cannot contain ownership state are irrelevant and may be skipped;
-    /// ownership-shaped rows remain strict so uncertainty still fails closed.
-    pub(crate) fn load_ownership_strict(&self) -> Result<Vec<Instance>> {
-        self.load_ownership_rows(true)
-    }
-
-    /// Best-effort ownership load for asynchronous capture only. A malformed
-    /// row must not disable capture for every valid owner in the same foreign
-    /// profile; launch and destructive paths use the strict loader above.
-    pub(crate) fn load_ownership_for_capture(&self) -> Result<Vec<Instance>> {
-        self.load_ownership_rows(false)
-    }
-
-    fn load_ownership_rows(&self, strict: bool) -> Result<Vec<Instance>> {
-        if !self.sessions_path.exists() {
-            return Ok(Vec::new());
-        }
-        let content = fs::read_to_string(&self.sessions_path)?;
-        if content.trim().is_empty() {
-            return Ok(Vec::new());
-        }
-        let rows: Vec<serde_json::Value> = serde_json::from_str(&content)?;
-        let mut instances = Vec::with_capacity(rows.len());
-        for (index, row) in rows.into_iter().enumerate() {
-            match <Instance as serde::Deserialize>::deserialize(&row) {
-                Ok(mut instance) => {
-                    instance.source_profile = self.profile.clone();
-                    instance.set_file_watch(self.file_watch.clone());
-                    instances.push(instance);
-                }
-                Err(error) => {
-                    let may_own_conversation = row.as_object().is_some_and(|object| {
-                        [
-                            "id",
-                            "agent_session_id",
-                            "acp_session_id",
-                            "pending_tmux_ownership_session_id",
-                            "resume_intent",
-                            "prior_tool_session_ids",
-                        ]
-                        .iter()
-                        .any(|key| object.get(*key).is_some_and(|value| !value.is_null()))
-                    });
-                    if strict && may_own_conversation {
-                        return Err(error.into());
-                    }
-                    tracing::warn!(
-                        profile = %self.profile,
-                        row = index,
-                        error = %error,
-                        path = %self.sessions_path.display(),
-                        may_own_conversation,
-                        "skipping corrupt session row during ownership scan"
-                    );
-                }
-            }
-        }
         Ok(instances)
     }
 
@@ -1088,19 +1000,9 @@ impl Storage {
     /// `rename(2)` syscalls on sibling files and is tolerated by the
     /// loader (`GroupTree` accepts orphan group rows).
     ///
-    /// This is the only public mutator entry point; ordinary writes take the
-    /// process-local and per-profile locks. Ownership-sensitive callers must
-    /// hold the app-global ownership lock and use
-    /// `update_with_tmux_ownership_lock` instead.
+    /// This is the only public mutator entry point; all writes funnel
+    /// through here so both lock layers are always taken.
     pub fn update<F, R>(&self, f: F) -> Result<R>
-    where
-        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
-    {
-        self.update_with_tmux_ownership_lock(f)
-    }
-
-    /// Update while the caller already holds the app-global ownership lock.
-    pub(crate) fn update_with_tmux_ownership_lock<F, R>(&self, f: F) -> Result<R>
     where
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
@@ -1124,9 +1026,6 @@ impl Storage {
     where
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
-        // A typed rewrite cannot preserve an unreadable ownership-bearing row.
-        // Refuse every mutation before the tolerant loader could omit it.
-        self.load_ownership_strict()?;
         let (mut instances, mut groups) = self.load_with_groups()?;
         let groups_before = groups.clone();
         let result = f(&mut instances, &mut groups)?;
@@ -1173,7 +1072,6 @@ impl Storage {
         F: FnOnce(&[Instance], &Instance) -> Result<()>,
         B: FnOnce(&Instance) -> Result<()>,
     {
-        let _ownership = acquire_tmux_ownership_lock()?;
         let changes = [(before.clone(), after.clone())];
         let group_move = GroupMovePlan::single(&before.group_path, &after.group_path);
         let mut moved = self.move_instances_to_inner(
@@ -1207,7 +1105,6 @@ impl Storage {
     where
         F: FnOnce(&[Instance], &[Instance]) -> Result<()>,
     {
-        let _ownership = acquire_tmux_ownership_lock()?;
         self.move_instances_to_inner(
             target,
             changes,
@@ -1300,10 +1197,6 @@ impl Storage {
             ));
         }
 
-        // A cross-profile rewrite must not erase an unreadable row that may
-        // still reserve conversation ownership in either profile.
-        self.load_ownership_strict()?;
-        target.load_ownership_strict()?;
         let (mut source_instances, mut source_groups) = self.load_with_groups()?;
         let (mut target_instances, mut target_groups) = target.load_with_groups()?;
         let mut ids = std::collections::HashSet::with_capacity(changes.len());
@@ -2264,7 +2157,7 @@ fn repair_journal_entry(
     storages: &[(&str, &Storage)],
     journal_path: &Path,
 ) -> Result<bool> {
-    repair_journal_entry_with_sync(entry, storages, journal_path, sync_parent_directory, true)
+    repair_journal_entry_with_sync(entry, storages, journal_path, sync_parent_directory)
 }
 
 fn repair_journal_entry_with_sync<S>(
@@ -2272,7 +2165,6 @@ fn repair_journal_entry_with_sync<S>(
     storages: &[(&str, &Storage)],
     journal_path: &Path,
     mut sync: S,
-    reconcile_ownership: bool,
 ) -> Result<bool>
 where
     S: FnMut(&Path) -> Result<()>,
@@ -2348,8 +2240,7 @@ where
         }
     }
 
-    let _ownership = acquire_tmux_ownership_lock()?;
-    let repaired = with_two_storage_locks(source_storage, target_storage, || {
+    with_two_storage_locks(source_storage, target_storage, || {
         let (source_instances, _source_groups) = source_storage.load_with_groups()?;
         let (target_instances, _) = target_storage.load_with_groups()?;
         let plan = crate::session::GroupMovePlan {
@@ -2403,11 +2294,7 @@ where
         test_crash_point("profile-repair-source-written");
         super::move_journal::consume(journal_path)?;
         Ok(true)
-    })?;
-    if repaired && reconcile_ownership {
-        crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env_locked()?;
-    }
-    Ok(repaired)
+    })
 }
 
 fn sync_repaired_profile_durably<S>(storage: &Storage, mut sync: S) -> Result<()>
@@ -3581,29 +3468,6 @@ mod tests {
             Ok(())
         })?;
 
-        let ownership = acquire_tmux_ownership_lock()?;
-        let (updated_tx, updated_rx) = std::sync::mpsc::channel();
-        std::thread::scope(|scope| {
-            scope.spawn(|| {
-                let peer = Storage::new_unwatched("test-update-concurrent").unwrap();
-                crate::session::sync::with_tmux_ownership_lock(|| {
-                    peer.update_with_tmux_ownership_lock(|_, _| Ok(()))
-                })
-                .unwrap();
-                updated_tx.send(()).unwrap();
-            });
-            assert!(
-                updated_rx
-                    .recv_timeout(std::time::Duration::from_millis(100))
-                    .is_err(),
-                "an ownership-sensitive writer must wait for ownership reconciliation"
-            );
-            drop(ownership);
-            updated_rx
-                .recv_timeout(std::time::Duration::from_secs(5))
-                .unwrap();
-        });
-
         let n_threads = 32usize;
         std::thread::scope(|scope| {
             for tid in 0..n_threads {
@@ -4189,52 +4053,6 @@ mod tests {
         assert!(!effect_ran.get());
         assert_eq!(source.load()?.len(), 1);
         assert_eq!(target.load()?.len(), 1);
-        Ok(())
-    }
-
-    #[test]
-    fn profile_move_rejects_corrupt_ownership_rows() -> Result<()> {
-        for corrupt_source in [true, false] {
-            let temp = tempdir()?;
-            let source_dir = temp.path().join("source-corrupt");
-            let target_dir = temp.path().join("target-corrupt");
-            fs::create_dir_all(&source_dir)?;
-            fs::create_dir_all(&target_dir)?;
-            let source =
-                Storage::new_for_test_path("corrupt-source", source_dir.join("sessions.json"));
-            let target =
-                Storage::new_for_test_path("corrupt-target", target_dir.join("sessions.json"));
-            let before = Instance::new("move-me", "/repo/move-me");
-            source.update(|instances, _groups| {
-                instances.push(before.clone());
-                Ok(())
-            })?;
-            target.update(|_, _| Ok(()))?;
-
-            let corrupt = if corrupt_source { &source } else { &target };
-            let mut rows: serde_json::Value =
-                serde_json::from_str(&fs::read_to_string(&corrupt.sessions_path)?)?;
-            rows.as_array_mut().unwrap().push(serde_json::json!({
-                "agent_session_id": "reserved-by-unreadable-row"
-            }));
-            fs::write(&corrupt.sessions_path, serde_json::to_vec_pretty(&rows)?)?;
-            let before_move = fs::read(&corrupt.sessions_path)?;
-
-            let result = source.move_instance_to_with_effect(
-                &target,
-                &before,
-                &before,
-                |_instances, _candidate| Ok(()),
-                |_candidate| Ok(()),
-            );
-
-            assert!(result.is_err(), "corrupt_source={corrupt_source}");
-            assert_eq!(
-                fs::read(&corrupt.sessions_path)?,
-                before_move,
-                "corrupt_source={corrupt_source}"
-            );
-        }
         Ok(())
     }
 
@@ -5645,25 +5463,17 @@ mod tests {
         let journal_path = super::super::move_journal::record(&entry, source.sessions_path())?;
         let stores: Vec<(&str, &Storage)> =
             vec![(source.profile(), &source), (target.profile(), &target)];
-        let error = repair_journal_entry_with_sync(
-            &entry,
-            &stores,
-            &journal_path,
-            |_path| Err(anyhow!("forced repaired-profile sync failure")),
-            false,
-        )
+        let error = repair_journal_entry_with_sync(&entry, &stores, &journal_path, |_path| {
+            Err(anyhow!("forced repaired-profile sync failure"))
+        })
         .expect_err("failed durability barrier must fail recovery completion");
         assert!(error.to_string().contains("not made durable"));
         assert!(source.load()?.is_empty(), "repair row write reached disk");
         assert_eq!(journal_entry_count(&source), 1, "evidence must remain");
 
-        let retry_error = repair_journal_entry_with_sync(
-            &entry,
-            &stores,
-            &journal_path,
-            |_path| Err(anyhow!("forced retry sync failure")),
-            false,
-        )
+        let retry_error = repair_journal_entry_with_sync(&entry, &stores, &journal_path, |_path| {
+            Err(anyhow!("forced retry sync failure"))
+        })
         .expect_err("no-loser retry must repeat the durability barrier");
         assert!(retry_error.to_string().contains("not made durable"));
         assert_eq!(journal_entry_count(&source), 1, "retry keeps evidence too");

@@ -443,28 +443,19 @@ impl HomeView {
             }
         }
 
-        let tool_swap_requested =
-            new_tool.is_some_and(|target| target != restart_edit_baseline.tool.as_str());
         // Identity-changing restart edits follow the global order: app-wide
         // identity, then the session title and authoritative source lifecycle.
-        // Profile moves and same-profile tool swaps keep the per-session guards
-        // through the durable edit and save so another TUI cannot interleave.
+        // Keep these guards through the complete durable profile transaction.
         let profile_move_identity = if profile_move_target.is_some() {
             Some(acquire_session_identity_lock()?)
         } else {
             None
         };
-        let restart_edit_guards = if profile_move_target.is_some() || tool_swap_requested {
+        let profile_move_guards = if profile_move_target.is_some() {
             Some(self.lock_session_mutation_and_reload(&id)?)
         } else {
             None
         };
-        if tool_swap_requested {
-            self.instances
-                .get_mut(&id)
-                .ok_or_else(|| anyhow::anyhow!("Session not found"))?
-                .stop_and_flush_poller_lifecycle_locked();
-        }
         let restart_edit_authoritative = self
             .get_instance(&id)
             .cloned()
@@ -498,7 +489,7 @@ impl HomeView {
             }
             if let Some(target_tool) = new_tool {
                 if target_tool != restart_edit_authoritative.tool.as_str() {
-                    requested.swap_tool_for_restart(target_tool);
+                    requested.swap_tool(target_tool);
                 }
             }
             if let Some(command) = new_command_override {
@@ -527,8 +518,8 @@ impl HomeView {
                     .map(|i| i.tool.clone())
                     .unwrap_or_default();
                 if target_tool != current_tool {
-                    self.persist_tool_swap(&id, target_tool)?;
-                    self.mutate_instance(&id, |inst| inst.swap_tool_for_restart(target_tool));
+                    self.mutate_instance(&id, |inst| inst.swap_tool(target_tool));
+                    self.persist_tool_swap(&id, target_tool);
                 }
             }
             if let Some(command) = new_command_override {
@@ -542,10 +533,6 @@ impl HomeView {
                 });
             }
         }
-        // Keep the outgoing pane's ownership marker until the restart worker
-        // quiesces it. Reconciling a committed profile or tool change here
-        // would expose the still-live conversation to another shared-store
-        // poller; launch finalization reconciles after the replacement starts.
         self.restart_cooldown_at.insert(id.clone(), now);
         self.mutate_instance(&id, |inst| inst.touch_last_accessed());
 
@@ -558,7 +545,7 @@ impl HomeView {
         // Publish the final launch edit while identity/title/lifecycle remain
         // guarded, then drop identity before releasing the per-session guards.
         drop(profile_move_identity);
-        drop(restart_edit_guards);
+        drop(profile_move_guards);
 
         // The start cascade shells out to docker (image pull, container
         // create/start) and runs the before_start host hook, any of which can
@@ -606,39 +593,52 @@ impl HomeView {
     /// `reconcile_from_disk` restores the old engine's sid on the launch that
     /// follows and the new engine spawns with `--resume <foreign-sid>`.
     ///
-    /// `swap_tool_for_restart` runs against the disk row rather than copying the
-    /// in-memory result over it, because the capture pollers may have written a
-    /// fresher sid to disk than this snapshot carries; parking whatever disk
-    /// holds is what makes the swap-back restore the real conversation.
-    /// Failure aborts the restart before the in-memory tool changes, because a
-    /// later save would otherwise publish the old engine's session ID under the
-    /// new engine's namespace.
-    fn persist_tool_swap(&self, id: &str, new_tool: &str) -> anyhow::Result<()> {
-        let profile = self
-            .instances
-            .get(id)
-            .map(|i| i.source_profile.clone())
-            .ok_or_else(|| anyhow::anyhow!("session '{id}' disappeared before tool swap"))?;
-        let storage = self.storages.get(&profile).ok_or_else(|| {
-            anyhow::anyhow!(
-                "no storage registered for profile '{profile}' while swapping session '{id}'"
-            )
-        })?;
+    /// `swap_tool` runs against the disk row rather than copying the in-memory
+    /// result over it, because the capture pollers may have written a fresher
+    /// sid to disk than this snapshot carries; parking whatever disk holds is
+    /// what makes the swap-back restore the real conversation.
+    ///
+    /// Best-effort. A failed write leaves the stale sid on disk (the restart
+    /// still runs, and its resume-probe fallback recovers by starting fresh),
+    /// so it is logged rather than surfaced as a restart failure.
+    fn persist_tool_swap(&self, id: &str, new_tool: &str) {
+        let Some(profile) = self.instances.get(id).map(|i| i.source_profile.clone()) else {
+            return;
+        };
+        let Some(storage) = self.storages.get(&profile) else {
+            tracing::warn!(
+                target: "tui.home",
+                profile = %profile,
+                id = %id,
+                "persist_tool_swap: no storage registered for profile; \
+                 the old engine's session id stays on disk"
+            );
+            return;
+        };
         let id_owned = id.to_string();
         let new_tool = new_tool.to_string();
         let row_profile = profile.clone();
-        storage.update(|instances, _groups| {
-            let disk = instances
-                .iter_mut()
-                .find(|i| i.id == id_owned)
-                .ok_or_else(|| anyhow::anyhow!("session '{id_owned}' disappeared from storage"))?;
-            // Storage-loaded rows omit source_profile. Restore it before
-            // resolving a profile-scoped agent alias during the swap.
-            disk.source_profile = row_profile.clone();
-            disk.swap_tool_for_restart(&new_tool);
+        if let Err(e) = storage.update(|instances, _groups| {
+            if let Some(disk) = instances.iter_mut().find(|i| i.id == id_owned) {
+                // `source_profile` is `skip_serializing`, so a storage-loaded
+                // row always comes back blank and would resolve the incoming
+                // tool's `agent_detect_as` alias against the default profile.
+                // A tool name aliased differently per profile would then be
+                // pinned to the wrong built-in on disk, and `detect_as` is not
+                // in `reconcile_from_disk`'s carry set, so the next launch
+                // reads that value rather than the in-memory one. Restore it
+                // the same way `reconcile_from_disk` does before the swap.
+                disk.source_profile = row_profile.clone();
+                disk.swap_tool(&new_tool);
+            }
             Ok(())
-        })?;
-        Ok(())
+        }) {
+            tracing::error!(
+                target: "tui.home",
+                id = %id,
+                "persist_tool_swap: failed to move the old engine's session state aside: {e}"
+            );
+        }
     }
 
     pub(super) fn delete_selected(&mut self, options: &DeleteOptions) -> anyhow::Result<()> {

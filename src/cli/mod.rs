@@ -41,54 +41,6 @@ pub mod worktree;
 
 pub use definition::{command_name, Cli, Commands, CLI_COMMAND_NAMES};
 
-fn command_reconciles_session_id_env(command: &Commands) -> bool {
-    matches!(
-        command,
-        Commands::Add(_)
-            | Commands::List(_)
-            | Commands::Ps(_)
-            | Commands::Remove(_)
-            | Commands::Send(_)
-            | Commands::Status(_)
-            | Commands::Session { .. }
-            | Commands::Group { .. }
-    )
-}
-
-fn command_requires_reconciled_session_id_env(command: &Commands) -> bool {
-    match command {
-        Commands::Add(_) | Commands::Remove(_) | Commands::Send(_) => true,
-        Commands::Session { command } => match command {
-            session::SessionCommands::Show(_)
-            | session::SessionCommands::Capture(_)
-            | session::SessionCommands::Current(_)
-            | session::SessionCommands::ListTrash => false,
-            session::SessionCommands::Import(args) => !args.dry_run,
-            _ => true,
-        },
-        _ => false,
-    }
-}
-
-/// Remove legacy terminal ownership signals before a one-shot session command.
-pub fn reconcile_session_id_env_for_command(command: Option<&Commands>) -> anyhow::Result<()> {
-    if let Some(command) = command.filter(|command| command_reconciles_session_id_env(command)) {
-        if let Err(error) =
-            crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env()
-        {
-            if command_requires_reconciled_session_id_env(command) {
-                anyhow::bail!(
-                    "refusing session mutation because tmux ownership reconciliation failed: {error}"
-                );
-            }
-            tracing::warn!(target: "cli",
-                "Tmux ownership reconciliation failed; continuing read-only command without startup cleanup: {error}"
-            );
-        }
-    }
-    Ok(())
-}
-
 /// Whether CLI stdout should contain ANSI color. Color is terminal-only and
 /// follows the NO_COLOR convention (only a non-empty value disables it).
 pub(crate) fn color_enabled() -> bool {
@@ -274,37 +226,6 @@ where
 mod tests {
     use super::*;
     use crate::session::claim::purge_restored_row_must_be_kept;
-
-    #[test]
-    fn session_aware_top_level_commands_reconcile_legacy_env() {
-        use clap::Parser;
-
-        let cases: &[(&[&str], bool)] = &[
-            (&["aoe", "add", "/tmp/x"], true),
-            (&["aoe", "list"], true),
-            (&["aoe", "ps"], true),
-            (&["aoe", "remove", "session"], true),
-            (&["aoe", "send", "session", "message"], true),
-            (&["aoe", "status"], true),
-            (&["aoe", "session", "show", "session"], true),
-            (&["aoe", "group", "list"], true),
-            (&["aoe", "agents"], false),
-            (&["aoe", "profile", "delete", "doomed"], false),
-            (&["aoe", "worktree", "cleanup", "--force"], false),
-        ];
-        for (args, expected) in cases {
-            let cli = Cli::try_parse_from(*args).unwrap_or_else(|error| {
-                panic!("failed to parse {args:?}: {error}");
-            });
-            assert_eq!(
-                cli.command
-                    .as_ref()
-                    .is_some_and(command_reconciles_session_id_env),
-                *expected,
-                "{args:?}"
-            );
-        }
-    }
 
     #[test]
     fn truncate_id_shorter_than_max_returns_input() {
