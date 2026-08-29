@@ -3113,6 +3113,7 @@ fn load_all_instances(file_watch: &Arc<FileWatchService>) -> anyhow::Result<Vec<
 /// field on `Instance` requires extending this function or the field is
 /// silently wiped on every poll tick.
 fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
+    let same_poller_identity = fresh.has_same_poller_identity(&prior);
     fresh.last_error_check = prior.last_error_check;
     fresh.last_start_time = prior.last_start_time;
     // Only preserve `last_error` while the session is still in Error. A healthy
@@ -3123,8 +3124,10 @@ fn merge_runtime_fields(prior: Instance, mut fresh: Instance) -> Instance {
     if fresh.status == Status::Error {
         fresh.last_error = prior.last_error;
     }
-    fresh.session_id_poller = prior.session_id_poller;
-    fresh.retroactive_capture_excludes = prior.retroactive_capture_excludes;
+    if same_poller_identity {
+        fresh.session_id_poller = prior.session_id_poller;
+        fresh.retroactive_capture_excludes = prior.retroactive_capture_excludes;
+    }
     fresh
 }
 
@@ -3590,35 +3593,43 @@ fn repair_structured_rows_from_live_workers(
 }
 
 #[cfg(feature = "serve")]
+fn acp_assignment_namespace(instance: &Instance) -> String {
+    instance
+        .agent_session_store_namespace
+        .clone()
+        .or_else(|| instance.terminal_session_store_namespace())
+        .unwrap_or_else(|| {
+            let adapter = instance
+                .agent_name
+                .as_deref()
+                .filter(|name| !name.trim().is_empty())
+                .unwrap_or(&instance.tool);
+            format!("acp:{adapter}")
+        })
+}
+
+#[cfg(feature = "serve")]
 fn validate_acp_session_assignment(
     instance: &Instance,
     local: &[Instance],
     foreign: &[Instance],
     session_id: &str,
 ) -> anyhow::Result<()> {
+    let namespace = acp_assignment_namespace(instance);
     if local.iter().chain(foreign).any(|candidate| {
-        candidate.id != instance.id
-            && (candidate.acp_session_id.as_deref() == Some(session_id)
-                || candidate
-                    .prior_tool_session_ids
-                    .values()
-                    .any(|prior| prior.acp_session_id.as_deref() == Some(session_id)))
-    }) {
-        anyhow::bail!("ACP session '{session_id}' is already owned");
-    }
-    let Some(namespace) = instance
-        .agent_session_store_namespace
-        .clone()
-        .or_else(|| instance.terminal_session_store_namespace())
-    else {
-        // Structured ACP identities remain durable even when the terminal tool
-        // has no resumable store. The global ACP check above is the only
-        // ownership domain available for those tools.
-        return Ok(());
-    };
-    if local.iter().chain(foreign).any(|candidate| {
-        candidate.id != instance.id
-            && candidate.reserves_claude_import_id_in_namespace(session_id, &namespace)
+        if candidate.id == instance.id {
+            return false;
+        }
+        (candidate.acp_session_id.as_deref() == Some(session_id)
+            && acp_assignment_namespace(candidate) == namespace)
+            || candidate.reserves_claude_import_id_in_namespace(session_id, &namespace)
+            || candidate
+                .prior_tool_session_ids
+                .iter()
+                .any(|(tool, prior)| {
+                    prior.acp_session_id.as_deref() == Some(session_id)
+                        && format!("acp:{tool}") == namespace
+                })
     }) {
         anyhow::bail!("ACP session '{session_id}' is already owned in store '{namespace}'");
     }
@@ -5798,7 +5809,14 @@ async fn acp_event_listener(state: Arc<AppState>) {
                     .then(|| inst.source_profile.clone());
 
             (
-                apply_acp_session_change(inst, &frame.session_id, acp_change.as_ref()),
+                {
+                    let mut identity_probe = inst.clone();
+                    apply_acp_session_change(
+                        &mut identity_probe,
+                        &frame.session_id,
+                        acp_change.as_ref(),
+                    )
+                },
                 unread_profile,
             )
         };
@@ -5845,6 +5863,10 @@ async fn acp_event_listener(state: Arc<AppState>) {
             let session_id_for_save = frame.session_id.clone();
             let profile_for_save = profile.clone();
             let acp_change_for_save = acp_change.clone();
+            let rejected_assignment = match acp_change.as_ref() {
+                Some(AcpSessionChange::Assigned(id)) => Some(id.clone()),
+                _ => None,
+            };
             let file_watch = state.file_watch.clone();
             let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                 let storage = crate::session::Storage::new(&profile_for_save, file_watch)?;
@@ -5853,36 +5875,39 @@ async fn acp_event_listener(state: Arc<AppState>) {
                         storage.profile(),
                     ))?;
                     storage.update_with_tmux_ownership_lock(|all, _groups| {
-                        if let Some(index) = all.iter().position(|i| i.id == session_id_for_save) {
-                            if let Some(AcpSessionChange::Assigned(new_id)) =
-                                acp_change_for_save.as_ref()
-                            {
-                                validate_acp_session_assignment(
-                                    &all[index],
-                                    all,
-                                    &foreign,
-                                    new_id,
-                                )?;
-                            }
-                            apply_acp_session_change(
-                                &mut all[index],
-                                &session_id_for_save,
-                                acp_change_for_save.as_ref(),
-                            );
+                        let index = all
+                            .iter()
+                            .position(|i| i.id == session_id_for_save)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "session {} disappeared before ACP identity persistence",
+                                    session_id_for_save
+                                )
+                            })?;
+                        if let Some(AcpSessionChange::Assigned(new_id)) =
+                            acp_change_for_save.as_ref()
+                        {
+                            validate_acp_session_assignment(&all[index], all, &foreign, new_id)?;
                         }
+                        apply_acp_session_change(
+                            &mut all[index],
+                            &session_id_for_save,
+                            acp_change_for_save.as_ref(),
+                        );
                         Ok(())
                     })
                 })
             })
             .await;
-            match save_result {
-                Ok(Ok(())) => {}
+            let persisted = match save_result {
+                Ok(Ok(())) => true,
                 Ok(Err(e)) => {
                     tracing::warn!(
                         target: "acp.event_listener",
                         session = %session_id_for_log,
                         "save after acp_session_id update: {e}"
                     );
+                    false
                 }
                 Err(join_err) => {
                     tracing::warn!(
@@ -5890,7 +5915,19 @@ async fn acp_event_listener(state: Arc<AppState>) {
                         session = %session_id_for_log,
                         "spawn_blocking join error during acp_session_id save: {join_err}"
                     );
+                    false
                 }
+            };
+            if persisted {
+                let mut instances = state.instances.write().await;
+                if let Some(inst) = instances.iter_mut().find(|i| i.id == session_id_for_log) {
+                    apply_acp_session_change(inst, &session_id_for_log, acp_change.as_ref());
+                }
+            } else if let Some(rejected_id) = rejected_assignment {
+                state
+                    .acp_supervisor
+                    .reject_session_assignment(&session_id_for_log, &rejected_id)
+                    .await;
             }
         }
     }
@@ -6819,6 +6856,10 @@ mod tests {
             let mut unsupported = Instance::new(tool, "/tmp/project");
             unsupported.tool = tool.into();
             unsupported.view = crate::session::View::Structured;
+            let mut same_adapter_owner = unsupported.clone();
+            same_adapter_owner.id = format!("{tool}-owner");
+            same_adapter_owner.acp_session_id = Some("contested".into());
+
             assert!(
                 validate_acp_session_assignment(&unsupported, &[], &[], "acp-only").is_ok(),
                 "{tool}"
@@ -6830,8 +6871,18 @@ mod tests {
                     &[],
                     "contested"
                 )
+                .is_ok(),
+                "ACP identities from different adapters may share the same opaque token: {tool}"
+            );
+            assert!(
+                validate_acp_session_assignment(
+                    &unsupported,
+                    std::slice::from_ref(&same_adapter_owner),
+                    &[],
+                    "contested"
+                )
                 .is_err(),
-                "{tool}"
+                "same-adapter ownership must remain exclusive: {tool}"
             );
         }
     }
@@ -9190,6 +9241,24 @@ mod tests {
 
         let merged = merge_runtime_fields(prior, fresh);
         assert_eq!(merged.last_error.as_deref(), Some("recovery cascade: foo"));
+    }
+
+    #[test]
+    fn merge_runtime_fields_drops_capture_state_after_tool_change() {
+        let mut prior = Instance::new("seed", "/tmp/seed");
+        prior.tool = "codex".into();
+        prior.agent_session_store_namespace = Some("codex:/tmp/seed/.codex".into());
+        prior
+            .retroactive_capture_excludes
+            .insert("old-session".into());
+
+        let mut fresh = prior.clone();
+        fresh.tool = "qwen".into();
+        fresh.agent_session_store_namespace = None;
+        fresh.retroactive_capture_excludes.clear();
+
+        let merged = merge_runtime_fields(prior, fresh);
+        assert!(merged.retroactive_capture_excludes.is_empty());
     }
 
     // #2237: a worker coming live (AcpSessionAssigned) must clear a stale

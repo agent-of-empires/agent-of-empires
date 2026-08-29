@@ -2079,6 +2079,16 @@ impl Instance {
     /// generation would let an unrelated bump discard a poller's confirmed
     /// reachability and unknown streak, or a freshly derived
     /// `TMUX_SESSION_GONE_ERROR`, leaving the row stuck at `Error`+`None`.
+    pub(crate) fn has_same_poller_identity(&self, previous: &Self) -> bool {
+        self.tool == previous.tool
+            && self.project_path == previous.project_path
+            && self.command == previous.command
+            && self.extra_args == previous.extra_args
+            && self.detect_as == previous.detect_as
+            && self.view == previous.view
+            && self.agent_session_store_namespace == previous.agent_session_store_namespace
+    }
+
     pub(crate) fn merge_runtime_from_reload(&mut self, previous: &Self) {
         if self.lifecycle_generation <= previous.lifecycle_generation {
             self.status = previous.status;
@@ -2092,8 +2102,10 @@ impl Instance {
         self.last_error = previous.last_error.clone();
         self.last_error_check = previous.last_error_check;
         self.last_start_time = previous.last_start_time;
-        self.session_id_poller = previous.session_id_poller.clone();
-        self.retroactive_capture_excludes = previous.retroactive_capture_excludes.clone();
+        if self.has_same_poller_identity(previous) {
+            self.session_id_poller = previous.session_id_poller.clone();
+            self.retroactive_capture_excludes = previous.retroactive_capture_excludes.clone();
+        }
     }
     /// Carry every in-process field from a pre-move live row onto the
     /// committed disk-derived candidate published by `HomeView`.
@@ -10290,6 +10302,29 @@ mod tests {
         // last_error is runtime-only: the in-memory poller value survives even a
         // newer generation, since no lifecycle writer persists last_error.
         assert_eq!(reloaded.last_error.as_deref(), Some("old observation"));
+    }
+
+    #[test]
+    fn runtime_reload_drops_poller_state_when_capture_identity_changes() {
+        let mut previous = Instance::new("session", "/tmp/test");
+        previous.tool = "codex".into();
+        previous.agent_session_store_namespace = Some("codex:/tmp/test/.codex".into());
+        previous.session_id_poller = Some(std::sync::Arc::new(std::sync::Mutex::new(
+            crate::session::poller::SessionPoller::new("old-poller".into()),
+        )));
+        previous
+            .retroactive_capture_excludes
+            .insert("old-session".into());
+
+        let mut reloaded = previous.clone();
+        reloaded.tool = "qwen".into();
+        reloaded.agent_session_store_namespace = None;
+        reloaded.session_id_poller = None;
+        reloaded.retroactive_capture_excludes.clear();
+        reloaded.merge_runtime_from_reload(&previous);
+
+        assert!(reloaded.session_id_poller.is_none());
+        assert!(reloaded.retroactive_capture_excludes.is_empty());
     }
 
     #[test]

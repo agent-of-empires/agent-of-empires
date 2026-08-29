@@ -48,6 +48,7 @@ fn resolve_agent_home(env_var: Option<&str>, default_subdir: &str) -> Result<Pat
 /// the launched pane. An empty slice preserves ambient behavior for one-shot
 /// retroactive capture outside a launch.
 fn resolve_agent_home_for_host_environment(
+    project_path: &str,
     host_env: &[String],
     env_var: Option<&str>,
     default_subdir: &str,
@@ -55,12 +56,18 @@ fn resolve_agent_home_for_host_environment(
     let value = |key: &str| {
         crate::session::environment::resolve_host_environment_value(host_env, key)
             .or_else(|| std::env::var(key).ok())
-            .filter(|value| !value.is_empty())
     };
     if let Some(value) = env_var.and_then(value) {
-        return Ok(PathBuf::from(value));
+        anyhow::ensure!(!value.is_empty(), "agent store override is empty");
+        let path = PathBuf::from(value);
+        return Ok(if path.is_absolute() {
+            path
+        } else {
+            Path::new(project_path).join(path)
+        });
     }
     value("HOME")
+        .filter(|value| !value.is_empty())
         .map(PathBuf::from)
         .or_else(dirs::home_dir)
         .map(|home| home.join(default_subdir))
@@ -80,9 +87,16 @@ fn resolve_agent_home_for_host_environment(
 /// Precedence mirrors [`crate::hooks::agent_settings_path_in`]: the session's
 /// host environment first, then AoE's own env (a var exported in the shell that
 /// launched `aoe` is inherited by the agent too), then `~/.claude`.
-fn claude_home_for_host_environment(host_env: &[String]) -> Result<PathBuf> {
+fn claude_home_for_host_environment(project_path: &str, host_env: &[String]) -> Result<PathBuf> {
     match claude_config_dir_override(host_env) {
-        Some(dir) => Ok(PathBuf::from(dir)),
+        Some(dir) => {
+            let path = PathBuf::from(dir);
+            Ok(if path.is_absolute() {
+                path
+            } else {
+                Path::new(project_path).join(path)
+            })
+        }
         None => resolve_agent_home(None, ".claude"),
     }
 }
@@ -160,7 +174,7 @@ pub(crate) fn capture_claude_session_id(
     exclusion: &HashSet<String>,
     host_env: &[String],
 ) -> Result<String> {
-    let claude_home = claude_home_for_host_environment(host_env)?;
+    let claude_home = claude_home_for_host_environment(project_path, host_env)?;
     let canonical = canonicalize_or_raw(project_path);
 
     if let Some((id, modified)) =
@@ -239,7 +253,7 @@ pub(crate) fn claude_host_transcript_confirmed_absent(
     session_id: &str,
     host_env: &[String],
 ) -> bool {
-    let Ok(claude_home) = claude_home_for_host_environment(host_env) else {
+    let Ok(claude_home) = claude_home_for_host_environment(project_path, host_env) else {
         return false;
     };
     let canonical = canonicalize_or_raw(project_path);
@@ -696,6 +710,7 @@ fn capture_pi_family_session_id(
     host_environment: &[String],
 ) -> Result<String> {
     let pi_home = resolve_agent_home_for_host_environment(
+        project_path,
         host_environment,
         Some("PI_CODING_AGENT_DIR"),
         default_subdir,
@@ -1280,8 +1295,12 @@ fn capture_vibe_session_id_in_environment(
     exclusion: &HashSet<String>,
     host_environment: &[String],
 ) -> Result<String> {
-    let vibe_home =
-        resolve_agent_home_for_host_environment(host_environment, Some("VIBE_HOME"), ".vibe")?;
+    let vibe_home = resolve_agent_home_for_host_environment(
+        project_path,
+        host_environment,
+        Some("VIBE_HOME"),
+        ".vibe",
+    )?;
     let sessions_dir = vibe_home.join("logs").join("session");
 
     if !sessions_dir.exists() {
@@ -2164,8 +2183,12 @@ fn capture_codex_session_id_in_environment(
     exclusion: &HashSet<String>,
     host_environment: &[String],
 ) -> Result<String> {
-    let codex_home =
-        resolve_agent_home_for_host_environment(host_environment, Some("CODEX_HOME"), ".codex")?;
+    let codex_home = resolve_agent_home_for_host_environment(
+        project_path,
+        host_environment,
+        Some("CODEX_HOME"),
+        ".codex",
+    )?;
     let sessions_dir = codex_home.join("sessions");
 
     if !sessions_dir.exists() {
@@ -2538,6 +2561,7 @@ fn capture_gemini_session_id_in_environment(
     use sha2::{Digest, Sha256};
 
     let gemini_home = resolve_agent_home_for_host_environment(
+        project_path,
         host_environment,
         Some("GEMINI_CLI_HOME"),
         ".gemini",
@@ -2693,8 +2717,12 @@ fn extract_gemini_fields(path: &std::path::Path) -> Option<(Option<String>, Opti
 /// under its config dir (`$COPILOT_CONFIG_DIR`, default `~/.copilot`). Each row
 /// carries the session UUID (`id`), the working directory (`cwd`), and an RFC
 /// 3339 `updated_at` timestamp.
-fn copilot_db_path_in_environment(host_environment: &[String]) -> Result<PathBuf> {
+fn copilot_db_path_in_environment(
+    project_path: &str,
+    host_environment: &[String],
+) -> Result<PathBuf> {
     Ok(resolve_agent_home_for_host_environment(
+        project_path,
         host_environment,
         Some("COPILOT_CONFIG_DIR"),
         ".copilot",
@@ -2783,7 +2811,7 @@ fn capture_copilot_session_id_in_environment(
     exclusion: &HashSet<String>,
     host_environment: &[String],
 ) -> Result<String> {
-    let db_path = copilot_db_path_in_environment(host_environment)?;
+    let db_path = copilot_db_path_in_environment(project_path, host_environment)?;
     let entries = read_copilot_sessions_from_sqlite_at(&db_path)?;
     select_copilot_session(&entries, project_path, exclusion)
 }
@@ -2940,7 +2968,7 @@ pub(crate) fn capture_kimi_session_id(
     launch_time_ms: Option<f64>,
     environment: &[String],
 ) -> Result<String> {
-    let home = kimi_home_for_environment(environment)
+    let home = kimi_home_for_environment(project_path, environment)
         .ok_or_else(|| anyhow::anyhow!("could not resolve the Kimi home"))?;
     let sessions = read_kimi_session_index(&home.join("session_index.jsonl"))?;
     select_kimi_session(&sessions, project_path, exclusion, launch_time_ms)
@@ -3139,6 +3167,7 @@ fn capture_prime_agent_session_id_in_environment(
     host_environment: &[String],
 ) -> Result<String> {
     let home = resolve_agent_home_for_host_environment(
+        project_path,
         host_environment,
         Some("PRIME_AGENT_CODING_AGENT_DIR"),
         ".prime/agent",
@@ -3176,15 +3205,17 @@ pub(crate) fn prime_agent_poll_fn(
 /// Effective Kimi home for one environment list: `KIMI_CODE_HOME` resolved
 /// through the same `$VAR` / bare-key grammar launch applies
 /// ([`crate::session::environment::resolve_host_environment_value`]), else the
-/// ambient default resolution. An empty resolved value counts as unset; `None`
-/// when even the default cannot be resolved (the sharing predicate fails
-/// closed on `None`).
-fn kimi_home_for_environment(environment: &[String]) -> Option<PathBuf> {
-    crate::session::environment::resolve_host_environment_value(environment, "KIMI_CODE_HOME")
-        .map(PathBuf::from)
-        .filter(|home| !home.as_os_str().is_empty())
-        .or_else(|| resolve_agent_home(Some("KIMI_CODE_HOME"), ".kimi-code").ok())
-        .filter(|home| !home.as_os_str().is_empty())
+/// ambient default resolution. An explicit empty override or missing default
+/// returns `None`; the sharing predicate fails closed on either.
+fn kimi_home_for_environment(project_path: &str, environment: &[String]) -> Option<PathBuf> {
+    resolve_agent_home_for_host_environment(
+        project_path,
+        environment,
+        Some("KIMI_CODE_HOME"),
+        ".kimi-code",
+    )
+    .ok()
+    .filter(|home| !home.as_os_str().is_empty())
 }
 
 /// Whether another persisted host AoE session shares this one's Kimi store: a
@@ -3221,7 +3252,7 @@ pub(crate) fn kimi_store_is_shared(
     let canonical_current = canonicalize_or_raw(current_project_path);
     let own_homes = [own_resolved_environment, own_profile_environment]
         .iter()
-        .filter_map(|env| kimi_home_for_environment(env))
+        .filter_map(|env| kimi_home_for_environment(current_project_path, env))
         .map(|home| canonicalize_or_raw(home.to_string_lossy().as_ref()))
         .collect::<Vec<_>>();
     if own_homes.is_empty() {
@@ -3231,21 +3262,9 @@ pub(crate) fn kimi_store_is_shared(
         return true;
     };
     for peer_profile in profiles {
-        // Judge the namespace before paying for the store read: a peer whose
-        // resolved home differs cannot share this store however many rows its
-        // sessions.json holds. A successful resolve idempotently reinstalls
-        // that profile's status rules; a failed resolve returns shared without
-        // installing fallback rules or clearing the prior registry state.
         let Ok(peer_config) = super::profile_config::resolve_config(&peer_profile) else {
             return true;
         };
-        let Some(peer_home) = kimi_home_for_environment(&peer_config.environment) else {
-            return true;
-        };
-        let peer_home = canonicalize_or_raw(peer_home.to_string_lossy().as_ref());
-        if !own_homes.contains(&peer_home) {
-            continue;
-        }
         let Ok(storage) = crate::session::storage::Storage::new_unwatched(&peer_profile) else {
             return true;
         };
@@ -3262,10 +3281,16 @@ pub(crate) fn kimi_store_is_shared(
                     .get("kimi")
                     .and_then(|prior| prior.agent_session_id.as_deref())
                     .is_some_and(|sid| !sid.is_empty());
-            if !owns_kimi {
+            if !owns_kimi || canonicalize_or_raw(&inst.project_path) != canonical_current {
                 continue;
             }
-            if canonicalize_or_raw(&inst.project_path) == canonical_current {
+            let Some(peer_home) =
+                kimi_home_for_environment(&inst.project_path, &peer_config.environment)
+            else {
+                return true;
+            };
+            let peer_home = canonicalize_or_raw(peer_home.to_string_lossy().as_ref());
+            if own_homes.contains(&peer_home) {
                 return true;
             }
         }
@@ -3489,8 +3514,12 @@ fn capture_hermes_session_id_in_environment(
     exclusion: &HashSet<String>,
     host_environment: &[String],
 ) -> Result<String> {
-    let hermes_home =
-        resolve_agent_home_for_host_environment(host_environment, Some("HERMES_HOME"), ".hermes")?;
+    let hermes_home = resolve_agent_home_for_host_environment(
+        project_path,
+        host_environment,
+        Some("HERMES_HOME"),
+        ".hermes",
+    )?;
     let db_path = hermes_home.join("state.db");
 
     let scan = read_hermes_sessions_from_sqlite(&db_path)?;
@@ -6681,11 +6710,15 @@ mod tests {
 
     #[test]
     #[serial]
-    fn test_kimi_home_rejects_empty_ambient_fallback() {
+    fn test_kimi_home_resolves_environment_from_project() {
         let _env = EnvGuard::set(&[("KIMI_CODE_HOME", "")]);
         assert!(
-            kimi_home_for_environment(&[]).is_none(),
+            kimi_home_for_environment("/tmp/project", &[]).is_none(),
             "an explicitly empty ambient home must not become a relative store path"
+        );
+        assert_eq!(
+            kimi_home_for_environment("/tmp/project", &["KIMI_CODE_HOME=.kimi".to_string()],),
+            Some(PathBuf::from("/tmp/project/.kimi"))
         );
     }
 
