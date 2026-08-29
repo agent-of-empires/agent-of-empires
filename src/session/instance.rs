@@ -2166,6 +2166,12 @@ impl Instance {
         if new_tool == self.tool {
             return;
         }
+        // Capture the incoming alias before resolving the outgoing store. That
+        // resolution loads profile configuration and may refresh the registry;
+        // the swap must use the alias selected by its caller's resolved config.
+        let incoming_detect_as =
+            tmux::status_rules::effective_detect_as(&self.source_profile, new_tool, "")
+                .into_owned();
         // Park the outgoing agent's conversation under its own name so a swap
         // back to it resumes there instead of starting a third conversation.
         let retained_agent_session_id = self.agent_session_id.take();
@@ -2195,7 +2201,6 @@ impl Instance {
         // Command overrides are owned by the selected tool. A wrapper remains
         // authoritative while that tool is selected, but cannot cross a tool
         // transition and receive the new tool's resume flags.
-        self.command.clear();
         // The alias is resolved per-tool, so the outgoing tool's answer cannot
         // survive: kept, it points `resolved_agent` at the wrong built-in
         // outright (a `codex-personal` -> `claude-personal` swap would keep
@@ -2205,9 +2210,8 @@ impl Instance {
         // process-global registry `effective_detect_as` reads, so this stays a
         // lookup rather than a config load, and the row ends up exactly as if
         // it had been built on the new tool.
-        self.detect_as =
-            tmux::status_rules::effective_detect_as(&self.source_profile, new_tool, "")
-                .into_owned();
+        self.detect_as = incoming_detect_as;
+        self.command.clear();
         // Consumed, not copied: the row owns exactly one live conversation per
         // agent, and leaving the entry behind would let a later swap restore an
         // id this session has since replaced.
@@ -2893,12 +2897,8 @@ impl Instance {
             super::environment::resolve_host_environment_pairs(&self.resolved_host_environment());
         let mut absent = Vec::new();
         for key in CAPTURE_ROUTING_ENV_KEYS {
-            let existing = pairs.iter().position(|(candidate, _)| candidate == key);
-            if existing.is_some_and(|index| !pairs[index].1.is_empty()) {
+            if pairs.iter().any(|(candidate, _)| candidate == key) {
                 continue;
-            }
-            if let Some(index) = existing {
-                pairs.remove(index);
             }
             match std::env::var(key).ok().filter(|value| !value.is_empty()) {
                 Some(value) => pairs.push(((*key).to_string(), value)),
@@ -13387,11 +13387,6 @@ mod tests {
     #[test]
     fn swap_tool_reresolves_detect_as() {
         const PROFILE: &str = "detect-as-swap-test";
-        let _registry = install_aliases(
-            PROFILE,
-            &[("claude-personal", "claude"), ("codex-personal", "codex")],
-        );
-
         // (starting tool, stored alias, tool swapped to, expected alias)
         let cases = [
             // The reported row: created on a built-in (no alias to store),
@@ -13404,6 +13399,10 @@ mod tests {
             ("claude-personal", "claude", "codex", ""),
         ];
         for (tool, detect_as, new_tool, expected) in cases {
+            let _registry = install_aliases(
+                PROFILE,
+                &[("claude-personal", "claude"), ("codex-personal", "codex")],
+            );
             let mut inst = Instance::new("t", "/tmp/x");
             inst.source_profile = PROFILE.to_string();
             inst.tool = tool.to_string();
@@ -18752,6 +18751,50 @@ mod tests {
             isolate_home(&temp);
 
             let profile = "publish-applied";
+            let mut empty_routing = make_inst(profile, "empty-routing");
+            empty_routing.tool = "omp".to_string();
+            empty_routing.pending_host_env = vec![
+                ("CODEX_HOME".to_string(), String::new()),
+                ("OMP_PROFILE".to_string(), String::new()),
+                (
+                    "PI_PROFILE".to_string(),
+                    "fallback-must-not-win".to_string(),
+                ),
+            ];
+            let (environment, mutations) = empty_routing.launch_host_environment_snapshot();
+            assert!(environment.iter().any(|entry| entry == "CODEX_HOME="));
+            assert_eq!(
+                environment
+                    .iter()
+                    .filter(|entry| entry.starts_with("CODEX_HOME="))
+                    .count(),
+                1
+            );
+            assert!(environment.iter().any(|entry| entry == "OMP_PROFILE="));
+            assert_eq!(
+                environment
+                    .iter()
+                    .filter(|entry| entry.starts_with("OMP_PROFILE="))
+                    .count(),
+                1
+            );
+            assert!(environment
+                .iter()
+                .any(|entry| entry == "PI_PROFILE=fallback-must-not-win"));
+            assert!(mutations.contains(&crate::tmux::PaneEnvMutation::set(
+                "OMP_PROFILE".to_string(),
+                String::new(),
+            )));
+            assert!(!mutations.contains(&crate::tmux::PaneEnvMutation::unset(
+                "OMP_PROFILE".to_string(),
+            )));
+            assert!(mutations.contains(&crate::tmux::PaneEnvMutation::set(
+                "CODEX_HOME".to_string(),
+                String::new(),
+            )));
+            assert!(!mutations.contains(&crate::tmux::PaneEnvMutation::unset(
+                "CODEX_HOME".to_string(),
+            )));
             let mut inst = make_inst(profile, "fpaw");
             inst.tool = "omp".to_string();
             inst.pending_host_env = vec![

@@ -3266,9 +3266,15 @@ mod import_tests {
             let mut by_resume = Instance::new("resume", "/p");
             by_resume.tool = tool.to_string();
             by_resume.resume_intent = ResumeIntent::Use("id-1".to_string());
+            if tool == "claude" {
+                by_resume.agent_session_store_namespace = Some(namespace.clone());
+            }
             let mut by_observed = Instance::new("observed", "/p");
             by_observed.tool = tool.to_string();
             by_observed.agent_session_id = Some("id-2".to_string());
+            if tool == "claude" {
+                by_observed.agent_session_store_namespace = Some(namespace.clone());
+            }
             let instances = vec![by_resume, by_observed];
 
             assert_eq!(

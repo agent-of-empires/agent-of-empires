@@ -10597,6 +10597,15 @@ fn restart_selected_session_tool_swap_resolves_detect_as_for_the_row_profile() {
     std::fs::create_dir_all(app_dir.join("profiles").join("other")).expect("other profile");
     std::fs::write(app_dir.join("config.toml"), "default_profile = \"other\"\n")
         .expect("global config");
+    let test_profile_dir = app_dir.join("profiles").join("test");
+    std::fs::create_dir_all(&test_profile_dir).expect("test profile");
+    std::fs::write(
+        test_profile_dir.join("config.toml"),
+        "[session.agent_detect_as]
+gjc = \"claude\"
+",
+    )
+    .expect("test profile config");
 
     let mut config = crate::session::Config::default();
     config
@@ -19983,14 +19992,28 @@ mod apply_session_id_updates {
             .resolved_terminal_session_store_namespace()
             .unwrap();
         view.repair_session_id_pollers();
-        assert!(Arc::ptr_eq(
-            &view
-                .instances
-                .get(&terminal.id)
-                .and_then(|i| i.session_id_poller.clone())
-                .expect("legacy row must retain the stopped poller"),
-            &terminal_stopped,
-        ));
+        let backfilled = view
+            .instances
+            .get(&terminal.id)
+            .and_then(|i| i.session_id_poller.clone())
+            .expect("legacy row should receive a replacement poller after namespace backfill");
+        assert!(!Arc::ptr_eq(&backfilled, &terminal_stopped));
+        assert!(backfilled
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_running());
+        let disk = view.storages[profile].load().unwrap();
+        assert_eq!(
+            disk.iter()
+                .find(|instance| instance.id == terminal.id)
+                .and_then(|instance| instance.agent_session_store_namespace.as_deref()),
+            Some(resolved_namespace.as_str())
+        );
+        backfilled
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .stop();
+
         view.instances
             .get_mut(&terminal.id)
             .unwrap()
@@ -20002,7 +20025,7 @@ mod apply_session_id_updates {
                 .get(&terminal.id)
                 .and_then(|i| i.session_id_poller.clone())
                 .expect("changed store must retain the stopped poller"),
-            &terminal_stopped,
+            &backfilled,
         ));
 
         view.instances
@@ -20015,7 +20038,7 @@ mod apply_session_id_updates {
             .get(&terminal.id)
             .and_then(|i| i.session_id_poller.clone())
             .expect("live pane should receive a replacement poller");
-        assert!(!Arc::ptr_eq(&repaired, &terminal_stopped));
+        assert!(!Arc::ptr_eq(&repaired, &backfilled));
         assert!(repaired
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())

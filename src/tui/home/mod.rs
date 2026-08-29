@@ -6852,7 +6852,7 @@ impl HomeView {
             .load()?
             .into_iter()
             .find(|instance| instance.id == id)
-            .ok_or_else(|| anyhow::anyhow!("Session not found in source profile: {id}"))?;
+            .ok_or_else(|| anyhow::anyhow!("session '{id}' disappeared from storage"))?;
         let authoritative_generation = authoritative.lifecycle_generation;
         let authoritative_status = authoritative.status;
         let authoritative_idle_entered_at = authoritative.idle_entered_at;
