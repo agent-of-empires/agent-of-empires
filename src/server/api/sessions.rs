@@ -6191,7 +6191,9 @@ pub async fn create_session(
         #[cfg(feature = "serve")]
         agent_effort: body.agent_effort,
         #[cfg(feature = "serve")]
-        import_acp_session_id: body.import_acp_session_id,
+        import_acp_session_id: body
+            .import_acp_session_id
+            .filter(|id| !id.trim().is_empty()),
         #[cfg(feature = "serve")]
         import_acp_store_namespace,
         #[cfg(feature = "serve")]

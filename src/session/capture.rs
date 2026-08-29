@@ -414,7 +414,7 @@ pub(crate) fn claude_poll_fn(
         }
 
         let current_known = last_known.lock().ok().and_then(|g| g.clone());
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
         let captured = capture_claude_session_id(
             &project_path,
             current_known.as_deref(),
@@ -548,7 +548,7 @@ pub(crate) fn claude_poll_fn_sandboxed(
     let last_known = std::sync::Mutex::new(known_session_id);
     move || {
         let current_known = last_known.lock().ok().and_then(|g| g.clone());
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
         let captured = capture_claude_session_id_in_container(
             &container_name,
             &container_cwd,
@@ -856,7 +856,7 @@ pub(crate) fn pi_poll_fn(
     host_environment: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
         capture_pi_family_session_id(&project_path, &exclusion, ".pi/agent", &host_environment)
             .map_err(
                 |e| tracing::debug!(target: "session.capture", "Pi poll capture failed: {}", e),
@@ -976,7 +976,7 @@ pub(crate) fn pi_poll_fn_sandboxed(
     extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
         try_capture_pi_session_id_in_container(&container_name, &container_cwd, &exclusion)
             .map_err(|e| tracing::debug!(target: "session.capture", "Pi container poll capture failed: {}", e))
             .ok()
@@ -1003,7 +1003,7 @@ pub(crate) fn is_valid_session_id(id: &str) -> bool {
 pub(crate) fn compose_exclusion(
     current_instance_id: &str,
     extra: &HashSet<String>,
-) -> HashSet<String> {
+) -> anyhow::Result<HashSet<String>> {
     compose_exclusion_in(
         current_instance_id,
         None,
@@ -1021,10 +1021,10 @@ fn compose_exclusion_in(
     current_namespace: Option<&str>,
     extra: &HashSet<String>,
     live: &crate::tmux::LiveSessionSnapshot,
-) -> HashSet<String> {
-    let mut set = build_exclusion_set(current_instance_id, current_namespace, live);
+) -> anyhow::Result<HashSet<String>> {
+    let mut set = build_exclusion_set(current_instance_id, current_namespace, live)?;
     set.extend(extra.iter().cloned());
-    set
+    Ok(set)
 }
 
 /// Extend [`compose_exclusion`] with conversations same-project peers parked
@@ -1066,7 +1066,7 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
         Some(current_namespace),
         retroactive_capture_excludes,
         &live,
-    );
+    )?;
     // Canonical paths keep equivalent `..` and symlink spellings in one
     // ownership domain; raw comparison reopened cross-session capture (#2858).
     let canonical_current = canonicalize_or_raw(current_project_path);
@@ -1189,11 +1189,10 @@ fn build_exclusion_set(
     current_instance_id: &str,
     current_namespace: Option<&str>,
     live: &crate::tmux::LiveSessionSnapshot,
-) -> HashSet<String> {
-    let Some(names) = live.names() else {
-        return HashSet::new();
-    };
-
+) -> anyhow::Result<HashSet<String>> {
+    let names = live
+        .names()
+        .ok_or_else(|| anyhow::anyhow!("cannot list live tmux sessions"))?;
     let aoe_sessions: Vec<&str> = names
         .iter()
         .map(String::as_str)
@@ -1203,23 +1202,21 @@ fn build_exclusion_set(
         })
         .collect();
     if aoe_sessions.is_empty() {
-        return HashSet::new();
+        return Ok(HashSet::new());
     }
 
-    let rows = match crate::tmux::env::get_hidden_env_keys_batch_strict(
+    let rows = crate::tmux::env::get_hidden_env_keys_batch_strict(
         &aoe_sessions,
         &[
             crate::tmux::env::AOE_INSTANCE_ID_KEY,
             crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
             crate::tmux::env::AOE_SESSION_STORE_NAMESPACE_KEY,
         ],
-    ) {
-        Ok(rows) => rows,
-        Err(error) => {
-            tracing::warn!(target: "session.capture", "live ownership scan failed: {error}");
-            return HashSet::new();
-        }
-    };
+    )
+    .map_err(|error| {
+        tracing::warn!(target: "session.capture", "live ownership scan failed: {error}");
+        anyhow::anyhow!("live ownership scan failed: {error}")
+    })?;
     let rows: Vec<(Option<String>, Option<String>, Option<String>)> = rows
         .into_iter()
         .map(|(_, values)| {
@@ -1243,7 +1240,8 @@ fn build_exclusion_set(
     };
     let current_namespace = current_namespace.or(derived_namespace.as_deref());
 
-    rows.into_iter()
+    Ok(rows
+        .into_iter()
         .filter_map(|(owner, captured, namespace)| {
             if owner.as_deref() == Some(current_instance_id) {
                 return None;
@@ -1254,7 +1252,7 @@ fn build_exclusion_set(
                 _ => Some(captured),
             }
         })
-        .collect()
+        .collect())
 }
 
 /// Capture Vibe session ID from `meta.json` files in the session log directory.
@@ -1366,7 +1364,7 @@ pub(crate) fn vibe_poll_fn(
     host_environment: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
         capture_vibe_session_id_in_environment(&project_path, &exclusion, &host_environment)
             .map_err(
                 |e| tracing::debug!(target: "session.capture", "Vibe poll capture failed: {}", e),
@@ -1472,7 +1470,7 @@ pub(crate) fn vibe_poll_fn_sandboxed(
     extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
         try_capture_vibe_session_id_in_container(&container_name, &container_cwd, &exclusion)
             .map_err(|e| tracing::debug!(target: "session.capture", "Vibe container poll capture failed: {}", e))
             .ok()
@@ -2085,7 +2083,7 @@ pub(crate) fn opencode_poll_fn(
     host_environment: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
         try_capture_opencode_session_id_in_environment(
             &project_path,
             &exclusion,
@@ -2109,7 +2107,7 @@ pub(crate) fn opencode_poll_fn_sandboxed(
     extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
         try_capture_opencode_session_id_in_container(
             &container_name,
             &container_cwd,
@@ -2358,7 +2356,7 @@ pub(crate) fn codex_poll_fn(
     host_environment: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
         capture_codex_session_id_in_environment(&project_path, &exclusion, &host_environment)
             .map_err(
                 |e| tracing::debug!(target: "session.capture", "Codex poll capture failed: {}", e),
@@ -2376,7 +2374,7 @@ pub(crate) fn codex_poll_fn_sandboxed(
     extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
         try_capture_codex_session_id_in_container(&container_name, &container_cwd, &exclusion)
             .map_err(|e| tracing::debug!(target: "session.capture", "Codex container poll capture failed: {}", e))
             .ok()
@@ -2394,7 +2392,7 @@ pub(crate) fn gemini_poll_fn(
     host_environment: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
         capture_gemini_session_id_in_environment(&project_path, &exclusion, &host_environment)
             .map_err(
                 |e| tracing::debug!(target: "session.capture", "Gemini poll capture failed: {}", e),
@@ -2505,7 +2503,7 @@ pub(crate) fn gemini_poll_fn_sandboxed(
     extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
         try_capture_gemini_session_id_in_container(&container_name, &container_cwd, &exclusion)
             .map_err(|e| tracing::debug!(target: "session.capture", "Gemini container poll capture failed: {}", e))
             .ok()
@@ -2791,7 +2789,7 @@ pub(crate) fn copilot_poll_fn(
     host_environment: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
         capture_copilot_session_id_in_environment(
             &project_path,
             &exclusion,
@@ -2953,7 +2951,7 @@ pub(crate) fn kimi_poll_fn(
     environment: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
         capture_kimi_session_id(
             &project_path,
             &exclusion,
@@ -3156,7 +3154,7 @@ pub(crate) fn prime_agent_poll_fn(
     host_environment: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
         capture_prime_agent_session_id_in_environment(
             &project_path,
             &exclusion,
@@ -3611,7 +3609,7 @@ pub(crate) fn hermes_poll_fn(
     host_environment: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
         capture_hermes_session_id_in_environment(&project_path, &exclusion, &host_environment)
             .map_err(
                 |e| tracing::debug!(target: "session.capture", "Hermes poll capture failed: {}", e),
@@ -3629,7 +3627,7 @@ pub(crate) fn hermes_poll_fn_sandboxed(
     extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
-        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes).ok()?;
         try_capture_hermes_session_id_in_container(&container_name, &container_cwd, &exclusion)
             .map_err(|e| tracing::debug!(target: "session.capture", "Hermes container poll capture failed: {}", e))
             .ok()
@@ -5179,17 +5177,14 @@ mod tests {
     }
 
     #[test]
-    fn test_build_exclusion_set_empty() {
-        let result = build_exclusion_set(
-            "nonexistent-instance-id-12345",
-            None,
-            &crate::tmux::LiveSessionSnapshot::new(),
-        );
-        // The exclusion set should never contain our own instance ID
-        // (it collects OTHER instances' captured session IDs).
-        // On a machine with active AoE tmux sessions, the set may be
-        // non-empty, so we verify our own ID isn't self-excluded.
-        assert!(!result.contains("nonexistent-instance-id-12345"));
+    fn live_exclusion_distinguishes_empty_from_unreachable() {
+        let unavailable = crate::tmux::LiveSessionSnapshot::from_parts(None, None);
+        assert!(build_exclusion_set("instance", None, &unavailable).is_err());
+
+        let empty = crate::tmux::LiveSessionSnapshot::from_parts(Some(Vec::new()), None);
+        assert!(build_exclusion_set("instance", None, &empty)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

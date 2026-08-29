@@ -18734,10 +18734,11 @@ mod tests {
 
             let extra = HashSet::new();
             let other_exclusion =
-                crate::session::capture::compose_exclusion("other-instance", &extra);
+                crate::session::capture::compose_exclusion("other-instance", &extra).unwrap();
             assert!(other_exclusion.contains(PEER_SID));
 
-            let own_exclusion = crate::session::capture::compose_exclusion(&peer.id, &extra);
+            let own_exclusion =
+                crate::session::capture::compose_exclusion(&peer.id, &extra).unwrap();
             assert!(!own_exclusion.contains(PEER_SID));
         }
 

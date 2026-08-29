@@ -3590,6 +3590,27 @@ fn repair_structured_rows_from_live_workers(
 }
 
 #[cfg(feature = "serve")]
+fn validate_acp_session_assignment(
+    instance: &Instance,
+    local: &[Instance],
+    foreign: &[Instance],
+    session_id: &str,
+) -> anyhow::Result<()> {
+    let namespace = instance
+        .agent_session_store_namespace
+        .clone()
+        .or_else(|| instance.terminal_session_store_namespace())
+        .ok_or_else(|| anyhow::anyhow!("cannot resolve ACP conversation store namespace"))?;
+    if local.iter().chain(foreign).any(|candidate| {
+        candidate.id != instance.id
+            && candidate.reserves_claude_import_id_in_namespace(session_id, &namespace)
+    }) {
+        anyhow::bail!("ACP session '{session_id}' is already owned in store '{namespace}'");
+    }
+    Ok(())
+}
+
+#[cfg(feature = "serve")]
 fn persist_structured_row_repairs(state: &Arc<AppState>, repairs: Vec<StructuredRowRepair>) {
     if repairs.is_empty() {
         return;
@@ -3620,9 +3641,29 @@ fn persist_structured_row_repairs(state: &Arc<AppState>, repairs: Vec<Structured
                     .collect();
                 let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                     let storage = crate::session::Storage::new(&profile, file_watch)?;
-                    storage.update(|all, _groups| {
-                        for repair in repairs {
-                            if let Some(inst) = all.iter_mut().find(|i| i.id == repair.session_id) {
+                    crate::session::sync::with_tmux_ownership_lock(|| {
+                        let foreign = crate::session::sync::load_profile_instances_excluding(
+                            Some(storage.profile()),
+                        )?;
+                        storage.update_with_tmux_ownership_lock(|all, _groups| {
+                            for repair in repairs {
+                                let Some(index) =
+                                    all.iter().position(|i| i.id == repair.session_id)
+                                else {
+                                    tracing::debug!(
+                                        target: "server.file_watch",
+                                        session = %repair.session_id,
+                                        "repair target not found on disk; skipping"
+                                    );
+                                    continue;
+                                };
+                                validate_acp_session_assignment(
+                                    &all[index],
+                                    all,
+                                    &foreign,
+                                    &repair.acp_session_id,
+                                )?;
+                                let inst = &mut all[index];
                                 inst.view = crate::session::View::Structured;
                                 if inst.agent_name.is_none() {
                                     inst.agent_name = repair.agent_name;
@@ -3631,17 +3672,10 @@ fn persist_structured_row_repairs(state: &Arc<AppState>, repairs: Vec<Structured
                                     inst.agent_model = repair.agent_model;
                                 }
                                 inst.acp_session_id = Some(repair.acp_session_id);
-                            } else {
-                                tracing::debug!(
-                                    target: "server.file_watch",
-                                    session = %repair.session_id,
-                                    "repair target not found on disk; skipping"
-                                );
                             }
-                        }
-                        Ok(())
-                    })?;
-                    Ok(())
+                            Ok(())
+                        })
+                    })
                 })
                 .await;
                 match save_result {
@@ -5799,17 +5833,31 @@ async fn acp_event_listener(state: Arc<AppState>) {
             let file_watch = state.file_watch.clone();
             let save_result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                 let storage = crate::session::Storage::new(&profile_for_save, file_watch)?;
-                storage.update(|all, _groups| {
-                    if let Some(inst) = all.iter_mut().find(|i| i.id == session_id_for_save) {
-                        apply_acp_session_change(
-                            inst,
-                            &session_id_for_save,
-                            acp_change_for_save.as_ref(),
-                        );
-                    }
-                    Ok(())
-                })?;
-                Ok(())
+                crate::session::sync::with_tmux_ownership_lock(|| {
+                    let foreign = crate::session::sync::load_profile_instances_excluding(Some(
+                        storage.profile(),
+                    ))?;
+                    storage.update_with_tmux_ownership_lock(|all, _groups| {
+                        if let Some(index) = all.iter().position(|i| i.id == session_id_for_save) {
+                            if let Some(AcpSessionChange::Assigned(new_id)) =
+                                acp_change_for_save.as_ref()
+                            {
+                                validate_acp_session_assignment(
+                                    &all[index],
+                                    all,
+                                    &foreign,
+                                    new_id,
+                                )?;
+                            }
+                            apply_acp_session_change(
+                                &mut all[index],
+                                &session_id_for_save,
+                                acp_change_for_save.as_ref(),
+                            );
+                        }
+                        Ok(())
+                    })
+                })
             })
             .await;
             match save_result {
@@ -6726,6 +6774,33 @@ mod tests {
     fn vecs(v: &[&str]) -> Vec<String> {
         v.iter().map(|s| s.to_string()).collect()
     }
+    #[test]
+    fn acp_assignment_rejects_local_and_foreign_owners() {
+        let mut target = Instance::new("target", "/tmp/project");
+        target.tool = "claude".into();
+        target.view = crate::session::View::Structured;
+        target.agent_session_store_namespace = Some("claude-store".into());
+
+        let mut owner = Instance::new("owner", "/tmp/project");
+        owner.tool = "claude".into();
+        owner.view = crate::session::View::Structured;
+        owner.agent_session_store_namespace = Some("claude-store".into());
+        owner.acp_session_id = Some("contested".into());
+
+        assert!(validate_acp_session_assignment(&target, &[], &[], "free").is_ok());
+        for foreign in [false, true] {
+            let (local, remote) = if foreign {
+                (Vec::new(), vec![owner.clone()])
+            } else {
+                (vec![owner.clone()], Vec::new())
+            };
+            assert!(
+                validate_acp_session_assignment(&target, &local, &remote, "contested").is_err(),
+                "foreign={foreign}"
+            );
+        }
+    }
+
     #[test]
     fn drained_identity_reapply_honors_concurrent_generation_and_marker_writes() {
         let mut baseline_instance = Instance::new("session", "/tmp/project");
