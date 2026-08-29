@@ -291,6 +291,100 @@ impl PurgeTransaction {
         )
     }
 
+    fn ensure_unambiguous_purge_ownership(&self) -> Result<()> {
+        let id = &self.request.session_id;
+        crate::session::sync::with_tmux_ownership_lock(|| {
+            let local_count = self
+                .storage
+                .load_strict()?
+                .iter()
+                .filter(|instance| &instance.id == id)
+                .count();
+            anyhow::ensure!(
+                local_count <= 1,
+                "session id '{id}' is duplicated in profile '{}'; refusing ambiguous purge",
+                self.storage.profile()
+            );
+            anyhow::ensure!(
+                local_count == 0
+                    || !crate::session::sync::instance_ids_excluding_profile(
+                        self.storage.profile()
+                    )?
+                    .contains(id),
+                "session id '{id}' also exists in another profile; refusing ambiguous purge"
+            );
+            Ok(())
+        })
+    }
+
+    fn commit_reserved_removal(&self) -> Result<(CompletionGate, Option<Instance>)> {
+        let id = self.request.session_id.clone();
+        let generation = self.generation;
+        let was_trashed = self.was_trashed;
+        crate::session::sync::with_tmux_ownership_lock(|| {
+            let local_count = self
+                .storage
+                .load_strict()?
+                .iter()
+                .filter(|instance| instance.id == id)
+                .count();
+            anyhow::ensure!(
+                local_count <= 1,
+                "session id '{id}' is duplicated in profile '{}'; refusing ambiguous purge",
+                self.storage.profile()
+            );
+            if local_count == 1
+                && crate::session::sync::instance_ids_excluding_profile(self.storage.profile())?
+                    .contains(&id)
+            {
+                anyhow::bail!(
+                    "session id '{id}' also exists in another profile; refusing ambiguous purge"
+                );
+            }
+
+            let mut outcome = None;
+            self.storage
+                .update_with_tmux_ownership_lock(|instances, _groups| {
+                    let Some(index) = instances.iter().position(|instance| instance.id == id)
+                    else {
+                        outcome = Some((CompletionGate::AlreadyGone, None));
+                        return Ok(());
+                    };
+                    let restored = crate::session::claim::purge_restored_row_must_be_kept(
+                        was_trashed,
+                        instances[index].is_trashed(),
+                    );
+                    let owns = instances[index]
+                        .lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation);
+                    if restored {
+                        instances[index].release_lifecycle_reservation_if_owned(
+                            LifecycleOperation::Purge,
+                            generation,
+                        );
+                        outcome =
+                            Some((CompletionGate::KeptRestored, Some(instances[index].clone())));
+                    } else if !owns {
+                        outcome =
+                            Some((CompletionGate::Superseded, Some(instances[index].clone())));
+                    } else {
+                        instances.remove(index);
+                        outcome = Some((CompletionGate::Proceed, None));
+                    }
+                    Ok(())
+                })?;
+            let outcome =
+                outcome.ok_or_else(|| anyhow::anyhow!("purge commit produced no outcome"))?;
+            if matches!(outcome.0, CompletionGate::Proceed) {
+                if let Err(error) = crate::session::sync::
+                    reconcile_all_profiles_tmux_session_id_ownership_env_locked()
+                {
+                    tracing::warn!(target: "session.sync", session = %id, "Purge committed; deferred tmux ownership reconciliation: {error}");
+                }
+            }
+            Ok(outcome)
+        })
+    }
+
     /// Atomically validate this reservation and remove its durable row before
     /// any irreversible external teardown. The lifecycle flock acquired before
     /// reservation remains held through [`CommittedPurge::finish`].
@@ -306,47 +400,16 @@ impl PurgeTransaction {
             )));
         }
         let id = self.request.session_id.clone();
-        let generation = self.generation;
-        let was_trashed = self.was_trashed;
-        let mut commit = None;
-        if let Err(error) = self.storage.update(|instances, _groups| {
-            let Some(index) = instances.iter().position(|instance| instance.id == id) else {
-                commit = Some((CompletionGate::AlreadyGone, None));
-                return Ok(());
-            };
-            let restored = crate::session::claim::purge_restored_row_must_be_kept(
-                was_trashed,
-                instances[index].is_trashed(),
-            );
-            let owns = instances[index]
-                .lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation);
-            if restored {
-                instances[index]
-                    .release_lifecycle_reservation_if_owned(LifecycleOperation::Purge, generation);
-                commit = Some((CompletionGate::KeptRestored, Some(instances[index].clone())));
-            } else if !owns {
-                commit = Some((CompletionGate::Superseded, Some(instances[index].clone())));
-            } else {
-                instances.remove(index);
-                commit = Some((CompletionGate::Proceed, None));
+        let (gate, retained) = match self.commit_reserved_removal() {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                return Err(Box::new(DeletionResult::rejected(
+                    id,
+                    DeletionDisposition::Failed,
+                    format!("Failed to commit irreversible session purge: {error}"),
+                    None,
+                )));
             }
-            Ok(())
-        }) {
-            return Err(Box::new(DeletionResult::rejected(
-                id,
-                DeletionDisposition::Failed,
-                format!("Failed to commit irreversible session purge: {error}"),
-                None,
-            )));
-        }
-
-        let Some((gate, retained)) = commit else {
-            return Err(Box::new(DeletionResult::rejected(
-                id,
-                DeletionDisposition::Failed,
-                "Irreversible purge commit produced no outcome",
-                None,
-            )));
         };
         self.active = false;
         if !matches!(gate, CompletionGate::Proceed) {
@@ -400,6 +463,15 @@ impl PurgeTransaction {
         if !matches!(gate, CompletionGate::Proceed) {
             return self.result_for_gate(gate, retained);
         }
+        if let Err(error) = self.ensure_unambiguous_purge_ownership() {
+            let retained = self.release_reservation().ok().flatten();
+            return DeletionResult::rejected(
+                id,
+                DeletionDisposition::Failed,
+                format!("Failed to verify purge ownership before teardown: {error}"),
+                retained,
+            );
+        }
         let mut result = perform_deletion_teardown_lifecycle_locked(&self.request);
         if !result.success && !commit_on_teardown_failure {
             result.retained_instance = self.release_reservation().ok().flatten();
@@ -415,32 +487,7 @@ impl PurgeTransaction {
             return result;
         }
 
-        let generation = self.generation;
-        let was_trashed = self.was_trashed;
-        let mut commit = None;
-        let commit_result = self.storage.update(|instances, _groups| {
-            let Some(index) = instances.iter().position(|instance| instance.id == id) else {
-                commit = Some((CompletionGate::AlreadyGone, None));
-                return Ok(());
-            };
-            let restored = crate::session::claim::purge_restored_row_must_be_kept(
-                was_trashed,
-                instances[index].is_trashed(),
-            );
-            let owns = instances[index]
-                .lifecycle_reservation_is_owned(LifecycleOperation::Purge, generation);
-            if restored {
-                instances[index]
-                    .release_lifecycle_reservation_if_owned(LifecycleOperation::Purge, generation);
-                commit = Some((CompletionGate::KeptRestored, Some(instances[index].clone())));
-            } else if !owns {
-                commit = Some((CompletionGate::Superseded, Some(instances[index].clone())));
-            } else {
-                instances.remove(index);
-                commit = Some((CompletionGate::Proceed, None));
-            }
-            Ok(())
-        });
+        let commit_result = self.commit_reserved_removal();
         self.lifecycle_lock = None;
         match commit_result {
             Err(error) => {
@@ -451,27 +498,18 @@ impl PurgeTransaction {
                 ));
                 result
             }
-            Ok(()) => {
+            Ok((CompletionGate::Proceed, _)) => {
                 self.active = false;
-                match commit {
-                    Some((CompletionGate::Proceed, _)) => {
-                        result.disposition = DeletionDisposition::Removed;
-                        result
-                    }
-                    Some((gate, retained)) => {
-                        let mut gated = self.result_for_gate(gate, retained);
-                        gated.teardown_started = true;
-                        gated.messages = result.messages;
-                        gated.errors.extend(result.errors);
-                        gated
-                    }
-                    None => DeletionResult::rejected(
-                        id,
-                        DeletionDisposition::Failed,
-                        "Purge commit produced no outcome",
-                        None,
-                    ),
-                }
+                result.disposition = DeletionDisposition::Removed;
+                result
+            }
+            Ok((gate, retained)) => {
+                self.active = false;
+                let mut gated = self.result_for_gate(gate, retained);
+                gated.teardown_started = true;
+                gated.messages = result.messages;
+                gated.errors.extend(result.errors);
+                gated
             }
         }
     }
@@ -1398,6 +1436,48 @@ mod tests {
         );
         let result = committed.finish();
         assert_eq!(result.disposition, DeletionDisposition::Removed);
+
+        let duplicate_profile = "purge-duplicate-target";
+        let survivor_profile = "purge-duplicate-survivor";
+        let duplicate_storage = Storage::new_unwatched(duplicate_profile).unwrap();
+        let survivor_storage = Storage::new_unwatched(survivor_profile).unwrap();
+        let mut duplicate = create_test_instance();
+        duplicate.source_profile = duplicate_profile.to_string();
+        let duplicate_id = duplicate.id.clone();
+        for storage in [&duplicate_storage, &survivor_storage] {
+            storage
+                .update(|instances, _groups| {
+                    *instances = vec![duplicate.clone()];
+                    Ok(())
+                })
+                .unwrap();
+        }
+        let duplicate_request = DeletionRequest {
+            session_id: duplicate_id,
+            instance: duplicate,
+            delete_worktree: false,
+            delete_branch: false,
+            delete_sandbox: false,
+            force_delete: false,
+            detach_hooks: true,
+            keep_scratch: false,
+        };
+        let duplicate_transaction = match PurgeTransaction::reserve(
+            Storage::open_unwatched(duplicate_profile).unwrap(),
+            duplicate_request,
+        )
+        .unwrap()
+        {
+            PurgeReservation::Reserved(transaction) => transaction,
+            PurgeReservation::Rejected(_) => panic!("duplicate purge reservation was refused"),
+        };
+        let rejected = match duplicate_transaction.begin_irreversible() {
+            Ok(_) => panic!("duplicate purge crossed the irreversible boundary"),
+            Err(result) => result,
+        };
+        assert_eq!(rejected.disposition, DeletionDisposition::Failed);
+        assert_eq!(duplicate_storage.load().unwrap().len(), 1);
+        assert_eq!(survivor_storage.load().unwrap().len(), 1);
     }
 
     #[test]

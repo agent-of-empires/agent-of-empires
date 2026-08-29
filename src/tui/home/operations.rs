@@ -459,6 +459,12 @@ impl HomeView {
         } else {
             None
         };
+        if tool_swap_requested {
+            self.instances
+                .get_mut(&id)
+                .ok_or_else(|| anyhow::anyhow!("Session not found"))?
+                .stop_and_flush_poller_lifecycle_locked();
+        }
         let restart_edit_authoritative = self
             .get_instance(&id)
             .cloned()

@@ -402,6 +402,19 @@ pub(crate) fn instance_ids_excluding_profile(excluded: &str) -> anyhow::Result<H
         .map(|instance| instance.id)
         .collect())
 }
+
+/// Find a durable SID reservation outside `excluded` while the caller holds
+/// the app-global ownership lock. Strict loads make unreadable ownership state
+/// an error rather than licensing a cross-profile capture or launch.
+pub(crate) fn reserved_sid_holder_excluding_profile(
+    excluded: &str,
+    sid: &str,
+) -> anyhow::Result<Option<String>> {
+    Ok(load_profile_instances_excluding(Some(excluded))?
+        .into_iter()
+        .find(|instance| instance.reserves_agent_session_id(sid))
+        .map(|instance| instance.id))
+}
 pub(crate) fn reconcile_all_profiles_tmux_session_id_ownership_env_locked(
 ) -> anyhow::Result<ClearedTmuxOwnership> {
     let instances = load_profile_instances_excluding(None)?;
@@ -1726,9 +1739,11 @@ mod tests {
     fn drain_respects_only_operational_sid_owners() {
         let temp = tempdir().unwrap();
         let _guard = storage_home_guard(&temp);
-        let owned = "019342ab-1234-7def-8901-cccccccccccc";
-
-        for (owner_tool, blocks_claim) in [("claude", true), ("qwen", false), ("kiro", false)] {
+        for (owner_tool, owned, blocks_claim) in [
+            ("claude", "019342ab-1234-7def-8901-cccccccccccc", true),
+            ("qwen", "019342ab-1234-7def-8901-dddddddddddd", false),
+            ("kiro", "019342ab-1234-7def-8901-eeeeeeeeeeee", false),
+        ] {
             let profile = format!("sync-collision-{owner_tool}");
             let mut owner = Instance::new("owner-title", "/tmp/x");
             owner.tool = owner_tool.to_string();

@@ -630,10 +630,18 @@ pub fn delete_profile(name: &str) -> Result<()> {
     }
 
     sync::with_tmux_ownership_lock(|| {
-        let mut target_instances =
+        let target_instances =
             storage::Storage::open_unwatched(name).and_then(|store| store.load_strict())?;
         let survivor_ids = sync::instance_ids_excluding_profile(name)?;
-        target_instances.retain(|instance| !survivor_ids.contains(&instance.id));
+        if let Some(duplicate) = target_instances
+            .iter()
+            .find(|instance| survivor_ids.contains(&instance.id))
+        {
+            anyhow::bail!(
+                "Cannot delete profile '{name}': session id '{}' also exists in another profile",
+                duplicate.id
+            );
+        }
         sync::clear_tmux_session_id_ownership_for_instances_locked(&target_instances)?;
         if let Err(delete_error) = fs::remove_dir_all(&profile_dir) {
             if let Err(reconcile_error) =
@@ -1449,6 +1457,26 @@ mod tests {
     fn test_delete_profile_preserves_unclassifiable_ownership() {
         let temp = isolate_app_dir();
         let dir = app_dir(&temp);
+
+        let target_storage = storage::Storage::new_unwatched("duplicate-target").unwrap();
+        let survivor_storage = storage::Storage::new_unwatched("duplicate-survivor").unwrap();
+        let duplicate = Instance::new("duplicate", "/tmp/duplicate");
+        target_storage
+            .update(|instances, _groups| {
+                *instances = vec![duplicate.clone()];
+                Ok(())
+            })
+            .unwrap();
+        survivor_storage
+            .update(|instances, _groups| {
+                *instances = vec![duplicate.clone()];
+                Ok(())
+            })
+            .unwrap();
+        delete_profile("duplicate-target")
+            .expect_err("a duplicate id must make profile ownership unclassifiable");
+        assert!(dir.join("profiles").join("duplicate-target").exists());
+
         let work = dir.join("profiles").join("work");
         let corrupt = dir.join("profiles").join("corrupt");
         fs::create_dir_all(&work).unwrap();

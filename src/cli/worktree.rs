@@ -299,13 +299,21 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
             .map(|orphan| orphan.id.clone())
             .collect();
         crate::session::sync::with_tmux_ownership_lock(|| {
-            let mut authoritative: Vec<_> = storage
-                .load()?
+            let authoritative: Vec<_> = storage
+                .load_strict()?
                 .into_iter()
                 .filter(|instance| orphan_ids.contains(&instance.id))
                 .collect();
             let survivor_ids = crate::session::sync::instance_ids_excluding_profile(profile)?;
-            authoritative.retain(|instance| !survivor_ids.contains(&instance.id));
+            if let Some(duplicate) = authoritative
+                .iter()
+                .find(|instance| survivor_ids.contains(&instance.id))
+            {
+                bail!(
+                    "Cannot remove orphaned session '{}': the same id exists in another profile",
+                    duplicate.id
+                );
+            }
             let cleared =
                 crate::session::sync::clear_tmux_session_id_ownership_for_instances_locked(
                     &authoritative,
@@ -325,6 +333,7 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
                 }
                 return Err(delete_error);
             }
+            crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env_locked()?;
             Ok(())
         })?;
 

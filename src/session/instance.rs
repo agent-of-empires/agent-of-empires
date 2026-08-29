@@ -1480,59 +1480,73 @@ fn persist_session_to_storage_guarded(
         }
     };
 
-    let outcome = storage.update(|instances, _groups| {
-        let Some(target) = instances.iter().find(|instance| instance.id == instance_id) else {
-            return Ok(SidWrite::Failed);
-        };
-        if !target.supports_terminal_resume() {
-            return Ok(SidWrite::Skipped);
-        }
-        if let Some(holder) = foreign_sid_holder(instances, instance_id, session_id) {
+    let outcome = crate::session::sync::with_tmux_ownership_lock(|| {
+        if let Some(holder) =
+            crate::session::sync::reserved_sid_holder_excluding_profile(profile, session_id)?
+        {
             tracing::warn!(target: "session.store",
                 instance_id = %instance_id,
                 sid = %session_id,
-                holder = %holder.id,
-                "sid write rejected under flock: already owned by another instance"
+                holder = %holder,
+                "sid write rejected under ownership lock: reserved in another profile"
             );
             return Ok(SidWrite::Skipped);
         }
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == instance_id) {
-            if let ResumeIntent::Use(pinned) = &inst.resume_intent {
-                if pinned != session_id {
+        storage.update_with_tmux_ownership_lock(|instances, _groups| {
+            let Some(target) = instances.iter().find(|instance| instance.id == instance_id) else {
+                return Ok(SidWrite::Failed);
+            };
+            if !target.supports_terminal_resume() {
+                return Ok(SidWrite::Skipped);
+            }
+            if let Some(holder) = foreign_sid_holder(instances, instance_id, session_id) {
+                tracing::warn!(target: "session.store",
+                    instance_id = %instance_id,
+                    sid = %session_id,
+                    holder = %holder.id,
+                    "sid write rejected under flock: already owned by another instance"
+                );
+                return Ok(SidWrite::Skipped);
+            }
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == instance_id) {
+                if let ResumeIntent::Use(pinned) = &inst.resume_intent {
+                    if pinned != session_id {
+                        tracing::warn!(target: "session.store",
+                            instance_id = %instance_id,
+                            sid = %session_id,
+                            pinned = %pinned,
+                            "sid write rejected under flock: contradicts on-disk set-session-id pin"
+                        );
+                        return Ok(SidWrite::Skipped);
+                    }
+                }
+                if guard_generation && inst.omp_capture_generation.as_deref() != expected_generation
+                {
                     tracing::warn!(target: "session.store",
                         instance_id = %instance_id,
-                        sid = %session_id,
-                        pinned = %pinned,
-                        "sid write rejected under flock: contradicts on-disk set-session-id pin"
+                        expected_generation = ?expected_generation,
+                        disk_generation = ?inst.omp_capture_generation,
+                        "OMP generation CAS mismatch; skipping sid persist"
                     );
                     return Ok(SidWrite::Skipped);
                 }
+                if inst.agent_session_id.as_deref() != expected_prior {
+                    tracing::warn!(target: "session.store",
+                        instance_id = %instance_id,
+                        expected = ?expected_prior,
+                        disk = ?inst.agent_session_id,
+                        target = session_id,
+                        "sid CAS mismatch; skipping persist"
+                    );
+                    return Ok(SidWrite::Skipped);
+                }
+                inst.agent_session_id = Some(session_id.to_string());
+                inst.resume_probe_failed_sid = None;
+                Ok(SidWrite::Applied)
+            } else {
+                Ok(SidWrite::Failed)
             }
-            if guard_generation && inst.omp_capture_generation.as_deref() != expected_generation {
-                tracing::warn!(target: "session.store",
-                    instance_id = %instance_id,
-                    expected_generation = ?expected_generation,
-                    disk_generation = ?inst.omp_capture_generation,
-                    "OMP generation CAS mismatch; skipping sid persist"
-                );
-                return Ok(SidWrite::Skipped);
-            }
-            if inst.agent_session_id.as_deref() != expected_prior {
-                tracing::warn!(target: "session.store",
-                    instance_id = %instance_id,
-                    expected = ?expected_prior,
-                    disk = ?inst.agent_session_id,
-                    target = session_id,
-                    "sid CAS mismatch; skipping persist"
-                );
-                return Ok(SidWrite::Skipped);
-            }
-            inst.agent_session_id = Some(session_id.to_string());
-            inst.resume_probe_failed_sid = None;
-            Ok(SidWrite::Applied)
-        } else {
-            Ok(SidWrite::Failed)
-        }
+        })
     });
 
     match outcome {
@@ -3319,7 +3333,7 @@ impl Instance {
     /// ownership, cascade-cleared ids, conversations same-project peers parked
     /// while running another tool, and inactive peers that still own records
     /// in a shared host store.
-    fn retroactive_capture_exclusion_set(&self) -> HashSet<String> {
+    fn retroactive_capture_exclusion_set(&self) -> Option<HashSet<String>> {
         super::capture::compose_exclusion_with_persisted_peers(
             &self.id,
             &self.project_path,
@@ -3329,6 +3343,7 @@ impl Instance {
             &self.effective_profile(),
             &self.retroactive_capture_excludes,
         )
+        .ok()
     }
 
     /// Whether another AoE session shares this one's Kimi store, which makes
@@ -3351,7 +3366,7 @@ impl Instance {
                 // exclusion with stopped, archived, or pane-less peer sids so
                 // the mtime fallback skips peers whose jsonl outlived their
                 // tmux session (#2355).
-                let exclusion = self.retroactive_capture_exclusion_set();
+                let exclusion = self.retroactive_capture_exclusion_set()?;
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
                     capture_claude_session_id_in_container(
@@ -3372,7 +3387,7 @@ impl Instance {
                 }
             }
             "opencode" => {
-                let exclusion = self.retroactive_capture_exclusion_set();
+                let exclusion = self.retroactive_capture_exclusion_set()?;
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
                     try_capture_opencode_session_id_in_container(
@@ -3387,7 +3402,7 @@ impl Instance {
                 }
             }
             "vibe" => {
-                let exclusion = self.retroactive_capture_exclusion_set();
+                let exclusion = self.retroactive_capture_exclusion_set()?;
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
                     try_capture_vibe_session_id_in_container(
@@ -3401,7 +3416,7 @@ impl Instance {
                 }
             }
             "pi" => {
-                let exclusion = self.retroactive_capture_exclusion_set();
+                let exclusion = self.retroactive_capture_exclusion_set()?;
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
                     try_capture_pi_session_id_in_container(
@@ -3416,7 +3431,7 @@ impl Instance {
             }
             "omp" => {
                 let options = self.omp_capture_options()?;
-                let exclusion = self.retroactive_capture_exclusion_set();
+                let exclusion = self.retroactive_capture_exclusion_set()?;
                 let tmux_session_name = self
                     .tmux_env_session_name()
                     .or_else(|| self.tmux_session().ok().map(|s| s.name().to_string()))?;
@@ -3441,7 +3456,7 @@ impl Instance {
                     // their transcript stores cannot contain a sibling's
                     // rollout (#3317). The common helper therefore omits
                     // inactive same-tool peers on this path.
-                    let exclusion = self.retroactive_capture_exclusion_set();
+                    let exclusion = self.retroactive_capture_exclusion_set()?;
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
                     try_capture_codex_session_id_in_container(
                         &container_name,
@@ -3453,12 +3468,12 @@ impl Instance {
                     // Host Codex sessions share `~/.codex/sessions/`. Include
                     // stopped and pane-less same-directory peers so the mtime
                     // scan cannot adopt a sibling's newer conversation.
-                    let exclusion = self.retroactive_capture_exclusion_set();
+                    let exclusion = self.retroactive_capture_exclusion_set()?;
                     capture_codex_session_id(&self.project_path, &exclusion).ok()
                 }
             }
             "gemini" => {
-                let exclusion = self.retroactive_capture_exclusion_set();
+                let exclusion = self.retroactive_capture_exclusion_set()?;
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
                     try_capture_gemini_session_id_in_container(
@@ -3472,7 +3487,7 @@ impl Instance {
                 }
             }
             "hermes" => {
-                let exclusion = self.retroactive_capture_exclusion_set();
+                let exclusion = self.retroactive_capture_exclusion_set()?;
                 if self.is_sandboxed() {
                     let container_name = self.sandbox_info.as_ref()?.container_name.clone();
                     try_capture_hermes_session_id_in_container(
@@ -3493,7 +3508,7 @@ impl Instance {
                 if self.is_sandboxed() {
                     None
                 } else {
-                    let exclusion = self.retroactive_capture_exclusion_set();
+                    let exclusion = self.retroactive_capture_exclusion_set()?;
                     capture_copilot_session_id(&self.project_path, &exclusion).ok()
                 }
             }
@@ -3517,7 +3532,7 @@ impl Instance {
                     // new-conversation promotion path (#2291).
                     None
                 } else {
-                    let exclusion = self.retroactive_capture_exclusion_set();
+                    let exclusion = self.retroactive_capture_exclusion_set()?;
                     // Retroactive recovery is unrestricted (no launch floor):
                     // resuming an older session on restart is the goal here.
                     capture_kimi_session_id(
@@ -3539,7 +3554,7 @@ impl Instance {
                 if self.is_sandboxed() {
                     None
                 } else {
-                    let exclusion = self.retroactive_capture_exclusion_set();
+                    let exclusion = self.retroactive_capture_exclusion_set()?;
                     // Retroactive recovery is unrestricted (no launch floor):
                     // resuming an older session on restart is the goal here.
                     capture_prime_agent_session_id(&self.project_path, &exclusion, None).ok()
@@ -3918,11 +3933,18 @@ impl Instance {
         let is_new = !session.exists();
         if is_new {
             session.create_with_size(&self.project_path, None, size, &self.effective_profile())?;
-            crate::tmux::env::set_hidden_env(
+            if let Err(error) = crate::tmux::env::set_hidden_env(
                 session.name(),
                 crate::tmux::env::AOE_INSTANCE_ID_KEY,
                 &self.id,
-            )?;
+            ) {
+                return match session.kill() {
+                    Ok(()) => Err(error),
+                    Err(rollback) => Err(anyhow::anyhow!(
+                        "failed to stamp terminal owner: {error}; rollback failed: {rollback}"
+                    )),
+                };
+            }
             // Apply all configured tmux options to terminal sessions too
             self.apply_terminal_tmux_options(index);
         }
@@ -4064,11 +4086,18 @@ impl Instance {
                 &[],
                 &env_info.env,
             )?;
-            crate::tmux::env::set_hidden_env(
+            if let Err(error) = crate::tmux::env::set_hidden_env(
                 session.name(),
                 crate::tmux::env::AOE_INSTANCE_ID_KEY,
                 &self.id,
-            )?;
+            ) {
+                return match session.kill() {
+                    Ok(()) => Err(error),
+                    Err(rollback) => Err(anyhow::anyhow!(
+                        "failed to stamp container terminal owner: {error}; rollback failed: {rollback}"
+                    )),
+                };
+            }
             self.apply_container_terminal_tmux_options(index);
         }
 
@@ -4368,6 +4397,7 @@ impl Instance {
         let (_title_lock, _lifecycle_lock) =
             self.reacquire_launch_locks_after_hooks(&storage, hook_result)?;
         self.apply_fresh_launch_intent();
+        self.validate_launch_sid_ownership(&storage)?;
 
         let prepared = match self.prepare_launch_command() {
             Ok(prepared) => prepared,
@@ -5251,6 +5281,41 @@ impl Instance {
         false
     }
 
+    fn validate_launch_sid_ownership(&self, storage: &super::storage::Storage) -> Result<()> {
+        let Some(sid) = self
+            .supports_terminal_resume()
+            .then_some(self.agent_session_id.as_deref())
+            .flatten()
+        else {
+            return Ok(());
+        };
+        crate::session::sync::with_tmux_ownership_lock(|| {
+            if let Some(holder) =
+                crate::session::sync::reserved_sid_holder_excluding_profile(storage.profile(), sid)?
+            {
+                anyhow::bail!(
+                    "refusing to launch session '{}': conversation '{}' is reserved by session '{}' in another profile",
+                    self.id,
+                    sid,
+                    holder
+                );
+            }
+            let instances = storage.load_strict()?;
+            if let Some(holder) = instances.iter().find(|instance| {
+                instance.id != self.id
+                    && instance.pending_tmux_ownership_session_id.as_deref() == Some(sid)
+            }) {
+                anyhow::bail!(
+                    "refusing to launch session '{}': conversation '{}' is still live in session '{}'",
+                    self.id,
+                    sid,
+                    holder.id
+                );
+            }
+            Ok(())
+        })
+    }
+
     fn persist_session_id(
         &mut self,
         profile: &str,
@@ -5300,6 +5365,43 @@ impl Instance {
         expected_prior_intent: ResumeIntent,
     ) -> SidPersistOutcome {
         let new_sid = self.agent_session_id.clone();
+        let outcome = crate::session::sync::with_tmux_ownership_lock(|| {
+            if let Some(sid) = new_sid.as_deref() {
+                if let Some(holder) = crate::session::sync::reserved_sid_holder_excluding_profile(
+                    storage.profile(),
+                    sid,
+                )? {
+                    tracing::warn!(target: "session.store",
+                        instance_id = %self.id,
+                        sid = %sid,
+                        holder = %holder,
+                        "finalize persist rejected: sid reserved in another profile"
+                    );
+                    return Ok(SidPersistOutcome::Skip);
+                }
+            }
+            Ok(self.persist_session_id_with_storage_locked(
+                storage,
+                expected_prior_sid,
+                expected_prior_intent,
+            ))
+        });
+        outcome.unwrap_or_else(|error| {
+            tracing::warn!(target: "session.store",
+                instance_id = %self.id,
+                "finalize persist ownership check failed: {error}"
+            );
+            SidPersistOutcome::Skip
+        })
+    }
+
+    fn persist_session_id_with_storage_locked(
+        &mut self,
+        storage: &super::storage::Storage,
+        expected_prior_sid: Option<&str>,
+        expected_prior_intent: ResumeIntent,
+    ) -> SidPersistOutcome {
+        let new_sid = self.agent_session_id.clone();
         // Cleared, Fork, and Use are all one-shot launch directives: after the
         // launch they ran with completes, the session resumes its own id
         // normally, so the intent must auto-promote to Default. A fork left as
@@ -5318,7 +5420,7 @@ impl Instance {
         let new_sid_for_closure = new_sid.clone();
         let expected_prior_intent_for_closure = expected_prior_intent.clone();
         let mut cleared_holder_ids: Vec<String> = Vec::new();
-        let outcome = storage.update(|instances, _groups| {
+        let outcome = storage.update_with_tmux_ownership_lock(|instances, _groups| {
             let Some(inst) = instances.iter().find(|i| i.id == instance_id) else {
                 return Ok(SidWrite::Failed);
             };
@@ -5356,6 +5458,18 @@ impl Instance {
                     &inst.resume_intent,
                     ResumeIntent::Use(pinned) if pinned == sid
                 );
+                if let Some(holder) = instances.iter().find(|instance| {
+                    instance.id != instance_id
+                        && instance.pending_tmux_ownership_session_id.as_deref() == Some(sid)
+                }) {
+                    tracing::warn!(target: "session.store",
+                        instance_id = %instance_id,
+                        sid = %sid,
+                        holder = %holder.id,
+                        "explicit pin rejected: conversation is still live in an outgoing handoff pane"
+                    );
+                    return Ok(SidWrite::Skipped);
+                }
                 let holder_ids: Vec<String> = instances
                     .iter()
                     .filter(|instance| {
@@ -5377,14 +5491,8 @@ impl Instance {
                                 instances.iter_mut().find(|i| &i.id == holder_id)
                             {
                                 let had_handoff = holder.has_tmux_ownership_handoff();
-                                let outgoing_matches =
-                                    holder.pending_tmux_ownership_session_id.as_deref() == Some(sid);
                                 let incoming_matches =
                                     holder.incoming_handoff_agent_session_id() == Some(sid);
-                                if outgoing_matches {
-                                    holder.pending_tmux_ownership_session_id = None;
-                                    holder.tmux_ownership_handoff_pending = true;
-                                }
                                 if incoming_matches || !had_handoff {
                                     holder.agent_session_id = None;
                                     holder.resume_probe_failed_sid = None;
@@ -5874,7 +5982,9 @@ impl Instance {
         // poller-spawn time. This keeps storage reads off the hot polling path
         // while preventing the poller from adopting a conversation another row
         // parked during a tool swap.
-        let extra_excludes = self.retroactive_capture_exclusion_set();
+        let Some(extra_excludes) = self.retroactive_capture_exclusion_set() else {
+            return;
+        };
         if tool == "omp" {
             let Some(metadata) = omp_metadata.as_ref() else {
                 return;
@@ -6201,7 +6311,7 @@ impl Instance {
         self.stop_and_flush_poller_lifecycle_locked();
     }
 
-    fn stop_and_flush_poller_lifecycle_locked(&mut self) {
+    pub(crate) fn stop_and_flush_poller_lifecycle_locked(&mut self) {
         // stop_poller() signals the thread but leaves the handle in place, so
         // this is_some() means "a poller existed and may have queued a final
         // observation": drain it before dropping the handle below.
@@ -6520,6 +6630,7 @@ impl Instance {
             self.reacquire_launch_locks_after_hooks(&storage, hook_result)?;
         let skipped_failed_resume_sid = self.apply_resume_policy(resume_policy);
         self.apply_fresh_launch_intent();
+        self.validate_launch_sid_ownership(&storage)?;
 
         let prepared = match self.prepare_launch_command() {
             Ok(prepared) => prepared,
@@ -14975,7 +15086,8 @@ mod tests {
                     false,
                     profile,
                     &std::collections::HashSet::new(),
-                );
+                )
+                .unwrap();
                 assert!(
                     pi_exclusion.contains("pi-session-parked"),
                     "parked ids must be protected for every resumable tool"
@@ -15764,7 +15876,7 @@ mod tests {
                     inst.agent_session_id = Some("kimi-stored".to_string());
                     inst.resume_intent = ResumeIntent::Default;
 
-                    let exclusion = inst.retroactive_capture_exclusion_set();
+                    let exclusion = inst.retroactive_capture_exclusion_set().unwrap();
                     assert!(exclusion.contains(peer_sid), "{label} exclusion");
                     let (sid, _is_existing) = inst.acquire_session_id();
                     assert_eq!(sid.as_deref(), Some("kimi-stored"), "{label} anchor");
@@ -16953,6 +17065,43 @@ mod tests {
                     .as_deref(),
                 Some(SID_X)
             );
+
+            let owner_profile = "guards-owned-other";
+            let claimant_profile = "guards-owned-claimant";
+            let mut handoff_owner = make_inst(owner_profile, "handoff-owner");
+            handoff_owner.tool = "qwen".to_string();
+            handoff_owner.prior_tool_session_ids.insert(
+                "claude".to_string(),
+                PriorToolSession {
+                    agent_session_id: Some(SID_Y.to_string()),
+                    acp_session_id: None,
+                },
+            );
+            handoff_owner.swap_tool_for_restart("claude");
+            let cross_profile_claimant = make_inst(claimant_profile, "cross-profile-claimant");
+            seed(owner_profile, &[&handoff_owner]);
+            seed(claimant_profile, &[&cross_profile_claimant]);
+
+            assert_eq!(
+                persist_session_to_storage(
+                    claimant_profile,
+                    &cross_profile_claimant.id,
+                    SID_Y,
+                    None,
+                    &file_watch,
+                ),
+                SidWrite::Skipped
+            );
+            let exclusion = crate::session::capture::compose_exclusion_with_persisted_peers(
+                &cross_profile_claimant.id,
+                &cross_profile_claimant.project_path,
+                &cross_profile_claimant.tool,
+                false,
+                claimant_profile,
+                &std::collections::HashSet::new(),
+            )
+            .unwrap();
+            assert!(exclusion.contains(SID_Y));
         }
 
         #[test]
@@ -17034,20 +17183,17 @@ mod tests {
         }
         #[test]
         #[serial]
-        fn finalize_persist_consuming_pin_takes_ownership_from_stale_holder() {
+        fn finalize_pin_waits_for_live_handoff_then_takes_stale_owners() {
             let temp = tempdir().unwrap();
             let _guard = storage_home_guard(&temp);
             let profile = "guards-finalize-pin";
 
-            // A consumed explicit pin takes the SID from every matching field.
-            // Cover a plain ID, an outgoing handoff ID, and a restored incoming
-            // handoff ID so unrelated conversations remain untouched.
-            let mut stale_holder = make_inst(profile, "stale-holder");
-            stale_holder.agent_session_id = Some(SID_Y.to_string());
-            stale_holder.pending_tmux_ownership_session_id = Some(SID_X.to_string());
-            stale_holder.tmux_ownership_handoff_pending = true;
-            let mut second_holder = make_inst(profile, "second-holder");
-            second_holder.agent_session_id = Some(SID_X.to_string());
+            let mut live_handoff = make_inst(profile, "live-handoff");
+            live_handoff.agent_session_id = Some(SID_Y.to_string());
+            live_handoff.pending_tmux_ownership_session_id = Some(SID_X.to_string());
+            live_handoff.tmux_ownership_handoff_pending = true;
+            let mut plain_holder = make_inst(profile, "plain-holder");
+            plain_holder.agent_session_id = Some(SID_X.to_string());
             let mut incoming_holder = make_inst(profile, "incoming-holder");
             incoming_holder.tool = "qwen".to_string();
             incoming_holder.prior_tool_session_ids.insert(
@@ -17062,44 +17208,65 @@ mod tests {
             pinned.resume_intent = ResumeIntent::Use(SID_X.to_string());
             seed(
                 profile,
-                &[&stale_holder, &second_holder, &incoming_holder, &pinned],
+                &[&live_handoff, &plain_holder, &incoming_holder, &pinned],
             );
 
             let storage = Storage::new_unwatched(profile).unwrap();
-            let mut live = pinned.clone();
-            live.agent_session_id = Some(SID_X.to_string());
-            let outcome = live.persist_session_id_with_storage(
-                &storage,
-                None,
-                ResumeIntent::Use(SID_X.to_string()),
+            let mut blocked = pinned.clone();
+            blocked.agent_session_id = Some(SID_X.to_string());
+            assert_eq!(
+                blocked.persist_session_id_with_storage(
+                    &storage,
+                    None,
+                    ResumeIntent::Use(SID_X.to_string()),
+                ),
+                SidPersistOutcome::Published
             );
-
-            assert_eq!(outcome, SidPersistOutcome::Published);
-            assert_eq!(live.agent_session_id.as_deref(), Some(SID_X));
-            assert_eq!(live.resume_intent, ResumeIntent::Default);
+            assert_eq!(blocked.agent_session_id, None);
             let disk = load(profile);
+            let live_disk = disk
+                .iter()
+                .find(|instance| instance.id == live_handoff.id)
+                .unwrap();
+            assert_eq!(
+                live_disk.pending_tmux_ownership_session_id.as_deref(),
+                Some(SID_X)
+            );
             assert_eq!(
                 disk.iter()
-                    .find(|i| i.id == pinned.id)
+                    .find(|instance| instance.id == plain_holder.id)
                     .unwrap()
                     .agent_session_id
                     .as_deref(),
                 Some(SID_X)
             );
-            let stale_disk = disk.iter().find(|i| i.id == stale_holder.id).unwrap();
-            assert_eq!(stale_disk.agent_session_id.as_deref(), Some(SID_Y));
-            assert_eq!(stale_disk.pending_tmux_ownership_session_id, None);
-            assert!(stale_disk.tmux_ownership_handoff_pending);
+
+            seed(profile, &[&plain_holder, &incoming_holder, &pinned]);
+            let mut takeover = pinned.clone();
+            takeover.agent_session_id = Some(SID_X.to_string());
+            assert_eq!(
+                takeover.persist_session_id_with_storage(
+                    &storage,
+                    None,
+                    ResumeIntent::Use(SID_X.to_string()),
+                ),
+                SidPersistOutcome::Published
+            );
+            assert_eq!(takeover.agent_session_id.as_deref(), Some(SID_X));
+            assert_eq!(takeover.resume_intent, ResumeIntent::Default);
+            let disk = load(profile);
             assert_eq!(
                 disk.iter()
-                    .find(|i| i.id == second_holder.id)
+                    .find(|instance| instance.id == plain_holder.id)
                     .unwrap()
                     .agent_session_id,
                 None
             );
-            let incoming_disk = disk.iter().find(|i| i.id == incoming_holder.id).unwrap();
+            let incoming_disk = disk
+                .iter()
+                .find(|instance| instance.id == incoming_holder.id)
+                .unwrap();
             assert_eq!(incoming_disk.agent_session_id, None);
-            assert_eq!(incoming_disk.pending_tmux_ownership_session_id, None);
             assert!(incoming_disk.tmux_ownership_handoff_pending);
         }
 

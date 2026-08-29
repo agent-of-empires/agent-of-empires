@@ -1012,11 +1012,10 @@ fn compose_exclusion_in(
 /// omit that protection because their stores are instance-private or are not
 /// captured from the host (#3317).
 ///
-/// Scope: host stores are keyed by each agent's effective home, not by AoE
-/// profile, but this helper inspects only `sessions.json` for the caller's
-/// effective profile. A stopped peer in another profile against the same
-/// agent home will not be excluded; callers needing global ownership must
-/// compose their own cross-profile check.
+/// Scope: parked and inactive-peer exclusions remain profile-local because
+/// agent homes may differ by profile. Incoming handoff IDs are loaded from
+/// every profile because they are globally reserved until pane quiescence.
+/// Any profile discovery or strict-load failure aborts capture.
 pub(crate) fn compose_exclusion_with_persisted_peers(
     current_instance_id: &str,
     current_project_path: &str,
@@ -1024,68 +1023,72 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
     include_inactive_same_tool: bool,
     profile: &str,
     retroactive_capture_excludes: &HashSet<String>,
-) -> HashSet<String> {
+) -> anyhow::Result<HashSet<String>> {
     // One observation for the whole pass. Both halves consult tmux: the
     // cross-instance scan needs the live session names, and the walk below
     // visits every stored session sharing the project path, trashed ones
-    // included, so a per-instance liveness probe costs a fork each. A store of
-    // a few hundred sessions made that the dominant cost of the pass.
-    // `names() == None` (server unreachable) reads as "no live pane" here,
-    // which is what the per-item probe already did when its own
-    // `list-sessions` failed, and this pass re-runs.
+    // included, so a per-instance liveness probe costs a fork each.
     let live = crate::tmux::LiveSessionSnapshot::new();
     let mut set = compose_exclusion_in(current_instance_id, retroactive_capture_excludes, &live);
-    let Ok(storage) = crate::session::storage::Storage::new_unwatched(profile) else {
-        return set;
-    };
-    let Ok(instances) = storage.load() else {
-        return set;
-    };
-    // Compare canonicalized paths, not raw strings: worktree sessions created
-    // from `../`-style templates historically stored an unnormalized
-    // `project_path` (e.g. `/repos/x/../x-worktrees/b`), and a raw comparison
-    // silently drops them from this exclusion even though they share the
-    // directory — re-opening the #2355 steal for exactly those peers (#2858).
+    // Canonical paths keep equivalent `..` and symlink spellings in one
+    // ownership domain; raw comparison reopened cross-session capture (#2858).
     let canonical_current = canonicalize_or_raw(current_project_path);
-    for inst in instances {
-        if inst.id == current_instance_id {
-            continue;
+
+    crate::session::sync::with_tmux_ownership_lock(|| {
+        let mut profiles = crate::session::list_profiles()?;
+        if !profiles.iter().any(|candidate| candidate == profile) {
+            profiles.push(profile.to_string());
         }
-        if canonicalize_or_raw(&inst.project_path) != canonical_current {
-            continue;
-        }
-        // A live outgoing pane makes the normal inactive-peer check skip this
-        // row, but its restored incoming conversation is already reserved.
-        if inst.tool == current_tool {
-            if let Some(incoming) = inst.incoming_handoff_agent_session_id() {
-                set.insert(incoming.to_string());
+        for peer_profile in profiles {
+            let storage = crate::session::storage::Storage::new_unwatched(&peer_profile)
+                .map_err(|error| anyhow::anyhow!("open profile {peer_profile}: {error}"))?;
+            let instances = storage
+                .load_strict()
+                .map_err(|error| anyhow::anyhow!("load profile {peer_profile}: {error}"))?;
+            for inst in instances {
+                if peer_profile == profile && inst.id == current_instance_id {
+                    continue;
+                }
+                if canonicalize_or_raw(&inst.project_path) != canonical_current {
+                    continue;
+                }
+                // Incoming handoff IDs are globally reserved while the old
+                // pane remains live and cannot publish the incoming ID.
+                if inst.tool == current_tool {
+                    if let Some(incoming) = inst.incoming_handoff_agent_session_id() {
+                        set.insert(incoming.to_string());
+                    }
+                }
+                if peer_profile != profile {
+                    continue;
+                }
+                if let Some(parked) = inst
+                    .prior_tool_session_ids
+                    .get(current_tool)
+                    .and_then(|prior| prior.agent_session_id.as_deref())
+                    .filter(|sid| !sid.is_empty())
+                {
+                    set.insert(parked.to_string());
+                }
+                if !include_inactive_same_tool || inst.tool != current_tool {
+                    continue;
+                }
+                let should_exclude = matches!(inst.status, crate::session::Status::Stopped)
+                    || inst.is_archived()
+                    || !inst.has_live_tmux_pane_in(&live);
+                if should_exclude {
+                    if let Some(sid) = inst
+                        .agent_session_id
+                        .as_deref()
+                        .filter(|sid| !sid.is_empty())
+                    {
+                        set.insert(sid.to_string());
+                    }
+                }
             }
         }
-        // A peer that swapped away still owns the conversation it parked and
-        // intends to resume it on a swap back. Its pane is running another
-        // engine, so the live tmux ownership scan cannot discover this id.
-        if let Some(parked) = inst
-            .prior_tool_session_ids
-            .get(current_tool)
-            .and_then(|p| p.agent_session_id.as_deref())
-            .filter(|s| !s.is_empty())
-        {
-            set.insert(parked.to_string());
-        }
-        if !include_inactive_same_tool || inst.tool != current_tool {
-            continue;
-        }
-        let should_exclude = matches!(inst.status, crate::session::Status::Stopped)
-            || inst.is_archived()
-            || !inst.has_live_tmux_pane_in(&live);
-        if !should_exclude {
-            continue;
-        }
-        if let Some(sid) = inst.agent_session_id.as_deref().filter(|s| !s.is_empty()) {
-            set.insert(sid.to_string());
-        }
-    }
-    set
+        Ok(set)
+    })
 }
 
 /// Build the set of session IDs already claimed by other live AoE instances.
