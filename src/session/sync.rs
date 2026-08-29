@@ -1635,6 +1635,7 @@ mod tests {
 
         let mut first = Instance::new("first", "/tmp/x");
         first.tool = "claude".to_string();
+        first.agent_session_store_namespace = Some("claude-store".to_string());
         first.id = "12345678-0000-0000-0000-000000000001".to_string();
         first.agent_session_id = Some("first-sid".to_string());
         let mut second = first.clone();
@@ -1695,6 +1696,7 @@ mod tests {
         shared_conversation.agent_session_id = first.agent_session_id.clone();
         let mut independent_store = shared_conversation.clone();
         independent_store.tool = "codex".to_string();
+        independent_store.agent_session_store_namespace = Some("codex-store".to_string());
         let mut outgoing_handoff = first.clone();
         outgoing_handoff.swap_tool_for_restart("codex");
         let independent_rows = [outgoing_handoff, independent_store];
