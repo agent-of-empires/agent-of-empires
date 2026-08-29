@@ -1013,13 +1013,14 @@ fn compose_exclusion_in(
 /// captured from the host (#3317).
 ///
 /// Scope: parked and inactive-peer exclusions remain profile-local because
-/// agent homes may differ by profile. Incoming handoff IDs are loaded from
-/// every profile because they are globally reserved until pane quiescence.
-/// Any profile discovery or strict-load failure aborts capture.
+/// agent stores may differ by profile. Incoming handoff IDs are loaded from
+/// every profile only when they reserve the current agent store. Any profile
+/// discovery or strict-load failure aborts capture.
 pub(crate) fn compose_exclusion_with_persisted_peers(
     current_instance_id: &str,
     current_project_path: &str,
     current_tool: &str,
+    current_namespace: &str,
     include_inactive_same_tool: bool,
     profile: &str,
     retroactive_capture_excludes: &HashSet<String>,
@@ -1077,8 +1078,8 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
                 if canonicalize_or_raw(&inst.project_path) != canonical_current {
                     continue;
                 }
-                if inst.tool == current_tool {
-                    if let Some(incoming) = inst.incoming_handoff_agent_session_id() {
+                if let Some(incoming) = inst.incoming_handoff_agent_session_id() {
+                    if inst.reserves_agent_session_id_in_namespace(incoming, current_namespace) {
                         set.insert(incoming.to_string());
                     }
                 }

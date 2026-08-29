@@ -314,6 +314,10 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
                     duplicate.id
                 );
             }
+            crate::session::sync::ensure_instances_quiescent(
+                &authoritative,
+                "remove orphaned sessions",
+            )?;
             let cleared =
                 crate::session::sync::clear_tmux_session_id_ownership_for_instances_locked(
                     &authoritative,

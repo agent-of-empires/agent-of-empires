@@ -642,6 +642,7 @@ pub fn delete_profile(name: &str) -> Result<()> {
                 duplicate.id
             );
         }
+        sync::ensure_instances_quiescent(&target_instances, &format!("delete profile '{name}'"))?;
         sync::clear_tmux_session_id_ownership_for_instances_locked(&target_instances)?;
         if let Err(delete_error) = fs::remove_dir_all(&profile_dir) {
             if let Err(reconcile_error) =
@@ -1447,7 +1448,28 @@ mod tests {
         fs::create_dir_all(dir.join("profiles").join("default")).unwrap();
         fs::create_dir_all(dir.join("profiles").join("work")).unwrap();
 
-        delete_profile("default").expect("a non-last profile named default is deletable");
+        if crate::tmux::is_tmux_available() {
+            let mut instance = Instance::new("live-profile-delete", "/tmp");
+            instance.source_profile = "default".to_string();
+            storage::Storage::new_unwatched("default")
+                .unwrap()
+                .update(|instances, _groups| {
+                    instances.push(instance.clone());
+                    Ok(())
+                })
+                .unwrap();
+            let tmux = instance.tmux_session().unwrap();
+            let _guard = crate::tmux::test_helpers::TmuxTestSession::from_name(tmux.name());
+            tmux.create("/tmp", Some("sleep 30"), "default").unwrap();
+
+            let error = delete_profile("default")
+                .expect_err("a profile with a live agent pane must remain intact");
+            assert!(error.to_string().contains("live tmux pane"));
+            assert!(dir.join("profiles").join("default").exists());
+            tmux.kill().unwrap();
+        }
+
+        delete_profile("default").expect("a quiescent non-last profile is deletable");
         assert!(!dir.join("profiles").join("default").exists());
         assert!(dir.join("profiles").join("work").exists());
     }

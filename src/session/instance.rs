@@ -1400,9 +1400,14 @@ fn foreign_sid_holder<'a>(
     instance_id: &str,
     sid: &str,
 ) -> Option<&'a Instance> {
-    instances
+    let namespace = instances
         .iter()
-        .find(|instance| instance.id != instance_id && instance.reserves_agent_session_id(sid))
+        .find(|instance| instance.id == instance_id)?
+        .terminal_session_store_namespace()?;
+    instances.iter().find(|instance| {
+        instance.id != instance_id
+            && instance.reserves_agent_session_id_in_namespace(sid, &namespace)
+    })
 }
 
 /// CAS-write `agent_session_id` to disk. Caller passes the value the
@@ -1481,9 +1486,16 @@ fn persist_session_to_storage_guarded(
     };
 
     let outcome = crate::session::sync::with_tmux_ownership_lock(|| {
-        if let Some(holder) =
-            crate::session::sync::reserved_sid_holder_excluding_profile(profile, session_id)?
-        {
+        let stored = storage.load_strict()?;
+        let Some(target) = stored.iter().find(|instance| instance.id == instance_id) else {
+            return Ok(SidWrite::Failed);
+        };
+        let Some(namespace) = target.terminal_session_store_namespace() else {
+            return Ok(SidWrite::Skipped);
+        };
+        if let Some(holder) = crate::session::sync::reserved_sid_holder_excluding_profile(
+            profile, &namespace, session_id,
+        )? {
             tracing::warn!(target: "session.store",
                 instance_id = %instance_id,
                 sid = %session_id,
@@ -1493,9 +1505,6 @@ fn persist_session_to_storage_guarded(
             return Ok(SidWrite::Skipped);
         }
         storage.update_with_tmux_ownership_lock(|instances, _groups| {
-            let Some(target) = instances.iter().find(|instance| instance.id == instance_id) else {
-                return Ok(SidWrite::Failed);
-            };
             if !target.supports_terminal_resume() {
                 return Ok(SidWrite::Skipped);
             }
@@ -3093,6 +3102,56 @@ impl Instance {
         tool_supports_terminal_resume(&self.tool)
     }
 
+    /// Stable ownership domain for terminal conversation IDs. IDs are only
+    /// unique inside one agent store: different agents, sandbox containers,
+    /// or host config roots may legitimately use the same token.
+    pub(crate) fn terminal_session_store_namespace(&self) -> Option<String> {
+        self.terminal_session_store_namespace_for_tool(&self.tool)
+    }
+
+    fn terminal_session_store_namespace_for_tool(&self, tool: &str) -> Option<String> {
+        if !tool_supports_terminal_resume(tool) {
+            return None;
+        }
+        let detected = tmux::status_rules::effective_detect_as(&self.source_profile, tool, "");
+        let agent = if tool == self.tool {
+            self.resolved_agent()
+        } else {
+            crate::agents::get_agent(tool).or_else(|| crate::agents::get_agent(&detected))
+        }
+        .map(|definition| definition.name)
+        .unwrap_or(tool);
+        if self.is_sandboxed() {
+            return Some(format!("sandbox:{agent}:{}", self.id));
+        }
+
+        let environment = self.resolved_host_environment();
+        let value = |key: &str| {
+            environment
+                .iter()
+                .rev()
+                .find_map(|entry| entry.split_once('=').filter(|(name, _)| *name == key))
+                .map(|(_, value)| value.to_string())
+                .or_else(|| std::env::var(key).ok())
+        };
+        let home = value("HOME").map(std::path::PathBuf::from);
+        let root = match agent {
+            "claude" => value("CLAUDE_CONFIG_DIR")
+                .map(std::path::PathBuf::from)
+                .or_else(|| home.map(|path| path.join(".claude"))),
+            "codex" => value("CODEX_HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|| home.map(|path| path.join(".codex"))),
+            _ => home,
+        };
+        let root = root.map(|path| path.canonicalize().unwrap_or(path));
+        Some(format!(
+            "host:{agent}:{}",
+            root.map(|path| path.to_string_lossy().into_owned())
+                .unwrap_or_default()
+        ))
+    }
+
     /// Conversation ID that currently owns this row's tmux pane. A pending
     /// tool-swap handoff wins; otherwise unsupported agents' stored IDs remain
     /// inert and never become operational ownership.
@@ -3108,6 +3167,40 @@ impl Instance {
     pub(crate) fn reserves_agent_session_id(&self, sid: &str) -> bool {
         self.operational_agent_session_id() == Some(sid)
             || self.incoming_handoff_agent_session_id() == Some(sid)
+    }
+
+    pub(crate) fn reserves_agent_session_id_in_namespace(
+        &self,
+        sid: &str,
+        namespace: &str,
+    ) -> bool {
+        let current_namespace_matches =
+            self.terminal_session_store_namespace().as_deref() == Some(namespace);
+        if !self.has_tmux_ownership_handoff() {
+            return current_namespace_matches && self.operational_agent_session_id() == Some(sid);
+        }
+        if current_namespace_matches && self.incoming_handoff_agent_session_id() == Some(sid) {
+            return true;
+        }
+        if self.pending_tmux_ownership_session_id.as_deref() != Some(sid) {
+            return false;
+        }
+
+        let mut classified = false;
+        for (tool, prior) in &self.prior_tool_session_ids {
+            if prior.agent_session_id.as_deref() != Some(sid) {
+                continue;
+            }
+            classified = true;
+            if self
+                .terminal_session_store_namespace_for_tool(tool)
+                .as_deref()
+                == Some(namespace)
+            {
+                return true;
+            }
+        }
+        !classified
     }
 
     pub(crate) fn reserved_agent_session_ids(&self) -> impl Iterator<Item = &str> {
@@ -3341,10 +3434,12 @@ impl Instance {
     /// while running another tool, and inactive peers that still own records
     /// in a shared host store.
     fn retroactive_capture_exclusion_set(&self) -> Option<HashSet<String>> {
+        let namespace = self.terminal_session_store_namespace()?;
         super::capture::compose_exclusion_with_persisted_peers(
             &self.id,
             &self.project_path,
             &self.tool,
+            &namespace,
             self.tool == "claude"
                 || (matches!(self.tool.as_str(), "codex" | "kimi") && !self.is_sandboxed()),
             &self.effective_profile(),
@@ -4622,6 +4717,7 @@ impl Instance {
             prepared.expected_prior_sid.as_deref(),
             prepared.expected_prior_intent,
             omp_capture_metadata,
+            !matches!(prepared.session_flags, AppliedSessionFlags::None),
         )?;
 
         Ok(launch_sid_outcome)
@@ -5142,6 +5238,7 @@ impl Instance {
         expected_prior_sid: Option<&str>,
         expected_prior_intent: ResumeIntent,
         mut omp_capture_metadata: Option<OmpCaptureMetadata>,
+        emitted_session_flags: bool,
     ) -> Result<()> {
         if let Some(metadata) = omp_capture_metadata.as_ref() {
             let published = serde_json::to_string(metadata).ok().and_then(|encoded| {
@@ -5164,7 +5261,26 @@ impl Instance {
             }
         }
 
+        let emitted_owned_sid = emitted_session_flags
+            .then_some(self.agent_session_id.as_deref())
+            .flatten()
+            .filter(|sid| is_valid_session_id(sid))
+            .map(str::to_string);
         let outcome = self.persist_session_id(profile, expected_prior_sid, expected_prior_intent);
+        if matches!(outcome, SidPersistOutcome::Skip) && emitted_owned_sid.is_some() {
+            self.stop_poller();
+            if let Err(error) = crate::tmux::utils::kill_session_if_present(session_name) {
+                anyhow::bail!(
+                    "session ownership changed while launching '{}'; failed to stop conflicting pane '{}': {error}",
+                    self.id,
+                    session_name
+                );
+            }
+            anyhow::bail!(
+                "session ownership changed while launching '{}'; conflicting pane was stopped",
+                self.id
+            );
+        }
         // Re-read durable rows under the ownership lock before touching tmux.
         // This keeps a stale launcher from publishing after a tool swap or delete.
         if !matches!(outcome, SidPersistOutcome::Skip) {
@@ -5303,10 +5419,15 @@ impl Instance {
         let Some(sid) = sid.filter(|sid| is_valid_session_id(sid)) else {
             return Ok(());
         };
+        let Some(namespace) = self.terminal_session_store_namespace() else {
+            return Ok(());
+        };
         crate::session::sync::with_tmux_ownership_lock(|| {
-            if let Some(holder) =
-                crate::session::sync::reserved_sid_holder_excluding_profile(storage.profile(), sid)?
-            {
+            if let Some(holder) = crate::session::sync::reserved_sid_holder_excluding_profile(
+                storage.profile(),
+                &namespace,
+                sid,
+            )? {
                 anyhow::bail!(
                     "refusing to launch session '{}': conversation '{}' is reserved by session '{}' in another profile",
                     self.id,
@@ -5318,6 +5439,7 @@ impl Instance {
             if let Some(holder) = instances.iter().find(|instance| {
                 instance.id != self.id
                     && instance.pending_tmux_ownership_session_id.as_deref() == Some(sid)
+                    && instance.reserves_agent_session_id_in_namespace(sid, &namespace)
             }) {
                 anyhow::bail!(
                     "refusing to launch session '{}': conversation '{}' is still live in session '{}'",
@@ -5378,11 +5500,13 @@ impl Instance {
         expected_prior_sid: Option<&str>,
         expected_prior_intent: ResumeIntent,
     ) -> SidPersistOutcome {
+        let namespace = self.terminal_session_store_namespace();
         let new_sid = self.agent_session_id.clone();
         let outcome = crate::session::sync::with_tmux_ownership_lock(|| {
-            if let Some(sid) = new_sid.as_deref() {
+            if let (Some(sid), Some(namespace)) = (new_sid.as_deref(), namespace.as_deref()) {
                 if let Some(holder) = crate::session::sync::reserved_sid_holder_excluding_profile(
                     storage.profile(),
+                    namespace,
                     sid,
                 )? {
                     tracing::warn!(target: "session.store",
@@ -5465,6 +5589,9 @@ impl Instance {
             // authorize an ownership transfer the current disk state no
             // longer sanctions.
             if let Some(sid) = new_sid_for_closure.as_deref() {
+                let Some(namespace) = inst.terminal_session_store_namespace() else {
+                    return Ok(SidWrite::Skipped);
+                };
                 let consumed_pin = matches!(
                     &expected_prior_intent_for_closure,
                     ResumeIntent::Use(pinned) if pinned == sid
@@ -5475,6 +5602,7 @@ impl Instance {
                 if let Some(holder) = instances.iter().find(|instance| {
                     instance.id != instance_id
                         && instance.pending_tmux_ownership_session_id.as_deref() == Some(sid)
+                        && instance.reserves_agent_session_id_in_namespace(sid, &namespace)
                 }) {
                     tracing::warn!(target: "session.store",
                         instance_id = %instance_id,
@@ -5488,7 +5616,7 @@ impl Instance {
                     .iter()
                     .filter(|instance| {
                         instance.id != instance_id
-                            && instance.reserves_agent_session_id(sid)
+                            && instance.reserves_agent_session_id_in_namespace(sid, &namespace)
                     })
                     .map(|instance| instance.id.clone())
                     .collect();
@@ -15108,10 +15236,14 @@ mod tests {
                 assert_eq!(peer_inst.tool, "codex");
                 super::seed_disk_for_sidecar_test(profile, &peer_inst);
 
+                let pi_namespace = peer_inst
+                    .terminal_session_store_namespace_for_tool("pi")
+                    .unwrap();
                 let pi_exclusion = crate::session::capture::compose_exclusion_with_persisted_peers(
                     "other-pi-instance",
                     project_path,
                     "pi",
+                    &pi_namespace,
                     false,
                     profile,
                     &std::collections::HashSet::new(),
@@ -17129,16 +17261,43 @@ mod tests {
                 ),
                 SidWrite::Skipped
             );
+            let claimant_namespace = cross_profile_claimant
+                .terminal_session_store_namespace()
+                .unwrap();
             let exclusion = crate::session::capture::compose_exclusion_with_persisted_peers(
                 &cross_profile_claimant.id,
                 &cross_profile_claimant.project_path,
                 &cross_profile_claimant.tool,
+                &claimant_namespace,
                 false,
                 claimant_profile,
                 &std::collections::HashSet::new(),
             )
             .unwrap();
             assert!(exclusion.contains(SID_Y));
+
+            let independent_profile = "guards-owned-independent-agent";
+            let mut independent = make_inst(independent_profile, "independent-agent");
+            independent.tool = "opencode".to_string();
+            independent.resume_intent = ResumeIntent::Use(SID_Y.to_string());
+            seed(independent_profile, &[&independent]);
+            let independent_storage = Storage::new_unwatched(independent_profile).unwrap();
+            assert!(
+                independent
+                    .validate_launch_sid_ownership(&independent_storage)
+                    .is_ok(),
+                "the same token in a different agent store is not the same conversation"
+            );
+            assert_eq!(
+                persist_session_to_storage(
+                    independent_profile,
+                    &independent.id,
+                    SID_Y,
+                    None,
+                    &file_watch,
+                ),
+                SidWrite::Applied
+            );
         }
 
         #[test]
@@ -17635,6 +17794,7 @@ mod tests {
                     routing_fingerprint: plan.routing_fingerprint.clone(),
                     container_runtime: plan.container_runtime,
                 }),
+                false,
             )
             .unwrap();
 
@@ -17783,6 +17943,7 @@ mod tests {
                     expected_prior_sid.as_deref(),
                     ResumeIntent::Default,
                     None,
+                    publishes,
                 )
                 .unwrap();
 
@@ -17827,6 +17988,7 @@ mod tests {
                 Some("stale"),
                 ResumeIntent::Default,
                 None,
+                false,
             )
             .unwrap();
 
@@ -17863,6 +18025,7 @@ mod tests {
                 Some("stale"),
                 ResumeIntent::Default,
                 None,
+                false,
             )
             .unwrap();
 
@@ -17872,7 +18035,7 @@ mod tests {
 
         #[test]
         #[serial]
-        fn finalize_publish_failed_leaves_env_unchanged() {
+        fn finalize_publish_failure_stops_unowned_pane() {
             if skip_if_no_tmux() {
                 return;
             }
@@ -17882,28 +18045,28 @@ mod tests {
             let profile = "publish-failed";
             let _ = crate::session::storage::Storage::new_unwatched(profile).unwrap();
             let mut inst = make_inst(profile, "fpfle");
-
             let tmux = TmuxSession::create(&inst.id, &inst.title);
-            crate::tmux::env::set_hidden_env(
-                tmux.name(),
-                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
-                "stale-untouched",
-            )
-            .unwrap();
 
             inst.agent_session_id = Some(VALID_SID.to_string());
-            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Default, None)
-                .unwrap();
+            let error = inst
+                .finalize_launch(
+                    tmux.name(),
+                    profile,
+                    None,
+                    ResumeIntent::Default,
+                    None,
+                    true,
+                )
+                .expect_err("a launch without durable SID ownership must fail");
 
-            assert_eq!(
-                captured_env(tmux.name()).as_deref(),
-                Some("stale-untouched")
-            );
-            assert_eq!(
-                inst.agent_session_id.as_deref(),
-                Some(VALID_SID),
-                "memory must keep the daemon-set sid when persist returns Failed"
-            );
+            assert!(error.to_string().contains("ownership changed"));
+            let pane_exists = crate::tmux::tmux_command()
+                .args(["has-session", "-t", tmux.name()])
+                .status()
+                .unwrap()
+                .success();
+            assert!(!pane_exists, "the unowned agent pane must be stopped");
+            assert_eq!(inst.agent_session_id.as_deref(), Some(VALID_SID));
         }
 
         #[test]
@@ -17929,8 +18092,15 @@ mod tests {
             .unwrap();
 
             inst.agent_session_id = Some("bad sid!".to_string());
-            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Default, None)
-                .unwrap();
+            inst.finalize_launch(
+                tmux.name(),
+                profile,
+                None,
+                ResumeIntent::Default,
+                None,
+                false,
+            )
+            .unwrap();
 
             assert_eq!(
                 captured_env(tmux.name()).as_deref(),
@@ -17956,8 +18126,15 @@ mod tests {
             let tmux = TmuxSession::create(&inst.id, &inst.title);
 
             inst.agent_session_id = Some(VALID_SID.to_string());
-            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Cleared, None)
-                .unwrap();
+            inst.finalize_launch(
+                tmux.name(),
+                profile,
+                None,
+                ResumeIntent::Cleared,
+                None,
+                true,
+            )
+            .unwrap();
 
             assert_eq!(inst.agent_session_id.as_deref(), Some(VALID_SID));
             assert_eq!(inst.resume_intent, ResumeIntent::Default);

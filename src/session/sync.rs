@@ -350,6 +350,26 @@ fn owned_tmux_ownership_targets(
         .collect()
 }
 
+/// Refuse destructive metadata removal while any target agent pane is live.
+/// A deleted row cannot retain durable ownership, so callers must leave the
+/// row intact until its pane has stopped. Strict tmux enumeration fails closed.
+pub(crate) fn ensure_instances_quiescent(
+    instances: &[Instance],
+    action: &str,
+) -> anyhow::Result<()> {
+    let names: HashSet<String> = crate::tmux::session_names_strict()?.into_iter().collect();
+    for instance in instances {
+        let session = instance.tmux_session()?;
+        if names.contains(session.name()) {
+            anyhow::bail!(
+                "Cannot {action}: session '{}' still has a live tmux pane",
+                instance.id
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Remove ownership for rows immediately before deleting them.
 pub(crate) fn clear_tmux_session_id_ownership_for_instances_locked(
     instances: &[Instance],
@@ -436,11 +456,12 @@ pub(crate) fn instance_ids_excluding_profile(excluded: &str) -> anyhow::Result<H
 /// an error rather than licensing a cross-profile capture or launch.
 pub(crate) fn reserved_sid_holder_excluding_profile(
     excluded: &str,
+    namespace: &str,
     sid: &str,
 ) -> anyhow::Result<Option<String>> {
     Ok(load_profile_instances_excluding(Some(excluded))?
         .into_iter()
-        .find(|instance| instance.reserves_agent_session_id(sid))
+        .find(|instance| instance.reserves_agent_session_id_in_namespace(sid, namespace))
         .map(|instance| instance.id))
 }
 pub(crate) fn reconcile_all_profiles_tmux_session_id_ownership_env_locked(
