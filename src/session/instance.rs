@@ -3127,22 +3127,74 @@ impl Instance {
 
         let environment = self.resolved_host_environment();
         let value = |key: &str| {
-            environment
-                .iter()
-                .rev()
-                .find_map(|entry| entry.split_once('=').filter(|(name, _)| *name == key))
-                .map(|(_, value)| value.to_string())
+            super::environment::resolve_host_environment_value(&environment, key)
                 .or_else(|| std::env::var(key).ok())
+                .filter(|value| !value.is_empty())
         };
-        let home = value("HOME").map(std::path::PathBuf::from);
+        let home = value("HOME")
+            .map(std::path::PathBuf::from)
+            .or_else(dirs::home_dir);
+        let under_home = |path: &str| home.as_ref().map(|home| home.join(path));
         let root = match agent {
             "claude" => value("CLAUDE_CONFIG_DIR")
                 .map(std::path::PathBuf::from)
-                .or_else(|| home.map(|path| path.join(".claude"))),
+                .or_else(|| under_home(".claude")),
             "codex" => value("CODEX_HOME")
                 .map(std::path::PathBuf::from)
-                .or_else(|| home.map(|path| path.join(".codex"))),
-            _ => home,
+                .or_else(|| under_home(".codex")),
+            "vibe" => value("VIBE_HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|| under_home(".vibe")),
+            "gemini" => value("GEMINI_CLI_HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|| under_home(".gemini")),
+            "copilot" => value("COPILOT_CONFIG_DIR")
+                .map(std::path::PathBuf::from)
+                .or_else(|| under_home(".copilot")),
+            "pi" => value("PI_CODING_AGENT_DIR")
+                .map(std::path::PathBuf::from)
+                .or_else(|| under_home(".pi/agent"))
+                .map(|path| path.join("sessions")),
+            "hermes" => value("HERMES_HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|| under_home(".hermes")),
+            "kimi" => value("KIMI_CODE_HOME")
+                .map(std::path::PathBuf::from)
+                .or_else(|| under_home(".kimi-code")),
+            "omp" => value("PI_CODING_AGENT_DIR")
+                .map(std::path::PathBuf::from)
+                .or_else(|| under_home(".omp/agent"))
+                .map(|path| path.join("sessions")),
+            "prime-agent" => value("PRIME_AGENT_SESSION_DIR")
+                .or_else(|| value("PRIME_AGENT_CODING_AGENT_SESSION_DIR"))
+                .map(std::path::PathBuf::from)
+                .or_else(|| {
+                    value("PRIME_AGENT_CODING_AGENT_DIR")
+                        .map(std::path::PathBuf::from)
+                        .or_else(|| under_home(".prime/agent"))
+                        .map(|path| path.join("sessions"))
+                }),
+            "opencode" => {
+                let data_dir = value("XDG_DATA_HOME")
+                    .map(std::path::PathBuf::from)
+                    .or_else(|| under_home(".local/share"))?;
+                let default = data_dir.join("opencode");
+                match value("OPENCODE_DB").as_deref() {
+                    Some(":memory:") => {
+                        Some(std::path::PathBuf::from(format!(":memory:{}", self.id)))
+                    }
+                    Some(path) => {
+                        let path = std::path::PathBuf::from(path);
+                        Some(if path.is_absolute() {
+                            path
+                        } else {
+                            default.join(path)
+                        })
+                    }
+                    None => Some(default),
+                }
+            }
+            _ => None,
         };
         let root = root.map(|path| path.canonicalize().unwrap_or(path));
         Some(format!(
@@ -4499,7 +4551,10 @@ impl Instance {
         let (_title_lock, _lifecycle_lock) =
             self.reacquire_launch_locks_after_hooks(&storage, hook_result)?;
         self.apply_fresh_launch_intent();
-        self.validate_launch_sid_ownership(&storage)?;
+        if let Err(error) = self.validate_launch_sid_ownership(&storage) {
+            self.fail_reserved_launch(&storage, &error, false);
+            return Err(error);
+        }
 
         let prepared = match self.prepare_launch_command() {
             Ok(prepared) => prepared,
@@ -6772,7 +6827,10 @@ impl Instance {
             self.reacquire_launch_locks_after_hooks(&storage, hook_result)?;
         let skipped_failed_resume_sid = self.apply_resume_policy(resume_policy);
         self.apply_fresh_launch_intent();
-        self.validate_launch_sid_ownership(&storage)?;
+        if let Err(error) = self.validate_launch_sid_ownership(&storage) {
+            self.fail_reserved_launch(&storage, &error, false);
+            return Err(error);
+        }
 
         let prepared = match self.prepare_launch_command() {
             Ok(prepared) => prepared,
@@ -9569,6 +9627,36 @@ mod tests {
         assert!(
             leftover.is_none(),
             "a failed launch must clear its reservation even after a same-generation status drift"
+        );
+
+        let contested = "019342ab-1234-7def-8901-aaaaaaaaaaaa";
+        let mut owner = Instance::new("owner", "/tmp/test");
+        owner.source_profile = profile.to_string();
+        owner.agent_session_id = Some(contested.to_string());
+        owner.pending_tmux_ownership_session_id = Some(contested.to_string());
+        owner.tmux_ownership_handoff_pending = true;
+        let mut claimant = Instance::new("claimant", "/tmp/test");
+        claimant.source_profile = profile.to_string();
+        claimant.resume_intent = ResumeIntent::Use(contested.to_string());
+        storage
+            .update(|instances, _groups| {
+                instances.extend([owner.clone(), claimant.clone()]);
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(claimant.start_with_size_opts(None, true).is_err());
+        let claimant_reservation = storage
+            .update(|instances, _groups| {
+                Ok(instances
+                    .iter()
+                    .find(|instance| instance.id == claimant.id)
+                    .and_then(|instance| instance.lifecycle_reservation.clone()))
+            })
+            .unwrap();
+        assert!(
+            claimant_reservation.is_none(),
+            "ownership rejection must release the launch reservation immediately"
         );
     }
 
@@ -17243,6 +17331,22 @@ mod tests {
             cross_profile_claimant.resume_intent = ResumeIntent::Use(SID_Y.to_string());
             seed(owner_profile, &[&handoff_owner]);
             seed(claimant_profile, &[&cross_profile_claimant]);
+            let shared_store = temp.path().join("shared-claude-store");
+            std::fs::create_dir_all(&shared_store).unwrap();
+            let _store_guard = EnvGuard::set(&[("SHARED_CLAUDE_STORE", shared_store.clone())]);
+            std::fs::write(
+                crate::session::profile_config::get_profile_config_path(owner_profile).unwrap(),
+                r#"environment = ["CLAUDE_CONFIG_DIR=$SHARED_CLAUDE_STORE"]"#,
+            )
+            .unwrap();
+            std::fs::write(
+                crate::session::profile_config::get_profile_config_path(claimant_profile).unwrap(),
+                format!(
+                    r#"environment = ["CLAUDE_CONFIG_DIR={}"]"#,
+                    shared_store.display()
+                ),
+            )
+            .unwrap();
             let claimant_storage = Storage::new_unwatched(claimant_profile).unwrap();
             assert!(
                 cross_profile_claimant

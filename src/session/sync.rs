@@ -133,22 +133,26 @@ fn tmux_session_id_env_names(
 
 fn partition_unambiguous_instances(instances: &[Instance]) -> (Vec<&Instance>, HashSet<&str>) {
     let mut id_counts: HashMap<&str, usize> = HashMap::new();
-    let mut sid_counts: HashMap<&str, usize> = HashMap::new();
+    let mut sid_owners: HashMap<(String, String), &str> = HashMap::new();
+    let mut ambiguous_sid_owners = HashSet::new();
     for instance in instances {
-        *id_counts.entry(instance.id.as_str()).or_default() += 1;
-        if let Some(sid) = instance.operational_agent_session_id() {
-            *sid_counts.entry(sid).or_default() += 1;
+        let id = instance.id.as_str();
+        *id_counts.entry(id).or_default() += 1;
+        if let (Some(sid), Some(namespace)) = (
+            instance.operational_agent_session_id(),
+            instance.terminal_session_store_namespace(),
+        ) {
+            if let Some(previous) = sid_owners.insert((namespace, sid.to_string()), id) {
+                ambiguous_sid_owners.insert(previous);
+                ambiguous_sid_owners.insert(id);
+            }
         }
     }
     let mut ambiguous_ids: HashSet<&str> = id_counts
         .iter()
         .filter_map(|(id, count)| (*count > 1).then_some(*id))
         .collect();
-    ambiguous_ids.extend(instances.iter().filter_map(|instance| {
-        instance.operational_agent_session_id().and_then(|sid| {
-            (sid_counts.get(sid).copied().unwrap_or_default() > 1).then_some(instance.id.as_str())
-        })
-    }));
+    ambiguous_ids.extend(ambiguous_sid_owners);
     let trusted = instances
         .iter()
         .filter(|instance| !ambiguous_ids.contains(instance.id.as_str()))
@@ -1417,6 +1421,12 @@ mod tests {
         let mut shared_conversation = second.clone();
         shared_conversation.id = "87654321-0000-0000-0000-000000000003".to_string();
         shared_conversation.agent_session_id = first.agent_session_id.clone();
+        let mut independent_store = shared_conversation.clone();
+        independent_store.tool = "codex".to_string();
+        let independent_rows = [first.clone(), independent_store];
+        let (trusted, ambiguous) = partition_unambiguous_instances(&independent_rows);
+        assert_eq!(trusted.len(), 2);
+        assert!(ambiguous.is_empty());
         let shared_rows = [first.clone(), shared_conversation];
         let (trusted, ambiguous) = partition_unambiguous_instances(&shared_rows);
         assert!(trusted.is_empty());
@@ -1506,14 +1516,22 @@ mod tests {
         let mut loaded = load_profile_instances_excluding(None)
             .unwrap()
             .into_iter()
-            .map(|instance| (instance.title, instance.tool))
+            .map(|instance| (instance.title, instance.tool, instance.source_profile))
             .collect::<Vec<_>>();
         loaded.sort();
         assert_eq!(
             loaded,
             vec![
-                ("cleanup-alpha".to_string(), "qwen".to_string()),
-                ("cleanup-beta".to_string(), "kiro".to_string()),
+                (
+                    "cleanup-alpha".to_string(),
+                    "qwen".to_string(),
+                    "cleanup-alpha".to_string(),
+                ),
+                (
+                    "cleanup-beta".to_string(),
+                    "kiro".to_string(),
+                    "cleanup-beta".to_string(),
+                ),
             ]
         );
     }

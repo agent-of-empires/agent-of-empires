@@ -868,6 +868,7 @@ impl Storage {
         for (idx, row) in rows.into_iter().enumerate() {
             match <Instance as serde::Deserialize>::deserialize(&row) {
                 Ok(mut inst) => {
+                    inst.source_profile = self.profile.clone();
                     inst.set_file_watch(self.file_watch.clone());
                     instances.push(inst);
                 }
@@ -904,6 +905,7 @@ impl Storage {
         }
         let mut instances: Vec<Instance> = serde_json::from_str(&content)?;
         for instance in &mut instances {
+            instance.source_profile = self.profile.clone();
             instance.set_file_watch(self.file_watch.clone());
         }
         Ok(instances)
