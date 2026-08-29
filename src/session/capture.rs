@@ -2100,6 +2100,7 @@ fn extract_codex_uuid_from_filename(path: &Path) -> Option<String> {
     None
 }
 
+/// Returns whether `path` is a plain or zstd-compressed Codex rollout.
 fn is_codex_rollout(path: &Path) -> bool {
     path.extension().and_then(|e| e.to_str()) == Some("jsonl")
         || path
@@ -2108,6 +2109,7 @@ fn is_codex_rollout(path: &Path) -> bool {
             .is_some_and(|name| name.ends_with(".jsonl.zst"))
 }
 
+/// Opens a Codex rollout, transparently decoding zstd-compressed files.
 fn open_codex_rollout(path: &Path) -> Result<Box<dyn Read>> {
     let file = std::fs::File::open(path)?;
     if path.extension().and_then(|e| e.to_str()) == Some("zst") {
