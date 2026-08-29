@@ -2822,20 +2822,16 @@ pub async fn acp_replay(
     .into_response()
 }
 
-fn managed_claude_session_ids(
+fn manages_claude_import_id(
     instances: &[crate::session::Instance],
-) -> std::collections::HashSet<String> {
-    instances
-        .iter()
-        .flat_map(|instance| {
-            instance
-                .acp_session_id
-                .as_deref()
-                .into_iter()
-                .chain(instance.reserved_agent_session_ids())
-        })
-        .map(str::to_owned)
-        .collect()
+    id: &str,
+    namespace: Option<&str>,
+) -> bool {
+    namespace.is_some_and(|namespace| {
+        instances
+            .iter()
+            .any(|instance| instance.reserves_claude_import_id_in_namespace(id, namespace))
+    })
 }
 
 /// List existing Claude Code sessions on disk, newest first, for the import
@@ -2863,7 +2859,14 @@ pub async fn list_claude_sessions(State(state): State<Arc<AppState>>) -> impl In
     //     and is only filtered by id match.
     let (managed_ids, managed_dirs): (std::collections::HashSet<String>, Vec<PathBuf>) = {
         let instances = state.instances.read().await;
-        let ids = managed_claude_session_ids(&instances);
+        let namespace = crate::session::claude_import::claude_store_namespace();
+        let ids = sessions
+            .iter()
+            .filter(|session| {
+                manages_claude_import_id(&instances, &session.session_id, namespace.as_deref())
+            })
+            .map(|session| session.session_id.clone())
+            .collect();
         let dirs = instances
             .iter()
             .filter(|i| {
@@ -2895,18 +2898,41 @@ mod tests {
     use std::io::Write;
 
     #[test]
-    fn managed_claude_ids_ignore_inert_terminal_ids() {
-        for (tool, managed) in [("claude", true), ("qwen", false), ("kiro", false)] {
+    fn managed_claude_ids_require_the_scanned_store() {
+        let namespace = crate::session::claude_import::claude_store_namespace().unwrap();
+        for (tool, managed) in [
+            ("claude", true),
+            ("codex", false),
+            ("qwen", false),
+            ("kiro", false),
+        ] {
             let mut instance = crate::session::Instance::new("terminal", "/tmp/x");
             instance.tool = tool.to_string();
             instance.agent_session_id = Some("terminal-id".to_string());
-            let ids = managed_claude_session_ids(&[instance]);
-            assert_eq!(ids.contains("terminal-id"), managed, "{tool}");
+            assert_eq!(
+                manages_claude_import_id(&[instance], "terminal-id", Some(&namespace)),
+                managed,
+                "{tool}"
+            );
         }
 
         let mut structured = crate::session::Instance::new("structured", "/tmp/x");
+        structured.tool = "claude".to_string();
         structured.acp_session_id = Some("acp-id".to_string());
-        assert!(managed_claude_session_ids(&[structured]).contains("acp-id"));
+        assert!(manages_claude_import_id(
+            &[structured],
+            "acp-id",
+            Some(&namespace)
+        ));
+
+        let mut codex = crate::session::Instance::new("codex", "/tmp/x");
+        codex.tool = "codex".to_string();
+        codex.acp_session_id = Some("acp-id".to_string());
+        assert!(!manages_claude_import_id(
+            &[codex],
+            "acp-id",
+            Some(&namespace)
+        ));
     }
 
     fn utc_ts(raw: &str) -> DateTime<Utc> {

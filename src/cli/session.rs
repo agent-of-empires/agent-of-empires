@@ -918,33 +918,18 @@ fn resolve_import_roots(paths: &[String]) -> Result<Vec<std::path::PathBuf>> {
         .collect())
 }
 
-/// Stable store namespace for a discovered Claude transcript. Import scanning
-/// reads Claude's host store, so equal tokens owned by another agent or store
-/// must not suppress a valid import.
-fn claude_import_store_namespace(profile: &str, cwd: &str) -> Option<String> {
-    let mut candidate = Instance::new("claude-import-probe", cwd);
-    candidate.tool = "claude".to_string();
-    candidate.source_profile = profile.to_string();
-    candidate.terminal_session_store_namespace()
+/// Stable store namespace for the exact host store scanned by Claude import.
+fn claude_import_store_namespace() -> Option<String> {
+    crate::session::claude_import::claude_store_namespace()
 }
 
 /// True when the id is already imported from this namespace, so a re-run does
-/// not create duplicates. Checks namespace-scoped terminal ownership and
-/// (serve builds) the structured-view id.
+/// not create duplicates across agents, stores, or profiles.
 fn already_imported(instances: &[Instance], id: &str, namespace: Option<&str>) -> bool {
-    instances.iter().any(|inst| {
-        if namespace.is_some_and(|namespace| {
-            inst.reserves_agent_session_id_in_namespace(id, namespace)
-                || (inst.terminal_session_store_namespace().as_deref() == Some(namespace)
-                    && matches!(&inst.resume_intent, ResumeIntent::Use(s) if s == id))
-        }) {
-            return true;
-        }
-        #[cfg(feature = "serve")]
-        if inst.acp_session_id.as_deref() == Some(id) {
-            return true;
-        }
-        false
+    namespace.is_some_and(|namespace| {
+        instances
+            .iter()
+            .any(|instance| instance.reserves_claude_import_id_in_namespace(id, namespace))
     })
 }
 
@@ -1014,16 +999,16 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
     // silently start a fresh conversation. Skip and report those.
     let (candidates, missing_cwd): (Vec<_>, Vec<_>) =
         discovered.into_iter().partition(|s| s.cwd_exists);
-
-    // Dedupe against sessions already imported into this profile.
-    let (existing, _groups) = Storage::open_unwatched(profile)?.load_with_groups()?;
+    // Dedupe against strict ownership across every profile. A corrupt owner is
+    // ambiguity, not permission to create another resume pin.
+    let existing = crate::session::sync::with_tmux_ownership_lock(|| {
+        crate::session::sync::load_profile_instances_excluding(None)
+    })?;
+    let namespace = claude_import_store_namespace();
     let candidate_count = candidates.len();
     let mut to_import: Vec<_> = candidates
         .into_iter()
-        .filter(|s| {
-            let namespace = claude_import_store_namespace(profile, &s.cwd);
-            !already_imported(&existing, &s.session_id, namespace.as_deref())
-        })
+        .filter(|s| !already_imported(&existing, &s.session_id, namespace.as_deref()))
         .collect();
     let already = candidate_count - to_import.len();
 
@@ -1082,27 +1067,30 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
             return Ok(());
         }
     }
-
     let group = args.group.clone().unwrap_or_default();
     let storage = Storage::open_unwatched(profile)?;
-    let created_ids = storage.update(|all_instances, groups| {
-        let mut ids = Vec::new();
-        for s in &to_import {
-            // Re-check under the lock so a concurrent import does not duplicate.
-            let namespace = claude_import_store_namespace(profile, &s.cwd);
-            if already_imported(all_instances, &s.session_id, namespace.as_deref()) {
-                continue;
+    let created_ids = crate::session::sync::with_tmux_ownership_lock(|| {
+        let foreign = crate::session::sync::load_profile_instances_excluding(Some(profile))?;
+        storage.update_with_tmux_ownership_lock(|all_instances, groups| {
+            let mut ids = Vec::new();
+            for s in &to_import {
+                // Re-check every profile while the global ownership lock is held.
+                if already_imported(all_instances, &s.session_id, namespace.as_deref())
+                    || already_imported(&foreign, &s.session_id, namespace.as_deref())
+                {
+                    continue;
+                }
+                let inst = build_import_instance(s, structured, &group);
+                ids.push(inst.id.clone());
+                all_instances.push(inst.clone());
+                if !inst.group_path.is_empty() {
+                    let mut tree = GroupTree::new_with_groups(all_instances, groups);
+                    tree.create_group(&inst.group_path);
+                    *groups = tree.get_all_groups();
+                }
             }
-            let inst = build_import_instance(s, structured, &group);
-            ids.push(inst.id.clone());
-            all_instances.push(inst.clone());
-            if !inst.group_path.is_empty() {
-                let mut tree = GroupTree::new_with_groups(all_instances, groups);
-                tree.create_group(&inst.group_path);
-                *groups = tree.get_all_groups();
-            }
-        }
-        Ok(ids)
+            Ok(ids)
+        })
     })?;
 
     println!("✓ Imported {} session(s).", created_ids.len());
@@ -3155,7 +3143,7 @@ mod import_tests {
 
     #[test]
     fn already_imported_matches_only_claude_store_ownership() {
-        let namespace = claude_import_store_namespace("default", "/p").unwrap();
+        let namespace = claude_import_store_namespace().unwrap();
         for (tool, expected) in [
             ("claude", true),
             ("codex", false),

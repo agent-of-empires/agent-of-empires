@@ -44,6 +44,28 @@ fn resolve_agent_home(env_var: Option<&str>, default_subdir: &str) -> Result<Pat
         .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))?
         .join(default_subdir))
 }
+/// Resolve a host store from the concrete environment snapshot transported to
+/// the launched pane. An empty slice preserves ambient behavior for one-shot
+/// retroactive capture outside a launch.
+fn resolve_agent_home_for_host_environment(
+    host_env: &[String],
+    env_var: Option<&str>,
+    default_subdir: &str,
+) -> Result<PathBuf> {
+    let value = |key: &str| {
+        crate::session::environment::resolve_host_environment_value(host_env, key)
+            .or_else(|| std::env::var(key).ok())
+            .filter(|value| !value.is_empty())
+    };
+    if let Some(value) = env_var.and_then(value) {
+        return Ok(PathBuf::from(value));
+    }
+    value("HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+        .map(|home| home.join(default_subdir))
+        .ok_or_else(|| anyhow::anyhow!("Cannot determine home directory"))
+}
 
 /// Resolve the Claude config dir the *launched pane* will see.
 ///
@@ -659,7 +681,7 @@ pub(crate) fn capture_pi_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
 ) -> Result<String> {
-    capture_pi_family_session_id(project_path, exclusion, ".pi/agent")
+    capture_pi_family_session_id(project_path, exclusion, ".pi/agent", &[])
 }
 
 /// Scan Pi's on-disk session store.
@@ -671,8 +693,13 @@ fn capture_pi_family_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
     default_subdir: &str,
+    host_environment: &[String],
 ) -> Result<String> {
-    let pi_home = resolve_agent_home(Some("PI_CODING_AGENT_DIR"), default_subdir)?;
+    let pi_home = resolve_agent_home_for_host_environment(
+        host_environment,
+        Some("PI_CODING_AGENT_DIR"),
+        default_subdir,
+    )?;
     let sessions_dir = pi_home.join("sessions");
 
     if !sessions_dir.exists() {
@@ -826,10 +853,11 @@ pub(crate) fn pi_poll_fn(
     project_path: String,
     instance_id: String,
     extra_excludes: HashSet<String>,
+    host_environment: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
         let exclusion = compose_exclusion(&instance_id, &extra_excludes);
-        capture_pi_session_id(&project_path, &exclusion)
+        capture_pi_family_session_id(&project_path, &exclusion, ".pi/agent", &host_environment)
             .map_err(
                 |e| tracing::debug!(target: "session.capture", "Pi poll capture failed: {}", e),
             )
@@ -978,20 +1006,23 @@ pub(crate) fn compose_exclusion(
 ) -> HashSet<String> {
     compose_exclusion_in(
         current_instance_id,
+        None,
         extra,
         &crate::tmux::LiveSessionSnapshot::new(),
     )
 }
 
-/// [`compose_exclusion`] against a snapshot the caller already holds, so a
-/// pass that also probes per-instance liveness observes tmux once instead of
-/// twice.
+/// compose_exclusion against a snapshot the caller already holds, so a pass
+/// that also probes per-instance liveness observes tmux once instead of twice.
+/// A supplied namespace comes from the same launch snapshot as the poller;
+/// otherwise it is resolved from the current pane's stamped environment.
 fn compose_exclusion_in(
     current_instance_id: &str,
+    current_namespace: Option<&str>,
     extra: &HashSet<String>,
     live: &crate::tmux::LiveSessionSnapshot,
 ) -> HashSet<String> {
-    let mut set = build_exclusion_set(current_instance_id, live);
+    let mut set = build_exclusion_set(current_instance_id, current_namespace, live);
     set.extend(extra.iter().cloned());
     set
 }
@@ -1030,7 +1061,12 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
     // visits every stored session sharing the project path, trashed ones
     // included, so a per-instance liveness probe costs a fork each.
     let live = crate::tmux::LiveSessionSnapshot::new();
-    let mut set = compose_exclusion_in(current_instance_id, retroactive_capture_excludes, &live);
+    let mut set = compose_exclusion_in(
+        current_instance_id,
+        Some(current_namespace),
+        retroactive_capture_excludes,
+        &live,
+    );
     // Canonical paths keep equivalent `..` and symlink spellings in one
     // ownership domain; raw comparison reopened cross-session capture (#2858).
     let canonical_current = canonicalize_or_raw(current_project_path);
@@ -1151,6 +1187,7 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
 /// per-instance exclusion list.
 fn build_exclusion_set(
     current_instance_id: &str,
+    current_namespace: Option<&str>,
     live: &crate::tmux::LiveSessionSnapshot,
 ) -> HashSet<String> {
     let Some(names) = live.names() else {
@@ -1165,36 +1202,59 @@ fn build_exclusion_set(
                 && !name.starts_with(crate::tmux::TOOL_PREFIX)
         })
         .collect();
-
     if aoe_sessions.is_empty() {
         return HashSet::new();
     }
 
-    let instance_ids = crate::tmux::env::get_hidden_env_batch(
+    let rows = match crate::tmux::env::get_hidden_env_keys_batch_strict(
         &aoe_sessions,
-        crate::tmux::env::AOE_INSTANCE_ID_KEY,
-    );
-
-    let other_sessions: Vec<&str> = instance_ids
-        .iter()
-        .filter(|(_, owner)| {
-            owner
-                .as_deref()
-                .is_some_and(|owner| owner != current_instance_id)
+        &[
+            crate::tmux::env::AOE_INSTANCE_ID_KEY,
+            crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+            crate::tmux::env::AOE_SESSION_STORE_NAMESPACE_KEY,
+        ],
+    ) {
+        Ok(rows) => rows,
+        Err(error) => {
+            tracing::warn!(target: "session.capture", "live ownership scan failed: {error}");
+            return HashSet::new();
+        }
+    };
+    let rows: Vec<(Option<String>, Option<String>, Option<String>)> = rows
+        .into_iter()
+        .map(|(_, values)| {
+            let mut values = values.into_iter();
+            (
+                values.next().flatten(),
+                values.next().flatten(),
+                values.next().flatten(),
+            )
         })
-        .map(|(name, _)| name.as_str())
         .collect();
+    let derived_namespace = if current_namespace.is_none() {
+        let namespaces: HashSet<String> = rows
+            .iter()
+            .filter(|(owner, _, _)| owner.as_deref() == Some(current_instance_id))
+            .filter_map(|(_, _, namespace)| namespace.clone())
+            .collect();
+        (namespaces.len() == 1).then(|| namespaces.into_iter().next().expect("one namespace"))
+    } else {
+        None
+    };
+    let current_namespace = current_namespace.or(derived_namespace.as_deref());
 
-    if other_sessions.is_empty() {
-        return HashSet::new();
-    }
-
-    let captured_ids = crate::tmux::env::get_hidden_env_batch(
-        &other_sessions,
-        crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
-    );
-
-    captured_ids.into_iter().filter_map(|(_, id)| id).collect()
+    rows.into_iter()
+        .filter_map(|(owner, captured, namespace)| {
+            if owner.as_deref() == Some(current_instance_id) {
+                return None;
+            }
+            let captured = captured?;
+            match current_namespace {
+                Some(current) if namespace.as_deref().is_some_and(|peer| peer != current) => None,
+                _ => Some(captured),
+            }
+        })
+        .collect()
 }
 
 /// Capture Vibe session ID from `meta.json` files in the session log directory.
@@ -1207,7 +1267,16 @@ pub(crate) fn capture_vibe_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
 ) -> Result<String> {
-    let vibe_home = resolve_agent_home(Some("VIBE_HOME"), ".vibe")?;
+    capture_vibe_session_id_in_environment(project_path, exclusion, &[])
+}
+
+fn capture_vibe_session_id_in_environment(
+    project_path: &str,
+    exclusion: &HashSet<String>,
+    host_environment: &[String],
+) -> Result<String> {
+    let vibe_home =
+        resolve_agent_home_for_host_environment(host_environment, Some("VIBE_HOME"), ".vibe")?;
     let sessions_dir = vibe_home.join("logs").join("session");
 
     if !sessions_dir.exists() {
@@ -1294,10 +1363,11 @@ pub(crate) fn vibe_poll_fn(
     project_path: String,
     instance_id: String,
     extra_excludes: HashSet<String>,
+    host_environment: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
         let exclusion = compose_exclusion(&instance_id, &extra_excludes);
-        capture_vibe_session_id(&project_path, &exclusion)
+        capture_vibe_session_id_in_environment(&project_path, &exclusion, &host_environment)
             .map_err(
                 |e| tracing::debug!(target: "session.capture", "Vibe poll capture failed: {}", e),
             )
@@ -1606,38 +1676,40 @@ fn select_opencode_session_from_values(
 ///      joined to data dir, `:memory:` is unsupported (bail).
 ///   2. Most recently modified `opencode*.db` in the data dir (covers both
 ///      the standard `opencode.db` and channel variants like `opencode-dev.db`).
+#[cfg(test)]
 fn opencode_db_path() -> Result<PathBuf> {
-    // 1. Explicit override via OPENCODE_DB (same env var opencode reads).
-    if let Ok(db_env) = std::env::var("OPENCODE_DB") {
-        if !db_env.is_empty() {
-            if db_env == ":memory:" {
-                anyhow::bail!("opencode is using an in-memory DB; cannot read sessions via SQLite");
-            }
-            let p = PathBuf::from(&db_env);
-            if p.is_absolute() {
-                return Ok(p);
-            }
-            return Ok(opencode_data_dir()?.join(p));
+    opencode_db_path_in_environment(&[])
+}
+
+fn opencode_db_path_in_environment(host_environment: &[String]) -> Result<PathBuf> {
+    let value = |key: &str| {
+        crate::session::environment::resolve_host_environment_value(host_environment, key)
+            .or_else(|| std::env::var(key).ok())
+            .filter(|value| !value.is_empty())
+    };
+    if let Some(db_env) = value("OPENCODE_DB") {
+        if db_env == ":memory:" {
+            anyhow::bail!("opencode is using an in-memory DB; cannot read sessions via SQLite");
         }
+        let path = PathBuf::from(db_env);
+        if path.is_absolute() {
+            return Ok(path);
+        }
+        return Ok(opencode_data_dir_in_environment(host_environment)?.join(path));
     }
 
-    let data_dir = opencode_data_dir()?;
-
-    // 2. Find the most recently modified opencode DB in data_dir.
-    //    Covers both the standard filename (latest/beta/prod) and channel
-    //    variants (opencode-{channel}.db). Picking by mtime ensures we read
-    //    the DB the running opencode instance is actively writing to.
+    let data_dir = opencode_data_dir_in_environment(host_environment)?;
     if let Ok(entries) = std::fs::read_dir(&data_dir) {
         let mut best: Option<(PathBuf, std::time::SystemTime)> = None;
         for entry in entries.flatten() {
             let name = entry.file_name();
-            let name_str = name.to_string_lossy();
-            let is_candidate = name_str == "opencode.db"
-                || (name_str.starts_with("opencode-") && name_str.ends_with(".db"));
+            let name = name.to_string_lossy();
+            let is_candidate =
+                name == "opencode.db" || (name.starts_with("opencode-") && name.ends_with(".db"));
             if is_candidate {
                 if let Ok(meta) = entry.metadata() {
                     let mtime = meta.modified().unwrap_or(std::time::UNIX_EPOCH);
-                    if best.as_ref().is_none_or(|(_, t)| mtime > *t) {
+                    if best.as_ref().is_none_or(|(_, prior)| mtime > *prior) {
                         best = Some((entry.path(), mtime));
                     }
                 }
@@ -1647,24 +1719,21 @@ fn opencode_db_path() -> Result<PathBuf> {
             return Ok(path);
         }
     }
-
-    // Nothing found; return standard path so the caller gets a clear
-    // "not found" error and falls back to the subprocess path.
     Ok(data_dir.join("opencode.db"))
 }
 
-/// Resolve opencode's data directory.
-///
-/// Uses `XDG_DATA_HOME` if set (same `xdg-basedir` npm package opencode uses),
-/// otherwise `$HOME/.local/share`. Both Linux and macOS use this path.
-fn opencode_data_dir() -> Result<PathBuf> {
-    if let Ok(xdg) = std::env::var("XDG_DATA_HOME") {
-        if !xdg.is_empty() {
-            return Ok(PathBuf::from(xdg).join("opencode"));
-        }
+/// Resolve opencode's data directory from the launch environment, matching
+/// XDG precedence before falling back to the launch user's home directory.
+fn opencode_data_dir_in_environment(host_environment: &[String]) -> Result<PathBuf> {
+    let value = |key: &str| {
+        crate::session::environment::resolve_host_environment_value(host_environment, key)
+            .or_else(|| std::env::var(key).ok())
+            .filter(|value| !value.is_empty())
+    };
+    if let Some(xdg) = value("XDG_DATA_HOME") {
+        return Ok(PathBuf::from(xdg).join("opencode"));
     }
-    let home =
-        std::env::var("HOME").context("HOME is not set; cannot resolve opencode data dir")?;
+    let home = value("HOME").context("HOME is not set; cannot resolve opencode data dir")?;
     Ok(PathBuf::from(home)
         .join(".local")
         .join("share")
@@ -1750,8 +1819,17 @@ pub(crate) fn try_capture_opencode_session_id(
     exclusion: &HashSet<String>,
     launch_time_ms: Option<f64>,
 ) -> Result<String> {
-    let entries_or_fallback =
-        opencode_db_path().and_then(|p| read_opencode_sessions_from_sqlite_at(&p));
+    try_capture_opencode_session_id_in_environment(project_path, exclusion, launch_time_ms, &[])
+}
+
+fn try_capture_opencode_session_id_in_environment(
+    project_path: &str,
+    exclusion: &HashSet<String>,
+    launch_time_ms: Option<f64>,
+    host_environment: &[String],
+) -> Result<String> {
+    let entries_or_fallback = opencode_db_path_in_environment(host_environment)
+        .and_then(|path| read_opencode_sessions_from_sqlite_at(&path));
 
     match entries_or_fallback {
         Ok(entries) => {
@@ -1762,12 +1840,15 @@ pub(crate) fn try_capture_opencode_session_id(
                 launch_time_ms,
             );
         }
-        Err(e) => log_opencode_sqlite_fallback_once(&e),
+        Err(error) => log_opencode_sqlite_fallback_once(&error),
     }
 
     let mut cmd = std::process::Command::new("opencode");
     cmd.args(["session", "list", "--format", "json"])
-        .current_dir(project_path);
+        .current_dir(project_path)
+        .envs(super::environment::resolve_host_environment_pairs(
+            host_environment,
+        ));
 
     let stdout_bytes = run_with_timeout(
         cmd,
@@ -1776,11 +1857,10 @@ pub(crate) fn try_capture_opencode_session_id(
     )?;
     select_opencode_session(&stdout_bytes, project_path, exclusion, launch_time_ms)
 }
-
 /// Total wall-clock budget for the whole preassign dance (serve boot + POST).
-/// opencode's headless server boots in ~1.8s measured; 6s leaves slack on a
-/// loaded machine while keeping the opt-in launch stall bounded before we give
-/// up and let the poller take over.
+/// opencode's headless server boots in about 1.8s measured; 6s leaves slack on
+/// a loaded machine while keeping the opt-in launch stall bounded before we
+/// give up and let the poller take over.
 const OPENCODE_PREASSIGN_DEADLINE: Duration = Duration::from_secs(6);
 
 /// RAII guard that force-reaps an ephemeral `opencode serve` child, and its
@@ -2002,13 +2082,21 @@ pub(crate) fn opencode_poll_fn(
     instance_id: String,
     launch_time_ms: f64,
     extra_excludes: HashSet<String>,
+    host_environment: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
         let exclusion = compose_exclusion(&instance_id, &extra_excludes);
-        try_capture_opencode_session_id(&project_path, &exclusion, Some(launch_time_ms))
-            .map_err(|e| tracing::debug!(target: "session.capture", "OpenCode poll capture failed: {}", e))
-            .ok()
-            .and_then(validated_session_id)
+        try_capture_opencode_session_id_in_environment(
+            &project_path,
+            &exclusion,
+            Some(launch_time_ms),
+            &host_environment,
+        )
+        .map_err(
+            |e| tracing::debug!(target: "session.capture", "OpenCode poll capture failed: {}", e),
+        )
+        .ok()
+        .and_then(validated_session_id)
     }
 }
 
@@ -2063,7 +2151,16 @@ pub(crate) fn capture_codex_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
 ) -> Result<String> {
-    let codex_home = resolve_agent_home(Some("CODEX_HOME"), ".codex")?;
+    capture_codex_session_id_in_environment(project_path, exclusion, &[])
+}
+
+fn capture_codex_session_id_in_environment(
+    project_path: &str,
+    exclusion: &HashSet<String>,
+    host_environment: &[String],
+) -> Result<String> {
+    let codex_home =
+        resolve_agent_home_for_host_environment(host_environment, Some("CODEX_HOME"), ".codex")?;
     let sessions_dir = codex_home.join("sessions");
 
     if !sessions_dir.exists() {
@@ -2258,10 +2355,11 @@ pub(crate) fn codex_poll_fn(
     project_path: String,
     instance_id: String,
     extra_excludes: HashSet<String>,
+    host_environment: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
         let exclusion = compose_exclusion(&instance_id, &extra_excludes);
-        capture_codex_session_id(&project_path, &exclusion)
+        capture_codex_session_id_in_environment(&project_path, &exclusion, &host_environment)
             .map_err(
                 |e| tracing::debug!(target: "session.capture", "Codex poll capture failed: {}", e),
             )
@@ -2293,10 +2391,11 @@ pub(crate) fn gemini_poll_fn(
     project_path: String,
     instance_id: String,
     extra_excludes: HashSet<String>,
+    host_environment: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
         let exclusion = compose_exclusion(&instance_id, &extra_excludes);
-        capture_gemini_session_id(&project_path, &exclusion)
+        capture_gemini_session_id_in_environment(&project_path, &exclusion, &host_environment)
             .map_err(
                 |e| tracing::debug!(target: "session.capture", "Gemini poll capture failed: {}", e),
             )
@@ -2423,9 +2522,21 @@ pub(crate) fn capture_gemini_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
 ) -> Result<String> {
+    capture_gemini_session_id_in_environment(project_path, exclusion, &[])
+}
+
+fn capture_gemini_session_id_in_environment(
+    project_path: &str,
+    exclusion: &HashSet<String>,
+    host_environment: &[String],
+) -> Result<String> {
     use sha2::{Digest, Sha256};
 
-    let gemini_home = resolve_agent_home(Some("GEMINI_CLI_HOME"), ".gemini")?;
+    let gemini_home = resolve_agent_home_for_host_environment(
+        host_environment,
+        Some("GEMINI_CLI_HOME"),
+        ".gemini",
+    )?;
     let tmp_dir = gemini_home.join("tmp");
 
     if !tmp_dir.exists() {
@@ -2577,8 +2688,13 @@ fn extract_gemini_fields(path: &std::path::Path) -> Option<(Option<String>, Opti
 /// under its config dir (`$COPILOT_CONFIG_DIR`, default `~/.copilot`). Each row
 /// carries the session UUID (`id`), the working directory (`cwd`), and an RFC
 /// 3339 `updated_at` timestamp.
-fn copilot_db_path() -> Result<PathBuf> {
-    Ok(resolve_agent_home(Some("COPILOT_CONFIG_DIR"), ".copilot")?.join("session-store.db"))
+fn copilot_db_path_in_environment(host_environment: &[String]) -> Result<PathBuf> {
+    Ok(resolve_agent_home_for_host_environment(
+        host_environment,
+        Some("COPILOT_CONFIG_DIR"),
+        ".copilot",
+    )?
+    .join("session-store.db"))
 }
 
 /// Load Copilot's session rows from its SQLite store at `db_path`, newest
@@ -2654,7 +2770,15 @@ pub(crate) fn capture_copilot_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
 ) -> Result<String> {
-    let db_path = copilot_db_path()?;
+    capture_copilot_session_id_in_environment(project_path, exclusion, &[])
+}
+
+fn capture_copilot_session_id_in_environment(
+    project_path: &str,
+    exclusion: &HashSet<String>,
+    host_environment: &[String],
+) -> Result<String> {
+    let db_path = copilot_db_path_in_environment(host_environment)?;
     let entries = read_copilot_sessions_from_sqlite_at(&db_path)?;
     select_copilot_session(&entries, project_path, exclusion)
 }
@@ -2664,15 +2788,18 @@ pub(crate) fn copilot_poll_fn(
     project_path: String,
     instance_id: String,
     extra_excludes: HashSet<String>,
+    host_environment: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
         let exclusion = compose_exclusion(&instance_id, &extra_excludes);
-        capture_copilot_session_id(&project_path, &exclusion)
-            .map_err(
-                |e| tracing::debug!(target: "session.capture", "Copilot poll capture failed: {}", e),
-            )
-            .ok()
-            .and_then(validated_session_id)
+        capture_copilot_session_id_in_environment(
+            &project_path,
+            &exclusion,
+            &host_environment,
+        )
+        .map_err(|e| tracing::debug!(target: "session.capture", "Copilot poll capture failed: {}", e))
+        .ok()
+        .and_then(validated_session_id)
     }
 }
 
@@ -2965,35 +3092,56 @@ fn select_prime_agent_session(
 /// `PRIME_AGENT_CODING_AGENT_SESSION_DIR`, then `<coding agent
 /// home>/sessions`. The `--session-dir` flag and `settings.json.sessionDir`
 /// are invisible to this host-side scan (they are tracked separately).
-fn prime_agent_sessions_dir(coding_agent_home: &Path) -> PathBuf {
+fn prime_agent_sessions_dir_in_environment(
+    coding_agent_home: &Path,
+    host_environment: &[String],
+) -> PathBuf {
     for var in [
         "PRIME_AGENT_SESSION_DIR",
         "PRIME_AGENT_CODING_AGENT_SESSION_DIR",
     ] {
-        if let Ok(dir) = std::env::var(var) {
+        let dir =
+            crate::session::environment::resolve_host_environment_value(host_environment, var)
+                .or_else(|| std::env::var(var).ok())
+                .filter(|dir| !dir.is_empty());
+        if let Some(dir) = dir {
             return PathBuf::from(dir);
         }
     }
     coding_agent_home.join("sessions")
 }
-
-/// Capture a Prime Agent session ID for `project_path`.
+/// Capture a Prime Agent session ID for project_path.
 ///
 /// Reads the first line of every JSONL file in Prime Agent's resolved
-/// session directory (`PRIME_AGENT_SESSION_DIR`, then the legacy alias,
-/// else `<home>/sessions` where the home resolves from
-/// `PRIME_AGENT_CODING_AGENT_DIR`, default `~/.prime/agent`) and returns
-/// the id of the newest session whose header `cwd` matches `project_path`,
-/// skipping any ids in `exclusion`. `launch_time_ms` gates live polling to
-/// sessions touched after this run started (`None` for retroactive recovery).
-/// Prime Agent resumes the returned id with `prime-agent --resume <id>`.
+/// session directory (PRIME_AGENT_SESSION_DIR, then the legacy alias,
+/// else the sessions directory below the coding agent home) and returns
+/// the id of the newest session whose header cwd matches project_path,
+/// skipping any ids in exclusion. launch_time_ms gates live polling to
+/// sessions touched after this run started (None for retroactive recovery).
+/// Prime Agent resumes the returned id with prime-agent --resume <id>.
 pub(crate) fn capture_prime_agent_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
     launch_time_ms: Option<f64>,
 ) -> Result<String> {
-    let home = resolve_agent_home(Some("PRIME_AGENT_CODING_AGENT_DIR"), ".prime/agent")?;
-    let sessions = scan_prime_agent_sessions(&prime_agent_sessions_dir(&home));
+    capture_prime_agent_session_id_in_environment(project_path, exclusion, launch_time_ms, &[])
+}
+
+fn capture_prime_agent_session_id_in_environment(
+    project_path: &str,
+    exclusion: &HashSet<String>,
+    launch_time_ms: Option<f64>,
+    host_environment: &[String],
+) -> Result<String> {
+    let home = resolve_agent_home_for_host_environment(
+        host_environment,
+        Some("PRIME_AGENT_CODING_AGENT_DIR"),
+        ".prime/agent",
+    )?;
+    let sessions = scan_prime_agent_sessions(&prime_agent_sessions_dir_in_environment(
+        &home,
+        host_environment,
+    ));
     select_prime_agent_session(sessions, project_path, exclusion, launch_time_ms)
 }
 
@@ -3005,18 +3153,21 @@ pub(crate) fn prime_agent_poll_fn(
     instance_id: String,
     launch_time_ms: f64,
     extra_excludes: HashSet<String>,
+    host_environment: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
         let exclusion = compose_exclusion(&instance_id, &extra_excludes);
-        capture_prime_agent_session_id(&project_path, &exclusion, Some(launch_time_ms))
-            .map_err(|e| {
-                tracing::debug!(target: "session.capture", "Prime Agent poll capture failed: {}", e)
-            })
-            .ok()
-            .and_then(validated_session_id)
+        capture_prime_agent_session_id_in_environment(
+            &project_path,
+            &exclusion,
+            Some(launch_time_ms),
+            &host_environment,
+        )
+        .map_err(|e| tracing::debug!(target: "session.capture", "Prime Agent poll capture failed: {}", e))
+        .ok()
+        .and_then(validated_session_id)
     }
 }
-
 /// Effective Kimi home for one environment list: `KIMI_CODE_HOME` resolved
 /// through the same `$VAR` / bare-key grammar launch applies
 /// ([`crate::session::environment::resolve_host_environment_value`]), else the
@@ -3325,7 +3476,16 @@ pub(crate) fn capture_hermes_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
 ) -> Result<String> {
-    let hermes_home = resolve_agent_home(Some("HERMES_HOME"), ".hermes")?;
+    capture_hermes_session_id_in_environment(project_path, exclusion, &[])
+}
+
+fn capture_hermes_session_id_in_environment(
+    project_path: &str,
+    exclusion: &HashSet<String>,
+    host_environment: &[String],
+) -> Result<String> {
+    let hermes_home =
+        resolve_agent_home_for_host_environment(host_environment, Some("HERMES_HOME"), ".hermes")?;
     let db_path = hermes_home.join("state.db");
 
     let scan = read_hermes_sessions_from_sqlite(&db_path)?;
@@ -3448,10 +3608,11 @@ pub(crate) fn hermes_poll_fn(
     project_path: String,
     instance_id: String,
     extra_excludes: HashSet<String>,
+    host_environment: Vec<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
         let exclusion = compose_exclusion(&instance_id, &extra_excludes);
-        capture_hermes_session_id(&project_path, &exclusion)
+        capture_hermes_session_id_in_environment(&project_path, &exclusion, &host_environment)
             .map_err(
                 |e| tracing::debug!(target: "session.capture", "Hermes poll capture failed: {}", e),
             )
@@ -4780,6 +4941,7 @@ mod tests {
             project_dir.to_string_lossy().into_owned(),
             "test-instance".to_string(),
             extra,
+            Vec::new(),
         );
         assert_eq!(
             poll(),
@@ -4791,6 +4953,7 @@ mod tests {
             project_dir.to_string_lossy().into_owned(),
             "test-instance".to_string(),
             HashSet::new(),
+            Vec::new(),
         );
         assert_eq!(
             poll_no_excludes(),
@@ -5019,6 +5182,7 @@ mod tests {
     fn test_build_exclusion_set_empty() {
         let result = build_exclusion_set(
             "nonexistent-instance-id-12345",
+            None,
             &crate::tmux::LiveSessionSnapshot::new(),
         );
         // The exclusion set should never contain our own instance ID
@@ -6254,7 +6418,12 @@ mod tests {
             true,
         );
 
-        let poll = hermes_poll_fn(project_str, "test-instance".to_string(), HashSet::new());
+        let poll = hermes_poll_fn(
+            project_str,
+            "test-instance".to_string(),
+            HashSet::new(),
+            Vec::new(),
+        );
         assert_eq!(poll(), Some("20260429_193246_aaa".to_string()));
     }
 
@@ -6279,6 +6448,7 @@ mod tests {
             "/tmp/hermes-proj".to_string(),
             "test-instance".to_string(),
             HashSet::new(),
+            Vec::new(),
         );
         assert_eq!(poll(), None);
     }

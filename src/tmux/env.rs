@@ -5,8 +5,11 @@
 //! child processes, making them ideal for storing session metadata.
 
 use anyhow::bail;
+#[cfg(any(test, feature = "test-support"))]
 use std::collections::HashMap;
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::RwLock;
+#[cfg(any(test, feature = "test-support"))]
 use std::time::{Duration, Instant};
 
 #[derive(Debug, thiserror::Error)]
@@ -25,22 +28,28 @@ pub(crate) fn is_missing_session_error(error: &anyhow::Error) -> bool {
 
 pub const AOE_INSTANCE_ID_KEY: &str = "AOE_INSTANCE_ID";
 pub const AOE_CAPTURED_SESSION_ID_KEY: &str = "AOE_CAPTURED_SESSION_ID";
+pub const AOE_SESSION_STORE_NAMESPACE_KEY: &str = "AOE_SESSION_STORE_NAMESPACE";
 pub const AOE_OMP_CAPTURE_META_KEY: &str = "AOE_OMP_CAPTURE_META";
 pub const AOE_OMP_LAUNCH_ID_KEY: &str = "AOE_OMP_LAUNCH_ID";
 pub const AOE_OMP_CAPTURE_READY_KEY: &str = "AOE_OMP_CAPTURE_READY";
 
+#[cfg(any(test, feature = "test-support"))]
 const ENV_CACHE_TTL: Duration = Duration::from_secs(30);
+#[cfg(any(test, feature = "test-support"))]
 const ENV_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(5);
 
+#[cfg(any(test, feature = "test-support"))]
 struct EnvCacheEntry {
     value: Option<String>,
     fetched_at: Instant,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 struct EnvCache {
     entries: Option<HashMap<(String, String), EnvCacheEntry>>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 static ENV_CACHE: RwLock<EnvCache> = RwLock::new(EnvCache { entries: None });
 
 /// Set a hidden environment variable in a tmux session
@@ -74,6 +83,7 @@ pub fn set_hidden_env(session_name: &str, key: &str, value: &str) -> anyhow::Res
 /// Both hits and misses are cached to reduce subprocess spawns: positive
 /// results use [`ENV_CACHE_TTL`] (30s), negative results (var not set)
 /// use [`ENV_NEGATIVE_CACHE_TTL`] (5s).
+#[cfg(any(test, feature = "test-support"))]
 pub fn get_hidden_env(session_name: &str, key: &str) -> Option<String> {
     let cache_key = (session_name.to_string(), key.to_string());
 
@@ -328,6 +338,7 @@ fn sequential_set_fallback(entries: &[(&str, &str, &str)]) -> anyhow::Result<()>
         )
     }
 }
+#[cfg(any(test, feature = "test-support"))]
 fn invalidate_cache_entry(session_name: &str, key: &str) {
     if let Ok(mut cache) = ENV_CACHE.write() {
         if let Some(entries) = &mut cache.entries {
@@ -335,6 +346,9 @@ fn invalidate_cache_entry(session_name: &str, key: &str) {
         }
     }
 }
+
+#[cfg(not(any(test, feature = "test-support")))]
+fn invalidate_cache_entry(_: &str, _: &str) {}
 
 /// Strictly read several hidden keys for several sessions with one tmux client.
 /// A session that disappears during the batch is retried and omitted; every
@@ -435,6 +449,7 @@ pub(crate) fn get_hidden_env_keys_batch_strict(
 /// sequential reads if the batch command fails.
 ///
 /// Returns a vector of (session_name, value) tuples in the same order as input.
+#[cfg(any(test, feature = "test-support"))]
 pub fn get_hidden_env_batch(session_names: &[&str], key: &str) -> Vec<(String, Option<String>)> {
     if session_names.is_empty() {
         return Vec::new();
@@ -513,6 +528,7 @@ pub fn get_hidden_env_batch(session_names: &[&str], key: &str) -> Vec<(String, O
 /// Each session's output is on a separate line in the format "KEY=VALUE" or "-KEY".
 /// If the number of output lines does not match the number of sessions (e.g. due to
 /// tmux error lines), returns `None` so the caller can fall back to sequential reads.
+#[cfg(any(test, feature = "test-support"))]
 fn parse_batch_output(
     output: &str,
     session_names: &[&str],

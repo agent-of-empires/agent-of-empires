@@ -58,13 +58,24 @@ fn claude_config_dir() -> Option<PathBuf> {
     }
     dirs::home_dir().map(|h| h.join(".claude"))
 }
+/// Ownership namespace for the exact Claude host store scanned by
+/// scan_sessions. Unlike profile launch resolution, this follows only the
+/// scanner's ambient CLAUDE_CONFIG_DIR or home fallback.
+pub(crate) fn claude_store_namespace() -> Option<String> {
+    let root = claude_config_dir()?;
+    let root = if root.is_absolute() {
+        root
+    } else {
+        std::env::current_dir().ok()?.join(root)
+    };
+    let root = root.canonicalize().unwrap_or(root);
+    Some(format!("host:claude:{}", root.to_string_lossy()))
+}
 
-/// Literal directory tokens derived from the worktree path templates, e.g.
-/// `"-worktrees"` from `"../{repo-name}-worktrees/{branch}"` and `"-workspace-"`
-/// from `"../{branch}-workspace-{session-id}"`. A cwd living under a directory
-/// whose name contains one of these is an AoE worktree or workspace, so it is
-/// excluded from the import picker. Derived from config so a custom template is
-/// honored. See #2276.
+/// Literal directory tokens derived from the worktree path templates. A cwd
+/// living under a directory whose name contains one of these tokens is an AoE
+/// worktree or workspace, so it is excluded from the import picker. Derived
+/// from config so a custom template is honored. See #2276.
 fn worktree_dir_markers() -> Vec<String> {
     let cfg = crate::session::Config::load_or_warn();
     let mut markers = Vec::new();

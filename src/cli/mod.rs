@@ -55,14 +55,34 @@ fn command_reconciles_session_id_env(command: &Commands) -> bool {
     )
 }
 
+fn command_requires_reconciled_session_id_env(command: &Commands) -> bool {
+    match command {
+        Commands::Add(_) | Commands::Remove(_) | Commands::Send(_) => true,
+        Commands::Session { command } => match command {
+            session::SessionCommands::Show(_)
+            | session::SessionCommands::Capture(_)
+            | session::SessionCommands::Current(_)
+            | session::SessionCommands::ListTrash => false,
+            session::SessionCommands::Import(args) => !args.dry_run,
+            _ => true,
+        },
+        _ => false,
+    }
+}
+
 /// Remove legacy terminal ownership signals before a one-shot session command.
 pub fn reconcile_session_id_env_for_command(command: Option<&Commands>) -> anyhow::Result<()> {
-    if command.is_some_and(command_reconciles_session_id_env) {
+    if let Some(command) = command.filter(|command| command_reconciles_session_id_env(command)) {
         if let Err(error) =
             crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env()
         {
+            if command_requires_reconciled_session_id_env(command) {
+                anyhow::bail!(
+                    "refusing session mutation because tmux ownership reconciliation failed: {error}"
+                );
+            }
             tracing::warn!(target: "cli",
-                "Tmux ownership reconciliation failed; continuing without startup cleanup: {error}"
+                "Tmux ownership reconciliation failed; continuing read-only command without startup cleanup: {error}"
             );
         }
     }

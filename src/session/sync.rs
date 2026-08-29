@@ -62,18 +62,26 @@ fn tmux_session_id_env_updates<'a>(
     let mut set_batch = Vec::new();
     let mut unset_batch = Vec::new();
     for instance in instances {
+        let ownership = instance
+            .operational_agent_session_id()
+            .zip(instance.operational_agent_session_store_namespace());
         for tmux_name in session_names(instance) {
-            match instance.operational_agent_session_id() {
-                Some(sid) => {
+            match ownership.as_ref() {
+                Some((sid, namespace)) => {
                     set_batch.push((
                         tmux_name.clone(),
                         crate::tmux::env::AOE_INSTANCE_ID_KEY.to_string(),
                         instance.id.clone(),
                     ));
                     set_batch.push((
-                        tmux_name,
+                        tmux_name.clone(),
                         crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
-                        sid.to_string(),
+                        (*sid).to_string(),
+                    ));
+                    set_batch.push((
+                        tmux_name,
+                        crate::tmux::env::AOE_SESSION_STORE_NAMESPACE_KEY.to_string(),
+                        namespace.clone(),
                     ));
                 }
                 None => unset_batch.push((
@@ -361,18 +369,27 @@ fn owned_tmux_ownership_targets(
 }
 
 /// Refuse destructive metadata removal while any target agent pane is live.
-/// A deleted row cannot retain durable ownership, so callers must leave the
-/// row intact until its pane has stopped. Strict tmux enumeration fails closed.
 pub(crate) fn ensure_instances_quiescent(
     instances: &[Instance],
     action: &str,
 ) -> anyhow::Result<()> {
     let names = crate::tmux::session_names_strict()?;
+    let live = crate::tmux::LiveSessionSnapshot::from_names(names.clone());
+    let observations = read_tmux_ownership_observations(&names)?;
     for instance in instances {
-        if names
+        let stamped_live = observations
             .iter()
-            .any(|name| crate::tmux::agent_session_belongs_to(name, &instance.id))
-        {
+            .any(|(_, owner, _)| owner.as_deref() == Some(instance.id.as_str()));
+        let legacy_live = crate::tmux::live_any_kind_names_for_id_in(&live, &instance.id)
+            .into_iter()
+            .flatten()
+            .any(|candidate| {
+                observations
+                    .iter()
+                    .find(|(name, _, _)| name == &candidate)
+                    .is_none_or(|(_, owner, _)| owner.is_none())
+            });
+        if stamped_live || legacy_live {
             anyhow::bail!(
                 "Cannot {action}: session '{}' still has a live tmux pane",
                 instance.id
@@ -412,7 +429,9 @@ pub(crate) fn restore_tmux_session_id_ownership_locked(
         .collect();
     crate::tmux::env::set_hidden_env_batch(&refs)
 }
-fn load_profile_instances_excluding(excluded: Option<&str>) -> anyhow::Result<Vec<Instance>> {
+pub(crate) fn load_profile_instances_excluding(
+    excluded: Option<&str>,
+) -> anyhow::Result<Vec<Instance>> {
     load_profile_instances_excluding_with_policy(excluded, false)
 }
 
@@ -501,6 +520,7 @@ pub(crate) fn reserved_sid_holder_excluding_profile(
 /// Best-effort capture guard. A corrupt foreign profile must not disable
 /// capture for healthy sessions; launch and destructive paths keep using the
 /// strict variant above.
+#[cfg(test)]
 pub(crate) fn reserved_sid_holder_excluding_profile_for_capture(
     excluded: &str,
     namespace: &str,

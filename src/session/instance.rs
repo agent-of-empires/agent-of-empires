@@ -45,6 +45,22 @@ type LaunchCommandParts = (
     Option<OmpCapturePlan>,
     LaunchEnvironment,
 );
+const CAPTURE_ROUTING_ENV_KEYS: &[&str] = &[
+    "HOME",
+    "CLAUDE_CONFIG_DIR",
+    "CODEX_HOME",
+    "VIBE_HOME",
+    "GEMINI_CLI_HOME",
+    "COPILOT_CONFIG_DIR",
+    "PI_CODING_AGENT_DIR",
+    "HERMES_HOME",
+    "KIMI_CODE_HOME",
+    "PRIME_AGENT_SESSION_DIR",
+    "PRIME_AGENT_CODING_AGENT_SESSION_DIR",
+    "PRIME_AGENT_CODING_AGENT_DIR",
+    "XDG_DATA_HOME",
+    "OPENCODE_DB",
+];
 
 struct LaunchEnvironment {
     pane: Vec<tmux::PaneEnvMutation>,
@@ -56,9 +72,17 @@ struct PreparedLaunch {
     session_flags: AppliedSessionFlags,
     omp_capture_plan: Option<OmpCapturePlan>,
     launch_env: LaunchEnvironment,
+    host_environment: Vec<String>,
     expected_prior_sid: Option<String>,
     expected_prior_intent: ResumeIntent,
     expected_prior_omp_generation: Option<String>,
+}
+struct LaunchFinalizeContext {
+    expected_prior_sid: Option<String>,
+    expected_prior_intent: ResumeIntent,
+    omp_capture_metadata: Option<OmpCaptureMetadata>,
+    emitted_session_flags: bool,
+    host_environment: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1504,11 +1528,9 @@ fn persist_session_to_storage_guarded(
         let Some(namespace) = target.terminal_session_store_namespace() else {
             return Ok(SidWrite::Skipped);
         };
-        if let Some(holder) =
-            crate::session::sync::reserved_sid_holder_excluding_profile_for_capture(
-                profile, &namespace, session_id,
-            )?
-        {
+        if let Some(holder) = crate::session::sync::reserved_sid_holder_excluding_profile(
+            profile, &namespace, session_id,
+        )? {
             tracing::warn!(target: "session.store",
                 instance_id = %instance_id,
                 sid = %session_id,
@@ -2858,6 +2880,37 @@ impl Instance {
         }));
         environment
     }
+    /// Freeze and transport every environment input used to select a host
+    /// conversation store. Pollers retain this same concrete snapshot, so a
+    /// later profile edit or hook run cannot redirect capture to another store.
+    fn launch_host_environment_snapshot(&self) -> (Vec<String>, Vec<tmux::PaneEnvMutation>) {
+        let mut pairs =
+            super::environment::resolve_host_environment_pairs(&self.resolved_host_environment());
+        let mut absent = Vec::new();
+        for key in CAPTURE_ROUTING_ENV_KEYS {
+            let existing = pairs.iter().position(|(candidate, _)| candidate == key);
+            if existing.is_some_and(|index| !pairs[index].1.is_empty()) {
+                continue;
+            }
+            if let Some(index) = existing {
+                pairs.remove(index);
+            }
+            match std::env::var(key).ok().filter(|value| !value.is_empty()) {
+                Some(value) => pairs.push(((*key).to_string(), value)),
+                None => absent.push((*key).to_string()),
+            }
+        }
+        let environment = pairs
+            .iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect();
+        let mut mutations = pairs
+            .into_iter()
+            .map(|(key, value)| tmux::PaneEnvMutation::set(key, value))
+            .collect::<Vec<_>>();
+        mutations.extend(absent.into_iter().map(tmux::PaneEnvMutation::unset));
+        (environment, mutations)
+    }
 
     /// Capture is safe only for the built-in OMP command and a transparent,
     /// parseable argv. Benign arguments remain supported; store-selecting
@@ -3154,6 +3207,15 @@ impl Instance {
     }
 
     fn resolve_terminal_session_store_namespace_for_tool(&self, tool: &str) -> Option<String> {
+        let (environment, _) = self.launch_host_environment_snapshot();
+        self.resolve_terminal_session_store_namespace_for_tool_in(tool, &environment)
+    }
+
+    fn resolve_terminal_session_store_namespace_for_tool_in(
+        &self,
+        tool: &str,
+        environment: &[String],
+    ) -> Option<String> {
         if !tool_supports_terminal_resume(tool) {
             return None;
         }
@@ -3169,10 +3231,8 @@ impl Instance {
             return Some(format!("sandbox:{agent}:{}", self.id));
         }
 
-        let environment = self.resolved_host_environment();
         let value = |key: &str| {
-            super::environment::resolve_host_environment_value(&environment, key)
-                .or_else(|| std::env::var(key).ok())
+            super::environment::resolve_host_environment_value(environment, key)
                 .filter(|value| !value.is_empty())
         };
         let home = value("HOME")
@@ -3256,8 +3316,15 @@ impl Instance {
         ))
     }
 
+    #[cfg(test)]
     fn refresh_launch_store_namespace(&mut self) -> Result<()> {
-        let resolved = self.resolve_terminal_session_store_namespace_for_tool(&self.tool);
+        let (environment, _) = self.launch_host_environment_snapshot();
+        self.refresh_launch_store_namespace_in(&environment)
+    }
+
+    fn refresh_launch_store_namespace_in(&mut self, environment: &[String]) -> Result<()> {
+        let resolved =
+            self.resolve_terminal_session_store_namespace_for_tool_in(&self.tool, environment);
         let resumable_sid = self.launch_resume_sid();
         if let (Some(sid), Some(stored)) =
             (resumable_sid, self.agent_session_store_namespace.as_deref())
@@ -3272,7 +3339,6 @@ impl Instance {
         self.agent_session_store_namespace = resolved;
         Ok(())
     }
-
     /// Conversation ID that currently owns this row's tmux pane. A pending
     /// tool-swap handoff wins; otherwise unsupported agents' stored IDs remain
     /// inert and never become operational ownership.
@@ -3311,8 +3377,30 @@ impl Instance {
                     == Some(namespace)
         })
     }
+    pub(crate) fn reserves_claude_import_id_in_namespace(
+        &self,
+        sid: &str,
+        namespace: &str,
+    ) -> bool {
+        if self.reserves_agent_session_id_in_namespace(sid, namespace) {
+            return true;
+        }
+        if self.terminal_session_store_namespace().as_deref() == Some(namespace)
+            && (matches!(&self.resume_intent, ResumeIntent::Use(pinned) if pinned == sid)
+                || self.acp_session_id.as_deref() == Some(sid))
+        {
+            return true;
+        }
+        self.prior_tool_session_ids.iter().any(|(tool, prior)| {
+            prior.acp_session_id.as_deref() == Some(sid)
+                && self
+                    .terminal_session_store_namespace_for_tool(tool)
+                    .as_deref()
+                    == Some(namespace)
+        })
+    }
 
-    #[cfg(any(feature = "serve", test))]
+    #[cfg(test)]
     pub(crate) fn reserved_agent_session_ids(&self) -> impl Iterator<Item = &str> {
         [
             self.operational_agent_session_id(),
@@ -4663,10 +4751,6 @@ impl Instance {
         let (_title_lock, _lifecycle_lock) =
             self.reacquire_launch_locks_after_hooks(&storage, hook_result)?;
         self.apply_fresh_launch_intent();
-        if let Err(error) = self.refresh_launch_store_namespace() {
-            self.fail_reserved_launch(&storage, &error, false);
-            return Err(error);
-        }
         if let Err(error) = self.validate_launch_sid_ownership(&storage) {
             self.fail_reserved_launch(&storage, &error, false);
             return Err(error);
@@ -4767,12 +4851,16 @@ impl Instance {
         let expected_prior_sid = self.agent_session_id.clone();
         let expected_prior_intent = self.resume_intent.clone();
         let expected_prior_omp_generation = self.omp_capture_generation.clone();
-        let (command, session_flags, omp_capture_plan, launch_env) = self.build_launch_command()?;
+        let (host_environment, host_mutations) = self.launch_host_environment_snapshot();
+        self.refresh_launch_store_namespace_in(&host_environment)?;
+        let (command, session_flags, omp_capture_plan, launch_env) =
+            self.build_launch_command_in_environment(&host_environment, host_mutations)?;
         Ok(PreparedLaunch {
             command,
             session_flags,
             omp_capture_plan,
             launch_env,
+            host_environment,
             expected_prior_sid,
             expected_prior_intent,
             expected_prior_omp_generation,
@@ -4882,15 +4970,17 @@ impl Instance {
             }
         }
 
-        self.finalize_launch(
+        self.finalize_launch_in_environment(
             session.name(),
             profile,
-            prepared.expected_prior_sid.as_deref(),
-            prepared.expected_prior_intent,
-            omp_capture_metadata,
-            !matches!(prepared.session_flags, AppliedSessionFlags::None),
+            LaunchFinalizeContext {
+                expected_prior_sid: prepared.expected_prior_sid,
+                expected_prior_intent: prepared.expected_prior_intent,
+                omp_capture_metadata,
+                emitted_session_flags: !matches!(prepared.session_flags, AppliedSessionFlags::None),
+                host_environment: Some(prepared.host_environment),
+            },
         )?;
-
         Ok(launch_sid_outcome)
     }
 
@@ -4953,7 +5043,17 @@ impl Instance {
     /// Construct the command only after hook execution has completed. Keeping
     /// this phase hook-free prevents a revalidation retry from replaying user
     /// code while the lifecycle lock is held.
+    #[cfg(test)]
     fn build_launch_command(&mut self) -> Result<LaunchCommandParts> {
+        let (host_environment, host_mutations) = self.launch_host_environment_snapshot();
+        self.build_launch_command_in_environment(&host_environment, host_mutations)
+    }
+
+    fn build_launch_command_in_environment(
+        &mut self,
+        host_environment: &[String],
+        host_mutations: Vec<tmux::PaneEnvMutation>,
+    ) -> Result<LaunchCommandParts> {
         if self.tool == "omp" && !self.has_command_override() {
             reject_omp_secret_args(&super::config::quote_model_value_in_args(&self.extra_args))?;
         }
@@ -5069,28 +5169,11 @@ impl Instance {
             )
         } else {
             let result = self.build_host_command(agent)?;
-            let mut env = super::environment::resolve_host_environment_pairs(
-                &self.profile_host_environment(),
-            )
-            .into_iter()
-            .map(|(key, value)| tmux::PaneEnvMutation::set(key, value))
-            .collect::<Vec<_>>();
-            // The protected file is sourced in order, so freshly minted hook
-            // values appended last override same-keyed static profile values.
-            env.extend(
-                self.pending_host_env
-                    .iter()
-                    .cloned()
-                    .map(|(key, value)| tmux::PaneEnvMutation::set(key, value)),
-            );
+            let mut env = host_mutations;
             if result.2.is_some() {
-                // Pin every routing input, including explicit empty values and
-                // true absence, so tmux's frozen server environment cannot
-                // select another OMP store. The in-pane fingerprint still
-                // detects login-file drift.
-                env.extend(omp_host_routing_environment(
-                    &self.resolved_host_environment(),
-                ));
+                // OMP pins its additional routing inputs on top of the common
+                // capture-store snapshot.
+                env.extend(omp_host_routing_environment(host_environment));
             }
             (
                 result.0,
@@ -5402,15 +5485,43 @@ impl Instance {
     }
 
     /// Post-launch setup: persist state, start pollers, and apply tmux options.
+    #[cfg(test)]
     fn finalize_launch(
         &mut self,
         session_name: &str,
         profile: &str,
         expected_prior_sid: Option<&str>,
         expected_prior_intent: ResumeIntent,
-        mut omp_capture_metadata: Option<OmpCaptureMetadata>,
+        omp_capture_metadata: Option<OmpCaptureMetadata>,
         emitted_session_flags: bool,
     ) -> Result<()> {
+        self.finalize_launch_in_environment(
+            session_name,
+            profile,
+            LaunchFinalizeContext {
+                expected_prior_sid: expected_prior_sid.map(str::to_owned),
+                expected_prior_intent,
+                omp_capture_metadata,
+                emitted_session_flags,
+                host_environment: None,
+            },
+        )
+    }
+
+    fn finalize_launch_in_environment(
+        &mut self,
+        session_name: &str,
+        profile: &str,
+        context: LaunchFinalizeContext,
+    ) -> Result<()> {
+        let LaunchFinalizeContext {
+            expected_prior_sid,
+            expected_prior_intent,
+            mut omp_capture_metadata,
+            emitted_session_flags,
+            host_environment,
+        } = context;
+        let expected_prior_sid = expected_prior_sid.as_deref();
         if let Some(metadata) = omp_capture_metadata.as_ref() {
             let published = serde_json::to_string(metadata).ok().and_then(|encoded| {
                 crate::tmux::env::set_hidden_env(
@@ -5453,16 +5564,21 @@ impl Instance {
             );
         }
         // Re-read durable rows under the ownership lock before touching tmux.
-        // This keeps a stale launcher from publishing after a tool swap or delete.
-        if !matches!(outcome, SidPersistOutcome::Skip) {
-            if let Err(error) =
-                crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env()
-            {
-                tracing::warn!(target: "session.sync", session = %self.id, "Launch committed; deferred tmux ownership reconciliation: {error}");
+        // Capture stays disabled until stale ownership env has been repaired.
+        let ownership_reconciled = if matches!(outcome, SidPersistOutcome::Skip) {
+            false
+        } else {
+            match crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env() {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(target: "session.sync", session = %self.id, "Launch committed; capture deferred until tmux ownership reconciliation succeeds: {error}");
+                    false
+                }
             }
+        };
+        if ownership_reconciled {
+            self.maybe_start_poller_since(omp_capture_metadata, host_environment);
         }
-        self.maybe_start_poller_since(omp_capture_metadata);
-
         self.status = Status::Starting;
         self.last_start_time = Some(std::time::Instant::now());
 
@@ -5611,17 +5727,21 @@ impl Instance {
                 );
             }
             let instances = storage.load_strict()?;
-            if let Some(holder) = instances.iter().find(|instance| {
+            for holder in instances.iter().filter(|instance| {
                 instance.id != self.id
-                    && instance.pending_tmux_ownership_session_id.as_deref() == Some(sid)
                     && instance.reserves_agent_session_id_in_namespace(sid, &namespace)
             }) {
-                anyhow::bail!(
-                    "refusing to launch session '{}': conversation '{}' is still live in session '{}'",
-                    self.id,
-                    sid,
-                    holder.id
-                );
+                if let Err(error) = crate::session::sync::ensure_instances_quiescent(
+                    std::slice::from_ref(holder),
+                    "reuse conversation ownership",
+                ) {
+                    anyhow::bail!(
+                        "refusing to launch session '{}': conversation '{}' is still live in session '{}': {error}",
+                        self.id,
+                        sid,
+                        holder.id
+                    );
+                }
             }
             Ok(())
         })
@@ -6284,13 +6404,19 @@ impl Instance {
     }
 
     pub fn maybe_start_poller(&mut self) {
-        self.maybe_start_poller_since(None);
+        self.maybe_start_poller_since(None, None);
     }
 
-    fn maybe_start_poller_since(&mut self, omp_metadata: Option<OmpCaptureMetadata>) {
+    fn maybe_start_poller_since(
+        &mut self,
+        omp_metadata: Option<OmpCaptureMetadata>,
+        host_environment: Option<Vec<String>>,
+    ) {
         if !self.supports_session_poller() {
             return;
         }
+        let host_environment =
+            host_environment.unwrap_or_else(|| self.launch_host_environment_snapshot().0);
         let tool = self.tool.as_str();
 
         let tmux_session_name = self
@@ -6375,7 +6501,7 @@ impl Instance {
                         initial_known.clone(),
                         instance_id.clone(),
                         extra_excludes.clone(),
-                        self.resolved_host_environment(),
+                        host_environment.clone(),
                     ))
                 }
             }
@@ -6399,6 +6525,7 @@ impl Instance {
                         self.id.clone(),
                         launch_time_ms,
                         extra_excludes.clone(),
+                        host_environment.clone(),
                     ))
                 }
             }
@@ -6419,6 +6546,7 @@ impl Instance {
                         self.project_path.clone(),
                         self.id.clone(),
                         extra_excludes.clone(),
+                        host_environment.clone(),
                     ))
                 }
             }
@@ -6439,6 +6567,7 @@ impl Instance {
                         self.project_path.clone(),
                         self.id.clone(),
                         extra_excludes.clone(),
+                        host_environment.clone(),
                     ))
                 }
             }
@@ -6459,6 +6588,7 @@ impl Instance {
                         self.project_path.clone(),
                         self.id.clone(),
                         extra_excludes.clone(),
+                        host_environment.clone(),
                     ))
                 }
             }
@@ -6479,6 +6609,7 @@ impl Instance {
                         self.project_path.clone(),
                         self.id.clone(),
                         extra_excludes.clone(),
+                        host_environment.clone(),
                     ))
                 }
             }
@@ -6499,6 +6630,7 @@ impl Instance {
                         self.project_path.clone(),
                         self.id.clone(),
                         extra_excludes,
+                        host_environment.clone(),
                     ))
                 }
             }
@@ -6514,6 +6646,7 @@ impl Instance {
                     self.project_path.clone(),
                     self.id.clone(),
                     extra_excludes,
+                    host_environment.clone(),
                 ))
             }
             "kimi" => {
@@ -6531,7 +6664,7 @@ impl Instance {
                     self.id.clone(),
                     launch_time_ms,
                     extra_excludes,
-                    self.resolved_host_environment(),
+                    host_environment.clone(),
                 ))
             }
             "prime-agent" => {
@@ -6548,6 +6681,7 @@ impl Instance {
                     self.id.clone(),
                     launch_time_ms,
                     extra_excludes,
+                    host_environment.clone(),
                 ))
             }
             _ => return,
@@ -6970,10 +7104,6 @@ impl Instance {
             self.reacquire_launch_locks_after_hooks(&storage, hook_result)?;
         let skipped_failed_resume_sid = self.apply_resume_policy(resume_policy);
         self.apply_fresh_launch_intent();
-        if let Err(error) = self.refresh_launch_store_namespace() {
-            self.fail_reserved_launch(&storage, &error, false);
-            return Err(error);
-        }
         if let Err(error) = self.validate_launch_sid_ownership(&storage) {
             self.fail_reserved_launch(&storage, &error, false);
             return Err(error);
@@ -12658,7 +12788,7 @@ mod tests {
             container_workdir: None,
         });
         assert_eq!(inst.try_retroactive_capture(), None);
-        inst.maybe_start_poller_since(None);
+        inst.maybe_start_poller_since(None, None);
         assert!(inst.session_id_poller.is_none());
 
         // Host control: the same store yields the matching sid once the
@@ -17715,7 +17845,7 @@ mod tests {
                     &std::collections::HashSet::new(),
                 )
                 .is_ok(),
-                "ownership-shaped corruption in a foreign profile must not disable capture"
+                "tolerant discovery may retain valid owners before a malformed row"
             );
             assert_eq!(
                 persist_session_to_storage(
@@ -17725,9 +17855,21 @@ mod tests {
                     None,
                     &file_watch,
                 ),
-                SidWrite::Applied
+                SidWrite::Failed,
+                "authoritative poller persistence must fail closed on foreign corruption"
             );
             std::fs::remove_file(corrupt_ownership_storage.sessions_path()).unwrap();
+            assert_eq!(
+                persist_session_to_storage(
+                    independent_profile,
+                    &independent.id,
+                    SID_Y,
+                    None,
+                    &file_watch,
+                ),
+                SidWrite::Applied,
+                "capture should recover after ownership ambiguity is removed"
+            );
             let launch_profile = "guards-launch-namespace";
             let mut launch = make_inst(launch_profile, "launch-namespace");
             seed(launch_profile, &[&launch]);

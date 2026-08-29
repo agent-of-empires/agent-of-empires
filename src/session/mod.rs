@@ -613,25 +613,64 @@ pub fn create_profile(name: &str) -> Result<()> {
     Ok(())
 }
 
+fn lock_profile_lifecycle(
+    storage: &storage::Storage,
+    instances: &[Instance],
+) -> Result<(Vec<String>, Vec<storage::StorageFlock>)> {
+    let mut expected_ids: Vec<_> = instances
+        .iter()
+        .map(|instance| instance.id.clone())
+        .collect();
+    expected_ids.sort();
+    let mut lock_ids = expected_ids.clone();
+    lock_ids.dedup();
+    let locks = lock_ids
+        .iter()
+        .map(|id| storage.acquire_instance_lifecycle_lock(id))
+        .collect::<Result<Vec<_>>>()?;
+    Ok((expected_ids, locks))
+}
+
+fn ensure_profile_membership_unchanged(
+    instances: &[Instance],
+    expected_ids: &[String],
+) -> Result<()> {
+    let mut current_ids: Vec<_> = instances
+        .iter()
+        .map(|instance| instance.id.clone())
+        .collect();
+    current_ids.sort();
+    if current_ids != expected_ids {
+        anyhow::bail!(
+            "Profile changed while lifecycle locks were being acquired; retry the operation"
+        );
+    }
+    Ok(())
+}
+
 pub fn delete_profile(name: &str) -> Result<()> {
     validate_profile_name(name)?;
 
     let base = get_app_dir()?;
     let profile_dir = base.join("profiles").join(name);
-
     if !profile_dir.exists() {
         anyhow::bail!("Profile '{}' does not exist", name);
     }
-
-    // The invariant is "at least one profile must exist", a count, not a name.
-    // Any profile is deletable as long as deleting it would not leave zero.
-    if list_profiles()?.len() <= 1 {
-        anyhow::bail!("Cannot delete '{}': at least one profile must exist", name);
-    }
+    let storage = storage::Storage::open_unwatched(name)?;
+    let initial_instances = storage.load_strict()?;
+    let (expected_ids, _lifecycle_locks) = lock_profile_lifecycle(&storage, &initial_instances)?;
 
     sync::with_tmux_ownership_lock(|| {
-        let target_instances =
-            storage::Storage::open_unwatched(name).and_then(|store| store.load_strict())?;
+        if !profile_dir.exists() {
+            anyhow::bail!("Profile '{}' does not exist", name);
+        }
+        // Re-check inside the same ownership critical section as removal.
+        if list_profiles()?.len() <= 1 {
+            anyhow::bail!("Cannot delete '{}': at least one profile must exist", name);
+        }
+
+        let target_instances = storage.load_strict()?;
+        ensure_profile_membership_unchanged(&target_instances, &expected_ids)?;
         let survivor_ids = sync::instance_ids_excluding_profile(name)?;
         if let Some(duplicate) = target_instances
             .iter()
@@ -662,30 +701,39 @@ pub fn delete_profile(name: &str) -> Result<()> {
 }
 
 pub fn rename_profile(old_name: &str, new_name: &str) -> Result<()> {
-    if new_name.is_empty() {
-        anyhow::bail!("New profile name cannot be empty");
-    }
-    if new_name.contains('/') || new_name.contains('\\') {
-        anyhow::bail!("Profile name cannot contain path separators");
-    }
+    validate_profile_name(old_name)?;
+    validate_profile_name(new_name)?;
 
     let base = get_app_dir()?;
     let old_dir = base.join("profiles").join(old_name);
     let new_dir = base.join("profiles").join(new_name);
-
     if !old_dir.exists() {
         anyhow::bail!("Profile '{}' does not exist", old_name);
     }
     if new_dir.exists() {
         anyhow::bail!("Profile '{}' already exists", new_name);
     }
+    let storage = storage::Storage::open_unwatched(old_name)?;
+    let initial_instances = storage.load_strict()?;
+    let (expected_ids, _lifecycle_locks) = lock_profile_lifecycle(&storage, &initial_instances)?;
 
     sync::with_tmux_ownership_lock(|| {
+        if !old_dir.exists() {
+            anyhow::bail!("Profile '{}' does not exist", old_name);
+        }
+        if new_dir.exists() {
+            anyhow::bail!("Profile '{}' already exists", new_name);
+        }
+        let current_instances = storage.load_strict()?;
+        ensure_profile_membership_unchanged(&current_instances, &expected_ids)?;
+        sync::ensure_instances_quiescent(
+            &current_instances,
+            &format!("rename profile '{old_name}'"),
+        )?;
         fs::rename(&old_dir, &new_dir)?;
         Ok(())
     })?;
 
-    // Update default profile if the renamed profile was the default
     if let Some(config) = load_config()? {
         if config.default_profile == old_name {
             set_default_profile(new_name)?;
