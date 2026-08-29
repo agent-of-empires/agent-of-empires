@@ -486,6 +486,7 @@ pub(crate) fn reconcile_all_profiles_tmux_session_id_ownership_env() -> anyhow::
 struct Update {
     id: String,
     sid: String,
+    namespace: String,
     expected_prior: Option<String>,
     profile: String,
     guard: SessionIdGuard,
@@ -530,11 +531,11 @@ fn drain_and_persist_session_ids_inner(
     // streams (A reports B's id while B reports A's), a dynamic map would
     // accept or reject by slice iteration order. The snapshot rejects every
     // cross-claim deterministically (see #2708).
-    let mut sid_owners: HashMap<String, String> = HashMap::with_capacity(instances.len());
+    let mut sid_owners: HashMap<(String, String), String> = HashMap::with_capacity(instances.len());
     for inst in instances.iter() {
-        for sid in inst.reserved_agent_session_ids() {
+        for (sid, namespace) in inst.reserved_agent_session_ownerships() {
             sid_owners
-                .entry(sid.to_string())
+                .entry((namespace, sid.to_string()))
                 .or_insert_with(|| inst.id.clone());
         }
     }
@@ -550,6 +551,11 @@ fn drain_and_persist_session_ids_inner(
         };
         // Unguarded and legacy filesystem scans from a stopped session can
         // belong to a peer sharing the cwd. A generation-typed OMP result is
+        let Some(namespace) = inst.terminal_session_store_namespace() else {
+            acknowledge_poller_observation(inst, &observation);
+            filtered_ids.insert(inst.id.clone());
+            continue;
+        };
         // bound to the exact old pane and must remain eligible for the
         // restart's post-join final flush.
         if matches!(inst.status, Status::Stopped)
@@ -586,7 +592,7 @@ fn drain_and_persist_session_ids_inner(
         }
         // Never adopt an id another instance already owns: that is the
         // same-cwd cross-assignment drift itself (#2708 symptom 1).
-        if let Some(owner) = sid_owners.get(sid.as_str()) {
+        if let Some(owner) = sid_owners.get(&(namespace.clone(), sid.clone())) {
             if owner != &inst.id {
                 tracing::warn!(
                     target: "session.sync",
@@ -618,6 +624,7 @@ fn drain_and_persist_session_ids_inner(
         updates.push(Update {
             id: inst.id.clone(),
             sid,
+            namespace,
             expected_prior: inst.agent_session_id.clone(),
             profile: inst.source_profile.clone(),
             guard: observation.guard.clone(),
@@ -630,12 +637,20 @@ fn drain_and_persist_session_ids_inner(
     // the collision guard passed both), picking a winner by iteration order is
     // silent misassignment. Drop every claimant and defer; the next tick sees
     // the real owner's anchor advance and the collision guard resolves it (#2708).
-    let mut sid_claim_counts: HashMap<String, usize> = HashMap::with_capacity(updates.len());
+    let mut sid_claim_counts: HashMap<(String, String), usize> =
+        HashMap::with_capacity(updates.len());
     for update in &updates {
-        *sid_claim_counts.entry(update.sid.clone()).or_insert(0) += 1;
+        *sid_claim_counts
+            .entry((update.namespace.clone(), update.sid.clone()))
+            .or_insert(0) += 1;
     }
     updates.retain(|update| {
-        if sid_claim_counts.get(&update.sid).copied().unwrap_or(0) > 1 {
+        if sid_claim_counts
+            .get(&(update.namespace.clone(), update.sid.clone()))
+            .copied()
+            .unwrap_or(0)
+            > 1
+        {
             tracing::warn!(
                 target: "session.sync",
                 instance = %update.id,
@@ -1988,6 +2003,28 @@ mod tests {
         assert!(outcome.filtered.contains(&instances[1].id));
         assert_eq!(instances[0].agent_session_id, None);
         assert_eq!(instances[1].agent_session_id, None);
+
+        let mut c = Instance::new("peer-c-title", "/tmp/x");
+        c.source_profile = "sync-samebatch-c".to_string();
+        c.agent_session_store_namespace = Some("host:claude:/store-c".to_string());
+        let mut d = Instance::new("peer-d-title", "/tmp/x");
+        d.source_profile = "sync-samebatch-d".to_string();
+        d.agent_session_store_namespace = Some("host:claude:/store-d".to_string());
+        seed_instances_on_disk(&c.source_profile, &[&c]);
+        seed_instances_on_disk(&d.source_profile, &[&d]);
+        attach_poller_with_update(&mut c, contested);
+        attach_poller_with_update(&mut d, contested);
+
+        let mut distinct_stores = vec![c, d];
+        let outcome = drain_and_persist_session_ids(&mut distinct_stores, &file_watch);
+        assert!(outcome.filtered.is_empty());
+        assert_eq!(outcome.applied.len(), 2);
+        assert!(
+            distinct_stores
+                .iter()
+                .all(|instance| instance.agent_session_id.as_deref() == Some(contested)),
+            "equal tokens in distinct stores identify different conversations"
+        );
     }
 
     #[test]

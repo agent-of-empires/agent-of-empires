@@ -2547,26 +2547,26 @@ impl HomeView {
         // Reconcile durable IDs into every live tmux session. Unsupported
         // agents retain IDs on disk but must not publish them as ownership.
         let live = crate::tmux::LiveSessionSnapshot::new();
-        crate::session::sync::sync_tmux_session_id_env(view.instances.values(), &live)?;
+        match crate::session::sync::sync_tmux_session_id_env(view.instances.values(), &live) {
+            Ok(()) => {
+                // Recover session IDs for pre-existing sessions via pollers.
+                for inst in view.instances.values_mut() {
+                    let has_live_tmux = inst.has_live_tmux_pane_in(&live);
+                    if has_live_tmux {
+                        inst.repair_session_id_poller_if_needed(&live);
+                    }
+                }
 
-        // Recover session IDs for pre-existing sessions via pollers.
-        for inst in view.instances.values_mut() {
-            let has_live_tmux = inst.has_live_tmux_pane_in(&live);
-            if !has_live_tmux {
-                continue;
+                // Startup auto-recovery runs only after ownership reconciliation.
+                // Otherwise a restart could consume ambiguous durable state.
+                view.maybe_start_startup_recovery();
             }
-
-            inst.repair_session_id_poller_if_needed(&live);
+            Err(error) => {
+                tracing::warn!(target: "tui.home",
+                    "Tmux ownership reconciliation failed; startup recovery and capture repair are disabled for this launch: {error}"
+                );
+            }
         }
-
-        // Startup auto-recovery: kick off a worker pool to restart any
-        // resume-capable sessions whose tmux pane is missing. The TUI defers
-        // to the daemon when one is running (the daemon owns recovery in
-        // that case); when the TUI is standalone, it acquires the
-        // cross-process recovery lock to keep a late-starting daemon from
-        // duplicating cascades. See `crate::session::recovery` for the full
-        // exclusion rationale.
-        view.maybe_start_startup_recovery();
 
         view.refresh_registered_projects();
         view.flat_items = view.build_flat_items();

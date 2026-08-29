@@ -58,7 +58,13 @@ fn command_reconciles_session_id_env(command: &Commands) -> bool {
 /// Remove legacy terminal ownership signals before a one-shot session command.
 pub fn reconcile_session_id_env_for_command(command: Option<&Commands>) -> anyhow::Result<()> {
     if command.is_some_and(command_reconciles_session_id_env) {
-        crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env()?;
+        if let Err(error) =
+            crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env()
+        {
+            tracing::warn!(target: "cli",
+                "Tmux ownership reconciliation failed; continuing without startup cleanup: {error}"
+            );
+        }
     }
     Ok(())
 }

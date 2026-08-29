@@ -3267,8 +3267,8 @@ impl Instance {
     }
 
     pub(crate) fn reserves_agent_session_id(&self, sid: &str) -> bool {
-        self.operational_agent_session_id() == Some(sid)
-            || self.incoming_handoff_agent_session_id() == Some(sid)
+        self.reserved_agent_session_ids()
+            .any(|reserved| reserved == sid)
     }
 
     pub(crate) fn reserves_agent_session_id_in_namespace(
@@ -3278,19 +3278,28 @@ impl Instance {
     ) -> bool {
         let current_namespace_matches =
             self.terminal_session_store_namespace().as_deref() == Some(namespace);
-        if !self.has_tmux_ownership_handoff() {
-            return current_namespace_matches && self.operational_agent_session_id() == Some(sid);
-        }
-        if current_namespace_matches && self.incoming_handoff_agent_session_id() == Some(sid) {
+        if current_namespace_matches
+            && (self.operational_agent_session_id() == Some(sid)
+                || self.incoming_handoff_agent_session_id() == Some(sid))
+        {
             return true;
         }
-        if self.pending_tmux_ownership_session_id.as_deref() != Some(sid) {
-            return false;
+        if self.has_tmux_ownership_handoff()
+            && self.pending_tmux_ownership_session_id.as_deref() == Some(sid)
+        {
+            return match self.operational_agent_session_store_namespace() {
+                Some(outgoing) => outgoing == namespace,
+                None => true,
+            };
         }
-        match self.operational_agent_session_store_namespace() {
-            Some(outgoing) => outgoing == namespace,
-            None => true,
-        }
+        self.prior_tool_session_ids.iter().any(|(tool, prior)| {
+            tool_supports_terminal_resume(tool)
+                && prior.agent_session_id.as_deref() == Some(sid)
+                && self
+                    .terminal_session_store_namespace_for_tool(tool)
+                    .as_deref()
+                    == Some(namespace)
+        })
     }
 
     pub(crate) fn reserved_agent_session_ids(&self) -> impl Iterator<Item = &str> {
@@ -3300,6 +3309,33 @@ impl Instance {
         ]
         .into_iter()
         .flatten()
+        .chain(
+            self.prior_tool_session_ids
+                .iter()
+                .filter_map(|(tool, prior)| {
+                    tool_supports_terminal_resume(tool)
+                        .then_some(prior.agent_session_id.as_deref())
+                        .flatten()
+                }),
+        )
+    }
+
+    pub(crate) fn reserved_agent_session_ownerships(&self) -> impl Iterator<Item = (&str, String)> {
+        let operational = self
+            .operational_agent_session_id()
+            .zip(self.operational_agent_session_store_namespace());
+        let incoming = self
+            .incoming_handoff_agent_session_id()
+            .zip(self.terminal_session_store_namespace());
+        [operational, incoming].into_iter().flatten().chain(
+            self.prior_tool_session_ids
+                .iter()
+                .filter_map(|(tool, prior)| {
+                    let sid = prior.agent_session_id.as_deref()?;
+                    let namespace = self.terminal_session_store_namespace_for_tool(tool)?;
+                    Some((sid, namespace))
+                }),
+        )
     }
 
     pub(crate) fn operational_agent_session_id(&self) -> Option<&str> {
@@ -4402,6 +4438,7 @@ impl Instance {
             stored.idle_entered_at = self.idle_entered_at;
             stored.last_accessed_at = self.last_accessed_at;
             stored.sandbox_info = self.sandbox_info.clone();
+            stored.agent_session_store_namespace = self.agent_session_store_namespace.clone();
             if restart && stored.agent_session_id == self.agent_session_id {
                 stored.resume_probe_failed_sid = self.resume_probe_failed_sid.clone();
             }
@@ -4594,6 +4631,7 @@ impl Instance {
         } else {
             false
         };
+        self.clear_pending_tmux_ownership(&storage)?;
         self.acquire_lifecycle_reservation(
             &storage,
             LifecycleOperation::Launch,
@@ -5660,6 +5698,7 @@ impl Instance {
         expected_prior_intent: ResumeIntent,
     ) -> SidPersistOutcome {
         let new_sid = self.agent_session_id.clone();
+        let new_namespace = self.terminal_session_store_namespace();
         // Cleared, Fork, and Use are all one-shot launch directives: after the
         // launch they ran with completes, the session resumes its own id
         // normally, so the intent must auto-promote to Default. A fork left as
@@ -5709,7 +5748,7 @@ impl Instance {
             // authorize an ownership transfer the current disk state no
             // longer sanctions.
             if let Some(sid) = new_sid_for_closure.as_deref() {
-                let Some(namespace) = inst.terminal_session_store_namespace() else {
+                let Some(namespace) = new_namespace.as_deref() else {
                     return Ok(SidWrite::Skipped);
                 };
                 let consumed_pin = matches!(
@@ -5722,7 +5761,7 @@ impl Instance {
                 if let Some(holder) = instances.iter().find(|instance| {
                     instance.id != instance_id
                         && instance.pending_tmux_ownership_session_id.as_deref() == Some(sid)
-                        && instance.reserves_agent_session_id_in_namespace(sid, &namespace)
+                        && instance.reserves_agent_session_id_in_namespace(sid, namespace)
                 }) {
                     tracing::warn!(target: "session.store",
                         instance_id = %instance_id,
@@ -5736,7 +5775,7 @@ impl Instance {
                     .iter()
                     .filter(|instance| {
                         instance.id != instance_id
-                            && instance.reserves_agent_session_id_in_namespace(sid, &namespace)
+                            && instance.reserves_agent_session_id_in_namespace(sid, namespace)
                     })
                     .map(|instance| instance.id.clone())
                     .collect();
@@ -5778,6 +5817,7 @@ impl Instance {
                 return Ok(SidWrite::Failed);
             };
             inst.agent_session_id = new_sid_for_closure.clone();
+            inst.agent_session_store_namespace = new_namespace.clone();
             inst.resume_probe_failed_sid = None;
 
             if promote_one_shot {
@@ -5834,6 +5874,7 @@ impl Instance {
                         self.agent_session_id = disk.agent_session_id;
                         self.resume_intent = disk.resume_intent;
                         self.resume_probe_failed_sid = disk.resume_probe_failed_sid;
+                        self.agent_session_store_namespace = disk.agent_session_store_namespace;
                         SidPersistOutcome::Published
                     }
                     None => {
@@ -12251,6 +12292,10 @@ mod tests {
             Some("pi-session-9"),
             "pi's conversation is the parked one now"
         );
+        assert!(inst.reserves_agent_session_id_in_namespace("pi-session-9", "host:pi:/pi-store"));
+        assert!(
+            !inst.reserves_agent_session_id_in_namespace("pi-session-9", "host:pi:/other-store")
+        );
         assert!(
             !inst.prior_tool_session_ids.contains_key("claude"),
             "a restored entry is consumed, so a later swap cannot resurrect it"
@@ -17336,8 +17381,8 @@ mod tests {
 
     mod sid_disk_guards {
         use super::super::{
-            persist_session_to_storage, Instance, PriorToolSession, ResumeIntent,
-            SidPersistOutcome, SidWrite,
+            persist_session_to_storage, Instance, LifecycleOperation, PriorToolSession,
+            ResumeIntent, SidPersistOutcome, SidWrite, Status,
         };
         use crate::file_watch::FileWatchService;
         use crate::session::storage::Storage;
@@ -17527,6 +17572,46 @@ mod tests {
                     &file_watch,
                 ),
                 SidWrite::Applied
+            );
+            let launch_profile = "guards-launch-namespace";
+            let mut launch = make_inst(launch_profile, "launch-namespace");
+            seed(launch_profile, &[&launch]);
+            let launch_storage = Storage::new_unwatched(launch_profile).unwrap();
+            launch
+                .acquire_lifecycle_reservation(
+                    &launch_storage,
+                    LifecycleOperation::Launch,
+                    Some(Status::Starting),
+                )
+                .unwrap();
+            launch.agent_session_store_namespace =
+                Some("host:claude:/hook-launch-store".to_string());
+            launch
+                .commit_lifecycle_launch(&launch_storage, false)
+                .unwrap();
+            assert_eq!(
+                load(launch_profile)[0]
+                    .agent_session_store_namespace
+                    .as_deref(),
+                Some("host:claude:/hook-launch-store")
+            );
+
+            launch.agent_session_id = Some(SID_X.to_string());
+            launch.agent_session_store_namespace =
+                Some("host:claude:/hook-capture-store".to_string());
+            assert_eq!(
+                launch.persist_session_id_with_storage(
+                    &launch_storage,
+                    None,
+                    ResumeIntent::Default,
+                ),
+                SidPersistOutcome::Published
+            );
+            let launch_disk = load(launch_profile);
+            assert_eq!(launch_disk[0].agent_session_id.as_deref(), Some(SID_X));
+            assert_eq!(
+                launch_disk[0].agent_session_store_namespace.as_deref(),
+                Some("host:claude:/hook-capture-store")
             );
         }
 
