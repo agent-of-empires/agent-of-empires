@@ -2530,8 +2530,13 @@ mod tests {
             "fixture-session".into(),
         ));
 
-        tokio::task::yield_now().await;
-        assert!(shared.main_attached.load(Ordering::Relaxed));
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !shared.main_attached.load(Ordering::Relaxed) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("relay handler installs outbound within timeout");
 
         // Mirror relay write failure state, then make the failure notification
         // and a stale inbound frame ready without yielding to the handler.
