@@ -824,26 +824,34 @@ fn drain_and_persist_session_ids_inner(
         }
     }
     updates.retain(|update| {
-        let owner = authoritative_owners
-            .get(&(update.namespace.clone(), update.sid.clone()))
-            .and_then(|owner| owner.as_deref())
-            .filter(|owner| *owner != update.id.as_str());
-        if let Some(owner) = owner {
-            tracing::warn!(
-                target: "session.sync",
-                instance = %update.id,
-                sid = %update.sid,
-                owner = %owner,
-                "Ignoring heuristic poller sid claimed by an authoritative instance sidecar",
-            );
-            acknowledge_poller_observation_for(instances, &update.id, &update.observation);
-            filtered_ids.insert(update.id.clone());
-            false
-        } else {
-            true
+        let key = (update.namespace.clone(), update.sid.clone());
+        match authoritative_owners.get(&key) {
+            Some(None) => {
+                tracing::warn!(
+                    target: "session.sync",
+                    instance = %update.id,
+                    sid = %update.sid,
+                    "Ignoring poller sid with ambiguous authoritative ownership",
+                );
+                acknowledge_poller_observation_for(instances, &update.id, &update.observation);
+                filtered_ids.insert(update.id.clone());
+                false
+            }
+            Some(Some(owner)) if owner != &update.id => {
+                tracing::warn!(
+                    target: "session.sync",
+                    instance = %update.id,
+                    sid = %update.sid,
+                    owner = %owner,
+                    "Ignoring heuristic poller sid claimed by an authoritative instance sidecar",
+                );
+                acknowledge_poller_observation_for(instances, &update.id, &update.observation);
+                filtered_ids.insert(update.id.clone());
+                false
+            }
+            _ => true,
         }
     });
-
     // Multiple remaining heuristic claimants are ambiguous. Keep every sticky
     // observation pending until an authoritative sidecar or generation claim
     // identifies the owner; choosing by iteration order silently misassigns
@@ -2372,6 +2380,32 @@ mod tests {
         assert_eq!(split[0].agent_session_id.as_deref(), Some(split_contested));
         assert_eq!(split[1].agent_session_id, None);
         crate::hooks::cleanup_hook_status_dir(&split[0].id);
+
+        let ambiguous_sid = "019342ab-1234-7def-8901-ffffffffffff";
+        let ambiguous_profile = "sync-authoritative-ambiguous";
+        let mut sidecar_a = Instance::new("sidecar-a", "/tmp/x");
+        sidecar_a.source_profile = ambiguous_profile.to_string();
+        let mut sidecar_b = Instance::new("sidecar-b", "/tmp/x");
+        sidecar_b.source_profile = ambiguous_profile.to_string();
+        let mut lone_heuristic = Instance::new("lone-heuristic", "/tmp/x");
+        lone_heuristic.source_profile = ambiguous_profile.to_string();
+        seed_instances_on_disk(
+            ambiguous_profile,
+            &[&sidecar_a, &sidecar_b, &lone_heuristic],
+        );
+        for owner in [&sidecar_a, &sidecar_b] {
+            crate::hooks::ensure_instance_dir_path(&owner.id).unwrap();
+            crate::hooks::write_session_id_via_guard(&owner.id, ambiguous_sid).unwrap();
+        }
+        attach_poller_with_update(&mut lone_heuristic, ambiguous_sid);
+        let mut ambiguous = vec![sidecar_a, sidecar_b, lone_heuristic];
+        let outcome = drain_and_persist_session_ids(&mut ambiguous, &file_watch);
+        assert!(outcome.applied.is_empty());
+        assert!(outcome.filtered.contains(&ambiguous[2].id));
+        assert_eq!(ambiguous[2].agent_session_id, None);
+        for owner in &ambiguous[..2] {
+            crate::hooks::cleanup_hook_status_dir(&owner.id);
+        }
 
         let mut c = Instance::new("peer-c-title", "/tmp/x");
         c.source_profile = "sync-samebatch-c".to_string();

@@ -1004,12 +1004,19 @@ pub(crate) fn compose_exclusion(
     current_instance_id: &str,
     extra: &HashSet<String>,
 ) -> anyhow::Result<HashSet<String>> {
-    compose_exclusion_in(
-        current_instance_id,
-        None,
-        extra,
-        &crate::tmux::LiveSessionSnapshot::new(),
-    )
+    let live = capture_live_snapshot();
+    compose_exclusion_in(current_instance_id, None, extra, &live)
+}
+
+fn capture_live_snapshot() -> crate::tmux::LiveSessionSnapshot {
+    let live = crate::tmux::LiveSessionSnapshot::new();
+    #[cfg(test)]
+    if live.names().is_none() {
+        // Capture algorithm tests intentionally run without a tmux server.
+        // Production still treats the same observation as uncertain.
+        return crate::tmux::LiveSessionSnapshot::from_names(Vec::new());
+    }
+    live
 }
 
 /// compose_exclusion against a snapshot the caller already holds, so a pass
@@ -1060,7 +1067,7 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
     // cross-instance scan needs the live session names, and the walk below
     // visits every stored session sharing the project path, trashed ones
     // included, so a per-instance liveness probe costs a fork each.
-    let live = crate::tmux::LiveSessionSnapshot::new();
+    let live = capture_live_snapshot();
     let mut set = compose_exclusion_in(
         current_instance_id,
         Some(current_namespace),

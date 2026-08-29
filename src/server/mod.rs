@@ -3596,11 +3596,26 @@ fn validate_acp_session_assignment(
     foreign: &[Instance],
     session_id: &str,
 ) -> anyhow::Result<()> {
-    let namespace = instance
+    if local.iter().chain(foreign).any(|candidate| {
+        candidate.id != instance.id
+            && (candidate.acp_session_id.as_deref() == Some(session_id)
+                || candidate
+                    .prior_tool_session_ids
+                    .values()
+                    .any(|prior| prior.acp_session_id.as_deref() == Some(session_id)))
+    }) {
+        anyhow::bail!("ACP session '{session_id}' is already owned");
+    }
+    let Some(namespace) = instance
         .agent_session_store_namespace
         .clone()
         .or_else(|| instance.terminal_session_store_namespace())
-        .ok_or_else(|| anyhow::anyhow!("cannot resolve ACP conversation store namespace"))?;
+    else {
+        // Structured ACP identities remain durable even when the terminal tool
+        // has no resumable store. The global ACP check above is the only
+        // ownership domain available for those tools.
+        return Ok(());
+    };
     if local.iter().chain(foreign).any(|candidate| {
         candidate.id != instance.id
             && candidate.reserves_claude_import_id_in_namespace(session_id, &namespace)
@@ -6797,6 +6812,26 @@ mod tests {
             assert!(
                 validate_acp_session_assignment(&target, &local, &remote, "contested").is_err(),
                 "foreign={foreign}"
+            );
+        }
+
+        for tool in ["qwen", "kiro"] {
+            let mut unsupported = Instance::new(tool, "/tmp/project");
+            unsupported.tool = tool.into();
+            unsupported.view = crate::session::View::Structured;
+            assert!(
+                validate_acp_session_assignment(&unsupported, &[], &[], "acp-only").is_ok(),
+                "{tool}"
+            );
+            assert!(
+                validate_acp_session_assignment(
+                    &unsupported,
+                    std::slice::from_ref(&owner),
+                    &[],
+                    "contested"
+                )
+                .is_err(),
+                "{tool}"
             );
         }
     }
