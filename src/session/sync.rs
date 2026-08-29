@@ -125,12 +125,22 @@ fn read_tmux_ownership_observations(
         .iter()
         .filter(|name| crate::tmux::is_aoe_session(name))
     {
-        let captured = crate::tmux::env::get_hidden_env_strict(
+        let captured = match crate::tmux::env::get_hidden_env_strict(
             name,
             crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
-        )?;
-        let owner =
-            crate::tmux::env::get_hidden_env_strict(name, crate::tmux::env::AOE_INSTANCE_ID_KEY)?;
+        ) {
+            Ok(value) => value,
+            Err(error) if crate::tmux::env::is_missing_session_error(&error) => continue,
+            Err(error) => return Err(error),
+        };
+        let owner = match crate::tmux::env::get_hidden_env_strict(
+            name,
+            crate::tmux::env::AOE_INSTANCE_ID_KEY,
+        ) {
+            Ok(value) => value,
+            Err(error) if crate::tmux::env::is_missing_session_error(&error) => continue,
+            Err(error) => return Err(error),
+        };
         observations.push((name.clone(), owner, captured));
     }
     Ok(observations)
@@ -306,11 +316,20 @@ fn load_profile_instances_excluding(excluded: Option<&str>) -> anyhow::Result<Ve
         if excluded.is_some_and(|excluded| profile == excluded) {
             continue;
         }
-        let storage = Storage::open_unwatched(&profile)
-            .map_err(|error| anyhow::anyhow!("open profile {profile}: {error}"))?;
-        let mut rows = storage
-            .load()
-            .map_err(|error| anyhow::anyhow!("load profile {profile}: {error}"))?;
+        let storage = match Storage::open_unwatched(&profile) {
+            Ok(storage) => storage,
+            Err(error) => {
+                tracing::warn!(target: "session.store", profile, "Ignoring untrusted profile during tmux ownership reconciliation: {error}");
+                continue;
+            }
+        };
+        let mut rows = match storage.load() {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(target: "session.store", profile, "Ignoring unreadable profile during tmux ownership reconciliation: {error}");
+                continue;
+            }
+        };
         instances.append(&mut rows);
     }
     Ok(instances)
@@ -899,8 +918,10 @@ fn publish_tmux_env(
             .collect();
         crate::tmux::env::remove_hidden_env_batch(&unset_refs)
     });
-    if let Err(error) = result {
-        tracing::warn!(target: "session.sync", "Post-CAS env reconcile failed: {error}");
+    if let Err(first_error) = result {
+        if let Err(retry_error) = reconcile_all_profiles_tmux_session_id_ownership_env() {
+            tracing::warn!(target: "session.sync", "Post-CAS env reconcile failed: {first_error}; retry failed: {retry_error}");
+        }
     }
 }
 
@@ -1127,6 +1148,14 @@ mod tests {
             .unwrap(),
             None
         );
+        let vanished = format!(
+            "{}vanished_{}",
+            crate::tmux::SESSION_PREFIX,
+            uuid::Uuid::new_v4().simple()
+        );
+        let observations =
+            read_tmux_ownership_observations(&[supported_name.clone(), vanished]).unwrap();
+        assert_eq!(observations.len(), 1);
     }
 
     #[test]

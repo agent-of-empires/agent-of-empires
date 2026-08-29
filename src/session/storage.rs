@@ -2176,7 +2176,7 @@ fn repair_journal_entry(
     storages: &[(&str, &Storage)],
     journal_path: &Path,
 ) -> Result<bool> {
-    repair_journal_entry_with_sync(entry, storages, journal_path, sync_parent_directory)
+    repair_journal_entry_with_sync(entry, storages, journal_path, sync_parent_directory, true)
 }
 
 fn repair_journal_entry_with_sync<S>(
@@ -2184,6 +2184,7 @@ fn repair_journal_entry_with_sync<S>(
     storages: &[(&str, &Storage)],
     journal_path: &Path,
     mut sync: S,
+    reconcile_ownership: bool,
 ) -> Result<bool>
 where
     S: FnMut(&Path) -> Result<()>,
@@ -2259,7 +2260,8 @@ where
         }
     }
 
-    with_two_storage_locks(source_storage, target_storage, || {
+    let _ownership = acquire_tmux_ownership_lock()?;
+    let repaired = with_two_storage_locks(source_storage, target_storage, || {
         let (source_instances, _source_groups) = source_storage.load_with_groups()?;
         let (target_instances, _) = target_storage.load_with_groups()?;
         let plan = crate::session::GroupMovePlan {
@@ -2313,7 +2315,11 @@ where
         test_crash_point("profile-repair-source-written");
         super::move_journal::consume(journal_path)?;
         Ok(true)
-    })
+    })?;
+    if repaired && reconcile_ownership {
+        crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env_locked()?;
+    }
+    Ok(repaired)
 }
 
 fn sync_repaired_profile_durably<S>(storage: &Storage, mut sync: S) -> Result<()>
@@ -5502,17 +5508,25 @@ mod tests {
         let journal_path = super::super::move_journal::record(&entry, source.sessions_path())?;
         let stores: Vec<(&str, &Storage)> =
             vec![(source.profile(), &source), (target.profile(), &target)];
-        let error = repair_journal_entry_with_sync(&entry, &stores, &journal_path, |_path| {
-            Err(anyhow!("forced repaired-profile sync failure"))
-        })
+        let error = repair_journal_entry_with_sync(
+            &entry,
+            &stores,
+            &journal_path,
+            |_path| Err(anyhow!("forced repaired-profile sync failure")),
+            false,
+        )
         .expect_err("failed durability barrier must fail recovery completion");
         assert!(error.to_string().contains("not made durable"));
         assert!(source.load()?.is_empty(), "repair row write reached disk");
         assert_eq!(journal_entry_count(&source), 1, "evidence must remain");
 
-        let retry_error = repair_journal_entry_with_sync(&entry, &stores, &journal_path, |_path| {
-            Err(anyhow!("forced retry sync failure"))
-        })
+        let retry_error = repair_journal_entry_with_sync(
+            &entry,
+            &stores,
+            &journal_path,
+            |_path| Err(anyhow!("forced retry sync failure")),
+            false,
+        )
         .expect_err("no-loser retry must repeat the durability barrier");
         assert!(retry_error.to_string().contains("not made durable"));
         assert_eq!(journal_entry_count(&source), 1, "retry keeps evidence too");

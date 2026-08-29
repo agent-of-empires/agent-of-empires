@@ -9,6 +9,21 @@ use std::collections::HashMap;
 use std::sync::RwLock;
 use std::time::{Duration, Instant};
 
+#[derive(Debug, thiserror::Error)]
+#[error("tmux session disappeared: {0}")]
+struct MissingSession(String);
+
+fn missing_session_stderr(stderr: &str) -> bool {
+    stderr.lines().any(|line| {
+        let line = line.trim_start();
+        line.starts_with("can't find session:") || line.starts_with("no such session:")
+    })
+}
+
+pub(crate) fn is_missing_session_error(error: &anyhow::Error) -> bool {
+    error.downcast_ref::<MissingSession>().is_some()
+}
+
 pub const AOE_INSTANCE_ID_KEY: &str = "AOE_INSTANCE_ID";
 pub const AOE_CAPTURED_SESSION_ID_KEY: &str = "AOE_CAPTURED_SESSION_ID";
 pub const AOE_OMP_CAPTURE_META_KEY: &str = "AOE_OMP_CAPTURE_META";
@@ -39,6 +54,9 @@ pub fn set_hidden_env(session_name: &str, key: &str, value: &str) -> anyhow::Res
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        if missing_session_stderr(&stderr) {
+            return Err(MissingSession(session_name.to_string()).into());
+        }
         bail!(
             "tmux set-environment -h -t '{}' {}: exit {}: {}",
             session_name,
@@ -111,6 +129,9 @@ pub(crate) fn get_hidden_env_strict(
         .output()?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        if missing_session_stderr(&stderr) {
+            return Err(MissingSession(session_name.to_string()).into());
+        }
         let missing = format!("unknown variable: {key}");
         if stderr.lines().any(|line| line.trim() == missing) {
             return Ok(None);
@@ -157,6 +178,9 @@ pub fn remove_hidden_env(session_name: &str, key: &str) -> anyhow::Result<()> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
+        if missing_session_stderr(&stderr) {
+            return Err(MissingSession(session_name.to_string()).into());
+        }
         bail!("Failed to remove hidden env var: {}", stderr);
     }
 
@@ -216,7 +240,9 @@ fn sequential_remove_fallback(entries: &[(&str, &str)]) -> anyhow::Result<()> {
     let mut failures = Vec::new();
     for (session_name, key) in entries {
         if let Err(error) = remove_hidden_env(session_name, key) {
-            failures.push(format!("{session_name}:{key}: {error}"));
+            if !is_missing_session_error(&error) {
+                failures.push(format!("{session_name}:{key}: {error}"));
+            }
         }
     }
     if failures.is_empty() {
@@ -284,7 +310,9 @@ fn sequential_set_fallback(entries: &[(&str, &str, &str)]) -> anyhow::Result<()>
     let mut failures = Vec::new();
     for (session_name, key, value) in entries {
         if let Err(error) = set_hidden_env(session_name, key, value) {
-            failures.push(format!("{session_name}:{key}: {error}"));
+            if !is_missing_session_error(&error) {
+                failures.push(format!("{session_name}:{key}: {error}"));
+            }
         }
     }
     if failures.is_empty() {
@@ -574,17 +602,44 @@ mod tests {
     }
 
     #[test]
-    fn strict_hidden_env_operations_report_missing_session() {
+    fn strict_hidden_env_operations_classify_missing_session() {
+        if !crate::tmux::is_tmux_available() {
+            eprintln!("Skipping: tmux not available");
+            return;
+        }
+        let live = format!(
+            "{}env_live_{}",
+            crate::tmux::SESSION_PREFIX,
+            uuid::Uuid::new_v4().simple()
+        );
+        let output = crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", &live])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = crate::tmux::tmux_command()
+                    .args(["kill-session", "-t", &self.0])
+                    .output();
+            }
+        }
+        let _cleanup = Cleanup(live);
         let missing = format!(
             "{}missing_{}",
             crate::tmux::SESSION_PREFIX,
             uuid::Uuid::new_v4().simple()
         );
-        assert!(get_hidden_env_strict(&missing, AOE_INSTANCE_ID_KEY).is_err());
-        assert!(remove_hidden_env_batch(&[(&missing, AOE_CAPTURED_SESSION_ID_KEY)]).is_err());
-        assert!(
-            set_hidden_env_batch(&[(&missing, AOE_CAPTURED_SESSION_ID_KEY, "captured")]).is_err()
-        );
+        for error in [
+            get_hidden_env_strict(&missing, AOE_INSTANCE_ID_KEY).unwrap_err(),
+            remove_hidden_env(&missing, AOE_CAPTURED_SESSION_ID_KEY).unwrap_err(),
+            set_hidden_env(&missing, AOE_CAPTURED_SESSION_ID_KEY, "captured").unwrap_err(),
+        ] {
+            assert!(is_missing_session_error(&error), "{error:#}");
+        }
+        remove_hidden_env_batch(&[(&missing, AOE_CAPTURED_SESSION_ID_KEY)]).unwrap();
+        set_hidden_env_batch(&[(&missing, AOE_CAPTURED_SESSION_ID_KEY, "captured")]).unwrap();
     }
 
     #[test]

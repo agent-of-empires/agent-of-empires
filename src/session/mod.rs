@@ -648,7 +648,6 @@ pub fn delete_profile(name: &str) -> Result<()> {
             }
             return Err(delete_error.into());
         }
-        sync::reconcile_all_profiles_tmux_session_id_ownership_env_locked()?;
         Ok(())
     })
 }
@@ -672,7 +671,10 @@ pub fn rename_profile(old_name: &str, new_name: &str) -> Result<()> {
         anyhow::bail!("Profile '{}' already exists", new_name);
     }
 
-    fs::rename(&old_dir, &new_dir)?;
+    sync::with_tmux_ownership_lock(|| {
+        fs::rename(&old_dir, &new_dir)?;
+        Ok(())
+    })?;
 
     // Update default profile if the renamed profile was the default
     if let Some(config) = load_config()? {
@@ -1439,6 +1441,15 @@ mod tests {
         fs::create_dir_all(dir.join("profiles").join("default")).unwrap();
         fs::create_dir_all(dir.join("profiles").join("work")).unwrap();
 
+        let corrupt_a = dir.join("profiles").join("corrupt-a");
+        let corrupt_b = dir.join("profiles").join("corrupt-b");
+        for path in [&corrupt_a, &corrupt_b] {
+            fs::create_dir_all(path).unwrap();
+            fs::write(path.join("sessions.json"), b"not json").unwrap();
+        }
+        delete_profile("corrupt-a").expect("another unreadable profile must not block deletion");
+        assert!(!corrupt_a.exists());
+        assert!(corrupt_b.exists());
         delete_profile("default").expect("a non-last profile named default is deletable");
         assert!(!dir.join("profiles").join("default").exists());
         assert!(dir.join("profiles").join("work").exists());

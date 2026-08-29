@@ -17220,29 +17220,6 @@ mod tests {
 
         #[test]
         #[serial]
-        fn finalize_launch_propagates_ownership_reconcile_failure() {
-            if skip_if_no_tmux() {
-                return;
-            }
-            let temp = tempdir().unwrap();
-            isolate_home(&temp);
-
-            let profile = "publish-failure";
-            let mut inst = make_inst(profile, "publish-failure");
-            seed_disk_row(profile, &inst);
-            let corrupt = crate::session::Storage::new_unwatched("corrupt-profile").unwrap();
-            std::fs::write(corrupt.sessions_path(), b"not json").unwrap();
-            let tmux = TmuxSession::create(&inst.id, &inst.title);
-            inst.agent_session_id = Some(VALID_SID.to_string());
-
-            let error = inst
-                .finalize_launch(tmux.name(), profile, None, ResumeIntent::Default, None)
-                .unwrap_err();
-            assert!(error.to_string().contains("corrupt-profile"), "{error:#}");
-        }
-
-        #[test]
-        #[serial]
         fn finalize_publish_applied_writes_omp_metadata() {
             if skip_if_no_tmux() {
                 return;
