@@ -138,12 +138,13 @@ fn partition_unambiguous_instances(instances: &[Instance]) -> (Vec<&Instance>, H
     for instance in instances {
         let id = instance.id.as_str();
         *id_counts.entry(id).or_default() += 1;
-        if let (Some(sid), Some(namespace)) = (
-            instance.operational_agent_session_id(),
-            instance.terminal_session_store_namespace(),
-        ) {
-            if let Some(previous) = sid_owners.insert((namespace, sid.to_string()), id) {
-                ambiguous_sid_owners.insert(previous);
+        if let Some(sid) = instance.operational_agent_session_id() {
+            if let Some(namespace) = instance.operational_agent_session_store_namespace() {
+                if let Some(previous) = sid_owners.insert((namespace, sid.to_string()), id) {
+                    ambiguous_sid_owners.insert(previous);
+                    ambiguous_sid_owners.insert(id);
+                }
+            } else {
                 ambiguous_sid_owners.insert(id);
             }
         }
@@ -442,7 +443,7 @@ fn load_profile_instances_excluding(excluded: Option<&str>) -> anyhow::Result<Ve
             continue;
         }
         let mut rows = storage
-            .load_strict()
+            .load_ownership_strict()
             .map_err(|error| anyhow::anyhow!("load profile {profile}: {error}"))?;
         instances.append(&mut rows);
     }
@@ -1423,7 +1424,9 @@ mod tests {
         shared_conversation.agent_session_id = first.agent_session_id.clone();
         let mut independent_store = shared_conversation.clone();
         independent_store.tool = "codex".to_string();
-        let independent_rows = [first.clone(), independent_store];
+        let mut outgoing_handoff = first.clone();
+        outgoing_handoff.swap_tool_for_restart("codex");
+        let independent_rows = [outgoing_handoff, independent_store];
         let (trusted, ambiguous) = partition_unambiguous_instances(&independent_rows);
         assert_eq!(trusted.len(), 2);
         assert!(ambiguous.is_empty());
@@ -1496,7 +1499,11 @@ mod tests {
         let corrupt_path = crate::session::get_app_dir()
             .unwrap()
             .join("profiles/corrupt/sessions.json");
-        std::fs::write(corrupt_path, b"[null]").unwrap();
+        std::fs::write(
+            corrupt_path,
+            br#"[{"agent_session_id":"019342ab-1234-7def-8901-deadbeefdead"}]"#,
+        )
+        .unwrap();
         assert!(instance_ids_excluding_profile("deleted").is_err());
     }
 

@@ -1270,11 +1270,51 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // `aoe add --acp` while serve is already running.
 
     // Legacy Qwen/Kiro ownership must be gone before terminal recovery can
-    // inspect the global tmux environment.
-    tokio::task::spawn_blocking(
+    // inspect the global tmux environment. Failure only suppresses terminal
+    // recovery for this launch; structured sessions and the daemon stay live.
+    let ownership_reconciled = match tokio::task::spawn_blocking(
         crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env,
     )
-    .await??;
+    .await
+    {
+        Ok(Ok(())) => true,
+        Ok(Err(error)) => {
+            tracing::warn!(target: "session.sync", "Deferring daemon tmux ownership reconciliation: {error}");
+            false
+        }
+        Err(error) => {
+            tracing::warn!(target: "session.sync", "Daemon tmux ownership reconciliation task failed: {error}");
+            false
+        }
+    };
+    if !ownership_reconciled {
+        let shutdown = state.shutdown.clone();
+        crate::task_util::spawn_supervised(
+            "server.tmux_ownership_reconcile",
+            crate::task_util::PanicPolicy::Log,
+            async move {
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                        _ = shutdown.cancelled() => break,
+                    }
+                    match tokio::task::spawn_blocking(
+                        crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env,
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => break,
+                        Ok(Err(error)) => {
+                            tracing::warn!(target: "session.sync", "Retrying daemon tmux ownership reconciliation: {error}")
+                        }
+                        Err(error) => {
+                            tracing::warn!(target: "session.sync", "Daemon tmux ownership reconciliation retry task failed: {error}")
+                        }
+                    }
+                }
+            },
+        );
+    }
 
     // Seed acp sessions' status from the on-disk event log before
     // any background task runs. The status_poll_loop overlay reads
@@ -1291,7 +1331,11 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // missing tmux state and broadcast a phantom Idle->Error transition.
     // Phase B (the cascade workers) runs in a spawned task and holds
     // the lock until done.
-    let recovery_inputs = daemon_startup_recovery_mark(state.clone()).await;
+    let recovery_inputs = if ownership_reconciled {
+        daemon_startup_recovery_mark(state.clone()).await
+    } else {
+        None
+    };
 
     // Periodic opt-in `usage_snapshot` loop. Spawned after the transport is
     // resolved (so the first, immediate tick reports the real `serve_mode` and a

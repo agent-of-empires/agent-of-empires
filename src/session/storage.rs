@@ -911,6 +911,53 @@ impl Storage {
         Ok(instances)
     }
 
+    /// Load rows needed for conversation ownership decisions. Corrupt values
+    /// that cannot contain ownership state are irrelevant and may be skipped;
+    /// ownership-shaped rows remain strict so uncertainty still fails closed.
+    pub(crate) fn load_ownership_strict(&self) -> Result<Vec<Instance>> {
+        if !self.sessions_path.exists() {
+            return Ok(Vec::new());
+        }
+        let content = fs::read_to_string(&self.sessions_path)?;
+        if content.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&content)?;
+        let mut instances = Vec::with_capacity(rows.len());
+        for (index, row) in rows.into_iter().enumerate() {
+            match <Instance as serde::Deserialize>::deserialize(&row) {
+                Ok(mut instance) => {
+                    instance.source_profile = self.profile.clone();
+                    instance.set_file_watch(self.file_watch.clone());
+                    instances.push(instance);
+                }
+                Err(error) => {
+                    let may_own_conversation = row.as_object().is_some_and(|object| {
+                        [
+                            "agent_session_id",
+                            "pending_tmux_ownership_session_id",
+                            "resume_intent",
+                            "prior_tool_session_ids",
+                        ]
+                        .iter()
+                        .any(|key| object.get(*key).is_some_and(|value| !value.is_null()))
+                    });
+                    if may_own_conversation {
+                        return Err(error.into());
+                    }
+                    tracing::warn!(
+                        profile = %self.profile,
+                        row = index,
+                        error = %error,
+                        path = %self.sessions_path.display(),
+                        "skipping corrupt ownership-free session row"
+                    );
+                }
+            }
+        }
+        Ok(instances)
+    }
+
     fn quarantine_corrupt_rows(&self, rows: &[serde_json::Value]) {
         let path = self.sessions_path.with_file_name("sessions.corrupt.jsonl");
         Self::write_corrupt_rows_quarantine(&path, rows, "session");

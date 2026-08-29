@@ -1069,7 +1069,7 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
             }
             let is_current_profile = identity == current_identity;
             let instances = storage
-                .load_strict()
+                .load_ownership_strict()
                 .map_err(|error| anyhow::anyhow!("load profile {peer_profile}: {error}"))?;
             for inst in instances {
                 if is_current_profile && inst.id == current_instance_id {
