@@ -541,6 +541,7 @@ impl HomeView {
         // state. The worker owns the Starting reservation; publishing that
         // status here would make it reject its own request as concurrent.
         self.save()?;
+        crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env()?;
         // The transaction has already released its canonical profile locks.
         // Publish the final launch edit while identity/title/lifecycle remain
         // guarded, then drop identity before releasing the per-session guards.

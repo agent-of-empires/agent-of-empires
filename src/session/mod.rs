@@ -630,7 +630,16 @@ pub fn delete_profile(name: &str) -> Result<()> {
     }
 
     sync::with_tmux_ownership_lock(|| {
-        let cleared = sync::reconcile_tmux_session_id_ownership_excluding_profile_locked(name)?;
+        let cleared = match storage::Storage::open_unwatched(name)?.load() {
+            Ok(target_instances) => {
+                sync::clear_tmux_session_id_ownership_for_instances_locked(&target_instances)?
+            }
+            Err(_) => {
+                // A corrupt profile is still deletable. With no trustworthy rows,
+                // retain only ownership proven by the surviving profiles.
+                sync::reconcile_tmux_session_id_ownership_excluding_profile_locked(name)?
+            }
+        };
         if let Err(delete_error) = fs::remove_dir_all(&profile_dir) {
             if let Err(restore_error) = sync::restore_tmux_session_id_ownership_locked(&cleared) {
                 anyhow::bail!(

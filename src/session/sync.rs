@@ -161,28 +161,38 @@ fn stale_tmux_ownership_targets(
 }
 
 fn cleared_tmux_ownership(
+    instances: &[Instance],
     targets: &[String],
     observations: &[TmuxOwnershipObservation],
 ) -> ClearedTmuxOwnership {
     let target_set: HashSet<&str> = targets.iter().map(String::as_str).collect();
+    let operational: HashMap<&str, &str> = instances
+        .iter()
+        .filter_map(|instance| {
+            instance
+                .operational_agent_session_id()
+                .map(|sid| (instance.id.as_str(), sid))
+        })
+        .collect();
     let entries = observations
         .iter()
-        .filter_map(|(session, _, captured)| {
+        .filter_map(|(session, owner, _)| {
+            let owner = owner.as_deref()?;
+            let sid = operational.get(owner)?;
             target_set
                 .contains(session.as_str())
-                .then(|| captured.clone())
-                .flatten()
-                .map(|value| (session.clone(), value))
+                .then(|| (session.clone(), (*sid).to_string()))
         })
         .collect();
     ClearedTmuxOwnership { entries }
 }
 
 fn remove_tmux_session_id_ownership(
+    instances: &[Instance],
     targets: &[String],
     observations: &[TmuxOwnershipObservation],
 ) -> anyhow::Result<ClearedTmuxOwnership> {
-    let cleared = cleared_tmux_ownership(targets, observations);
+    let cleared = cleared_tmux_ownership(instances, targets, observations);
     let refs: Vec<(&str, &str)> = targets
         .iter()
         .map(|session| {
@@ -192,7 +202,12 @@ fn remove_tmux_session_id_ownership(
             )
         })
         .collect();
-    crate::tmux::env::remove_hidden_env_batch(&refs)?;
+    if let Err(error) = crate::tmux::env::remove_hidden_env_batch(&refs) {
+        if let Err(repair_error) = restore_tmux_session_id_ownership_locked(&cleared) {
+            anyhow::bail!("{error}; ownership repair failed: {repair_error}");
+        }
+        return Err(error);
+    }
     Ok(cleared)
 }
 
@@ -216,12 +231,17 @@ fn reconcile_tmux_session_id_ownership_env_locked(
     targets.sort();
     targets.dedup();
 
-    let cleared = remove_tmux_session_id_ownership(&targets, &observations)?;
+    let cleared = remove_tmux_session_id_ownership(instances, &targets, &observations)?;
     let refs: Vec<(&str, &str, &str)> = set_batch
         .iter()
         .map(|(session, key, value)| (session.as_str(), key.as_str(), value.as_str()))
         .collect();
-    crate::tmux::env::set_hidden_env_batch(&refs)?;
+    if let Err(error) = crate::tmux::env::set_hidden_env_batch(&refs) {
+        if let Err(repair_error) = restore_tmux_session_id_ownership_locked(&cleared) {
+            anyhow::bail!("{error}; ownership repair failed: {repair_error}");
+        }
+        return Err(error);
+    }
     Ok(cleared)
 }
 
@@ -260,7 +280,7 @@ pub(crate) fn clear_tmux_session_id_ownership_for_instances_locked(
         .map(|instance| instance.id.as_str())
         .collect();
     let targets = owned_tmux_ownership_targets(&instance_ids, observations.iter().cloned());
-    remove_tmux_session_id_ownership(&targets, &observations)
+    remove_tmux_session_id_ownership(instances, &targets, &observations)
 }
 
 pub(crate) fn restore_tmux_session_id_ownership_locked(
@@ -302,20 +322,19 @@ pub(crate) fn reconcile_all_profiles_tmux_session_id_ownership_env_locked(
     reconcile_tmux_session_id_ownership_env_locked(&instances)
 }
 
+pub(crate) fn reconcile_tmux_session_id_ownership_excluding_profile_locked(
+    excluded: &str,
+) -> anyhow::Result<ClearedTmuxOwnership> {
+    let instances = load_profile_instances_excluding(Some(excluded))?;
+    reconcile_tmux_session_id_ownership_env_locked(&instances)
+}
+
 /// Strict ownership reconciliation across every profile.
 pub(crate) fn reconcile_all_profiles_tmux_session_id_ownership_env() -> anyhow::Result<()> {
     with_tmux_ownership_lock(|| {
         reconcile_all_profiles_tmux_session_id_ownership_env_locked()?;
         Ok(())
     })
-}
-
-/// Clear ownership from one profile while its deletion transaction owns the lock.
-pub(crate) fn reconcile_tmux_session_id_ownership_excluding_profile_locked(
-    excluded: &str,
-) -> anyhow::Result<ClearedTmuxOwnership> {
-    let instances = load_profile_instances_excluding(Some(excluded))?;
-    reconcile_tmux_session_id_ownership_env_locked(&instances)
 }
 
 struct Update {
@@ -989,18 +1008,27 @@ mod tests {
     }
 
     #[test]
-    fn deletion_plan_clears_only_removed_instance_ownership() {
-        let instance_ids = HashSet::from(["deleted"]);
+    fn deletion_plan_restores_only_operational_ownership() {
+        let mut supported = Instance::new("supported", "/tmp/x");
+        supported.id = "deleted".to_string();
+        supported.tool = "claude".to_string();
+        supported.agent_session_id = Some("durable".to_string());
+        let mut unsupported = Instance::new("unsupported", "/tmp/y");
+        unsupported.id = "inert".to_string();
+        unsupported.tool = "qwen".to_string();
+        unsupported.agent_session_id = Some("retained".to_string());
+        let instances = [supported, unsupported];
+        let instance_ids = HashSet::from(["deleted", "inert"]);
         let observations = [
             (
                 "deleted-session".to_string(),
                 Some("deleted".to_string()),
-                Some("captured".to_string()),
+                Some("stale".to_string()),
             ),
             (
-                "survivor".to_string(),
-                Some("surviving".to_string()),
-                Some("other".to_string()),
+                "inert-session".to_string(),
+                Some("inert".to_string()),
+                Some("retained".to_string()),
             ),
             (
                 "deleted-without-capture".to_string(),
@@ -1010,13 +1038,12 @@ mod tests {
             ("ownerless".to_string(), None, Some("orphan".to_string())),
         ];
         let targets = owned_tmux_ownership_targets(&instance_ids, observations.iter().cloned());
-        assert_eq!(targets, vec!["deleted-session"]);
+        assert_eq!(targets, vec!["deleted-session", "inert-session"]);
         assert_eq!(
-            cleared_tmux_ownership(&targets, &observations).entries,
-            vec![("deleted-session".to_string(), "captured".to_string())]
+            cleared_tmux_ownership(&instances, &targets, &observations).entries,
+            vec![("deleted-session".to_string(), "durable".to_string())]
         );
     }
-
     #[test]
     #[serial]
     fn global_reconcile_publishes_supported_and_clears_unsupported() {

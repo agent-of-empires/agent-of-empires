@@ -2078,8 +2078,15 @@ impl Instance {
         }
         // Park the outgoing agent's conversation under its own name so a swap
         // back to it resumes there instead of starting a third conversation.
+        let retained_agent_session_id = self.agent_session_id.take();
+        let inert_pinned_sid = (!self.supports_terminal_resume())
+            .then(|| match &self.resume_intent {
+                ResumeIntent::Use(sid) => Some(sid.clone()),
+                _ => None,
+            })
+            .flatten();
         let outgoing = PriorToolSession {
-            agent_session_id: self.agent_session_id.take(),
+            agent_session_id: inert_pinned_sid.or(retained_agent_session_id),
             acp_session_id: self.acp_session_id.take(),
         };
         if !outgoing.is_empty() {
@@ -4525,7 +4532,7 @@ impl Instance {
             prepared.expected_prior_sid.as_deref(),
             prepared.expected_prior_intent,
             omp_capture_metadata,
-        );
+        )?;
 
         Ok(launch_sid_outcome)
     }
@@ -5045,7 +5052,7 @@ impl Instance {
         expected_prior_sid: Option<&str>,
         expected_prior_intent: ResumeIntent,
         mut omp_capture_metadata: Option<OmpCaptureMetadata>,
-    ) {
+    ) -> Result<()> {
         if let Some(metadata) = omp_capture_metadata.as_ref() {
             let published = serde_json::to_string(metadata).ok().and_then(|encoded| {
                 crate::tmux::env::set_hidden_env(
@@ -5071,17 +5078,8 @@ impl Instance {
         // Re-read durable rows under the ownership lock before touching tmux.
         // This keeps a stale launcher from publishing after a tool swap or delete.
         if !matches!(outcome, SidPersistOutcome::Skip) {
-            if let Err(error) =
-                crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env()
-            {
-                tracing::warn!(
-                    target: "session.store",
-                    instance = %self.id,
-                    "Failed to reconcile tmux ownership after launch: {error}"
-                );
-            }
+            crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env()?;
         }
-
         self.maybe_start_poller_since(omp_capture_metadata);
 
         self.status = Status::Starting;
@@ -5119,6 +5117,7 @@ impl Instance {
                 );
             }
         }
+        Ok(())
     }
 
     /// Publish the capture plan's generation, or mint a tombstone generation
@@ -11766,6 +11765,17 @@ mod tests {
             "a restored entry is consumed, so a later swap cannot resurrect it"
         );
 
+        let mut inert = Instance::new("Inert", "/tmp/inert");
+        inert.tool = "qwen".to_string();
+        inert.resume_intent = ResumeIntent::Use("qwen-pinned-session".to_string());
+        inert.swap_tool("claude");
+        inert.swap_tool("qwen");
+        assert_eq!(
+            inert.agent_session_id.as_deref(),
+            Some("qwen-pinned-session"),
+            "an unsupported pin must survive a round-trip tool swap"
+        );
+
         // Same-tool call is a no-op: the caller applies the swap to the disk row
         // and the in-memory row independently, and the second must not re-park.
         inst.swap_tool("claude");
@@ -17210,6 +17220,29 @@ mod tests {
 
         #[test]
         #[serial]
+        fn finalize_launch_propagates_ownership_reconcile_failure() {
+            if skip_if_no_tmux() {
+                return;
+            }
+            let temp = tempdir().unwrap();
+            isolate_home(&temp);
+
+            let profile = "publish-failure";
+            let mut inst = make_inst(profile, "publish-failure");
+            seed_disk_row(profile, &inst);
+            let corrupt = crate::session::Storage::new_unwatched("corrupt-profile").unwrap();
+            std::fs::write(corrupt.sessions_path(), b"not json").unwrap();
+            let tmux = TmuxSession::create(&inst.id, &inst.title);
+            inst.agent_session_id = Some(VALID_SID.to_string());
+
+            let error = inst
+                .finalize_launch(tmux.name(), profile, None, ResumeIntent::Default, None)
+                .unwrap_err();
+            assert!(error.to_string().contains("corrupt-profile"), "{error:#}");
+        }
+
+        #[test]
+        #[serial]
         fn finalize_publish_applied_writes_omp_metadata() {
             if skip_if_no_tmux() {
                 return;
@@ -17253,7 +17286,8 @@ mod tests {
                     routing_fingerprint: plan.routing_fingerprint.clone(),
                     container_runtime: plan.container_runtime,
                 }),
-            );
+            )
+            .unwrap();
 
             assert_eq!(captured_env(tmux.name()).as_deref(), Some(VALID_SID));
             let metadata: crate::session::capture::OmpCaptureMetadata = serde_json::from_str(
@@ -17400,7 +17434,8 @@ mod tests {
                     expected_prior_sid.as_deref(),
                     ResumeIntent::Default,
                     None,
-                );
+                )
+                .unwrap();
 
                 assert_eq!(
                     captured_env(tmux.name()).as_deref(),
@@ -17443,7 +17478,8 @@ mod tests {
                 Some("stale"),
                 ResumeIntent::Default,
                 None,
-            );
+            )
+            .unwrap();
 
             assert_eq!(inst.agent_session_id.as_deref(), Some(PEER_SID));
             assert_eq!(captured_env(tmux.name()).as_deref(), Some(PEER_SID));
@@ -17478,7 +17514,8 @@ mod tests {
                 Some("stale"),
                 ResumeIntent::Default,
                 None,
-            );
+            )
+            .unwrap();
 
             assert!(inst.agent_session_id.is_none());
             assert!(captured_env(tmux.name()).is_none());
@@ -17506,7 +17543,8 @@ mod tests {
             .unwrap();
 
             inst.agent_session_id = Some(VALID_SID.to_string());
-            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Default, None);
+            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Default, None)
+                .unwrap();
 
             assert_eq!(
                 captured_env(tmux.name()).as_deref(),
@@ -17542,7 +17580,8 @@ mod tests {
             .unwrap();
 
             inst.agent_session_id = Some("bad sid!".to_string());
-            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Default, None);
+            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Default, None)
+                .unwrap();
 
             assert_eq!(
                 captured_env(tmux.name()).as_deref(),
@@ -17568,7 +17607,8 @@ mod tests {
             let tmux = TmuxSession::create(&inst.id, &inst.title);
 
             inst.agent_session_id = Some(VALID_SID.to_string());
-            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Cleared, None);
+            inst.finalize_launch(tmux.name(), profile, None, ResumeIntent::Cleared, None)
+                .unwrap();
 
             assert_eq!(inst.agent_session_id.as_deref(), Some(VALID_SID));
             assert_eq!(inst.resume_intent, ResumeIntent::Default);

@@ -301,10 +301,12 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
                 )?;
             let orphan_ids: HashSet<String> =
                 orphaned_sessions.iter().map(|o| o.id.clone()).collect();
-            if let Err(delete_error) = storage.update(|all_instances, _groups| {
-                all_instances.retain(|inst| !orphan_ids.contains(&inst.id));
-                Ok(())
-            }) {
+            if let Err(delete_error) =
+                storage.update_with_tmux_ownership_lock(|all_instances, _groups| {
+                    all_instances.retain(|inst| !orphan_ids.contains(&inst.id));
+                    Ok(())
+                })
+            {
                 if let Err(restore_error) =
                     crate::session::sync::restore_tmux_session_id_ownership_locked(&cleared)
                 {

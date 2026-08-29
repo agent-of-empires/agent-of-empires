@@ -1,7 +1,9 @@
 //! Session storage - JSON file persistence with in-process and cross-process
 //! locking.
 //!
-//! `Storage` serialises read-modify-write cycles via two layers:
+//! Storage serialises read-modify-write cycles with an app-global ownership
+//! flock around the two per-profile layers below. The outer lock prevents a
+//! tmux ownership reconciliation from racing a durable tool or session-ID write.
 //!
 //! 1. **In-process per-profile mutex** (one `Arc<Mutex<()>>` per profile name,
 //!    registered process-wide). Performance + observability layer, not a
@@ -44,10 +46,10 @@
 //! source profile's per-instance lifecycle flock before any profile Storage
 //! mutex/flock: session title -> lifecycle -> Storage.
 //!
-//! All mutation goes through `update` (load -> mutate -> save under both
-//! locks). `save_workspace_ordering` is private and only consumed by
-//! `update_workspace_ordering` internally; the per-profile `save` /
-//! `save_groups` helpers were removed entirely. This keeps it structurally
+//! All profile mutation goes through Storage::update (ownership flock, then
+//! load, mutate, and save under the per-profile locks). save_workspace_ordering
+//! is private and only consumed by update_workspace_ordering internally; the
+//! per-profile save helpers were removed entirely. This keeps it structurally
 //! impossible to bypass the locks.
 //!
 //! Lock-ordering rule across the process: a mutation that can change or create
@@ -1006,9 +1008,18 @@ impl Storage {
     /// `rename(2)` syscalls on sibling files and is tolerated by the
     /// loader (`GroupTree` accepts orphan group rows).
     ///
-    /// This is the only public mutator entry point; all writes funnel
-    /// through here so both lock layers are always taken.
+    /// This is the only public mutator entry point; all writes funnel through
+    /// here so the ownership, process-local, and per-profile locks are taken.
     pub fn update<F, R>(&self, f: F) -> Result<R>
+    where
+        F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
+    {
+        let _ownership = acquire_tmux_ownership_lock()?;
+        self.update_with_tmux_ownership_lock(f)
+    }
+
+    /// Update while the caller already holds the app-global ownership lock.
+    pub(crate) fn update_with_tmux_ownership_lock<F, R>(&self, f: F) -> Result<R>
     where
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
@@ -1078,6 +1089,7 @@ impl Storage {
         F: FnOnce(&[Instance], &Instance) -> Result<()>,
         B: FnOnce(&Instance) -> Result<()>,
     {
+        let _ownership = acquire_tmux_ownership_lock()?;
         let changes = [(before.clone(), after.clone())];
         let group_move = GroupMovePlan::single(&before.group_path, &after.group_path);
         let mut moved = self.move_instances_to_inner(
@@ -1111,6 +1123,7 @@ impl Storage {
     where
         F: FnOnce(&[Instance], &[Instance]) -> Result<()>,
     {
+        let _ownership = acquire_tmux_ownership_lock()?;
         self.move_instances_to_inner(
             target,
             changes,
@@ -3473,6 +3486,26 @@ mod tests {
             *g = GroupTree::new_with_groups(&[], &[]).get_all_groups();
             Ok(())
         })?;
+
+        let ownership = acquire_tmux_ownership_lock()?;
+        let (updated_tx, updated_rx) = std::sync::mpsc::channel();
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let peer = Storage::new_unwatched("test-update-concurrent").unwrap();
+                peer.update(|_, _| Ok(())).unwrap();
+                updated_tx.send(()).unwrap();
+            });
+            assert!(
+                updated_rx
+                    .recv_timeout(std::time::Duration::from_millis(100))
+                    .is_err(),
+                "a durable writer must wait for ownership reconciliation"
+            );
+            drop(ownership);
+            updated_rx
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap();
+        });
 
         let n_threads = 32usize;
         std::thread::scope(|scope| {
