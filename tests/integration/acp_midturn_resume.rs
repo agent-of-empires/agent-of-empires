@@ -25,8 +25,10 @@ use std::time::{Duration, Instant};
 
 use agent_of_empires::acp::acp_client::AcpClient;
 use agent_of_empires::acp::state::{AcpSessionId, Event};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::UnixListener;
 use tokio::process::Command;
+use tokio::sync::oneshot;
 
 use crate::common::{shim_path, shim_ready};
 
@@ -86,6 +88,91 @@ async fn spawn_shim_socket_bridge_with_preseed(
 
 async fn spawn_shim_socket_bridge() -> (PathBuf, tempfile::TempDir) {
     spawn_shim_socket_bridge_with_preseed(None).await
+}
+
+async fn write_control_frame(stream: &mut tokio::net::UnixStream, body: serde_json::Value) {
+    let body = serde_json::to_vec(&body).unwrap();
+    stream
+        .write_all(&(body.len() as u32).to_be_bytes())
+        .await
+        .unwrap();
+    stream.write_all(&body).await.unwrap();
+}
+
+async fn read_control_frame(stream: &mut tokio::net::UnixStream) -> Option<serde_json::Value> {
+    let mut len = [0u8; 4];
+    match stream.read_exact(&mut len).await {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return None,
+        Err(e) => panic!("read control frame length: {e}"),
+    }
+    let mut body = vec![0u8; u32::from_be_bytes(len) as usize];
+    stream.read_exact(&mut body).await.unwrap();
+    Some(serde_json::from_slice(&body).unwrap())
+}
+
+/// A minimal v2 runner that completes the control handshake, waits for a
+/// prompt, then closes only its relay write half. Its relay read half stays
+/// open until the daemon closes the paired control connection.
+async fn spawn_half_closing_v2_runner() -> (PathBuf, tempfile::TempDir, oneshot::Receiver<()>) {
+    let temp = tempfile::tempdir().unwrap();
+    let socket_path = temp.path().join("runner.sock");
+    let control_path = agent_of_empires::process::worker::control_socket_sibling(&socket_path);
+    let relay_listener = UnixListener::bind(&socket_path).unwrap();
+    let control_listener = UnixListener::bind(&control_path).unwrap();
+    let (control_closed_tx, control_closed_rx) = oneshot::channel();
+
+    tokio::spawn(async move {
+        let (relay, _) = relay_listener.accept().await.unwrap();
+        let (relay_read, relay_write) = relay.into_split();
+        let (mut control, _) = control_listener.accept().await.unwrap();
+
+        write_control_frame(
+            &mut control,
+            serde_json::json!({
+                "kind": "hello",
+                "control_protocol_version": 2,
+                "session_id": "half-close-client"
+            }),
+        )
+        .await;
+        assert_eq!(
+            read_control_frame(&mut control).await.unwrap()["kind"],
+            "attach"
+        );
+        assert_eq!(
+            read_control_frame(&mut control).await.unwrap()["kind"],
+            "initialize"
+        );
+        write_control_frame(
+            &mut control,
+            serde_json::json!({
+                "kind": "initialized",
+                "result": {
+                    "protocolVersion": 1,
+                    "agentCapabilities": {
+                        "loadSession": false,
+                        "promptCapabilities": {}
+                    }
+                }
+            }),
+        )
+        .await;
+
+        assert_eq!(
+            read_control_frame(&mut control).await.unwrap()["kind"],
+            "prompt"
+        );
+        drop(relay_write);
+        let _relay_read_stays_open = relay_read;
+        assert!(
+            read_control_frame(&mut control).await.is_none(),
+            "daemon must close the paired control connection on relay EOF"
+        );
+        let _ = control_closed_tx.send(());
+    });
+
+    (socket_path, temp, control_closed_rx)
 }
 
 /// Variant for the watchdog-disarm test: preseeds `session_id` AND tells
@@ -331,4 +418,37 @@ async fn socket_transport_round_trips_prompt_via_attach() {
         "shim should echo received: hello over socket via the socket transport"
     );
     assert!(saw_stopped, "shim should emit Stopped at end of turn");
+}
+
+#[tokio::test]
+async fn incoming_half_close_ends_v2_connection_task() {
+    let (socket_path, _tmp, control_closed) = spawn_half_closing_v2_runner().await;
+    let mut client = AcpClient::attach(
+        socket_path,
+        std::env::temp_dir(),
+        vec![],
+        "established-session".into(),
+        false,
+        AcpSessionId("half-close-client".into()),
+        None,
+        "fake-agent".into(),
+        None,
+    )
+    .await
+    .expect("attach to v2 runner");
+
+    client
+        .send_prompt("hold the prompt open", &[])
+        .await
+        .expect("send prompt");
+
+    tokio::time::timeout(Duration::from_secs(5), control_closed)
+        .await
+        .expect("paired control connection stayed open")
+        .expect("control observer dropped");
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while client.next_event().await.is_some() {}
+    })
+    .await
+    .expect("AcpClient event channel stayed open after relay EOF");
 }

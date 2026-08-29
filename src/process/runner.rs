@@ -712,6 +712,10 @@ struct RunnerShared {
     /// gap (buffer it for the next control attach). Set/cleared alongside
     /// `active_outbound`.
     main_attached: std::sync::atomic::AtomicBool,
+    /// Advances when the active daemon's relay write half fails. The
+    /// connection reader watches this so a daemon that keeps only its write
+    /// half open cannot pin the sequential accept loop.
+    relay_failures: watch::Sender<u64>,
     /// Runner-owned ACP handshake cache (#2976 Phase B). Populated the
     /// first time a v2 daemon drives `initialize` / `session/new|load|fork`
     /// through the control channel; replayed verbatim on every later
@@ -859,6 +863,7 @@ impl RunnerShared {
             prompt_requests: Mutex::new(HashSet::new()),
             control: Mutex::new(ControlChannel::default()),
             main_attached: std::sync::atomic::AtomicBool::new(false),
+            relay_failures: watch::channel(0).0,
             handshake: Mutex::new(RunnerHandshake::default()),
             next_req_id: AtomicI64::new(RUNNER_REQUEST_ID_BASE),
             pending_client_responses: Mutex::new(HashMap::new()),
@@ -912,17 +917,22 @@ impl RunnerShared {
         // session does not JSON-parse every agent line twice (this on top
         // of `note_daemon_response`). Independent of the byte-relay
         // outbound below, since the control channel is a separate socket.
-        if !self.prompt_requests.lock().await.is_empty() {
+        let prompt_completed = if !self.prompt_requests.lock().await.is_empty() {
             if let Some((id, outcome)) = parse_response(line) {
                 if self.prompt_requests.lock().await.remove(&id) {
-                    self.emit_control(ControlBody::PromptCompleted {
+                    Some(ControlBody::PromptCompleted {
                         prompt_req_id: id,
                         outcome,
                     })
-                    .await;
+                } else {
+                    None
                 }
+            } else {
+                None
             }
-        }
+        } else {
+            None
+        };
 
         // #2979: refresh the cached handshake session when this line answers
         // a daemon-driven relay `session/new` (conversation reset). Gated on
@@ -933,11 +943,21 @@ impl RunnerShared {
         let mut guard = self.active_outbound.lock().await;
         if let Some(out) = guard.as_mut() {
             if out.write_all(line).await.is_ok() && out.flush().await.is_ok() {
+                drop(guard);
+                if let Some(body) = prompt_completed {
+                    self.emit_control(body).await;
+                }
                 return true;
             }
             // Write failure: daemon side closed. Drop the writer and
-            // buffer this line for the next attach.
+            // buffer this line for the next attach. Advance the failure
+            // signal while holding `active_outbound` so the reader cannot
+            // observe a half-updated attachment state.
             *guard = None;
+            self.main_attached
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            self.relay_failures
+                .send_modify(|generation| *generation = generation.wrapping_add(1));
         }
         // Buffer while STILL holding `active_outbound`. Dropping it before
         // locking `pending` opens a TOCTOU window: a reattaching
@@ -951,6 +971,11 @@ impl RunnerShared {
             pending.pop_front();
         }
         pending.push_back(line.to_vec());
+        drop(pending);
+        drop(guard);
+        if let Some(body) = prompt_completed {
+            self.emit_control(body).await;
+        }
         false
     }
 
@@ -1063,7 +1088,7 @@ impl RunnerShared {
     async fn install_outbound(
         &self,
         mut out: tokio::net::unix::OwnedWriteHalf,
-    ) -> Option<tokio::net::unix::OwnedWriteHalf> {
+    ) -> Result<Option<tokio::net::unix::OwnedWriteHalf>, ()> {
         // Hold `active_outbound` across the whole drain + install so a
         // concurrent `deliver_line` (which locks `active_outbound` first,
         // sees None, then buffers into `pending`) cannot slip a line into
@@ -1080,24 +1105,30 @@ impl RunnerShared {
                 // stays None (via the earlier take), matching the old
                 // behavior of leaving no live writer on a failed attach.
                 pending.push_front(line);
-                return None;
+                self.main_attached
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                self.relay_failures
+                    .send_modify(|generation| *generation = generation.wrapping_add(1));
+                return Err(());
             }
         }
         drop(pending);
         *guard = Some(out);
         self.main_attached
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        prev
+        Ok(prev)
     }
 
-    async fn clear_outbound(&self) {
+    async fn clear_outbound(&self, preserve_completion: bool) {
         *self.active_outbound.lock().await = None;
         self.main_attached
             .store(false, std::sync::atomic::Ordering::Relaxed);
         // A main-relay disconnect starts a no-daemon gap. Drop any
         // completion left un-drained from a prior gap so only the current
         // gap's completion is ever replayed to the next resuming daemon.
-        self.control.lock().await.pending = None;
+        if !preserve_completion {
+            self.control.lock().await.pending = None;
+        }
     }
 
     /// Peek a daemon to agent line: if it is a `session/prompt` request,
@@ -1666,7 +1697,18 @@ async fn handle_connection(
     session_id: String,
 ) {
     let (read_half, write_half) = stream.into_split();
-    let prev = shared.install_outbound(write_half).await;
+    let mut relay_failures = shared.relay_failures.subscribe();
+    let relay_generation = *relay_failures.borrow_and_update();
+    let prev = match shared.install_outbound(write_half).await {
+        Ok(prev) => prev,
+        Err(()) => {
+            shared
+                .cancel_outstanding_requests(&agent_stdin, &session_id)
+                .await;
+            shared.clear_outbound(true).await;
+            return;
+        }
+    };
     if prev.is_some() {
         debug!(
             target: "acp.runner",
@@ -1677,8 +1719,18 @@ async fn handle_connection(
 
     let mut reader = BufReader::with_capacity(STDOUT_READ_BUF, read_half);
     let mut line = Vec::with_capacity(4096);
+    let mut relay_failed = false;
     loop {
-        match read_frame_bounded(&mut reader, &mut line).await {
+        let read = tokio::select! {
+            changed = relay_failures.changed() => {
+                if changed.is_ok() {
+                    relay_failed = true;
+                }
+                break;
+            }
+            read = read_frame_bounded(&mut reader, &mut line) => read,
+        };
+        match read {
             Ok(0) => break, // EOF: daemon closed the connection.
             Ok(_) => {
                 // #2976: once the runner owns the session, answer a relay
@@ -1719,7 +1771,8 @@ async fn handle_connection(
     shared
         .cancel_outstanding_requests(&agent_stdin, &session_id)
         .await;
-    shared.clear_outbound().await;
+    relay_failed |= *relay_failures.borrow() != relay_generation;
+    shared.clear_outbound(relay_failed).await;
 }
 
 enum ControlRead {
@@ -2419,6 +2472,38 @@ mod tests {
         assert!(
             shared.control.lock().await.pending.is_none(),
             "a live main-relay daemon owns the completion; nothing should buffer"
+        );
+    }
+
+    #[tokio::test]
+    async fn prompt_completion_survives_main_relay_write_failure() {
+        use std::sync::atomic::Ordering;
+
+        let shared = RunnerShared::new();
+        let (peer, ours) = tokio::net::UnixStream::pair().unwrap();
+        drop(peer);
+        let (_read, write) = ours.into_split();
+        *shared.active_outbound.lock().await = Some(write);
+        shared.main_attached.store(true, Ordering::Relaxed);
+
+        shared
+            .note_prompt_request(
+                br#"{"jsonrpc":"2.0","id":9,"method":"session/prompt","params":{}}"#,
+            )
+            .await;
+        let response = br#"{"jsonrpc":"2.0","id":9,"result":{"stopReason":"end_turn"}}
+"#;
+        assert!(!shared.deliver_line(response).await);
+
+        assert!(!shared.main_attached.load(Ordering::Relaxed));
+        assert_eq!(
+            shared.control.lock().await.pending,
+            Some(ControlBody::PromptCompleted {
+                prompt_req_id: 9,
+                outcome: PromptOutcome::Completed {
+                    stop_reason: Some("end_turn".into()),
+                },
+            })
         );
     }
 

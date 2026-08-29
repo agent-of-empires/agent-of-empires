@@ -340,10 +340,17 @@ pub(super) async fn run_connection_task<W, R>(
     // new turn that legitimately reuses the prior turn's trailing text under a
     // fresh message_id would be misclassified as a restatement. See #2281.
     let agent_msg_dedup_for_block = agent_msg_dedup.clone();
+    let control_on_close = control_client.clone();
 
     let result = Client
         .builder()
         .name("aoe-acp")
+        .on_close(move |_connection| async move {
+            if let Some(control) = control_on_close {
+                control.shutdown();
+            }
+            Err(acp_internal_error("agent transport closed".into()))
+        })
         .on_receive_notification(
             move |notification: SessionNotification, _cx| {
                 let event_tx = event_tx_for_notif.clone();

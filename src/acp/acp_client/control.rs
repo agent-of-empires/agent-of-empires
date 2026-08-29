@@ -20,8 +20,7 @@ pub(super) struct ShutdownControlOnDrop(pub(super) Option<Arc<DaemonControlClien
 impl Drop for ShutdownControlOnDrop {
     fn drop(&mut self) {
         if let Some(control) = self.0.take() {
-            // SAFETY: `control` keeps this exact socket alive for the call.
-            unsafe { libc::shutdown(control.raw_fd, libc::SHUT_RDWR) };
+            control.shutdown();
         }
     }
 }
@@ -45,6 +44,11 @@ pub(super) struct DaemonControlClient {
 }
 
 impl DaemonControlClient {
+    pub(super) fn shutdown(&self) {
+        // SAFETY: `self` keeps this exact socket alive for the call.
+        unsafe { libc::shutdown(self.raw_fd, libc::SHUT_RDWR) };
+    }
+
     async fn send(&self, body: ControlBody) -> Result<(), AcpError> {
         let mut w = self.write.lock().await;
         control_protocol::write_frame(&mut *w, &body)
