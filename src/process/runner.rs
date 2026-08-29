@@ -1722,6 +1722,7 @@ async fn handle_connection(
     let mut relay_failed = false;
     loop {
         let read = tokio::select! {
+            biased;
             changed = relay_failures.changed() => {
                 if changed.is_ok() {
                     relay_failed = true;
@@ -2504,6 +2505,61 @@ mod tests {
                     stop_reason: Some("end_turn".into()),
                 },
             })
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_failure_preempts_ready_stale_daemon_frame() {
+        use tokio::io::AsyncReadExt;
+
+        let mut child = Command::new("sh")
+            .arg("-c")
+            .arg("cat")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .expect("spawn agent stdin fixture");
+        let agent_stdin = Arc::new(Mutex::new(child.stdin.take().expect("agent stdin")));
+        let mut agent_stdout = child.stdout.take().expect("agent stdout");
+        let shared = Arc::new(RunnerShared::new());
+        let (daemon, runner) = UnixStream::pair().expect("relay socket pair");
+        let handler = tokio::spawn(handle_connection(
+            runner,
+            Arc::clone(&shared),
+            Arc::clone(&agent_stdin),
+            "fixture-session".into(),
+        ));
+
+        tokio::task::yield_now().await;
+        assert!(shared.main_attached.load(Ordering::Relaxed));
+
+        // Mirror relay write failure state, then make the failure notification
+        // and a stale inbound frame ready without yielding to the handler.
+        drop(shared.active_outbound.lock().await.take());
+        shared.main_attached.store(false, Ordering::Relaxed);
+        shared
+            .relay_failures
+            .send_modify(|generation| *generation = generation.wrapping_add(1));
+        let stale = b"stale daemon frame\n";
+        assert_eq!(
+            daemon.try_write(stale).expect("queue stale frame"),
+            stale.len()
+        );
+
+        handler.await.expect("connection handler");
+        drop(daemon);
+        let agent_stdin =
+            Arc::try_unwrap(agent_stdin).unwrap_or_else(|_| panic!("handler retained agent stdin"));
+        drop(agent_stdin.into_inner());
+        let mut forwarded = Vec::new();
+        agent_stdout
+            .read_to_end(&mut forwarded)
+            .await
+            .expect("read agent fixture output");
+        child.wait().await.expect("agent fixture exits");
+        assert!(
+            forwarded.is_empty(),
+            "relay failure must prevent stale daemon input from reaching agent stdin"
         );
     }
 
