@@ -121,25 +121,25 @@ fn launch_kiro_and_read_command(
     };
     // `wait_until_consumed` returns once the pane `rm`s the env file, which is
     // BEFORE it execs kiro-cli, so poll for the stub to record its argv.
-    let cmd = wait_for_recorded_argv(&argv_file);
+    let cmd = wait_for_recorded_argv(&argv_file, "kiro-cli chat");
     (cmd, guard)
 }
 
 /// Poll (up to 10s) for the recording stub to write the argv the launch ran it
 /// with. Returns the recorded command line.
-fn wait_for_recorded_argv(path: &std::path::Path) -> String {
+fn wait_for_recorded_argv(path: &std::path::Path, expected: &str) -> String {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         if let Ok(content) = std::fs::read_to_string(path) {
             // Hook installation invokes the same stub with "agent set-default"
             // before the pane launches. Wait for the interactive invocation.
-            if content.contains("kiro-cli chat") {
+            if content.contains(expected) {
                 return content.trim().to_string();
             }
         }
         if std::time::Instant::now() >= deadline {
             panic!(
-                "kiro-cli stub never recorded its argv at {} (launch did not exec it)",
+                "agent stub never recorded {expected:?} at {} (launch did not exec it)",
                 path.display()
             );
         }
@@ -147,6 +147,128 @@ fn wait_for_recorded_argv(path: &std::path::Path) -> String {
     }
 }
 
+#[test]
+#[parallel]
+fn test_qwen_and_kiro_stored_ids_stay_inert_on_cli_start() {
+    require_tmux!();
+
+    const STORED_SID: &str = "019342ab-1234-7def-8901-111111111111";
+    const PINNED_SID: &str = "019342ab-1234-7def-8901-222222222222";
+    let cases = [
+        ("qwen_inert_ids", "QwenInertIds", "qwen", "qwen", "qwen"),
+        (
+            "kiro_inert_ids",
+            "KiroInertIds",
+            "kiro",
+            "kiro-cli",
+            "kiro-cli chat",
+        ),
+    ];
+
+    for (harness_name, title, tool, binary, expected_argv) in cases {
+        let mut h = TuiTestHarness::new(harness_name);
+        let argv_file = h.install_recording_path_command(binary);
+        let project = h.project_path();
+        let add = h.run_cli(&[
+            "add",
+            project.to_str().unwrap(),
+            "-t",
+            title,
+            "--tool",
+            tool,
+        ]);
+        assert!(
+            add.status.success(),
+            "{tool} add failed: {}",
+            String::from_utf8_lossy(&add.stderr)
+        );
+
+        let sessions_path =
+            crate::harness::app_dir_in(h.home_path()).join("profiles/default/sessions.json");
+        let mut sessions: Value = serde_json::from_str(
+            &std::fs::read_to_string(&sessions_path).expect("read sessions before launch"),
+        )
+        .expect("parse sessions before launch");
+        let row = sessions
+            .as_array_mut()
+            .and_then(|rows| rows.iter_mut().find(|row| row["title"] == title))
+            .expect("find unsupported session row");
+        let instance_id = row["id"].as_str().expect("session id").to_string();
+        row["agent_session_id"] = Value::String(STORED_SID.to_string());
+        row["resume_intent"] = serde_json::json!({ "kind": "Use", "value": PINNED_SID });
+        std::fs::write(
+            &sessions_path,
+            serde_json::to_vec_pretty(&sessions).expect("serialize seeded sessions"),
+        )
+        .expect("seed stored session IDs");
+
+        let socket = h.home_path().join("tmux.sock");
+        let tmux_name = launched_tmux_name(&h, title);
+        let _guard = TmuxSessionGuard {
+            socket: socket.clone(),
+            name: tmux_name.clone(),
+        };
+        for attempt in ["initial start", "stopped relaunch"] {
+            if attempt != "initial start" {
+                let stop = h.run_cli(&["session", "stop", title]);
+                assert!(stop.status.success(), "{tool} stop failed");
+            }
+            let _ = std::fs::remove_file(&argv_file);
+            let start = h.run_cli(&["session", "start", title]);
+            assert!(
+                start.status.success(),
+                "{tool} {attempt} failed: {}",
+                String::from_utf8_lossy(&start.stderr)
+            );
+            let owner = Command::new("tmux")
+                .arg("-S")
+                .arg(&socket)
+                .args([
+                    "show-environment",
+                    "-h",
+                    "-t",
+                    &tmux_name,
+                    "AOE_INSTANCE_ID",
+                ])
+                .output()
+                .expect("read hidden owner");
+            assert!(owner.status.success(), "{tool} owner read failed");
+            assert_eq!(
+                String::from_utf8_lossy(&owner.stdout).trim(),
+                format!("AOE_INSTANCE_ID={instance_id}"),
+                "{tool} agent pane must carry its full owner ID"
+            );
+            let argv = wait_for_recorded_argv(&argv_file, expected_argv);
+            for forbidden in [
+                STORED_SID,
+                PINNED_SID,
+                "--resume",
+                "--resume-id",
+                "--session-id",
+            ] {
+                assert!(
+                    !argv.contains(forbidden),
+                    "{tool} {attempt} operationalized stored state via {forbidden:?}: {argv:?}"
+                );
+            }
+        }
+
+        let sessions: Value = serde_json::from_str(
+            &std::fs::read_to_string(&sessions_path).expect("read sessions after launch"),
+        )
+        .expect("parse sessions after launch");
+        let row = sessions
+            .as_array()
+            .and_then(|rows| rows.iter().find(|row| row["title"] == title))
+            .expect("find relaunched unsupported session row");
+        assert_eq!(row["agent_session_id"].as_str(), Some(STORED_SID), "{tool}");
+        assert_eq!(
+            row["resume_intent"]["value"].as_str(),
+            Some(PINNED_SID),
+            "{tool}"
+        );
+    }
+}
 #[test]
 #[parallel]
 fn test_kiro_launches_via_chat_subcommand() {

@@ -443,15 +443,18 @@ impl HomeView {
             }
         }
 
+        let tool_swap_requested =
+            new_tool.is_some_and(|target| target != restart_edit_baseline.tool.as_str());
         // Identity-changing restart edits follow the global order: app-wide
         // identity, then the session title and authoritative source lifecycle.
-        // Keep these guards through the complete durable profile transaction.
+        // Profile moves and same-profile tool swaps keep the per-session guards
+        // through the durable edit and save so another TUI cannot interleave.
         let profile_move_identity = if profile_move_target.is_some() {
             Some(acquire_session_identity_lock()?)
         } else {
             None
         };
-        let profile_move_guards = if profile_move_target.is_some() {
+        let restart_edit_guards = if profile_move_target.is_some() || tool_swap_requested {
             Some(self.lock_session_mutation_and_reload(&id)?)
         } else {
             None
@@ -549,7 +552,7 @@ impl HomeView {
         // Publish the final launch edit while identity/title/lifecycle remain
         // guarded, then drop identity before releasing the per-session guards.
         drop(profile_move_identity);
-        drop(profile_move_guards);
+        drop(restart_edit_guards);
 
         // The start cascade shells out to docker (image pull, container
         // create/start) and runs the before_start host hook, any of which can

@@ -2832,7 +2832,7 @@ fn managed_claude_session_ids(
                 .acp_session_id
                 .as_deref()
                 .into_iter()
-                .chain(instance.operational_agent_session_id())
+                .chain(instance.reserved_agent_session_ids())
         })
         .map(str::to_owned)
         .collect()

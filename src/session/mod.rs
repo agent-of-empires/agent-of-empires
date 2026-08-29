@@ -630,24 +630,11 @@ pub fn delete_profile(name: &str) -> Result<()> {
     }
 
     sync::with_tmux_ownership_lock(|| {
-        let target_instances =
-            storage::Storage::open_unwatched(name).and_then(|store| store.load_strict());
-        let survivor_ids = sync::instance_ids_excluding_profile(name);
-        match (target_instances, survivor_ids) {
-            (Ok(mut target_instances), Ok(survivor_ids)) => {
-                target_instances.retain(|instance| !survivor_ids.contains(&instance.id));
-                sync::clear_tmux_session_id_ownership_for_instances_locked(&target_instances)?;
-            }
-            (target, survivors) => {
-                tracing::warn!(
-                    target: "session.store",
-                    profile = name,
-                    target_readable = target.is_ok(),
-                    survivors_readable = survivors.is_ok(),
-                    "Deleting profile without pre-clearing ambiguous tmux ownership"
-                );
-            }
-        }
+        let mut target_instances =
+            storage::Storage::open_unwatched(name).and_then(|store| store.load_strict())?;
+        let survivor_ids = sync::instance_ids_excluding_profile(name)?;
+        target_instances.retain(|instance| !survivor_ids.contains(&instance.id));
+        sync::clear_tmux_session_id_ownership_for_instances_locked(&target_instances)?;
         if let Err(delete_error) = fs::remove_dir_all(&profile_dir) {
             if let Err(reconcile_error) =
                 sync::reconcile_all_profiles_tmux_session_id_ownership_env_locked()
@@ -1447,34 +1434,33 @@ mod tests {
     #[test]
     #[serial_test::serial]
     fn test_delete_profile_named_default_allowed_when_others_exist() {
-        // A profile literally named "default" carries no protection once
-        // other profiles exist; only the count invariant applies.
         let temp = isolate_app_dir();
         let dir = app_dir(&temp);
         fs::create_dir_all(dir.join("profiles").join("default")).unwrap();
         fs::create_dir_all(dir.join("profiles").join("work")).unwrap();
 
-        let corrupt_a = dir.join("profiles").join("corrupt-a");
-        let corrupt_b = dir.join("profiles").join("corrupt-b");
-        for path in [&corrupt_a, &corrupt_b] {
-            fs::create_dir_all(path).unwrap();
-            fs::write(path.join("sessions.json"), b"not json").unwrap();
-        }
-        delete_profile("corrupt-a").expect("another unreadable profile must not block deletion");
-        assert!(!corrupt_a.exists());
-        assert!(corrupt_b.exists());
         delete_profile("default").expect("a non-last profile named default is deletable");
         assert!(!dir.join("profiles").join("default").exists());
         assert!(dir.join("profiles").join("work").exists());
-
-        let corrupt = dir.join("profiles").join("corrupt");
-        fs::create_dir_all(&corrupt).unwrap();
-        fs::write(corrupt.join("sessions.json"), b"not json").unwrap();
-        delete_profile("corrupt").expect("the target profile need not be readable");
-        assert!(!corrupt.exists());
-        assert!(dir.join("profiles").join("work").exists());
     }
 
+    #[test]
+    #[serial_test::serial]
+    fn test_delete_profile_preserves_unclassifiable_ownership() {
+        let temp = isolate_app_dir();
+        let dir = app_dir(&temp);
+        let work = dir.join("profiles").join("work");
+        let corrupt = dir.join("profiles").join("corrupt");
+        fs::create_dir_all(&work).unwrap();
+        fs::create_dir_all(&corrupt).unwrap();
+        fs::write(corrupt.join("sessions.json"), b"not json").unwrap();
+
+        delete_profile("corrupt").expect_err("an unreadable target must remain intact");
+        assert!(corrupt.exists());
+
+        delete_profile("work").expect_err("an unreadable survivor must block deletion");
+        assert!(work.exists());
+    }
     #[test]
     #[serial_test::serial]
     fn test_delete_profile_rejects_path_traversal() {

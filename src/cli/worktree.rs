@@ -304,18 +304,12 @@ async fn cleanup_orphaned(profile: &str, force: bool) -> Result<()> {
                 .into_iter()
                 .filter(|instance| orphan_ids.contains(&instance.id))
                 .collect();
-            let cleared = match crate::session::sync::instance_ids_excluding_profile(profile) {
-                Ok(survivor_ids) => {
-                    authoritative.retain(|instance| !survivor_ids.contains(&instance.id));
-                    crate::session::sync::clear_tmux_session_id_ownership_for_instances_locked(
-                        &authoritative,
-                    )?
-                }
-                Err(error) => {
-                    tracing::warn!(target: "session.store", profile, "Removing orphaned rows without pre-clearing ambiguous tmux ownership: {error}");
-                    crate::session::sync::ClearedTmuxOwnership::default()
-                }
-            };
+            let survivor_ids = crate::session::sync::instance_ids_excluding_profile(profile)?;
+            authoritative.retain(|instance| !survivor_ids.contains(&instance.id));
+            let cleared =
+                crate::session::sync::clear_tmux_session_id_ownership_for_instances_locked(
+                    &authoritative,
+                )?;
             if let Err(delete_error) =
                 storage.update_with_tmux_ownership_lock(|all_instances, _groups| {
                     all_instances.retain(|inst| !orphan_ids.contains(&inst.id));

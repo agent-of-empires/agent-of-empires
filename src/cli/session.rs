@@ -923,7 +923,7 @@ fn resolve_import_roots(paths: &[String]) -> Result<Vec<std::path::PathBuf>> {
 /// id, and (serve builds) the structured-view id.
 fn already_imported(instances: &[Instance], id: &str) -> bool {
     instances.iter().any(|inst| {
-        if inst.operational_agent_session_id() == Some(id) {
+        if inst.reserves_agent_session_id(id) {
             return true;
         }
         if inst.supports_terminal_resume()

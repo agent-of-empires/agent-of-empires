@@ -1054,10 +1054,16 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
         if canonicalize_or_raw(&inst.project_path) != canonical_current {
             continue;
         }
+        // A live outgoing pane makes the normal inactive-peer check skip this
+        // row, but its restored incoming conversation is already reserved.
+        if inst.tool == current_tool {
+            if let Some(incoming) = inst.incoming_handoff_agent_session_id() {
+                set.insert(incoming.to_string());
+            }
+        }
         // A peer that swapped away still owns the conversation it parked and
-        // intends to resume it on a swap back. It is excluded regardless of the
-        // peer's current tool or liveness: its pane is running another engine,
-        // so the live tmux ownership scan cannot discover this id.
+        // intends to resume it on a swap back. Its pane is running another
+        // engine, so the live tmux ownership scan cannot discover this id.
         if let Some(parked) = inst
             .prior_tool_session_ids
             .get(current_tool)

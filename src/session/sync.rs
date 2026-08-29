@@ -211,12 +211,12 @@ fn read_tmux_ownership_observations(
         .collect())
 }
 
-fn stale_tmux_ownership_targets(
-    instances: &[Instance],
+fn stale_tmux_ownership_targets<'a>(
+    trusted_instances: impl IntoIterator<Item = &'a Instance>,
     observations: impl IntoIterator<Item = TmuxOwnershipObservation>,
 ) -> Vec<String> {
-    let operational: HashSet<(&str, &str)> = instances
-        .iter()
+    let operational: HashSet<(&str, &str)> = trusted_instances
+        .into_iter()
         .filter_map(|instance| {
             instance
                 .operational_agent_session_id()
@@ -291,20 +291,22 @@ fn reconcile_tmux_session_id_ownership_env_locked(
     let observations = read_tmux_ownership_observations(&names)?;
     let (trusted, _) = partition_unambiguous_instances(instances);
     let ambiguous_suffixes = ambiguous_tmux_id_suffixes(instances);
-    let (set_batch, unset_batch) = tmux_session_id_env_updates(trusted, |instance| {
-        tmux_session_id_env_names(
-            instance,
-            &live,
-            &observations,
-            !ambiguous_suffixes.contains(tmux_id_suffix(&instance.id)),
-        )
-    });
+    let (set_batch, unset_batch) =
+        tmux_session_id_env_updates(trusted.iter().copied(), |instance| {
+            tmux_session_id_env_names(
+                instance,
+                &live,
+                &observations,
+                !ambiguous_suffixes.contains(tmux_id_suffix(&instance.id)),
+            )
+        });
     let desired: HashSet<&str> = set_batch
         .iter()
         .filter(|(_, key, _)| key == crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY)
         .map(|(session, _, _)| session.as_str())
         .collect();
-    let mut targets = stale_tmux_ownership_targets(instances, observations.iter().cloned());
+    let mut targets =
+        stale_tmux_ownership_targets(trusted.iter().copied(), observations.iter().cloned());
     targets.retain(|session| !desired.contains(session.as_str()));
     targets.extend(unset_batch.iter().map(|(session, _)| session.clone()));
     targets.sort();
@@ -463,7 +465,7 @@ fn drain_and_persist_session_ids_inner(
     // cross-claim deterministically (see #2708).
     let mut sid_owners: HashMap<String, String> = HashMap::with_capacity(instances.len());
     for inst in instances.iter() {
-        if let Some(sid) = inst.operational_agent_session_id() {
+        for sid in inst.reserved_agent_session_ids() {
             sid_owners
                 .entry(sid.to_string())
                 .or_insert_with(|| inst.id.clone());
@@ -1008,12 +1010,12 @@ mod tests {
                 ),
                 (
                     "mismatched".to_string(),
-                    Some(supported.id),
+                    Some(supported.id.clone()),
                     Some("stale-sid".to_string()),
                 ),
                 (
                     "unsupported".to_string(),
-                    Some(unsupported.id),
+                    Some(unsupported.id.clone()),
                     Some("retained-sid".to_string()),
                 ),
                 (
@@ -1033,6 +1035,20 @@ mod tests {
             targets,
             vec!["mismatched", "unsupported", "orphan", "missing-owner"]
         );
+
+        let duplicate = supported.clone();
+        let ambiguous = [supported, duplicate];
+        let (trusted, _) = partition_unambiguous_instances(&ambiguous);
+        assert!(trusted.is_empty());
+        let targets = stale_tmux_ownership_targets(
+            trusted,
+            [(
+                "ambiguous".to_string(),
+                Some(ambiguous[0].id.clone()),
+                Some("supported-sid".to_string()),
+            )],
+        );
+        assert_eq!(targets, vec!["ambiguous"]);
     }
 
     #[test]
@@ -1110,6 +1126,11 @@ mod tests {
         unsupported.agent_session_id = Some("retained".to_string());
         let mut unsupported_duplicate = unsupported.clone();
         unsupported_duplicate.title = "unsupported duplicate".to_string();
+        let mut ambiguous = Instance::new("ambiguous", "/tmp/z");
+        ambiguous.tool = "claude".to_string();
+        ambiguous.agent_session_id = Some("019342ab-1234-7def-8901-eeeeeeeeeeee".to_string());
+        let mut ambiguous_duplicate = ambiguous.clone();
+        ambiguous_duplicate.title = "ambiguous duplicate".to_string();
         let storage = Storage::new_unwatched(profile).unwrap();
         storage
             .update(|instances, _groups| {
@@ -1117,6 +1138,8 @@ mod tests {
                     supported.clone(),
                     unsupported.clone(),
                     unsupported_duplicate.clone(),
+                    ambiguous.clone(),
+                    ambiguous_duplicate.clone(),
                 ];
                 Ok(())
             })
@@ -1125,7 +1148,8 @@ mod tests {
         let supported_name = crate::tmux::Session::generate_name(&supported.id, &supported.title);
         let unsupported_name =
             crate::tmux::Session::generate_name(&unsupported.id, &unsupported.title);
-        for name in [&supported_name, &unsupported_name] {
+        let ambiguous_name = crate::tmux::Session::generate_name(&ambiguous.id, &ambiguous.title);
+        for name in [&supported_name, &unsupported_name, &ambiguous_name] {
             let output = crate::tmux::tmux_command()
                 .args(["new-session", "-d", "-s", name])
                 .output()
@@ -1136,7 +1160,11 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr)
             );
         }
-        let _cleanup = Cleanup(vec![supported_name.clone(), unsupported_name.clone()]);
+        let _cleanup = Cleanup(vec![
+            supported_name.clone(),
+            unsupported_name.clone(),
+            ambiguous_name.clone(),
+        ]);
         crate::tmux::env::set_hidden_env(
             &unsupported_name,
             crate::tmux::env::AOE_INSTANCE_ID_KEY,
@@ -1147,6 +1175,19 @@ mod tests {
             &unsupported_name,
             crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
             "retained",
+        )
+        .unwrap();
+
+        crate::tmux::env::set_hidden_env(
+            &ambiguous_name,
+            crate::tmux::env::AOE_INSTANCE_ID_KEY,
+            &ambiguous.id,
+        )
+        .unwrap();
+        crate::tmux::env::set_hidden_env(
+            &ambiguous_name,
+            crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+            ambiguous.agent_session_id.as_deref().unwrap(),
         )
         .unwrap();
 
@@ -1163,6 +1204,14 @@ mod tests {
         assert_eq!(
             crate::tmux::env::get_hidden_env_strict(
                 &unsupported_name,
+                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+            )
+            .unwrap(),
+            None
+        );
+        assert_eq!(
+            crate::tmux::env::get_hidden_env_strict(
+                &ambiguous_name,
                 crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
             )
             .unwrap(),

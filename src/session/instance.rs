@@ -1400,9 +1400,9 @@ fn foreign_sid_holder<'a>(
     instance_id: &str,
     sid: &str,
 ) -> Option<&'a Instance> {
-    instances.iter().find(|instance| {
-        instance.id != instance_id && instance.operational_agent_session_id() == Some(sid)
-    })
+    instances
+        .iter()
+        .find(|instance| instance.id != instance_id && instance.reserves_agent_session_id(sid))
 }
 
 /// CAS-write `agent_session_id` to disk. Caller passes the value the
@@ -3078,6 +3078,25 @@ impl Instance {
     fn has_tmux_ownership_handoff(&self) -> bool {
         self.tmux_ownership_handoff_pending || self.pending_tmux_ownership_session_id.is_some()
     }
+    pub(crate) fn incoming_handoff_agent_session_id(&self) -> Option<&str> {
+        (self.has_tmux_ownership_handoff() && self.supports_terminal_resume())
+            .then_some(self.agent_session_id.as_deref())
+            .flatten()
+    }
+
+    pub(crate) fn reserves_agent_session_id(&self, sid: &str) -> bool {
+        self.operational_agent_session_id() == Some(sid)
+            || self.incoming_handoff_agent_session_id() == Some(sid)
+    }
+
+    pub(crate) fn reserved_agent_session_ids(&self) -> impl Iterator<Item = &str> {
+        [
+            self.operational_agent_session_id(),
+            self.incoming_handoff_agent_session_id(),
+        ]
+        .into_iter()
+        .flatten()
+    }
 
     pub(crate) fn operational_agent_session_id(&self) -> Option<&str> {
         if self.has_tmux_ownership_handoff() {
@@ -4543,6 +4562,11 @@ impl Instance {
             &prepared.launch_env.pane,
             &prepared.launch_env.container,
         )?;
+        crate::tmux::env::set_hidden_env(
+            session.name(),
+            crate::tmux::env::AOE_INSTANCE_ID_KEY,
+            &self.id,
+        )?;
         if let Some(metadata) = omp_capture_metadata.as_ref() {
             let pane_generation = crate::tmux::env::get_env_uncached(
                 session.name(),
@@ -5336,7 +5360,7 @@ impl Instance {
                     .iter()
                     .filter(|instance| {
                         instance.id != instance_id
-                            && instance.operational_agent_session_id() == Some(sid)
+                            && instance.reserves_agent_session_id(sid)
                     })
                     .map(|instance| instance.id.clone())
                     .collect();
@@ -5352,10 +5376,16 @@ impl Instance {
                             if let Some(holder) =
                                 instances.iter_mut().find(|i| &i.id == holder_id)
                             {
-                                if holder.has_tmux_ownership_handoff() {
+                                let had_handoff = holder.has_tmux_ownership_handoff();
+                                let outgoing_matches =
+                                    holder.pending_tmux_ownership_session_id.as_deref() == Some(sid);
+                                let incoming_matches =
+                                    holder.incoming_handoff_agent_session_id() == Some(sid);
+                                if outgoing_matches {
                                     holder.pending_tmux_ownership_session_id = None;
                                     holder.tmux_ownership_handoff_pending = true;
-                                } else {
+                                }
+                                if incoming_matches || !had_handoff {
                                     holder.agent_session_id = None;
                                     holder.resume_probe_failed_sid = None;
                                 }
@@ -11863,6 +11893,13 @@ mod tests {
             None,
             "ownership-free outgoing pane must suppress the restored incoming ID"
         );
+        assert!(ownership_free.reserves_agent_session_id("incoming-claude-session"));
+        assert_eq!(
+            ownership_free
+                .reserved_agent_session_ids()
+                .collect::<Vec<_>>(),
+            vec!["incoming-claude-session"]
+        );
 
         let mut pre = Instance::new("Move", "/tmp/move");
         pre.tool = "claude".to_string();
@@ -16840,7 +16877,8 @@ mod tests {
 
     mod sid_disk_guards {
         use super::super::{
-            persist_session_to_storage, Instance, ResumeIntent, SidPersistOutcome, SidWrite,
+            persist_session_to_storage, Instance, PriorToolSession, ResumeIntent,
+            SidPersistOutcome, SidWrite,
         };
         use crate::file_watch::FileWatchService;
         use crate::session::storage::Storage;
@@ -16947,16 +16985,25 @@ mod tests {
                 persist_session_to_storage(profile, &pinned.id, SID_X, Some(SID_X), &file_watch);
             assert_eq!(write, SidWrite::Applied);
         }
-
         #[test]
         #[serial]
-        fn finalize_persist_rejects_foreign_sid_without_pin() {
+        fn finalize_persist_rejects_incoming_handoff_sid_without_pin() {
             let temp = tempdir().unwrap();
             let _guard = storage_home_guard(&temp);
             let profile = "guards-finalize-reject";
 
             let mut owner = make_inst(profile, "owner");
-            owner.agent_session_id = Some(SID_X.to_string());
+            owner.tool = "qwen".to_string();
+            owner.prior_tool_session_ids.insert(
+                "claude".to_string(),
+                PriorToolSession {
+                    agent_session_id: Some(SID_X.to_string()),
+                    acp_session_id: None,
+                },
+            );
+            owner.swap_tool_for_restart("claude");
+            assert_eq!(owner.operational_agent_session_id(), None);
+            assert_eq!(owner.incoming_handoff_agent_session_id(), Some(SID_X));
             let claimant = make_inst(profile, "claimant");
             seed(profile, &[&owner, &claimant]);
 
@@ -16966,7 +17013,6 @@ mod tests {
             let outcome =
                 live.persist_session_id_with_storage(&storage, None, ResumeIntent::Default);
 
-            // Skipped-and-reloaded: memory converges back to the disk value.
             assert_eq!(outcome, SidPersistOutcome::Published);
             assert_eq!(live.agent_session_id, None);
             let disk = load(profile);
@@ -16986,7 +17032,6 @@ mod tests {
                 None
             );
         }
-
         #[test]
         #[serial]
         fn finalize_persist_consuming_pin_takes_ownership_from_stale_holder() {
@@ -16994,22 +17039,31 @@ mod tests {
             let _guard = storage_home_guard(&temp);
             let profile = "guards-finalize-pin";
 
-            // The documented repair for a same-cwd duplicate: pin the true
-            // owner via `set-session-id`, then launch it. The launch that
-            // consumes the pin must take the sid even though stale holders
-            // still carry it on disk — and every stale holder is relieved of
-            // it so no duplicate can persist. Two holders because the bug
-            // being repaired manufactures duplicates, so more than one stale
-            // row with the same sid is a reachable state.
+            // A consumed explicit pin takes the SID from every matching field.
+            // Cover a plain ID, an outgoing handoff ID, and a restored incoming
+            // handoff ID so unrelated conversations remain untouched.
             let mut stale_holder = make_inst(profile, "stale-holder");
             stale_holder.agent_session_id = Some(SID_Y.to_string());
             stale_holder.pending_tmux_ownership_session_id = Some(SID_X.to_string());
             stale_holder.tmux_ownership_handoff_pending = true;
             let mut second_holder = make_inst(profile, "second-holder");
             second_holder.agent_session_id = Some(SID_X.to_string());
+            let mut incoming_holder = make_inst(profile, "incoming-holder");
+            incoming_holder.tool = "qwen".to_string();
+            incoming_holder.prior_tool_session_ids.insert(
+                "claude".to_string(),
+                PriorToolSession {
+                    agent_session_id: Some(SID_X.to_string()),
+                    acp_session_id: None,
+                },
+            );
+            incoming_holder.swap_tool_for_restart("claude");
             let mut pinned = make_inst(profile, "pinned");
             pinned.resume_intent = ResumeIntent::Use(SID_X.to_string());
-            seed(profile, &[&stale_holder, &second_holder, &pinned]);
+            seed(
+                profile,
+                &[&stale_holder, &second_holder, &incoming_holder, &pinned],
+            );
 
             let storage = Storage::new_unwatched(profile).unwrap();
             let mut live = pinned.clone();
@@ -17022,11 +17076,7 @@ mod tests {
 
             assert_eq!(outcome, SidPersistOutcome::Published);
             assert_eq!(live.agent_session_id.as_deref(), Some(SID_X));
-            assert_eq!(
-                live.resume_intent,
-                ResumeIntent::Default,
-                "consumed pin must promote to Default"
-            );
+            assert_eq!(live.resume_intent, ResumeIntent::Default);
             let disk = load(profile);
             assert_eq!(
                 disk.iter()
@@ -17037,24 +17087,20 @@ mod tests {
                 Some(SID_X)
             );
             let stale_disk = disk.iter().find(|i| i.id == stale_holder.id).unwrap();
-            assert_eq!(
-                stale_disk.agent_session_id.as_deref(),
-                Some(SID_Y),
-                "taking the outgoing SID must preserve the incoming conversation"
-            );
+            assert_eq!(stale_disk.agent_session_id.as_deref(), Some(SID_Y));
             assert_eq!(stale_disk.pending_tmux_ownership_session_id, None);
-            assert!(
-                stale_disk.tmux_ownership_handoff_pending,
-                "the old pane still suppresses incoming ownership until quiescence"
-            );
+            assert!(stale_disk.tmux_ownership_handoff_pending);
             assert_eq!(
                 disk.iter()
                     .find(|i| i.id == second_holder.id)
                     .unwrap()
                     .agent_session_id,
-                None,
-                "every duplicate holder must be relieved, not just the first"
+                None
             );
+            let incoming_disk = disk.iter().find(|i| i.id == incoming_holder.id).unwrap();
+            assert_eq!(incoming_disk.agent_session_id, None);
+            assert_eq!(incoming_disk.pending_tmux_ownership_session_id, None);
+            assert!(incoming_disk.tmux_ownership_handoff_pending);
         }
 
         #[test]
@@ -17064,11 +17110,6 @@ mod tests {
             let _guard = storage_home_guard(&temp);
             let profile = "guards-finalize-stale-pin";
 
-            // The caller consumed a Use(SID_X) pin pre-launch, but a peer
-            // process has since rewritten the on-disk intent (here: cleared
-            // it back to Default). The stale snapshot alone must not
-            // authorize taking the sid from its current holder; the write is
-            // rejected and memory converges to disk.
             let mut holder = make_inst(profile, "holder");
             holder.agent_session_id = Some(SID_X.to_string());
             let launcher = make_inst(profile, "launcher");
@@ -17084,10 +17125,7 @@ mod tests {
             );
 
             assert_eq!(outcome, SidPersistOutcome::Published);
-            assert_eq!(
-                live.agent_session_id, None,
-                "launcher must converge to disk, not keep the contested sid"
-            );
+            assert_eq!(live.agent_session_id, None);
             let disk = load(profile);
             assert_eq!(
                 disk.iter()
@@ -17095,8 +17133,7 @@ mod tests {
                     .unwrap()
                     .agent_session_id
                     .as_deref(),
-                Some(SID_X),
-                "holder must keep the sid when the pin is gone from disk"
+                Some(SID_X)
             );
         }
     }
