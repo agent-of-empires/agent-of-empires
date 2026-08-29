@@ -213,10 +213,9 @@ fn read_tmux_ownership_observations(
 
 fn stale_tmux_ownership_targets(
     instances: &[Instance],
-    preserved_owner_ids: &HashSet<&str>,
     observations: impl IntoIterator<Item = TmuxOwnershipObservation>,
 ) -> Vec<String> {
-    let operational: HashMap<&str, &str> = instances
+    let operational: HashSet<(&str, &str)> = instances
         .iter()
         .filter_map(|instance| {
             instance
@@ -227,16 +226,10 @@ fn stale_tmux_ownership_targets(
     observations
         .into_iter()
         .filter_map(|(session, owner, captured)| {
-            if owner
-                .as_deref()
-                .is_some_and(|owner| preserved_owner_ids.contains(owner))
-            {
-                return None;
-            }
             let captured = captured?;
             let valid = owner
                 .as_deref()
-                .is_some_and(|owner| operational.get(owner).is_some_and(|sid| **sid == captured));
+                .is_some_and(|owner| operational.contains(&(owner, captured.as_str())));
             (!valid).then_some(session)
         })
         .collect()
@@ -296,7 +289,7 @@ fn reconcile_tmux_session_id_ownership_env_locked(
     let names = crate::tmux::session_names_strict()?;
     let live = crate::tmux::LiveSessionSnapshot::from_names(names.clone());
     let observations = read_tmux_ownership_observations(&names)?;
-    let (trusted, ambiguous_ids) = partition_unambiguous_instances(instances);
+    let (trusted, _) = partition_unambiguous_instances(instances);
     let ambiguous_suffixes = ambiguous_tmux_id_suffixes(instances);
     let (set_batch, unset_batch) = tmux_session_id_env_updates(trusted, |instance| {
         tmux_session_id_env_names(
@@ -311,8 +304,7 @@ fn reconcile_tmux_session_id_ownership_env_locked(
         .filter(|(_, key, _)| key == crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY)
         .map(|(session, _, _)| session.as_str())
         .collect();
-    let mut targets =
-        stale_tmux_ownership_targets(instances, &ambiguous_ids, observations.iter().cloned());
+    let mut targets = stale_tmux_ownership_targets(instances, observations.iter().cloned());
     targets.retain(|session| !desired.contains(session.as_str()));
     targets.extend(unset_batch.iter().map(|(session, _)| session.clone()));
     targets.sort();
@@ -1008,7 +1000,6 @@ mod tests {
 
         let targets = stale_tmux_ownership_targets(
             &[supported.clone(), unsupported.clone()],
-            &HashSet::new(),
             [
                 (
                     "valid".to_string(),
@@ -1117,10 +1108,16 @@ mod tests {
         let mut unsupported = Instance::new("unsupported", "/tmp/y");
         unsupported.tool = "qwen".to_string();
         unsupported.agent_session_id = Some("retained".to_string());
+        let mut unsupported_duplicate = unsupported.clone();
+        unsupported_duplicate.title = "unsupported duplicate".to_string();
         let storage = Storage::new_unwatched(profile).unwrap();
         storage
             .update(|instances, _groups| {
-                *instances = vec![supported.clone(), unsupported.clone()];
+                *instances = vec![
+                    supported.clone(),
+                    unsupported.clone(),
+                    unsupported_duplicate.clone(),
+                ];
                 Ok(())
             })
             .unwrap();
