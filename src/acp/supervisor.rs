@@ -2797,7 +2797,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                         }
                         matches
                     }
-                    WorkerKind::Attached { .. } => registry_matches,
+                    WorkerKind::Attached => registry_matches,
                     #[cfg(test)]
                     WorkerKind::Stdio => registry_matches,
                 }
