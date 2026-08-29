@@ -3368,6 +3368,17 @@ impl Instance {
         {
             return true;
         }
+        if self.supports_terminal_resume()
+            && matches!(&self.resume_intent, ResumeIntent::Use(pinned) if pinned == sid)
+        {
+            let pinned_namespace = self
+                .agent_session_store_namespace
+                .clone()
+                .or_else(|| self.terminal_session_store_namespace());
+            if pinned_namespace.as_deref() == Some(namespace) {
+                return true;
+            }
+        }
         self.prior_tool_session_ids.iter().any(|(tool, prior)| {
             tool_supports_terminal_resume(tool)
                 && prior.agent_session_id.as_deref() == Some(sid)
@@ -3385,11 +3396,14 @@ impl Instance {
         if self.reserves_agent_session_id_in_namespace(sid, namespace) {
             return true;
         }
-        if self.terminal_session_store_namespace().as_deref() == Some(namespace)
-            && (matches!(&self.resume_intent, ResumeIntent::Use(pinned) if pinned == sid)
-                || self.acp_session_id.as_deref() == Some(sid))
-        {
-            return true;
+        if self.acp_session_id.as_deref() == Some(sid) {
+            let acp_namespace = self
+                .agent_session_store_namespace
+                .clone()
+                .or_else(|| self.terminal_session_store_namespace());
+            if acp_namespace.as_deref() == Some(namespace) {
+                return true;
+            }
         }
         self.prior_tool_session_ids.iter().any(|(tool, prior)| {
             prior.acp_session_id.as_deref() == Some(sid)
@@ -5716,6 +5730,8 @@ impl Instance {
         let Some(namespace) = self.terminal_session_store_namespace() else {
             return Ok(());
         };
+        let explicit_pin =
+            matches!(&self.resume_intent, ResumeIntent::Use(pinned) if pinned == sid);
         crate::session::sync::with_tmux_ownership_lock(|| {
             if let Some(holder) = crate::session::sync::reserved_sid_holder_excluding_profile(
                 storage.profile(),
@@ -5734,6 +5750,14 @@ impl Instance {
                 instance.id != self.id
                     && instance.reserves_agent_session_id_in_namespace(sid, &namespace)
             }) {
+                if !explicit_pin {
+                    anyhow::bail!(
+                        "refusing to launch session '{}': conversation '{}' is reserved by session '{}'",
+                        self.id,
+                        sid,
+                        holder.id
+                    );
+                }
                 if let Err(error) = crate::session::sync::ensure_instances_quiescent(
                     std::slice::from_ref(holder),
                     "reuse conversation ownership",
@@ -5921,6 +5945,20 @@ impl Instance {
                     .collect();
                 if !holder_ids.is_empty() {
                     if consumed_pin {
+                        let holders: Vec<Instance> = instances
+                            .iter()
+                            .filter(|instance| holder_ids.contains(&instance.id))
+                            .cloned()
+                            .collect();
+                        crate::session::sync::ensure_instances_quiescent(
+                            &holders,
+                            "take conversation ownership",
+                        )
+                        .with_context(|| {
+                            format!(
+                                "explicit pin rejected while conversation '{sid}' became live"
+                            )
+                        })?;
                         for holder_id in &holder_ids {
                             tracing::warn!(target: "session.store",
                                 instance_id = %instance_id,
@@ -17646,6 +17684,19 @@ mod tests {
                     agent_session_id: Some(SID_Y.to_string()),
                     acp_session_id: None,
                 },
+            );
+            let pin_profile = "guards-pinned-reservation";
+            let pin_sid = "019342ab-1234-7def-8901-444444444444";
+            let mut pinned = make_inst(pin_profile, "pinned");
+            pinned.resume_intent = ResumeIntent::Use(pin_sid.to_string());
+            let mut ordinary = make_inst(pin_profile, "ordinary");
+            ordinary.agent_session_id = Some(pin_sid.to_string());
+            seed(pin_profile, &[&pinned, &ordinary]);
+            assert!(
+                ordinary
+                    .validate_launch_sid_ownership(&Storage::new_unwatched(pin_profile).unwrap())
+                    .is_err(),
+                "a durable explicit pin must block a racing ordinary launch"
             );
             handoff_owner.swap_tool_for_restart("claude");
             let mut cross_profile_claimant = make_inst(claimant_profile, "cross-profile-claimant");

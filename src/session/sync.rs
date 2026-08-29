@@ -94,16 +94,12 @@ fn tmux_session_id_env_updates<'a>(
     (set_batch, unset_batch)
 }
 
-fn tmux_session_id_env_names(
+fn live_tmux_names_for_instance(
     instance: &Instance,
     live: &crate::tmux::LiveSessionSnapshot,
     observations: &[TmuxOwnershipObservation],
     allow_ownerless_fallback: bool,
 ) -> Vec<String> {
-    if instance.operational_agent_session_id().is_none() {
-        return Vec::new();
-    }
-
     let mut targets: Vec<String> = observations
         .iter()
         .filter(|(name, owner, _)| {
@@ -137,6 +133,18 @@ fn tmux_session_id_env_names(
     targets.sort();
     targets.dedup();
     targets
+}
+
+fn tmux_session_id_env_names(
+    instance: &Instance,
+    live: &crate::tmux::LiveSessionSnapshot,
+    observations: &[TmuxOwnershipObservation],
+    allow_ownerless_fallback: bool,
+) -> Vec<String> {
+    if instance.operational_agent_session_id().is_none() {
+        return Vec::new();
+    }
+    live_tmux_names_for_instance(instance, live, observations, allow_ownerless_fallback)
 }
 
 fn partition_unambiguous_instances(instances: &[Instance]) -> (Vec<&Instance>, HashSet<&str>) {
@@ -301,6 +309,40 @@ fn remove_tmux_session_id_ownership(
     Ok(cleared)
 }
 
+fn clear_unsupported_tmux_session_ids_locked(instances: &[Instance]) -> anyhow::Result<()> {
+    let unsupported: Vec<&Instance> = instances
+        .iter()
+        .filter(|instance| !instance.supports_terminal_resume())
+        .collect();
+    if unsupported.is_empty() {
+        return Ok(());
+    }
+
+    let names = crate::tmux::session_names_strict()?;
+    let live = crate::tmux::LiveSessionSnapshot::from_names(names.clone());
+    let observations = read_tmux_ownership_observations(&names)?;
+    let captured_names: HashSet<&str> = observations
+        .iter()
+        .filter_map(|(name, _, captured)| captured.as_ref().map(|_| name.as_str()))
+        .collect();
+    let ambiguous_suffixes = ambiguous_tmux_id_suffixes(instances);
+    let mut targets: Vec<String> = unsupported
+        .into_iter()
+        .flat_map(|instance| {
+            live_tmux_names_for_instance(
+                instance,
+                &live,
+                &observations,
+                !ambiguous_suffixes.contains(tmux_id_suffix(&instance.id)),
+            )
+        })
+        .filter(|name| captured_names.contains(name.as_str()))
+        .collect();
+    targets.sort();
+    targets.dedup();
+    remove_tmux_session_id_ownership(instances, &targets, &observations)?;
+    Ok(())
+}
 fn reconcile_tmux_session_id_ownership_env_locked(
     instances: &[Instance],
 ) -> anyhow::Result<ClearedTmuxOwnership> {
@@ -535,6 +577,8 @@ pub(crate) fn reserved_sid_holder_excluding_profile_for_capture(
 }
 pub(crate) fn reconcile_all_profiles_tmux_session_id_ownership_env_locked(
 ) -> anyhow::Result<ClearedTmuxOwnership> {
+    let cleanup_instances = load_profile_instances_excluding_with_policy(None, true)?;
+    clear_unsupported_tmux_session_ids_locked(&cleanup_instances)?;
     let instances = load_profile_instances_excluding(None)?;
     reconcile_tmux_session_id_ownership_env_locked(&instances)
 }
@@ -1338,6 +1382,30 @@ mod tests {
         )
         .unwrap();
 
+        let corrupt_storage = Storage::new_unwatched("ownership-corrupt").unwrap();
+        let corrupt = Instance::new("corrupt", "/tmp/corrupt");
+        corrupt_storage
+            .update(|instances, _groups| {
+                instances.push(corrupt.clone());
+                Ok(())
+            })
+            .unwrap();
+        std::fs::write(
+            corrupt_storage.sessions_path(),
+            br#"[{"agent_session_id":"019342ab-1234-7def-8901-deadbeefdead"}]"#,
+        )
+        .unwrap();
+        assert!(reconcile_all_profiles_tmux_session_id_ownership_env().is_err());
+        assert_eq!(
+            crate::tmux::env::get_hidden_env_strict(
+                &unsupported_name,
+                crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY,
+            )
+            .unwrap(),
+            None,
+            "unsupported IDs must be removed before strict foreign parsing"
+        );
+        std::fs::remove_file(corrupt_storage.sessions_path()).unwrap();
         reconcile_all_profiles_tmux_session_id_ownership_env().unwrap();
         assert_eq!(
             crate::tmux::env::get_hidden_env_strict(

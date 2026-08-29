@@ -941,6 +941,7 @@ fn build_import_instance(
     s: &crate::session::claude_import::ClaudeSessionSummary,
     structured: bool,
     group: &str,
+    store_namespace: Option<&str>,
 ) -> Instance {
     let title = s.title.clone().unwrap_or_else(|| {
         let short = s.session_id.get(..8).unwrap_or(s.session_id.as_str());
@@ -948,6 +949,7 @@ fn build_import_instance(
     });
     let mut inst = Instance::new(&title, &s.cwd);
     inst.tool = "claude".to_string();
+    inst.agent_session_store_namespace = store_namespace.map(str::to_string);
     if !group.is_empty() {
         inst.group_path = group.to_string();
     }
@@ -1005,6 +1007,9 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
         crate::session::sync::load_profile_instances_excluding(None)
     })?;
     let namespace = claude_import_store_namespace();
+    if !candidates.is_empty() && namespace.is_none() {
+        anyhow::bail!("cannot resolve the Claude store namespace for imported sessions");
+    }
     let candidate_count = candidates.len();
     let mut to_import: Vec<_> = candidates
         .into_iter()
@@ -1068,6 +1073,7 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
         }
     }
     let group = args.group.clone().unwrap_or_default();
+    let namespace = namespace.expect("nonempty Claude imports have a resolved namespace");
     let storage = Storage::open_unwatched(profile)?;
     let created_ids = crate::session::sync::with_tmux_ownership_lock(|| {
         let foreign = crate::session::sync::load_profile_instances_excluding(Some(profile))?;
@@ -1075,12 +1081,12 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
             let mut ids = Vec::new();
             for s in &to_import {
                 // Re-check every profile while the global ownership lock is held.
-                if already_imported(all_instances, &s.session_id, namespace.as_deref())
-                    || already_imported(&foreign, &s.session_id, namespace.as_deref())
+                if already_imported(all_instances, &s.session_id, Some(&namespace))
+                    || already_imported(&foreign, &s.session_id, Some(&namespace))
                 {
                     continue;
                 }
-                let inst = build_import_instance(s, structured, &group);
+                let inst = build_import_instance(s, structured, &group, Some(namespace.as_str()));
                 ids.push(inst.id.clone());
                 all_instances.push(inst.clone());
                 if !inst.group_path.is_empty() {
@@ -3111,7 +3117,7 @@ mod import_tests {
     #[test]
     fn terminal_import_pins_resume_target() {
         let s = summary("abc123-def456", "/home/me/proj", Some("Fix bug"));
-        let inst = build_import_instance(&s, false, "");
+        let inst = build_import_instance(&s, false, "", Some("claude-store"));
         assert_eq!(inst.tool, "claude");
         assert_eq!(inst.project_path, "/home/me/proj");
         assert_eq!(inst.title, "Fix bug");
@@ -3119,12 +3125,16 @@ mod import_tests {
             inst.resume_intent,
             ResumeIntent::Use("abc123-def456".to_string())
         );
+        assert_eq!(
+            inst.agent_session_store_namespace.as_deref(),
+            Some("claude-store")
+        );
     }
 
     #[test]
     fn title_falls_back_to_short_id() {
         let s = summary("abcdef12-3456-7890", "/home/me/proj", None);
-        let inst = build_import_instance(&s, false, "team/imports");
+        let inst = build_import_instance(&s, false, "team/imports", None);
         assert_eq!(inst.title, "Claude import abcdef12");
         assert_eq!(inst.group_path, "team/imports");
     }
@@ -3133,11 +3143,15 @@ mod import_tests {
     #[test]
     fn structured_import_seeds_replay_fields() {
         let s = summary("sid-1", "/home/me/proj", Some("x"));
-        let inst = build_import_instance(&s, true, "");
+        let inst = build_import_instance(&s, true, "", Some("claude-store"));
         assert!(inst.is_structured());
         assert_eq!(inst.acp_session_id.as_deref(), Some("sid-1"));
         assert_eq!(inst.import_pending, Some(true));
         // Structured imports do not pin a terminal resume target.
+        assert_eq!(
+            inst.agent_session_store_namespace.as_deref(),
+            Some("claude-store")
+        );
         assert_eq!(inst.resume_intent, ResumeIntent::Default);
     }
 
@@ -3175,6 +3189,22 @@ mod import_tests {
             );
         }
 
+        let mut bound_resume = Instance::new("bound-resume", "/p");
+        bound_resume.tool = "claude".to_string();
+        bound_resume.resume_intent = ResumeIntent::Use("id-bound".to_string());
+        bound_resume.agent_session_store_namespace = Some("foreign-store".to_string());
+        assert!(!already_imported(
+            std::slice::from_ref(&bound_resume),
+            "id-bound",
+            Some(&namespace)
+        ));
+        bound_resume.agent_session_store_namespace = Some(namespace.clone());
+        assert!(already_imported(
+            &[bound_resume],
+            "id-bound",
+            Some(&namespace)
+        ));
+
         let mut parked_claude = Instance::new("parked-claude", "/p");
         parked_claude.tool = "claude".to_string();
         parked_claude.agent_session_id = Some("parked".to_string());
@@ -3202,6 +3232,13 @@ mod import_tests {
         {
             let mut structured = Instance::new("structured", "/p");
             structured.acp_session_id = Some("id-acp".to_string());
+            structured.agent_session_store_namespace = Some("foreign-store".to_string());
+            assert!(!already_imported(
+                std::slice::from_ref(&structured),
+                "id-acp",
+                Some(&namespace)
+            ));
+            structured.agent_session_store_namespace = Some(namespace.clone());
             assert!(already_imported(&[structured], "id-acp", Some(&namespace)));
         }
     }
