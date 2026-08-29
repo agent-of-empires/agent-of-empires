@@ -2001,8 +2001,9 @@ done
 /// Capture session ID from Codex filesystem.
 ///
 /// Walks the Codex sessions directory (including date-partitioned `YYYY/MM/DD/` subdirectories)
-/// for `.jsonl` rollout files and extracts the UUID from the most recent one.
-/// Codex filenames follow the pattern `rollout-<timestamp>-<uuid>.jsonl`.
+/// for `.jsonl` and `.jsonl.zst` rollout files and extracts the UUID from the
+/// most recent one. Codex filenames follow the pattern
+/// `rollout-<timestamp>-<uuid>.jsonl[.zst]`.
 /// Respects `CODEX_HOME` env var, falling back to `~/.codex`.
 pub(crate) fn capture_codex_session_id(
     project_path: &str,
@@ -2034,8 +2035,8 @@ pub(crate) fn capture_codex_session_id(
         if exclusion.contains(&uuid) {
             return None;
         }
-        let file = std::fs::File::open(path).ok()?;
-        let reader = std::io::BufReader::new(file);
+        let reader = open_codex_rollout(path).ok()?;
+        let reader = std::io::BufReader::new(reader);
         let first_line = std::io::BufRead::lines(reader).next()?.ok()?;
         let cwd = parse_codex_cwd_from_json(&first_line, &uuid)?;
         let cwd_matches = std::fs::canonicalize(&cwd)
@@ -2086,6 +2087,7 @@ fn parse_codex_cwd_from_json(line: &str, filename_uuid: &str) -> Option<String> 
 /// The UUID is the last 36 characters of the stem (before `.jsonl`).
 fn extract_codex_uuid_from_filename(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
+    let stem = stem.strip_suffix(".jsonl").unwrap_or(stem);
     if stem.len() >= 36 {
         let candidate = &stem[stem.len() - 36..];
         if Uuid::parse_str(candidate).is_ok() {
@@ -2095,10 +2097,28 @@ fn extract_codex_uuid_from_filename(path: &Path) -> Option<String> {
     None
 }
 
+fn is_codex_rollout(path: &Path) -> bool {
+    path.extension().and_then(|e| e.to_str()) == Some("jsonl")
+        || path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".jsonl.zst"))
+}
+
+fn open_codex_rollout(path: &Path) -> Result<Box<dyn Read>> {
+    let file = std::fs::File::open(path)?;
+    if path.extension().and_then(|e| e.to_str()) == Some("zst") {
+        Ok(Box::new(zstd::stream::read::Decoder::new(file)?))
+    } else {
+        Ok(Box::new(file))
+    }
+}
+
 /// Recursively collect Codex session `.jsonl` files, descending into date-partitioned dirs.
 ///
 /// Directories whose names are all ASCII digits (e.g. `2025`, `03`, `06`) are treated as
-/// date components and recursed into. Files ending in `.jsonl` are collected as session entries.
+/// date components and recursed into. Files ending in `.jsonl` or `.jsonl.zst` are collected as
+/// session entries.
 pub(crate) fn collect_codex_sessions(
     dir: &Path,
     entries: &mut Vec<(PathBuf, std::time::SystemTime)>,
@@ -2111,7 +2131,7 @@ pub(crate) fn collect_codex_sessions(
             if name_str.chars().all(|c| c.is_ascii_digit()) {
                 collect_codex_sessions(&path, entries)?;
             }
-        } else if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+        } else if is_codex_rollout(&path) {
             let modified = entry
                 .metadata()
                 .and_then(|m| m.modified())
@@ -5166,6 +5186,33 @@ mod tests {
 
         let result = capture_codex_session_id(project_dir.to_str().unwrap(), &HashSet::new());
         assert!(result.is_ok());
+        assert_eq!(result.unwrap(), uuid);
+    }
+
+    #[test]
+    #[serial]
+    fn test_codex_capture_reads_compressed_rollout() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let uuid = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+        let project_dir = tmp.path().join("test-project");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let jsonl_content = format!(
+            r#"{{"type":"session_meta","payload":{{"cwd":"{}"}}}}"#,
+            project_dir.display()
+        );
+        let compressed = zstd::stream::encode_all(jsonl_content.as_bytes(), 0).unwrap();
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2025-03-06T10-30-00-{uuid}.jsonl.zst")),
+            compressed,
+        )
+        .unwrap();
+
+        let _guard = EnvGuard::set(&[("CODEX_HOME", tmp.path())]);
+
+        let result = capture_codex_session_id(project_dir.to_str().unwrap(), &HashSet::new());
         assert_eq!(result.unwrap(), uuid);
     }
 
