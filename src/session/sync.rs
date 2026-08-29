@@ -615,10 +615,18 @@ struct Update {
     id: String,
     sid: String,
     namespace: String,
+    tool: String,
+    lifecycle_generation: u64,
     expected_prior: Option<String>,
     profile: String,
     guard: SessionIdGuard,
     observation: SessionIdObservation,
+}
+
+fn poller_update_matches_instance(update: &Update, instance: &Instance) -> bool {
+    instance.tool == update.tool
+        && instance.lifecycle_generation == update.lifecycle_generation
+        && instance.terminal_session_store_namespace().as_deref() == Some(update.namespace.as_str())
 }
 
 struct Rollback {
@@ -753,6 +761,8 @@ fn drain_and_persist_session_ids_inner(
             id: inst.id.clone(),
             sid,
             namespace,
+            tool: inst.tool.clone(),
+            lifecycle_generation: inst.lifecycle_generation,
             expected_prior: inst.agent_session_id.clone(),
             profile: inst.source_profile.clone(),
             guard: observation.guard.clone(),
@@ -802,30 +812,40 @@ fn drain_and_persist_session_ids_inner(
 
     let mut capture_generations: Vec<(String, u64)> = Vec::with_capacity(updates.len());
     for update in &updates {
-        let ownership: anyhow::Result<_> = if lifecycle_already_locked {
-            Ok(None)
-        } else {
-            (|| {
-                let storage = Storage::new(&update.profile, file_watch.clone())?;
-                let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&update.id)?;
-                let generation = storage.update(|instances, _groups| {
-                    let Some(instance) = instances
-                        .iter_mut()
-                        .find(|instance| instance.id == update.id)
-                    else {
-                        anyhow::bail!("session disappeared before capture");
-                    };
-                    instance
-                        .try_acquire_lifecycle_reservation(
-                            crate::session::LifecycleOperation::Capture,
-                            Instance::LIFECYCLE_RESERVATION_TTL,
-                            chrono::Utc::now(),
-                        )
-                        .map_err(|error| anyhow::anyhow!("capture blocked: {error}"))
-                })?;
-                Ok(Some((storage, lifecycle_lock, generation)))
-            })()
-        };
+        let ownership: anyhow::Result<_> = (|| {
+            let storage = Storage::new(&update.profile, file_watch.clone())?;
+            if lifecycle_already_locked {
+                let stored = storage.load_strict()?;
+                let Some(instance) = stored.iter().find(|instance| instance.id == update.id) else {
+                    anyhow::bail!("session disappeared before capture");
+                };
+                if !poller_update_matches_instance(update, instance) {
+                    anyhow::bail!("poller observation belongs to a superseded launch");
+                }
+                return Ok(None);
+            }
+
+            let lifecycle_lock = storage.acquire_instance_lifecycle_lock(&update.id)?;
+            let generation = storage.update(|instances, _groups| {
+                let Some(instance) = instances
+                    .iter_mut()
+                    .find(|instance| instance.id == update.id)
+                else {
+                    anyhow::bail!("session disappeared before capture");
+                };
+                if !poller_update_matches_instance(update, instance) {
+                    anyhow::bail!("poller observation belongs to a superseded launch");
+                }
+                instance
+                    .try_acquire_lifecycle_reservation(
+                        crate::session::LifecycleOperation::Capture,
+                        Instance::LIFECYCLE_RESERVATION_TTL,
+                        chrono::Utc::now(),
+                    )
+                    .map_err(|error| anyhow::anyhow!("capture blocked: {error}"))
+            })?;
+            Ok(Some((storage, lifecycle_lock, generation)))
+        })();
         let mut outcome = match &ownership {
             Err(error) => {
                 tracing::warn!(
@@ -1994,6 +2014,36 @@ mod tests {
             Some(crate::session::LifecycleOperation::Trash)
         );
         assert_eq!(stored[0].lifecycle_generation, 1);
+    }
+
+    #[test]
+    #[serial]
+    fn drain_rejects_capture_from_superseded_launch() {
+        let temp = tempdir().unwrap();
+        let _guard = storage_home_guard(&temp);
+        let profile = "sync-superseded-launch";
+        let captured = "019342ab-1234-7def-8901-bbbbbbbbbbbb";
+
+        let mut stale = Instance::new("superseded-title", "/tmp/x");
+        stale.source_profile = profile.to_string();
+        stale.tool = "claude".to_string();
+        stale.lifecycle_generation = 4;
+        let mut current = stale.clone();
+        current.tool = "codex".to_string();
+        current.lifecycle_generation = 5;
+        seed_instance_on_disk(profile, &current);
+        attach_poller_with_update(&mut stale, captured);
+
+        let file_watch = FileWatchService::noop();
+        let mut instances = vec![stale];
+        let outcome = drain_and_persist_session_ids(&mut instances, &file_watch);
+
+        assert_eq!(outcome.filtered, vec![instances[0].id.clone()]);
+        assert!(outcome.applied.is_empty());
+        assert_eq!(instances[0].agent_session_id, None);
+        let stored = Storage::new_unwatched(profile).unwrap().load().unwrap();
+        assert_eq!(stored[0].tool, "codex");
+        assert_eq!(stored[0].agent_session_id, None);
     }
 
     #[test]

@@ -6335,7 +6335,25 @@ pub(crate) fn derive_acp_status(event: &crate::acp::Event) -> Option<StatusInten
     }
 }
 
-type SessionIdentityBaseline = (Option<String>, Option<String>, Option<String>);
+type SessionIdentityBaseline = (
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+    Option<String>,
+    u64,
+);
+
+fn session_identity_baseline(instance: &Instance) -> SessionIdentityBaseline {
+    (
+        instance.agent_session_id.clone(),
+        instance.resume_probe_failed_sid.clone(),
+        instance.omp_capture_generation.clone(),
+        instance.tool.clone(),
+        instance.terminal_session_store_namespace(),
+        instance.lifecycle_generation,
+    )
+}
 
 /// Merge a drained instance's captured identity back into live state, but only
 /// the identity fields and only if they are unchanged since the baseline. The
@@ -6348,11 +6366,24 @@ fn apply_drained_identity_if_unchanged(
     drained: &Instance,
     baseline: &SessionIdentityBaseline,
 ) {
-    let (baseline_sid, baseline_marker, baseline_generation) = baseline;
-    if live.agent_session_id == *baseline_sid && live.omp_capture_generation == *baseline_generation
+    let (
+        baseline_sid,
+        baseline_marker,
+        baseline_omp_generation,
+        baseline_tool,
+        baseline_namespace,
+        baseline_lifecycle_generation,
+    ) = baseline;
+    if live.agent_session_id == *baseline_sid
+        && live.omp_capture_generation == *baseline_omp_generation
+        && live.tool == *baseline_tool
+        && live.terminal_session_store_namespace() == *baseline_namespace
+        && live.lifecycle_generation == *baseline_lifecycle_generation
     {
         live.agent_session_id = drained.agent_session_id.clone();
         live.omp_capture_generation = drained.omp_capture_generation.clone();
+        live.lifecycle_generation = drained.lifecycle_generation;
+        live.lifecycle_reservation = drained.lifecycle_reservation.clone();
         if live.resume_probe_failed_sid == *baseline_marker {
             live.resume_probe_failed_sid = drained.resume_probe_failed_sid.clone();
         }
@@ -6368,16 +6399,7 @@ async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
     match tokio::task::spawn_blocking(move || {
         let baseline: std::collections::HashMap<String, SessionIdentityBaseline> = snapshot
             .iter()
-            .map(|inst| {
-                (
-                    inst.id.clone(),
-                    (
-                        inst.agent_session_id.clone(),
-                        inst.resume_probe_failed_sid.clone(),
-                        inst.omp_capture_generation.clone(),
-                    ),
-                )
-            })
+            .map(|inst| (inst.id.clone(), session_identity_baseline(inst)))
             .collect();
         let mut snapshot = snapshot;
         // Preserve a final queued observation before replacing a stopped
@@ -6437,6 +6459,10 @@ async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
                     apply_drained_identity_if_unchanged(dst, src, identity_baseline);
                 }
                 if repaired.contains(&src.id)
+                    && dst.tool == src.tool
+                    && dst.terminal_session_store_namespace()
+                        == src.terminal_session_store_namespace()
+                    && dst.lifecycle_generation == src.lifecycle_generation
                     && dst.omp_capture_generation == src.omp_capture_generation
                     && !dst.session_id_poller_is_running()
                     && src.session_id_poller_is_running()
@@ -6702,19 +6728,18 @@ mod tests {
     }
     #[test]
     fn drained_identity_reapply_honors_concurrent_generation_and_marker_writes() {
-        let baseline = (
-            Some("old-sid".to_string()),
-            Some("old-marker".to_string()),
-            Some("generation-a".to_string()),
-        );
-        let mut drained = Instance::new("session", "/tmp/project");
+        let mut baseline_instance = Instance::new("session", "/tmp/project");
+        baseline_instance.agent_session_id = Some("old-sid".to_string());
+        baseline_instance.resume_probe_failed_sid = Some("old-marker".to_string());
+        baseline_instance.omp_capture_generation = Some("generation-a".to_string());
+        let baseline = session_identity_baseline(&baseline_instance);
+
+        let mut drained = baseline_instance.clone();
         drained.agent_session_id = Some("captured-sid".to_string());
         drained.resume_probe_failed_sid = None;
-        drained.omp_capture_generation = Some("generation-a".to_string());
+        drained.lifecycle_generation += 1;
 
-        let mut relaunched = Instance::new("session", "/tmp/project");
-        relaunched.agent_session_id = Some("old-sid".to_string());
-        relaunched.resume_probe_failed_sid = Some("old-marker".to_string());
+        let mut relaunched = baseline_instance.clone();
         relaunched.omp_capture_generation = Some("generation-b".to_string());
         apply_drained_identity_if_unchanged(&mut relaunched, &drained, &baseline);
         assert_eq!(
@@ -6723,10 +6748,8 @@ mod tests {
         );
         assert_eq!(relaunched.agent_session_id.as_deref(), Some("old-sid"));
 
-        let mut marker_changed = Instance::new("session", "/tmp/project");
-        marker_changed.agent_session_id = Some("old-sid".to_string());
+        let mut marker_changed = baseline_instance.clone();
         marker_changed.resume_probe_failed_sid = Some("peer-marker".to_string());
-        marker_changed.omp_capture_generation = Some("generation-a".to_string());
         apply_drained_identity_if_unchanged(&mut marker_changed, &drained, &baseline);
         assert_eq!(
             marker_changed.agent_session_id.as_deref(),
@@ -6736,8 +6759,14 @@ mod tests {
             marker_changed.resume_probe_failed_sid.as_deref(),
             Some("peer-marker")
         );
-    }
+        assert_eq!(marker_changed.lifecycle_generation, 1);
 
+        let mut tool_changed = baseline_instance;
+        tool_changed.tool = "codex".to_string();
+        apply_drained_identity_if_unchanged(&mut tool_changed, &drained, &baseline);
+        assert_eq!(tool_changed.agent_session_id.as_deref(), Some("old-sid"));
+        assert_eq!(tool_changed.tool, "codex");
+    }
     /// `idempotency_locks` must not grow for the daemon's lifetime: keys are
     /// caller-supplied and unbounded, so an entry nobody holds is pruned on
     /// the next miss. A key whose lock is still held must survive. See #3156.

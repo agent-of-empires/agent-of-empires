@@ -4178,6 +4178,9 @@ impl Instance {
     }
 
     fn apply_session_flags(&mut self, cmd: &mut String, context: &str) -> AppliedSessionFlags {
+        if !self.launch_command_matches_tool() {
+            return AppliedSessionFlags::None;
+        }
         if let ResumeIntent::Fork { from } = self.resume_intent.clone() {
             let child = self.agent_session_id.clone();
             if let Some(child_id) = child.as_deref() {
@@ -4262,6 +4265,22 @@ impl Instance {
         } else {
             format!("{} {}", self.command, self.extra_args)
         }
+    }
+
+    fn launch_command_matches_tool(&self) -> bool {
+        if self.command.is_empty() {
+            return true;
+        }
+        let Some(expected) = crate::agents::get_agent(&self.tool).map(|agent| agent.binary) else {
+            return false;
+        };
+        let Ok(argv) = shell_words::split(&self.command) else {
+            return false;
+        };
+        let Some(executable) = argv.first() else {
+            return false;
+        };
+        std::path::Path::new(executable).file_name() == std::path::Path::new(expected).file_name()
     }
 
     /// Launch command including any agent `launch_subcommand` (e.g.
@@ -4793,7 +4812,7 @@ impl Instance {
             return Err(error);
         }
 
-        let prepared = match self.prepare_launch_command() {
+        let prepared = match self.prepare_launch_command(&storage) {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.fail_reserved_launch(&storage, &error, false);
@@ -4884,7 +4903,10 @@ impl Instance {
         self.run_launch_hooks(skip_on_launch, profile)
     }
 
-    fn prepare_launch_command(&mut self) -> Result<PreparedLaunch> {
+    fn prepare_launch_command(
+        &mut self,
+        storage: &super::storage::Storage,
+    ) -> Result<PreparedLaunch> {
         let expected_prior_sid = self.agent_session_id.clone();
         let expected_prior_intent = self.resume_intent.clone();
         let expected_prior_omp_generation = self.omp_capture_generation.clone();
@@ -4892,6 +4914,7 @@ impl Instance {
         self.refresh_launch_store_namespace_in(&host_environment)?;
         let (command, session_flags, omp_capture_plan, launch_env) =
             self.build_launch_command_in_environment(&host_environment, host_mutations)?;
+        self.validate_launch_sid_ownership(storage)?;
         Ok(PreparedLaunch {
             command,
             session_flags,
@@ -5729,7 +5752,8 @@ impl Instance {
     }
 
     fn launch_resume_sid(&self) -> Option<&str> {
-        if !self.supports_terminal_resume()
+        if !self.launch_command_matches_tool()
+            || !self.supports_terminal_resume()
             || (self.is_sandboxed()
                 && matches!(self.tool.as_str(), "copilot" | "kimi" | "prime-agent"))
         {
@@ -5770,6 +5794,14 @@ impl Instance {
                 instance.id != self.id
                     && instance.reserves_agent_session_id_in_namespace(sid, &namespace)
             }) {
+                if holder.is_structured() {
+                    anyhow::bail!(
+                        "refusing to launch session '{}': conversation '{}' belongs to structured session '{}'",
+                        self.id,
+                        sid,
+                        holder.id
+                    );
+                }
                 if !explicit_pin {
                     anyhow::bail!(
                         "refusing to launch session '{}': conversation '{}' is reserved by session '{}'",
@@ -5952,6 +5984,19 @@ impl Instance {
                         sid = %sid,
                         holder = %holder.id,
                         "explicit pin rejected: conversation is still live in an outgoing handoff pane"
+                    );
+                    return Ok(SidWrite::Skipped);
+                }
+                if let Some(holder) = instances.iter().find(|instance| {
+                    instance.id != instance_id
+                        && instance.is_structured()
+                        && instance.reserves_agent_session_id_in_namespace(sid, namespace)
+                }) {
+                    tracing::warn!(target: "session.store",
+                        instance_id = %instance_id,
+                        sid = %sid,
+                        holder = %holder.id,
+                        "explicit pin rejected: conversation belongs to a structured session"
                     );
                     return Ok(SidWrite::Skipped);
                 }
@@ -7193,7 +7238,7 @@ impl Instance {
             return Err(error);
         }
 
-        let prepared = match self.prepare_launch_command() {
+        let prepared = match self.prepare_launch_command(&storage) {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.fail_reserved_launch(&storage, &error, false);
@@ -13085,6 +13130,18 @@ mod tests {
             inst.apply_session_flags(&mut cmd2, "test"),
             AppliedSessionFlags::Existing
         );
+
+        for executable in ["qwen", "kiro-cli"] {
+            inst.command = executable.to_string();
+            let mut command = executable.to_string();
+            assert_eq!(
+                inst.apply_session_flags(&mut command, "test"),
+                AppliedSessionFlags::None,
+                "{executable}"
+            );
+            assert_eq!(command, executable, "{executable}");
+            assert_eq!(inst.launch_resume_sid(), None, "{executable}");
+        }
     }
 
     #[test]
@@ -17716,6 +17773,41 @@ mod tests {
                     .as_deref(),
                 Some(SID_X)
             );
+
+            let storage = Storage::new_unwatched(profile).unwrap();
+            let mut late_capture = claimant.clone();
+            assert!(late_capture.validate_launch_sid_ownership(&storage).is_ok());
+            late_capture.agent_session_id = Some(SID_X.to_string());
+            assert!(
+                late_capture.prepare_launch_command(&storage).is_err(),
+                "a sid discovered during command preparation must be revalidated before spawn"
+            );
+
+            let acp_profile = "guards-owned-structured";
+            let mut acp_owner = make_inst(acp_profile, "structured-owner");
+            acp_owner.view = crate::session::View::Structured;
+            acp_owner.acp_session_id = Some(SID_Y.to_string());
+            let mut terminal_claimant = make_inst(acp_profile, "terminal-claimant");
+            terminal_claimant.resume_intent = ResumeIntent::Use(SID_Y.to_string());
+            seed(acp_profile, &[&acp_owner, &terminal_claimant]);
+            let acp_storage = Storage::new_unwatched(acp_profile).unwrap();
+            assert!(
+                terminal_claimant
+                    .validate_launch_sid_ownership(&acp_storage)
+                    .is_err(),
+                "a structured ACP conversation cannot be taken by a terminal pin"
+            );
+            terminal_claimant.agent_session_id = Some(SID_Y.to_string());
+            assert_eq!(
+                terminal_claimant.persist_session_id_with_storage(
+                    &acp_storage,
+                    None,
+                    ResumeIntent::Use(SID_Y.to_string()),
+                ),
+                SidPersistOutcome::Published
+            );
+            assert_eq!(terminal_claimant.agent_session_id, None);
+            assert_eq!(load(acp_profile)[0].acp_session_id.as_deref(), Some(SID_Y));
 
             let owner_profile = "guards-owned-other";
             let claimant_profile = "guards-owned-claimant";
