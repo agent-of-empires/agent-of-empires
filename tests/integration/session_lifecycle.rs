@@ -183,9 +183,9 @@ fn test_source_profile_not_serialized() {
         "source_profile should not be serialized"
     );
 
-    // Reload -- source_profile should default to empty
+    // Reload assigns the owning profile at runtime without serializing it.
     let loaded = storage.load().unwrap();
-    assert_eq!(loaded[0].source_profile, "");
+    assert_eq!(loaded[0].source_profile, "default");
 }
 
 #[test]

@@ -1,9 +1,9 @@
 //! Session storage - JSON file persistence with in-process and cross-process
 //! locking.
 //!
-//! Storage serialises read-modify-write cycles with an app-global ownership
-//! flock around the two per-profile layers below. The outer lock prevents a
-//! tmux ownership reconciliation from racing a durable tool or session-ID write.
+//! Storage serialises ordinary read-modify-write cycles with the two per-profile
+//! layers below. Ownership-sensitive callers additionally take the app-global
+//! tmux ownership flock before using `update_with_tmux_ownership_lock`.
 //!
 //! 1. **In-process per-profile mutex** (one `Arc<Mutex<()>>` per profile name,
 //!    registered process-wide). Performance + observability layer, not a
@@ -1087,13 +1087,14 @@ impl Storage {
     /// `rename(2)` syscalls on sibling files and is tolerated by the
     /// loader (`GroupTree` accepts orphan group rows).
     ///
-    /// This is the only public mutator entry point; all writes funnel through
-    /// here so the ownership, process-local, and per-profile locks are taken.
+    /// This is the only public mutator entry point; ordinary writes take the
+    /// process-local and per-profile locks. Ownership-sensitive callers must
+    /// hold the app-global ownership lock and use
+    /// `update_with_tmux_ownership_lock` instead.
     pub fn update<F, R>(&self, f: F) -> Result<R>
     where
         F: FnOnce(&mut Vec<Instance>, &mut Vec<Group>) -> Result<R>,
     {
-        let _ownership = acquire_tmux_ownership_lock()?;
         self.update_with_tmux_ownership_lock(f)
     }
 
@@ -1298,6 +1299,10 @@ impl Storage {
             ));
         }
 
+        // A cross-profile rewrite must not erase an unreadable row that may
+        // still reserve conversation ownership in either profile.
+        self.load_ownership_strict()?;
+        target.load_ownership_strict()?;
         let (mut source_instances, mut source_groups) = self.load_with_groups()?;
         let (mut target_instances, mut target_groups) = target.load_with_groups()?;
         let mut ids = std::collections::HashSet::with_capacity(changes.len());
@@ -4180,6 +4185,52 @@ mod tests {
         assert!(!effect_ran.get());
         assert_eq!(source.load()?.len(), 1);
         assert_eq!(target.load()?.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn profile_move_rejects_corrupt_ownership_rows() -> Result<()> {
+        for corrupt_source in [true, false] {
+            let temp = tempdir()?;
+            let source_dir = temp.path().join("source-corrupt");
+            let target_dir = temp.path().join("target-corrupt");
+            fs::create_dir_all(&source_dir)?;
+            fs::create_dir_all(&target_dir)?;
+            let source =
+                Storage::new_for_test_path("corrupt-source", source_dir.join("sessions.json"));
+            let target =
+                Storage::new_for_test_path("corrupt-target", target_dir.join("sessions.json"));
+            let before = Instance::new("move-me", "/repo/move-me");
+            source.update(|instances, _groups| {
+                instances.push(before.clone());
+                Ok(())
+            })?;
+            target.update(|_, _| Ok(()))?;
+
+            let corrupt = if corrupt_source { &source } else { &target };
+            let mut rows: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&corrupt.sessions_path)?)?;
+            rows.as_array_mut().unwrap().push(serde_json::json!({
+                "agent_session_id": "reserved-by-unreadable-row"
+            }));
+            fs::write(&corrupt.sessions_path, serde_json::to_vec_pretty(&rows)?)?;
+            let before_move = fs::read(&corrupt.sessions_path)?;
+
+            let result = source.move_instance_to_with_effect(
+                &target,
+                &before,
+                &before,
+                |_instances, _candidate| Ok(()),
+                |_candidate| Ok(()),
+            );
+
+            assert!(result.is_err(), "corrupt_source={corrupt_source}");
+            assert_eq!(
+                fs::read(&corrupt.sessions_path)?,
+                before_move,
+                "corrupt_source={corrupt_source}"
+            );
+        }
         Ok(())
     }
 
