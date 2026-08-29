@@ -944,6 +944,7 @@ impl Storage {
                 Err(error) => {
                     let may_own_conversation = row.as_object().is_some_and(|object| {
                         [
+                            "id",
                             "agent_session_id",
                             "acp_session_id",
                             "pending_tmux_ownership_session_id",

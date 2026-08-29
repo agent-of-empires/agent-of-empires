@@ -2779,39 +2779,49 @@ impl<S: BroadcastSink> Supervisor<S> {
     /// Stop a worker whose adapter assigned an ownership-conflicting identity,
     /// and clear that rejected identity from every respawn source.
     pub async fn reject_session_assignment(&self, session_id: &str, rejected_id: &str) {
-        let registry_matches = crate::process::worker_registry::load(session_id)
-            .ok()
-            .flatten()
-            .and_then(|record| record.stored_acp_session_id)
-            .as_deref()
-            == Some(rejected_id);
-        let matches_current = {
+        let rejected_handle = {
             let mut guard = self.workers.lock().await;
-            if let Some(handle) = guard.get_mut(session_id) {
-                match &mut handle.kind {
+            let registry_matches = crate::process::worker_registry::load(session_id)
+                .ok()
+                .flatten()
+                .and_then(|record| record.stored_acp_session_id)
+                .as_deref()
+                == Some(rejected_id);
+            let matches_current = guard
+                .get(session_id)
+                .is_some_and(|handle| match &handle.kind {
                     WorkerKind::Runner { spawn_config } => {
-                        let matches = registry_matches
-                            || spawn_config.stored_acp_session_id.as_deref() == Some(rejected_id);
-                        if matches {
-                            spawn_config.stored_acp_session_id = None;
-                        }
-                        matches
+                        registry_matches
+                            || spawn_config.stored_acp_session_id.as_deref() == Some(rejected_id)
                     }
                     WorkerKind::Attached => registry_matches,
                     #[cfg(test)]
                     WorkerKind::Stdio => registry_matches,
+                });
+            if matches_current {
+                let handle = guard.remove(session_id);
+                if let Some(handle) = &handle {
+                    handle.drain_task.abort();
                 }
+                handle
             } else {
-                false
+                None
             }
         };
-        if matches_current {
-            if let Err(error) = self.shutdown(session_id).await {
-                warn!(
-                    target: "acp.supervisor",
-                    session = %session_id,
-                    %error,
-                    "failed to stop worker after rejecting ACP session assignment"
+        if let Some(handle) = rejected_handle {
+            let _ = handle.client.shutdown().await;
+            terminate_runner_for_session(session_id);
+            let should_publish = match &handle.kind {
+                WorkerKind::Runner { .. } | WorkerKind::Attached => true,
+                #[cfg(test)]
+                WorkerKind::Stdio => false,
+            };
+            if should_publish {
+                self.publish_next(
+                    session_id,
+                    &Event::Stopped {
+                        reason: "ownership_rejected".into(),
+                    },
                 );
             }
         }

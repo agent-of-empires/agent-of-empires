@@ -4819,6 +4819,7 @@ impl Instance {
         if self.is_structured() {
             return Ok(LaunchSidOutcome::Skipped);
         }
+        self.validate_launch_sid_ownership(&storage)?;
         // A `remain-on-exit` corpse still owns the tmux name, so plain
         // `exists()` reads a crashed agent as a running session and start
         // becomes a silent no-op the caller reports as success. Recreate the
@@ -5817,58 +5818,85 @@ impl Instance {
     }
 
     fn validate_launch_sid_ownership(&self, storage: &super::storage::Storage) -> Result<()> {
-        let Some(sid) = self.launch_resume_sid() else {
-            return Ok(());
-        };
-        let Some(namespace) = self.terminal_session_store_namespace() else {
-            return Ok(());
-        };
-        let explicit_pin =
-            matches!(&self.resume_intent, ResumeIntent::Use(pinned) if pinned == sid);
+        let sid = self.launch_resume_sid();
+        let namespace = sid
+            .map(|_| {
+                self.terminal_session_store_namespace().ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "refusing to launch session '{}': conversation store ownership is unknown",
+                        self.id
+                    )
+                })
+            })
+            .transpose()?;
         crate::session::sync::with_tmux_ownership_lock(|| {
-            if let Some(holder) = crate::session::sync::reserved_sid_holder_excluding_profile(
-                storage.profile(),
-                &namespace,
-                sid,
-            )? {
+            let foreign =
+                crate::session::sync::load_profile_instances_excluding(Some(storage.profile()))?;
+            if foreign.iter().any(|instance| instance.id == self.id) {
                 anyhow::bail!(
-                    "refusing to launch session '{}': conversation '{}' is reserved by session '{}' in another profile",
-                    self.id,
-                    sid,
-                    holder
+                    "refusing to launch session '{}': its instance ID exists in another profile",
+                    self.id
                 );
             }
-            let instances = storage.load_strict()?;
+            let instances = storage.load_ownership_strict()?;
+            if instances
+                .iter()
+                .filter(|instance| instance.id == self.id)
+                .count()
+                > 1
+            {
+                anyhow::bail!(
+                    "refusing to launch session '{}': its instance ID is ambiguous in profile '{}'",
+                    self.id,
+                    storage.profile()
+                );
+            }
+            let Some((sid, namespace)) = sid.zip(namespace.as_deref()) else {
+                return Ok(());
+            };
+            let explicit_pin =
+                matches!(&self.resume_intent, ResumeIntent::Use(pinned) if pinned == sid);
+            if let Some(holder) = foreign
+                .iter()
+                .find(|instance| instance.reserves_agent_session_id_in_namespace(sid, namespace))
+            {
+                anyhow::bail!(
+                        "refusing to launch session '{}': conversation '{}' is reserved by session '{}' in another profile",
+                        self.id,
+                        sid,
+                        holder.id
+                    );
+            }
             for holder in instances.iter().filter(|instance| {
                 instance.id != self.id
-                    && instance.reserves_agent_session_id_in_namespace(sid, &namespace)
+                    && instance.reserves_agent_session_id_in_namespace(sid, namespace)
             }) {
                 if holder.is_structured() {
                     anyhow::bail!(
-                        "refusing to launch session '{}': conversation '{}' belongs to structured session '{}'",
-                        self.id,
-                        sid,
-                        holder.id
-                    );
+                            "refusing to launch session '{}': conversation '{}' belongs to structured session '{}'",
+                            self.id,
+                            sid,
+                            holder.id
+                        );
                 }
                 if !explicit_pin {
                     anyhow::bail!(
-                        "refusing to launch session '{}': conversation '{}' is reserved by session '{}'",
-                        self.id,
-                        sid,
-                        holder.id
-                    );
+                            "refusing to launch session '{}': conversation '{}' is reserved by session '{}'",
+                            self.id,
+                            sid,
+                            holder.id
+                        );
                 }
                 if let Err(error) = crate::session::sync::ensure_instances_quiescent(
                     std::slice::from_ref(holder),
                     "reuse conversation ownership",
                 ) {
                     anyhow::bail!(
-                        "refusing to launch session '{}': conversation '{}' is still live in session '{}': {error}",
-                        self.id,
-                        sid,
-                        holder.id
-                    );
+                            "refusing to launch session '{}': conversation '{}' is still live in session '{}': {error}",
+                            self.id,
+                            sid,
+                            holder.id
+                        );
                 }
             }
             Ok(())
@@ -18116,6 +18144,24 @@ mod tests {
             relative_a.resume_intent = ResumeIntent::Cleared;
             relative_a.refresh_launch_store_namespace().unwrap();
             assert_ne!(relative_a.agent_session_store_namespace, stored_namespace);
+            let duplicate_owner_profile = "guards-duplicate-id-owner";
+            let duplicate_claimant_profile = "guards-duplicate-id-claimant";
+            let mut duplicate_owner = make_inst(duplicate_owner_profile, "duplicate-owner");
+            duplicate_owner.tool = "qwen".to_string();
+            let mut duplicate_claimant =
+                make_inst(duplicate_claimant_profile, "duplicate-claimant");
+            duplicate_claimant.tool = "qwen".to_string();
+            duplicate_claimant.id = duplicate_owner.id.clone();
+            seed(duplicate_owner_profile, &[&duplicate_owner]);
+            seed(duplicate_claimant_profile, &[&duplicate_claimant]);
+            assert!(
+                duplicate_claimant
+                    .validate_launch_sid_ownership(
+                        &Storage::new_unwatched(duplicate_claimant_profile).unwrap()
+                    )
+                    .is_err(),
+                "a terminal-disabled agent must still reject a cross-profile instance ID owner"
+            );
             let corrupt_storage = Storage::new_unwatched("guards-owned-corrupt").unwrap();
             std::fs::write(corrupt_storage.sessions_path(), "[null]").unwrap();
             let independent_profile = "guards-owned-independent-agent";
@@ -18140,7 +18186,7 @@ mod tests {
             valid_foreign.resume_intent = ResumeIntent::Default;
             let rows = serde_json::json!([
                 serde_json::to_value(&valid_foreign).unwrap(),
-                {"id": 42, "acp_session_id": SID_X}
+                {"id": "malformed-live-owner", "status": 42}
             ]);
             std::fs::write(
                 corrupt_ownership_storage.sessions_path(),

@@ -3616,21 +3616,23 @@ fn validate_acp_session_assignment(
     session_id: &str,
 ) -> anyhow::Result<()> {
     let namespace = acp_assignment_namespace(instance);
-    if local.iter().chain(foreign).any(|candidate| {
-        if candidate.id == instance.id {
-            return false;
-        }
-        (candidate.acp_session_id.as_deref() == Some(session_id)
-            && acp_assignment_namespace(candidate) == namespace)
-            || candidate.reserves_claude_import_id_in_namespace(session_id, &namespace)
-            || candidate
-                .prior_tool_session_ids
-                .iter()
-                .any(|(tool, prior)| {
-                    prior.acp_session_id.as_deref() == Some(session_id)
-                        && format!("acp:{tool}") == namespace
-                })
-    }) {
+    if local
+        .iter()
+        .filter(|candidate| !std::ptr::eq(*candidate, instance))
+        .chain(foreign)
+        .any(|candidate| {
+            (candidate.acp_session_id.as_deref() == Some(session_id)
+                && acp_assignment_namespace(candidate) == namespace)
+                || candidate.reserves_claude_import_id_in_namespace(session_id, &namespace)
+                || candidate
+                    .prior_tool_session_ids
+                    .iter()
+                    .any(|(tool, prior)| {
+                        prior.acp_session_id.as_deref() == Some(session_id)
+                            && format!("acp:{tool}") == namespace
+                    })
+        })
+    {
         anyhow::bail!("ACP session '{session_id}' is already owned in store '{namespace}'");
     }
     Ok(())
@@ -5785,7 +5787,7 @@ async fn acp_event_listener(state: Arc<AppState>) {
 
         // Acquire `instances` once for both branches. Releases before
         // the (potentially blocking) sessions.json save.
-        let (profile_to_save, unread_profile) = {
+        let (profile_to_save, assignment_profile, unread_profile) = {
             let mut instances = state.instances.write().await;
             let Some(inst) = instances.iter_mut().find(|i| i.id == frame.session_id) else {
                 continue;
@@ -5817,6 +5819,8 @@ async fn acp_event_listener(state: Arc<AppState>) {
                         acp_change.as_ref(),
                     )
                 },
+                matches!(acp_change.as_ref(), Some(AcpSessionChange::Assigned(_)))
+                    .then(|| inst.source_profile.clone()),
                 unread_profile,
             )
         };
@@ -5855,10 +5859,11 @@ async fn acp_event_listener(state: Arc<AppState>) {
             .await;
         }
 
-        // Persist `acp_session_id` to disk if the field changed.
+        // Validate every assigned identity; persist only when durable fields changed.
         // Sync FS (file copy + JSON write) goes through spawn_blocking
         // so the runtime stays responsive under large session lists.
-        if let Some(profile) = profile_to_save {
+        let should_persist = profile_to_save.is_some();
+        if let Some(profile) = profile_to_save.or(assignment_profile) {
             let session_id_for_log = frame.session_id.clone();
             let session_id_for_save = frame.session_id.clone();
             let profile_for_save = profile.clone();
@@ -5874,6 +5879,24 @@ async fn acp_event_listener(state: Arc<AppState>) {
                     let foreign = crate::session::sync::load_profile_instances_excluding(Some(
                         storage.profile(),
                     ))?;
+                    if !should_persist {
+                        let all = storage.load_ownership_strict()?;
+                        let index = all
+                            .iter()
+                            .position(|i| i.id == session_id_for_save)
+                            .ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "session {} disappeared before ACP identity validation",
+                                    session_id_for_save
+                                )
+                            })?;
+                        let Some(AcpSessionChange::Assigned(new_id)) = acp_change_for_save.as_ref()
+                        else {
+                            return Ok(());
+                        };
+                        validate_acp_session_assignment(&all[index], &all, &foreign, new_id)?;
+                        return Ok(());
+                    }
                     storage.update_with_tmux_ownership_lock(|all, _groups| {
                         let index = all
                             .iter()
@@ -6840,6 +6863,29 @@ mod tests {
         owner.acp_session_id = Some("contested".into());
 
         assert!(validate_acp_session_assignment(&target, &[], &[], "free").is_ok());
+        let mut persisted_target = target.clone();
+        persisted_target.acp_session_id = Some("contested".into());
+        assert!(
+            validate_acp_session_assignment(
+                &persisted_target,
+                std::slice::from_ref(&persisted_target),
+                &[],
+                "contested"
+            )
+            .is_ok(),
+            "the target row itself is not a competing owner"
+        );
+        let duplicate_id_owner = persisted_target.clone();
+        assert!(
+            validate_acp_session_assignment(
+                &persisted_target,
+                std::slice::from_ref(&persisted_target),
+                std::slice::from_ref(&duplicate_id_owner),
+                "contested"
+            )
+            .is_err(),
+            "a distinct foreign row with the target ID remains a competing owner"
+        );
         for foreign in [false, true] {
             let (local, remote) = if foreign {
                 (Vec::new(), vec![owner.clone()])
