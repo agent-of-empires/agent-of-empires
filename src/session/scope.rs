@@ -3,7 +3,7 @@
 //! drift. See #3350 for the CLI parity motivation and #3156/#3187 for
 //! the API's original design.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use super::Instance;
 
@@ -11,7 +11,7 @@ use super::Instance;
 /// vocabulary (`state=live|trashed|all`); `#[serde(rename_all = "lowercase")]`
 /// pins that and rejects any other value at deserialize time so a typo
 /// surfaces as an error rather than silently returning every session.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SessionScope {
     /// The default in every current caller: sessions that are neither

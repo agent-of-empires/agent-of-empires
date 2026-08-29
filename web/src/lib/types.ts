@@ -592,8 +592,8 @@ export interface ClaudeSessionSummary {
   cwd_exists: boolean;
 }
 
-/** Live acp worker lifecycle, mirrored from
- *  `crate::acp::supervisor::AcpWorkerState`. See #1088. */
+/** Live ACP worker lifecycle, mirrored from
+ *  crate::daemon::AcpWorkerState. See #1088. */
 export type AcpWorkerState = "absent" | "resuming" | "running";
 
 // --- Settings schema (single source of truth, see #1692) ---

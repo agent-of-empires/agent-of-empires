@@ -38,7 +38,7 @@ use crate::acp::client::{
 };
 use crate::acp::elicitations::ElicitationResolution;
 use crate::acp::protocol::ApprovalDecisionWire;
-use crate::acp::state::QueuedPromptEntry;
+use crate::daemon::QueuedPromptEntry;
 use crate::plugin::ui_state::{Tone, UiSnapshot};
 use crate::session::config::{resolve_theme_name, resolve_theme_palette_mode};
 use crate::tui::styles::Theme;

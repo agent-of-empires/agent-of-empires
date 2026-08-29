@@ -62,11 +62,12 @@ use super::permissions::build_approval;
 use super::state::{
     AcpSessionId, AvailableCommand, ConfigOptionCategory, ConfigOptionChoice,
     ConfigOptionDescriptor, DiffPreview, Event, MemoryRecall, ModeInfo, Plan, PlanStep,
-    PlanStepStatus, PromptAttachmentKind, RateLimitInfo, SessionMode, SessionUsage,
-    StartupErrorDetail, ToolCall, ToolOutputBlock, UsageCost,
+    PlanStepStatus, RateLimitInfo, SessionMode, SessionUsage, StartupErrorDetail, ToolCall,
+    ToolOutputBlock, UsageCost,
 };
 use super::terminal_handler::TerminalManager;
 use crate::acp::control_protocol::{self, ControlBody};
+use crate::daemon::PromptAttachmentKind;
 use crate::session::SandboxInfo;
 
 #[derive(Debug, Error)]

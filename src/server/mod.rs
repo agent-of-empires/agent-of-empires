@@ -242,7 +242,7 @@ fn test_token_grace_override() -> Option<Duration> {
 /// disk after `CLEANUP_DEFAULTS_TTL`.
 pub struct CleanupDefaultsCache {
     pub refreshed_at: std::time::Instant,
-    pub entries: std::collections::HashMap<String, api::CleanupDefaults>,
+    pub entries: std::collections::HashMap<String, crate::daemon::CleanupDefaults>,
 }
 
 pub const CLEANUP_DEFAULTS_TTL: std::time::Duration = std::time::Duration::from_secs(30);

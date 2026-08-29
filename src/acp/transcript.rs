@@ -30,7 +30,8 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use super::elicitations::ElicitationAnswer;
-use super::state::{DiffComment, Event, PromptAttachmentRef, ToolCall, ToolOutputBlock};
+use super::state::{DiffComment, Event, ToolCall, ToolOutputBlock};
+use crate::daemon::PromptAttachmentRef;
 
 /// One renderable row of the transcript. A stable superset of the web
 /// `ActivityRow` union and the TUI `ActivityRow` enum: the same shape serves
@@ -921,7 +922,8 @@ mod tests {
     use crate::acp::approvals::Nonce;
     use crate::acp::elicitations::Elicitation;
     use crate::acp::elicitations::ElicitationOutcome;
-    use crate::acp::state::{DiffPreview, MemoryRecall, PromptAttachmentKind};
+    use crate::acp::state::{DiffPreview, MemoryRecall};
+    use crate::daemon::PromptAttachmentKind;
     use chrono::TimeZone;
 
     fn at(secs: i64) -> DateTime<Utc> {

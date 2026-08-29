@@ -1,0 +1,270 @@
+//! Reusable client and shared wire contract for the daemon REST API.
+
+mod wire;
+
+use std::fmt;
+use std::time::Duration;
+
+use reqwest::header::{HeaderValue, AUTHORIZATION};
+use reqwest::{StatusCode, Url};
+use thiserror::Error;
+
+pub use wire::{
+    AcpWorkerState, CleanupDefaults, ListSessionsQuery, PlanSummary, PromptAttachmentKind,
+    PromptAttachmentRef, QueuedPromptEntry, SessionResponse, SessionsEnvelope,
+    WorkspaceRepoSummary,
+};
+
+const DEFAULT_TIMEOUT: Duration = Duration::from_secs(15);
+const MAX_ERROR_BODY_BYTES: usize = 8 * 1024;
+const MAX_SUCCESS_BODY_BYTES: usize = 16 * 1024 * 1024;
+
+/// Client for the daemon's session REST API.
+///
+/// Clones share the underlying reqwest connection pool.
+#[derive(Clone)]
+pub struct DaemonClient {
+    http: reqwest::Client,
+    sessions_url: Url,
+    authorization: Option<HeaderValue>,
+}
+
+impl fmt::Debug for DaemonClient {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("DaemonClient")
+            .field("sessions_url", &self.sessions_url)
+            .field("authenticated", &self.authorization.is_some())
+            .finish()
+    }
+}
+
+/// Failure from constructing or calling a [`DaemonClient`].
+#[derive(Debug, Error)]
+pub enum DaemonClientError {
+    /// The supplied URL is not a usable HTTP daemon base URL.
+    #[error("invalid daemon base URL: {reason}")]
+    InvalidBaseUrl { reason: &'static str },
+    /// The bearer token cannot be represented as an HTTP authorization header.
+    #[error("invalid daemon bearer token")]
+    InvalidBearerToken,
+    /// The default reqwest client could not be built.
+    #[error("failed to build daemon HTTP client: {0}")]
+    ClientBuild(#[source] reqwest::Error),
+    /// Sending the request or reading its response failed.
+    #[error("daemon transport error: {0}")]
+    Transport(#[source] reqwest::Error),
+    /// The daemon returned a non-successful HTTP status.
+    #[error("daemon returned HTTP {status}: {body}")]
+    Status {
+        status: StatusCode,
+        body: String,
+        truncated: bool,
+    },
+    /// A successful response exceeded the bounded sessions-envelope limit.
+    #[error("daemon response exceeded the {limit}-byte limit")]
+    ResponseTooLarge { limit: usize },
+    /// A successful response did not match the shared wire contract.
+    #[error("failed to decode daemon response: {0}")]
+    Decode(#[source] serde_json::Error),
+}
+
+impl DaemonClient {
+    /// Build a client with a 15-second timeout and redirects disabled.
+    pub fn new(base_url: &str, bearer_token: Option<&str>) -> Result<Self, DaemonClientError> {
+        let sessions_url = sessions_url(base_url)?;
+        let authorization = authorization_header(bearer_token)?;
+        let http = reqwest::Client::builder()
+            .timeout(DEFAULT_TIMEOUT)
+            .user_agent(concat!("aoe-daemon-client/", env!("CARGO_PKG_VERSION")))
+            .redirect(reqwest::redirect::Policy::none())
+            .build()
+            .map_err(DaemonClientError::ClientBuild)?;
+        Ok(Self {
+            http,
+            sessions_url,
+            authorization,
+        })
+    }
+
+    /// Fetch the sessions endpoint, optionally filtered by session state.
+    pub async fn list_sessions(
+        &self,
+        state: Option<crate::session::SessionScope>,
+    ) -> Result<SessionsEnvelope, DaemonClientError> {
+        let query = ListSessionsQuery { state };
+        let mut request = self
+            .http
+            .get(self.sessions_url.clone())
+            .query(&query)
+            .timeout(DEFAULT_TIMEOUT);
+        if let Some(authorization) = &self.authorization {
+            request = request.header(AUTHORIZATION, authorization.clone());
+        }
+        let request = request.build().map_err(DaemonClientError::Transport)?;
+        let mut response = self
+            .http
+            .execute(request)
+            .await
+            .map_err(DaemonClientError::Transport)?;
+
+        let status = response.status();
+        if !status.is_success() {
+            let (body, truncated) = self.read_error_body(&mut response).await?;
+            return Err(DaemonClientError::Status {
+                status,
+                body,
+                truncated,
+            });
+        }
+
+        let body = read_bounded_body(&mut response, MAX_SUCCESS_BODY_BYTES).await?;
+        serde_json::from_slice(&body).map_err(DaemonClientError::Decode)
+    }
+
+    async fn read_error_body(
+        &self,
+        response: &mut reqwest::Response,
+    ) -> Result<(String, bool), DaemonClientError> {
+        let mut bytes = Vec::with_capacity(MAX_ERROR_BODY_BYTES);
+        let mut truncated = false;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(DaemonClientError::Transport)?
+        {
+            let remaining = MAX_ERROR_BODY_BYTES.saturating_sub(bytes.len());
+            if chunk.len() > remaining {
+                bytes.extend_from_slice(&chunk[..remaining]);
+                truncated = true;
+                break;
+            }
+            bytes.extend_from_slice(&chunk);
+        }
+
+        let mut body = String::from_utf8_lossy(&bytes).into_owned();
+        if body.len() > MAX_ERROR_BODY_BYTES {
+            truncate_utf8(&mut body, MAX_ERROR_BODY_BYTES);
+            truncated = true;
+        }
+        if let Some(token) = self.bearer_token() {
+            body = body.replace(token, "<redacted>");
+            if truncated {
+                redact_truncated_token(&mut body, token);
+            }
+        }
+        if body.len() > MAX_ERROR_BODY_BYTES {
+            truncate_utf8(&mut body, MAX_ERROR_BODY_BYTES);
+        }
+        Ok((body, truncated))
+    }
+
+    fn bearer_token(&self) -> Option<&str> {
+        self.authorization
+            .as_ref()?
+            .to_str()
+            .ok()?
+            .strip_prefix("Bearer ")
+    }
+}
+
+async fn read_bounded_body(
+    response: &mut reqwest::Response,
+    limit: usize,
+) -> Result<Vec<u8>, DaemonClientError> {
+    if response
+        .content_length()
+        .is_some_and(|length| length > limit as u64)
+    {
+        return Err(DaemonClientError::ResponseTooLarge { limit });
+    }
+
+    let capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or_default()
+        .min(limit);
+    let mut bytes = Vec::with_capacity(capacity);
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(DaemonClientError::Transport)?
+    {
+        let remaining = limit.saturating_sub(bytes.len());
+        if chunk.len() > remaining {
+            return Err(DaemonClientError::ResponseTooLarge { limit });
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(bytes)
+}
+
+fn sessions_url(base_url: &str) -> Result<Url, DaemonClientError> {
+    let mut base = Url::parse(base_url).map_err(|_| DaemonClientError::InvalidBaseUrl {
+        reason: "could not parse URL",
+    })?;
+    if !matches!(base.scheme(), "http" | "https") {
+        return Err(DaemonClientError::InvalidBaseUrl {
+            reason: "scheme must be http or https",
+        });
+    }
+    if base.host().is_none() {
+        return Err(DaemonClientError::InvalidBaseUrl {
+            reason: "URL must include a host",
+        });
+    }
+    if !base.username().is_empty() || base.password().is_some() {
+        return Err(DaemonClientError::InvalidBaseUrl {
+            reason: "URL must not include credentials",
+        });
+    }
+    if base.query().is_some() || base.fragment().is_some() {
+        return Err(DaemonClientError::InvalidBaseUrl {
+            reason: "URL must not include a query or fragment",
+        });
+    }
+    if !base.path().ends_with('/') {
+        base.path_segments_mut()
+            .map_err(|_| DaemonClientError::InvalidBaseUrl {
+                reason: "URL cannot be used as a base",
+            })?
+            .push("");
+    }
+    base.join("api/sessions")
+        .map_err(|_| DaemonClientError::InvalidBaseUrl {
+            reason: "could not join sessions endpoint",
+        })
+}
+
+fn authorization_header(
+    bearer_token: Option<&str>,
+) -> Result<Option<HeaderValue>, DaemonClientError> {
+    let Some(token) = bearer_token else {
+        return Ok(None);
+    };
+    if token.is_empty() || !token.bytes().all(|byte| byte.is_ascii_graphic()) {
+        return Err(DaemonClientError::InvalidBearerToken);
+    }
+    let mut value = HeaderValue::from_str(&format!("Bearer {token}"))
+        .map_err(|_| DaemonClientError::InvalidBearerToken)?;
+    value.set_sensitive(true);
+    Ok(Some(value))
+}
+
+fn truncate_utf8(value: &mut String, max_bytes: usize) {
+    let mut boundary = max_bytes.min(value.len());
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value.truncate(boundary);
+}
+
+fn redact_truncated_token(body: &mut String, token: &str) {
+    let max_prefix = body.len().min(token.len());
+    if let Some(prefix_len) = (1..=max_prefix)
+        .rev()
+        .find(|prefix_len| body.ends_with(&token[..*prefix_len]))
+    {
+        body.truncate(body.len() - prefix_len);
+        body.push_str("<redacted>");
+    }
+}

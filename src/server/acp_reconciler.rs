@@ -2940,7 +2940,7 @@ mod tests {
     #[tokio::test]
     async fn drain_queued_prompts_wakes_a_dormant_session_with_a_queue() {
         use super::drain_queued_prompts;
-        use crate::acp::state::QueuedPromptEntry;
+        use crate::daemon::QueuedPromptEntry;
         use crate::server::test_support::build_test_app_state;
         use crate::session::{Instance, Status, View};
 

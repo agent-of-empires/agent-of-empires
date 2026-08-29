@@ -10,6 +10,7 @@ pub mod build_info;
 pub mod claude_settings;
 pub mod cli;
 pub mod containers;
+pub mod daemon;
 /// Protocol-agnostic durable event log, the storage substrate behind the
 /// ACP transcript store and (later) the plugin host's event bus. Serve-gated
 /// because its only consumer today is the serve-gated acp module.
