@@ -10547,6 +10547,32 @@ fn restart_selected_session_tool_swap_clears_old_agent_session_state() {
     assert_eq!(parked.acp_session_id.as_deref(), Some("acp-sess-1"));
 }
 
+#[test]
+#[serial]
+fn restart_tool_swap_aborts_when_durable_row_disappears() {
+    let mut env = create_test_env_with_sessions(1);
+    let id = env.view.instance_at(0).id.clone();
+    let original_tool = env.view.instance_at(0).tool.clone();
+    env.view.selected_session = Some(id.clone());
+    env.view
+        .storages
+        .get("test")
+        .unwrap()
+        .update(|instances, groups| {
+            instances.retain(|instance| instance.id != id);
+            groups.clear();
+            Ok(())
+        })
+        .unwrap();
+
+    let error = env
+        .view
+        .restart_selected_session(None, Some("codex"), None, None)
+        .expect_err("a tool swap without a durable row must abort");
+    assert!(error.to_string().contains("disappeared from storage"));
+    assert_eq!(env.view.instance_at(0).tool, original_tool);
+}
+
 /// The disk row a tool swap writes must resolve `agent_detect_as` against the
 /// session's own profile. `source_profile` is `skip_serializing`, so a
 /// storage-loaded row comes back blank and would key the default profile's

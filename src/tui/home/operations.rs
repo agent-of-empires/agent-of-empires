@@ -504,6 +504,7 @@ impl HomeView {
                 requested,
                 Some(&restart_edit_authoritative),
             )?;
+            crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env()?;
             self.reload_preserving_profile_move_runtime(std::slice::from_ref(&id))?;
         } else {
             // Outside Attention sort, restart on a snoozed row clears the
@@ -518,8 +519,9 @@ impl HomeView {
                     .map(|i| i.tool.clone())
                     .unwrap_or_default();
                 if target_tool != current_tool {
+                    self.persist_tool_swap(&id, target_tool)?;
                     self.mutate_instance(&id, |inst| inst.swap_tool(target_tool));
-                    self.persist_tool_swap(&id, target_tool);
+                    crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env()?;
                 }
             }
             if let Some(command) = new_command_override {
@@ -541,7 +543,6 @@ impl HomeView {
         // state. The worker owns the Starting reservation; publishing that
         // status here would make it reject its own request as concurrent.
         self.save()?;
-        crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env()?;
         // The transaction has already released its canonical profile locks.
         // Publish the final launch edit while identity/title/lifecycle remain
         // guarded, then drop identity before releasing the per-session guards.
@@ -598,48 +599,35 @@ impl HomeView {
     /// result over it, because the capture pollers may have written a fresher
     /// sid to disk than this snapshot carries; parking whatever disk holds is
     /// what makes the swap-back restore the real conversation.
-    ///
-    /// Best-effort. A failed write leaves the stale sid on disk (the restart
-    /// still runs, and its resume-probe fallback recovers by starting fresh),
-    /// so it is logged rather than surfaced as a restart failure.
-    fn persist_tool_swap(&self, id: &str, new_tool: &str) {
-        let Some(profile) = self.instances.get(id).map(|i| i.source_profile.clone()) else {
-            return;
-        };
-        let Some(storage) = self.storages.get(&profile) else {
-            tracing::warn!(
-                target: "tui.home",
-                profile = %profile,
-                id = %id,
-                "persist_tool_swap: no storage registered for profile; \
-                 the old engine's session id stays on disk"
-            );
-            return;
-        };
+    /// Failure aborts the restart before the in-memory tool changes, because a
+    /// later save would otherwise publish the old engine's session ID under the
+    /// new engine's namespace.
+    fn persist_tool_swap(&self, id: &str, new_tool: &str) -> anyhow::Result<()> {
+        let profile = self
+            .instances
+            .get(id)
+            .map(|i| i.source_profile.clone())
+            .ok_or_else(|| anyhow::anyhow!("session '{id}' disappeared before tool swap"))?;
+        let storage = self.storages.get(&profile).ok_or_else(|| {
+            anyhow::anyhow!(
+                "no storage registered for profile '{profile}' while swapping session '{id}'"
+            )
+        })?;
         let id_owned = id.to_string();
         let new_tool = new_tool.to_string();
         let row_profile = profile.clone();
-        if let Err(e) = storage.update(|instances, _groups| {
-            if let Some(disk) = instances.iter_mut().find(|i| i.id == id_owned) {
-                // `source_profile` is `skip_serializing`, so a storage-loaded
-                // row always comes back blank and would resolve the incoming
-                // tool's `agent_detect_as` alias against the default profile.
-                // A tool name aliased differently per profile would then be
-                // pinned to the wrong built-in on disk, and `detect_as` is not
-                // in `reconcile_from_disk`'s carry set, so the next launch
-                // reads that value rather than the in-memory one. Restore it
-                // the same way `reconcile_from_disk` does before the swap.
-                disk.source_profile = row_profile.clone();
-                disk.swap_tool(&new_tool);
-            }
+        storage.update(|instances, _groups| {
+            let disk = instances
+                .iter_mut()
+                .find(|i| i.id == id_owned)
+                .ok_or_else(|| anyhow::anyhow!("session '{id_owned}' disappeared from storage"))?;
+            // Storage-loaded rows omit source_profile. Restore it before
+            // resolving a profile-scoped agent alias during the swap.
+            disk.source_profile = row_profile.clone();
+            disk.swap_tool(&new_tool);
             Ok(())
-        }) {
-            tracing::error!(
-                target: "tui.home",
-                id = %id,
-                "persist_tool_swap: failed to move the old engine's session state aside: {e}"
-            );
-        }
+        })?;
+        Ok(())
     }
 
     pub(super) fn delete_selected(&mut self, options: &DeleteOptions) -> anyhow::Result<()> {

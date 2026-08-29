@@ -630,14 +630,23 @@ pub fn delete_profile(name: &str) -> Result<()> {
     }
 
     sync::with_tmux_ownership_lock(|| {
-        let cleared = match storage::Storage::open_unwatched(name)?.load() {
-            Ok(target_instances) => {
+        let target_instances =
+            storage::Storage::open_unwatched(name).and_then(|store| store.load());
+        let survivor_ids = sync::instance_ids_excluding_profile(name);
+        let cleared = match (target_instances, survivor_ids) {
+            (Ok(mut target_instances), Ok(survivor_ids)) => {
+                target_instances.retain(|instance| !survivor_ids.contains(&instance.id));
                 sync::clear_tmux_session_id_ownership_for_instances_locked(&target_instances)?
             }
-            Err(_) => {
-                // A corrupt profile is still deletable. With no trustworthy rows,
-                // retain only ownership proven by the surviving profiles.
-                sync::reconcile_tmux_session_id_ownership_excluding_profile_locked(name)?
+            (target, survivors) => {
+                tracing::warn!(
+                    target: "session.store",
+                    profile = name,
+                    target_readable = target.is_ok(),
+                    survivors_readable = survivors.is_ok(),
+                    "Deleting profile without pre-clearing ambiguous tmux ownership"
+                );
+                sync::ClearedTmuxOwnership::default()
             }
         };
         if let Err(delete_error) = fs::remove_dir_all(&profile_dir) {
@@ -647,6 +656,9 @@ pub fn delete_profile(name: &str) -> Result<()> {
                 );
             }
             return Err(delete_error.into());
+        }
+        if let Err(error) = sync::reconcile_all_profiles_tmux_session_id_ownership_env_locked() {
+            tracing::warn!(target: "session.store", profile = name, "Profile deleted; deferred tmux ownership cleanup: {error}");
         }
         Ok(())
     })

@@ -63,17 +63,19 @@ fn tmux_session_id_env_updates<'a>(
     let mut unset_batch = Vec::new();
     for instance in instances {
         for tmux_name in session_names(instance) {
-            set_batch.push((
-                tmux_name.clone(),
-                crate::tmux::env::AOE_INSTANCE_ID_KEY.to_string(),
-                instance.id.clone(),
-            ));
             match instance.operational_agent_session_id() {
-                Some(sid) => set_batch.push((
-                    tmux_name,
-                    crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
-                    sid.to_string(),
-                )),
+                Some(sid) => {
+                    set_batch.push((
+                        tmux_name.clone(),
+                        crate::tmux::env::AOE_INSTANCE_ID_KEY.to_string(),
+                        instance.id.clone(),
+                    ));
+                    set_batch.push((
+                        tmux_name,
+                        crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
+                        sid.to_string(),
+                    ));
+                }
                 None => unset_batch.push((
                     tmux_name,
                     crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY.to_string(),
@@ -94,12 +96,10 @@ fn tmux_session_id_env_names(
             .into_iter()
             .collect()
     } else {
-        crate::tmux::existing_any_kind_names_for_id_in(live, &instance.id).unwrap_or_else(|| {
-            instance
-                .tmux_env_session_name_in_or_probe(live)
-                .into_iter()
-                .collect()
-        })
+        // Unsupported rows may only clear panes already marked with their exact
+        // instance ID. The observation pass handles those without claiming a
+        // suffix-colliding or unmarked pane.
+        Vec::new()
     }
 }
 
@@ -309,42 +309,31 @@ pub(crate) fn restore_tmux_session_id_ownership_locked(
         .collect();
     crate::tmux::env::set_hidden_env_batch(&refs)
 }
-
 fn load_profile_instances_excluding(excluded: Option<&str>) -> anyhow::Result<Vec<Instance>> {
     let mut instances = Vec::new();
     for profile in crate::session::list_profiles()? {
         if excluded.is_some_and(|excluded| profile == excluded) {
             continue;
         }
-        let storage = match Storage::open_unwatched(&profile) {
-            Ok(storage) => storage,
-            Err(error) => {
-                tracing::warn!(target: "session.store", profile, "Ignoring untrusted profile during tmux ownership reconciliation: {error}");
-                continue;
-            }
-        };
-        let mut rows = match storage.load() {
-            Ok(rows) => rows,
-            Err(error) => {
-                tracing::warn!(target: "session.store", profile, "Ignoring unreadable profile during tmux ownership reconciliation: {error}");
-                continue;
-            }
-        };
+        let storage = Storage::open_unwatched(&profile)
+            .map_err(|error| anyhow::anyhow!("open profile {profile}: {error}"))?;
+        let mut rows = storage
+            .load()
+            .map_err(|error| anyhow::anyhow!("load profile {profile}: {error}"))?;
         instances.append(&mut rows);
     }
     Ok(instances)
 }
 
+pub(crate) fn instance_ids_excluding_profile(excluded: &str) -> anyhow::Result<HashSet<String>> {
+    Ok(load_profile_instances_excluding(Some(excluded))?
+        .into_iter()
+        .map(|instance| instance.id)
+        .collect())
+}
 pub(crate) fn reconcile_all_profiles_tmux_session_id_ownership_env_locked(
 ) -> anyhow::Result<ClearedTmuxOwnership> {
     let instances = load_profile_instances_excluding(None)?;
-    reconcile_tmux_session_id_ownership_env_locked(&instances)
-}
-
-pub(crate) fn reconcile_tmux_session_id_ownership_excluding_profile_locked(
-    excluded: &str,
-) -> anyhow::Result<ClearedTmuxOwnership> {
-    let instances = load_profile_instances_excluding(Some(excluded))?;
     reconcile_tmux_session_id_ownership_env_locked(&instances)
 }
 
@@ -961,9 +950,13 @@ mod tests {
 
             let (set_batch, unset_batch) =
                 tmux_session_id_env_updates([&instance], |row| vec![format!("tmux-{}", row.id)]);
-            assert!(set_batch.iter().any(|(_, key, value)| {
-                key == crate::tmux::env::AOE_INSTANCE_ID_KEY && value == &instance.id
-            }));
+            assert_eq!(
+                set_batch.iter().any(|(_, key, value)| {
+                    key == crate::tmux::env::AOE_INSTANCE_ID_KEY && value == &instance.id
+                }),
+                publishes,
+                "{tool}: ownership publication"
+            );
             assert_eq!(
                 set_batch
                     .iter()
@@ -975,7 +968,7 @@ mod tests {
             assert_eq!(
                 unset_batch
                     .iter()
-                    .any(|(_, key)| { key == crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY }),
+                    .any(|(_, key)| key == crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY),
                 !publishes,
                 "{tool}: unset"
             );
@@ -1157,9 +1150,8 @@ mod tests {
             read_tmux_ownership_observations(&[supported_name.clone(), vanished]).unwrap();
         assert_eq!(observations.len(), 1);
     }
-
     #[test]
-    fn unsupported_env_cleanup_targets_dead_and_live_matching_panes() {
+    fn unsupported_env_cleanup_ignores_suffix_colliding_panes() {
         for tool in ["qwen", "kiro"] {
             let mut instance = Instance::new("owner", "/tmp/x");
             instance.tool = tool.to_string();
@@ -1170,7 +1162,7 @@ mod tests {
                 Some(vec![agent.clone(), terminal.clone()]),
                 Some(HashMap::from([
                     (
-                        agent.clone(),
+                        agent,
                         crate::tmux::PaneMetadata {
                             pane_dead: true,
                             pane_current_command: None,
@@ -1190,8 +1182,8 @@ mod tests {
 
             assert_eq!(
                 tmux_session_id_env_names(&instance, &live),
-                vec![agent, terminal.clone()],
-                "{tool}: unsupported cleanup"
+                Vec::<String>::new(),
+                "{tool}: unsupported rows do not claim suffix matches"
             );
             instance.tool = "claude".to_string();
             assert_eq!(
@@ -1225,6 +1217,27 @@ mod tests {
                 Ok(())
             })
             .unwrap();
+    }
+
+    #[test]
+    #[serial]
+    fn survivor_lookup_preserves_duplicates_and_rejects_unreadable_profiles() {
+        let temp = tempdir().unwrap();
+        let _guard = storage_home_guard(&temp);
+        let shared = Instance::new("shared", "/tmp/x");
+        seed_instance_on_disk("deleted", &shared);
+        seed_instance_on_disk("survivor", &shared);
+
+        let survivor_ids = instance_ids_excluding_profile("deleted").unwrap();
+        assert!(survivor_ids.contains(&shared.id));
+
+        let corrupt = Instance::new("corrupt", "/tmp/x");
+        seed_instance_on_disk("corrupt", &corrupt);
+        let corrupt_path = crate::session::get_app_dir()
+            .unwrap()
+            .join("profiles/corrupt/sessions.json");
+        std::fs::write(corrupt_path, b"not json").unwrap();
+        assert!(instance_ids_excluding_profile("deleted").is_err());
     }
 
     #[test]

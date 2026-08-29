@@ -328,7 +328,7 @@ const FIELD_SEP: char = '|';
 /// so a socket path that happens to contain either phrase cannot fake the
 /// empty case on a different errno. Callers MUST use [`tmux_query_command`] so
 /// the `strerror` text is stable English (see #3327/#3328).
-fn tmux_no_server_running(stderr: &[u8]) -> bool {
+pub(crate) fn tmux_no_server_running(stderr: &[u8]) -> bool {
     let s = String::from_utf8_lossy(stderr);
     // tmux (`client.c`) prints both markers at the start of their own line
     // (`no server running on <socket>` / `error connecting to <socket>
@@ -697,27 +697,6 @@ impl LiveSessionSnapshot {
             .map(|meta| meta.pane_dead)
             .unwrap_or(false)
     }
-}
-
-/// Every extant AoE tmux session carrying `session_id`'s suffix, including
-/// remain-on-exit panes. Cleanup callers need dead panes; liveness callers use
-/// [`live_any_kind_name_for_id_in`] instead.
-pub(crate) fn existing_any_kind_names_for_id_in(
-    snapshot: &LiveSessionSnapshot,
-    session_id: &str,
-) -> Option<Vec<String>> {
-    let suffix = id_suffix(session_id);
-    let agent = NameShape::agent(&suffix);
-    let terminal = NameShape::terminal(&suffix);
-    let container = NameShape::container(&suffix);
-    Some(
-        snapshot
-            .names()?
-            .iter()
-            .filter(|name| agent.matches(name) || terminal.matches(name) || container.matches(name))
-            .cloned()
-            .collect(),
-    )
 }
 
 /// [`live_any_kind_name_for_id`] against an already-taken snapshot, so a batch
@@ -1951,12 +1930,6 @@ mod tests {
             assert_eq!(
                 live_any_kind_name_for_id_in(&snapshot, ID).as_deref(),
                 expected,
-                "pane_dead = {pane_dead}"
-            );
-            assert_eq!(
-                existing_any_kind_names_for_id_in(&snapshot, ID),
-                Some(vec![agent.clone()]),
-                "dead panes remain cleanup targets"
             );
         }
 
@@ -1971,12 +1944,6 @@ mod tests {
         assert_eq!(
             live_any_kind_name_for_id_in(&snapshot, ID),
             Some(terminal.clone()),
-            "live lookup skips the dead agent pane"
-        );
-        assert_eq!(
-            existing_any_kind_names_for_id_in(&snapshot, ID),
-            Some(vec![agent, terminal]),
-            "cleanup targets both dead and live matching sessions"
         );
     }
     #[test]

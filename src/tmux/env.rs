@@ -17,9 +17,8 @@ fn missing_session_stderr(stderr: &str) -> bool {
     stderr.lines().any(|line| {
         let line = line.trim_start();
         line.starts_with("can't find session:") || line.starts_with("no such session:")
-    })
+    }) || crate::tmux::tmux_no_server_running(stderr.as_bytes())
 }
-
 pub(crate) fn is_missing_session_error(error: &anyhow::Error) -> bool {
     error.downcast_ref::<MissingSession>().is_some()
 }
@@ -603,6 +602,17 @@ mod tests {
 
     #[test]
     fn strict_hidden_env_operations_classify_missing_session() {
+        for stderr in [
+            "can't find session: missing",
+            "no such session: missing",
+            "no server running on /tmp/tmux.sock",
+            "error connecting to /tmp/tmux.sock (No such file or directory)",
+        ] {
+            assert!(missing_session_stderr(stderr), "{stderr}");
+        }
+        assert!(!missing_session_stderr(
+            "error connecting to /tmp/tmux.sock (Permission denied)"
+        ));
         if !crate::tmux::is_tmux_available() {
             eprintln!("Skipping: tmux not available");
             return;
