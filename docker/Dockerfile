@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y \
     ripgrep \
     fzf \
     unzip \
+    zstd \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js (required for Codex CLI)
