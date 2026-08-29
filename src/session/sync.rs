@@ -456,7 +456,12 @@ fn load_profile_instances_excluding_with_policy(
         if excluded_identity.as_ref() == Some(&identity) {
             continue;
         }
-        let mut rows = match storage.load_ownership_strict() {
+        let load_result = if tolerate_corrupt_profiles {
+            storage.load_ownership_for_capture()
+        } else {
+            storage.load_ownership_strict()
+        };
+        let mut rows = match load_result {
             Ok(rows) => rows,
             Err(error) if tolerate_corrupt_profiles => {
                 tracing::warn!(

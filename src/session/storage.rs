@@ -910,11 +910,21 @@ impl Storage {
         }
         Ok(instances)
     }
-
     /// Load rows needed for conversation ownership decisions. Corrupt values
     /// that cannot contain ownership state are irrelevant and may be skipped;
     /// ownership-shaped rows remain strict so uncertainty still fails closed.
     pub(crate) fn load_ownership_strict(&self) -> Result<Vec<Instance>> {
+        self.load_ownership_rows(true)
+    }
+
+    /// Best-effort ownership load for asynchronous capture only. A malformed
+    /// row must not disable capture for every valid owner in the same foreign
+    /// profile; launch and destructive paths use the strict loader above.
+    pub(crate) fn load_ownership_for_capture(&self) -> Result<Vec<Instance>> {
+        self.load_ownership_rows(false)
+    }
+
+    fn load_ownership_rows(&self, strict: bool) -> Result<Vec<Instance>> {
         if !self.sessions_path.exists() {
             return Ok(Vec::new());
         }
@@ -942,7 +952,7 @@ impl Storage {
                         .iter()
                         .any(|key| object.get(*key).is_some_and(|value| !value.is_null()))
                     });
-                    if may_own_conversation {
+                    if strict && may_own_conversation {
                         return Err(error.into());
                     }
                     tracing::warn!(
@@ -950,7 +960,8 @@ impl Storage {
                         row = index,
                         error = %error,
                         path = %self.sessions_path.display(),
-                        "skipping corrupt ownership-free session row"
+                        may_own_conversation,
+                        "skipping corrupt session row during ownership scan"
                     );
                 }
             }

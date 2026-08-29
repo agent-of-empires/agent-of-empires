@@ -3256,6 +3256,23 @@ impl Instance {
         ))
     }
 
+    fn refresh_launch_store_namespace(&mut self) -> Result<()> {
+        let resolved = self.resolve_terminal_session_store_namespace_for_tool(&self.tool);
+        let resumable_sid = self.launch_resume_sid();
+        if let (Some(sid), Some(stored)) =
+            (resumable_sid, self.agent_session_store_namespace.as_deref())
+        {
+            if resolved.as_deref() != Some(stored) {
+                let current = resolved.as_deref().unwrap_or("<unresolved>");
+                anyhow::bail!(
+                    "refusing to resume conversation '{sid}': its store changed from '{stored}' to '{current}'; clear the session ID before launching fresh"
+                );
+            }
+        }
+        self.agent_session_store_namespace = resolved;
+        Ok(())
+    }
+
     /// Conversation ID that currently owns this row's tmux pane. A pending
     /// tool-swap handoff wins; otherwise unsupported agents' stored IDs remain
     /// inert and never become operational ownership.
@@ -3268,31 +3285,22 @@ impl Instance {
             .flatten()
     }
 
-    pub(crate) fn reserves_agent_session_id(&self, sid: &str) -> bool {
-        self.reserved_agent_session_ids()
-            .any(|reserved| reserved == sid)
-    }
-
     pub(crate) fn reserves_agent_session_id_in_namespace(
         &self,
         sid: &str,
         namespace: &str,
     ) -> bool {
-        let current_namespace_matches =
-            self.terminal_session_store_namespace().as_deref() == Some(namespace);
-        if current_namespace_matches
-            && (self.operational_agent_session_id() == Some(sid)
-                || self.incoming_handoff_agent_session_id() == Some(sid))
+        if self.operational_agent_session_id() == Some(sid) {
+            match self.operational_agent_session_store_namespace() {
+                Some(operational) if operational == namespace => return true,
+                None => return true,
+                Some(_) => {}
+            }
+        }
+        if self.incoming_handoff_agent_session_id() == Some(sid)
+            && self.terminal_session_store_namespace().as_deref() == Some(namespace)
         {
             return true;
-        }
-        if self.has_tmux_ownership_handoff()
-            && self.pending_tmux_ownership_session_id.as_deref() == Some(sid)
-        {
-            return match self.operational_agent_session_store_namespace() {
-                Some(outgoing) => outgoing == namespace,
-                None => true,
-            };
         }
         self.prior_tool_session_ids.iter().any(|(tool, prior)| {
             tool_supports_terminal_resume(tool)
@@ -3304,6 +3312,7 @@ impl Instance {
         })
     }
 
+    #[cfg(any(feature = "serve", test))]
     pub(crate) fn reserved_agent_session_ids(&self) -> impl Iterator<Item = &str> {
         [
             self.operational_agent_session_id(),
@@ -4653,9 +4662,11 @@ impl Instance {
         let hook_result = self.run_pre_launch_hooks(skip_on_launch, &profile);
         let (_title_lock, _lifecycle_lock) =
             self.reacquire_launch_locks_after_hooks(&storage, hook_result)?;
-        self.agent_session_store_namespace =
-            self.resolve_terminal_session_store_namespace_for_tool(&self.tool);
         self.apply_fresh_launch_intent();
+        if let Err(error) = self.refresh_launch_store_namespace() {
+            self.fail_reserved_launch(&storage, &error, false);
+            return Err(error);
+        }
         if let Err(error) = self.validate_launch_sid_ownership(&storage) {
             self.fail_reserved_launch(&storage, &error, false);
             return Err(error);
@@ -5564,19 +5575,23 @@ impl Instance {
         false
     }
 
-    fn validate_launch_sid_ownership(&self, storage: &super::storage::Storage) -> Result<()> {
+    fn launch_resume_sid(&self) -> Option<&str> {
         if !self.supports_terminal_resume()
             || (self.is_sandboxed()
                 && matches!(self.tool.as_str(), "copilot" | "kimi" | "prime-agent"))
         {
-            return Ok(());
+            return None;
         }
-        let sid = match &self.resume_intent {
+        match &self.resume_intent {
             ResumeIntent::Use(sid) => Some(sid.as_str()),
             ResumeIntent::Cleared => None,
             ResumeIntent::Fork { .. } | ResumeIntent::Default => self.agent_session_id.as_deref(),
-        };
-        let Some(sid) = sid.filter(|sid| is_valid_session_id(sid)) else {
+        }
+        .filter(|sid| is_valid_session_id(sid))
+    }
+
+    fn validate_launch_sid_ownership(&self, storage: &super::storage::Storage) -> Result<()> {
+        let Some(sid) = self.launch_resume_sid() else {
             return Ok(());
         };
         let Some(namespace) = self.terminal_session_store_namespace() else {
@@ -5664,13 +5679,11 @@ impl Instance {
         let new_sid = self.agent_session_id.clone();
         let outcome = crate::session::sync::with_tmux_ownership_lock(|| {
             if let (Some(sid), Some(namespace)) = (new_sid.as_deref(), namespace.as_deref()) {
-                if let Some(holder) =
-                    crate::session::sync::reserved_sid_holder_excluding_profile_for_capture(
-                        storage.profile(),
-                        namespace,
-                        sid,
-                    )?
-                {
+                if let Some(holder) = crate::session::sync::reserved_sid_holder_excluding_profile(
+                    storage.profile(),
+                    namespace,
+                    sid,
+                )? {
                     tracing::warn!(target: "session.store",
                         instance_id = %self.id,
                         sid = %sid,
@@ -6956,9 +6969,11 @@ impl Instance {
         let (_title_lock, _lifecycle_lock) =
             self.reacquire_launch_locks_after_hooks(&storage, hook_result)?;
         let skipped_failed_resume_sid = self.apply_resume_policy(resume_policy);
-        self.agent_session_store_namespace =
-            self.resolve_terminal_session_store_namespace_for_tool(&self.tool);
         self.apply_fresh_launch_intent();
+        if let Err(error) = self.refresh_launch_store_namespace() {
+            self.fail_reserved_launch(&storage, &error, false);
+            return Err(error);
+        }
         if let Err(error) = self.validate_launch_sid_ownership(&storage) {
             self.fail_reserved_launch(&storage, &error, false);
             return Err(error);
@@ -12364,6 +12379,17 @@ mod tests {
             Some("outgoing-claude-session"),
             "unsupported incoming tool must retain the live outgoing ownership"
         );
+        let mut scoped_handoff = Instance::new("Scoped Handoff", "/tmp/handoff");
+        scoped_handoff.tool = "claude".to_string();
+        scoped_handoff.agent_session_id = Some("shared-token".to_string());
+        scoped_handoff.agent_session_store_namespace =
+            Some("host:claude:/outgoing-store".to_string());
+        scoped_handoff.swap_tool_for_restart("codex");
+        let incoming_namespace = scoped_handoff.terminal_session_store_namespace().unwrap();
+        assert!(scoped_handoff
+            .reserves_agent_session_id_in_namespace("shared-token", "host:claude:/outgoing-store"));
+        assert!(!scoped_handoff
+            .reserves_agent_session_id_in_namespace("shared-token", &incoming_namespace));
 
         let temp = tempfile::tempdir().unwrap();
         let storage = crate::session::storage::Storage::new_for_test_path(
@@ -12412,7 +12438,6 @@ mod tests {
             None,
             "ownership-free outgoing pane must suppress the restored incoming ID"
         );
-        assert!(ownership_free.reserves_agent_session_id("incoming-claude-session"));
         assert_eq!(
             ownership_free
                 .reserved_agent_session_ids()
@@ -17607,6 +17632,15 @@ mod tests {
                 Some("host:claude:/hook-selected-store"),
                 "durable post-hook namespace wins over static profile configuration"
             );
+            relative_a.agent_session_id = Some(SID_X.to_string());
+            relative_a.tmux_ownership_handoff_pending = true;
+            let stored_namespace = relative_a.agent_session_store_namespace.clone();
+            let error = relative_a.refresh_launch_store_namespace().unwrap_err();
+            assert!(error.to_string().contains("its store changed"));
+            assert_eq!(relative_a.agent_session_store_namespace, stored_namespace);
+            relative_a.resume_intent = ResumeIntent::Cleared;
+            relative_a.refresh_launch_store_namespace().unwrap();
+            assert_ne!(relative_a.agent_session_store_namespace, stored_namespace);
             let corrupt_storage = Storage::new_unwatched("guards-owned-corrupt").unwrap();
             std::fs::write(corrupt_storage.sessions_path(), "[null]").unwrap();
             let independent_profile = "guards-owned-independent-agent";
@@ -17621,14 +17655,55 @@ mod tests {
                     .is_ok(),
                 "the same token in a different agent store is not the same conversation"
             );
+            let independent_namespace = independent.terminal_session_store_namespace().unwrap();
             let corrupt_ownership_storage =
                 Storage::new_unwatched("guards-owned-corrupt-foreign").unwrap();
+            let mut valid_foreign = independent.clone();
+            valid_foreign.id = "valid-before-corrupt".to_string();
+            valid_foreign.agent_session_id = Some(SID_X.to_string());
+            valid_foreign.agent_session_store_namespace = Some(independent_namespace.clone());
+            valid_foreign.resume_intent = ResumeIntent::Default;
+            let rows = serde_json::json!([
+                serde_json::to_value(&valid_foreign).unwrap(),
+                {"id": 42, "agent_session_id": SID_X}
+            ]);
             std::fs::write(
                 corrupt_ownership_storage.sessions_path(),
-                format!(r#"[{{"id":42,"agent_session_id":"{SID_X}"}}]"#),
+                serde_json::to_vec(&rows).unwrap(),
             )
             .unwrap();
-            let independent_namespace = independent.terminal_session_store_namespace().unwrap();
+            assert_eq!(
+                crate::session::sync::reserved_sid_holder_excluding_profile_for_capture(
+                    independent_profile,
+                    &independent_namespace,
+                    SID_X,
+                )
+                .unwrap()
+                .as_deref(),
+                Some("valid-before-corrupt"),
+                "capture must retain valid owners before a malformed row"
+            );
+            assert!(
+                crate::session::sync::reserved_sid_holder_excluding_profile(
+                    independent_profile,
+                    &independent_namespace,
+                    SID_X,
+                )
+                .is_err(),
+                "strict launch ownership scans must reject the malformed row"
+            );
+            let mut strict_finalize = independent.clone();
+            strict_finalize.agent_session_id = Some("strict-finalize-only".to_string());
+            assert_eq!(
+                strict_finalize.persist_session_id_with_storage(
+                    &independent_storage,
+                    None,
+                    ResumeIntent::Default,
+                ),
+                SidPersistOutcome::Skip,
+                "launch finalization must fail closed on foreign ownership corruption"
+            );
+            assert_eq!(load(independent_profile)[0].agent_session_id, None);
             assert!(
                 crate::session::capture::compose_exclusion_with_persisted_peers(
                     &independent.id,
@@ -17652,6 +17727,7 @@ mod tests {
                 ),
                 SidWrite::Applied
             );
+            std::fs::remove_file(corrupt_ownership_storage.sessions_path()).unwrap();
             let launch_profile = "guards-launch-namespace";
             let mut launch = make_inst(launch_profile, "launch-namespace");
             seed(launch_profile, &[&launch]);

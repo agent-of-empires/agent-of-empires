@@ -1068,7 +1068,12 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
                 continue;
             }
             let is_current_profile = identity == current_identity;
-            let instances = match storage.load_ownership_strict() {
+            let load_result = if is_current_profile {
+                storage.load_ownership_strict()
+            } else {
+                storage.load_ownership_for_capture()
+            };
+            let instances = match load_result {
                 Ok(instances) => instances,
                 Err(error) if !is_current_profile => {
                     tracing::warn!(

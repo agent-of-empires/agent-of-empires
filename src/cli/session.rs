@@ -918,17 +918,26 @@ fn resolve_import_roots(paths: &[String]) -> Result<Vec<std::path::PathBuf>> {
         .collect())
 }
 
-/// True when `id` is already imported by some instance, so a re-run does not
-/// create duplicates. Checks the terminal resume target, the poller-observed
-/// id, and (serve builds) the structured-view id.
-fn already_imported(instances: &[Instance], id: &str) -> bool {
+/// Stable store namespace for a discovered Claude transcript. Import scanning
+/// reads Claude's host store, so equal tokens owned by another agent or store
+/// must not suppress a valid import.
+fn claude_import_store_namespace(profile: &str, cwd: &str) -> Option<String> {
+    let mut candidate = Instance::new("claude-import-probe", cwd);
+    candidate.tool = "claude".to_string();
+    candidate.source_profile = profile.to_string();
+    candidate.terminal_session_store_namespace()
+}
+
+/// True when the id is already imported from this namespace, so a re-run does
+/// not create duplicates. Checks namespace-scoped terminal ownership and
+/// (serve builds) the structured-view id.
+fn already_imported(instances: &[Instance], id: &str, namespace: Option<&str>) -> bool {
     instances.iter().any(|inst| {
-        if inst.reserves_agent_session_id(id) {
-            return true;
-        }
-        if inst.supports_terminal_resume()
-            && matches!(&inst.resume_intent, ResumeIntent::Use(s) if s == id)
-        {
+        if namespace.is_some_and(|namespace| {
+            inst.reserves_agent_session_id_in_namespace(id, namespace)
+                || (inst.terminal_session_store_namespace().as_deref() == Some(namespace)
+                    && matches!(&inst.resume_intent, ResumeIntent::Use(s) if s == id))
+        }) {
             return true;
         }
         #[cfg(feature = "serve")]
@@ -1011,7 +1020,10 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
     let candidate_count = candidates.len();
     let mut to_import: Vec<_> = candidates
         .into_iter()
-        .filter(|s| !already_imported(&existing, &s.session_id))
+        .filter(|s| {
+            let namespace = claude_import_store_namespace(profile, &s.cwd);
+            !already_imported(&existing, &s.session_id, namespace.as_deref())
+        })
         .collect();
     let already = candidate_count - to_import.len();
 
@@ -1077,7 +1089,8 @@ async fn import_sessions(profile: &str, args: ImportArgs) -> Result<()> {
         let mut ids = Vec::new();
         for s in &to_import {
             // Re-check under the lock so a concurrent import does not duplicate.
-            if already_imported(all_instances, &s.session_id) {
+            let namespace = claude_import_store_namespace(profile, &s.cwd);
+            if already_imported(all_instances, &s.session_id, namespace.as_deref()) {
                 continue;
             }
             let inst = build_import_instance(s, structured, &group);
@@ -3141,8 +3154,15 @@ mod import_tests {
     }
 
     #[test]
-    fn already_imported_matches_only_operational_ids() {
-        for (tool, expected) in [("claude", true), ("qwen", false), ("kiro", false)] {
+    fn already_imported_matches_only_claude_store_ownership() {
+        let namespace = claude_import_store_namespace("default", "/p").unwrap();
+        for (tool, expected) in [
+            ("claude", true),
+            ("codex", false),
+            ("gemini", false),
+            ("qwen", false),
+            ("kiro", false),
+        ] {
             let mut by_resume = Instance::new("resume", "/p");
             by_resume.tool = tool.to_string();
             by_resume.resume_intent = ResumeIntent::Use("id-1".to_string());
@@ -3151,20 +3171,50 @@ mod import_tests {
             by_observed.agent_session_id = Some("id-2".to_string());
             let instances = vec![by_resume, by_observed];
 
-            assert_eq!(already_imported(&instances, "id-1"), expected, "{tool} Use");
             assert_eq!(
-                already_imported(&instances, "id-2"),
+                already_imported(&instances, "id-1", Some(&namespace)),
+                expected,
+                "{tool} Use"
+            );
+            assert_eq!(
+                already_imported(&instances, "id-2", Some(&namespace)),
                 expected,
                 "{tool} observed"
             );
-            assert!(!already_imported(&instances, "id-3"), "{tool} fresh");
+            assert!(
+                !already_imported(&instances, "id-3", Some(&namespace)),
+                "{tool} fresh"
+            );
         }
+
+        let mut parked_claude = Instance::new("parked-claude", "/p");
+        parked_claude.tool = "claude".to_string();
+        parked_claude.agent_session_id = Some("parked".to_string());
+        parked_claude.agent_session_store_namespace = Some(namespace.clone());
+        parked_claude.swap_tool("qwen");
+        assert!(already_imported(
+            &[parked_claude],
+            "parked",
+            Some(&namespace)
+        ));
+
+        let mut parked_codex = Instance::new("parked-codex", "/p");
+        parked_codex.tool = "codex".to_string();
+        parked_codex.agent_session_id = Some("parked".to_string());
+        parked_codex.agent_session_store_namespace =
+            parked_codex.terminal_session_store_namespace();
+        parked_codex.swap_tool("qwen");
+        assert!(!already_imported(
+            &[parked_codex],
+            "parked",
+            Some(&namespace)
+        ));
 
         #[cfg(feature = "serve")]
         {
             let mut structured = Instance::new("structured", "/p");
             structured.acp_session_id = Some("id-acp".to_string());
-            assert!(already_imported(&[structured], "id-acp"));
+            assert!(already_imported(&[structured], "id-acp", Some(&namespace)));
         }
     }
 }
