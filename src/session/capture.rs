@@ -1035,31 +1035,54 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
     let canonical_current = canonicalize_or_raw(current_project_path);
 
     crate::session::sync::with_tmux_ownership_lock(|| {
+        let current_storage = crate::session::storage::Storage::new_unwatched(profile)
+            .map_err(|error| anyhow::anyhow!("open profile {profile}: {error}"))?;
+        let current_directory = current_storage.sessions_path().parent().ok_or_else(|| {
+            anyhow::anyhow!(
+                "sessions path has no profile directory: {}",
+                current_storage.sessions_path().display()
+            )
+        })?;
+        let current_identity = current_directory
+            .canonicalize()
+            .map_err(|error| anyhow::anyhow!("resolve profile {profile}: {error}"))?;
         let mut profiles = crate::session::list_profiles()?;
         if !profiles.iter().any(|candidate| candidate == profile) {
             profiles.push(profile.to_string());
         }
+        let mut visited = HashSet::new();
         for peer_profile in profiles {
             let storage = crate::session::storage::Storage::new_unwatched(&peer_profile)
                 .map_err(|error| anyhow::anyhow!("open profile {peer_profile}: {error}"))?;
+            let directory = storage.sessions_path().parent().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "sessions path has no profile directory: {}",
+                    storage.sessions_path().display()
+                )
+            })?;
+            let identity = directory
+                .canonicalize()
+                .map_err(|error| anyhow::anyhow!("resolve profile {peer_profile}: {error}"))?;
+            if !visited.insert(identity.clone()) {
+                continue;
+            }
+            let is_current_profile = identity == current_identity;
             let instances = storage
                 .load_strict()
                 .map_err(|error| anyhow::anyhow!("load profile {peer_profile}: {error}"))?;
             for inst in instances {
-                if peer_profile == profile && inst.id == current_instance_id {
+                if is_current_profile && inst.id == current_instance_id {
                     continue;
                 }
                 if canonicalize_or_raw(&inst.project_path) != canonical_current {
                     continue;
                 }
-                // Incoming handoff IDs are globally reserved while the old
-                // pane remains live and cannot publish the incoming ID.
                 if inst.tool == current_tool {
                     if let Some(incoming) = inst.incoming_handoff_agent_session_id() {
                         set.insert(incoming.to_string());
                     }
                 }
-                if peer_profile != profile {
+                if !is_current_profile {
                     continue;
                 }
                 if let Some(parked) = inst

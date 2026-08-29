@@ -1875,6 +1875,9 @@ impl Instance {
         self.lifecycle_generation = src.lifecycle_generation;
         let sid_unchanged = self.agent_session_id == before.agent_session_id;
         let marker_unchanged = self.resume_probe_failed_sid == before.resume_probe_failed_sid;
+        let handoff_unchanged = self.pending_tmux_ownership_session_id
+            == before.pending_tmux_ownership_session_id
+            && self.tmux_ownership_handoff_pending == before.tmux_ownership_handoff_pending;
 
         if generation_can_merge {
             self.omp_capture_generation = src.omp_capture_generation.clone();
@@ -1892,6 +1895,10 @@ impl Instance {
         if generation_can_merge && marker_unchanged && self.agent_session_id == src.agent_session_id
         {
             self.resume_probe_failed_sid = src.resume_probe_failed_sid.clone();
+        }
+        if handoff_unchanged {
+            self.pending_tmux_ownership_session_id = src.pending_tmux_ownership_session_id.clone();
+            self.tmux_ownership_handoff_pending = src.tmux_ownership_handoff_pending;
         }
     }
 
@@ -5282,11 +5289,18 @@ impl Instance {
     }
 
     fn validate_launch_sid_ownership(&self, storage: &super::storage::Storage) -> Result<()> {
-        let Some(sid) = self
-            .supports_terminal_resume()
-            .then_some(self.agent_session_id.as_deref())
-            .flatten()
-        else {
+        if !self.supports_terminal_resume()
+            || (self.is_sandboxed()
+                && matches!(self.tool.as_str(), "copilot" | "kimi" | "prime-agent"))
+        {
+            return Ok(());
+        }
+        let sid = match &self.resume_intent {
+            ResumeIntent::Use(sid) => Some(sid.as_str()),
+            ResumeIntent::Cleared => None,
+            ResumeIntent::Fork { .. } | ResumeIntent::Default => self.agent_session_id.as_deref(),
+        };
+        let Some(sid) = sid.filter(|sid| is_valid_session_id(sid)) else {
             return Ok(());
         };
         crate::session::sync::with_tmux_ownership_lock(|| {
@@ -9689,8 +9703,12 @@ mod tests {
         let mut before = Instance::new("omp-session", "/tmp/test");
         before.agent_session_id = Some("old-sid".to_string());
         before.omp_capture_generation = Some("generation-a".to_string());
+        before.pending_tmux_ownership_session_id = Some("outgoing-sid".to_string());
+        before.tmux_ownership_handoff_pending = true;
         let mut restarted = before.clone();
         restarted.omp_capture_generation = Some("generation-b".to_string());
+        restarted.pending_tmux_ownership_session_id = None;
+        restarted.tmux_ownership_handoff_pending = false;
         let mut poller = crate::session::poller::SessionPoller::new("omp-restarted".to_string());
         assert!(poller.start(before.id.clone(), Box::new(|| None), Box::new(|_| {}), None,));
         let restarted_poller = std::sync::Arc::new(std::sync::Mutex::new(poller));
@@ -9699,6 +9717,17 @@ mod tests {
         live.merge_post_restart_with_baseline(&before, &restarted);
         assert_eq!(live.omp_capture_generation.as_deref(), Some("generation-b"));
         assert!(live.session_id_poller.is_some());
+        assert_eq!(live.pending_tmux_ownership_session_id, None);
+        assert!(!live.tmux_ownership_handoff_pending);
+
+        let mut peer_handoff = before.clone();
+        peer_handoff.pending_tmux_ownership_session_id = Some("peer-handoff".to_string());
+        peer_handoff.merge_post_restart_with_baseline(&before, &restarted);
+        assert_eq!(
+            peer_handoff.pending_tmux_ownership_session_id.as_deref(),
+            Some("peer-handoff")
+        );
+        assert!(peer_handoff.tmux_ownership_handoff_pending);
 
         let mut generation_converged = before.clone();
         generation_converged.agent_session_id = Some("peer-sid".to_string());
@@ -17078,9 +17107,17 @@ mod tests {
                 },
             );
             handoff_owner.swap_tool_for_restart("claude");
-            let cross_profile_claimant = make_inst(claimant_profile, "cross-profile-claimant");
+            let mut cross_profile_claimant = make_inst(claimant_profile, "cross-profile-claimant");
+            cross_profile_claimant.resume_intent = ResumeIntent::Use(SID_Y.to_string());
             seed(owner_profile, &[&handoff_owner]);
             seed(claimant_profile, &[&cross_profile_claimant]);
+            let claimant_storage = Storage::new_unwatched(claimant_profile).unwrap();
+            assert!(
+                cross_profile_claimant
+                    .validate_launch_sid_ownership(&claimant_storage)
+                    .is_err(),
+                "a pin must be checked before apply_session_flags copies it into agent_session_id"
+            );
 
             assert_eq!(
                 persist_session_to_storage(

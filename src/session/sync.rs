@@ -381,13 +381,42 @@ pub(crate) fn restore_tmux_session_id_ownership_locked(
     crate::tmux::env::set_hidden_env_batch(&refs)
 }
 fn load_profile_instances_excluding(excluded: Option<&str>) -> anyhow::Result<Vec<Instance>> {
+    let excluded_identity = excluded
+        .map(|profile| {
+            let storage = Storage::open_unwatched(profile)
+                .map_err(|error| anyhow::anyhow!("open profile {profile}: {error}"))?;
+            let directory = storage.sessions_path().parent().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "sessions path has no profile directory: {}",
+                    storage.sessions_path().display()
+                )
+            })?;
+            directory
+                .canonicalize()
+                .map_err(|error| anyhow::anyhow!("resolve profile {profile}: {error}"))
+        })
+        .transpose()?;
+
     let mut instances = Vec::new();
+    let mut visited = HashSet::new();
     for profile in crate::session::list_profiles()? {
-        if excluded.is_some_and(|excluded| profile == excluded) {
-            continue;
-        }
         let storage = Storage::open_unwatched(&profile)
             .map_err(|error| anyhow::anyhow!("open profile {profile}: {error}"))?;
+        let directory = storage.sessions_path().parent().ok_or_else(|| {
+            anyhow::anyhow!(
+                "sessions path has no profile directory: {}",
+                storage.sessions_path().display()
+            )
+        })?;
+        let identity = directory
+            .canonicalize()
+            .map_err(|error| anyhow::anyhow!("resolve profile {profile}: {error}"))?;
+        if !visited.insert(identity.clone()) {
+            continue;
+        }
+        if excluded_identity.as_ref() == Some(&identity) {
+            continue;
+        }
         let mut rows = storage
             .load_strict()
             .map_err(|error| anyhow::anyhow!("load profile {profile}: {error}"))?;
@@ -395,7 +424,6 @@ fn load_profile_instances_excluding(excluded: Option<&str>) -> anyhow::Result<Ve
     }
     Ok(instances)
 }
-
 pub(crate) fn instance_ids_excluding_profile(excluded: &str) -> anyhow::Result<HashSet<String>> {
     Ok(load_profile_instances_excluding(Some(excluded))?
         .into_iter()
@@ -1420,6 +1448,17 @@ mod tests {
 
         let survivor_ids = instance_ids_excluding_profile("deleted").unwrap();
         assert!(survivor_ids.contains(&shared.id));
+
+        #[cfg(unix)]
+        {
+            let alias_only = Instance::new("alias-only", "/tmp/alias");
+            seed_instances_on_disk("deleted", &[&shared, &alias_only]);
+            let profiles = crate::session::get_app_dir().unwrap().join("profiles");
+            std::os::unix::fs::symlink("deleted", profiles.join("deleted-alias")).unwrap();
+            let alias_survivors = instance_ids_excluding_profile("deleted-alias").unwrap();
+            assert!(alias_survivors.contains(&shared.id));
+            assert!(!alias_survivors.contains(&alias_only.id));
+        }
 
         let corrupt = Instance::new("corrupt", "/tmp/x");
         seed_instance_on_disk("corrupt", &corrupt);
