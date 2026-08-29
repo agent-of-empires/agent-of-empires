@@ -3585,14 +3585,17 @@ mod tests {
         std::thread::scope(|scope| {
             scope.spawn(|| {
                 let peer = Storage::new_unwatched("test-update-concurrent").unwrap();
-                peer.update(|_, _| Ok(())).unwrap();
+                crate::session::sync::with_tmux_ownership_lock(|| {
+                    peer.update_with_tmux_ownership_lock(|_, _| Ok(()))
+                })
+                .unwrap();
                 updated_tx.send(()).unwrap();
             });
             assert!(
                 updated_rx
                     .recv_timeout(std::time::Duration::from_millis(100))
                     .is_err(),
-                "a durable writer must wait for ownership reconciliation"
+                "an ownership-sensitive writer must wait for ownership reconciliation"
             );
             drop(ownership);
             updated_rx
