@@ -343,6 +343,16 @@ fn clear_unsupported_tmux_session_ids_locked(instances: &[Instance]) -> anyhow::
     remove_tmux_session_id_ownership(instances, &targets, &observations)?;
     Ok(())
 }
+fn clear_all_tmux_session_ids_locked(instances: &[Instance]) -> anyhow::Result<()> {
+    let names = crate::tmux::session_names_strict()?;
+    let observations = read_tmux_ownership_observations(&names)?;
+    let targets: Vec<String> = observations
+        .iter()
+        .filter_map(|(name, _, captured)| captured.as_ref().map(|_| name.clone()))
+        .collect();
+    remove_tmux_session_id_ownership(instances, &targets, &observations)?;
+    Ok(())
+}
 fn reconcile_tmux_session_id_ownership_env_locked(
     instances: &[Instance],
 ) -> anyhow::Result<ClearedTmuxOwnership> {
@@ -579,7 +589,17 @@ pub(crate) fn reconcile_all_profiles_tmux_session_id_ownership_env_locked(
 ) -> anyhow::Result<ClearedTmuxOwnership> {
     let cleanup_instances = load_profile_instances_excluding_with_policy(None, true)?;
     clear_unsupported_tmux_session_ids_locked(&cleanup_instances)?;
-    let instances = load_profile_instances_excluding(None)?;
+    let instances = match load_profile_instances_excluding(None) {
+        Ok(instances) => instances,
+        Err(error) => {
+            clear_all_tmux_session_ids_locked(&cleanup_instances).map_err(|cleanup_error| {
+                anyhow::anyhow!(
+                    "{error}; fail-closed tmux ownership cleanup failed: {cleanup_error}"
+                )
+            })?;
+            return Err(error);
+        }
+    };
     reconcile_tmux_session_id_ownership_env_locked(&instances)
 }
 
@@ -1382,17 +1402,19 @@ mod tests {
         )
         .unwrap();
 
-        let corrupt_storage = Storage::new_unwatched("ownership-corrupt").unwrap();
-        let corrupt = Instance::new("corrupt", "/tmp/corrupt");
-        corrupt_storage
+        storage
             .update(|instances, _groups| {
-                instances.push(corrupt.clone());
+                instances.retain(|instance| instance.id != unsupported.id);
                 Ok(())
             })
             .unwrap();
+        let corrupt_storage = Storage::new_unwatched("ownership-corrupt").unwrap();
         std::fs::write(
             corrupt_storage.sessions_path(),
-            br#"[{"agent_session_id":"019342ab-1234-7def-8901-deadbeefdead"}]"#,
+            format!(
+                r#"[{{"id":"{}","title":"corrupt-qwen","project_path":"/tmp/corrupt","tool":"qwen","status":"invalid-status","agent_session_id":"retained"}}]"#,
+                unsupported.id
+            ),
         )
         .unwrap();
         assert!(reconcile_all_profiles_tmux_session_id_ownership_env().is_err());

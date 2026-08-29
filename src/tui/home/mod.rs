@@ -2567,7 +2567,7 @@ impl HomeView {
             }
             Err(error) => {
                 tracing::warn!(target: "tui.home",
-                    "Tmux ownership reconciliation failed; startup recovery and capture repair are disabled for this launch: {error}"
+                    "Tmux ownership reconciliation failed; startup recovery and capture repair remain disabled until reconciliation succeeds: {error}"
                 );
             }
         }
@@ -3744,9 +3744,13 @@ impl HomeView {
         // Profiling a store of a few hundred sessions put this path at the top
         // of the main thread.
         let live = crate::tmux::LiveSessionSnapshot::new();
+        let mut reconciled_now = false;
         if !self.tmux_ownership_reconciled {
             match crate::session::sync::sync_tmux_session_id_env(self.instances.values(), &live) {
-                Ok(()) => self.tmux_ownership_reconciled = true,
+                Ok(()) => {
+                    self.tmux_ownership_reconciled = true;
+                    reconciled_now = true;
+                }
                 Err(error) => {
                     tracing::warn!(target: "tui.home",
                         "Tmux ownership reconciliation retry failed; capture repair remains disabled: {error}"
@@ -3758,9 +3762,12 @@ impl HomeView {
         for instance in self.instances.values_mut() {
             instance.repair_session_id_poller_if_needed(&live);
         }
+        if reconciled_now {
+            self.maybe_start_startup_recovery();
+        }
     }
     /// Drain the startup-recovery channel and apply each recovery update
-    /// to the in-memory `Instance` snapshot. Released the recovery lock
+    /// to the in-memory Instance snapshot. Releases the recovery lock
     /// (and the receiver) when all workers have completed.
     ///
     /// Called from the `App::run` event-loop tick alongside

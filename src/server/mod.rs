@@ -1270,8 +1270,8 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     // `aoe add --acp` while serve is already running.
 
     // Legacy Qwen/Kiro ownership must be gone before terminal recovery can
-    // inspect the global tmux environment. Failure only suppresses terminal
-    // recovery for this launch; structured sessions and the daemon stay live.
+    // inspect the global tmux environment. Failure defers terminal recovery;
+    // structured sessions and the daemon stay live while reconciliation retries.
     let ownership_reconciled = match tokio::task::spawn_blocking(
         crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env,
     )
@@ -1289,6 +1289,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
     };
     if !ownership_reconciled {
         let shutdown = state.shutdown.clone();
+        let recovery_state = state.clone();
         crate::task_util::spawn_supervised(
             "server.tmux_ownership_reconcile",
             crate::task_util::PanicPolicy::Log,
@@ -1303,7 +1304,12 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
                     )
                     .await
                     {
-                        Ok(Ok(())) => break,
+                        Ok(Ok(())) => {
+                            let recovery_inputs =
+                                daemon_startup_recovery_mark(recovery_state.clone()).await;
+                            spawn_daemon_startup_recovery(recovery_state.clone(), recovery_inputs);
+                            break;
+                        }
                         Ok(Err(error)) => {
                             tracing::warn!(target: "session.sync", "Retrying daemon tmux ownership reconciliation: {error}")
                         }
@@ -1418,52 +1424,7 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         );
     }
 
-    if let Some((lock, candidates)) = recovery_inputs {
-        // Background mark-refresher (#1264). Re-stamps every still-pending
-        // candidate in `recently_restarted` every RECENTLY_RESTARTED_TTL / 2
-        // so a candidate queued past the TTL behind a
-        // STARTUP_RECOVERY_CONCURRENCY permit does not age out of suppression
-        // and trip a phantom Status::Error in status_poll_loop. Exits once the
-        // pending set drains (every worker finished) or on shutdown.
-        {
-            let pending = state.recovery_pending.clone();
-            let recently = state.recently_restarted.clone();
-            let shutdown = state.shutdown.clone();
-            crate::task_util::spawn_supervised(
-                "server.startup_recovery_refresher",
-                crate::task_util::PanicPolicy::Log,
-                async move {
-                    let mut interval =
-                        tokio::time::interval(crate::session::recovery::RECENTLY_RESTARTED_TTL / 2);
-                    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-                    // First tick fires immediately; skip past it so we don't
-                    // redundantly re-stamp the marks Phase A just wrote.
-                    interval.tick().await;
-                    loop {
-                        tokio::select! {
-                            _ = interval.tick() => {
-                                if !crate::session::recovery::refresh_recovery_pending(
-                                    &pending, &recently,
-                                ) {
-                                    break;
-                                }
-                            }
-                            _ = shutdown.cancelled() => break,
-                        }
-                    }
-                },
-            );
-        }
-
-        let cascade_state = state.clone();
-        crate::task_util::spawn_supervised(
-            "server.startup_recovery_cascade",
-            crate::task_util::PanicPolicy::Log,
-            async move {
-                daemon_startup_recovery_cascade(cascade_state, lock, candidates).await;
-            },
-        );
-    }
+    spawn_daemon_startup_recovery(state.clone(), recovery_inputs);
 
     // Spawn background tasks
     let poll_state = state.clone();
@@ -5159,6 +5120,52 @@ async fn daemon_startup_recovery_mark(
     );
 
     Some((lock, candidates))
+}
+fn spawn_daemon_startup_recovery(
+    state: Arc<AppState>,
+    recovery_inputs: Option<(
+        crate::session::recovery::RecoveryLock,
+        Vec<crate::session::Instance>,
+    )>,
+) {
+    let Some((lock, candidates)) = recovery_inputs else {
+        return;
+    };
+
+    let pending = state.recovery_pending.clone();
+    let recently = state.recently_restarted.clone();
+    let shutdown = state.shutdown.clone();
+    crate::task_util::spawn_supervised(
+        "server.startup_recovery_refresher",
+        crate::task_util::PanicPolicy::Log,
+        async move {
+            let mut interval =
+                tokio::time::interval(crate::session::recovery::RECENTLY_RESTARTED_TTL / 2);
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            interval.tick().await;
+            loop {
+                tokio::select! {
+                    _ = interval.tick() => {
+                        if !crate::session::recovery::refresh_recovery_pending(
+                            &pending, &recently,
+                        ) {
+                            break;
+                        }
+                    }
+                    _ = shutdown.cancelled() => break,
+                }
+            }
+        },
+    );
+
+    let cascade_state = state.clone();
+    crate::task_util::spawn_supervised(
+        "server.startup_recovery_cascade",
+        crate::task_util::PanicPolicy::Log,
+        async move {
+            daemon_startup_recovery_cascade(cascade_state, lock, candidates).await;
+        },
+    );
 }
 
 /// Phase B: drive the cascade workers for the pre-marked candidates.
