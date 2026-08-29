@@ -504,7 +504,11 @@ impl HomeView {
                 requested,
                 Some(&restart_edit_authoritative),
             )?;
-            crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env()?;
+            if let Err(error) =
+                crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env()
+            {
+                tracing::warn!(target: "session.sync", id = %id, "Profile move committed; deferred tmux ownership reconciliation: {error}");
+            }
             self.reload_preserving_profile_move_runtime(std::slice::from_ref(&id))?;
         } else {
             // Outside Attention sort, restart on a snoozed row clears the
@@ -521,7 +525,11 @@ impl HomeView {
                 if target_tool != current_tool {
                     self.persist_tool_swap(&id, target_tool)?;
                     self.mutate_instance(&id, |inst| inst.swap_tool(target_tool));
-                    crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env()?;
+                    if let Err(error) =
+                        crate::session::sync::reconcile_all_profiles_tmux_session_id_ownership_env()
+                    {
+                        tracing::warn!(target: "session.sync", id = %id, "Tool swap committed; deferred tmux ownership reconciliation: {error}");
+                    }
                 }
             }
             if let Some(command) = new_command_override {

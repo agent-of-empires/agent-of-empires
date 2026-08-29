@@ -6338,20 +6338,16 @@ async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
         // visits every instance, so a per-item `list-sessions` fork scales with
         // the store.
         let live = crate::tmux::LiveSessionSnapshot::new();
-        let repaired: std::collections::HashSet<String> = if let Err(error) =
-            crate::session::sync::sync_tmux_session_id_env(snapshot.iter(), &live)
-        {
+        if let Err(error) = crate::session::sync::sync_tmux_session_id_env(snapshot.iter(), &live) {
             tracing::warn!(target: "session.sync", "Daemon env reconcile failed: {error}");
-            std::collections::HashSet::new()
-        } else {
-            snapshot
-                .iter_mut()
-                .filter_map(|inst| {
-                    inst.repair_session_id_poller_if_needed(&live)
-                        .then(|| inst.id.clone())
-                })
-                .collect()
-        };
+        }
+        let repaired: std::collections::HashSet<String> = snapshot
+            .iter_mut()
+            .filter_map(|inst| {
+                inst.repair_session_id_poller_if_needed(&live)
+                    .then(|| inst.id.clone())
+            })
+            .collect();
         (outcome, snapshot, baseline, repaired)
     })
     .await

@@ -891,6 +891,24 @@ impl Storage {
         Ok(instances)
     }
 
+    /// Load every session row or fail without interpreting an unreadable row
+    /// as a deleted session. Ownership reconciliation uses this conservative
+    /// view because a skipped row may still own a live tmux pane.
+    pub(crate) fn load_strict(&self) -> Result<Vec<Instance>> {
+        if !self.sessions_path.exists() {
+            return Ok(Vec::new());
+        }
+        let content = fs::read_to_string(&self.sessions_path)?;
+        if content.trim().is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut instances: Vec<Instance> = serde_json::from_str(&content)?;
+        for instance in &mut instances {
+            instance.set_file_watch(self.file_watch.clone());
+        }
+        Ok(instances)
+    }
+
     fn quarantine_corrupt_rows(&self, rows: &[serde_json::Value]) {
         let path = self.sessions_path.with_file_name("sessions.corrupt.jsonl");
         Self::write_corrupt_rows_quarantine(&path, rows, "session");

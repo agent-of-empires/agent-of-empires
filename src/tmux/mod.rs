@@ -699,34 +699,46 @@ impl LiveSessionSnapshot {
     }
 }
 
-/// [`live_any_kind_name_for_id`] against an already-taken snapshot, so a batch
-/// of lookups costs one observation instead of one per instance.
-pub(crate) fn live_any_kind_name_for_id_in(
+/// Every live AoE tmux session carrying the ID suffix, ordered by agent,
+/// terminal, then container panes.
+pub(crate) fn live_any_kind_names_for_id_in(
     snapshot: &LiveSessionSnapshot,
     session_id: &str,
-) -> Option<String> {
+) -> Option<Vec<String>> {
     let names = snapshot.names()?;
     let suffix = id_suffix(session_id);
     let agent = NameShape::agent(&suffix);
     let terminal = NameShape::terminal(&suffix);
     let container = NameShape::container(&suffix);
-    let (mut agent_hit, mut terminal_hit, mut container_hit) = (None, None, None);
+    let (mut agent_hits, mut terminal_hits, mut container_hits) =
+        (Vec::new(), Vec::new(), Vec::new());
     for name in names {
-        let name = name.as_str();
         let bucket = if agent.matches(name) {
-            &mut agent_hit
+            &mut agent_hits
         } else if terminal.matches(name) {
-            &mut terminal_hit
+            &mut terminal_hits
         } else if container.matches(name) {
-            &mut container_hit
+            &mut container_hits
         } else {
             continue;
         };
-        if bucket.is_none() && !snapshot.pane_dead(name) {
-            *bucket = Some(name.to_string());
+        if !snapshot.pane_dead(name) {
+            bucket.push(name.clone());
         }
     }
-    agent_hit.or(terminal_hit).or(container_hit)
+    agent_hits.extend(terminal_hits);
+    agent_hits.extend(container_hits);
+    Some(agent_hits)
+}
+
+/// Snapshot-backed form of the single live-session lookup.
+pub(crate) fn live_any_kind_name_for_id_in(
+    snapshot: &LiveSessionSnapshot,
+    session_id: &str,
+) -> Option<String> {
+    live_any_kind_names_for_id_in(snapshot, session_id)?
+        .into_iter()
+        .next()
 }
 
 /// The live tmux session name carrying `session_id`'s `_<id8>` tail, preferring

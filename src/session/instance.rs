@@ -3928,27 +3928,6 @@ impl Instance {
         crate::tmux::live_any_kind_name_for_id_in(snapshot, &self.id)
     }
 
-    /// [`Self::tmux_env_session_name_in`] for a one-shot pass that cannot
-    /// retry: an unreachable tmux server is Unknown, not "no live pane", so
-    /// fall back to a fresh per-item probe rather than dropping the row.
-    ///
-    /// The startup hidden-env publication in `HomeView::new` is such a pass.
-    /// Nothing re-runs it on reload and a poller does not re-emit an unchanged
-    /// sid, so a row skipped there stays unpublished until an unrelated sid
-    /// change or a relaunch, weakening the ownership attribution
-    /// `build_exclusion_set` reads. Startup recovery treats the same
-    /// distinction the other way, skipping its whole pass on a failed probe
-    /// rather than reading it as "every pane is dead".
-    pub(crate) fn tmux_env_session_name_in_or_probe(
-        &self,
-        snapshot: &crate::tmux::LiveSessionSnapshot,
-    ) -> Option<String> {
-        match snapshot.names() {
-            Some(_) => self.tmux_env_session_name_in(snapshot),
-            None => self.tmux_env_session_name(),
-        }
-    }
-
     /// Whether this instance has a live tmux pane, answered from a snapshot
     /// the caller already holds. `exists()` alone is insufficient: a pane can
     /// exist while its agent has died. Used by peer exclusion, poller repair,
@@ -8008,54 +7987,6 @@ mod tests {
             !contended.contains(&("opencode".to_string(), canon)),
             "a dead id-less peer must not force the live session to abstain"
         );
-    }
-
-    /// A one-shot pass must not read an unreachable snapshot as "no live
-    /// pane". The startup hidden-env publication is batched behind one
-    /// `LiveSessionSnapshot`, and nothing re-runs it, so collapsing Unknown
-    /// into Absent there would leave every row's `AOE_INSTANCE_ID` and
-    /// `AOE_CAPTURED_SESSION_ID` unpublished until an unrelated sid change or
-    /// a relaunch, and peer exclusion reads exactly those variables.
-    #[test]
-    #[serial_test::serial]
-    #[cfg(unix)]
-    fn one_shot_name_probes_when_the_snapshot_missed_tmux() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp = tempfile::tempdir().unwrap();
-        let inst = Instance::new("Refactor billing", "/tmp/aoe-test-one-shot-probe");
-        let live_name = crate::tmux::Session::generate_name(&inst.id, &inst.title);
-
-        // A `tmux` that answers with one live session name, standing in for the
-        // probe that succeeds after the snapshot's own `list-sessions` failed.
-        // The pane-liveness check reads the same output and parses it as "not
-        // dead", which is what the real probe does for any answer but `1`.
-        let shim = temp.path().join("tmux");
-        std::fs::write(&shim, format!("#!/bin/sh\necho '{live_name}'\n")).unwrap();
-        std::fs::set_permissions(&shim, std::fs::Permissions::from_mode(0o755)).unwrap();
-        let path = format!(
-            "{}:{}",
-            temp.path().display(),
-            std::env::var("PATH").unwrap_or_default()
-        );
-        let _guard = EnvGuard::set(&[("PATH", path)]);
-
-        let missed = crate::tmux::LiveSessionSnapshot::from_parts(None, None);
-        assert_eq!(
-            inst.tmux_env_session_name_in(&missed),
-            None,
-            "the snapshot alone has nothing to answer an unreachable server with"
-        );
-        assert_eq!(
-            inst.tmux_env_session_name_in_or_probe(&missed).as_deref(),
-            Some(live_name.as_str()),
-            "a one-shot caller falls back to the per-item probe"
-        );
-
-        // A snapshot that did reach the server is authoritative: absent from
-        // its list means absent, with no probe behind it.
-        let observed = crate::tmux::LiveSessionSnapshot::from_parts(Some(Vec::new()), None);
-        assert_eq!(inst.tmux_env_session_name_in_or_probe(&observed), None);
     }
 
     /// Force the tmux session cache into a fresh "server reachable, but this

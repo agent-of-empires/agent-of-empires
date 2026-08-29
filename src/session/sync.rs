@@ -89,18 +89,51 @@ fn tmux_session_id_env_updates<'a>(
 fn tmux_session_id_env_names(
     instance: &Instance,
     live: &crate::tmux::LiveSessionSnapshot,
+    observations: &[TmuxOwnershipObservation],
 ) -> Vec<String> {
-    if instance.supports_terminal_resume() {
-        instance
-            .tmux_env_session_name_in_or_probe(live)
-            .into_iter()
-            .collect()
-    } else {
-        // Unsupported rows may only clear panes already marked with their exact
-        // instance ID. The observation pass handles those without claiming a
-        // suffix-colliding or unmarked pane.
-        Vec::new()
+    if !instance.supports_terminal_resume() {
+        return Vec::new();
     }
+
+    let exact: Vec<String> = observations
+        .iter()
+        .filter(|(name, owner, _)| {
+            owner.as_deref() == Some(instance.id.as_str()) && !live.pane_dead(name)
+        })
+        .map(|(name, _, _)| name.clone())
+        .collect();
+    if !exact.is_empty() {
+        return exact;
+    }
+
+    let Some(candidates) = crate::tmux::live_any_kind_names_for_id_in(live, &instance.id) else {
+        return Vec::new();
+    };
+    let [candidate] = candidates.as_slice() else {
+        return Vec::new();
+    };
+    observations
+        .iter()
+        .find(|(name, _, _)| name == candidate)
+        .and_then(|(_, owner, _)| owner.is_none().then(|| candidate.clone()))
+        .into_iter()
+        .collect()
+}
+
+fn partition_unambiguous_instances(instances: &[Instance]) -> (Vec<&Instance>, HashSet<&str>) {
+    let mut id_counts: HashMap<&str, usize> = HashMap::new();
+    for instance in instances {
+        *id_counts.entry(instance.id.as_str()).or_default() += 1;
+    }
+    let ambiguous_ids: HashSet<&str> = id_counts
+        .iter()
+        .filter_map(|(id, count)| (*count > 1).then_some(*id))
+        .collect();
+    let trusted = instances
+        .iter()
+        .filter(|instance| !ambiguous_ids.contains(instance.id.as_str()))
+        .collect();
+    (trusted, ambiguous_ids)
 }
 
 type TmuxOwnershipObservation = (String, Option<String>, Option<String>);
@@ -148,6 +181,7 @@ fn read_tmux_ownership_observations(
 
 fn stale_tmux_ownership_targets(
     instances: &[Instance],
+    preserved_owner_ids: &HashSet<&str>,
     observations: impl IntoIterator<Item = TmuxOwnershipObservation>,
 ) -> Vec<String> {
     let operational: HashMap<&str, &str> = instances
@@ -161,6 +195,12 @@ fn stale_tmux_ownership_targets(
     observations
         .into_iter()
         .filter_map(|(session, owner, captured)| {
+            if owner
+                .as_deref()
+                .is_some_and(|owner| preserved_owner_ids.contains(owner))
+            {
+                return None;
+            }
             let captured = captured?;
             let valid = owner
                 .as_deref()
@@ -227,15 +267,17 @@ fn reconcile_tmux_session_id_ownership_env_locked(
     let names = crate::tmux::session_names_strict()?;
     let live = crate::tmux::LiveSessionSnapshot::from_names(names.clone());
     let observations = read_tmux_ownership_observations(&names)?;
-    let (set_batch, unset_batch) = tmux_session_id_env_updates(instances, |instance| {
-        tmux_session_id_env_names(instance, &live)
+    let (trusted, ambiguous_ids) = partition_unambiguous_instances(instances);
+    let (set_batch, unset_batch) = tmux_session_id_env_updates(trusted, |instance| {
+        tmux_session_id_env_names(instance, &live, &observations)
     });
     let desired: HashSet<&str> = set_batch
         .iter()
         .filter(|(_, key, _)| key == crate::tmux::env::AOE_CAPTURED_SESSION_ID_KEY)
         .map(|(session, _, _)| session.as_str())
         .collect();
-    let mut targets = stale_tmux_ownership_targets(instances, observations.iter().cloned());
+    let mut targets =
+        stale_tmux_ownership_targets(instances, &ambiguous_ids, observations.iter().cloned());
     targets.retain(|session| !desired.contains(session.as_str()));
     targets.extend(unset_batch.iter().map(|(session, _)| session.clone()));
     targets.sort();
@@ -318,7 +360,7 @@ fn load_profile_instances_excluding(excluded: Option<&str>) -> anyhow::Result<Ve
         let storage = Storage::open_unwatched(&profile)
             .map_err(|error| anyhow::anyhow!("open profile {profile}: {error}"))?;
         let mut rows = storage
-            .load()
+            .load_strict()
             .map_err(|error| anyhow::anyhow!("load profile {profile}: {error}"))?;
         instances.append(&mut rows);
     }
@@ -986,6 +1028,7 @@ mod tests {
 
         let targets = stale_tmux_ownership_targets(
             &[supported.clone(), unsupported.clone()],
+            &HashSet::new(),
             [
                 (
                     "valid".to_string(),
@@ -1151,7 +1194,7 @@ mod tests {
         assert_eq!(observations.len(), 1);
     }
     #[test]
-    fn unsupported_env_cleanup_ignores_suffix_colliding_panes() {
+    fn ownership_planner_rejects_ambiguous_ids_and_suffixes() {
         for tool in ["qwen", "kiro"] {
             let mut instance = Instance::new("owner", "/tmp/x");
             instance.tool = tool.to_string();
@@ -1162,7 +1205,7 @@ mod tests {
                 Some(vec![agent.clone(), terminal.clone()]),
                 Some(HashMap::from([
                     (
-                        agent,
+                        agent.clone(),
                         crate::tmux::PaneMetadata {
                             pane_dead: true,
                             pane_current_command: None,
@@ -1179,19 +1222,68 @@ mod tests {
                     ),
                 ])),
             );
-
+            let observations = vec![(agent, None, None), (terminal.clone(), None, None)];
             assert_eq!(
-                tmux_session_id_env_names(&instance, &live),
+                tmux_session_id_env_names(&instance, &live, &observations),
                 Vec::<String>::new(),
                 "{tool}: unsupported rows do not claim suffix matches"
             );
             instance.tool = "claude".to_string();
             assert_eq!(
-                tmux_session_id_env_names(&instance, &live),
+                tmux_session_id_env_names(&instance, &live, &observations),
                 vec![terminal],
                 "supported publication stays live-only"
             );
         }
+
+        let mut first = Instance::new("first", "/tmp/x");
+        first.tool = "claude".to_string();
+        first.id = "12345678-0000-0000-0000-000000000001".to_string();
+        first.agent_session_id = Some("first-sid".to_string());
+        let mut second = first.clone();
+        second.id = "12345678-0000-0000-0000-000000000002".to_string();
+        second.agent_session_id = Some("second-sid".to_string());
+        let first_name = format!("{}First_12345678", crate::tmux::SESSION_PREFIX);
+        let second_name = format!("{}Second_12345678", crate::tmux::SESSION_PREFIX);
+        let live = crate::tmux::LiveSessionSnapshot::from_parts(
+            Some(vec![first_name.clone(), second_name.clone()]),
+            Some(HashMap::from([
+                (
+                    first_name.clone(),
+                    crate::tmux::PaneMetadata {
+                        pane_dead: false,
+                        pane_current_command: None,
+                        pane_start_command_is_protected: false,
+                    },
+                ),
+                (
+                    second_name.clone(),
+                    crate::tmux::PaneMetadata {
+                        pane_dead: false,
+                        pane_current_command: None,
+                        pane_start_command_is_protected: false,
+                    },
+                ),
+            ])),
+        );
+        let observations = vec![
+            (first_name.clone(), Some(first.id.clone()), None),
+            (second_name.clone(), Some(second.id.clone()), None),
+        ];
+        assert_eq!(
+            tmux_session_id_env_names(&first, &live, &observations),
+            vec![first_name]
+        );
+        assert_eq!(
+            tmux_session_id_env_names(&second, &live, &observations),
+            vec![second_name]
+        );
+
+        let duplicate = first.clone();
+        let rows = [first, duplicate];
+        let (trusted, ambiguous) = partition_unambiguous_instances(&rows);
+        assert!(trusted.is_empty());
+        assert!(ambiguous.contains("12345678-0000-0000-0000-000000000001"));
     }
 
     fn seed_instance_on_disk(profile: &str, inst: &Instance) {
@@ -1236,7 +1328,7 @@ mod tests {
         let corrupt_path = crate::session::get_app_dir()
             .unwrap()
             .join("profiles/corrupt/sessions.json");
-        std::fs::write(corrupt_path, b"not json").unwrap();
+        std::fs::write(corrupt_path, b"[null]").unwrap();
         assert!(instance_ids_excluding_profile("deleted").is_err());
     }
 
