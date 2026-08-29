@@ -1080,6 +1080,7 @@ fn publish_tmux_env() {
 mod tests {
     use super::*;
     use crate::file_watch::FileWatchService;
+    use crate::session::instance::PriorToolSession;
     use crate::session::poller::SessionPoller;
     use crate::session::storage::Storage;
     use crate::session::test_support::EnvGuard;
@@ -1507,6 +1508,32 @@ mod tests {
         outgoing_handoff.swap_tool_for_restart("codex");
         let independent_rows = [outgoing_handoff, independent_store];
         let (trusted, ambiguous) = partition_unambiguous_instances(&independent_rows);
+        assert_eq!(trusted.len(), 2);
+        assert!(ambiguous.is_empty());
+        let mut stale_qwen_first = first.clone();
+        stale_qwen_first.prior_tool_session_ids.insert(
+            "qwen".to_string(),
+            PriorToolSession {
+                agent_session_id: Some("stale-qwen-sid".to_string()),
+                ..PriorToolSession::default()
+            },
+        );
+        stale_qwen_first
+            .prior_tool_store_namespaces
+            .insert("qwen".to_string(), "qwen-store".to_string());
+        let mut stale_qwen_second = second.clone();
+        stale_qwen_second.prior_tool_session_ids.insert(
+            "qwen".to_string(),
+            PriorToolSession {
+                agent_session_id: Some("stale-qwen-sid".to_string()),
+                ..PriorToolSession::default()
+            },
+        );
+        stale_qwen_second
+            .prior_tool_store_namespaces
+            .insert("qwen".to_string(), "qwen-store".to_string());
+        let stale_qwen_rows = [stale_qwen_first, stale_qwen_second];
+        let (trusted, ambiguous) = partition_unambiguous_instances(&stale_qwen_rows);
         assert_eq!(trusted.len(), 2);
         assert!(ambiguous.is_empty());
         let shared_rows = [first.clone(), shared_conversation];

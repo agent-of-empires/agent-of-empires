@@ -3430,6 +3430,9 @@ impl Instance {
             self.prior_tool_session_ids
                 .iter()
                 .filter_map(|(tool, prior)| {
+                    if !tool_supports_terminal_resume(tool) {
+                        return None;
+                    }
                     let sid = prior.agent_session_id.as_deref()?;
                     let namespace = self.terminal_session_store_namespace_for_tool(tool)?;
                     Some((sid, namespace))
