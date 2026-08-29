@@ -138,14 +138,19 @@ fn partition_unambiguous_instances(instances: &[Instance]) -> (Vec<&Instance>, H
     for instance in instances {
         let id = instance.id.as_str();
         *id_counts.entry(id).or_default() += 1;
-        if let Some(sid) = instance.operational_agent_session_id() {
-            if let Some(namespace) = instance.operational_agent_session_store_namespace() {
-                if let Some(previous) = sid_owners.insert((namespace, sid.to_string()), id) {
+        if instance.operational_agent_session_id().is_some()
+            && instance
+                .operational_agent_session_store_namespace()
+                .is_none()
+        {
+            ambiguous_sid_owners.insert(id);
+        }
+        for (sid, namespace) in instance.reserved_agent_session_ownerships() {
+            if let Some(previous) = sid_owners.insert((namespace, sid.to_string()), id) {
+                if previous != id {
                     ambiguous_sid_owners.insert(previous);
                     ambiguous_sid_owners.insert(id);
                 }
-            } else {
-                ambiguous_sid_owners.insert(id);
             }
         }
     }
@@ -362,10 +367,12 @@ pub(crate) fn ensure_instances_quiescent(
     instances: &[Instance],
     action: &str,
 ) -> anyhow::Result<()> {
-    let names: HashSet<String> = crate::tmux::session_names_strict()?.into_iter().collect();
+    let names = crate::tmux::session_names_strict()?;
     for instance in instances {
-        let session = instance.tmux_session()?;
-        if names.contains(session.name()) {
+        if names
+            .iter()
+            .any(|name| crate::tmux::agent_session_belongs_to(name, &instance.id))
+        {
             anyhow::bail!(
                 "Cannot {action}: session '{}' still has a live tmux pane",
                 instance.id
@@ -406,6 +413,13 @@ pub(crate) fn restore_tmux_session_id_ownership_locked(
     crate::tmux::env::set_hidden_env_batch(&refs)
 }
 fn load_profile_instances_excluding(excluded: Option<&str>) -> anyhow::Result<Vec<Instance>> {
+    load_profile_instances_excluding_with_policy(excluded, false)
+}
+
+fn load_profile_instances_excluding_with_policy(
+    excluded: Option<&str>,
+    tolerate_corrupt_profiles: bool,
+) -> anyhow::Result<Vec<Instance>> {
     let excluded_identity = excluded
         .map(|profile| {
             let storage = Storage::open_unwatched(profile)
@@ -442,9 +456,18 @@ fn load_profile_instances_excluding(excluded: Option<&str>) -> anyhow::Result<Ve
         if excluded_identity.as_ref() == Some(&identity) {
             continue;
         }
-        let mut rows = storage
-            .load_ownership_strict()
-            .map_err(|error| anyhow::anyhow!("load profile {profile}: {error}"))?;
+        let mut rows = match storage.load_ownership_strict() {
+            Ok(rows) => rows,
+            Err(error) if tolerate_corrupt_profiles => {
+                tracing::warn!(
+                    profile = %profile,
+                    error = %error,
+                    "skipping corrupt foreign ownership profile during capture"
+                );
+                continue;
+            }
+            Err(error) => return Err(anyhow::anyhow!("load profile {profile}: {error}")),
+        };
         instances.append(&mut rows);
     }
     Ok(instances)
@@ -468,6 +491,22 @@ pub(crate) fn reserved_sid_holder_excluding_profile(
         .into_iter()
         .find(|instance| instance.reserves_agent_session_id_in_namespace(sid, namespace))
         .map(|instance| instance.id))
+}
+
+/// Best-effort capture guard. A corrupt foreign profile must not disable
+/// capture for healthy sessions; launch and destructive paths keep using the
+/// strict variant above.
+pub(crate) fn reserved_sid_holder_excluding_profile_for_capture(
+    excluded: &str,
+    namespace: &str,
+    sid: &str,
+) -> anyhow::Result<Option<String>> {
+    Ok(
+        load_profile_instances_excluding_with_policy(Some(excluded), true)?
+            .into_iter()
+            .find(|instance| instance.reserves_agent_session_id_in_namespace(sid, namespace))
+            .map(|instance| instance.id),
+    )
 }
 pub(crate) fn reconcile_all_profiles_tmux_session_id_ownership_env_locked(
 ) -> anyhow::Result<ClearedTmuxOwnership> {
@@ -1450,6 +1489,14 @@ mod tests {
         assert!(trusted.is_empty());
         assert!(ambiguous.contains(first.id.as_str()));
         assert!(ambiguous.contains("87654321-0000-0000-0000-000000000003"));
+        let mut parked_conversation = first.clone();
+        parked_conversation.id = "87654321-0000-0000-0000-000000000004".to_string();
+        parked_conversation.swap_tool("codex");
+        let parked_rows = [first.clone(), parked_conversation];
+        let (trusted, ambiguous) = partition_unambiguous_instances(&parked_rows);
+        assert!(trusted.is_empty());
+        assert!(ambiguous.contains(first.id.as_str()));
+        assert!(ambiguous.contains("87654321-0000-0000-0000-000000000004"));
         assert!(tmux_session_id_env_names(&second, &ownerless_live, &ownerless, false).is_empty());
         let colliding_rows = [first.clone(), second];
         assert!(ambiguous_tmux_id_suffixes(&colliding_rows).contains("12345678"));

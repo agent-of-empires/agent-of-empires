@@ -1111,6 +1111,8 @@ pub struct HomeView {
     /// owns recovery, lock contended, or no candidates). Drained on every
     /// tick by `apply_recovery_updates`.
     recovery_rx: Option<std::sync::mpsc::Receiver<RecoveryUpdate>>,
+    /// Pollers may start only after stale tmux ownership has been reconciled.
+    tmux_ownership_reconciled: bool,
     /// Lock guard kept alive for the recovery pass so a peer (a daemon
     /// that starts after the TUI) cannot duplicate cascades. Released
     /// when the field is set to `None` after the last worker has
@@ -2500,6 +2502,7 @@ impl HomeView {
                 .unwrap_or(true),
             trashed_section_collapsed: true,
             recovery_rx: None,
+            tmux_ownership_reconciled: false,
             recovery_lock: None,
             recovery_in_flight: std::collections::HashSet::new(),
             restart_cooldown_at: std::collections::HashMap::new(),
@@ -2549,6 +2552,7 @@ impl HomeView {
         let live = crate::tmux::LiveSessionSnapshot::new();
         match crate::session::sync::sync_tmux_session_id_env(view.instances.values(), &live) {
             Ok(()) => {
+                view.tmux_ownership_reconciled = true;
                 // Recover session IDs for pre-existing sessions via pollers.
                 for inst in view.instances.values_mut() {
                     let has_live_tmux = inst.has_live_tmux_pane_in(&live);
@@ -3734,18 +3738,28 @@ impl HomeView {
     /// [`Self::apply_session_id_updates`], which runs on every input/render
     /// wake while live views are open.
     pub fn repair_session_id_pollers(&mut self) {
-        // One observation for the whole walk. This runs on the `App::run` tick
-        // over every instance, so a per-item `list-sessions` fork scales with
+        // One observation for the whole walk. This runs on the App::run tick
+        // over every instance, so a per-item list-sessions fork scales with
         // the store and lands on the thread that also serves keystrokes.
         // Profiling a store of a few hundred sessions put this path at the top
         // of the main thread.
         let live = crate::tmux::LiveSessionSnapshot::new();
+        if !self.tmux_ownership_reconciled {
+            match crate::session::sync::sync_tmux_session_id_env(self.instances.values(), &live) {
+                Ok(()) => self.tmux_ownership_reconciled = true,
+                Err(error) => {
+                    tracing::warn!(target: "tui.home",
+                        "Tmux ownership reconciliation retry failed; capture repair remains disabled: {error}"
+                    );
+                    return;
+                }
+            }
+        }
         for instance in self.instances.values_mut() {
             instance.repair_session_id_poller_if_needed(&live);
         }
     }
-
-    /// Drain the startup-recovery channel and apply each `RecoveryUpdate`
+    /// Drain the startup-recovery channel and apply each recovery update
     /// to the in-memory `Instance` snapshot. Released the recovery lock
     /// (and the receiver) when all workers have completed.
     ///

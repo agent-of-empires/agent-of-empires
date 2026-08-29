@@ -6385,20 +6385,28 @@ async fn drain_session_id_updates_in_state(state: &Arc<AppState>) {
         let needs_poller_repair = snapshot
             .iter()
             .any(|instance| instance.needs_session_id_poller_repair(&live));
-        if outcome.touched() || needs_poller_repair {
-            if let Err(error) =
-                crate::session::sync::sync_tmux_session_id_env(snapshot.iter(), &live)
-            {
-                tracing::warn!(target: "session.sync", "Daemon env reconcile failed: {error}");
+        let ownership_reconciled = if outcome.touched() || needs_poller_repair {
+            match crate::session::sync::sync_tmux_session_id_env(snapshot.iter(), &live) {
+                Ok(()) => true,
+                Err(error) => {
+                    tracing::warn!(target: "session.sync", "Daemon env reconcile failed: {error}");
+                    false
+                }
             }
-        }
-        let repaired: std::collections::HashSet<String> = snapshot
-            .iter_mut()
-            .filter_map(|inst| {
-                inst.repair_session_id_poller_if_needed(&live)
-                    .then(|| inst.id.clone())
-            })
-            .collect();
+        } else {
+            true
+        };
+        let repaired: std::collections::HashSet<String> = if ownership_reconciled {
+            snapshot
+                .iter_mut()
+                .filter_map(|inst| {
+                    inst.repair_session_id_poller_if_needed(&live)
+                        .then(|| inst.id.clone())
+                })
+                .collect()
+        } else {
+            std::collections::HashSet::new()
+        };
         (outcome, snapshot, baseline, repaired)
     })
     .await

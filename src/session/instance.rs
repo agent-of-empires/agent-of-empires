@@ -1504,9 +1504,11 @@ fn persist_session_to_storage_guarded(
         let Some(namespace) = target.terminal_session_store_namespace() else {
             return Ok(SidWrite::Skipped);
         };
-        if let Some(holder) = crate::session::sync::reserved_sid_holder_excluding_profile(
-            profile, &namespace, session_id,
-        )? {
+        if let Some(holder) =
+            crate::session::sync::reserved_sid_holder_excluding_profile_for_capture(
+                profile, &namespace, session_id,
+            )?
+        {
             tracing::warn!(target: "session.store",
                 instance_id = %instance_id,
                 sid = %session_id,
@@ -5662,11 +5664,13 @@ impl Instance {
         let new_sid = self.agent_session_id.clone();
         let outcome = crate::session::sync::with_tmux_ownership_lock(|| {
             if let (Some(sid), Some(namespace)) = (new_sid.as_deref(), namespace.as_deref()) {
-                if let Some(holder) = crate::session::sync::reserved_sid_holder_excluding_profile(
-                    storage.profile(),
-                    namespace,
-                    sid,
-                )? {
+                if let Some(holder) =
+                    crate::session::sync::reserved_sid_holder_excluding_profile_for_capture(
+                        storage.profile(),
+                        namespace,
+                        sid,
+                    )?
+                {
                     tracing::warn!(target: "session.store",
                         instance_id = %self.id,
                         sid = %sid,
@@ -5791,12 +5795,28 @@ impl Instance {
                             if let Some(holder) =
                                 instances.iter_mut().find(|i| &i.id == holder_id)
                             {
+                                let parked_tools: Vec<String> = holder
+                                    .prior_tool_session_ids
+                                    .iter()
+                                    .filter(|(tool, prior)| {
+                                        prior.agent_session_id.as_deref() == Some(sid)
+                                            && holder
+                                                .terminal_session_store_namespace_for_tool(tool)
+                                                .as_deref()
+                                                == Some(namespace)
+                                    })
+                                    .map(|(tool, _)| tool.clone())
+                                    .collect();
                                 let had_handoff = holder.has_tmux_ownership_handoff();
                                 let incoming_matches =
                                     holder.incoming_handoff_agent_session_id() == Some(sid);
                                 if incoming_matches || !had_handoff {
                                     holder.agent_session_id = None;
                                     holder.resume_probe_failed_sid = None;
+                                }
+                                for tool in parked_tools {
+                                    holder.prior_tool_session_ids.remove(&tool);
+                                    holder.prior_tool_store_namespaces.remove(&tool);
                                 }
                             }
                         }
@@ -17523,6 +17543,44 @@ mod tests {
             .unwrap();
             assert!(exclusion.contains(SID_Y));
 
+            let sid_z = "019342ab-1234-7def-8901-333333333333";
+            let mut parked_other_store = make_inst(claimant_profile, "parked-other-store");
+            parked_other_store.tool = "codex".to_string();
+            parked_other_store.prior_tool_session_ids.insert(
+                "claude".to_string(),
+                PriorToolSession {
+                    agent_session_id: Some(SID_X.to_string()),
+                    acp_session_id: None,
+                },
+            );
+            parked_other_store
+                .prior_tool_store_namespaces
+                .insert("claude".to_string(), "host:claude:/other-store".to_string());
+            let mut inactive_other_store = make_inst(claimant_profile, "inactive-other-store");
+            inactive_other_store.agent_session_id = Some(sid_z.to_string());
+            inactive_other_store.agent_session_store_namespace =
+                Some("host:claude:/other-store".to_string());
+            seed(
+                claimant_profile,
+                &[
+                    &cross_profile_claimant,
+                    &parked_other_store,
+                    &inactive_other_store,
+                ],
+            );
+            let scoped_exclusion = crate::session::capture::compose_exclusion_with_persisted_peers(
+                &cross_profile_claimant.id,
+                &cross_profile_claimant.project_path,
+                &cross_profile_claimant.tool,
+                &claimant_namespace,
+                true,
+                claimant_profile,
+                &std::collections::HashSet::new(),
+            )
+            .unwrap();
+            assert!(!scoped_exclusion.contains(SID_X));
+            assert!(!scoped_exclusion.contains(sid_z));
+
             let relative_profile = "guards-owned-relative-store";
             let _relative_storage = Storage::new_unwatched(relative_profile).unwrap();
             std::fs::write(
@@ -17562,6 +17620,27 @@ mod tests {
                     .validate_launch_sid_ownership(&independent_storage)
                     .is_ok(),
                 "the same token in a different agent store is not the same conversation"
+            );
+            let corrupt_ownership_storage =
+                Storage::new_unwatched("guards-owned-corrupt-foreign").unwrap();
+            std::fs::write(
+                corrupt_ownership_storage.sessions_path(),
+                format!(r#"[{{"id":42,"agent_session_id":"{SID_X}"}}]"#),
+            )
+            .unwrap();
+            let independent_namespace = independent.terminal_session_store_namespace().unwrap();
+            assert!(
+                crate::session::capture::compose_exclusion_with_persisted_peers(
+                    &independent.id,
+                    &independent.project_path,
+                    &independent.tool,
+                    &independent_namespace,
+                    false,
+                    independent_profile,
+                    &std::collections::HashSet::new(),
+                )
+                .is_ok(),
+                "ownership-shaped corruption in a foreign profile must not disable capture"
             );
             assert_eq!(
                 persist_session_to_storage(
@@ -17717,9 +17796,19 @@ mod tests {
             incoming_holder.swap_tool_for_restart("claude");
             let mut pinned = make_inst(profile, "pinned");
             pinned.resume_intent = ResumeIntent::Use(SID_X.to_string());
+            let mut parked_holder = make_inst(profile, "parked-holder");
+            parked_holder.agent_session_id = Some(SID_X.to_string());
+            parked_holder.agent_session_store_namespace = pinned.terminal_session_store_namespace();
+            parked_holder.swap_tool("codex");
             seed(
                 profile,
-                &[&live_handoff, &plain_holder, &incoming_holder, &pinned],
+                &[
+                    &live_handoff,
+                    &plain_holder,
+                    &incoming_holder,
+                    &parked_holder,
+                    &pinned,
+                ],
             );
 
             let storage = Storage::new_unwatched(profile).unwrap();
@@ -17752,7 +17841,10 @@ mod tests {
                 Some(SID_X)
             );
 
-            seed(profile, &[&plain_holder, &incoming_holder, &pinned]);
+            seed(
+                profile,
+                &[&plain_holder, &incoming_holder, &parked_holder, &pinned],
+            );
             let mut takeover = pinned.clone();
             takeover.agent_session_id = Some(SID_X.to_string());
             assert_eq!(
@@ -17779,6 +17871,14 @@ mod tests {
                 .unwrap();
             assert_eq!(incoming_disk.agent_session_id, None);
             assert!(incoming_disk.tmux_ownership_handoff_pending);
+            let parked_disk = disk
+                .iter()
+                .find(|instance| instance.id == parked_holder.id)
+                .unwrap();
+            assert!(!parked_disk.prior_tool_session_ids.contains_key("claude"));
+            assert!(!parked_disk
+                .prior_tool_store_namespaces
+                .contains_key("claude"));
         }
 
         #[test]

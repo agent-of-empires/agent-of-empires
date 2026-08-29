@@ -19960,6 +19960,25 @@ mod apply_session_id_updates {
             "the hot drain path must not repair pollers"
         );
 
+        let sessions_path = view.storages[profile].sessions_path().to_path_buf();
+        let original_sessions = std::fs::read(&sessions_path).unwrap();
+        std::fs::write(
+            &sessions_path,
+            r#"[{"id":42,"agent_session_id":"ambiguous"}]"#,
+        )
+        .unwrap();
+        view.tmux_ownership_reconciled = false;
+        view.repair_session_id_pollers();
+        assert!(Arc::ptr_eq(
+            &view
+                .instances
+                .get(&terminal.id)
+                .and_then(|i| i.session_id_poller.clone())
+                .expect("failed reconciliation must retain the stopped poller"),
+            &terminal_stopped,
+        ));
+
+        std::fs::write(&sessions_path, original_sessions).unwrap();
         view.repair_session_id_pollers();
         let repaired = view
             .instances

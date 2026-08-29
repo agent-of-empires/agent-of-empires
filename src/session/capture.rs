@@ -1012,10 +1012,10 @@ fn compose_exclusion_in(
 /// omit that protection because their stores are instance-private or are not
 /// captured from the host (#3317).
 ///
-/// Scope: parked and inactive-peer exclusions remain profile-local because
-/// agent stores may differ by profile. Incoming handoff IDs are loaded from
-/// every profile only when they reserve the current agent store. Any profile
-/// discovery or strict-load failure aborts capture.
+/// Scope: parked and inactive-peer exclusions require the current store
+/// namespace. Incoming handoff IDs are loaded from every profile under the
+/// same rule. Corruption in the current profile aborts capture; corrupt
+/// foreign profiles are skipped because capture must remain available.
 pub(crate) fn compose_exclusion_with_persisted_peers(
     current_instance_id: &str,
     current_project_path: &str,
@@ -1068,9 +1068,20 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
                 continue;
             }
             let is_current_profile = identity == current_identity;
-            let instances = storage
-                .load_ownership_strict()
-                .map_err(|error| anyhow::anyhow!("load profile {peer_profile}: {error}"))?;
+            let instances = match storage.load_ownership_strict() {
+                Ok(instances) => instances,
+                Err(error) if !is_current_profile => {
+                    tracing::warn!(
+                        profile = %peer_profile,
+                        error = %error,
+                        "skipping corrupt foreign ownership profile during capture exclusion"
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    return Err(anyhow::anyhow!("load profile {peer_profile}: {error}"));
+                }
+            };
             for inst in instances {
                 if is_current_profile && inst.id == current_instance_id {
                     continue;
@@ -1091,6 +1102,9 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
                     .get(current_tool)
                     .and_then(|prior| prior.agent_session_id.as_deref())
                     .filter(|sid| !sid.is_empty())
+                    .filter(|sid| {
+                        inst.reserves_agent_session_id_in_namespace(sid, current_namespace)
+                    })
                 {
                     set.insert(parked.to_string());
                 }
@@ -1105,6 +1119,9 @@ pub(crate) fn compose_exclusion_with_persisted_peers(
                         .agent_session_id
                         .as_deref()
                         .filter(|sid| !sid.is_empty())
+                        .filter(|sid| {
+                            inst.reserves_agent_session_id_in_namespace(sid, current_namespace)
+                        })
                     {
                         set.insert(sid.to_string());
                     }
