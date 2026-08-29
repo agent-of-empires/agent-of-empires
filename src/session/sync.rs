@@ -113,26 +113,35 @@ fn tmux_session_id_env_names(
     let Some(candidates) = crate::tmux::live_any_kind_names_for_id_in(live, &instance.id) else {
         return Vec::new();
     };
-    let [candidate] = candidates.as_slice() else {
-        return Vec::new();
-    };
-    observations
-        .iter()
-        .find(|(name, _, _)| name == candidate)
-        .and_then(|(_, owner, _)| owner.is_none().then(|| candidate.clone()))
+    candidates
         .into_iter()
+        .filter(|candidate| {
+            observations
+                .iter()
+                .find(|(name, _, _)| name == candidate)
+                .is_some_and(|(_, owner, _)| owner.is_none())
+        })
         .collect()
 }
 
 fn partition_unambiguous_instances(instances: &[Instance]) -> (Vec<&Instance>, HashSet<&str>) {
     let mut id_counts: HashMap<&str, usize> = HashMap::new();
+    let mut sid_counts: HashMap<&str, usize> = HashMap::new();
     for instance in instances {
         *id_counts.entry(instance.id.as_str()).or_default() += 1;
+        if let Some(sid) = instance.operational_agent_session_id() {
+            *sid_counts.entry(sid).or_default() += 1;
+        }
     }
-    let ambiguous_ids: HashSet<&str> = id_counts
+    let mut ambiguous_ids: HashSet<&str> = id_counts
         .iter()
         .filter_map(|(id, count)| (*count > 1).then_some(*id))
         .collect();
+    ambiguous_ids.extend(instances.iter().filter_map(|instance| {
+        instance.operational_agent_session_id().and_then(|sid| {
+            (sid_counts.get(sid).copied().unwrap_or_default() > 1).then_some(instance.id.as_str())
+        })
+    }));
     let trusted = instances
         .iter()
         .filter(|instance| !ambiguous_ids.contains(instance.id.as_str()))
@@ -1177,7 +1186,7 @@ mod tests {
                     (
                         agent.clone(),
                         crate::tmux::PaneMetadata {
-                            pane_dead: true,
+                            pane_dead: false,
                             pane_current_command: None,
                             pane_start_command_is_protected: false,
                         },
@@ -1192,7 +1201,7 @@ mod tests {
                     ),
                 ])),
             );
-            let observations = vec![(agent, None, None), (terminal.clone(), None, None)];
+            let observations = vec![(agent.clone(), None, None), (terminal.clone(), None, None)];
             assert_eq!(
                 tmux_session_id_env_names(&instance, &live, &observations, false),
                 Vec::<String>::new(),
@@ -1201,8 +1210,8 @@ mod tests {
             instance.tool = "claude".to_string();
             assert_eq!(
                 tmux_session_id_env_names(&instance, &live, &observations, true),
-                vec![terminal],
-                "supported publication stays live-only"
+                vec![agent, terminal],
+                "paired ownerless panes share unambiguous ownership"
             );
         }
 
@@ -1262,6 +1271,15 @@ mod tests {
         );
         let ownerless = vec![(first_name, None, None)];
         assert!(tmux_session_id_env_names(&first, &ownerless_live, &ownerless, false).is_empty());
+
+        let mut shared_conversation = second.clone();
+        shared_conversation.id = "87654321-0000-0000-0000-000000000003".to_string();
+        shared_conversation.agent_session_id = first.agent_session_id.clone();
+        let shared_rows = [first.clone(), shared_conversation];
+        let (trusted, ambiguous) = partition_unambiguous_instances(&shared_rows);
+        assert!(trusted.is_empty());
+        assert!(ambiguous.contains(first.id.as_str()));
+        assert!(ambiguous.contains("87654321-0000-0000-0000-000000000003"));
         assert!(tmux_session_id_env_names(&second, &ownerless_live, &ownerless, false).is_empty());
         let colliding_rows = [first.clone(), second];
         assert!(ambiguous_tmux_id_suffixes(&colliding_rows).contains("12345678"));
