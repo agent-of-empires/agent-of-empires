@@ -37,7 +37,7 @@ use crate::session::capture::{
     try_capture_opencode_session_id_in_container, try_capture_pi_session_id_in_container,
     try_capture_vibe_session_id_in_container, validate_omp_capture_metadata, validated_session_id,
     vibe_poll_fn, vibe_poll_fn_sandboxed, OmpCaptureMetadata, OmpCapturePlan, OmpCliCaptureOptions,
-    OmpStoreKind,
+    OmpStoreKind, OmpStoreLayout,
 };
 type LaunchCommandParts = (
     Option<String>,
@@ -2192,6 +2192,10 @@ impl Instance {
             }
         }
         self.tool = new_tool.to_string();
+        // Command overrides are owned by the selected tool. A wrapper remains
+        // authoritative while that tool is selected, but cannot cross a tool
+        // transition and receive the new tool's resume flags.
+        self.command.clear();
         // The alias is resolved per-tool, so the outgoing tool's answer cannot
         // survive: kept, it points `resolved_agent` at the wrong built-in
         // outright (a `codex-personal` -> `claude-personal` swap would keep
@@ -2316,7 +2320,8 @@ impl Instance {
     /// conversation field staged by `swap_tool` must travel together.
     pub(crate) fn merge_profile_move_diff(&mut self, pre: &Self, post: &Self) {
         self.merge_user_action_diff(pre, post);
-        if pre.tool != post.tool {
+        let tool_changed = pre.tool != post.tool;
+        if tool_changed {
             // Apply the requested transition to the freshly locked disk row.
             // The TUI post snapshot can carry parked session ids captured
             // before a poller or peer refreshed the durable conversation state.
@@ -2326,7 +2331,7 @@ impl Instance {
                 self.swap_tool(&post.tool);
             }
         }
-        if pre.command != post.command {
+        if tool_changed || pre.command != post.command {
             self.command = post.command.clone();
         }
         if pre.extra_args != post.extra_args {
@@ -3212,6 +3217,51 @@ impl Instance {
             .or_else(|| self.resolve_terminal_session_store_namespace_for_tool(tool))
     }
 
+    fn omp_store_namespace(&self, layout: &OmpStoreLayout) -> Option<String> {
+        let sessions = if self.is_sandboxed() {
+            layout.sessions.clone()
+        } else {
+            layout
+                .sessions
+                .canonicalize()
+                .unwrap_or_else(|_| layout.sessions.clone())
+        };
+        if self.is_sandboxed() {
+            let container = &self.sandbox_info.as_ref()?.container_name;
+            Some(format!(
+                "sandbox:omp:{container}:{}",
+                sessions.to_string_lossy()
+            ))
+        } else {
+            Some(format!("host:omp:{}", sessions.to_string_lossy()))
+        }
+    }
+
+    fn resolve_omp_store_namespace(&self, environment: &[String]) -> Option<String> {
+        let options = self.omp_capture_options()?;
+        let layout = if self.is_sandboxed() {
+            let sandbox = self.sandbox_info.as_ref()?;
+            let launch_environment = resolved_sandbox_environment(
+                &self.source_profile,
+                sandbox,
+                Path::new(&self.project_path),
+            );
+            resolve_omp_store_layout_in_container_with_environment(
+                &sandbox.container_name,
+                &self.container_workdir(),
+                &launch_environment,
+                &options,
+            )
+            .ok()?
+            .0
+        } else {
+            resolve_omp_store_layout_with_environment(environment, &self.project_path, &options)
+                .ok()?
+                .0
+        };
+        self.omp_store_namespace(&layout)
+    }
+
     fn resolve_terminal_session_store_namespace_for_tool(&self, tool: &str) -> Option<String> {
         let (environment, _) = self.launch_host_environment_snapshot();
         self.resolve_terminal_session_store_namespace_for_tool_in(tool, &environment)
@@ -3233,6 +3283,9 @@ impl Instance {
         }
         .map(|definition| definition.name)
         .unwrap_or(tool);
+        if agent == "omp" {
+            return self.resolve_omp_store_namespace(environment);
+        }
         if self.is_sandboxed() {
             return Some(format!("sandbox:{agent}:{}", self.id));
         }
@@ -3271,10 +3324,6 @@ impl Instance {
             "kimi" => value("KIMI_CODE_HOME")
                 .map(std::path::PathBuf::from)
                 .or_else(|| under_home(".kimi-code")),
-            "omp" => value("PI_CODING_AGENT_DIR")
-                .map(std::path::PathBuf::from)
-                .or_else(|| under_home(".omp/agent"))
-                .map(|path| path.join("sessions")),
             "prime-agent" => value("PRIME_AGENT_SESSION_DIR")
                 .or_else(|| value("PRIME_AGENT_CODING_AGENT_SESSION_DIR"))
                 .map(std::path::PathBuf::from)
@@ -3328,9 +3377,7 @@ impl Instance {
         self.refresh_launch_store_namespace_in(&environment)
     }
 
-    fn refresh_launch_store_namespace_in(&mut self, environment: &[String]) -> Result<()> {
-        let resolved =
-            self.resolve_terminal_session_store_namespace_for_tool_in(&self.tool, environment);
+    fn apply_resolved_launch_store_namespace(&mut self, resolved: Option<String>) -> Result<()> {
         let resumable_sid = self.launch_resume_sid();
         if let (Some(sid), Some(stored)) =
             (resumable_sid, self.agent_session_store_namespace.as_deref())
@@ -3344,6 +3391,12 @@ impl Instance {
         }
         self.agent_session_store_namespace = resolved;
         Ok(())
+    }
+
+    fn refresh_launch_store_namespace_in(&mut self, environment: &[String]) -> Result<()> {
+        let resolved =
+            self.resolve_terminal_session_store_namespace_for_tool_in(&self.tool, environment);
+        self.apply_resolved_launch_store_namespace(resolved)
     }
     /// Conversation ID that currently owns this row's tmux pane. A pending
     /// tool-swap handoff wins; otherwise unsupported agents' stored IDs remain
@@ -4178,9 +4231,6 @@ impl Instance {
     }
 
     fn apply_session_flags(&mut self, cmd: &mut String, context: &str) -> AppliedSessionFlags {
-        if !self.launch_command_matches_tool() {
-            return AppliedSessionFlags::None;
-        }
         if let ResumeIntent::Fork { from } = self.resume_intent.clone() {
             let child = self.agent_session_id.clone();
             if let Some(child_id) = child.as_deref() {
@@ -4265,22 +4315,6 @@ impl Instance {
         } else {
             format!("{} {}", self.command, self.extra_args)
         }
-    }
-
-    fn launch_command_matches_tool(&self) -> bool {
-        if self.command.is_empty() {
-            return true;
-        }
-        let Some(expected) = crate::agents::get_agent(&self.tool).map(|agent| agent.binary) else {
-            return false;
-        };
-        let Ok(argv) = shell_words::split(&self.command) else {
-            return false;
-        };
-        let Some(executable) = argv.first() else {
-            return false;
-        };
-        std::path::Path::new(executable).file_name() == std::path::Path::new(expected).file_name()
     }
 
     /// Launch command including any agent `launch_subcommand` (e.g.
@@ -4914,6 +4948,10 @@ impl Instance {
         self.refresh_launch_store_namespace_in(&host_environment)?;
         let (command, session_flags, omp_capture_plan, launch_env) =
             self.build_launch_command_in_environment(&host_environment, host_mutations)?;
+        if let Some(plan) = omp_capture_plan.as_ref() {
+            let resolved = self.omp_store_namespace(&plan.layout);
+            self.apply_resolved_launch_store_namespace(resolved)?;
+        }
         self.validate_launch_sid_ownership(storage)?;
         Ok(PreparedLaunch {
             command,
@@ -5752,8 +5790,7 @@ impl Instance {
     }
 
     fn launch_resume_sid(&self) -> Option<&str> {
-        if !self.launch_command_matches_tool()
-            || !self.supports_terminal_resume()
+        if !self.supports_terminal_resume()
             || (self.is_sandboxed()
                 && matches!(self.tool.as_str(), "copilot" | "kimi" | "prime-agent"))
         {
@@ -6848,11 +6885,85 @@ impl Instance {
             && self.has_live_tmux_pane_in(snapshot)
     }
 
+    fn ensure_durable_poller_namespace(&mut self) -> bool {
+        if self.agent_session_store_namespace.is_some() {
+            return true;
+        }
+        let Some(resolved) = self.resolved_terminal_session_store_namespace() else {
+            tracing::warn!(target: "session.store",
+                instance_id = %self.id,
+                "refusing to repair session poller because its conversation store is unresolved"
+            );
+            return false;
+        };
+        let profile = self.effective_profile();
+        let storage = match super::storage::Storage::open(&profile, self.resolve_file_watch()) {
+            Ok(storage) => storage,
+            Err(error) => {
+                tracing::warn!(target: "session.store",
+                    instance_id = %self.id,
+                    "failed to open storage for legacy poller namespace backfill: {error}"
+                );
+                return false;
+            }
+        };
+        let _lifecycle = match storage.acquire_instance_lifecycle_lock(&self.id) {
+            Ok(lock) => lock,
+            Err(error) => {
+                tracing::warn!(target: "session.store",
+                    instance_id = %self.id,
+                    "failed to lock legacy poller namespace backfill: {error}"
+                );
+                return false;
+            }
+        };
+        let id = self.id.clone();
+        let tool = self.tool.clone();
+        let generation = self.lifecycle_generation;
+        let candidate = resolved.clone();
+        let result = storage.update(|instances, _groups| {
+            let row = instances
+                .iter_mut()
+                .find(|row| row.id == id)
+                .ok_or_else(|| anyhow::anyhow!("session disappeared before namespace backfill"))?;
+            anyhow::ensure!(
+                row.tool == tool && row.lifecycle_generation == generation,
+                "session changed before namespace backfill"
+            );
+            if let Some(durable) = row.agent_session_store_namespace.as_deref() {
+                anyhow::ensure!(
+                    durable == candidate,
+                    "conversation store changed before backfill"
+                );
+            } else {
+                anyhow::ensure!(
+                    row.resolved_terminal_session_store_namespace().as_deref()
+                        == Some(candidate.as_str()),
+                    "legacy conversation store no longer matches the live launch"
+                );
+                row.agent_session_store_namespace = Some(candidate.clone());
+            }
+            Ok(())
+        });
+        if let Err(error) = result {
+            tracing::warn!(target: "session.store",
+                instance_id = %self.id,
+                "legacy poller namespace backfill failed: {error}"
+            );
+            return false;
+        }
+        self.agent_session_store_namespace = Some(resolved);
+        true
+    }
+
     pub(crate) fn repair_session_id_poller_if_needed(
         &mut self,
         snapshot: &crate::tmux::LiveSessionSnapshot,
     ) -> bool {
         if !self.needs_session_id_poller_repair(snapshot) {
+            return false;
+        }
+        if !self.ensure_durable_poller_namespace() {
             return false;
         }
         let Some(durable_namespace) = self.agent_session_store_namespace.as_deref() else {
@@ -13131,17 +13242,28 @@ mod tests {
             AppliedSessionFlags::Existing
         );
 
-        for executable in ["qwen", "kiro-cli"] {
-            inst.command = executable.to_string();
-            let mut command = executable.to_string();
+        for wrapper in ["my-wrapper", "/bin/sh -c 'claude'", "env FOO=bar claude"] {
+            inst.command = wrapper.to_string();
+            let mut command = wrapper.to_string();
             assert_eq!(
                 inst.apply_session_flags(&mut command, "test"),
-                AppliedSessionFlags::None,
-                "{executable}"
+                AppliedSessionFlags::Existing,
+                "{wrapper}"
             );
-            assert_eq!(command, executable, "{executable}");
-            assert_eq!(inst.launch_resume_sid(), None, "{executable}");
+            assert!(command.contains("--resume"), "{wrapper}: {command}");
+            assert!(inst.launch_resume_sid().is_some(), "{wrapper}");
         }
+
+        inst.command = "qwen".to_string();
+        inst.swap_tool("qwen");
+        assert!(inst.command.is_empty());
+        let mut qwen_command = inst.get_launch_command();
+        assert_eq!(
+            inst.apply_session_flags(&mut qwen_command, "test"),
+            AppliedSessionFlags::None
+        );
+        assert!(!qwen_command.contains("--resume"));
+        assert_eq!(inst.launch_resume_sid(), None);
     }
 
     #[test]
@@ -18447,6 +18569,42 @@ mod tests {
 
         #[test]
         #[serial]
+        fn live_legacy_row_backfills_namespace_before_poller_repair() {
+            if skip_if_no_tmux() {
+                return;
+            }
+            let temp = tempdir().unwrap();
+            let _home = crate::session::test_support::isolate_app_dir_at(temp.path());
+            let profile = "legacy-poller-namespace";
+            let mut inst = make_inst(profile, "legacy-live");
+            inst.agent_session_id = Some(VALID_SID.to_string());
+            inst.agent_session_store_namespace = None;
+            inst.terminal_info = Some(crate::session::TerminalInfo { created: true });
+            seed_disk_row(profile, &inst);
+
+            let tmux = TmuxSession::create_terminal(&inst.id, &inst.title);
+            crate::tmux::env::set_hidden_env(
+                tmux.name(),
+                crate::tmux::env::AOE_INSTANCE_ID_KEY,
+                &inst.id,
+            )
+            .unwrap();
+            let live = crate::tmux::LiveSessionSnapshot::new();
+            assert!(inst.repair_session_id_poller_if_needed(&live));
+            assert!(inst.session_id_poller_is_running());
+            let disk = crate::session::storage::Storage::new_unwatched(profile)
+                .unwrap()
+                .load()
+                .unwrap();
+            assert_eq!(
+                disk[0].agent_session_store_namespace,
+                inst.agent_session_store_namespace
+            );
+            assert!(disk[0].agent_session_store_namespace.is_some());
+        }
+
+        #[test]
+        #[serial]
         fn terminal_creation_stamps_owner_without_reclaiming_existing_pane() {
             if skip_if_no_tmux() {
                 return;
@@ -18600,11 +18758,40 @@ mod tests {
                 ("OMP_PROFILE".to_string(), "work".to_string()),
                 ("PI_CONFIG_DIR".to_string(), "/custom".to_string()),
             ];
+            let custom_store = temp.path().join("explicit-omp-sessions");
+            inst.extra_args = format!("--session-dir {}", custom_store.display());
             inst.agent_session_id = None;
             let plan = inst
                 .resolve_omp_capture_plan(&inst.omp_capture_options().unwrap())
                 .expect("OMP launch plan");
             let expected_layout = plan.layout.clone();
+            let namespace = inst
+                .resolved_terminal_session_store_namespace()
+                .expect("OMP ownership namespace");
+            assert_eq!(
+                namespace,
+                inst.omp_store_namespace(&expected_layout).unwrap()
+            );
+
+            let mut same_store = inst.clone();
+            same_store.pending_host_env = vec![(
+                "HOME".to_string(),
+                temp.path().join("other-home").display().to_string(),
+            )];
+            assert_eq!(
+                same_store.resolved_terminal_session_store_namespace(),
+                Some(namespace.clone()),
+                "an explicit OMP store is one ownership domain across ambient roots"
+            );
+
+            let mut changed_store = inst.clone();
+            changed_store.agent_session_id = Some(VALID_SID.to_string());
+            changed_store.agent_session_store_namespace = Some(namespace);
+            changed_store.extra_args = format!(
+                "--session-dir {}",
+                temp.path().join("other-omp-sessions").display()
+            );
+            assert!(changed_store.refresh_launch_store_namespace().is_err());
             seed_disk_row(profile, &inst);
 
             let tmux = TmuxSession::create(&inst.id, &inst.title);

@@ -629,6 +629,36 @@ fn poller_update_matches_instance(update: &Update, instance: &Instance) -> bool 
         && instance.terminal_session_store_namespace().as_deref() == Some(update.namespace.as_str())
 }
 
+fn claude_sidecar_session_id(instance: &Instance) -> Option<String> {
+    let detected = crate::tmux::status_rules::effective_detect_as(
+        &instance.source_profile,
+        &instance.tool,
+        &instance.detect_as,
+    );
+    let is_claude = crate::agents::get_agent(&instance.tool)
+        .or_else(|| crate::agents::get_agent(&detected))
+        .is_some_and(|agent| agent.name == "claude");
+    is_claude
+        .then(|| crate::hooks::read_hook_session_id(&instance.id))
+        .flatten()
+}
+
+fn register_authoritative_owner(
+    owners: &mut HashMap<(String, String), Option<String>>,
+    namespace: String,
+    sid: String,
+    instance_id: &str,
+) {
+    owners
+        .entry((namespace, sid))
+        .and_modify(|owner| {
+            if owner.as_deref() != Some(instance_id) {
+                *owner = None;
+            }
+        })
+        .or_insert_with(|| Some(instance_id.to_string()));
+}
+
 struct Rollback {
     id: String,
     disk_sid: Option<String>,
@@ -769,12 +799,55 @@ fn drain_and_persist_session_ids_inner(
             observation,
         });
     }
+    // Per-instance hook sidecars are authoritative; shared-store filesystem
+    // scans are heuristic. Read every live candidate, including instances
+    // without a queued update, so split daemon/TUI drains cannot let a
+    // heuristic claimant persist before the sidecar owner reports.
+    let mut authoritative_owners: HashMap<(String, String), Option<String>> = HashMap::new();
+    for instance in instances.iter() {
+        let Some(sid) = claude_sidecar_session_id(instance) else {
+            continue;
+        };
+        let Some(namespace) = instance.terminal_session_store_namespace() else {
+            continue;
+        };
+        register_authoritative_owner(&mut authoritative_owners, namespace, sid, &instance.id);
+    }
+    for update in &updates {
+        if matches!(update.guard, SessionIdGuard::OmpGeneration(_)) {
+            register_authoritative_owner(
+                &mut authoritative_owners,
+                update.namespace.clone(),
+                update.sid.clone(),
+                &update.id,
+            );
+        }
+    }
+    updates.retain(|update| {
+        let owner = authoritative_owners
+            .get(&(update.namespace.clone(), update.sid.clone()))
+            .and_then(|owner| owner.as_deref())
+            .filter(|owner| *owner != update.id.as_str());
+        if let Some(owner) = owner {
+            tracing::warn!(
+                target: "session.sync",
+                instance = %update.id,
+                sid = %update.sid,
+                owner = %owner,
+                "Ignoring heuristic poller sid claimed by an authoritative instance sidecar",
+            );
+            acknowledge_poller_observation_for(instances, &update.id, &update.observation);
+            filtered_ids.insert(update.id.clone());
+            false
+        } else {
+            true
+        }
+    });
 
-    // Reject, don't arbitrate: if two same-cwd peers both claim the same
-    // currently-unowned sid in one tick (neither is in the frozen snapshot, so
-    // the collision guard passed both), picking a winner by iteration order is
-    // silent misassignment. Drop every claimant and defer; the next tick sees
-    // the real owner's anchor advance and the collision guard resolves it (#2708).
+    // Multiple remaining heuristic claimants are ambiguous. Keep every sticky
+    // observation pending until an authoritative sidecar or generation claim
+    // identifies the owner; choosing by iteration order silently misassigns
+    // the conversation (#2708).
     let mut sid_claim_counts: HashMap<(String, String), usize> =
         HashMap::with_capacity(updates.len());
     for update in &updates {
@@ -795,7 +868,7 @@ fn drain_and_persist_session_ids_inner(
                 sid = %update.sid,
                 "Ignoring poller-reported sid claimed by multiple instances this tick",
             );
-            acknowledge_poller_observation_for(instances, &update.id, &update.observation);
+            request_poller_retry(instances, &update.id);
             filtered_ids.insert(update.id.clone());
             false
         } else {
@@ -2217,7 +2290,7 @@ mod tests {
 
     #[test]
     #[serial]
-    fn drain_rejects_all_claimants_of_same_batch_duplicate_sid() {
+    fn drain_converges_duplicate_sid_claims_by_authoritative_provenance() {
         let temp = tempdir().unwrap();
         let _guard = storage_home_guard(&temp);
 
@@ -2242,6 +2315,63 @@ mod tests {
         assert!(outcome.filtered.contains(&instances[1].id));
         assert_eq!(instances[0].agent_session_id, None);
         assert_eq!(instances[1].agent_session_id, None);
+        assert!(drain_poller(&instances[0]).is_some());
+        assert!(drain_poller(&instances[1]).is_some());
+
+        let same_profile = "sync-authoritative-samebatch";
+        let mut authoritative = Instance::new("authoritative-title", "/tmp/x");
+        authoritative.source_profile = same_profile.to_string();
+        let mut heuristic = Instance::new("heuristic-title", "/tmp/x");
+        heuristic.source_profile = same_profile.to_string();
+        seed_instances_on_disk(same_profile, &[&authoritative, &heuristic]);
+        crate::hooks::ensure_instance_dir_path(&authoritative.id).unwrap();
+        crate::hooks::write_session_id_via_guard(&authoritative.id, contested).unwrap();
+        attach_poller_with_update(&mut authoritative, contested);
+        attach_poller_with_update(&mut heuristic, contested);
+        let mut same_batch = vec![authoritative, heuristic];
+        let outcome = drain_and_persist_session_ids(&mut same_batch, &file_watch);
+        assert_eq!(outcome.applied, vec![same_batch[0].id.clone()]);
+        assert!(outcome.filtered.contains(&same_batch[1].id));
+        assert_eq!(same_batch[0].agent_session_id.as_deref(), Some(contested));
+        assert_eq!(same_batch[1].agent_session_id, None);
+        crate::hooks::cleanup_hook_status_dir(&same_batch[0].id);
+
+        let split_contested = "019342ab-1234-7def-8901-eeeeeeeeeeee";
+        let split_profile = "sync-authoritative-split";
+        let mut split_owner = Instance::new("split-owner-title", "/tmp/x");
+        split_owner.source_profile = split_profile.to_string();
+        let mut split_heuristic = Instance::new("split-heuristic-title", "/tmp/x");
+        split_heuristic.source_profile = split_profile.to_string();
+        seed_instances_on_disk(split_profile, &[&split_owner, &split_heuristic]);
+        crate::hooks::ensure_instance_dir_path(&split_owner.id).unwrap();
+        crate::hooks::write_session_id_via_guard(&split_owner.id, split_contested).unwrap();
+        attach_poller_with_update(&mut split_heuristic, split_contested);
+        let mut split = vec![split_owner, split_heuristic];
+        let first = drain_and_persist_session_ids(&mut split, &file_watch);
+        assert!(first.applied.is_empty());
+        let split_disk = Storage::new_unwatched(split_profile)
+            .unwrap()
+            .load()
+            .unwrap();
+        let split_disk_owner = split_disk
+            .iter()
+            .find(|instance| instance.id == split[0].id)
+            .unwrap();
+        assert_eq!(
+            split[0].agent_session_id, split_disk_owner.agent_session_id,
+            "owner drifted before its authoritative observation"
+        );
+        assert!(first.filtered.contains(&split[1].id));
+        attach_poller_with_update(&mut split[0], split_contested);
+        let second = drain_and_persist_session_ids(&mut split, &file_watch);
+        assert_eq!(
+            second.applied,
+            vec![split[0].id.clone()],
+            "second outcome: {second:?}"
+        );
+        assert_eq!(split[0].agent_session_id.as_deref(), Some(split_contested));
+        assert_eq!(split[1].agent_session_id, None);
+        crate::hooks::cleanup_hook_status_dir(&split[0].id);
 
         let mut c = Instance::new("peer-c-title", "/tmp/x");
         c.source_profile = "sync-samebatch-c".to_string();
