@@ -422,8 +422,8 @@ pub struct AcpConfig {
         widget = "toggle"
     )]
     pub offer_structured_in_new_session: bool,
-    /// Acp agent used when --agent is not specified (e.g. aoe-agent,
-    /// claude-code, gemini).
+    /// Acp agent used when --agent is not specified (e.g. claude-code,
+    /// codex, aoe-agent).
     #[serde(default = "default_agent")]
     #[setting(label = "Default agent", widget = "text", validate = "nonempty")]
     pub default_agent: String,
@@ -646,7 +646,7 @@ impl Default for AcpConfig {
 }
 
 fn default_agent() -> String {
-    "aoe-agent".to_string()
+    "claude-code".to_string()
 }
 fn default_max_workers() -> u32 {
     100
