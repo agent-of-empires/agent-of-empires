@@ -631,12 +631,12 @@ pub fn delete_profile(name: &str) -> Result<()> {
 
     sync::with_tmux_ownership_lock(|| {
         let target_instances =
-            storage::Storage::open_unwatched(name).and_then(|store| store.load());
+            storage::Storage::open_unwatched(name).and_then(|store| store.load_strict());
         let survivor_ids = sync::instance_ids_excluding_profile(name);
-        let cleared = match (target_instances, survivor_ids) {
+        match (target_instances, survivor_ids) {
             (Ok(mut target_instances), Ok(survivor_ids)) => {
                 target_instances.retain(|instance| !survivor_ids.contains(&instance.id));
-                sync::clear_tmux_session_id_ownership_for_instances_locked(&target_instances)?
+                sync::clear_tmux_session_id_ownership_for_instances_locked(&target_instances)?;
             }
             (target, survivors) => {
                 tracing::warn!(
@@ -646,13 +646,14 @@ pub fn delete_profile(name: &str) -> Result<()> {
                     survivors_readable = survivors.is_ok(),
                     "Deleting profile without pre-clearing ambiguous tmux ownership"
                 );
-                sync::ClearedTmuxOwnership::default()
             }
-        };
+        }
         if let Err(delete_error) = fs::remove_dir_all(&profile_dir) {
-            if let Err(restore_error) = sync::restore_tmux_session_id_ownership_locked(&cleared) {
+            if let Err(reconcile_error) =
+                sync::reconcile_all_profiles_tmux_session_id_ownership_env_locked()
+            {
                 anyhow::bail!(
-                    "Failed to delete profile '{name}': {delete_error}; ownership restore failed: {restore_error}"
+                    "Failed to delete profile '{name}': {delete_error}; ownership reconciliation failed: {reconcile_error}"
                 );
             }
             return Err(delete_error.into());
