@@ -92,8 +92,6 @@ fn drain_and_persist_session_ids_inner(
     lifecycle_already_locked: bool,
 ) -> SessionIdSyncOutcome {
     let mut updates: Vec<Update> = Vec::with_capacity(instances.len());
-    // Pollers whose work is done (Pi: see `supports_session_poller`).
-    let mut to_retire: Vec<String> = Vec::new();
     let mut filtered_ids: HashSet<String> = HashSet::with_capacity(instances.len());
 
     // Frozen pre-update ownership snapshot. Collision checks must read this,
@@ -184,24 +182,6 @@ fn drain_and_persist_session_ids_inner(
         }
         if inst.agent_session_id.as_deref() == Some(sid.as_str()) {
             acknowledge_poller_observation(inst, &observation);
-            continue;
-        }
-        // A known Pi conversation is authoritative: its shared store may fill
-        // but never replace. The start gate cannot stop a poller that captured
-        // the id itself, so refuse the observation and retire it here.
-        if inst.tool == "pi"
-            && inst.agent_session_id.is_some()
-            && observation.guard != SessionIdGuard::InstanceSidecar
-        {
-            tracing::debug!(
-                target: "session.sync",
-                instance = %inst.id,
-                sid = %sid,
-                "Ignoring poller-reported sid: host Pi conversation already known",
-            );
-            acknowledge_poller_observation(inst, &observation);
-            to_retire.push(inst.id.clone());
-            filtered_ids.insert(inst.id.clone());
             continue;
         }
         updates.push(Update {
@@ -387,18 +367,6 @@ fn drain_and_persist_session_ids_inner(
         if let Some(inst) = instances.iter_mut().find(|i| i.id == *id) {
             inst.agent_session_id = Some(sid.clone());
             inst.resume_probe_failed_sid = None;
-            // A Pi capture is the pane's whole identity and its last, so the
-            // worker retires with it rather than holding a slot.
-            // A sidecar poller keeps watching: it reports the pane's own
-            // conversation, so a later `/new` is still this session's.
-            if inst.tool == "pi" && !inst.uses_pi_session_sidecar() {
-                to_retire.push(inst.id.clone());
-            }
-        }
-    }
-    for id in &to_retire {
-        if let Some(inst) = instances.iter_mut().find(|i| i.id == *id) {
-            inst.retire_session_id_poller();
         }
     }
     for rb in &to_rollback {
@@ -406,17 +374,6 @@ fn drain_and_persist_session_ids_inner(
             inst.agent_session_id = rb.disk_sid.clone();
             inst.resume_probe_failed_sid = rb.disk_failed_sid.clone();
             inst.omp_capture_generation = rb.disk_omp_capture_generation.clone();
-            // A lost CAS still converges on a known conversation, so the loser
-            // retires too; repair cannot reap it later, the id being known.
-            if inst.tool == "pi"
-                && !inst.uses_pi_session_sidecar()
-                && inst
-                    .agent_session_id
-                    .as_deref()
-                    .is_some_and(|s| !s.is_empty())
-            {
-                inst.retire_session_id_poller();
-            }
         }
     }
 
@@ -1131,45 +1088,6 @@ mod tests {
         assert_eq!(loaded[0].agent_session_id.as_deref(), Some(fresh));
     }
 
-    // A host Pi conversation that is already known must survive whatever its
-    // own poller reports next: the store it scans is shared by every session
-    // on the project path and names no pane, and an id no other row claims
-    // (a `pi` run by hand in the same directory) passes the ownership check
-    // above (#3576). The poller that produced the anchor is retired with it,
-    // since the start gate alone cannot stop one that is already running.
-    #[test]
-    #[serial]
-    fn host_pi_keeps_a_known_conversation_and_retires_its_poller() {
-        let temp = tempdir().unwrap();
-        let _guard = storage_home_guard(&temp);
-
-        let profile = "sync-pi-anchored";
-        let mut inst = Instance::new("pi-anchored-title", "/tmp/pi-anchored");
-        inst.source_profile = profile.to_string();
-        inst.tool = "pi".to_string();
-        inst.agent_session_id = Some("pi-own-conversation".to_string());
-        seed_instance_on_disk(profile, &inst);
-        attach_poller_with_update(&mut inst, "pi-foreign-conversation");
-
-        let file_watch = FileWatchService::noop();
-        let mut instances = [inst];
-        drain_and_persist_session_ids(&mut instances, &file_watch);
-
-        assert_eq!(
-            instances[0].agent_session_id.as_deref(),
-            Some("pi-own-conversation")
-        );
-        let loaded = Storage::new_unwatched(profile).unwrap().load().unwrap();
-        assert_eq!(
-            loaded[0].agent_session_id.as_deref(),
-            Some("pi-own-conversation")
-        );
-        assert!(
-            instances[0].session_id_poller.is_none(),
-            "the poller must be retired once its capture is anchored"
-        );
-    }
-
     // The sidecar names the pane, so a conversation started inside it with
     // `/new` is this session's and replaces the anchor. The store scan is what
     // may not, and the guard is how the drain tells them apart.
@@ -1204,86 +1122,6 @@ mod tests {
             instances[0].session_id_poller.is_some(),
             "a sidecar poller keeps watching for the next switch"
         );
-    }
-
-    // Losing the persistence CAS converges this pane onto the conversation a
-    // concurrent drainer persisted first. That id is just as known as the
-    // winner's, so the loser's poller has to be retired too; otherwise it
-    // holds one of the 50 slots and keeps scanning, and repair cannot reap it
-    // because `supports_session_poller` is already false for a known id.
-    #[test]
-    #[serial]
-    fn pi_retires_its_poller_when_a_skipped_cas_converges() {
-        let temp = tempdir().unwrap();
-        let _guard = storage_home_guard(&temp);
-
-        let profile = "sync-pi-cas-loser";
-        let captured = "pi-first-capture";
-
-        // Disk already holds the capture: the peer drainer won the race.
-        let mut on_disk = Instance::new("pi-cas-title", "/tmp/pi-cas");
-        on_disk.source_profile = profile.to_string();
-        on_disk.tool = "pi".to_string();
-        on_disk.agent_session_id = Some(captured.to_string());
-        seed_instance_on_disk(profile, &on_disk);
-
-        // This snapshot still believes the session is id-less, so its write
-        // fails the CAS and rolls back onto the durable value.
-        let mut loser = on_disk.clone();
-        loser.agent_session_id = None;
-        attach_poller_with_update(&mut loser, captured);
-
-        let file_watch = FileWatchService::noop();
-        let mut instances = [loser];
-        drain_and_persist_session_ids(&mut instances, &file_watch);
-
-        assert_eq!(instances[0].agent_session_id.as_deref(), Some(captured));
-        assert!(
-            instances[0].session_id_poller.is_none(),
-            "the CAS loser must retire its poller too"
-        );
-    }
-
-    // The same drain still fills an id-less host Pi session, which is the
-    // only way an unpinnable pane learns its conversation at all, and still
-    // retargets another tool (the #2291 promotion path).
-    #[test]
-    #[serial]
-    fn drain_still_fills_id_less_pi_and_retargets_other_tools() {
-        let temp = tempdir().unwrap();
-        let _guard = storage_home_guard(&temp);
-
-        let profile = "sync-pi-fill";
-        let mut id_less = Instance::new("pi-fill-title", "/tmp/pi-fill");
-        id_less.source_profile = profile.to_string();
-        id_less.tool = "pi".to_string();
-        id_less.agent_session_id = None;
-        seed_instance_on_disk(profile, &id_less);
-        attach_poller_with_update(&mut id_less, "pi-first-capture");
-
-        let file_watch = FileWatchService::noop();
-        let mut instances = [id_less];
-        drain_and_persist_session_ids(&mut instances, &file_watch);
-        assert_eq!(
-            instances[0].agent_session_id.as_deref(),
-            Some("pi-first-capture")
-        );
-        assert!(
-            instances[0].session_id_poller.is_none(),
-            "the first capture is the last: the poller must be retired with it"
-        );
-
-        let other_profile = "sync-claude-retarget";
-        let mut claude = Instance::new("claude-title", "/tmp/claude-retarget");
-        claude.source_profile = other_profile.to_string();
-        claude.tool = "claude".to_string();
-        claude.agent_session_id = Some("claude-old".to_string());
-        seed_instance_on_disk(other_profile, &claude);
-        attach_poller_with_update(&mut claude, "claude-new");
-
-        let mut instances = [claude];
-        drain_and_persist_session_ids(&mut instances, &file_watch);
-        assert_eq!(instances[0].agent_session_id.as_deref(), Some("claude-new"));
     }
 
     #[test]
