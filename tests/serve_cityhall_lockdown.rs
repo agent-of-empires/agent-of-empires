@@ -7,7 +7,7 @@
 //! `{"error":"cityhall_mode"}` body before doing any work. Reachability is
 //! enforced by the default-deny `cityhall_gate` middleware; the runtime
 //! counterpart of the build-time `every_mutating_route_is_cityhall_classified`
-//! audit in `src/server/mod.rs`. Loopback + a null token clears the
+//! audit in `src/server/access.rs`. Loopback + a null token clears the
 //! DNS-rebinding gate and auth, so the only 403 source under test is the
 //! CityHall boundary (asserted via the body).
 

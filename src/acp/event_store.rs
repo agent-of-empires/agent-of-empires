@@ -1631,7 +1631,7 @@ impl EventStore {
     ) -> std::collections::HashMap<String, i64> {
         // Exclude non-substantive lifecycle/metadata events so they do not
         // reset the idle clock. AcpSessionAssigned in particular is emitted
-        // on every cold-start resume (acp_client.rs), so counting it would
+        // on every cold-start resume (acp_client/update_events.rs), so counting it would
         // make a daemon restart look like fresh activity for every worker
         // and the idle-reap (#1689) would never fire across restarts. Shares
         // NON_SUBSTANTIVE_EVENT_DISCRIMINANTS with the retention prune so the

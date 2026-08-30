@@ -1,7 +1,7 @@
 // Structured view WebSocket lagged-channel signaling.
 //
 // When the broadcast channel overflows (capacity 256, see
-// `ACP_CHANNEL_CAPACITY` in `src/server/mod.rs`), the per-client
+// `ACP_CHANNEL_CAPACITY` in `src/server/state.rs`), the per-client
 // receiver gets `RecvError::Lagged(skipped)` and the WS handler sends
 // `{ kind: "lagged", skipped: N }` so the client knows to request a
 // snapshot+replay rather than silently diverging

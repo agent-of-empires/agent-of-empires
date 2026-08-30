@@ -53,7 +53,7 @@ pub fn npm_package_for(binary: &str) -> Option<&'static str> {
 }
 
 /// Operator env vars to forward to a given ACP binary, on top of the
-/// infrastructure-only `ALWAYS_FORWARD_ENV` in `acp_client.rs`. Empty slice
+/// infrastructure-only `ALWAYS_FORWARD_ENV` in `acp_client/spawn.rs`. Empty slice
 /// means no ambient provider credentials. Five adapters (`pi-acp`, `omp`,
 /// `kimi`, `vibe-acp`, `prime-agent`) are intentionally deferred because
 /// their env-var names could not be source-verified for #3238 and shipping a
