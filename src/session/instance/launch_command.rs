@@ -629,11 +629,18 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn sandboxed_pi_publishes_without_a_command_line_extension() {
         // `pi -e <missing path>` refuses to start, and a container created
         // before this change has no mount for one, so a sandboxed launch names
         // no extension: pi discovers it inside the config bind instead. The
         // sidecar path it publishes to is a container path.
+        //
+        // The extension is written under `HOME`, so this owns one: the
+        // global lock keeps it from racing another test's `HOME` swap.
+        let temp_home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::EnvGuard::set(&[("HOME", temp_home.path())]);
+
         let mut inst = Instance::new("pi-sandbox", "/tmp/pi-sandbox");
         inst.tool = "pi".to_string();
         inst.sandbox_info = Some(crate::session::SandboxInfo {

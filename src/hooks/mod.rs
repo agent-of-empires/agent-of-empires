@@ -3293,6 +3293,7 @@ trust_level = "trusted"
     // A half-written config must not block the launch; the installers above
     // treat unparseable files as empty and this one has to match.
     #[test]
+    #[serial_test::serial]
     fn test_trust_claude_project_replaces_malformed_config() {
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join(".claude.json");
@@ -4126,6 +4127,7 @@ hooks_auto_accept: false
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_install_hermes_hooks_rejects_invalid_allowlist_without_overwrite() {
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join("config.yaml");
@@ -4419,6 +4421,7 @@ hooks_auto_accept: false
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_resolve_kiro_agent_file_ignores_non_json_and_invalid_files() {
         // Unreadable-as-JSON and non-.json files in the dir must not break the
         // scan or produce a false match.
