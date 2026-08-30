@@ -1494,17 +1494,44 @@ impl AgentDef {
     }
 }
 
-/// Whether `help` advertises Pi's `--session-id` flag.
-///
-/// Matched on the flag followed by whitespace or `=` so `--session-id` is
-/// never confused with a longer flag that merely starts the same way.
-fn help_advertises_session_id(help: &str) -> bool {
-    help.match_indices("--session-id").any(|(index, _)| {
-        help[index + "--session-id".len()..]
+/// Whether `help` advertises `flag`, matched on the whole flag: what follows
+/// must end it (whitespace, `=`, or the `,` of an alias list such as
+/// `--extension, -e`), so `--session-id` is never read out of
+/// `--session-id-file`.
+fn help_advertises_flag(help: &str, flag: &str) -> bool {
+    help.match_indices(flag).any(|(index, _)| {
+        help[index + flag.len()..]
             .chars()
             .next()
-            .is_none_or(|next| next.is_whitespace() || next == '=')
+            .is_none_or(|next| next.is_whitespace() || next == '=' || next == ',')
     })
+}
+
+/// One cached `pi --help` per process: two launch decisions read it, and a
+/// launch cannot afford to re-run it.
+fn pi_help_text() -> &'static str {
+    static HELP: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    HELP.get_or_init(|| {
+        let Some(agent) = get_agent("pi") else {
+            return String::new();
+        };
+        let mut cmd = std::process::Command::new(agent.binary);
+        cmd.arg("--help");
+        crate::process::run_with_timeout(&mut cmd, PI_HELP_PROBE_TIMEOUT)
+            .ok()
+            .flatten()
+            .filter(|output| output.status.success())
+            .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
+            .unwrap_or_default()
+    })
+}
+
+/// Whether the `pi` on PATH loads an extension from the command line
+/// (`--extension`, `-e`). That is what lets AoE publish the pane's current
+/// conversation, `/new` included, instead of inferring it from a store keyed
+/// by cwd.
+pub(crate) fn pi_supports_extension_flag() -> bool {
+    help_advertises_flag(pi_help_text(), "--extension")
 }
 
 /// Whether the `pi` on PATH understands `--session-id` (pi 0.76.0+), which is
@@ -1518,27 +1545,7 @@ fn help_advertises_session_id(help: &str) -> bool {
 /// than emitting a flag it may not accept. The cache keeps a failure too, so
 /// a transient one disables pinning until the process restarts.
 pub(crate) fn pi_supports_session_id_flag() -> bool {
-    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SUPPORTED.get_or_init(|| {
-        let Some(agent) = get_agent("pi") else {
-            return false;
-        };
-        let mut cmd = std::process::Command::new(agent.binary);
-        cmd.arg("--help");
-        let supported = crate::process::run_with_timeout(&mut cmd, PI_HELP_PROBE_TIMEOUT)
-            .ok()
-            .flatten()
-            .filter(|output| output.status.success())
-            .is_some_and(|output| {
-                help_advertises_session_id(&String::from_utf8_lossy(&output.stdout))
-            });
-        tracing::debug!(
-            target: "session.store",
-            supported,
-            "probed pi for --session-id support"
-        );
-        supported
-    })
+    help_advertises_flag(pi_help_text(), "--session-id")
 }
 
 const PI_HELP_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
@@ -2034,14 +2041,27 @@ mod tests {
         // The probe decides whether AoE may pin a Pi conversation at launch,
         // so a longer flag that merely starts the same way must not pass for
         // it, and an old help text without the flag must not either.
-        assert!(help_advertises_session_id(
-            "  --session-id <id>    Use exact project session ID\n"
+        assert!(help_advertises_flag(
+            "  --session-id <id>    Use exact project session ID\n",
+            "--session-id"
         ));
-        assert!(help_advertises_session_id("--session-id=<id>"));
-        assert!(help_advertises_session_id("--session-id"));
-        assert!(!help_advertises_session_id("  --session-id-file <path>\n"));
-        assert!(!help_advertises_session_id(
-            "  --session <path|id>    Use specific session file\n"
+        assert!(help_advertises_flag("--session-id=<id>", "--session-id"));
+        assert!(help_advertises_flag("--session-id", "--session-id"));
+        assert!(!help_advertises_flag(
+            "  --session-id-file <path>\n",
+            "--session-id"
+        ));
+        assert!(!help_advertises_flag(
+            "  --extensions-dir <dir>\n",
+            "--extension"
+        ));
+        assert!(!help_advertises_flag(
+            "  --session <path|id>    Use specific session file\n",
+            "--session-id"
+        ));
+        assert!(help_advertises_flag(
+            "  --extension, -e <path>   Load an extension file\n",
+            "--extension"
         ));
     }
 

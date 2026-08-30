@@ -578,6 +578,13 @@ pub struct Instance {
     #[serde(skip)]
     pending_host_env: Vec<(String, String)>,
 
+    /// Set when this pane's launch line carried the Pi session-id extension.
+    /// Runtime only: after an AoE restart the pane is still running with it,
+    /// and the sidecar it wrote is what says so (see
+    /// `uses_pi_session_sidecar`).
+    #[serde(skip)]
+    pi_extension_launched: bool,
+
     #[serde(skip)]
     pub last_error: Option<String>,
     #[serde(skip)]

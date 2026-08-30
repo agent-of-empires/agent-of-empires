@@ -189,7 +189,10 @@ fn drain_and_persist_session_ids_inner(
         // A known Pi conversation is authoritative: its shared store may fill
         // but never replace. The start gate cannot stop a poller that captured
         // the id itself, so refuse the observation and retire it here.
-        if inst.tool == "pi" && inst.agent_session_id.is_some() {
+        if inst.tool == "pi"
+            && inst.agent_session_id.is_some()
+            && observation.guard != SessionIdGuard::InstanceSidecar
+        {
             tracing::debug!(
                 target: "session.sync",
                 instance = %inst.id,
@@ -279,13 +282,18 @@ fn drain_and_persist_session_ids_inner(
                 SidWrite::Failed
             }
             Ok(_) => match &update.guard {
-                SessionIdGuard::Unguarded => persist_session_to_storage(
-                    &update.profile,
-                    &update.id,
-                    &update.sid,
-                    update.expected_prior.as_deref(),
-                    file_watch,
-                ),
+                // Same CAS as an unguarded write; the guard only records that
+                // the observation named this pane, which the Pi rule below
+                // reads.
+                SessionIdGuard::Unguarded | SessionIdGuard::InstanceSidecar => {
+                    persist_session_to_storage(
+                        &update.profile,
+                        &update.id,
+                        &update.sid,
+                        update.expected_prior.as_deref(),
+                        file_watch,
+                    )
+                }
                 SessionIdGuard::OmpLegacy => persist_omp_session_to_storage(
                     &update.profile,
                     &update.id,
@@ -381,7 +389,9 @@ fn drain_and_persist_session_ids_inner(
             inst.resume_probe_failed_sid = None;
             // A Pi capture is the pane's whole identity and its last, so the
             // worker retires with it rather than holding a slot.
-            if inst.tool == "pi" {
+            // A sidecar poller keeps watching: it reports the pane's own
+            // conversation, so a later `/new` is still this session's.
+            if inst.tool == "pi" && !inst.uses_pi_session_sidecar() {
                 to_retire.push(inst.id.clone());
             }
         }
@@ -399,6 +409,7 @@ fn drain_and_persist_session_ids_inner(
             // A lost CAS still converges on a known conversation, so the loser
             // retires too; repair cannot reap it later, the id being known.
             if inst.tool == "pi"
+                && !inst.uses_pi_session_sidecar()
                 && inst
                     .agent_session_id
                     .as_deref()
@@ -1156,6 +1167,42 @@ mod tests {
         assert!(
             instances[0].session_id_poller.is_none(),
             "the poller must be retired once its capture is anchored"
+        );
+    }
+
+    // The sidecar names the pane, so a conversation started inside it with
+    // `/new` is this session's and replaces the anchor. The store scan is what
+    // may not, and the guard is how the drain tells them apart.
+    #[test]
+    #[serial]
+    fn pi_accepts_a_sidecar_retarget_and_keeps_its_poller() {
+        let temp = tempdir().unwrap();
+        let _guard = storage_home_guard(&temp);
+
+        let profile = "sync-pi-sidecar";
+        let mut inst = Instance::new("pi-sidecar-title", "/tmp/pi-sidecar");
+        inst.source_profile = profile.to_string();
+        inst.tool = "pi".to_string();
+        inst.agent_session_id = Some("pi-launch-conversation".to_string());
+        inst.mark_pi_extension_launched_for_test();
+        seed_instance_on_disk(profile, &inst);
+
+        let poller = SessionPoller::new(format!("test-tmux-{}", inst.id));
+        poller.inject_test_sidecar_update(&inst.id, "pi-new-conversation");
+        inst.session_id_poller = Some(Arc::new(Mutex::new(poller)));
+
+        let file_watch = FileWatchService::noop();
+        let mut instances = [inst];
+        drain_and_persist_session_ids(&mut instances, &file_watch);
+
+        assert_eq!(
+            instances[0].agent_session_id.as_deref(),
+            Some("pi-new-conversation"),
+            "an attributable observation must be adopted"
+        );
+        assert!(
+            instances[0].session_id_poller.is_some(),
+            "a sidecar poller keeps watching for the next switch"
         );
     }
 

@@ -37,6 +37,22 @@ fn apply_yolo_mode(cmd: &mut String, yolo: &crate::agents::YoloMode, is_sandboxe
     }
 }
 
+/// Write the Pi session-id extension into the app dir and return its path.
+///
+/// Rewritten when the content differs so an upgrade ships its own version.
+pub(super) fn pi_extension_path() -> Result<PathBuf> {
+    const SOURCE: &str = include_str!("../../../assets/pi/aoe-session-id.js");
+    let dir = crate::session::get_app_dir()?.join("agent-extensions");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("pi-aoe-session-id.js");
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(SOURCE) {
+        let tmp = dir.join("pi-aoe-session-id.js.tmp");
+        std::fs::write(&tmp, SOURCE)?;
+        std::fs::rename(&tmp, &path)?;
+    }
+    Ok(path)
+}
+
 /// Whether a host `environment` list assigns `PATH`. Entries are either `KEY`
 /// (pass AoE's own value through, which cannot redirect a binary lookup) or
 /// `KEY=VALUE`, so only the assigning form counts.
@@ -474,12 +490,23 @@ impl Instance {
             .and_then(|options| self.resolve_omp_capture_plan(&options));
 
         let profile = self.effective_profile();
-        let env_prefix = status_hook_env_prefix(&profile, &self.id, agent);
+        let mut env_prefix = status_hook_env_prefix(&profile, &self.id, agent);
+        // Pi publishes its own conversation through an AoE extension; the flag
+        // rides the built-in command only, an override being unvouched.
+        let pi_extension = self.pi_extension_launch();
+        if let Some((_, ref env)) = pi_extension {
+            env_prefix.push_str(env);
+            self.pi_extension_launched = true;
+        }
+        let env_prefix = env_prefix;
 
         if self.command.is_empty() {
             match crate::agents::get_agent(&self.tool) {
                 Some(a) => {
                     let mut cmd = a.launch_base_command();
+                    if let Some((ref flag, _)) = pi_extension {
+                        cmd.push_str(flag);
+                    }
                     if !self.extra_args.is_empty() {
                         // A model id carrying shell metacharacters (a
                         // context-window suffix such as `[1m]`) would abort the

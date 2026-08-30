@@ -857,6 +857,18 @@ fn capture_pi_family_session_id(
     anyhow::bail!("No Pi session found matching project path")
 }
 
+/// Polling closure over the sidecar Pi's AoE extension writes: the pane's own
+/// conversation, `/new` included, with no store scan involved.
+pub(crate) fn pi_sidecar_poll_fn(
+    instance_id: String,
+) -> impl Fn() -> Option<crate::session::poller::SessionIdObservation> + Send + 'static {
+    move || {
+        crate::hooks::read_hook_session_id(&instance_id)
+            .and_then(validated_session_id)
+            .map(crate::session::poller::SessionIdObservation::instance_sidecar)
+    }
+}
+
 /// Polling closure for host Pi session tracking, floored by `launch_time_ms`
 /// (see [`capture_pi_session_id`]).
 pub(crate) fn pi_poll_fn(

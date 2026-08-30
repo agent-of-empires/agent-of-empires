@@ -13,7 +13,9 @@ impl Instance {
     /// sandbox alike, one `~/.pi/sandbox` being bound into every pi container.
     /// Reads memory only: this runs per session on every TUI refresh.
     pub fn supports_session_poller(&self) -> bool {
-        if self.tool == "pi" && self.agent_session_id.is_some() {
+        // A sidecar-backed Pi pane keeps polling: its observations name the
+        // pane, so `/new` is still attributable.
+        if self.tool == "pi" && self.agent_session_id.is_some() && !self.uses_pi_session_sidecar() {
             return false;
         }
         crate::agents::get_agent(&self.tool).is_some_and(|a| {
@@ -162,11 +164,27 @@ impl Instance {
                 }
             }
             "pi" => {
-                // Only host launches with no id yet and sandboxed panes reach
-                // here; `supports_session_poller` refuses the rest. Floored (see
-                // `capture_pi_session_id`), which is how an unpinned launch
-                // gets its id at all: pi writes the session file on the first
-                // message, necessarily after launch.
+                // The extension names this pane, so prefer its sidecar; a
+                // binary that cannot load one falls back to the floored store
+                // scan, which is how an unpinned launch gets an id at all.
+                if self.uses_pi_session_sidecar() {
+                    let inner = crate::session::capture::pi_sidecar_poll_fn(self.id.clone());
+                    let poll_fn: crate::session::poller::SessionIdPollFn =
+                        Box::new(move |_| inner());
+                    let cb_instance_id = self.id.clone();
+                    let on_change: Box<dyn Fn(&str) + Send + 'static> = Box::new(
+                        move |new_id: &str| {
+                            tracing::info!(target: "session.store", "Session ID observed for {}: {}", cb_instance_id, new_id);
+                        },
+                    );
+                    let initial = initial_known
+                        .clone()
+                        .map(crate::session::poller::SessionIdObservation::instance_sidecar);
+                    if poller.start_observations(instance_id.clone(), poll_fn, on_change, initial) {
+                        self.session_id_poller = Some(Arc::new(Mutex::new(poller)));
+                    }
+                    return;
+                }
                 let launch_time_ms = crate::util::now_ms() as f64;
                 if self.is_sandboxed() {
                     let container_name = match self.sandbox_info.as_ref() {

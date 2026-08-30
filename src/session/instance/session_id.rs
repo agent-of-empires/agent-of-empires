@@ -339,6 +339,15 @@ impl Instance {
     /// reads can briefly surface different UUIDs, benign under the existing
     /// eventual-consistency capture model.
     pub(crate) fn capture_freshest_session_id(&self) -> Option<String> {
+        // Pi's extension publishes the pane's own conversation to the same
+        // sidecar, so this is the one Pi observation that names a pane.
+        if self.tool == "pi" {
+            let authoritative = crate::hooks::read_hook_session_id(&self.id)?;
+            if self.retroactive_capture_excludes.contains(&authoritative) {
+                return None;
+            }
+            return override_if_distinct(self.agent_session_id.as_deref(), authoritative);
+        }
         if self.tool == "claude" {
             if let Some(authoritative) = crate::hooks::read_hook_session_id(&self.id) {
                 if self.retroactive_capture_excludes.contains(&authoritative) {
@@ -354,6 +363,49 @@ impl Instance {
         // tool; the gating lives in the callee.
         let live = self.try_retroactive_capture()?;
         override_if_distinct(self.agent_session_id.as_deref(), live)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn mark_pi_extension_launched_for_test(&mut self) {
+        self.pi_extension_launched = true;
+    }
+
+    /// The `-e <extension>` flag and sidecar env var a Pi launch needs to
+    /// publish its own conversation, or `None` when it cannot.
+    ///
+    /// The extension reports every `session_start`, so a `/new` inside the
+    /// pane is attributed to it rather than inferred from a store keyed by
+    /// cwd. Requires the same vouched binary as the pin: an override or a
+    /// profile-set `PATH` may not be the `pi` that was probed.
+    pub(super) fn pi_extension_launch(&self) -> Option<(String, String)> {
+        if self.tool != "pi"
+            || self.has_command_override()
+            || super::launch_command::environment_defines_path(&self.resolved_host_environment())
+            || !crate::agents::pi_supports_extension_flag()
+        {
+            return None;
+        }
+        let extension = super::launch_command::pi_extension_path().ok()?;
+        let sidecar = crate::hooks::ensure_instance_dir_path(&self.id)
+            .ok()?
+            .join("session_id");
+        Some((
+            format!(" -e {}", shell_escape(&extension.to_string_lossy())),
+            format!(
+                "AOE_PI_SESSION_ID_FILE={} ",
+                shell_escape(&sidecar.to_string_lossy())
+            ),
+        ))
+    }
+
+    /// Whether this Pi pane publishes its conversation through the AoE
+    /// extension, which is what makes its observations name a pane.
+    ///
+    /// Read from what the launch did, not from the binary probe: an upgrade
+    /// mid-session must not reclassify a pane that is already running.
+    pub(crate) fn uses_pi_session_sidecar(&self) -> bool {
+        self.tool == "pi"
+            && (self.pi_extension_launched || crate::hooks::session_id_sidecar_exists(&self.id))
     }
 
     /// Whether this session may pin its Pi conversation with `--session-id`.
