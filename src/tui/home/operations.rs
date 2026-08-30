@@ -27,6 +27,7 @@ fn group_membership<'a>(
             && profile.is_none_or(|p| i.source_profile == p)
     }
 }
+
 enum PersistGroupDelete {
     Ready(Vec<Instance>),
     Creating,
@@ -714,6 +715,12 @@ impl HomeView {
         Ok(())
     }
 
+    /// Commit one profile's group deletion before any purge is queued, so a
+    /// watcher reload or restart cannot rebuild the group from an unchanged
+    /// `groups.json`. Blockers are re-checked against the durable rows because
+    /// a Creating member may exist only on disk. `Status::Deleting` is
+    /// deliberately not persisted: it stays an in-memory overlay owned by the
+    /// `PurgeTransaction` lifecycle.
     fn persist_group_delete_with_sessions(
         &mut self,
         profile: &str,
@@ -863,6 +870,8 @@ impl HomeView {
                     delete_sandbox,
                     force_delete: options.force_delete_worktrees,
                     detach_hooks: true,
+                    // No per-session keep-scratch toggle in the group-delete
+                    // UX, so scratch dirs always go.
                     keep_scratch: false,
                 });
             }
