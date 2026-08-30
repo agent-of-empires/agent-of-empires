@@ -149,6 +149,24 @@ If the referenced host env var is not set, the entry is silently skipped.
 
 To use a literal value starting with `$`, double it: `$$LITERAL` is injected as `$LITERAL`.
 
+## Folder Trust
+
+Claude Code, Codex, and Gemini each refuse to start in a directory they have
+not been told to trust. A container workspace is always a new directory to
+them, so AoE pre-trusts it in the agent's staged config before the session
+starts. Claude Code is trusted in every sandboxed session because its prompt
+blocks startup; Codex and Gemini are trusted only in YOLO mode, where their
+prompts guard approvals the user has already opted out of.
+
+A repo that ships an `.mcp.json` still asks per server before any of them run.
+Trust does activate the repo's own `.claude/settings.json`, whose
+`permissions.allow` rules an untrusted workspace drops, and since the prompt is
+what holds a session before startup, a pre-trusted workspace runs that file's
+hooks unprompted.
+
+To pre-trust worktrees for host sessions too, see `session.pre_trust_agent_folders`
+in the [configuration guide](configuration.md).
+
 ## Available Images
 
 AOE provides two official sandbox images:

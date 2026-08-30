@@ -38,6 +38,7 @@ impl Instance {
         }
         let agent = self.resolved_agent();
         self.install_agent_status_hooks(agent);
+        self.ensure_host_folder_trust(agent);
         self.propagate_managed_skills();
 
         let on_launch_hooks = self.resolve_on_launch_hooks(skip_on_launch, profile);
@@ -208,6 +209,38 @@ impl Instance {
                 }
                 // Sandboxed sessions install via build_container_config.
             }
+        }
+    }
+
+    /// Pre-trust this session's worktree in the agent's host config so it does
+    /// not open on a folder-trust prompt.
+    ///
+    /// Sandboxed sessions are handled by `build_container_config` against a
+    /// staged config; this writes to the user's real one, so it is opt-in via
+    /// `session.pre_trust_agent_folders`. The path is canonicalized because
+    /// agents key trust on the resolved directory, not the symlink used to
+    /// reach it.
+    fn ensure_host_folder_trust(&self, agent: Option<&'static crate::agents::AgentDef>) {
+        if self.is_sandboxed() {
+            return;
+        }
+        let profile = self.effective_profile();
+        let config = crate::session::profile_config::resolve_config_or_warn(&profile);
+        if !config.session.pre_trust_agent_folders {
+            return;
+        }
+        let (Some(agent), Some(home)) = (agent, dirs::home_dir()) else {
+            return;
+        };
+        let project_path = std::fs::canonicalize(&self.project_path)
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| self.project_path.clone());
+        let environment = self.resolved_host_environment();
+        if let Err(e) =
+            crate::hooks::trust_host_project(agent.name, &home, &environment, &project_path)
+        {
+            tracing::warn!(target: "session.store",
+                "Failed to pre-trust {} in the host {} config: {}", project_path, agent.name, e);
         }
     }
 
@@ -409,6 +442,59 @@ mod tests {
         inst.install_agent_status_hooks(crate::agents::get_agent(&inst.detect_as));
 
         assert!(!tmp.path().join(".codex").join("hooks.json").exists());
+    }
+
+    // The host pre-trust is opt-in and host-only. Both gates are what stop it
+    // writing into the user's real agent config, so both need a test.
+    #[test]
+    #[serial_test::serial]
+    fn test_host_folder_trust_is_gated_on_the_setting_and_on_host_sessions() {
+        // (profile, setting on, sandboxed, expect a trust record)
+        let cases = [
+            ("trust-off", false, false, false),
+            ("trust-on", true, false, true),
+            ("trust-on-sandboxed", true, true, false),
+        ];
+        for (profile, enabled, sandboxed, expected) in cases {
+            let tmp = tempfile::TempDir::new().unwrap();
+            let _guard = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+            std::env::set_var("HOME", tmp.path());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            std::env::set_var("XDG_CONFIG_HOME", tmp.path().join(".config"));
+
+            let profile_dir = crate::session::get_profile_dir(profile).unwrap();
+            std::fs::write(
+                profile_dir.join("config.toml"),
+                format!("[session]\npre_trust_agent_folders = {enabled}\n"),
+            )
+            .unwrap();
+
+            let project = tmp.path().join("repo");
+            std::fs::create_dir_all(&project).unwrap();
+            let mut inst = Instance::new("claude", project.to_str().unwrap());
+            inst.tool = "claude".to_string();
+            inst.detect_as = "claude".to_string();
+            inst.source_profile = profile.to_string();
+            if sandboxed {
+                inst.sandbox_info = Some(crate::session::instance::SandboxInfo {
+                    enabled: true,
+                    container_id: None,
+                    image: "test:latest".to_string(),
+                    container_name: "test-container".to_string(),
+                    extra_env: None,
+                    custom_instruction: None,
+                    before_start_env: Vec::new(),
+                    container_workdir: None,
+                });
+            }
+            inst.ensure_host_folder_trust(crate::agents::get_agent(&inst.detect_as));
+
+            assert_eq!(
+                tmp.path().join(".claude.json").exists(),
+                expected,
+                "profile={profile}: host trust record presence"
+            );
+        }
     }
 
     #[test]
