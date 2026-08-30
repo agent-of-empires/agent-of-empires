@@ -2896,13 +2896,13 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
                 .next()
                 .is_some_and(|border| line.ends_with(border))
     };
-    let is_panel_option = |line: &str, expected: &str| {
+    let panel_option_match = |line: &str, expected: &str| {
         let first = line.chars().next();
         let inner = first.and_then(|border| {
             line.strip_prefix(border)
                 .and_then(|line| line.strip_suffix(border))
         });
-        let Some(inner) = inner else { return false };
+        let inner = inner?;
         let inner = inner.trim();
         let inner = inner
             .strip_prefix("❯ ")
@@ -2911,13 +2911,27 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
             .unwrap_or(inner)
             .trim();
         let lower = inner.to_lowercase();
-        lower == expected
-            || lower
+        if lower == expected {
+            Some(true)
+        } else {
+            lower
                 .strip_suffix(expected)
                 .is_some_and(|prefix| prefix.chars().next_back().is_some_and(char::is_whitespace))
+                .then_some(false)
+        }
     };
-    let has_approve = window8.iter().any(|line| is_panel_option(line, "approve"));
-    let has_deny = window8.iter().any(|line| is_panel_option(line, "deny"));
+    let is_panel_option = |line: &str, expected: &str| panel_option_match(line, expected).is_some();
+    let approval_option_presence = |expected: &str| {
+        window8
+            .iter()
+            .fold((false, false), |(present, exact), line| {
+                panel_option_match(line, expected).map_or((present, exact), |candidate_exact| {
+                    (true, exact || candidate_exact)
+                })
+            })
+    };
+    let (has_approve, exact_approve) = approval_option_presence("approve");
+    let (has_deny, exact_deny) = approval_option_presence("deny");
     let mut panel_text = String::new();
     for line in window12.iter().filter(|line| is_panel_row(line)) {
         let line = line.trim();
@@ -2933,6 +2947,7 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
     }
     if has_approve
         && has_deny
+        && (exact_approve || exact_deny)
         && panel_text.contains("up/down navigate")
         && panel_text.contains("enter select")
         && panel_text.contains("esc cancel")
@@ -3011,14 +3026,14 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
             consider(pos, OmpSignal::Approval);
         }
     }
-    let has_ask_title = window12.iter().any(|line| {
+    let is_ask_title = |line: &str| {
         let lower = line.to_lowercase();
         lower.contains(" ask ")
             && (!is_panel_row(line) || lower.trim_start().starts_with("+- ask"))
             && line
                 .chars()
                 .any(|ch| !ch.is_alphanumeric() && !ch.is_whitespace())
-    });
+    };
     let ask_footer_pos = lowest_matching_line(window8, |line| {
         let trimmed = line.trim();
         let inner = trimmed.chars().next().and_then(|border| {
@@ -3033,8 +3048,18 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
             || lower.starts_with("enter submit")
             || lower.contains("current prompt to answer")
     });
-    if has_ask_title {
-        if let Some(pos) = ask_footer_pos {
+    if let Some(pos) = ask_footer_pos {
+        let footer_index = signal_non_empty_lines.len().saturating_sub(pos);
+        let has_ask_title = signal_non_empty_lines[..footer_index]
+            .iter()
+            .rev()
+            .take_while(|line| {
+                is_ask_title(line)
+                    || is_panel_row(line) && !is_box_top(line)
+                    || line.trim().chars().all(|ch| !ch.is_alphanumeric())
+            })
+            .any(|line| is_ask_title(line));
+        if has_ask_title {
             consider(pos, OmpSignal::Approval);
         }
     }
@@ -7953,6 +7978,30 @@ Working…
                 "wrapped one-character custom interrupt icon",
                 "  !\n Working…\n\n╭── π ─╮\n╰─ ─╯",
                 Status::Running,
+            ),
+        ];
+        let failures: Vec<_> = cases
+            .into_iter()
+            .filter_map(|(name, pane, expected)| {
+                let actual = detect_omp_status(pane);
+                (actual != expected).then_some((name, actual, expected))
+            })
+            .collect();
+        assert!(failures.is_empty(), "mismatches: {failures:?}");
+    }
+
+    #[test]
+    fn test_detect_omp_status_third_fresh_review_regressions() {
+        let cases = [
+            (
+                "Ask title above twelve-line tail",
+                "╭─ Ask ───────────────────────────────────────────────╮\n│ Pick one?                                           │\n├─────────────────────────────────────────────────────┤\n│ ❯ ○ A                                               │\n│   ○ B                                               │\n│   ○ C                                               │\n│   ○ D                                               │\n│   ○ E                                               │\n│   ○ F                                               │\n│   ○ Other (type your own)                           │\n├─────────────────────────────────────────────────────┤\n│ Enter select · n note · ↑/↓ move · Esc cancel       │\n╰─────────────────────────────────────────────────────╯",
+                Status::Waiting,
+            ),
+            (
+                "approval-like bordered prose above idle composer",
+                "│ I approve │\n│ Never deny │\n│ up/down navigate  enter select  esc cancel │\n╭── π  > GPT-5.6 Sol ─╮\n╰─                   ─╯",
+                Status::Idle,
             ),
         ];
         let failures: Vec<_> = cases
