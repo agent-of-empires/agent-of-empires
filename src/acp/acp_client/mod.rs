@@ -84,10 +84,9 @@ use self::pending::{
     ApprovalResolutionMessage, ElicitationResolutionMessage, PendingResolver, PendingResponders,
 };
 use self::reset::{SESSION_RESET_IN_TASK_TIMEOUT, SESSION_RESET_TIMEOUT};
-use self::runner::{
-    runner_socket_deadline, spawn_runner_detached, take_injected_fresh_handshake_failure,
-    wait_for_socket,
-};
+#[cfg(debug_assertions)]
+use self::runner::take_injected_fresh_handshake_failure;
+use self::runner::{runner_socket_deadline, spawn_runner_detached, wait_for_socket};
 use self::spawn::spawn_subprocess;
 
 /// Top-level ACP client. Owns the subprocess lifetime and pumps events
