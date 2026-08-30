@@ -632,12 +632,25 @@ pub(crate) fn extract_pi_cwd_from_header(path: &Path) -> Option<String> {
 
 /// Polling closure over the sidecar Pi's AoE extension writes: the pane's own
 /// conversation, `/new` included, with no store scan involved.
+/// Polling closure over the sidecar Pi's AoE extension writes.
+///
+/// `sandbox_sidecar` is the host directory backing a container's sidecar; a
+/// host pane passes `None` and the per-instance hook dir is read instead.
+/// Getting this wrong is silent: the poller simply never observes anything,
+/// and only a clean stop recovers the conversation.
 pub(crate) fn pi_sidecar_poll_fn(
     instance_id: String,
+    sandbox_sidecar: Option<std::path::PathBuf>,
 ) -> impl Fn() -> Option<crate::session::poller::SessionIdObservation> + Send + 'static {
     move || {
-        crate::hooks::read_hook_session_id(&instance_id)
-            .and_then(validated_session_id)
+        let id = match sandbox_sidecar {
+            Some(ref dir) => std::fs::read_to_string(dir.join("session_id"))
+                .ok()
+                .map(|raw| raw.trim().to_string())
+                .filter(|id| Uuid::parse_str(id).is_ok()),
+            None => crate::hooks::read_hook_session_id(&instance_id),
+        };
+        id.and_then(validated_session_id)
             .map(crate::session::poller::SessionIdObservation::instance_sidecar)
     }
 }

@@ -456,6 +456,14 @@ impl Instance {
         path.starts_with('/').then(|| path.to_string())
     }
 
+    /// Host directory backing this sandboxed pane's sidecar, or `None` for a
+    /// host pane, whose sidecar is the per-instance hook dir.
+    pub(crate) fn pi_sandbox_sidecar_dir(&self) -> Option<std::path::PathBuf> {
+        self.is_sandboxed()
+            .then(|| self.pi_sandbox_sidecar())
+            .flatten()
+    }
+
     /// Host directory backing this sandboxed pane's sidecar.
     fn pi_sandbox_sidecar(&self) -> Option<std::path::PathBuf> {
         crate::session::validate_instance_id(&self.id).ok()?;

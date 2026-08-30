@@ -26,7 +26,29 @@ impl Instance {
         });
     }
 
-    fn flush_pi_sidecar_conversation(&self, storage: &crate::session::storage::Storage) {
+    /// [`flush_pi_sidecar_conversation`] against this session's own storage,
+    /// for teardown paths that hold no handle.
+    pub(super) fn flush_pi_sidecar_if_published(&mut self) {
+        if self.tool != "pi" {
+            return;
+        }
+        let profile = self.effective_profile();
+        let Ok(storage) =
+            crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
+        else {
+            return;
+        };
+        self.flush_pi_sidecar_conversation(&storage);
+        // Keep the in-memory row with disk: a restart reads it moments later.
+        if let Ok(instances) = storage.load() {
+            if let Some(row) = instances.iter().find(|i| i.id == self.id) {
+                self.agent_session_id = row.agent_session_id.clone();
+                self.pi_session_path = row.pi_session_path.clone();
+            }
+        }
+    }
+
+    pub(super) fn flush_pi_sidecar_conversation(&self, storage: &crate::session::storage::Storage) {
         if !self.uses_pi_session_sidecar() {
             return;
         }
