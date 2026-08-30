@@ -2060,7 +2060,7 @@ pub fn detect_pi_status(raw_content: &str) -> Status {
 /// it the signal is ignored, so a completed turn's loader or a dismissed
 /// banner in scrollback cannot pin the session.
 ///
-/// Pre-v18 live loaders use an activity frame plus a same-row working or
+/// Loaders through OMP 18.0.9 use an activity frame plus a same-row working or
 /// interrupt marker. OMP 18.0.10 instead uses a standard, nerd, or ASCII
 /// interrupt icon followed by an arbitrary streamed intent. A candidate must
 /// occupy the renderer's loader role: band output reaches its bottom rule,
@@ -6366,7 +6366,7 @@ Final prose line.\n";
                 format!("⠋ Working… ⟦esc⟧\nCompleted response.\nAdditional output.\nOK\n{MINIMAL_COMPOSER_BOX}"),
             ),
             (
-                "stale v18 loader ignored",
+                "stale 18.0.10 loader ignored",
                 "  ⎋ Working…
 Completed response.
 Additional output.
@@ -6375,19 +6375,19 @@ Additional output.
 ╰─".to_string(),
             ),
             (
-                "stale v18 loader before blank response",
+                "stale 18.0.10 loader before blank response",
                 "  ⎋ Working…\n\nCompleted response.\nAdditional output.\n\n π > idle status\n╰─".to_string(),
             ),
             (
-                "stale v18 loader before whitespace response",
+                "stale 18.0.10 loader before whitespace response",
                 "  ⎋ Working…\n   \nCompleted response.\nAdditional output.\n\n π > idle status\n╰─".to_string(),
             ),
             (
-                "stale v18 loader before timed response",
+                "stale 18.0.10 loader before timed response",
                 "  ⎋ Working…\n\nCompleted in 1s\nAdditional output.\n\n╭── π > idle ─╮\n╰─           ─╯".to_string(),
             ),
             (
-                "stale v18 loader before rendered rule",
+                "stale 18.0.10 loader before rendered rule",
                 "  ⎋ Working…\n\n---\nCompleted response.\n\n╭── π > idle ─╮\n╰─           ─╯".to_string(),
             ),
             (
@@ -6535,15 +6535,15 @@ Additional output.
                 "  ⎋ Working…\n\n────────────────\nSummary\n────────────────\nFinal answer.".to_string(),
             ),
             (
-                "v18 loader without activity status",
+                "18.0.10 loader without activity status",
                 "⎋ Working…\nπ > idle status\n╰─".to_string(),
             ),
             (
-                "activity timer without v18 loader",
+                "activity timer without 18.0.10 loader",
                 "Completed response.\n⠸ 1s > historical timing\n╰─".to_string(),
             ),
             (
-                "timer-like prose below v18 loader",
+                "timer-like prose below 18.0.10 loader",
                 "⎋ Working…\nThe probe took 1s\n╰─".to_string(),
             ),
             (
@@ -7145,8 +7145,8 @@ Additional output.
 
     #[test]
     fn test_detect_omp_status_running_loaders() {
-        // Pre-v18 loaders carry one framed Working/hint row. OMP 18.0.10
-        // instead pairs its escape-prefixed loader with a timed activity row.
+        // Loaders through OMP 18.0.9 carry one framed Working/hint row. OMP
+        // 18.0.10 pairs its escape-prefixed loader with a timed activity row.
         let box_unicode = "╭── π ─╮\n╰─ ─╯";
         let box_ascii = "+-- pi ---+\n+- -------+";
         let v18_band_capture = "  ⎋ Working…
