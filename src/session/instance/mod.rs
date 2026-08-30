@@ -570,6 +570,29 @@ pub struct Instance {
     #[serde(skip)]
     pub unknown_since: Option<std::time::Instant>,
 
+    /// tmux's last-output timestamp for the pane at the last capture, and the
+    /// status that capture resolved to. A pane that has drawn nothing since
+    /// cannot have changed, so the capture is skipped and that status stands:
+    /// a parked session costs one batched format read per poll rather than a
+    /// subprocess. `#[serde(skip)]` like the rest of the live-status
+    /// bookkeeping, so a fresh load re-derives both.
+    #[serde(skip)]
+    pub detection_activity: Option<i64>,
+    #[serde(skip)]
+    pub detection_status: Option<Status>,
+    /// The manifest rule that decided the last detection, for the
+    /// status-change log. Names why a session is in the state it is in, which
+    /// is what a wrong-state report needs and what a fingerprint of pane
+    /// markers could only hint at.
+    #[serde(skip)]
+    pub detection_rule: Option<&'static str>,
+    /// A status proposed by a rule that did not read it off the agent's own
+    /// live chrome. It is published once a second poll agrees. Mid-redraw
+    /// frames are otherwise indistinguishable from real transitions, and they
+    /// flipped parked sessions between Idle and Running every few seconds.
+    #[serde(skip)]
+    pub pending_detection: Option<(Status, u8)>,
+
     /// Runtime-only `KEY=VALUE` pairs minted by
     /// `host_hooks.before_session` for the host launch currently being
     /// assembled. They are appended after resolved static profile values in

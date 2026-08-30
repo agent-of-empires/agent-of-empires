@@ -1,6 +1,7 @@
 //! tmux integration module
 
 pub(crate) mod composite;
+pub(crate) mod detect;
 pub(crate) mod env;
 mod session;
 pub mod status_bar;
@@ -17,12 +18,10 @@ pub(crate) mod vt;
 pub use composite::PaneGeom;
 pub use session::{PaneCursor, PaneEnvMutation, Session, SIZE_OWNER_HEARTBEAT, SIZE_OWNER_TTL};
 pub use status_bar::{get_session_info_for_current, get_status_for_current_session};
-pub(crate) use status_detection::{
-    claude_pane_is_ambiguous_typed_prompt, claude_pane_marker_fingerprint,
-    reconcile_claude_hook_status, reconcile_claude_idle_hook_status, reconcile_codex_hook_status,
-    reconcile_waiting_hook,
+pub use status_detection::{
+    detect_claude, detect_status_from_content, detect_status_from_content_in,
 };
-pub use status_detection::{detect_status_from_content, detect_status_from_content_in};
+pub(crate) use status_detection::{reconcile_codex_hook_status, reconcile_waiting_hook};
 pub use terminal_session::{kill_all_terminals_for_id, ContainerTerminalSession, TerminalSession};
 pub use tool_session::{kill_all_tool_sessions_for_id, ToolSession};
 pub use utils::tmux_prefix_display;
@@ -248,6 +247,13 @@ pub struct PaneMetadata {
     pub pane_current_command: Option<String>,
     pub pane_start_command_is_protected: bool,
     pub pane_pid: Option<u32>,
+    /// The terminal title the pane's program published over OSC 0/2. Several
+    /// agent CLIs put their own state in it, which is the one signal that does
+    /// not depend on what the transcript happens to contain.
+    pub pane_title: Option<String>,
+    /// tmux's last-output timestamp for the pane's window, used to skip a
+    /// capture when nothing has been drawn since the last one.
+    pub window_activity: Option<i64>,
 }
 
 static SESSION_CACHE: RwLock<SessionCache> = RwLock::new(SessionCache {
@@ -311,6 +317,12 @@ pub enum SessionCacheRefresh {
 // control bytes (ASCII 0x1F is emitted as the literal 4-char sequence
 // `\037`), so anything non-printable is unreliable. Pipe is safe.
 const FIELD_SEP: char = '|';
+/// Separator for the two trailing fields. `pane_start_command` may itself
+/// contain [`FIELD_SEP`], which is why it was last in the original format, and
+/// a pane title may contain anything its program writes. A C0 control byte
+/// belongs to neither: terminals strip it from an OSC string, and it cannot
+/// appear in a shell command line tmux echoes back.
+const TAIL_SEP: char = '\x1f';
 
 /// tmux exits non-zero with `no server running on <socket>` on stderr when
 /// there is no server on the resolved socket (zero sessions, or the socket's
@@ -914,7 +926,14 @@ pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
             "list-panes",
             "-a",
             "-F",
-            "#{session_name}|#{pane_index}|#{pane_dead}|#{pane_current_command}|#{pane_start_command}|#{pane_pid}",
+            // `pane_pid` stays at the end of the pipe-separated head, where
+            // the parser splits it back off the start command's tail; the two
+            // fields after it ride [`TAIL_SEP`], because a start command or a
+            // title may carry a pipe of its own.
+            concat!(
+                "#{session_name}|#{pane_index}|#{pane_dead}|#{pane_current_command}",
+                "|#{pane_start_command}|#{pane_pid}\x1f#{window_activity}\x1f#{pane_title}"
+            ),
         ])
         .output();
 
@@ -1015,6 +1034,16 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
     let mut map = HashMap::new();
 
     for line in output.lines() {
+        // The two trailing fields ride their own separator (see [`TAIL_SEP`]),
+        // so the pipe-separated head parses exactly as it did before them.
+        let mut tail = line.splitn(3, TAIL_SEP);
+        let (Some(line), window_activity, pane_title) = (
+            tail.next(),
+            tail.next().and_then(|a| a.trim().parse::<i64>().ok()),
+            tail.next().unwrap_or(""),
+        ) else {
+            continue;
+        };
         let mut parts = line.splitn(5, FIELD_SEP);
         let (
             Some(session_name),
@@ -1065,6 +1094,8 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
                 },
                 pane_start_command_is_protected: pane_start_command
                     .contains(utils::PANE_ENV_FILE_PREFIX),
+                pane_title: (!pane_title.is_empty()).then(|| pane_title.to_string()),
+                window_activity,
             },
         );
     }
@@ -1829,6 +1860,8 @@ mod tests {
                             pane_current_command: None,
                             pane_start_command_is_protected: false,
                             pane_pid: None,
+                            pane_title: None,
+                            window_activity: None,
                         },
                     )
                 })
@@ -1897,6 +1930,8 @@ mod tests {
             pane_current_command: None,
             pane_start_command_is_protected: false,
             pane_pid: None,
+            pane_title: None,
+            window_activity: None,
         }
     }
 

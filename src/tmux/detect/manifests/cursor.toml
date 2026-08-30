@@ -1,0 +1,117 @@
+id = "cursor"
+
+# Cursor renders its live status bar on the follow-up prompt line or just
+# below it. Everything above belongs to the previous turn, so an interrupt
+# hint or spinner left in that scrollback must not read as a live signal.
+prompt_marker = ['(?i)^\s*\x{2192}(?:\s+add a follow-up.*)?\s*$']
+
+[[rules]]
+id = "permission_prompt"
+state = "waiting"
+priority = 980
+region = "whole_recent"
+visible = true
+any = [
+  { contains = ["(y/n)"] },
+  { contains = ["[y/n]"] },
+  { contains = ["approve"] },
+  { contains = ["allow"] },
+  { contains = ["permission required"] },
+  { contains = ["approval required"] },
+  { contains = ["allow command"] },
+  { contains = ["allow this command"] },
+  { contains = ["run this command"] },
+  { contains = ["enter to approve"] },
+  { contains = ["enter to select"] },
+  { contains = ["esc to cancel"] },
+]
+
+[[rules]]
+id = "interrupt_hint"
+state = "running"
+priority = 970
+region = "from_prompt_marker"
+visible = true
+any = [
+  { contains = ["ctrl+c to stop"] },
+  { contains = ["ctrl+c to interrupt"] },
+  { contains = ["esc to interrupt"] },
+]
+
+# A spinner frame on the same line as a live activity verb. Either alone is
+# ordinary output; together they are Cursor's working line.
+[[rules]]
+id = "spinner_activity"
+state = "running"
+priority = 970
+region = "from_prompt_marker"
+visible = true
+line_regex = ['(?i)[\x{2800}-\x{28FF}].*\b(analyz|apply|build|edit|execut|fetch|generat|grepp|process|read|runn|search|test|think|work|writ)ing\b']
+
+# An activity verb opening the line, which is how Cursor prefixes its live
+# status without a spinner frame.
+[[rules]]
+id = "activity_line"
+state = "running"
+priority = 965
+region = "from_prompt_marker"
+visible = true
+line = { regex = ['(?i)^\s*(analyzing|applying|building|editing|executing|fetching|generating|grepping|processing|reading|running|searching|testing|thinking|working|writing)[\s.:\x{2026}]'], not_regex = ['(?i)^\s*\w+(?:\W+\w+){0,4}\W+(completed?|done|finished|successful|successfully|success)\b'] }
+
+# The follow-up prompt itself: Cursor is parked, waiting for input.
+[[rules]]
+id = "follow_up_prompt"
+state = "idle"
+priority = 500
+region = "whole_recent"
+visible = true
+line_regex = ['(?i)^\s*\x{2192}(?:\s+add a follow-up.*)?\s*$']
+
+# Background tasks keep running with the prompt already back, so this ranks
+# below the prompt itself: it only speaks when nothing else does.
+[[rules]]
+id = "background_task"
+state = "running"
+priority = 400
+region = "whole_recent"
+any = [
+  { contains = ["background task"] },
+  { contains = ["background tasks"] },
+]
+
+[[rules]]
+id = "hook_waiting"
+state = "waiting"
+priority = 900
+region = "hook"
+hook_status = "waiting"
+
+[[rules]]
+id = "hook_running_fresh"
+state = "running"
+priority = 600
+region = "hook"
+hook_status = "running"
+max_age_secs = 30
+
+[[rules]]
+id = "hook_running_standing"
+state = "running"
+priority = 400
+region = "hook"
+hook_status = "running"
+max_age_secs = 900
+
+[[rules]]
+id = "hook_idle"
+state = "idle"
+priority = 300
+region = "hook"
+hook_status = "idle"
+
+[[rules]]
+id = "hook_error"
+state = "error"
+priority = 300
+region = "hook"
+hook_status = "error"
