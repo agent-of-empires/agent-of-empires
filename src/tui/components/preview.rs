@@ -570,7 +570,7 @@ pub fn format_scroll_indicator(
 /// Parse a captured ANSI string into a ratatui `Text`.
 ///
 /// Visible at the module level so `PreviewCache::ensure_parsed` can
-/// call it from `src/tui/home/mod.rs` to drive the cache.
+/// call it from `src/tui/home/preview.rs` to drive the cache.
 pub fn parse_output_text(content: &str) -> Text<'static> {
     let cleaned = crate::tmux::utils::strip_osc_st(content);
     cleaned.into_text().unwrap_or_else(|_| Text::from(cleaned))

@@ -6,7 +6,8 @@ use serial_test::serial;
 use tempfile::TempDir;
 use tui_input::Input;
 
-use super::{ConfigRefreshOrigin, ConfigWatchKey, HomeView, PreviewSelection, ViewMode};
+use super::watchers::ConfigWatchKey;
+use super::{ConfigRefreshOrigin, HomeView, PreviewSelection, ViewMode};
 use crate::session::{
     Group, GroupTree, Instance, Item, LifecycleOperation, LifecycleReservation, Status, Storage,
 };
