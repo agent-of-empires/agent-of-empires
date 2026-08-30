@@ -39,6 +39,8 @@ pub mod test_support {
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{OnceLock, RwLock};
 use std::time::{Duration, Instant};
 
@@ -249,6 +251,27 @@ pub struct PaneMetadata {
     pub pane_start_command_is_protected: bool,
 }
 
+#[cfg(test)]
+static FORCED_SESSION_CACHE_GUARDS: AtomicUsize = AtomicUsize::new(0);
+
+/// Whether a test owns [`SESSION_CACHE`] through a live [`SessionCacheGuard`],
+/// in which case [`refresh_session_cache`] must leave the forced snapshot
+/// alone. `#[serial_test::serial]` only orders serial tests against each
+/// other, so a parallel test can already be past its staleness check and
+/// blocked on the `list-sessions` fork when the guard forces a snapshot, then
+/// land its write mid-test. On a host with no tmux server that write is
+/// `data: None`, which reads back as [`SessionExistence::Unknown`] and flips
+/// the status assertion the guard was meant to pin.
+#[cfg(test)]
+fn forced_session_cache_active() -> bool {
+    FORCED_SESSION_CACHE_GUARDS.load(Ordering::SeqCst) > 0
+}
+
+#[cfg(not(test))]
+fn forced_session_cache_active() -> bool {
+    false
+}
+
 static SESSION_CACHE: RwLock<SessionCache> = RwLock::new(SessionCache {
     data: None,
     time: None,
@@ -388,9 +411,14 @@ pub fn refresh_session_cache() -> SessionCacheRefresh {
         "session cache refreshed",
     );
 
+    // Checked under the write lock, which `SessionCacheGuard::capture` also
+    // takes: either the guard registers first and this refresh skips, or this
+    // write lands first and the guard captures it as the state to restore.
     if let Ok(mut cache) = SESSION_CACHE.write() {
-        cache.data = new_data;
-        cache.time = Some(Instant::now());
+        if !forced_session_cache_active() {
+            cache.data = new_data;
+            cache.time = Some(Instant::now());
+        }
     }
     outcome
 }
@@ -1095,7 +1123,10 @@ pub(crate) struct SessionCacheGuard {
 #[cfg(test)]
 impl SessionCacheGuard {
     pub(crate) fn capture() -> Self {
-        let cache = SESSION_CACHE.read().expect("session cache lock");
+        // Write lock, not read: registering the guard and reading the state
+        // to restore must be one step against a concurrent refresh.
+        let cache = SESSION_CACHE.write().expect("session cache lock");
+        FORCED_SESSION_CACHE_GUARDS.fetch_add(1, Ordering::SeqCst);
         Self {
             prev_data: cache.data.clone(),
             prev_time: cache.time,
@@ -1127,6 +1158,7 @@ impl Drop for SessionCacheGuard {
             cache.data = self.prev_data.take();
             cache.time = self.prev_time;
         }
+        FORCED_SESSION_CACHE_GUARDS.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -2032,6 +2064,24 @@ mod tests {
         let name = format!("{P}exists_probe_cache_hit");
         test_inject_session_into_cache(&name);
         assert!(session_exists(&name));
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn a_forced_cache_snapshot_survives_a_concurrent_refresh() {
+        // See `forced_session_cache_active`: a refresh a parallel test
+        // started must not land inside a guarded window.
+        let guard = SessionCacheGuard::capture();
+        let name = format!("{P}forced_snapshot_survives_refresh");
+        guard.force_present(&[name.as_str()]);
+
+        refresh_session_cache();
+
+        assert_eq!(
+            probe_session_existence(&name),
+            SessionExistence::Present,
+            "a live SessionCacheGuard must own the snapshot"
+        );
     }
 
     #[test]
