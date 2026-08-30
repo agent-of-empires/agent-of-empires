@@ -10,7 +10,6 @@ use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 use tokio_util::sync::CancellationToken;
 
-use super::acp_events::instance_lock_in;
 use super::serve_snapshot::{
     FormFactorCounters, ReportedServeSignals, StructuredTelemetryCounters,
 };
@@ -433,6 +432,27 @@ impl AppState {
         presence.retain(|_, last| now.saturating_sub(*last) < max_age);
         !presence.is_empty()
     }
+}
+
+/// Get or create the per-instance serialization mutex in `locks`. Free function
+/// rather than only an [`AppState`] method so the ACP turn-end unread writers
+/// can take the *same* lock a REST handler takes without needing an `AppState`
+/// (which has no test constructor). See [`AppState::instance_lock`].
+pub(super) async fn instance_lock_in(
+    locks: &RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    id: &str,
+) -> Arc<tokio::sync::Mutex<()>> {
+    {
+        let guard = locks.read().await;
+        if let Some(lock) = guard.get(id) {
+            return lock.clone();
+        }
+    }
+    let mut guard = locks.write().await;
+    guard
+        .entry(id.to_string())
+        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone()
 }
 
 #[cfg(test)]

@@ -7,7 +7,7 @@ use crate::session::Status;
 use std::sync::Arc;
 use tokio::sync::{broadcast, RwLock};
 
-use super::state::AppState;
+use super::state::{instance_lock_in, AppState};
 use crate::server::{acp_ws, api};
 
 /// One task instead of two halves the broadcast clone count and locks
@@ -554,27 +554,6 @@ pub(crate) fn apply_status_intent(
         new: target,
         at: now,
     });
-}
-
-/// Get or create the per-instance serialization mutex in `locks`. Free function
-/// rather than only an [`AppState`] method so the ACP turn-end unread writers
-/// can take the *same* lock a REST handler takes without needing an `AppState`
-/// (which has no test constructor). See [`AppState::instance_lock`].
-pub(super) async fn instance_lock_in(
-    locks: &RwLock<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
-    id: &str,
-) -> Arc<tokio::sync::Mutex<()>> {
-    {
-        let guard = locks.read().await;
-        if let Some(lock) = guard.get(id) {
-            return lock.clone();
-        }
-    }
-    let mut guard = locks.write().await;
-    guard
-        .entry(id.to_string())
-        .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
-        .clone()
 }
 
 /// Whether a structured row whose ACP status just moved should take the
