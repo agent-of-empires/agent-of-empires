@@ -8,11 +8,7 @@ state = "waiting"
 priority = 980
 region = "whole_recent"
 visible = true
-any = [
-  { contains = ["↑↓ navigate"] },
-  { contains = ["enter select"] },
-  { contains = ["esc reject"] },
-]
+contains_any = ["↑↓ navigate", "enter select", "esc reject"]
 
 [[rules]]
 id = "command_warning"
@@ -28,13 +24,7 @@ state = "waiting"
 priority = 970
 region = "whole_recent"
 visible = true
-any = [
-  { contains = ["yes and always allow"] },
-  { contains = ["no and tell the agent"] },
-  { contains = ["› 1."] },
-  { contains = ["› 2."] },
-  { contains = ["› 3."] },
-]
+contains_any = ["yes and always allow", "no and tell the agent", "› 1.", "› 2.", "› 3."]
 
 [[rules]]
 id = "cursor_line"
@@ -59,14 +49,14 @@ id = "activity_word"
 state = "running"
 priority = 955
 region = "whole_recent"
-any = [
-  { contains = ["running"] },
-  { contains = ["reading"] },
-  { contains = ["writing"] },
-  { contains = ["executing"] },
-  { contains = ["processing"] },
-  { contains = ["generating"] },
-  { contains = ["thinking"] },
+contains_any = [
+  "running",
+  "reading",
+  "writing",
+  "executing",
+  "processing",
+  "generating",
+  "thinking",
 ]
 
 # A trailing ellipsis on the last line: a status line mid-render.
@@ -79,40 +69,3 @@ any = [
   { line_regex = ['\x{2026}\s*$'] },
   { line_regex = ['\.\.\.\s*$'] },
 ]
-
-[[rules]]
-id = "hook_waiting"
-state = "waiting"
-priority = 900
-region = "hook"
-hook_status = "waiting"
-
-[[rules]]
-id = "hook_running_fresh"
-state = "running"
-priority = 600
-region = "hook"
-hook_status = "running"
-max_age_secs = 30
-
-[[rules]]
-id = "hook_running_standing"
-state = "running"
-priority = 400
-region = "hook"
-hook_status = "running"
-max_age_secs = 900
-
-[[rules]]
-id = "hook_idle"
-state = "idle"
-priority = 300
-region = "hook"
-hook_status = "idle"
-
-[[rules]]
-id = "hook_error"
-state = "error"
-priority = 300
-region = "hook"
-hook_status = "error"

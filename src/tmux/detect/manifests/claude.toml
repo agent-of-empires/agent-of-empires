@@ -25,10 +25,7 @@ state = "waiting"
 priority = 980
 region = "whole_recent"
 visible = true
-any = [
-  { contains = ["do you want to"] },
-  { contains = ["would you like to proceed"] },
-]
+contains_any = ["do you want to", "would you like to proceed"]
 line_regex = ['^\s*\x{276F}\s*[1-9]\.']
 
 # The `AskUserQuestion` selection UI. Its question is arbitrary turn text, so
@@ -122,29 +119,6 @@ contains = [
 # sticks; the running signals above and the parked evidence below both outrank
 # it, which is what releases it once the prompt is gone.
 [[rules]]
-id = "hook_waiting"
-state = "waiting"
-priority = 900
-region = "hook"
-hook_status = "waiting"
-
-# A `running` write younger than the poll's own settling time outranks parked
-# evidence: a turn that has just started still shows the previous turn's
-# completion line above the box until its spinner renders.
-[[rules]]
-id = "hook_running_fresh"
-state = "running"
-priority = 600
-region = "hook"
-hook_status = "running"
-max_age_secs = 30
-
-# Positive parked evidence: the past-tense completion line in the status slot
-# (`✻ Cooked for 49s`). A digits+unit duration is required so a rendered
-# markdown bullet in prose (`* Thanks for 2 examples`) is not parked evidence.
-# The background-agent wait line shares the skeleton but means the opposite,
-# and is excluded.
-[[rules]]
 id = "completed_turn"
 state = "idle"
 priority = 500
@@ -177,30 +151,6 @@ regex = ['^\s*\x{276F}\s*$']
 # ends on a tool result fires neither terminating hook, and an unbounded write
 # then outranks every later capture for as long as the session lives.
 [[rules]]
-id = "hook_running_standing"
-state = "running"
-priority = 400
-region = "hook"
-hook_status = "running"
-max_age_secs = 900
-
-[[rules]]
-id = "hook_idle"
-state = "idle"
-priority = 300
-region = "hook"
-hook_status = "idle"
-
-[[rules]]
-id = "hook_error"
-state = "error"
-priority = 300
-region = "hook"
-hook_status = "error"
-
-# The static title glyph. Weak evidence, because it also shows during a long
-# tool call; it only decides a capture nothing else spoke for.
-[[rules]]
 id = "osc_title_idle"
 state = "idle"
 priority = 250
@@ -217,10 +167,7 @@ id = "interrupt_hint_wrapped"
 state = "running"
 priority = 490
 region = "collapsed_recent"
-any = [
-  { contains = ["esc to interrupt"] },
-  { contains = ["ctrl+c to interrupt"] },
-]
+contains_any = ["esc to interrupt", "ctrl+c to interrupt"]
 
 # An agent-owned viewer shows history, not live state, so no status can be read
 # off it and the last known one stands. Both shapes and their footers come from
@@ -232,12 +179,12 @@ priority = 1000
 region = "bottom_non_empty_lines(3)"
 skip_state_update = true
 contains = ["showing detailed transcript"]
-any = [
-  { contains = ["ctrl+o", "to toggle"] },
-  { contains = ["ctrl+e", "show all"] },
-  { contains = ["ctrl+e", "collapse"] },
-  { contains = ["\u2191\u2193 scroll"] },
-  { contains = ["? for shortcuts"] },
+contains_any = [
+  "ctrl+o", "to toggle",
+  "ctrl+e", "show all",
+  "ctrl+e", "collapse",
+  "\u2191\u2193 scroll",
+  "? for shortcuts",
 ]
 
 [[rules]]

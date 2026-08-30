@@ -8,12 +8,12 @@ state = "waiting"
 priority = 980
 region = "whole_recent"
 visible = true
-any = [
-  { contains = ["not signed in"] },
-  { contains = ["signing in"] },
-  { contains = ["authorization url"] },
-  { contains = ["authorization code"] },
-  { contains = ["google sign-in"] },
+contains_any = [
+  "not signed in",
+  "signing in",
+  "authorization url",
+  "authorization code",
+  "google sign-in",
 ]
 
 [[rules]]
@@ -22,11 +22,7 @@ state = "waiting"
 priority = 975
 region = "whole_recent"
 visible = true
-any = [
-  { contains = ["approval required"] },
-  { contains = ["awaiting user approval"] },
-  { contains = ["deny access"] },
-]
+contains_any = ["approval required", "awaiting user approval", "deny access"]
 
 [[rules]]
 id = "approval_prompt"
@@ -34,18 +30,18 @@ state = "waiting"
 priority = 970
 region = "whole_recent"
 visible = true
-any = [
-  { contains = ["(y/n)"] },
-  { contains = ["[y/n]"] },
-  { contains = ["approve"] },
-  { contains = ["allow"] },
-  { contains = ["permission request"] },
-  { contains = ["do you trust the contents"] },
-  { contains = ["yes, i trust this folder"] },
-  { contains = ["execute?"] },
-  { contains = ["enter to select"] },
-  { contains = ["enter confirm"] },
-  { contains = ["esc to cancel"] },
+contains_any = [
+  "(y/n)",
+  "[y/n]",
+  "approve",
+  "allow",
+  "permission request",
+  "do you trust the contents",
+  "yes, i trust this folder",
+  "execute?",
+  "enter to select",
+  "enter confirm",
+  "esc to cancel",
 ]
 
 [[rules]]
@@ -54,11 +50,7 @@ state = "running"
 priority = 960
 region = "whole_recent"
 visible = true
-any = [
-  { contains = ["esc to interrupt"] },
-  { contains = ["ctrl+c to interrupt"] },
-  { contains = ["ctrl+c to stop"] },
-]
+contains_any = ["esc to interrupt", "ctrl+c to interrupt", "ctrl+c to stop"]
 
 [[rules]]
 id = "spinner"
@@ -77,40 +69,3 @@ priority = 950
 region = "bottom_non_empty_lines(10)"
 visible = true
 line = { regex = ['(?i)^\s*(analyzing|applying|building|editing|executing|fetching|generating|grepping|processing|reading|running|searching|testing|thinking|working|writing)[\s.:\x{2026}]'], not_regex = ['(?i)^\s*\w+(?:\W+\w+){0,4}\W+(completed?|done|finished|successful|successfully|success)\b'] }
-
-[[rules]]
-id = "hook_waiting"
-state = "waiting"
-priority = 900
-region = "hook"
-hook_status = "waiting"
-
-[[rules]]
-id = "hook_running_fresh"
-state = "running"
-priority = 600
-region = "hook"
-hook_status = "running"
-max_age_secs = 30
-
-[[rules]]
-id = "hook_running_standing"
-state = "running"
-priority = 400
-region = "hook"
-hook_status = "running"
-max_age_secs = 900
-
-[[rules]]
-id = "hook_idle"
-state = "idle"
-priority = 300
-region = "hook"
-hook_status = "idle"
-
-[[rules]]
-id = "hook_error"
-state = "error"
-priority = 300
-region = "hook"
-hook_status = "error"

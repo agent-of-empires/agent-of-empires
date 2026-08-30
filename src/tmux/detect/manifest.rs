@@ -45,6 +45,11 @@ pub(super) struct RawMatcher {
     /// Case-insensitive substrings, all of which must appear.
     #[serde(default)]
     pub(super) contains: Vec<String>,
+    /// Case-insensitive substrings, at least one of which must appear. The
+    /// common shape by far, and `any` with one `contains` per clause said the
+    /// same thing five times as long.
+    #[serde(default)]
+    pub(super) contains_any: Vec<String>,
     /// Regexes over the region text, all of which must match.
     #[serde(default)]
     pub(super) regex: Vec<String>,
@@ -95,6 +100,7 @@ struct RawManifest {
 /// pre-lowered, so evaluation is substring and regex work only.
 pub(super) struct Matcher {
     contains: Vec<String>,
+    contains_any: Vec<String>,
     regex: Vec<regex::Regex>,
     line_regex: Vec<regex::Regex>,
     line: Option<(Vec<regex::Regex>, Vec<regex::Regex>)>,
@@ -155,6 +161,7 @@ impl Matcher {
         };
         Ok(Self {
             contains: raw.contains.iter().map(|c| c.to_lowercase()).collect(),
+            contains_any: raw.contains_any.iter().map(|c| c.to_lowercase()).collect(),
             regex: compile_all(&raw.regex)?,
             line_regex: compile_all(&raw.line_regex)?,
             line: match &raw.line {
@@ -193,6 +200,8 @@ impl Matcher {
     /// matcher matches, which is what lets a rule be pure `not` clauses.
     fn matches(&self, text: &str, lower: &str) -> bool {
         self.contains.iter().all(|c| lower.contains(c.as_str()))
+            && (self.contains_any.is_empty()
+                || self.contains_any.iter().any(|c| lower.contains(c.as_str())))
             && self.regex.iter().all(|r| r.is_match(text))
             && self
                 .line_regex
@@ -278,12 +287,71 @@ impl Rule {
     }
 }
 
+/// The hook rules every agent shares, so ten manifests do not carry ten
+/// copies of the same five rows. They rank below the screen rules that read
+/// state off live chrome and above the ones that only guess, which is the
+/// arrangement the whole design turns on. A manifest that needs different
+/// bounds declares its own rule with the same id and wins.
+const SHARED_HOOK_RULES: &str = r#"
+[[rules]]
+id = "hook_waiting"
+state = "waiting"
+priority = 900
+region = "hook"
+hook_status = "waiting"
+
+# Younger than the poll's own settling time: a turn that has just started
+# still shows the previous turn's parked chrome.
+[[rules]]
+id = "hook_running_fresh"
+state = "running"
+priority = 600
+region = "hook"
+hook_status = "running"
+max_age_secs = 30
+
+# Older than that, it still beats no evidence at all, but positive parked
+# evidence on screen wins. Bounded, because a turn that ends on a tool result
+# fires no terminating hook and an unbounded write then outranks every later
+# capture for the life of the session.
+[[rules]]
+id = "hook_running_standing"
+state = "running"
+priority = 400
+region = "hook"
+hook_status = "running"
+max_age_secs = 900
+
+[[rules]]
+id = "hook_idle"
+state = "idle"
+priority = 300
+region = "hook"
+hook_status = "idle"
+
+[[rules]]
+id = "hook_error"
+state = "error"
+priority = 300
+region = "hook"
+hook_status = "error"
+"#;
+
 impl Manifest {
     pub(super) fn parse(source: &str) -> anyhow::Result<Self> {
         let raw: RawManifest = toml::from_str(source)?;
+        let shared: RawManifest = toml::from_str(&format!("id = \"shared\"\n{SHARED_HOOK_RULES}"))?;
+        let declared: std::collections::HashSet<&str> =
+            raw.rules.iter().map(|r| r.id.as_str()).collect();
+        let inherited: Vec<RawRule> = shared
+            .rules
+            .into_iter()
+            .filter(|r| !declared.contains(r.id.as_str()))
+            .collect();
         let mut rules = raw
             .rules
             .into_iter()
+            .chain(inherited)
             .map(Rule::compile)
             .collect::<anyhow::Result<Vec<_>>>()?;
         rules.sort_by_key(|rule| std::cmp::Reverse(rule.priority));

@@ -6,10 +6,7 @@ state = "running"
 priority = 970
 region = "whole_recent"
 visible = true
-any = [
-  { contains = ["esc to interrupt"] },
-  { contains = ["esc interrupt"] },
-]
+contains_any = ["esc to interrupt", "esc interrupt"]
 
 [[rules]]
 id = "spinner"
@@ -25,15 +22,15 @@ state = "waiting"
 priority = 950
 region = "whole_recent"
 visible = true
-any = [
-  { contains = ["(y/n)"] },
-  { contains = ["[y/n]"] },
-  { contains = ["approve"] },
-  { contains = ["allow"] },
-  { contains = ["continue?"] },
-  { contains = ["proceed?"] },
-  { contains = ["enter to select"] },
-  { contains = ["esc to cancel"] },
+contains_any = [
+  "(y/n)",
+  "[y/n]",
+  "approve",
+  "allow",
+  "continue?",
+  "proceed?",
+  "enter to select",
+  "esc to cancel",
 ]
 
 # A numbered menu row carrying the selection cursor.
@@ -57,40 +54,3 @@ any = [
   { line_regex = ['^\s*>>?\s*$'] },
   { line = { regex = ['^\s*>\s\S.{0,96}$'], not_regex = ['esc'] } },
 ]
-
-[[rules]]
-id = "hook_waiting"
-state = "waiting"
-priority = 900
-region = "hook"
-hook_status = "waiting"
-
-[[rules]]
-id = "hook_running_fresh"
-state = "running"
-priority = 600
-region = "hook"
-hook_status = "running"
-max_age_secs = 30
-
-[[rules]]
-id = "hook_running_standing"
-state = "running"
-priority = 400
-region = "hook"
-hook_status = "running"
-max_age_secs = 900
-
-[[rules]]
-id = "hook_idle"
-state = "idle"
-priority = 300
-region = "hook"
-hook_status = "idle"
-
-[[rules]]
-id = "hook_error"
-state = "error"
-priority = 300
-region = "hook"
-hook_status = "error"

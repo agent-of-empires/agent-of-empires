@@ -9,17 +9,17 @@ state = "waiting"
 priority = 950
 region = "whole_recent"
 visible = true
-any = [
-  { contains = ["(y/n)"] },
-  { contains = ["[y/n]"] },
-  { contains = ["approve"] },
-  { contains = ["allow"] },
-  { contains = ["continue?"] },
-  { contains = ["run command?"] },
-  { contains = ["allow this tool"] },
-  { contains = ["approve for the rest"] },
-  { contains = ["enter to select"] },
-  { contains = ["esc to cancel"] },
+contains_any = [
+  "(y/n)",
+  "[y/n]",
+  "approve",
+  "allow",
+  "continue?",
+  "run command?",
+  "allow this tool",
+  "approve for the rest",
+  "enter to select",
+  "esc to cancel",
 ]
 
 # The parked footer (`/ commands · ? help · tab next tab`), or the input
@@ -60,47 +60,10 @@ state = "running"
 priority = 920
 region = "bottom_non_empty_lines(3)"
 visible = true
-any = [
-  { contains = ["thinking"] },
-  { contains = ["working"] },
-  { contains = ["esc to interrupt"] },
-  { contains = ["ctrl+c to interrupt"] },
-  { contains = ["esc cancel"] },
+contains_any = [
+  "thinking",
+  "working",
+  "esc to interrupt",
+  "ctrl+c to interrupt",
+  "esc cancel",
 ]
-
-[[rules]]
-id = "hook_waiting"
-state = "waiting"
-priority = 900
-region = "hook"
-hook_status = "waiting"
-
-[[rules]]
-id = "hook_running_fresh"
-state = "running"
-priority = 600
-region = "hook"
-hook_status = "running"
-max_age_secs = 30
-
-[[rules]]
-id = "hook_running_standing"
-state = "running"
-priority = 400
-region = "hook"
-hook_status = "running"
-max_age_secs = 900
-
-[[rules]]
-id = "hook_idle"
-state = "idle"
-priority = 300
-region = "hook"
-hook_status = "idle"
-
-[[rules]]
-id = "hook_error"
-state = "error"
-priority = 300
-region = "hook"
-hook_status = "error"

@@ -11,19 +11,19 @@ state = "waiting"
 priority = 980
 region = "whole_recent"
 visible = true
-any = [
-  { contains = ["(y/n)"] },
-  { contains = ["[y/n]"] },
-  { contains = ["approve"] },
-  { contains = ["allow"] },
-  { contains = ["permission required"] },
-  { contains = ["approval required"] },
-  { contains = ["allow command"] },
-  { contains = ["allow this command"] },
-  { contains = ["run this command"] },
-  { contains = ["enter to approve"] },
-  { contains = ["enter to select"] },
-  { contains = ["esc to cancel"] },
+contains_any = [
+  "(y/n)",
+  "[y/n]",
+  "approve",
+  "allow",
+  "permission required",
+  "approval required",
+  "allow command",
+  "allow this command",
+  "run this command",
+  "enter to approve",
+  "enter to select",
+  "esc to cancel",
 ]
 
 [[rules]]
@@ -32,11 +32,7 @@ state = "running"
 priority = 970
 region = "from_prompt_marker"
 visible = true
-any = [
-  { contains = ["ctrl+c to stop"] },
-  { contains = ["ctrl+c to interrupt"] },
-  { contains = ["esc to interrupt"] },
-]
+contains_any = ["ctrl+c to stop", "ctrl+c to interrupt", "esc to interrupt"]
 
 # A spinner frame on the same line as a live activity verb. Either alone is
 # ordinary output; together they are Cursor's working line.
@@ -74,44 +70,4 @@ id = "background_task"
 state = "running"
 priority = 400
 region = "whole_recent"
-any = [
-  { contains = ["background task"] },
-  { contains = ["background tasks"] },
-]
-
-[[rules]]
-id = "hook_waiting"
-state = "waiting"
-priority = 900
-region = "hook"
-hook_status = "waiting"
-
-[[rules]]
-id = "hook_running_fresh"
-state = "running"
-priority = 600
-region = "hook"
-hook_status = "running"
-max_age_secs = 30
-
-[[rules]]
-id = "hook_running_standing"
-state = "running"
-priority = 400
-region = "hook"
-hook_status = "running"
-max_age_secs = 900
-
-[[rules]]
-id = "hook_idle"
-state = "idle"
-priority = 300
-region = "hook"
-hook_status = "idle"
-
-[[rules]]
-id = "hook_error"
-state = "error"
-priority = 300
-region = "hook"
-hook_status = "error"
+contains_any = ["background task", "background tasks"]

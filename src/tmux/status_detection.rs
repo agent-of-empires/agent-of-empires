@@ -1191,29 +1191,10 @@ pub fn detect_hermes_status(raw_content: &str) -> Status {
     detect_via_manifest("hermes", raw_content, "", None)
 }
 
-/// Kiro CLI status is detected via hooks (JSON-based), not tmux pane parsing.
-/// This stub exists so the agent registry has a valid function pointer.
-pub fn detect_kiro_status(_content: &str) -> Status {
-    Status::Idle
-}
-
-/// settl status is detected via hooks (TOML-based), not tmux pane parsing.
-/// This stub exists so the agent registry has a valid function pointer.
-pub fn detect_settl_status(_content: &str) -> Status {
-    Status::Idle
-}
-
-/// Kimi Code status is detected via hooks (`[[hooks]]` in config.toml), not
-/// tmux pane parsing. This stub exists so the agent registry has a valid
-/// function pointer.
-pub fn detect_kimi_status(_content: &str) -> Status {
-    Status::Idle
-}
-
-/// Prime Agent's TUI is pi-derived but rebranded, and no pane-content
-/// contract is documented we could verify without the binary, so detection
-/// stays an Idle stub.
-pub fn detect_prime_agent_status(_content: &str) -> Status {
+/// Agents whose status comes from hooks alone: Kiro, settl, Kimi Code and
+/// Prime Agent render no pane shape worth parsing, so the pane fallback
+/// reports Idle and the hook file speaks for them.
+pub fn detect_hook_only_status(_content: &str) -> Status {
     Status::Idle
 }
 
@@ -4078,6 +4059,25 @@ run this command? (y/n)
     }
 
     #[test]
+    fn test_hook_only_agents_report_idle_from_the_pane() {
+        // Kiro, settl, Kimi and Prime Agent are hook-detected; their pane
+        // fallback is a constant, so what is worth pinning is the registry
+        // wiring: each must route to it rather than to a real detector.
+        assert_eq!(detect_hook_only_status("anything"), Status::Idle);
+        assert_eq!(detect_hook_only_status(""), Status::Idle);
+        for agent in ["kiro", "settl", "kimi", "prime-agent"] {
+            let Some(def) = crate::agents::get_agent(agent) else {
+                continue;
+            };
+            assert_eq!(
+                (def.detect_status)("\u{2736} Working\u{2026} (4s \u{b7} \u{2193} 88 tokens)"),
+                Status::Idle,
+                "{agent} must not parse the pane"
+            );
+        }
+    }
+
+    #[test]
     fn test_detect_gemini_status_running() {
         assert_eq!(
             detect_gemini_status("processing request\nesc to interrupt"),
@@ -5302,26 +5302,6 @@ Final prose line.\n";
     }
 
     #[test]
-    fn test_detect_settl_status_is_stub() {
-        // settl uses hook-based detection; the stub always returns Idle
-        assert_eq!(detect_settl_status("anything"), Status::Idle);
-    }
-
-    #[test]
-    fn test_detect_kimi_status_is_stub() {
-        // Kimi uses hook-based detection; the stub always returns Idle
-        assert_eq!(detect_kimi_status("anything"), Status::Idle);
-        assert_eq!(detect_kimi_status(""), Status::Idle);
-    }
-
-    #[test]
-    fn test_detect_prime_agent_status_is_stub() {
-        // Prime Agent has no verifiable pane contract; the stub returns Idle
-        assert_eq!(detect_prime_agent_status("anything"), Status::Idle);
-        assert_eq!(detect_prime_agent_status(""), Status::Idle);
-    }
-
-    #[test]
     fn test_detect_qwen_status_running() {
         assert_eq!(
             detect_qwen_status("processing request\nesc to interrupt"),
@@ -5484,11 +5464,5 @@ path: /workspace/secrets.env
             detect_antigravity_status("random output text"),
             Status::Idle
         );
-    }
-
-    #[test]
-    fn test_detect_kiro_status_is_stub() {
-        // Kiro CLI uses hook-based detection; the stub always returns Idle
-        assert_eq!(detect_kiro_status("anything"), Status::Idle);
     }
 }

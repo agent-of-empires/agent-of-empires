@@ -6,10 +6,7 @@ state = "running"
 priority = 970
 region = "whole_recent"
 visible = true
-any = [
-  { contains = ["esc to interrupt"] },
-  { contains = ["ctrl+c to interrupt"] },
-]
+contains_any = ["esc to interrupt", "ctrl+c to interrupt"]
 
 [[rules]]
 id = "spinner"
@@ -25,14 +22,14 @@ state = "waiting"
 priority = 950
 region = "whole_recent"
 visible = true
-any = [
-  { contains = ["(y/n)"] },
-  { contains = ["[y/n]"] },
-  { contains = ["approve"] },
-  { contains = ["allow"] },
-  { contains = ["execute?"] },
-  { contains = ["enter to select"] },
-  { contains = ["esc to cancel"] },
+contains_any = [
+  "(y/n)",
+  "[y/n]",
+  "approve",
+  "allow",
+  "execute?",
+  "enter to select",
+  "esc to cancel",
 ]
 
 # Only a bare `>`: Gemini renders ordinary prose behind the same glyph, so the
@@ -44,40 +41,3 @@ priority = 930
 region = "bottom_non_empty_lines(10)"
 visible = true
 line_regex = ['^\s*>\s*$']
-
-[[rules]]
-id = "hook_waiting"
-state = "waiting"
-priority = 900
-region = "hook"
-hook_status = "waiting"
-
-[[rules]]
-id = "hook_running_fresh"
-state = "running"
-priority = 600
-region = "hook"
-hook_status = "running"
-max_age_secs = 30
-
-[[rules]]
-id = "hook_running_standing"
-state = "running"
-priority = 400
-region = "hook"
-hook_status = "running"
-max_age_secs = 900
-
-[[rules]]
-id = "hook_idle"
-state = "idle"
-priority = 300
-region = "hook"
-hook_status = "idle"
-
-[[rules]]
-id = "hook_error"
-state = "error"
-priority = 300
-region = "hook"
-hook_status = "error"

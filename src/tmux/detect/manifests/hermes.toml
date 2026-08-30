@@ -46,19 +46,19 @@ id = "activity_word"
 state = "running"
 priority = 950
 region = "whole_recent"
-any = [
-  { contains = ["reasoning"] },
-  { contains = ["pondering"] },
-  { contains = ["contemplating"] },
-  { contains = ["forging"] },
-  { contains = ["plotting"] },
-  { contains = ["jacking in"] },
-  { contains = ["decrypting"] },
-  { contains = ["uploading"] },
-  { contains = ["processing"] },
-  { contains = ["analyzing"] },
-  { contains = ["computing"] },
-  { contains = ["evaluating"] },
+contains_any = [
+  "reasoning",
+  "pondering",
+  "contemplating",
+  "forging",
+  "plotting",
+  "jacking in",
+  "decrypting",
+  "uploading",
+  "processing",
+  "analyzing",
+  "computing",
+  "evaluating",
 ]
 
 [[rules]]
@@ -67,49 +67,12 @@ state = "waiting"
 priority = 940
 region = "whole_recent"
 visible = true
-any = [
-  { contains = ["(y/n)"] },
-  { contains = ["[y/n]"] },
-  { contains = ["approve"] },
-  { contains = ["allow"] },
-  { contains = ["choice [o/s/a/d]:"] },
-  { contains = ["[o]nce"] },
-  { contains = ["dangerous command"] },
+contains_any = [
+  "(y/n)",
+  "[y/n]",
+  "approve",
+  "allow",
+  "choice [o/s/a/d]:",
+  "[o]nce",
+  "dangerous command",
 ]
-
-[[rules]]
-id = "hook_waiting"
-state = "waiting"
-priority = 900
-region = "hook"
-hook_status = "waiting"
-
-[[rules]]
-id = "hook_running_fresh"
-state = "running"
-priority = 600
-region = "hook"
-hook_status = "running"
-max_age_secs = 30
-
-[[rules]]
-id = "hook_running_standing"
-state = "running"
-priority = 400
-region = "hook"
-hook_status = "running"
-max_age_secs = 900
-
-[[rules]]
-id = "hook_idle"
-state = "idle"
-priority = 300
-region = "hook"
-hook_status = "idle"
-
-[[rules]]
-id = "hook_error"
-state = "error"
-priority = 300
-region = "hook"
-hook_status = "error"

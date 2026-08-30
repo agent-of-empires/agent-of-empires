@@ -14,12 +14,12 @@ state = "running"
 priority = 965
 region = "whole_recent"
 visible = true
-any = [
-  { contains = ["esc to interrupt"] },
-  { contains = ["ctrl+c to interrupt"] },
-  { contains = ["thinking"] },
-  { contains = ["working"] },
-  { contains = ["executing"] },
+contains_any = [
+  "esc to interrupt",
+  "ctrl+c to interrupt",
+  "thinking",
+  "working",
+  "executing",
 ]
 
 [[rules]]
@@ -28,16 +28,16 @@ state = "waiting"
 priority = 950
 region = "whole_recent"
 visible = true
-any = [
-  { contains = ["(y/n)"] },
-  { contains = ["[y/n]"] },
-  { contains = ["approve"] },
-  { contains = ["allow"] },
-  { contains = ["continue?"] },
-  { contains = ["proceed?"] },
-  { contains = ["execute?"] },
-  { contains = ["enter to select"] },
-  { contains = ["esc to cancel"] },
+contains_any = [
+  "(y/n)",
+  "[y/n]",
+  "approve",
+  "allow",
+  "continue?",
+  "proceed?",
+  "execute?",
+  "enter to select",
+  "esc to cancel",
 ]
 
 [[rules]]
@@ -51,40 +51,3 @@ any = [
   { line_regex = ['^\s*droid>\s*$'] },
   { line = { regex = ['^\s*>\s\S.{0,96}$'], not_regex = ['esc'] } },
 ]
-
-[[rules]]
-id = "hook_waiting"
-state = "waiting"
-priority = 900
-region = "hook"
-hook_status = "waiting"
-
-[[rules]]
-id = "hook_running_fresh"
-state = "running"
-priority = 600
-region = "hook"
-hook_status = "running"
-max_age_secs = 30
-
-[[rules]]
-id = "hook_running_standing"
-state = "running"
-priority = 400
-region = "hook"
-hook_status = "running"
-max_age_secs = 900
-
-[[rules]]
-id = "hook_idle"
-state = "idle"
-priority = 300
-region = "hook"
-hook_status = "idle"
-
-[[rules]]
-id = "hook_error"
-state = "error"
-priority = 300
-region = "hook"
-hook_status = "error"

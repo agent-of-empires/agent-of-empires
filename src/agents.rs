@@ -1096,7 +1096,7 @@ pub const AGENTS: &[AgentDef] = &[
         yolo: Some(YoloMode::AlwaysYolo),
         instruction_flag: None,
         set_default_command: false,
-        detect_status: status_detection::detect_settl_status,
+        detect_status: status_detection::detect_hook_only_status,
         container_env: &[],
         // settl uses TOML config (`[[hooks]]` entries), not the JSON
         // settings.json schema, so it installs via a sidecar hook. host_only,
@@ -1176,7 +1176,7 @@ pub const AGENTS: &[AgentDef] = &[
         yolo: Some(YoloMode::CliFlag("--trust-all-tools")),
         instruction_flag: None,
         set_default_command: false,
-        detect_status: status_detection::detect_kiro_status,
+        detect_status: status_detection::detect_hook_only_status,
         container_env: &[("KIRO_CONFIG_DIR", "/root/.kiro")],
         // Kiro uses a per-agent JSON config (lowercase event names, flat
         // {command} objects) rather than the JSON settings.json schema shared
@@ -1275,7 +1275,7 @@ pub const AGENTS: &[AgentDef] = &[
         yolo: Some(YoloMode::CliFlag("--yolo")),
         instruction_flag: None,
         set_default_command: false,
-        detect_status: status_detection::detect_kimi_status,
+        detect_status: status_detection::detect_hook_only_status,
         container_env: &[("KIMI_CODE_HOME", "/root/.kimi-code")],
         // Kimi Code stores hooks as `[[hooks]]` entries in its runtime
         // `config.toml` (which also holds provider/oauth settings), so it
@@ -1348,7 +1348,7 @@ pub const AGENTS: &[AgentDef] = &[
         yolo: Some(YoloMode::AlwaysYolo),
         instruction_flag: Some("--append-system-prompt {}"),
         set_default_command: false,
-        detect_status: status_detection::detect_prime_agent_status,
+        detect_status: status_detection::detect_hook_only_status,
         container_env: &[("PRIME_AGENT_CODING_AGENT_DIR", "/root/.prime/agent")],
         // Level 3 (hooks) is skipped by design: upstream has no hook system
         // at all (no Claude/Codex/Kiro-style config file to write), so status
