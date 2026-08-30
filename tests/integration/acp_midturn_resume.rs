@@ -17,7 +17,7 @@
 //! `cfg(all(feature = "serve", debug_assertions))`. Debug-only because
 //! the watchdog grace is tunable via `AOE_RESUME_IDLE_GRACE_MS` only
 //! under `cfg(debug_assertions)` (see `resume_idle_grace()` in
-//! `src/structured view/acp_client.rs`); release builds would wait the full
+//! `src/acp/acp_client/connection.rs`); release builds would wait the full
 //! 10s production default and fail the 3s assertion below.
 
 use std::path::PathBuf;

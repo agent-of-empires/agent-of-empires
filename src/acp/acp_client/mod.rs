@@ -14,36 +14,36 @@
 //! `AcpClient` and its public surface live here; each concern of the client
 //! lives in a submodule.
 
-pub(crate) mod between_prompt;
-pub(crate) mod commands;
-pub(crate) mod config_options;
-pub(crate) mod connection;
-pub(crate) mod control;
-pub(crate) mod delete;
-pub(crate) mod errors;
-pub(crate) mod fs_handlers;
-pub(crate) mod handshake;
-pub(crate) mod lifecycle;
-pub(crate) mod opencode;
-pub(crate) mod pending;
-pub(crate) mod permission_handlers;
-pub(crate) mod plan;
-pub(crate) mod rate_limit;
-pub(crate) mod raw_input;
-pub(crate) mod reset;
-pub(crate) mod resolve_command;
-pub(crate) mod runner;
-pub(crate) mod session_sandbox;
-pub(crate) mod spawn;
-pub(crate) mod steer;
-pub(crate) mod terminal_handlers;
+mod between_prompt;
+mod commands;
+mod config_options;
+mod connection;
+mod control;
+mod delete;
+mod errors;
+mod fs_handlers;
+mod handshake;
+mod lifecycle;
+mod opencode;
+mod pending;
+mod permission_handlers;
+mod plan;
+mod rate_limit;
+mod raw_input;
+mod reset;
+mod resolve_command;
+mod runner;
+mod session_sandbox;
+mod spawn;
+mod steer;
+mod terminal_handlers;
 #[cfg(test)]
 mod test_helpers;
-pub(crate) mod tool_context;
-pub(crate) mod tool_output;
-pub(crate) mod transcript_filter;
-pub(crate) mod update_events;
-pub(crate) mod watchdog;
+mod tool_context;
+mod tool_output;
+mod transcript_filter;
+mod update_events;
+mod watchdog;
 
 pub(crate) use connection::CANCEL_ESCALATION_GRACE;
 pub use delete::DeleteSessionOutcome;

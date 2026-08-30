@@ -128,7 +128,7 @@ const NOTIFICATION_BUFFER_LINES: usize = 256;
 /// An agent that exits within this window of being spawned is treated as a
 /// broken spawn and logged at warn (not info), so a crash loop is visible in
 /// debug.log without grepping for the absence of success. Intentionally
-/// mirrors `runner_socket_deadline()` in `acp/acp_client.rs` (the
+/// mirrors `runner_socket_deadline()` in `acp/acp_client/runner.rs` (the
 /// daemon's 10s wait for this runner's socket to appear); update both if
 /// the handshake window changes. See #1945.
 const FAST_EXIT_THRESHOLD: Duration = Duration::from_secs(10);
@@ -1902,7 +1902,7 @@ fn spawn_agent(
         .stderr(Stdio::piped());
     // The rest of the env is inherited from the launching daemon, which has
     // already applied `env_clear` + the shared allowlist (see
-    // `apply_env_filter` in acp_client.rs), so no second filter pass is
+    // `apply_env_filter` in acp_client/spawn.rs), so no second filter pass is
     // needed here.
     //
     // The one exception is the daemon's configured host environment

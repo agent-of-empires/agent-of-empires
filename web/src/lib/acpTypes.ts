@@ -437,7 +437,7 @@ export type AcpEvent =
         title: string | null;
         args_preview: string | null;
         /** Re-stamped start time when the agent reports the tool's
-         *  status transitioned to InProgress. See acp_client.rs;
+         *  status transitioned to InProgress. See acp_client/update_events.rs;
          *  reused so the duration label measures real tool runtime
          *  rather than adapter scheduling time. Null for non-status
          *  updates. */

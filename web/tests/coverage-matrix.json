@@ -2247,7 +2247,7 @@
       "risk": "high",
       "specs": ["tests/live/acp-codex-new-reset.spec.ts"],
       "components": [
-        "src/acp/acp_client.rs",
+        "src/acp/acp_client/",
         "src/acp/agent_profiles.rs",
         "src/acp/supervisor.rs",
         "src/process/runner.rs",
@@ -2261,7 +2261,7 @@
       "risk": "high",
       "specs": ["tests/live/acp-claude-clear-reset.spec.ts"],
       "components": [
-        "src/acp/acp_client.rs",
+        "src/acp/acp_client/",
         "src/acp/agent_profiles.rs",
         "src/acp/supervisor.rs",
         "src/server/mod.rs",
@@ -2501,7 +2501,7 @@
         "tests/live/acp-worker-log.spec.ts",
         "tests/live/acp-stories/startup-error-banner-native-binary.spec.ts"
       ],
-      "components": ["web/src/components/acp/StructuredView.tsx", "src/server/api/acp.rs", "src/acp/acp_client.rs"]
+      "components": ["web/src/components/acp/StructuredView.tsx", "src/server/api/acp.rs", "src/acp/acp_client/"]
     },
     {
       "id": "read-only.mode",
