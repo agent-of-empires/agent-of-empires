@@ -1,0 +1,95 @@
+id = "qwen"
+
+[[rules]]
+id = "interrupt_hint"
+state = "running"
+priority = 970
+region = "whole_recent"
+visible = true
+any = [
+  { contains = ["esc to interrupt"] },
+  { contains = ["ctrl+c to interrupt"] },
+]
+
+[[rules]]
+id = "spinner"
+state = "running"
+priority = 960
+region = "whole_recent"
+visible = true
+line_regex = ['[\x{2800}-\x{28FF}]']
+
+[[rules]]
+id = "approval_prompt"
+state = "waiting"
+priority = 950
+region = "whole_recent"
+visible = true
+any = [
+  { contains = ["(y/n)"] },
+  { contains = ["[y/n]"] },
+  { contains = ["approve"] },
+  { contains = ["allow"] },
+  { contains = ["execute?"] },
+  { contains = ["run command?"] },
+  { contains = ["enter to select"] },
+  { contains = ["esc to cancel"] },
+]
+
+# Qwen renders its menu cursor as `›` by default and `❯` in some themes.
+[[rules]]
+id = "numbered_choice"
+state = "waiting"
+priority = 940
+region = "whole_recent"
+visible = true
+line_regex = ['^\s*[\x{203A}\x{276F}]\s*[123]\.']
+
+[[rules]]
+id = "input_prompt"
+state = "waiting"
+priority = 930
+region = "bottom_non_empty_lines(10)"
+visible = true
+any = [
+  { line_regex = ['^\s*>\s*$'] },
+  { line_regex = ['^\s*qwen>\s*$'] },
+  { line = { regex = ['^\s*>\s\S.{0,96}$'], not_regex = ['esc'] } },
+]
+
+[[rules]]
+id = "hook_waiting"
+state = "waiting"
+priority = 900
+region = "hook"
+hook_status = "waiting"
+
+[[rules]]
+id = "hook_running_fresh"
+state = "running"
+priority = 600
+region = "hook"
+hook_status = "running"
+max_age_secs = 30
+
+[[rules]]
+id = "hook_running_standing"
+state = "running"
+priority = 400
+region = "hook"
+hook_status = "running"
+max_age_secs = 900
+
+[[rules]]
+id = "hook_idle"
+state = "idle"
+priority = 300
+region = "hook"
+hook_status = "idle"
+
+[[rules]]
+id = "hook_error"
+state = "error"
+priority = 300
+region = "hook"
+hook_status = "error"

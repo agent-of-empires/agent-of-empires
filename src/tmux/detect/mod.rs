@@ -28,6 +28,14 @@ use region::Screen;
 const MANIFEST_SOURCES: &[(&str, &str)] = &[
     ("claude", include_str!("manifests/claude.toml")),
     ("cursor", include_str!("manifests/cursor.toml")),
+    ("opencode", include_str!("manifests/opencode.toml")),
+    ("vibe", include_str!("manifests/vibe.toml")),
+    ("droid", include_str!("manifests/droid.toml")),
+    ("gemini", include_str!("manifests/gemini.toml")),
+    ("qwen", include_str!("manifests/qwen.toml")),
+    ("copilot", include_str!("manifests/copilot.toml")),
+    ("antigravity", include_str!("manifests/antigravity.toml")),
+    ("hermes", include_str!("manifests/hermes.toml")),
 ];
 
 /// What one capture says about a session.

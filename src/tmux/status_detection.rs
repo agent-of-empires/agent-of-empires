@@ -97,6 +97,20 @@ pub fn detect_status_from_content_in(profile: &str, content: &str, tool: &str) -
         .unwrap_or(Status::Idle)
 }
 
+/// Run an agent's detection manifest over one capture, falling back to Idle
+/// when no rule matches. The per-agent `detect_*_status` entry points are thin
+/// wrappers so the agent registry keeps its stable function pointers.
+pub fn detect_via_manifest(
+    agent: &str,
+    raw_content: &str,
+    osc_title: &str,
+    hook: Option<super::detect::HookObservation>,
+) -> Status {
+    super::detect::detect(agent, &strip_ansi(raw_content), osc_title, hook)
+        .and_then(|d| d.status)
+        .unwrap_or(Status::Idle)
+}
+
 /// Rules-free pane detection: strip ANSI, then the built-in detector only, no
 /// status-rule registry consult. Used by callers that are keyed to the
 /// built-in / alias identity rather than to a session's profile (see
@@ -187,176 +201,11 @@ pub(crate) fn reconcile_waiting_hook(agent: &str, raw_content: &str) -> Status {
 }
 
 pub fn detect_opencode_status(raw_content: &str) -> Status {
-    let content = raw_content.to_lowercase();
-    let lines: Vec<&str> = content.lines().collect();
-    let non_empty_lines: Vec<&str> = lines
-        .iter()
-        .filter(|l| !l.trim().is_empty())
-        .copied()
-        .collect();
-
-    let last_lines: String = non_empty_lines
-        .iter()
-        .rev()
-        .take(30)
-        .rev()
-        .copied()
-        .collect::<Vec<&str>>()
-        .join("\n");
-    let last_lines_lower = last_lines.to_lowercase();
-
-    if last_lines_lower.contains("esc to interrupt") || last_lines_lower.contains("esc interrupt") {
-        return Status::Running;
-    }
-
-    if has_any_spinner(&lines) {
-        return Status::Running;
-    }
-
-    if contains_approval_prompt(
-        &last_lines_lower,
-        &["continue?", "proceed?", "enter to select", "esc to cancel"],
-    ) {
-        return Status::Waiting;
-    }
-
-    for line in &lines {
-        let trimmed = line.trim();
-        if trimmed.starts_with("❯") && trimmed.len() > 2 {
-            let after_cursor = trimmed.get(3..).unwrap_or("").trim_start();
-            if after_cursor.starts_with("1.")
-                || after_cursor.starts_with("2.")
-                || after_cursor.starts_with("3.")
-            {
-                return Status::Waiting;
-            }
-        }
-    }
-    if lines.iter().any(|line| {
-        line.contains("❯") && (line.contains(" 1.") || line.contains(" 2.") || line.contains(" 3."))
-    }) {
-        return Status::Waiting;
-    }
-
-    if matches_input_prompt(&non_empty_lines, 10, &[">>"]) {
-        return Status::Waiting;
-    }
-
-    // Completion indicators + input prompt nearby
-    let completion_indicators = [
-        "complete",
-        "done",
-        "finished",
-        "ready",
-        "what would you like",
-        "what else",
-        "anything else",
-        "how can i help",
-        "let me know",
-    ];
-    let has_completion = completion_indicators
-        .iter()
-        .any(|ind| last_lines_lower.contains(ind));
-    if has_completion {
-        for line in non_empty_lines.iter().rev().take(10) {
-            let clean = strip_ansi(line).trim().to_string();
-            if clean == ">" || clean == ">>" {
-                return Status::Waiting;
-            }
-        }
-    }
-
-    Status::Idle
+    detect_via_manifest("opencode", raw_content, "", None)
 }
 
 pub fn detect_vibe_status(raw_content: &str) -> Status {
-    let content = raw_content.to_lowercase();
-    let lines: Vec<&str> = content.lines().collect();
-    let non_empty_lines: Vec<&str> = lines
-        .iter()
-        .filter(|l| !l.trim().is_empty())
-        .copied()
-        .collect();
-
-    let last_lines: String = non_empty_lines
-        .iter()
-        .rev()
-        .take(30)
-        .rev()
-        .copied()
-        .collect::<Vec<&str>>()
-        .join("\n");
-    let last_lines_lower = last_lines.to_lowercase();
-
-    // Vibe uses Textual TUI which can render text vertically (one char per line).
-    // Join recent single-char lines to reconstruct words for detection.
-    let recent_text: String = non_empty_lines
-        .iter()
-        .rev()
-        .take(50)
-        .rev()
-        .map(|l| l.trim())
-        .collect::<Vec<&str>>()
-        .join("");
-    let recent_text_lower = recent_text.to_lowercase();
-
-    if last_lines_lower.contains("↑↓ navigate")
-        || last_lines_lower.contains("enter select")
-        || last_lines_lower.contains("esc reject")
-    {
-        return Status::Waiting;
-    }
-
-    if last_lines.contains("⚠") && last_lines_lower.contains("command") {
-        return Status::Waiting;
-    }
-
-    let approval_options = [
-        "yes and always allow",
-        "no and tell the agent",
-        "› 1.",
-        "› 2.",
-        "› 3.",
-    ];
-    for option in &approval_options {
-        if last_lines_lower.contains(option) {
-            return Status::Waiting;
-        }
-    }
-
-    for line in &lines {
-        let trimmed = line.trim();
-        if trimmed.starts_with("›") && trimmed.len() > 2 {
-            return Status::Waiting;
-        }
-    }
-
-    for spinner in SPINNER_CHARS {
-        if recent_text.contains(spinner) {
-            return Status::Running;
-        }
-    }
-
-    let activity_indicators = [
-        "running",
-        "reading",
-        "writing",
-        "executing",
-        "processing",
-        "generating",
-        "thinking",
-    ];
-    for indicator in &activity_indicators {
-        if recent_text_lower.contains(indicator) {
-            return Status::Running;
-        }
-    }
-
-    if recent_text.ends_with("…") || recent_text.ends_with("...") {
-        return Status::Running;
-    }
-
-    Status::Idle
+    detect_via_manifest("vibe", raw_content, "", None)
 }
 
 /// Fallback Codex status detection from pane text. Strategy, in priority order:
@@ -817,85 +666,7 @@ pub fn detect_cursor(raw_content: &str, hook: Option<super::detect::HookObservat
 ///     tool/folder-trust approval (Waiting). `--yolo` (allow-all-paths +
 ///     allow-all-tools) suppresses most of these.
 pub fn detect_copilot_status(raw_content: &str) -> Status {
-    let content = raw_content.to_lowercase();
-    let lines: Vec<&str> = content.lines().collect();
-    let non_empty_lines: Vec<&str> = lines
-        .iter()
-        .filter(|l| !l.trim().is_empty())
-        .copied()
-        .collect();
-
-    let last_lines: String = non_empty_lines
-        .iter()
-        .rev()
-        .take(30)
-        .rev()
-        .copied()
-        .collect::<Vec<&str>>()
-        .join("\n");
-    let last_lines_lower = last_lines.to_lowercase();
-
-    // Terminal states are checked before Running. capture-pane grabs 50 lines of
-    // scrollback (`-S -50`), and Copilot leaves a finished turn's `◎ Working esc
-    // cancel` footer and spinner glyphs in that history. A completed turn whose
-    // live footer is the approval or ready prompt must win over those stale
-    // lines, otherwise the session spins forever (#2815).
-    if contains_approval_prompt(
-        &last_lines_lower,
-        &[
-            "continue?",
-            "run command?",
-            "allow this tool",
-            "approve for the rest",
-            "enter to select",
-            "esc to cancel",
-        ],
-    ) {
-        return Status::Waiting;
-    }
-
-    // Empty ready prompt: Copilot's idle footer is `/ commands · ? help · tab
-    // next tab`. Require all three tokens together so ordinary prose mentioning
-    // `? help` or `tab next tab` mid-turn does not falsely read as Waiting; the
-    // full footer only renders at the ready prompt (Working and approval footers
-    // differ). `copilot>` is kept for custom wrappers/older builds.
-    if (last_lines_lower.contains("/ commands")
-        && last_lines_lower.contains("? help")
-        && last_lines_lower.contains("tab next tab"))
-        || matches_input_prompt(&non_empty_lines, 10, &["copilot>"])
-    {
-        return Status::Waiting;
-    }
-
-    // Running signals only count on the live footer, the bottom few non-empty
-    // lines where Copilot renders its status footer and input box. Scanning the
-    // whole capture would latch onto a completed turn's `◎ Working`/spinner line
-    // still sitting in scrollback and never let go (#2815).
-    let footer: Vec<&str> = non_empty_lines
-        .iter()
-        .rev()
-        .take(3)
-        .rev()
-        .copied()
-        .collect();
-    let footer_lower = footer.join("\n");
-
-    if has_any_spinner(&footer) {
-        return Status::Running;
-    }
-
-    if footer_lower.contains("thinking")
-        || footer_lower.contains("working")
-        || footer_lower.contains("esc to interrupt")
-        || footer_lower.contains("ctrl+c to interrupt")
-        // Copilot's live footer reads `◎ Working ... esc cancel`; key on the
-        // interrupt hint too so a verb change doesn't drop the Running signal.
-        || footer_lower.contains("esc cancel")
-    {
-        return Status::Running;
-    }
-
-    Status::Idle
+    detect_via_manifest("copilot", raw_content, "", None)
 }
 
 /// How many of the last non-empty pane lines count as plain pi's footer for
@@ -1409,55 +1180,7 @@ fn attempt_re() -> &'static Regex {
 /// Droid uses an interactive REPL similar to other coding agents. It shows
 /// activity indicators while processing and prompts for input when idle.
 pub fn detect_droid_status(raw_content: &str) -> Status {
-    let content = raw_content.to_lowercase();
-    let lines: Vec<&str> = content.lines().collect();
-    let non_empty_lines: Vec<&str> = lines
-        .iter()
-        .filter(|l| !l.trim().is_empty())
-        .copied()
-        .collect();
-
-    let last_lines: String = non_empty_lines
-        .iter()
-        .rev()
-        .take(30)
-        .rev()
-        .copied()
-        .collect::<Vec<&str>>()
-        .join("\n");
-    let last_lines_lower = last_lines.to_lowercase();
-
-    if has_any_spinner(&lines) {
-        return Status::Running;
-    }
-
-    if last_lines_lower.contains("esc to interrupt")
-        || last_lines_lower.contains("ctrl+c to interrupt")
-        || last_lines_lower.contains("thinking")
-        || last_lines_lower.contains("working")
-        || last_lines_lower.contains("executing")
-    {
-        return Status::Running;
-    }
-
-    if contains_approval_prompt(
-        &last_lines_lower,
-        &[
-            "continue?",
-            "proceed?",
-            "execute?",
-            "enter to select",
-            "esc to cancel",
-        ],
-    ) {
-        return Status::Waiting;
-    }
-
-    if matches_input_prompt(&non_empty_lines, 10, &["droid>"]) {
-        return Status::Waiting;
-    }
-
-    Status::Idle
+    detect_via_manifest("droid", raw_content, "", None)
 }
 
 /// Hermes (NousResearch) status detection via tmux pane parsing.
@@ -1465,99 +1188,7 @@ pub fn detect_droid_status(raw_content: &str) -> Status {
 /// Detects spinner faces (◜ ◠ ✧), tool execution prefix (┊), thinking verbs,
 /// dangerous-command approval prompt, and input prompt (❯ / ⚡).
 pub fn detect_hermes_status(raw_content: &str) -> Status {
-    let content = raw_content.to_lowercase();
-    let lines: Vec<&str> = content.lines().collect();
-    let non_empty_lines: Vec<&str> = lines
-        .iter()
-        .filter(|l| !l.trim().is_empty())
-        .copied()
-        .collect();
-
-    let last_lines: String = non_empty_lines
-        .iter()
-        .rev()
-        .take(30)
-        .rev()
-        .copied()
-        .collect::<Vec<&str>>()
-        .join("\n");
-
-    // Hermes spinner faces animate during LLM calls; only present while active
-    // (unicode, unaffected by to_lowercase).
-    const HERMES_SPINNERS: &[&str] = &["◜", "◠", "✧"];
-    if lines
-        .iter()
-        .any(|line| HERMES_SPINNERS.iter().any(|s| line.contains(s)))
-    {
-        return Status::Running;
-    }
-
-    // While running, Hermes replaces the input prompt with
-    // "❯ Ctrl+C to interrupt…". Check this before the idle-prompt
-    // detection below so we don't misidentify Running as Waiting.
-    if non_empty_lines
-        .iter()
-        .rev()
-        .take(5)
-        .any(|l| l.contains("ctrl+c to interrupt"))
-    {
-        return Status::Running;
-    }
-
-    // Input prompt ❯ (default skin) or ⚡ (cyberpunk skin) on its own means
-    // the agent finished its turn and is ready for the next message — Idle,
-    // not Waiting (which in AoE means "needs user approval for a dangerous
-    // command"). Placed before scrollback activity words to avoid false-positive
-    // Running from a previous turn.
-    for line in non_empty_lines.iter().rev().take(5) {
-        let clean = strip_ansi(line).trim().to_string();
-        if clean == "❯" || clean.starts_with("❯ ") || clean == "⚡" || clean.starts_with("⚡ ")
-        {
-            return Status::Idle;
-        }
-    }
-
-    // Active streaming lines are prefixed with ┊; check recent lines only
-    // to avoid triggering on scrollback from a completed turn.
-    if non_empty_lines
-        .iter()
-        .rev()
-        .take(10)
-        .any(|l| l.contains("┊"))
-    {
-        return Status::Running;
-    }
-
-    // Thinking verbs from the default skin and community Hermes skins.
-    let activity_indicators = [
-        "reasoning",
-        "pondering",
-        "contemplating",
-        "forging",
-        "plotting",
-        "jacking in",
-        "decrypting",
-        "uploading",
-        "processing",
-        "analyzing",
-        "computing",
-        "evaluating",
-    ];
-    for indicator in &activity_indicators {
-        if last_lines.contains(indicator) {
-            return Status::Running;
-        }
-    }
-
-    // Dangerous-command approval prompt.
-    if contains_approval_prompt(
-        &last_lines,
-        &["choice [o/s/a/d]:", "[o]nce", "dangerous command"],
-    ) {
-        return Status::Waiting;
-    }
-
-    Status::Idle
+    detect_via_manifest("hermes", raw_content, "", None)
 }
 
 /// Kiro CLI status is detected via hooks (JSON-based), not tmux pane parsing.
@@ -1587,51 +1218,7 @@ pub fn detect_prime_agent_status(_content: &str) -> Status {
 }
 
 pub fn detect_gemini_status(raw_content: &str) -> Status {
-    let content = raw_content.to_lowercase();
-    let lines: Vec<&str> = content.lines().collect();
-    let non_empty_lines: Vec<&str> = lines
-        .iter()
-        .filter(|l| !l.trim().is_empty())
-        .copied()
-        .collect();
-
-    let last_lines: String = non_empty_lines
-        .iter()
-        .rev()
-        .take(30)
-        .rev()
-        .copied()
-        .collect::<Vec<&str>>()
-        .join("\n");
-    let last_lines_lower = last_lines.to_lowercase();
-
-    if last_lines_lower.contains("esc to interrupt")
-        || last_lines_lower.contains("ctrl+c to interrupt")
-    {
-        return Status::Running;
-    }
-
-    if has_any_spinner(&lines) {
-        return Status::Running;
-    }
-
-    if contains_approval_prompt(
-        &last_lines_lower,
-        &["execute?", "enter to select", "esc to cancel"],
-    ) {
-        return Status::Waiting;
-    }
-
-    // Gemini's input prompt is a bare `>` with nothing after it, so we don't
-    // share matches_input_prompt (which also fires on `> something` lines).
-    for line in non_empty_lines.iter().rev().take(10) {
-        let clean_line = strip_ansi(line).trim().to_string();
-        if clean_line == ">" {
-            return Status::Waiting;
-        }
-    }
-
-    Status::Idle
+    detect_via_manifest("gemini", raw_content, "", None)
 }
 
 /// Qwen Code status detection via tmux pane parsing.
@@ -1639,144 +1226,11 @@ pub fn detect_gemini_status(raw_content: &str) -> Status {
 /// Gemini's: braille spinner + "esc to interrupt" while working, approval
 /// prompts and a numbered `❯` selection menu while waiting.
 pub fn detect_qwen_status(raw_content: &str) -> Status {
-    let content = raw_content.to_lowercase();
-    let lines: Vec<&str> = content.lines().collect();
-    let non_empty_lines: Vec<&str> = lines
-        .iter()
-        .filter(|l| !l.trim().is_empty())
-        .copied()
-        .collect();
-
-    let last_lines_lower: String = non_empty_lines
-        .iter()
-        .rev()
-        .take(30)
-        .rev()
-        .copied()
-        .collect::<Vec<&str>>()
-        .join("\n");
-
-    if last_lines_lower.contains("esc to interrupt")
-        || last_lines_lower.contains("ctrl+c to interrupt")
-    {
-        return Status::Running;
-    }
-
-    if has_any_spinner(&lines) {
-        return Status::Running;
-    }
-
-    if contains_approval_prompt(
-        &last_lines_lower,
-        &[
-            "execute?",
-            "run command?",
-            "enter to select",
-            "esc to cancel",
-        ],
-    ) {
-        return Status::Waiting;
-    }
-
-    // Numbered selection menu cursor. Qwen renders `›` (U+203A) by default but
-    // also `❯` (U+276F) in some themes; the shared helpers don't cover either.
-    for line in &lines {
-        let trimmed = line.trim();
-        let after_cursor = trimmed
-            .strip_prefix("›")
-            .or_else(|| trimmed.strip_prefix("❯"));
-        if let Some(rest) = after_cursor {
-            let rest = rest.trim_start();
-            if rest.starts_with("1.") || rest.starts_with("2.") || rest.starts_with("3.") {
-                return Status::Waiting;
-            }
-        }
-    }
-
-    if matches_input_prompt(&non_empty_lines, 10, &["qwen>"]) {
-        return Status::Waiting;
-    }
-
-    Status::Idle
+    detect_via_manifest("qwen", raw_content, "", None)
 }
 
 pub fn detect_antigravity_status(raw_content: &str) -> Status {
-    let content = raw_content.to_lowercase();
-    let lines: Vec<&str> = content.lines().collect();
-    let non_empty_lines: Vec<&str> = lines
-        .iter()
-        .filter(|l| !l.trim().is_empty())
-        .copied()
-        .collect();
-
-    let last_lines_lower: String = non_empty_lines
-        .iter()
-        .rev()
-        .take(30)
-        .rev()
-        .copied()
-        .collect::<Vec<&str>>()
-        .join("\n");
-
-    if last_lines_lower.contains("not signed in")
-        || last_lines_lower.contains("signing in")
-        || last_lines_lower.contains("authorization url")
-        || last_lines_lower.contains("authorization code")
-        || last_lines_lower.contains("google sign-in")
-    {
-        return Status::Waiting;
-    }
-
-    // "Approval Required" is the actual header Antigravity renders above tool
-    // permission prompts. The substring "approve" does NOT appear in
-    // "approval", so the base contains_approval_prompt list misses it; match
-    // explicitly. "deny access" is the rejection button rendered alongside.
-    // "awaiting user approval" is the status line shown while the agent is
-    // blocked on the user's decision.
-    if last_lines_lower.contains("approval required")
-        || last_lines_lower.contains("awaiting user approval")
-        || last_lines_lower.contains("deny access")
-    {
-        return Status::Waiting;
-    }
-
-    if contains_approval_prompt(
-        &last_lines_lower,
-        &[
-            "permission request",
-            "do you trust the contents",
-            "yes, i trust this folder",
-            "execute?",
-            "run command?",
-            "enter to select",
-            "enter confirm",
-            "esc to cancel",
-        ],
-    ) {
-        return Status::Waiting;
-    }
-
-    if last_lines_lower.contains("esc to interrupt")
-        || last_lines_lower.contains("ctrl+c to interrupt")
-        || last_lines_lower.contains("ctrl+c to stop")
-    {
-        return Status::Running;
-    }
-
-    if has_any_spinner(&lines) {
-        return Status::Running;
-    }
-
-    if non_empty_lines
-        .iter()
-        .rev()
-        .take(10)
-        .any(|line| has_live_activity_word(line))
-    {
-        return Status::Running;
-    }
-
-    Status::Idle
+    detect_via_manifest("antigravity", raw_content, "", None)
 }
 
 #[cfg(test)]
