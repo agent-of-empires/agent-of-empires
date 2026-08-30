@@ -2130,22 +2130,15 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
         })
     };
     let starts_with_symbolic_frame = |line: &str| {
-        let Some((frame, _)) = line.trim_start().split_once(' ') else {
+        let Some((frame, message)) = line.trim_start().split_once(' ') else {
             return false;
         };
         const RESERVED_PREFIXES: &[&str] =
             &["•", "\u{f111}", "※", "❯", "\u{f054}", "│", "┃", "▏", "▎"];
-        if frame.is_empty() || RESERVED_PREFIXES.contains(&frame) {
-            return false;
-        }
-        let mut has_non_ascii = false;
-        for ch in frame.chars() {
-            if ch.is_alphanumeric() {
-                return false;
-            }
-            has_non_ascii |= !ch.is_ascii();
-        }
-        has_non_ascii
+        !frame.is_empty()
+            && !RESERVED_PREFIXES.contains(&frame)
+            && (!frame.chars().all(char::is_alphanumeric)
+                || has_live_activity_word(&message.to_lowercase()))
     };
 
     let has_hint_marker = |line: &str| {
@@ -2358,7 +2351,14 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
             .map(UnicodeWidthStr::width)
             .max()
             .unwrap_or_default();
-        let icon_only_loader = ["⎋", "󱊷", "esc"].contains(&clean.lines().nth(line_index)?.trim());
+        let loader_body = clean.lines().nth(line_index)?.trim();
+        let icon_only_loader = ["⎋", "󱊷", "esc"].contains(&loader_body)
+            || (!loader_body.is_empty()
+                && loader_body.split_whitespace().count() == 1
+                && clean
+                    .lines()
+                    .nth(line_index + 1)
+                    .is_some_and(|next| has_live_activity_word(&next.trim().to_lowercase())));
         let mut previous_line_width = UnicodeWidthStr::width(clean.lines().nth(line_index)?);
         let continuation_spaces = usize::from(loader_spaces > 1);
         let mut saw_gap = false;
@@ -2618,12 +2618,24 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
                     })
                 });
                 let has_builtin_interrupt = builtin_interrupt.is_some();
-                let icon_only_continues = builtin_interrupt == Some(true)
-                    && clean.lines().nth(*line_index + 1).is_some_and(|next| {
-                        !next.trim().is_empty()
-                            && next.len() - next.trim_start_matches(' ').len()
-                                == usize::from(leading_spaces > 1)
-                    });
+                if has_builtin_interrupt && leading_spaces > 2 {
+                    return None;
+                }
+                let next_line = clean.lines().nth(*line_index + 1);
+                let continuation_indent = usize::from(leading_spaces > 1);
+                let continuation_matches = next_line.is_some_and(|next| {
+                    !next.trim().is_empty()
+                        && next.len() - next.trim_start_matches(' ').len() == continuation_indent
+                });
+                let builtin_icon_only_continues =
+                    builtin_interrupt == Some(true) && continuation_matches;
+                let custom_icon_only_continues = !has_builtin_interrupt
+                    && !body.is_empty()
+                    && body.split_whitespace().count() == 1
+                    && continuation_matches
+                    && next_line
+                        .is_some_and(|next| has_live_activity_word(&next.trim().to_lowercase()));
+                let icon_only_continues = builtin_icon_only_continues || custom_icon_only_continues;
                 let has_custom_activity = body.split_once(' ').is_some_and(|(icon, message)| {
                     let next_non_empty_is_band_bottom = clean
                         .lines()
@@ -2641,6 +2653,7 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
                         || ((icon.chars().count() > 1 || next_non_empty_is_band_bottom)
                             && has_live_activity_word(&message.to_lowercase()))
                 });
+                let has_custom_interrupt = has_custom_activity || custom_icon_only_continues;
                 let has_later_parked_surface = clean
                     .lines()
                     .enumerate()
@@ -2676,10 +2689,24 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
                         .skip(*line_index + 1)
                         .filter(|(_, candidate)| !candidate.trim().is_empty());
                     rows.next().and_then(|(_, top)| {
-                        rows.next().and_then(|(bottom_index, bottom)| {
-                            (UnicodeWidthStr::width(top) >= 8
+                        let has_edge_chrome = |row: &str| {
+                            let mut chars = row.trim().chars();
+                            chars.next();
+                            chars.next_back();
+                            let left = chars.next();
+                            let right = chars.next_back();
+                            left.is_some_and(|ch| !ch.is_alphanumeric() && !ch.is_whitespace())
+                                && right
+                                    .is_some_and(|ch| !ch.is_alphanumeric() && !ch.is_whitespace())
+                        };
+                        rows.find_map(|(bottom_index, bottom)| {
+                            (composer_kind(top) == 0
+                                && composer_kind(bottom) == 0
+                                && has_edge_chrome(top)
+                                && has_edge_chrome(bottom)
+                                && UnicodeWidthStr::width(top) >= 8
                                 && UnicodeWidthStr::width(top) == UnicodeWidthStr::width(bottom)
-                                && is_structural_custom_bottom(bottom))
+                                && is_custom_box_bottom(bottom))
                             .then_some((true, false, bottom_index))
                         })
                     })
@@ -2754,7 +2781,7 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
                     .lines()
                     .nth(*line_index + 1)
                     .is_some_and(|line| line.trim().is_empty());
-                if (has_builtin_interrupt || has_custom_activity)
+                if (has_builtin_interrupt || has_custom_interrupt)
                     && !activity_timer
                     && has_inactive_elapsed
                     && detached_from_loader
@@ -2764,7 +2791,7 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
                 ((activity_timer && (leading_spaces >= 2 || has_builtin_interrupt))
                     || (layout
                         && (leading_spaces >= 2 || icon_only_continues)
-                        && (has_builtin_interrupt || has_custom_activity)))
+                        && (has_builtin_interrupt || has_custom_interrupt)))
                     .then_some(loader_window.len() - i)
             });
     if let Some(pos) = v18_loader_pos {
@@ -2773,15 +2800,17 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
     // Retry countdown: fixed live region above the prompt (window 6). (a)
     // single-line match; (b) if none, the window joined with single spaces so
     // a character-wrap cut between tokens still matches.
-    let last_banner_anchor = clean
-        .lines()
-        .enumerate()
-        .filter_map(|(index, line)| {
-            line.to_lowercase()
-                .contains(OMP_BANNER_DISMISSAL_ANCHOR)
-                .then_some(index)
+    let find_wrapped_banner_anchor_end = |lines: &[&str]| {
+        (0..lines.len()).rev().find(|end| {
+            let earliest = end.saturating_sub(2);
+            (earliest..=*end).any(|start| {
+                let joined = lines[start..=*end].join(" ").to_lowercase();
+                collapse_ascii_whitespace(&joined).contains(OMP_BANNER_DISMISSAL_ANCHOR)
+            })
         })
-        .last();
+    };
+    let pane_lines: Vec<&str> = clean.lines().collect();
+    let last_banner_anchor = find_wrapped_banner_anchor_end(&pane_lines);
     let error_banner_bottom = last_banner_anchor.and_then(|anchor_index| {
         clean
             .lines()
@@ -2841,10 +2870,8 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
     }
 
     // Pinned error banner anchor and terminal retry lines: window 6.
-    if let Some(pos) = lowest_matching_line(window6, |l| {
-        l.to_lowercase().contains(OMP_BANNER_DISMISSAL_ANCHOR)
-    }) {
-        consider(pos, OmpSignal::Anchor);
+    if let Some(index) = find_wrapped_banner_anchor_end(window6) {
+        consider(window6.len() - index, OmpSignal::Anchor);
     }
     if let Some(pos) = lowest_matching_line(window6, |l| {
         let l = l.to_lowercase();
@@ -2953,7 +2980,7 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
             return false;
         }
         let lower = line.to_lowercase();
-        ["approve and exec", "approve and comp", "approve and keep"]
+        ["approve an", "refine plan", "save and"]
             .iter()
             .filter_map(|prefix| lower.find(prefix))
             .any(|position| !lower[..position].trim_matches(['│', '|', ' ']).is_empty())
@@ -2964,34 +2991,35 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
     let has_plan_options = ["approve and execute", "refine plan", "save and quit"]
         .iter()
         .all(|expected| window12.iter().any(|line| is_panel_option(line, expected)));
-    let full_plan_footer_pos = lowest_matching_line(window12, |line| {
-        is_panel_row(line) && line.to_lowercase().contains("tab regions")
-    });
     let has_plan_title = window12
         .iter()
-        .any(|line| is_panel_row(line) && line.to_lowercase().contains("plan mode - next"));
-    let narrow_plan_footer_pos = lowest_matching_line(window12, |line| {
+        .any(|line| line.to_lowercase().contains("plan mode -"));
+    let plan_footer_pos = lowest_matching_line(window12, |line| {
         if !is_panel_row(line) {
             return false;
         }
         let lower = line.to_lowercase();
-        lower.contains("↑↓ select") && (lower.contains('⏎') || lower.contains("confirm"))
+        lower.contains("tab regions")
+            || lower.contains("enter save") && lower.contains("esc cancel")
+            || lower.contains("↑↓ select")
+            || lower.contains("↑↓ section")
     });
-    let plan_footer_pos = if has_plan_options {
-        full_plan_footer_pos
-    } else if has_plan_title {
-        narrow_plan_footer_pos
-    } else {
-        None
-    };
-    if has_selected_option {
+    let has_plan_structure = (has_plan_options && (has_selected_option || has_plan_title))
+        || (has_plan_title && has_selected_option);
+    if has_plan_structure {
         if let Some(pos) = plan_footer_pos {
             consider(pos, OmpSignal::Approval);
         }
     }
-
-    // Ask dialog footer phrases count only on a bordered dialog row.
-    if let Some(pos) = lowest_matching_line(window8, |line| {
+    let has_ask_title = window12.iter().any(|line| {
+        let lower = line.to_lowercase();
+        lower.contains(" ask ")
+            && (!is_panel_row(line) || lower.trim_start().starts_with("+- ask"))
+            && line
+                .chars()
+                .any(|ch| !ch.is_alphanumeric() && !ch.is_whitespace())
+    });
+    let ask_footer_pos = lowest_matching_line(window8, |line| {
         let trimmed = line.trim();
         let inner = trimmed.chars().next().and_then(|border| {
             trimmed
@@ -3000,17 +3028,30 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
         });
         let Some(inner) = inner else { return false };
         let lower = inner.trim().to_lowercase();
-        let has_select_hint = lower.strip_prefix("enter select ·").is_some_and(|tail| {
-            let tail = tail.trim();
-            let truncated = tail.strip_suffix('…').unwrap_or(tail).trim();
-            tail.starts_with("n note") || "n note".starts_with(truncated)
-        });
-        has_select_hint
-            || lower.contains("space toggle · enter ")
-            || lower.contains("enter submit · ↑/↓ scroll")
+        lower.starts_with("enter select")
+            || lower.starts_with("space toggle")
+            || lower.starts_with("enter submit")
             || lower.contains("current prompt to answer")
-    }) {
-        consider(pos, OmpSignal::Approval);
+    });
+    if has_ask_title {
+        if let Some(pos) = ask_footer_pos {
+            consider(pos, OmpSignal::Approval);
+        }
+    }
+
+    let has_nested_ask_title = window12.iter().any(|line| {
+        let lower = line.to_lowercase();
+        lower.contains("note for ") || lower.contains("custom answer:")
+    });
+    if has_nested_ask_title {
+        if let Some(pos) = lowest_matching_line(window8, |line| {
+            let lower = line.to_lowercase();
+            is_panel_row(line)
+                && lower.contains("enter or ctrl+q submit")
+                && lower.contains("esc cancel")
+        }) {
+            consider(pos, OmpSignal::Approval);
+        }
     }
 
     // Sub-agent retry labels and rule-repair progress: window 12.
@@ -7676,7 +7717,7 @@ Working…
     #[test]
     fn test_detect_omp_status_waiting_on_ask_dialog() {
         // The built-in ask tool swaps its dialog into the composer slot and
-        // blocks the turn; the footer hint rows are the stable anchor.
+        // blocks the turn; the Ask title plus footer identifies that surface.
         let cases = [
             // Single-select footer.
             "\
@@ -7693,16 +7734,19 @@ Working…
 ╰──────────────────────────────────────────────╯",
             // ASCII dialog footer.
             "\
++- Ask ----------------------------------------+
 | Space toggle · Enter next · ↑/↓ move · Esc   |
 +----------------------------------------------+",
             // Nerd uses the same unicode box border as the unicode preset.
             "\
+╭─ Ask ────────────────────────────────────────╮
 │ Enter submit · ↑/↓ scroll · Esc              │
 ╰──────────────────────────────────────────────╯",
             // Input-guard footer: shown while a composer draft exists.
             "\
+╭─ Ask ───────────────────────────────────────────────────╮
 │ Finish or clear the current prompt to answer · Esc cancel │
-╰──────────────────────────────────────────────╯",
+╰─────────────────────────────────────────────────────────╯",
             "\
 ╭─ Ask ────────────────╮
 │ Which database?      │
@@ -7711,7 +7755,7 @@ Working…
 │   SQLite             │
 │ Enter select · n not │
 ╰──────────────────────╯",
-            "│ Enter select · … │\n╰──────────────────╯",
+            "╭─ Ask ──────────╮\n│ Enter select · … │\n╰──────────────────╯",
         ];
         for (i, pane) in cases.iter().enumerate() {
             assert_eq!(detect_omp_status(pane), Status::Waiting, "case {i}");
@@ -7835,6 +7879,90 @@ Working…
         for pane in &cases {
             assert_eq!(detect_omp_status(pane), Status::Idle, "case: {pane:?}");
         }
+    }
+
+    #[test]
+    fn test_detect_omp_status_second_fresh_review_regressions() {
+        let cases = [
+            (
+                "right-aligned idle title starts with interrupt icon",
+                "          ⎋ Notes\n π > GPT-5.6 Sol\n╰─",
+                Status::Idle,
+            ),
+            (
+                "wrapped pinned-error dismissal anchor",
+                "────────────────────────────\n ✖ Output blocked by content\n filtering policy\n Dismissed when you send your\n next message.\n────────────────────────────\n╭── π ─╮\n╰─ ─╯",
+                Status::Error,
+            ),
+            (
+                "Ask note editor",
+                "╭─ Note for PostgreSQL: Which database? ─╮\n│ >                                              │\n│ enter or ctrl+q submit  esc cancel  ctrl+g external editor │\n╰────────────────────────────────────────────────╯",
+                Status::Waiting,
+            ),
+            (
+                "Ask custom-answer editor",
+                "╭─ Custom answer: Which database? ───────╮\n│ >                                              │\n│ enter or ctrl+q submit  esc cancel  ctrl+g external editor │\n╰────────────────────────────────────────────────╯",
+                Status::Waiting,
+            ),
+            (
+                "Plan Review annotation editor",
+                "│ Plan mode - next step                                      │\n│ ❯ Approve and execute                                      │\n│   Approve and compact context                              │\n│   Approve and keep context                                 │\n│   Refine plan                                              │\n│   Save and quit                                            │\n│ Annotate ‹Implementation›                                  │\n│ >                                                          │\n│ enter save · esc cancel                                    │\n╰────────────────────────────────────────────────────────────╯",
+                Status::Waiting,
+            ),
+            (
+                "Plan Review at seventeen columns",
+                "╭─ Plan ───────╮\n│ Plan mode - … │\n│ ❯ Approve an… │\n│   Approve an… │\n│   Refine plan │\n│   Save and q… │\n│ ↑↓ select · … │\n╰───────────────╯",
+                Status::Waiting,
+            ),
+            (
+                "Ask footer at seventeen columns",
+                "╭─ Ask ─────────╮\n│ Database?     │\n│ ❯ PostgreSQL  │\n│   SQLite      │\n│ Enter select… │\n╰───────────────╯",
+                Status::Waiting,
+            ),
+            (
+                "18.0.9 alphanumeric custom activity frame",
+                " X Working… ⟦esc⟧\n╭── π ─╮\n╰─ ─╯",
+                Status::Running,
+            ),
+            (
+                "18.0.9 punctuation custom activity frame",
+                " . Working… ⟦esc⟧\n╭── π ─╮\n╰─ ─╯",
+                Status::Running,
+            ),
+            (
+                "custom persistent time icon under stale loader",
+                "  ⎋ Working…\nDone.\n╭── ⌛ 5m ─╮\n╰─       ─╯",
+                Status::Idle,
+            ),
+            (
+                "multiline custom-border composer",
+                "  ⎋ Working…\n\nA===============B\nV first line    V\nC= second line =D",
+                Status::Running,
+            ),
+            (
+                "Plan Review with hidden cursor symbol",
+                "│ Plan mode - next step                                      │\n│   Approve and execute                                      │\n│   Approve and compact context                              │\n│   Approve and keep context                                 │\n│   Refine plan                                              │\n│   Save and quit                                            │\n│ ↑↓ select · ⏎ confirm · tab regions · esc cancel          │\n╰────────────────────────────────────────────────────────────╯",
+                Status::Waiting,
+            ),
+            (
+                "boxed editor draft containing complete Ask hint",
+                "╭── π > GPT-5.6 Sol ─────────────────────╮\n│ Enter select · n note while documenting the UI │\n│ second draft line                              │\n╰────────────────────────────────────────────────╯",
+                Status::Idle,
+            ),
+            (
+                "wrapped one-character custom interrupt icon",
+                "  !\n Working…\n\n╭── π ─╮\n╰─ ─╯",
+                Status::Running,
+            ),
+        ];
+        let failures: Vec<_> = cases
+            .into_iter()
+            .filter_map(|(name, pane, expected)| {
+                let actual = detect_omp_status(pane);
+                (actual != expected).then_some((name, actual, expected))
+            })
+            .collect();
+        assert!(failures.is_empty(), "mismatches: {failures:?}");
     }
 
     #[test]
