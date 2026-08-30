@@ -1572,6 +1572,49 @@ impl Drop for PaneMetaCacheGuard {
     }
 }
 
+/// Test-only owner for a held [`AGENT_PROBE_LOCK`] guard plus the worker that
+/// is blocked on it. `Drop` releases the lock and then joins, so a panicking
+/// assertion cannot detach the worker and let it clear the memo after
+/// [`AgentAvailabilityGuard`] has restored it. Declare it after that guard so
+/// it drops first.
+#[cfg(test)]
+pub(crate) struct BlockedProbeWorker<'a> {
+    guard: Option<std::sync::MutexGuard<'a, ()>>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[cfg(test)]
+impl<'a> BlockedProbeWorker<'a> {
+    pub(crate) fn new(
+        guard: std::sync::MutexGuard<'a, ()>,
+        handle: std::thread::JoinHandle<()>,
+    ) -> Self {
+        Self {
+            guard: Some(guard),
+            handle: Some(handle),
+        }
+    }
+
+    /// Release the lock and wait for the worker, so assertions after this run
+    /// against a settled memo. Idempotent; `Drop` is then a no-op.
+    pub(crate) fn release_and_join(&mut self) {
+        drop(self.guard.take());
+        if let Some(handle) = self.handle.take() {
+            handle.join().expect("probe worker");
+        }
+    }
+}
+
+#[cfg(test)]
+impl Drop for BlockedProbeWorker<'_> {
+    fn drop(&mut self) {
+        drop(self.guard.take());
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 /// Test-only RAII guard for tests that seed [`AGENT_AVAILABILITY`] into a known
 /// state. Same shape and reason as [`SessionCacheGuard`]: the memo is
 /// process-global, so a mid-test panic must not leak a seeded entry into a
@@ -2506,14 +2549,17 @@ mod tests {
         assert!(memo.is_populated(), "seeded memo");
 
         // Stand in for a probe mid-login-shell: holds the probe lock, has not
-        // written its results yet.
-        let probe_guard = AGENT_PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        // written its results yet. Declared after `memo` so it drops first,
+        // joining the worker before the memo is restored even on a panic.
         let (tx, rx) = std::sync::mpsc::channel::<&'static str>();
-        let invalidating = std::thread::spawn(move || {
-            tx.send("entered").expect("test receiver alive");
-            invalidate_agent_availability();
-            tx.send("returned").expect("test receiver alive");
-        });
+        let mut worker = BlockedProbeWorker::new(
+            AGENT_PROBE_LOCK.lock().unwrap_or_else(|e| e.into_inner()),
+            std::thread::spawn(move || {
+                tx.send("entered").expect("test receiver alive");
+                invalidate_agent_availability();
+                tx.send("returned").expect("test receiver alive");
+            }),
+        );
 
         // Blocks until the thread is definitely running, so the assertion
         // below cannot pass merely because it never got scheduled.
@@ -2534,11 +2580,8 @@ mod tests {
             "and the memo still stands while it waits"
         );
 
-        // Released and joined before `memo` drops, so the worker cannot write
-        // the memo after the guard has restored it.
-        drop(probe_guard);
+        worker.release_and_join();
         assert_eq!(rx.recv().expect("invalidate completes"), "returned");
-        invalidating.join().expect("invalidate thread");
         assert!(
             !memo.is_populated(),
             "invalidate must clear once the in-flight probe releases the lock"
