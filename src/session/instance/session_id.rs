@@ -46,6 +46,10 @@ impl Instance {
             ResumeIntent::Cleared => {
                 self.agent_session_id = None;
                 self.resume_probe_failed_sid = None;
+                // The transcript belonged to the conversation being dropped.
+                // `pi_resumable_transcript` would refuse it on the id check
+                // anyway; not carrying it is one less thing depending on that.
+                self.pi_session_path = None;
                 let session_id = self.fresh_launch_session_id(mint_fresh_id);
                 if let Some(ref id) = session_id {
                     self.agent_session_id = Some(id.clone());
@@ -955,6 +959,27 @@ mod tests {
         assert_eq!(
             inst.try_retroactive_capture().as_deref(),
             Some("11111111-2222-3333-4444-555555555555")
+        );
+    }
+
+    #[test]
+    fn clearing_the_conversation_drops_its_transcript_path() {
+        let mut inst = Instance::new("pi-clear", "/tmp/pi-clear");
+        inst.tool = "pi".to_string();
+        inst.agent_session_id = Some("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa".to_string());
+        inst.pi_session_path = Some(
+            "/store/2026-01-01T00-00-00-000Z_aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa.jsonl"
+                .to_string(),
+        );
+        inst.resume_intent = ResumeIntent::Cleared;
+
+        let (sid, is_existing) = inst.acquire_session_id_with(&|_| None);
+
+        assert_eq!(sid, None, "no pin without a mint seam");
+        assert!(!is_existing);
+        assert_eq!(
+            inst.pi_session_path, None,
+            "the dropped conversation's transcript must not linger"
         );
     }
 

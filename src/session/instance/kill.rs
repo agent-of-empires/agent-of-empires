@@ -346,6 +346,59 @@ impl Instance {
 mod tests {
     #[test]
     #[serial_test::serial(hook_base)]
+    fn pi_stop_persists_a_conversation_published_long_ago() {
+        // An idle pane's `/new` can be hours old by the time it stops. The
+        // freshness window that guards a resume must not apply to the last
+        // read before the sidecar is deleted.
+        let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_app_dir_at(home.path());
+
+        let profile = "pi-sidecar-stale";
+        let mut inst = Instance::new("pi-stale", "/tmp/pi-stale");
+        inst.source_profile = profile.to_string();
+        inst.tool = "pi".to_string();
+        inst.agent_session_id = Some("22f13307-461c-4161-908e-95a247fac750".to_string());
+        inst.mark_pi_extension_launched_for_test();
+
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        let seed = inst.clone();
+        storage
+            .update(|instances, _| {
+                *instances = vec![seed.clone()];
+                Ok(())
+            })
+            .unwrap();
+
+        let published = "01a0538e-5868-7c22-84bc-40cfd7a09ab1";
+        crate::hooks::write_session_id_via_guard(&inst.id, published).unwrap();
+        let sidecar = crate::hooks::ensure_instance_dir_path(&inst.id)
+            .unwrap()
+            .join("session_id");
+        let hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(6 * 3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&sidecar)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(hours_ago))
+            .unwrap();
+        assert_eq!(
+            crate::hooks::read_hook_session_id(&inst.id),
+            None,
+            "the fixture must be past the freshness window"
+        );
+
+        inst.flush_pi_sidecar_conversation(&storage);
+
+        assert_eq!(
+            storage.load().unwrap()[0].agent_session_id.as_deref(),
+            Some(published),
+            "a stale sidecar is still the pane's own last word"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial(hook_base)]
     fn pi_stop_persists_the_conversation_the_extension_published() {
         // A `/new` inside a CLI-launched pane is observed by nobody: no poller
         // outlives the CLI, and the instance dir is cleaned up at stop. The

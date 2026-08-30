@@ -7,10 +7,8 @@ impl Instance {
     /// resume strategy to capture for, and its conversation is not already
     /// known.
     ///
-    /// Pi is the second clause (see `capture_pi_session_id` for why its store
-    /// cannot attribute one): once the id is known, a scan can only
-    /// propose someone else's, and a `/new` in the pane is the price. Host and
-    /// sandbox alike, one `~/.pi/sandbox` being bound into every pi container.
+    /// Pi polls its sidecar or nothing: the pane publishes its own
+    /// conversation, and a store keyed by cwd cannot say which pane owns what.
     /// Reads memory only: this runs per session on every TUI refresh.
     pub fn supports_session_poller(&self) -> bool {
         // Pi polls only what names a pane. Without the extension there is
