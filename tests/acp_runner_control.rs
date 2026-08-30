@@ -17,6 +17,7 @@
 #![cfg(feature = "serve")]
 
 use std::io::{Read, Write};
+use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
@@ -221,6 +222,80 @@ fn runner_reports_native_prompt_complete_over_control_socket() {
 
     let _ = child.kill();
     let _ = child.wait();
+}
+
+#[test]
+fn runner_accepts_next_relay_after_outbound_half_close() {
+    if cfg!(not(unix)) {
+        return;
+    }
+    let scratch = Scratch::new("half");
+    let home = scratch.0.join("home");
+    let xdg = scratch.0.join("xdg");
+    std::fs::create_dir_all(&home).unwrap();
+    std::fs::create_dir_all(&xdg).unwrap();
+
+    let session_id = "shalf001";
+    let workers = app_dir(&home, &xdg).join("acp-workers");
+    let socket = workers.join(format!("{session_id}.sock"));
+    let record = workers.join(format!("{session_id}.json"));
+    let bin = env!("CARGO_BIN_EXE_aoe");
+    let _child = KillOnDrop(
+        Command::new(bin)
+            .args([
+                "__acp-runner",
+                "--socket",
+                socket.to_str().unwrap(),
+                "--session-id",
+                session_id,
+                "--agent-name",
+                "fake-agent",
+                "--cwd",
+                home.to_str().unwrap(),
+                "--",
+                "/bin/cat",
+            ])
+            .env("HOME", &home)
+            .env("XDG_CONFIG_HOME", &xdg)
+            .env("AOE_ACP_WATCHDOG_POLL_MS", "150")
+            .spawn()
+            .expect("spawn acp runner"),
+    );
+
+    wait_for(&record, "registry record");
+    wait_for(&socket, "relay socket");
+
+    let mut first = UnixStream::connect(&socket).expect("connect first relay");
+    first
+        .shutdown(Shutdown::Read)
+        .expect("half-close first relay input");
+    let failed_line = b"{\"jsonrpc\":\"2.0\",\"method\":\"half-close\"}\n";
+    first.write_all(failed_line).expect("write first relay");
+    first.flush().expect("flush first relay");
+
+    // Keep `first` and therefore its daemon -> runner write side open. The
+    // runner must still leave that connection after cat's echo fails, accept
+    // this relay, replay the complete failed line, and carry new traffic.
+    let mut second = UnixStream::connect(&socket).expect("connect second relay");
+    second
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let fresh_line = b"{\"jsonrpc\":\"2.0\",\"method\":\"fresh\"}\n";
+    second.write_all(fresh_line).expect("write second relay");
+    second.flush().expect("flush second relay");
+
+    let mut received = Vec::new();
+    let mut byte = [0u8; 1];
+    while !received.ends_with(fresh_line) {
+        second
+            .read_exact(&mut byte)
+            .expect("read replay and fresh echo");
+        received.push(byte[0]);
+    }
+    assert!(
+        received.starts_with(failed_line),
+        "failed outbound line must be replayed intact: {received:?}"
+    );
 }
 
 /// Write a length-prefixed control frame (4-byte big-endian length, then

@@ -34,7 +34,7 @@ const SCRIPT = {
         // Long enough that the navigate-away + navigate-back cycle
         // below completes while turn 1 is still in flight, but well
         // under any 10s idle watchdog in the structured view supervisor (see
-        // `RESUME_IDLE_GRACE_DEFAULT` in src/acp/acp_client.rs).
+        // `RESUME_IDLE_GRACE_DEFAULT` in src/acp/acp_client/connection.rs).
         { sessionUpdate: "wait_ms", ms: 6_000 },
       ],
       stopReason: "end_turn",

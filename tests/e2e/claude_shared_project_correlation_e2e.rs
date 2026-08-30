@@ -28,7 +28,7 @@
 //! the CLI process that launches the session exits right after, so its poller
 //! dies with it. The native TUI is the long-lived host used here: on startup it
 //! starts a poller for every already-live session it loads
-//! (`HomeView::new`, `src/tui/home/mod.rs`), one at a time, and its tick drains
+//! (`HomeView::new`, `src/tui/home/lifecycle.rs`), one at a time, and its tick drains
 //! each observation to disk.
 //!
 //! Sessions are created with `aoe add` and launched with `aoe session start`
@@ -334,7 +334,7 @@ impl Drop for HookDirCleanup {
 
 /// Persist `uuid` as the session's `agent_session_id` in sessions.json. Used to
 /// seed an established peer: on load the poller host republishes
-/// `AOE_CAPTURED_SESSION_ID` from `agent_session_id` (`src/tui/home/mod.rs`)
+/// `AOE_CAPTURED_SESSION_ID` from `agent_session_id` (`src/tui/home/lifecycle.rs`)
 /// before it starts any poller, so a co-located filesystem-scan session excludes this
 /// peer's id from its very first poll. Without this, the peer's own poller only
 /// publishes its captured id AFTER observing it, racing the filesystem-scan session; a

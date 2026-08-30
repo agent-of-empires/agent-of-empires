@@ -80,7 +80,7 @@ test.describe("edit card diff scroll", () => {
 // read it.
 //
 // A tool_call frame renders the card, then a failed completion frame
-// carries the error text. `src/acp/acp_client.rs` maps the failed
+// carries the error text. `src/acp/acp_client/update_events.rs` maps the failed
 // update to a tool_error row, so the web `statusFor` resolves to "err"
 // and the card opens on its own. Clicking the header collapses the rose
 // error block; clicking again re-expands it.

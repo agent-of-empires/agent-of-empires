@@ -1993,7 +1993,7 @@ impl<S: BroadcastSink> Supervisor<S> {
                 loop {
                     // Tracks whether the connection task ended because the
                     // cancel-escalation watchdog declared the agent
-                    // unresponsive (see acp_client.rs's CANCEL_ESCALATION_GRACE)
+                    // unresponsive (see acp_client/connection.rs's CANCEL_ESCALATION_GRACE)
                     // OR because the silent-orphan watchdog detected the
                     // adapter dropped PromptResponse (see #1240). Both
                     // failure modes need the same recovery: SIGTERM the

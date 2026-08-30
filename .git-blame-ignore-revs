@@ -11,3 +11,12 @@
 # instance.rs split into src/session/instance/
 # Only helps files that predate it: use `git blame -C -C` inside the new modules.
 7f0fb177140efe82e2390991e22a322eecd6ea76
+
+# acp_client.rs split into src/acp/acp_client/
+f197ae07c9c64fcec1520948266e4b4f98cd23a0
+
+# server/mod.rs split into per-concern modules under src/server/
+8827701d98ad839c31a17d6b0f962504417b0348
+
+# tui/home/mod.rs split into per-concern modules under src/tui/home/
+d649c3d9d70637f2105c3f6cf99fb144895aea39

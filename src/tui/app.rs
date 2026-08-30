@@ -2174,7 +2174,7 @@ impl App {
     /// (mirroring the serve deferred-clear).
     fn build_telemetry_snapshot(&self) -> Option<crate::telemetry::UsageSnapshot> {
         // Boundary snapshot: `build_usage_snapshot` takes `&[Instance]`
-        // (shared API with the daemon caller in `src/server/mod.rs`).
+        // (shared API with the daemon caller in `src/server/serve_snapshot.rs`).
         let instances: Vec<crate::session::Instance> = self.home.instances().cloned().collect();
         crate::telemetry::build_usage_snapshot(
             crate::telemetry::Surface::Tui,
@@ -3369,7 +3369,7 @@ impl App {
         };
         let now = chrono::Utc::now();
         // Boundary snapshot: `idle_reap_candidates` takes `&[Instance]`
-        // (shared API with the daemon caller in `src/server/mod.rs`).
+        // (shared API with the daemon caller in `src/server/idle_reap.rs`).
         let instances: Vec<crate::session::Instance> = self.home.instances().cloned().collect();
         let candidates = crate::session::idle_reap::idle_reap_candidates(
             &instances,

@@ -24,7 +24,7 @@ pub struct AgentSpec {
     /// `aoe acp agents`.
     pub description: String,
     /// Provider env vars forwarded to this agent on top of the infrastructure
-    /// inheritance set defined by `ALWAYS_FORWARD_ENV` in `acp_client.rs`.
+    /// inheritance set defined by `ALWAYS_FORWARD_ENV` in `acp_client/spawn.rs`.
     /// `None` means no ambient provider credentials. Populated by
     /// `default_env_allowlist` for built-in adapters via
     /// `install_hints::env_allowlist_for`; a custom `from_acp_cmd` spec leaves
