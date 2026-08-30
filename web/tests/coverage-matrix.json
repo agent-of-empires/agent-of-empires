@@ -345,7 +345,7 @@
       "kind": "live-playwright",
       "risk": "high",
       "specs": ["tests/live/auth-token-rotation.spec.ts"],
-      "components": ["src/server/mod.rs"]
+      "components": ["src/server/token.rs"]
     },
     {
       "id": "settings.theme-persistence",
@@ -2264,7 +2264,7 @@
         "src/acp/acp_client.rs",
         "src/acp/agent_profiles.rs",
         "src/acp/supervisor.rs",
-        "src/server/mod.rs",
+        "src/server/acp_events.rs",
         "src/server/session_service.rs"
       ]
     },

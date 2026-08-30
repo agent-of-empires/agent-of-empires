@@ -3456,7 +3456,7 @@ impl HomeView {
 
                     // One flock for both the status/timestamp patch and the
                     // unread mark, matching the daemon's per-tick batching
-                    // shape (server/mod.rs's status_poll_loop) instead of
+                    // shape (server/status_poll.rs's status_poll_loop) instead of
                     // two separate Storage::update calls on the same row.
                     self.persist_passive_status_transition(&update.id, should_mark_unread);
                     if should_mark_unread {
@@ -3747,7 +3747,7 @@ impl HomeView {
             .any(|i| i.session_id_poller.is_some())
         {
             // `drain_and_persist_session_ids` takes `&mut [Instance]` and is
-            // shared with `src/server/mod.rs`. Snapshot into a `Vec` at the
+            // shared with `src/server/session_identity.rs`. Snapshot into a `Vec` at the
             // boundary, then re-`insert` touched ids back into the map;
             // `IndexMap::insert` on an existing key updates in place,
             // preserving position. The full-object re-insert is sound here
@@ -7052,7 +7052,7 @@ impl HomeView {
         // daemon boot by `seed_acp_statuses`, and the daemon's own passive
         // writer gates the patch on exactly this predicate
         // (`decide_passive_transition` returns `patch: None` for
-        // `is_structured()`, `server/mod.rs`). Persisting it here would strand a
+        // `is_structured()`, `server/status_poll.rs`). Persisting it here would strand a
         // row at `Running` or `Error` with no producer left to heal it once the
         // daemon is gone, since the tmux poller now bails on structured rows
         // (`status_poller.rs`); this is the #3201 regression from #3170.
