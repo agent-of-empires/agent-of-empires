@@ -423,7 +423,8 @@ pub struct AcpConfig {
     )]
     pub offer_structured_in_new_session: bool,
     /// Acp agent used when --agent is not specified (e.g. claude-code,
-    /// codex, aoe-agent).
+    /// codex). Must name an agent that can start: `aoe-agent` is not
+    /// packaged yet (#3553).
     #[serde(default = "default_agent")]
     #[setting(label = "Default agent", widget = "text", validate = "nonempty")]
     pub default_agent: String,

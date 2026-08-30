@@ -147,7 +147,7 @@ pub struct AddArgs {
     #[arg(long = "agent")]
     agent: Option<String>,
 
-    /// Override the model used by aoe-agent (e.g., claude-opus-4-7,
+    /// Override the model used by the ACP agent (e.g., claude-opus-4-7,
     /// gpt-5, gemini-2.5-pro). Forwarded to the agent at session start.
     #[cfg(feature = "serve")]
     #[arg(long = "model")]
