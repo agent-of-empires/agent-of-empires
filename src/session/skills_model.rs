@@ -68,7 +68,11 @@ const SKILL_ROOTS: &[SkillRoot] = &[
         id: "agents-standard",
         label: "Agent Skills",
         relative_path: ".agents/skills",
-        consumers: &["codex", "opencode"],
+        // Prime Agent also loads this standard root (upstream
+        // `packages/coding-agent/docs/skills.md` lists `~/.agents/skills/`
+        // alongside `~/.prime/agent/skills/`), so it is a consumer even
+        // though its own root below is where AoE writes managed skills.
+        consumers: &["codex", "opencode", "prime-agent"],
         primary_agent: "codex",
         legacy: false,
     },
@@ -95,6 +99,14 @@ const SKILL_ROOTS: &[SkillRoot] = &[
         consumers: &["kimi"],
         primary_agent: "kimi",
         legacy: true,
+    },
+    SkillRoot {
+        id: "prime-agent-user",
+        label: "Prime Agent",
+        relative_path: ".prime/agent/skills",
+        consumers: &["prime-agent"],
+        primary_agent: "prime-agent",
+        legacy: false,
     },
 ];
 

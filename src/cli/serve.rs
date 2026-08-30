@@ -1328,8 +1328,7 @@ fn start_daemon(profile: &str, args: &ServeArgs) -> Result<()> {
     // than disappearing into /dev/null. The tracing subscriber inside the
     // child resolves the same path via `logging::resolve_log_path`, so the
     // two streams interleave in one file. Inherited fds may go stale across
-    // a rotation; that is best-effort behavior documented in
-    // docs/development/logging.md.
+    // a rotation; that is best-effort behavior.
     let stdio_path = stdio_redirect_path().ok();
     match stdio_path.as_ref().and_then(|p| {
         std::fs::OpenOptions::new()

@@ -512,9 +512,7 @@ pub struct AcpState {
 
     /// Whether a turn is in flight. Server-observed edges: opened by
     /// `UserPromptSent` / `UserDiffCommentsPrompt` / `ThinkingStarted`, closed
-    /// by `Stopped` / startup error / runtime error / rejection. Ported from
-    /// the TUI's `AcpTranscript` so the daemon derives it once for every client
-    /// (see `docs/development/server-owned-sv-state.md`).
+    /// by `Stopped`, startup error, runtime error, or rejection.
     #[serde(default)]
     pub turn_active: bool,
     /// Whether the running turn is steerable (a mid-turn prompt is injected
@@ -679,8 +677,7 @@ pub struct PromptAttachmentRef {
 /// One entry in a session's server-owned prompt queue: a follow-up the
 /// user lined up while a turn was busy. The daemon is the source of truth
 /// (persisted on the `Instance`), so the queue survives a client reload or
-/// a closed PWA and drains on turn-end with no tab open. See
-/// `docs/development/server-side-prompt-queue.md`.
+/// a closed PWA and drains on turn-end with no tab open.
 ///
 /// Attachments carry metadata only, exactly like [`PromptAttachmentRef`]
 /// on a live prompt: the bytes live in the event store's pending-attachment

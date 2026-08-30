@@ -18,6 +18,7 @@ describe("resolveAgentProfile", () => {
     expect(resolveAgentProfile("pi").key).toBe("pi");
     expect(resolveAgentProfile("omp").key).toBe("omp");
     expect(resolveAgentProfile("kimi").key).toBe("kimi");
+    expect(resolveAgentProfile("prime-agent").key).toBe("prime-agent");
     expect(resolveAgentProfile("aoe-agent").key).toBe("aoe-agent");
   });
 

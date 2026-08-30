@@ -617,18 +617,8 @@ export interface AcpFrame {
   event: AcpEvent;
 }
 
-/** The daemon's folded control state, carried by the WS `reduced_state`
- *  frame on connect and after every event. Mirrors the Rust `AcpState`
- *  (`src/acp/state.rs`), which is the single reducer for everything here:
- *  the fields below are adopted verbatim by {@link applyReducedState} rather
- *  than re-derived from raw events. Only the fields this client reads are
- *  declared; the frame carries more.
- *
- *  Everything still folded client-side in `applyEvent` is state the server
- *  does not model: the worker-lifecycle latches (`Stopped` reasons), the
- *  monitor / wakeup badges, the usage cost baseline, rejected prompts, and
- *  the optimistic turn counters. See
- *  `docs/development/server-owned-sv-state.md`. */
+/** Fields this client adopts from the daemon's folded `AcpState`. Worker
+ *  lifecycle and optimistic UI state remain client-side. */
 export interface ReducedState {
   agent: string;
   model: string | null;
@@ -669,47 +659,16 @@ export interface AcpState {
   /** Latest agent-reported context-window usage. Null until the agent
    *  emits its first ACP `UsageUpdate`. */
   sessionUsage: SessionUsage | null;
-  /** Cumulative cost snapshot captured at the most recent context
-   *  boundary (`/clear`, `/compact`). The ACP agent keeps reporting
-   *  session-lifetime cumulative cost via `UsageUpdate`, but the user
-   *  expects the composer footer to read "since the most recent
-   *  clear/compact." The `UsageUpdated` reducer arm subtracts this
-   *  baseline from the incoming cumulative before storing it on
-   *  `sessionUsage.cost`. Reset to null on `AgentSwitched` and
-   *  `SessionContextReset` (new backend or new ACP session restarts
-   *  the agent-side cumulative at zero). Re-derived on hard reload via
-   *  the full event-store replay, since boundary events are applied in
-   *  seq order. See #1354. */
+  /** Cost at the latest context boundary, subtracted from the agent's
+   *  session-lifetime total. */
   usageBaseline: { cost: number } | null;
-  /** Usage snapshot captured when the user dismissed the compaction
-   *  reminder, or null while the reminder is armed. Lives on reducer
-   *  state rather than component state so one dismissal survives a
-   *  session switch and a reload, the same reason `contextPrimerAvailable`
-   *  does (#1110).
-   *
-   *  Re-armed in the `UsageUpdated` arm whenever the previous snapshot was
-   *  null, which every context boundary already guarantees: compact,
-   *  clear, `SessionContextReset`, `AgentSwitched`, and a model change all
-   *  null `sessionUsage`. Latching there rather than deriving "used went
-   *  down" at render time is deliberate: the drop is visible only on the
-   *  first post-boundary snapshot, so a derived check would re-suppress
-   *  the reminder as soon as usage climbed back past the dismissed value.
-   *  See #3253. */
+  /** Usage when the compaction reminder was dismissed, or null while armed.
+   *  Stored in reducer state so it survives session switches and reloads. */
   compactionReminderDismissed: SessionUsage | null;
-  /** Ordered transcript rows, oldest first. Server-owned (Tier 4): the
-   *  daemon folds the event stream into these rows and ships them via the
-   *  WS transcript channel (`transcript_snapshot` / `transcript_delta`) and
-   *  `GET /acp/replay?view=rows`. The client reconciles by the server's
-   *  deterministic row id rather than re-reducing frames. See
-   *  `docs/development/server-owned-sv-state.md`. */
+  /** Server-folded transcript rows in oldest-first order. */
   activity: ActivityRow[];
-  /** Client-only optimistic overlay rows (an in-flight `user_prompt` the
-   *  POST has not yet confirmed, or a just-answered elicitation), keyed by
-   *  the deterministic id the server will assign the confirmed row (the
-   *  minted `prompt_id`, or `elicitation-<nonce>`). Rendered on top of
-   *  `activity`; each entry is dropped the moment a server row with the same
-   *  id lands in `activity`, so this is a pure presentation layer and never a
-   *  second source of truth. Not persisted. */
+  /** Unpersisted optimistic rows, removed when the server row with the same id
+   *  arrives. */
   optimisticRows: ActivityRow[];
   /** Last seen seq, for reconnect requests. Frames whose `seq` is
    *  not strictly greater than this are dropped by the reducer so
@@ -1912,17 +1871,9 @@ export function appendElicitationAnswerRow(
   });
 }
 
-/** Rendered `turnActive`: the daemon's steady-state truth, OR'd with the
- *  client's own unacknowledged prompt POSTs.
- *
- *  This replaced a client-side `pendingUserPromptSeq > lastStoppedSeq`
- *  counter pair, which assumed one terminal `Stopped` per prompt. Mid-turn
- *  steering (#2805) breaks that cardinality: the daemon injects a prompt
- *  into the running turn and deliberately emits no extra terminal event,
- *  so N prompts closed with one `Stopped` left the counters permanently
- *  apart and the composer stuck on Stop plus a spinner. The daemon already
- *  models this correctly as a boolean and already ships it; the client now
- *  adopts it. See #3417 and `docs/development/server-owned-sv-state.md`. */
+/** Daemon turn state plus prompt POSTs whose acknowledgements have not arrived.
+ *  Mid-turn steering can complete several prompts with one terminal event, so
+ *  prompt counters cannot derive this reliably. */
 export function deriveTurnActive(state: Pick<AcpState, "serverTurnActive" | "inflightPromptIds">): boolean {
   return state.serverTurnActive || state.inflightPromptIds.length > 0;
 }

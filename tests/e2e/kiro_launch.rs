@@ -131,7 +131,9 @@ fn wait_for_recorded_argv(path: &std::path::Path) -> String {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         if let Ok(content) = std::fs::read_to_string(path) {
-            if !content.trim().is_empty() {
+            // Hook installation invokes the same stub with "agent set-default"
+            // before the pane launches. Wait for the interactive invocation.
+            if content.contains("kiro-cli chat") {
                 return content.trim().to_string();
             }
         }

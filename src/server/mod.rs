@@ -248,7 +248,7 @@ pub struct CleanupDefaultsCache {
 pub const CLEANUP_DEFAULTS_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// How long attachment bytes buffered for a queued prompt live before the
-/// hourly sweep reclaims them (Q5 in the server-side prompt queue design). A
+/// hourly sweep reclaims them. A
 /// queued prompt normally drains within seconds; this only catches bytes
 /// stranded by a session that never becomes idle again.
 const PENDING_ATTACHMENT_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);

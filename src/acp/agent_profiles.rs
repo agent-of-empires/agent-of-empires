@@ -274,6 +274,25 @@ pub const KIMI: AgentProfile = AgentProfile {
     yolo_mode_id: Some("yolo"),
 };
 
+/// PrimeIntellect Prime Agent via native `prime-agent --mode acp`. One ACP
+/// session per process is an upstream limit; a second `session/new` is
+/// refused rather than silently sharing state. Extensions (subagents,
+/// goals, gates) travel in a reverse-domain `_meta` envelope
+/// (`ai.primeintellect.prime-agent`), but only session-info envelopes are
+/// documented; tool-call parent linkage is not, so indentation stays off.
+/// `/new` exists as a TUI command, but its ACP-side clear semantics are
+/// unobserved, so clear aliases stay empty until then.
+pub const PRIME_AGENT: AgentProfile = AgentProfile {
+    key: "prime-agent",
+    parent_meta_namespaces: &[],
+    clear_aliases: &[],
+    clear_requires_driven_reset: false,
+    supports_exit_plan_mode: false,
+    supports_wakeup_tools: false,
+    emits_heartbeat_keepalives: false,
+    yolo_mode_id: None,
+};
+
 /// aoe's bundled multi-provider agent. Treated as Claude-equivalent
 /// for now (Vercel AI SDK 6 with Claude as one of the providers); the
 /// claude_capabilities subset is the safest reference until aoe-agent
@@ -317,6 +336,7 @@ pub fn resolve(key: &str) -> &'static AgentProfile {
         "pi" => &PI,
         "omp" => &OMP,
         "kimi" => &KIMI,
+        "prime-agent" => &PRIME_AGENT,
         "aoe-agent" => &AOE_AGENT,
         _ => &DEFAULT,
     }
@@ -353,6 +373,7 @@ mod tests {
         assert_eq!(resolve("pi").key, "pi");
         assert_eq!(resolve("omp").key, "omp");
         assert_eq!(resolve("kimi").key, "kimi");
+        assert_eq!(resolve("prime-agent").key, "prime-agent");
         assert_eq!(resolve("aoe-agent").key, "aoe-agent");
     }
 
@@ -377,7 +398,15 @@ mod tests {
         }
         // Adapters whose default/mode approval behavior is unverified fail
         // closed to unattended, and unknown keys never count as reviewed.
-        for key in ["opencode", "vibe", "pi", "omp", "unknown-agent", ""] {
+        for key in [
+            "opencode",
+            "vibe",
+            "pi",
+            "omp",
+            "prime-agent",
+            "unknown-agent",
+            "",
+        ] {
             assert!(!is_reviewed(key), "{key} should not be reviewed");
         }
     }
@@ -409,6 +438,7 @@ mod tests {
         assert_eq!(resolve("vibe").yolo_mode_id, None);
         assert_eq!(resolve("pi").yolo_mode_id, None);
         assert_eq!(resolve("omp").yolo_mode_id, None);
+        assert_eq!(resolve("prime-agent").yolo_mode_id, None);
         assert_eq!(resolve("unknown-agent").yolo_mode_id, None);
     }
 
@@ -452,7 +482,15 @@ mod tests {
             assert!(profile.clear_requires_driven_reset, "{}", profile.key);
         }
         for profile in [
-            &AOE_AGENT, &OPENCODE, &GEMINI, &VIBE, &PI, &OMP, &KIMI, &DEFAULT,
+            &AOE_AGENT,
+            &OPENCODE,
+            &GEMINI,
+            &VIBE,
+            &PI,
+            &OMP,
+            &KIMI,
+            &PRIME_AGENT,
+            &DEFAULT,
         ] {
             assert!(!profile.clear_requires_driven_reset, "{}", profile.key);
         }
@@ -517,13 +555,36 @@ mod tests {
     }
 
     #[test]
+    fn deferred_profiles_keep_parent_linkage_disabled() {
+        // These adapters' tool-call parent linkage is undocumented; pin the
+        // conservative empty namespace so a future edit cannot silently
+        // start claiming hierarchy (prime-agent's _meta envelope is
+        // session-info only today).
+        for profile in [&VIBE, &PI, &OMP, &KIMI, &PRIME_AGENT] {
+            assert!(
+                profile.parent_meta_namespaces.is_empty(),
+                "{}: parent linkage must stay off until observed",
+                profile.key
+            );
+        }
+    }
+
+    #[test]
     fn capability_flags_only_set_for_claude_family() {
         for profile in [&CLAUDE, &CLAUDE_CODE, &AOE_AGENT] {
             assert!(profile.supports_exit_plan_mode);
             assert!(profile.supports_wakeup_tools);
         }
         for profile in [
-            &CODEX, &OPENCODE, &GEMINI, &VIBE, &PI, &OMP, &KIMI, &DEFAULT,
+            &CODEX,
+            &OPENCODE,
+            &GEMINI,
+            &VIBE,
+            &PI,
+            &OMP,
+            &KIMI,
+            &PRIME_AGENT,
+            &DEFAULT,
         ] {
             assert!(!profile.supports_exit_plan_mode, "{}", profile.key);
             assert!(!profile.supports_wakeup_tools, "{}", profile.key);

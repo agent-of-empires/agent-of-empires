@@ -1944,7 +1944,7 @@ impl<S: BroadcastSink> Supervisor<S> {
         // Honor the wizard's "Auto-approve" / profile `yolo_mode_default`
         // by switching the ACP session to the adapter's bypass mode. The
         // tmux path achieves the same with `--dangerously-skip-permissions`
-        // (see `apply_yolo_mode()` in `src/session/instance.rs`); structured view
+        // (see `apply_yolo_mode()` in `src/session/instance/launch_command.rs`); structured view
         // can't pass CLI flags through the ACP adapter, so we apply the
         // adapter-specific mode id through whichever ACP mode channel the
         // adapter advertised (claude: `bypassPermissions`, codex:
@@ -4360,6 +4360,7 @@ cursor-acp-bridge = "agent acp"
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn spawn_unknown_agent_errors_cleanly() {
         let sink = VecSink::new();
         let sup = Supervisor::new(sink);

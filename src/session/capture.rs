@@ -1,7 +1,7 @@
 //! Session ID capture logic for all supported agent types.
 
 use std::collections::HashSet;
-use std::io::Read;
+use std::io::{BufRead, Read};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
@@ -2781,6 +2781,184 @@ pub(crate) fn kimi_poll_fn(
         .map_err(|e| tracing::debug!(target: "session.capture", "Kimi poll capture failed: {}", e))
         .ok()
         .and_then(validated_session_id)
+    }
+}
+
+/// Slack (ms) applied to the launch-time floor, mirroring
+/// [`KIMI_MTIME_FLOOR_SLACK_MS`]: session files can carry second-granularity
+/// mtimes that land below the millisecond launch timestamp and must still
+/// count as "touched after launch".
+const PRIME_AGENT_MTIME_FLOOR_SLACK_MS: f64 = 2000.0;
+
+/// Byte cap on the first-line header read, mirroring
+/// [`PI_HEADER_SCAN_BYTES`]: `BufRead::read_line` otherwise allocates
+/// without bound for one hostile or corrupt line. A header longer than this
+/// fails to parse and the file is skipped until the next poll.
+const PRIME_AGENT_HEADER_SCAN_BYTES: u64 = 64 * 1024;
+
+/// One Prime Agent session, parsed from the first line of a
+/// `~/.prime/agent/sessions/<uuid>.jsonl` file. The header carries both the
+/// resume id and the working directory; the file name is a different uuid,
+/// so the id must come from the header, never from the path.
+struct PrimeAgentSession {
+    id: String,
+    cwd: String,
+    mtime_ms: u64,
+}
+
+/// Scan `<prime-agent home>/sessions/*.jsonl` and parse each file's first
+/// line as a session header. Unreadable files, non-JSON first lines, headers
+/// whose `type` is not `session`, and headers missing `id`/`cwd` are skipped:
+/// a read-only poll races writers and must tolerate partial files.
+fn scan_prime_agent_sessions(sessions_dir: &Path) -> Vec<PrimeAgentSession> {
+    #[cfg(unix)]
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let Ok(entries) = resilient_read_dir(sessions_dir) else {
+        return Vec::new();
+    };
+    let mut sessions = Vec::new();
+    for entry in entries.filter(|e| e.path().extension().is_some_and(|ext| ext == "jsonl")) {
+        // Guarded open, mirroring extract_pi_header_fields: O_NONBLOCK keeps
+        // a misnamed FIFO from blocking the poll on open, O_NOFOLLOW refuses
+        // symlinked entries, and only regular files are scanned.
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true);
+        #[cfg(unix)]
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+        #[cfg(not(unix))]
+        if std::fs::symlink_metadata(entry.path())
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(true)
+        {
+            continue;
+        }
+        let Ok(file) = options.open(entry.path()) else {
+            continue;
+        };
+        if !file.metadata().map(|m| m.is_file()).unwrap_or(false) {
+            continue;
+        }
+        let mut first_line = String::new();
+        let mut reader = std::io::BufReader::new(file);
+        if (&mut reader)
+            .take(PRIME_AGENT_HEADER_SCAN_BYTES)
+            .read_line(&mut first_line)
+            .is_err()
+        {
+            continue;
+        }
+        let Ok(header) = serde_json::from_str::<serde_json::Value>(&first_line) else {
+            continue;
+        };
+        if header.get("type").and_then(|v| v.as_str()) != Some("session") {
+            continue;
+        }
+        let (Some(id), Some(cwd)) = (
+            header.get("id").and_then(|v| v.as_str()),
+            header.get("cwd").and_then(|v| v.as_str()),
+        ) else {
+            continue;
+        };
+        let mtime_ms = std::fs::metadata(entry.path())
+            .and_then(|m| m.modified())
+            .map(crate::util::system_time_to_ms)
+            .unwrap_or(0);
+        sessions.push(PrimeAgentSession {
+            id: id.to_string(),
+            cwd: cwd.to_string(),
+            mtime_ms,
+        });
+    }
+    sessions
+}
+
+/// Pick the newest unexcluded Prime Agent session whose header `cwd` matches
+/// `project_path`. Paths are canonicalized so a symlinked cwd still matches.
+/// When `launch_time_ms` is `Some`, only sessions whose file was modified at
+/// or after that floor are eligible, so a fresh live poll cannot latch onto a
+/// pre-existing conversation before the agent writes the new one. Retroactive
+/// recovery passes `None` to allow resuming an older session.
+fn select_prime_agent_session(
+    sessions: Vec<PrimeAgentSession>,
+    project_path: &str,
+    exclusion: &HashSet<String>,
+    launch_time_ms: Option<f64>,
+) -> Result<String> {
+    let canonical_match = canonicalize_or_raw(project_path);
+    let mut candidates: Vec<(String, u64)> = sessions
+        .into_iter()
+        .filter(|s| !exclusion.contains(&s.id))
+        .filter(|s| canonicalize_or_raw(&s.cwd) == canonical_match)
+        .map(|s| (s.id, s.mtime_ms))
+        .collect();
+    if let Some(threshold) = launch_time_ms {
+        candidates.retain(|(_, mtime_ms)| {
+            (*mtime_ms as f64) + PRIME_AGENT_MTIME_FLOOR_SLACK_MS >= threshold
+        });
+    }
+    candidates.sort_by_key(|c| std::cmp::Reverse(c.1));
+    candidates
+        .into_iter()
+        .next()
+        .map(|(id, _)| id)
+        .ok_or_else(|| anyhow::anyhow!("No Prime Agent session found matching project path"))
+}
+
+/// Resolve Prime Agent's session directory with the CLI's own env
+/// precedence: `PRIME_AGENT_SESSION_DIR`, then its legacy alias
+/// `PRIME_AGENT_CODING_AGENT_SESSION_DIR`, then `<coding agent
+/// home>/sessions`. The `--session-dir` flag and `settings.json.sessionDir`
+/// are invisible to this host-side scan (they are tracked separately).
+fn prime_agent_sessions_dir(coding_agent_home: &Path) -> PathBuf {
+    for var in [
+        "PRIME_AGENT_SESSION_DIR",
+        "PRIME_AGENT_CODING_AGENT_SESSION_DIR",
+    ] {
+        if let Ok(dir) = std::env::var(var) {
+            return PathBuf::from(dir);
+        }
+    }
+    coding_agent_home.join("sessions")
+}
+
+/// Capture a Prime Agent session ID for `project_path`.
+///
+/// Reads the first line of every JSONL file in Prime Agent's resolved
+/// session directory (`PRIME_AGENT_SESSION_DIR`, then the legacy alias,
+/// else `<home>/sessions` where the home resolves from
+/// `PRIME_AGENT_CODING_AGENT_DIR`, default `~/.prime/agent`) and returns
+/// the id of the newest session whose header `cwd` matches `project_path`,
+/// skipping any ids in `exclusion`. `launch_time_ms` gates live polling to
+/// sessions touched after this run started (`None` for retroactive recovery).
+/// Prime Agent resumes the returned id with `prime-agent --resume <id>`.
+pub(crate) fn capture_prime_agent_session_id(
+    project_path: &str,
+    exclusion: &HashSet<String>,
+    launch_time_ms: Option<f64>,
+) -> Result<String> {
+    let home = resolve_agent_home(Some("PRIME_AGENT_CODING_AGENT_DIR"), ".prime/agent")?;
+    let sessions = scan_prime_agent_sessions(&prime_agent_sessions_dir(&home));
+    select_prime_agent_session(sessions, project_path, exclusion, launch_time_ms)
+}
+
+/// Polling closure for Prime Agent session tracking, mirroring
+/// [`kimi_poll_fn`]. Host-only: the sessions directory is read from the host,
+/// so sandboxed sessions have no poller and start fresh on restart.
+pub(crate) fn prime_agent_poll_fn(
+    project_path: String,
+    instance_id: String,
+    launch_time_ms: f64,
+    extra_excludes: HashSet<String>,
+) -> impl Fn() -> Option<String> + Send + 'static {
+    move || {
+        let exclusion = compose_exclusion(&instance_id, &extra_excludes);
+        capture_prime_agent_session_id(&project_path, &exclusion, Some(launch_time_ms))
+            .map_err(|e| {
+                tracing::debug!(target: "session.capture", "Prime Agent poll capture failed: {}", e)
+            })
+            .ok()
+            .and_then(validated_session_id)
     }
 }
 
@@ -7052,5 +7230,194 @@ mod tests {
 
         let found = scan_claude_project_dir(home.path(), project, None, &HashSet::new()).unwrap();
         assert_eq!(found.map(|(id, _)| id), Some(sid.to_string()));
+    }
+
+    /// Write one Prime Agent session file into `dir` and return its path.
+    fn write_prime_session(dir: &Path, name: &str, id: &str, cwd: &str) -> PathBuf {
+        let path = dir.join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "{{\"type\":\"session\",\"version\":3,\"id\":\"{id}\",\
+                 \"timestamp\":\"2026-08-23T00:00:00.000Z\",\"cwd\":\"{cwd}\",\"rlmDepth\":0}}\n"
+            ),
+        )
+        .unwrap();
+        path
+    }
+
+    #[test]
+    fn test_scan_prime_agent_sessions_parses_headers_and_skips_noise() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir(&sessions_dir).unwrap();
+        write_prime_session(&sessions_dir, "aaa.jsonl", "id-valid", "/tmp/proj");
+        // A non-session first line (a mid-file event) must be skipped.
+        std::fs::write(
+            sessions_dir.join("bbb.jsonl"),
+            "{\"type\":\"model_change\",\"id\":\"x\"}\n",
+        )
+        .unwrap();
+        // Malformed JSON, a header without cwd, and a non-jsonl extension are
+        // all ignored by the scan.
+        std::fs::write(sessions_dir.join("ccc.jsonl"), "not json at all\n").unwrap();
+        std::fs::write(
+            sessions_dir.join("ddd.jsonl"),
+            "{\"type\":\"session\",\"version\":3,\"id\":\"id-nocwd\"}\n",
+        )
+        .unwrap();
+        std::fs::write(
+            sessions_dir.join("eee.txt"),
+            "{\"type\":\"session\",\"id\":\"id-txt\",\"cwd\":\"/tmp/proj\"}\n",
+        )
+        .unwrap();
+        // A missing directory scans empty rather than erroring.
+        assert!(scan_prime_agent_sessions(&tmp.path().join("nope")).is_empty());
+
+        let scanned = scan_prime_agent_sessions(&sessions_dir);
+        let mut ids: Vec<&str> = scanned.iter().map(|s| s.id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["id-valid"]);
+    }
+
+    #[test]
+    fn test_scan_prime_agent_sessions_skips_oversized_header() {
+        // A first line longer than PRIME_AGENT_HEADER_SCAN_BYTES is read
+        // truncated, fails JSON parsing, and the file is skipped instead of
+        // allocating without bound (mirror of the pi oversized-line pin).
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir(&sessions_dir).unwrap();
+        let mut oversized = String::from(
+            "{\"type\":\"session\",\"id\":\"id-big\",\"cwd\":\"/tmp/proj\",\"pad\":\"",
+        );
+        oversized.push_str(&"x".repeat(96 * 1024));
+        oversized.push_str("\"}\n");
+        std::fs::write(sessions_dir.join("big.jsonl"), &oversized).unwrap();
+
+        assert!(scan_prime_agent_sessions(&sessions_dir).is_empty());
+    }
+
+    /// Unix-only: a FIFO named `*.jsonl` must be skipped without blocking
+    /// the scan, and a symlinked entry must not be followed. If this test
+    /// ever hangs, the guarded open regressed to plain `File::open`.
+    #[test]
+    #[cfg(unix)]
+    fn test_scan_prime_agent_sessions_skips_fifo_and_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir(&sessions_dir).unwrap();
+        let fifo = sessions_dir.join("fifo.jsonl");
+        let fifo_c = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(fifo_c.as_ptr(), 0o600) }, 0);
+        symlink(
+            tmp.path().join("elsewhere.jsonl"),
+            sessions_dir.join("link.jsonl"),
+        )
+        .unwrap();
+
+        assert!(scan_prime_agent_sessions(&sessions_dir).is_empty());
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_prime_agent_session_id_selects_newest_matching_cwd() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir(&sessions_dir).unwrap();
+        let proj_path = tmp.path().join("proj").to_str().unwrap().to_string();
+        write_prime_session(&sessions_dir, "old.jsonl", "id-old", &proj_path);
+        set_mtime_secs(&sessions_dir.join("old.jsonl"), 1_000);
+        write_prime_session(&sessions_dir, "new.jsonl", "id-new", &proj_path);
+        set_mtime_secs(&sessions_dir.join("new.jsonl"), 2_000);
+        write_prime_session(
+            &sessions_dir,
+            "other.jsonl",
+            "id-other",
+            "/some/other/project",
+        );
+        set_mtime_secs(&sessions_dir.join("other.jsonl"), 3_000);
+
+        let _guard = EnvGuard::set(&[("PRIME_AGENT_CODING_AGENT_DIR", tmp.path())]);
+        let got = capture_prime_agent_session_id(&proj_path, &HashSet::new(), None).unwrap();
+        assert_eq!(got, "id-new");
+        // The exclusion set drops the newest match so the older one wins.
+        let excluded: HashSet<String> = ["id-new".to_string()].into_iter().collect();
+        let got = capture_prime_agent_session_id(&proj_path, &excluded, None).unwrap();
+        assert_eq!(got, "id-old");
+        // No session matches a different project.
+        assert!(capture_prime_agent_session_id("/elsewhere", &HashSet::new(), None).is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_prime_agent_session_id_launch_floor_excludes_stale_sessions() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let sessions_dir = tmp.path().join("sessions");
+        std::fs::create_dir(&sessions_dir).unwrap();
+        let proj_path = tmp.path().join("proj").to_str().unwrap().to_string();
+        write_prime_session(&sessions_dir, "stale.jsonl", "id-stale", &proj_path);
+        set_mtime_secs(&sessions_dir.join("stale.jsonl"), 1_000);
+
+        let _guard = EnvGuard::set(&[("PRIME_AGENT_CODING_AGENT_DIR", tmp.path())]);
+        // A floor far in the future rejects the stale file; retroactive
+        // recovery (None) still finds it.
+        assert!(
+            capture_prime_agent_session_id(&proj_path, &HashSet::new(), Some(f64::MAX / 2.0))
+                .is_err()
+        );
+        assert_eq!(
+            capture_prime_agent_session_id(&proj_path, &HashSet::new(), None).unwrap(),
+            "id-stale"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn test_capture_prime_agent_session_id_honors_session_dir_overrides() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        // The default location holds a decoy that must be ignored whenever an
+        // override points elsewhere.
+        let default_sessions = tmp.path().join("sessions");
+        std::fs::create_dir(&default_sessions).unwrap();
+        write_prime_session(
+            &default_sessions,
+            "default.jsonl",
+            "id-default",
+            "/tmp/test",
+        );
+
+        let proj_path = "/tmp/test".to_string();
+        // Primary override wins over the default location.
+        let redirected = tmp.path().join("redirected");
+        std::fs::create_dir(&redirected).unwrap();
+        write_prime_session(&redirected, "seed.jsonl", "id-override", &proj_path);
+        let _primary = EnvGuard::set(&[
+            ("PRIME_AGENT_CODING_AGENT_DIR", tmp.path()),
+            ("PRIME_AGENT_SESSION_DIR", redirected.as_path()),
+        ]);
+        assert_eq!(
+            capture_prime_agent_session_id(&proj_path, &HashSet::new(), None).unwrap(),
+            "id-override"
+        );
+        // An ambient PRIME_AGENT_SESSION_DIR from the developer's own shell
+        // must not shadow the legacy alias under test.
+        drop(_primary);
+        let _unset_primary = EnvGuard::unset(&["PRIME_AGENT_SESSION_DIR"]);
+
+        // Legacy alias applies when the primary override is unset.
+        let legacy = tmp.path().join("legacy");
+        std::fs::create_dir(&legacy).unwrap();
+        write_prime_session(&legacy, "seed.jsonl", "id-legacy", &proj_path);
+        let _legacy = EnvGuard::set(&[
+            ("PRIME_AGENT_CODING_AGENT_DIR", tmp.path()),
+            ("PRIME_AGENT_CODING_AGENT_SESSION_DIR", legacy.as_path()),
+        ]);
+        assert_eq!(
+            capture_prime_agent_session_id(&proj_path, &HashSet::new(), None).unwrap(),
+            "id-legacy"
+        );
     }
 }

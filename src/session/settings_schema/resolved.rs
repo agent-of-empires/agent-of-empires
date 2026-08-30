@@ -1,14 +1,10 @@
-//! Settings resolution with provenance (#2094).
+//! Settings resolution with provenance.
 //!
 //! A setting's effective value can come from more than one layer.
 //!
-//! For a **core** key at Tier 0 the effective value is the user's value (when it
-//! differs from the baseline default), else the core schema default. A plugin's
-//! `setting_defaults` override of a core key is surfaced as a *candidate* so it
-//! is observable, but it does NOT win: nothing applies it during real `Config`
-//! load or merge yet, so the running app uses the user value or the struct
-//! default. The runtime host applies these overrides for real (#2095); until
-//! then a `plugin_default` candidate is "declared, not yet in effect".
+//! For a core key the user value wins, otherwise the schema default does.
+//! Plugin `setting_defaults` are reported as candidates but are not applied to
+//! runtime config.
 //!
 //! For a **plugin's own** setting the effective value is the stored value, else
 //! the plugin's manifest default.
@@ -29,10 +25,8 @@ pub enum SettingSource {
     /// The user's stored value (a core field changed from its default, or a
     /// stored plugin setting value).
     User,
-    /// A plugin's `setting_defaults` override of a core setting. At Tier 0 this
-    /// only ever appears as a candidate, never as the winning source: it is
-    /// declared but not yet applied at runtime (the runtime host applies it,
-    /// #2095).
+    /// A plugin's declared override of a core setting. Reported as a candidate,
+    /// but not applied to runtime config.
     PluginDefault { plugin: String },
     /// The owning plugin's manifest default for one of its own settings.
     ManifestDefault { plugin: String },
@@ -141,13 +135,8 @@ fn resolve_core(
         });
     }
 
-    // Plugin overrides, in active-plugin order (builtins first). At Tier 0 these
-    // are recorded as candidates so they are observable, but they do NOT win:
-    // nothing applies a plugin's core-default override during real Config load
-    // or merge yet, so the running app uses the user value or the struct
-    // default. The runtime host applies these for real (#2095). Reporting one
-    // as the effective value here would misrepresent what every core consumer
-    // actually reads.
+    // Preserve declared plugin defaults in provenance without treating them as
+    // effective runtime values.
     for p in crate::plugin::registry().active() {
         if let Some(tv) = p.manifest.setting_defaults.get(key) {
             if let Ok(v) = serde_json::to_value(tv) {

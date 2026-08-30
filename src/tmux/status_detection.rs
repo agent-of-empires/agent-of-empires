@@ -2586,6 +2586,13 @@ pub fn detect_kimi_status(_content: &str) -> Status {
     Status::Idle
 }
 
+/// Prime Agent's TUI is pi-derived but rebranded, and no pane-content
+/// contract is documented we could verify without the binary, so detection
+/// stays an Idle stub.
+pub fn detect_prime_agent_status(_content: &str) -> Status {
+    Status::Idle
+}
+
 pub fn detect_gemini_status(raw_content: &str) -> Status {
     let content = raw_content.to_lowercase();
     let lines: Vec<&str> = content.lines().collect();
@@ -6624,6 +6631,13 @@ Final prose line.\n";
         // Kimi uses hook-based detection; the stub always returns Idle
         assert_eq!(detect_kimi_status("anything"), Status::Idle);
         assert_eq!(detect_kimi_status(""), Status::Idle);
+    }
+
+    #[test]
+    fn test_detect_prime_agent_status_is_stub() {
+        // Prime Agent has no verifiable pane contract; the stub returns Idle
+        assert_eq!(detect_prime_agent_status("anything"), Status::Idle);
+        assert_eq!(detect_prime_agent_status(""), Status::Idle);
     }
 
     #[test]

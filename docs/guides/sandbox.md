@@ -2,7 +2,7 @@
 
 ## Overview
 
-Docker sandboxing runs your AI coding agents (Claude Code, OpenCode, Mistral Vibe, Hermes, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi, Oh My Pi (OMP), Kiro CLI, Qwen Code, Kimi Code) inside isolated Docker containers while maintaining access to your project files and credentials.
+Docker sandboxing runs your AI coding agents (Claude Code, OpenCode, Mistral Vibe, Hermes, Codex CLI, Gemini CLI, Antigravity CLI, Cursor CLI, Copilot CLI, Pi, Oh My Pi (OMP), Kiro CLI, Qwen Code, Kimi Code, Prime Agent) inside isolated Docker containers while maintaining access to your project files and credentials.
 
 > **Linux users:** AoE also supports [Podman](podman.md) as a daemonless, rootless-friendly alternative to Docker.
 >
@@ -14,7 +14,10 @@ Docker sandboxing runs your AI coding agents (Claude Code, OpenCode, Mistral Vib
 - Automatic container lifecycle management
 - Full project access via volume mounts
 
-Agent credentials are shared into containers automatically, so agents authenticate without re-login. For how this works, see [Sandbox internals](../development/internals/sandbox.md).
+Agent credentials are copied into per-agent `sandbox/` directories and shared
+across containers, so agents authenticate without re-login. These directories
+persist after sessions are deleted; remove one to reset that agent's sandbox
+state.
 
 ## CLI vs TUI Behavior
 
@@ -152,7 +155,7 @@ AOE provides two official sandbox images:
 
 | Image | Description |
 |-------|-------------|
-| `ghcr.io/agent-of-empires/aoe-sandbox:latest` | Base image with Claude Code, OpenCode, Mistral Vibe, Hermes, Codex CLI, Gemini CLI, Cursor CLI, Copilot CLI, Pi, Oh My Pi (OMP), Kiro CLI, Qwen Code, Kimi Code, git, ripgrep, fzf |
+| `ghcr.io/agent-of-empires/aoe-sandbox:latest` | Base image with Claude Code, OpenCode, Mistral Vibe, Hermes, Codex CLI, Gemini CLI, Cursor CLI, Copilot CLI, Pi, Oh My Pi (OMP), Kiro CLI, Qwen Code, Kimi Code, Prime Agent, git, ripgrep, fzf |
 | `ghcr.io/agent-of-empires/aoe-dev-sandbox:latest` | Extended image with additional dev tools |
 
 ### Dev Sandbox Tools
@@ -230,11 +233,12 @@ default_image = "my-sandbox:latest"
 aoe add --sandbox-image my-sandbox:latest .
 ```
 
-> Building a custom image and using structured view? Install the ACP adapters too, or the handshake fails. See [Sandbox internals](../development/internals/sandbox.md).
+> Building a custom image and using structured view? Install the agent's ACP
+> adapter in the image too, or the handshake fails.
 
 ## Worktrees and Sandboxing
 
-Git worktrees need the bare repo pattern so the container can reach the repo's git directory. See the [Workflow Guide](workflow.md).
+Git worktrees need the bare repo pattern so the container can reach the repo's git directory. See [Worktrees](worktrees.md#bare-repos).
 
 ## Troubleshooting
 
