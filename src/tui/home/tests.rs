@@ -3441,26 +3441,74 @@ fn test_prompt_archive_selected_group() {
 #[test]
 #[serial]
 fn test_delete_group_with_sessions_updates_groups_field() {
-    use crate::session::Status;
     use crate::tui::dialogs::GroupDeleteOptions;
 
-    let mut env = create_test_env_with_group_sessions();
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let storage = Storage::new_unwatched("test").unwrap();
+    let other_storage = Storage::new_unwatched("other").unwrap();
 
-    // Select the "work" group
-    for (i, item) in env.view.flat_items.iter().enumerate() {
-        if let Item::Group { path, .. } = item {
+    let project = temp.path().join("work");
+    std::fs::create_dir(&project).unwrap();
+    let mut hidden = Instance::new("hidden-trash-member", &project.to_string_lossy());
+    hidden.group_path = "work/projects".to_string();
+    hidden.trash();
+    hidden.lifecycle_generation = 1;
+    hidden.lifecycle_reservation = Some(LifecycleReservation {
+        op: LifecycleOperation::Launch,
+        generation: 1,
+        at: chrono::Utc::now(),
+    });
+    storage
+        .update(|instances, groups| {
+            instances.push(hidden);
+            groups.extend([
+                Group::new("work", "work"),
+                Group::new("projects", "work/projects"),
+                Group::new("workbench", "workbench"),
+            ]);
+            Ok(())
+        })
+        .unwrap();
+    other_storage
+        .update(|_, groups| {
+            groups.extend([
+                Group::new("work", "work"),
+                Group::new("projects", "work/projects"),
+            ]);
+            Ok(())
+        })
+        .unwrap();
+
+    let tools = AvailableTools::with_tools(&["claude"]);
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        tools,
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+    view.group_by = crate::session::config::GroupByMode::Manual;
+    view.flat_items = view.build_flat_items();
+    view.update_selected();
+
+    for (i, item) in view.flat_items.iter().enumerate() {
+        if let Item::Group {
+            path,
+            session_count,
+            ..
+        } = item
+        {
             if path == "work" {
-                env.view.cursor = i;
-                env.view.update_selected();
+                assert_eq!(*session_count, 0, "trashed members stay hidden");
+                view.cursor = i;
+                view.update_selected();
                 break;
             }
         }
     }
+    assert_eq!(view.selected_group.as_deref(), Some("work"));
+    assert_eq!(view.selected_group_profile.as_deref(), Some("test"));
 
-    assert!(env.view.selected_group.is_some());
-    let initial_instance_count = env.view.instances().len();
-
-    // Delete the group with all sessions
     let options = GroupDeleteOptions {
         delete_sessions: true,
         delete_worktrees: false,
@@ -3468,39 +3516,79 @@ fn test_delete_group_with_sessions_updates_groups_field() {
         delete_containers: false,
         force_delete_worktrees: false,
     };
-    env.view.delete_group_with_sessions(&options).unwrap();
+    view.delete_group_with_sessions(&options).unwrap();
+    view.save().unwrap();
+    let during_delete = storage.load().unwrap();
+    assert_eq!(during_delete.len(), 1);
+    assert_ne!(
+        during_delete[0].status,
+        Status::Deleting,
+        "save persisted the transient Deleting status"
+    );
 
-    // Verify the group is removed from group_tree
-    assert!(!env
-        .view
-        .group_trees
-        .get("test")
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+    while !view.apply_deletion_results() && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(
+        view.info_dialog.is_some(),
+        "busy purge result was not delivered"
+    );
+
+    let persisted = storage.load().unwrap();
+    assert_eq!(persisted.len(), 1);
+    assert!(persisted[0].group_path.is_empty());
+    assert_ne!(persisted[0].status, Status::Deleting);
+    storage
+        .update(|instances, _| {
+            instances.clear();
+            Ok(())
+        })
+        .unwrap();
+
+    view.reload().unwrap();
+    let tree = view.group_trees.get("test").unwrap();
+    assert!(!tree.group_exists("work"));
+    assert!(!tree.group_exists("work/projects"));
+    assert!(tree.group_exists("workbench"), "near-prefix group removed");
+
+    let (_, groups) = storage.load_with_groups().unwrap();
+    assert!(!groups
+        .iter()
+        .any(|group| group.path == "work" || group.path.starts_with("work/")));
+    assert!(groups.iter().any(|group| group.path == "workbench"));
+    let (_, other_groups) = other_storage.load_with_groups().unwrap();
+    assert!(other_groups.iter().any(|group| group.path == "work"));
+    assert!(other_groups
+        .iter()
+        .any(|group| group.path == "work/projects"));
+    let mut creating = Instance::new("creating-member", "/tmp/creating");
+    creating.source_profile = "test".to_string();
+    creating.group_path = "creating".to_string();
+    creating.status = Status::Creating;
+    let creating_id = creating.id.clone();
+    view.add_instance(creating);
+    view.rebuild_group_trees();
+    view.selected_group = Some("creating".to_string());
+    view.selected_group_profile = Some("test".to_string());
+    view.info_dialog = None;
+
+    view.delete_group_with_sessions(&options).unwrap();
+    assert_eq!(view.selected_group.as_deref(), Some("creating"));
+    assert_eq!(
+        view.info_dialog.as_ref().map(InfoDialog::title),
+        Some("Creation in progress")
+    );
+
+    view.mutate_instance(&creating_id, |instance| {
+        instance.status = Status::Deleting;
+    });
+    view.save().unwrap();
+    assert!(!storage
+        .load()
         .unwrap()
-        .group_exists("work"));
-    assert!(!env
-        .view
-        .group_trees
-        .get("test")
-        .unwrap()
-        .group_exists("work/projects"));
-
-    // Verify self.groups is updated (this is the bug fix)
-    let all_groups = env.view.all_groups();
-    let group_paths: Vec<_> = all_groups.iter().map(|g| g.path.as_str()).collect();
-    assert!(!group_paths.contains(&"work"));
-    assert!(!group_paths.contains(&"work/projects"));
-
-    // Verify sessions are marked as deleting
-    let deleting_count = env
-        .view
-        .instances()
-        .filter(|i| i.status == Status::Deleting)
-        .count();
-    // Should have 3 sessions in the work group marked as deleting
-    assert_eq!(deleting_count, 3);
-
-    // Instance count should remain the same (they're marked as deleting, not removed yet)
-    assert_eq!(env.view.instances().len(), initial_instance_count);
+        .iter()
+        .any(|instance| instance.id == creating_id));
 }
 
 #[test]
@@ -10891,7 +10979,7 @@ fn restart_selected_session_skips_when_already_in_flight() {
 #[test]
 #[serial]
 fn delete_selected_refused_during_restart() {
-    use crate::tui::dialogs::DeleteOptions;
+    use crate::tui::dialogs::{DeleteOptions, GroupDeleteOptions};
 
     let mut env = create_test_env_with_sessions(1);
     let id = env.view.instance_at(0).id.clone();
@@ -10909,6 +10997,84 @@ fn delete_selected_refused_during_restart() {
         env.view.info_dialog.is_some(),
         "the refused delete must surface a dialog, not silently no-op"
     );
+    {
+        let storage = env.view.storages.get("test").unwrap();
+        storage
+            .update(|instances, groups| {
+                instances
+                    .iter_mut()
+                    .find(|instance| instance.id == id)
+                    .unwrap()
+                    .group_path = "work".to_string();
+                groups.push(Group::new("work", "work"));
+                Ok(())
+            })
+            .unwrap();
+    }
+    env.view.selected_session = None;
+    env.view.selected_group = Some("work".to_string());
+    env.view.selected_group_profile = Some("test".to_string());
+    env.view.info_dialog = None;
+
+    env.view
+        .delete_group_with_sessions(&GroupDeleteOptions {
+            delete_sessions: true,
+            delete_worktrees: false,
+            delete_branches: false,
+            delete_containers: false,
+            force_delete_worktrees: false,
+        })
+        .unwrap();
+
+    assert_eq!(env.view.selected_group.as_deref(), Some("work"));
+    assert_eq!(
+        env.view.info_dialog.as_ref().map(InfoDialog::title),
+        Some("Restart in progress")
+    );
+    let (instances, groups) = Storage::open_unwatched("test")
+        .unwrap()
+        .load_with_groups()
+        .unwrap();
+    assert_eq!(instances[0].group_path, "work");
+    assert!(groups.iter().any(|group| group.path == "work"));
+    env.view.restart_in_flight.remove(&id);
+    {
+        let storage = env.view.storages.get("test").unwrap();
+        storage
+            .update(|instances, _groups| {
+                instances
+                    .iter_mut()
+                    .find(|instance| instance.id == id)
+                    .unwrap()
+                    .status = crate::session::Status::Creating;
+                Ok(())
+            })
+            .unwrap();
+    }
+    env.view.info_dialog = None;
+
+    env.view
+        .delete_group_with_sessions(&GroupDeleteOptions {
+            delete_sessions: true,
+            delete_worktrees: false,
+            delete_branches: false,
+            delete_containers: false,
+            force_delete_worktrees: false,
+        })
+        .unwrap();
+
+    assert_eq!(env.view.selected_group.as_deref(), Some("work"));
+    assert_eq!(
+        env.view.info_dialog.as_ref().map(InfoDialog::title),
+        Some("Creation in progress")
+    );
+    let (instances, groups) = Storage::open_unwatched("test")
+        .unwrap()
+        .load_with_groups()
+        .unwrap();
+    assert_eq!(instances[0].group_path, "work");
+    assert_eq!(instances[0].status, crate::session::Status::Creating);
+    assert!(groups.iter().any(|group| group.path == "work"));
 }
 
 /// Build a HomeView seeded with two distinct projects, each containing

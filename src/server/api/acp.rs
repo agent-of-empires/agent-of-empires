@@ -1275,7 +1275,7 @@ async fn touch_on_prompt_and_wake_if_sunk(state: &Arc<AppState>, id: &str) -> bo
 /// mistake to claim otherwise. Advancing `last_accessed_at` on disk arms the
 /// very signal the wipe keys on: `merge_user_action_diff` computes
 /// `touched = self.last_accessed_at > pre.last_accessed_at`
-/// (`session/instance.rs`) and clears `archived_at` / `snoozed_until` /
+/// (`session/instance/merge.rs`) and clears `archived_at` / `snoozed_until` /
 /// `idle_dormant_since` when it holds, so a writer whose `pre` snapshot
 /// predates this advance still loses its archive one hop later. That is the
 /// documented invariant rather than a bug (a prompt is a real user gesture, and

@@ -36,6 +36,8 @@ For web commands and tests, read `web/AGENTS.md`.
 - Keep comments short and precise. Add one only when the code cannot clearly express a
   non-obvious reason or invariant; do not restate code or preserve
   implementation history.
+- Leave the comments around a change shorter than you found them: prune
+  narration, repeated rationale, and implementation history as you touch them.
 - Add standalone documentation only for a durable user workflow, public
   contract, or cross-cutting invariant. Keep implementation details with the
   code; do not add feature inventories, rollout history, or duplicate guides.
