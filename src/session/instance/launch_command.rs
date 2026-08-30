@@ -586,6 +586,48 @@ impl Instance {
 #[cfg(test)]
 mod tests {
 
+    // The sidecar env var has to survive into the docker argv, not just be
+    // computed: nothing in CI runs a container to catch it going missing.
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn sandboxed_pi_launch_line_carries_the_sidecar_env() {
+        let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let temp_home = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::EnvGuard::set(&[("HOME", temp_home.path())]);
+
+        let project = temp_home.path().join("proj");
+        std::fs::create_dir_all(&project).unwrap();
+        let mut inst = Instance::new("pi-argv", project.to_str().unwrap());
+        inst.tool = "pi".to_string();
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "aoe-pi-argv".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: Some("/workspace".to_string()),
+            before_start_env: Vec::new(),
+        });
+
+        let (cmd, _, _, _) = inst
+            .build_launch_command()
+            .expect("a sandboxed launch line");
+        let cmd = cmd.expect("a command");
+        assert!(
+            cmd.contains(&format!(
+                "AOE_PI_SESSION_ID_FILE={}/{}/session_id",
+                crate::session::container_config::PI_SIDECAR_DIR_IN_CONTAINER,
+                inst.id
+            )),
+            "the pane cannot publish without this: {cmd}"
+        );
+        assert!(
+            !cmd.contains(" -e /") || !cmd.contains("aoe-session-id.js"),
+            "no `-e` path may reach a container launch: {cmd}"
+        );
+    }
+
     #[test]
     fn sandboxed_pi_publishes_without_a_command_line_extension() {
         // `pi -e <missing path>` refuses to start, and a container created
