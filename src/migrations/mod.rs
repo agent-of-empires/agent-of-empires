@@ -33,13 +33,14 @@ mod v022_prune_tuning_settings;
 mod v023_clear_structured_container_error;
 mod v024_backfill_detect_as;
 mod v025_reenable_confirm_delete;
+mod v026_repoint_acp_default_agent;
 
 use anyhow::Result;
 use std::fs;
 use std::path::PathBuf;
 use tracing::{debug, info};
 
-const CURRENT_VERSION: u32 = 25;
+const CURRENT_VERSION: u32 = 26;
 const VERSION_FILE: &str = ".schema_version";
 
 struct Migration {
@@ -173,6 +174,11 @@ const MIGRATIONS: &[Migration] = &[
         version: 25,
         name: "reenable_confirm_delete",
         run: v025_reenable_confirm_delete::run,
+    },
+    Migration {
+        version: 26,
+        name: "repoint_acp_default_agent",
+        run: v026_repoint_acp_default_agent::run,
     },
 ];
 

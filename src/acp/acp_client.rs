@@ -15289,7 +15289,7 @@ done
 
         let mut config = env_test_spawn_config(tmp.path().to_path_buf());
         let reg = crate::acp::agent_registry::AgentRegistry::with_defaults();
-        config.spec = reg.get("aoe-agent").expect("aoe-agent registered").clone();
+        config.spec = reg.get("aoe-agent").expect("aoe-agent default").clone();
 
         let mut cmd = std::process::Command::new("/bin/true");
         cmd.env_clear();

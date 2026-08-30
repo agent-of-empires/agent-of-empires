@@ -141,8 +141,8 @@ pub struct AddArgs {
     #[arg(long = "structured-view")]
     structured_view: bool,
 
-    /// Pick a specific ACP agent for the structured view (e.g., aoe-agent,
-    /// claude-code).
+    /// Pick a specific ACP agent for the structured view (e.g., claude-code,
+    /// codex).
     #[cfg(feature = "serve")]
     #[arg(long = "agent")]
     agent: Option<String>,
@@ -747,14 +747,15 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         let agent_name = pick_acp_agent_name(
             &registry,
             &config.session,
+            &config.acp,
             &instance.tool,
             instance.agent_name.as_deref(),
         );
         // Capability is judged against the explicit `--agent` (or, with none,
-        // the tool itself), NOT `pick_acp_agent_name`'s aoe-agent fallback:
-        // otherwise every tool would look ACP-capable via the bundled default
-        // and `--structured-view` could never be rejected for a non-ACP tool
-        // (it would silently substitute aoe-agent). Mirrors the server create
+        // the tool itself), NOT `pick_acp_agent_name`'s default-agent fallback:
+        // otherwise every tool would look ACP-capable via that default and
+        // `--structured-view` could never be rejected for a non-ACP tool (it
+        // would silently substitute the default). Mirrors the server create
         // path in `src/server/api/sessions.rs`.
         let capability_key = instance
             .agent_name
@@ -1449,11 +1450,12 @@ fn cleanup_partial_session(
 /// async supervisor. Precedence: explicit override → tool-keyed
 /// registry entry → custom agent with `agent_acp_cmd` → custom agent
 /// inheriting a registry-backed base via `agent_detect_as` (resolves to
-/// the base key) → legacy (`claude` → `claude`, else `aoe-agent`).
+/// the base key) → `claude` for the claude tool, else `acp.default_agent`.
 #[cfg(feature = "serve")]
 fn pick_acp_agent_name(
     registry: &crate::acp::agent_registry::AgentRegistry,
     session: &crate::session::config::SessionConfig,
+    acp: &crate::session::config::AcpConfig,
     tool: &str,
     explicit_override: Option<&str>,
 ) -> String {
@@ -1476,7 +1478,7 @@ fn pick_acp_agent_name(
     if tool == "claude" {
         "claude".into()
     } else {
-        "aoe-agent".into()
+        acp.resolved_default_agent().to_string()
     }
 }
 
