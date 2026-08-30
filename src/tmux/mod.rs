@@ -1154,7 +1154,11 @@ impl SessionCacheGuard {
 #[cfg(test)]
 impl Drop for SessionCacheGuard {
     fn drop(&mut self) {
-        if let Ok(mut cache) = SESSION_CACHE.write() {
+        // Deregistered under the same lock the restore takes, mirroring
+        // `capture`: a refresh arriving mid-drop is either suppressed or lands
+        // on top of the restored snapshot, never dropped on the floor.
+        let mut cache = SESSION_CACHE.write();
+        if let Ok(cache) = cache.as_mut() {
             cache.data = self.prev_data.take();
             cache.time = self.prev_time;
         }
