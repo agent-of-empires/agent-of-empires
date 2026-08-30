@@ -89,18 +89,10 @@ impl Instance {
                 }
             }
             "pi" => {
-                let exclusion = self.retroactive_capture_exclusion_set();
-                if self.is_sandboxed() {
-                    let container_name = self.sandbox_info.as_ref()?.container_name.clone();
-                    try_capture_pi_session_id_in_container(
-                        &container_name,
-                        &self.container_workdir(),
-                        &exclusion,
-                    )
-                    .ok()
-                } else {
-                    capture_pi_session_id(&self.project_path, &exclusion).ok()
-                }
+                // Never: identity comes from the pin or the floored poller,
+                // and this path has no floor at all. Sandboxed panes share one
+                // `~/.pi/sandbox`, so they are no more attributable.
+                None
             }
             "omp" => {
                 let options = self.omp_capture_options()?;
@@ -297,6 +289,63 @@ impl Instance {
 
 #[cfg(test)]
 mod tests {
+    use crate::session::test_support::EnvGuard;
+    #[test]
+    #[serial_test::serial]
+    fn pi_never_retroactively_scans_its_store() {
+        // Host and sandbox alike: the retroactive path carries no launch floor,
+        // and both stores are shared by cwd, so a scan could only guess.
+        //
+        // The sandbox half needs a `docker` that answers, or the removed scan
+        // would fail for want of one and the test would pass either way. This
+        // stub speaks `PI_CONTAINER_LIST_SCRIPT`'s output format and offers a
+        // conversation matching the container workdir, which is exactly what
+        // the old path would have adopted.
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let docker = bin.join("docker");
+        std::fs::write(
+            &docker,
+            "#!/bin/sh\nprintf '===PI:1700000000===\\n'\n\
+             printf '{\"type\":\"session\",\"id\":\"sandbox-foreign\",\"cwd\":\"/workspace\"}\\n'\n\
+             printf '===END===\\n'\n",
+        )
+        .unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&docker, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let path = format!(
+            "{}:{}",
+            bin.display(),
+            std::env::var("PATH").unwrap_or_default()
+        );
+        let _path_guard = EnvGuard::set(&[("PATH", &path)]);
+
+        let mut inst = Instance::new("pi-retro", "/tmp/pi-retro");
+        inst.tool = "pi".to_string();
+        assert_eq!(inst.try_retroactive_capture(), None);
+
+        inst.agent_session_id = Some("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa".to_string());
+        assert_eq!(inst.try_retroactive_capture(), None);
+
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test-image".to_string(),
+            container_name: "aoe-pi-retro".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: Some("/workspace".to_string()),
+            before_start_env: Vec::new(),
+        });
+        assert_eq!(
+            inst.container_workdir(),
+            "/workspace",
+            "the stub's conversation must match the workdir the scan would query"
+        );
+        assert_eq!(inst.try_retroactive_capture(), None);
+    }
+
     use super::*;
 
     #[test]

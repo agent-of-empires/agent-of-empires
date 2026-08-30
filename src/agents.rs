@@ -1047,7 +1047,14 @@ pub const AGENTS: &[AgentDef] = &[
         container_env: &[("PI_CODING_AGENT_DIR", "/root/.pi/agent")],
         hook_config: None,
         sidecar_hooks: None,
-        resume_strategy: ResumeStrategy::Flag("--session"),
+        // `--session-id` both creates and attaches, so it carries a pinned
+        // id; `--session` (every pi version) only resumes one already on
+        // file, and is what an unpinnable binary falls back to. See
+        // `pi_supports_session_id_flag`.
+        resume_strategy: ResumeStrategy::FlagPair {
+            existing: "--session",
+            new_session: "--session-id",
+        },
         fork_strategy: ForkStrategy::Unsupported,
         host_only: false,
         send_keys_enter_delay_ms: 0,
@@ -1486,6 +1493,55 @@ impl AgentDef {
         }
     }
 }
+
+/// Whether `help` advertises Pi's `--session-id` flag.
+///
+/// Matched on the flag followed by whitespace or `=` so `--session-id` is
+/// never confused with a longer flag that merely starts the same way.
+fn help_advertises_session_id(help: &str) -> bool {
+    help.match_indices("--session-id").any(|(index, _)| {
+        help[index + "--session-id".len()..]
+            .chars()
+            .next()
+            .is_none_or(|next| next.is_whitespace() || next == '=')
+    })
+}
+
+/// Whether the `pi` on PATH understands `--session-id` (pi 0.76.0+), which is
+/// what lets AoE pin a conversation at launch instead of guessing which file
+/// in the shared store belongs to this pane (#3576).
+///
+/// Probed once per process from `pi --help` and cached: the answer is a
+/// property of the installed binary, and a launch cannot afford to re-run it.
+/// Any failure (binary absent, non-zero exit, timeout) reports `false`, so an
+/// unknown binary launches exactly as it did before pinning existed rather
+/// than emitting a flag it may not accept. The cache keeps a failure too, so
+/// a transient one disables pinning until the process restarts.
+pub(crate) fn pi_supports_session_id_flag() -> bool {
+    static SUPPORTED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *SUPPORTED.get_or_init(|| {
+        let Some(agent) = get_agent("pi") else {
+            return false;
+        };
+        let mut cmd = std::process::Command::new(agent.binary);
+        cmd.arg("--help");
+        let supported = crate::process::run_with_timeout(&mut cmd, PI_HELP_PROBE_TIMEOUT)
+            .ok()
+            .flatten()
+            .filter(|output| output.status.success())
+            .is_some_and(|output| {
+                help_advertises_session_id(&String::from_utf8_lossy(&output.stdout))
+            });
+        tracing::debug!(
+            target: "session.store",
+            supported,
+            "probed pi for --session-id support"
+        );
+        supported
+    })
+}
+
+const PI_HELP_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub fn get_agent(name: &str) -> Option<&'static AgentDef> {
     AGENTS.iter().find(|a| a.name == name)
@@ -1971,6 +2027,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn pi_help_probe_matches_only_the_whole_flag() {
+        // The probe decides whether AoE may pin a Pi conversation at launch,
+        // so a longer flag that merely starts the same way must not pass for
+        // it, and an old help text without the flag must not either.
+        assert!(help_advertises_session_id(
+            "  --session-id <id>    Use exact project session ID\n"
+        ));
+        assert!(help_advertises_session_id("--session-id=<id>"));
+        assert!(help_advertises_session_id("--session-id"));
+        assert!(!help_advertises_session_id("  --session-id-file <path>\n"));
+        assert!(!help_advertises_session_id(
+            "  --session <path|id>    Use specific session file\n"
+        ));
     }
 
     #[test]
