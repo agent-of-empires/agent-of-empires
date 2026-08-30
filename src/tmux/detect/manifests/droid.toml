@@ -47,7 +47,7 @@ priority = 930
 region = "bottom_non_empty_lines(10)"
 visible = true
 any = [
-  { line_regex = ['^\s*>\s*$'] },
-  { line_regex = ['^\s*droid>\s*$'] },
-  { line = { regex = ['^\s*>\s\S.{0,96}$'], not_regex = ['esc'] } },
+  { line_regex = ['(?i)^\s*>\s*$'] },
+  { line_regex = ['(?i)^\s*droid>\s*$'] },
+  { line = { regex = ['(?i)^\s*>\s\S.{0,96}$'], not_regex = ['(?i)esc'] } },
 ]

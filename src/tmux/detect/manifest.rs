@@ -8,7 +8,7 @@
 
 use serde::Deserialize;
 
-use super::region::{Region, Screen};
+use super::region::{Marker, Region, Screen};
 use crate::session::Status;
 
 /// A rule as written in TOML.
@@ -34,6 +34,22 @@ pub(super) struct RawRule {
     /// lower-priority evidence decides.
     #[serde(default)]
     pub(super) max_age_secs: Option<u64>,
+    /// Arbitrate this rule against its priority peers by where it matches
+    /// rather than by rank: of the positional rules sharing a priority, the
+    /// one matching lowest on screen wins. Some agents stack their state
+    /// markers, so the bottom-most one is the current one and a fixed ranking
+    /// cannot express it.
+    #[serde(default)]
+    pub(super) positional: bool,
+    /// Match against the join of up to this many consecutive lines, for a
+    /// marker a narrow pane wraps. Positional rules only.
+    #[serde(default = "one")]
+    pub(super) wrap: usize,
+    /// How far above the bottom the match may sit. A wrapped rule needs a
+    /// region one line deeper than its real window so the joined lines are
+    /// available; this keeps the match itself inside the window.
+    #[serde(default)]
+    pub(super) max_position: Option<usize>,
     #[serde(flatten)]
     pub(super) matcher: RawMatcher,
 }
@@ -75,6 +91,14 @@ pub(super) struct RawMatcher {
     /// For `region = "hook"`: the status the hook file must carry.
     #[serde(default)]
     pub(super) hook_status: Option<String>,
+    /// Evaluate this clause (and anything nested in it) against a different
+    /// region than the rule's own. A prompt whose evidence spans two places on
+    /// screen, like Codex's plan dialog, cannot be written any other way.
+    #[serde(default)]
+    pub(super) region: Option<String>,
+    /// The `line_regex` patterns must match at least this many distinct lines.
+    #[serde(default)]
+    pub(super) min_lines: Option<usize>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -85,9 +109,34 @@ pub(super) struct RawLineClause {
     pub(super) not_regex: Vec<String>,
 }
 
+#[derive(Debug, Default, Deserialize)]
+pub(super) struct RawMarker {
+    #[serde(default)]
+    pub(super) line_regex: Vec<String>,
+    #[serde(default)]
+    pub(super) contains: Vec<String>,
+    #[serde(default = "one")]
+    pub(super) occurrence: usize,
+    #[serde(default)]
+    pub(super) max_depth: Option<usize>,
+    #[serde(default = "one")]
+    pub(super) wrap: usize,
+    #[serde(default)]
+    pub(super) strip_prefix: Option<String>,
+    #[serde(default)]
+    pub(super) absent_is_whole: bool,
+}
+
+fn one() -> usize {
+    1
+}
+
 #[derive(Debug, Deserialize)]
 struct RawManifest {
     id: String,
+    /// Landmark lines the rules scope themselves to; see [`Marker`].
+    #[serde(default)]
+    markers: std::collections::HashMap<String, RawMarker>,
     /// Lines that mark the start of the agent's live area, so rules can name
     /// it (`from_prompt_marker`) instead of matching against a transcript that
     /// still holds the previous turn's chrome.
@@ -98,7 +147,16 @@ struct RawManifest {
 
 /// A compiled matcher. Regexes are compiled once at startup; substrings are
 /// pre-lowered, so evaluation is substring and regex work only.
+/// What a nested clause needs to resolve a region of its own.
+pub(super) struct MatchContext<'a> {
+    pub(super) screen: &'a Screen<'a>,
+    pub(super) prompt_marker: &'a [regex::Regex],
+    pub(super) markers: &'a std::collections::HashMap<String, Marker>,
+}
+
 pub(super) struct Matcher {
+    region: Option<Region>,
+    min_lines: Option<usize>,
     contains: Vec<String>,
     contains_any: Vec<String>,
     regex: Vec<regex::Regex>,
@@ -112,6 +170,9 @@ pub(super) struct Matcher {
 
 pub(super) struct Rule {
     pub(super) id: String,
+    pub(super) positional: bool,
+    pub(super) wrap: usize,
+    max_position: Option<usize>,
     pub(super) state: Option<Status>,
     pub(super) priority: i32,
     pub(super) region: Region,
@@ -127,6 +188,7 @@ pub(super) struct Rule {
 pub(super) struct Manifest {
     pub(super) id: String,
     prompt_marker: Vec<regex::Regex>,
+    markers: std::collections::HashMap<String, Marker>,
     /// Sorted by descending priority, so evaluation stops at the first match.
     pub(super) rules: Vec<Rule>,
 }
@@ -160,6 +222,13 @@ impl Matcher {
                 .collect()
         };
         Ok(Self {
+            region: match &raw.region {
+                Some(r) => Some(Region::parse(r).ok_or_else(|| {
+                    anyhow::anyhow!("rule {rule_id}: unknown clause region {r:?}")
+                })?),
+                None => None,
+            },
+            min_lines: raw.min_lines,
             contains: raw.contains.iter().map(|c| c.to_lowercase()).collect(),
             contains_any: raw.contains_any.iter().map(|c| c.to_lowercase()).collect(),
             regex: compile_all(&raw.regex)?,
@@ -196,26 +265,41 @@ impl Matcher {
         })
     }
 
-    /// Whether every form this matcher carries holds for `text`. An empty
-    /// matcher matches, which is what lets a rule be pure `not` clauses.
-    fn matches(&self, text: &str, lower: &str) -> bool {
+    /// Whether every form this matcher carries holds. `text`/`lower` are the
+    /// enclosing region; a clause naming its own `region` re-slices the screen
+    /// instead. An empty matcher matches, which is what lets a rule be pure
+    /// `not` clauses.
+    fn matches(&self, text: &str, lower: &str, ctx: &MatchContext) -> bool {
+        match self.region {
+            Some(region) => {
+                let sliced = ctx
+                    .screen
+                    .region_text(region, ctx.prompt_marker, ctx.markers);
+                let lowered = sliced.to_lowercase();
+                self.matches_in(&sliced, &lowered, ctx)
+            }
+            None => self.matches_in(text, lower, ctx),
+        }
+    }
+
+    fn matches_in(&self, text: &str, lower: &str, ctx: &MatchContext) -> bool {
         self.contains.iter().all(|c| lower.contains(c.as_str()))
             && (self.contains_any.is_empty()
                 || self.contains_any.iter().any(|c| lower.contains(c.as_str())))
             && self.regex.iter().all(|r| r.is_match(text))
-            && self
-                .line_regex
-                .iter()
-                .all(|r| text.lines().any(|line| r.is_match(line)))
+            && self.line_regex.iter().all(|r| {
+                let hits = text.lines().filter(|line| r.is_match(line)).count();
+                hits >= self.min_lines.unwrap_or(1)
+            })
             && self.line.as_ref().is_none_or(|(want, reject)| {
                 text.lines().any(|line| {
                     want.iter().all(|r| r.is_match(line))
                         && !reject.iter().any(|r| r.is_match(line))
                 })
             })
-            && (self.any.is_empty() || self.any.iter().any(|m| m.matches(text, lower)))
-            && self.all.iter().all(|m| m.matches(text, lower))
-            && !self.not.iter().any(|m| m.matches(text, lower))
+            && (self.any.is_empty() || self.any.iter().any(|m| m.matches(text, lower, ctx)))
+            && self.all.iter().all(|m| m.matches(text, lower, ctx))
+            && !self.not.iter().any(|m| m.matches(text, lower, ctx))
     }
 }
 
@@ -242,6 +326,9 @@ impl Rule {
         let matcher = Matcher::compile(&raw.matcher, &raw.id)?;
         Ok(Self {
             id: raw.id,
+            positional: raw.positional,
+            wrap: raw.wrap.max(1),
+            max_position: raw.max_position,
             state,
             priority: raw.priority,
             region,
@@ -258,6 +345,7 @@ impl Rule {
         screen: &Screen,
         hook: Option<HookObservation>,
         prompt_marker: &[regex::Regex],
+        markers: &std::collections::HashMap<String, Marker>,
     ) -> bool {
         if self.is_hook {
             let Some(hook) = hook else {
@@ -278,12 +366,17 @@ impl Rule {
                 (None, _) => true,
             };
         }
-        let text = screen.region_text(self.region, prompt_marker);
+        let text = screen.region_text(self.region, prompt_marker, markers);
         if text.is_empty() {
             return false;
         }
         let lower = text.to_lowercase();
-        self.matcher.matches(text, &lower)
+        let ctx = MatchContext {
+            screen,
+            prompt_marker,
+            markers,
+        };
+        self.matcher.matches(&text, &lower, &ctx)
     }
 }
 
@@ -337,6 +430,37 @@ region = "hook"
 hook_status = "error"
 "#;
 
+impl Rule {
+    /// How far above the bottom of its region this rule matches, counting the
+    /// bottom line as 1. `None` when it does not match at all.
+    fn match_position(
+        &self,
+        screen: &Screen,
+        prompt_marker: &[regex::Regex],
+        markers: &std::collections::HashMap<String, Marker>,
+    ) -> Option<usize> {
+        let text = screen.region_text(self.region, prompt_marker, markers);
+        let lines: Vec<&str> = text.lines().collect();
+        let ctx = MatchContext {
+            screen,
+            prompt_marker,
+            markers,
+        };
+        (0..lines.len()).rev().find_map(|idx| {
+            let start = idx + 1 - self.wrap.min(idx + 1);
+            // Joined with newlines so a rule can still speak about the
+            // individual lines of a wrapped match: `line_regex` tests each,
+            // and `\s` in a plain regex spans the break.
+            let window = lines[start..=idx].join("\n");
+            let lower = window.to_lowercase();
+            let position = lines.len() - idx;
+            (self.max_position.is_none_or(|max| position <= max)
+                && self.matcher.matches(&window, &lower, &ctx))
+            .then_some(position)
+        })
+    }
+}
+
 impl Manifest {
     pub(super) fn parse(source: &str) -> anyhow::Result<Self> {
         let raw: RawManifest = toml::from_str(source)?;
@@ -363,9 +487,36 @@ impl Manifest {
                     .map_err(|e| anyhow::anyhow!("prompt_marker {p:?} is not a valid regex: {e}"))
             })
             .collect::<anyhow::Result<Vec<_>>>()?;
+        let markers = raw
+            .markers
+            .into_iter()
+            .map(|(name, m)| {
+                Ok((
+                    name.clone(),
+                    Marker {
+                        line_regex: m
+                            .line_regex
+                            .iter()
+                            .map(|p| {
+                                regex::Regex::new(p).map_err(|e| {
+                                    anyhow::anyhow!("marker {name}: invalid regex {p:?}: {e}")
+                                })
+                            })
+                            .collect::<anyhow::Result<Vec<_>>>()?,
+                        contains: m.contains.iter().map(|c| c.to_lowercase()).collect(),
+                        occurrence: m.occurrence.max(1),
+                        max_depth: m.max_depth,
+                        wrap: m.wrap.max(1),
+                        strip_prefix: m.strip_prefix,
+                        absent_is_whole: m.absent_is_whole,
+                    },
+                ))
+            })
+            .collect::<anyhow::Result<std::collections::HashMap<_, _>>>()?;
         Ok(Self {
             id: raw.id,
             prompt_marker,
+            markers,
             rules,
         })
     }
@@ -383,13 +534,43 @@ impl Manifest {
         hook: Option<HookObservation>,
     ) -> bool {
         self.rule(id)
-            .is_some_and(|r| r.matches(screen, hook, &self.prompt_marker))
+            .is_some_and(|r| r.matches(screen, hook, &self.prompt_marker, &self.markers))
     }
 
-    /// The highest-priority rule that matches, if any.
+    /// The rule that decides, if any.
+    ///
+    /// Rules are tried in descending priority. Positional rules sharing a
+    /// priority are one group: every member is evaluated and the one matching
+    /// lowest on screen wins, since for those agents the bottom-most marker is
+    /// the current one.
     pub(super) fn evaluate(&self, screen: &Screen, hook: Option<HookObservation>) -> Option<&Rule> {
-        self.rules
-            .iter()
-            .find(|rule| rule.matches(screen, hook, &self.prompt_marker))
+        let mut i = 0;
+        while i < self.rules.len() {
+            let rule = &self.rules[i];
+            if !rule.positional {
+                if rule.matches(screen, hook, &self.prompt_marker, &self.markers) {
+                    return Some(rule);
+                }
+                i += 1;
+                continue;
+            }
+            let group_end = self.rules[i..]
+                .iter()
+                .position(|r| !r.positional || r.priority != rule.priority)
+                .map_or(self.rules.len(), |offset| i + offset);
+            let winner = self.rules[i..group_end]
+                .iter()
+                .filter_map(|r| {
+                    r.match_position(screen, &self.prompt_marker, &self.markers)
+                        .map(|pos| (pos, r))
+                })
+                .min_by_key(|(pos, _)| *pos)
+                .map(|(_, r)| r);
+            if winner.is_some() {
+                return winner;
+            }
+            i = group_end;
+        }
+        None
     }
 }

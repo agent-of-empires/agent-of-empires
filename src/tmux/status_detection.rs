@@ -2,82 +2,7 @@
 
 use crate::session::Status;
 
-use regex::Regex;
-use std::{collections::VecDeque, sync::OnceLock};
-
 use super::utils::strip_ansi;
-
-/// Lowercase omp banner footer, shared with pane-error summarization.
-pub(crate) const OMP_BANNER_DISMISSAL_ANCHOR: &str = "dismissed when you send your next message";
-/// Lowercase omp terminal retry markers, shared with pane-error summarization.
-pub(crate) const OMP_TERMINAL_RETRY_MARKERS: &[&str] =
-    &["error: retry budget exhausted", "error: retry failed after"];
-
-const SPINNER_CHARS: &[&str] = &[
-    "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏", "⠘", "⠣", "⠆", "⠳", "⠰", "⠞", "⣻",
-];
-const LIVE_ACTIVITY_WORDS: &[&str] = &[
-    "analyzing",
-    "applying",
-    "building",
-    "editing",
-    "executing",
-    "fetching",
-    "generating",
-    "grepping",
-    "processing",
-    "reading",
-    "running",
-    "searching",
-    "testing",
-    "thinking",
-    "working",
-    "writing",
-];
-const COMPLETED_ACTIVITY_MARKERS: &[&str] = &[
-    "complete",
-    "completed",
-    "done",
-    "finished",
-    "success",
-    "successful",
-    "successfully",
-];
-
-fn has_any_spinner(lines: &[&str]) -> bool {
-    lines
-        .iter()
-        .any(|line| SPINNER_CHARS.iter().any(|s| line.contains(s)))
-}
-
-fn has_live_activity_word(text_lower: &str) -> bool {
-    LIVE_ACTIVITY_WORDS
-        .iter()
-        .any(|word| status_line_starts_with_phrase(text_lower.trim(), word))
-}
-
-fn contains_approval_prompt(text_lower: &str, extra: &[&str]) -> bool {
-    const BASE: &[&str] = &["(y/n)", "[y/n]", "approve", "allow"];
-    BASE.iter()
-        .chain(extra.iter())
-        .any(|p| text_lower.contains(p))
-}
-
-fn matches_input_prompt(non_empty_lines: &[&str], take_n: usize, tool_prompts: &[&str]) -> bool {
-    for line in non_empty_lines.iter().rev().take(take_n) {
-        let clean_line = strip_ansi(line).trim().to_string();
-        if clean_line == ">" {
-            return true;
-        }
-        if tool_prompts.iter().any(|p| clean_line == *p) {
-            return true;
-        }
-        if clean_line.starts_with("> ") && !clean_line.contains("esc") && clean_line.len() < 100 {
-            return true;
-        }
-    }
-    false
-}
 
 /// Rules-aware pane detection for `profile`'s session. Configured declarative
 /// rules outrank the built-in detector: they are the only detection path for a
@@ -225,419 +150,7 @@ pub fn detect_vibe_status(raw_content: &str) -> Status {
 ///
 /// All comparisons are case-insensitive (content is lowercased on entry).
 pub fn detect_codex_status(raw_content: &str) -> Status {
-    let content = raw_content.to_lowercase();
-    let lines: Vec<&str> = content.lines().collect();
-    let non_empty_lines: Vec<&str> = lines
-        .iter()
-        .filter(|l| !l.trim().is_empty())
-        .copied()
-        .collect();
-
-    let last_lines: String = non_empty_lines
-        .iter()
-        .rev()
-        .take(30)
-        .rev()
-        .copied()
-        .collect::<Vec<&str>>()
-        .join("\n");
-    let last_lines_lower = last_lines.to_lowercase();
-
-    if codex_has_plan_radio_prompt(&non_empty_lines) {
-        return Status::Waiting;
-    }
-
-    if codex_has_running_signal(&non_empty_lines) {
-        return Status::Running;
-    }
-
-    if contains_approval_prompt(
-        &last_lines_lower,
-        &[
-            "continue?",
-            "proceed?",
-            "execute?",
-            "run command?",
-            "enter to select",
-            "esc to cancel",
-        ],
-    ) {
-        return Status::Waiting;
-    }
-
-    if codex_has_recent_numbered_choice_prompt(&non_empty_lines) {
-        return Status::Waiting;
-    }
-
-    if codex_has_interrupted_turn_without_new_activity(&non_empty_lines) {
-        return Status::Idle;
-    }
-
-    Status::Idle
-}
-
-pub(crate) fn reconcile_codex_hook_status(hook_status: Status, raw_content: &str) -> Status {
-    if hook_status != Status::Running {
-        return hook_status;
-    }
-
-    detect_codex_hook_gap_status(raw_content).unwrap_or(hook_status)
-}
-
-fn detect_codex_hook_gap_status(raw_content: &str) -> Option<Status> {
-    let clean = strip_ansi(raw_content);
-    let content = clean.to_lowercase();
-    let non_empty_lines: Vec<&str> = content.lines().filter(|l| !l.trim().is_empty()).collect();
-
-    // A cancelled Plan-mode radio prompt remains in scrollback above the
-    // interruption marker, so the newer interruption must win here.
-    if codex_has_interrupted_turn_without_new_activity(&non_empty_lines) {
-        return Some(Status::Idle);
-    }
-
-    if codex_has_plan_radio_prompt(&non_empty_lines)
-        || codex_has_recent_numbered_choice_prompt(&non_empty_lines)
-    {
-        return Some(Status::Waiting);
-    }
-
-    if codex_has_completed_turn_prompt(&non_empty_lines) {
-        return Some(Status::Idle);
-    }
-
-    if codex_has_completed_review_prompt(&non_empty_lines) {
-        return Some(Status::Idle);
-    }
-
-    None
-}
-
-fn codex_has_plan_radio_prompt(non_empty_lines: &[&str]) -> bool {
-    let recent_start = non_empty_lines.len().saturating_sub(40);
-    let recent = &non_empty_lines[recent_start..];
-
-    let Some(question_index) = recent.iter().rposition(|line| {
-        let trimmed = line.trim();
-        trimmed.starts_with("question ") && trimmed.contains("unanswered")
-    }) else {
-        return false;
-    };
-    let Some(choice_index) = recent
-        .iter()
-        .rposition(|line| codex_line_has_numbered_choice_cursor(line.trim()))
-    else {
-        return false;
-    };
-    let Some(submit_hint_index) = recent
-        .iter()
-        .rposition(|line| line.contains("enter to submit answer"))
-    else {
-        return false;
-    };
-
-    if !(question_index <= choice_index && choice_index <= submit_hint_index) {
-        return false;
-    }
-
-    !codex_has_running_signal(&recent[submit_hint_index + 1..])
-}
-
-fn codex_line_has_numbered_choice_cursor(line: &str) -> bool {
-    let Some(rest) = line
-        .strip_prefix("❯")
-        .or_else(|| line.strip_prefix("›"))
-        .map(str::trim_start)
-    else {
-        return false;
-    };
-
-    let mut chars = rest.chars();
-    matches!(chars.next(), Some('1'..='9')) && matches!(chars.next(), Some('.'))
-}
-
-fn codex_has_recent_numbered_choice_prompt(non_empty_lines: &[&str]) -> bool {
-    let recent_start = non_empty_lines.len().saturating_sub(10);
-    let recent = &non_empty_lines[recent_start..];
-    let Some(choice_index) = recent
-        .iter()
-        .rposition(|line| codex_line_has_numbered_choice_cursor(line.trim()))
-    else {
-        return false;
-    };
-    let lines_after_choice = &recent[choice_index + 1..];
-
-    !codex_has_running_signal(lines_after_choice)
-        && !codex_has_non_numbered_cursor_prompt(lines_after_choice)
-}
-
-fn codex_has_non_numbered_cursor_prompt(non_empty_lines: &[&str]) -> bool {
-    non_empty_lines
-        .iter()
-        .any(|line| codex_is_non_numbered_cursor_prompt(line.trim()))
-}
-
-fn codex_has_tail_non_numbered_cursor_prompt(non_empty_lines: &[&str]) -> bool {
-    let Some(prompt_index) = non_empty_lines
-        .iter()
-        .rposition(|line| codex_is_non_numbered_cursor_prompt(line.trim()))
-    else {
-        return false;
-    };
-
-    non_empty_lines[prompt_index + 1..]
-        .iter()
-        .all(|line| codex_is_terminal_footer_line(line.trim()))
-}
-
-fn codex_is_non_numbered_cursor_prompt(line: &str) -> bool {
-    let Some(rest) = line.strip_prefix("❯").or_else(|| line.strip_prefix("›")) else {
-        return false;
-    };
-
-    !rest.trim_start().is_empty() && !codex_line_has_numbered_choice_cursor(line)
-}
-
-// The footer Codex prints under its input prompt looks like
-// `gpt-5.5 xhigh fast · ~/project`. The model-prefix list is intentionally
-// narrow so unrelated lines (e.g. assistant prose containing ` · `) don't
-// accidentally satisfy the tail check. If Codex ships a new model family
-// prefix this list needs to grow; the safe failure mode is that the hook
-// keeps reporting Running until it catches up on its own.
-fn codex_is_terminal_footer_line(line: &str) -> bool {
-    line.contains(" · ")
-        && (line.starts_with("gpt-") || line.starts_with("o3") || line.starts_with("o4"))
-}
-
-fn codex_has_interrupted_turn_without_new_activity(non_empty_lines: &[&str]) -> bool {
-    let Some(marker_index) = codex_interruption_marker_end_index(non_empty_lines) else {
-        return false;
-    };
-
-    let lines_after_marker = &non_empty_lines[marker_index + 1..];
-    if codex_has_running_signal(lines_after_marker)
-        || codex_has_plan_radio_prompt(lines_after_marker)
-        || codex_has_recent_numbered_choice_prompt(lines_after_marker)
-        || codex_has_approval_prompt(lines_after_marker)
-        || codex_cursor_prompt_count(lines_after_marker) > 1
-    {
-        return false;
-    }
-
-    true
-}
-
-fn codex_has_completed_turn_prompt(non_empty_lines: &[&str]) -> bool {
-    codex_has_idle_prompt_after_marker(non_empty_lines, |line| {
-        codex_is_completed_work_divider(line.trim())
-    })
-}
-
-fn codex_has_completed_review_prompt(non_empty_lines: &[&str]) -> bool {
-    codex_has_idle_prompt_after_marker(non_empty_lines, |line| {
-        line.trim().contains("<< code review finished >>")
-    })
-}
-
-fn codex_has_idle_prompt_after_marker(
-    non_empty_lines: &[&str],
-    is_marker: impl Fn(&str) -> bool,
-) -> bool {
-    let Some(marker_index) = non_empty_lines.iter().rposition(|line| is_marker(line)) else {
-        return false;
-    };
-
-    let lines_after_marker = &non_empty_lines[marker_index + 1..];
-    !codex_has_running_signal(lines_after_marker)
-        && !codex_has_plan_radio_prompt(lines_after_marker)
-        && !codex_has_recent_numbered_choice_prompt(lines_after_marker)
-        && !codex_has_approval_prompt(lines_after_marker)
-        && codex_has_tail_non_numbered_cursor_prompt(lines_after_marker)
-}
-
-fn codex_interruption_marker_end_index(non_empty_lines: &[&str]) -> Option<usize> {
-    const INTERRUPTED_MARKER: &str =
-        "conversation interrupted - tell the model what to do differently";
-    const MAX_MARKER_LINES: usize = 4;
-
-    for start in (0..non_empty_lines.len()).rev() {
-        let end_exclusive = (start + MAX_MARKER_LINES).min(non_empty_lines.len());
-        let mut joined = String::new();
-
-        for (end, line) in non_empty_lines
-            .iter()
-            .enumerate()
-            .take(end_exclusive)
-            .skip(start)
-        {
-            if !joined.is_empty() {
-                joined.push(' ');
-            }
-            joined.push_str(codex_interruption_line_body(line));
-
-            if collapse_ascii_whitespace(&joined).contains(INTERRUPTED_MARKER) {
-                return Some(end);
-            }
-        }
-    }
-
-    None
-}
-
-fn codex_interruption_line_body(line: &str) -> &str {
-    let trimmed = line.trim_start();
-    trimmed
-        .strip_prefix('■')
-        .map(str::trim_start)
-        .unwrap_or(trimmed)
-}
-
-fn collapse_ascii_whitespace(text: &str) -> String {
-    text.split_whitespace().collect::<Vec<_>>().join(" ")
-}
-
-fn codex_has_approval_prompt(non_empty_lines: &[&str]) -> bool {
-    let text = non_empty_lines.join("\n");
-    contains_approval_prompt(
-        &text,
-        &[
-            "continue?",
-            "proceed?",
-            "execute?",
-            "run command?",
-            "enter to select",
-            "esc to cancel",
-        ],
-    )
-}
-
-fn codex_cursor_prompt_count(non_empty_lines: &[&str]) -> usize {
-    non_empty_lines
-        .iter()
-        .filter(|line| {
-            let trimmed = line.trim();
-            let Some(rest) = trimmed
-                .strip_prefix("❯")
-                .or_else(|| trimmed.strip_prefix("›"))
-            else {
-                return false;
-            };
-            !rest.trim_start().is_empty()
-        })
-        .count()
-}
-
-fn codex_line_starts_with_activity(line: &str) -> bool {
-    let trimmed = codex_status_line_body(line);
-    ["working", "thinking", "processing", "generating"]
-        .iter()
-        .any(|activity| status_line_starts_with_phrase(trimmed, activity))
-}
-
-fn codex_line_starts_with_live_interrupt_activity(line: &str) -> bool {
-    let trimmed = codex_status_line_body(line);
-    [
-        "working",
-        "thinking",
-        "processing",
-        "generating",
-        "running command",
-        "starting mcp servers",
-    ]
-    .iter()
-    .any(|activity| status_line_starts_with_phrase(trimmed, activity))
-}
-
-fn codex_line_has_activity_spinner(line: &str) -> bool {
-    let trimmed = codex_status_line_body(line);
-    let Some(rest) = SPINNER_CHARS
-        .iter()
-        .find_map(|spinner| trimmed.strip_prefix(spinner))
-    else {
-        return false;
-    };
-
-    codex_line_starts_with_activity(rest)
-}
-
-fn codex_status_line_body(line: &str) -> &str {
-    let trimmed = line.trim_start();
-    trimmed
-        .strip_prefix("•")
-        .map(str::trim_start)
-        .unwrap_or(trimmed)
-}
-
-const CODEX_RECENT_ACTIVITY_WINDOW: usize = 10;
-
-fn codex_has_running_signal(non_empty_lines: &[&str]) -> bool {
-    for (index, line) in codex_current_block_lines(non_empty_lines).enumerate() {
-        let trimmed = line.trim();
-
-        if trimmed == "esc to interrupt" || trimmed == "ctrl+c to interrupt" {
-            return true;
-        }
-
-        if codex_line_starts_with_live_interrupt_activity(trimmed)
-            && (trimmed.contains("esc to interrupt") || trimmed.contains("ctrl+c to interrupt"))
-        {
-            return true;
-        }
-
-        if index < CODEX_RECENT_ACTIVITY_WINDOW
-            && (codex_line_starts_with_activity(trimmed)
-                || codex_line_has_activity_spinner(trimmed))
-        {
-            return true;
-        }
-    }
-
-    false
-}
-
-fn codex_current_block_lines<'a>(
-    non_empty_lines: &'a [&'a str],
-) -> impl Iterator<Item = &'a str> + 'a {
-    non_empty_lines
-        .iter()
-        .rev()
-        .copied()
-        .take_while(|line| !codex_is_completed_work_divider(line.trim()))
-}
-
-fn codex_is_completed_work_divider(line: &str) -> bool {
-    line.trim_start_matches('─')
-        .trim_start()
-        .starts_with("worked for")
-}
-
-/// Shared with Codex (`codex_line_starts_with_activity`,
-/// `codex_line_starts_with_live_interrupt_activity`) as well as the Cursor and
-/// Antigravity fallbacks, so the completion-marker suppression applies to every
-/// caller. The completion list is kept small and explicit to avoid swallowing
-/// legitimate activity descriptions that happen to contain past-tense words.
-fn status_line_starts_with_phrase(line: &str, phrase: &str) -> bool {
-    let Some(rest) = line.strip_prefix(phrase) else {
-        return false;
-    };
-    let has_valid_boundary = rest
-        .chars()
-        .next()
-        .is_none_or(|c| c.is_whitespace() || c == '.' || c == '…' || c == ':');
-    has_valid_boundary && !activity_tail_has_completion_marker(rest)
-}
-
-fn activity_tail_has_completion_marker(rest: &str) -> bool {
-    let tail =
-        rest.trim_start_matches(|c: char| c.is_whitespace() || c == '.' || c == '…' || c == ':');
-    if tail.is_empty() {
-        return false;
-    }
-
-    tail.split(|c: char| !c.is_alphanumeric())
-        .filter(|word| !word.is_empty())
-        .take(5)
-        .map(str::to_lowercase)
-        .any(|word| COMPLETED_ACTIVITY_MARKERS.contains(&word.as_str()))
+    detect_via_manifest("codex", raw_content, "", None)
 }
 
 /// Cursor agent status is detected via hooks first, but pane parsing is still
@@ -667,51 +180,6 @@ pub fn detect_cursor(raw_content: &str, hook: Option<super::detect::HookObservat
 ///     allow-all-tools) suppresses most of these.
 pub fn detect_copilot_status(raw_content: &str) -> Status {
     detect_via_manifest("copilot", raw_content, "", None)
-}
-
-/// How many of the last non-empty pane lines count as plain pi's footer for
-/// the spinner and activity-word running signals; the sizing rationale
-/// (measured busy-line depth, prose exclusion) lives at the call site in
-/// `detect_pi_status`. It doubles as the ceiling on the input box rule
-/// anchor: the box is footer furniture (plain pi anchors at 4, omo at 5), so
-/// a deeper rule pair is transcript content, not the box.
-const PI_FOOTER_WINDOW: usize = 6;
-
-/// How many non-empty lines above the input box's rule anchor the
-/// `esc to interrupt` hint scan covers. Plain pi puts its busy line directly
-/// above the box (anchor + 1); the omo frame in #3475 stacks it behind two
-/// tip lines (anchor + 3). The value is tuned to those captures rather than
-/// derived: sweeping the tip-line count shows the busy line drops out of the
-/// band at three tips, so a derivative carrying one more line of furniture
-/// between its busy line and its box reopens #3475 and widens this by one.
-/// The failure is bounded and degrades to Idle, unlike a window over the
-/// whole tail.
-const PI_HINT_BAND_ABOVE_BOX: usize = 3;
-
-/// Non-empty position (1 = bottom) of the second rule counting from the
-/// bottom, or `None` when the pane shows fewer than two rules. Pi stacks two
-/// `────` rules around its input area and derivatives keep that furniture
-/// (omo separates them with the prompt line), so with the box in the capture
-/// this is the box's topmost rule and rule lines drawn by transcript content
-/// sit higher and are never reached. With the box off-capture it can return a
-/// prose line instead, since pi renders a markdown `---` as the same glyph
-/// run, which is why callers reject an anchor deeper than the footer.
-fn input_box_rule_anchor_depth(non_empty_lines: &[&str]) -> Option<usize> {
-    let is_rule = |line: &str| {
-        let trimmed = line.trim();
-        trimmed.chars().count() >= 3 && trimmed.chars().all(|c| c == '─')
-    };
-    let mut lowest_seen = false;
-    for (idx, line) in non_empty_lines.iter().enumerate().rev() {
-        if !is_rule(line) {
-            continue;
-        }
-        if lowest_seen {
-            return Some(non_empty_lines.len() - idx);
-        }
-        lowest_seen = true;
-    }
-    None
 }
 
 /// Pi coding agent status detection via tmux pane parsing.
@@ -745,65 +213,7 @@ fn input_box_rule_anchor_depth(non_empty_lines: &[&str]) -> Option<usize> {
 /// scoping mirrors the approach already used by `detect_omp_status` and
 /// `detect_copilot_status`.
 pub fn detect_pi_status(raw_content: &str) -> Status {
-    let clean = strip_ansi(raw_content);
-    let non_empty_lines: Vec<&str> = clean.lines().filter(|l| !l.trim().is_empty()).collect();
-
-    // The `⠹ Working...` status line sits ~5 non-empty lines above the bottom
-    // (above the input box's two rules, the cwd line, and the status line), so
-    // the footer window must reach it while staying tight enough to exclude the
-    // bulk of a finished turn's response prose.
-    let footer = tail_lines(&non_empty_lines, PI_FOOTER_WINDOW);
-
-    // A spinner glyph in the footer is pi's primary running signal; prose never
-    // contains braille spinner chars, so this is the reliable positive marker.
-    if has_any_spinner(footer) {
-        return Status::Running;
-    }
-
-    // The hint region is the `PI_HINT_BAND_ABOVE_BOX` non-empty lines above
-    // the input box's rule anchor: plain pi puts its busy line directly above
-    // the box and derivatives stack up to two tip lines between busy line and
-    // box (#3475), while response prose always sits above that band. An anchor
-    // deeper than the footer is rejected: the box is footer furniture, so a
-    // deeper rule pair is transcript prose drawing the same glyph run (pi
-    // renders a markdown `---` that way), and without the ceiling the band
-    // floats to unbounded depth. Panes without a usable rule pair (odd
-    // wrappers, synthetic captures, an off-capture box) keep the pre-#3475
-    // footer-only hint check.
-    let hint_region = match input_box_rule_anchor_depth(&non_empty_lines)
-        .filter(|depth| *depth <= PI_FOOTER_WINDOW)
-    {
-        Some(rule_depth) => {
-            let above_box = &non_empty_lines[..non_empty_lines.len() - rule_depth];
-            tail_lines(above_box, PI_HINT_BAND_ABOVE_BOX).to_vec()
-        }
-        None => tail_lines(&non_empty_lines, PI_FOOTER_WINDOW).to_vec(),
-    };
-    let hint_lower = hint_region.join("\n").to_lowercase();
-    if hint_lower.contains("esc to interrupt") || hint_lower.contains("ctrl+c to interrupt") {
-        return Status::Running;
-    }
-
-    // A parked input prompt outranks the activity-word fallback below: custom
-    // wrappers / older builds show a `pi>` or bare `>` prompt at rest, and an
-    // activity word lingering just above it must not flip that back to Running.
-    if matches_input_prompt(&non_empty_lines, 5, &["pi>"]) {
-        return Status::Waiting;
-    }
-
-    // Reduced-motion / no-spinner fallback: a footer line that *starts* with a
-    // live activity verb (`Working...`) is a status line, not narration buried
-    // mid-sentence. `has_live_activity_word` anchors to the line start and
-    // rejects completion markers, so a finished "...now working on #443" prose
-    // line (which does not start with the verb) stays Idle.
-    if footer
-        .iter()
-        .any(|line| has_live_activity_word(&line.to_lowercase()))
-    {
-        return Status::Running;
-    }
-
-    Status::Idle
+    detect_via_manifest("pi", raw_content, "", None)
 }
 
 /// Oh My Pi status detection via its live pane output.
@@ -850,330 +260,7 @@ pub fn detect_pi_status(raw_content: &str) -> Status {
 /// present. The heuristic cannot see structured turn events; the structured
 /// error/retry path (herdr-style extension) is tracked in #3380.
 pub fn detect_omp_status(raw_content: &str) -> Status {
-    let clean = strip_ansi(raw_content);
-    let mut non_empty_lines = Vec::new();
-    let mut loader_window = VecDeque::with_capacity(4);
-    for (line_index, line) in clean.lines().enumerate() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        non_empty_lines.push(line);
-        if loader_window.len() == 4 {
-            loader_window.pop_front();
-        }
-        loader_window.push_back((line_index, line));
-    }
-
-    // Each signal registers the position of its lowest matching line (1 =
-    // bottom, within its freshness window); the lowest position wins, ties
-    // broken by registration order (spinner > countdown > anchor > terminal
-    // lines > approval > labels).
-    let mut winner: Option<(usize, OmpSignal)> = None;
-    let mut consider = |pos: usize, signal: OmpSignal| {
-        if winner.is_none_or(|(wpos, _)| pos < wpos) {
-            winner = Some((pos, signal));
-        }
-    };
-
-    // Live loader rows sit directly above the composer. Known braille frames
-    // keep the historical Working/hint markers. Configured symbolic and ASCII
-    // frames require an esc hint because their glyphs can prefix ordinary prose.
-    // A wrapped hint must be physically adjacent and indented beneath an
-    // unfinished frame row.
-    let starts_with_braille_frame = |line: &str| {
-        let line = line.trim_start();
-        SPINNER_CHARS.iter().any(|frame| {
-            line.strip_prefix(*frame)
-                .is_some_and(|rest| rest.starts_with(' '))
-        })
-    };
-    let starts_with_ascii_frame = |line: &str| {
-        let line = line.trim_start();
-        ["-", "\\", "|", "/"].iter().any(|frame| {
-            line.strip_prefix(frame)
-                .is_some_and(|rest| rest.starts_with(' '))
-        })
-    };
-    let starts_with_symbolic_frame = |line: &str| {
-        let Some((frame, _)) = line.trim_start().split_once(' ') else {
-            return false;
-        };
-        const RESERVED_PREFIXES: &[&str] =
-            &["•", "\u{f111}", "※", "❯", "\u{f054}", "│", "┃", "▏", "▎"];
-        if frame.is_empty() || RESERVED_PREFIXES.contains(&frame) {
-            return false;
-        }
-        let mut has_non_ascii = false;
-        for ch in frame.chars() {
-            if ch.is_alphanumeric() {
-                return false;
-            }
-            has_non_ascii |= !ch.is_ascii();
-        }
-        has_non_ascii
-    };
-
-    let has_hint_marker = |line: &str| {
-        let line = line.trim().to_lowercase();
-        line.ends_with("⟦esc⟧")
-            || line.ends_with("⟨esc⟩")
-            || line.ends_with("[esc]")
-            || line.contains("(esc to cancel)")
-    };
-    let has_loader_marker =
-        |line: &str| line.to_lowercase().contains("working") || has_hint_marker(line);
-    let starts_with_hint_gated_frame =
-        |line: &str| starts_with_ascii_frame(line) || starts_with_symbolic_frame(line);
-    let loader_pos = (0..loader_window.len()).rev().find_map(|i| {
-        let pos = loader_window.len() - i;
-        let (line_index, line) = loader_window[i];
-        let direct = pos <= 3
-            && ((starts_with_braille_frame(line) && has_loader_marker(line))
-                || (starts_with_hint_gated_frame(line) && has_hint_marker(line)));
-        let wrapped = if pos <= 3 && i > 0 {
-            let (frame_line_index, frame_line) = loader_window[i - 1];
-            let continuation_is_indented = line.len() > line.trim_start().len();
-            let frame_text = frame_line.trim_end();
-            let frame_is_unfinished = frame_text.ends_with("...")
-                || !matches!(
-                    frame_text.chars().next_back(),
-                    Some('.' | '!' | '?' | ':' | ';')
-                );
-            frame_line_index + 1 == line_index
-                && continuation_is_indented
-                && frame_is_unfinished
-                && !has_hint_marker(frame_line)
-                && (starts_with_braille_frame(frame_line)
-                    || starts_with_hint_gated_frame(frame_line))
-                && has_hint_marker(line)
-        } else {
-            false
-        };
-        (direct || wrapped).then_some(pos)
-    });
-    if let Some(pos) = loader_pos {
-        consider(pos, OmpSignal::Spinner);
-    }
-
-    // Retry countdown: fixed live region above the prompt (window 6). (a)
-    // single-line match; (b) if none, the window joined with single spaces so
-    // a character-wrap cut between tokens still matches.
-    let window6 = tail_lines(&non_empty_lines, 6);
-    let mut countdown_pos = None;
-    for (i, line) in window6.iter().rev().enumerate() {
-        if countdown_a().is_match(&line.to_lowercase()) {
-            countdown_pos = Some(i + 1);
-            break;
-        }
-    }
-    if countdown_pos.is_none() {
-        let mut joined = String::new();
-        let mut line_ends = Vec::with_capacity(window6.len());
-        for (i, line) in window6.iter().enumerate() {
-            if i > 0 {
-                joined.push(' ');
-            }
-            joined.push_str(&line.to_lowercase());
-            line_ends.push(joined.len());
-        }
-        // The last (lowest) fragment wins, matching the lowest-signal rule.
-        if let Some(m) = countdown_b().find_iter(&joined).last() {
-            for (i, end) in line_ends.iter().enumerate() {
-                if m.end() <= *end {
-                    countdown_pos = Some(window6.len() - i);
-                    break;
-                }
-            }
-        }
-    }
-    if let Some(pos) = countdown_pos {
-        consider(pos, OmpSignal::Countdown);
-    }
-
-    // Pinned error banner anchor and terminal retry lines: window 6.
-    if let Some(pos) = lowest_matching_line(window6, |l| {
-        l.to_lowercase().contains(OMP_BANNER_DISMISSAL_ANCHOR)
-    }) {
-        consider(pos, OmpSignal::Anchor);
-    }
-    if let Some(pos) = lowest_matching_line(window6, |l| {
-        let l = l.to_lowercase();
-        OMP_TERMINAL_RETRY_MARKERS
-            .iter()
-            .any(|marker| l.contains(marker))
-    }) {
-        consider(pos, OmpSignal::TerminalLines);
-    }
-
-    let window8 = tail_lines(&non_empty_lines, 8);
-    let window12 = tail_lines(&non_empty_lines, 12);
-
-    // Tool approval: the selector always renders bordered Approve/Deny rows
-    // plus its navigation footer, even when the tool supplies no detail row.
-    // Exact option labels keep surrounding prose from satisfying the gate.
-    let is_panel_row = |line: &str| {
-        let line = line.trim();
-        (line.starts_with('│') && line.ends_with('│'))
-            || (line.starts_with('|') && line.ends_with('|'))
-    };
-    let is_panel_option = |line: &str, expected: &str| {
-        let line = line.trim();
-        let inner = line
-            .strip_prefix('│')
-            .and_then(|line| line.strip_suffix('│'))
-            .or_else(|| {
-                line.strip_prefix('|')
-                    .and_then(|line| line.strip_suffix('|'))
-            });
-        let Some(inner) = inner else { return false };
-        let inner = inner.trim();
-        let inner = inner
-            .strip_prefix("❯ ")
-            .or_else(|| inner.strip_prefix("\u{f054} "))
-            .or_else(|| inner.strip_prefix("> "))
-            .unwrap_or(inner);
-        inner.trim().eq_ignore_ascii_case(expected)
-    };
-    let has_approve = window8.iter().any(|line| is_panel_option(line, "approve"));
-    let has_deny = window8.iter().any(|line| is_panel_option(line, "deny"));
-    if has_approve && has_deny {
-        if let Some(pos) = lowest_matching_line(window8, |line| {
-            let lower = line.to_lowercase();
-            is_panel_row(line)
-                && lower.contains("up/down navigate")
-                && lower.contains("enter select")
-                && lower.contains("esc cancel")
-        }) {
-            consider(pos, OmpSignal::Approval);
-        }
-    }
-
-    // Plan Review: stable bordered option rows, a selected option cursor,
-    // and the live bordered footer prove that the overlay is still active.
-    let has_panel_cursor = |line: &str| {
-        let line = line.trim();
-        let inner = line
-            .strip_prefix('│')
-            .and_then(|line| line.strip_suffix('│'))
-            .or_else(|| {
-                line.strip_prefix('|')
-                    .and_then(|line| line.strip_suffix('|'))
-            });
-        let Some(inner) = inner else { return false };
-        let inner = inner.trim();
-        inner.starts_with("❯ ") || inner.starts_with("\u{f054} ") || inner.starts_with("> ")
-    };
-    let is_plan_option = |line: &str| {
-        is_panel_option(line, "approve and execute")
-            || is_panel_option(line, "approve and compact context")
-            || is_panel_option(line, "refine plan")
-            || is_panel_option(line, "save and quit")
-            || (is_panel_row(line) && line.to_lowercase().contains("approve and keep context"))
-    };
-    let has_selected_option = window12
-        .iter()
-        .any(|line| has_panel_cursor(line) && is_plan_option(line));
-    let has_plan_options = ["approve and execute", "refine plan", "save and quit"]
-        .iter()
-        .all(|expected| window12.iter().any(|line| is_panel_option(line, expected)));
-    if has_selected_option && has_plan_options {
-        if let Some(pos) = lowest_matching_line(window12, |line| {
-            let lower = line.to_lowercase();
-            is_panel_row(line) && lower.contains("tab regions") && lower.contains("esc cancel")
-        }) {
-            consider(pos, OmpSignal::Approval);
-        }
-    }
-
-    // Ask dialog footer phrases count only on a bordered dialog row.
-    if let Some(pos) = lowest_matching_line(window8, |line| {
-        let lower = line.to_lowercase();
-        is_panel_row(line)
-            && (lower.contains("enter select · n note")
-                || lower.contains("space toggle · enter ")
-                || lower.contains("enter submit · ↑/↓ scroll")
-                || lower.contains("current prompt to answer"))
-    }) {
-        consider(pos, OmpSignal::Approval);
-    }
-
-    // Sub-agent retry labels and rule-repair progress: window 12.
-    if let Some(pos) = lowest_matching_line(window12, |l| {
-        let l = l.to_lowercase();
-        label_re().is_match(&l) || attempt_re().is_match(&l)
-    }) {
-        consider(pos, OmpSignal::Labels);
-    }
-
-    if let Some((_, signal)) = winner {
-        return match signal {
-            OmpSignal::Spinner | OmpSignal::Countdown | OmpSignal::Labels => Status::Running,
-            OmpSignal::Anchor | OmpSignal::TerminalLines => Status::Error,
-            OmpSignal::Approval => Status::Waiting,
-        };
-    }
-
-    // No live signal matched. omp parks every healthy frame on its
-    // always-visible composer box, so an unsignaled frame is idle at the
-    // composer, not waiting for the user.
-    Status::Idle
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum OmpSignal {
-    Spinner,
-    Countdown,
-    Anchor,
-    TerminalLines,
-    Approval,
-    Labels,
-}
-
-/// Last `n` non-empty lines in pane order (top-down), without allocating.
-fn tail_lines<'slice, 'line>(lines: &'slice [&'line str], n: usize) -> &'slice [&'line str] {
-    &lines[lines.len().saturating_sub(n)..]
-}
-
-/// Position (1 = bottom) of the lowest line matching `matches`, within
-/// `lines` (assumed to be in pane order).
-fn lowest_matching_line(lines: &[&str], matches: impl Fn(&str) -> bool) -> Option<usize> {
-    lines
-        .iter()
-        .rev()
-        .position(|line| matches(line))
-        .map(|i| i + 1)
-}
-
-fn countdown_a() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"retrying \(\d+/\d+\) in \d+s…").expect("static countdown regex"))
-}
-
-fn countdown_b() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"retrying\s+\(\d+/\d+\)\s+in\s+\d+\s*s\s*…").expect("static countdown regex")
-    })
-}
-
-fn label_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        // Exact grammar of omp's formatDuration (packages/utils/src/format.ts
-        // in the 17.3.4 source): Nms (fractional: the retry jitter leaves
-        // fractional milliseconds) / X.Ys (toFixed(1)) / Nm / NmNs / Nh /
-        // NhNm / Nd / NdNh, never more than two units, never decimals below
-        // the seconds level.
-        Regex::new(
-            r"retrying \d+/\d+ (in (\d+(\.\d+)?ms|\d+\.\d+s|\d+m(\d+s)?|\d+h(\d+m)?|\d+d(\d+h)?)|now):",
-        )
-        .expect("static label regex")
-    })
-}
-
-fn attempt_re() -> &'static Regex {
-    static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| Regex::new(r"attempt \d+/\d+ ·").expect("static attempt regex"))
+    detect_via_manifest("omp", raw_content, "", None)
 }
 
 /// Factory Droid CLI status detection via tmux pane parsing.
@@ -3727,7 +2814,12 @@ To continue this session, run codex resume 019e270b-5139-7752-ac61-86fe4bb5170c
 "#;
 
         assert_eq!(
-            reconcile_codex_hook_status(Status::Running, pane),
+            detect_via_manifest(
+                "codex",
+                pane,
+                "",
+                Some(hook_at(Status::Running, Some(std::time::Duration::ZERO)))
+            ),
             Status::Waiting
         );
     }
@@ -3741,7 +2833,12 @@ To continue this session, run codex resume 019e270b-5139-7752-ac61-86fe4bb5170c
 ";
 
         assert_eq!(
-            reconcile_codex_hook_status(Status::Running, pane),
+            detect_via_manifest(
+                "codex",
+                pane,
+                "",
+                Some(hook_at(Status::Running, Some(std::time::Duration::ZERO)))
+            ),
             Status::Waiting
         );
     }
@@ -3765,7 +2862,12 @@ To continue this session, run codex resume 019e270b-5139-7752-ac61-86fe4bb5170c
 "#;
 
         assert_eq!(
-            reconcile_codex_hook_status(Status::Running, pane),
+            detect_via_manifest(
+                "codex",
+                pane,
+                "",
+                Some(hook_at(Status::Running, Some(std::time::Duration::ZERO)))
+            ),
             Status::Running
         );
     }
@@ -3794,7 +2896,12 @@ report the issue.
 "#;
 
         assert_eq!(
-            reconcile_codex_hook_status(Status::Running, pane),
+            detect_via_manifest(
+                "codex",
+                pane,
+                "",
+                Some(hook_at(Status::Running, Some(std::time::Duration::ZERO)))
+            ),
             Status::Idle
         );
     }
@@ -3816,7 +2923,12 @@ report the issue.
 "#;
 
         assert_eq!(
-            reconcile_codex_hook_status(Status::Running, pane),
+            detect_via_manifest(
+                "codex",
+                pane,
+                "",
+                Some(hook_at(Status::Running, Some(std::time::Duration::ZERO)))
+            ),
             Status::Idle
         );
     }
@@ -3838,7 +2950,12 @@ report the issue.
 "#;
 
         assert_eq!(
-            reconcile_codex_hook_status(Status::Running, pane),
+            detect_via_manifest(
+                "codex",
+                pane,
+                "",
+                Some(hook_at(Status::Running, Some(std::time::Duration::ZERO)))
+            ),
             Status::Idle
         );
     }
@@ -3869,7 +2986,12 @@ report the issue.
 "#;
 
         assert_eq!(
-            reconcile_codex_hook_status(Status::Running, pane),
+            detect_via_manifest(
+                "codex",
+                pane,
+                "",
+                Some(hook_at(Status::Running, Some(std::time::Duration::ZERO)))
+            ),
             Status::Idle
         );
     }
@@ -3899,7 +3021,12 @@ report the issue.
 "#;
 
         assert_eq!(
-            reconcile_codex_hook_status(Status::Running, pane),
+            detect_via_manifest(
+                "codex",
+                pane,
+                "",
+                Some(hook_at(Status::Running, Some(std::time::Duration::ZERO)))
+            ),
             Status::Idle
         );
     }
@@ -3928,7 +3055,12 @@ report the issue.
 "#;
 
         assert_eq!(
-            reconcile_codex_hook_status(Status::Running, pane),
+            detect_via_manifest(
+                "codex",
+                pane,
+                "",
+                Some(hook_at(Status::Running, Some(std::time::Duration::ZERO)))
+            ),
             Status::Idle
         );
     }
@@ -3946,7 +3078,12 @@ report the issue.
 "#;
 
         assert_eq!(
-            reconcile_codex_hook_status(Status::Running, pane),
+            detect_via_manifest(
+                "codex",
+                pane,
+                "",
+                Some(hook_at(Status::Running, Some(std::time::Duration::ZERO)))
+            ),
             Status::Running
         );
     }
@@ -3962,7 +3099,12 @@ I’ll inspect the status detection path first and then adjust the idle override
 "#;
 
         assert_eq!(
-            reconcile_codex_hook_status(Status::Running, pane),
+            detect_via_manifest(
+                "codex",
+                pane,
+                "",
+                Some(hook_at(Status::Running, Some(std::time::Duration::ZERO)))
+            ),
             Status::Running
         );
     }
@@ -3981,7 +3123,12 @@ I’ll inspect the status detection path first and then adjust the idle override
 "#;
 
         assert_eq!(
-            reconcile_codex_hook_status(Status::Running, pane),
+            detect_via_manifest(
+                "codex",
+                pane,
+                "",
+                Some(hook_at(Status::Running, Some(std::time::Duration::ZERO)))
+            ),
             Status::Running
         );
     }
@@ -3989,15 +3136,30 @@ I’ll inspect the status detection path first and then adjust the idle override
     #[test]
     fn test_reconcile_codex_hook_status_does_not_use_generic_pane_states() {
         assert_eq!(
-            reconcile_codex_hook_status(Status::Running, "run this command? (y/n)"),
+            detect_via_manifest(
+                "codex",
+                "run this command? (y/n)",
+                "",
+                Some(hook_at(Status::Running, Some(std::time::Duration::ZERO)))
+            ),
             Status::Running
         );
         assert_eq!(
-            reconcile_codex_hook_status(Status::Running, "› Write tests for @filename"),
+            detect_via_manifest(
+                "codex",
+                "› Write tests for @filename",
+                "",
+                Some(hook_at(Status::Running, Some(std::time::Duration::ZERO)))
+            ),
             Status::Running
         );
         assert_eq!(
-            reconcile_codex_hook_status(Status::Running, "file saved"),
+            detect_via_manifest(
+                "codex",
+                "file saved",
+                "",
+                Some(hook_at(Status::Running, Some(std::time::Duration::ZERO)))
+            ),
             Status::Running
         );
     }
@@ -4015,12 +3177,27 @@ I’ll inspect the status detection path first and then adjust the idle override
 ";
 
         assert_eq!(
-            reconcile_codex_hook_status(Status::Waiting, pane),
+            detect_via_manifest(
+                "codex",
+                pane,
+                "",
+                Some(hook_at(Status::Waiting, Some(std::time::Duration::ZERO)))
+            ),
             Status::Waiting
         );
+        // A live radio prompt on screen now outranks an `idle` write, where
+        // the reconciler this replaces only ever looked at the pane for a
+        // `running` one. Codex's idle writers are not ordered against its
+        // prompt events any more than Claude's are, so the prompt is the
+        // better evidence.
         assert_eq!(
-            reconcile_codex_hook_status(Status::Idle, pane),
-            Status::Idle
+            detect_via_manifest(
+                "codex",
+                pane,
+                "",
+                Some(hook_at(Status::Idle, Some(std::time::Duration::ZERO)))
+            ),
+            Status::Waiting
         );
     }
 
@@ -4036,7 +3213,12 @@ report the issue.
 "#;
 
         assert_eq!(
-            reconcile_codex_hook_status(Status::Running, pane),
+            detect_via_manifest(
+                "codex",
+                pane,
+                "",
+                Some(hook_at(Status::Running, Some(std::time::Duration::ZERO)))
+            ),
             Status::Running
         );
     }
@@ -4053,7 +3235,12 @@ run this command? (y/n)
 "#;
 
         assert_eq!(
-            reconcile_codex_hook_status(Status::Running, pane),
+            detect_via_manifest(
+                "codex",
+                pane,
+                "",
+                Some(hook_at(Status::Running, Some(std::time::Duration::ZERO)))
+            ),
             Status::Running
         );
     }

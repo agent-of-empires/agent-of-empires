@@ -10,6 +10,14 @@ use super::*;
 /// non-empty lines of the pane and pick something that looks like an error
 /// message; otherwise fall back to a generic "stopped responding" string so
 /// the UI never renders an Error state without any explanation.
+/// omp's error banner footer, and the terminal retry lines it can replace.
+/// They live here rather than with detection: the manifest carries its own
+/// copies for deciding status, while these drive the message this module
+/// lifts out of the banner.
+const OMP_BANNER_DISMISSAL_ANCHOR: &str = "dismissed when you send your next message";
+const OMP_TERMINAL_RETRY_MARKERS: &[&str] =
+    &["error: retry budget exhausted", "error: retry failed after"];
+
 pub(super) fn summarize_error_from_pane(pane_content: &str) -> String {
     const MAX_BANNER_LINES: usize = 3;
 

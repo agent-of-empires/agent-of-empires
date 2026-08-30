@@ -21,7 +21,6 @@ use crate::session::environment::{
 };
 use crate::session::poller::SessionPoller;
 use crate::tmux;
-use crate::tmux::status_detection::{OMP_BANNER_DISMISSAL_ANCHOR, OMP_TERMINAL_RETRY_MARKERS};
 
 use crate::session::capture::{
     capture_claude_session_id, capture_claude_session_id_in_container, capture_codex_session_id,

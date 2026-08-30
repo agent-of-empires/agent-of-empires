@@ -29,7 +29,7 @@ state = "idle"
 priority = 960
 region = "bottom_non_empty_lines(5)"
 visible = true
-line_regex = ['^\s*[\x{276F}\x{26A1}](?:\s|$)']
+line_regex = ['(?i)^\s*[\x{276F}\x{26A1}](?:\s|$)']
 
 # Streaming lines carry a `┊` prefix; recent lines only, so a completed turn's
 # transcript does not read as live.

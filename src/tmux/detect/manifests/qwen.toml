@@ -40,7 +40,7 @@ state = "waiting"
 priority = 940
 region = "whole_recent"
 visible = true
-line_regex = ['^\s*[\x{203A}\x{276F}]\s*[123]\.']
+line_regex = ['(?i)^\s*[\x{203A}\x{276F}]\s*[123]\.']
 
 [[rules]]
 id = "input_prompt"
@@ -49,7 +49,7 @@ priority = 930
 region = "bottom_non_empty_lines(10)"
 visible = true
 any = [
-  { line_regex = ['^\s*>\s*$'] },
-  { line_regex = ['^\s*qwen>\s*$'] },
-  { line = { regex = ['^\s*>\s\S.{0,96}$'], not_regex = ['esc'] } },
+  { line_regex = ['(?i)^\s*>\s*$'] },
+  { line_regex = ['(?i)^\s*qwen>\s*$'] },
+  { line = { regex = ['(?i)^\s*>\s\S.{0,96}$'], not_regex = ['(?i)esc'] } },
 ]

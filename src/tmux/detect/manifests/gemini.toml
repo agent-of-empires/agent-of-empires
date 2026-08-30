@@ -40,4 +40,4 @@ state = "waiting"
 priority = 930
 region = "bottom_non_empty_lines(10)"
 visible = true
-line_regex = ['^\s*>\s*$']
+line_regex = ['(?i)^\s*>\s*$']

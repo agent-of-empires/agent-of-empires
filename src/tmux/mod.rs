@@ -18,10 +18,10 @@ pub(crate) mod vt;
 pub use composite::PaneGeom;
 pub use session::{PaneCursor, PaneEnvMutation, Session, SIZE_OWNER_HEARTBEAT, SIZE_OWNER_TTL};
 pub use status_bar::{get_session_info_for_current, get_status_for_current_session};
+pub(crate) use status_detection::reconcile_waiting_hook;
 pub use status_detection::{
-    detect_claude, detect_status_from_content, detect_status_from_content_in,
+    detect_claude, detect_status_from_content, detect_status_from_content_in, detect_via_manifest,
 };
-pub(crate) use status_detection::{reconcile_codex_hook_status, reconcile_waiting_hook};
 pub use terminal_session::{kill_all_terminals_for_id, ContainerTerminalSession, TerminalSession};
 pub use tool_session::{kill_all_tool_sessions_for_id, ToolSession};
 pub use utils::tmux_prefix_display;

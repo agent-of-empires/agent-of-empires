@@ -32,7 +32,7 @@ state = "waiting"
 priority = 965
 region = "whole_recent"
 visible = true
-line_regex = ['^\s*\x{203A}\s*\S']
+line_regex = ['(?i)^\s*\x{203A}\s*\S']
 
 [[rules]]
 id = "spinner"
@@ -66,6 +66,6 @@ state = "running"
 priority = 950
 region = "bottom_non_empty_lines(1)"
 any = [
-  { line_regex = ['\x{2026}\s*$'] },
-  { line_regex = ['\.\.\.\s*$'] },
+  { line_regex = ['(?i)\x{2026}\s*$'] },
+  { line_regex = ['(?i)\.\.\.\s*$'] },
 ]

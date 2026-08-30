@@ -40,7 +40,7 @@ state = "waiting"
 priority = 940
 region = "whole_recent"
 visible = true
-line_regex = ['\x{276F}(?:\s*|.* )[123]\.']
+line_regex = ['(?i)\x{276F}(?:\s*|.* )[123]\.']
 
 # Parked at the input prompt. OpenCode's ready state is reported as Waiting
 # rather than Idle, which is what its callers have always seen.
@@ -51,6 +51,6 @@ priority = 930
 region = "bottom_non_empty_lines(10)"
 visible = true
 any = [
-  { line_regex = ['^\s*>>?\s*$'] },
-  { line = { regex = ['^\s*>\s\S.{0,96}$'], not_regex = ['esc'] } },
+  { line_regex = ['(?i)^\s*>>?\s*$'] },
+  { line = { regex = ['(?i)^\s*>\s\S.{0,96}$'], not_regex = ['(?i)esc'] } },
 ]

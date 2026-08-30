@@ -284,8 +284,7 @@ impl Instance {
 
         // Agents still on hand-written detectors: the hook file decides, with
         // the pane consulted to release a `waiting` write whose clearing hook
-        // never fired (an Esc-cancelled prompt) and, for Codex, to catch the
-        // prompts it keeps re-emitting `running` through.
+        // never fired (an Esc-cancelled prompt).
         //
         // A `running` write past the freshness bound is not consulted at all.
         // The terminating hook can be lost, and an unbounded write then
@@ -298,14 +297,9 @@ impl Instance {
                     .is_some_and(|age| age >= LEGACY_RUNNING_HOOK_MAX_AGE);
             if !stale_running {
                 self.status = match hook.status {
-                    Status::Waiting | Status::Running => match session.capture_pane(50) {
-                        Ok(pane) if hook.status == Status::Waiting => {
-                            tmux::reconcile_waiting_hook(hook_tool, &pane)
-                        }
-                        Ok(pane) if hook_tool == "codex" => {
-                            tmux::reconcile_codex_hook_status(hook.status, &pane)
-                        }
-                        _ => hook.status,
+                    Status::Waiting => match session.capture_pane(50) {
+                        Ok(pane) => tmux::reconcile_waiting_hook(hook_tool, &pane),
+                        Err(_) => hook.status,
                     },
                     other => other,
                 };

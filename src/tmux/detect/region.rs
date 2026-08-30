@@ -31,6 +31,91 @@ pub(super) struct Screen<'a> {
 /// on a pane whose box carries several rows of chrome.
 const RECENT_LINES: usize = 30;
 
+/// A landmark line a manifest names so its rules can be scoped relative to it:
+/// the divider a finished turn draws, the rule pair around an input box, an
+/// interruption banner. Regions like `after(<name>)` and `above(<name>, n)`
+/// resolve through one of these.
+pub(super) struct Marker {
+    /// Any of these matching a line makes it a candidate.
+    pub(super) line_regex: Vec<regex::Regex>,
+    /// Case-insensitive substrings, all of which must appear in the candidate.
+    pub(super) contains: Vec<String>,
+    /// Which candidate to take, counting from the bottom. Pi's input box is
+    /// its *second* rule from the bottom, since it draws one above and one
+    /// below the prompt.
+    pub(super) occurrence: usize,
+    /// A candidate further from the bottom than this is transcript content
+    /// drawing the same shape, not the landmark, and resolves to absent.
+    /// Doubles as the fallback window for `above`.
+    pub(super) max_depth: Option<usize>,
+    /// Join up to this many consecutive lines before matching, for a banner a
+    /// narrow pane wraps. The marker resolves to the last line of the window.
+    pub(super) wrap: usize,
+    /// Dropped from the front of each line before matching, so a banner glyph
+    /// does not have to appear in every pattern.
+    pub(super) strip_prefix: Option<String>,
+    /// What `after(<marker>)` means when the marker is not on screen. A
+    /// landmark whose absence is meaningful (an interruption banner) leaves
+    /// the region empty, so a rule scoped to it cannot fire. One that only
+    /// bounds a region (the divider between turns) leaves the whole window,
+    /// since with no divider the current block *is* the whole window.
+    pub(super) absent_is_whole: bool,
+}
+
+impl Marker {
+    /// Index into `lines` of the marker, or `None` when it is absent, deeper
+    /// than `max_depth`, or occurs fewer than `occurrence` times.
+    ///
+    /// A wrapped marker is located by growing a window *forward* from each
+    /// candidate start and taking the line where the phrase completes, not by
+    /// asking which windows contain it: every window that reaches back far
+    /// enough contains it, so the latter resolves to the bottom of the pane
+    /// and leaves `after(<marker>)` empty.
+    fn resolve(&self, lines: &[&str]) -> Option<usize> {
+        let body = |line: &str| -> String {
+            let trimmed = line.trim_start();
+            match &self.strip_prefix {
+                Some(p) => trimmed
+                    .strip_prefix(p.as_str())
+                    .unwrap_or(trimmed)
+                    .trim_start(),
+                None => trimmed,
+            }
+            .to_string()
+        };
+        let hit = |joined: &str| {
+            let collapsed = collapse_ascii_whitespace(joined);
+            let lower = collapsed.to_lowercase();
+            (self.line_regex.is_empty() || self.line_regex.iter().any(|r| r.is_match(&collapsed)))
+                && self.contains.iter().all(|c| lower.contains(c.as_str()))
+        };
+        let mut seen = 0;
+        for start in (0..lines.len()).rev() {
+            let last = (start + self.wrap).min(lines.len());
+            let mut joined = String::new();
+            for (end, line) in lines.iter().enumerate().take(last).skip(start) {
+                if !joined.is_empty() {
+                    joined.push(' ');
+                }
+                joined.push_str(&body(line));
+                if !hit(&joined) {
+                    continue;
+                }
+                seen += 1;
+                if seen < self.occurrence {
+                    break;
+                }
+                let depth = lines.len() - end;
+                return match self.max_depth {
+                    Some(max) if depth > max => None,
+                    _ => Some(end),
+                };
+            }
+        }
+        None
+    }
+}
+
 /// What a rule matches against, resolved from its `region` key.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Region {
@@ -59,10 +144,36 @@ pub(super) enum Region {
     FromPromptMarker,
     /// Everything above the `prompt_marker` line.
     BeforePromptMarker,
+    /// Everything below a named marker, exclusive, optionally limited to that
+    /// slice's own last `n` lines. Empty when the marker is absent, so a rule
+    /// scoped to it cannot fire without its landmark.
+    AfterMarker(&'static str, Option<usize>),
+    /// The `n` lines directly above a named marker, falling back to the
+    /// marker's `max_depth` lines at the bottom when it is absent.
+    AboveMarker(&'static str, usize),
 }
 
 impl Region {
+    /// Region names carrying a marker are leaked once at manifest compile
+    /// time, which happens on a `OnceLock` path that lives for the process.
     pub(super) fn parse(raw: &str) -> Option<Self> {
+        if let Some(rest) = raw.strip_prefix("after(").and_then(|r| r.strip_suffix(')')) {
+            let (name, limit) = match rest.split_once(',') {
+                Some((name, n)) => (name, Some(n.trim().parse().ok()?)),
+                None => (rest, None),
+            };
+            return Some(Region::AfterMarker(
+                Box::leak(name.trim().to_string().into_boxed_str()),
+                limit,
+            ));
+        }
+        if let Some(rest) = raw.strip_prefix("above(").and_then(|r| r.strip_suffix(')')) {
+            let (name, n) = rest.split_once(',')?;
+            return Some(Region::AboveMarker(
+                Box::leak(name.trim().to_string().into_boxed_str()),
+                n.trim().parse().ok()?,
+            ));
+        }
         if let Some(n) = raw
             .strip_prefix("bottom_non_empty_lines(")
             .and_then(|r| r.strip_suffix(')'))
@@ -106,8 +217,13 @@ impl<'a> Screen<'a> {
     /// The region's text, or `""` when the pane has no such slice (no input
     /// box on screen, no title set). An empty region matches nothing, which is
     /// the safe direction: a rule that cannot see its evidence must not fire.
-    pub(super) fn region_text(&self, region: Region, prompt_marker: &[regex::Regex]) -> &str {
-        match region {
+    pub(super) fn region_text(
+        &self,
+        region: Region,
+        prompt_marker: &[regex::Regex],
+        markers: &std::collections::HashMap<String, Marker>,
+    ) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(match region {
             Region::WholeRecent => self.joined(),
             Region::CollapsedRecent => self
                 .collapsed
@@ -117,7 +233,7 @@ impl<'a> Screen<'a> {
                 // sliced from it rather than joined again per rule.
                 let start = self.recent.len().saturating_sub(n);
                 if start == 0 {
-                    return self.joined();
+                    return std::borrow::Cow::Borrowed(self.joined());
                 }
                 let skipped: usize = self.recent[..start].iter().map(|l| l.len() + 1).sum();
                 &self.joined()[skipped..]
@@ -150,7 +266,39 @@ impl<'a> Screen<'a> {
                         None => self.joined().to_string(),
                     })
             }
-        }
+            // The marker regions are built per lookup rather than cached: a
+            // manifest scopes only a handful of rules to a marker, and the
+            // capture they run against is discarded at the end of the poll.
+            Region::AfterMarker(name, limit) => {
+                return std::borrow::Cow::Owned(match markers.get(name) {
+                    Some(marker) => match marker.resolve(&self.recent) {
+                        Some(idx) => {
+                            let after = &self.recent[idx + 1..];
+                            let start = limit.map_or(0, |n| after.len().saturating_sub(n));
+                            after[start..].join("\n")
+                        }
+                        None if marker.absent_is_whole => {
+                            let start = limit.map_or(0, |n| self.recent.len().saturating_sub(n));
+                            self.recent[start..].join("\n")
+                        }
+                        None => String::new(),
+                    },
+                    None => String::new(),
+                })
+            }
+            Region::AboveMarker(name, n) => {
+                let marker = markers.get(name);
+                return std::borrow::Cow::Owned(
+                    match marker.and_then(|m| m.resolve(&self.recent)) {
+                        Some(idx) => self.recent[idx.saturating_sub(n)..idx].join("\n"),
+                        None => {
+                            let window = marker.and_then(|m| m.max_depth).unwrap_or(n);
+                            self.recent[self.recent.len().saturating_sub(window)..].join("\n")
+                        }
+                    },
+                );
+            }
+        })
     }
 
     /// The last line matching any of the manifest's prompt-marker patterns.

@@ -39,9 +39,9 @@ priority = 940
 region = "bottom_non_empty_lines(10)"
 visible = true
 any = [
-  { line_regex = ['^\s*>\s*$'] },
-  { line_regex = ['^\s*copilot>\s*$'] },
-  { line = { regex = ['^\s*>\s\S.{0,96}$'], not_regex = ['esc'] } },
+  { line_regex = ['(?i)^\s*>\s*$'] },
+  { line_regex = ['(?i)^\s*copilot>\s*$'] },
+  { line = { regex = ['(?i)^\s*>\s\S.{0,96}$'], not_regex = ['(?i)esc'] } },
 ]
 
 # Only the last three lines: a finished turn leaves its own activity text in
