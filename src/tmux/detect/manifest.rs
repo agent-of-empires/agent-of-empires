@@ -12,14 +12,24 @@ use super::region::{Marker, Region, Screen};
 use crate::session::Status;
 
 /// A rule as written in TOML.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 pub(super) struct RawRule {
+    /// Empty for a shared template, which is named by its table key.
+    #[serde(default)]
     pub(super) id: String,
+    /// A template in `manifests/shared.toml` to build on. Scalars set here win
+    /// over the template's; list fields concatenate, so an agent adds its own
+    /// phrases to the shared ones rather than restating them.
+    #[serde(default)]
+    pub(super) extends: Option<String>,
     /// Omitted by rules that only carry `skip_state_update`.
     #[serde(default)]
     pub(super) state: Option<String>,
+    /// Templates carry no priority: each agent ranks the shape itself.
+    #[serde(default)]
     pub(super) priority: i32,
-    pub(super) region: String,
+    #[serde(default)]
+    pub(super) region: Option<String>,
     /// The pane visibly shows this state's own chrome, as opposed to the state
     /// being inferred. The poller uses it to publish a transition immediately
     /// instead of waiting for a second agreeing poll.
@@ -56,7 +66,7 @@ pub(super) struct RawRule {
 
 /// The match forms a rule (or a nested clause) may carry. Several may be set
 /// at once, in which case all of them must hold.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub(super) struct RawMatcher {
     /// Case-insensitive substrings, all of which must appear.
     #[serde(default)]
@@ -101,7 +111,7 @@ pub(super) struct RawMatcher {
     pub(super) min_lines: Option<usize>,
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Default, Clone, Deserialize)]
 pub(super) struct RawLineClause {
     #[serde(default)]
     pub(super) regex: Vec<String>,
@@ -305,12 +315,15 @@ impl Matcher {
 
 impl Rule {
     fn compile(raw: RawRule) -> anyhow::Result<Self> {
-        let is_hook = raw.region == "hook";
+        let region_name = raw.region.clone().ok_or_else(|| {
+            anyhow::anyhow!("rule {}: no region, and no template gave one", raw.id)
+        })?;
+        let is_hook = region_name == "hook";
         let region = if is_hook {
             Region::WholeRecent
         } else {
-            Region::parse(&raw.region).ok_or_else(|| {
-                anyhow::anyhow!("rule {}: unknown region {:?}", raw.id, raw.region)
+            Region::parse(&region_name).ok_or_else(|| {
+                anyhow::anyhow!("rule {}: unknown region {:?}", raw.id, region_name)
             })?
         };
         let state = match &raw.state {
@@ -385,6 +398,50 @@ impl Rule {
 /// state off live chrome and above the ones that only guess, which is the
 /// arrangement the whole design turns on. A manifest that needs different
 /// bounds declares its own rule with the same id and wins.
+/// Rule templates shared across manifests, keyed by name.
+const SHARED_TEMPLATES: &str = include_str!("manifests/shared.toml");
+
+#[derive(Debug, Deserialize)]
+struct RawTemplates {
+    templates: std::collections::HashMap<String, RawRule>,
+}
+
+impl RawRule {
+    /// Fold a template into this rule: scalars already set here win, lists
+    /// concatenate so an agent extends the shared phrases rather than
+    /// restating them.
+    fn inherit(&mut self, base: &RawRule) {
+        self.state = self.state.take().or_else(|| base.state.clone());
+        self.region = self.region.take().or_else(|| base.region.clone());
+        self.visible |= base.visible;
+        self.skip_state_update |= base.skip_state_update;
+        self.positional |= base.positional;
+        self.max_age_secs = self.max_age_secs.or(base.max_age_secs);
+        self.max_position = self.max_position.or(base.max_position);
+        if self.wrap == 1 {
+            self.wrap = base.wrap;
+        }
+        self.matcher.inherit(&base.matcher);
+    }
+}
+
+impl RawMatcher {
+    fn inherit(&mut self, base: &RawMatcher) {
+        self.contains.extend(base.contains.iter().cloned());
+        self.contains_any.extend(base.contains_any.iter().cloned());
+        self.regex.extend(base.regex.iter().cloned());
+        self.line_regex.extend(base.line_regex.iter().cloned());
+        self.not.extend(base.not.iter().cloned());
+        self.all.extend(base.all.iter().cloned());
+        self.any.extend(base.any.iter().cloned());
+        if self.line.is_none() {
+            self.line = base.line.clone();
+        }
+        self.hook_status = self.hook_status.take().or_else(|| base.hook_status.clone());
+        self.min_lines = self.min_lines.or(base.min_lines);
+    }
+}
+
 const SHARED_HOOK_RULES: &str = r#"
 [[rules]]
 id = "hook_waiting"
@@ -463,7 +520,17 @@ impl Rule {
 
 impl Manifest {
     pub(super) fn parse(source: &str) -> anyhow::Result<Self> {
-        let raw: RawManifest = toml::from_str(source)?;
+        let mut raw: RawManifest = toml::from_str(source)?;
+        let templates: RawTemplates = toml::from_str(SHARED_TEMPLATES)?;
+        for rule in &mut raw.rules {
+            let Some(name) = rule.extends.clone() else {
+                continue;
+            };
+            let base = templates.templates.get(&name).ok_or_else(|| {
+                anyhow::anyhow!("rule {}: no shared template named {name:?}", rule.id)
+            })?;
+            rule.inherit(base);
+        }
         let shared: RawManifest = toml::from_str(&format!("id = \"shared\"\n{SHARED_HOOK_RULES}"))?;
         let declared: std::collections::HashSet<&str> =
             raw.rules.iter().map(|r| r.id.as_str()).collect();

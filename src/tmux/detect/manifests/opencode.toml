@@ -1,37 +1,21 @@
 id = "opencode"
 
 [[rules]]
+extends = "interrupt_hint"
 id = "interrupt_hint"
-state = "running"
 priority = 970
-region = "whole_recent"
-visible = true
 contains_any = ["esc to interrupt", "esc interrupt"]
 
 [[rules]]
+extends = "spinner"
 id = "spinner"
-state = "running"
 priority = 960
-region = "whole_recent"
-visible = true
-line_regex = ['[\x{2800}-\x{28FF}]']
 
 [[rules]]
+extends = "approval_prompt"
 id = "approval_prompt"
-state = "waiting"
 priority = 950
-region = "whole_recent"
-visible = true
-contains_any = [
-  "(y/n)",
-  "[y/n]",
-  "approve",
-  "allow",
-  "continue?",
-  "proceed?",
-  "enter to select",
-  "esc to cancel",
-]
+contains_any = ["continue?", "proceed?", "enter to select", "esc to cancel"]
 
 # A numbered menu row carrying the selection cursor.
 [[rules]]
@@ -45,12 +29,8 @@ line_regex = ['(?i)\x{276F}(?:\s*|.* )[123]\.']
 # Parked at the input prompt. OpenCode's ready state is reported as Waiting
 # rather than Idle, which is what its callers have always seen.
 [[rules]]
+extends = "input_prompt"
 id = "input_prompt"
-state = "waiting"
 priority = 930
-region = "bottom_non_empty_lines(10)"
-visible = true
-any = [
-  { line_regex = ['(?i)^\s*>>?\s*$'] },
-  { line = { regex = ['(?i)^\s*>\s\S.{0,96}$'], not_regex = ['(?i)esc'] } },
-]
+# opencode also parks on a doubled prompt.
+any = [{ line_regex = ['(?i)^\s*>>\s*$'] }]

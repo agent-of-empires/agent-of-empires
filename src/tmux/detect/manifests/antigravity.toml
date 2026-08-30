@@ -25,16 +25,10 @@ visible = true
 contains_any = ["approval required", "awaiting user approval", "deny access"]
 
 [[rules]]
+extends = "approval_prompt"
 id = "approval_prompt"
-state = "waiting"
 priority = 970
-region = "whole_recent"
-visible = true
 contains_any = [
-  "(y/n)",
-  "[y/n]",
-  "approve",
-  "allow",
   "permission request",
   "do you trust the contents",
   "yes, i trust this folder",
@@ -45,27 +39,19 @@ contains_any = [
 ]
 
 [[rules]]
+extends = "interrupt_hint"
 id = "interrupt_hint"
-state = "running"
 priority = 960
-region = "whole_recent"
-visible = true
 contains_any = ["esc to interrupt", "ctrl+c to interrupt", "ctrl+c to stop"]
 
 [[rules]]
+extends = "spinner"
 id = "spinner"
-state = "running"
 priority = 955
-region = "whole_recent"
-visible = true
-line_regex = ['[\x{2800}-\x{28FF}]']
 
 # An activity verb opening a line, with the completion-marker suppression the
 # shared helper applies: `Running tests completed` is a report, not activity.
 [[rules]]
+extends = "activity_line"
 id = "activity_line"
-state = "running"
 priority = 950
-region = "bottom_non_empty_lines(10)"
-visible = true
-line = { regex = ['(?i)^\s*(analyzing|applying|building|editing|executing|fetching|generating|grepping|processing|reading|running|searching|testing|thinking|working|writing)[\s.:\x{2026}]'], not_regex = ['(?i)^\s*\w+(?:\W+\w+){0,4}\W+(completed?|done|finished|successful|successfully|success)\b'] }

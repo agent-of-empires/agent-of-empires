@@ -1,12 +1,9 @@
 id = "droid"
 
 [[rules]]
+extends = "spinner"
 id = "spinner"
-state = "running"
 priority = 970
-region = "whole_recent"
-visible = true
-line_regex = ['[\x{2800}-\x{28FF}]']
 
 [[rules]]
 id = "activity_hint"
@@ -23,31 +20,16 @@ contains_any = [
 ]
 
 [[rules]]
+extends = "approval_prompt"
 id = "approval_prompt"
-state = "waiting"
 priority = 950
-region = "whole_recent"
-visible = true
-contains_any = [
-  "(y/n)",
-  "[y/n]",
-  "approve",
-  "allow",
-  "continue?",
-  "proceed?",
-  "execute?",
-  "enter to select",
-  "esc to cancel",
-]
+contains_any = ["continue?", "proceed?", "execute?", "enter to select", "esc to cancel"]
 
 [[rules]]
+extends = "input_prompt"
 id = "input_prompt"
-state = "waiting"
 priority = 930
-region = "bottom_non_empty_lines(10)"
-visible = true
 any = [
-  { line_regex = ['(?i)^\s*>\s*$'] },
   { line_regex = ['(?i)^\s*droid>\s*$'] },
   { line = { regex = ['(?i)^\s*>\s\S.{0,96}$'], not_regex = ['(?i)esc'] } },
 ]

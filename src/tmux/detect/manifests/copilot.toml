@@ -4,16 +4,10 @@ id = "copilot"
 # signal. The parked and blocked shapes outrank the working ones, because it
 # keeps its spinner rendered under a prompt it is blocked on.
 [[rules]]
+extends = "approval_prompt"
 id = "approval_prompt"
-state = "waiting"
 priority = 950
-region = "whole_recent"
-visible = true
 contains_any = [
-  "(y/n)",
-  "[y/n]",
-  "approve",
-  "allow",
   "continue?",
   "run command?",
   "allow this tool",
@@ -33,13 +27,10 @@ visible = true
 contains = ["/ commands", "? help", "tab next tab"]
 
 [[rules]]
+extends = "input_prompt"
 id = "input_prompt"
-state = "waiting"
 priority = 940
-region = "bottom_non_empty_lines(10)"
-visible = true
 any = [
-  { line_regex = ['(?i)^\s*>\s*$'] },
   { line_regex = ['(?i)^\s*copilot>\s*$'] },
   { line = { regex = ['(?i)^\s*>\s\S.{0,96}$'], not_regex = ['(?i)esc'] } },
 ]

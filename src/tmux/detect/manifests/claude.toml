@@ -20,11 +20,9 @@ regex = ['^[\x{2800}-\x{28FF}\x{25D0}-\x{25D3}]']
 # common in ordinary turn text, so it is paired with a menu row carrying the
 # selection cursor: prose renders no cursor.
 [[rules]]
+extends = "approval_prompt"
 id = "approval_prompt"
-state = "waiting"
 priority = 980
-region = "whole_recent"
-visible = true
 contains_any = ["do you want to", "would you like to proceed"]
 line_regex = ['^\s*\x{276F}\s*[1-9]\.']
 
@@ -50,11 +48,9 @@ line_regex = [
 # echoes the phrase verbatim, and a loose window match pinned those panes on
 # Running until the text scrolled away.
 [[rules]]
+extends = "interrupt_hint"
 id = "interrupt_hint"
-state = "running"
 priority = 970
-region = "whole_recent"
-visible = true
 line_regex = ['(?i)^[ \t]*(?:[^"\x{23BF}+\s\d][^"]*)?(?:esc|ctrl\+c) to interrupt']
 
 # The live token counter (`(4s · ↓ 88 tokens)`), which only renders while a

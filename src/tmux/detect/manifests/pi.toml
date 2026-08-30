@@ -15,34 +15,28 @@ max_depth = 6
 # running one minus its spinner line: every signal here is scoped to pi's own
 # footer, because a finished turn's prose routinely says "working on #443".
 [[rules]]
+extends = "spinner"
 id = "spinner"
-state = "running"
 priority = 970
 region = "bottom_non_empty_lines(6)"
-visible = true
-line_regex = ['[\x{2800}-\x{28FF}]']
 
 # The busy line sits directly above the box in plain pi, and behind up to two
 # tip lines in derivatives aliased to pi (#3475), so the band is three deep.
 [[rules]]
+extends = "interrupt_hint"
 id = "interrupt_hint"
-state = "running"
 priority = 965
 region = "above(input_box, 3)"
-visible = true
-contains_any = ["esc to interrupt", "ctrl+c to interrupt"]
 
 # A parked prompt outranks the activity fallback below: custom wrappers and
 # older builds show `pi>` or a bare `>` at rest, and an activity word lingering
 # just above it must not flip that back to Running.
 [[rules]]
+extends = "input_prompt"
 id = "input_prompt"
-state = "waiting"
 priority = 960
 region = "bottom_non_empty_lines(5)"
-visible = true
 any = [
-  { line_regex = ['(?i)^\s*>\s*$'] },
   { line_regex = ['(?i)^\s*pi>\s*$'] },
   { line = { regex = ['(?i)^\s*>\s\S.{0,96}$'], not_regex = ['(?i)esc'] } },
 ]
@@ -50,9 +44,7 @@ any = [
 # Reduced-motion fallback: a footer line that *starts* with a live verb is a
 # status line, not narration buried mid-sentence.
 [[rules]]
+extends = "activity_line"
 id = "activity_line"
-state = "running"
 priority = 950
 region = "bottom_non_empty_lines(6)"
-visible = true
-line = { regex = ['(?i)^\s*(analyzing|applying|building|editing|executing|fetching|generating|grepping|processing|reading|running|searching|testing|thinking|working|writing)[\s.:\x{2026}]'], not_regex = ['(?i)^\s*\w+(?:\W+\w+){0,4}\W+(completed?|done|finished|successful|successfully|success)\b'] }

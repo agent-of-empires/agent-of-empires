@@ -1,37 +1,20 @@
 id = "qwen"
 
 [[rules]]
+extends = "interrupt_hint"
 id = "interrupt_hint"
-state = "running"
 priority = 970
-region = "whole_recent"
-visible = true
-contains_any = ["esc to interrupt", "ctrl+c to interrupt"]
 
 [[rules]]
+extends = "spinner"
 id = "spinner"
-state = "running"
 priority = 960
-region = "whole_recent"
-visible = true
-line_regex = ['[\x{2800}-\x{28FF}]']
 
 [[rules]]
+extends = "approval_prompt"
 id = "approval_prompt"
-state = "waiting"
 priority = 950
-region = "whole_recent"
-visible = true
-contains_any = [
-  "(y/n)",
-  "[y/n]",
-  "approve",
-  "allow",
-  "execute?",
-  "run command?",
-  "enter to select",
-  "esc to cancel",
-]
+contains_any = ["execute?", "run command?", "enter to select", "esc to cancel"]
 
 # Qwen renders its menu cursor as `›` by default and `❯` in some themes.
 [[rules]]
@@ -43,13 +26,10 @@ visible = true
 line_regex = ['(?i)^\s*[\x{203A}\x{276F}]\s*[123]\.']
 
 [[rules]]
+extends = "input_prompt"
 id = "input_prompt"
-state = "waiting"
 priority = 930
-region = "bottom_non_empty_lines(10)"
-visible = true
 any = [
-  { line_regex = ['(?i)^\s*>\s*$'] },
   { line_regex = ['(?i)^\s*qwen>\s*$'] },
   { line = { regex = ['(?i)^\s*>\s\S.{0,96}$'], not_regex = ['(?i)esc'] } },
 ]

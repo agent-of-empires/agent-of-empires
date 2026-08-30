@@ -82,23 +82,17 @@ state = "running"
 priority = 970
 region = "after(divider, 10)"
 visible = true
-line = { regex = ['(?i)^\s*(?:•\s*)?[\x{2800}-\x{28FF}]?\s*(working|thinking|processing|generating)[\s.:\x{2026}]'], not_regex = ['(?i)^\s*\S+(?:\W+\w+){0,4}\W+(completed?|done|finished|successful|successfully|success)\b'] }
+line = { regex = ['(?i)^\s*(?:\u{2022}\s*)?[\x{2800}-\x{28FF}]?\s*(working|thinking|processing|generating)[\s.:\x{2026}]'], not_regex = ['(?i)^\s*\S+(?:\W+\w+){0,4}\W+(completed?|done|finished|successful|successfully|success)\b'] }
 
 # Ranked below `hook_running_fresh`: `(y/n)` and `run command?` appear in
 # ordinary turn output, so on their own they are not enough to contradict a
 # `running` write from the last few seconds. Against a standing write, or with
 # no hook at all, they decide.
 [[rules]]
+extends = "approval_prompt"
 id = "approval_prompt"
-state = "waiting"
 priority = 590
-region = "whole_recent"
-visible = true
 contains_any = [
-  "(y/n)",
-  "[y/n]",
-  "approve",
-  "allow",
   "continue?",
   "proceed?",
   "execute?",
