@@ -983,7 +983,8 @@ mod tests {
             .expect("yolo flag present");
         assert!(
             yolo_pos > chat_pos,
-            "--trust-all-tools must come after `kiro-cli chat`: {cmd_str}"
+            "--trust-all-tools must come after `kiro-cli chat` \
+             (chat at {chat_pos}, flag at {yolo_pos})"
         );
     }
 
@@ -1002,7 +1003,7 @@ mod tests {
         assert_eq!(
             cmd_str.matches("chat").count(),
             1,
-            "no duplicate subcommand: {cmd_str}"
+            "no duplicate subcommand"
         );
     }
 
