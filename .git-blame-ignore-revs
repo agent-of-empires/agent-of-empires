@@ -7,3 +7,7 @@
 
 # oxfmt 80 -> 120 line width
 1f1a33396d189a596d29404df074b22e11646721
+
+# instance.rs split into src/session/instance/
+# Only helps files that predate it: use `git blame -C -C` inside the new modules.
+7f0fb177140efe82e2390991e22a322eecd6ea76
