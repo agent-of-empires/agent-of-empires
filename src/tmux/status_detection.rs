@@ -2122,7 +2122,16 @@ fn is_elapsed_token(token: &str) -> bool {
         .or_else(|| token.strip_suffix('m'))
         .or_else(|| token.strip_suffix('h'))
         .is_some_and(|number| {
-            !number.is_empty() && number.chars().all(|ch| ch.is_ascii_digit() || ch == '.')
+            let mut has_digit = false;
+            let mut has_decimal = false;
+            for byte in number.bytes() {
+                match byte {
+                    b'0'..=b'9' => has_digit = true,
+                    b'.' if !has_decimal => has_decimal = true,
+                    _ => return false,
+                }
+            }
+            has_digit
         })
 }
 
@@ -6869,6 +6878,14 @@ Additional output.
             (
                 "stale loader before two rendered rules",
                 "  ⎋ Working…\n\n────────────────\nSummary\n────────────────\nFinal answer.".to_string(),
+            ),
+            (
+                "digitless elapsed token cannot revive stale loader",
+                "  ⎋ Working…\nπ > RCA Slow Turn > .s\n╰─".to_string(),
+            ),
+            (
+                "multi-decimal elapsed token cannot revive stale loader",
+                "  ⎋ Working…\nπ > RCA Slow Turn > 1..2s\n╰─".to_string(),
             ),
             (
                 "18.0.10 loader without activity status",
