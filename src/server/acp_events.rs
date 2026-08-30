@@ -561,7 +561,8 @@ pub(crate) fn apply_status_intent(
 ///
 /// `inst` is the row *after* [`apply_status_intent`] ran and `old_status` is
 /// the snapshot taken before it. The predicate is deliberately byte-identical
-/// to the one in [`decide_passive_transition`] and in the TUI's
+/// to the one in [`super::status_poll::decide_passive_transition`] and in the
+/// TUI's
 /// `apply_status_update`, so "a turn just finished" means the same thing on
 /// every surface.
 ///
@@ -658,7 +659,8 @@ pub(super) async fn persist_and_mirror_unread(
 /// ACP broadcast dropped frames, marking any row whose turn ended while we were
 /// not listening. Returns the number of rows marked.
 ///
-/// `acp_events_tx` is a `broadcast` of [`ACP_CHANNEL_CAPACITY`], and a lagged
+/// `acp_events_tx` is a `broadcast` of [`super::state::ACP_CHANNEL_CAPACITY`],
+/// and a lagged
 /// receiver is told only *how many* frames it missed, never which. Status
 /// tolerated that because it is level-triggered: any later event re-derives the
 /// right value. The unread mark is edge-triggered, so a dropped `Stopped` loses
@@ -1040,7 +1042,7 @@ mod tests {
 
     /// Seed `profile`'s store with `rows`, so a persist closure has a matching
     /// id to mark. Mirrors the shape used by the `flush_passive_transition_*`
-    /// tests above.
+    /// tests in `status_poll.rs`.
     #[cfg(feature = "serve")]
     fn seed_profile_store(profile: &str, rows: Vec<Instance>) {
         crate::session::Storage::new_unwatched(profile)
@@ -1135,9 +1137,9 @@ mod tests {
     }
 
     /// A failed write must not strand a memory-only mark, the #2755 rule that
-    /// `flush_passive_transition_defers_unread_until_persist_ok` locks for the
-    /// tmux poller. Separate test rather than a row in the one above because it
-    /// needs the store deliberately broken.
+    /// `flush_passive_transition_defers_unread_until_persist_ok` (in
+    /// `status_poll.rs`) locks for the tmux poller. Separate test rather than a
+    /// row in the one above because it needs the store deliberately broken.
     #[cfg(feature = "serve")]
     #[tokio::test]
     #[serial_test::serial]

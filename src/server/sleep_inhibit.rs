@@ -5,7 +5,8 @@ use std::sync::Arc;
 use super::state::AppState;
 
 /// Cadence at which the daemon reconciles the OS sleep-inhibit assertion.
-/// Mirrors [`SESSION_IDLE_REAP_INTERVAL`]: a 2s status tick must not drive a
+/// Mirrors [`super::idle_reap::SESSION_IDLE_REAP_INTERVAL`]: a 2s status tick
+/// must not drive a
 /// config-file read plus a subprocess reconcile every iteration. Recovery
 /// latency is irrelevant here: the backing child only dies on external kill
 /// (caffeinate `-w <pid>` and the systemd-inhibit `cat` otherwise outlive every
