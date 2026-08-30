@@ -48,6 +48,7 @@ mod flags;
 mod hooks;
 mod kill;
 mod launch_command;
+pub(crate) use launch_command::pi_extension_path;
 mod lifecycle;
 mod merge;
 mod omp;

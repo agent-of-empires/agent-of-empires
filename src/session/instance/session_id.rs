@@ -375,12 +375,30 @@ impl Instance {
     ///
     /// The extension reports every `session_start`, so a `/new` inside the
     /// pane is attributed to it rather than inferred from a store keyed by
-    /// cwd. Requires the same vouched binary as the pin: an override or a
-    /// profile-set `PATH` may not be the `pi` that was probed.
+    /// cwd. Requires a binary AoE can vouch for on the host; a sandboxed pane
+    /// runs the container's pi, which is why the paths differ: the extension
+    /// and the instance dir are both bind-mounted in, so the flag and the env
+    /// var name container paths (see `container_config::pi_extension_mounts`).
     pub(super) fn pi_extension_launch(&self) -> Option<(String, String)> {
-        if self.tool != "pi"
-            || self.has_command_override()
-            || super::launch_command::environment_defines_path(&self.resolved_host_environment())
+        if self.tool != "pi" || self.has_command_override() {
+            return None;
+        }
+        if self.is_sandboxed() {
+            // The container's pi is not the binary the probe read, but every
+            // published pi takes `--extension`, so the flag is safe there.
+            return Some((
+                format!(
+                    " -e {}",
+                    crate::session::container_config::PI_EXTENSION_PATH_IN_CONTAINER
+                ),
+                format!(
+                    "AOE_PI_SESSION_ID_FILE={}/{}/session_id ",
+                    crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER,
+                    self.id
+                ),
+            ));
+        }
+        if super::launch_command::environment_defines_path(&self.resolved_host_environment())
             || !crate::agents::pi_supports_extension_flag()
         {
             return None;

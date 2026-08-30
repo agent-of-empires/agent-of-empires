@@ -40,7 +40,7 @@ fn apply_yolo_mode(cmd: &mut String, yolo: &crate::agents::YoloMode, is_sandboxe
 /// Write the Pi session-id extension into the app dir and return its path.
 ///
 /// Rewritten when the content differs so an upgrade ships its own version.
-pub(super) fn pi_extension_path() -> Result<PathBuf> {
+pub(crate) fn pi_extension_path() -> Result<PathBuf> {
     const SOURCE: &str = include_str!("../../../assets/pi/aoe-session-id.js");
     let dir = crate::session::get_app_dir()?.join("agent-extensions");
     std::fs::create_dir_all(&dir)?;
@@ -390,6 +390,14 @@ impl Instance {
                 }
             }
 
+            // Pi publishes its conversation from inside the container through
+            // the same extension, reaching the instance dir and the extension
+            // file by bind-mount (see `container_config`).
+            let pi_extension = self.pi_extension_launch();
+            if let Some((ref flag, _)) = pi_extension {
+                tool_cmd.push_str(flag);
+                self.pi_extension_launched = true;
+            }
             let is_existing = self.apply_session_flags(&mut tool_cmd, "sandboxed");
             apply_agent_launch_env(&mut tool_cmd, agent);
 
@@ -418,6 +426,12 @@ impl Instance {
                 shell_escape(&profile),
                 shell_escape(&self.id)
             ));
+            if let Some((_, ref env)) = pi_extension {
+                // `KEY=VALUE ` from the host form, passed as a docker `-e`.
+                env_info
+                    .docker_args
+                    .push_str(&format!(" -e {}", shell_escape(env.trim())));
+            }
             let env_part = format!("{} ", env_info.docker_args);
             let raw_command = container.exec_command(Some(&env_part), &tool_cmd);
             let launch_command = if let Some(plan) = omp_capture_plan.as_ref() {
@@ -569,6 +583,47 @@ impl Instance {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn sandboxed_pi_launch_carries_the_extension_and_container_paths() {
+        // The container's pi is a different binary from the one the probe
+        // read, so the sandbox arm cannot gate on it; every published pi takes
+        // `--extension`. Both paths it names are bind-mounts, not host paths.
+        let mut inst = Instance::new("pi-sandbox", "/tmp/pi-sandbox");
+        inst.tool = "pi".to_string();
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test-image".to_string(),
+            container_name: "aoe-pi-sandbox".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: None,
+            before_start_env: Vec::new(),
+        });
+
+        let (flag, env) = inst.pi_extension_launch().expect("sandboxed pi publishes");
+        assert_eq!(
+            flag.trim(),
+            format!(
+                "-e {}",
+                crate::session::container_config::PI_EXTENSION_PATH_IN_CONTAINER
+            )
+        );
+        assert_eq!(
+            env.trim(),
+            format!(
+                "AOE_PI_SESSION_ID_FILE={}/{}/session_id",
+                crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER,
+                inst.id
+            )
+        );
+        assert!(
+            !flag.contains(&std::env::var("HOME").unwrap_or_default())
+                || std::env::var("HOME").unwrap_or_default().is_empty(),
+            "a host path would not resolve inside the container"
+        );
+    }
     use super::*;
 
     use crate::session::test_support::EnvGuard;
