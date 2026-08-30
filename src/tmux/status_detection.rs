@@ -2069,6 +2069,239 @@ pub fn detect_pi_status(raw_content: &str) -> Status {
 
     Status::Idle
 }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerKind {
+    Unknown,
+    Box,
+    Prompt,
+    Block,
+    Rail,
+    Rule,
+    Extension,
+}
+
+impl ComposerKind {
+    fn is_complete(
+        self,
+        box_bottom: bool,
+        prompt: bool,
+        rules: usize,
+        paired_rules: bool,
+        saw_extension_row: bool,
+    ) -> bool {
+        match self {
+            Self::Unknown => prompt && rules > 0,
+            Self::Box => box_bottom,
+            Self::Prompt | Self::Block | Self::Rail => true,
+            Self::Rule => prompt || paired_rules,
+            Self::Extension => saw_extension_row,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ElapsedTextOptions {
+    count_after_time_icon: bool,
+    separator_qualifies: bool,
+    qualifying_token_count: Option<usize>,
+    persistent_time_icon_qualifies: bool,
+}
+
+struct ElapsedTextScan {
+    token_count: usize,
+    has_separator: bool,
+    has_elapsed: bool,
+    has_activity_elapsed: bool,
+    has_persistent_time_icon: bool,
+}
+
+fn is_elapsed_token(token: &str) -> bool {
+    token
+        .strip_suffix('s')
+        .or_else(|| token.strip_suffix('m'))
+        .or_else(|| token.strip_suffix('h'))
+        .is_some_and(|number| {
+            !number.is_empty() && number.chars().all(|ch| ch.is_ascii_digit() || ch == '.')
+        })
+}
+
+fn is_persistent_time_icon(token: &str) -> bool {
+    matches!(token, "◷" | "⏱" | "" | "t:" | "clock")
+}
+
+fn is_activity_frame(token: &str) -> bool {
+    SPINNER_CHARS.contains(&token)
+        || matches!(token, "-" | "/" | "|" | "X" | "◐")
+        || token.as_bytes() == [92]
+}
+
+fn scan_elapsed_text(line: &str, count_after_time_icon: bool) -> ElapsedTextScan {
+    let mut previous = None;
+    let mut scan = ElapsedTextScan {
+        token_count: 0,
+        has_separator: OMP_STATUS_SEPARATORS
+            .iter()
+            .any(|separator| line.contains(separator)),
+        has_elapsed: false,
+        has_activity_elapsed: false,
+        has_persistent_time_icon: false,
+    };
+    for token in line.split_whitespace() {
+        let elapsed = is_elapsed_token(token);
+        scan.token_count += 1;
+        scan.has_elapsed |= elapsed
+            && (count_after_time_icon
+                || previous.is_none_or(|token| !is_persistent_time_icon(token)));
+        scan.has_activity_elapsed |= elapsed && previous.is_some_and(is_activity_frame);
+        scan.has_persistent_time_icon |= is_persistent_time_icon(token);
+        previous = Some(token);
+    }
+    scan
+}
+
+fn has_elapsed_text_with_options(line: &str, options: ElapsedTextOptions) -> bool {
+    let scan = scan_elapsed_text(line, options.count_after_time_icon);
+    scan.has_elapsed
+        && (options.separator_qualifies && scan.has_separator
+            || options
+                .qualifying_token_count
+                .is_some_and(|count| scan.token_count == count)
+            || options.persistent_time_icon_qualifies && scan.has_persistent_time_icon)
+}
+
+fn has_known_activity_elapsed(line: &str) -> bool {
+    scan_elapsed_text(line, true).has_activity_elapsed
+}
+
+fn is_box_top(line: &str) -> bool {
+    let mut chars = line.trim().chars();
+    let Some(corner) = chars.next() else {
+        return false;
+    };
+    let Some(horizontal) = chars.next() else {
+        return false;
+    };
+    matches!(corner, '╭' | '┌' | '╔' | '+')
+        && !horizontal.is_alphanumeric()
+        && chars.next().is_some_and(|next| next == horizontal)
+}
+
+fn is_box_bottom(line: &str) -> bool {
+    let mut chars = line.trim().chars();
+    let Some(corner) = chars.next() else {
+        return false;
+    };
+    let Some(horizontal) = chars.next() else {
+        return false;
+    };
+    matches!(corner, '╰' | '└' | '╚' | '+') && !horizontal.is_alphanumeric()
+}
+
+fn is_structural_custom_bottom(line: &str) -> bool {
+    let mut chars = line.trim().chars();
+    let _left = chars.next();
+    let _right = chars.next_back();
+    let Some(horizontal) = chars.next() else {
+        return false;
+    };
+    chars.clone().next().is_some() && chars.all(|candidate| candidate == horizontal)
+}
+
+fn is_custom_box_bottom(line: &str) -> bool {
+    !has_known_activity_elapsed(line)
+        && line
+            .chars()
+            .filter(|ch| !ch.is_alphanumeric() && !ch.is_whitespace())
+            .count()
+            >= 2
+}
+
+fn has_custom_box_edge_chrome(row: &str) -> bool {
+    let mut chars = row.trim().chars();
+    chars.next();
+    chars.next_back();
+    let left = chars.next();
+    let right = chars.next_back();
+    left.is_some_and(|ch| !ch.is_alphanumeric() && !ch.is_whitespace())
+        && right.is_some_and(|ch| !ch.is_alphanumeric() && !ch.is_whitespace())
+}
+
+fn composer_kind(line: &str) -> ComposerKind {
+    let line = line.trim();
+    let first = line.chars().next();
+    let horizontal_rule = line.chars().count() >= 3
+        && first.is_some_and(|rule| {
+            !rule.is_alphanumeric()
+                && !rule.is_whitespace()
+                && line.chars().all(|candidate| candidate == rule)
+        });
+    if is_box_top(line) {
+        ComposerKind::Box
+    } else if line == "❯" || line.starts_with("❯ ") {
+        ComposerKind::Prompt
+    } else if line.starts_with('▐') {
+        ComposerKind::Block
+    } else if line.starts_with('▎') {
+        ComposerKind::Rail
+    } else if horizontal_rule && first == Some('=') {
+        ComposerKind::Extension
+    } else if horizontal_rule {
+        ComposerKind::Rule
+    } else {
+        ComposerKind::Unknown
+    }
+}
+
+fn has_activity_segment_elapsed(line: &str) -> bool {
+    let trimmed = line.trim();
+    if has_known_activity_elapsed(trimmed) {
+        return true;
+    }
+    let segment_end = OMP_STATUS_SEPARATORS
+        .iter()
+        .filter_map(|separator| trimmed.find(separator))
+        .min()
+        .unwrap_or(trimmed.len());
+    let mut tokens = trimmed[..segment_end].split_whitespace();
+    let first = tokens.next();
+    let frame = if first.is_some_and(|token| is_box_top(token) || token.starts_with('')) {
+        tokens.next()
+    } else {
+        first
+    };
+    let has_persistent_time_icon = scan_elapsed_text(trimmed, true).has_persistent_time_icon;
+    !has_persistent_time_icon
+        && !frame.is_some_and(is_persistent_time_icon)
+        && tokens.take(3).any(is_elapsed_token)
+}
+
+fn has_any_elapsed_text(line: &str) -> bool {
+    has_elapsed_text_with_options(
+        line,
+        ElapsedTextOptions {
+            count_after_time_icon: true,
+            separator_qualifies: true,
+            qualifying_token_count: Some(2),
+            persistent_time_icon_qualifies: true,
+        },
+    )
+}
+
+fn has_elapsed_text(line: &str) -> bool {
+    has_elapsed_text_with_options(
+        line,
+        ElapsedTextOptions {
+            count_after_time_icon: false,
+            separator_qualifies: true,
+            qualifying_token_count: Some(2),
+            persistent_time_icon_qualifies: false,
+        },
+    )
+}
+
+fn has_activity_timer(line: &str) -> bool {
+    line.split_whitespace().any(is_activity_frame) && has_elapsed_text(line)
+}
 
 /// Oh My Pi status detection via its live pane output.
 ///
@@ -2113,9 +2346,16 @@ pub fn detect_pi_status(raw_content: &str) -> Status {
 /// error/retry path (herdr-style extension) is tracked in #3380.
 pub fn detect_omp_status(raw_content: &str) -> Status {
     let clean = strip_ansi(raw_content);
+    let pane_lines: Vec<&str> = clean.lines().collect();
+    let pane_width = pane_lines
+        .iter()
+        .copied()
+        .map(UnicodeWidthStr::width)
+        .max()
+        .unwrap_or_default();
     let mut non_empty_lines = Vec::new();
     let mut loader_window = VecDeque::new();
-    for (line_index, line) in clean.lines().enumerate() {
+    for (line_index, line) in pane_lines.iter().copied().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
@@ -2213,182 +2453,23 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
     // gap, while every other composer begins flush-left after the editor gap.
     // This works with configured icons and extension chrome without treating
     // activity-like editor text or stale transcript rows as a live loader.
-    let is_elapsed = |token: &str| {
-        token
-            .strip_suffix('s')
-            .or_else(|| token.strip_suffix('m'))
-            .or_else(|| token.strip_suffix('h'))
-            .is_some_and(|number| {
-                !number.is_empty() && number.chars().all(|ch| ch.is_ascii_digit() || ch == '.')
-            })
-    };
-    let is_activity_frame = |token: &str| {
-        SPINNER_CHARS.contains(&token)
-            || matches!(token, "-" | "/" | "|" | "X" | "◐")
-            || token.as_bytes() == [92]
-    };
-    let has_known_activity_elapsed = |line: &str| {
-        let mut previous = None;
-        line.split_whitespace().any(|token| {
-            let found = is_elapsed(token) && previous.is_some_and(is_activity_frame);
-            previous = Some(token);
-            found
-        })
-    };
-    let is_box_top = |line: &str| {
-        let mut chars = line.trim().chars();
-        let Some(corner) = chars.next() else {
-            return false;
-        };
-        let Some(horizontal) = chars.next() else {
-            return false;
-        };
-        matches!(corner, '╭' | '┌' | '╔' | '+')
-            && !horizontal.is_alphanumeric()
-            && chars.next().is_some_and(|next| next == horizontal)
-    };
-    let is_box_bottom = |line: &str| {
-        let mut chars = line.trim().chars();
-        let Some(corner) = chars.next() else {
-            return false;
-        };
-        let Some(horizontal) = chars.next() else {
-            return false;
-        };
-        matches!(corner, '╰' | '└' | '╚' | '+') && !horizontal.is_alphanumeric()
-    };
-    let is_structural_custom_bottom = |line: &str| {
-        let mut chars = line.trim().chars();
-        let _left = chars.next();
-        let _right = chars.next_back();
-        let Some(horizontal) = chars.next() else {
-            return false;
-        };
-        chars.clone().next().is_some() && chars.all(|candidate| candidate == horizontal)
-    };
-    let is_custom_box_bottom = |line: &str| {
-        !has_known_activity_elapsed(line)
-            && line
-                .chars()
-                .filter(|ch| !ch.is_alphanumeric() && !ch.is_whitespace())
-                .count()
-                >= 2
-    };
-    let composer_kind = |line: &str| {
-        let line = line.trim();
-        let first = line.chars().next();
-        let horizontal_rule = line.chars().count() >= 3
-            && first.is_some_and(|rule| {
-                !rule.is_alphanumeric()
-                    && !rule.is_whitespace()
-                    && line.chars().all(|candidate| candidate == rule)
-            });
-        if is_box_top(line) {
-            1
-        } else if line == "❯" || line.starts_with("❯ ") {
-            2
-        } else if line.starts_with('▐') {
-            3
-        } else if line.starts_with('▎') {
-            4
-        } else if horizontal_rule && first == Some('=') {
-            6
-        } else if horizontal_rule {
-            5
-        } else {
-            0
-        }
-    };
-    let composer_complete =
-        |kind: u8, box_bottom: bool, prompt: bool, rules: usize, paired_rules: bool| match kind {
-            0 => prompt && rules > 0,
-            1 => box_bottom,
-            2..=4 => true,
-            5 => prompt || paired_rules,
-            _ => false,
-        };
-    let has_activity_segment_elapsed = |line: &str| {
-        let trimmed = line.trim();
-        let mut previous = None;
-        let mut known_activity_elapsed = false;
-        for token in trimmed.split_whitespace() {
-            known_activity_elapsed |= is_elapsed(token) && previous.is_some_and(is_activity_frame);
-            previous = Some(token);
-        }
-        if known_activity_elapsed {
-            return true;
-        }
-        let segment_end = OMP_STATUS_SEPARATORS
-            .iter()
-            .filter_map(|separator| trimmed.find(separator))
-            .min()
-            .unwrap_or(trimmed.len());
-        let mut tokens = trimmed[..segment_end].split_whitespace();
-        let first = tokens.next();
-        let frame = if first.is_some_and(|token| is_box_top(token) || token.starts_with('')) {
-            tokens.next()
-        } else {
-            first
-        };
-        let has_persistent_time_icon = trimmed
-            .split_whitespace()
-            .any(|token| matches!(token, "◷" | "⏱" | "" | "t:" | "clock"));
-        !has_persistent_time_icon
-            && !matches!(frame, Some("◷" | "⏱" | "" | "t:" | "clock"))
-            && tokens.take(3).any(is_elapsed)
-    };
-    let has_any_elapsed_text = |line: &str| {
-        let has_separator = OMP_STATUS_SEPARATORS
-            .iter()
-            .any(|separator| line.contains(separator));
-        let mut token_count = 0;
-        let mut found = false;
-        let mut has_persistent_time_icon = false;
-        for token in line.split_whitespace() {
-            token_count += 1;
-            found |= is_elapsed(token);
-            has_persistent_time_icon |= matches!(token, "◷" | "⏱" | "" | "t:" | "clock");
-        }
-        found && (has_separator || token_count == 2 || has_persistent_time_icon)
-    };
-    let has_elapsed_text = |line: &str| {
-        let has_separator = OMP_STATUS_SEPARATORS
-            .iter()
-            .any(|separator| line.contains(separator));
-        let mut previous = "";
-        let mut token_count = 0;
-        let mut found = false;
-        for token in line.split_whitespace() {
-            token_count += 1;
-            found |= !["◷", "⏱", "", "t:", "clock"].contains(&previous) && is_elapsed(token);
-            previous = token;
-        }
-        found && (has_separator || token_count == 2)
-    };
-    let has_activity_timer =
-        |line: &str| line.split_whitespace().any(is_activity_frame) && has_elapsed_text(line);
     let live_loader_layout = |line_index: usize,
                               loader_spaces: usize,
                               allow_continuations: bool| {
-        let pane_width = clean
-            .lines()
-            .map(UnicodeWidthStr::width)
-            .max()
-            .unwrap_or_default();
-        let loader_body = clean.lines().nth(line_index)?.trim();
+        let loader_body = pane_lines.get(line_index).copied()?.trim();
         let icon_only_loader = ["⎋", "󱊷", "esc"].contains(&loader_body)
             || (!loader_body.is_empty()
                 && loader_body.split_whitespace().count() == 1
-                && clean
-                    .lines()
-                    .nth(line_index + 1)
+                && pane_lines
+                    .get(line_index + 1)
+                    .copied()
                     .is_some_and(|next| has_live_activity_word(&next.trim().to_lowercase())));
-        let mut previous_line_width = UnicodeWidthStr::width(clean.lines().nth(line_index)?);
+        let mut previous_line_width = UnicodeWidthStr::width(pane_lines.get(line_index).copied()?);
         let continuation_spaces = usize::from(loader_spaces > 1);
         let mut saw_gap = false;
         let mut post_gap_started = false;
         let mut detached_status_gap = false;
-        let mut first_kind = 0;
+        let mut first_kind = ComposerKind::Unknown;
         let mut box_bottom = false;
         let mut prompt = false;
         let mut rules = 0;
@@ -2402,16 +2483,17 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
         let mut expect_standalone_status = false;
         let mut activity_timer = false;
         let mut unknown_composer_rows = 0;
-        for (current_index, line) in clean.lines().enumerate().skip(line_index + 1) {
+        for (current_index, line) in pane_lines.iter().copied().enumerate().skip(line_index + 1) {
             if line.trim().is_empty() {
                 if post_gap_started {
-                    if first_kind == 5 && rules == 1 {
-                        let matching_bottom = clean
-                            .lines()
+                    if first_kind == ComposerKind::Rule && rules == 1 {
+                        let matching_bottom = pane_lines
+                            .iter()
+                            .copied()
                             .skip(current_index + 1)
                             .find(|line| !line.trim().is_empty())
                             .is_some_and(|line| {
-                                composer_kind(line) == 5
+                                composer_kind(line) == ComposerKind::Rule
                                     && UnicodeWidthStr::width(line)
                                         == rule_width.unwrap_or_default()
                             });
@@ -2420,18 +2502,23 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
                             continue;
                         }
                     }
-                    let complete =
-                        composer_complete(first_kind, box_bottom, prompt, rules, paired_rules)
-                            || (first_kind == 6 && saw_extension_row);
+                    let complete = first_kind.is_complete(
+                        box_bottom,
+                        prompt,
+                        rules,
+                        paired_rules,
+                        saw_extension_row,
+                    );
                     if complete {
-                        let rule_status_after_gap = first_kind == 5
+                        let rule_status_after_gap = first_kind == ComposerKind::Rule
                             && prompt
                             && !paired_rules
-                            && clean
-                                .lines()
+                            && pane_lines
+                                .iter()
+                                .copied()
                                 .skip(current_index + 1)
                                 .find(|line| !line.trim().is_empty())
-                                .is_some_and(|line| composer_kind(line) != 5);
+                                .is_some_and(|line| composer_kind(line) != ComposerKind::Rule);
                         if (expect_standalone_status || rule_status_after_gap)
                             && !detached_status_gap
                         {
@@ -2457,28 +2544,31 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
                 let kind = if leading_spaces == 0 {
                     composer_kind(line)
                 } else {
-                    0
+                    ComposerKind::Unknown
                 };
                 let mut first_composer_row = !post_gap_started;
                 if first_composer_row {
                     first_kind = kind;
                     post_gap_started = true;
-                    rule_width = (kind == 5).then(|| UnicodeWidthStr::width(line));
+                    rule_width = (kind == ComposerKind::Rule).then(|| UnicodeWidthStr::width(line));
                 }
-                if first_kind == 0 && kind != 0 && !first_composer_row {
+                if first_kind == ComposerKind::Unknown
+                    && kind != ComposerKind::Unknown
+                    && !first_composer_row
+                {
                     first_kind = kind;
                     box_bottom = false;
                     prompt = false;
                     rules = 0;
                     paired_rules = false;
-                    rule_width = (kind == 5).then(|| UnicodeWidthStr::width(line));
+                    rule_width = (kind == ComposerKind::Rule).then(|| UnicodeWidthStr::width(line));
                     saw_pi_editor_row = false;
                     saw_extension_row = false;
                     expect_standalone_status = false;
                     unknown_composer_rows = 0;
                     first_composer_row = true;
                 }
-                if first_kind == 1
+                if first_kind == ComposerKind::Box
                     && !first_composer_row
                     && leading_spaces == 0
                     && is_box_bottom(trimmed)
@@ -2489,17 +2579,26 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
                         current_index,
                     ));
                 }
-                if first_kind == 6 && !first_composer_row && !saw_extension_row {
+                if first_kind == ComposerKind::Extension
+                    && !first_composer_row
+                    && !saw_extension_row
+                {
                     saw_extension_row = true;
                     expect_standalone_status = true;
                     continue;
                 }
-                let complete_before =
-                    composer_complete(first_kind, box_bottom, prompt, rules, paired_rules)
-                        || (first_kind == 6 && saw_extension_row);
+                let complete_before = first_kind.is_complete(
+                    box_bottom,
+                    prompt,
+                    rules,
+                    paired_rules,
+                    saw_extension_row,
+                );
                 if complete_before
                     && !first_composer_row
-                    && !(expect_standalone_status && first_kind == 5 && kind == 5)
+                    && !(expect_standalone_status
+                        && first_kind == ComposerKind::Rule
+                        && kind == ComposerKind::Rule)
                 {
                     if expect_standalone_status {
                         activity_timer |= has_activity_segment_elapsed(line);
@@ -2510,13 +2609,18 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
                     activity_timer |= has_activity_segment_elapsed(line);
                     return Some((false, activity_timer, current_index));
                 }
-                if first_kind == 5 && rules == 1 && kind != 5 && line.starts_with(' ') {
-                    let matching_bottom = clean
-                        .lines()
+                if first_kind == ComposerKind::Rule
+                    && rules == 1
+                    && kind != ComposerKind::Rule
+                    && line.starts_with(' ')
+                {
+                    let matching_bottom = pane_lines
+                        .iter()
+                        .copied()
                         .skip(current_index + 1)
                         .find(|line| !line.trim().is_empty())
                         .is_some_and(|line| {
-                            composer_kind(line) == 5
+                            composer_kind(line) == ComposerKind::Rule
                                 && UnicodeWidthStr::width(line) == rule_width.unwrap_or_default()
                         });
                     if matching_bottom && rule_width.unwrap_or_default() >= 8 {
@@ -2527,8 +2631,9 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
                 if !matches!(trimmed.chars().next(), Some('│' | '▐' | '▎'))
                     && has_known_activity_elapsed(line)
                 {
-                    if let Some((bottom_index, _)) = clean
-                        .lines()
+                    if let Some((bottom_index, _)) = pane_lines
+                        .iter()
+                        .copied()
                         .enumerate()
                         .skip(current_index + 1)
                         .find(|(_, line)| !line.trim().is_empty())
@@ -2537,46 +2642,61 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
                         return Some((true, true, bottom_index));
                     }
                 }
-                if first_kind == 0
+                if first_kind == ComposerKind::Unknown
                     && unknown_composer_rows >= 2
                     && has_activity_segment_elapsed(line)
                 {
                     return Some((false, true, current_index));
                 }
-                box_bottom |= first_kind == 1
+                box_bottom |= first_kind == ComposerKind::Box
                     && !first_composer_row
                     && leading_spaces == 0
                     && is_box_bottom(trimmed);
-                prompt |= kind == 2;
-                rules += usize::from(kind == 5);
-                paired_rules |= kind == 5
+                prompt |= kind == ComposerKind::Prompt;
+                rules += usize::from(kind == ComposerKind::Rule);
+                paired_rules |= kind == ComposerKind::Rule
                     && saw_pi_editor_row
                     && UnicodeWidthStr::width(line) == rule_width.unwrap_or_default();
-                let complete =
-                    composer_complete(first_kind, box_bottom, prompt, rules, paired_rules)
-                        || (first_kind == 6 && saw_extension_row);
+                let complete = first_kind.is_complete(
+                    box_bottom,
+                    prompt,
+                    rules,
+                    paired_rules,
+                    saw_extension_row,
+                );
                 if complete {
-                    expect_standalone_status = matches!(first_kind, 2..=4 | 6)
-                        || (first_kind == 5 && (prompt || (paired_rules && saw_pi_editor_row)));
+                    expect_standalone_status = matches!(
+                        first_kind,
+                        ComposerKind::Prompt
+                            | ComposerKind::Block
+                            | ComposerKind::Rail
+                            | ComposerKind::Extension
+                    ) || (first_kind == ComposerKind::Rule
+                        && (prompt || (paired_rules && saw_pi_editor_row)));
                 }
-                pending_unknown_elapsed = first_kind == 0 && has_activity_segment_elapsed(line);
-                pending_unknown_persistent_elapsed = first_kind == 0
+                pending_unknown_elapsed =
+                    first_kind == ComposerKind::Unknown && has_activity_segment_elapsed(line);
+                pending_unknown_persistent_elapsed = first_kind == ComposerKind::Unknown
                     && has_elapsed_text(line)
                     && !has_activity_segment_elapsed(line);
-                pending_unknown_idle = first_kind == 0
+                pending_unknown_idle = first_kind == ComposerKind::Unknown
                     && line
                         .to_ascii_lowercase()
                         .split_whitespace()
                         .any(|word| word == "idle");
-                let is_last_non_empty = clean
-                    .lines()
+                let is_last_non_empty = pane_lines
+                    .iter()
+                    .copied()
                     .skip(current_index + 1)
                     .all(|line| line.trim().is_empty());
                 activity_timer |= first_composer_row
-                    && matches!(kind, 1 | 5 | 6)
+                    && matches!(
+                        kind,
+                        ComposerKind::Box | ComposerKind::Rule | ComposerKind::Extension
+                    )
                     && has_activity_segment_elapsed(line);
                 activity_timer |= line_has_timer && !complete && is_last_non_empty;
-                unknown_composer_rows += usize::from(kind == 0);
+                unknown_composer_rows += usize::from(kind == ComposerKind::Unknown);
                 continue;
             }
             activity_timer |= line_has_timer;
@@ -2589,8 +2709,9 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
             let looks_like_status = OMP_STATUS_SEPARATORS
                 .iter()
                 .any(|separator| line.contains(separator));
-            let before_band_bottom = clean
-                .lines()
+            let before_band_bottom = pane_lines
+                .iter()
+                .copied()
                 .skip(current_index + 1)
                 .find(|line| !line.trim().is_empty())
                 .is_some_and(is_box_bottom);
@@ -2611,10 +2732,9 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
             }
         }
         post_gap_started.then_some((
-            composer_complete(first_kind, box_bottom, prompt, rules, paired_rules)
-                || (first_kind == 6 && saw_extension_row),
+            first_kind.is_complete(box_bottom, prompt, rules, paired_rules, saw_extension_row),
             activity_timer,
-            clean.lines().count().saturating_sub(1),
+            pane_lines.len().saturating_sub(1),
         ))
     };
     let v18_loader_pos =
@@ -2628,9 +2748,9 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
                     return None;
                 }
                 let preceded_by_loader_gap = *line_index == 0
-                    || clean
-                        .lines()
-                        .nth(*line_index - 1)
+                    || pane_lines
+                        .get(*line_index - 1)
+                        .copied()
                         .is_some_and(|line| line.trim().is_empty());
                 if !preceded_by_loader_gap {
                     return None;
@@ -2645,7 +2765,7 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
                 if has_builtin_interrupt && leading_spaces > 2 {
                     return None;
                 }
-                let next_line = clean.lines().nth(*line_index + 1);
+                let next_line = pane_lines.get(*line_index + 1).copied();
                 let continuation_indent = usize::from(leading_spaces > 1);
                 let continuation_matches = next_line.is_some_and(|next| {
                     !next.trim().is_empty()
@@ -2661,39 +2781,46 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
                         .is_some_and(|next| has_live_activity_word(&next.trim().to_lowercase()));
                 let icon_only_continues = builtin_icon_only_continues || custom_icon_only_continues;
                 let has_custom_activity = body.split_once(' ').is_some_and(|(icon, message)| {
-                    let next_non_empty_is_band_bottom = clean
-                        .lines()
+                    let next_non_empty_is_band_bottom = pane_lines
+                        .iter()
+                        .copied()
                         .skip(*line_index + 1)
                         .find(|next| !next.trim().is_empty())
                         .is_some_and(is_box_bottom);
-                    clean
-                        .lines()
-                        .nth(*line_index + 1)
+                    pane_lines
+                        .get(*line_index + 1)
+                        .copied()
                         .is_some_and(|next| next.trim().is_empty())
-                        || clean
-                            .lines()
+                        || pane_lines
+                            .iter()
+                            .copied()
                             .skip(*line_index + 1)
                             .any(has_activity_segment_elapsed)
                         || ((icon.chars().count() > 1 || next_non_empty_is_band_bottom)
                             && has_live_activity_word(&message.to_lowercase()))
                 });
                 let has_custom_interrupt = has_custom_activity || custom_icon_only_continues;
-                let has_later_parked_surface = clean
-                    .lines()
-                    .enumerate()
-                    .skip(*line_index + 1)
-                    .filter(|(_, candidate)| candidate.trim().is_empty())
-                    .any(|(blank_index, _)| {
-                        clean
-                            .lines()
-                            .take(blank_index)
-                            .skip(*line_index + 1)
-                            .any(has_known_activity_elapsed)
-                            && clean.lines().skip(blank_index + 1).any(|candidate| {
-                                candidate.len() == candidate.trim_start().len()
-                                    && composer_kind(candidate) != 0
-                            })
-                    });
+                let has_later_parked_surface =
+                    pane_lines
+                        .iter()
+                        .copied()
+                        .enumerate()
+                        .skip(*line_index + 1)
+                        .filter(|(_, candidate)| candidate.trim().is_empty())
+                        .any(|(blank_index, _)| {
+                            pane_lines
+                                .iter()
+                                .copied()
+                                .take(blank_index)
+                                .skip(*line_index + 1)
+                                .any(has_known_activity_elapsed)
+                                && pane_lines.iter().copied().skip(blank_index + 1).any(
+                                    |candidate| {
+                                        candidate.len() == candidate.trim_start().len()
+                                            && composer_kind(candidate) != ComposerKind::Unknown
+                                    },
+                                )
+                        });
                 if has_later_parked_surface && !has_builtin_interrupt {
                     return None;
                 }
@@ -2707,27 +2834,18 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
                         .is_some_and(|rest| matches!(rest.trim(), "Working…" | "Working..."))
                 });
                 let custom_box_layout = {
-                    let mut rows = clean
-                        .lines()
+                    let mut rows = pane_lines
+                        .iter()
+                        .copied()
                         .enumerate()
                         .skip(*line_index + 1)
                         .filter(|(_, candidate)| !candidate.trim().is_empty());
                     rows.next().and_then(|(_, top)| {
-                        let has_edge_chrome = |row: &str| {
-                            let mut chars = row.trim().chars();
-                            chars.next();
-                            chars.next_back();
-                            let left = chars.next();
-                            let right = chars.next_back();
-                            left.is_some_and(|ch| !ch.is_alphanumeric() && !ch.is_whitespace())
-                                && right
-                                    .is_some_and(|ch| !ch.is_alphanumeric() && !ch.is_whitespace())
-                        };
                         rows.find_map(|(bottom_index, bottom)| {
-                            (composer_kind(top) == 0
-                                && composer_kind(bottom) == 0
-                                && has_edge_chrome(top)
-                                && has_edge_chrome(bottom)
+                            (composer_kind(top) == ComposerKind::Unknown
+                                && composer_kind(bottom) == ComposerKind::Unknown
+                                && has_custom_box_edge_chrome(top)
+                                && has_custom_box_edge_chrome(bottom)
                                 && UnicodeWidthStr::width(top) >= 8
                                 && UnicodeWidthStr::width(top) == UnicodeWidthStr::width(bottom)
                                 && is_custom_box_bottom(bottom))
@@ -2735,7 +2853,7 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
                         })
                     })
                 };
-                let line_count = clean.lines().count();
+                let line_count = pane_lines.len();
                 let active_surface = ((*line_index + 1)..line_count.saturating_sub(1))
                     .filter_map(|probe| {
                         live_loader_layout(probe, 2, true).and_then(
@@ -2760,16 +2878,19 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
                         used_relaxed_layout
                             .then(|| live_loader_layout(*line_index, leading_spaces, true))?
                     })?;
-                let lower_composer = clean
-                    .lines()
+                let lower_composer = pane_lines
+                    .iter()
+                    .copied()
                     .enumerate()
                     .skip(layout_end.saturating_add(1))
                     .find(|(_, line)| {
-                        line.len() == line.trim_start().len() && composer_kind(line) != 0
+                        line.len() == line.trim_start().len()
+                            && composer_kind(line) != ComposerKind::Unknown
                     });
                 if let Some((lower_index, _)) = lower_composer {
-                    let lower_activity = clean
-                        .lines()
+                    let lower_activity = pane_lines
+                        .iter()
+                        .copied()
                         .skip(lower_index)
                         .any(has_known_activity_elapsed);
                     if !lower_activity {
@@ -2780,30 +2901,32 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
                 if used_relaxed_layout && known_default_message && !activity_timer {
                     return None;
                 }
-                let has_inactive_elapsed =
-                    clean
-                        .lines()
-                        .enumerate()
-                        .skip(*line_index + 1)
-                        .any(|(elapsed_index, line)| {
-                            let first_composer_row = clean
-                                .lines()
-                                .skip(*line_index + 1)
-                                .take(elapsed_index.saturating_sub(*line_index + 1))
-                                .all(|line| line.trim().is_empty());
-                            let band_status_row = line.starts_with(' ')
-                                && clean
-                                    .lines()
-                                    .skip(elapsed_index + 1)
-                                    .find(|line| !line.trim().is_empty())
-                                    .is_some_and(|line| line.trim_start().starts_with("╰─"));
-                            has_any_elapsed_text(line)
-                                && ((!first_composer_row && !band_status_row)
-                                    || (first_composer_row && !has_activity_segment_elapsed(line)))
-                        });
-                let detached_from_loader = clean
-                    .lines()
-                    .nth(*line_index + 1)
+                let has_inactive_elapsed = pane_lines
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .skip(*line_index + 1)
+                    .any(|(elapsed_index, line)| {
+                        let first_composer_row = pane_lines
+                            .iter()
+                            .copied()
+                            .skip(*line_index + 1)
+                            .take(elapsed_index.saturating_sub(*line_index + 1))
+                            .all(|line| line.trim().is_empty());
+                        let band_status_row = line.starts_with(' ')
+                            && pane_lines
+                                .iter()
+                                .copied()
+                                .skip(elapsed_index + 1)
+                                .find(|line| !line.trim().is_empty())
+                                .is_some_and(|line| line.trim_start().starts_with("╰─"));
+                        has_any_elapsed_text(line)
+                            && ((!first_composer_row && !band_status_row)
+                                || (first_composer_row && !has_activity_segment_elapsed(line)))
+                    });
+                let detached_from_loader = pane_lines
+                    .get(*line_index + 1)
+                    .copied()
                     .is_some_and(|line| line.trim().is_empty());
                 if (has_builtin_interrupt || has_custom_interrupt)
                     && !activity_timer
@@ -2833,31 +2956,37 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
             })
         })
     };
-    let pane_lines: Vec<&str> = clean.lines().collect();
     let last_banner_anchor = find_wrapped_banner_anchor_end(&pane_lines);
     let error_banner_bottom = last_banner_anchor.and_then(|anchor_index| {
-        clean
-            .lines()
+        pane_lines
+            .iter()
+            .copied()
             .enumerate()
             .skip(anchor_index + 1)
             .find(|(_, line)| {
-                is_box_bottom(line) || is_structural_custom_bottom(line) || composer_kind(line) == 5
+                is_box_bottom(line)
+                    || is_structural_custom_bottom(line)
+                    || composer_kind(line) == ComposerKind::Rule
             })
             .map(|(index, _)| index)
     });
-    let signal_end = clean
-        .lines()
+    let signal_end = pane_lines
+        .iter()
+        .copied()
         .enumerate()
         .filter(|(index, line)| {
-            (is_box_bottom(line) || is_structural_custom_bottom(line) || composer_kind(line) == 5)
+            (is_box_bottom(line)
+                || is_structural_custom_bottom(line)
+                || composer_kind(line) == ComposerKind::Rule)
                 && last_banner_anchor.is_none_or(|_| {
                     error_banner_bottom.is_some_and(|bottom_index| *index > bottom_index)
                 })
         })
         .map(|(index, _)| index + 1)
-        .last();
-    let signal_non_empty_lines: Vec<&str> = clean
-        .lines()
+        .next_back();
+    let signal_non_empty_lines: Vec<&str> = pane_lines
+        .iter()
+        .copied()
         .take(signal_end.unwrap_or(usize::MAX))
         .filter(|line| !line.trim().is_empty())
         .collect();
