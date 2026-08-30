@@ -345,7 +345,7 @@ impl Instance {
 #[cfg(test)]
 mod tests {
     #[test]
-    #[serial_test::serial(hook_base)]
+    #[serial_test::serial]
     fn pi_stop_persists_a_conversation_published_long_ago() {
         // An idle pane's `/new` can be hours old by the time it stops. The
         // freshness window that guards a resume must not apply to the last
@@ -398,7 +398,7 @@ mod tests {
     }
 
     #[test]
-    #[serial_test::serial(hook_base)]
+    #[serial_test::serial]
     fn pi_stop_persists_the_conversation_the_extension_published() {
         // A `/new` inside a CLI-launched pane is observed by nobody: no poller
         // outlives the CLI, and the instance dir is cleaned up at stop. The

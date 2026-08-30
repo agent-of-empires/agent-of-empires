@@ -984,6 +984,7 @@ mod tests {
     }
 
     #[test]
+    #[serial_test::serial]
     fn sandbox_transcript_paths_validate_in_the_host_namespace() {
         // The container publishes `/root/.pi/...`; the file lives under the
         // sandbox dir on this side. Checking the container path verbatim would

@@ -2172,7 +2172,7 @@ mod tests {
     // the builder actually produces rather than the one this branch intended.
     // No container runs in CI, which is exactly why this has to be pinned here.
     #[test]
-    #[serial_test::serial(hook_base)]
+    #[serial_test::serial]
     fn sandboxed_pi_config_mount_backs_the_sidecar_and_extension() {
         let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();

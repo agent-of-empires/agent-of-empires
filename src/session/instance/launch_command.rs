@@ -589,7 +589,7 @@ mod tests {
     // The sidecar env var has to survive into the docker argv, not just be
     // computed: nothing in CI runs a container to catch it going missing.
     #[test]
-    #[serial_test::serial(hook_base)]
+    #[serial_test::serial]
     fn sandboxed_pi_launch_line_carries_the_sidecar_env() {
         let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
         let temp_home = tempfile::tempdir().unwrap();
