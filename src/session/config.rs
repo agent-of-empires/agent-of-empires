@@ -1138,6 +1138,23 @@ pub struct SessionConfig {
     )]
     pub agent_acp_cmd: HashMap<String, String>,
 
+    /// Config directory an agent reads instead of its built-in default, keyed
+    /// by the agent name the session runs (e.g. `claude-personal =
+    /// "~/.claude-personal"` for a wrapper that exports `CLAUDE_CONFIG_DIR`).
+    /// The value is a host path in both contexts: host sessions use the
+    /// directory itself, sandboxed sessions its `sandbox` subdirectory, which
+    /// is the layout AoE already uses for the built-in agents. Consulted for
+    /// folder-trust records only; status hooks keep resolving their config dir
+    /// from the agent's own env var.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    #[setting(
+        label = "Agent Config Dir",
+        widget = "list",
+        web = "local_only:points an agent at a config dir whose settings file can run commands",
+        category = "Agents"
+    )]
+    pub agent_config_dir: HashMap<String, String>,
+
     /// Require SHIFT on letter-based TUI hotkeys (e.g. SHIFT+N for New, SHIFT+D for Delete).
     /// Guards against accidental destructive actions from dictation software, a forgotten
     /// focus, or stray keystrokes. Navigation keys (h/j/k/l, arrows, Enter, Esc), punctuation
@@ -1624,6 +1641,7 @@ impl Default for SessionConfig {
             mouse_capture: true,
             custom_agents: HashMap::new(),
             agent_detect_as: HashMap::new(),
+            agent_config_dir: HashMap::new(),
             agent_acp_cmd: HashMap::new(),
             strict_hotkeys: false,
             snooze_duration_minutes: 30,
@@ -1714,6 +1732,24 @@ impl SessionConfig {
             .unwrap_or_default()
     }
 
+    /// The `agent_config_dir` entry for `tool`, with a leading `~` expanded.
+    ///
+    /// `tool` is the name the session runs, so a custom agent is looked up
+    /// under its own name and a built-in one under the registry name they
+    /// share. Relative paths are rejected: the value is written to, and a path
+    /// resolved against AoE's working directory would be a surprise.
+    pub fn agent_config_dir_for(&self, tool: &str, home: &std::path::Path) -> Option<PathBuf> {
+        let dir = self.agent_config_dir.get(tool).filter(|d| !d.is_empty())?;
+        let expanded = match dir.as_str() {
+            "~" => home.to_path_buf(),
+            _ => match dir.strip_prefix("~/") {
+                Some(rest) => home.join(rest),
+                None => PathBuf::from(dir),
+            },
+        };
+        expanded.is_absolute().then_some(expanded)
+    }
+
     /// Log warnings for misconfigured custom agent entries.
     /// Called after config load to surface TOML editing mistakes.
     pub fn warn_custom_agent_issues(&self) {
@@ -1784,6 +1820,19 @@ impl SessionConfig {
                         name, e
                     );
                 }
+            }
+        }
+        for (name, dir) in &self.agent_config_dir {
+            if name.is_empty() {
+                tracing::warn!(target: "session.store", "agent_config_dir: entry with empty agent name will be ignored");
+            } else if dir.is_empty() {
+                tracing::warn!(target: "session.store",
+                    "agent_config_dir: '{}' has an empty directory and will be ignored", name);
+            } else if !dir.starts_with('/') && !dir.starts_with('~') {
+                tracing::warn!(target: "session.store",
+                    "agent_config_dir: '{}' maps to relative path '{}'; use an absolute path or ~/, the entry will be ignored",
+                    name, dir
+                );
             }
         }
     }
@@ -4726,6 +4775,31 @@ mod tests {
     fn test_resolve_tool_command_returns_empty_for_unknown() {
         let config = SessionConfig::default();
         assert_eq!(config.resolve_tool_command("nonexistent"), "");
+    }
+
+    #[test]
+    fn test_agent_config_dir_for_resolves_only_usable_paths() {
+        let home = std::path::Path::new("/home/me");
+        let mut config = SessionConfig::default();
+        for (value, expected) in [
+            ("~/.claude-personal", Some("/home/me/.claude-personal")),
+            ("~", Some("/home/me")),
+            ("/opt/claude", Some("/opt/claude")),
+            // A relative path would resolve against AoE's working directory,
+            // and an empty one against nothing at all.
+            (".claude-personal", None),
+            ("", None),
+        ] {
+            config
+                .agent_config_dir
+                .insert("my-agent".to_string(), value.to_string());
+            assert_eq!(
+                config.agent_config_dir_for("my-agent", home),
+                expected.map(PathBuf::from),
+                "value: {value:?}"
+            );
+        }
+        assert_eq!(config.agent_config_dir_for("other-agent", home), None);
     }
 
     #[test]

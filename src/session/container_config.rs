@@ -740,7 +740,18 @@ fn sandbox_dir_for(
     home: &Path,
     instance_id: Option<&str>,
 ) -> Result<PathBuf> {
-    let sandbox_dir = home.join(mount.host_rel).join(SANDBOX_SUBDIR);
+    sandbox_dir_in(&home.join(mount.host_rel), mount, instance_id)
+}
+
+/// [`sandbox_dir_for`] against an explicit agent config directory, for a
+/// session whose agent reads somewhere other than the built-in `~/.claude`-style
+/// default (`session.agent_config_dir`).
+fn sandbox_dir_in(
+    config_dir: &Path,
+    mount: &AgentConfigMount,
+    instance_id: Option<&str>,
+) -> Result<PathBuf> {
+    let sandbox_dir = config_dir.join(SANDBOX_SUBDIR);
     if mount.tool_name != "codex" {
         return Ok(sandbox_dir);
     }
@@ -1310,26 +1321,65 @@ fn refresh_codex_sandbox_hooks(
     }
 }
 
-/// Pre-trust the container workspace in the staged config of `mount`'s agent.
+/// Whether any `sandbox.extra_volumes` entry mounts `sandbox_dir`, directly or
+/// as an ancestor. Host paths are compared as written: Docker needs them
+/// absolute, so there is nothing to expand.
+fn is_mounted_into_container(sandbox_dir: &Path, extra_volumes: &[String]) -> bool {
+    extra_volumes.iter().any(|entry| {
+        entry
+            .split(':')
+            .next()
+            .filter(|host| !host.is_empty())
+            .is_some_and(|host| sandbox_dir.starts_with(Path::new(host.trim_end_matches('/'))))
+    })
+}
+
+/// Warn when the directory a session's `agent_config_dir` resolves to reaches
+/// no container, so the trust record is written where the agent cannot read it.
+///
+/// AoE mounts the built-in agents' staged config itself; a config dir it does
+/// not own has to be bind-mounted by the user, and forgetting that mount is the
+/// silent failure this whole path exists to avoid. Only a warning: the mount
+/// may come from a source AoE cannot see, and the write itself is harmless.
+fn warn_unless_mounted(sandbox_dir: &Path, extra_volumes: &[String], tool: &str) {
+    if !is_mounted_into_container(sandbox_dir, extra_volumes) {
+        tracing::warn!(target: "session.profile",
+            "agent_config_dir for {} resolves to {}, which no sandbox.extra_volumes entry mounts into the container; {} will still open on its folder-trust prompt",
+            tool, sandbox_dir.display(), tool
+        );
+    }
+}
+
+/// Pre-trust the container workspace in the config `mount`'s agent will read.
 ///
 /// Codex and Gemini stay gated on YOLO mode: their prompts guard approvals the
 /// user has already opted out of there, and outside YOLO the prompt is the
 /// approval. Claude Code's dialog is not an approval gate but a startup gate,
 /// so it blocks a non-YOLO session just as hard and is applied unconditionally.
+///
+/// `staged` marks a directory AoE writes for one container. A directory named
+/// by `session.agent_config_dir` is the user's own, so Gemini takes the
+/// per-path entry there rather than the wholesale feature disable, which would
+/// outlive the session in a config the user also runs on the host.
 fn apply_folder_trust_config(
     mount: &AgentConfigMount,
     sandbox_dir: &Path,
     container_workspace_path: &str,
     is_yolo_mode: bool,
+    staged: bool,
 ) -> Result<()> {
     match (mount.tool_name, mount.host_rel) {
         ("codex", ".codex") if is_yolo_mode => crate::hooks::trust_codex_project(
             &sandbox_dir.join("config.toml"),
             container_workspace_path,
         ),
-        ("gemini", ".gemini") if is_yolo_mode => {
+        ("gemini", ".gemini") if is_yolo_mode && staged => {
             crate::hooks::disable_gemini_folder_trust(&sandbox_dir.join("settings.json"))
         }
+        ("gemini", ".gemini") if is_yolo_mode => crate::hooks::trust_gemini_project(
+            &sandbox_dir.join("trustedFolders.json"),
+            container_workspace_path,
+        ),
         // The same host file is bind-mounted at both `$CLAUDE_CONFIG_DIR/.claude.json`
         // (via the config dir) and `~/.claude.json` (via `home_seed_files`), so one
         // write covers whichever path this Claude Code build reads.
@@ -1354,15 +1404,24 @@ pub(crate) fn ensure_folder_trust_config_for_active_agent(
     };
 
     let resolved_profile = super::config::effective_profile(profile);
-    let session_config = super::profile_config::resolve_config_or_warn(&resolved_profile).session;
+    let config = super::profile_config::resolve_config_or_warn(&resolved_profile);
+    let session_config = config.session;
     let active_agent = resolve_active_agent(tool, detect_as, &session_config);
     let config_tool = active_agent.map_or(tool, |agent| agent.name);
+    // A session whose agent reads its own config dir (a wrapper exporting
+    // CLAUDE_CONFIG_DIR, say) is seeded there instead: the staged directory
+    // below is mounted at the built-in default, which that agent never opens.
+    let agent_config_dir = session_config.agent_config_dir_for(tool, &home);
 
     for mount in AGENT_CONFIG_MOUNTS
         .iter()
         .filter(|m| m.tool_name == config_tool)
     {
-        let sandbox_dir = match sandbox_dir_for(mount, &home, Some(instance_id)) {
+        let sandbox_dir = match agent_config_dir.as_ref() {
+            Some(dir) => sandbox_dir_in(dir, mount, Some(instance_id)),
+            None => sandbox_dir_for(mount, &home, Some(instance_id)),
+        };
+        let sandbox_dir = match sandbox_dir {
             Ok(dir) => dir,
             Err(e) => {
                 tracing::warn!(target: "session.profile",
@@ -1371,6 +1430,9 @@ pub(crate) fn ensure_folder_trust_config_for_active_agent(
                 continue;
             }
         };
+        if agent_config_dir.is_some() {
+            warn_unless_mounted(&sandbox_dir, &config.sandbox.extra_volumes, tool);
+        }
         if let Err(e) = std::fs::create_dir_all(&sandbox_dir)
             .with_context(|| format!("creating sandbox config dir {}", sandbox_dir.display()))
             .and_then(|_| {
@@ -1379,6 +1441,7 @@ pub(crate) fn ensure_folder_trust_config_for_active_agent(
                     &sandbox_dir,
                     container_workspace_path,
                     is_yolo_mode,
+                    agent_config_dir.is_none(),
                 )
             })
         {
@@ -4319,6 +4382,154 @@ volume_ignores = ["node_modules"]
             );
 
             crate::hooks::cleanup_hook_status_dir(&instance_id);
+        }
+    }
+
+    // A wrapper that points its CLI at another config dir (one binary, two
+    // accounts) makes the staged default a directory the agent never opens, so
+    // the seed has to follow `session.agent_config_dir` instead. Keyed on the
+    // session's own agent name, so a plain `claude` session in the same profile
+    // keeps the default.
+    #[test]
+    #[serial_test::serial]
+    fn test_build_container_config_seeds_declared_agent_config_dir() {
+        let (_hg, _, _tmp_base) = BaseGuard::ready();
+        let temp_home = TempDir::new().unwrap();
+        std::env::set_var("HOME", temp_home.path());
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+        let declared = temp_home.path().join(".claude-personal");
+        let app_dir = crate::session::get_app_dir().unwrap();
+        fs::write(
+            app_dir.join("config.toml"),
+            format!(
+                r#"
+[session.custom_agents]
+claude-personal = "claude-personal"
+
+[session.agent_detect_as]
+claude-personal = "claude"
+
+[session.agent_config_dir]
+claude-personal = "~/.claude-personal"
+
+[sandbox]
+extra_volumes = ["{}/sandbox:/root/.claude-personal:rw"]
+"#,
+                declared.display()
+            ),
+        )
+        .unwrap();
+
+        let project_dir = TempDir::new().unwrap();
+        git2::Repository::init(project_dir.path()).unwrap();
+
+        let sandbox_info = super::super::instance::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "test-container".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            before_start_env: Vec::new(),
+            container_workdir: None,
+        };
+        let instance_id = "declared-config-dir-test";
+        let config = build_container_config(
+            project_dir.path().to_str().unwrap(),
+            &sandbox_info,
+            ContainerAgentSelection::new("claude-personal", Some("claude")),
+            false,
+            instance_id,
+            None,
+            "",
+        )
+        .unwrap();
+
+        let seeded: serde_json::Value = serde_json::from_str(
+            &fs::read_to_string(declared.join(SANDBOX_SUBDIR).join(".claude.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            seeded["projects"][&config.working_dir]["hasTrustDialogAccepted"].as_bool(),
+            Some(true),
+            "the declared config dir must carry the trust record"
+        );
+
+        let default_config = temp_home
+            .path()
+            .join(".claude")
+            .join(SANDBOX_SUBDIR)
+            .join(".claude.json");
+        let default_trust = fs::read_to_string(&default_config)
+            .ok()
+            .and_then(|c| serde_json::from_str::<serde_json::Value>(&c).ok())
+            .map(|c| c["projects"][&config.working_dir].clone())
+            .unwrap_or(serde_json::Value::Null);
+        assert!(
+            default_trust.is_null(),
+            "the built-in config dir must be left alone, got {default_trust}"
+        );
+
+        crate::hooks::cleanup_hook_status_dir(instance_id);
+    }
+
+    // The wholesale folder-trust disable is only safe against a config AoE
+    // stages for one container. In a config dir the user named (and also runs
+    // on the host) it would outlive the session, so that arm trusts one path.
+    #[test]
+    fn test_apply_folder_trust_config_gemini_disable_is_staged_only() {
+        let mount = AGENT_CONFIG_MOUNTS
+            .iter()
+            .find(|m| m.tool_name == "gemini")
+            .unwrap();
+
+        for staged in [true, false] {
+            let dir = TempDir::new().unwrap();
+            apply_folder_trust_config(mount, dir.path(), "/workspace/wt", true, staged).unwrap();
+
+            let settings = dir.path().join("settings.json");
+            let trusted = dir.path().join("trustedFolders.json");
+            if staged {
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&fs::read_to_string(&settings).unwrap()).unwrap();
+                assert_eq!(
+                    parsed["security"]["folderTrust"]["enabled"],
+                    serde_json::json!(false)
+                );
+                assert!(!trusted.exists());
+            } else {
+                let parsed: serde_json::Value =
+                    serde_json::from_str(&fs::read_to_string(&trusted).unwrap()).unwrap();
+                assert_eq!(parsed["/workspace/wt"], serde_json::json!("TRUST_FOLDER"));
+                assert!(!settings.exists(), "folder trust must stay enabled");
+            }
+        }
+    }
+
+    #[test]
+    fn test_is_mounted_into_container_covers_ancestors_only() {
+        let dir = Path::new("/home/me/.claude-personal/sandbox");
+        for (volumes, expected) in [
+            (vec!["/home/me/.claude-personal/sandbox:/root/.cp:rw"], true),
+            (vec!["/home/me/.claude-personal:/root/.cp"], true),
+            (vec!["/home/me/.claude-personal/sandbox/:/root/.cp"], true),
+            // A sibling, and a prefix that is not a path component boundary.
+            (vec!["/home/me/.claude:/root/.claude"], false),
+            (
+                vec!["/home/me/.claude-personal/sandbox-other:/root/.cp"],
+                false,
+            ),
+            (vec![], false),
+            (vec![":/root/.cp"], false),
+        ] {
+            let volumes: Vec<String> = volumes.into_iter().map(String::from).collect();
+            assert_eq!(
+                is_mounted_into_container(dir, &volumes),
+                expected,
+                "volumes: {volumes:?}"
+            );
         }
     }
 

@@ -1341,35 +1341,46 @@ pub fn trust_gemini_project(trusted_folders_path: &Path, project_path: &str) -> 
 /// scoped to a single directory. Gemini in particular gets a per-path entry
 /// rather than the global [`disable_gemini_folder_trust`] the sandbox uses.
 ///
+/// `config_dir` is the session's `session.agent_config_dir` entry. It wins over
+/// the agent's own config-dir env var, which AoE can only read from the
+/// environment it hands the agent: a wrapper that exports the variable itself
+/// (the usual way to run one CLI against two accounts) sets it after AoE has
+/// already chosen a file, so without the setting the record lands in the
+/// default config the agent never reads.
+///
 /// Agents with no folder-trust prompt are a no-op.
 pub fn trust_host_project(
     agent_name: &str,
     home: &Path,
     host_env: &[String],
+    config_dir: Option<&Path>,
     project_path: &str,
 ) -> Result<()> {
-    let config_dir = |var: &str, default: &str| {
-        resolve_config_dir_override(var, host_env)
-            .map(PathBuf::from)
-            .unwrap_or_else(|| home.join(default))
-    };
+    let declared = || config_dir.map(Path::to_path_buf);
+    let from_env = |var: &str| resolve_config_dir_override(var, host_env).map(PathBuf::from);
     match agent_name {
-        // Without `CLAUDE_CONFIG_DIR` the trust record lives at `~/.claude.json`,
-        // beside `~/.claude/` rather than inside it; the override replaces the
+        // Without a config dir the trust record lives at `~/.claude.json`,
+        // beside `~/.claude/` rather than inside it; an override replaces the
         // whole directory, so it takes the file with it.
         "claude" => trust_claude_project(
-            &resolve_config_dir_override("CLAUDE_CONFIG_DIR", host_env)
-                .map(|dir| PathBuf::from(dir).join(".claude.json"))
+            &declared()
+                .or_else(|| from_env("CLAUDE_CONFIG_DIR"))
+                .map(|dir| dir.join(".claude.json"))
                 .unwrap_or_else(|| home.join(".claude.json")),
             project_path,
         ),
         "codex" => trust_codex_project(
-            &config_dir("CODEX_HOME", ".codex").join("config.toml"),
+            &declared()
+                .or_else(|| from_env("CODEX_HOME"))
+                .unwrap_or_else(|| home.join(".codex"))
+                .join("config.toml"),
             project_path,
         ),
+        // Gemini's env var names the file rather than the directory holding it.
         "gemini" => trust_gemini_project(
-            &resolve_config_dir_override("GEMINI_CLI_TRUSTED_FOLDERS_PATH", host_env)
-                .map(PathBuf::from)
+            &config_dir
+                .map(|dir| dir.join("trustedFolders.json"))
+                .or_else(|| from_env("GEMINI_CLI_TRUSTED_FOLDERS_PATH"))
                 .unwrap_or_else(|| home.join(".gemini").join("trustedFolders.json")),
             project_path,
         ),
@@ -3341,11 +3352,12 @@ trust_level = "trusted"
             "claude",
             home,
             &[format!("CLAUDE_CONFIG_DIR={}", claude_dir.display())],
+            None,
             "/repo",
         )
         .unwrap();
-        trust_host_project("gemini", home, &[], "/repo").unwrap();
-        trust_host_project("opencode", home, &[], "/repo").unwrap();
+        trust_host_project("gemini", home, &[], None, "/repo").unwrap();
+        trust_host_project("opencode", home, &[], None, "/repo").unwrap();
 
         assert!(
             claude_dir.join(".claude.json").exists(),
@@ -3368,7 +3380,7 @@ trust_level = "trusted"
         let home = tmp.path();
         let _guard = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
 
-        trust_host_project("claude", home, &[], "/repo").unwrap();
+        trust_host_project("claude", home, &[], None, "/repo").unwrap();
 
         let config: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(home.join(".claude.json")).unwrap())
@@ -3378,6 +3390,49 @@ trust_level = "trusted"
             Some(true)
         );
         assert!(!home.join(".claude").join(".claude.json").exists());
+    }
+
+    // `session.agent_config_dir` exists for wrappers that export the config-dir
+    // env var themselves, after AoE has already picked a file, so it has to win
+    // over the env var rather than merely fill in for it.
+    #[test]
+    fn test_trust_host_project_config_dir_wins_over_env_var() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let from_env = home.join("from-env");
+        let declared = home.join("declared");
+
+        for (agent, env_var, rel) in [
+            ("claude", "CLAUDE_CONFIG_DIR", ".claude.json"),
+            ("codex", "CODEX_HOME", "config.toml"),
+            (
+                "gemini",
+                "GEMINI_CLI_TRUSTED_FOLDERS_PATH",
+                "trustedFolders.json",
+            ),
+        ] {
+            let env = vec![format!(
+                "{env_var}={}",
+                // Gemini's variable names the file, not the directory.
+                if agent == "gemini" {
+                    from_env.join(rel)
+                } else {
+                    from_env.clone()
+                }
+                .display()
+            )];
+            trust_host_project(agent, home, &env, Some(&declared), "/repo").unwrap();
+
+            assert!(
+                declared.join(rel).exists(),
+                "{agent}: the declared config dir must take the write"
+            );
+            assert!(
+                !from_env.join(rel).exists(),
+                "{agent}: the env var must not win over the declared config dir"
+            );
+            std::fs::remove_dir_all(&declared).unwrap();
+        }
     }
 
     #[test]

@@ -658,6 +658,9 @@ impl SettingsView {
                             }
                             ListItemValidation::DetectAs => Some(validate_detect_as_entry(&text)),
                             ListItemValidation::AcpCmd => Some(validate_acp_cmd_entry(&text)),
+                            ListItemValidation::AgentConfigDir => {
+                                Some(validate_agent_config_dir_entry(&text))
+                            }
                             ListItemValidation::None | ListItemValidation::EnvEntry => None,
                         };
                         if let Some(Err(msg)) = validation_result {
@@ -930,6 +933,30 @@ impl SettingsView {
     }
 }
 
+/// `name=dir`: any agent name (custom ones are the point of the setting), and
+/// a directory AoE can resolve without a working directory to guess from.
+fn validate_agent_config_dir_entry(text: &str) -> Result<(), String> {
+    let Some((name, dir)) = text.split_once('=') else {
+        return Err(
+            "Must be in agent_name=dir format (e.g. claude-personal=~/.claude-personal)"
+                .to_string(),
+        );
+    };
+    if name.is_empty() {
+        return Err("Agent name cannot be empty".to_string());
+    }
+    if dir.is_empty() {
+        return Err("Config directory cannot be empty".to_string());
+    }
+    if !dir.starts_with('/') && !dir.starts_with('~') {
+        return Err(format!(
+            "'{}' must be an absolute path or start with ~/",
+            dir
+        ));
+    }
+    Ok(())
+}
+
 /// Validate that an entry for AgentExtraArgs or AgentCommandOverride is in `agent_name=value` format.
 fn validate_agent_key_value(text: &str) -> Result<(), String> {
     let Some((key, value)) = text.split_once('=') else {
@@ -1042,6 +1069,23 @@ mod tests {
             ("nonexistent=cmd", "not a known agent"),
         ] {
             let err = validate_agent_key_value(entry).unwrap_err();
+            assert!(err.contains(expected), "{entry:?} -> {err:?}");
+        }
+    }
+
+    #[test]
+    fn test_validate_agent_config_dir_entry() {
+        // A custom agent name is the point of the setting, so the name is not
+        // checked against the registry the way agent_key_value does.
+        assert!(validate_agent_config_dir_entry("claude-personal=~/.claude-personal").is_ok());
+        assert!(validate_agent_config_dir_entry("claude=/opt/claude").is_ok());
+        for (entry, expected) in [
+            ("just-a-name", "agent_name=dir"),
+            ("=~/.claude-personal", "name cannot be empty"),
+            ("my-agent=", "directory cannot be empty"),
+            ("my-agent=.claude-personal", "absolute path"),
+        ] {
+            let err = validate_agent_config_dir_entry(entry).unwrap_err();
             assert!(err.contains(expected), "{entry:?} -> {err:?}");
         }
     }
