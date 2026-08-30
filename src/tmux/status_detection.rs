@@ -2625,6 +2625,11 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
                                 == usize::from(leading_spaces > 1)
                     });
                 let has_custom_activity = body.split_once(' ').is_some_and(|(icon, message)| {
+                    let next_non_empty_is_band_bottom = clean
+                        .lines()
+                        .skip(*line_index + 1)
+                        .find(|next| !next.trim().is_empty())
+                        .is_some_and(is_box_bottom);
                     clean
                         .lines()
                         .nth(*line_index + 1)
@@ -2633,7 +2638,7 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
                             .lines()
                             .skip(*line_index + 1)
                             .any(has_activity_segment_elapsed)
-                        || (icon.chars().count() > 1
+                        || ((icon.chars().count() > 1 || next_non_empty_is_band_bottom)
                             && has_live_activity_word(&message.to_lowercase()))
                 });
                 let has_later_parked_surface = clean
@@ -2768,11 +2773,33 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
     // Retry countdown: fixed live region above the prompt (window 6). (a)
     // single-line match; (b) if none, the window joined with single spaces so
     // a character-wrap cut between tokens still matches.
+    let last_banner_anchor = clean
+        .lines()
+        .enumerate()
+        .filter_map(|(index, line)| {
+            line.to_lowercase()
+                .contains(OMP_BANNER_DISMISSAL_ANCHOR)
+                .then_some(index)
+        })
+        .last();
+    let error_banner_bottom = last_banner_anchor.and_then(|anchor_index| {
+        clean
+            .lines()
+            .enumerate()
+            .skip(anchor_index + 1)
+            .find(|(_, line)| {
+                is_box_bottom(line) || is_structural_custom_bottom(line) || composer_kind(line) == 5
+            })
+            .map(|(index, _)| index)
+    });
     let signal_end = clean
         .lines()
         .enumerate()
-        .filter(|(_, line)| {
-            is_box_bottom(line) || is_structural_custom_bottom(line) || composer_kind(line) == 5
+        .filter(|(index, line)| {
+            (is_box_bottom(line) || is_structural_custom_bottom(line) || composer_kind(line) == 5)
+                && last_banner_anchor.is_none_or(|_| {
+                    error_banner_bottom.is_some_and(|bottom_index| *index > bottom_index)
+                })
         })
         .map(|(index, _)| index + 1)
         .last();
@@ -2921,27 +2948,67 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
             || is_panel_option(line, "save and quit")
             || (is_panel_row(line) && line.to_lowercase().contains("approve and keep context"))
     };
-    let has_selected_option = window12
-        .iter()
-        .any(|line| has_panel_cursor(line) && is_plan_option(line));
+    let is_truncated_selected_plan_option = |line: &str| {
+        if !is_panel_row(line) || !line.contains('…') {
+            return false;
+        }
+        let lower = line.to_lowercase();
+        ["approve and exec", "approve and comp", "approve and keep"]
+            .iter()
+            .filter_map(|prefix| lower.find(prefix))
+            .any(|position| !lower[..position].trim_matches(['│', '|', ' ']).is_empty())
+    };
+    let has_selected_option = window12.iter().any(|line| {
+        (has_panel_cursor(line) && is_plan_option(line)) || is_truncated_selected_plan_option(line)
+    });
     let has_plan_options = ["approve and execute", "refine plan", "save and quit"]
         .iter()
         .all(|expected| window12.iter().any(|line| is_panel_option(line, expected)));
-    if has_selected_option && has_plan_options && panel_text.contains("tab regions") {
-        if let Some(pos) = lowest_matching_line(window12, |line| {
-            is_panel_row(line) && line.to_lowercase().contains("tab regions")
-        }) {
+    let full_plan_footer_pos = lowest_matching_line(window12, |line| {
+        is_panel_row(line) && line.to_lowercase().contains("tab regions")
+    });
+    let has_plan_title = window12
+        .iter()
+        .any(|line| is_panel_row(line) && line.to_lowercase().contains("plan mode - next"));
+    let narrow_plan_footer_pos = lowest_matching_line(window12, |line| {
+        if !is_panel_row(line) {
+            return false;
+        }
+        let lower = line.to_lowercase();
+        lower.contains("↑↓ select") && (lower.contains('⏎') || lower.contains("confirm"))
+    });
+    let plan_footer_pos = if has_plan_options {
+        full_plan_footer_pos
+    } else if has_plan_title {
+        narrow_plan_footer_pos
+    } else {
+        None
+    };
+    if has_selected_option {
+        if let Some(pos) = plan_footer_pos {
             consider(pos, OmpSignal::Approval);
         }
     }
+
     // Ask dialog footer phrases count only on a bordered dialog row.
     if let Some(pos) = lowest_matching_line(window8, |line| {
-        let lower = line.to_lowercase();
-        is_panel_row(line)
-            && (lower.contains("enter select ·")
-                || lower.contains("space toggle · enter ")
-                || lower.contains("enter submit · ↑/↓ scroll")
-                || lower.contains("current prompt to answer"))
+        let trimmed = line.trim();
+        let inner = trimmed.chars().next().and_then(|border| {
+            trimmed
+                .strip_prefix(border)
+                .and_then(|line| line.strip_suffix(border))
+        });
+        let Some(inner) = inner else { return false };
+        let lower = inner.trim().to_lowercase();
+        let has_select_hint = lower.strip_prefix("enter select ·").is_some_and(|tail| {
+            let tail = tail.trim();
+            let truncated = tail.strip_suffix('…').unwrap_or(tail).trim();
+            tail.starts_with("n note") || "n note".starts_with(truncated)
+        });
+        has_select_hint
+            || lower.contains("space toggle · enter ")
+            || lower.contains("enter submit · ↑/↓ scroll")
+            || lower.contains("current prompt to answer")
     }) {
         consider(pos, OmpSignal::Approval);
     }
@@ -6757,6 +6824,13 @@ Additional output.
                 ),
                 Status::Running,
             ),
+            (
+                "countdown with banner and borderless composer",
+                format!(
+                    "{br}\n ✖ 429 Too Many Requests (rate limited). Retry after 30s.\n Dismissed when you send your next message.\n{br}\n⠋ Retrying (2/3) in 30s… (esc to cancel)\n❯\n π > RCA Slow Turn"
+                ),
+                Status::Running,
+            ),
             // Character wrap cutting between tokens is re-joined via (b).
             (
                 "countdown wrapped",
@@ -7343,6 +7417,10 @@ Working…
                 "  Q Working…\n ⏱ 5s   ⠋ 5s\n╰─".to_string(),
             ),
             (
+                "v18.0.10 single-character custom interrupt without status timer",
+                "  Q Working…\n╰─".to_string(),
+            ),
+            (
                 "v18.0.10 custom horizontal pi composer",
                 "  ⎋ Working…\n\n━━━━━━━━\n\n━━━━━━━━\n 🌳 repo/main".to_string(),
             ),
@@ -7707,6 +7785,17 @@ Working…
 │   Save and quit                       │
 │ ↑↓ select · ⏎ confirm · tab regions… │",
             ),
+            (
+                "renderer-truncated narrow overlay",
+                "\
+│ Plan mode - next st… │
+│ ❯ Approve and execu… │
+│   Approve and compa… │
+│   Approve and keep … │
+│   Refine plan        │
+│   Save and quit      │
+│ ↑↓ select · ⏎ confi… │",
+            ),
         ];
         for (name, pane) in cases {
             assert_eq!(detect_omp_status(pane), Status::Waiting, "case: {name}");
@@ -7727,6 +7816,8 @@ Working…
             // Real composer top row carries a > status separator: it must not
             // become a Plan Review cursor when the draft names an option.
             "╭── π  > approve and execute the migration ─╮\n│ then refine plan wording                    │\n╰─                                           ─╯".to_string(),
+            // Ordinary bordered editor text is not an Ask dialog footer.
+            "╭──────────────────────────────╮\n│ Enter select · document this │\n╰──────────────────────────────╯".to_string(),
             // Markdown blockquote with option prose is not a live overlay.
             format!("Options were:\n> Approve and execute\nor Refine plan\n{box_}"),
             // Answered overlay rows retained in scrollback have no live
