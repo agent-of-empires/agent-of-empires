@@ -237,7 +237,7 @@ impl HomeView {
             .any(|i| i.session_id_poller.is_some())
         {
             // `drain_and_persist_session_ids` takes `&mut [Instance]` and is
-            // shared with `src/server/mod.rs`. Snapshot into a `Vec` at the
+            // shared with `src/server/session_identity.rs`. Snapshot into a `Vec` at the
             // boundary, then re-`insert` touched ids back into the map;
             // `IndexMap::insert` on an existing key updates in place,
             // preserving position. The full-object re-insert is sound here

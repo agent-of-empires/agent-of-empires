@@ -1,23 +1,18 @@
 //! Home view - main session list and navigation
 
 pub(crate) mod bindings;
-mod input;
-mod live_send;
-mod operations;
-pub(crate) mod render;
-
-#[cfg(test)]
-mod tests;
-
 mod config_refresh;
 mod creation;
 mod dialogs;
 #[cfg(test)]
 mod file_watch_tests;
 mod icons;
+mod input;
 mod layout;
 mod lifecycle;
+mod live_send;
 mod live_send_prep;
+mod operations;
 mod overlays;
 mod panes;
 mod persistence;
@@ -25,10 +20,13 @@ mod pollers;
 mod preview;
 mod profiles;
 mod projects;
+pub(crate) mod render;
 mod rows;
 mod selection;
 mod send;
 mod status;
+#[cfg(test)]
+mod tests;
 mod user_action;
 mod watchers;
 

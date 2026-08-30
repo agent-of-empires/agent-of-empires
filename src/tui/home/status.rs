@@ -479,7 +479,7 @@ impl HomeView {
 
                     // One flock for both the status/timestamp patch and the
                     // unread mark, matching the daemon's per-tick batching
-                    // shape (server/mod.rs's status_poll_loop) instead of
+                    // shape (server/status_poll.rs's status_poll_loop) instead of
                     // two separate Storage::update calls on the same row.
                     self.persist_passive_status_transition(&update.id, should_mark_unread);
                     if should_mark_unread {

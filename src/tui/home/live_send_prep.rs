@@ -352,7 +352,8 @@ impl HomeView {
     /// `Paragraph` render then drop those rows on every frame, which
     /// the user perceives as content shifted up. The math is shared
     /// with the per-frame resize in `refresh_preview_cache_if_needed`
-    /// and friends; the rect comes from `preview::PreviewLayout::compute`.
+    /// and friends; the rect comes from
+    /// `components::preview::PreviewLayout::compute`.
     pub fn finalize_live_send_resize(&mut self) {
         let Some(state) = self.live_send.as_ref() else {
             return;

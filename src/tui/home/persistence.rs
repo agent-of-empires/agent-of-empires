@@ -461,7 +461,7 @@ impl HomeView {
         // daemon boot by `seed_acp_statuses`, and the daemon's own passive
         // writer gates the patch on exactly this predicate
         // (`decide_passive_transition` returns `patch: None` for
-        // `is_structured()`, `server/mod.rs`). Persisting it here would strand a
+        // `is_structured()`, `server/status_poll.rs`). Persisting it here would strand a
         // row at `Running` or `Error` with no producer left to heal it once the
         // daemon is gone, since the tmux poller now bails on structured rows
         // (`status_poller.rs`); this is the #3201 regression from #3170.
