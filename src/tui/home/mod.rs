@@ -6628,9 +6628,15 @@ impl HomeView {
                 for tui_inst in &tui_rows {
                     if let Some(disk_inst) = disk_instances.iter_mut().find(|d| d.id == tui_inst.id)
                     {
+                        let durable_status = disk_inst.status;
                         disk_inst.merge_from_tui(tui_inst);
+                        if tui_inst.status == crate::session::Status::Deleting {
+                            disk_inst.status = durable_status;
+                        }
                     } else if added.contains(&tui_inst.id) {
-                        disk_instances.push(tui_inst.clone());
+                        if tui_inst.status != crate::session::Status::Deleting {
+                            disk_instances.push(tui_inst.clone());
+                        }
                     } else {
                         // Disk had no row with this id and we did not add it
                         // this session: a peer (CLI / aoe serve) removed it.

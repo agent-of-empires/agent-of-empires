@@ -7,7 +7,7 @@
 | `src/agents.rs` | Agent registry entry (name, binary, detection, flags) |
 | `src/tmux/status_detection.rs` | Status detection function (pane parsing or stub) |
 | `src/hooks/mod.rs` | Hook installer (if the agent supports hooks) |
-| `src/session/instance.rs` | Wire hook installation + `AOE_INSTANCE_ID` env prefix |
+| `src/session/instance/hooks.rs` | Wire hook installation + `AOE_INSTANCE_ID` env prefix |
 | `src/session/container_config.rs` | Config mount for Docker sandbox |
 | `src/acp/agent_registry.rs` | Structured view ACP adapter entry (only if the agent ships an ACP server) |
 | `src/acp/agent_profiles.rs` + `web/src/lib/agentProfiles.ts` | Structured view profile (clear aliases, meta namespace, capability gates, tool aliases) |

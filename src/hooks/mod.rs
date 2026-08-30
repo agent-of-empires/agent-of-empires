@@ -1219,6 +1219,163 @@ pub fn trust_codex_project(config_path: &Path, project_path: &str) -> Result<()>
     })
 }
 
+/// Mark `project_path` as trusted in Claude Code's `.claude.json` by merging
+/// `projects."<project_path>".hasTrustDialogAccepted = true`.
+///
+/// Claude Code keys folder trust on the resolved workspace directory (a trusted
+/// entry also covers its subdirectories), so `project_path` must be the path it
+/// resolves as its workspace (inside a sandbox that is the in-container worktree
+/// path, not the host path). Unlike
+/// `CLAUDE_CODE_SANDBOXED`, a persisted entry also lets the repo's own
+/// `.claude/settings.json` permission rules load; the env var leaves them
+/// ignored. Neither auto-approves `.mcp.json` servers, which keep their own
+/// per-server prompt.
+///
+/// The file doubles as Claude Code's onboarding state, so every other key is
+/// preserved and a malformed file is treated as empty rather than propagated,
+/// mirroring the installers above.
+pub fn trust_claude_project(config_path: &Path, project_path: &str) -> Result<()> {
+    with_config_lock(config_path, "json.lock", || {
+        let mut config: Value = if config_path.exists() {
+            let content = std::fs::read_to_string(config_path)?;
+            serde_json::from_str(&content).unwrap_or_else(|e| {
+                tracing::warn!(target: "hooks.install", "Failed to parse {}: {}", config_path.display(), e);
+                serde_json::json!({})
+            })
+        } else {
+            serde_json::json!({})
+        };
+
+        let before = config.clone();
+
+        let root = config
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("Claude config root is not a JSON object"))?;
+        let projects = root
+            .entry("projects")
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if !projects.is_object() {
+            *projects = Value::Object(serde_json::Map::new());
+        }
+        let project = projects
+            .as_object_mut()
+            .expect("ensured object above")
+            .entry(project_path)
+            .or_insert_with(|| Value::Object(serde_json::Map::new()));
+        if !project.is_object() {
+            *project = Value::Object(serde_json::Map::new());
+        }
+        project
+            .as_object_mut()
+            .expect("ensured object above")
+            .insert("hasTrustDialogAccepted".to_string(), Value::Bool(true));
+
+        if config == before {
+            return Ok(());
+        }
+
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let formatted = serde_json::to_string_pretty(&config)?;
+        crate::session::atomic_write(config_path, formatted.as_bytes())?;
+        tracing::info!(target: "hooks.install",
+            "Marked {} trusted in Claude config {}", project_path, config_path.display());
+        Ok(())
+    })
+}
+
+/// Mark `project_path` as trusted in Gemini's `trustedFolders.json` by merging
+/// `"<project_path>": "TRUST_FOLDER"`.
+///
+/// The per-path counterpart to [`disable_gemini_folder_trust`], which turns the
+/// feature off wholesale. That is acceptable against a staged sandbox config
+/// that only ever reaches one container, but on the host it would disable
+/// folder trust for the user's Gemini everywhere, so the host path trusts one
+/// directory at a time instead.
+pub fn trust_gemini_project(trusted_folders_path: &Path, project_path: &str) -> Result<()> {
+    with_config_lock(trusted_folders_path, "json.lock", || {
+        let mut folders: Value = if trusted_folders_path.exists() {
+            let content = std::fs::read_to_string(trusted_folders_path)?;
+            serde_json::from_str(&content).unwrap_or_else(|e| {
+                tracing::warn!(target: "hooks.install", "Failed to parse {}: {}", trusted_folders_path.display(), e);
+                serde_json::json!({})
+            })
+        } else {
+            serde_json::json!({})
+        };
+
+        let before = folders.clone();
+
+        let root = folders
+            .as_object_mut()
+            .ok_or_else(|| anyhow::anyhow!("Gemini trustedFolders root is not a JSON object"))?;
+        root.insert(
+            project_path.to_string(),
+            Value::String("TRUST_FOLDER".to_string()),
+        );
+
+        if folders == before {
+            return Ok(());
+        }
+
+        if let Some(parent) = trusted_folders_path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let formatted = serde_json::to_string_pretty(&folders)?;
+        crate::session::atomic_write(trusted_folders_path, formatted.as_bytes())?;
+        tracing::info!(target: "hooks.install",
+            "Marked {} trusted in Gemini trustedFolders {}",
+            project_path, trusted_folders_path.display());
+        Ok(())
+    })
+}
+
+/// Pre-trust `project_path` in the agent's real host config.
+///
+/// The host counterpart of the sandbox trust registry in `container_config`.
+/// Sandboxed sessions write to a staged config that only ever reaches one
+/// container; here the write lands in the user's own config and outlives the
+/// session, so it is gated on `session.pre_trust_agent_folders` and always
+/// scoped to a single directory. Gemini in particular gets a per-path entry
+/// rather than the global [`disable_gemini_folder_trust`] the sandbox uses.
+///
+/// Agents with no folder-trust prompt are a no-op.
+pub fn trust_host_project(
+    agent_name: &str,
+    home: &Path,
+    host_env: &[String],
+    project_path: &str,
+) -> Result<()> {
+    let config_dir = |var: &str, default: &str| {
+        resolve_config_dir_override(var, host_env)
+            .map(PathBuf::from)
+            .unwrap_or_else(|| home.join(default))
+    };
+    match agent_name {
+        // Without `CLAUDE_CONFIG_DIR` the trust record lives at `~/.claude.json`,
+        // beside `~/.claude/` rather than inside it; the override replaces the
+        // whole directory, so it takes the file with it.
+        "claude" => trust_claude_project(
+            &resolve_config_dir_override("CLAUDE_CONFIG_DIR", host_env)
+                .map(|dir| PathBuf::from(dir).join(".claude.json"))
+                .unwrap_or_else(|| home.join(".claude.json")),
+            project_path,
+        ),
+        "codex" => trust_codex_project(
+            &config_dir("CODEX_HOME", ".codex").join("config.toml"),
+            project_path,
+        ),
+        "gemini" => trust_gemini_project(
+            &resolve_config_dir_override("GEMINI_CLI_TRUSTED_FOLDERS_PATH", host_env)
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".gemini").join("trustedFolders.json")),
+            project_path,
+        ),
+        _ => Ok(()),
+    }
+}
+
 /// Remove all AoE hooks from an agent's `settings.json` file.
 ///
 /// Strips AoE hook entries while preserving user-defined hooks. If an event
@@ -3088,6 +3245,137 @@ trust_level = "trusted"
             mtime,
             std::fs::metadata(&config_path).unwrap().modified().unwrap()
         );
+    }
+
+    // The file Claude Code keys folder trust in is the same one that carries
+    // its onboarding state, so a trust write must merge rather than replace.
+    #[test]
+    fn test_trust_claude_project_merges_into_existing_config() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join(".claude").join(".claude.json");
+
+        // Table cases share the file: each runs against what the last left.
+        // (existing content, path to trust)
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &config_path,
+            r#"{"hasCompletedOnboarding":true,"projects":{"/other":{"hasTrustDialogAccepted":true,"allowedTools":["Bash"]}}}"#,
+        )
+        .unwrap();
+
+        trust_claude_project(&config_path, "/workspace/my-worktree").unwrap();
+
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(config["hasCompletedOnboarding"].as_bool(), Some(true));
+        assert_eq!(
+            config["projects"]["/workspace/my-worktree"]["hasTrustDialogAccepted"].as_bool(),
+            Some(true)
+        );
+        // A sibling project keeps every key it had, not just the trust flag.
+        assert_eq!(
+            config["projects"]["/other"]["allowedTools"][0].as_str(),
+            Some("Bash")
+        );
+
+        // Idempotent: a second call must not rewrite the file.
+        let first = std::fs::read_to_string(&config_path).unwrap();
+        let mtime = std::fs::metadata(&config_path).unwrap().modified().unwrap();
+        trust_claude_project(&config_path, "/workspace/my-worktree").unwrap();
+        assert_eq!(first, std::fs::read_to_string(&config_path).unwrap());
+        assert_eq!(
+            mtime,
+            std::fs::metadata(&config_path).unwrap().modified().unwrap()
+        );
+    }
+
+    // A half-written config must not block the launch; the installers above
+    // treat unparseable files as empty and this one has to match.
+    #[test]
+    fn test_trust_claude_project_replaces_malformed_config() {
+        let tmp = TempDir::new().unwrap();
+        let config_path = tmp.path().join(".claude.json");
+        std::fs::write(&config_path, "{not json").unwrap();
+
+        trust_claude_project(&config_path, "/workspace/my-worktree").unwrap();
+
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+        assert_eq!(
+            config["projects"]["/workspace/my-worktree"]["hasTrustDialogAccepted"].as_bool(),
+            Some(true)
+        );
+    }
+
+    // The host path trusts one directory instead of turning the whole feature
+    // off the way the sandbox-only `disable_gemini_folder_trust` does.
+    #[test]
+    fn test_trust_gemini_project_writes_per_path_entry() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join(".gemini").join("trustedFolders.json");
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, r#"{"/other":"TRUST_FOLDER"}"#).unwrap();
+
+        trust_gemini_project(&path, "/workspace/my-worktree").unwrap();
+
+        let folders: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(folders["/other"].as_str(), Some("TRUST_FOLDER"));
+        assert_eq!(
+            folders["/workspace/my-worktree"].as_str(),
+            Some("TRUST_FOLDER")
+        );
+    }
+
+    // Agents with no folder-trust prompt must not have a config invented for
+    // them, and the claude arm has to honor CLAUDE_CONFIG_DIR.
+    #[test]
+    fn test_trust_host_project_routes_per_agent() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let claude_dir = home.join("custom-claude");
+
+        trust_host_project(
+            "claude",
+            home,
+            &[format!("CLAUDE_CONFIG_DIR={}", claude_dir.display())],
+            "/repo",
+        )
+        .unwrap();
+        trust_host_project("gemini", home, &[], "/repo").unwrap();
+        trust_host_project("opencode", home, &[], "/repo").unwrap();
+
+        assert!(
+            claude_dir.join(".claude.json").exists(),
+            "claude must honor CLAUDE_CONFIG_DIR over ~/.claude"
+        );
+        assert!(!home.join(".claude").exists());
+        assert!(home.join(".gemini").join("trustedFolders.json").exists());
+        assert!(
+            std::fs::read_dir(home).unwrap().count() == 2,
+            "an agent without a folder-trust prompt must write nothing"
+        );
+    }
+
+    // Claude Code reads `~/.claude.json`, a sibling of `~/.claude/` and not a
+    // file inside it, whenever CLAUDE_CONFIG_DIR is unset. Writing the trust
+    // record one directory down leaves it somewhere the agent never looks.
+    #[test]
+    fn test_trust_host_project_claude_defaults_to_home_level_config() {
+        let tmp = TempDir::new().unwrap();
+        let home = tmp.path();
+        let _guard = EnvGuard::unset(&["CLAUDE_CONFIG_DIR"]);
+
+        trust_host_project("claude", home, &[], "/repo").unwrap();
+
+        let config: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(home.join(".claude.json")).unwrap())
+                .unwrap();
+        assert_eq!(
+            config["projects"]["/repo"]["hasTrustDialogAccepted"].as_bool(),
+            Some(true)
+        );
+        assert!(!home.join(".claude").join(".claude.json").exists());
     }
 
     #[test]
