@@ -605,7 +605,31 @@ fn claude_has_approval_prompt(recent: &[&str], recent_lower: &str) -> bool {
     has_question
         && recent
             .iter()
-            .any(|line| claude_line_is_numbered_choice(line))
+            .any(|line| claude_line_is_selected_choice(line))
+}
+
+/// A numbered choice carrying the selection cursor, which is what separates a
+/// live menu from an assistant-authored list: Claude highlights exactly one
+/// option of a menu it is blocked on, and prose renders no cursor.
+///
+/// The cursor is `figures.pointer`, which is `\u{276f}` in every terminal AoE
+/// launches an agent in. `\u{203a}` is that library's `pointerSmall` and never
+/// renders here, so accepting it would only cost a `\u{203a} 1. build` prose
+/// bullet reading as a menu. A `>` is how a markdown blockquote and quoted
+/// terminal output render, the same reason [`claude_trust_choice_option_text`]
+/// rejects one.
+///
+/// Only the permission guard needs this, since its other signal is a phrase
+/// common in ordinary turn text. The folder-trust and `AskUserQuestion`
+/// detectors keep the wider [`claude_line_is_numbered_choice`].
+///
+/// This narrows rather than closes: a pane reproducing a menu verbatim, cursor
+/// and all, still matches.
+fn claude_line_is_selected_choice(line: &str) -> bool {
+    let Some(rest) = line.trim_start().strip_prefix('\u{276f}') else {
+        return false;
+    };
+    claude_line_is_numbered_choice(rest)
 }
 
 /// The first-run folder-trust prompt: `Accessing workspace:` over
@@ -3380,6 +3404,49 @@ enter to select · esc to cancel";
  \u{2736} Working\u{2026} (12s \u{b7} \u{2193} 431 tokens)
    esc to interrupt
 ";
+
+    #[test]
+    fn claude_prose_carrying_a_numbered_list_is_not_waiting() {
+        // A blocking prompt outranks the running signal (#1913), so whatever
+        // reads as a menu wins over the spinner below it. The cursor is what
+        // keeps an assistant-authored numbered list out of that: the guard's
+        // other signal is a phrase common in ordinary turn text, so each pane
+        // here carries both a numbered list and one such phrase.
+        let cases = [
+            // Prose: a numbered list and a stock question, no cursor anywhere.
+            "\
+ Tensions I'd want us to discuss, not resolve by menu:
+ 1. What does deterministic bind? The arc's step gates what runs may launch.
+ 2. Whether product survives as a word.
+ 3. What's left of lane the tool under this shape.
+ Where do you want to dig, the delta policy or the teeth question?
+ \u{2733} Puttering\u{2026} (26s \u{b7} thinking more with high effort)",
+            // A markdown blockquote of a real menu renders `>` ahead of the
+            // number, which is why `>` is not read as a cursor.
+            "\
+\u{25cf} The menu it showed was:
+> 1. Yes
+> 2. No
+\u{25cf} Do you want to proceed with that reading?
+ \u{273b} Working\u{2026} (12s \u{b7} \u{2193} 431 tokens)
+   esc to interrupt
+",
+            // U+203A is `figures.pointerSmall`. Claude renders its cursor from
+            // `figures.pointer`, so this shape is a bulleted list, not a menu.
+            "\
+  Do you want to proceed?
+  \u{203a} 1. Yes
+    2. No
+\u{2736} Herding\u{2026} (53s \u{b7} \u{2193} 7.0k tokens)",
+        ];
+        for content in cases {
+            assert!(
+                content.lines().any(claude_line_is_active_spinner),
+                "fixture must carry a live spinner, or it proves nothing about the ranking",
+            );
+            assert_eq!(detect_claude_status(content), Status::Running, "{content}");
+        }
+    }
 
     #[test]
     fn claude_assistant_quoting_the_trust_option_is_not_waiting() {

@@ -28,9 +28,13 @@ fn install_fake_prompt(h: &TuiTestHarness, tool: &str) -> std::path::PathBuf {
     // never see it without a newline. Disable icanon/echo first so a
     // single byte is delivered to `dd` as soon as it arrives, matching
     // how a real full-screen TUI (raw mode) actually reads a keypress.
+    // The cursor on the first option is load-bearing, not decoration: the
+    // permission-prompt detector reads a menu by its highlighted option, so a
+    // cursorless list is prose to it and this pane would stop reading Waiting
+    // without any assertion here going red.
     let script = "#!/bin/sh\n\
 echo 'Do you want to proceed?'\n\
-echo '1. Yes'\n\
+echo '\u{276f} 1. Yes'\n\
 echo \"2. Yes, and don't ask again\"\n\
 echo '3. No'\n\
 stty -icanon -echo 2>/dev/null\n\
