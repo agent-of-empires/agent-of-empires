@@ -5246,7 +5246,7 @@ fn resolve_create_fork_seed(
     crate::session::fork::terminal_fork_seed(
         tool,
         Some(parent_id),
-        crate::session::capture::generate_claude_session_id(),
+        crate::session::capture::generate_session_uuid(),
     )
 }
 

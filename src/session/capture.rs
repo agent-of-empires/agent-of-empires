@@ -97,8 +97,10 @@ pub(crate) fn validated_session_id(id: String) -> Option<String> {
     }
 }
 
-/// Generate a new UUID v4 for a Claude Code session.
-pub(crate) fn generate_claude_session_id() -> String {
+/// Generate a new UUID v4 to pin an agent session id at launch. Claude
+/// (`--session-id`), its fork children, and Pi (`--session-id`) all accept
+/// this spelling.
+pub(crate) fn generate_session_uuid() -> String {
     Uuid::new_v4().to_string()
 }
 
@@ -566,6 +568,22 @@ pub(crate) fn encode_pi_project_path(cwd: &str) -> String {
     format!("--{encoded}--")
 }
 
+/// Slack (ms) applied to the launch-time floor, mirroring
+/// [`KIMI_MTIME_FLOOR_SLACK_MS`]: session files carry second-granular mtimes
+/// that can land just below the millisecond launch timestamp and must still
+/// count as "written after launch".
+const PI_MTIME_FLOOR_SLACK_MS: f64 = 2000.0;
+
+/// Whether a session file written at `modified` is eligible under
+/// `launch_time_ms`. `None` (retroactive recovery) accepts any age; a floor
+/// keeps a live poll from claiming a conversation that predates this pane.
+fn pi_passes_launch_floor(modified: std::time::SystemTime, launch_time_ms: Option<f64>) -> bool {
+    let Some(floor) = launch_time_ms else {
+        return true;
+    };
+    crate::util::system_time_to_ms(modified) as f64 >= floor - PI_MTIME_FLOOR_SLACK_MS
+}
+
 /// Number of leading lines and bytes scanned when locating a pi-family
 /// session header. The byte cap matters because `BufRead::lines` otherwise
 /// allocates without bound for one hostile or corrupt line.
@@ -655,11 +673,17 @@ pub(crate) fn extract_pi_uuid_from_filename(path: &Path) -> Option<String> {
 /// `$PI_CODING_AGENT_DIR/sessions/`). The primary lookup uses the encoded
 /// project path as a directory name. Falls back to scanning all session
 /// directories and matching via the `cwd` header field.
+///
+/// The store is shared by every session on the project path and names no
+/// pane, so `launch_time_ms` is what makes a hit attributable: a floored
+/// caller only sees files touched after this pane launched. `None` restores
+/// newest-file-wins.
 pub(crate) fn capture_pi_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
+    launch_time_ms: Option<f64>,
 ) -> Result<String> {
-    capture_pi_family_session_id(project_path, exclusion, ".pi/agent")
+    capture_pi_family_session_id(project_path, exclusion, ".pi/agent", launch_time_ms)
 }
 
 /// Scan Pi's on-disk session store.
@@ -671,6 +695,7 @@ fn capture_pi_family_session_id(
     project_path: &str,
     exclusion: &HashSet<String>,
     default_subdir: &str,
+    launch_time_ms: Option<f64>,
 ) -> Result<String> {
     let pi_home = resolve_agent_home(Some("PI_CODING_AGENT_DIR"), default_subdir)?;
     let sessions_dir = pi_home.join("sessions");
@@ -701,6 +726,9 @@ fn capture_pi_family_session_id(
                 .metadata()
                 .and_then(|m| m.modified())
                 .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            if !pi_passes_launch_floor(modified, launch_time_ms) {
+                continue;
+            }
             candidates.push((session_id, modified));
         }
 
@@ -751,6 +779,9 @@ fn capture_pi_family_session_id(
                 .metadata()
                 .and_then(|m| m.modified())
                 .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            if !pi_passes_launch_floor(modified, launch_time_ms) {
+                continue;
+            }
             fallback_candidates.push((session_id, modified));
         }
     }
@@ -761,12 +792,13 @@ fn capture_pi_family_session_id(
         return Ok(id.clone());
     }
 
-    // A session for this project exists on disk but every cwd match was
-    // excluded (e.g. the just-crashed sid the resume cascade cleared). Return
-    // an error rather than the project-scoped newest-dir fallback below, which
+    // A session for this project exists on disk but no cwd match survived the
+    // exclusion set or the launch floor (e.g. the just-crashed sid the resume
+    // cascade cleared, or a conversation older than this pane). Return an
+    // error rather than the project-scoped newest-dir fallback below, which
     // would otherwise resume a different project's session.
     if saw_cwd_match {
-        anyhow::bail!("All Pi sessions matching project path are excluded");
+        anyhow::bail!("All Pi sessions matching project path are excluded or predate this launch");
     }
 
     // Third fallback: when JSONL headers fail to parse (no `id` field),
@@ -808,6 +840,9 @@ fn capture_pi_family_session_id(
                             .metadata()
                             .and_then(|m| m.modified())
                             .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+                        if !pi_passes_launch_floor(mtime, launch_time_ms) {
+                            continue;
+                        }
                         file_candidates.push((uuid, mtime));
                     }
                 }
@@ -822,14 +857,17 @@ fn capture_pi_family_session_id(
     anyhow::bail!("No Pi session found matching project path")
 }
 
+/// Polling closure for host Pi session tracking, floored by `launch_time_ms`
+/// (see [`capture_pi_session_id`]).
 pub(crate) fn pi_poll_fn(
     project_path: String,
     instance_id: String,
+    launch_time_ms: f64,
     extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
         let exclusion = compose_exclusion(&instance_id, &extra_excludes);
-        capture_pi_session_id(&project_path, &exclusion)
+        capture_pi_session_id(&project_path, &exclusion, Some(launch_time_ms))
             .map_err(
                 |e| tracing::debug!(target: "session.capture", "Pi poll capture failed: {}", e),
             )
@@ -882,6 +920,7 @@ pub(crate) fn try_capture_pi_session_id_in_container(
     container_name: &str,
     container_cwd: &str,
     exclusion: &HashSet<String>,
+    launch_time_ms: Option<f64>,
 ) -> Result<String> {
     let mut cmd = std::process::Command::new("docker");
     cmd.args(["exec", container_name, "sh", "-c", PI_CONTAINER_LIST_SCRIPT]);
@@ -891,7 +930,7 @@ pub(crate) fn try_capture_pi_session_id_in_container(
         Duration::from_secs(PI_COMMAND_TIMEOUT_SECS),
         "docker exec sh (pi session scan)",
     )?;
-    select_pi_session_in_container(&stdout_bytes, container_cwd, exclusion)
+    select_pi_session_in_container(&stdout_bytes, container_cwd, exclusion, launch_time_ms)
 }
 
 /// Parse the delimited stream emitted by `PI_CONTAINER_LIST_SCRIPT` and pick
@@ -900,6 +939,7 @@ fn select_pi_session_in_container(
     stdout_bytes: &[u8],
     container_cwd: &str,
     exclusion: &HashSet<String>,
+    launch_time_ms: Option<f64>,
 ) -> Result<String> {
     let text = String::from_utf8_lossy(stdout_bytes);
     let mut candidates: Vec<(String, Option<String>, u64)> = Vec::new();
@@ -922,6 +962,12 @@ fn select_pi_session_in_container(
             Some(id) if !id.is_empty() && !exclusion.contains(&id) => id,
             _ => continue,
         };
+        // `stat` reports whole seconds; compare in ms against the same floor.
+        if let Some(floor) = launch_time_ms {
+            if (ts as f64) * 1000.0 < floor - PI_MTIME_FLOOR_SLACK_MS {
+                continue;
+            }
+        }
         candidates.push((session_id, cwd, ts));
     }
 
@@ -945,11 +991,17 @@ pub(crate) fn pi_poll_fn_sandboxed(
     container_name: String,
     container_cwd: String,
     instance_id: String,
+    launch_time_ms: f64,
     extra_excludes: HashSet<String>,
 ) -> impl Fn() -> Option<String> + Send + 'static {
     move || {
         let exclusion = compose_exclusion(&instance_id, &extra_excludes);
-        try_capture_pi_session_id_in_container(&container_name, &container_cwd, &exclusion)
+        try_capture_pi_session_id_in_container(
+            &container_name,
+            &container_cwd,
+            &exclusion,
+            Some(launch_time_ms),
+        )
             .map_err(|e| tracing::debug!(target: "session.capture", "Pi container poll capture failed: {}", e))
             .ok()
             .and_then(validated_session_id)
@@ -1008,8 +1060,11 @@ fn compose_exclusion_in(
 /// another session can capture the parked conversation before its owner swaps
 /// back. Claude, host Codex, and host Kimi additionally need inactive
 /// same-tool protection because their shared-store MRU scans can select a
-/// conversation after the owning pane disappears. Sandboxed Codex and Kimi
-/// omit that protection because their stores are instance-private or are not
+/// conversation after the owning pane disappears. Host Pi is included for its
+/// poller alone: acquisition no longer scans its store at all (#3576), but a
+/// peer that goes inactive after this pane launched can still leave the
+/// freshest file inside the poller's floor. Sandboxed Codex, Kimi, and Pi omit
+/// the protection because their stores are instance-private or are not
 /// captured from the host (#3317).
 ///
 /// Scope: host stores are keyed by each agent's effective home, not by AoE
@@ -3573,16 +3628,16 @@ mod tests {
     }
 
     #[test]
-    fn test_generate_claude_session_id() {
-        let id = generate_claude_session_id();
+    fn test_generate_session_uuid() {
+        let id = generate_session_uuid();
 
         // Should be a valid UUID format
         assert!(uuid::Uuid::parse_str(&id).is_ok());
     }
 
     #[test]
-    fn test_generate_claude_session_id_uniqueness() {
-        let ids: Vec<String> = (0..100).map(|_| generate_claude_session_id()).collect();
+    fn test_generate_session_uuid_uniqueness() {
+        let ids: Vec<String> = (0..100).map(|_| generate_session_uuid()).collect();
         let unique_ids: std::collections::HashSet<_> = ids.iter().collect();
 
         assert_eq!(ids.len(), unique_ids.len());
@@ -4252,8 +4307,9 @@ mod tests {
             output.status
         );
 
-        let id = select_pi_session_in_container(&output.stdout, &project_path, &HashSet::new())
-            .expect("parser failed on real Pi output");
+        let id =
+            select_pi_session_in_container(&output.stdout, &project_path, &HashSet::new(), None)
+                .expect("parser failed on real Pi output");
         assert!(
             Uuid::parse_str(&id).is_ok(),
             "captured id {id:?} is not a UUID"
@@ -4280,7 +4336,7 @@ mod tests {
         let old_val = std::env::var("PI_CODING_AGENT_DIR").ok();
         std::env::set_var("PI_CODING_AGENT_DIR", &agent_dir);
 
-        let result = capture_pi_session_id(&project_path, &HashSet::new());
+        let result = capture_pi_session_id(&project_path, &HashSet::new(), None);
 
         match old_val {
             Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
@@ -4288,11 +4344,7 @@ mod tests {
         }
 
         let id = result.expect("real Pi session capture failed");
-        assert!(
-            Uuid::parse_str(&id).is_ok(),
-            "captured id {id:?} is not a UUID"
-        );
-        eprintln!("captured pi session id: {id}");
+        assert!(Uuid::parse_str(&id).is_ok(), "captured id is not a UUID");
     }
 
     #[test]
@@ -4314,7 +4366,7 @@ mod tests {
         let old_val = std::env::var("PI_CODING_AGENT_DIR").ok();
         std::env::set_var("PI_CODING_AGENT_DIR", tmp.path());
 
-        let result = capture_pi_session_id("/home/user/project", &HashSet::new());
+        let result = capture_pi_session_id("/home/user/project", &HashSet::new(), None);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), uuid);
 
@@ -4355,7 +4407,7 @@ mod tests {
         let old_val = std::env::var("PI_CODING_AGENT_DIR").ok();
         std::env::set_var("PI_CODING_AGENT_DIR", tmp.path());
 
-        let result = capture_pi_session_id("/home/user/project", &HashSet::new());
+        let result = capture_pi_session_id("/home/user/project", &HashSet::new(), None);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), uuid_new);
 
@@ -4363,6 +4415,76 @@ mod tests {
             Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
             None => std::env::remove_var("PI_CODING_AGENT_DIR"),
         }
+    }
+
+    // The store names no pane, so the floor is what attributes a hit to this
+    // one: a live poll may only see a conversation written after the pane
+    // launched. Retroactive callers pass `None` and keep the old selection.
+    #[test]
+    #[serial]
+    fn test_capture_pi_session_id_launch_floor_excludes_pre_launch_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = "/home/user/floored-project";
+        let project_dir = tmp
+            .path()
+            .join("sessions")
+            .join(encode_pi_project_path(project));
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let before = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+        let after = "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb";
+        for (uuid, mtime_secs) in [(before, 1_700_000_000), (after, 1_700_000_600)] {
+            let path = project_dir.join(format!("2024-12-01T10-00-00-000Z_{uuid}.jsonl"));
+            std::fs::write(
+                &path,
+                format!(r#"{{"type":"session","id":"{uuid}","cwd":"{project}"}}"#),
+            )
+            .unwrap();
+            set_mtime_secs(&path, mtime_secs);
+        }
+
+        let _pi_home = EnvGuard::set(&[("PI_CODING_AGENT_DIR", tmp.path())]);
+
+        // A pane launched between the two files sees only the newer one, even
+        // though both match the project and neither is excluded.
+        let floor = 1_700_000_300_000.0;
+        assert_eq!(
+            capture_pi_session_id(project, &HashSet::new(), Some(floor)).unwrap(),
+            after
+        );
+        // Floored past both: nothing is attributable, so capture fails rather
+        // than falling back to the newest file.
+        assert!(
+            capture_pi_session_id(project, &HashSet::new(), Some(1_700_001_000_000.0)).is_err()
+        );
+        // Retroactive recovery is unfloored.
+        assert_eq!(
+            capture_pi_session_id(project, &HashSet::new(), None).unwrap(),
+            after
+        );
+    }
+
+    // The container store carries conversations from before this pane: the
+    // host `agent` dir is copied in on every sandboxed launch, and the store
+    // is shared by every sandboxed Pi pane. The floor applies there too, on
+    // `stat`'s whole-second mtimes. It is weaker than the host floor, because
+    // `sync_agent_config` copies with `std::fs::copy`, which restamps mtimes
+    // at container-prep time rather than preserving the host's.
+    #[test]
+    fn test_select_pi_session_in_container_honors_launch_floor() {
+        let stdout = b"===PI:1700000000===\n{\"type\":\"session\",\"id\":\"copied-in\",\"cwd\":\"/workspace\"}\n===END===\n===PI:1700000600===\n{\"type\":\"session\",\"id\":\"written-here\",\"cwd\":\"/workspace\"}\n===END===\n";
+        let floor = Some(1_700_000_300_000.0);
+        assert_eq!(
+            select_pi_session_in_container(stdout, "/workspace", &HashSet::new(), floor).unwrap(),
+            "written-here"
+        );
+        assert!(select_pi_session_in_container(
+            stdout,
+            "/workspace",
+            &HashSet::new(),
+            Some(1_700_001_000_000.0)
+        )
+        .is_err());
     }
 
     #[test]
@@ -4394,7 +4516,7 @@ mod tests {
         let mut exclusion = HashSet::new();
         exclusion.insert(uuid_excluded.to_string());
 
-        let result = capture_pi_session_id("/home/user/project", &exclusion);
+        let result = capture_pi_session_id("/home/user/project", &exclusion, None);
         assert!(result.is_ok());
         assert_eq!(result.unwrap(), uuid_kept);
 
@@ -4437,7 +4559,7 @@ mod tests {
 
         let mut exclusion = HashSet::new();
         exclusion.insert(target_id.to_string());
-        let result = capture_pi_session_id("/home/user/project", &exclusion);
+        let result = capture_pi_session_id("/home/user/project", &exclusion, None);
 
         match old_val {
             Some(v) => std::env::set_var("PI_CODING_AGENT_DIR", v),
@@ -4481,7 +4603,7 @@ mod tests {
         let old_val = std::env::var("PI_CODING_AGENT_DIR").ok();
         std::env::set_var("PI_CODING_AGENT_DIR", tmp.path());
 
-        let result = capture_pi_session_id("/home/user/project", &HashSet::new());
+        let result = capture_pi_session_id("/home/user/project", &HashSet::new(), None);
         assert!(
             result.is_ok(),
             "Fallback should find sessions via CWD header"
@@ -4514,7 +4636,7 @@ mod tests {
         let old_val = std::env::var("PI_CODING_AGENT_DIR").ok();
         std::env::set_var("PI_CODING_AGENT_DIR", tmp.path());
 
-        let result = capture_pi_session_id("/home/user/project", &HashSet::new());
+        let result = capture_pi_session_id("/home/user/project", &HashSet::new(), None);
         assert!(result.is_ok(), "Fallback CWD scan should find the session");
         assert_eq!(result.unwrap(), uuid);
 
@@ -4562,11 +4684,11 @@ mod tests {
 
         // Should find the session in the matching directory, not the newer
         // (but unrelated) one.
-        let result = capture_pi_session_id("/nonexistent/path/for/test", &HashSet::new());
+        let result = capture_pi_session_id("/nonexistent/path/for/test", &HashSet::new(), None);
         assert!(
             result.is_ok(),
             "Dir-mtime fallback should find session: {:?}",
-            result
+            result.as_ref().err()
         );
         assert_eq!(result.unwrap(), uuid_match);
     }
@@ -4592,11 +4714,11 @@ mod tests {
 
         let _env = EnvGuard::set(&[("PI_CODING_AGENT_DIR", tmp.path())]);
 
-        let result = capture_pi_session_id("/nonexistent/path/for/test", &HashSet::new());
+        let result = capture_pi_session_id("/nonexistent/path/for/test", &HashSet::new(), None);
         assert!(
             result.is_err(),
             "Should error when no matching project directory exists: {:?}",
-            result
+            result.as_ref().ok().map(|_| "unexpected session")
         );
     }
 
@@ -4808,7 +4930,8 @@ mod tests {
 {\"type\":\"session\",\"id\":\"other-project\",\"cwd\":\"/elsewhere\"}
 ===END===
 ";
-        let result = select_pi_session_in_container(stdout, "/workspace", &HashSet::new()).unwrap();
+        let result =
+            select_pi_session_in_container(stdout, "/workspace", &HashSet::new(), None).unwrap();
         assert_eq!(result, "newer-match");
     }
 
@@ -4824,7 +4947,8 @@ mod tests {
 ";
         let mut exclusion = HashSet::new();
         exclusion.insert("already-claimed".to_string());
-        let result = select_pi_session_in_container(stdout, "/workspace", &exclusion).unwrap();
+        let result =
+            select_pi_session_in_container(stdout, "/workspace", &exclusion, None).unwrap();
         assert_eq!(result, "available");
     }
 
@@ -4835,13 +4959,13 @@ mod tests {
 {\"type\":\"session\",\"id\":\"foo\",\"cwd\":\"/somewhere/else\"}
 ===END===
 ";
-        let result = select_pi_session_in_container(stdout, "/workspace", &HashSet::new());
+        let result = select_pi_session_in_container(stdout, "/workspace", &HashSet::new(), None);
         assert!(result.is_err());
     }
 
     #[test]
     fn test_select_pi_session_in_container_empty_input() {
-        let result = select_pi_session_in_container(b"", "/workspace", &HashSet::new());
+        let result = select_pi_session_in_container(b"", "/workspace", &HashSet::new(), None);
         assert!(result.is_err());
     }
 
@@ -4855,7 +4979,8 @@ mod tests {
 {\"type\":\"session\",\"id\":\"valid\",\"cwd\":\"/workspace\"}
 ===END===
 ";
-        let result = select_pi_session_in_container(stdout, "/workspace", &HashSet::new()).unwrap();
+        let result =
+            select_pi_session_in_container(stdout, "/workspace", &HashSet::new(), None).unwrap();
         assert_eq!(result, "valid");
     }
 

@@ -410,7 +410,7 @@ pub async fn run(profile: &str, args: AddArgs) -> Result<()> {
         let seed = crate::session::fork::terminal_fork_seed(
             &resolved_tool,
             parent_agent_session_id.as_deref(),
-            crate::session::capture::generate_claude_session_id(),
+            crate::session::capture::generate_session_uuid(),
         )
         .map_err(|denied| match denied {
             crate::session::ForkDenied::AgentCannotFork => anyhow::anyhow!(

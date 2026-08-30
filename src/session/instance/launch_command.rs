@@ -37,6 +37,17 @@ fn apply_yolo_mode(cmd: &mut String, yolo: &crate::agents::YoloMode, is_sandboxe
     }
 }
 
+/// Whether a host `environment` list assigns `PATH`. Entries are either `KEY`
+/// (pass AoE's own value through, which cannot redirect a binary lookup) or
+/// `KEY=VALUE`, so only the assigning form counts.
+pub(super) fn environment_defines_path(environment: &[String]) -> bool {
+    environment.iter().any(|entry| {
+        entry
+            .split_once('=')
+            .is_some_and(|(key, _)| key.trim() == "PATH")
+    })
+}
+
 pub(super) fn build_resume_flags(
     tool: &str,
     session_id: &str,
@@ -833,12 +844,32 @@ mod tests {
     }
 
     #[test]
+    fn environment_defines_path_only_for_the_assigning_form() {
+        // A pass-through entry hands the pane AoE's own PATH, so the probed
+        // binary is the one that runs; an assignment can front a different pi.
+        assert!(environment_defines_path(&["PATH=/opt/bin".to_string()]));
+        assert!(environment_defines_path(&[
+            "API_KEY=x".to_string(),
+            " PATH =/opt/bin".to_string()
+        ]));
+        assert!(!environment_defines_path(&["PATH".to_string()]));
+        assert!(!environment_defines_path(&["PATHOLOGICAL=1".to_string()]));
+        assert!(!environment_defines_path(&[]));
+    }
+
+    #[test]
     fn test_build_pi_resume_flags() {
+        // An id already on file resumes with `--session`, which every pi
+        // version takes. A fresh launch pins the id AoE minted with
+        // `--session-id`, which creates the session when it is missing.
         let flags = build_resume_flags("pi", "019342ab-1234-7def-8901-abcdef012345", true);
         assert_eq!(flags, "--session 019342ab-1234-7def-8901-abcdef012345");
 
         let flags_new = build_resume_flags("pi", "019342ab-1234-7def-8901-abcdef012345", false);
-        assert_eq!(flags_new, "--session 019342ab-1234-7def-8901-abcdef012345");
+        assert_eq!(
+            flags_new,
+            "--session-id 019342ab-1234-7def-8901-abcdef012345"
+        );
     }
 
     #[test]
