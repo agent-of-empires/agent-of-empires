@@ -143,7 +143,8 @@ fn test_live_send_resize_uses_chrome_aware_resize_window() {
     );
 
     // Live-send entry sync (`finalize_live_send_resize`).
-    let home = std::fs::read_to_string("src/tui/home/mod.rs").expect("Failed to read home/mod.rs");
+    let home = std::fs::read_to_string("src/tui/home/live_send_prep.rs")
+        .expect("Failed to read home/live_send_prep.rs");
     let finalize = app_method_body(&home, "finalize_live_send_resize");
     assert!(
         finalize.contains("resize_window("),
