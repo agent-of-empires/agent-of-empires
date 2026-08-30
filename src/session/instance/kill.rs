@@ -30,7 +30,9 @@ impl Instance {
         if !self.uses_pi_session_sidecar() {
             return;
         }
-        let Some(published) = crate::hooks::read_hook_session_id(&self.id) else {
+        // No freshness window here: this is the last read before the sidecar
+        // is deleted, and an idle pane's `/new` can be hours old.
+        let Some(published) = crate::hooks::read_hook_session_id_any_age(&self.id) else {
             return;
         };
         if self.agent_session_id.as_deref() == Some(published.as_str()) {

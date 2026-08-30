@@ -431,7 +431,14 @@ impl Instance {
         let path = self.pi_session_path.as_deref()?;
         let id = self.agent_session_id.as_deref()?;
         let name = std::path::Path::new(path).file_name()?.to_str()?;
-        (name.contains(id) && std::path::Path::new(path).is_file()).then(|| path.to_string())
+        // `<timestamp>_<uuid>.jsonl`, matched on the whole id segment. A
+        // substring test would let a partial pin (which `set-session-id`
+        // accepts) match a timestamp digit or another file's uuid.
+        let names_this_conversation = name
+            .rsplit_once('_')
+            .and_then(|(_, tail)| tail.strip_suffix(".jsonl"))
+            .is_some_and(|uuid| uuid == id);
+        (names_this_conversation && std::path::Path::new(path).is_file()).then(|| path.to_string())
     }
 
     /// Record the conversation and transcript the pane published, if any.
@@ -537,7 +544,9 @@ impl Instance {
         // resolves the conversation wherever it was started, while
         // `--session-id` looks only in the current project and would create an
         // empty one under the same uuid after a worktree move.
-        if is_existing && session_id.is_some() {
+        // Never over an explicit pin: the user named a conversation, and a
+        // stored path is AoE's own bookkeeping.
+        if is_existing && !explicitly_pinned && session_id.is_some() {
             if let Some(path) = self.pi_resumable_transcript() {
                 let flags = format!("--session {}", shell_escape(&path));
                 splice_subcommand_or_append(cmd, &flags, false);
@@ -933,6 +942,13 @@ mod tests {
             None,
             "a path for another conversation must not be resumed"
         );
+
+        // A partial pin, which `set-session-id` accepts, must not match by
+        // substring: the id segment has to be the whole uuid.
+        inst.agent_session_id = Some("aaaaaaaa".to_string());
+        inst.pi_session_path = Some(mine.to_string_lossy().to_string());
+        assert_eq!(inst.pi_resumable_transcript(), None, "partial pin");
+        inst.agent_session_id = Some(id.to_string());
 
         inst.pi_session_path = Some(
             temp.path()

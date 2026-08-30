@@ -117,11 +117,31 @@ pub fn session_id_sidecar_exists(instance_id: &str) -> bool {
 /// Returns `None` when the file is absent, malformed (non-UUID), or older
 /// than `SESSION_ID_SIDECAR_MAX_AGE`.
 pub fn read_hook_session_id(instance_id: &str) -> Option<String> {
+    read_hook_session_id_within(instance_id, Some(SESSION_ID_SIDECAR_MAX_AGE))
+}
+
+/// [`read_hook_session_id`] without the freshness window.
+///
+/// The window exists so a resume does not adopt an id from some earlier run,
+/// which matters when the sidecar competes with other evidence. It has no
+/// place in a final flush at stop: the pane published that id, nothing else
+/// will, and the instance directory is about to be deleted. An idle pane whose
+/// `/new` is older than the window would otherwise lose it.
+pub fn read_hook_session_id_any_age(instance_id: &str) -> Option<String> {
+    read_hook_session_id_within(instance_id, None)
+}
+
+fn read_hook_session_id_within(
+    instance_id: &str,
+    max_age: Option<std::time::Duration>,
+) -> Option<String> {
     let dir = dir_guard::open_instance_dir_read_only(instance_id).ok()??;
     let meta = dir_guard::metadata_at(dir.as_fd(), "session_id").ok()??;
-    let mtime = meta.modified().ok()?;
-    if mtime.elapsed().ok()? > SESSION_ID_SIDECAR_MAX_AGE {
-        return None;
+    if let Some(max_age) = max_age {
+        let mtime = meta.modified().ok()?;
+        if mtime.elapsed().ok()? > max_age {
+            return None;
+        }
     }
     let bytes =
         dir_guard::read_file_at(dir.as_fd(), "session_id", SESSION_ID_FILE_READ_CAP).ok()??;
