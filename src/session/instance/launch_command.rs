@@ -40,8 +40,8 @@ fn apply_yolo_mode(cmd: &mut String, yolo: &crate::agents::YoloMode, is_sandboxe
 /// Write the Pi session-id extension into the app dir and return its path.
 ///
 /// Rewritten when the content differs so an upgrade ships its own version.
-pub(crate) fn pi_extension_path() -> Result<PathBuf> {
-    const SOURCE: &str = include_str!("../../../assets/pi/aoe-session-id.js");
+pub(super) fn pi_extension_path() -> Result<PathBuf> {
+    const SOURCE: &str = crate::session::instance::PI_SESSION_EXTENSION;
     let dir = crate::session::get_app_dir()?.join("agent-extensions");
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("pi-aoe-session-id.js");
@@ -395,6 +395,8 @@ impl Instance {
             // file by bind-mount (see `container_config`).
             let pi_extension = self.pi_extension_launch();
             if let Some((ref flag, _)) = pi_extension {
+                // Empty for a container: the extension is discovered there
+                // rather than named on the command line.
                 tool_cmd.push_str(flag);
                 self.pi_extension_launched = true;
             }
@@ -585,10 +587,11 @@ impl Instance {
 mod tests {
 
     #[test]
-    fn sandboxed_pi_launch_carries_the_extension_and_container_paths() {
-        // The container's pi is a different binary from the one the probe
-        // read, so the sandbox arm cannot gate on it; every published pi takes
-        // `--extension`. Both paths it names are bind-mounts, not host paths.
+    fn sandboxed_pi_publishes_without_a_command_line_extension() {
+        // `pi -e <missing path>` refuses to start, and a container created
+        // before this change has no mount for one, so a sandboxed launch names
+        // no extension: pi discovers it inside the config bind instead. The
+        // sidecar path it publishes to is a container path.
         let mut inst = Instance::new("pi-sandbox", "/tmp/pi-sandbox");
         inst.tool = "pi".to_string();
         inst.sandbox_info = Some(crate::session::SandboxInfo {
@@ -603,25 +606,14 @@ mod tests {
         });
 
         let (flag, env) = inst.pi_extension_launch().expect("sandboxed pi publishes");
-        assert_eq!(
-            flag.trim(),
-            format!(
-                "-e {}",
-                crate::session::container_config::PI_EXTENSION_PATH_IN_CONTAINER
-            )
-        );
+        assert!(flag.is_empty(), "no `-e` may reach a container launch");
         assert_eq!(
             env.trim(),
             format!(
                 "AOE_PI_SESSION_ID_FILE={}/{}/session_id",
-                crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER,
+                crate::session::container_config::PI_SIDECAR_DIR_IN_CONTAINER,
                 inst.id
             )
-        );
-        assert!(
-            !flag.contains(&std::env::var("HOME").unwrap_or_default())
-                || std::env::var("HOME").unwrap_or_default().is_empty(),
-            "a host path would not resolve inside the container"
         );
     }
     use super::*;

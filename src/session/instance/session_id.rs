@@ -342,7 +342,7 @@ impl Instance {
         // Pi's extension publishes the pane's own conversation to the same
         // sidecar, so this is the one Pi observation that names a pane.
         if self.tool == "pi" {
-            let authoritative = crate::hooks::read_hook_session_id(&self.id)?;
+            let authoritative = self.pi_published_session_id(false)?;
             if self.retroactive_capture_excludes.contains(&authoritative) {
                 return None;
             }
@@ -384,16 +384,19 @@ impl Instance {
             return None;
         }
         if self.is_sandboxed() {
-            // The container's pi is not the binary the probe read, but every
-            // published pi takes `--extension`, so the flag is safe there.
+            // No `-e`: pi refuses to start when an `-e` path is missing, and a
+            // container created before this change has no mount for one. The
+            // extension is written where pi discovers it, inside the config
+            // bind every Pi container already has, and the sidecar is published
+            // into that same bind.
+            if crate::session::container_config::install_pi_sandbox_extension().is_err() {
+                return None;
+            }
             return Some((
-                format!(
-                    " -e {}",
-                    crate::session::container_config::PI_EXTENSION_PATH_IN_CONTAINER
-                ),
+                String::new(),
                 format!(
                     "AOE_PI_SESSION_ID_FILE={}/{}/session_id ",
-                    crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER,
+                    crate::session::container_config::PI_SIDECAR_DIR_IN_CONTAINER,
                     self.id
                 ),
             ));
@@ -421,6 +424,56 @@ impl Instance {
     ///
     /// Read from what the launch did, not from the binary probe: an upgrade
     /// mid-session must not reclassify a pane that is already running.
+    /// The conversation this pane published, whichever side of the container
+    /// boundary it published on. `any_age` drops the freshness window, which a
+    /// final flush wants and a resume does not.
+    pub(crate) fn pi_published_session_id(&self, any_age: bool) -> Option<String> {
+        if !self.is_sandboxed() {
+            return if any_age {
+                crate::hooks::read_hook_session_id_any_age(&self.id)
+            } else {
+                crate::hooks::read_hook_session_id(&self.id)
+            };
+        }
+        let raw = std::fs::read_to_string(self.pi_sandbox_sidecar()?.join("session_id")).ok()?;
+        let id = raw.trim();
+        uuid::Uuid::parse_str(id).ok().map(|_| id.to_string())
+    }
+
+    /// The transcript path this pane published, as the pane sees it. In a
+    /// container that is a `/root/.pi/...` path, which is what pi's argv needs;
+    /// `pi_host_view_of` maps it back for host-side checks.
+    pub(crate) fn pi_published_session_path(&self) -> Option<String> {
+        if !self.is_sandboxed() {
+            return crate::hooks::read_hook_session_path(&self.id);
+        }
+        let raw = std::fs::read_to_string(self.pi_sandbox_sidecar()?.join("session_path")).ok()?;
+        let path = raw.trim();
+        path.starts_with('/').then(|| path.to_string())
+    }
+
+    /// Host directory backing this sandboxed pane's sidecar.
+    fn pi_sandbox_sidecar(&self) -> Option<std::path::PathBuf> {
+        crate::session::validate_instance_id(&self.id).ok()?;
+        Some(
+            crate::session::container_config::pi_sandbox_dir()?
+                .join("aoe-session")
+                .join(&self.id),
+        )
+    }
+
+    /// A published path as the host filesystem sees it. The Pi config dir is
+    /// bound at `/root/.pi` inside the container, so a transcript published
+    /// there lives under the sandbox dir here; checking the container path
+    /// verbatim on the host finds nothing and would discard a valid transcript.
+    fn pi_host_view_of(&self, published: &str) -> Option<std::path::PathBuf> {
+        if !self.is_sandboxed() {
+            return Some(std::path::PathBuf::from(published));
+        }
+        let rest = published.strip_prefix("/root/.pi/")?;
+        Some(crate::session::container_config::pi_sandbox_dir()?.join(rest))
+    }
+
     /// The transcript to resume by path, when the pane published one that
     /// still exists and belongs to the conversation we hold.
     ///
@@ -438,7 +491,10 @@ impl Instance {
             .rsplit_once('_')
             .and_then(|(_, tail)| tail.strip_suffix(".jsonl"))
             .is_some_and(|uuid| uuid == id);
-        (names_this_conversation && std::path::Path::new(path).is_file()).then(|| path.to_string())
+        let exists = self
+            .pi_host_view_of(path)
+            .is_some_and(|host_path| host_path.is_file());
+        (names_this_conversation && exists).then(|| path.to_string())
     }
 
     /// Record the conversation and transcript the pane published, if any.
@@ -446,7 +502,7 @@ impl Instance {
         if self.tool != "pi" {
             return;
         }
-        if let Some(path) = crate::hooks::read_hook_session_path(&self.id) {
+        if let Some(path) = self.pi_published_session_path() {
             self.pi_session_path = Some(path);
         }
     }
@@ -899,6 +955,48 @@ mod tests {
         assert_eq!(
             inst.try_retroactive_capture().as_deref(),
             Some("11111111-2222-3333-4444-555555555555")
+        );
+    }
+
+    #[test]
+    fn sandbox_transcript_paths_validate_in_the_host_namespace() {
+        // The container publishes `/root/.pi/...`; the file lives under the
+        // sandbox dir on this side. Checking the container path verbatim would
+        // reject every sandbox transcript.
+        let mut inst = Instance::new("pi-ns", "/tmp/pi-ns");
+        inst.tool = "pi".to_string();
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test-image".to_string(),
+            container_name: "aoe-pi-ns".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: None,
+            before_start_env: Vec::new(),
+        });
+
+        let published = "/root/.pi/sessions/--proj--/2026-01-01T00-00-00-000Z_x.jsonl";
+        let host = inst
+            .pi_host_view_of(published)
+            .expect("a container path maps to the sandbox dir");
+        assert!(
+            host.starts_with(crate::session::container_config::pi_sandbox_dir().unwrap()),
+            "resolved under the sandbox dir, got {host:?}"
+        );
+        assert!(host.ends_with("sessions/--proj--/2026-01-01T00-00-00-000Z_x.jsonl"));
+        assert_eq!(
+            inst.pi_host_view_of("/elsewhere/x.jsonl"),
+            None,
+            "a path outside the bind cannot be mapped"
+        );
+
+        // A host pane's path is already a host path.
+        let mut host_inst = Instance::new("pi-host-ns", "/tmp/pi-ns");
+        host_inst.tool = "pi".to_string();
+        assert_eq!(
+            host_inst.pi_host_view_of("/home/u/.pi/x.jsonl"),
+            Some(std::path::PathBuf::from("/home/u/.pi/x.jsonl"))
         );
     }
 

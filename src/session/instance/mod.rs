@@ -48,7 +48,11 @@ mod flags;
 mod hooks;
 mod kill;
 mod launch_command;
-pub(crate) use launch_command::pi_extension_path;
+
+/// The extension AoE loads into Pi so a pane publishes its own conversation.
+/// Written to the app dir for a host launch and into the Pi sandbox dir for a
+/// container one.
+pub(crate) const PI_SESSION_EXTENSION: &str = include_str!("../../../assets/pi/aoe-session-id.js");
 mod lifecycle;
 mod merge;
 mod omp;

@@ -952,39 +952,40 @@ fn sync_managed_skills_into_sandbox(
 /// default case where no worktree is detected).
 ///
 /// Returns (host_mount_path, container_mount_path, working_dir)
-/// Where a sandboxed Pi finds the AoE session-id extension. Fixed like
-/// `HOOK_STATUS_BASE_IN_CONTAINER` so the launch line bakes one string
-/// whatever the host path is.
-pub(crate) const PI_EXTENSION_PATH_IN_CONTAINER: &str = "/tmp/aoe-pi-session-id.js";
+/// Where a sandboxed Pi publishes its conversation, inside the container.
+///
+/// Under the pi config mount rather than the hook base: that bind already
+/// exists for every Pi container, so no new mount is needed and an image
+/// created by an older AoE keeps working. Docker cannot add a mount to a
+/// container that already exists, and reusing one is the normal path.
+pub(crate) const PI_SIDECAR_DIR_IN_CONTAINER: &str = "/root/.pi/aoe-session";
 
-/// The volumes a sandboxed Pi needs so its extension can load and publish.
-fn pi_extension_mounts(instance_id: &str) -> Vec<VolumeMount> {
-    let mut volumes = Vec::new();
-    if crate::session::validate_instance_id(instance_id).is_ok() {
-        if let Ok(hook_dir) = crate::hooks::ensure_instance_dir_path(instance_id) {
-            volumes.push(VolumeMount {
-                host_path: hook_dir.to_string_lossy().to_string(),
-                container_path: format!(
-                    "{}/{instance_id}",
-                    crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER
-                ),
-                read_only: false,
-            });
-        }
-    }
-    if let Ok(extension) = crate::session::instance::pi_extension_path() {
-        volumes.push(VolumeMount {
-            host_path: extension.to_string_lossy().to_string(),
-            container_path: PI_EXTENSION_PATH_IN_CONTAINER.to_string(),
-            read_only: true,
-        });
-    }
-    volumes
+/// Host directory backing [`PI_SIDECAR_DIR_IN_CONTAINER`], and the root the
+/// extension is written under.
+pub(crate) fn pi_sandbox_dir() -> Option<std::path::PathBuf> {
+    let mount = AGENT_CONFIG_MOUNTS.iter().find(|m| m.tool_name == "pi")?;
+    let home = dirs::home_dir()?;
+    sandbox_dir_for(mount, &home, None).ok()
 }
 
-#[cfg(test)]
-fn pi_extension_mount_paths_for_test(instance_id: &str) -> Vec<VolumeMount> {
-    pi_extension_mounts(instance_id)
+/// Write the session-id extension where a sandboxed Pi discovers it
+/// (`~/.pi/agent/extensions/` in the container). Discovery rather than `-e`:
+/// pi refuses to start when an `-e` path is missing, and the file has to
+/// survive an upgrade of AoE under a container that already exists.
+pub(crate) fn install_pi_sandbox_extension() -> Result<()> {
+    let dir = pi_sandbox_dir()
+        .ok_or_else(|| anyhow::anyhow!("no Pi sandbox dir"))?
+        .join("agent")
+        .join("extensions");
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("aoe-session-id.js");
+    let source = crate::session::instance::PI_SESSION_EXTENSION;
+    if std::fs::read_to_string(&path).ok().as_deref() != Some(source) {
+        let tmp = dir.join("aoe-session-id.js.tmp");
+        std::fs::write(&tmp, source)?;
+        std::fs::rename(&tmp, &path)?;
+    }
+    Ok(())
 }
 
 pub(crate) fn compute_volume_paths(
@@ -1856,13 +1857,6 @@ pub(crate) fn build_container_config(
         }
     }
 
-    // Pi declares no hooks, so the block below skips it, but its extension
-    // publishes into the same per-instance dir and needs both that dir and the
-    // extension file inside the container.
-    if active_agent.is_some_and(|a| a.name == "pi") {
-        volumes.extend(pi_extension_mounts(instance_id));
-    }
-
     let hooks_enabled = profile_session_config.agent_status_hooks;
     if let Some(agent) = active_agent {
         if hooks_enabled {
@@ -2173,36 +2167,6 @@ fn common_ancestor(a: &Path, b: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
 
-    #[test]
-    #[serial_test::serial(hook_base)]
-    fn sandboxed_pi_mounts_its_instance_dir_and_extension() {
-        // Pi declares no hooks, so the hook-dir mount the block below adds for
-        // Claude and friends skips it, and without both mounts the extension
-        // could neither be loaded nor write where AoE reads.
-        let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
-        let home = tempfile::tempdir().unwrap();
-        let _home_guard = crate::session::test_support::isolate_app_dir_at(home.path());
-
-        let instance_id = "pisandboxmount01";
-        let volumes = pi_extension_mount_paths_for_test(instance_id);
-
-        assert!(
-            volumes.iter().any(|v| v.container_path
-                == format!(
-                    "{}/{instance_id}",
-                    crate::hooks::HOOK_STATUS_BASE_IN_CONTAINER
-                )),
-            "the instance dir must be reachable from inside the container"
-        );
-        let extension = volumes
-            .iter()
-            .find(|v| v.container_path == PI_EXTENSION_PATH_IN_CONTAINER)
-            .expect("the extension file must be mounted");
-        assert!(
-            extension.read_only,
-            "the container has no reason to write it"
-        );
-    }
     use super::*;
     use crate::hooks::test_support::BaseGuard;
     use std::fs;

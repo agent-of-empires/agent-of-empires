@@ -12,7 +12,7 @@ impl Instance {
     /// which is the common case: the pane published a path this launch and the
     /// row was already on that conversation.
     fn persist_pi_session_path(&self, storage: &crate::session::storage::Storage) {
-        let Some(path) = crate::hooks::read_hook_session_path(&self.id) else {
+        let Some(path) = self.pi_published_session_path() else {
             return;
         };
         if self.pi_session_path.as_deref() == Some(path.as_str()) {
@@ -32,14 +32,14 @@ impl Instance {
         }
         // No freshness window here: this is the last read before the sidecar
         // is deleted, and an idle pane's `/new` can be hours old.
-        let Some(published) = crate::hooks::read_hook_session_id_any_age(&self.id) else {
+        let Some(published) = self.pi_published_session_id(true) else {
             return;
         };
         if self.agent_session_id.as_deref() == Some(published.as_str()) {
             self.persist_pi_session_path(storage);
             return;
         }
-        let published_path = crate::hooks::read_hook_session_path(&self.id);
+        let published_path = self.pi_published_session_path();
         if let Err(error) = storage.update(|instances, _| {
             if let Some(inst) = instances.iter_mut().find(|i| i.id == self.id) {
                 inst.agent_session_id = Some(published.clone());
