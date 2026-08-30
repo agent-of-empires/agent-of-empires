@@ -520,8 +520,22 @@ impl Instance {
     }
 
     pub(crate) fn uses_pi_session_sidecar(&self) -> bool {
-        self.tool == "pi"
-            && (self.pi_extension_launched || crate::hooks::session_id_sidecar_exists(&self.id))
+        self.tool == "pi" && (self.pi_extension_launched || self.pi_sidecar_exists())
+    }
+
+    /// Whether a sidecar exists for this pane, looked for where the pane
+    /// publishes: the bind-backed directory for a container, the per-instance
+    /// hook directory for a host pane.
+    ///
+    /// This is the reload path. `pi_extension_launched` is runtime state, so a
+    /// daemon or TUI that reloads a still-live session has only the file to go
+    /// on, and looking in the wrong place makes a publishing pane read as a
+    /// silent one: no poller repair, and a final flush that returns early.
+    fn pi_sidecar_exists(&self) -> bool {
+        match self.pi_sandbox_sidecar_dir() {
+            Some(dir) => dir.join("session_id").is_file(),
+            None => crate::hooks::session_id_sidecar_exists(&self.id),
+        }
     }
 
     /// Whether this session may pin its Pi conversation with `--session-id`.
@@ -988,6 +1002,63 @@ mod tests {
         assert_eq!(
             inst.pi_session_path, None,
             "the dropped conversation's transcript must not linger"
+        );
+    }
+
+    // A reload keeps the row and drops the runtime flag, so the file is all
+    // that says this pane publishes. Looking in the host hook dir for a
+    // container's sidecar reads a live publisher as a silent one: no poller
+    // repair, and a flush that returns before reading anything.
+    #[test]
+    #[serial_test::serial]
+    fn reloaded_sandbox_session_still_finds_its_sidecar() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::EnvGuard::set(&[("HOME", temp.path())]);
+
+        let mut inst = Instance::new("pireloadsandbox01", "/tmp/pi-reload");
+        inst.tool = "pi".to_string();
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "aoe-pi-reload".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: None,
+            before_start_env: Vec::new(),
+        });
+        inst.mark_pi_extension_launched_for_test();
+
+        // Round-trip the way a daemon or TUI reload does.
+        let reloaded: Instance =
+            serde_json::from_str(&serde_json::to_string(&inst).unwrap()).unwrap();
+        assert!(
+            !reloaded.uses_pi_session_sidecar(),
+            "nothing published yet, so nothing to find"
+        );
+
+        let dir = reloaded
+            .pi_sandbox_sidecar_dir()
+            .expect("a sandboxed pane has a bind-backed sidecar");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("session_id"),
+            "01a053b6-c470-78de-9d8f-bc00ef05332a\n",
+        )
+        .unwrap();
+
+        assert!(
+            reloaded.uses_pi_session_sidecar(),
+            "the published file is what a reloaded session has to go on"
+        );
+        assert!(
+            reloaded.supports_session_poller(),
+            "poller repair must stay available after a reload"
+        );
+        assert_eq!(
+            reloaded.pi_published_session_id(true).as_deref(),
+            Some("01a053b6-c470-78de-9d8f-bc00ef05332a"),
+            "and the final flush must read it"
         );
     }
 
