@@ -421,6 +421,29 @@ impl Instance {
     ///
     /// Read from what the launch did, not from the binary probe: an upgrade
     /// mid-session must not reclassify a pane that is already running.
+    /// The transcript to resume by path, when the pane published one that
+    /// still exists and belongs to the conversation we hold.
+    ///
+    /// Pi names its files `<timestamp>_<uuid>.jsonl`, so the id check is what
+    /// keeps a path left over from a previous conversation (a `/new` the drain
+    /// recorded but no stop flushed) from resuming the wrong one.
+    fn pi_resumable_transcript(&self) -> Option<String> {
+        let path = self.pi_session_path.as_deref()?;
+        let id = self.agent_session_id.as_deref()?;
+        let name = std::path::Path::new(path).file_name()?.to_str()?;
+        (name.contains(id) && std::path::Path::new(path).is_file()).then(|| path.to_string())
+    }
+
+    /// Record the conversation and transcript the pane published, if any.
+    pub(super) fn absorb_published_pi_session(&mut self) {
+        if self.tool != "pi" {
+            return;
+        }
+        if let Some(path) = crate::hooks::read_hook_session_path(&self.id) {
+            self.pi_session_path = Some(path);
+        }
+    }
+
     pub(crate) fn uses_pi_session_sidecar(&self) -> bool {
         self.tool == "pi"
             && (self.pi_extension_launched || crate::hooks::session_id_sidecar_exists(&self.id))
@@ -489,6 +512,7 @@ impl Instance {
         // Read before acquisition: the `Use` intent is what marks an id the
         // user pinned rather than one AoE minted or captured.
         let explicitly_pinned = matches!(self.resume_intent, ResumeIntent::Use(_));
+        self.absorb_published_pi_session();
         let (mut session_id, is_existing) = self.acquire_session_id();
         // Which ResumeStrategy arm to emit. Pi diverges from `is_existing`
         // (see `resume_flag_arm_is_existing`), so the launch flag and the
@@ -508,6 +532,18 @@ impl Instance {
         // to gate emission too.
         if matches!(self.tool.as_str(), "copilot" | "kimi" | "prime-agent") && self.is_sandboxed() {
             session_id = None;
+        }
+        // A transcript the pane published outranks its id: `--session <path>`
+        // resolves the conversation wherever it was started, while
+        // `--session-id` looks only in the current project and would create an
+        // empty one under the same uuid after a worktree move.
+        if is_existing && session_id.is_some() {
+            if let Some(path) = self.pi_resumable_transcript() {
+                let flags = format!("--session {}", shell_escape(&path));
+                splice_subcommand_or_append(cmd, &flags, false);
+                tracing::debug!(target: "session.store", "Added resume flags to {} command: {}", context, flags);
+                return true;
+            }
         }
         let emitted = append_resume_flags(
             &self.tool,
@@ -855,6 +891,56 @@ mod tests {
             inst.try_retroactive_capture().as_deref(),
             Some("11111111-2222-3333-4444-555555555555")
         );
+    }
+
+    #[test]
+    fn pi_resumes_by_published_path_only_for_its_own_transcript() {
+        // The path is what survives a worktree move, but a path left over from
+        // a previous conversation must not resume it, so the file name has to
+        // carry the id the row holds.
+        let temp = tempfile::tempdir().unwrap();
+        let id = "aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa";
+        let other = "bbbbbbbb-2222-4222-8222-bbbbbbbbbbbb";
+        let mine = temp
+            .path()
+            .join(format!("2026-01-01T00-00-00-000Z_{id}.jsonl"));
+        std::fs::write(&mine, "{}\n").unwrap();
+        let theirs = temp
+            .path()
+            .join(format!("2026-01-01T00-00-00-000Z_{other}.jsonl"));
+        std::fs::write(&theirs, "{}\n").unwrap();
+
+        let mut inst = Instance::new("pi-path", "/tmp/pi-path");
+        inst.tool = "pi".to_string();
+        inst.agent_session_id = Some(id.to_string());
+
+        assert_eq!(
+            inst.pi_resumable_transcript(),
+            None,
+            "no path published yet"
+        );
+
+        inst.pi_session_path = Some(mine.to_string_lossy().to_string());
+        assert_eq!(
+            inst.pi_resumable_transcript().as_deref(),
+            Some(mine.to_string_lossy().as_ref()),
+            "the pane's own transcript resumes by path"
+        );
+
+        inst.pi_session_path = Some(theirs.to_string_lossy().to_string());
+        assert_eq!(
+            inst.pi_resumable_transcript(),
+            None,
+            "a path for another conversation must not be resumed"
+        );
+
+        inst.pi_session_path = Some(
+            temp.path()
+                .join(format!("2026-01-01T00-00-00-000Z_{id}.jsonl.gone"))
+                .to_string_lossy()
+                .to_string(),
+        );
+        assert_eq!(inst.pi_resumable_transcript(), None, "the file must exist");
     }
 
     #[test]

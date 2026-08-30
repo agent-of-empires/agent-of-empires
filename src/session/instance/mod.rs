@@ -586,6 +586,13 @@ pub struct Instance {
     #[serde(skip)]
     pi_extension_launched: bool,
 
+    /// Absolute transcript path this Pi pane last published. Pi indexes
+    /// sessions by their starting cwd, so this is what resumes a conversation
+    /// whose managed worktree has since moved; the id alone would resolve to
+    /// nothing there.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pi_session_path: Option<String>,
+
     #[serde(skip)]
     pub last_error: Option<String>,
     #[serde(skip)]

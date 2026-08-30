@@ -79,6 +79,26 @@ fn parse_status(bytes: &[u8]) -> Option<Status> {
     }
 }
 
+/// Read the transcript path a Pi pane published beside its `session_id`.
+///
+/// Pi indexes sessions by the cwd they started in, so a managed worktree that
+/// moves leaves the transcript behind: the id alone would resolve to nothing
+/// in the new directory and `--session-id` would create an empty conversation
+/// under it. The absolute path still resolves. Absent, unreadable, oversized,
+/// or relative values give `None`; no age check, since a path does not go
+/// stale the way a fresh-conversation id does.
+pub fn read_hook_session_path(instance_id: &str) -> Option<String> {
+    let dir = dir_guard::open_instance_dir_read_only(instance_id).ok()??;
+    let bytes =
+        dir_guard::read_file_at(dir.as_fd(), "session_path", SESSION_PATH_FILE_READ_CAP).ok()??;
+    let path = std::str::from_utf8(&bytes).ok()?.trim().to_string();
+    (path.starts_with('/') && !path.contains('\n')).then_some(path)
+}
+
+/// Cap on the published transcript path, generous next to `PATH_MAX` and far
+/// below anything worth reading into memory.
+const SESSION_PATH_FILE_READ_CAP: usize = 8 * 1024;
+
 /// Whether a `session_id` sidecar exists for this instance, whatever its age.
 ///
 /// [`read_hook_session_id`] answers "is there a fresh id to adopt"; this

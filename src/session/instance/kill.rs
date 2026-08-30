@@ -8,6 +8,24 @@ impl Instance {
     ///
     /// Without this a CLI-only lifecycle loses a `/new`: no poller is running
     /// to observe it, and by the next launch the sidecar is gone.
+    /// Record the transcript path for a conversation whose id has not moved,
+    /// which is the common case: the pane published a path this launch and the
+    /// row was already on that conversation.
+    fn persist_pi_session_path(&self, storage: &crate::session::storage::Storage) {
+        let Some(path) = crate::hooks::read_hook_session_path(&self.id) else {
+            return;
+        };
+        if self.pi_session_path.as_deref() == Some(path.as_str()) {
+            return;
+        }
+        let _ = storage.update(|instances, _| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == self.id) {
+                inst.pi_session_path = Some(path.clone());
+            }
+            Ok(())
+        });
+    }
+
     fn flush_pi_sidecar_conversation(&self, storage: &crate::session::storage::Storage) {
         if !self.uses_pi_session_sidecar() {
             return;
@@ -16,11 +34,16 @@ impl Instance {
             return;
         };
         if self.agent_session_id.as_deref() == Some(published.as_str()) {
+            self.persist_pi_session_path(storage);
             return;
         }
+        let published_path = crate::hooks::read_hook_session_path(&self.id);
         if let Err(error) = storage.update(|instances, _| {
             if let Some(inst) = instances.iter_mut().find(|i| i.id == self.id) {
                 inst.agent_session_id = Some(published.clone());
+                if published_path.is_some() {
+                    inst.pi_session_path = published_path.clone();
+                }
             }
             Ok(())
         }) {

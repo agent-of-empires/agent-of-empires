@@ -27,8 +27,8 @@ pub(crate) use dir_guard::{
     write_session_id_via_guard,
 };
 pub use status_file::{
-    cleanup_hook_status_dir, hook_status_dir, read_hook_session_id, read_hook_status,
-    read_hook_status_age, read_hook_urgent, session_id_sidecar_exists,
+    cleanup_hook_status_dir, hook_status_dir, read_hook_session_id, read_hook_session_path,
+    read_hook_status, read_hook_status_age, read_hook_urgent, session_id_sidecar_exists,
 };
 pub(crate) use targets::{
     has_aoe_marker, iter_hook_targets, iter_hook_targets_in, HookTarget, HookTargetKind,
