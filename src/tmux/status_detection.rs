@@ -1,4 +1,5 @@
 //! Status detection for agent sessions
+use unicode_width::UnicodeWidthStr;
 
 use crate::session::Status;
 
@@ -43,7 +44,10 @@ const COMPLETED_ACTIVITY_MARKERS: &[&str] = &[
     "successful",
     "successfully",
 ];
-
+const OMP_STATUS_SEPARATORS: &[&str] = &[
+    " > ", " < ", " ▶ ", " ◀ ", "  ", "  ", " · ", "  ", " / ", "  ", " │ ", "  ", " ▕ ",
+    " ┆ ", " █ ", " ▌ ", " # ", " | ",
+];
 fn has_any_spinner(lines: &[&str]) -> bool {
     lines
         .iter()
@@ -2056,17 +2060,15 @@ pub fn detect_pi_status(raw_content: &str) -> Status {
 /// it the signal is ignored, so a completed turn's loader or a dismissed
 /// banner in scrollback cannot pin the session.
 ///
-/// A live loader has a built-in activity frame or configured symbolic frame,
-/// or an ASCII preset frame (`- \ | /`), plus its marker on the same row. A
-/// wrapped marker must be physically adjacent and indented beneath an
-/// unfinished frame row. This matches OMP's text layout and rejects prose
-/// separated by blank output. Known braille frames retain the historical
-/// `Working` marker; other symbolic and ASCII
-/// frames require an esc hint (`⟦esc⟧`, `⟨esc⟩`, `[esc]`, or `(esc to cancel)`).
-/// OMP intents are arbitrary, so hint-bearing ASCII or symbolic prose can be
-/// textually identical to a direct loader row. The bottom-three-line window
-/// favors the active direction for that irreducible case, avoiding a false
-/// Idle while a turn runs.
+/// Pre-v18 live loaders use an activity frame plus a same-row working or
+/// interrupt marker. OMP 18.0.10 instead uses a standard, nerd, or ASCII
+/// interrupt icon followed by an arbitrary streamed intent. A candidate must
+/// occupy the renderer's loader role: band output reaches its bottom rule,
+/// while non-band and extension composers follow the editor gap. That role
+/// check rejects editor drafts, status rows, and completed output; a built-in
+/// interrupt icon, known activity phrase, or live elapsed timer corroborates
+/// the candidate. An arbitrary timerless custom band loader can be byte-identical
+/// to an arbitrary idle title; structured turn events are tracked in #3380.
 ///
 /// A tool approval replaces the composer with a selector panel. Exact
 /// bordered `Approve`/`Deny` option rows corroborate its navigation footer;
@@ -2088,15 +2090,12 @@ pub fn detect_pi_status(raw_content: &str) -> Status {
 pub fn detect_omp_status(raw_content: &str) -> Status {
     let clean = strip_ansi(raw_content);
     let mut non_empty_lines = Vec::new();
-    let mut loader_window = VecDeque::with_capacity(4);
+    let mut loader_window = VecDeque::new();
     for (line_index, line) in clean.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
         non_empty_lines.push(line);
-        if loader_window.len() == 4 {
-            loader_window.pop_front();
-        }
         loader_window.push_back((line_index, line));
     }
 
@@ -2191,10 +2190,598 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
         consider(pos, OmpSignal::Spinner);
     }
 
+    // OMP 18.0.10 replaced the old spinner-and-hint loader with an interrupt
+    // icon followed by an arbitrary streamed intent. Validate that row by the
+    // renderer roles below it: band output reaches its bottom rule without a
+    // gap, while every other composer begins flush-left after the editor gap.
+    // This works with configured icons and extension chrome without treating
+    // activity-like editor text or stale transcript rows as a live loader.
+    let is_elapsed = |token: &str| {
+        token
+            .strip_suffix('s')
+            .or_else(|| token.strip_suffix('m'))
+            .or_else(|| token.strip_suffix('h'))
+            .is_some_and(|number| {
+                !number.is_empty() && number.chars().all(|ch| ch.is_ascii_digit() || ch == '.')
+            })
+    };
+    let is_activity_frame = |token: &str| {
+        SPINNER_CHARS.contains(&token)
+            || matches!(token, "-" | "/" | "|" | "X" | "◐")
+            || token.as_bytes() == [92]
+    };
+    let has_known_activity_elapsed = |line: &str| {
+        let mut previous = None;
+        line.split_whitespace().any(|token| {
+            let found = is_elapsed(token) && previous.is_some_and(is_activity_frame);
+            previous = Some(token);
+            found
+        })
+    };
+    let is_box_top = |line: &str| {
+        let mut chars = line.trim().chars();
+        let Some(corner) = chars.next() else {
+            return false;
+        };
+        let Some(horizontal) = chars.next() else {
+            return false;
+        };
+        matches!(corner, '╭' | '┌' | '╔' | '+')
+            && !horizontal.is_alphanumeric()
+            && chars.next().is_some_and(|next| next == horizontal)
+    };
+    let is_box_bottom = |line: &str| {
+        let mut chars = line.trim().chars();
+        let Some(corner) = chars.next() else {
+            return false;
+        };
+        let Some(horizontal) = chars.next() else {
+            return false;
+        };
+        matches!(corner, '╰' | '└' | '╚' | '+') && !horizontal.is_alphanumeric()
+    };
+    let is_structural_custom_bottom = |line: &str| {
+        let mut chars = line.trim().chars();
+        let _left = chars.next();
+        let _right = chars.next_back();
+        let Some(horizontal) = chars.next() else {
+            return false;
+        };
+        chars.clone().next().is_some() && chars.all(|candidate| candidate == horizontal)
+    };
+    let is_custom_box_bottom = |line: &str| {
+        !has_known_activity_elapsed(line)
+            && line
+                .chars()
+                .filter(|ch| !ch.is_alphanumeric() && !ch.is_whitespace())
+                .count()
+                >= 2
+    };
+    let composer_kind = |line: &str| {
+        let line = line.trim();
+        let first = line.chars().next();
+        let horizontal_rule = line.chars().count() >= 3
+            && first.is_some_and(|rule| {
+                !rule.is_alphanumeric()
+                    && !rule.is_whitespace()
+                    && line.chars().all(|candidate| candidate == rule)
+            });
+        if is_box_top(line) {
+            1
+        } else if line == "❯" || line.starts_with("❯ ") {
+            2
+        } else if line.starts_with('▐') {
+            3
+        } else if line.starts_with('▎') {
+            4
+        } else if horizontal_rule && first == Some('=') {
+            6
+        } else if horizontal_rule {
+            5
+        } else {
+            0
+        }
+    };
+    let composer_complete =
+        |kind: u8, box_bottom: bool, prompt: bool, rules: usize, paired_rules: bool| match kind {
+            0 => prompt && rules > 0,
+            1 => box_bottom,
+            2..=4 => true,
+            5 => prompt || paired_rules,
+            _ => false,
+        };
+    let has_activity_segment_elapsed = |line: &str| {
+        let trimmed = line.trim();
+        let mut previous = None;
+        let mut known_activity_elapsed = false;
+        for token in trimmed.split_whitespace() {
+            known_activity_elapsed |= is_elapsed(token) && previous.is_some_and(is_activity_frame);
+            previous = Some(token);
+        }
+        if known_activity_elapsed {
+            return true;
+        }
+        let segment_end = OMP_STATUS_SEPARATORS
+            .iter()
+            .filter_map(|separator| trimmed.find(separator))
+            .min()
+            .unwrap_or(trimmed.len());
+        let mut tokens = trimmed[..segment_end].split_whitespace();
+        let first = tokens.next();
+        let frame = if first.is_some_and(|token| is_box_top(token) || token.starts_with('')) {
+            tokens.next()
+        } else {
+            first
+        };
+        let has_persistent_time_icon = trimmed
+            .split_whitespace()
+            .any(|token| matches!(token, "◷" | "⏱" | "" | "t:" | "clock"));
+        !has_persistent_time_icon
+            && !matches!(frame, Some("◷" | "⏱" | "" | "t:" | "clock"))
+            && tokens.take(3).any(is_elapsed)
+    };
+    let has_any_elapsed_text = |line: &str| {
+        let has_separator = OMP_STATUS_SEPARATORS
+            .iter()
+            .any(|separator| line.contains(separator));
+        let mut token_count = 0;
+        let mut found = false;
+        let mut has_persistent_time_icon = false;
+        for token in line.split_whitespace() {
+            token_count += 1;
+            found |= is_elapsed(token);
+            has_persistent_time_icon |= matches!(token, "◷" | "⏱" | "" | "t:" | "clock");
+        }
+        found && (has_separator || token_count == 2 || has_persistent_time_icon)
+    };
+    let has_elapsed_text = |line: &str| {
+        let has_separator = OMP_STATUS_SEPARATORS
+            .iter()
+            .any(|separator| line.contains(separator));
+        let mut previous = "";
+        let mut token_count = 0;
+        let mut found = false;
+        for token in line.split_whitespace() {
+            token_count += 1;
+            found |= !["◷", "⏱", "", "t:", "clock"].contains(&previous) && is_elapsed(token);
+            previous = token;
+        }
+        found && (has_separator || token_count == 2)
+    };
+    let has_activity_timer =
+        |line: &str| line.split_whitespace().any(is_activity_frame) && has_elapsed_text(line);
+    let live_loader_layout = |line_index: usize,
+                              loader_spaces: usize,
+                              allow_continuations: bool| {
+        let pane_width = clean
+            .lines()
+            .map(UnicodeWidthStr::width)
+            .max()
+            .unwrap_or_default();
+        let icon_only_loader = ["⎋", "󱊷", "esc"].contains(&clean.lines().nth(line_index)?.trim());
+        let mut previous_line_width = UnicodeWidthStr::width(clean.lines().nth(line_index)?);
+        let continuation_spaces = usize::from(loader_spaces > 1);
+        let mut saw_gap = false;
+        let mut post_gap_started = false;
+        let mut detached_status_gap = false;
+        let mut first_kind = 0;
+        let mut box_bottom = false;
+        let mut prompt = false;
+        let mut rules = 0;
+        let mut paired_rules = false;
+        let mut rule_width = None;
+        let mut saw_pi_editor_row = false;
+        let mut pending_unknown_elapsed = false;
+        let mut pending_unknown_idle = false;
+        let mut pending_unknown_persistent_elapsed = false;
+        let mut saw_extension_row = false;
+        let mut expect_standalone_status = false;
+        let mut activity_timer = false;
+        let mut unknown_composer_rows = 0;
+        for (current_index, line) in clean.lines().enumerate().skip(line_index + 1) {
+            if line.trim().is_empty() {
+                if post_gap_started {
+                    if first_kind == 5 && rules == 1 {
+                        let matching_bottom = clean
+                            .lines()
+                            .skip(current_index + 1)
+                            .find(|line| !line.trim().is_empty())
+                            .is_some_and(|line| {
+                                composer_kind(line) == 5
+                                    && UnicodeWidthStr::width(line)
+                                        == rule_width.unwrap_or_default()
+                            });
+                        if matching_bottom && rule_width.unwrap_or_default() >= 8 {
+                            saw_pi_editor_row = true;
+                            continue;
+                        }
+                    }
+                    let complete =
+                        composer_complete(first_kind, box_bottom, prompt, rules, paired_rules)
+                            || (first_kind == 6 && saw_extension_row);
+                    if complete {
+                        let rule_status_after_gap = first_kind == 5
+                            && prompt
+                            && !paired_rules
+                            && clean
+                                .lines()
+                                .skip(current_index + 1)
+                                .find(|line| !line.trim().is_empty())
+                                .is_some_and(|line| composer_kind(line) != 5);
+                        if (expect_standalone_status || rule_status_after_gap)
+                            && !detached_status_gap
+                        {
+                            expect_standalone_status = true;
+                            detached_status_gap = true;
+                            continue;
+                        }
+                        return Some((true, activity_timer, current_index));
+                    }
+                    if !detached_status_gap {
+                        detached_status_gap = true;
+                        continue;
+                    }
+                    return Some((false, activity_timer, current_index));
+                }
+                saw_gap = true;
+                continue;
+            }
+            let trimmed = line.trim_start();
+            let leading_spaces = line.len() - trimmed.len();
+            let line_has_timer = has_activity_timer(line);
+            if saw_gap {
+                let kind = if leading_spaces == 0 {
+                    composer_kind(line)
+                } else {
+                    0
+                };
+                let mut first_composer_row = !post_gap_started;
+                if first_composer_row {
+                    first_kind = kind;
+                    post_gap_started = true;
+                    rule_width = (kind == 5).then(|| UnicodeWidthStr::width(line));
+                }
+                if first_kind == 0 && kind != 0 && !first_composer_row {
+                    first_kind = kind;
+                    box_bottom = false;
+                    prompt = false;
+                    rules = 0;
+                    paired_rules = false;
+                    rule_width = (kind == 5).then(|| UnicodeWidthStr::width(line));
+                    saw_pi_editor_row = false;
+                    saw_extension_row = false;
+                    expect_standalone_status = false;
+                    unknown_composer_rows = 0;
+                    first_composer_row = true;
+                }
+                if first_kind == 1
+                    && !first_composer_row
+                    && leading_spaces == 0
+                    && is_box_bottom(trimmed)
+                {
+                    return Some((
+                        !pending_unknown_idle && !pending_unknown_persistent_elapsed,
+                        activity_timer || pending_unknown_elapsed,
+                        current_index,
+                    ));
+                }
+                if first_kind == 6 && !first_composer_row && !saw_extension_row {
+                    saw_extension_row = true;
+                    expect_standalone_status = true;
+                    continue;
+                }
+                let complete_before =
+                    composer_complete(first_kind, box_bottom, prompt, rules, paired_rules)
+                        || (first_kind == 6 && saw_extension_row);
+                if complete_before
+                    && !first_composer_row
+                    && !(expect_standalone_status && first_kind == 5 && kind == 5)
+                {
+                    if expect_standalone_status {
+                        activity_timer |= has_activity_segment_elapsed(line);
+                    }
+                    return Some((true, activity_timer, current_index));
+                }
+                if detached_status_gap {
+                    activity_timer |= has_activity_segment_elapsed(line);
+                    return Some((false, activity_timer, current_index));
+                }
+                if first_kind == 5 && rules == 1 && kind != 5 && line.starts_with(' ') {
+                    let matching_bottom = clean
+                        .lines()
+                        .skip(current_index + 1)
+                        .find(|line| !line.trim().is_empty())
+                        .is_some_and(|line| {
+                            composer_kind(line) == 5
+                                && UnicodeWidthStr::width(line) == rule_width.unwrap_or_default()
+                        });
+                    if matching_bottom && rule_width.unwrap_or_default() >= 8 {
+                        saw_pi_editor_row = true;
+                        continue;
+                    }
+                }
+                if !matches!(trimmed.chars().next(), Some('│' | '▐' | '▎'))
+                    && has_known_activity_elapsed(line)
+                {
+                    if let Some((bottom_index, _)) = clean
+                        .lines()
+                        .enumerate()
+                        .skip(current_index + 1)
+                        .find(|(_, line)| !line.trim().is_empty())
+                        .filter(|(_, line)| is_custom_box_bottom(line))
+                    {
+                        return Some((true, true, bottom_index));
+                    }
+                }
+                if first_kind == 0
+                    && unknown_composer_rows >= 2
+                    && has_activity_segment_elapsed(line)
+                {
+                    return Some((false, true, current_index));
+                }
+                box_bottom |= first_kind == 1
+                    && !first_composer_row
+                    && leading_spaces == 0
+                    && is_box_bottom(trimmed);
+                prompt |= kind == 2;
+                rules += usize::from(kind == 5);
+                paired_rules |= kind == 5
+                    && saw_pi_editor_row
+                    && UnicodeWidthStr::width(line) == rule_width.unwrap_or_default();
+                let complete =
+                    composer_complete(first_kind, box_bottom, prompt, rules, paired_rules)
+                        || (first_kind == 6 && saw_extension_row);
+                if complete {
+                    expect_standalone_status = matches!(first_kind, 2..=4 | 6)
+                        || (first_kind == 5 && (prompt || (paired_rules && saw_pi_editor_row)));
+                }
+                pending_unknown_elapsed = first_kind == 0 && has_activity_segment_elapsed(line);
+                pending_unknown_persistent_elapsed = first_kind == 0
+                    && has_elapsed_text(line)
+                    && !has_activity_segment_elapsed(line);
+                pending_unknown_idle = first_kind == 0
+                    && line
+                        .to_ascii_lowercase()
+                        .split_whitespace()
+                        .any(|word| word == "idle");
+                let is_last_non_empty = clean
+                    .lines()
+                    .skip(current_index + 1)
+                    .all(|line| line.trim().is_empty());
+                activity_timer |= first_composer_row
+                    && matches!(kind, 1 | 5 | 6)
+                    && has_activity_segment_elapsed(line);
+                activity_timer |= line_has_timer && !complete && is_last_non_empty;
+                unknown_composer_rows += usize::from(kind == 0);
+                continue;
+            }
+            activity_timer |= line_has_timer;
+            if leading_spaces == 0 && is_box_bottom(trimmed) {
+                return Some((true, activity_timer, current_index));
+            }
+            if trimmed.starts_with('') {
+                continue;
+            }
+            let looks_like_status = OMP_STATUS_SEPARATORS
+                .iter()
+                .any(|separator| line.contains(separator));
+            let before_band_bottom = clean
+                .lines()
+                .skip(current_index + 1)
+                .find(|line| !line.trim().is_empty())
+                .is_some_and(is_box_bottom);
+            if !allow_continuations && !looks_like_status && !before_band_bottom {
+                return None;
+            }
+            if !looks_like_status && !before_band_bottom {
+                let icon_only_first_wrap = icon_only_loader && current_index == line_index + 1;
+                if !icon_only_first_wrap && previous_line_width.saturating_add(2) < pane_width {
+                    return None;
+                }
+                previous_line_width = UnicodeWidthStr::width(line);
+            }
+            activity_timer |= before_band_bottom && has_elapsed_text(line);
+            if leading_spaces != continuation_spaces && !(loader_spaces == 1 && leading_spaces == 1)
+            {
+                return None;
+            }
+        }
+        post_gap_started.then_some((
+            composer_complete(first_kind, box_bottom, prompt, rules, paired_rules)
+                || (first_kind == 6 && saw_extension_row),
+            activity_timer,
+            clean.lines().count().saturating_sub(1),
+        ))
+    };
+    let v18_loader_pos =
+        loader_window
+            .iter()
+            .enumerate()
+            .rev()
+            .find_map(|(i, (line_index, line))| {
+                let leading_spaces = line.len() - line.trim_start_matches(' ').len();
+                if leading_spaces == 0 {
+                    return None;
+                }
+                let preceded_by_loader_gap = *line_index == 0
+                    || clean
+                        .lines()
+                        .nth(*line_index - 1)
+                        .is_some_and(|line| line.trim().is_empty());
+                if !preceded_by_loader_gap {
+                    return None;
+                }
+                let body = line.trim_start();
+                let builtin_interrupt = ["⎋", "󱊷", "esc"].iter().find_map(|icon| {
+                    body.strip_prefix(icon).and_then(|rest| {
+                        (rest.is_empty() || rest.starts_with(' ')).then_some(rest.is_empty())
+                    })
+                });
+                let has_builtin_interrupt = builtin_interrupt.is_some();
+                let icon_only_continues = builtin_interrupt == Some(true)
+                    && clean.lines().nth(*line_index + 1).is_some_and(|next| {
+                        !next.trim().is_empty()
+                            && next.len() - next.trim_start_matches(' ').len()
+                                == usize::from(leading_spaces > 1)
+                    });
+                let has_custom_activity = body.split_once(' ').is_some_and(|(icon, message)| {
+                    clean
+                        .lines()
+                        .nth(*line_index + 1)
+                        .is_some_and(|next| next.trim().is_empty())
+                        || clean
+                            .lines()
+                            .skip(*line_index + 1)
+                            .any(has_activity_segment_elapsed)
+                        || (icon.chars().count() > 1
+                            && has_live_activity_word(&message.to_lowercase()))
+                });
+                let has_later_parked_surface = clean
+                    .lines()
+                    .enumerate()
+                    .skip(*line_index + 1)
+                    .filter(|(_, candidate)| candidate.trim().is_empty())
+                    .any(|(blank_index, _)| {
+                        clean
+                            .lines()
+                            .take(blank_index)
+                            .skip(*line_index + 1)
+                            .any(has_known_activity_elapsed)
+                            && clean.lines().skip(blank_index + 1).any(|candidate| {
+                                candidate.len() == candidate.trim_start().len()
+                                    && composer_kind(candidate) != 0
+                            })
+                    });
+                if has_later_parked_surface && !has_builtin_interrupt {
+                    return None;
+                }
+                let allow_continuations = builtin_interrupt == Some(true)
+                    || !matches!(
+                        body.chars().next_back(),
+                        Some('.' | '!' | '?' | ':' | ';' | '…')
+                    );
+                let known_default_message = ["⎋", "󱊷", "esc"].iter().any(|icon| {
+                    body.strip_prefix(icon)
+                        .is_some_and(|rest| matches!(rest.trim(), "Working…" | "Working..."))
+                });
+                let custom_box_layout = {
+                    let mut rows = clean
+                        .lines()
+                        .enumerate()
+                        .skip(*line_index + 1)
+                        .filter(|(_, candidate)| !candidate.trim().is_empty());
+                    rows.next().and_then(|(_, top)| {
+                        rows.next().and_then(|(bottom_index, bottom)| {
+                            (UnicodeWidthStr::width(top) >= 8
+                                && UnicodeWidthStr::width(top) == UnicodeWidthStr::width(bottom)
+                                && is_structural_custom_bottom(bottom))
+                            .then_some((true, false, bottom_index))
+                        })
+                    })
+                };
+                let line_count = clean.lines().count();
+                let active_surface = ((*line_index + 1)..line_count.saturating_sub(1))
+                    .filter_map(|probe| {
+                        live_loader_layout(probe, 2, true).and_then(
+                            |(surface_layout, surface_activity, surface_end)| {
+                                (surface_layout && surface_activity).then_some((
+                                    surface_layout,
+                                    surface_activity,
+                                    surface_end,
+                                ))
+                            },
+                        )
+                    })
+                    .max_by_key(|(_, _, surface_end)| *surface_end);
+                let strict_layout =
+                    live_loader_layout(*line_index, leading_spaces, allow_continuations);
+                let used_relaxed_layout =
+                    active_surface.is_none() && strict_layout.is_none() && !allow_continuations;
+                let (layout, mut activity_timer, layout_end) = active_surface
+                    .or(custom_box_layout)
+                    .or(strict_layout)
+                    .or_else(|| {
+                        used_relaxed_layout
+                            .then(|| live_loader_layout(*line_index, leading_spaces, true))?
+                    })?;
+                let lower_composer = clean
+                    .lines()
+                    .enumerate()
+                    .skip(layout_end.saturating_add(1))
+                    .find(|(_, line)| {
+                        line.len() == line.trim_start().len() && composer_kind(line) != 0
+                    });
+                if let Some((lower_index, _)) = lower_composer {
+                    let lower_activity = clean
+                        .lines()
+                        .skip(lower_index)
+                        .any(has_known_activity_elapsed);
+                    if !lower_activity {
+                        return None;
+                    }
+                    activity_timer = true;
+                }
+                if used_relaxed_layout && known_default_message && !activity_timer {
+                    return None;
+                }
+                let has_inactive_elapsed =
+                    clean
+                        .lines()
+                        .enumerate()
+                        .skip(*line_index + 1)
+                        .any(|(elapsed_index, line)| {
+                            let first_composer_row = clean
+                                .lines()
+                                .skip(*line_index + 1)
+                                .take(elapsed_index.saturating_sub(*line_index + 1))
+                                .all(|line| line.trim().is_empty());
+                            let band_status_row = line.starts_with(' ')
+                                && clean
+                                    .lines()
+                                    .skip(elapsed_index + 1)
+                                    .find(|line| !line.trim().is_empty())
+                                    .is_some_and(|line| line.trim_start().starts_with("╰─"));
+                            has_any_elapsed_text(line)
+                                && ((!first_composer_row && !band_status_row)
+                                    || (first_composer_row && !has_activity_segment_elapsed(line)))
+                        });
+                let detached_from_loader = clean
+                    .lines()
+                    .nth(*line_index + 1)
+                    .is_some_and(|line| line.trim().is_empty());
+                if (has_builtin_interrupt || has_custom_activity)
+                    && !activity_timer
+                    && has_inactive_elapsed
+                    && detached_from_loader
+                {
+                    return None;
+                }
+                ((activity_timer && (leading_spaces >= 2 || has_builtin_interrupt))
+                    || (layout
+                        && (leading_spaces >= 2 || icon_only_continues)
+                        && (has_builtin_interrupt || has_custom_activity)))
+                    .then_some(loader_window.len() - i)
+            });
+    if let Some(pos) = v18_loader_pos {
+        consider(pos, OmpSignal::Spinner);
+    }
     // Retry countdown: fixed live region above the prompt (window 6). (a)
     // single-line match; (b) if none, the window joined with single spaces so
     // a character-wrap cut between tokens still matches.
-    let window6 = tail_lines(&non_empty_lines, 6);
+    let signal_end = clean
+        .lines()
+        .enumerate()
+        .filter(|(_, line)| {
+            is_box_bottom(line) || is_structural_custom_bottom(line) || composer_kind(line) == 5
+        })
+        .map(|(index, _)| index + 1)
+        .last();
+    let signal_non_empty_lines: Vec<&str> = clean
+        .lines()
+        .take(signal_end.unwrap_or(usize::MAX))
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+    let window6 = tail_lines(&signal_non_empty_lines, 6);
     let mut countdown_pos = None;
     for (i, line) in window6.iter().rev().enumerate() {
         if countdown_a().is_match(&line.to_lowercase()) {
@@ -2241,44 +2828,63 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
         consider(pos, OmpSignal::TerminalLines);
     }
 
-    let window8 = tail_lines(&non_empty_lines, 8);
-    let window12 = tail_lines(&non_empty_lines, 12);
+    let window8 = tail_lines(&signal_non_empty_lines, 8);
+    let window12 = tail_lines(&signal_non_empty_lines, 12);
 
     // Tool approval: the selector always renders bordered Approve/Deny rows
     // plus its navigation footer, even when the tool supplies no detail row.
     // Exact option labels keep surrounding prose from satisfying the gate.
     let is_panel_row = |line: &str| {
         let line = line.trim();
-        (line.starts_with('│') && line.ends_with('│'))
-            || (line.starts_with('|') && line.ends_with('|'))
+        line.chars().count() >= 3
+            && line
+                .chars()
+                .next()
+                .is_some_and(|border| line.ends_with(border))
     };
     let is_panel_option = |line: &str, expected: &str| {
-        let line = line.trim();
-        let inner = line
-            .strip_prefix('│')
-            .and_then(|line| line.strip_suffix('│'))
-            .or_else(|| {
-                line.strip_prefix('|')
-                    .and_then(|line| line.strip_suffix('|'))
-            });
+        let first = line.chars().next();
+        let inner = first.and_then(|border| {
+            line.strip_prefix(border)
+                .and_then(|line| line.strip_suffix(border))
+        });
         let Some(inner) = inner else { return false };
         let inner = inner.trim();
         let inner = inner
             .strip_prefix("❯ ")
             .or_else(|| inner.strip_prefix("\u{f054} "))
             .or_else(|| inner.strip_prefix("> "))
-            .unwrap_or(inner);
-        inner.trim().eq_ignore_ascii_case(expected)
+            .unwrap_or(inner)
+            .trim();
+        let lower = inner.to_lowercase();
+        lower == expected
+            || lower
+                .strip_suffix(expected)
+                .is_some_and(|prefix| prefix.chars().next_back().is_some_and(char::is_whitespace))
     };
     let has_approve = window8.iter().any(|line| is_panel_option(line, "approve"));
     let has_deny = window8.iter().any(|line| is_panel_option(line, "deny"));
-    if has_approve && has_deny {
+    let mut panel_text = String::new();
+    for line in window12.iter().filter(|line| is_panel_row(line)) {
+        let line = line.trim();
+        let border = line.chars().next().unwrap_or_default();
+        let inner = line
+            .strip_prefix(border)
+            .and_then(|line| line.strip_suffix(border))
+            .unwrap_or(line);
+        for token in inner.split_whitespace() {
+            panel_text.push_str(&token.to_lowercase());
+            panel_text.push(' ');
+        }
+    }
+    if has_approve
+        && has_deny
+        && panel_text.contains("up/down navigate")
+        && panel_text.contains("enter select")
+        && panel_text.contains("esc cancel")
+    {
         if let Some(pos) = lowest_matching_line(window8, |line| {
-            let lower = line.to_lowercase();
-            is_panel_row(line)
-                && lower.contains("up/down navigate")
-                && lower.contains("enter select")
-                && lower.contains("esc cancel")
+            is_panel_row(line) && line.to_lowercase().contains("esc cancel")
         }) {
             consider(pos, OmpSignal::Approval);
         }
@@ -2287,17 +2893,26 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
     // Plan Review: stable bordered option rows, a selected option cursor,
     // and the live bordered footer prove that the overlay is still active.
     let has_panel_cursor = |line: &str| {
-        let line = line.trim();
-        let inner = line
-            .strip_prefix('│')
-            .and_then(|line| line.strip_suffix('│'))
-            .or_else(|| {
-                line.strip_prefix('|')
-                    .and_then(|line| line.strip_suffix('|'))
-            });
+        let first = line.chars().next();
+        let inner = first.and_then(|border| {
+            line.strip_prefix(border)
+                .and_then(|line| line.strip_suffix(border))
+        });
         let Some(inner) = inner else { return false };
-        let inner = inner.trim();
-        inner.starts_with("❯ ") || inner.starts_with("\u{f054} ") || inner.starts_with("> ")
+        let lower = inner.trim().to_lowercase();
+        [
+            "approve and execute",
+            "approve and compact context",
+            "refine plan",
+            "save and quit",
+        ]
+        .iter()
+        .any(|option| {
+            lower != *option
+                && lower.strip_suffix(option).is_some_and(|prefix| {
+                    prefix.chars().next_back().is_some_and(char::is_whitespace)
+                })
+        })
     };
     let is_plan_option = |line: &str| {
         is_panel_option(line, "approve and execute")
@@ -2312,20 +2927,18 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
     let has_plan_options = ["approve and execute", "refine plan", "save and quit"]
         .iter()
         .all(|expected| window12.iter().any(|line| is_panel_option(line, expected)));
-    if has_selected_option && has_plan_options {
+    if has_selected_option && has_plan_options && panel_text.contains("tab regions") {
         if let Some(pos) = lowest_matching_line(window12, |line| {
-            let lower = line.to_lowercase();
-            is_panel_row(line) && lower.contains("tab regions") && lower.contains("esc cancel")
+            is_panel_row(line) && line.to_lowercase().contains("tab regions")
         }) {
             consider(pos, OmpSignal::Approval);
         }
     }
-
     // Ask dialog footer phrases count only on a bordered dialog row.
     if let Some(pos) = lowest_matching_line(window8, |line| {
         let lower = line.to_lowercase();
         is_panel_row(line)
-            && (lower.contains("enter select · n note")
+            && (lower.contains("enter select ·")
                 || lower.contains("space toggle · enter ")
                 || lower.contains("enter submit · ↑/↓ scroll")
                 || lower.contains("current prompt to answer"))
@@ -5752,6 +6365,233 @@ Final prose line.\n";
                 "stale loader ignored",
                 format!("⠋ Working… ⟦esc⟧\nCompleted response.\nAdditional output.\nOK\n{MINIMAL_COMPOSER_BOX}"),
             ),
+            (
+                "stale v18 loader ignored",
+                "  ⎋ Working…
+Completed response.
+Additional output.
+
+ π > idle status
+╰─".to_string(),
+            ),
+            (
+                "stale v18 loader before blank response",
+                "  ⎋ Working…\n\nCompleted response.\nAdditional output.\n\n π > idle status\n╰─".to_string(),
+            ),
+            (
+                "stale v18 loader before whitespace response",
+                "  ⎋ Working…\n   \nCompleted response.\nAdditional output.\n\n π > idle status\n╰─".to_string(),
+            ),
+            (
+                "stale v18 loader before timed response",
+                "  ⎋ Working…\n\nCompleted in 1s\nAdditional output.\n\n╭── π > idle ─╮\n╰─           ─╯".to_string(),
+            ),
+            (
+                "stale v18 loader before rendered rule",
+                "  ⎋ Working…\n\n---\nCompleted response.\n\n╭── π > idle ─╮\n╰─           ─╯".to_string(),
+            ),
+            (
+                "stale loader before elapsed box draft",
+                "  ⎋ Working…\n\n╭── π > idle ─╮\n│ fix npm test · 12s · passed │\n╰─                           ─╯".to_string(),
+            ),
+            (
+                "stale loader before elapsed prompt draft",
+                "  ⎋ Working…\n\n────────────────────────\n❯ fix npm test · 12s · passed\n────────────────────────\n π > idle".to_string(),
+            ),
+            (
+                "stale loader before elapsed extension hook status",
+                "  ⎋ Working…\n\n────────────────────────\n❯\n────────────────────────\n π > idle status\nbuild · 12s · passed".to_string(),
+            ),
+            (
+                "stale loader before spinner-shaped box draft",
+                "  ⎋ Working…\n\n╭── π > idle ─╮\n│ fix ⠋ 12s · passed │\n╰─                   ─╯".to_string(),
+            ),
+            (
+                "elapsed field draft cannot create loader candidate",
+                " Final answer.\n\n▐ fix npm test · 12s · passed ▌\n\n π > idle".to_string(),
+            ),
+            (
+                "elapsed rail draft cannot create loader candidate",
+                " Final answer.\n\n▎ fix npm test · 12s · passed\n\n π > idle".to_string(),
+            ),
+            (
+                "stale tight pi loader ignores spinner-shaped hook status",
+                " ⎋ Working…\n\n────────────────────────\n                        \n────────────────────────\n π > idle\n⠋ 12s · build hook".to_string(),
+            ),
+            (
+                "idle one-space ascii interrupt prose",
+                "\n esc cancels the dialog.\n\n╭── π > idle ─╮\n╰─           ─╯".to_string(),
+            ),
+            (
+                "idle one-space unicode interrupt prose",
+                "\n ⎋ Final answer\n\n╭── π > idle ─╮\n╰─           ─╯".to_string(),
+            ),
+            (
+                "idle persistent time-spent segment",
+                "  CANCEL Verifying exact status transition\n\n❯\n π > RCA Slow Turn > ◷ 5m".to_string(),
+            ),
+            (
+                "idle shipped standard time-spent icon",
+                "  CANCEL Verifying exact status transition\n\n❯\n π > RCA Slow Turn > ⏱ 5m".to_string(),
+            ),
+            (
+                "idle shipped nerd time-spent icon",
+                "  CANCEL Verifying exact status transition\n\n❯\n π  RCA Slow Turn   5m".to_string(),
+            ),
+            (
+                "idle shipped ascii time-spent icon",
+                "  CANCEL Verifying exact status transition\n\n❯\n pi > RCA Slow Turn > t: 5m".to_string(),
+            ),
+            (
+                "stale loader before separated duration prose",
+                "  ⎋ Working…\n\nnpm test · 12s · passed\nAdditional output.\n\n╭── π > idle ─╮\n╰─           ─╯".to_string(),
+            ),
+            (
+                "stale loader before second-row duration prose",
+                "  ⎋ Working…\n\nCompleted response.\nnpm test · 12s · passed\n\n╭── π > idle ─╮\n╰─           ─╯".to_string(),
+            ),
+            (
+                "stale loader before padded assistant output",
+                "  ⎋ Working…\n Final answer.\n\n╭── π > idle ─╮\n╰─           ─╯".to_string(),
+            ),
+            (
+                "stale arbitrary intent before indented assistant output",
+                "  ⎋ Verifying exact status transition\n Final answer.\n\n╭──────────────────────────────────────────────────────────────────────────────╮\n╰──────────────────────────────────────────────────────────────────────────────╯".to_string(),
+            ),
+            (
+                "stale active surface above current idle composer",
+                "  ⎋ Working…\n\n╭── ⠹ 1s > RCA Slow Turn ─╮\n╰─                       ─╯\nCompleted response.\n\n╭── π > idle ─╮\n╰─           ─╯".to_string(),
+            ),
+            (
+                "stale elapsed widget before current idle band",
+                "  ⎋ Working…\n\nbuild · 12s · passed\n π > idle status\n╰─".to_string(),
+            ),
+            (
+                "shipped idle widget text cannot mimic custom loader",
+                "
+  X Working…
+ π > RCA Slow Turn
+╰─".to_string(),
+            ),
+            (
+                "custom idle time icon cannot revive stale loader",
+                "  ⎋ Working…\n\n π > RCA Slow Turn > clock 5m\n╰─".to_string(),
+            ),
+            (
+                "custom idle clock in box cannot revive stale loader",
+                "  ⎋ Working…
+
+╭── π > RCA Slow Turn > clock 5m ─╮
+╰─                               ─╯".to_string(),
+            ),
+            (
+                "shipped idle clock in box cannot revive stale loader",
+                "  ⎋ Working…
+
+╭── π > RCA Slow Turn > ⏱ 5m ─╮
+╰─                           ─╯".to_string(),
+            ),
+            (
+                "shipped clock-only first segment cannot revive stale loader",
+                "  ⎋ Working…
+
+❯
+ ⏱ 5m · RCA Slow Turn".to_string(),
+            ),
+            (
+                "custom clock-only first segment cannot revive stale loader",
+                "  ⎋ Working…
+
+❯
+ clock 5m > RCA Slow Turn".to_string(),
+            ),
+            (
+                "full powerline time segment cannot revive stale loader",
+                "  ⎋ Working…
+
+ π ▶ RCA Slow Turn ▶ ⏱ 5m
+╰─".to_string(),
+            ),
+            (
+                "nerd powerline time segment cannot revive stale loader",
+                "  󱊷 Working…
+
+ π  RCA Slow Turn   5m 
+╰─".to_string(),
+            ),
+            (
+                "separator-none persistent clock cannot revive stale loader",
+                "  ⎋ Working…
+
+ π   ⬢ RCA Slow Turn   ⏱ 5s
+╰─".to_string(),
+            ),
+            (
+                "idle one-space icon-only assistant output",
+                " ⎋\n\n╭── π > idle ─╮\n╰─           ─╯".to_string(),
+            ),
+            (
+                "stale loader before two rendered rules",
+                "  ⎋ Working…\n\n────────────────\nSummary\n────────────────\nFinal answer.".to_string(),
+            ),
+            (
+                "v18 loader without activity status",
+                "⎋ Working…\nπ > idle status\n╰─".to_string(),
+            ),
+            (
+                "activity timer without v18 loader",
+                "Completed response.\n⠸ 1s > historical timing\n╰─".to_string(),
+            ),
+            (
+                "timer-like prose below v18 loader",
+                "⎋ Working…\nThe probe took 1s\n╰─".to_string(),
+            ),
+            (
+                "stale borderless loader ignored",
+                "  CANCEL Working…\n❯\n X 1s > active status\n\n❯\n idle status".to_string(),
+            ),
+            (
+                "hook status retry text below idle composer",
+                " π > RCA Slow Turn\n╰─\nError: Retry budget exhausted after 10 retries: hook-owned diagnostic"
+                    .to_string(),
+            ),
+            (
+                "idle right-aligned multiword title",
+                "  My Session
+╰─".to_string(),
+            ),
+            (
+                "idle activity-like title",
+                "  Working Session
+╰─".to_string(),
+            ),
+            (
+                "idle pi draft with activity verb",
+                "────────────────
+ Run testing this
+────────────────
+
+ idle status".to_string(),
+            ),
+            (
+                "idle whitespace editor row",
+                "────────────────\n ⎋ Working…\n                        \n────────────────\n idle status".to_string(),
+            ),
+            (
+                "idle indented assistant output",
+                " Final answer.\n\n╭── π > RCA Slow Turn ─╮\n╰─                    ─╯".to_string(),
+            ),
+            (
+                "idle indented recap output",
+                " ※ recap: replied OK successfully.\n\n╭── π > RCA Slow Turn ─╮\n╰─                    ─╯".to_string(),
+            ),
+            (
+                "idle right-only interrupt-like title",
+                "────────────────
+❯
+────────────────
+ ⎋ Notes".to_string(),
+            ),
             // Live loader pushed one line past the 3-line footer window:
             // the miss reads Idle, the same bounded flapping other agents
             // accept between polls.
@@ -5763,7 +6603,11 @@ Final prose line.\n";
             ("repro snapshot", OMP_PARKED_AT_COMPOSER_REPRO.to_string()),
         ];
         for (name, pane) in &cases {
-            assert_eq!(detect_omp_status(pane), Status::Idle, "case: {name}");
+            assert_eq!(
+                detect_status_from_content(pane, "omp"),
+                Status::Idle,
+                "case: {name}"
+            );
         }
     }
 
@@ -6284,6 +7128,15 @@ Final prose line.\n";
 │ up/down navigate  enter select  esc cancel               │
 │                                                          │
 ╰──────────────────────────────────────────────────────────╯",
+            "\
+┃  → Approve                                               ┃
+┃    Deny                                                  ┃
+┃ up/down navigate  enter select  esc cancel               ┃",
+            "\
+│  ❯ Approve                 │
+│    Deny                    │
+│ up/down navigate  enter    │
+│ select  esc cancel         │",
         ];
         for (i, pane) in cases.iter().enumerate() {
             assert_eq!(detect_omp_status(pane), Status::Waiting, "case {i}");
@@ -6292,10 +7145,13 @@ Final prose line.\n";
 
     #[test]
     fn test_detect_omp_status_running_loaders() {
-        // Same behavior and setup: every live loader has a preset activity or
-        // configured frame plus a direct marker or indented wrapped continuation.
+        // Pre-v18 loaders carry one framed Working/hint row. OMP 18.0.10
+        // instead pairs its escape-prefixed loader with a timed activity row.
         let box_unicode = "╭── π ─╮\n╰─ ─╯";
         let box_ascii = "+-- pi ---+\n+- -------+";
+        let v18_band_capture = "  ⎋ Working…
+ ⠸ 1s  > ⬢ RCA Slow Turn > 🌳 …-rca ▶─────13%────────────────────╎───┃─────128K─
+╰─";
         let answered_panel = "\
 ╭─ Allow tool: bash ───────────────────────────────────────╮
 │                                                          │
@@ -6308,6 +7164,374 @@ Final prose line.\n";
 │                                                          │
 ╰──────────────────────────────────────────────────────────╯";
         let cases = [
+            ("v18.0.10 band capture", v18_band_capture.to_string()),
+            (
+                "v18.0.10 narrow band",
+                "  ⎋ Working…\n ⠧ 37s > ⬢ RCA Slow Turn ▶─13%─┃128K─\n╰─".to_string(),
+            ),
+            (
+                "v18.0.10 nerd band",
+                "  󱊷 Working…\n ⠋ 0s  RCA Slow Turn \n╰─".to_string(),
+            ),
+            (
+                "v18.0.10 ascii band",
+                "  esc Working…\n - 1s > [M] RCA Slow Turn >-13%--:|128K-\n╰─".to_string(),
+            ),
+            (
+                "v18.0.10 custom activity frame",
+                "  ⎋ Working…\n ◐ 0s > RCA Slow Turn ▶─13%─┃128K─\n╰─".to_string(),
+            ),
+            (
+                "v18.0.10 streamed intent",
+                "  ⎋ Verifying exact status transition\n ⠋ 2m > RCA Slow Turn ▶─13%─┃128K─\n╰─".to_string(),
+            ),
+            (
+                "v18.0.10 wrapped streamed intent",
+                "  ⎋ Verifying all affected status matrix!!\n across every supported composer shape now\n and every preset at all narrow widths now\n final fragment\n ⠋ 2s > RCA Slow Turn\n╰─".to_string(),
+            ),
+            (
+                "v18.0.10 tmux-trimmed ASCII wrap",
+                "  ⎋ 123456789012345
+ continuation
+ ⠋ 2s > RCA─────────
+╰─".to_string(),
+            ),
+            (
+                "v18.0.10 tmux-trimmed CJK wrap",
+                "  ⎋ 1234567890123界
+ continuation
+ ⠋ 2s > RCA─────────
+╰─".to_string(),
+            ),
+            (
+                "v18.0.10 legacy box",
+                "  ⎋ Working…
+
+╭── ⠹ 0s > RCA Slow Turn ─╮
+╰─                       ─╯".to_string(),
+            ),
+            (
+                "v18.0.10 narrow band without pi",
+                "  CANCEL Working…
+ 🌳 …-rca ▶─13%─┃128K─
+╰─".to_string(),
+            ),
+            (
+                "v18.0.10 custom symbols",
+                "  CANCEL Working…
+ X 1s > RCA Slow Turn ▶─13%─┃128K─
+╰─".to_string(),
+            ),
+            (
+                "v18.0.10 ascii box",
+                "  esc Working…\n\n+-- X 1s > RCA Slow Turn ---+\n+-                         -+".to_string(),
+            ),
+            (
+                "v18.0.10 alternate round box symbols",
+                "  ⎋ Working…
+
+╔══ ⠋ 2s > RCA Slow Turn ════════╗
+╚═                              ═╝".to_string(),
+            ),
+            (
+                "v18.0.10 arbitrary box symbol overrides",
+                "  ⎋ Working…
+
+A== ⠋ 2s > RCA Slow Turn ==================B
+C=                                    =D".to_string(),
+            ),
+            (
+                "v18.0.10 borderless composer",
+                "  ⎋ Working…
+
+❯
+ ⠴ 0s · RCA Slow Turn".to_string(),
+            ),
+            (
+                "v18.0.10 time segment before active brand",
+                "  ⎋ Waiting requested duration
+
+❯
+ ⏱ 6.3s · ⠏ 6s".to_string(),
+            ),
+            (
+                "v18.0.10 rule composer",
+                "  ⎋ Working…
+
+────────────────────────
+❯
+
+ ⠴ 0s · RCA Slow Turn".to_string(),
+            ),
+            (
+                "v18.0.10 field composer",
+                "  ⎋ Working…
+
+▐                    ▌
+
+ ⠏ 0s · RCA Slow Turn".to_string(),
+            ),
+            (
+                "v18.0.10 rail composer",
+                "  ⎋ Working…
+
+▎
+
+ ⠹ 0s · RCA Slow Turn".to_string(),
+            ),
+            (
+                "v18.0.10 pi composer empty row",
+                "  ⎋ Working…\n\n────────────────────────\n\n────────────────────────\n 🌳 repo/main > branch".to_string(),
+            ),
+            (
+                "v18.0.10 pi composer input row",
+                "  ⎋ Working…\n\n────────────────────────\n edit current prompt\n────────────────────────\n 🌳 repo/main > branch".to_string(),
+            ),
+            (
+                "v18.0.10 pi composer wide input row",
+                "  ⎋ Working…\n\n────────────────────────\n 你好\n────────────────────────\n 🌳 repo/main > branch".to_string(),
+            ),
+            (
+                "v18.0.10 claude composer",
+                "  ⎋ Working…
+
+────────────────────────
+❯
+────────────────────────
+ ⠋ 0s · RCA Slow Turn".to_string(),
+            ),
+            (
+                "v18.0.10 tight layout",
+                " ⎋ Working…
+ ⠙ 1s > RCA Slow Turn
+╰─".to_string(),
+            ),
+            (
+                "v18.0.10 icon-only narrow wrap",
+                " ⎋
+Working…
+╰─".to_string(),
+            ),
+            (
+                "v18.0.10 extension composer",
+                "  ⎋ Working…\n\n  ========================\nEXT \n ⠋ 1s · RCA Slow Turn"
+                    .to_string(),
+            ),
+            (
+                "v18.0.10 custom activity frame and separator",
+                "  Q Working…\n Z 2s  ~ ⬢ RCA Slow Turn\n╰─".to_string(),
+            ),
+            (
+                "v18.0.10 arbitrary intent with custom separator",
+                "  CANCEL Frobnicate quux\n ⠋ 2s  ~ ⬢ RCA Slow Turn\n╰─".to_string(),
+            ),
+            (
+                "v18.0.10 multiword custom frame without separator",
+                "  CANCEL Frobnicate quux\n loading now 2s   RCA Slow Turn\n╰─".to_string(),
+            ),
+            (
+                "v18.0.10 custom icon non-band",
+                "  CANCEL Working…\n\n╭── RCA Slow Turn ─╮\n╰─                 ─╯".to_string(),
+            ),
+            (
+                "v18.0.10 custom interrupt with arbitrary intent",
+                "  CANCEL Frobnicate quux\n\n╭── RCA Slow Turn ─╮\n╰─                 ─╯"
+                    .to_string(),
+            ),
+            (
+                "v18.0.10 single-character custom interrupt with unseparated status",
+                "  Q Working…\n ⏱ 5s   ⠋ 5s\n╰─".to_string(),
+            ),
+            (
+                "v18.0.10 custom horizontal pi composer",
+                "  ⎋ Working…\n\n━━━━━━━━\n\n━━━━━━━━\n 🌳 repo/main".to_string(),
+            ),
+            (
+                "v18.0.10 heavy custom box without status",
+                "  ⎋ Working…\n\n┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓\n┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛"
+                    .to_string(),
+            ),
+            (
+                "v18.0.10 padded custom interrupt with active box",
+                "    X Working…\n\n╭── ⠋ 2s > RCA Slow Turn ─╮\n╰─                       ─╯"
+                    .to_string(),
+            ),
+            (
+                "v18.0.10 multiword activity frame",
+                "  CANCEL Verifying exact status transition\n loading now > 1s > RCA Slow Turn\n╰─".to_string(),
+            ),
+            (
+                "v18.0.10 arbitrary custom non-band intent",
+                "  CANCEL Verifying exact status transition\n\n╭── ⠹ 1s > RCA Slow Turn ─╮\n╰─                       ─╯".to_string(),
+            ),
+            (
+                "v18.0.10 composer-like activity frame",
+                "  ⎋ Verifying exact status transition\n ▎ pulse 1s > RCA Slow Turn\n╰─".to_string(),
+            ),
+            (
+                "v18.0.10 arbitrary custom band intent",
+                "  CANCEL Verifying exact status transition\n ⠋ 2s > RCA Slow Turn\n╰─".to_string(),
+            ),
+            (
+                "v18.0.10 composer-prefix wrapped intent",
+                "  CANCEL Verifying exact status transition\n ❯ operator behavior in the wrapped intent\n ⠋ 2s > RCA Slow Turn\n╰─".to_string(),
+            ),
+            (
+                "v18.0.10 punctuated wrapped intent",
+                "  ⎋ Check the first sentence.
+ Then continue validation
+ ⠋ 2s > RCA Slow Turn
+╰─".to_string(),
+            ),
+            (
+                "v18.0.10 arbitrary extension chrome",
+                "  CANCEL Verifying exact status transition\n\n  CUSTOM CHROME\n  EXT editor row\n ⠋ 2s > RCA Slow Turn".to_string(),
+            ),
+            (
+                "v18.0.10 arbitrary extension ascii frame",
+                "  esc Frobnicate quux\n\n  CUSTOM CHROME\n  EXT editor row\n / 2s > RCA Slow Turn".to_string(),
+            ),
+            (
+                "v18.0.10 arbitrary extension custom frame",
+                "  CANCEL Frobnicate quux\n\n  CUSTOM CHROME\n  EXT editor row\n ◐ 2s > RCA Slow Turn".to_string(),
+            ),
+            (
+                "v18.0.10 custom field status before hook",
+                "  CANCEL Frobnicate quux\n\n▐                    ▌\n\n / 2s · RCA Slow Turn\nbuild hook complete".to_string(),
+            ),
+            (
+                "v18.0.10 above-editor widget before band",
+                "  ⎋ Working…\n\n audit widget\n ⠋ 2s > RCA Slow Turn\n╰─".to_string(),
+            ),
+            (
+                "v18.0.10 above-editor widget before box",
+                "  ⎋ Working…\n\n audit widget\n╭── ⠋ 2s > RCA Slow Turn ─╮\n╰─                       ─╯".to_string(),
+            ),
+            (
+                "v18.0.10 framed above-editor widget before box",
+                "  ⎋ Working…
+
+ ╭── audit widget ─╮
+ ╰─────────────────╯
+╭── ⠋ 2s > RCA Slow Turn ─╮
+╰─                       ─╯".to_string(),
+            ),
+            (
+                "v18.0.10 framed below-editor widget after box",
+                "  ⎋ Working…
+
+╭── ⠋ 2s > RCA Slow Turn ─╮
+╰─                       ─╯
+ ╭── audit widget ─╮
+ ╰─────────────────╯".to_string(),
+            ),
+            (
+                "v18.0.10 two-line widget before band",
+                "  ⎋ Working…
+
+ first widget row
+ second widget row
+ ⠋ 2s > RCA Slow Turn
+╰─".to_string(),
+            ),
+            (
+                "v18.0.10 slash-separated active band",
+                "  CANCEL Frobnicate quux
+ ⠋ 2s / RCA Slow Turn / branch
+╰─".to_string(),
+            ),
+            (
+                "v18.0.10 full powerline active band",
+                "  CANCEL Frobnicate quux
+ ⠋ 2s ▶ RCA Slow Turn ▶ branch
+╰─".to_string(),
+            ),
+            (
+                "v18.0.10 nerd powerline active band",
+                "  CANCEL Frobnicate quux
+ ⠋ 2s  RCA Slow Turn  branch 
+╰─".to_string(),
+            ),
+            (
+                "v18.0.10 custom multiword activity frame",
+                "  CANCEL Frobnicate quux
+
+▐                    ▌
+
+ loading now 2s".to_string(),
+            ),
+            (
+                "v18.0.10 arbitrary extension bottom bar gap",
+                "  ⎋ Frobnicate quux
+
+  CUSTOM CHROME
+  EXT editor row
+
+ ⠋ 2s · RCA Slow Turn".to_string(),
+            ),
+            (
+                "v18.0.10 slash-frame extension dock",
+                r"  esc Working…
+
+  CUSTOM CHROME
+  EXT editor row
+ / 2s · RCA Slow Turn".to_string(),
+            ),
+            (
+                "v18.0.10 backslash-frame extension dock",
+                r"  esc Working…
+
+  CUSTOM CHROME
+  EXT editor row
+ \ 2s · RCA Slow Turn".to_string(),
+            ),
+            (
+                "v18.0.10 detached extension status",
+                "  CANCEL Frobnicate quux\n\n────────────────────────\n❯\n\n ⠋ 2s · RCA Slow Turn".to_string(),
+            ),
+            (
+                "v18.0.10 bare detached activity timer",
+                "  CANCEL Frobnicate quux\n\n  CUSTOM CHROME\n  EXT editor row\n ⠋ 2s".to_string(),
+            ),
+            (
+                "v18.0.10 rule chip detached status",
+                "  ⎋ Working…\n\n──────────────────── ⬢ Session ─\n❯\n\n 🌳 repo/main · ⬢ Session".to_string(),
+            ),
+            (
+                "v18.0.10 rule chip without timer",
+                "  ⎋ Working…\n\n──────────────────── ⬢ Session ─\n❯\n────────────────────────────────\n 🌳 repo/main · ⬢ Session".to_string(),
+            ),
+            (
+                "v18.0.10 deeply wrapped intent",
+                format!(
+                    "  ⎋ Verifying a deeply wrapped intent now!!\n{}\n❯\n status",
+                    " continuation words fill full pane width!!!\n".repeat(60)
+                ),
+            ),
+            (
+                "v18.0.10 minimal status preset",
+                "  ⎋ Working…\n 🌳 …-rca > branch ▶─13%╎┃128K─\n╰─".to_string(),
+            ),
+            (
+                "v18.0.10 compact status preset",
+                "  ⎋ Working…\n ⬢ RCA Slow Turn > branch ▶─13%╎┃128K─\n╰─".to_string(),
+            ),
+            (
+                "v18.0.10 ascii status preset",
+                "  ⎋ Working…\n [M] RCA Slow Turn > branch >-13%-|128K-\n╰─".to_string(),
+            ),
+            (
+                "v18.0.10 custom status preset",
+                "  CANCEL Working…\n╰─".to_string(),
+            ),
+            (
+                "v18.0.10 full status preset",
+                "  ⎋ Working…\n ⠙ 1s > host > RCA Slow Turn ▶─13%─┃128K─\n╰─".to_string(),
+            ),
+            (
+                "v18.0.10 nerd status preset",
+                "  󱊷 Working…\n ⠙ 1s  host  RCA Slow Turn\n╰─".to_string(),
+            ),
             ("unicode default", format!("⠋ Working… ⟦esc⟧\n{box_unicode}")),
             (
                 "unicode intent",
@@ -6363,7 +7587,11 @@ Final prose line.\n";
             ),
         ];
         for (name, pane) in &cases {
-            assert_eq!(detect_omp_status(pane), Status::Running, "case: {name}");
+            assert_eq!(
+                detect_status_from_content(pane, "omp"),
+                Status::Running,
+                "case: {name}"
+            );
         }
     }
 
@@ -6397,6 +7625,15 @@ Final prose line.\n";
             "\
 │ Finish or clear the current prompt to answer · Esc cancel │
 ╰──────────────────────────────────────────────╯",
+            "\
+╭─ Ask ────────────────╮
+│ Which database?      │
+├──────────────────────┤
+│ ❯ PostgreSQL         │
+│   SQLite             │
+│ Enter select · n not │
+╰──────────────────────╯",
+            "│ Enter select · … │\n╰──────────────────╯",
         ];
         for (i, pane) in cases.iter().enumerate() {
             assert_eq!(detect_omp_status(pane), Status::Waiting, "case {i}");
@@ -6446,6 +7683,29 @@ Final prose line.\n";
 ├──────────────────────────────────────────────────────────────────────────────┤
 │ ↑↓ scroll · ⇧ faster · pgup/pgdn · g/G ends · tab regions · esc cancel      │
 ╰──────────────────────────────────────────────────────────────────────────────╯",
+            ),
+            (
+                "actions focus with custom cursor",
+                "\
+│ Plan mode - next step                                                        │
+│   Approve and execute                                                        │
+│   Approve and compact context                                                │
+│   Approve and keep context (~28k / 1m)                                       │
+│ arrow Refine plan                                                            │
+│   Save and quit                                                              │
+├──────────────────────────────────────────────────────────────────────────────┤
+│ ↑↓ section · ⏎ open · a annotate · d delete · u undo · tab regions · esc cancel │
+╰──────────────────────────────────────────────────────────────────────────────╯",
+            ),
+            (
+                "narrow actions footer",
+                "\
+│ > Approve and execute                 │
+│   Approve and compact context         │
+│   Approve and keep context            │
+│   Refine plan                         │
+│   Save and quit                       │
+│ ↑↓ select · ⏎ confirm · tab regions… │",
             ),
         ];
         for (name, pane) in cases {
