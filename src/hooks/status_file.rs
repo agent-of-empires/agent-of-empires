@@ -79,6 +79,19 @@ fn parse_status(bytes: &[u8]) -> Option<Status> {
     }
 }
 
+/// Whether a `session_id` sidecar exists for this instance, whatever its age.
+///
+/// [`read_hook_session_id`] answers "is there a fresh id to adopt"; this
+/// answers "does this pane publish its own id at all", which stays true while
+/// a pane sits idle for longer than `SESSION_ID_SIDECAR_MAX_AGE`.
+pub fn session_id_sidecar_exists(instance_id: &str) -> bool {
+    (|| {
+        let dir = dir_guard::open_instance_dir_read_only(instance_id).ok()??;
+        dir_guard::metadata_at(dir.as_fd(), "session_id").ok()?
+    })()
+    .is_some()
+}
+
 /// Read a Claude session UUID from the hook-written `session_id` sidecar.
 ///
 /// Returns `None` when the file is absent, malformed (non-UUID), or older

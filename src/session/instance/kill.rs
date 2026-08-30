@@ -3,6 +3,35 @@
 use super::*;
 
 impl Instance {
+    /// Persist the conversation Pi's extension last published, before the
+    /// sidecar is cleaned up with the rest of the instance dir.
+    ///
+    /// Without this a CLI-only lifecycle loses a `/new`: no poller is running
+    /// to observe it, and by the next launch the sidecar is gone.
+    fn flush_pi_sidecar_conversation(&self, storage: &crate::session::storage::Storage) {
+        if !self.uses_pi_session_sidecar() {
+            return;
+        }
+        let Some(published) = crate::hooks::read_hook_session_id(&self.id) else {
+            return;
+        };
+        if self.agent_session_id.as_deref() == Some(published.as_str()) {
+            return;
+        }
+        if let Err(error) = storage.update(|instances, _| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == self.id) {
+                inst.agent_session_id = Some(published.clone());
+            }
+            Ok(())
+        }) {
+            tracing::warn!(
+                target: "session.store",
+                instance = %self.id,
+                "could not persist the Pi conversation published at stop: {error}",
+            );
+        }
+    }
+
     /// Tear down the current tmux session cleanly so a fresh
     /// `start_with_size_opts` can recreate it.
     ///
@@ -272,6 +301,7 @@ impl Instance {
                     LifecycleOperation::Stop,
                     Status::Stopped,
                 )?;
+                self.flush_pi_sidecar_conversation(&storage);
                 crate::hooks::cleanup_hook_status_dir(&self.id);
                 Ok(())
             }
@@ -289,6 +319,44 @@ impl Instance {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[serial_test::serial(hook_base)]
+    fn pi_stop_persists_the_conversation_the_extension_published() {
+        // A `/new` inside a CLI-launched pane is observed by nobody: no poller
+        // outlives the CLI, and the instance dir is cleaned up at stop. The
+        // flush is the only thing that keeps it.
+        let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_app_dir_at(home.path());
+
+        let profile = "pi-sidecar-flush";
+        let mut inst = Instance::new("pi-flush", "/tmp/pi-flush");
+        inst.source_profile = profile.to_string();
+        inst.tool = "pi".to_string();
+        inst.agent_session_id = Some("22f13307-461c-4161-908e-95a247fac750".to_string());
+        inst.mark_pi_extension_launched_for_test();
+
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        let seed = inst.clone();
+        storage
+            .update(|instances, _| {
+                *instances = vec![seed.clone()];
+                Ok(())
+            })
+            .unwrap();
+
+        let published = "01a05234-8889-72e2-a7c9-7ebc27b25b78";
+        crate::hooks::write_session_id_via_guard(&inst.id, published).unwrap();
+
+        inst.flush_pi_sidecar_conversation(&storage);
+
+        assert_eq!(
+            storage.load().unwrap()[0].agent_session_id.as_deref(),
+            Some(published),
+            "the conversation the pane published must outlive its instance dir"
+        );
+    }
+
     use super::*;
 
     /// Real-tmux integration for #3157: a session whose stored title moved
