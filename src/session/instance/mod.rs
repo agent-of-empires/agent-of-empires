@@ -86,11 +86,11 @@ pub use status::{Status, TMUX_SERVER_UNREACHABLE_ERROR, TMUX_SESSION_GONE_ERROR}
 pub(crate) use tmux_session::{
     duplicate_session_error, find_duplicate_session, is_duplicate_session,
 };
+pub(crate) use types::{PiSidecarSource, PriorToolSession, ResumeIntent};
 pub use types::{
     PluginCreateIdempotency, SandboxInfo, TerminalInfo, View, WorkspaceInfo, WorkspaceRepo,
     WorktreeInfo,
 };
-pub(crate) use types::{PriorToolSession, ResumeIntent};
 
 // Re-exported so each submodule can reach its siblings through `use super::*`.
 use hooks::status_hook_env_prefix;

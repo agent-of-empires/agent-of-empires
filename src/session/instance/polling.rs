@@ -169,10 +169,12 @@ impl Instance {
                 if !self.uses_pi_session_sidecar() {
                     return;
                 }
-                let inner = crate::session::capture::pi_sidecar_poll_fn(
-                    self.id.clone(),
-                    self.pi_sandbox_sidecar_dir(),
-                );
+                // No source means the pane cannot be attributed; it does not
+                // fall back to the host sidecar.
+                let Some(source) = self.pi_sidecar_source() else {
+                    return;
+                };
+                let inner = crate::session::capture::pi_sidecar_poll_fn(self.id.clone(), source);
                 let poll_fn: crate::session::poller::SessionIdPollFn = Box::new(move |_| inner());
                 let cb_instance_id = self.id.clone();
                 let on_change: Box<dyn Fn(&str) + Send + 'static> = Box::new(
@@ -473,7 +475,10 @@ mod tests {
         let mut host = Instance::new("pi-host-poll", "/tmp/pi-poll");
         host.tool = "pi".to_string();
         assert_eq!(
-            host.pi_sandbox_sidecar_dir(),
+            host.pi_sidecar_source().and_then(|s| match s {
+                crate::session::instance::PiSidecarSource::SandboxDir(d) => Some(d),
+                _ => None,
+            }),
             None,
             "a host pane reads the hook dir"
         );
@@ -491,7 +496,11 @@ mod tests {
             before_start_env: Vec::new(),
         });
         let dir = sandboxed
-            .pi_sandbox_sidecar_dir()
+            .pi_sidecar_source()
+            .and_then(|s| match s {
+                crate::session::instance::PiSidecarSource::SandboxDir(d) => Some(d),
+                _ => None,
+            })
             .expect("a sandboxed pane reads its bind");
         assert!(
             dir.ends_with(format!("aoe-session/{}", sandboxed.id)),
@@ -504,7 +513,9 @@ mod tests {
         std::fs::write(dir.join("session_id"), format!("{published}\n")).unwrap();
         let poll = crate::session::capture::pi_sidecar_poll_fn(
             sandboxed.id.clone(),
-            sandboxed.pi_sandbox_sidecar_dir(),
+            sandboxed
+                .pi_sidecar_source()
+                .expect("a resolvable sandbox source"),
         );
         assert_eq!(poll().map(|o| o.sid).as_deref(), Some(published));
     }

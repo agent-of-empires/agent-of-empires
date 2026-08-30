@@ -432,36 +432,47 @@ impl Instance {
     /// boundary it published on. `any_age` drops the freshness window, which a
     /// final flush wants and a resume does not.
     pub(crate) fn pi_published_session_id(&self, any_age: bool) -> Option<String> {
-        if !self.is_sandboxed() {
-            return if any_age {
-                crate::hooks::read_hook_session_id_any_age(&self.id)
-            } else {
-                crate::hooks::read_hook_session_id(&self.id)
-            };
+        match self.pi_sidecar_source()? {
+            PiSidecarSource::HostHooks => {
+                if any_age {
+                    crate::hooks::read_hook_session_id_any_age(&self.id)
+                } else {
+                    crate::hooks::read_hook_session_id(&self.id)
+                }
+            }
+            PiSidecarSource::SandboxDir(dir) => {
+                let raw = std::fs::read_to_string(dir.join("session_id")).ok()?;
+                let id = raw.trim();
+                uuid::Uuid::parse_str(id).ok().map(|_| id.to_string())
+            }
         }
-        let raw = std::fs::read_to_string(self.pi_sandbox_sidecar()?.join("session_id")).ok()?;
-        let id = raw.trim();
-        uuid::Uuid::parse_str(id).ok().map(|_| id.to_string())
     }
 
     /// The transcript path this pane published, as the pane sees it. In a
     /// container that is a `/root/.pi/...` path, which is what pi's argv needs;
     /// `pi_host_view_of` maps it back for host-side checks.
     pub(crate) fn pi_published_session_path(&self) -> Option<String> {
-        if !self.is_sandboxed() {
-            return crate::hooks::read_hook_session_path(&self.id);
+        match self.pi_sidecar_source()? {
+            PiSidecarSource::HostHooks => crate::hooks::read_hook_session_path(&self.id),
+            PiSidecarSource::SandboxDir(dir) => {
+                let raw = std::fs::read_to_string(dir.join("session_path")).ok()?;
+                let path = raw.trim();
+                path.starts_with('/').then(|| path.to_string())
+            }
         }
-        let raw = std::fs::read_to_string(self.pi_sandbox_sidecar()?.join("session_path")).ok()?;
-        let path = raw.trim();
-        path.starts_with('/').then(|| path.to_string())
     }
 
-    /// Host directory backing this sandboxed pane's sidecar, or `None` for a
-    /// host pane, whose sidecar is the per-instance hook dir.
-    pub(crate) fn pi_sandbox_sidecar_dir(&self) -> Option<std::path::PathBuf> {
-        self.is_sandboxed()
-            .then(|| self.pi_sandbox_sidecar())
-            .flatten()
+    /// Where this pane publishes, or `None` when that cannot be established.
+    ///
+    /// `None` is the fail-closed answer and never means "try the host": a
+    /// sandboxed pane whose bind-backed path will not resolve must not read
+    /// the host hook directory, or it adopts a conversation from another
+    /// namespace, which is the attribution bug this change exists to remove.
+    pub(crate) fn pi_sidecar_source(&self) -> Option<PiSidecarSource> {
+        if self.is_sandboxed() {
+            return self.pi_sandbox_sidecar().map(PiSidecarSource::SandboxDir);
+        }
+        Some(PiSidecarSource::HostHooks)
     }
 
     /// Host directory backing this sandboxed pane's sidecar.
@@ -520,7 +531,9 @@ impl Instance {
     }
 
     pub(crate) fn uses_pi_session_sidecar(&self) -> bool {
-        self.tool == "pi" && (self.pi_extension_launched || self.pi_sidecar_exists())
+        self.tool == "pi"
+            && self.pi_sidecar_source().is_some()
+            && (self.pi_extension_launched || self.pi_sidecar_exists())
     }
 
     /// Whether a sidecar exists for this pane, looked for where the pane
@@ -532,9 +545,10 @@ impl Instance {
     /// on, and looking in the wrong place makes a publishing pane read as a
     /// silent one: no poller repair, and a final flush that returns early.
     fn pi_sidecar_exists(&self) -> bool {
-        match self.pi_sandbox_sidecar_dir() {
-            Some(dir) => dir.join("session_id").is_file(),
-            None => crate::hooks::session_id_sidecar_exists(&self.id),
+        match self.pi_sidecar_source() {
+            Some(PiSidecarSource::SandboxDir(dir)) => dir.join("session_id").is_file(),
+            Some(PiSidecarSource::HostHooks) => crate::hooks::session_id_sidecar_exists(&self.id),
+            None => false,
         }
     }
 
@@ -1009,6 +1023,52 @@ mod tests {
     // that says this pane publishes. Looking in the host hook dir for a
     // container's sidecar reads a live publisher as a silent one: no poller
     // repair, and a flush that returns before reading anything.
+    // An unresolvable sandbox path must not read as "use the host one": that
+    // is a conversation from another namespace, which is the attribution bug
+    // this change removes.
+    #[test]
+    #[serial_test::serial]
+    fn an_unresolvable_sandbox_source_fails_closed() {
+        let temp = tempfile::tempdir().unwrap();
+        let _home = crate::session::test_support::EnvGuard::set(&[("HOME", temp.path())]);
+
+        // An id the dir guard refuses is one way the path cannot resolve.
+        let mut inst = Instance::new("pi-unresolvable", "/tmp/pi-unresolvable");
+        inst.id = "../escape".to_string();
+        inst.tool = "pi".to_string();
+        inst.sandbox_info = Some(crate::session::SandboxInfo {
+            enabled: true,
+            container_id: None,
+            image: "test:latest".to_string(),
+            container_name: "aoe-pi-unresolvable".to_string(),
+            extra_env: None,
+            custom_instruction: None,
+            container_workdir: None,
+            before_start_env: Vec::new(),
+        });
+
+        assert_eq!(
+            inst.pi_sidecar_source(),
+            None,
+            "no source is the safe answer"
+        );
+        assert!(
+            !inst.uses_pi_session_sidecar(),
+            "a pane with no resolvable source does not publish"
+        );
+        assert!(
+            !inst.supports_session_poller(),
+            "and must not poll, which would read the host sidecar"
+        );
+        assert_eq!(inst.pi_published_session_id(true), None);
+        assert_eq!(inst.pi_published_session_path(), None);
+
+        // The host pane it must not be confused with does have a source.
+        let mut host = Instance::new("pi-host-src", "/tmp/pi-unresolvable");
+        host.tool = "pi".to_string();
+        assert_eq!(host.pi_sidecar_source(), Some(PiSidecarSource::HostHooks));
+    }
+
     #[test]
     #[serial_test::serial]
     fn reloaded_sandbox_session_still_finds_its_sidecar() {
@@ -1038,7 +1098,11 @@ mod tests {
         );
 
         let dir = reloaded
-            .pi_sandbox_sidecar_dir()
+            .pi_sidecar_source()
+            .and_then(|s| match s {
+                crate::session::instance::PiSidecarSource::SandboxDir(d) => Some(d),
+                _ => None,
+            })
             .expect("a sandboxed pane has a bind-backed sidecar");
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(
