@@ -238,10 +238,9 @@ fn rate_limit_resume_marker_resets_at(
 
 #[derive(Debug, Deserialize)]
 pub struct SpawnAcpRequest {
-    /// Optional override; falls back to the acp_default_agent
-    /// setting / aoe-agent.
+    /// Optional override; falls back to `Supervisor::pick_agent_for_tool`.
     pub agent: Option<String>,
-    /// Optional model override; forwarded to aoe-agent as
+    /// Optional model override; forwarded to the agent as
     /// AOE_AGENT_MODEL env var.
     pub model: Option<String>,
     /// Optional additional dirs the agent may read/write through
