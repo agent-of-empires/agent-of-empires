@@ -2080,21 +2080,22 @@ enum ComposerKind {
     Extension,
 }
 
+struct ComposerState {
+    box_bottom: bool,
+    prompt: bool,
+    rules: usize,
+    paired_rules: bool,
+    saw_extension_row: bool,
+}
+
 impl ComposerKind {
-    fn is_complete(
-        self,
-        box_bottom: bool,
-        prompt: bool,
-        rules: usize,
-        paired_rules: bool,
-        saw_extension_row: bool,
-    ) -> bool {
+    fn is_complete(self, state: ComposerState) -> bool {
         match self {
-            Self::Unknown => prompt && rules > 0,
-            Self::Box => box_bottom,
+            Self::Unknown => state.prompt && state.rules > 0,
+            Self::Box => state.box_bottom,
             Self::Prompt | Self::Block | Self::Rail => true,
-            Self::Rule => prompt || paired_rules,
-            Self::Extension => saw_extension_row,
+            Self::Rule => state.prompt || state.paired_rules,
+            Self::Extension => state.saw_extension_row,
         }
     }
 }
@@ -2130,9 +2131,7 @@ fn is_persistent_time_icon(token: &str) -> bool {
 }
 
 fn is_activity_frame(token: &str) -> bool {
-    SPINNER_CHARS.contains(&token)
-        || matches!(token, "-" | "/" | "|" | "X" | "◐")
-        || token.as_bytes() == [92]
+    SPINNER_CHARS.contains(&token) || matches!(token, "-" | "/" | "|" | "X" | "◐") || token == "\\"
 }
 
 fn scan_elapsed_text(line: &str, count_after_time_icon: bool) -> ElapsedTextScan {
@@ -2502,13 +2501,13 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
                             continue;
                         }
                     }
-                    let complete = first_kind.is_complete(
+                    let complete = first_kind.is_complete(ComposerState {
                         box_bottom,
                         prompt,
                         rules,
                         paired_rules,
                         saw_extension_row,
-                    );
+                    });
                     if complete {
                         let rule_status_after_gap = first_kind == ComposerKind::Rule
                             && prompt
@@ -2587,13 +2586,13 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
                     expect_standalone_status = true;
                     continue;
                 }
-                let complete_before = first_kind.is_complete(
+                let complete_before = first_kind.is_complete(ComposerState {
                     box_bottom,
                     prompt,
                     rules,
                     paired_rules,
                     saw_extension_row,
-                );
+                });
                 if complete_before
                     && !first_composer_row
                     && !(expect_standalone_status
@@ -2657,13 +2656,13 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
                 paired_rules |= kind == ComposerKind::Rule
                     && saw_pi_editor_row
                     && UnicodeWidthStr::width(line) == rule_width.unwrap_or_default();
-                let complete = first_kind.is_complete(
+                let complete = first_kind.is_complete(ComposerState {
                     box_bottom,
                     prompt,
                     rules,
                     paired_rules,
                     saw_extension_row,
-                );
+                });
                 if complete {
                     expect_standalone_status = matches!(
                         first_kind,
@@ -2732,7 +2731,13 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
             }
         }
         post_gap_started.then_some((
-            first_kind.is_complete(box_bottom, prompt, rules, paired_rules, saw_extension_row),
+            first_kind.is_complete(ComposerState {
+                box_bottom,
+                prompt,
+                rules,
+                paired_rules,
+                saw_extension_row,
+            }),
             activity_timer,
             pane_lines.len().saturating_sub(1),
         ))
@@ -3050,6 +3055,7 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
                 .is_some_and(|border| line.ends_with(border))
     };
     let panel_option_match = |line: &str, expected: &str| {
+        let line = line.trim();
         let first = line.chars().next();
         let inner = first.and_then(|border| {
             line.strip_prefix(border)
@@ -3115,6 +3121,7 @@ pub fn detect_omp_status(raw_content: &str) -> Status {
     // Plan Review: stable bordered option rows, a selected option cursor,
     // and the live bordered footer prove that the overlay is still active.
     let has_panel_cursor = |line: &str| {
+        let line = line.trim();
         let first = line.chars().next();
         let inner = first.and_then(|border| {
             line.strip_prefix(border)
@@ -8051,6 +8058,17 @@ Working…
 │ ↑↓ select · ⏎ confirm · tab regions… │",
             ),
             (
+                "indented options and cursor",
+                "\
+  │ Plan mode - next step                         │
+  │ ❯ Approve and execute                         │
+  │   Approve and compact context                 │
+  │   Approve and keep context                    │
+  │   Refine plan                                 │
+  │   Save and quit                               │
+  │ ↑↓ select · ⏎ confirm · tab regions · esc cancel │",
+            ),
+            (
                 "renderer-truncated narrow overlay",
                 "\
 │ Plan mode - next st… │
@@ -8093,6 +8111,7 @@ Working…
             format!("│ up/down navigate  enter select  esc cancel │\n{box_}"),
             // Panel help plus approval prose is not a real approval panel.
             format!("│ up/down navigate  enter select  esc cancel │\nI will approve or deny later\n{box_}"),
+            format!("  │ I approve │\n  │ Never deny │\n  │ up/down navigate  enter select  esc cancel │\n{box_}"),
             format!("I would approve and execute refine plan steps\n{box_}"),
             // Ask-arm verbs without the dialog's exact footer phrasing.
             format!("press enter to select an option\n{box_}"),
