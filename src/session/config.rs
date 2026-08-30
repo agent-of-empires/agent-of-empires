@@ -908,6 +908,23 @@ pub struct SessionConfig {
     #[setting(label = "YOLO Mode Default", widget = "toggle")]
     pub yolo_mode_default: bool,
 
+    /// Pre-trust each session's worktree in the agent's own config so it does
+    /// not open on a folder-trust prompt. Sandboxed sessions always do this;
+    /// this setting extends it to host sessions, where the record is written to
+    /// your real agent config and persists after the session is gone. Trust is
+    /// also what activates a repo's own `.claude/settings.json`, so a
+    /// pre-trusted worktree runs that file's hooks at session start without
+    /// anyone having looked at the repo. Enable it only for directories you
+    /// would have trusted by hand.
+    #[serde(default)]
+    #[setting(
+        label = "Pre-trust worktrees on the host",
+        widget = "toggle",
+        category = "Agents",
+        web = "elevation:lets a repo's own hooks run unprompted on the host"
+    )]
+    pub pre_trust_agent_folders: bool,
+
     /// Show the compact system-health strip below the session list. It reports
     /// CPU, memory pressure, and running agent and process counts. Off by
     /// default; also toggleable from the command palette.
@@ -1573,6 +1590,7 @@ impl Default for SessionConfig {
         Self {
             default_tool: None,
             yolo_mode_default: false,
+            pre_trust_agent_folders: false,
             show_diagnostics_pane: false,
             inherit_host_environment: false,
             agent_extra_args: HashMap::new(),
