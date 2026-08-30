@@ -65,15 +65,14 @@ impl Instance {
                 Some(detect_as.as_str()),
             );
             self.backfill_container_workdir(&container);
-            if self.is_yolo_mode() {
-                container_config::ensure_yolo_trust_config_for_active_agent(
-                    &self.tool,
-                    Some(detect_as.as_str()),
-                    &self.source_profile,
-                    &self.id,
-                    &self.container_workdir(),
-                );
-            }
+            container_config::ensure_folder_trust_config_for_active_agent(
+                &self.tool,
+                Some(detect_as.as_str()),
+                &self.source_profile,
+                &self.id,
+                &self.container_workdir(),
+                self.is_yolo_mode(),
+            );
             return Ok(container);
         }
 
@@ -89,15 +88,14 @@ impl Instance {
             );
             container.start()?;
             self.backfill_container_workdir(&container);
-            if self.is_yolo_mode() {
-                container_config::ensure_yolo_trust_config_for_active_agent(
-                    &self.tool,
-                    Some(detect_as.as_str()),
-                    &self.source_profile,
-                    &self.id,
-                    &self.container_workdir(),
-                );
-            }
+            container_config::ensure_folder_trust_config_for_active_agent(
+                &self.tool,
+                Some(detect_as.as_str()),
+                &self.source_profile,
+                &self.id,
+                &self.container_workdir(),
+                self.is_yolo_mode(),
+            );
             return Ok(container);
         }
 

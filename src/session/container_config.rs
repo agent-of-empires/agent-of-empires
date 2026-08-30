@@ -1274,29 +1274,44 @@ fn refresh_codex_sandbox_hooks(
     }
 }
 
-fn apply_yolo_trust_config(
+/// Pre-trust the container workspace in the staged config of `mount`'s agent.
+///
+/// Codex and Gemini stay gated on YOLO mode: their prompts guard approvals the
+/// user has already opted out of there, and outside YOLO the prompt is the
+/// approval. Claude Code's dialog is not an approval gate but a startup gate,
+/// so it blocks a non-YOLO session just as hard and is applied unconditionally.
+fn apply_folder_trust_config(
     mount: &AgentConfigMount,
     sandbox_dir: &Path,
     container_workspace_path: &str,
+    is_yolo_mode: bool,
 ) -> Result<()> {
     match (mount.tool_name, mount.host_rel) {
-        ("codex", ".codex") => crate::hooks::trust_codex_project(
+        ("codex", ".codex") if is_yolo_mode => crate::hooks::trust_codex_project(
             &sandbox_dir.join("config.toml"),
             container_workspace_path,
         ),
-        ("gemini", ".gemini") => {
+        ("gemini", ".gemini") if is_yolo_mode => {
             crate::hooks::disable_gemini_folder_trust(&sandbox_dir.join("settings.json"))
         }
+        // The same host file is bind-mounted at both `$CLAUDE_CONFIG_DIR/.claude.json`
+        // (via the config dir) and `~/.claude.json` (via `home_seed_files`), so one
+        // write covers whichever path this Claude Code build reads.
+        ("claude", ".claude") => crate::hooks::trust_claude_project(
+            &sandbox_dir.join(".claude.json"),
+            container_workspace_path,
+        ),
         _ => Ok(()),
     }
 }
 
-pub(crate) fn ensure_yolo_trust_config_for_active_agent(
+pub(crate) fn ensure_folder_trust_config_for_active_agent(
     tool: &str,
     detect_as: Option<&str>,
     profile: &str,
     instance_id: &str,
     container_workspace_path: &str,
+    is_yolo_mode: bool,
 ) {
     let Some(home) = dirs::home_dir() else {
         return;
@@ -1315,17 +1330,24 @@ pub(crate) fn ensure_yolo_trust_config_for_active_agent(
             Ok(dir) => dir,
             Err(e) => {
                 tracing::warn!(target: "session.profile",
-                    "Failed to resolve sandbox YOLO trust config for {}: {}", mount.tool_name, e
+                    "Failed to resolve sandbox folder trust config for {}: {}", mount.tool_name, e
                 );
                 continue;
             }
         };
         if let Err(e) = std::fs::create_dir_all(&sandbox_dir)
             .with_context(|| format!("creating sandbox config dir {}", sandbox_dir.display()))
-            .and_then(|_| apply_yolo_trust_config(mount, &sandbox_dir, container_workspace_path))
+            .and_then(|_| {
+                apply_folder_trust_config(
+                    mount,
+                    &sandbox_dir,
+                    container_workspace_path,
+                    is_yolo_mode,
+                )
+            })
         {
             tracing::warn!(target: "session.profile",
-                "Failed to apply sandbox YOLO trust config for {} at {}: {}",
+                "Failed to apply sandbox folder trust config for {} at {}: {}",
                 mount.tool_name,
                 sandbox_dir.display(),
                 e
@@ -1943,54 +1965,21 @@ pub(crate) fn build_container_config(
                     value: value.to_string(),
                 });
             }
-
-            // Codex and Gemini re-prompt for folder trust on every launch, and
-            // in a sandbox the config dir is ephemeral so the prompt never
-            // "sticks". In YOLO mode the user has already opted out of
-            // approvals, so disable the trust confirmation in the staged
-            // sandbox config to match that intent (issue #472). The `.codex`
-            // /`.gemini` sandbox dirs were staged by the AGENT_CONFIG_MOUNTS
-            // loop above, so these merges land in files that get bind-mounted
-            // into the container.
-            match agent.name {
-                "codex" => {
-                    if let Some(mount) = AGENT_CONFIG_MOUNTS
-                        .iter()
-                        .find(|mount| mount.tool_name == "codex" && mount.host_rel == ".codex")
-                    {
-                        match sandbox_dir_for(mount, &home, Some(instance_id)) {
-                            Ok(sandbox_dir) => {
-                                if let Err(e) = crate::hooks::trust_codex_project(
-                                    &sandbox_dir.join("config.toml"),
-                                    &workspace_path,
-                                ) {
-                                    tracing::warn!(target: "session.profile",
-                                        "Failed to mark project trusted in sandbox Codex config: {}", e);
-                                }
-                            }
-                            Err(e) => tracing::warn!(target: "session.profile",
-                                "Failed to resolve sandbox Codex config for YOLO trust: {}", e
-                            ),
-                        }
-                    } else {
-                        tracing::warn!(target: "session.profile",
-                            "Codex config mount is unavailable for sandbox YOLO trust");
-                    }
-                }
-                "gemini" => {
-                    let settings_file = home
-                        .join(".gemini")
-                        .join(SANDBOX_SUBDIR)
-                        .join("settings.json");
-                    if let Err(e) = crate::hooks::disable_gemini_folder_trust(&settings_file) {
-                        tracing::warn!(target: "session.profile",
-                            "Failed to disable folder trust in sandbox Gemini settings: {}", e);
-                    }
-                }
-                _ => {}
-            }
         }
     }
+
+    // Folder trust goes through the shared registry so the create path and the
+    // attach/restart path in `instance/container.rs` cannot drift (issue #472).
+    // Called outside the YOLO gate because the registry decides per agent which
+    // prompts are approval gates and which merely block startup.
+    ensure_folder_trust_config_for_active_agent(
+        agent_selection.tool,
+        agent_selection.detect_as,
+        profile,
+        instance_id,
+        &workspace_path,
+        is_yolo_mode,
+    );
 
     // Add extra_volumes from config (host:container format)
     // Also collect container paths to filter conflicting volume_ignores later
@@ -4104,7 +4093,7 @@ volume_ignores = ["node_modules"]
     // every launch.
     #[test]
     #[serial_test::serial]
-    fn test_build_container_config_yolo_trusts_codex_project() {
+    fn test_build_container_config_yolo_trusts_codex_project_only_in_yolo() {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
@@ -4156,6 +4145,70 @@ volume_ignores = ["node_modules"]
         );
 
         crate::hooks::cleanup_hook_status_dir(instance_id);
+    }
+
+    // Claude Code's folder-trust dialog is keyed on the git root, so every
+    // container workspace is a fresh key and the dialog blocks startup. Unlike
+    // Codex and Gemini this is not an approval gate, so it is seeded in both
+    // YOLO and non-YOLO sessions, and it must merge into the onboarding state
+    // the same file already carries (issue #472).
+    #[test]
+    #[serial_test::serial]
+    fn test_build_container_config_seeds_claude_folder_trust() {
+        for is_yolo in [false, true] {
+            let (_hg, _, _tmp_base) = BaseGuard::ready();
+            let temp_home = TempDir::new().unwrap();
+            std::env::set_var("HOME", temp_home.path());
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            std::env::set_var("XDG_CONFIG_HOME", temp_home.path().join(".config"));
+
+            let project_dir = TempDir::new().unwrap();
+            git2::Repository::init(project_dir.path()).unwrap();
+
+            let sandbox_info = super::super::instance::SandboxInfo {
+                enabled: true,
+                container_id: None,
+                image: "test:latest".to_string(),
+                container_name: "test-container".to_string(),
+                extra_env: None,
+                custom_instruction: None,
+                before_start_env: Vec::new(),
+                container_workdir: None,
+            };
+            let instance_id = format!("claude-trust-test-{is_yolo}");
+            let config = build_container_config(
+                project_dir.path().to_str().unwrap(),
+                &sandbox_info,
+                ContainerAgentSelection::new("claude", None),
+                is_yolo,
+                &instance_id,
+                None,
+                "",
+            )
+            .unwrap();
+
+            let seeded = temp_home
+                .path()
+                .join(".claude")
+                .join(SANDBOX_SUBDIR)
+                .join(".claude.json");
+            let parsed: serde_json::Value =
+                serde_json::from_str(&fs::read_to_string(&seeded).unwrap()).unwrap();
+            // The trust key is the in-container working dir, not the host path.
+            assert_eq!(
+                parsed["projects"][&config.working_dir]["hasTrustDialogAccepted"].as_bool(),
+                Some(true),
+                "yolo={is_yolo}: container workspace must be pre-trusted"
+            );
+            // The same file carries onboarding state seeded by the mount.
+            assert_eq!(
+                parsed["hasCompletedOnboarding"].as_bool(),
+                Some(true),
+                "yolo={is_yolo}: trust seed must merge, not replace"
+            );
+
+            crate::hooks::cleanup_hook_status_dir(&instance_id);
+        }
     }
 
     #[test]
@@ -4212,7 +4265,7 @@ volume_ignores = ["node_modules"]
 
     #[test]
     #[serial_test::serial]
-    fn test_ensure_yolo_trust_config_restores_codex_after_refresh() {
+    fn test_ensure_folder_trust_config_restores_codex_after_refresh() {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
@@ -4244,12 +4297,13 @@ trust_level = "trusted"
         assert_eq!(refreshed["model"].as_str(), Some("host"));
         assert!(refreshed.get("projects").is_none());
 
-        ensure_yolo_trust_config_for_active_agent(
+        ensure_folder_trust_config_for_active_agent(
             "codex",
             None,
             "",
             instance_id,
             "/workspace/project",
+            true,
         );
         let restored: toml::Value =
             toml::from_str(&fs::read_to_string(codex_sandbox.join("config.toml")).unwrap())
@@ -4263,7 +4317,7 @@ trust_level = "trusted"
 
     #[test]
     #[serial_test::serial]
-    fn test_ensure_yolo_trust_config_restores_gemini_after_refresh() {
+    fn test_ensure_folder_trust_config_restores_gemini_after_refresh() {
         let (_hg, _, _tmp_base) = BaseGuard::ready();
         let temp_home = TempDir::new().unwrap();
         std::env::set_var("HOME", temp_home.path());
@@ -4293,12 +4347,13 @@ trust_level = "trusted"
         assert_eq!(refreshed["theme"].as_str(), Some("host"));
         assert!(refreshed["security"]["folderTrust"]["enabled"].is_null());
 
-        ensure_yolo_trust_config_for_active_agent(
+        ensure_folder_trust_config_for_active_agent(
             "gemini",
             None,
             "",
             "gemini-yolo-refresh-test",
             "/workspace/project",
+            true,
         );
         let restored: serde_json::Value = serde_json::from_str(
             &fs::read_to_string(gemini_sandbox.join("settings.json")).unwrap(),
