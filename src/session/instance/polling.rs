@@ -13,9 +13,9 @@ impl Instance {
     /// sandbox alike, one `~/.pi/sandbox` being bound into every pi container.
     /// Reads memory only: this runs per session on every TUI refresh.
     pub fn supports_session_poller(&self) -> bool {
-        // A sidecar-backed Pi pane keeps polling: its observations name the
-        // pane, so `/new` is still attributable.
-        if self.tool == "pi" && self.agent_session_id.is_some() && !self.uses_pi_session_sidecar() {
+        // Pi polls only what names a pane. Without the extension there is
+        // nothing attributable to observe, so it does not poll at all.
+        if self.tool == "pi" && !self.uses_pi_session_sidecar() {
             return false;
         }
         crate::agents::get_agent(&self.tool).is_some_and(|a| {
@@ -164,48 +164,28 @@ impl Instance {
                 }
             }
             "pi" => {
-                // The extension names this pane, so prefer its sidecar; a
-                // binary that cannot load one falls back to the floored store
-                // scan, which is how an unpinned launch gets an id at all.
-                if self.uses_pi_session_sidecar() {
-                    let inner = crate::session::capture::pi_sidecar_poll_fn(self.id.clone());
-                    let poll_fn: crate::session::poller::SessionIdPollFn =
-                        Box::new(move |_| inner());
-                    let cb_instance_id = self.id.clone();
-                    let on_change: Box<dyn Fn(&str) + Send + 'static> = Box::new(
-                        move |new_id: &str| {
-                            tracing::info!(target: "session.store", "Session ID observed for {}: {}", cb_instance_id, new_id);
-                        },
-                    );
-                    let initial = initial_known
-                        .clone()
-                        .map(crate::session::poller::SessionIdObservation::instance_sidecar);
-                    if poller.start_observations(instance_id.clone(), poll_fn, on_change, initial) {
-                        self.session_id_poller = Some(Arc::new(Mutex::new(poller)));
-                    }
+                // Sidecar or nothing. Pi's store is keyed by cwd and names no
+                // pane, so a scan of it can only guess, and a guess is what
+                // #3576 cost. A binary that cannot load the extension gets no
+                // poller and, absent a pin, no resume.
+                if !self.uses_pi_session_sidecar() {
                     return;
                 }
-                let launch_time_ms = crate::util::now_ms() as f64;
-                if self.is_sandboxed() {
-                    let container_name = match self.sandbox_info.as_ref() {
-                        Some(s) => s.container_name.clone(),
-                        None => return,
-                    };
-                    Box::new(pi_poll_fn_sandboxed(
-                        container_name,
-                        self.container_workdir(),
-                        self.id.clone(),
-                        launch_time_ms,
-                        extra_excludes.clone(),
-                    ))
-                } else {
-                    Box::new(pi_poll_fn(
-                        self.project_path.clone(),
-                        self.id.clone(),
-                        launch_time_ms,
-                        extra_excludes.clone(),
-                    ))
+                let inner = crate::session::capture::pi_sidecar_poll_fn(self.id.clone());
+                let poll_fn: crate::session::poller::SessionIdPollFn = Box::new(move |_| inner());
+                let cb_instance_id = self.id.clone();
+                let on_change: Box<dyn Fn(&str) + Send + 'static> = Box::new(
+                    move |new_id: &str| {
+                        tracing::info!(target: "session.store", "Session ID observed for {}: {}", cb_instance_id, new_id);
+                    },
+                );
+                let initial = initial_known
+                    .clone()
+                    .map(crate::session::poller::SessionIdObservation::instance_sidecar);
+                if poller.start_observations(instance_id.clone(), poll_fn, on_change, initial) {
+                    self.session_id_poller = Some(Arc::new(Mutex::new(poller)));
                 }
+                return;
             }
             "codex" => {
                 if self.is_sandboxed() {
@@ -376,17 +356,6 @@ impl Instance {
         self.session_id_poller_is_running()
     }
 
-    /// Stop the session-id poller without waiting for its final capture.
-    ///
-    /// Used when the poller's job is provably finished (see
-    /// `supports_session_poller`): a host Pi pane whose conversation is
-    /// already known has nothing left to discover, and leaving the thread
-    /// running only gives it the chance to propose a different one.
-    pub(crate) fn retire_session_id_poller(&mut self) {
-        self.stop_poller();
-        self.session_id_poller = None;
-    }
-
     pub(super) fn stop_poller(&self) {
         if let Some(ref poller_arc) = self.session_id_poller {
             match poller_arc.lock() {
@@ -445,35 +414,22 @@ mod tests {
     use crate::session::Instance;
 
     #[test]
-    fn pi_stops_polling_once_its_conversation_is_known() {
-        // The gate that keeps an unattributable scan off a known Pi
-        // conversation, cheap enough to assert directly.
-        let mut inst = Instance::new("pi-known", "/tmp/pi-known");
+    fn pi_polls_only_what_names_a_pane() {
+        // Without the extension there is nothing attributable to observe, and
+        // the store is not an answer, so the pane does not poll at all.
+        let mut inst = Instance::new("pi-poll", "/tmp/pi-poll");
         inst.tool = "pi".to_string();
-        assert!(inst.supports_session_poller(), "id-less Pi must still poll");
+        assert!(!inst.supports_session_poller());
 
+        inst.mark_pi_extension_launched_for_test();
+        assert!(inst.supports_session_poller());
+
+        // A known id is no reason to stop: `/new` is still this pane's.
         inst.agent_session_id = Some("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa".to_string());
-        assert!(!inst.supports_session_poller());
+        assert!(inst.supports_session_poller());
 
-        // Sandboxed Pi shares one `~/.pi/sandbox` across containers, so the
-        // same rule applies there.
-        inst.sandbox_info = Some(crate::session::SandboxInfo {
-            enabled: true,
-            container_id: None,
-            image: "test-image".to_string(),
-            container_name: "aoe-pi-known".to_string(),
-            extra_env: None,
-            custom_instruction: None,
-            container_workdir: None,
-            before_start_env: Vec::new(),
-        });
-        assert!(!inst.supports_session_poller());
-
-        // Other tools keep polling with an id: their promotion path (#2291)
-        // does not run through a store shared by cwd alone.
-        let mut claude = Instance::new("claude-known", "/tmp/pi-known");
+        let mut claude = Instance::new("claude-poll", "/tmp/pi-poll");
         claude.tool = "claude".to_string();
-        claude.agent_session_id = Some("aaaaaaaa-1111-4111-8111-aaaaaaaaaaaa".to_string());
         assert!(claude.supports_session_poller());
     }
 }
