@@ -461,17 +461,26 @@ mod tests {
         }
     }
 
-    #[test]
-    fn start_with_resume_fallback_uses_launch_sid_for_probe_decision() {
+    /// This file's own source from `start_marker` up to the tests module.
+    /// The end is searched from `start_marker` onward so the slice stays
+    /// valid if a `#[cfg(test)]` item is ever added above `mod tests`.
+    fn source_from(start_marker: &str) -> String {
         let source = std::fs::read_to_string(
             std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/session/instance/resume.rs"),
         )
         .unwrap();
         let start = source
-            .find("pub(crate) fn start_with_resume_fallback")
-            .unwrap();
-        let end = source.find("#[cfg(test)]").unwrap();
-        let fallback_source = &source[start..end];
+            .find(start_marker)
+            .unwrap_or_else(|| panic!("start marker not found: {start_marker}"));
+        let end = source[start..]
+            .find("\n#[cfg(test)]")
+            .map_or(source.len(), |offset| start + offset);
+        source[start..end].to_string()
+    }
+
+    #[test]
+    fn start_with_resume_fallback_uses_launch_sid_for_probe_decision() {
+        let fallback_source = source_from("pub(crate) fn start_with_resume_fallback");
 
         assert!(fallback_source
             .contains("let (attempted_sid, pinned_prior_sid) = match launch_outcome"));
@@ -482,13 +491,7 @@ mod tests {
 
     #[test]
     fn resume_probe_failure_marks_before_cleanup() {
-        let source = std::fs::read_to_string(
-            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/session/instance/resume.rs"),
-        )
-        .unwrap();
-        let start = source.find("fn finish_resume_launch").unwrap();
-        let end = source.find("#[cfg(test)]").unwrap();
-        let fallback_source = &source[start..end];
+        let fallback_source = source_from("fn finish_resume_launch");
         let local_marker = fallback_source
             .find("self.resume_probe_failed_sid = Some(stale_sid.clone())")
             .unwrap();

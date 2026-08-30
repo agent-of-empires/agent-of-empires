@@ -164,9 +164,8 @@ impl Instance {
             CONTAINER_TERMINAL_AUTODETECT_CMD,
         );
 
-        // The pane wrapper opens the target values on a protected descriptor.
-        // No repo-configured key is installed in the host shell or runtime
-        // process environment.
+        // Values ride the protected env-file, never the host shell or runtime
+        // process env. See [`crate::session::environment::DockerExecEnv`].
         let session = self.container_terminal_tmux_session_indexed(index)?;
         let is_new = !session.exists();
         if is_new {
