@@ -266,8 +266,16 @@ pub(crate) fn pane_title(session_name: &str) -> Option<String> {
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim_end_matches('\n').to_string())
+        .map(|s| strip_display_delimiter(&s).to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Drop the single newline `display-message -p` appends, and only that one.
+/// Trimming every trailing newline would also eat one the title itself
+/// carried, which is the difference between reporting a title and reporting a
+/// truncated one.
+fn strip_display_delimiter(raw: &str) -> &str {
+    raw.strip_suffix('\n').unwrap_or(raw)
 }
 
 fn pane_start_command_is_protected(session_name: &str) -> bool {
@@ -948,5 +956,21 @@ mod tests {
         let title = pane_title(name);
         let _ = kill_session_if_present(name);
         assert_eq!(title.as_deref(), Some("aoe-title-probe"));
+    }
+
+    /// Only the delimiter `display-message` adds comes off. tmux 3.6 will not
+    /// store a newline in a title (`select-pane -T` refuses one and an OSC
+    /// title is sanitized), so this is locked here rather than against a live
+    /// pane, which cannot produce the input.
+    #[test]
+    fn strip_display_delimiter_removes_only_the_delimiter() {
+        assert_eq!(strip_display_delimiter("title\n"), "title");
+        assert_eq!(strip_display_delimiter("title"), "title");
+        assert_eq!(strip_display_delimiter(""), "");
+        assert_eq!(
+            strip_display_delimiter("title\n\n"),
+            "title\n",
+            "a newline the title itself carried must survive"
+        );
     }
 }
