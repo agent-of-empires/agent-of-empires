@@ -87,6 +87,7 @@ pub(crate) struct MetricsSampler {
     last_at: Option<Instant>,
     last_host_cpu: Option<(u64, u64)>,
     last_process_cpu: HashMap<(u32, u64), f64>,
+    last_pane_pids: HashMap<String, u32>,
 }
 
 impl MetricsSampler {
@@ -109,19 +110,21 @@ impl MetricsSampler {
 
         let processes = process_snapshot();
         // One `list-panes -a` for every pane root, instead of one
-        // `display-message` per session.
-        let pane_pids: HashMap<String, u32> = crate::tmux::batch_pane_metadata()
-            .map(|panes| {
-                panes
-                    .into_iter()
-                    .filter_map(|(name, meta)| Some((name, meta.pane_pid?)))
-                    .collect()
-            })
-            .unwrap_or_default();
+        // `display-message` per session. `Err` means tmux could not answer, not
+        // that there are no panes, so the previous map stands for that tick. A
+        // dead pane's pid has exited, and the OS may already have handed it to
+        // something unrelated, so it must not seed a process-tree walk.
+        if let Ok(panes) = crate::tmux::batch_pane_metadata() {
+            self.last_pane_pids = panes
+                .into_iter()
+                .filter(|(_, meta)| !meta.pane_dead)
+                .filter_map(|(name, meta)| Some((name, meta.pane_pid?)))
+                .collect();
+        }
         let agents = aggregate_agents(
             instances,
             &processes,
-            &pane_pids,
+            &self.last_pane_pids,
             elapsed,
             &self.last_process_cpu,
         );

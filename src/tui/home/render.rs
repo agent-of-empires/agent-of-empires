@@ -190,14 +190,31 @@ fn preview_frozen(scroll_offset: u16, has_selection: bool) -> bool {
 /// `capture-pane` fallback fires no more often than this.
 const PREVIEW_REFRESH_MS: u128 = 250;
 
+/// Ceiling on how long a pulsing `capture-pane` worker suppresses the
+/// fallback fork. That worker publishes nothing for a pane that is gone, so
+/// without a ceiling a stale preview would stand forever. A VT worker re-seeds
+/// its own grid on `VT_RESYNC_INTERVAL` and needs none.
+const WORKER_TRUST_CEILING_MS: u128 = 10_000;
+
 /// Whether the idle poll should pay for a synchronous `capture-pane`: only
-/// past the cadence, never while frozen (a fresh bottom-anchored snapshot
-/// would shift held content out from under a reader or a drag), and never
-/// while the capture worker is pulsing, since it publishes every change and
-/// re-seeds its own grid on `VT_RESYNC_INTERVAL`. Session change, resize, and
-/// the reading grow refresh through their own clauses regardless.
-fn idle_poll_due(frozen: bool, idle_elapsed_ms: u128, worker_covers_idle: bool) -> bool {
-    !frozen && idle_elapsed_ms > PREVIEW_REFRESH_MS && !worker_covers_idle
+/// past the cadence; never while frozen (a fresh bottom-anchored snapshot
+/// would shift held content out from under a reader or a drag); never while
+/// the worker pulses on a VT grid; and only past [`WORKER_TRUST_CEILING_MS`]
+/// while a `capture-pane` worker pulses. Session change, resize, and the
+/// reading grow refresh through their own clauses regardless.
+fn idle_poll_due(
+    frozen: bool,
+    idle_elapsed_ms: u128,
+    worker_covers_idle: bool,
+    worker_is_vt: bool,
+) -> bool {
+    if frozen || idle_elapsed_ms <= PREVIEW_REFRESH_MS {
+        return false;
+    }
+    if !worker_covers_idle {
+        return true;
+    }
+    !worker_is_vt && idle_elapsed_ms > WORKER_TRUST_CEILING_MS
 }
 
 /// How an observed capture-worker cycle counter folds into a liveness verdict,
@@ -2035,6 +2052,10 @@ impl HomeView {
         // `apply_worker_capture` almost always has a fresh frame to hand over
         // and returns before this.
         let worker_covers_idle = self.observe_worker_pulse();
+        let worker_is_vt = self
+            .preview_capture_worker
+            .as_ref()
+            .is_some_and(|worker| worker.vt_active());
 
         let cache = select(self);
         let idle_elapsed = cache.last_refresh.elapsed().as_millis();
@@ -2047,7 +2068,7 @@ impl HomeView {
                 visible_rows,
                 scroll_offset,
             )
-            || idle_poll_due(frozen, idle_elapsed, worker_covers_idle);
+            || idle_poll_due(frozen, idle_elapsed, worker_covers_idle, worker_is_vt);
         if !needs_refresh {
             return;
         }
@@ -2270,8 +2291,8 @@ impl HomeView {
         // content flowing on its own thread; `apply_worker_capture` below
         // just applies the newest it has produced. The synchronous fork via
         // `refresh_preview_cache_core` remains as the cold-start fallback,
-        // plus the wedged-worker path in `idle_poll_due`; a worker that is
-        // merely idle no longer trips it. This
+        // plus the wedged-worker and capture-pane-ceiling paths in
+        // `idle_poll_due`; a worker that is merely idle no longer trips it. This
         // moves the per-frame capture cost (~8.5ms on macOS, ~90% of a
         // frame; the `tui.render` `capture_us` trace measures it) off the
         // render thread for every view, not just agent live-send.
@@ -4192,31 +4213,36 @@ mod tests {
     // `home/tests.rs`, which renders a real frame and asserts
     // `preview_visible_rows == preview_pane_area.height`.
 
-    /// The idle-poll gate itself: a pulsing worker suppresses the fork for as
-    /// long as it pulses, since the worker owns the grid resync (#3559).
+    /// The idle-poll gate itself: a pulsing VT worker suppresses the fork for
+    /// as long as it pulses (it owns the grid resync, #3559), while a pulsing
+    /// `capture-pane` worker is trusted only up to the ceiling.
     #[test]
-    fn idle_poll_due_suppresses_a_pulsing_worker() {
+    fn idle_poll_due_trusts_a_vt_worker_and_bounds_a_capture_worker() {
         let past_cadence = PREVIEW_REFRESH_MS + 1;
-        let long_idle = PREVIEW_REFRESH_MS * 1_000;
-        // (frozen, elapsed_ms, worker_covers_idle, expected)
+        let past_ceiling = WORKER_TRUST_CEILING_MS + 1;
+        // (frozen, elapsed_ms, worker_covers_idle, worker_is_vt, expected)
         let cases = [
             // Inside the cadence: the pre-existing throttle, worker or not.
-            (false, PREVIEW_REFRESH_MS, false, false),
-            (false, PREVIEW_REFRESH_MS, true, false),
+            (false, PREVIEW_REFRESH_MS, false, false, false),
+            (false, PREVIEW_REFRESH_MS, true, true, false),
             // Past the cadence with no trustworthy worker: fork, as before.
-            (false, past_cadence, false, true),
-            // Past the cadence with a pulsing worker: never fork here.
-            (false, past_cadence, true, false),
-            (false, long_idle, true, false),
+            (false, past_cadence, false, false, true),
+            (false, past_cadence, false, true, true),
+            // A pulsing VT worker: never fork, however long it has been.
+            (false, past_cadence, true, true, false),
+            (false, past_ceiling, true, true, false),
+            // A pulsing capture-pane worker: trusted only until the ceiling.
+            (false, past_cadence, true, false, false),
+            (false, past_ceiling, true, false, true),
             // Frozen wins over everything; the reader's content must not move.
-            (true, past_cadence, false, false),
-            (true, long_idle, false, false),
+            (true, past_cadence, false, false, false),
+            (true, past_ceiling, true, false, false),
         ];
-        for (frozen, elapsed, covered, expected) in cases {
+        for (frozen, elapsed, covered, vt, expected) in cases {
             assert_eq!(
-                idle_poll_due(frozen, elapsed, covered),
+                idle_poll_due(frozen, elapsed, covered, vt),
                 expected,
-                "frozen={frozen} elapsed={elapsed} covered={covered}"
+                "frozen={frozen} elapsed={elapsed} covered={covered} vt={vt}"
             );
         }
     }
