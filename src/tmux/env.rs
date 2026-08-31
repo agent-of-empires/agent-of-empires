@@ -202,9 +202,11 @@ fn sequential_set_fallback(entries: &[(&str, &str, &str)]) {
 /// its `show-environment` output, so a block that is empty (the session has
 /// no hidden vars) cannot shift every later line onto the wrong session.
 ///
-/// Printable ASCII on purpose: tmux rewrites every byte outside `0x20..=0x7e`
-/// to `_` for a client whose locale is not UTF-8, so a control character here
-/// would erase every marker and leave the whole batch to the fallback.
+/// It carries the session's batch index, not its name, because tmux rewrites
+/// every byte outside `0x20..=0x7e` to `_` for a client whose locale is not
+/// UTF-8: a control character would erase every marker, and a name would let
+/// `aoe_café` print the marker of a live `aoe_caf_`. Decimal digits are
+/// injective under that rewrite, so a marker names exactly one session.
 const BATCH_MARKER: char = '@';
 
 /// Get a hidden environment variable from multiple sessions in one tmux
@@ -275,7 +277,7 @@ fn batch_args(session_names: &[&str]) -> Vec<String> {
             "-p".to_string(),
             "-t".to_string(),
             session_name.to_string(),
-            format!("{BATCH_MARKER}{}", session_name.replace('#', "##")),
+            format!("{BATCH_MARKER}{i}"),
             ";".to_string(),
             "show-environment".to_string(),
             "-h".to_string(),
@@ -301,16 +303,17 @@ fn parse_batch_output<'a>(
 ) -> HashMap<&'a str, Option<String>> {
     let mut values: HashMap<&str, Option<String>> = HashMap::new();
     let mut unparsed: HashSet<&str> = HashSet::new();
+    let mut read_key: HashSet<&str> = HashSet::new();
     let mut current: Option<&str> = None;
     let mut rest = output;
     while !rest.is_empty() {
         let (line, after_line) = split_line(rest);
         let marked = line.trim().strip_prefix(BATCH_MARKER);
-        if let Some(name) = marked.and_then(|n| session_names.iter().copied().find(|s| *s == n)) {
-            // tmux collapses each non-ASCII character of the name to `_` for a
-            // client whose locale is not UTF-8, so two sessions can print the
-            // same marker. A repeat is ambiguous: drop it and let the caller
-            // re-read that session exactly.
+        if let Some(name) = marked
+            .and_then(|i| i.parse::<usize>().ok())
+            .and_then(|i| session_names.get(i).copied())
+        {
+            // Each index is printed once, so a repeat did not come from tmux.
             if values.insert(name, None).is_some() {
                 unparsed.insert(name);
             }
@@ -321,6 +324,11 @@ fn parse_batch_output<'a>(
         if let Some((name, value, after_entry)) = parse_env_entry(rest) {
             if name == key {
                 if let Some(session) = current {
+                    // tmux walks a keyed tree once, so a second record for the
+                    // requested key is not a shape tmux can emit.
+                    if !read_key.insert(session) {
+                        unparsed.insert(session);
+                    }
                     values.insert(session, value);
                 }
             }
@@ -350,7 +358,9 @@ fn parse_batch_output<'a>(
 /// backslash inside it, so a value holding a newline cannot end a record: the
 /// scan runs to the first unescaped quote, not to the next line break. That is
 /// what stops a continuation line reading `KEY=...` from impersonating an
-/// entry for `KEY` (#3616).
+/// entry for `KEY` (#3616). The `; export <name>;` tail is required rather
+/// than skipped, so a record tmux did not write is rejected outright instead
+/// of being read up to its quote.
 fn parse_env_entry(input: &str) -> Option<(&str, Option<String>, &str)> {
     if let Some(rest) = input.strip_prefix("unset ") {
         let (line, after) = split_line(rest);
@@ -368,7 +378,11 @@ fn parse_env_entry(input: &str) -> Option<(&str, Option<String>, &str)> {
     while let Some((i, c)) = chars.next() {
         match c {
             '\\' => value.push(chars.next()?.1),
-            '"' => return Some((name, Some(value), split_line(&body[i + 1..]).1)),
+            '"' => {
+                let (tail, after) = split_line(&body[i + 1..]);
+                let exported = tail.strip_prefix("; export ")?.strip_suffix(';')?;
+                return (exported == name).then_some((name, Some(value), after));
+            }
             _ => value.push(c),
         }
     }
@@ -392,8 +406,9 @@ mod tests {
         format!("{name}=\"{value}\"; export {name};\n")
     }
 
-    fn marked(name: &str, body: &str) -> String {
-        format!("{BATCH_MARKER}{name}\n{body}")
+    /// One session's segment: its batch-index marker, then its records.
+    fn marked(index: usize, body: &str) -> String {
+        format!("{BATCH_MARKER}{index}\n{body}")
     }
 
     #[test]
@@ -404,34 +419,34 @@ mod tests {
         // (output, sessions, expected per session: None = not covered by the
         // run at all, Some(None) = covered and unset)
         let cases = vec![
-            (marked("s1", &id), &["s1"][..], vec![Some(Some("abc123"))]),
+            (marked(0, &id), &["s1"][..], vec![Some(Some("abc123"))]),
             // Covered but unset: the block is empty, or holds other keys only.
-            (marked("s1", ""), &["s1"][..], vec![Some(None)]),
+            (marked(0, ""), &["s1"][..], vec![Some(None)]),
             (
-                marked("s1", &entry(AOE_CAPTURED_SESSION_ID_KEY, "other")),
+                marked(0, &entry(AOE_CAPTURED_SESSION_ID_KEY, "other")),
                 &["s1"][..],
                 vec![Some(None)],
             ),
             (
-                marked("s1", "unset AOE_INSTANCE_ID;\n"),
+                marked(0, "unset AOE_INSTANCE_ID;\n"),
                 &["s1"][..],
                 vec![Some(None)],
             ),
             (
-                marked("s1", &entry(key, "value=with=equals")),
+                marked(0, &entry(key, "value=with=equals")),
                 &["s1"][..],
                 vec![Some(Some("value=with=equals"))],
             ),
             // tmux escapes quotes and backslashes inside the value; the
             // reading must undo that rather than stop at the first quote.
             (
-                marked("s1", &entry(key, r#"a\"b\\c"#)),
+                marked(0, &entry(key, r#"a\"b\\c"#)),
                 &["s1"][..],
                 vec![Some(Some(r#"a"b\c"#))],
             ),
             // A session lacking the variable must not shift the rest.
             (
-                format!("{m}s1\n{id}{m}s2\n{m}s3\n{}", entry(key, "xyz789")),
+                format!("{m}0\n{id}{m}1\n{m}2\n{}", entry(key, "xyz789")),
                 &["s1", "s2", "s3"][..],
                 vec![Some(Some("abc123")), Some(None), Some(Some("xyz789"))],
             ),
@@ -439,7 +454,7 @@ mod tests {
             // produce no marker and must read as uncovered (the caller
             // re-reads them) rather than as unset.
             (
-                format!("{m}s1\n{id}"),
+                format!("{m}0\n{id}"),
                 &["s1", "s2"][..],
                 vec![Some(Some("abc123")), None],
             ),
@@ -447,28 +462,48 @@ mod tests {
             (id.clone(), &["s1"][..], vec![None]),
             // A block for a session that was not asked about is ignored.
             (
-                format!("{m}other\n{}{m}s1\n{id}", entry(key, "nope")),
+                format!("{m}9\n{}{m}0\n{id}", entry(key, "nope")),
                 &["s1"][..],
                 vec![Some(Some("abc123"))],
             ),
             (
-                format!("  {m}s1  \n{id}"),
+                format!("  {m}0  \n{id}"),
                 &["s1"][..],
                 vec![Some(Some("abc123"))],
             ),
             // A line tmux could not have written leaves the block ambiguous,
             // so it drops out and the caller re-reads the session.
+            (format!("{m}0\nnot an entry\n{id}"), &["s1"][..], vec![None]),
+            // A repeated marker did not come from tmux; neither reading of
+            // that block is trustworthy.
             (
-                format!("{m}s1\nnot an entry\n{id}"),
+                format!("{m}0\n{id}{m}0\n{}", entry(key, "second")),
                 &["s1"][..],
                 vec![None],
             ),
-            // Two sessions whose names differ only outside ASCII print one
-            // marker to a non-UTF-8 client; neither reading is trustworthy.
+            // Jerome #3628: a second record for the requested key is a shape
+            // tmux cannot emit, so the block loses its exact-read fallback
+            // unless it drops out here.
             (
-                format!("{m}s1\n{id}{m}s1\n{}", entry(key, "second")),
+                format!("{m}0\n{id}{}", entry(key, "second")),
                 &["s1"][..],
                 vec![None],
+            ),
+            // Trailing text after the closing quote means the record is not
+            // what tmux wrote.
+            (
+                format!("{m}0\nAOE_INSTANCE_ID=\"real\"; export AOE_INSTANCE_ID; junk\n"),
+                &["s1"][..],
+                vec![None],
+            ),
+            // A sanitized name can no longer claim a colliding session: the
+            // marker is the batch index, so the truncated run leaves the ASCII
+            // session uncovered instead of handing it the Unicode session's
+            // block.
+            (
+                format!("{m}0\n{}", entry(key, "cafe-id")),
+                &["aoe_caf\u{e9}", "aoe_caf_"][..],
+                vec![Some(Some("cafe-id")), None],
             ),
         ];
         for (output, sessions, expected) in cases {
@@ -492,7 +527,7 @@ mod tests {
             // The key is set and a later variable's continuation claims it.
             (
                 format!(
-                    "{m}s1\n{}{}",
+                    "{m}0\n{}{}",
                     entry(key, "real-id"),
                     entry("ZZZ", "unrelated\nAOE_INSTANCE_ID=spoofed-id"),
                 ),
@@ -503,7 +538,7 @@ mod tests {
             // it. Sorted output puts that continuation where the real entry
             // would have been.
             (
-                format!("{m}s1\n{}", entry("AAA", "x\nAOE_INSTANCE_ID=spoofed-id")),
+                format!("{m}0\n{}", entry("AAA", "x\nAOE_INSTANCE_ID=spoofed-id")),
                 &["s1"][..],
                 vec![Some(None)],
             ),
@@ -511,8 +546,8 @@ mod tests {
             // reattribute the rest of the run.
             (
                 format!(
-                    "{m}s1\n{}{m}s2\n{}",
-                    entry("ZZZ", &format!("x\n{m}s2\nAOE_INSTANCE_ID=spoofed-id")),
+                    "{m}0\n{}{m}1\n{}",
+                    entry("ZZZ", &format!("x\n{m}1\nAOE_INSTANCE_ID=spoofed-id")),
                     entry(key, "s2-id"),
                 ),
                 &["s1", "s2"][..],
@@ -521,7 +556,7 @@ mod tests {
             // Escaped quotes cannot close the value early to fake an entry.
             (
                 format!(
-                    "{m}s1\n{}",
+                    "{m}0\n{}",
                     entry(
                         "NASTY",
                         "a\\\"; export ZZZ;\nAOE_INSTANCE_ID=\\\"spoofed-id\\\""
@@ -587,6 +622,70 @@ mod tests {
                 "{locale}: {stdout:?}"
             );
         }
+    }
+
+    /// #3628 review: under a non-UTF-8 client tmux prints `aoe_..caf\u{e9}` as
+    /// `aoe_..caf_`, so a name-based marker let the Unicode session's block be
+    /// attributed to the live ASCII session whose name it now matched. A
+    /// repeated marker catches that only when the twin marker arrives; tmux
+    /// aborts the list at a failing segment, so here it never does. Batch
+    /// indices are injective under that rewrite, so the block stays with the
+    /// session that produced it and the unreached one falls back.
+    #[test]
+    #[serial_test::serial]
+    fn test_batch_marker_survives_a_sanitized_name_collision() {
+        let base = format!("aoe_env_collide_{}", std::process::id());
+        // `sanitize_session_name` keeps any Unicode alphanumeric, and tmux
+        // rewrites the last character of this one to `_`, producing `ascii`.
+        let unicode =
+            crate::tmux::test_helpers::TmuxTestSession::from_name(format!("{base}\u{e9}"));
+        let ascii = crate::tmux::test_helpers::TmuxTestSession::from_name(format!("{base}_"));
+        for (session, id) in [(&unicode, "unicode-id"), (&ascii, "ascii-id")] {
+            let created = crate::tmux::tmux_command()
+                .args(["new-session", "-d", "-s", session.name(), "sh"])
+                .output();
+            if !created.is_ok_and(|out| out.status.success()) {
+                eprintln!("skipping: tmux unavailable");
+                return;
+            }
+            set_hidden_env(session.name(), AOE_INSTANCE_ID_KEY, id).unwrap();
+        }
+
+        let sanitized = crate::tmux::tmux_command()
+            .env("LC_ALL", "C")
+            .args([
+                "display-message",
+                "-p",
+                "-t",
+                unicode.name(),
+                "#{session_name}",
+            ])
+            .output()
+            .unwrap();
+        if String::from_utf8_lossy(&sanitized.stdout).trim() != ascii.name() {
+            eprintln!("skipping: this tmux client does not sanitize the name");
+            return;
+        }
+
+        // The middle session does not exist, so tmux aborts the list there and
+        // the ASCII session's own marker is never printed.
+        let missing = format!("{base}_gone");
+        let names = [unicode.name(), missing.as_str(), ascii.name()];
+        let output = crate::tmux::tmux_command()
+            .env("LC_ALL", "C")
+            .args(batch_args(&names))
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let parsed = parse_batch_output(&stdout, &names, AOE_INSTANCE_ID_KEY);
+        assert_eq!(
+            names.map(|n| parsed.get(n).map(|v| v.as_deref())),
+            // The unreached ASCII session is what a name-based marker used to
+            // fill in with the Unicode session's value. The middle name never
+            // existed, so reporting it unset matches what re-reading it gives.
+            [Some(Some("unicode-id")), Some(None), None],
+            "{stdout:?}"
+        );
     }
 
     #[test]
