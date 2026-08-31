@@ -2273,6 +2273,12 @@ Do you want to proceed?\n\
         assert_eq!(detect_vibe_status(glued), Status::Idle);
         assert!(!vibe_rule_matches("activity_word", glued));
 
+        // A blank row ends a run too: the window drops blank lines, so without
+        // this the halves of two separate blocks would stack into one word.
+        let split = "R\nu\nn\n\nn\ni\nn\ng";
+        assert_eq!(detect_vibe_status(split), Status::Idle);
+        assert!(!vibe_rule_matches("activity_word", split));
+
         // Ellipsis indicates ongoing activity
         assert_eq!(detect_vibe_status("Working…"), Status::Running);
         assert_eq!(detect_vibe_status("Loading..."), Status::Running);

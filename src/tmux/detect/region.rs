@@ -16,6 +16,10 @@ pub(super) struct Screen<'a> {
     /// blank tail carries nothing and filtering it keeps window sizes
     /// meaningful.
     recent: Vec<&'a str>,
+    /// Whether a blank row sat above each [`Self::recent`] line. Blank rows are
+    /// dropped from the window, so this is the only thing left that says two
+    /// stacked characters came from different blocks rather than one word.
+    blank_before: Vec<bool>,
     osc_title: &'a str,
     joined: OnceLock<String>,
     collapsed: OnceLock<String>,
@@ -211,13 +215,21 @@ impl Region {
 
 impl<'a> Screen<'a> {
     pub(super) fn new(clean_screen: &'a str, osc_title: &'a str) -> Self {
-        let non_empty: Vec<&str> = clean_screen
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .collect();
+        let mut non_empty: Vec<&str> = Vec::new();
+        let mut blank_before: Vec<bool> = Vec::new();
+        let mut after_blank = false;
+        for line in clean_screen.lines() {
+            if line.trim().is_empty() {
+                after_blank = true;
+                continue;
+            }
+            non_empty.push(line);
+            blank_before.push(std::mem::take(&mut after_blank));
+        }
         let start = non_empty.len().saturating_sub(RECENT_LINES);
         Self {
             recent: non_empty[start..].to_vec(),
+            blank_before: blank_before[start..].to_vec(),
             osc_title,
             joined: OnceLock::new(),
             collapsed: OnceLock::new(),
@@ -244,7 +256,9 @@ impl<'a> Screen<'a> {
             Region::CollapsedRecent => self
                 .collapsed
                 .get_or_init(|| collapse_ascii_whitespace(self.joined())),
-            Region::UnstackedRecent => self.unstacked.get_or_init(|| unstack(&self.recent)),
+            Region::UnstackedRecent => self
+                .unstacked
+                .get_or_init(|| unstack(&self.recent, &self.blank_before)),
             Region::BottomLines(n) => {
                 // Bottom-n is a suffix of the joined recent window, so it is
                 // sliced from it rather than joined again per rule.
@@ -407,19 +421,23 @@ fn line_is_update_banner(trimmed: &str) -> bool {
 /// character per row, and a run of such rows is the word; anything wider is
 /// ordinary content, so it keeps its own line and cannot be glued to the text
 /// under it.
-fn unstack(lines: &[&str]) -> String {
+///
+/// A blank row ends a run for the same reason: characters either side of one
+/// came from different blocks, so they are not one word.
+fn unstack(lines: &[&str], blank_before: &[bool]) -> String {
     let mut out: Vec<String> = Vec::new();
     let mut run = String::new();
-    for line in lines {
+    for (i, line) in lines.iter().enumerate() {
         let trimmed = line.trim();
-        if trimmed.chars().count() == 1 {
-            run.push_str(trimmed);
-            continue;
-        }
-        if !run.is_empty() {
+        let stacked = trimmed.chars().count() == 1;
+        if (!stacked || blank_before[i]) && !run.is_empty() {
             out.push(std::mem::take(&mut run));
         }
-        out.push((*line).to_string());
+        if stacked {
+            run.push_str(trimmed);
+        } else {
+            out.push((*line).to_string());
+        }
     }
     if !run.is_empty() {
         out.push(run);
