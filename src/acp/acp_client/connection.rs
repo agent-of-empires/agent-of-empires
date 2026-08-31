@@ -2472,6 +2472,13 @@ pub(super) async fn run_connection_task<W, R>(
                         let finished_after_orphan_cancel = orphan_cancel_sent
                             && watchdog.cost_seen()
                             && watchdog.off_protocol_work_seen().is_none();
+                        if prompt_orphaned && !finished_after_orphan_cancel {
+                            // A cancel acknowledgement ends prompt_fut before the
+                            // escalation timer can close the connection. Close it
+                            // here so the supervisor can perform the promised
+                            // worker restart; preserve the late-cost recovery above.
+                            shutdown = true;
+                        }
                         if profile.key == "opencode"
                             && watchdog.cost_seen()
                             && !watchdog.saw_progress()

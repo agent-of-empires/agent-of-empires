@@ -204,7 +204,8 @@ async function handlePrompt(params, client) {
   //   1. emit one assistant chunk
   //   2. emit a cost-populated usage_update (claude-agent-acp's
   //      "wrap up accounting" marker the daemon uses as a
-  //      terminal-candidate signal)
+  //      terminal-candidate signal), unless the prompt requests the
+  //      no-usage variant used by adapters that do not report cost
   //   3. park until cancel() resolves the promise
   // Without the cancel handler we'd hang the test for the full
   // CANCEL_ESCALATION_GRACE; the explicit resolve keeps the test
@@ -217,15 +218,17 @@ async function handlePrompt(params, client) {
         content: { type: "text", text: "wedged response complete" },
       },
     });
-    await client.notify("session/update", {
-      sessionId: params.sessionId,
-      update: {
-        sessionUpdate: "usage_update",
-        input_tokens: 100,
-        output_tokens: 200,
-        cost: { amount: 0.01, currency: "USD" },
-      },
-    });
+    if (!userText.includes("SILENT_ORPHAN_NO_USAGE")) {
+      await client.notify("session/update", {
+        sessionId: params.sessionId,
+        update: {
+          sessionUpdate: "usage_update",
+          input_tokens: 100,
+          output_tokens: 200,
+          cost: { amount: 0.01, currency: "USD" },
+        },
+      });
+    }
     await new Promise((resolve) => {
       silentOrphanResolve = resolve;
     });

@@ -126,6 +126,69 @@ async fn drain_for_stopped_reason(client: &mut AcpClient, deadline: Instant) -> 
     None
 }
 
+async fn drain_until_closed(client: &mut AcpClient, deadline: Instant) -> bool {
+    while Instant::now() < deadline {
+        match tokio::time::timeout(Duration::from_millis(200), client.next_event()).await {
+            Ok(None) => return true,
+            Ok(Some(_)) | Err(_) => continue,
+        }
+    }
+    false
+}
+
+#[tokio::test]
+#[serial]
+async fn silent_orphan_without_usage_closes_connection_for_restart() {
+    if let Err(reason) = shim_ready() {
+        eprintln!("skipping: {reason}");
+        return;
+    }
+
+    let _env = EnvGuard::set(&[
+        ("AOE_SILENT_ORPHAN_GRACE_MS", "300"),
+        ("AOE_SILENT_ORPHAN_FAST_GRACE_MS", "300"),
+        ("AOE_SILENT_ORPHAN_CHECK_INTERVAL_MS", "50"),
+    ]);
+
+    let preseed = "silent-orphan-no-usage";
+    let (socket_path, _tmp) = spawn_shim_socket_bridge_with_preseed(preseed).await;
+
+    let client = AcpClient::attach(
+        socket_path,
+        std::env::temp_dir(),
+        vec![],
+        preseed.to_string(),
+        false,
+        AcpSessionId(preseed.into()),
+        None,
+        "claude".into(),
+        None,
+    )
+    .await
+    .expect("attach for no-usage silent-orphan test");
+
+    let mut client = client;
+    client
+        .send_prompt("SILENT_ORPHAN_NO_USAGE trigger", &[])
+        .await
+        .expect("send prompt");
+
+    let stopped =
+        drain_for_stopped_reason(&mut client, Instant::now() + Duration::from_secs(5)).await;
+    assert_eq!(
+        stopped.as_deref(),
+        Some("prompt_orphaned"),
+        "no-usage orphan must retain the restart-triggering terminal reason"
+    );
+
+    let closed = drain_until_closed(&mut client, Instant::now() + Duration::from_secs(2)).await;
+    let _ = client.shutdown().await;
+    assert!(
+        closed,
+        "the connection task must close its event stream so the supervisor can restart the worker"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn silent_orphan_fires_on_cost_then_silence() {
