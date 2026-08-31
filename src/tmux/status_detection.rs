@@ -171,7 +171,7 @@ mod tests {
 
     /// Whether one of Vibe's manifest rules matches a fixture.
     fn vibe_rule_matches(rule: &str, content: &str) -> bool {
-        super::super::detect::rule_matches("vibe", rule, content, "", None)
+        super::super::detect::rule_matches("vibe", rule, &strip_ansi(content), "", None)
     }
 
     /// A `waiting` write left behind by a prompt the user cancelled: the write
@@ -2265,6 +2265,12 @@ Do you want to proceed?\n\
         assert!(vibe_rule_matches("activity_word", vertical));
         assert!(!vibe_rule_matches("spinner", vertical));
         assert!(!vibe_rule_matches("trailing_ellipsis", vertical));
+
+        // A pane narrow enough to stack the word is narrow enough to stack the
+        // chrome under it, so the word sits well above the line-oriented
+        // window and only the deeper concatenated one still reaches it.
+        let buried = format!("{vertical}\n{}", "x\n".repeat(40));
+        assert_eq!(detect_vibe_status(&buried), Status::Running);
 
         // Ellipsis indicates ongoing activity
         assert_eq!(detect_vibe_status("Working…"), Status::Running);

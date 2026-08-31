@@ -11,11 +11,11 @@ use std::sync::OnceLock;
 /// against it. Regions are computed lazily: a capture whose first rule
 /// matches never pays for the rest.
 pub(super) struct Screen<'a> {
-    /// Non-empty lines, most recent [`RECENT_LINES`] of them. Claude parks the
-    /// cursor below its output and small responses sit in a tall pane, so the
-    /// blank tail carries nothing and filtering it keeps window sizes
-    /// meaningful.
-    recent: Vec<&'a str>,
+    /// Every non-empty line. Claude parks the cursor below its output and small
+    /// responses sit in a tall pane, so the blank tail carries nothing and
+    /// filtering it keeps window sizes meaningful. Each region slices its own
+    /// window off the end of this.
+    non_empty: Vec<&'a str>,
     osc_title: &'a str,
     joined: OnceLock<String>,
     collapsed: OnceLock<String>,
@@ -31,6 +31,12 @@ pub(super) struct Screen<'a> {
 /// fit well inside this, and a shorter window would drop the completion line
 /// on a pane whose box carries several rows of chrome.
 const RECENT_LINES: usize = 30;
+
+/// How far back [`Region::ConcatenatedRecent`] reaches. A Textual pane narrow
+/// enough to stack a status word one character per line spends a whole line on
+/// each character, so [`RECENT_LINES`] is not deep enough to hold one word plus
+/// the chrome under it.
+const CONCATENATED_LINES: usize = 50;
 
 /// A landmark line a manifest names so its rules can be scoped relative to it:
 /// the divider a finished turn draws, the rule pair around an input box, an
@@ -209,13 +215,11 @@ impl Region {
 
 impl<'a> Screen<'a> {
     pub(super) fn new(clean_screen: &'a str, osc_title: &'a str) -> Self {
-        let non_empty: Vec<&str> = clean_screen
-            .lines()
-            .filter(|l| !l.trim().is_empty())
-            .collect();
-        let start = non_empty.len().saturating_sub(RECENT_LINES);
         Self {
-            recent: non_empty[start..].to_vec(),
+            non_empty: clean_screen
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .collect(),
             osc_title,
             joined: OnceLock::new(),
             collapsed: OnceLock::new(),
@@ -242,17 +246,20 @@ impl<'a> Screen<'a> {
             Region::CollapsedRecent => self
                 .collapsed
                 .get_or_init(|| collapse_ascii_whitespace(self.joined())),
-            Region::ConcatenatedRecent => self
-                .concatenated
-                .get_or_init(|| self.recent.iter().map(|l| l.trim()).collect()),
+            Region::ConcatenatedRecent => self.concatenated.get_or_init(|| {
+                self.window(CONCATENATED_LINES)
+                    .iter()
+                    .map(|l| l.trim())
+                    .collect()
+            }),
             Region::BottomLines(n) => {
                 // Bottom-n is a suffix of the joined recent window, so it is
                 // sliced from it rather than joined again per rule.
-                let start = self.recent.len().saturating_sub(n);
+                let start = self.recent().len().saturating_sub(n);
                 if start == 0 {
                     return std::borrow::Cow::Borrowed(self.joined());
                 }
-                let skipped: usize = self.recent[..start].iter().map(|l| l.len() + 1).sum();
+                let skipped: usize = self.recent()[..start].iter().map(|l| l.len() + 1).sum();
                 &self.joined()[skipped..]
             }
             Region::AboveInputBox => self
@@ -272,14 +279,14 @@ impl<'a> Screen<'a> {
             Region::FromPromptMarker => {
                 self.from_marker
                     .get_or_init(|| match self.marker_index(prompt_marker) {
-                        Some(idx) => self.recent[idx..].join("\n"),
+                        Some(idx) => self.recent()[idx..].join("\n"),
                         None => self.joined().to_string(),
                     })
             }
             Region::BeforePromptMarker => {
                 self.before_marker
                     .get_or_init(|| match self.marker_index(prompt_marker) {
-                        Some(idx) => self.recent[..idx].join("\n"),
+                        Some(idx) => self.recent()[..idx].join("\n"),
                         None => self.joined().to_string(),
                     })
             }
@@ -288,15 +295,15 @@ impl<'a> Screen<'a> {
             // capture they run against is discarded at the end of the poll.
             Region::AfterMarker(name, limit) => {
                 return std::borrow::Cow::Owned(match markers.get(name) {
-                    Some(marker) => match marker.resolve(&self.recent) {
+                    Some(marker) => match marker.resolve(self.recent()) {
                         Some(idx) => {
-                            let after = &self.recent[idx + 1..];
+                            let after = &self.recent()[idx + 1..];
                             let start = limit.map_or(0, |n| after.len().saturating_sub(n));
                             after[start..].join("\n")
                         }
                         None if marker.absent_is_whole => {
-                            let start = limit.map_or(0, |n| self.recent.len().saturating_sub(n));
-                            self.recent[start..].join("\n")
+                            let start = limit.map_or(0, |n| self.recent().len().saturating_sub(n));
+                            self.recent()[start..].join("\n")
                         }
                         None => String::new(),
                     },
@@ -306,11 +313,11 @@ impl<'a> Screen<'a> {
             Region::AboveMarker(name, n) => {
                 let marker = markers.get(name);
                 return std::borrow::Cow::Owned(
-                    match marker.and_then(|m| m.resolve(&self.recent)) {
-                        Some(idx) => self.recent[idx.saturating_sub(n)..idx].join("\n"),
+                    match marker.and_then(|m| m.resolve(self.recent())) {
+                        Some(idx) => self.recent()[idx.saturating_sub(n)..idx].join("\n"),
                         None => {
                             let window = marker.and_then(|m| m.max_depth).unwrap_or(n);
-                            self.recent[self.recent.len().saturating_sub(window)..].join("\n")
+                            self.recent()[self.recent().len().saturating_sub(window)..].join("\n")
                         }
                     },
                 );
@@ -318,24 +325,34 @@ impl<'a> Screen<'a> {
         })
     }
 
+    /// The last `n` non-empty lines.
+    fn window(&self, n: usize) -> &[&'a str] {
+        &self.non_empty[self.non_empty.len().saturating_sub(n)..]
+    }
+
+    /// The window every line-oriented region reads.
+    fn recent(&self) -> &[&'a str] {
+        self.window(RECENT_LINES)
+    }
+
     /// The last line matching any of the manifest's prompt-marker patterns.
     fn marker_index(&self, prompt_marker: &[regex::Regex]) -> Option<usize> {
-        self.recent
+        self.recent()
             .iter()
             .rposition(|line| prompt_marker.iter().any(|re| re.is_match(line)))
     }
 
     fn joined(&self) -> &str {
-        self.joined.get_or_init(|| self.recent.join("\n"))
+        self.joined.get_or_init(|| self.recent().join("\n"))
     }
 
     fn compute_above_input_box(&self) -> Option<String> {
         let box_top = self
-            .recent
+            .recent()
             .iter()
             .rposition(|l| l.trim_start().starts_with('❯'))
-            .unwrap_or(self.recent.len());
-        self.recent[..box_top]
+            .unwrap_or(self.recent().len());
+        self.recent()[..box_top]
             .iter()
             .rev()
             .find(|l| !line_is_input_box_chrome(l))
@@ -343,19 +360,19 @@ impl<'a> Screen<'a> {
     }
 
     fn compute_prompt_box_body(&self) -> Option<String> {
-        self.recent
+        self.recent()
             .iter()
             .rposition(|l| l.trim_start().starts_with('❯'))
-            .map(|idx| self.recent[idx].to_string())
+            .map(|idx| self.recent()[idx].to_string())
     }
 
     fn compute_after_last_rule(&self) -> String {
         match self
-            .recent
+            .recent()
             .iter()
             .rposition(|l| line_is_horizontal_rule(l.trim()))
         {
-            Some(idx) => self.recent[idx + 1..].join("\n"),
+            Some(idx) => self.recent()[idx + 1..].join("\n"),
             None => self.joined().to_string(),
         }
     }
