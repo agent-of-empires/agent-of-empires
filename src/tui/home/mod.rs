@@ -503,6 +503,25 @@ pub struct HomeView {
     // Performance: background trash prep (stops the sandbox container, so the
     // same ~10s docker stop block as `stop_poller`, plus the worktree move)
     pub(super) trash_poller: crate::tui::trash_poller::TrashPoller,
+    /// Load-time healing (trashed-worktree relocation, worktree paths moved
+    /// outside aoe) kicked once from `HomeView::new` so it never delays the
+    /// first frame; `apply_reconcile_results` reloads when it lands. See #3611.
+    pub(super) reconcile_poller: crate::tui::reconcile_poller::ReconcilePoller,
+    /// When the startup-recovery gate was armed, held until the first reconcile
+    /// sweep lands so auto-recovery runs against repaired paths rather than the
+    /// stale ones the sweep is about to fix. Carries the arming instant, not a
+    /// bare flag, so a sweep that never lands cannot strand recovery for the
+    /// whole boot. See `release_startup_recovery_gate`.
+    pub(super) startup_recovery_gate: Option<std::time::Instant>,
+    /// A landed sweep whose repair has not reached `instances` yet, because
+    /// live-send is holding the reload. Keeps the recovery gate armed until the
+    /// repair is applied. See `apply_reconcile_results`.
+    pub(super) pending_reconcile_reload: bool,
+    /// Earliest retry for a reconcile reload that failed. The tick calls
+    /// `apply_reconcile_results` ~30 times a second, so an unreadable store
+    /// would otherwise spin on storage and flood the log. See
+    /// `RECONCILE_RELOAD_RETRY_INTERVAL`.
+    pub(super) reconcile_reload_retry_at: Option<std::time::Instant>,
 
     // Performance: background restart (the start cascade shells out to docker
     // and runs the before_start host hook, which can block for seconds)

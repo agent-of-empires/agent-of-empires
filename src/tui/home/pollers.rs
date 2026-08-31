@@ -222,6 +222,130 @@ impl HomeView {
         }
     }
 
+    /// How long startup recovery waits for the first reconcile sweep before
+    /// starting without it.
+    ///
+    /// The sweep takes milliseconds on a healthy store, but it writes through
+    /// `Storage::update`, and `acquire_open_storage_flock` retries a contended
+    /// profile lock forever with no timeout. A peer holding that lock would
+    /// otherwise leave the worker neither delivering nor disconnecting, and
+    /// recovery gated behind it for the whole boot. Recovering from a stale
+    /// path is a wasted attempt; not recovering at all is a dead session.
+    /// Gap between retries of a reconcile reload that failed, matching the
+    /// heartbeat reload's own cadence in the same loop.
+    pub(super) const RECONCILE_RELOAD_RETRY_INTERVAL: std::time::Duration =
+        std::time::Duration::from_secs(5);
+
+    pub(super) const STARTUP_RECOVERY_GATE_TIMEOUT: std::time::Duration =
+        std::time::Duration::from_secs(30);
+
+    /// Start startup auto-recovery once the first sweep has landed, or once
+    /// [`Self::STARTUP_RECOVERY_GATE_TIMEOUT`] has elapsed if it never does.
+    /// Idempotent: the gate is cleared as it fires.
+    pub(super) fn release_startup_recovery_gate(&mut self, sweep_landed: bool) {
+        // The gate exists so recovery reads repaired rows, and that holds only
+        // if every repair has already been applied to `instances` when it
+        // opens. The ordering is otherwise invisible from outside the call, so
+        // it is asserted here rather than left to a test to notice.
+        debug_assert!(
+            !self.pending_reconcile_reload,
+            "startup recovery gate released with a repair still unapplied",
+        );
+        let Some(armed_at) = self.startup_recovery_gate else {
+            return;
+        };
+        if !sweep_landed {
+            if armed_at.elapsed() < Self::STARTUP_RECOVERY_GATE_TIMEOUT {
+                return;
+            }
+            tracing::warn!(
+                target: "tui.home",
+                "load-time reconciliation has not landed; starting startup recovery without it",
+            );
+        }
+        self.startup_recovery_gate = None;
+        self.maybe_start_startup_recovery();
+    }
+
+    /// Reload once the background load-time healing sweeps land, so a row the
+    /// worker repointed is shown at its real path. Nothing to merge field by
+    /// field: the sweeps only rewrite durable state, so a storage reload is
+    /// both sufficient and cheaper than mirroring each repair. See #3611.
+    pub fn apply_reconcile_results(&mut self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+
+        // Probe before anything else, the deadline included. A repair sitting
+        // in the channel has to reach `instances` before the gate opens, or
+        // startup recovery clones a `project_path` the sweep has already fixed
+        // on disk and spends that row's one boot-scoped attempt on it, which is
+        // the failure the gate exists to prevent.
+        let mut sweep_landed = self.pending_reconcile_reload;
+        if !sweep_landed {
+            match self.reconcile_poller.try_recv_result() {
+                Ok(result) => {
+                    sweep_landed = true;
+                    self.pending_reconcile_reload = result.changed;
+                }
+                // The worker is gone, so neither a sweep nor a repair is
+                // coming; nothing is left to apply before opening the gate.
+                Err(TryRecvError::Disconnected) => sweep_landed = true,
+                Err(TryRecvError::Empty) => {}
+            }
+        }
+
+        // Only the reload waits on live-send, since it repaints. An unapplied
+        // repair holds the gate shut regardless of the deadline: opening early
+        // is worse than opening late. With nothing to apply the deadline still
+        // runs, so a long paste cannot strand recovery on its own.
+        if self.live_send.is_some() {
+            if !self.pending_reconcile_reload {
+                self.release_startup_recovery_gate(sweep_landed);
+            }
+            return false;
+        }
+
+        let mut reloaded = false;
+        if self.pending_reconcile_reload {
+            // Back off between attempts. This runs once per tick (~30Hz), and
+            // the heartbeat reload beside it retries on a 5s interval, so an
+            // unreadable store would otherwise spin on storage and emit tens of
+            // warn lines a second where every other reload in the loop is
+            // throttled.
+            if self
+                .reconcile_reload_retry_at
+                .is_some_and(|at| std::time::Instant::now() < at)
+            {
+                return false;
+            }
+            match self.reload_storage_only() {
+                Ok(()) => {
+                    self.pending_reconcile_reload = false;
+                    self.reconcile_reload_retry_at = None;
+                    reloaded = true;
+                }
+                Err(error) => {
+                    // The repair stays pending and the gate stays shut, so a
+                    // later tick retries rather than letting recovery run
+                    // against rows the sweep has already superseded on disk.
+                    // The gate deliberately stays shut for the whole boot if
+                    // this never succeeds: recovery reads the same store, so
+                    // opening it would only spend each row's one attempt
+                    // against the same failure.
+                    tracing::warn!(
+                        target: "tui.home",
+                        "reload after load-time reconciliation failed: {error}",
+                    );
+                    self.reconcile_reload_retry_at =
+                        Some(std::time::Instant::now() + Self::RECONCILE_RELOAD_RETRY_INTERVAL);
+                    return false;
+                }
+            }
+        }
+        // Released only now, so recovery reads the repaired rows.
+        self.release_startup_recovery_gate(sweep_landed);
+        reloaded
+    }
+
     /// Apply any pending session ID updates from background pollers.
     /// Returns true if any instance's in-memory `agent_session_id` changed.
     /// Tmux env may also be republished when this returns `false`

@@ -488,11 +488,12 @@ pub struct SpawnRequest {
     /// session. Distinct from [`Self::agent`]: `agent` is what
     /// `pick_agent_for_tool` resolved the tool to for ACP spawning, and can
     /// differ from the tool on an explicit override, a custom agent with no
-    /// configured ACP command (falls back to `"aoe-agent"`), or the
-    /// `switch-agent` path (the tool stays fixed while `agent` becomes the new
-    /// backend). Tool-scoped `host_hooks.before_session` env (`AOE_TOOL`) uses
-    /// this field so it agrees with the terminal view rather than with
-    /// whatever ACP backend happened to serve the request.
+    /// configured ACP command (falls back to the configured
+    /// `acp.default_agent`), or the `switch-agent` path (the tool stays fixed
+    /// while `agent` becomes the new backend). Tool-scoped
+    /// `host_hooks.before_session` env (`AOE_TOOL`) uses this field so it
+    /// agrees with the terminal view rather than with whatever ACP backend
+    /// happened to serve the request.
     pub tool: String,
     pub cwd: PathBuf,
     pub additional_dirs: Vec<PathBuf>,
@@ -3314,6 +3315,29 @@ impl<S: BroadcastSink> Supervisor<S> {
     #[cfg(test)]
     pub(crate) async fn test_insert_worker(&self, session_id: &str) {
         let (client, _tx) = AcpClient::fake_for_test(AcpSessionId(format!("acp-{session_id}")));
+        self.test_install_worker(session_id, client).await;
+    }
+
+    /// Like `test_insert_worker`, but the fake worker's command loop records
+    /// every `ClientCmd` it receives. Lets a test count how many prompts
+    /// actually reached the agent, which is the only place a lost prompt is
+    /// visible: `send_prompt` returns Ok as soon as the command is queued.
+    #[cfg(test)]
+    pub(crate) async fn test_insert_worker_cmd_recording(
+        &self,
+        session_id: &str,
+    ) -> Arc<std::sync::Mutex<Vec<&'static str>>> {
+        let (client, _tx, cmds) =
+            AcpClient::fake_for_test_cmd_recording(AcpSessionId(format!("acp-{session_id}")));
+        self.test_install_worker(session_id, client).await;
+        cmds
+    }
+
+    /// Register `client` as this session's in-memory worker. Shared by the
+    /// `test_insert_worker*` fixtures so they differ only in which fake
+    /// client they build.
+    #[cfg(test)]
+    async fn test_install_worker(&self, session_id: &str, client: AcpClient) {
         self.workers.lock().await.insert(
             session_id.to_string(),
             WorkerHandle {

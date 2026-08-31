@@ -5,12 +5,20 @@ use super::*;
 
 /// Whether this poll can reuse the last verdict instead of capturing the pane.
 ///
-/// Four conditions, and each one has cost a bug:
+/// Five conditions, and each one has cost a bug:
 ///
 /// - tmux has to have given us an activity stamp at all; without one there is
 ///   nothing to compare and every poll captures.
 /// - The pane must have drawn nothing since the last capture. Anything drawn
 ///   could have changed the verdict.
+/// - The last capture must have been taken *after* the second the stamp names.
+///   `#{window_activity}` is an epoch second, and the poll runs twice a second,
+///   so a capture taken inside that second can have read the screen before a
+///   later frame in it: equal stamps then said "unchanged" about a screen that
+///   had changed, and a hookless agent whose last frame shared a second with
+///   its previous one stayed Running for good (#3624). Waiting for a capture
+///   past the second costs one trailing capture and makes the comparison mean
+///   what it claims.
 /// - The session must have no hook file, since a hook write changes the
 ///   verdict without the pane drawing anything.
 /// - No proposal may be waiting on its confirming poll. The pane that produced
@@ -21,10 +29,17 @@ use super::*;
 fn skip_capture(
     activity: Option<i64>,
     last_activity: Option<i64>,
+    last_capture_second: Option<i64>,
     has_hook: bool,
     pending: bool,
 ) -> bool {
-    activity.is_some() && activity == last_activity && !has_hook && !pending
+    let Some(activity) = activity else {
+        return false;
+    };
+    Some(activity) == last_activity
+        && last_capture_second.is_some_and(|taken| taken > activity)
+        && !has_hook
+        && !pending
 }
 
 /// How long a `running` hook write keeps its authority for an agent that is
@@ -319,10 +334,20 @@ impl Instance {
         // three that reach this path (settl, kiro, kimi) render no pane shape
         // worth parsing, so there is nothing to weigh the write against.
         //
+        // Unless the user wrote rules for the tool. Configured
+        // `[[agents.<name>.status_rules]]` outrank a hook file on the manifest
+        // path, and the same precedence has to hold here (#3626); once a tool
+        // has rules they always decide, since `status_rules::detect` answers
+        // Idle rather than `None` when none of them match. Gated on
+        // `has_rules` so the far commoner ruleless session keeps its
+        // capture-free short-circuit.
+        //
         // A `running` write past the freshness bound is not consulted at all.
         // The terminating hook can be lost, and an unbounded write then
         // outranks every later capture for the life of the session; the
         // manifest agents express the same bound as a rule.
+        let hook =
+            hook.filter(|_| !tmux::status_rules::has_rules(&self.source_profile, &pane_tool));
         if let Some(hook) = hook {
             let stale_running = hook.status == Status::Running
                 && hook
@@ -330,7 +355,18 @@ impl Instance {
                     .is_some_and(|age| age >= LEGACY_RUNNING_HOOK_MAX_AGE);
             if !stale_running {
                 self.status = hook.status;
-                self.last_error = None;
+                // An Error keeps its explanation, as the manifest path does.
+                // Clearing it cost the user the reason and disabled the 30s
+                // error re-check throttle, which is keyed on `last_error`
+                // being present (#3626).
+                if hook.status == Status::Error {
+                    if self.last_error.is_none() {
+                        let pane_content = session.capture_pane(20).unwrap_or_default();
+                        self.last_error = Some(summarize_error_from_pane(&pane_content));
+                    }
+                } else {
+                    self.last_error = None;
+                }
                 return;
             }
             tracing::debug!(target: "session.store",
@@ -427,6 +463,7 @@ impl Instance {
         let screen_unchanged = skip_capture(
             activity,
             self.detection_activity,
+            self.detection_captured_at,
             hook.is_some(),
             self.pending_detection.is_some(),
         );
@@ -438,25 +475,28 @@ impl Instance {
             return;
         }
 
+        // Stamped before the capture, never after: a capture that began inside
+        // the activity second may still read the screen before a later frame
+        // in it, and a stamp taken afterwards could claim the second had
+        // passed when the read did not.
+        let captured_at = Utc::now().timestamp();
         let pane_content = session.capture_pane(50).unwrap_or_default();
         let clean = tmux::utils::strip_ansi(&pane_content);
-        // A profile's own `[[agents.<name>.status_rules]]` outrank the
-        // manifest, matching the hookless path they were written for.
-        // `rules_tool` keeps a session's own rules ahead of its `detect_as`
-        // alias, the precedence `detection_tool` declares.
-        let detection = tmux::status_rules::detect(&self.source_profile, rules_tool, &clean)
-            .map(|status| tmux::detect::Detection {
-                status: Some(status),
-                visible: true,
-                rule: "configured_status_rule",
-            })
-            .or_else(|| tmux::detect::detect(agent, &clean, osc_title, hook))
-            .unwrap_or_else(tmux::detect::Detection::idle_by_default);
+        let detection = tmux::detect_with_rules(
+            &self.source_profile,
+            rules_tool,
+            agent,
+            &clean,
+            osc_title,
+            hook,
+        )
+        .unwrap_or_else(tmux::detect::Detection::idle_by_default);
 
         let Some(candidate) = detection.status else {
             // The screen is an agent-owned viewer; the last known status
             // stands rather than being overwritten by what a pager shows.
             self.detection_activity = activity;
+            self.detection_captured_at = Some(captured_at);
             self.detection_rule = Some(detection.rule);
             return;
         };
@@ -487,6 +527,7 @@ impl Instance {
             }
         }
         self.detection_activity = activity;
+        self.detection_captured_at = Some(captured_at);
         self.detection_rule = Some(detection.rule);
         tracing::trace!(target: "session.store",
             "status '{}': manifest rule={} candidate={:?} visible={} -> {:?}",
@@ -547,17 +588,41 @@ mod tests {
         // confirming poll, and the pane then draws nothing. Skipping that
         // confirming poll leaves the hold unresolved forever.
         assert!(
-            !skip_capture(Some(100), Some(100), false, true),
+            !skip_capture(Some(100), Some(100), Some(101), false, true),
             "a pending proposal must be resolved, not skipped past"
         );
-        assert!(skip_capture(Some(100), Some(100), false, false));
+        assert!(skip_capture(Some(100), Some(100), Some(101), false, false));
 
         // A hook write changes the verdict without the pane drawing anything.
-        assert!(!skip_capture(Some(100), Some(100), true, false));
+        assert!(!skip_capture(Some(100), Some(100), Some(101), true, false));
         // Fresh output, or no stamp to compare against at all.
-        assert!(!skip_capture(Some(101), Some(100), false, false));
-        assert!(!skip_capture(None, None, false, false));
-        assert!(!skip_capture(Some(100), None, false, false));
+        assert!(!skip_capture(Some(101), Some(100), Some(102), false, false));
+        assert!(!skip_capture(None, None, Some(101), false, false));
+        assert!(!skip_capture(Some(100), None, Some(101), false, false));
+    }
+
+    #[test]
+    fn skip_capture_waits_for_a_capture_past_the_activity_second() {
+        // #3624: `#{window_activity}` is an epoch second and the poll runs
+        // twice a second, so two frames can share one value. A capture taken
+        // inside the second the stamp names may have read the screen before
+        // the later frame in it, and reusing its verdict left a hookless agent
+        // Running with nothing to ever advance the stamp again.
+        assert!(
+            !skip_capture(Some(100), Some(100), Some(100), false, false),
+            "a capture taken inside the activity second proves nothing about \
+             what was drawn later in it"
+        );
+        assert!(
+            !skip_capture(Some(100), Some(100), Some(99), false, false),
+            "nor does one taken before it"
+        );
+        assert!(
+            skip_capture(Some(100), Some(100), Some(101), false, false),
+            "a capture past the second is the proof the stamp claims to be"
+        );
+        // No capture recorded yet: nothing to date the stamp against.
+        assert!(!skip_capture(Some(100), Some(100), None, false, false));
     }
 
     #[test]
@@ -1250,6 +1315,271 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
             inst.status,
             Status::Waiting,
             "Claude blocked on an approval prompt must reconcile Running -> Waiting (#1913)"
+        );
+    }
+
+    /// Pane metadata for a live agent pane: not dead, running the agent
+    /// itself, so neither the dead-pane branch nor the stale-shell check
+    /// spawns tmux behind the test.
+    fn agent_pane_metadata(command: &str, window_activity: Option<i64>) -> tmux::PaneMetadata {
+        tmux::PaneMetadata {
+            pane_dead: false,
+            pane_current_command: Some(command.to_string()),
+            pane_start_command_is_protected: false,
+            pane_pid: None,
+            pane_title: None,
+            window_activity,
+        }
+    }
+
+    fn write_hook_status(instance_id: &str, status: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let base = crate::hooks::hook_base_path();
+        if !base.exists() {
+            std::fs::create_dir_all(&base).expect("create hook base dir");
+        }
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o700))
+            .expect("set hook base mode 0700");
+        let dir = crate::hooks::hook_status_dir(instance_id).expect("hook dir");
+        std::fs::create_dir_all(&dir).expect("create hook dir");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))
+            .expect("set hook instance mode 0700");
+        std::fs::write(dir.join("status"), status).expect("write status");
+    }
+
+    /// Install `rules` for `agent` under `profile` and return the registry
+    /// guard that restores the profile's prior entries on drop.
+    fn install_status_rules(
+        profile: &str,
+        agent: &str,
+        rules: Vec<crate::session::config::StatusRule>,
+    ) -> crate::tmux::status_rules::ProfileRegistryGuard {
+        let guard = crate::tmux::status_rules::ProfileRegistryGuard::take(profile);
+        let mut config = crate::session::Config::default();
+        config
+            .agents
+            .entry(agent.to_string())
+            .or_default()
+            .status_rules = rules;
+        crate::tmux::status_rules::install_from_config(profile, &config);
+        guard
+    }
+
+    /// #3626: the hookless path's precedence is that a profile's own
+    /// `[[agents.<name>.status_rules]]` decide, and the manifest path applies
+    /// it. The legacy path returned on a fresh hook before rules were ever
+    /// consulted, so a user who wrote rules for settl/kiro/kimi could not
+    /// override what the hook claimed.
+    ///
+    /// Rules that exist always decide, matching, since `status_rules::detect`
+    /// answers `Idle` rather than `None` when none of them match: the capture
+    /// here is empty, so the assertion is that the hook's `running` lost.
+    #[test]
+    #[serial_test::serial]
+    fn configured_rules_outrank_a_fresh_legacy_hook() {
+        const PROFILE: &str = "legacy-hook-rules-precedence-test";
+        let _registry = install_status_rules(
+            PROFILE,
+            "settl",
+            vec![crate::session::config::StatusRule {
+                status: crate::agents::HookStatus::Waiting,
+                contains: Some("approve this?".to_string()),
+                regex: None,
+            }],
+        );
+
+        let mut inst = Instance::new("legacy-rules", "/tmp/legacy-rules");
+        inst.source_profile = PROFILE.to_string();
+        inst.tool = "settl".to_string();
+        inst.status = Status::Idle;
+        assert!(
+            !tmux::detect::has_manifest(&inst.tool),
+            "fixture invariant: settl must still be on the legacy hook path"
+        );
+        write_hook_status(&inst.id, "running");
+
+        let name = tmux::Session::generate_name(&inst.id, &inst.title);
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        guard.force_present(&[name.as_str()]);
+
+        let metadata = agent_pane_metadata("settl", None);
+        inst.update_status_with_metadata_inner(Some(&metadata), None);
+        crate::hooks::cleanup_hook_status_dir(&inst.id);
+
+        assert_eq!(
+            inst.status,
+            Status::Idle,
+            "configured rules must decide over a fresh `running` hook write"
+        );
+    }
+
+    /// #3626: the legacy hook path cleared `last_error` unconditionally, so an
+    /// `error` write landed a row on Error with no explanation to render and
+    /// no `last_error` for the 30s error re-check throttle to key on. The
+    /// manifest path derives one from the pane; this must too, and must not
+    /// overwrite an explanation that is already there.
+    #[test]
+    #[serial_test::serial]
+    fn legacy_error_hook_keeps_an_explanation() {
+        const PROFILE: &str = "legacy-hook-error-explanation-test";
+        // An empty config under a profile of its own: no rules for settl, so
+        // this exercises the hook short-circuit rather than the rules path.
+        let _registry = install_status_rules(PROFILE, "settl", Vec::new());
+
+        let mut inst = Instance::new("legacy-error", "/tmp/legacy-error");
+        inst.source_profile = PROFILE.to_string();
+        inst.tool = "settl".to_string();
+        inst.status = Status::Running;
+        inst.last_error = None;
+        write_hook_status(&inst.id, "error");
+
+        let name = tmux::Session::generate_name(&inst.id, &inst.title);
+        let guard = crate::tmux::SessionCacheGuard::capture();
+        guard.force_present(&[name.as_str()]);
+        let metadata = agent_pane_metadata("settl", None);
+
+        inst.update_status_with_metadata_inner(Some(&metadata), None);
+        assert_eq!(inst.status, Status::Error);
+        assert!(
+            inst.last_error.is_some(),
+            "an Error hook must leave an explanation, which the error re-check \
+             throttle also keys on"
+        );
+
+        // A standing explanation is the better one: it came from whatever
+        // first diagnosed the failure.
+        inst.last_error = Some("agent crashed".to_string());
+        inst.last_error_check = None;
+        inst.update_status_with_metadata_inner(Some(&metadata), None);
+        crate::hooks::cleanup_hook_status_dir(&inst.id);
+
+        assert_eq!(inst.status, Status::Error);
+        assert_eq!(inst.last_error.as_deref(), Some("agent crashed"));
+    }
+
+    /// #3624: `#{window_activity}` is an epoch second and the poller runs
+    /// twice a second, so a turn's last running frame and the idle frame that
+    /// follows it can share one value. Treating equal values as proof that
+    /// nothing was drawn skipped the capture that would have seen the idle
+    /// frame, and since no later output advances the stamp, a hookless
+    /// manifest agent stayed Running for the life of the session.
+    ///
+    /// Two pane updates under one activity value, through the real capture
+    /// path: the second frame has to be observed, and then confirmed by the
+    /// poll after it (nothing matches it, so it is an unwitnessed Idle).
+    #[test]
+    #[serial_test::serial]
+    fn idle_frame_sharing_an_activity_second_is_still_observed() {
+        if !tmux_available() {
+            eprintln!("skipping: tmux not available");
+            return;
+        }
+
+        let mut inst = Instance::new("aoe_test_3624_activity", "/tmp");
+        assert_eq!(inst.tool, "claude");
+
+        // The running frame is Claude's `active_spinner` shape. The idle frame
+        // matches no rule at all, which is the unwitnessed Idle that has to
+        // wait for a confirming poll. Its leading blank lines scroll the
+        // spinner out of reach of the capture, which starts 50 lines above a
+        // 40-row screen, so nothing of the running frame is left to match.
+        let dir = std::env::temp_dir().join(format!("aoe_test_3624_{}", inst.id));
+        std::fs::create_dir_all(&dir).expect("create fixture dir");
+        let running_file = dir.join("running.txt");
+        let idle_file = dir.join("idle.txt");
+        let marker = dir.join("marker");
+        std::fs::write(&running_file, "\u{2736} Working\u{2026} (5s)\n").expect("write running");
+        std::fs::write(&idle_file, format!("{}turn over\n", "\n".repeat(150))).expect("write idle");
+
+        let session_name = tmux::Session::generate_name(&inst.id, &inst.title);
+        let _guard = KillTmuxOnDrop(session_name.clone());
+        let quote =
+            |p: &std::path::Path| format!("'{}'", p.to_string_lossy().replace('\'', r#"'\''"#));
+        // The marker file is the test's clock: the pane holds the running
+        // frame until it appears, then draws the idle frame and stops.
+        let launch = format!(
+            "cat {}; until [ -f {} ]; do sleep 0.05; done; cat {}; sleep 300",
+            quote(&running_file),
+            quote(&marker),
+            quote(&idle_file),
+        );
+        let created = crate::tmux::tmux_command()
+            .args([
+                "new-session",
+                "-d",
+                "-s",
+                &session_name,
+                "-x",
+                "120",
+                "-y",
+                "40",
+                &launch,
+            ])
+            .output()
+            .expect("spawn tmux");
+        assert!(
+            created.status.success(),
+            "tmux new-session failed: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
+
+        let wait_for_pane = |needle: &str| {
+            for _ in 0..100 {
+                let cap = crate::tmux::tmux_command()
+                    .args(["capture-pane", "-p", "-t", &session_name])
+                    .output();
+                if let Ok(out) = cap {
+                    if String::from_utf8_lossy(&out.stdout).contains(needle) {
+                        return true;
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            false
+        };
+        assert!(wait_for_pane("Working"), "running frame never painted");
+
+        let cache = crate::tmux::SessionCacheGuard::capture();
+        cache.force_present(&[session_name.as_str()]);
+
+        let poll = |inst: &mut Instance, activity: Option<i64>| {
+            let metadata = agent_pane_metadata("claude", activity);
+            inst.update_status_with_metadata_inner(Some(&metadata), Some(&session_name));
+        };
+
+        // The activity value both frames share. tmux stamps it in whichever
+        // second the output landed in, which is the second this first capture
+        // is taken in: read it back rather than guessing, so the race is
+        // reproduced whatever the wall clock does mid-test.
+        poll(&mut inst, Some(0));
+        assert_eq!(inst.status, Status::Running, "running frame must be seen");
+        let shared = inst
+            .detection_captured_at
+            .expect("capture stamps its second");
+        inst.detection_activity = Some(shared);
+
+        std::fs::File::create(&marker).expect("touch marker");
+        assert!(wait_for_pane("turn over"), "idle frame never painted");
+
+        poll(&mut inst, Some(shared));
+        assert_eq!(
+            inst.status,
+            Status::Running,
+            "an unwitnessed Idle waits one poll before it publishes"
+        );
+        assert_eq!(
+            inst.pending_detection,
+            Some(Status::Idle),
+            "the final frame must be captured, not skipped as unchanged (#3624)"
+        );
+
+        poll(&mut inst, Some(shared));
+        std::fs::remove_dir_all(&dir).ok();
+
+        assert_eq!(
+            inst.status,
+            Status::Idle,
+            "the confirming poll must publish the idle the final frame showed"
         );
     }
 }

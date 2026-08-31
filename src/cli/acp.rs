@@ -767,8 +767,8 @@ pub(crate) fn command_present(command: &str) -> bool {
     // runtime against the app data dir, so the literal string contains
     // both `${` and `/`. Check the placeholder branch FIRST — otherwise
     // the `/`-branch tries to stat a literal path containing `${...}`
-    // and reports "missing" for every placeholder-based agent
-    // (notably `aoe-agent`, our bundled multi-provider fallback).
+    // and reports "missing" for every placeholder-based agent (notably
+    // `aoe-agent`).
     if command.contains("${") {
         true
     } else if command.contains('/') || command.contains('\\') {

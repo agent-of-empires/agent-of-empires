@@ -35,10 +35,6 @@
 //! is published; the UI renders an amber callout in the transcript so
 //! the user knows prior turns are no longer in the model's context.
 //!
-//! The bundled `aoe-agent` does not yet advertise `load_session`, so
-//! its UI transcript replays from this store on restart but the model
-//! itself starts fresh each spawn (tracked in #1005).
-//!
 //! ## Lifecycle
 //!
 //! Per-session rows are dropped on session delete and on

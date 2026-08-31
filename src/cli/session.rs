@@ -1657,7 +1657,17 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
         (String::new(), "stopped".to_string())
     } else {
         let raw = tmux_session.capture_pane(args.lines)?;
-        let detection_tool =
+        // The poller's two detection identities, resolved the same way: the
+        // manifest follows the `agent_detect_as` alias, while configured rules
+        // stay keyed to the session's own tool.
+        let hook_alias =
+            crate::tmux::status_rules::effective_detect_as(profile, &inst.tool, &inst.detect_as);
+        let manifest_tool: &str = if hook_alias.is_empty() {
+            &inst.tool
+        } else {
+            &hook_alias
+        };
+        let rules_tool =
             crate::tmux::status_rules::detection_tool(profile, &inst.tool, &inst.detect_as);
         let hook = crate::hooks::read_hook_status(&inst.id).map(|status| {
             crate::tmux::detect::HookObservation {
@@ -1668,7 +1678,7 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
         // The same rule table the poller runs, so `aoe session capture`
         // reports what the dashboard would. A short `--lines` still detects
         // against the window the rules expect.
-        let status = if crate::tmux::detect::has_manifest(&detection_tool) {
+        let status = if crate::tmux::detect::has_manifest(manifest_tool) {
             let status_raw;
             let status_content = if args.lines >= 50 {
                 raw.as_str()
@@ -1678,13 +1688,30 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
                     .unwrap_or_else(|_| raw.clone());
                 status_raw.as_str()
             };
-            crate::tmux::detect_via_manifest(&detection_tool, status_content, "", hook)
-        } else if let Some(hook) = hook {
-            hook.status
+            // The pane title is a rule region like any other (Claude ranks it
+            // above every screen shape), so it has to be read here too; the
+            // poller gets it batched with the rest of the pane metadata.
+            let osc_title = crate::tmux::utils::pane_title(tmux_session.name()).unwrap_or_default();
+            crate::tmux::detect_with_rules(
+                profile,
+                &rules_tool,
+                manifest_tool,
+                &crate::tmux::utils::strip_ansi(status_content),
+                &osc_title,
+                hook,
+            )
+            .and_then(|d| d.status)
+            .unwrap_or_default()
         } else {
-            tmux_session
-                .detect_status(profile, &detection_tool)
-                .unwrap_or_default()
+            // Configured rules outrank the hook file here as they do in the
+            // poller; `detect_status` runs them ahead of the built-in detector.
+            let hook = hook.filter(|_| !crate::tmux::status_rules::has_rules(profile, &rules_tool));
+            match hook {
+                Some(hook) => hook.status,
+                None => tmux_session
+                    .detect_status(profile, &rules_tool)
+                    .unwrap_or_default(),
+            }
         };
         let content = if args.strip_ansi {
             crate::tmux::utils::strip_ansi(&raw)

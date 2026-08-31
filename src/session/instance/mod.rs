@@ -485,8 +485,9 @@ pub struct Instance {
     /// session's tool.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_name: Option<String>,
-    /// Optional model id forwarded to aoe-agent (e.g., "claude-opus-4-7",
-    /// "gpt-5", "llama3.3:ollama").
+    /// Optional model id, injected at spawn as `AOE_AGENT_MODEL` (e.g.,
+    /// "claude-opus-4-7", "gpt-5", "llama3.3:ollama"). Only `aoe-agent`
+    /// reads that variable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_model: Option<String>,
     /// Reasoning effort ("thought level") this session was explicitly pinned
@@ -577,6 +578,15 @@ pub struct Instance {
     /// fresh load re-derives it.
     #[serde(skip)]
     pub detection_activity: Option<i64>,
+    /// The wall-clock second in which the last capture was taken, stamped
+    /// before it rather than after. `detection_activity` has one-second
+    /// granularity, so a capture taken inside the second it names can have
+    /// read the screen before a later frame in that same second (#3624): the
+    /// stamp is only proof of "nothing drawn since" once a capture has been
+    /// taken past the end of that second. A clock that never satisfies that
+    /// degrades to capturing every poll, which is the pre-gate behavior.
+    #[serde(skip)]
+    pub detection_captured_at: Option<i64>,
     /// The manifest rule that decided the last detection, for the
     /// status-change log. Names why a session is in the state it is in, which
     /// is what a wrong-state report needs and what a fingerprint of pane
@@ -609,6 +619,13 @@ pub struct Instance {
     /// `uses_pi_session_sidecar`).
     #[serde(skip)]
     pi_extension_launched: bool,
+
+    /// Memo for `declares_agent_config_dir`. Resolving the profile config
+    /// reads several files, and the answer gates the Pi sidecar, which sits on
+    /// the per-refresh path. Runtime only, so an edit to `agent_config_dir`
+    /// lands on the next reload rather than mid-life of a session object.
+    #[serde(skip)]
+    agent_config_dir_declared: std::sync::OnceLock<bool>,
 
     /// Absolute transcript path this Pi pane last published. Pi indexes
     /// sessions by their starting cwd, so this is what resumes a conversation

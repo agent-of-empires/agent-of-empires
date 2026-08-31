@@ -244,6 +244,7 @@ mod tests {
             "custom_agents",
             "agent_detect_as",
             "agent_acp_cmd",
+            "agent_config_dir",
         ] {
             let mut body = json!({"session": {field: {"claude": "x"}, "yolo_mode_default": true}});
             strip_local_only(&mut body);

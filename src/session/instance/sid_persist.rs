@@ -1578,7 +1578,7 @@ mod tests {
                 "a current pane missing its hidden launch snapshot must fail closed"
             );
             assert!(
-                crate::tmux::env::get_hidden_env_uncached(
+                crate::tmux::env::get_hidden_env(
                     tmux.name(),
                     crate::tmux::env::AOE_OMP_CAPTURE_META_KEY,
                 )

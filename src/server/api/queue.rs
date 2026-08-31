@@ -100,6 +100,15 @@ pub async fn queue_enqueue(
         )
             .into_response();
     }
+    // Re-enqueuing an existing id rewrites that row's text and replaces its
+    // buffered blobs, so it is a queue mutation of exactly the kind
+    // `edit_queued_prompt` and `remove_queued_prompt` are serialized against:
+    // landing inside a drain's snapshot-to-send window means the old text goes
+    // to the agent and `retire_drained_rows` then deletes the row and the
+    // freshly buffered bytes (#3621). Claimed here rather than in
+    // `buffer_and_enqueue` because the prompt endpoint's `Queued` disposition
+    // reaches that helper already holding the guard, and it is not reentrant.
+    let _submission = state.session_service.prompt_submission(&id).await;
     // Depth cap. Re-enqueuing an existing id replaces that row rather than
     // adding one, so it must not count against a full queue.
     {
@@ -308,4 +317,58 @@ pub async fn queue_clear(
     }
     state.session_service.clear_queued_prompts(&id).await;
     StatusCode::NO_CONTENT.into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::session::Instance;
+    use std::time::Duration;
+
+    /// #3621: `POST /queue` rewrites an existing row's text and blobs when the
+    /// client re-posts its id, so it must wait for an in-flight delivery the
+    /// same way an edit does. Otherwise the drain sends the pre-rewrite text
+    /// and then retires the row, dropping what the client just posted.
+    #[tokio::test]
+    async fn a_re_enqueue_waits_for_an_in_flight_delivery() {
+        let mut inst = Instance::new("queue-enq", "/tmp/aoe-3621-enqueue");
+        inst.id = "sess-3621-enq".to_string();
+        inst.view = crate::session::View::Structured;
+        inst.status = crate::session::Status::Idle;
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        // Stand in for a drain holding the session across snapshot -> send.
+        let delivering = state.session_service.prompt_submission(&id).await;
+        let enqueue = tokio::spawn({
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            async move {
+                queue_enqueue(
+                    State(state),
+                    Path(id),
+                    Ok(Json(EnqueueRequest {
+                        id: "q1".to_string(),
+                        text: "rewritten".to_string(),
+                        created_at: None,
+                        origin_device: None,
+                        attachments: Vec::new(),
+                    })),
+                )
+                .await
+                .into_response()
+            }
+        });
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !enqueue.is_finished(),
+            "an enqueue must not rewrite a row a delivery has already snapshotted"
+        );
+        drop(delivering);
+        let response = tokio::time::timeout(Duration::from_secs(10), enqueue)
+            .await
+            .expect("the enqueue lands once the delivery releases the session")
+            .expect("enqueue task must not panic");
+        assert_eq!(response.status(), StatusCode::OK);
+    }
 }

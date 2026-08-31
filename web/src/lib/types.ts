@@ -172,8 +172,8 @@ export interface SessionResponse {
   clear_aliases?: string[];
   /** True when this session's agent can run a structured ACP `session/fork`:
    *  it is ACP-capable AND declares a real fork strategy. Resume-only ACP
-   *  agents (e.g. the bundled `aoe-agent`, which advertises `loadSession` but
-   *  not `session/fork`) are ACP-capable yet not forkable. The sidebar gates the
+   *  agents (e.g. `aoe-agent`, which advertises `loadSession` but not
+   *  `session/fork`) are ACP-capable yet not forkable. The sidebar gates the
    *  "Fork" action on this together with `acp_session_id` so a resume-only row
    *  never shows a dead-end fork button. Absent (read as not-forkable) for
    *  terminal sessions and non-forkable agents. */
