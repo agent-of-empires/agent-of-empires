@@ -53,7 +53,8 @@ pub enum DaemonClientError {
     /// Sending the request or reading its response failed.
     #[error("daemon transport error: {0}")]
     Transport(#[source] reqwest::Error),
-    /// The daemon returned a non-successful HTTP status.
+    /// The daemon returned a non-successful HTTP status. Authenticated
+    /// responses omit the body so transformed credentials cannot be reflected.
     #[error("daemon returned HTTP {status}: {body}")]
     Status {
         status: StatusCode,
@@ -66,6 +67,9 @@ pub enum DaemonClientError {
     /// A successful response did not match the shared wire contract.
     #[error("failed to decode daemon response: {0}")]
     Decode(#[source] serde_json::Error),
+    /// An authenticated daemon response did not match the wire contract.
+    #[error("failed to decode authenticated daemon response")]
+    AuthenticatedDecode,
 }
 
 impl DaemonClient {
@@ -118,7 +122,13 @@ impl DaemonClient {
         }
 
         let body = read_bounded_body(&mut response, MAX_SUCCESS_BODY_BYTES).await?;
-        serde_json::from_slice(&body).map_err(DaemonClientError::Decode)
+        serde_json::from_slice(&body).map_err(|error| {
+            if self.authorization.is_some() {
+                DaemonClientError::AuthenticatedDecode
+            } else {
+                DaemonClientError::Decode(error)
+            }
+        })
     }
 
     async fn read_error_body(
@@ -146,24 +156,10 @@ impl DaemonClient {
             truncate_utf8(&mut body, MAX_ERROR_BODY_BYTES);
             truncated = true;
         }
-        if let Some(token) = self.bearer_token() {
-            body = body.replace(token, "<redacted>");
-            if truncated {
-                redact_truncated_token(&mut body, token);
-            }
-        }
-        if body.len() > MAX_ERROR_BODY_BYTES {
-            truncate_utf8(&mut body, MAX_ERROR_BODY_BYTES);
+        if self.authorization.is_some() {
+            body.clear();
         }
         Ok((body, truncated))
-    }
-
-    fn bearer_token(&self) -> Option<&str> {
-        self.authorization
-            .as_ref()?
-            .to_str()
-            .ok()?
-            .strip_prefix("Bearer ")
     }
 }
 
@@ -256,15 +252,4 @@ fn truncate_utf8(value: &mut String, max_bytes: usize) {
         boundary -= 1;
     }
     value.truncate(boundary);
-}
-
-fn redact_truncated_token(body: &mut String, token: &str) {
-    let max_prefix = body.len().min(token.len());
-    if let Some(prefix_len) = (1..=max_prefix)
-        .rev()
-        .find(|prefix_len| body.ends_with(&token[..*prefix_len]))
-    {
-        body.truncate(body.len() - prefix_len);
-        body.push_str("<redacted>");
-    }
 }
