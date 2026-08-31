@@ -1,12 +1,12 @@
 //! Session CRUD, ensure-* lifecycle endpoints, and per-file diff handlers.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use axum::{
     extract::{Path, State},
-    http::StatusCode,
-    response::IntoResponse,
+    http::{header::VARY, HeaderMap, HeaderValue, StatusCode},
+    response::{IntoResponse, Response},
     Json,
 };
 use serde::{Deserialize, Serialize};
@@ -15,7 +15,7 @@ use crate::git::error::GitError;
 use crate::session::config::SessionConfig;
 use crate::session::{
     duplicate_session_error, is_duplicate_session, EnsureReadyError, EnsureReadyOutcome, Instance,
-    LifecycleOperation, Status, Storage,
+    LifecycleOperation, Status, Storage, TerminalContextResume,
 };
 
 use super::validate_display_label;
@@ -569,6 +569,65 @@ fn truncate_title(s: &str, max: usize) -> String {
     out
 }
 
+const CLIENT_CAPABILITIES_HEADER: &str = "x-aoe-client-capabilities";
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextResumeUnavailableReason {
+    AgentUnsupported,
+    SandboxUnsupported,
+    ForcedFresh,
+    InvalidTarget,
+    ForkPending,
+    PreviousFailure,
+    NoTarget,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ContextResumeIndeterminateReason {
+    RuntimeCheckRequired,
+    AgentHandshakeRequired,
+}
+
+/// Whether the daemon can preserve agent context during a future authorized
+/// lifecycle transition. This is not current start eligibility.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum ContextResumeAvailability {
+    Available,
+    Indeterminate {
+        reason: ContextResumeIndeterminateReason,
+    },
+    Unavailable {
+        reason: ContextResumeUnavailableReason,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachTransport {
+    AcpWebsocketV1,
+    TerminalWebsocketV1,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttachUnavailableReason {
+    ClientMissingTransport,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "state", rename_all = "snake_case")]
+pub enum AttachAvailability {
+    Available { transport: AttachTransport },
+    Unavailable { reason: AttachUnavailableReason },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionInteraction {
+    pub context_resume: ContextResumeAvailability,
+    pub attach: AttachAvailability,
+}
 // Envelope for `GET /api/sessions`. Wraps the sessions list with the
 // user's persisted workspace ordering so the client can render the
 // sidebar in the requested order on the first paint, with no extra
@@ -578,6 +637,7 @@ fn truncate_title(s: &str, max: usize) -> String {
 pub struct SessionsEnvelope {
     pub sessions: Vec<SessionResponse>,
     pub workspace_ordering: Vec<String>,
+    pub session_interactions: BTreeMap<String, SessionInteraction>,
 }
 
 /// Process-wide built-in ACP registry, built once. Used to compute
@@ -654,7 +714,6 @@ pub async fn get_recent_projects() -> Json<RecentProjectsResponse> {
         .collect();
     Json(RecentProjectsResponse { projects })
 }
-
 /// Query params for `GET /api/sessions`. `state` shares its vocabulary with
 /// the CLI's `aoe list --state` via [`crate::session::SessionScope`] so a
 /// future third caller cannot drift.
@@ -663,10 +722,155 @@ pub struct ListSessionsQuery {
     pub state: Option<crate::session::SessionScope>,
 }
 
+const MAX_CLIENT_CAPABILITIES_BYTES: usize = 1024;
+const MAX_CLIENT_CAPABILITIES: usize = 32;
+const MAX_CLIENT_CAPABILITY_BYTES: usize = 64;
+
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+struct RequestedClientCapabilities {
+    acp_websocket_v1: bool,
+    terminal_websocket_v1: bool,
+}
+
+fn parse_client_capabilities(
+    headers: &HeaderMap,
+) -> Result<RequestedClientCapabilities, &'static str> {
+    let mut parsed = RequestedClientCapabilities::default();
+    let mut bytes = 0;
+    let mut count = 0;
+    for value in headers.get_all(CLIENT_CAPABILITIES_HEADER) {
+        let value = value
+            .to_str()
+            .map_err(|_| "invalid x-aoe-client-capabilities header")?;
+        bytes += value.len();
+        if bytes > MAX_CLIENT_CAPABILITIES_BYTES || value.is_empty() {
+            return Err("invalid x-aoe-client-capabilities header");
+        }
+        for token in value.split(',') {
+            count += 1;
+            if count > MAX_CLIENT_CAPABILITIES
+                || token.is_empty()
+                || token.len() > MAX_CLIENT_CAPABILITY_BYTES
+                || !token.bytes().all(|byte| {
+                    byte.is_ascii_alphanumeric()
+                        || matches!(
+                            byte,
+                            b'!' | b'#'
+                                | b'$'
+                                | b'%'
+                                | b'&'
+                                | b'*'
+                                | b'+'
+                                | b'-'
+                                | b'.'
+                                | b'^'
+                                | b'_'
+                                | b'|'
+                                | b'~'
+                        )
+                        || byte == 39
+                        || byte == 96
+                })
+            {
+                return Err("invalid x-aoe-client-capabilities header");
+            }
+            match token {
+                "acp_ws_v1" => parsed.acp_websocket_v1 = true,
+                "terminal_ws_v1" => parsed.terminal_websocket_v1 = true,
+                _ => {}
+            }
+        }
+    }
+    Ok(parsed)
+}
+
+fn context_resume_for(inst: &Instance) -> ContextResumeAvailability {
+    if inst.is_structured() {
+        return if inst.fork_pending.is_some() {
+            ContextResumeAvailability::Unavailable {
+                reason: ContextResumeUnavailableReason::ForkPending,
+            }
+        } else if inst.acp_session_id.is_some() {
+            ContextResumeAvailability::Indeterminate {
+                reason: ContextResumeIndeterminateReason::AgentHandshakeRequired,
+            }
+        } else {
+            ContextResumeAvailability::Unavailable {
+                reason: ContextResumeUnavailableReason::NoTarget,
+            }
+        };
+    }
+
+    match inst.terminal_context_resume() {
+        TerminalContextResume::Available => ContextResumeAvailability::Available,
+        TerminalContextResume::RuntimeCheckRequired => ContextResumeAvailability::Indeterminate {
+            reason: ContextResumeIndeterminateReason::RuntimeCheckRequired,
+        },
+        TerminalContextResume::AgentUnsupported => ContextResumeAvailability::Unavailable {
+            reason: ContextResumeUnavailableReason::AgentUnsupported,
+        },
+        TerminalContextResume::SandboxUnsupported => ContextResumeAvailability::Unavailable {
+            reason: ContextResumeUnavailableReason::SandboxUnsupported,
+        },
+        TerminalContextResume::ForcedFresh => ContextResumeAvailability::Unavailable {
+            reason: ContextResumeUnavailableReason::ForcedFresh,
+        },
+        TerminalContextResume::InvalidTarget => ContextResumeAvailability::Unavailable {
+            reason: ContextResumeUnavailableReason::InvalidTarget,
+        },
+        TerminalContextResume::ForkPending => ContextResumeAvailability::Unavailable {
+            reason: ContextResumeUnavailableReason::ForkPending,
+        },
+        TerminalContextResume::PreviousFailure => ContextResumeAvailability::Unavailable {
+            reason: ContextResumeUnavailableReason::PreviousFailure,
+        },
+    }
+}
+
+fn interaction_for(
+    inst: &Instance,
+    capabilities: RequestedClientCapabilities,
+) -> SessionInteraction {
+    let attach = match inst.view {
+        crate::session::View::Structured if capabilities.acp_websocket_v1 => {
+            AttachAvailability::Available {
+                transport: AttachTransport::AcpWebsocketV1,
+            }
+        }
+        crate::session::View::Terminal if capabilities.terminal_websocket_v1 => {
+            AttachAvailability::Available {
+                transport: AttachTransport::TerminalWebsocketV1,
+            }
+        }
+        _ => AttachAvailability::Unavailable {
+            reason: AttachUnavailableReason::ClientMissingTransport,
+        },
+    };
+    SessionInteraction {
+        context_resume: context_resume_for(inst),
+        attach,
+    }
+}
+
+fn with_client_capabilities_vary(mut response: Response) -> Response {
+    response
+        .headers_mut()
+        .insert(VARY, HeaderValue::from_static(CLIENT_CAPABILITIES_HEADER));
+    response
+}
 pub async fn list_sessions(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     axum::extract::Query(query): axum::extract::Query<ListSessionsQuery>,
-) -> Json<SessionsEnvelope> {
+) -> Response {
+    let capabilities = match parse_client_capabilities(&headers) {
+        Ok(capabilities) => capabilities,
+        Err(message) => {
+            return with_client_capabilities_vary(
+                (StatusCode::BAD_REQUEST, message).into_response(),
+            );
+        }
+    };
     let instances = state.instances.read().await;
     let claude_fullscreen = crate::claude_settings::read_tui_fullscreen();
     // Snapshot the supervisor's worker lifecycle map once per request
@@ -685,6 +889,10 @@ pub async fn list_sessions(
         // structured-target gate. See #7.
         .filter(|inst| !state.cityhall_mode || inst.is_structured())
         .filter(|inst| crate::session::SessionScope::matches(query.state, inst))
+        .collect();
+    let session_interactions: BTreeMap<String, SessionInteraction> = scoped_instances
+        .iter()
+        .map(|inst| (inst.id.clone(), interaction_for(inst, capabilities)))
         .collect();
     let mut sessions: Vec<SessionResponse> = scoped_instances
         .iter()
@@ -924,10 +1132,14 @@ pub async fn list_sessions(
             Vec::new()
         });
 
-    Json(SessionsEnvelope {
-        sessions,
-        workspace_ordering,
-    })
+    with_client_capabilities_vary(
+        Json(SessionsEnvelope {
+            sessions,
+            workspace_ordering,
+            session_interactions,
+        })
+        .into_response(),
+    )
 }
 
 // Workspace id derivation. Mirrors the client logic in `useWorkspaces.ts`:
@@ -7785,6 +7997,128 @@ pub async fn serve_session_artifact(Path((id, path)): Path<(String, String)>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn capability_headers(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            CLIENT_CAPABILITIES_HEADER,
+            HeaderValue::from_str(value).unwrap(),
+        );
+        headers
+    }
+    #[derive(Deserialize)]
+    struct DecodedSessionsEnvelope {
+        sessions: Vec<DecodedSession>,
+    }
+
+    #[derive(Deserialize)]
+    struct DecodedSession {
+        id: String,
+    }
+    async fn decode_sessions_response(response: Response) -> DecodedSessionsEnvelope {
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[test]
+    fn client_capabilities_are_bounded_and_request_scoped() {
+        let parsed =
+            parse_client_capabilities(&capability_headers("acp_ws_v1,unknown_v2,terminal_ws_v1"))
+                .unwrap();
+        assert_eq!(
+            parsed,
+            RequestedClientCapabilities {
+                acp_websocket_v1: true,
+                terminal_websocket_v1: true,
+            }
+        );
+
+        for invalid in ["", ",acp_ws_v1", "acp_ws_v1,", "contains space"] {
+            assert!(parse_client_capabilities(&capability_headers(invalid)).is_err());
+        }
+        assert!(parse_client_capabilities(&capability_headers(&"x".repeat(65))).is_err());
+        assert!(parse_client_capabilities(&capability_headers(&vec!["x"; 33].join(","))).is_err());
+
+        let response = with_client_capabilities_vary(StatusCode::OK.into_response());
+        assert_eq!(
+            response
+                .headers()
+                .get(VARY)
+                .and_then(|value| value.to_str().ok()),
+            Some(CLIENT_CAPABILITIES_HEADER)
+        );
+    }
+
+    #[test]
+    fn interaction_projection_separates_context_resume_from_attach() {
+        let mut structured = Instance::new("structured", "/tmp/structured");
+        structured.view = crate::session::View::Structured;
+        let no_transport = interaction_for(&structured, RequestedClientCapabilities::default());
+        assert_eq!(
+            no_transport.context_resume,
+            ContextResumeAvailability::Unavailable {
+                reason: ContextResumeUnavailableReason::NoTarget,
+            }
+        );
+        assert_eq!(
+            no_transport.attach,
+            AttachAvailability::Unavailable {
+                reason: AttachUnavailableReason::ClientMissingTransport,
+            }
+        );
+
+        structured.acp_session_id = Some("opaque-server-target".to_string());
+        let acp = interaction_for(
+            &structured,
+            RequestedClientCapabilities {
+                acp_websocket_v1: true,
+                terminal_websocket_v1: false,
+            },
+        );
+        assert_eq!(
+            acp.context_resume,
+            ContextResumeAvailability::Indeterminate {
+                reason: ContextResumeIndeterminateReason::AgentHandshakeRequired,
+            }
+        );
+        assert_eq!(
+            acp.attach,
+            AttachAvailability::Available {
+                transport: AttachTransport::AcpWebsocketV1,
+            }
+        );
+
+        structured.fork_pending = Some("opaque-parent".to_string());
+        assert_eq!(
+            context_resume_for(&structured),
+            ContextResumeAvailability::Unavailable {
+                reason: ContextResumeUnavailableReason::ForkPending,
+            }
+        );
+
+        let mut terminal = Instance::new("terminal", "/tmp/terminal");
+        terminal.tool = "claude".to_string();
+        let projected = interaction_for(
+            &terminal,
+            RequestedClientCapabilities {
+                acp_websocket_v1: false,
+                terminal_websocket_v1: true,
+            },
+        );
+        assert_eq!(
+            projected.context_resume,
+            ContextResumeAvailability::Indeterminate {
+                reason: ContextResumeIndeterminateReason::RuntimeCheckRequired,
+            }
+        );
+        assert_eq!(
+            projected.attach,
+            AttachAvailability::Available {
+                transport: AttachTransport::TerminalWebsocketV1,
+            }
+        );
+    }
 
     /// `remove_instance` is the only way a row leaves `state.instances` on the
     /// delete path, so the epoch bump has to be tied to an actual removal
@@ -8433,6 +8767,7 @@ mod tests {
         LIST_SESSIONS_RESOLVER_MISSES.store(0, Ordering::Relaxed);
         let _envelope = list_sessions(
             axum::extract::State(state.clone()),
+            HeaderMap::new(),
             axum::extract::Query(ListSessionsQuery { state: None }),
         )
         .await;
@@ -8463,13 +8798,17 @@ mod tests {
             archived.clone(),
         ]);
 
-        let ids = |envelope: &SessionsEnvelope| -> Vec<String> {
+        let ids = |envelope: &DecodedSessionsEnvelope| -> Vec<String> {
             envelope.sessions.iter().map(|s| s.id.clone()).collect()
         };
 
-        let all = list_sessions(
-            axum::extract::State(state.clone()),
-            axum::extract::Query(ListSessionsQuery { state: None }),
+        let all = decode_sessions_response(
+            list_sessions(
+                axum::extract::State(state.clone()),
+                HeaderMap::new(),
+                axum::extract::Query(ListSessionsQuery { state: None }),
+            )
+            .await,
         )
         .await;
         assert_eq!(
@@ -8478,29 +8817,41 @@ mod tests {
             "no param stays unfiltered (back-compat)"
         );
 
-        let live_only = list_sessions(
-            axum::extract::State(state.clone()),
-            axum::extract::Query(ListSessionsQuery {
-                state: Some(crate::session::SessionScope::Live),
-            }),
+        let live_only = decode_sessions_response(
+            list_sessions(
+                axum::extract::State(state.clone()),
+                HeaderMap::new(),
+                axum::extract::Query(ListSessionsQuery {
+                    state: Some(crate::session::SessionScope::Live),
+                }),
+            )
+            .await,
         )
         .await;
         assert_eq!(ids(&live_only), vec!["scope-live".to_string()]);
 
-        let trashed_only = list_sessions(
-            axum::extract::State(state.clone()),
-            axum::extract::Query(ListSessionsQuery {
-                state: Some(crate::session::SessionScope::Trashed),
-            }),
+        let trashed_only = decode_sessions_response(
+            list_sessions(
+                axum::extract::State(state.clone()),
+                HeaderMap::new(),
+                axum::extract::Query(ListSessionsQuery {
+                    state: Some(crate::session::SessionScope::Trashed),
+                }),
+            )
+            .await,
         )
         .await;
         assert_eq!(ids(&trashed_only), vec!["scope-trashed".to_string()]);
 
-        let explicit_all = list_sessions(
-            axum::extract::State(state),
-            axum::extract::Query(ListSessionsQuery {
-                state: Some(crate::session::SessionScope::All),
-            }),
+        let explicit_all = decode_sessions_response(
+            list_sessions(
+                axum::extract::State(state),
+                HeaderMap::new(),
+                axum::extract::Query(ListSessionsQuery {
+                    state: Some(crate::session::SessionScope::All),
+                }),
+            )
+            .await,
         )
         .await;
         assert_eq!(ids(&explicit_all).len(), 3);

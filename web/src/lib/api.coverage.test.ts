@@ -107,12 +107,43 @@ function bodyOf(init: RequestInit | undefined): unknown {
 // Sessions
 
 describe("fetchSessions", () => {
-  it("GETs /api/sessions and returns the envelope", async () => {
-    const env = { sessions: [{ id: "s1" }], workspace_ordering: ["s1"] };
+  const available = {
+    context_resume: { state: "available" },
+    attach: { state: "available", transport: "acp_websocket_v1" },
+  };
+
+  it("negotiates transports and returns a validated envelope", async () => {
+    const env = {
+      sessions: [{ id: "s1" }],
+      workspace_ordering: ["s1"],
+      session_interactions: { s1: available, extra: available },
+    };
     fetchSpy.mockResolvedValueOnce(jsonResponse(env));
-    const result = await fetchSessions();
-    expect(result).toEqual(env);
-    expect(lastCall()[0]).toBe("/api/sessions");
+    expect(await fetchSessions()).toEqual(env);
+    const [url, init] = lastCall();
+    expect(url).toBe("/api/sessions");
+    expect(init?.headers).toEqual({ "X-Aoe-Client-Capabilities": "acp_ws_v1,terminal_ws_v1" });
+  });
+
+  it.each([
+    { sessions: [{ id: "s1" }], workspace_ordering: [], session_interactions: {} },
+    {
+      sessions: [{ id: "s1" }],
+      workspace_ordering: [],
+      session_interactions: {
+        s1: { context_resume: { state: "unavailable", reason: "new_reason" }, attach: available.attach },
+      },
+    },
+    {
+      sessions: [{ id: "s1" }],
+      workspace_ordering: [],
+      session_interactions: {
+        s1: { context_resume: available.context_resume, attach: { state: "available", transport: "new_ws" } },
+      },
+    },
+  ])("rejects malformed interaction contracts", async (body) => {
+    fetchSpy.mockResolvedValueOnce(jsonResponse(body));
+    expect(await fetchSessions()).toBeNull();
   });
 
   it("returns null on non-2xx", async () => {

@@ -6,6 +6,7 @@
 //! `Authorization: Bearer <token>` on every request, never as a
 //! query string, so it doesn't leak via logs or `ps`.
 
+use std::collections::BTreeMap;
 use std::time::Duration;
 
 use percent_encoding::{utf8_percent_encode, AsciiSet, CONTROLS};
@@ -46,6 +47,27 @@ const PATH_SEGMENT: &AsciiSet = &CONTROLS
 #[derive(serde::Deserialize)]
 struct SessionsEnvelope<T> {
     sessions: Vec<T>,
+}
+#[derive(serde::Deserialize)]
+struct SessionsContextEnvelope<T, I> {
+    sessions: Vec<T>,
+    session_interactions: BTreeMap<String, I>,
+}
+
+/// Transport features this HTTP client can consume for a sessions request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClientCapability {
+    AcpWebsocketV1,
+    TerminalWebsocketV1,
+}
+
+impl ClientCapability {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::AcpWebsocketV1 => "acp_ws_v1",
+            Self::TerminalWebsocketV1 => "terminal_ws_v1",
+        }
+    }
 }
 
 /// One active plugin command as the daemon reports it (`GET
@@ -586,6 +608,30 @@ impl HttpClient {
         let res = self.auth(self.http.get(&url)).send().await?;
         let res = check_status(res, "<sessions>").await?;
         Ok(res.json::<SessionsEnvelope<T>>().await?.sessions)
+    }
+    /// `GET /api/sessions` with request-scoped client transport negotiation.
+    pub async fn list_sessions_with_interactions<T, I>(
+        &self,
+        capabilities: &[ClientCapability],
+    ) -> Result<(Vec<T>, BTreeMap<String, I>), HttpError>
+    where
+        T: serde::de::DeserializeOwned,
+        I: serde::de::DeserializeOwned,
+    {
+        let url = format!("{}/api/sessions", self.endpoint.base_url);
+        let mut request = self.http.get(&url);
+        if !capabilities.is_empty() {
+            let value = capabilities
+                .iter()
+                .map(|capability| capability.as_str())
+                .collect::<Vec<_>>()
+                .join(",");
+            request = request.header("X-Aoe-Client-Capabilities", value);
+        }
+        let res = self.auth(request).send().await?;
+        let res = check_status(res, "<sessions>").await?;
+        let envelope = res.json::<SessionsContextEnvelope<T, I>>().await?;
+        Ok((envelope.sessions, envelope.session_interactions))
     }
 
     /// Session title, resolved ACP agent, and path roots used by the native
