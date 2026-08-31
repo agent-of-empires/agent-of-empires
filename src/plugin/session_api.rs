@@ -557,6 +557,13 @@ async fn sessions_turn_send(
 
     let result = async {
         deps.policy.admit_turn(&plugin_id)?;
+        // Same per-session submission authority the HTTP surfaces and the
+        // queue drain take, so a plugin turn cannot land between the drain's
+        // idle check and its send (#3621).
+        let _submission = deps
+            .session_service
+            .prompt_submission(&req.session_id)
+            .await;
         deps.session_service
             .send_turn(
                 &SessionCaller::Plugin {

@@ -3342,6 +3342,29 @@ impl<S: BroadcastSink> Supervisor<S> {
         );
     }
 
+    /// Like `test_insert_worker`, but the fake worker's command loop records
+    /// every `ClientCmd` it receives. Lets a test count how many prompts
+    /// actually reached the agent, which is the only place a lost prompt is
+    /// visible: `send_prompt` returns Ok as soon as the command is queued.
+    #[cfg(test)]
+    pub(crate) async fn test_insert_worker_cmd_recording(
+        &self,
+        session_id: &str,
+    ) -> Arc<std::sync::Mutex<Vec<&'static str>>> {
+        let (client, _tx, cmds) =
+            AcpClient::fake_for_test_cmd_recording(AcpSessionId(format!("acp-{session_id}")));
+        self.workers.lock().await.insert(
+            session_id.to_string(),
+            WorkerHandle {
+                client: Arc::new(client),
+                drain_task: tokio::spawn(async {}),
+                restart_history: vec![],
+                kind: WorkerKind::Stdio,
+            },
+        );
+        cmds
+    }
+
     /// Drop a fake in-memory worker inserted by `test_insert_worker`, freeing
     /// the capacity slot for the next reconciler tick.
     #[cfg(test)]
