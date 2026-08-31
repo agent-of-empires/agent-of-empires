@@ -1631,6 +1631,16 @@ impl VtChannel {
         self.clear_drift();
     }
 
+    /// Rebuild the grid from a fresh `capture-pane` at its current size, the
+    /// seed `acquire` starts from, so a grid that has stably diverged from
+    /// tmux cannot stand indefinitely.
+    pub(crate) fn resync_from_pane(&self) {
+        self.reseed(
+            self.cols.load(Ordering::Relaxed),
+            self.rows.load(Ordering::Relaxed),
+        );
+    }
+
     /// Serialise up to `max_lines` of (scrollback + screen) to per-row ANSI,
     /// plus the authoritative cursor (with `history_size` set to the full
     /// scrollback depth). `max_lines` mirrors the capture path's window: both

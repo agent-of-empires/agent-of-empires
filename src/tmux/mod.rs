@@ -247,6 +247,7 @@ pub struct PaneMetadata {
     pub pane_dead: bool,
     pub pane_current_command: Option<String>,
     pub pane_start_command_is_protected: bool,
+    pub pane_pid: Option<u32>,
 }
 
 static SESSION_CACHE: RwLock<SessionCache> = RwLock::new(SessionCache {
@@ -913,7 +914,7 @@ pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
             "list-panes",
             "-a",
             "-F",
-            "#{session_name}|#{pane_index}|#{pane_dead}|#{pane_current_command}|#{pane_start_command}",
+            "#{session_name}|#{pane_index}|#{pane_dead}|#{pane_current_command}|#{pane_start_command}|#{pane_pid}",
         ])
         .output();
 
@@ -1020,7 +1021,7 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
             Some(pane_index),
             Some(pane_dead),
             Some(pane_current_command),
-            Some(pane_start_command),
+            Some(rest),
         ) = (
             parts.next(),
             parts.next(),
@@ -1030,6 +1031,12 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
         )
         else {
             continue;
+        };
+        // The start command may itself contain the separator, so the pid is
+        // split off the tail rather than the command off the head.
+        let (pane_start_command, pane_pid) = match rest.rsplit_once(FIELD_SEP) {
+            Some((command, pid)) => (command, pid.trim().parse().ok()),
+            None => (rest, None),
         };
         if !session_name.starts_with(SESSION_PREFIX) {
             continue;
@@ -1050,6 +1057,7 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
             session_name.to_string(),
             PaneMetadata {
                 pane_dead: pane_dead == "1",
+                pane_pid,
                 pane_current_command: if pane_current_command.is_empty() {
                     None
                 } else {
@@ -1820,6 +1828,7 @@ mod tests {
                             pane_dead: false,
                             pane_current_command: None,
                             pane_start_command_is_protected: false,
+                            pane_pid: None,
                         },
                     )
                 })
@@ -1887,6 +1896,7 @@ mod tests {
             pane_dead: dead,
             pane_current_command: None,
             pane_start_command_is_protected: false,
+            pane_pid: None,
         }
     }
 
@@ -2080,13 +2090,14 @@ mod tests {
 
     #[test]
     fn test_parse_pane_metadata_basic() {
-        let output = format!("{P}my_proj_abc12345|0|0|claude|claude\n");
+        let output = format!("{P}my_proj_abc12345|0|0|claude|claude|4242\n");
         let map = parse_pane_metadata(&output);
         assert_eq!(map.len(), 1);
         let meta = map.get(&format!("{P}my_proj_abc12345")).unwrap();
         assert!(!meta.pane_dead);
         assert_eq!(meta.pane_current_command.as_deref(), Some("claude"));
         assert!(!meta.pane_start_command_is_protected);
+        assert_eq!(meta.pane_pid, Some(4242));
     }
 
     #[test]

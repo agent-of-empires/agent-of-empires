@@ -717,6 +717,12 @@ const LIVE_CAPTURE_INTERVAL_IDLE_MS: u64 = 250;
 /// one cheap failed attempt per interval rather than one per 25ms tick.
 const VT_REARM_INTERVAL: std::time::Duration = std::time::Duration::from_secs(3);
 
+/// How long the VT grid stands as the sole source of truth before the worker
+/// re-seeds it from `capture-pane`. Bounds a grid that has stably diverged
+/// from tmux (a dropped byte, a reflow the stream did not carry) at one fork
+/// per interval, off the render thread.
+const VT_RESYNC_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Cloneable handle that nudges a [`LiveCaptureWorker`] out of its
 /// inter-capture wait. Handed to [`LiveSendWorker`] so a dispatched
 /// keystroke batch triggers an immediate capture of the typed echo rather
@@ -1061,6 +1067,8 @@ impl LiveCaptureWorker {
             #[cfg(unix)]
             let mut last_vt_arm: Option<std::time::Instant> = None;
             #[cfg(unix)]
+            let mut last_vt_resync: Option<std::time::Instant> = None;
+            #[cfg(unix)]
             let mut last_osc52_arm: Option<std::time::Instant> = None;
             // Panes in the target window, refreshed on the lazy
             // `PANE_COUNT_PROBE_MS` cadence. The seed only covers the window
@@ -1111,6 +1119,7 @@ impl LiveCaptureWorker {
                     {
                         vt_source = None;
                         last_vt_arm = None;
+                        last_vt_resync = None;
                         osc52_source = None;
                         osc52_seen = 0;
                         last_osc52_arm = None;
@@ -1223,6 +1232,7 @@ impl LiveCaptureWorker {
                             // the remainder of a poll interval.
                             if let Some(v) = vt_source.as_ref() {
                                 v.set_change_wakeup(nudge_thread.clone());
+                                last_vt_resync = last_vt_arm;
                             }
                         }
                         // A channel whose forwarder has disconnected stops
@@ -1236,6 +1246,11 @@ impl LiveCaptureWorker {
                         }
                         match vt_source.as_ref() {
                             Some(v) => {
+                                if last_vt_resync.is_none_or(|t| t.elapsed() >= VT_RESYNC_INTERVAL)
+                                {
+                                    last_vt_resync = Some(std::time::Instant::now());
+                                    v.resync_from_pane();
+                                }
                                 clipboard_now = v.take_clipboard();
                                 if composite {
                                     capture_composited_over_grid(

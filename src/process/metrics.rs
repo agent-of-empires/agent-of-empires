@@ -108,7 +108,23 @@ impl MetricsSampler {
         });
 
         let processes = process_snapshot();
-        let agents = aggregate_agents(instances, &processes, elapsed, &self.last_process_cpu);
+        // One `list-panes -a` for every pane root, instead of one
+        // `display-message` per session.
+        let pane_pids: HashMap<String, u32> = crate::tmux::batch_pane_metadata()
+            .map(|panes| {
+                panes
+                    .into_iter()
+                    .filter_map(|(name, meta)| Some((name, meta.pane_pid?)))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let agents = aggregate_agents(
+            instances,
+            &processes,
+            &pane_pids,
+            elapsed,
+            &self.last_process_cpu,
+        );
         let counts = AgentCounts {
             agents: agents.len(),
             procs: agents.iter().filter_map(|a| a.procs).sum(),
@@ -205,6 +221,7 @@ fn host_figures(
 fn aggregate_agents(
     instances: &[Instance],
     processes: &[ProcessRecord],
+    pane_pids: &HashMap<String, u32>,
     elapsed: Option<f64>,
     previous: &HashMap<(u32, u64), f64>,
 ) -> Vec<AgentMetric> {
@@ -253,13 +270,9 @@ fn aggregate_agents(
         || sandboxed_worker)
         .then(crate::containers::stats::cached_stats)
         .unwrap_or_default();
-    let alive = crate::session::recovery::orphaned_agents_alive(&eligible);
-    for (inst, is_alive) in eligible.iter().zip(alive) {
-        if !is_alive {
-            continue;
-        }
+    for inst in &eligible {
         let session_name = crate::tmux::Session::resolve_name(&inst.id, &inst.title);
-        let Some(root) = crate::process::get_pane_pid(&session_name) else {
+        let Some(&root) = pane_pids.get(&session_name) else {
             continue;
         };
         if !by_pid.contains_key(&root) {

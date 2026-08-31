@@ -190,35 +190,14 @@ fn preview_frozen(scroll_offset: u16, has_selection: bool) -> bool {
 /// `capture-pane` fallback fires no more often than this.
 const PREVIEW_REFRESH_MS: u128 = 250;
 
-/// Ceiling on how long the capture worker may be the sole source of truth.
-///
-/// The 250ms poll was incidentally a self-healing authoritative refresh: it
-/// overwrote the cache with real `capture-pane` output four times a second, so
-/// any divergence between the worker's picture of the pane and tmux's was
-/// repaired before anyone saw it. Suppressing it removes that net for the one
-/// failure a cycle counter cannot see, a worker that cycles at full rate while
-/// being confidently wrong (its VT grid stably diverged, so `last_captured`
-/// matches every cycle and nothing publishes). This restores the self-heal at
-/// one fortieth of the old fork rate, which keeps essentially all of the win.
-const WORKER_TRUST_CEILING_MS: u128 = 10_000;
-
-/// Whether the idle poll should pay for a synchronous `capture-pane`.
-///
-/// Three ways it does not:
-/// - inside the cadence, which is the pre-existing throttle;
-/// - while frozen (reading scrollback or holding a selection), because a fresh
-///   bottom-anchored snapshot would shift the held content out from under the
-///   reader or the drag. Session change, resize, and the reading grow refresh
-///   through their own clauses regardless;
-/// - while the capture worker is pulsing, because it publishes every change,
-///   so a fork here could only re-read identical bytes at 10-50ms on the
-///   render thread. That suppression expires at [`WORKER_TRUST_CEILING_MS`],
-///   so a worker that is wrong rather than wedged still gets corrected.
+/// Whether the idle poll should pay for a synchronous `capture-pane`: only
+/// past the cadence, never while frozen (a fresh bottom-anchored snapshot
+/// would shift held content out from under a reader or a drag), and never
+/// while the capture worker is pulsing, since it publishes every change and
+/// re-seeds its own grid on `VT_RESYNC_INTERVAL`. Session change, resize, and
+/// the reading grow refresh through their own clauses regardless.
 fn idle_poll_due(frozen: bool, idle_elapsed_ms: u128, worker_covers_idle: bool) -> bool {
-    if frozen || idle_elapsed_ms <= PREVIEW_REFRESH_MS {
-        return false;
-    }
-    !worker_covers_idle || idle_elapsed_ms > WORKER_TRUST_CEILING_MS
+    !frozen && idle_elapsed_ms > PREVIEW_REFRESH_MS && !worker_covers_idle
 }
 
 /// How an observed capture-worker cycle counter folds into a liveness verdict,
@@ -2291,8 +2270,8 @@ impl HomeView {
         // content flowing on its own thread; `apply_worker_capture` below
         // just applies the newest it has produced. The synchronous fork via
         // `refresh_preview_cache_core` remains as the cold-start fallback,
-        // plus the wedged-worker and trust-ceiling paths in `idle_poll_due`;
-        // a worker that is merely idle no longer trips it. This
+        // plus the wedged-worker path in `idle_poll_due`; a worker that is
+        // merely idle no longer trips it. This
         // moves the per-frame capture cost (~8.5ms on macOS, ~90% of a
         // frame; the `tui.render` `capture_us` trace measures it) off the
         // render thread for every view, not just agent live-send.
@@ -4213,13 +4192,12 @@ mod tests {
     // `home/tests.rs`, which renders a real frame and asserts
     // `preview_visible_rows == preview_pane_area.height`.
 
-    /// The idle-poll gate itself. A pulsing worker suppresses the fork, but
-    /// only up to the trust ceiling, so a worker that is confidently wrong
-    /// rather than wedged still gets corrected (njbrake on #3559).
+    /// The idle-poll gate itself: a pulsing worker suppresses the fork for as
+    /// long as it pulses, since the worker owns the grid resync (#3559).
     #[test]
-    fn idle_poll_due_suppresses_a_pulsing_worker_only_until_the_trust_ceiling() {
+    fn idle_poll_due_suppresses_a_pulsing_worker() {
         let past_cadence = PREVIEW_REFRESH_MS + 1;
-        let past_ceiling = WORKER_TRUST_CEILING_MS + 1;
+        let long_idle = PREVIEW_REFRESH_MS * 1_000;
         // (frozen, elapsed_ms, worker_covers_idle, expected)
         let cases = [
             // Inside the cadence: the pre-existing throttle, worker or not.
@@ -4227,13 +4205,12 @@ mod tests {
             (false, PREVIEW_REFRESH_MS, true, false),
             // Past the cadence with no trustworthy worker: fork, as before.
             (false, past_cadence, false, true),
-            // Past the cadence with a pulsing worker: this is the whole fix.
+            // Past the cadence with a pulsing worker: never fork here.
             (false, past_cadence, true, false),
-            // Past the ceiling: the self-heal fires even while pulsing.
-            (false, past_ceiling, true, true),
+            (false, long_idle, true, false),
             // Frozen wins over everything; the reader's content must not move.
             (true, past_cadence, false, false),
-            (true, past_ceiling, false, false),
+            (true, long_idle, false, false),
         ];
         for (frozen, elapsed, covered, expected) in cases {
             assert_eq!(
