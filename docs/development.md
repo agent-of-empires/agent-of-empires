@@ -28,7 +28,7 @@ AOE_TERMINAL_TRACE=1 cargo run
 aoe logs
 ```
 
-For the dashboard, `cargo xtask dev` runs a serve-enabled debug backend on 8081
+For the dashboard, `cargo xtask dev` runs a dashboard-enabled debug backend on 8081
 and Vite with HMR on 5173. Add `--watch` to rebuild and restart the backend when
 Rust inputs change. A failed rebuild leaves the previous backend running.
 
