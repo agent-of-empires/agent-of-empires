@@ -1,4 +1,6 @@
+import { readFileSync, readdirSync } from "node:fs";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { bundledThemes } from "shiki/themes";
 
 // Stub the shiki core/engine so no real wasm or grammar loads happen.
 // `createHighlighterCore` returns a fake HighlighterCore whose loaded-theme
@@ -33,20 +35,27 @@ vi.mock("shiki/engine/oniguruma", () => ({
 // into the stubbed engine, so we don't need to resolve it to a real module.
 vi.mock("shiki/wasm", () => ({ default: {} }));
 
-// Every theme module the source can import. Each resolves to a `default`
-// carrying a `name`, except the two below that exercise fallback branches.
+// `getHighlighter` imports github-dark directly for its construction theme.
 vi.mock("shiki/themes/github-dark.mjs", () => ({ default: { name: "github-dark" } }));
-vi.mock("shiki/themes/github-light.mjs", () => ({ default: { name: "github-light" } }));
-vi.mock("shiki/themes/github-dark-dimmed.mjs", () => ({ default: { name: "github-dark-dimmed" } }));
-vi.mock("shiki/themes/catppuccin-latte.mjs", () => ({ default: { name: "catppuccin-latte" } }));
-vi.mock("shiki/themes/dracula.mjs", () => ({ default: { name: "dracula" } }));
-vi.mock("shiki/themes/material-theme-ocean.mjs", () => ({ default: { name: "material-theme-ocean" } }));
-// Resolves with no usable default -> exercises the `if (theme)` falsy branch.
-vi.mock("shiki/themes/tokyo-night.mjs", () => ({ default: undefined }));
-// Import rejects -> exercises the catch branch.
-vi.mock("shiki/themes/rose-pine.mjs", () => {
-  throw new Error("boom");
-});
+
+// `ensureThemeLoaded` reads shiki's real `bundledThemes` registry, so these
+// tests run against the ids shiki actually ships rather than a restatement of
+// them. Shiki's registry entries are dynamic imports inside its own dist
+// bundle, which `vi.mock` cannot reach, so the two failure branches swap one
+// registry entry for the duration of a single test instead.
+async function withThemeImport(
+  id: keyof typeof bundledThemes,
+  stub: () => Promise<unknown>,
+  body: () => Promise<void>,
+): Promise<void> {
+  const real = bundledThemes[id];
+  (bundledThemes as Record<string, () => Promise<unknown>>)[id] = stub;
+  try {
+    await body();
+  } finally {
+    (bundledThemes as Record<string, () => Promise<unknown>>)[id] = real;
+  }
+}
 
 // Every language module the source can import. The exact `name` value is
 // irrelevant; loadLanguage only needs a truthy `default`.
@@ -285,21 +294,36 @@ describe("ensureThemeLoaded", () => {
     expect(loadThemeMock).not.toHaveBeenCalled();
   });
 
-  it("returns the appearance-appropriate fallback for an unknown theme", async () => {
+  it("returns the appearance-appropriate fallback for an unknown theme, warning once", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => {});
     expect(await ensureThemeLoaded("not-a-real-theme", "light")).toBe(DEFAULT_SHIKI_THEME_LIGHT);
     expect(await ensureThemeLoaded("not-a-real-theme", "dark")).toBe(DEFAULT_SHIKI_THEME);
     expect(await ensureThemeLoaded("not-a-real-theme")).toBe(DEFAULT_SHIKI_THEME);
+    expect(warn).toHaveBeenCalledTimes(1);
+    warn.mockRestore();
   });
 
   it("falls back when the module resolves without a usable default", async () => {
-    const name = await ensureThemeLoaded("tokyo-night", "light");
-    expect(name).toBe(DEFAULT_SHIKI_THEME_LIGHT);
-    expect(loadThemeMock).not.toHaveBeenCalled();
+    await withThemeImport(
+      "tokyo-night",
+      async () => ({ default: undefined }),
+      async () => {
+        expect(await ensureThemeLoaded("tokyo-night", "light")).toBe(DEFAULT_SHIKI_THEME_LIGHT);
+        expect(loadThemeMock).not.toHaveBeenCalled();
+      },
+    );
   });
 
   it("falls back when the importer rejects", async () => {
-    const name = await ensureThemeLoaded("rose-pine", "dark");
-    expect(name).toBe(DEFAULT_SHIKI_THEME);
+    await withThemeImport(
+      "rose-pine",
+      async () => {
+        throw new Error("boom");
+      },
+      async () => {
+        expect(await ensureThemeLoaded("rose-pine", "dark")).toBe(DEFAULT_SHIKI_THEME);
+      },
+    );
   });
 
   it("loads every other registered theme cleanly", async () => {
@@ -309,9 +333,36 @@ describe("ensureThemeLoaded", () => {
       "github-dark-dimmed",
       "catppuccin-latte",
       "material-theme-ocean",
+      // Shipped by shiki but outside the old hand-picked allowlist.
+      "dark-plus",
+      "light-plus",
+      "monokai",
+      "solarized-dark",
+      "solarized-light",
+      "red",
+      "min-light",
+      "gruvbox-dark-medium",
+      "github-dark-high-contrast",
+      "github-light-high-contrast",
     ]) {
       expect(await ensureThemeLoaded(theme, "dark")).toBe(theme);
       expect(loadedThemes).toContain(theme);
+    }
+  });
+});
+
+// The Rust side asserts every builtin theme *has* a `shiki_theme`; this asserts
+// the id it names is one shiki can actually load, which the wholesale registry
+// read no longer checks for us.
+describe("builtin theme syntax palettes", () => {
+  it("each name a palette shiki bundles", () => {
+    const dir = new URL("../../../themes/builtin/", import.meta.url);
+    const files = readdirSync(dir).filter((f) => f.endsWith(".toml"));
+    expect(files.length).toBeGreaterThan(0);
+    for (const file of files) {
+      const id = /^\s*shiki_theme\s*=\s*"([^"]+)"/m.exec(readFileSync(new URL(file, dir), "utf8"))?.[1];
+      expect(id, `${file} declares no shiki_theme`).toBeTruthy();
+      expect(Object.hasOwn(bundledThemes, id!), `${file} names "${id}"`).toBe(true);
     }
   });
 });
