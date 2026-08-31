@@ -807,7 +807,7 @@ fn with_codex_config_lock<T>(
     f: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
     let lock_base_path = policy.lock_path(config_path)?;
-    with_config_lock(&lock_base_path, "toml.lock", f)
+    with_config_lock_policy(&lock_base_path, "toml.lock", policy, f)
 }
 
 /// Generic advisory-lock helper for hook settings files. Holds an exclusive
@@ -820,17 +820,36 @@ fn with_config_lock<T>(
     lock_extension: &str,
     f: impl FnOnce() -> Result<T>,
 ) -> Result<T> {
+    with_config_lock_policy(path, lock_extension, SymlinkPolicy::Follow, f)
+}
+
+/// [`with_config_lock`] with an explicit symlink policy. Under
+/// [`SymlinkPolicy::Never`] the sidecar is opened `O_NOFOLLOW`, so a link
+/// planted at the lock path by a process in the container fails the open and
+/// the write it guards never runs, rather than the lock landing on a host file
+/// outside the bind.
+fn with_config_lock_policy<T>(
+    path: &Path,
+    lock_extension: &str,
+    policy: SymlinkPolicy,
+    f: impl FnOnce() -> Result<T>,
+) -> Result<T> {
     use std::os::unix::fs::OpenOptionsExt;
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let lock_path = path.with_extension(lock_extension);
-    let lock_file = std::fs::OpenOptions::new()
+    let mut options = std::fs::OpenOptions::new();
+    options
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .mode(0o600)
+        .mode(0o600);
+    if policy == SymlinkPolicy::Never {
+        options.custom_flags(libc::O_NOFOLLOW);
+    }
+    let lock_file = options
         .open(&lock_path)
         .with_context(|| format!("Failed to open config lock {}", lock_path.display()))?;
 
@@ -1187,7 +1206,7 @@ pub fn disable_gemini_folder_trust(settings_path: &Path) -> Result<()> {
     // Staged for one container, so the file is always inside a bind the agent
     // can write; there is no host arm to keep a dotfile link for.
     let policy = SymlinkPolicy::Never;
-    with_config_lock(settings_path, "json.lock", || {
+    with_config_lock_policy(settings_path, "json.lock", policy, || {
         let mut settings: Value = if let Some(content) = policy.read(settings_path)? {
             serde_json::from_str(&content).unwrap_or_else(|e| {
                 tracing::warn!(target: "hooks.install", "Failed to parse {}: {}", settings_path.display(), e);
@@ -1314,7 +1333,7 @@ pub fn trust_claude_project(
     project_path: &str,
     policy: SymlinkPolicy,
 ) -> Result<()> {
-    with_config_lock(&policy.lock_path(config_path)?, "json.lock", || {
+    with_config_lock_policy(&policy.lock_path(config_path)?, "json.lock", policy, || {
         let mut config: Value = if let Some(content) = policy.read(config_path)? {
             serde_json::from_str(&content).unwrap_or_else(|e| {
                 tracing::warn!(target: "hooks.install", "Failed to parse {}: {}", config_path.display(), e);
@@ -1373,9 +1392,10 @@ pub fn trust_gemini_project(
     project_path: &str,
     policy: SymlinkPolicy,
 ) -> Result<()> {
-    with_config_lock(
+    with_config_lock_policy(
         &policy.lock_path(trusted_folders_path)?,
         "json.lock",
+        policy,
         || {
             let mut folders: Value = if let Some(content) = policy.read(trusted_folders_path)? {
                 serde_json::from_str(&content).unwrap_or_else(|e| {
@@ -3420,6 +3440,16 @@ trust_level = "trusted"
         // The link's target is not merged in either: it never reaches a config
         // the container can read.
         assert_eq!(written.as_object().unwrap().len(), 1);
+
+        // The lock sidecar is part of the path the container can plant on, so
+        // a link there fails the write closed rather than locking a host file.
+        let locked = bind.join("locked.claude.json");
+        std::os::unix::fs::symlink(&outside, bind.join("locked.claude.json.lock")).unwrap();
+        assert!(
+            trust_claude_project(&locked, "/workspace/wt", SymlinkPolicy::Never).is_err(),
+            "a planted lock link must fail the write, not follow it"
+        );
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "untouched");
     }
 
     #[test]
