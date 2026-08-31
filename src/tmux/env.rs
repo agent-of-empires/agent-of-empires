@@ -307,8 +307,14 @@ fn parse_batch_output<'a>(
         let (line, after_line) = split_line(rest);
         let marked = line.trim().strip_prefix(BATCH_MARKER);
         if let Some(name) = marked.and_then(|n| session_names.iter().copied().find(|s| *s == n)) {
+            // tmux collapses each non-ASCII character of the name to `_` for a
+            // client whose locale is not UTF-8, so two sessions can print the
+            // same marker. A repeat is ambiguous: drop it and let the caller
+            // re-read that session exactly.
+            if values.insert(name, None).is_some() {
+                unparsed.insert(name);
+            }
             current = Some(name);
-            values.entry(name).or_insert(None);
             rest = after_line;
             continue;
         }
@@ -454,6 +460,13 @@ mod tests {
             // so it drops out and the caller re-reads the session.
             (
                 format!("{m}s1\nnot an entry\n{id}"),
+                &["s1"][..],
+                vec![None],
+            ),
+            // Two sessions whose names differ only outside ASCII print one
+            // marker to a non-UTF-8 client; neither reading is trustworthy.
+            (
+                format!("{m}s1\n{id}{m}s1\n{}", entry(key, "second")),
                 &["s1"][..],
                 vec![None],
             ),
