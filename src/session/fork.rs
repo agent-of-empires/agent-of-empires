@@ -60,8 +60,8 @@ fn builtin_acp_registry() -> &'static crate::acp::AgentRegistry {
 /// refuse. Only `ClaudeFork` is checked here until another agent's ACP adapter
 /// is confirmed to support the handshake.
 ///
-/// The bundled `aoe-agent` is ACP-capable (it is in the ACP registry) but is
-/// not a fork-capable agent, so it reads false: it is absent from `get_agent`
+/// `aoe-agent` is ACP-capable (it is in the ACP registry) but is not a
+/// fork-capable agent, so it reads false: it is absent from `get_agent`
 /// (only agents with a published fork strategy are members), so the
 /// `get_agent(..).is_some_and(..)` clause is false for it, the same path custom
 /// agents take (no custom agent currently exposes a structured fork). Treating

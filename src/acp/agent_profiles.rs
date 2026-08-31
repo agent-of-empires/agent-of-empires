@@ -293,7 +293,7 @@ pub const PRIME_AGENT: AgentProfile = AgentProfile {
     yolo_mode_id: None,
 };
 
-/// aoe's bundled multi-provider agent. Treated as Claude-equivalent
+/// aoe's own multi-provider agent. Treated as Claude-equivalent
 /// for now (Vercel AI SDK 6 with Claude as one of the providers); the
 /// claude_capabilities subset is the safest reference until aoe-agent
 /// has its own conventions.
