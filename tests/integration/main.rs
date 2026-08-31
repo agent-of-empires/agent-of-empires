@@ -14,6 +14,7 @@ mod config_merge;
 mod config_wiring;
 mod diff_integration;
 mod group_persistence;
+mod hidden_env_batch;
 mod hooks_config;
 mod migration_pipeline;
 mod parallel_capture;

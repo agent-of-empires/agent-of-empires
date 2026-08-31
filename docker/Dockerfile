@@ -5,7 +5,7 @@ FROM ubuntu:26.04
 
 ENV DEBIAN_FRONTEND=noninteractive
 
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
     curl \
     git \
     build-essential \
@@ -16,6 +16,7 @@ RUN apt-get update && apt-get install -y \
     ripgrep \
     fzf \
     unzip \
+    zstd \
     && rm -rf /var/lib/apt/lists/*
 
 # Install Node.js (required for Codex CLI)

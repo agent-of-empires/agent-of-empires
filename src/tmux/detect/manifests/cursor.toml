@@ -1,0 +1,71 @@
+id = "cursor"
+
+# Cursor renders its live status bar on the follow-up prompt line or just
+# below it. Everything above belongs to the previous turn, so an interrupt
+# hint or spinner left in that scrollback must not read as a live signal.
+prompt_marker = ['(?i)^\s*\x{2192}(?:\s+add a follow-up.*)?\s*$']
+
+[[rules]]
+id = "permission_prompt"
+state = "waiting"
+priority = 980
+region = "whole_recent"
+visible = true
+contains_any = [
+  "(y/n)",
+  "[y/n]",
+  "approve",
+  "allow",
+  "permission required",
+  "approval required",
+  "allow command",
+  "allow this command",
+  "run this command",
+  "enter to approve",
+  "enter to select",
+  "esc to cancel",
+]
+
+[[rules]]
+id = "interrupt_hint"
+state = "running"
+priority = 970
+region = "from_prompt_marker"
+visible = true
+contains_any = ["ctrl+c to stop", "ctrl+c to interrupt", "esc to interrupt"]
+
+# A spinner frame on the same line as a live activity verb. Either alone is
+# ordinary output; together they are Cursor's working line.
+[[rules]]
+id = "spinner_activity"
+state = "running"
+priority = 970
+region = "from_prompt_marker"
+visible = true
+line_regex = ['(?i)[\x{2800}-\x{28FF}].*\b(analyz|apply|build|edit|execut|fetch|generat|grepp|process|read|runn|search|test|think|work|writ)ing\b']
+
+# An activity verb opening the line, which is how Cursor prefixes its live
+# status without a spinner frame.
+[[rules]]
+extends = "activity_line"
+id = "activity_line"
+priority = 965
+region = "from_prompt_marker"
+
+# The follow-up prompt itself: Cursor is parked, waiting for input.
+[[rules]]
+id = "follow_up_prompt"
+state = "idle"
+priority = 500
+region = "whole_recent"
+visible = true
+line_regex = ['(?i)^\s*\x{2192}(?:\s+add a follow-up.*)?\s*$']
+
+# Background tasks keep running with the prompt already back, so this ranks
+# below the prompt itself: it only speaks when nothing else does.
+[[rules]]
+id = "background_task"
+state = "running"
+priority = 400
+region = "whole_recent"
+contains_any = ["background task", "background tasks"]

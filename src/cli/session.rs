@@ -1659,21 +1659,28 @@ async fn capture_session(profile: &str, args: CaptureArgs) -> Result<()> {
         let raw = tmux_session.capture_pane(args.lines)?;
         let detection_tool =
             crate::tmux::status_rules::detection_tool(profile, &inst.tool, &inst.detect_as);
-        let status = if let Some(hook_status) = crate::hooks::read_hook_status(&inst.id) {
-            if detection_tool == "codex" && hook_status == crate::session::Status::Running {
-                let status_raw;
-                let status_content = if args.lines >= 50 {
-                    raw.as_str()
-                } else {
-                    status_raw = tmux_session
-                        .capture_pane(50)
-                        .unwrap_or_else(|_| raw.clone());
-                    status_raw.as_str()
-                };
-                crate::tmux::reconcile_codex_hook_status(hook_status, status_content)
-            } else {
-                hook_status
+        let hook = crate::hooks::read_hook_status(&inst.id).map(|status| {
+            crate::tmux::detect::HookObservation {
+                status,
+                age: crate::hooks::read_hook_status_age(&inst.id),
             }
+        });
+        // The same rule table the poller runs, so `aoe session capture`
+        // reports what the dashboard would. A short `--lines` still detects
+        // against the window the rules expect.
+        let status = if crate::tmux::detect::has_manifest(&detection_tool) {
+            let status_raw;
+            let status_content = if args.lines >= 50 {
+                raw.as_str()
+            } else {
+                status_raw = tmux_session
+                    .capture_pane(50)
+                    .unwrap_or_else(|_| raw.clone());
+                status_raw.as_str()
+            };
+            crate::tmux::detect_via_manifest(&detection_tool, status_content, "", hook)
+        } else if let Some(hook) = hook {
+            hook.status
         } else {
             tmux_session
                 .detect_status(profile, &detection_tool)

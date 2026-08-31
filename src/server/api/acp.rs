@@ -238,10 +238,9 @@ fn rate_limit_resume_marker_resets_at(
 
 #[derive(Debug, Deserialize)]
 pub struct SpawnAcpRequest {
-    /// Optional override; falls back to the acp_default_agent
-    /// setting / aoe-agent.
+    /// Optional override; falls back to `Supervisor::pick_agent_for_tool`.
     pub agent: Option<String>,
-    /// Optional model override; forwarded to aoe-agent as
+    /// Optional model override; forwarded to the agent as
     /// AOE_AGENT_MODEL env var.
     pub model: Option<String>,
     /// Optional additional dirs the agent may read/write through
@@ -1930,27 +1929,29 @@ pub async fn acp_enable(
 
     // Verify the tool has an ACP-capable agent. Otherwise there's no
     // agent to spawn and the swap would just produce a dead structured view.
-    // Built-in tools resolve from the registry; a custom agent is valid
-    // when it declares an `agent_acp_cmd` in its profile config.
-    let agent_name = state
-        .acp_supervisor
-        .pick_agent_for_tool(
-            &instance.tool,
-            instance.agent_name.as_deref(),
-            &profile,
-            std::path::Path::new(&instance.project_path),
-        )
-        .await;
-    let registry = state.acp_supervisor.registry_snapshot().await;
-    let resolvable = registry.get(&agent_name).is_some()
-        || state
-            .acp_supervisor
-            .custom_agent_has_acp_cmd(
-                &agent_name,
+    //
+    // Judged against the session's explicit `agent_name` (or, with none, the
+    // tool itself), NOT `pick_agent_for_tool`'s default-agent fallback: that
+    // fallback always resolves to a registry key, so gating on it would accept
+    // every tool and switch a terminal-only session into a structured one
+    // running some other agent. Shares the create path's predicate so the two
+    // cannot drift.
+    let resolvable = {
+        let profile = profile.clone();
+        let project_path = std::path::PathBuf::from(&instance.project_path);
+        let tool = instance.tool.clone();
+        let agent_name = instance.agent_name.clone();
+        tokio::task::spawn_blocking(move || {
+            super::sessions::agent_is_acp_capable(
                 &profile,
-                std::path::Path::new(&instance.project_path),
+                &project_path,
+                &tool,
+                agent_name.as_deref(),
             )
-            .await;
+        })
+        .await
+        .unwrap_or(false)
+    };
     if !resolvable {
         return (
             StatusCode::BAD_REQUEST,
@@ -1964,6 +1965,15 @@ pub async fn acp_enable(
 
     // A real terminal -> acp transition is now committed (the idempotent
     // already-acp and unresolvable-agent cases returned above).
+    let agent_name = state
+        .acp_supervisor
+        .pick_agent_for_tool(
+            &instance.tool,
+            instance.agent_name.as_deref(),
+            &profile,
+            std::path::Path::new(&instance.project_path),
+        )
+        .await;
 
     // Tear down the tmux side. Best-effort: a stale tmux name should
     // not block the swap. Run on a blocking pool worker because each

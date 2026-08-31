@@ -402,3 +402,12 @@ mod tests {
         assert_eq!(back.resume_intent, ResumeIntent::Default);
     }
 }
+
+/// Where a Pi pane publishes its conversation. Sandboxed panes write into the
+/// config bind; host panes into the per-instance hook directory. Kept distinct
+/// so an unresolvable sandbox path cannot read as "use the host one".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum PiSidecarSource {
+    HostHooks,
+    SandboxDir(std::path::PathBuf),
+}

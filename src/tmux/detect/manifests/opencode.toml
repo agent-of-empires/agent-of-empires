@@ -1,0 +1,36 @@
+id = "opencode"
+
+[[rules]]
+extends = "interrupt_hint"
+id = "interrupt_hint"
+priority = 970
+contains_any = ["esc to interrupt", "esc interrupt"]
+
+[[rules]]
+extends = "spinner"
+id = "spinner"
+priority = 960
+
+[[rules]]
+extends = "approval_prompt"
+id = "approval_prompt"
+priority = 950
+contains_any = ["continue?", "proceed?", "enter to select", "esc to cancel"]
+
+# A numbered menu row carrying the selection cursor.
+[[rules]]
+id = "numbered_choice"
+state = "waiting"
+priority = 940
+region = "whole_recent"
+visible = true
+line_regex = ['(?i)\x{276F}(?:\s*|.* )[123]\.']
+
+# Parked at the input prompt. OpenCode's ready state is reported as Waiting
+# rather than Idle, which is what its callers have always seen.
+[[rules]]
+extends = "input_prompt"
+id = "input_prompt"
+priority = 930
+# opencode also parks on a doubled prompt.
+any = [{ line_regex = ['(?i)^\s*>>\s*$'] }]

@@ -3,6 +3,14 @@
 
 use super::*;
 
+/// omp's error banner footer, and the terminal retry lines it can replace.
+/// They live here rather than with detection: the manifest carries its own
+/// copies for deciding status, while these drive the message this module
+/// lifts out of the banner.
+const OMP_BANNER_DISMISSAL_ANCHOR: &str = "dismissed when you send your next message";
+const OMP_TERMINAL_RETRY_MARKERS: &[&str] =
+    &["error: retry budget exhausted", "error: retry failed after"];
+
 /// Build a short human-readable hint for why a session transitioned to Error.
 ///
 /// Called when we set Status::Error but don't already have a `last_error`

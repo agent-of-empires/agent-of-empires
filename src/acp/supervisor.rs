@@ -939,13 +939,14 @@ impl<S: BroadcastSink> Supervisor<S> {
     ///      `agent_detect_as` (e.g. a Claude wrapper); resolves to the *base*
     ///      registry key so the base agent's adapter, version gate, env
     ///      allowlist, and `AgentProfile` all apply
-    ///   5. legacy fallback: `claude` for the claude tool, otherwise
-    ///      `aoe-agent` (our bundled multi-provider agent)
+    ///   5. fallback: `claude` for the claude tool, otherwise the resolved
+    ///      `acp.default_agent` setting
     ///
     /// `profile` is the session's source profile (`""` resolves the
     /// user's default) and `project_path` is its working directory;
-    /// both are consulted for step 3 so repo-local `agent_acp_cmd`
-    /// overrides are honored.
+    /// both are consulted for steps 3 and 4 so repo-local `agent_acp_cmd`
+    /// overrides are honored; step 5 reads `acp.default_agent`, which only a
+    /// profile may override (`acp` is not repo-overridable).
     pub async fn pick_agent_for_tool(
         &self,
         tool: &str,
@@ -983,12 +984,32 @@ impl<S: BroadcastSink> Supervisor<S> {
         {
             return base;
         }
-        // Step 5: legacy fallbacks.
+        // Step 5: the claude tool keeps its own registry key; everything else
+        // falls back to the configured default agent.
         if tool == "claude" {
             "claude".into()
         } else {
-            "aoe-agent".into()
+            self.resolved_default_agent(profile, project_path).await
         }
+    }
+
+    /// The session's resolved `acp.default_agent`, or the built-in default if
+    /// the config resolve panics.
+    async fn resolved_default_agent(
+        &self,
+        profile: &str,
+        project_path: &std::path::Path,
+    ) -> String {
+        let profile = profile.to_string();
+        let project_path = project_path.to_path_buf();
+        tokio::task::spawn_blocking(move || {
+            crate::session::repo_config::resolve_config_with_repo_or_warn(&profile, &project_path)
+                .acp
+                .resolved_default_agent()
+                .to_string()
+        })
+        .await
+        .unwrap_or_else(|_| crate::session::config::DEFAULT_ACP_AGENT.to_string())
     }
 
     /// The registry-backed base key `tool` inherits via `agent_detect_as` in
@@ -4086,6 +4107,40 @@ mod tests {
             assert_eq!(got, None, "{label}: expected silence");
         }
     }
+
+    /// Step 5 of `pick_agent_for_tool` reads `acp.default_agent`, so the
+    /// setting actually selects the agent instead of only being displayed.
+    /// Needs HOME isolation for the config resolve.
+    #[tokio::test]
+    #[serial_test::serial]
+    async fn unregistered_tool_falls_back_to_the_configured_default_agent() {
+        let tmp = tempfile::TempDir::with_prefix_in("aoe-default-agent-", "/tmp").unwrap();
+        let _guard = crate::session::test_support::isolate_home(tmp.path());
+        let cfg_path = crate::session::get_app_dir().unwrap().join("config.toml");
+        let sup = Supervisor::new(VecSink::new());
+
+        // (configured acp.default_agent, tool, expected agent)
+        let cases = [
+            (None, "plain-tool", "claude-code"),
+            (None, "claude", "claude"),
+            // A tool with its own registry entry never reaches step 5.
+            (Some("codex"), "opencode", "opencode"),
+            (Some("codex"), "plain-tool", "codex"),
+            (Some("codex"), "claude", "claude"),
+            // A hand-edited blank value resolves to the built-in default.
+            (Some("   "), "plain-tool", "claude-code"),
+        ];
+        for (configured, tool, expected) in cases {
+            let body = match configured {
+                Some(agent) => format!("[acp]\ndefault_agent = \"{agent}\"\n"),
+                None => String::new(),
+            };
+            std::fs::write(&cfg_path, body).unwrap();
+            let got = sup.pick_agent_for_tool(tool, None, "", tmp.path()).await;
+            assert_eq!(got, expected, "default={configured:?} tool={tool}");
+        }
+    }
+
     /// `spawn_inner` would leave them green. Here a full `Supervisor::spawn`
     /// runs a detect_as wrapper against the real claude adapter with an
     /// unwritable working directory: the warning is emitted before any

@@ -422,8 +422,9 @@ pub struct AcpConfig {
         widget = "toggle"
     )]
     pub offer_structured_in_new_session: bool,
-    /// Acp agent used when --agent is not specified (e.g. aoe-agent,
-    /// claude-code, gemini).
+    /// Acp agent used when --agent is not specified (e.g. claude-code,
+    /// codex). Must name an agent that can start: `aoe-agent` is not
+    /// packaged yet (#3553).
     #[serde(default = "default_agent")]
     #[setting(label = "Default agent", widget = "text", validate = "nonempty")]
     pub default_agent: String,
@@ -645,8 +646,12 @@ impl Default for AcpConfig {
     }
 }
 
+/// Built-in `acp.default_agent`. `aoe-agent` is not packaged yet (#3553), so
+/// the default has to be an adapter `aoe acp doctor --fix` can install.
+pub const DEFAULT_ACP_AGENT: &str = "claude-code";
+
 fn default_agent() -> String {
-    "aoe-agent".to_string()
+    DEFAULT_ACP_AGENT.to_string()
 }
 fn default_max_workers() -> u32 {
     100
@@ -1500,6 +1505,19 @@ impl AcpAgentDefaults {
 }
 
 impl AcpConfig {
+    /// The agent name a structured-view spawn falls back to when nothing more
+    /// specific applies. A hand-edited config can leave `default_agent` blank
+    /// (the settings layer rejects empty, a file edit does not), which would
+    /// otherwise resolve to `UnknownAgent("")`.
+    pub fn resolved_default_agent(&self) -> &str {
+        let configured = self.default_agent.trim();
+        if configured.is_empty() {
+            DEFAULT_ACP_AGENT
+        } else {
+            configured
+        }
+    }
+
     pub fn acp_defaults_for(&self, agent: &str) -> Option<&AcpAgentDefaults> {
         self.acp_defaults
             .get(agent)

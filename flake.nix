@@ -33,6 +33,8 @@
             # every other compile-time embedded asset has to be unioned in
             # explicitly: the acp-worker/adapters manifests that
             # src/acp/adapters.rs reads with include_bytes! (#3204), and
+            # assets/pi, the extension src/session/instance.rs materializes so
+            # pi can publish its own conversation id, and
             # docker/Dockerfile, which the agent_compat test embeds to pin the
             # sandbox npm floor (the aoe-test and aoe-clippy checks compile test
             # code, so they need it even though the packages do not).
@@ -43,6 +45,7 @@
               fileset = pkgs.lib.fileset.unions [
                 (craneLib.fileset.commonCargoSources ./.)
                 ./acp-worker/adapters
+                ./assets
                 ./docker
               ];
             };
@@ -91,7 +94,7 @@
             pname = "agent-of-empires-web";
             version = "0";
             src = ./web;
-            npmDepsHash = "sha256-2yEWUP278jgQaqeFuBxQ81xs+5KXsIHnPMfnHpGNSVc=";
+            npmDepsHash = "sha256-KBpbvnYwJB7nJgSs5N6crXhn05dQF6fbyRHLumMZZ/Y=";
             # tsc -b && vite build; output goes to web/dist
             installPhase = ''
               mkdir $out
