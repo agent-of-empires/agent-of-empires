@@ -79,6 +79,7 @@ impl Instance {
             ever_confirmed_present: false,
             unknown_since: None,
             detection_activity: None,
+            detection_captured_at: None,
             detection_rule: None,
             pending_detection: None,
             pending_host_env: Vec::new(),

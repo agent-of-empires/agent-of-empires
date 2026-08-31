@@ -252,6 +252,19 @@ pub(crate) fn pane_current_command(session_name: &str) -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
+/// The terminal title the pane's program published over OSC, for callers
+/// outside the batched poll that reads it as part of [`crate::tmux::PaneMetadata`].
+pub(crate) fn pane_title(session_name: &str) -> Option<String> {
+    let target = format!("{session_name}:^.0");
+    crate::tmux::tmux_command()
+        .args(["display-message", "-t", &target, "-p", "#{pane_title}"])
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 fn pane_start_command_is_protected(session_name: &str) -> bool {
     let target = format!("{session_name}:^.0");
     crate::tmux::tmux_command()

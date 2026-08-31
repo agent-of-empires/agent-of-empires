@@ -577,6 +577,15 @@ pub struct Instance {
     /// fresh load re-derives it.
     #[serde(skip)]
     pub detection_activity: Option<i64>,
+    /// The wall-clock second in which the last capture was taken, stamped
+    /// before it rather than after. `detection_activity` has one-second
+    /// granularity, so a capture taken inside the second it names can have
+    /// read the screen before a later frame in that same second (#3624): the
+    /// stamp is only proof of "nothing drawn since" once a capture has been
+    /// taken past the end of that second. A clock that never satisfies that
+    /// degrades to capturing every poll, which is the pre-gate behavior.
+    #[serde(skip)]
+    pub detection_captured_at: Option<i64>,
     /// The manifest rule that decided the last detection, for the
     /// status-change log. Names why a session is in the state it is in, which
     /// is what a wrong-state report needs and what a fingerprint of pane
