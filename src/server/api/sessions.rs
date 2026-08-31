@@ -5282,7 +5282,7 @@ fn acp_agent_key<'a>(tool: &'a str, agent_name: Option<&'a str>) -> &'a str {
     agent_name.filter(|s| !s.is_empty()).unwrap_or(tool)
 }
 
-fn agent_is_acp_capable(
+pub(super) fn agent_is_acp_capable(
     profile: &str,
     project_path: &std::path::Path,
     tool: &str,
@@ -8187,6 +8187,30 @@ mod tests {
                 "default",
                 std::path::Path::new("/nonexistent"),
                 "definitely-not-a-real-tool",
+                None,
+            ));
+        }
+
+        /// Why `acp_enable` gates on this predicate and not on
+        /// `pick_agent_for_tool`: the default-agent fallback always names a
+        /// registry entry, so a post-fallback registry lookup reports every
+        /// tool capable and would switch a terminal-only session into a
+        /// structured one running some other agent.
+        #[test]
+        #[serial]
+        fn the_default_agent_fallback_is_not_a_capability_signal() {
+            let _tmp = isolate_app_dir();
+            let fallback = crate::session::config::DEFAULT_ACP_AGENT;
+            assert!(
+                crate::acp::AgentRegistry::with_defaults()
+                    .get(fallback)
+                    .is_some(),
+                "the fallback must be spawnable, which is what makes it useless as a gate"
+            );
+            assert!(!agent_is_acp_capable(
+                "default",
+                std::path::Path::new("/nonexistent"),
+                "plain-tool",
                 None,
             ));
         }
