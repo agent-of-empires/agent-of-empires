@@ -1,0 +1,78 @@
+id = "hermes"
+
+# Hermes' own spinner glyphs, anywhere in the capture.
+[[rules]]
+id = "spinner"
+state = "running"
+priority = 970
+region = "whole_recent"
+visible = true
+line_regex = ['[\x{25DC}\x{25E0}\x{2727}]']
+
+# While running, Hermes replaces its input prompt with `❯ Ctrl+C to
+# interrupt…`, so this has to outrank the parked-prompt rule below.
+[[rules]]
+id = "interrupt_hint"
+state = "running"
+priority = 965
+region = "bottom_non_empty_lines(5)"
+visible = true
+contains = ["ctrl+c to interrupt"]
+
+# The input prompt on its own (`❯` default skin, `⚡` cyberpunk) means the turn
+# is over. Idle, not Waiting: Waiting here means a dangerous command needs
+# approval. Ranked above the activity words so a previous turn's scrollback
+# cannot flip a parked pane back to Running.
+[[rules]]
+id = "ready_prompt"
+state = "idle"
+priority = 960
+region = "bottom_non_empty_lines(5)"
+visible = true
+line_regex = ['(?i)^\s*[\x{276F}\x{26A1}](?:\s|$)']
+
+# Streaming lines carry a `┊` prefix; recent lines only, so a completed turn's
+# transcript does not read as live.
+[[rules]]
+id = "streaming_prefix"
+state = "running"
+priority = 955
+region = "bottom_non_empty_lines(10)"
+visible = true
+contains = ["┊"]
+
+[[rules]]
+id = "activity_word"
+state = "running"
+priority = 950
+region = "whole_recent"
+contains_any = [
+  "reasoning",
+  "pondering",
+  "contemplating",
+  "forging",
+  "plotting",
+  "jacking in",
+  "decrypting",
+  "uploading",
+  "processing",
+  "analyzing",
+  "computing",
+  "evaluating",
+]
+
+[[rules]]
+id = "dangerous_command_prompt"
+state = "waiting"
+priority = 940
+region = "whole_recent"
+visible = true
+contains_any = [
+  "(y/n)",
+  "[y/n]",
+  "approve",
+  "allow",
+  "choice [o/s/a/d]:",
+  "[o]nce",
+  "dangerous command",
+]

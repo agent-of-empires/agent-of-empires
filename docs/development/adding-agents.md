@@ -5,7 +5,8 @@
 | File | Purpose |
 |------|---------|
 | `src/agents.rs` | Agent registry entry (name, binary, detection, flags) |
-| `src/tmux/status_detection.rs` | Status detection function (pane parsing or stub) |
+| `src/tmux/detect/manifests/<agent>.toml` | Detection rules, for an agent whose pane is parsed |
+| `src/tmux/status_detection.rs` | Detection entry point (manifest call or stub) |
 | `src/hooks/mod.rs` | Hook installer (if the agent supports hooks) |
 | `src/session/instance/hooks.rs` | Wire hook installation + `AOE_INSTANCE_ID` env prefix |
 | `src/session/container_config.rs` | Config mount for Docker sandbox |
@@ -23,8 +24,8 @@ Each level is additive; do only what the agent supports.
 | Level | What it gives | Requires |
 |-------|---------------|----------|
 | 1. Basic | Appears in `aoe agents`, sessions launch, status always "Idle" | `AgentDef` + stub `detect_status` |
-| 2. Pane-parse status | Status inferred from terminal output; no agent config, brittle to UI changes | `detect_<agent>_status(&str) -> Status` (OpenCode, Vibe, Copilot, Pi, Droid) |
-| 3. Hook status | Agent writes status to a file via hooks; reliable, survives UI changes | `hook_config` + generic `install_hooks()` or a custom `install_<agent>_hooks()` (Claude, Cursor, Gemini generic; Codex TOML, Hermes YAML, Kiro JSON) |
+| 2. Pane-parse status | Status inferred from terminal output; no agent config | A manifest in `src/tmux/detect/manifests/`, plus a `detect_<agent>_status(&str) -> Status` calling into it |
+| 3. Hook status | Agent writes status to a file via hooks; lands the instant state changes, and carries the agent's session id for resume | `hook_config` + generic `install_hooks()` or a custom `install_<agent>_hooks()` (Claude, Cursor, Gemini generic; Codex TOML, Hermes YAML, Kiro JSON) |
 | 4. Session resume | Restart resumes the prior conversation | `resume_strategy` in `AgentDef` |
 | 5. Docker sandbox | Runs isolated; host config synced in | `AgentConfigMount` + Dockerfile install |
 
@@ -34,7 +35,7 @@ Each level is additive; do only what the agent supports.
 
 **2. `AgentDef` (`src/agents.rs`):** add to the `AGENTS` array. Key fields: `detection: DetectionMethod::Which(...)`, `yolo: Some(YoloMode::CliFlag(...))`, either `hook_config` (with `format: HookFormat::JsonSettings` or `HookFormat::CodexJson`) or `sidecar_hooks` (with `format: SidecarFormat::SettlToml`, `HermesYaml`, or `KiroJson`, plus `events: ..._SIDECAR_EVENTS`), `resume_strategy`, `host_only`, `install_hint`, and `lifecycle`. Use `AgentLifecycle::Active` for ordinary new agents; reserve `Deprecated { since, note, replacement }` for an upstream lifecycle change that users need to see. The format enums drive installer and marker-walker dispatch; adding a hook-based agent without picking a variant is a compile error. `set_default_command: true` only when the binary name alone is not enough to relaunch (e.g. opencode).
 
-**3. Status detection (`src/tmux/status_detection.rs`):** hook-based agents get a stub returning `Status::Idle`. Pane-parse agents get a function matching on lowercased pane content. Prefer `--format json` over substring matching when the CLI offers it; human-readable output changes between versions.
+**3. Status detection:** an agent whose pane carries state gets a manifest in `src/tmux/detect/manifests/<agent>.toml`, and a `detect_<agent>_status` that calls into it (see `detect_claude`). Rules are `{id, state, priority, region, matcher}` and the highest-priority match wins, so a new case is a row rather than another branch. The hook file is a rule too (`region = "hook"`), which is what lets a blocking prompt on screen outrank a `running` write, and what bounds how long an unrefreshed write keeps its authority. Give a rule `visible = true` only when it reads the state off the agent's own live chrome: that is what lets the poller publish it without waiting for a confirming capture. Agents with no pane signal keep a stub returning `Status::Idle`. See `src/tmux/detect/mod.rs` for the region vocabulary.
 
 **4. Hooks (if applicable):** for non-Claude formats add a custom installer in `src/hooks/mod.rs` (see `install_hermes_hooks_with_events`, `install_kiro_hooks_with_events`). Wire it into `SidecarHooks::install`, and make sure `status_hook_env_prefix()` includes the agent so `AOE_INSTANCE_ID` and `AOE_PROFILE` reach the hook (without the instance id hooks write nothing). Hook statuses use `HookStatus` (`Running`, `Waiting`, `Idle`, `Error`), not raw strings, and sidecar event defaults live on the agent so profile `agents.<name>.status_map` entries feed host and sandbox installs through the same resolver. Keep installers as pure file IO; any subprocess work (e.g. setting a default agent) goes in a separate function so `cargo test` doesn't mutate the dev's real environment.
 
@@ -42,7 +43,7 @@ Each level is additive; do only what the agent supports.
 
 **6. Dockerfile (`docker/Dockerfile`):** install the agent and add its config dir to the `mkdir -p` block.
 
-**7. Tests:** update the `src/agents.rs` tests (`test_get_agent_known`, `test_agent_names`, `test_resolve_tool_name`, `test_settings_index_roundtrip`, `test_send_keys_enter_delay`, `test_install_hint_lookup`); add a detection test in `status_detection.rs`; for hook-based agents add to `test_status_hook_env_prefix_includes_hermes`.
+**7. Tests:** update the `src/agents.rs` tests (`test_get_agent_known`, `test_agent_names`, `test_resolve_tool_name`, `test_settings_index_roundtrip`, `test_send_keys_enter_delay`, `test_install_hint_lookup`); add a detection test in `status_detection.rs` (fixtures go through the public `detect_<agent>_status`, and `detect::rule_matches` pins that a fixture really carries the shape it claims); for hook-based agents add to `test_status_hook_env_prefix_includes_hermes`.
 
 **8. Structured view profile (if the agent ships an ACP server):** its CLI accepts `acp`/`--acp` or ships a `*-acp` adapter. Add the binary to `src/acp/agent_registry.rs::with_defaults()` (keyed on the `src/agents.rs` name), an install hint to `src/acp/install_hints.rs`, a server profile to `src/acp/agent_profiles.rs` (registered in `resolve()`), and a mirrored profile in `web/src/lib/agentProfiles.ts` (registered in `PROFILES`). Keep profiles conservative: until you've observed the adapter's `_meta` convention for child tool-call linkage, leave `parent_meta_namespaces` and the alias map empty. Missing indentation is safer than fake parent links; an empty alias map renders the generic tool card, which is the correct fallback. Add the agent to the feature matrix in `docs/structured-view.md`; profile mechanics are documented in `docs/development/internals/structured-view.md`.
 
@@ -94,7 +95,7 @@ type = "command"
 command = "sh -c '...'"
 ```
 
-Set `hook_config: Some(AgentHookConfig { settings_rel_path: ".codex/config.toml", ... })`. Host installs must go through `install_codex_hooks()` / `uninstall_codex_hooks()` so `CODEX_HOME`, existing `[hooks.state]` trust data, `[features].hooks = false`, the `config.toml.lock`, and atomic replacement are respected. Codex status is hook-first with targeted pane reconciliation for known hook gaps.
+Set `hook_config: Some(AgentHookConfig { settings_rel_path: ".codex/config.toml", ... })`. Host installs must go through `install_codex_hooks()` / `uninstall_codex_hooks()` so `CODEX_HOME`, existing `[hooks.state]` trust data, `[features].hooks = false`, the `config.toml.lock`, and atomic replacement are respected. Codex status weighs the hook write against its manifest rules by declared priority, so a prompt on screen outranks a `running` write.
 
 ### Hermes (custom YAML)
 

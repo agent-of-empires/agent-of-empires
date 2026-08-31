@@ -656,6 +656,17 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     AOE_TMUX_SOCKET: tmuxSocketPath(home),
   };
 
+  // The isolated HOME is only isolated if nothing overrides where the agents
+  // read their config from. A developer shell that exports CLAUDE_CONFIG_DIR
+  // (or the Codex / Cursor equivalents) leaks it into `aoe serve` through the
+  // `...process.env` spread above, and the daemon then scans the developer's
+  // real `~/.claude` instead of the tree the spec seeded: acp-import-claude-
+  // session and acp-keep-context-round-trip fail deterministically, locally
+  // only, which reads as "the suite is broken on my machine".
+  for (const leak of ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "CURSOR_CONFIG_DIR"]) {
+    delete seedEnv[leak];
+  }
+
   if (authMode === "token") {
     if (typeof opts.tokenLifetimeSecs === "number") {
       seedEnv.AOE_TEST_TOKEN_LIFETIME_SECS = String(opts.tokenLifetimeSecs);

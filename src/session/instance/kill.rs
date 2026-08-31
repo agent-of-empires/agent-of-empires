@@ -3,6 +3,82 @@
 use super::*;
 
 impl Instance {
+    /// Persist the conversation Pi's extension last published, before the
+    /// sidecar is cleaned up with the rest of the instance dir.
+    ///
+    /// Without this a CLI-only lifecycle loses a `/new`: no poller is running
+    /// to observe it, and by the next launch the sidecar is gone.
+    /// Record the transcript path for a conversation whose id has not moved,
+    /// which is the common case: the pane published a path this launch and the
+    /// row was already on that conversation.
+    fn persist_pi_session_path(&self, storage: &crate::session::storage::Storage) {
+        let Some(path) = self.pi_published_session_path() else {
+            return;
+        };
+        if self.pi_session_path.as_deref() == Some(path.as_str()) {
+            return;
+        }
+        let _ = storage.update(|instances, _| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == self.id) {
+                inst.pi_session_path = Some(path.clone());
+            }
+            Ok(())
+        });
+    }
+
+    /// [`flush_pi_sidecar_conversation`] against this session's own storage,
+    /// for teardown paths that hold no handle.
+    pub(super) fn flush_pi_sidecar_if_published(&mut self) {
+        if self.tool != "pi" {
+            return;
+        }
+        let profile = self.effective_profile();
+        let Ok(storage) =
+            crate::session::storage::Storage::new(&profile, self.resolve_file_watch())
+        else {
+            return;
+        };
+        self.flush_pi_sidecar_conversation(&storage);
+        // Keep the in-memory row with disk: a restart reads it moments later.
+        if let Ok(instances) = storage.load() {
+            if let Some(row) = instances.iter().find(|i| i.id == self.id) {
+                self.agent_session_id = row.agent_session_id.clone();
+                self.pi_session_path = row.pi_session_path.clone();
+            }
+        }
+    }
+
+    pub(super) fn flush_pi_sidecar_conversation(&self, storage: &crate::session::storage::Storage) {
+        if !self.uses_pi_session_sidecar() {
+            return;
+        }
+        // No freshness window here: this is the last read before the sidecar
+        // is deleted, and an idle pane's `/new` can be hours old.
+        let Some(published) = self.pi_published_session_id(true) else {
+            return;
+        };
+        if self.agent_session_id.as_deref() == Some(published.as_str()) {
+            self.persist_pi_session_path(storage);
+            return;
+        }
+        let published_path = self.pi_published_session_path();
+        if let Err(error) = storage.update(|instances, _| {
+            if let Some(inst) = instances.iter_mut().find(|i| i.id == self.id) {
+                inst.agent_session_id = Some(published.clone());
+                if published_path.is_some() {
+                    inst.pi_session_path = published_path.clone();
+                }
+            }
+            Ok(())
+        }) {
+            tracing::warn!(
+                target: "session.store",
+                instance = %self.id,
+                "could not persist the Pi conversation published at stop: {error}",
+            );
+        }
+    }
+
     /// Tear down the current tmux session cleanly so a fresh
     /// `start_with_size_opts` can recreate it.
     ///
@@ -272,6 +348,7 @@ impl Instance {
                     LifecycleOperation::Stop,
                     Status::Stopped,
                 )?;
+                self.flush_pi_sidecar_conversation(&storage);
                 crate::hooks::cleanup_hook_status_dir(&self.id);
                 Ok(())
             }
@@ -289,6 +366,97 @@ impl Instance {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    #[serial_test::serial]
+    fn pi_stop_persists_a_conversation_published_long_ago() {
+        // An idle pane's `/new` can be hours old by the time it stops. The
+        // freshness window that guards a resume must not apply to the last
+        // read before the sidecar is deleted.
+        let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_app_dir_at(home.path());
+
+        let profile = "pi-sidecar-stale";
+        let mut inst = Instance::new("pi-stale", "/tmp/pi-stale");
+        inst.source_profile = profile.to_string();
+        inst.tool = "pi".to_string();
+        inst.agent_session_id = Some("22f13307-461c-4161-908e-95a247fac750".to_string());
+        inst.mark_pi_extension_launched_for_test();
+
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        let seed = inst.clone();
+        storage
+            .update(|instances, _| {
+                *instances = vec![seed.clone()];
+                Ok(())
+            })
+            .unwrap();
+
+        let published = "01a0538e-5868-7c22-84bc-40cfd7a09ab1";
+        crate::hooks::write_session_id_via_guard(&inst.id, published).unwrap();
+        let sidecar = crate::hooks::ensure_instance_dir_path(&inst.id)
+            .unwrap()
+            .join("session_id");
+        let hours_ago = std::time::SystemTime::now() - std::time::Duration::from_secs(6 * 3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&sidecar)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(hours_ago))
+            .unwrap();
+        assert_eq!(
+            crate::hooks::read_hook_session_id(&inst.id),
+            None,
+            "the fixture must be past the freshness window"
+        );
+
+        inst.flush_pi_sidecar_conversation(&storage);
+
+        assert_eq!(
+            storage.load().unwrap()[0].agent_session_id.as_deref(),
+            Some(published),
+            "a stale sidecar is still the pane's own last word"
+        );
+    }
+
+    #[test]
+    #[serial_test::serial]
+    fn pi_stop_persists_the_conversation_the_extension_published() {
+        // A `/new` inside a CLI-launched pane is observed by nobody: no poller
+        // outlives the CLI, and the instance dir is cleaned up at stop. The
+        // flush is the only thing that keeps it.
+        let (_guard, _base, _tmp) = crate::hooks::test_support::BaseGuard::ready();
+        let home = tempfile::tempdir().unwrap();
+        let _home_guard = crate::session::test_support::isolate_app_dir_at(home.path());
+
+        let profile = "pi-sidecar-flush";
+        let mut inst = Instance::new("pi-flush", "/tmp/pi-flush");
+        inst.source_profile = profile.to_string();
+        inst.tool = "pi".to_string();
+        inst.agent_session_id = Some("22f13307-461c-4161-908e-95a247fac750".to_string());
+        inst.mark_pi_extension_launched_for_test();
+
+        let storage = crate::session::storage::Storage::new_unwatched(profile).unwrap();
+        let seed = inst.clone();
+        storage
+            .update(|instances, _| {
+                *instances = vec![seed.clone()];
+                Ok(())
+            })
+            .unwrap();
+
+        let published = "01a05234-8889-72e2-a7c9-7ebc27b25b78";
+        crate::hooks::write_session_id_via_guard(&inst.id, published).unwrap();
+
+        inst.flush_pi_sidecar_conversation(&storage);
+
+        assert_eq!(
+            storage.load().unwrap()[0].agent_session_id.as_deref(),
+            Some(published),
+            "the conversation the pane published must outlive its instance dir"
+        );
+    }
+
     use super::*;
 
     /// Real-tmux integration for #3157: a session whose stored title moved

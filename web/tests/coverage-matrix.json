@@ -2951,24 +2951,10 @@
       "components": ["web/src/components/DeleteSessionDialog.tsx", "web/src/components/WorkspaceSidebar.tsx"]
     },
     {
-      "id": "story.mobile-toolbar-arrow-up",
+      "id": "story.mobile-toolbar-keys",
       "kind": "live-playwright",
-      "risk": "medium",
-      "specs": ["tests/live/acp-stories/mobile-toolbar-arrow-up.spec.ts"],
-      "components": ["web/src/components/MobileTerminalToolbar.tsx"]
-    },
-    {
-      "id": "story.mobile-toolbar-tab",
-      "kind": "live-playwright",
-      "risk": "medium",
-      "specs": ["tests/live/acp-stories/mobile-toolbar-tab.spec.ts"],
-      "components": ["web/src/components/MobileTerminalToolbar.tsx"]
-    },
-    {
-      "id": "story.mobile-toolbar-escape",
-      "kind": "live-playwright",
-      "risk": "medium",
-      "specs": ["tests/live/acp-stories/mobile-toolbar-escape.spec.ts"],
+      "risk": "high",
+      "specs": ["tests/live/acp-stories/mobile-toolbar-keys.spec.ts"],
       "components": ["web/src/components/MobileTerminalToolbar.tsx"]
     },
     {
@@ -2976,13 +2962,6 @@
       "kind": "vitest",
       "risk": "low",
       "specs": ["src/components/__tests__/MobileTerminalToolbar.test.tsx"],
-      "components": ["web/src/components/MobileTerminalToolbar.tsx"]
-    },
-    {
-      "id": "story.mobile-toolbar-ctrl-c",
-      "kind": "live-playwright",
-      "risk": "high",
-      "specs": ["tests/live/acp-stories/mobile-toolbar-ctrl-c.spec.ts"],
       "components": ["web/src/components/MobileTerminalToolbar.tsx"]
     },
     {
@@ -3049,11 +3028,11 @@
       "components": ["web/src/components/acp/Composer.tsx", "web/src/components/acp/SessionConfigControls.tsx"]
     },
     {
-      "id": "acp.story.composer-stop-mid-turn",
+      "id": "acp.story.composer-stop",
       "kind": "live-playwright",
       "risk": "high",
-      "specs": ["tests/live/acp-stories/composer-stop-mid-turn.spec.ts"],
-      "components": ["web/src/components/acp/Composer.tsx"]
+      "specs": ["tests/live/acp-stories/composer-stop.spec.ts"],
+      "components": ["web/src/components/acp/Composer.tsx", "web/src/components/acp/ToolCards.tsx"]
     },
     {
       "id": "acp.story.composer-queue-follow-up",
@@ -3110,9 +3089,9 @@
     },
     {
       "id": "acp.story.queue-recall-arrow",
-      "kind": "live-playwright",
+      "kind": "vitest",
       "risk": "medium",
-      "specs": ["tests/live/acp-stories/queue-recall-arrow.spec.ts"],
+      "specs": ["src/components/acp/recallNav.test.ts", "src/components/acp/Composer.recall.dom.test.tsx"],
       "components": ["web/src/components/acp/Composer.tsx", "web/src/components/acp/StructuredView.tsx"]
     },
     {
@@ -3135,24 +3114,10 @@
     },
     {
       "id": "acp.story.queue-fold-unfold",
-      "kind": "live-playwright",
+      "kind": "vitest",
       "risk": "low",
-      "specs": ["tests/live/acp-stories/queue-fold-unfold.spec.ts"],
+      "specs": ["src/components/acp/QueuedPromptsStrip.test.tsx", "src/components/acp/queuedPromptsLayout.test.ts"],
       "components": ["web/src/components/acp/StructuredView.tsx"]
-    },
-    {
-      "id": "acp.story.stop-during-thinking",
-      "kind": "live-playwright",
-      "risk": "medium",
-      "specs": ["tests/live/acp-stories/composer-stop-during-thinking.spec.ts"],
-      "components": ["web/src/components/acp/Composer.tsx"]
-    },
-    {
-      "id": "acp.story.stop-during-tool-call",
-      "kind": "live-playwright",
-      "risk": "medium",
-      "specs": ["tests/live/acp-stories/composer-stop-during-tool-call.spec.ts"],
-      "components": ["web/src/components/acp/Composer.tsx", "web/src/components/acp/ToolCards.tsx"]
     },
     {
       "id": "acp.story.fold-failed-tool-card",
@@ -3181,13 +3146,6 @@
       "risk": "high",
       "specs": ["tests/live/acp-stories/queue-follow-up-with-nav.spec.ts"],
       "components": ["web/src/components/acp/Composer.tsx", "web/src/hooks/useAcpSession.ts"]
-    },
-    {
-      "id": "acp.story.stop-during-sub-agent",
-      "kind": "live-playwright",
-      "risk": "medium",
-      "specs": ["tests/live/acp-stories/composer-stop-during-sub-agent.spec.ts"],
-      "components": ["web/src/components/acp/Composer.tsx", "web/src/components/acp/ToolCards.tsx"]
     },
     {
       "id": "acp.mid-turn-steering",

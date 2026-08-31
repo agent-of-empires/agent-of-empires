@@ -33,8 +33,8 @@ const SCRIPT = {
         },
         // Long enough that the navigate-away + navigate-back cycle
         // below completes while turn 1 is still in flight, but well
-        // under any 10s idle watchdog in the structured view supervisor (see
-        // `RESUME_IDLE_GRACE_DEFAULT` in src/acp/acp_client/connection.rs).
+        // under `RESUME_IDLE_GRACE_DEFAULT` in
+        // src/acp/acp_client/connection.rs.
         { sessionUpdate: "wait_ms", ms: 6_000 },
       ],
       stopReason: "end_turn",
@@ -97,6 +97,24 @@ base("queued follow-up fires after navigation away and back", async ({ page }, t
     await expect(queueBtn).toBeVisible({ timeout: 5_000 });
     await composerA.fill("from-after-nav");
     await queueBtn.click();
+
+    // The click POSTs `/acp/prompt`, which the daemon parks on the server
+    // queue. `page.goto` below is a document navigation, so it aborts that
+    // request if it is still in flight and the follow-up is lost with no
+    // trace: on a loaded runner the POST outlived the click often enough to
+    // fail this spec roughly 1 run in 3. Wait for the daemon to own the row
+    // before navigating; "the queue survives an unmount" is the story, and it
+    // presupposes a queued prompt.
+    const queueUrl = `${serve.baseUrl}/api/sessions/${encodeURIComponent(sessionA.id)}/queue`;
+    await expect
+      .poll(
+        async () => {
+          const rows = (await fetch(queueUrl).then((r) => r.json())) as Array<{ text: string }>;
+          return rows.map((r) => r.text);
+        },
+        { timeout: 10_000 },
+      )
+      .toEqual(["from-after-nav"]);
 
     // Navigate away to settings (no structured view, no PTY), then back to A.
     // The StructuredView unmount/remount is what we want to exercise; the

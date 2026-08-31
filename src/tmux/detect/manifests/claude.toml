@@ -1,0 +1,246 @@
+id = "claude"
+
+# The terminal title Claude publishes over OSC: a braille or half-circle
+# spinner frame while a turn runs, a static glyph when it is over. It is the
+# only signal immune to what the transcript happens to contain, so it outranks
+# everything. The idle half of the pair sits far lower (`osc_title_idle`):
+# measured against 2.1.251, the spinner animates only while the model streams,
+# so the static glyph also shows during a long tool call.
+[[rules]]
+id = "osc_title_working"
+state = "running"
+priority = 1100
+region = "osc_title"
+visible = true
+regex = ['^[\x{2800}-\x{28FF}\x{25D0}-\x{25D3}]']
+
+# A tool-permission prompt. Claude keeps its live "Working…" line rendered
+# below the prompt and re-emits running-mapped hooks while it waits, so this
+# has to outrank every running signal (#1913). The stock question phrasing is
+# common in ordinary turn text, so it is paired with a menu row carrying the
+# selection cursor: prose renders no cursor.
+[[rules]]
+extends = "approval_prompt"
+id = "approval_prompt"
+priority = 980
+contains_any = ["do you want to", "would you like to proceed"]
+line_regex = ['^\s*\x{276F}\s*[1-9]\.']
+
+# The `AskUserQuestion` selection UI. Its question is arbitrary turn text, so
+# the footer is the marker: `Enter to select · ↑/↓ to navigate` is unique to
+# this UI (a permission prompt's footer is `Esc to cancel · Tab to amend`).
+# Anchored to the start of a line so a pane echoing the footer (a diff, a
+# fixture dump) carries a prefix and does not read as live.
+[[rules]]
+id = "ask_user_question"
+state = "waiting"
+priority = 980
+region = "whole_recent"
+visible = true
+line_regex = [
+  '(?i)^\s*enter to select.*to navigate',
+  '^\s*[\x{276F}>]?\s*[1-9]\.',
+]
+
+# The interrupt hint. Matched per line, and only on a line that does not open
+# with a tool-output prefix (`⎿`, a diff `+`, a `NNN:` line number) or carry a
+# quote before the hint: a turn that reads or greps this repo's own detector
+# echoes the phrase verbatim, and a loose window match pinned those panes on
+# Running until the text scrolled away.
+[[rules]]
+extends = "interrupt_hint"
+id = "interrupt_hint"
+priority = 970
+line_regex = ['(?i)^[ \t]*(?:[^"\x{23BF}+\s\d][^"]*)?(?:esc|ctrl\+c) to interrupt']
+
+# The live token counter (`(4s · ↓ 88 tokens)`), which only renders while a
+# turn generates. The opening paren and the closing paren at end of line are
+# both required: the background-agents strip below the footer renders the same
+# counts unparenthesized and stays on screen, frozen, after the session goes
+# idle (#2909), and quoted literals in prose carry punctuation after the paren.
+[[rules]]
+id = "live_token_counter"
+state = "running"
+priority = 970
+region = "whole_recent"
+visible = true
+# `\d+\s*[hms]` rather than a contiguous token: a narrow pane wraps mid-token,
+# putting the capture's newline between a duration's digits and its unit.
+regex = ['(?m)\(\s*(?:\d+\s*[hms]\s+)*\d+\s*[hms]\s*·?\s*\x{2193}\s*\d+(?:\.\d+)?[kmg]?\s+tokens\s*\)\s*$']
+
+# The `<frame> <Verb…>` shape. The ellipsis must fall in the first or second
+# word after the frame char: single-verb lines end it on word one (`Working…`),
+# compaction on word two (`✢ Compacting conversation… (17s)`). Later words do
+# not count, which is what keeps past-tense completions (`Worked for 1m 52s`,
+# no ellipsis) and rendered markdown bullets out.
+[[rules]]
+id = "active_spinner"
+state = "running"
+priority = 970
+region = "whole_recent"
+visible = true
+line_regex = ['^\s*[\x{00B7}\x{2722}\x{2733}\x{2736}\x{273B}\x{273D}*\x{25CF}]\s+\p{Lu}\S*(?:\x{2026}|\s+\S*\x{2026})']
+
+# `✻ Waiting for 1 background agent to finish`: the main REPL is between turns
+# while background agents run, so the pane shows an idle box with this line in
+# the status slot. Anchored to that slot, never the whole window: unlike the
+# spinner the renderer does not clear it, and a finished turn's copy scrolling
+# past would pin a parked session on Running.
+[[rules]]
+id = "background_agent_wait"
+state = "running"
+priority = 970
+region = "last_non_empty_above_prompt_box"
+visible = true
+line_regex = ['(?i)^\s*[\x{00B7}\x{2722}\x{2733}\x{2736}\x{273B}\x{273D}*\x{25CF}]\s+waiting for \d+ background agents? to finish\s*$']
+
+# Background shells the agent started and has not reaped: a build, a test run,
+# a server. The footer's count is live, dropping the segment when the last one
+# exits, so this reads a real running process rather than a banner. A shell the
+# agent leaves up for good (a dev server) does keep the session Running, which
+# is true rather than stale.
+[[rules]]
+id = "background_shell"
+state = "running"
+priority = 970
+region = "bottom_non_empty_lines(5)"
+visible = true
+line_regex = ['(?i)^\s*[\x{23F8}\x{23F5}].*\x{b7}\s*[1-9]\d*\s+shells?\s*(?:\x{b7}|$)']
+
+# MCP tasks still running behind a finished turn. Same argument as the
+# background agents above, and the same anchoring problem: the count sits on an
+# activity line the renderer leaves in place, so it is read at column zero on
+# the recent window rather than anywhere it may have scrolled to. The `not`
+# clauses drop panes where the line is quoted inside a permission prompt.
+[[rules]]
+id = "background_mcp_task"
+state = "running"
+priority = 970
+region = "bottom_non_empty_lines(12)"
+visible = true
+line_regex = ['(?i)^[\x{00B7}\x{2722}\x{2733}\x{2736}\x{273B}\x{273D}*\x{25CF}]\s+\S.*\x{b7}\s*[1-9]\d*\s+MCP tasks? still running\s*$']
+not = [
+  { contains_any = [
+    "do you want to proceed?",
+    "waiting for permission",
+    "do you want to allow this connection?",
+    "tab to amend",
+    "ctrl+e to explain",
+  ] },
+]
+
+# The first-run folder-trust dialog. It is not a tool permission, so it phrases
+# its question without either stock opener. Below the running signals rather
+# than carrying a "no running signal" clause of its own: the real dialog
+# renders before any turn starts, so a pane that shows both is echoing the
+# prompt, not sitting on it.
+[[rules]]
+id = "folder_trust_prompt"
+state = "waiting"
+priority = 960
+region = "collapsed_recent"
+visible = true
+contains = [
+  "is this a project you created or one you trust",
+  "yes, i trust this folder",
+]
+
+# The completion line a finished turn leaves in the status slot above the
+# input box (`✻ Cooked for 1m 58s`). Positive evidence that the turn is over,
+# so it outranks a `running` write nobody has refreshed for 30 seconds.
+[[rules]]
+id = "completed_turn"
+state = "idle"
+priority = 500
+region = "last_non_empty_above_prompt_box"
+visible = true
+regex = ['^\s*[\x{00B7}\x{2722}\x{2733}\x{2736}\x{273B}\x{273D}*\x{25CF}]\s+\p{Lu}[^\s\x{2026}]*\s+for\s+\d+[smh]\b']
+not = [{ contains = ["background agent"] }]
+
+# The banner Claude leaves after the user cancels a turn with Esc. That path
+# fires neither `Stop` nor `idle_prompt`, so the hook file stays on its last
+# `running` write with nothing else to release it.
+[[rules]]
+id = "interrupt_banner"
+state = "idle"
+priority = 965
+region = "whole_recent"
+visible = true
+contains = ["what should claude do instead"]
+
+# An empty input box: the agent is parked, waiting for the user to type.
+[[rules]]
+id = "ready_prompt"
+state = "idle"
+priority = 480
+region = "prompt_box_body"
+visible = true
+regex = ['^\s*\x{276F}\s*$']
+
+# The static title glyph. Weak evidence of idle and never proof: measured
+# against 2.1.251 it also shows during a long tool call, so it ranks below
+# every screen rule and only speaks for a capture nothing else does.
+[[rules]]
+id = "osc_title_idle"
+state = "idle"
+priority = 250
+region = "osc_title"
+regex = ['^\x{2733}']
+
+# A footer wrapped mid-phrase by a narrow pane, where the hint is split across
+# lines and no per-line rule can see it. Below `completed_turn`, because this
+# match cannot tell a live footer from a turn that echoed the phrase, and above
+# `ready_prompt`, because an empty input box under a wrapped footer is what an
+# active turn looks like on a narrow pane.
+[[rules]]
+id = "interrupt_hint_wrapped"
+state = "running"
+priority = 490
+region = "collapsed_recent"
+contains_any = ["esc to interrupt", "ctrl+c to interrupt"]
+
+# An agent-owned viewer shows history, not live state, so no status can be read
+# off it and the last known one stands. Both shapes and their footers come from
+# herdr's claude manifest (Apache-2.0), which has carried them longer than this
+# table has existed.
+[[rules]]
+id = "transcript_viewer"
+priority = 1000
+region = "bottom_non_empty_lines(3)"
+skip_state_update = true
+contains = ["showing detailed transcript"]
+contains_any = [
+  "ctrl+o", "to toggle",
+  "ctrl+e", "show all",
+  "ctrl+e", "collapse",
+  "\u2191\u2193 scroll",
+  "? for shortcuts",
+]
+
+[[rules]]
+id = "model_picker_menu"
+priority = 900
+region = "whole_recent"
+skip_state_update = true
+contains = ["select model", "enter to set as default", "esc to cancel"]
+not = [
+  { contains = ["do you want to proceed?"] },
+  { contains = ["enter to select"] },
+]
+
+# The input box on screen at all, whatever it holds. Weaker than the rules
+# above and than a standing `running` write, so it only speaks for a capture
+# nothing else does: herdr ranks the same shape as plain idle evidence and
+# leans on live PTY byte activity to outrank it, which a tmux poller cannot
+# see. It is what catches a parked pane whose completion line has scrolled
+# away entirely.
+[[rules]]
+id = "live_prompt_box"
+state = "idle"
+priority = 350
+region = "prompt_box_body"
+line_regex = ['^\s*\x{276F}']
+not = [
+  { contains = ["enter to select"] },
+  { contains = ["esc to cancel"] },
+]

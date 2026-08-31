@@ -27,8 +27,9 @@ pub(crate) use dir_guard::{
     write_session_id_via_guard,
 };
 pub use status_file::{
-    cleanup_hook_status_dir, hook_status_dir, read_hook_session_id, read_hook_status,
-    read_hook_status_age, read_hook_urgent,
+    cleanup_hook_status_dir, hook_status_dir, read_hook_session_id, read_hook_session_id_any_age,
+    read_hook_session_path, read_hook_status, read_hook_status_age, read_hook_urgent,
+    session_id_sidecar_exists,
 };
 pub(crate) use targets::{
     has_aoe_marker, iter_hook_targets, iter_hook_targets_in, HookTarget, HookTargetKind,
@@ -3292,6 +3293,7 @@ trust_level = "trusted"
     // A half-written config must not block the launch; the installers above
     // treat unparseable files as empty and this one has to match.
     #[test]
+    #[serial_test::serial]
     fn test_trust_claude_project_replaces_malformed_config() {
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join(".claude.json");
@@ -4125,6 +4127,7 @@ hooks_auto_accept: false
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_install_hermes_hooks_rejects_invalid_allowlist_without_overwrite() {
         let tmp = TempDir::new().unwrap();
         let config_path = tmp.path().join("config.yaml");
@@ -4418,6 +4421,7 @@ hooks_auto_accept: false
     }
 
     #[test]
+    #[serial_test::serial]
     fn test_resolve_kiro_agent_file_ignores_non_json_and_invalid_files() {
         // Unreadable-as-JSON and non-.json files in the dir must not break the
         // scan or produce a false match.

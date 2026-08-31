@@ -116,7 +116,7 @@ Profiles are conservative: an unverified tool surface is omitted rather than gue
 
 ```toml
 [acp]
-default_agent = "aoe-agent"
+default_agent = "claude-code"
 approval_timeout_secs = 300
 destructive_require_double_confirm = true
 max_concurrent_workers = 100
