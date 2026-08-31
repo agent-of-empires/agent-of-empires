@@ -227,6 +227,8 @@ impl HomeView {
     /// field: the sweeps only rewrite durable state, so a storage reload is
     /// both sufficient and cheaper than mirroring each repair. See #3611.
     pub fn apply_reconcile_results(&mut self) -> bool {
+        use std::sync::mpsc::TryRecvError;
+
         // Every storage reload gates on live-send being idle so none of them
         // interrupts a paste in progress. Checked before the drain, so the
         // worker's result stays queued for the next eligible tick rather than
@@ -234,10 +236,20 @@ impl HomeView {
         if self.live_send.is_some() {
             return false;
         }
-        let Ok(result) = self.reconcile_poller.try_recv_result() else {
-            return false;
+        let changed = match self.reconcile_poller.try_recv_result() {
+            Ok(result) => result.changed,
+            Err(TryRecvError::Empty) => return false,
+            // The worker is gone, so no sweep is coming. Release the recovery
+            // gate below rather than stranding it for the whole boot.
+            Err(TryRecvError::Disconnected) => false,
         };
-        if !result.changed {
+        // Startup recovery waits for the sweep either way: an unchanged sweep
+        // still means the paths it would launch from are now known good.
+        if self.startup_recovery_pending {
+            self.startup_recovery_pending = false;
+            self.maybe_start_startup_recovery();
+        }
+        if !changed {
             return false;
         }
         if let Err(error) = self.reload_storage_only() {

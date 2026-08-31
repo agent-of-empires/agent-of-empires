@@ -507,6 +507,10 @@ pub struct HomeView {
     /// outside aoe) kicked once from `HomeView::new` so it never delays the
     /// first frame; `apply_reconcile_results` reloads when it lands. See #3611.
     pub(super) reconcile_poller: crate::tui::reconcile_poller::ReconcilePoller,
+    /// Set until the first reconcile sweep lands, so startup auto-recovery
+    /// runs against repaired paths rather than the stale ones the sweep is
+    /// about to fix. See `apply_reconcile_results`.
+    pub(super) startup_recovery_pending: bool,
 
     // Performance: background restart (the start cascade shells out to docker
     // and runs the before_start host hook, which can block for seconds)

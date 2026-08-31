@@ -132,10 +132,11 @@ fn is_protected_default_branch_cached(inst: &Instance, cache: &mut ProtectedBran
 /// the directory is still there, git no longer knows about it, and no retry
 /// changes that. Two `stat`s, no spawn, no error-string sniffing.
 ///
-/// The target is resolved against the worktree, not the process directory:
-/// under `worktree.useRelativePaths` git writes it relative (`gitdir:
-/// ../repo/.git/worktrees/x`), and resolving that from the cwd would read a
-/// live checkout as stranded and refuse to relocate it.
+/// Resolution goes through [`crate::git::cleanup::read_linked_worktree_gitdir`]
+/// so the pointer is read the same way everywhere: aoe rewrites every managed
+/// worktree's pointer to a relative target in `create_worktree`, so resolving
+/// it against the process directory instead of the worktree would read a live
+/// checkout as stranded and refuse to relocate it for good.
 ///
 /// Anything unreadable is treated as present. This decides whether to stop
 /// retrying, so guessing "stranded" from a transient read error is the
@@ -149,19 +150,10 @@ fn is_orphaned_checkout(worktree: &Path) -> bool {
         // A repo of its own, not a linked worktree; nothing to strand.
         return false;
     }
-    let Ok(contents) = std::fs::read_to_string(&link) else {
-        return false;
-    };
-    let Some((_, target)) = contents.split_once("gitdir:") else {
-        return false;
-    };
-    let target = Path::new(target.trim());
-    let admin = if target.is_absolute() {
-        target.to_path_buf()
-    } else {
-        worktree.join(target)
-    };
-    !admin.exists()
+    match crate::git::cleanup::read_linked_worktree_gitdir(worktree) {
+        Some(admin) => !admin.exists(),
+        None => false,
+    }
 }
 
 fn is_sandboxed(inst: &Instance) -> bool {
@@ -691,19 +683,29 @@ pub fn reconcile_trashed_location(inst: &mut Instance) -> bool {
 pub fn reconcile_trashed_profile(profile: &str) -> anyhow::Result<Vec<Instance>> {
     let storage = crate::session::Storage::open_unwatched(profile)?;
     let mut cache = ProtectedBranchCache::default();
-    let mut candidates: Vec<String> = storage
+    let mut candidates: Vec<Instance> = storage
         .load()?
         .into_iter()
         .filter(|inst| plan_trashed_reconcile_cached(inst, &mut cache) != ReconcilePlan::Nothing)
-        .map(|inst| inst.id)
         .collect();
-    candidates.sort();
+    candidates.sort_by(|a, b| a.id.cmp(&b.id));
 
     let mut healed = Vec::new();
     for batch in candidates.chunks(RECONCILE_BATCH) {
         healed.extend(reconcile_trashed_batch(&storage, batch)?);
     }
     Ok(healed)
+}
+
+/// Whether the durable row still matches the snapshot the plan was decided
+/// from. Everything [`plan_trashed_reconcile`] reads, so a row a peer touched
+/// between the scan and the reservation is dropped rather than reserved.
+fn plan_inputs_unchanged(snapshot: &Instance, durable: &Instance) -> bool {
+    durable.is_trashed()
+        && durable.project_path == snapshot.project_path
+        && durable.pre_trash_project_path == snapshot.pre_trash_project_path
+        && durable.worktree_info == snapshot.worktree_info
+        && durable.scratch == snapshot.scratch
 }
 
 /// How many rows one batch reserves at once.
@@ -717,15 +719,32 @@ const RECONCILE_BATCH: usize = 8;
 
 fn reconcile_trashed_batch(
     storage: &crate::session::Storage,
-    batch: &[String],
+    batch: &[Instance],
 ) -> anyhow::Result<Vec<Instance>> {
     let now = Utc::now();
     let reserved = storage.update(|instances, _groups| {
         let mut reserved: Vec<(u64, Instance)> = Vec::new();
-        for id in batch {
-            let Some(stored) = instances.iter_mut().find(|candidate| &candidate.id == id) else {
+        for snapshot in batch {
+            let Some(stored) = instances
+                .iter_mut()
+                .find(|candidate| candidate.id == snapshot.id)
+            else {
                 continue;
             };
+            // Compare and set: the plan was decided from a snapshot taken
+            // without any lock, so a peer can have restored, purged, or moved
+            // the row since. Reserving it anyway would put a Trash reservation
+            // on a live session and hold it for the rest of the batch, making
+            // that session's launch, restore, and purge report Busy behind
+            // unrelated worktree moves.
+            if !plan_inputs_unchanged(snapshot, stored) {
+                tracing::debug!(
+                    target: "session.trash",
+                    session = %snapshot.id,
+                    "trash reconciliation skipped: the row changed after it was scanned"
+                );
+                continue;
+            }
             match stored.try_acquire_lifecycle_reservation(
                 crate::session::LifecycleOperation::Trash,
                 Instance::LIFECYCLE_RESERVATION_TTL,
@@ -734,7 +753,7 @@ fn reconcile_trashed_batch(
                 Ok(generation) => reserved.push((generation, stored.clone())),
                 Err(error) => tracing::debug!(
                     target: "session.trash",
-                    session = %id,
+                    session = %snapshot.id,
                     "trash reconciliation deferred: {error}"
                 ),
             }
@@ -1264,10 +1283,12 @@ mod tests {
         }
     }
 
-    /// A worktree git wrote with a relative `gitdir:` (the
-    /// `worktree.useRelativePaths` layout) is still live. Resolving that target
-    /// from the process directory instead of the worktree would read it as
-    /// stranded and refuse to relocate it for good.
+    /// A worktree whose `.git` names its admin dir by a relative path is still
+    /// live. aoe rewrites every managed worktree's pointer that way in
+    /// `create_worktree`, and git does the same under
+    /// `worktree.useRelativePaths`, so resolving the target from the process
+    /// directory instead of the worktree would read essentially every managed
+    /// trashed worktree as stranded and refuse to relocate it for good.
     #[test]
     fn a_relative_gitdir_link_is_not_mistaken_for_a_stranded_checkout() {
         if !git_available() {
@@ -1353,6 +1374,61 @@ mod tests {
         // Still a candidate: the next pass tries again rather than giving up.
         assert_eq!(plan_trashed_reconcile(&inst), ReconcilePlan::Relocate);
         assert!(!reconcile_trashed_location(&mut inst));
+    }
+
+    /// #3611 review: the plan is decided from an unlocked snapshot, so a peer
+    /// can restore the row before the batch reserves it. Reserving anyway would
+    /// pin a Trash reservation on a live session for the rest of the batch and
+    /// make its launch, restore, and purge report Busy.
+    #[test]
+    #[serial_test::serial]
+    fn a_row_restored_after_the_scan_is_not_reserved() {
+        if !git_available() {
+            return;
+        }
+        let _guard = crate::session::test_support::isolate_app_dir();
+        let storage = crate::session::Storage::new_unwatched("default").unwrap();
+        let (_tmp, mut inst) = real_worktree_instance();
+        inst.trash();
+        let id = inst.id.clone();
+        let snapshot = inst.clone();
+        storage
+            .update(|instances, _groups| {
+                instances.push(inst);
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(
+            plan_trashed_reconcile(&snapshot),
+            ReconcilePlan::Relocate,
+            "the scan must see work to do, or the test proves nothing"
+        );
+
+        // The peer restore lands between the scan and the batch.
+        storage
+            .update(|instances, _groups| {
+                instances[0].untrash();
+                Ok(())
+            })
+            .unwrap();
+
+        assert!(
+            reconcile_trashed_batch(&storage, std::slice::from_ref(&snapshot))
+                .unwrap()
+                .is_empty()
+        );
+        let stored = storage.load().unwrap().into_iter().next().unwrap();
+        assert_eq!(stored.id, id);
+        assert!(
+            stored.lifecycle_reservation.is_none(),
+            "a restored row must not be left carrying a Trash reservation"
+        );
+        assert_eq!(
+            stored.lifecycle_generation, 0,
+            "the restored row must not be reserved at all"
+        );
+        // And its worktree was left where the restore put it.
+        assert!(stored.pre_trash_project_path.is_none());
     }
 
     /// #3611: the sweep decides from the filesystem alone, so a profile whose

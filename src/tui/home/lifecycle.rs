@@ -330,6 +330,7 @@ impl HomeView {
             stop_poller: StopPoller::new(),
             trash_poller: crate::tui::trash_poller::TrashPoller::new(),
             reconcile_poller: crate::tui::reconcile_poller::ReconcilePoller::new(),
+            startup_recovery_pending: false,
             restart_poller: RestartPoller::new(),
             restart_in_flight: std::collections::HashSet::new(),
             attach_project_poller: crate::tui::attach_project_poller::AttachProjectPoller::new(),
@@ -508,15 +509,6 @@ impl HomeView {
             inst.repair_session_id_poller_if_needed(&live);
         }
 
-        // Startup auto-recovery: kick off a worker pool to restart any
-        // resume-capable sessions whose tmux pane is missing. The TUI defers
-        // to the daemon when one is running (the daemon owns recovery in
-        // that case); when the TUI is standalone, it acquires the
-        // cross-process recovery lock to keep a late-starting daemon from
-        // duplicating cascades. See `crate::session::recovery` for the full
-        // exclusion rationale.
-        view.maybe_start_startup_recovery();
-
         view.refresh_registered_projects();
         view.flat_items = view.build_flat_items();
         view.update_selected();
@@ -535,6 +527,15 @@ impl HomeView {
         // loaded profiles on a worker so they never delay the first frame
         // (#3611).
         view.reconcile_poller.request(initial_disk_profiles.clone());
+        // Startup auto-recovery restarts resume-capable sessions whose tmux
+        // pane is missing, launching each from its recorded `project_path` and
+        // recording the attempt in a boot-scoped ledger that is not retried.
+        // It therefore has to wait for the sweep above: a row whose worktree
+        // moved outside aoe (#2002) still carries the stale path until the
+        // sweep repoints it, and recovering from the stale path would burn
+        // that row's only attempt for the whole boot.
+        // `apply_reconcile_results` starts it once the sweep lands.
+        view.startup_recovery_pending = true;
         // Config subscriptions are intentionally asymmetric: even in
         // single-profile mode, peer edits to ANY profile's config.toml
         // (or the global config) must be observable so the picker UI

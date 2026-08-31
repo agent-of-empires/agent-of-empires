@@ -21373,3 +21373,46 @@ fn reconcile_reload_waits_for_live_send_to_finish() {
         "the skipped verdict must still be waiting once live-send ends"
     );
 }
+
+/// #3615 review: startup auto-recovery launches from `project_path` and records
+/// each attempt in a boot-scoped ledger that is not retried, so it must not run
+/// until the reconcile sweep has had its chance to repoint a row whose worktree
+/// moved outside aoe (#2002). `HomeView::new` therefore arms the gate instead of
+/// starting recovery, and `apply_reconcile_results` releases it exactly once,
+/// whether or not the sweep changed anything.
+#[test]
+#[serial]
+fn startup_recovery_waits_for_the_first_reconcile_sweep() {
+    let temp = TempDir::new().unwrap();
+    let _guard = setup_test_home(&temp);
+    let _storage = Storage::new_unwatched("test").unwrap();
+    let mut view = HomeView::new(
+        Some("test".to_string()),
+        AvailableTools::with_tools(&["claude"]),
+        crate::file_watch::FileWatchService::noop(),
+    )
+    .unwrap();
+
+    assert!(
+        view.startup_recovery_pending,
+        "construction must arm the gate rather than recover from unrepaired paths"
+    );
+
+    // An unchanged sweep still releases it: the paths are now known good.
+    view.reconcile_poller =
+        crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(false);
+    assert!(
+        !view.apply_reconcile_results(),
+        "nothing changed, so no reload"
+    );
+    assert!(
+        !view.startup_recovery_pending,
+        "the sweep landing must release the recovery gate"
+    );
+
+    // Released exactly once, so later ticks cannot re-run recovery.
+    view.reconcile_poller =
+        crate::tui::reconcile_poller::ReconcilePoller::with_result_for_test(false);
+    assert!(!view.apply_reconcile_results());
+    assert!(!view.startup_recovery_pending);
+}
