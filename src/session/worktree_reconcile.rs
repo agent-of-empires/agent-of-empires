@@ -268,6 +268,49 @@ pub fn reconcile_and_persist(
     Ok(resolution)
 }
 
+/// Reconcile every session in one profile against git's worktree listing.
+///
+/// Returns true when a row was repointed, so the caller can refresh. One
+/// [`ReconcileCache`] is shared across the pass, and a healthy row costs one
+/// `stat`, so an untouched profile spawns no git at all.
+///
+/// Storage is opened unwatched: the callers that sweep a whole profile are
+/// background workers whose writes the view picks up from the returned verdict
+/// rather than from a local-change notification.
+///
+/// BLOCKING: opens repos and stats every recorded worktree. Never call it on an
+/// event loop or the async runtime.
+pub fn reconcile_profile(profile: &str) -> bool {
+    let storage = match Storage::open_unwatched(profile) {
+        Ok(storage) => storage,
+        Err(error) => {
+            tracing::warn!(
+                target: "session.worktree",
+                profile = %profile,
+                "worktree path reconciliation skipped: {error}",
+            );
+            return false;
+        }
+    };
+    let Ok(mut instances) = storage.load() else {
+        return false;
+    };
+    let mut cache = ReconcileCache::default();
+    let mut changed = false;
+    for instance in &mut instances {
+        match reconcile_and_persist(&storage, instance, &mut cache) {
+            Ok(WorktreePathResolution::Moved(_)) => changed = true,
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                target: "session.worktree",
+                session = %instance.id,
+                "worktree path reconciliation skipped: {error}",
+            ),
+        }
+    }
+    changed
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

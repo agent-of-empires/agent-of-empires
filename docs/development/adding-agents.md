@@ -25,7 +25,7 @@ Each level is additive; do only what the agent supports.
 |-------|---------------|----------|
 | 1. Basic | Appears in `aoe agents`, sessions launch, status always "Idle" | `AgentDef` + stub `detect_status` |
 | 2. Pane-parse status | Status inferred from terminal output; no agent config | A manifest in `src/tmux/detect/manifests/`, plus a `detect_<agent>_status(&str) -> Status` calling into it |
-| 3. Hook status | Agent writes status to a file via hooks; lands the instant state changes | `hook_config` + generic `install_hooks()` or a custom `install_<agent>_hooks()` (Claude, Cursor, Gemini generic; Codex TOML, Hermes YAML, Kiro JSON) |
+| 3. Hook status | Agent writes status to a file via hooks; lands the instant state changes | `hook_config` + generic `install_hooks()` or a custom `install_<agent>_hooks()` |
 | 4. Session resume | Restart resumes the prior conversation | Non-`Unsupported` `resume_strategy` plus project-agnostic automatic session-ID capture |
 | 5. Docker sandbox | Runs isolated; host config synced in | `AgentConfigMount` + Dockerfile install |
 

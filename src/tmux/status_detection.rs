@@ -22,6 +22,37 @@ pub fn detect_status_from_content_in(profile: &str, content: &str, tool: &str) -
         .unwrap_or(Status::Idle)
 }
 
+/// The one manifest-backed detection entry point: a profile's own
+/// `[[agents.<name>.status_rules]]` first, then the agent's manifest.
+///
+/// The status poller and `aoe session capture` both route through this so they
+/// cannot disagree about a configured rule or a terminal title (#3625). The
+/// two identities are separate on purpose: `rules_tool` is what configured
+/// rules are keyed to (`status_rules::detection_tool`, which keeps a session's
+/// own rules ahead of its `agent_detect_as` alias), while `agent` is the
+/// manifest identity, which follows the alias. `clean` must already be
+/// ANSI-stripped; `osc_title` is tmux's `#{pane_title}`, empty when unknown.
+///
+/// `None` means the agent has no manifest and no configured rules, leaving the
+/// verdict to the caller.
+pub fn detect_with_rules(
+    profile: &str,
+    rules_tool: &str,
+    agent: &str,
+    clean: &str,
+    osc_title: &str,
+    hook: Option<super::detect::HookObservation>,
+) -> Option<super::detect::Detection> {
+    if let Some(status) = super::status_rules::detect(profile, rules_tool, clean) {
+        return Some(super::detect::Detection {
+            status: Some(status),
+            visible: true,
+            rule: "configured_status_rule",
+        });
+    }
+    super::detect::detect(agent, clean, osc_title, hook)
+}
+
 /// Run an agent's detection manifest over one capture, falling back to Idle
 /// when no rule matches. The per-agent `detect_*_status` entry points are thin
 /// wrappers so the agent registry keeps its stable function pointers.
@@ -163,10 +194,70 @@ pub fn detect_antigravity_status(raw_content: &str) -> Status {
 mod tests {
     use super::*;
 
+    /// #3625: `aoe session capture` went straight to the manifest, so a
+    /// profile's own `[[agents.<name>.status_rules]]` were skipped and the
+    /// terminal title arrived empty. Both are inputs the poller supplies, and
+    /// both now come through this one entry point.
+    #[test]
+    #[serial_test::serial]
+    fn detect_with_rules_puts_configured_rules_and_the_title_in_reach() {
+        const PROFILE: &str = "detect-with-rules-test";
+        let _registry = super::super::status_rules::ProfileRegistryGuard::take(PROFILE);
+        let mut config = crate::session::Config::default();
+        config
+            .agents
+            .entry("claude".to_string())
+            .or_default()
+            .status_rules = vec![crate::session::config::StatusRule {
+            status: crate::agents::HookStatus::Waiting,
+            contains: Some("deploy to prod?".to_string()),
+            regex: None,
+        }];
+        super::super::status_rules::install_from_config(PROFILE, &config);
+
+        // A screen the manifest reads as Running: the configured rule has to
+        // outrank it, not merely fill in where the manifest is silent.
+        let running = "\u{2736} Working\u{2026} (5s)\ndeploy to prod?\n";
+        assert_eq!(
+            detect_via_manifest("claude", running, "", None),
+            Status::Running,
+            "fixture invariant: the manifest alone reads this screen as Running"
+        );
+        let detection = detect_with_rules(PROFILE, "claude", "claude", running, "", None)
+            .expect("claude has a manifest");
+        assert_eq!(detection.status, Some(Status::Waiting));
+        assert_eq!(detection.rule, "configured_status_rule");
+
+        // The terminal title is a rule region of its own, and Claude ranks it
+        // above every screen shape. A capture that drops it cannot see this.
+        let idle_screen = "turn over\n";
+        let titled = detect_with_rules(
+            "no-rules-profile-for-title-test",
+            "claude",
+            "claude",
+            idle_screen,
+            "\u{2807}",
+            None,
+        )
+        .expect("claude has a manifest");
+        assert_eq!(titled.status, Some(Status::Running));
+        assert_eq!(titled.rule, "osc_title_working");
+        assert_eq!(
+            detect_via_manifest("claude", idle_screen, "", None),
+            Status::Idle,
+            "the same capture without the title is what the CLI used to report"
+        );
+    }
+
     /// Whether one manifest rule matches a fixture, used where a test asserts
     /// the shape it claims to exercise is really present.
     fn claude_rule_matches(rule: &str, content: &str) -> bool {
         super::super::detect::rule_matches("claude", rule, &strip_ansi(content), "", None)
+    }
+
+    /// Whether one of Vibe's manifest rules matches a fixture.
+    fn vibe_rule_matches(rule: &str, content: &str) -> bool {
+        super::super::detect::rule_matches("vibe", rule, &strip_ansi(content), "", None)
     }
 
     /// A `waiting` write left behind by a prompt the user cancelled: the write
@@ -2252,11 +2343,27 @@ Do you want to proceed?\n\
         assert_eq!(detect_vibe_status("Writing changes"), Status::Running);
         assert_eq!(detect_vibe_status("Generating code"), Status::Running);
 
-        // Vertical text (Vibe's Textual TUI renders one char per line)
-        assert_eq!(
-            detect_vibe_status("⠋\nR\nu\nn\nn\ni\nn\ng\nb\na\ns\nh\n…"),
-            Status::Running
-        );
+        // Vertical text (Vibe's Textual TUI renders one char per line). No
+        // spinner and no trailing ellipsis, so the activity word alone has to
+        // carry it.
+        let vertical = "R\nu\nn\nn\ni\nn\ng";
+        assert_eq!(detect_vibe_status(vertical), Status::Running);
+        assert!(vibe_rule_matches("activity_word", vertical));
+        assert!(!vibe_rule_matches("spinner", vertical));
+        assert!(!vibe_rule_matches("trailing_ellipsis", vertical));
+
+        // Only stacked runs are glued: two ordinary lines that happen to meet
+        // mid-word stay separate, so they cannot spell an activity word
+        // neither of them contains.
+        let glued = "finished a long run\nning total of 3 files";
+        assert_eq!(detect_vibe_status(glued), Status::Idle);
+        assert!(!vibe_rule_matches("activity_word", glued));
+
+        // A blank row ends a run too: the window drops blank lines, so without
+        // this the halves of two separate blocks would stack into one word.
+        let split = "R\nu\nn\n\nn\ni\nn\ng";
+        assert_eq!(detect_vibe_status(split), Status::Idle);
+        assert!(!vibe_rule_matches("activity_word", split));
 
         // Ellipsis indicates ongoing activity
         assert_eq!(detect_vibe_status("Working…"), Status::Running);
@@ -2289,6 +2396,10 @@ Do you want to proceed?\n\
         assert_eq!(detect_vibe_status("some random output"), Status::Idle);
         assert_eq!(detect_vibe_status("file saved successfully"), Status::Idle);
         assert_eq!(detect_vibe_status("Done!"), Status::Idle);
+
+        // A middle dot is separator punctuation in parked output; Vibe's
+        // Textual spinner is braille and draws no other frame.
+        assert_eq!(detect_vibe_status("main · 3 files changed"), Status::Idle);
     }
 
     #[test]

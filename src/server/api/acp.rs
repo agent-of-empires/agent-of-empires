@@ -1334,29 +1334,25 @@ pub async fn acp_prompt(
         Ok(a) => a,
         Err((code, msg)) => return (code, msg).into_response(),
     };
+    // Claim the session's prompt-submission authority for the rest of the
+    // handler: the decision below and the dispatch it picks must be one
+    // atomic step. Releasing between them let a queue drain read a fold this
+    // prompt had not published into yet, so both delivered and whichever lost
+    // the agent's race came back `agent_busy` after its queue row was already
+    // retired (#3621). Not `instance_lock`, for the reason `prompt_submission`
+    // documents: holding that one here stalls this handler's own resume
+    // (#3172).
+    let _submission = state.session_service.prompt_submission(&id).await;
     // A fresh user prompt supersedes any queued rate-limit resume
     // continuation, so drop it before sending: otherwise the reconciler could
     // later replay the older interrupted prompt after this newer one (#3028).
-    // The clear alone runs under the per-session `instance_lock`, and the
-    // guard is dropped before `send_turn`. Mutual exclusion with the
-    // pending-turn drain is enough to keep the #3028 ordering: the drain
-    // holds this same lock across its whole snapshot -> reload -> send ->
-    // clear, so whichever side wins the lock, the stale continuation can
-    // never be published after this newer prompt. If the drain wins it
-    // delivers first; if we win, the drain then reads None and returns.
-    //
-    // Holding the guard across `send_turn` is what broke #3172:
-    // `send_turn` -> `trigger_resume_background` detaches a task that calls
-    // `build_spawn_request`, which takes this very lock, so the spawn could
-    // not start until this handler released it, and the handler was busy
-    // burning `WORKER_READY_TIMEOUT` waiting for that spawn. Resume +
-    // publish + forward still live in the shared service so the plugin host
-    // delivers turns through the same path (#2897).
-    {
-        let inst_lock = state.instance_lock(&id).await;
-        let _serialized = inst_lock.lock().await;
-        state.session_service.clear_pending_initial_turn(&id).await;
-    }
+    // The pending-turn drain holds this same guard across its whole
+    // snapshot -> reload -> send -> clear, so whichever side wins it, the
+    // stale continuation can never be published after this newer prompt. If
+    // the drain wins it delivers first; if we win, the drain then reads None
+    // and returns. Resume + publish + forward live in the shared service so
+    // the plugin host delivers turns through the same path (#2897).
+    state.session_service.clear_pending_initial_turn(&id).await;
     // Decide here so every client follows the same send, steer, or queue rules.
     let dispatch = {
         let control = crate::server::acp_ws::fold_control_state(&state, &id).await;
@@ -1486,6 +1482,11 @@ pub async fn acp_prompt_diff_comments(
             return (StatusCode::NOT_FOUND, "session not found").into_response();
         }
     }
+    // This opens a turn (`UserDiffCommentsPrompt` folds to `turn_active`) just
+    // as an ordinary prompt does, so it takes the same submission authority:
+    // otherwise it can publish between a queue drain's idle check and its
+    // send, and the agent rejects whichever of the two it sees second (#3621).
+    let _submission = state.session_service.prompt_submission(&id).await;
     // Idle-dormant wake: respawn synchronously-reserved + detached so the
     // send_prompt below waits for the worker instead of 404ing. Mirrors
     // acp_prompt. See #1748.
@@ -3382,12 +3383,12 @@ mod tests {
         });
 
         // Let the handler reach its parked wait. It cannot return until the
-        // reservation drops, so anything past the lock scope is enough.
+        // reservation drops, so anything past the wake is enough.
         tokio::time::sleep(Duration::from_millis(300)).await;
 
         // The 2s budget is far under the 10s `WORKER_READY_TIMEOUT` the
         // pre-fix handler holds the lock for, and far over the microseconds
-        // the fixed one needs to clear and release.
+        // `touch_on_prompt_and_wake_if_sunk` holds it now.
         let inst_lock = state.instance_lock(&id).await;
         let acquired = tokio::time::timeout(Duration::from_secs(2), inst_lock.lock()).await;
         assert!(
@@ -3410,6 +3411,109 @@ mod tests {
                 .iter()
                 .any(|(_, e)| matches!(e, Event::UserPromptSent { .. })),
             "a prompt no worker ever received must not reach the event store"
+        );
+    }
+
+    /// #3621: deciding a prompt's disposition and acting on it is one step, so
+    /// a direct prompt cannot slip between a queue drain's idle check and the
+    /// moment its prompt reaches the agent.
+    ///
+    /// The drain reads the control fold, reloads attachments, and only then
+    /// sends; `send_turn` flips the fold to `turn_active` when it publishes. A
+    /// direct prompt whose own fold read landed inside that window also
+    /// decided "idle", so both pushed a `ClientCmd::Prompt`. The agent takes
+    /// the first and answers the second `agent_busy` — but `send_prompt`
+    /// reports success as soon as the command is queued, so the drain has
+    /// already retired the rows it sent. The follow-up is then gone from
+    /// durable queue state having never been delivered.
+    ///
+    /// Both halves are asserted: the direct prompt parks while the drain owns
+    /// the session, and a drain that runs against the turn the direct prompt
+    /// started leaves its row queued instead of retiring it into a rejection.
+    #[tokio::test]
+    async fn a_direct_prompt_and_the_queue_drain_cannot_both_own_the_same_turn() {
+        use std::time::Duration;
+
+        let mut inst = crate::session::Instance::new("race-3621", "/tmp/aoe-3621-race");
+        inst.id = "sess-3621-race".to_string();
+        inst.view = crate::session::View::Structured;
+        inst.status = crate::session::Status::Idle;
+        let id = inst.id.clone();
+        let state = crate::server::test_support::build_test_app_state(vec![inst]);
+
+        // A worker that records what actually reaches the ACP command loop.
+        let cmds = state
+            .acp_supervisor
+            .test_insert_worker_cmd_recording(&id)
+            .await;
+        state
+            .session_service
+            .enqueue_prompt(
+                &id,
+                "q1".into(),
+                "queued follow-up".into(),
+                vec![],
+                None,
+                "t0".into(),
+            )
+            .await
+            .expect("session exists");
+
+        // Stand in for a drain that has decided to deliver and has not
+        // published yet: it owns the session's submission slot for that whole
+        // span.
+        let drain_owns_it = state.session_service.prompt_submission(&id).await;
+
+        let handler = tokio::spawn({
+            let state = Arc::clone(&state);
+            let id = id.clone();
+            async move {
+                acp_prompt(
+                    State(state),
+                    Path(id),
+                    Ok(Json(PromptRequest {
+                        text: "typed while the drain was mid-delivery".to_string(),
+                        attachments: Vec::new(),
+                        prompt_id: None,
+                    })),
+                )
+                .await
+                .into_response()
+            }
+        });
+
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        assert!(
+            !handler.is_finished(),
+            "a direct prompt must not decide its disposition while a drain owns the session"
+        );
+
+        drop(drain_owns_it);
+        let response = tokio::time::timeout(Duration::from_secs(30), handler)
+            .await
+            .expect("the handler must finish once the drain releases the session")
+            .expect("handler task must not panic");
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        // Its publish is what makes the fold read `turn_active`, so the drain
+        // that follows must park the queued row rather than deliver it into
+        // the turn this prompt just started.
+        state.session_service.drain_queued_prompts_once(&id).await;
+        assert_eq!(
+            state
+                .session_service
+                .queued_prompts_snapshot(&id)
+                .await
+                .len(),
+            1,
+            "the queued follow-up survives for the next tick instead of being retired into an agent_busy rejection"
+        );
+
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            *cmds.lock().expect("cmd log mutex poisoned"),
+            ["prompt"],
+            "exactly one prompt reaches the agent; a second would be refused as agent_busy"
         );
     }
 

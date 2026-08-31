@@ -236,9 +236,14 @@ impl Instance {
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_else(|_| self.project_path.clone());
         let environment = self.resolved_host_environment();
-        if let Err(e) =
-            crate::hooks::trust_host_project(agent.name, &home, &environment, &project_path)
-        {
+        let config_dir = config.session.agent_config_dir_for(&self.tool, &home);
+        if let Err(e) = crate::hooks::trust_host_project(
+            agent.name,
+            &home,
+            &environment,
+            config_dir.as_deref(),
+            &project_path,
+        ) {
             tracing::warn!(target: "session.store",
                 "Failed to pre-trust {} in the host {} config: {}", project_path, agent.name, e);
         }

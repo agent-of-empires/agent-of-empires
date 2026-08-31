@@ -68,11 +68,10 @@ impl AgentRegistry {
     }
 
     /// Returns a registry seeded with one entry per aoe tool that has
-    /// a published ACP server, plus our own `aoe-agent` as a generic
-    /// multi-provider fallback. Each entry is keyed on the same name
-    /// the tmux view uses (claude / opencode / gemini / codex /
-    /// vibe / pi / omp) so the spawn path can map `instance.tool`
-    /// directly to a registry key.
+    /// a published ACP server, plus aoe's own multi-provider `aoe-agent`.
+    /// Each entry is keyed on the same name the tmux view uses (claude /
+    /// opencode / gemini / codex / vibe / pi / omp) so the spawn path can
+    /// map `instance.tool` directly to a registry key.
     ///
     /// Sources verified against
     /// <https://agentclientprotocol.com/get-started/agents.md>

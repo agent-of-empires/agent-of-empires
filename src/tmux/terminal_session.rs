@@ -479,7 +479,7 @@ impl ContainerTerminalSession {
 pub fn kill_all_terminals_for_id(id: &str) {
     let needle = format!("_{}", truncate_id(id, 8));
 
-    let output = crate::tmux::tmux_command()
+    let output = crate::tmux::tmux_query_command()
         .args(["list-sessions", "-F", "#{session_name}"])
         .output();
 
