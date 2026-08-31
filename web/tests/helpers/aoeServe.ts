@@ -1,7 +1,7 @@
 // Live-backend test harness for Playwright.
 //
 // `spawnAoeServe()` boots a real `aoe serve` subprocess against an isolated
-// filesystem root (`HOME`, `XDG_CONFIG_HOME`, `TMPDIR`, `TMUX_TMPDIR`) and a
+// filesystem root (`HOME`, the XDG bases, `TMPDIR`, `TMUX_TMPDIR`) and a
 // per-worker port range, returns a `ServeHandle`, and cleans up after the
 // test via `stop()`. Designed for fresh-process-per-test isolation: each
 // test gets its own root, its own port, its own tmux socket.
@@ -18,6 +18,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { randomBytes } from "node:crypto";
 import { expect } from "@playwright/test";
+import { isolateEnv } from "./isolatedEnv";
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -100,7 +101,7 @@ export interface ServeHandle {
   /** Directory prepended to PATH (contains the fake `claude` shim). */
   shimBin: string;
   /**
-   * The exact env (isolated HOME / XDG_CONFIG_HOME / TMPDIR / PATH with the
+   * The exact env (isolated HOME / XDG bases / TMPDIR / PATH with the
    * shim) the daemon and seed ran with. Specs that drive `aoe` CLI
    * subprocesses against the same isolated state (e.g. `aoe session rename`
    * from a peer process) MUST pass this as `spawnSync(..., { env })`. Passing
@@ -592,10 +593,11 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
   const shortBase = process.platform === "win32" ? tmpdir() : "/tmp";
   const home = realpathSync(mkdtempSync(join(shortBase, `aoe-pw-w${opts.workerIndex}-p${opts.parallelIndex}-`)));
   const xdg = join(home, "config");
+  const xdgData = join(home, "share");
   const tmp = join(home, "tmp");
   const tmuxTmp = join(home, "tmux");
   const shimBin = join(home, "bin");
-  for (const dir of [xdg, tmp, tmuxTmp, shimBin]) {
+  for (const dir of [xdg, xdgData, tmp, tmuxTmp, shimBin]) {
     mkdirSync(dir, { recursive: true, mode: 0o700 });
   }
   const fakeAcpDebugLog = join(home, "fake-acp.log");
@@ -608,11 +610,9 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
   const authMode: AuthMode = opts.authMode ?? "none";
 
   const seedEnv: NodeJS.ProcessEnv = {
-    ...process.env,
-    HOME: home,
-    XDG_CONFIG_HOME: xdg,
-    TMPDIR: tmp,
-    TMUX_TMPDIR: tmuxTmp,
+    // The isolated HOME is only isolated if nothing overrides where the agents
+    // read their config and data from. See `isolatedEnv.ts`.
+    ...isolateEnv(process.env, { home, xdgConfig: xdg, xdgData, tmp, tmuxTmp }),
     PATH: `${shimBin}:${process.env.PATH ?? ""}`,
     // Lift the runner-socket appearance deadline. The `aoe
     // __acp-runner` shim re-execs the debug `aoe` binary, which
@@ -655,17 +655,6 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
     // TMUX_TMPDIR.
     AOE_TMUX_SOCKET: tmuxSocketPath(home),
   };
-
-  // The isolated HOME is only isolated if nothing overrides where the agents
-  // read their config from. A developer shell that exports CLAUDE_CONFIG_DIR
-  // (or the Codex / Cursor equivalents) leaks it into `aoe serve` through the
-  // `...process.env` spread above, and the daemon then scans the developer's
-  // real `~/.claude` instead of the tree the spec seeded: acp-import-claude-
-  // session and acp-keep-context-round-trip fail deterministically, locally
-  // only, which reads as "the suite is broken on my machine".
-  for (const leak of ["CLAUDE_CONFIG_DIR", "CODEX_HOME", "CURSOR_CONFIG_DIR"]) {
-    delete seedEnv[leak];
-  }
 
   if (authMode === "token") {
     if (typeof opts.tokenLifetimeSecs === "number") {
@@ -856,11 +845,7 @@ export async function spawnAoeServe(opts: SpawnOptions): Promise<ServeHandle> {
           // aoe binds its own `-S <socket>` (#2608), not the default socket
           // under TMUX_TMPDIR, so kill the server on that explicit socket.
           spawnSync("tmux", ["-S", tmuxSocketPath(home), "kill-server"], {
-            env: {
-              ...process.env,
-              HOME: home,
-              TMUX_TMPDIR: join(home, "tmux"),
-            },
+            env: seedEnv,
             stdio: "ignore",
           });
         } catch {

@@ -84,14 +84,15 @@ export default defineConfig(({ mode, command }) => {
       // there. `scripts/merge-coverage.mjs` reads either layout.
       sourcemap: collectCoverage ? (env.AOE_COVERAGE_INLINE_SOURCEMAP === "1" ? "inline" : true) : false,
     },
-    // Vitest unit tests live alongside source as `*.test.ts(x)`. Playwright
-    // suites under `tests/` use the same `.spec.ts` extension Playwright
-    // expects but aren't valid vitest tests, so we explicitly exclude them.
+    // Vitest unit tests live alongside source as `*.test.ts(x)`, plus the
+    // node-only live-harness helpers under `tests/helpers/`. Playwright suites
+    // under `tests/` use the `.spec.ts` extension Playwright expects but
+    // aren't valid vitest tests, so we explicitly exclude them.
     test: {
-      include: ["src/**/*.{test,spec}.{ts,tsx}"],
+      include: ["src/**/*.{test,spec}.{ts,tsx}", "tests/helpers/**/*.test.ts"],
       // Type-level tests (`*.types.test.ts`) run under the typecheck runner
       // below, not the runtime runner, so keep them out of `include`.
-      exclude: ["tests/**", "node_modules/**", "dist/**", "src/**/*.types.test.ts"],
+      exclude: ["tests/**/*.spec.{ts,tsx}", "node_modules/**", "dist/**", "src/**/*.types.test.ts"],
       // `expectTypeOf` assertions in `*.types.test.ts` are checked by tsc.
       // A failing assertion surfaces as a type error. Scoped to the
       // dedicated type-test files so the rest of the suite stays fast.
