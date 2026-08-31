@@ -1,0 +1,71 @@
+id = "vibe"
+
+# Vibe's selection menus and approval prompts all outrank its activity
+# signals: it keeps rendering a spinner under a menu it is blocked on.
+[[rules]]
+id = "menu_footer"
+state = "waiting"
+priority = 980
+region = "whole_recent"
+visible = true
+contains_any = ["↑↓ navigate", "enter select", "esc reject"]
+
+[[rules]]
+id = "command_warning"
+state = "waiting"
+priority = 975
+region = "whole_recent"
+visible = true
+contains = ["⚠", "command"]
+
+[[rules]]
+id = "approval_option"
+state = "waiting"
+priority = 970
+region = "whole_recent"
+visible = true
+contains_any = ["yes and always allow", "no and tell the agent", "› 1.", "› 2.", "› 3."]
+
+[[rules]]
+id = "cursor_line"
+state = "waiting"
+priority = 965
+region = "whole_recent"
+visible = true
+line_regex = ['(?i)^\s*\x{203A}\s*\S']
+
+[[rules]]
+id = "spinner"
+state = "running"
+priority = 960
+region = "whole_recent"
+visible = true
+line_regex = ['[\x{00B7}\x{2722}\x{2733}\x{2736}\x{273B}\x{273D}\x{25CF}\x{2800}-\x{28FF}]']
+
+# Loose on purpose: these words are matched anywhere in the window, which is
+# the behaviour this detector has always had.
+[[rules]]
+id = "activity_word"
+state = "running"
+priority = 955
+region = "whole_recent"
+contains_any = [
+  "running",
+  "reading",
+  "writing",
+  "executing",
+  "processing",
+  "generating",
+  "thinking",
+]
+
+# A trailing ellipsis on the last line: a status line mid-render.
+[[rules]]
+id = "trailing_ellipsis"
+state = "running"
+priority = 950
+region = "bottom_non_empty_lines(1)"
+any = [
+  { line_regex = ['(?i)\x{2026}\s*$'] },
+  { line_regex = ['(?i)\.\.\.\s*$'] },
+]

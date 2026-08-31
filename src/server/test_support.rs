@@ -75,8 +75,11 @@ fn build_test_app_state_impl(
         Arc::clone(&file_watch),
         Arc::clone(&telemetry_session_creates),
         Arc::clone(&mutation_epoch),
-        supervisor.clone(),
-        event_store.clone(),
+        session_service::AcpDeps {
+            supervisor: supervisor.clone(),
+            event_store: event_store.clone(),
+            control_cache: acp_control_cache.clone(),
+        },
     ));
     Arc::new(AppState {
         profile: "test".to_string(),

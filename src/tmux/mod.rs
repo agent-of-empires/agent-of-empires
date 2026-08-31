@@ -1,6 +1,7 @@
 //! tmux integration module
 
 pub(crate) mod composite;
+pub(crate) mod detect;
 pub(crate) mod env;
 mod session;
 pub mod status_bar;
@@ -17,12 +18,9 @@ pub(crate) mod vt;
 pub use composite::PaneGeom;
 pub use session::{PaneCursor, PaneEnvMutation, Session, SIZE_OWNER_HEARTBEAT, SIZE_OWNER_TTL};
 pub use status_bar::{get_session_info_for_current, get_status_for_current_session};
-pub(crate) use status_detection::{
-    claude_pane_is_ambiguous_typed_prompt, claude_pane_marker_fingerprint,
-    reconcile_claude_hook_status, reconcile_claude_idle_hook_status, reconcile_codex_hook_status,
-    reconcile_waiting_hook,
+pub use status_detection::{
+    detect_claude, detect_status_from_content, detect_status_from_content_in, detect_via_manifest,
 };
-pub use status_detection::{detect_status_from_content, detect_status_from_content_in};
 pub use terminal_session::{kill_all_terminals_for_id, ContainerTerminalSession, TerminalSession};
 pub use tool_session::{kill_all_tool_sessions_for_id, ToolSession};
 pub use utils::tmux_prefix_display;
@@ -250,6 +248,13 @@ pub struct PaneMetadata {
     pub pane_current_command: Option<String>,
     pub pane_start_command_is_protected: bool,
     pub pane_pid: Option<u32>,
+    /// The terminal title the pane's program published over OSC 0/2. Several
+    /// agent CLIs put their own state in it, which is the one signal that does
+    /// not depend on what the transcript happens to contain.
+    pub pane_title: Option<String>,
+    /// tmux's last-output timestamp for the pane's window, used to skip a
+    /// capture when nothing has been drawn since the last one.
+    pub window_activity: Option<i64>,
 }
 
 static SESSION_REFRESH_ID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -344,13 +349,17 @@ pub enum SessionCacheRefresh {
     Unknown,
 }
 
-// Field separator for multi-field tmux `-F` format strings. Must be a
-// printable ASCII byte that does not appear in `sanitize_session_name` output
-// (which preserves `[A-Za-z0-9_-]` and replaces everything else with `_`).
-// tmux 3.4 mangles whitespace (tab, newline become `_`) and octal-escapes
-// control bytes (ASCII 0x1F is emitted as the literal 4-char sequence
-// `\037`), so anything non-printable is unreliable. Pipe is safe.
+// Field separator for the fixed tmux -F head. Must be printable ASCII and
+// absent from sanitize_session_name output (which preserves [A-Za-z0-9_-]
+// and replaces everything else with _). C0 bytes are reserved for the tail,
+// whose parser handles tmux 3.4's octal escaping explicitly.
 const FIELD_SEP: char = '|';
+/// Separator for the two trailing fields. pane_start_command may itself
+/// contain FIELD_SEP, which is why it was last in the original format. A C0
+/// control byte cannot appear in a shell command or terminal title. tmux 3.4
+/// escapes it as ESCAPED_TAIL_SEP, while newer versions emit it raw.
+const TAIL_SEP: char = '\x1f';
+const ESCAPED_TAIL_SEP: &str = r"\037";
 
 /// tmux exits non-zero with `no server running on <socket>` on stderr when
 /// there is no server on the resolved socket (zero sessions, or the socket's
@@ -986,7 +995,14 @@ pub fn batch_pane_metadata() -> anyhow::Result<HashMap<String, PaneMetadata>> {
         "list-panes",
         "-a",
         "-F",
-        "#{session_name}|#{pane_index}|#{pane_dead}|#{pane_current_command}|#{pane_start_command}|#{pane_pid}",
+        // `pane_pid` stays at the end of the pipe-separated head, where
+        // the parser splits it back off the start command's tail; the two
+        // fields after it ride [`TAIL_SEP`], because a start command or a
+        // title may carry a pipe of its own.
+        concat!(
+            "#{session_name}|#{pane_index}|#{pane_dead}|#{pane_current_command}",
+            "|#{pane_start_command}|#{pane_pid}\x1f#{window_activity}\x1f#{pane_title}"
+        ),
     ]);
     let output = run_tmux_command_with_timeout(&mut command);
 
@@ -1081,12 +1097,66 @@ pub fn attached_session_names() -> anyhow::Result<HashSet<String>> {
     }
 }
 
+fn find_escaped_tail_sep(line: &str, from: usize) -> Option<usize> {
+    let bytes = line.as_bytes();
+    let separator = ESCAPED_TAIL_SEP.as_bytes();
+    let mut offset = from;
+    while offset + separator.len() <= bytes.len() {
+        if bytes[offset..].starts_with(separator) {
+            let preceding_slashes = bytes[..offset]
+                .iter()
+                .rev()
+                .take_while(|&&byte| byte == b'\\')
+                .count();
+            if preceding_slashes % 2 == 0 {
+                return Some(offset);
+            }
+        }
+        offset += 1;
+    }
+    None
+}
+
+fn split_pane_metadata_tail(line: &str) -> (&str, Option<&str>, Option<&str>) {
+    if let Some(first) = line.find(TAIL_SEP) {
+        let rest = &line[first + TAIL_SEP.len_utf8()..];
+        return match rest.find(TAIL_SEP) {
+            Some(second) => (
+                &line[..first],
+                Some(&rest[..second]),
+                Some(&rest[second + 1..]),
+            ),
+            None => (&line[..first], Some(rest), None),
+        };
+    }
+
+    let Some(first) = find_escaped_tail_sep(line, 0) else {
+        return (line, None, None);
+    };
+    let rest_start = first + ESCAPED_TAIL_SEP.len();
+    match find_escaped_tail_sep(line, rest_start) {
+        Some(second) => (
+            &line[..first],
+            Some(&line[rest_start..second]),
+            Some(&line[second + ESCAPED_TAIL_SEP.len()..]),
+        ),
+        None => (&line[..first], Some(&line[rest_start..]), None),
+    }
+}
+
 /// Parse the output of `tmux list-panes -a` into a map of session name to pane metadata.
 /// Filters to aoe sessions, pane index 0, and takes only the first window per session.
 fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
     let mut map = HashMap::new();
 
     for line in output.lines() {
+        // The two trailing fields ride their own separator (see TAIL_SEP), so
+        // the pipe-separated head parses exactly as it did before them; a line
+        // with no tail is all head. Accept tmux 3.4's octal rendering as well
+        // as the raw byte emitted by newer versions.
+        let (line, activity, pane_title) = split_pane_metadata_tail(line);
+        let window_activity = activity.and_then(|a| a.trim().parse::<i64>().ok());
+        let pane_title = pane_title.unwrap_or("");
         let mut parts = line.splitn(5, FIELD_SEP);
         let (
             Some(session_name),
@@ -1137,6 +1207,8 @@ fn parse_pane_metadata(output: &str) -> HashMap<String, PaneMetadata> {
                 },
                 pane_start_command_is_protected: pane_start_command
                     .contains(utils::PANE_ENV_FILE_PREFIX),
+                pane_title: (!pane_title.is_empty()).then(|| pane_title.to_string()),
+                window_activity,
             },
         );
     }
@@ -2524,6 +2596,8 @@ mod tests {
                             pane_current_command: None,
                             pane_start_command_is_protected: false,
                             pane_pid: None,
+                            pane_title: None,
+                            window_activity: None,
                         },
                     )
                 })
@@ -2592,6 +2666,8 @@ mod tests {
             pane_current_command: None,
             pane_start_command_is_protected: false,
             pane_pid: None,
+            pane_title: None,
+            window_activity: None,
         }
     }
 
@@ -2793,6 +2869,47 @@ mod tests {
         assert_eq!(meta.pane_current_command.as_deref(), Some("claude"));
         assert!(!meta.pane_start_command_is_protected);
         assert_eq!(meta.pane_pid, Some(4242));
+    }
+
+    #[test]
+    fn test_parse_pane_metadata_reads_the_tail_fields() {
+        // Built from TAIL_SEP itself, so a drift between the constant and the
+        // `list-panes` format literal fails here instead of degrading silently
+        // (no activity gate, every title rule dark).
+        let output =
+            format!("{P}proj_abc12345|0|0|claude|claude{TAIL_SEP}1770000000{TAIL_SEP}✶ Working\n");
+        let meta = parse_pane_metadata(&output)
+            .remove(&format!("{P}proj_abc12345"))
+            .unwrap();
+        assert_eq!(meta.window_activity, Some(1770000000));
+        assert_eq!(meta.pane_title.as_deref(), Some("✶ Working"));
+
+        // tmux 3.4 renders the control separators as unescaped octal tokens.
+        // A doubled backslash belongs to the title and must not split it.
+        let escaped_output = format!(
+            "{P}proj_escaped_abc12345|0|0|claude|claude literal{}{ESCAPED_TAIL_SEP}|4242{ESCAPED_TAIL_SEP}1770000001{ESCAPED_TAIL_SEP}literal{}{ESCAPED_TAIL_SEP}title{}",
+            char::from(92),
+            char::from(92),
+            char::from(10)
+        );
+        let escaped_meta = parse_pane_metadata(&escaped_output)
+            .remove(&format!("{P}proj_escaped_abc12345"))
+            .unwrap();
+        assert_eq!(escaped_meta.pane_pid, Some(4242));
+        assert_eq!(escaped_meta.window_activity, Some(1770000001));
+        assert_eq!(
+            escaped_meta.pane_title,
+            Some(format!("literal{}{ESCAPED_TAIL_SEP}title", char::from(92)))
+        );
+
+        // An unparsable activity reads as absent, an empty title as `None`,
+        // and a head with no tail at all parses as it did before the fields.
+        let odd = format!("{P}proj_def67890|0|0|claude|claude{TAIL_SEP}{TAIL_SEP}\n");
+        let meta = parse_pane_metadata(&odd)
+            .remove(&format!("{P}proj_def67890"))
+            .unwrap();
+        assert_eq!(meta.window_activity, None);
+        assert_eq!(meta.pane_title, None);
     }
 
     #[test]

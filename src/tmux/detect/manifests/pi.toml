@@ -1,0 +1,50 @@
+id = "pi"
+
+# Pi draws a `────` rule above and below its input prompt, so the box's top
+# rule is the *second* one counting from the bottom. A rule further up than
+# pi's own footer is transcript content drawing the same glyph run (pi renders
+# a markdown `---` that way), so it does not count as the box, and the regions
+# below fall back to the footer window.
+[markers.input_box]
+line_regex = ['(?i)^\s*─{3,}\s*$']
+occurrence = 2
+max_depth = 6
+
+# Pi has no hooks and always auto-approves, so the only question is whether a
+# turn is live. It renders no prompt at rest, which makes a parked pane the
+# running one minus its spinner line: every signal here is scoped to pi's own
+# footer, because a finished turn's prose routinely says "working on #443".
+[[rules]]
+extends = "spinner"
+id = "spinner"
+priority = 970
+region = "bottom_non_empty_lines(6)"
+
+# The busy line sits directly above the box in plain pi, and behind up to two
+# tip lines in derivatives aliased to pi (#3475), so the band is three deep.
+[[rules]]
+extends = "interrupt_hint"
+id = "interrupt_hint"
+priority = 965
+region = "above(input_box, 3)"
+
+# A parked prompt outranks the activity fallback below: custom wrappers and
+# older builds show `pi>` or a bare `>` at rest, and an activity word lingering
+# just above it must not flip that back to Running.
+[[rules]]
+extends = "input_prompt"
+id = "input_prompt"
+priority = 960
+region = "bottom_non_empty_lines(5)"
+any = [
+  { line_regex = ['(?i)^\s*pi>\s*$'] },
+  { line = { regex = ['(?i)^\s*>\s\S.{0,96}$'], not_regex = ['(?i)esc'] } },
+]
+
+# Reduced-motion fallback: a footer line that *starts* with a live verb is a
+# status line, not narration buried mid-sentence.
+[[rules]]
+extends = "activity_line"
+id = "activity_line"
+priority = 950
+region = "bottom_non_empty_lines(6)"

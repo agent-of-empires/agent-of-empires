@@ -3,6 +3,36 @@
 
 use super::*;
 
+/// Whether this poll can reuse the last verdict instead of capturing the pane.
+///
+/// Four conditions, and each one has cost a bug:
+///
+/// - tmux has to have given us an activity stamp at all; without one there is
+///   nothing to compare and every poll captures.
+/// - The pane must have drawn nothing since the last capture. Anything drawn
+///   could have changed the verdict.
+/// - The session must have no hook file, since a hook write changes the
+///   verdict without the pane drawing anything.
+/// - No proposal may be waiting on its confirming poll. The pane that produced
+///   a hold is exactly the one that then goes quiet, so skipping here would
+///   leave the proposal unresolved and the session pinned on its previous
+///   status until new output arrived, which is the failure this whole path
+///   exists to end.
+fn skip_capture(
+    activity: Option<i64>,
+    last_activity: Option<i64>,
+    has_hook: bool,
+    pending: bool,
+) -> bool {
+    activity.is_some() && activity == last_activity && !has_hook && !pending
+}
+
+/// How long a `running` hook write keeps its authority for an agent that is
+/// still on a hand-written detector. Matches the bound the manifests declare,
+/// which is what keeps a lost terminating hook from pinning a parked session
+/// on Running for the life of the session.
+const LEGACY_RUNNING_HOOK_MAX_AGE: std::time::Duration = std::time::Duration::from_secs(900);
+
 impl Instance {
     /// Update status using pre-fetched pane metadata to avoid per-instance
     /// subprocess spawns. Falls back to subprocess calls if metadata is missing.
@@ -43,50 +73,31 @@ impl Instance {
 
     /// One `info` line per observed status transition, carrying the evidence a
     /// wrong-state report needs: the hook file's value and age at the moment
-    /// of the flip, and (for Claude) a content-free fingerprint of which pane
-    /// markers were on screen. Intermittent status flakes can't be reproduced
-    /// on demand, so this trail must land at the default log level; the
-    /// per-rule detector traces stay at debug/trace for when a report narrows
-    /// the hunt.
+    /// of the flip, and the manifest rule that decided. Intermittent status
+    /// flakes cannot be reproduced on demand, so this trail lands at the
+    /// default log level; the per-rule traces stay at debug/trace for when a
+    /// report narrows the hunt.
     ///
     /// Sessions are identified by the opaque instance id, not the title:
     /// smart-rename derives titles from the first prompt, so a title in an
-    /// always-on log would leak conversation-derived text and break the
-    /// content-free promise the pane fingerprint keeps. `aoe list` maps ids
+    /// always-on log would leak conversation-derived text. `aoe list` maps ids
     /// back to titles when correlating.
     ///
     /// The hook file is re-read here rather than threaded out of the detection
     /// path, so a value that changed in the microseconds since detection can
-    /// disagree with the decision; the age field makes that visible. Costs one
-    /// file stat, plus one pane capture for Claude, gated on an actual
-    /// transition, so steady-state polling pays nothing.
+    /// disagree with the decision; the age field makes that visible. It costs
+    /// one file stat, gated on an actual transition, so steady-state polling
+    /// pays nothing.
     fn log_status_transition(&self, prev: Status) {
-        // Resolved the same way the pane fallback resolves it, so the label and
-        // the `pane=` fingerprint describe the detector that actually ran. The
-        // ad-hoc `detect_as`-or-`tool` this used to do disagreed with the
-        // detector whenever the stored alias was stale, which is exactly the
-        // case a wrong-state report needs the log to be honest about.
         let detection_tool =
             tmux::status_rules::detection_tool(&self.source_profile, &self.tool, &self.detect_as);
         let hook = crate::hooks::read_hook_status(&self.id);
         let hook_age_ms = crate::hooks::read_hook_status_age(&self.id).map(|age| age.as_millis());
-        if detection_tool == "claude" {
-            let fingerprint = self
-                .tmux_session()
-                .ok()
-                .and_then(|s| s.capture_pane(50).ok())
-                .map(|pane| tmux::claude_pane_marker_fingerprint(&pane))
-                .unwrap_or_else(|| "capture_failed".to_string());
-            tracing::info!(target: "session.status_change",
-                "{} [{}] {:?} -> {:?} (hook={:?} hook_age_ms={:?} pane={})",
-                self.id, detection_tool, prev, self.status, hook, hook_age_ms, fingerprint
-            );
-        } else {
-            tracing::info!(target: "session.status_change",
-                "{} [{}] {:?} -> {:?} (hook={:?} hook_age_ms={:?})",
-                self.id, detection_tool, prev, self.status, hook, hook_age_ms
-            );
-        }
+        tracing::info!(target: "session.status_change",
+            "{} [{}] {:?} -> {:?} (hook={:?} hook_age_ms={:?} rule={})",
+            self.id, detection_tool, prev, self.status, hook, hook_age_ms,
+            self.detection_rule.unwrap_or("none")
+        );
     }
 
     /// Drop a [`TMUX_SESSION_GONE_ERROR`] left on a row that no longer has a
@@ -268,91 +279,65 @@ impl Instance {
         } else {
             &hook_alias
         };
+        let pane_tool =
+            tmux::status_rules::detection_tool(&self.source_profile, &self.tool, &self.detect_as);
 
-        if let Some(hook_status) = crate::hooks::read_hook_status(&self.id) {
-            tracing::trace!(target: "session.store",
-                "status '{}': hook detected {:?}, is_dead={}",
-                self.title,
-                hook_status,
-                is_dead
-            );
-            if is_dead {
-                self.status = Status::Error;
-                if self.last_error.is_none() {
-                    let pane_content = session.capture_pane(20).unwrap_or_default();
-                    self.last_error = Some(summarize_error_from_pane(&pane_content));
-                }
-            } else {
-                // Three hook/pane mismatches need the pane captured and consulted:
-                //
-                // 1. Running hook, pane parked on a blocking prompt: Codex and
-                //    Claude keep re-emitting running-mapped hooks while blocked,
-                //    so a Running write can mean "still working" or "waiting on
-                //    the user". Their reconcilers read the pane to tell which
-                //    (Codex: plan/numbered prompts; Claude: tool-approval
-                //    prompts, see #1913).
-                // 2. Waiting hook gone stale: several agents write `waiting`
-                //    directly when a prompt appears (Claude AskUserQuestion /
-                //    permission prompt, Codex PermissionRequest, Cursor / Qwen /
-                //    Gemini permission notifications). Esc-cancelling the prompt
-                //    fires no completing hook, so the file sticks on `waiting`
-                //    until the next turn (regression from #2937). Any such agent
-                //    is reconciled against the pane by reconcile_waiting_hook.
-                // 3. Idle hook on a session last observed Running/Waiting:
-                //    Claude's `Notification(idle_prompt)` hook is
-                //    fire-and-forget, so when a queued prompt submits at turn
-                //    end its `idle` write can land after `UserPromptSubmit`'s
-                //    `running`, showing Idle mid-turn until the first
-                //    PreToolUse rewrites the file. The previous-status gate
-                //    keeps parked sessions (the dominant steady state) from
-                //    paying a capture per poll; see
-                //    reconcile_claude_idle_hook_status.
-                let reconciles_running = (hook_tool == "codex" || hook_tool == "claude")
-                    && hook_status == Status::Running;
-                let reconciles_waiting = hook_status == Status::Waiting;
-                let reconciles_idle = hook_tool == "claude"
-                    && hook_status == Status::Idle
-                    && matches!(self.status, Status::Running | Status::Waiting);
-                self.status = if reconciles_running || reconciles_waiting || reconciles_idle {
-                    match session.capture_pane(50) {
-                        Ok(pane_content) => {
-                            if reconciles_waiting {
-                                tmux::reconcile_waiting_hook(hook_tool, &pane_content)
-                            } else if reconciles_idle {
-                                tmux::reconcile_claude_idle_hook_status(&pane_content)
-                            } else if hook_tool == "codex" {
-                                tmux::reconcile_codex_hook_status(hook_status, &pane_content)
-                            } else {
-                                let running_age = crate::hooks::read_hook_status_age(&self.id);
-                                tmux::reconcile_claude_hook_status(
-                                    hook_status,
-                                    &pane_content,
-                                    running_age,
-                                )
-                            }
-                        }
-                        Err(e) => {
-                            tracing::trace!(
-                                "status '{}': {} hook fallback pane capture failed: {}",
-                                self.title,
-                                hook_tool,
-                                e
-                            );
-                            hook_status
-                        }
-                    }
-                } else {
-                    hook_status
-                };
-                self.last_error = None;
+        let hook =
+            crate::hooks::read_hook_status(&self.id).map(|status| tmux::detect::HookObservation {
+                status,
+                age: crate::hooks::read_hook_status_age(&self.id),
+            });
+
+        // A dead pane outranks every other signal, and only for a session that
+        // reported hooks at all: a hookless agent's pane is allowed to end.
+        if is_dead && hook.is_some() {
+            self.status = Status::Error;
+            if self.last_error.is_none() {
+                let pane_content = session.capture_pane(20).unwrap_or_default();
+                self.last_error = Some(summarize_error_from_pane(&pane_content));
             }
             return;
         }
 
-        // Pane-fallback identity: the session's own configured status rules
-        // outrank the `agent_detect_as` alias; without rules the alias applies.
-        let pane_tool =
-            tmux::status_rules::detection_tool(&self.source_profile, &self.tool, &self.detect_as);
+        if tmux::detect::has_manifest(hook_tool) {
+            // Owned: both identities borrow `self`, which the manifest path
+            // mutates.
+            let agent = hook_tool.to_string();
+            let rules_tool = pane_tool.to_string();
+            self.update_status_from_manifest(
+                &session,
+                metadata,
+                &agent,
+                &rules_tool,
+                hook,
+                is_dead,
+            );
+            return;
+        }
+
+        // Agents still on hand-written detectors: the hook file decides. The
+        // three that reach this path (settl, kiro, kimi) render no pane shape
+        // worth parsing, so there is nothing to weigh the write against.
+        //
+        // A `running` write past the freshness bound is not consulted at all.
+        // The terminating hook can be lost, and an unbounded write then
+        // outranks every later capture for the life of the session; the
+        // manifest agents express the same bound as a rule.
+        if let Some(hook) = hook {
+            let stale_running = hook.status == Status::Running
+                && hook
+                    .age
+                    .is_some_and(|age| age >= LEGACY_RUNNING_HOOK_MAX_AGE);
+            if !stale_running {
+                self.status = hook.status;
+                self.last_error = None;
+                return;
+            }
+            tracing::debug!(target: "session.store",
+                "status '{}': {} `running` hook write is {:?} old, falling back to the pane",
+                self.title, hook_tool, hook.age);
+        }
+
         let pane_content = session.capture_pane(50).unwrap_or_default();
         let detected =
             tmux::detect_status_from_content_in(&self.source_profile, &pane_content, &pane_tool);
@@ -363,55 +348,11 @@ impl Instance {
             self.has_command_override(),
             self.has_custom_command(),
         );
-        let is_shell_stale = || {
-            let expects = self.expects_shell();
-            if expects {
-                return false;
-            }
-            let shell_check = metadata
-                .and_then(|m| {
-                    m.pane_current_command.as_deref().map(|current_command| {
-                        tmux::utils::is_pane_running_shell_command(
-                            current_command,
-                            m.pane_start_command_is_protected,
-                        )
-                    })
-                })
-                .unwrap_or_else(|| session.is_pane_running_shell());
-            tracing::trace!(target: "session.store",
-                "status '{}': is_shell_stale check: expects_shell={}, shell_check={}",
-                self.title,
-                expects,
-                shell_check,
-            );
-            shell_check
-        };
         let has_command_override = self.has_command_override();
-        let shell_stale = if detected == Status::Idle && !has_command_override && !is_dead {
-            is_shell_stale()
-        } else {
-            false
-        };
-        // A Claude pane with unsubmitted typed text in the input box can show
-        // no running signal at all while a turn streams (typing suppresses the
-        // `esc to interrupt` hint and prose streaming renders no spinner), and
-        // that pane is identical to a parked one minus the completion line. In
-        // the ambiguous state, hold an already-observed Running rather than
-        // flap a working session to Idle; the completion line rendered at turn
-        // end releases the hold on the next poll.
-        let detected = if detected == Status::Idle
-            && !shell_stale
+        let shell_stale = detected == Status::Idle
+            && !has_command_override
             && !is_dead
-            && self.status == Status::Running
-            && pane_tool == "claude"
-            && tmux::claude_pane_is_ambiguous_typed_prompt(&pane_content)
-        {
-            tracing::debug!(target: "session.store",
-                "status '{}': holding Running over ambiguous typed-prompt Idle", self.title);
-            Status::Running
-        } else {
-            detected
-        };
+            && self.pane_is_stale_shell(metadata, &session);
         self.status = resolve_detected_status(
             detected,
             is_dead,
@@ -432,6 +373,156 @@ impl Instance {
         }
     }
 
+    /// Whether the pane is sitting on a bare shell rather than the agent it
+    /// was launched with: the agent exited and left the pane's shell behind.
+    /// Only consulted for a detected Idle, since a pane showing agent activity
+    /// is self-evidently not a stale shell.
+    fn pane_is_stale_shell(
+        &self,
+        metadata: Option<&tmux::PaneMetadata>,
+        session: &tmux::Session,
+    ) -> bool {
+        if self.expects_shell() {
+            return false;
+        }
+        metadata
+            .and_then(|m| {
+                m.pane_current_command.as_deref().map(|current_command| {
+                    tmux::utils::is_pane_running_shell_command(
+                        current_command,
+                        m.pane_start_command_is_protected,
+                    )
+                })
+            })
+            .unwrap_or_else(|| session.is_pane_running_shell())
+    }
+
+    /// Resolve status from the agent's detection manifest.
+    ///
+    /// The screen, the terminal title and the hook file are all inputs to the
+    /// same rule table, so which one wins is decided by declared priority
+    /// rather than by a chain of reconcilers. Two guards wrap it:
+    ///
+    /// - The capture is skipped when tmux reports no output since the last
+    ///   one: a pane that has drawn nothing cannot have changed, so the
+    ///   previous verdict stands and a parked session costs no subprocess.
+    ///   Only for a session with no hook file, since a hook write changes the
+    ///   verdict without the pane drawing anything.
+    /// - A change the rules did not read off live chrome must survive a second
+    ///   poll. Mid-redraw frames are otherwise indistinguishable from real
+    ///   transitions, and they flipped parked sessions every few seconds.
+    fn update_status_from_manifest(
+        &mut self,
+        session: &tmux::Session,
+        metadata: Option<&tmux::PaneMetadata>,
+        agent: &str,
+        rules_tool: &str,
+        hook: Option<tmux::detect::HookObservation>,
+        is_dead: bool,
+    ) {
+        let activity = metadata.and_then(|m| m.window_activity);
+        let osc_title = metadata
+            .and_then(|m| m.pane_title.as_deref())
+            .unwrap_or_default();
+        let screen_unchanged = skip_capture(
+            activity,
+            self.detection_activity,
+            hook.is_some(),
+            self.pending_detection.is_some(),
+        );
+
+        if screen_unchanged {
+            // Nothing to re-decide, and nothing to re-derive from: the checks
+            // below read the capture we deliberately did not take.
+            self.detection_rule = Some("screen_unchanged");
+            return;
+        }
+
+        let pane_content = session.capture_pane(50).unwrap_or_default();
+        let clean = tmux::utils::strip_ansi(&pane_content);
+        // A profile's own `[[agents.<name>.status_rules]]` outrank the
+        // manifest, matching the hookless path they were written for.
+        // `rules_tool` keeps a session's own rules ahead of its `detect_as`
+        // alias, the precedence `detection_tool` declares.
+        let detection = tmux::status_rules::detect(&self.source_profile, rules_tool, &clean)
+            .map(|status| tmux::detect::Detection {
+                status: Some(status),
+                visible: true,
+                rule: "configured_status_rule",
+            })
+            .or_else(|| tmux::detect::detect(agent, &clean, osc_title, hook))
+            .unwrap_or_else(tmux::detect::Detection::idle_by_default);
+
+        let Some(candidate) = detection.status else {
+            // The screen is an agent-owned viewer; the last known status
+            // stands rather than being overwritten by what a pager shows.
+            self.detection_activity = activity;
+            self.detection_rule = Some(detection.rule);
+            return;
+        };
+
+        let has_command_override = self.has_command_override();
+        let shell_stale = candidate == Status::Idle
+            && !has_command_override
+            && !is_dead
+            && self.pane_is_stale_shell(metadata, session);
+        let candidate = resolve_detected_status(
+            candidate,
+            is_dead,
+            shell_stale,
+            has_command_override,
+            &pane_content,
+            &self.tool,
+        );
+
+        let confirmed = self.confirm_detection(candidate, detection.visible);
+        if let Some(status) = confirmed {
+            self.status = status;
+            if status == Status::Error {
+                if self.last_error.is_none() {
+                    self.last_error = Some(summarize_error_from_pane(&pane_content));
+                }
+            } else {
+                self.last_error = None;
+            }
+        }
+        self.detection_activity = activity;
+        self.detection_rule = Some(detection.rule);
+        tracing::trace!(target: "session.store",
+            "status '{}': manifest rule={} candidate={:?} visible={} -> {:?}",
+            self.title, detection.rule, candidate, detection.visible, self.status);
+    }
+
+    /// Whether `candidate` may be published now.
+    ///
+    /// Only one direction waits: a running session dropping to a plain Idle,
+    /// meaning no rule read that idle off the agent's own chrome. That is the
+    /// change a mid-redraw frame produces, and it is the one that flipped
+    /// parked sessions every couple of seconds. Every other change, and any
+    /// change a visible rule decided, publishes on sight, so a turn starting
+    /// or a prompt appearing is never a poll late.
+    ///
+    /// Returns the status to publish, or `None` while a proposal is still
+    /// waiting on its confirming poll.
+    fn confirm_detection(&mut self, candidate: Status, visible: bool) -> Option<Status> {
+        let needs_confirmation =
+            self.status == Status::Running && candidate == Status::Idle && !visible;
+        if !needs_confirmation {
+            self.pending_detection = None;
+            return Some(candidate);
+        }
+        match self.pending_detection {
+            Some(pending) if pending == candidate => {
+                self.pending_detection = None;
+                Some(candidate)
+            }
+            _ => {
+                self.pending_detection = Some(candidate);
+                None
+            }
+        }
+    }
+
     pub fn update_status(&mut self) {
         self.update_status_with_metadata(None, None);
     }
@@ -441,6 +532,72 @@ impl Instance {
 mod tests {
     use super::*;
     use crate::session::instance::test_helpers::*;
+
+    #[test]
+    fn test_skip_capture_requires_a_resolved_proposal() {
+        // The regression this guard reintroduced once: a turn ends, the poll
+        // that sees the final frame proposes Idle and holds it for a
+        // confirming poll, and the pane then draws nothing. Skipping that
+        // confirming poll leaves the hold unresolved forever.
+        assert!(
+            !skip_capture(Some(100), Some(100), false, true),
+            "a pending proposal must be resolved, not skipped past"
+        );
+        assert!(skip_capture(Some(100), Some(100), false, false));
+
+        // A hook write changes the verdict without the pane drawing anything.
+        assert!(!skip_capture(Some(100), Some(100), true, false));
+        // Fresh output, or no stamp to compare against at all.
+        assert!(!skip_capture(Some(101), Some(100), false, false));
+        assert!(!skip_capture(None, None, false, false));
+        assert!(!skip_capture(Some(100), None, false, false));
+    }
+
+    #[test]
+    fn test_confirm_detection_holds_only_unwitnessed_idle() {
+        // The one change a mid-redraw frame produces is a running session
+        // reading as a plain Idle, so that is the only one that waits. A
+        // second agreeing poll publishes it; a different verdict in between
+        // replaces the proposal rather than counting toward it.
+        let mut inst = Instance::new("test", "/tmp/test");
+        inst.status = Status::Running;
+
+        assert_eq!(inst.confirm_detection(Status::Idle, false), None);
+        assert_eq!(inst.status, Status::Running);
+        assert_eq!(
+            inst.confirm_detection(Status::Idle, false),
+            Some(Status::Idle)
+        );
+
+        // An idle a rule read off the agent's own chrome does not wait.
+        inst.status = Status::Running;
+        assert_eq!(
+            inst.confirm_detection(Status::Idle, true),
+            Some(Status::Idle)
+        );
+
+        // Nor does any other direction: a turn starting or a prompt appearing
+        // must not be a poll late.
+        inst.status = Status::Idle;
+        assert_eq!(
+            inst.confirm_detection(Status::Running, false),
+            Some(Status::Running)
+        );
+        inst.status = Status::Running;
+        assert_eq!(
+            inst.confirm_detection(Status::Waiting, false),
+            Some(Status::Waiting)
+        );
+
+        // A proposal that changes before it is confirmed starts over.
+        inst.status = Status::Running;
+        assert_eq!(inst.confirm_detection(Status::Idle, false), None);
+        assert_eq!(
+            inst.confirm_detection(Status::Waiting, false),
+            Some(Status::Waiting)
+        );
+        assert!(inst.pending_detection.is_none());
+    }
 
     #[test]
     fn test_archived_session_not_marked_error_when_tmux_gone() {
@@ -1026,6 +1183,12 @@ Esc to cancel \u{b7} Tab to amend \u{b7} ctrl+e to explain\n\
                 "-y",
                 "40",
                 &launch,
+                ";",
+                "set-option",
+                "-t",
+                &session_name,
+                "pane-base-index",
+                "0",
             ])
             .output()
             .expect("spawn tmux");

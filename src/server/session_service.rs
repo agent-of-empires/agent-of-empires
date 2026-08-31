@@ -177,6 +177,11 @@ pub struct SessionService {
     /// resume continuation (#3028).
     #[cfg(feature = "serve")]
     pub acp_event_store: Arc<crate::acp::event_store::EventStore>,
+    /// Live control-state projection, shared with `AppState.acp_control_cache`.
+    /// The queue drain reads turn liveness from it so it agrees with prompt
+    /// dispatch; see [`SessionService::fold_control_state`].
+    #[cfg(feature = "serve")]
+    pub acp_control_cache: Arc<crate::acp::control_cache::ControlStateCache>,
     /// In-flight plugin creates keyed by `(plugin_id, idempotency_key)`.
     /// Sync mutex: critical sections are tiny and never span an `await`.
     // ponytail: one daemon process is the only sessions.json writer, so a
@@ -252,6 +257,16 @@ impl std::fmt::Display for SendTurnError {
     }
 }
 
+/// The ACP collaborators `SessionService` shares with `AppState`. Grouped so
+/// the constructor keeps one parameter for "the ACP side" rather than one per
+/// handle.
+#[cfg(feature = "serve")]
+pub struct AcpDeps {
+    pub supervisor: Arc<crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>>,
+    pub event_store: Arc<crate::acp::event_store::EventStore>,
+    pub control_cache: Arc<crate::acp::control_cache::ControlStateCache>,
+}
+
 impl SessionService {
     #[cfg(feature = "serve")]
     pub fn new(
@@ -260,10 +275,7 @@ impl SessionService {
         file_watch: Arc<crate::file_watch::FileWatchService>,
         telemetry_session_creates: Arc<std::sync::atomic::AtomicU32>,
         mutation_epoch: Arc<std::sync::atomic::AtomicU64>,
-        acp_supervisor: Arc<
-            crate::acp::supervisor::Supervisor<crate::acp::supervisor::ChannelSink>,
-        >,
-        acp_event_store: Arc<crate::acp::event_store::EventStore>,
+        acp: AcpDeps,
     ) -> Self {
         Self {
             instances,
@@ -271,8 +283,9 @@ impl SessionService {
             file_watch,
             telemetry_session_creates,
             mutation_epoch,
-            acp_supervisor,
-            acp_event_store,
+            acp_supervisor: acp.supervisor,
+            acp_event_store: acp.event_store,
+            acp_control_cache: acp.control_cache,
             create_in_flight: std::sync::Mutex::new(HashMap::new()),
             pending_drains: std::sync::Mutex::new(std::collections::HashSet::new()),
             persist_locks: RwLock::new(HashMap::new()),
@@ -1063,14 +1076,73 @@ impl SessionService {
             .unwrap_or_default()
     }
 
+    /// The daemon's live control state for a session, folded once at the
+    /// publish choke point and hydrated from the event log on a cache miss.
+    ///
+    /// This is the daemon's only non-lagging answer to "is a turn in flight":
+    /// `ChannelSink::publish_persisted` folds each event in as it records it,
+    /// whereas `Instance.status` is a mirror the broadcast listener applies
+    /// afterwards, one serial task behind every session's event stream.
+    ///
+    /// The fold is cached because rebuilding it per call measured 68ms at 20k
+    /// events and 342ms at 100k, holding the event store's connection mutex
+    /// for the whole scan, which stalls event recording daemon-wide.
+    #[cfg(feature = "serve")]
+    pub(crate) async fn fold_control_state(&self, id: &str) -> crate::acp::state::AcpState {
+        use crate::acp::state::{AcpSessionId, AcpState, AgentName};
+        let (agent, model) = {
+            let instances = self.instances.read().await;
+            instances
+                .iter()
+                .find(|i| i.id == id)
+                .map(|i| {
+                    (
+                        AgentName(i.agent_name.clone().unwrap_or_else(|| i.tool.clone())),
+                        i.agent_model.clone(),
+                    )
+                })
+                .unwrap_or_else(|| (AgentName(String::new()), None))
+        };
+        let store = Arc::clone(&self.acp_event_store);
+        let cache = Arc::clone(&self.acp_control_cache);
+        let sid = id.to_string();
+        // The hydrate closure runs under the cache's per-session lock and does
+        // a locking SQLite scan, so the whole thing goes off the runtime rather
+        // than just the scan.
+        tokio::task::spawn_blocking(move || {
+            cache.get_or_hydrate(&sid.clone(), || {
+                let mut reduced = AcpState::new(AcpSessionId(sid.clone()), agent, model);
+                let mut last_seq = 0;
+                for (seq, event) in store.replay_from(&sid, 0) {
+                    let _ = reduced.apply_event(event);
+                    last_seq = seq;
+                }
+                (reduced, last_seq)
+            })
+        })
+        .await
+        .unwrap_or_else(|_| {
+            // The blocking pool panicked or shut down. An empty state reads as
+            // "idle", which would let both prompt dispatch and the queue drain
+            // push into whatever turn is running, so hand back one that parks.
+            let mut fallback =
+                AcpState::new(AcpSessionId(id.to_string()), AgentName(String::new()), None);
+            fallback.turn_active = true;
+            fallback
+        })
+    }
+
     /// Drain the leading batch of a session's server-owned queue into the live
     /// worker once the current turn has ended. Mirrors
     /// `drain_pending_initial_turn`'s single-owner `pending_drains` claim +
     /// per-instance-lock delivery, so a batch is never sent twice concurrently.
     ///
-    /// Only drains an idle turn: `Status::Idle` means the prior turn emitted its
-    /// terminal `Stopped`, so this starts a fresh turn rather than racing a live
-    /// one. Callers (the reconciler tick) gate on `is_running`, so the worker is
+    /// Only drains an idle turn, and asks the live control fold rather than
+    /// `Instance.status`: dispatch parks a prompt on that fold, so gating the
+    /// delivery on the lagging status mirror lets the drain hand a queued
+    /// prompt to the turn it was parked behind.
+    ///
+    /// Callers (the reconciler tick) gate on `is_running`, so the worker is
     /// live and `send_turn` will not spawn, making it safe to hold the instance
     /// lock across delivery (the #3172 re-entrant-spawn deadlock cannot occur on
     /// a live worker). The `/clear`-boundary split matches the client
@@ -1122,6 +1194,16 @@ impl SessionService {
             let agent_key = inst.agent_name.clone().unwrap_or_else(|| inst.tool.clone());
             (caller, agent_key, queue)
         };
+
+        // `Status::Idle` above is a mirror the broadcast listener applies one
+        // serial task behind every session's events, so it still reads Idle for
+        // as long as that task is behind. Prompt dispatch reads the live fold
+        // instead, which is why a prompt can be parked as `turn_active` and
+        // then drained into that very turn a moment later. Ask the same
+        // authority dispatch asked before delivering; the next tick retries.
+        if self.fold_control_state(id).await.turn_active {
+            return;
+        }
 
         // Leading batch up to a clear boundary (mirrors the client's split).
         let profile = crate::acp::agent_profiles::resolve(&agent_key);
@@ -1791,6 +1873,94 @@ mod tests {
                 .map(|q| q.id.clone())
                 .collect::<Vec<_>>(),
             ["next"]
+        );
+    }
+
+    /// The drain must not deliver into a turn prompt dispatch parked the
+    /// prompt behind.
+    ///
+    /// `Instance.status` is applied by `acp_event_listener`, one serial task
+    /// behind every session's event stream, while dispatch reads the fold
+    /// `ChannelSink::publish_persisted` updates as it records. Whenever the
+    /// listener is behind, a session with a live turn still reads `Idle`, and
+    /// the pre-fix drain took that as "the turn ended" and sent the queued
+    /// prompt as a second concurrent turn.
+    ///
+    /// Both rows below are undeliverable husks (empty text, no buffered
+    /// bytes), because retiring a husk is the drain's only externally visible
+    /// effect in a test with no live worker: the idle session's row is retired,
+    /// the mid-turn session's row survives untouched.
+    #[cfg(feature = "serve")]
+    #[tokio::test]
+    async fn a_queued_prompt_is_not_drained_into_a_turn_status_has_not_caught_up_with() {
+        use crate::acp::state::Event;
+        use crate::acp::supervisor::BroadcastSink;
+
+        let mut idle = Instance::new("idle", "/tmp/aoe-queue-idle");
+        idle.id = "sess-idle".to_string();
+        idle.view = crate::session::View::Structured;
+        idle.status = crate::session::Status::Idle;
+        let mut mid_turn = Instance::new("mid", "/tmp/aoe-queue-mid-turn");
+        mid_turn.id = "sess-mid-turn".to_string();
+        mid_turn.view = crate::session::View::Structured;
+        // The lagging mirror: a turn is running, but the listener has not
+        // applied its `UserPromptSent` yet, so the row still says Idle.
+        mid_turn.status = crate::session::Status::Idle;
+        let state = crate::server::test_support::build_test_app_state(vec![idle, mid_turn]);
+        let service = state.session_service.clone();
+
+        // Publish through the real choke point: that is what folds the live
+        // projection the drain now reads.
+        let sink = crate::acp::supervisor::ChannelSink {
+            tx: state.acp_events_tx.clone(),
+            event_store: Arc::clone(&state.acp_event_store),
+            control_cache: Arc::clone(&state.acp_control_cache),
+        };
+        assert!(
+            sink.publish_persisted(
+                "sess-mid-turn",
+                1,
+                &Event::UserPromptSent {
+                    text: "go".into(),
+                    attachments: Vec::new(),
+                    prompt_id: None,
+                },
+            ),
+            "publish must reach the event store"
+        );
+
+        for id in ["sess-idle", "sess-mid-turn"] {
+            service
+                .enqueue_prompt(
+                    id,
+                    "husk".into(),
+                    String::new(),
+                    vec![crate::acp::state::PromptAttachmentRef {
+                        id: "att-1".into(),
+                        kind: crate::acp::state::PromptAttachmentKind::Image,
+                        mime_type: "image/png".into(),
+                        name: Some("shot.png".into()),
+                        size: 9,
+                    }],
+                    None,
+                    "t0".into(),
+                )
+                .await
+                .expect("session exists");
+            service.drain_queued_prompts_once(id).await;
+        }
+
+        assert!(
+            service
+                .queued_prompts_snapshot("sess-idle")
+                .await
+                .is_empty(),
+            "no turn in flight: the drain runs and retires the husk"
+        );
+        assert_eq!(
+            service.queued_prompts_snapshot("sess-mid-turn").await.len(),
+            1,
+            "a turn is in flight, so the drain must leave the queue for the next tick"
         );
     }
 

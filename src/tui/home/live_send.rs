@@ -779,12 +779,16 @@ fn authoritative_refresh_action(
     result: Option<crate::tmux::vt::VtRefreshResult>,
 ) -> AuthoritativeRefreshAction {
     match (due, result) {
-        (false, _) | (true, Some(crate::tmux::vt::VtRefreshResult::Busy)) => {
-            AuthoritativeRefreshAction::None
-        }
-        (true, Some(crate::tmux::vt::VtRefreshResult::Refreshed)) => {
-            AuthoritativeRefreshAction::Stamp
-        }
+        (false, _) => AuthoritativeRefreshAction::None,
+        // Busy still consumed an authoritative capture attempt. Defer the
+        // next one so continuous output cannot turn self-heal into a fork loop.
+        (
+            true,
+            Some(
+                crate::tmux::vt::VtRefreshResult::Busy
+                | crate::tmux::vt::VtRefreshResult::Refreshed,
+            ),
+        ) => AuthoritativeRefreshAction::Stamp,
         (true, Some(crate::tmux::vt::VtRefreshResult::Failed) | None) => {
             AuthoritativeRefreshAction::DropToCapture
         }
@@ -3501,7 +3505,7 @@ mod tests {
             (
                 true,
                 Some(VtRefreshResult::Busy),
-                AuthoritativeRefreshAction::None,
+                AuthoritativeRefreshAction::Stamp,
             ),
             (
                 true,

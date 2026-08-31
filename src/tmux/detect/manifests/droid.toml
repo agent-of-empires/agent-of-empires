@@ -1,0 +1,35 @@
+id = "droid"
+
+[[rules]]
+extends = "spinner"
+id = "spinner"
+priority = 970
+
+[[rules]]
+id = "activity_hint"
+state = "running"
+priority = 965
+region = "whole_recent"
+visible = true
+contains_any = [
+  "esc to interrupt",
+  "ctrl+c to interrupt",
+  "thinking",
+  "working",
+  "executing",
+]
+
+[[rules]]
+extends = "approval_prompt"
+id = "approval_prompt"
+priority = 950
+contains_any = ["continue?", "proceed?", "execute?", "enter to select", "esc to cancel"]
+
+[[rules]]
+extends = "input_prompt"
+id = "input_prompt"
+priority = 930
+any = [
+  { line_regex = ['(?i)^\s*droid>\s*$'] },
+  { line = { regex = ['(?i)^\s*>\s\S.{0,96}$'], not_regex = ['(?i)esc'] } },
+]

@@ -1,0 +1,159 @@
+id = "omp"
+
+# omp stacks its state markers, so the current one is whichever sits lowest on
+# screen: a retry countdown under a finished spinner line means it is retrying,
+# not working. Every screen rule below is `positional` at one priority, so they
+# compete by position rather than by rank.
+
+# The loader: a frame glyph opening the line, plus either the word `working` or
+# an interrupt hint. Braille frames carry the word; ascii and symbolic frames
+# are only a loader when the hint is there, since `- foo` and `• foo` are
+# ordinary bullets.
+[[rules]]
+id = "loader_braille"
+state = "running"
+priority = 960
+positional = true
+region = "bottom_non_empty_lines(3)"
+visible = true
+line_regex = ['^\s*[\x{2800}-\x{28FF}] ']
+contains_any = ["working", "⟦esc⟧", "⟨esc⟩", "[esc]", "(esc to cancel)"]
+
+[[rules]]
+id = "loader_hint_frame"
+state = "running"
+priority = 960
+positional = true
+region = "bottom_non_empty_lines(3)"
+visible = true
+# An ascii spinner frame, or a symbolic one: a leading token of punctuation
+# carrying at least one non-ascii character. The reserved glyphs are omp's own
+# bullets and panel borders, which open ordinary rows.
+any = [
+  { line_regex = ['^\s*[-\\|/] '] },
+  { line_regex = ['^\s*[^\w\s\x{2022}\x{f111}\x{203B}\x{276F}\x{f054}\x{2502}\x{2503}\x{258F}\x{258E}]*[^\x00-\x7F][^\w\s]* '] },
+]
+contains_any = ["⟦esc⟧", "⟨esc⟩", "[esc]", "(esc to cancel)"]
+# omp's own bullets and panel borders open ordinary rows, so a line led by one
+# is never a loader however punctuation-shaped the glyph is.
+not = [{ line_regex = ['^\s*[\x{2022}\x{f111}\x{203B}\x{276F}\x{f054}\x{2502}\x{2503}\x{258F}\x{258E}]'] }]
+
+# The wrapped variant: the frame line runs on and the hint lands on an
+# indented continuation. The frame line itself must carry neither the hint (or
+# the plain rule above would have caught it) nor sentence-final punctuation,
+# which is what separates a wrapped loader from prose followed by a hint.
+[[rules]]
+id = "loader_wrapped"
+state = "running"
+priority = 960
+positional = true
+wrap = 2
+max_position = 3
+region = "bottom_non_empty_lines(4)"
+visible = true
+regex = ['(?s)^\s*(?:[\x{2800}-\x{28FF}]|[-\\|/]|[^\w\s\x{2022}\x{f111}\x{203B}\x{276F}\x{f054}\x{2502}\x{2503}\x{258F}\x{258E}]*[^\x00-\x7F][^\w\s]*) [^\n]*\n[ \t]+\S']
+contains_any = ["⟦esc⟧", "⟨esc⟩", "[esc]", "(esc to cancel)"]
+not = [
+  { line_regex = ['^\s*[\x{2022}\x{f111}\x{203B}\x{276F}\x{f054}\x{2502}\x{2503}\x{258F}\x{258E}]'] },
+  { line_regex = ['^\s*\S+ [^\n]*(?:⟦esc⟧|⟨esc⟩|\[esc\]|\(esc to cancel\))[^\n]*$'] },
+  { line = { regex = ['^\s*\S+ [^\n]*[.!?:;]\s*$'], not_regex = ['\.\.\.\s*$'] } },
+]
+
+# The retry countdown, which a narrow pane wraps across the window.
+[[rules]]
+id = "retry_countdown"
+state = "running"
+priority = 960
+positional = true
+wrap = 6
+region = "bottom_non_empty_lines(6)"
+visible = true
+regex = ['(?i)retrying\s+\(\d+/\d+\)\s+in\s+\d+\s*s\s*\x{2026}']
+
+[[rules]]
+id = "banner_dismissal"
+state = "error"
+priority = 960
+positional = true
+region = "bottom_non_empty_lines(6)"
+visible = true
+contains = ["dismissed when you send your next message"]
+
+[[rules]]
+id = "retry_exhausted"
+state = "error"
+priority = 960
+positional = true
+region = "bottom_non_empty_lines(6)"
+visible = true
+contains_any = ["error: retry budget exhausted", "error: retry failed after"]
+
+# A prompt panel's footer row. The panel is drawn as `│ ... │` rows, and the
+# footer is the row that names its keys.
+[[rules]]
+id = "panel_prompt"
+state = "waiting"
+priority = 960
+positional = true
+region = "bottom_non_empty_lines(8)"
+visible = true
+line_regex = ['^\s*[│|].*[│|]\s*$']
+contains_any = [
+  "enter select · n note",
+  "space toggle · enter ",
+  "enter submit · ↑/↓ scroll",
+  "current prompt to answer",
+]
+
+# The approve/deny selector: its footer decides the position, gated on both
+# options really being on the panel.
+[[rules]]
+id = "approve_deny_panel"
+state = "waiting"
+priority = 960
+positional = true
+region = "bottom_non_empty_lines(8)"
+visible = true
+line_regex = ['^\s*[│|].*[│|]\s*$']
+contains = ["up/down navigate", "enter select", "esc cancel"]
+all = [
+  { region = "bottom_non_empty_lines(8)", line_regex = [
+    '(?i)^\s*[│|]\s*(?:[\x{276F}\x{f054}>]\s*)?approve\s*[│|]?\s*$',
+    '(?i)^\s*[│|]\s*(?:[\x{276F}\x{f054}>]\s*)?deny\s*[│|]?\s*$',
+  ] },
+]
+
+# The plan panel: its footer decides the position, but only when the panel is
+# really on screen, which is its three options plus a cursor on one of them.
+[[rules]]
+id = "plan_panel"
+state = "waiting"
+priority = 960
+positional = true
+region = "bottom_non_empty_lines(12)"
+visible = true
+line_regex = ['^\s*[│|].*[│|]\s*$']
+contains = ["tab regions", "esc cancel"]
+all = [
+  { region = "bottom_non_empty_lines(12)", line_regex = [
+    '(?i)^\s*[│|]\s*(?:[\x{276F}\x{f054}>]\s*)?approve and execute',
+    '(?i)^\s*[│|]\s*(?:[\x{276F}\x{f054}>]\s*)?refine plan',
+    '(?i)^\s*[│|]\s*(?:[\x{276F}\x{f054}>]\s*)?save and quit',
+    '^\s*[│|]\s*[\x{276F}\x{f054}>] ',
+  ] },
+]
+
+# omp's own retry labels, which keep rendering between attempts.
+[[rules]]
+id = "retry_labels"
+state = "running"
+priority = 960
+positional = true
+region = "bottom_non_empty_lines(12)"
+visible = true
+any = [
+  { line_regex = ['(?i)retrying \d+/\d+ (in (\d+(\.\d+)?ms|\d+\.\d+s|\d+m(\d+s)?|\d+h(\d+m)?|\d+d(\d+h)?)|now):'] },
+  { line_regex = ['(?i)attempt \d+/\d+ \x{b7}'] },
+]
+
+# A terminal failure banner: omp has stopped and is waiting to be dismissed.

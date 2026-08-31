@@ -319,8 +319,11 @@ pub async fn start_server(config: ServerConfig<'_>) -> anyhow::Result<()> {
         Arc::clone(&file_watch),
         Arc::clone(&telemetry_session_creates),
         Arc::clone(&mutation_epoch),
-        acp_supervisor.clone(),
-        acp_event_store.clone(),
+        session_service::AcpDeps {
+            supervisor: acp_supervisor.clone(),
+            event_store: acp_event_store.clone(),
+            control_cache: acp_control_cache.clone(),
+        },
     ));
     #[cfg(not(feature = "serve"))]
     let session_service = Arc::new(session_service::SessionService::new(

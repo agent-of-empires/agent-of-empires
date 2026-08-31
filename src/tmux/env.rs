@@ -6,7 +6,9 @@
 
 use anyhow::bail;
 use std::collections::HashMap;
+#[cfg(any(test, feature = "test-support"))]
 use std::sync::RwLock;
+#[cfg(any(test, feature = "test-support"))]
 use std::time::{Duration, Instant};
 
 pub const AOE_INSTANCE_ID_KEY: &str = "AOE_INSTANCE_ID";
@@ -15,18 +17,23 @@ pub const AOE_OMP_CAPTURE_META_KEY: &str = "AOE_OMP_CAPTURE_META";
 pub const AOE_OMP_LAUNCH_ID_KEY: &str = "AOE_OMP_LAUNCH_ID";
 pub const AOE_OMP_CAPTURE_READY_KEY: &str = "AOE_OMP_CAPTURE_READY";
 
+#[cfg(any(test, feature = "test-support"))]
 const ENV_CACHE_TTL: Duration = Duration::from_secs(30);
+#[cfg(any(test, feature = "test-support"))]
 const ENV_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(5);
 
+#[cfg(any(test, feature = "test-support"))]
 struct EnvCacheEntry {
     value: Option<String>,
     fetched_at: Instant,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 struct EnvCache {
     entries: Option<HashMap<(String, String), EnvCacheEntry>>,
 }
 
+#[cfg(any(test, feature = "test-support"))]
 static ENV_CACHE: RwLock<EnvCache> = RwLock::new(EnvCache { entries: None });
 
 /// Set a hidden environment variable in a tmux session
@@ -48,6 +55,7 @@ pub fn set_hidden_env(session_name: &str, key: &str, value: &str) -> anyhow::Res
         );
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     invalidate_cache_entry(session_name, key);
     Ok(())
 }
@@ -57,6 +65,7 @@ pub fn set_hidden_env(session_name: &str, key: &str, value: &str) -> anyhow::Res
 /// Both hits and misses are cached to reduce subprocess spawns: positive
 /// results use [`ENV_CACHE_TTL`] (30s), negative results (var not set)
 /// use [`ENV_NEGATIVE_CACHE_TTL`] (5s).
+#[cfg(any(test, feature = "test-support"))]
 pub fn get_hidden_env(session_name: &str, key: &str) -> Option<String> {
     let cache_key = (session_name.to_string(), key.to_string());
 
@@ -136,6 +145,7 @@ pub fn remove_hidden_env(session_name: &str, key: &str) -> anyhow::Result<()> {
         bail!("Failed to remove hidden env var: {}", stderr);
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     invalidate_cache_entry(session_name, key);
     Ok(())
 }
@@ -168,6 +178,7 @@ pub fn remove_hidden_env_batch(entries: &[(&str, &str)]) -> anyhow::Result<()> {
 
     match output {
         Ok(out) if out.status.success() => {
+            #[cfg(any(test, feature = "test-support"))]
             for (session_name, key) in entries {
                 invalidate_cache_entry(session_name, key);
             }
@@ -233,6 +244,7 @@ pub fn set_hidden_env_batch(entries: &[(&str, &str, &str)]) -> anyhow::Result<()
 
     match output {
         Ok(out) if out.status.success() => {
+            #[cfg(any(test, feature = "test-support"))]
             for (session_name, key, _) in entries {
                 invalidate_cache_entry(session_name, key);
             }
@@ -270,6 +282,7 @@ fn sequential_set_fallback(entries: &[(&str, &str, &str)]) {
     }
 }
 
+#[cfg(any(test, feature = "test-support"))]
 fn invalidate_cache_entry(session_name: &str, key: &str) {
     if let Ok(mut cache) = ENV_CACHE.write() {
         if let Some(entries) = &mut cache.entries {
@@ -352,6 +365,7 @@ pub fn get_hidden_env_batch(session_names: &[&str], key: &str) -> Vec<(String, O
         );
     }
 
+    #[cfg(any(test, feature = "test-support"))]
     if let Ok(mut cache) = ENV_CACHE.write() {
         let entries = cache.entries.get_or_insert_with(HashMap::new);
         let now = Instant::now();
