@@ -35,15 +35,16 @@ pub fn set_hidden_env(session_name: &str, key: &str, value: &str) -> anyhow::Res
     Ok(())
 }
 
-pub(crate) fn get_hidden_env_uncached(session_name: &str, key: &str) -> Option<String> {
-    fetch_env_uncached(session_name, key, true)
+/// Get a hidden environment variable from a tmux session.
+pub fn get_hidden_env(session_name: &str, key: &str) -> Option<String> {
+    fetch_env(session_name, key, true)
 }
 
-pub(crate) fn get_env_uncached(session_name: &str, key: &str) -> Option<String> {
-    fetch_env_uncached(session_name, key, false)
+pub(crate) fn get_env(session_name: &str, key: &str) -> Option<String> {
+    fetch_env(session_name, key, false)
 }
 
-fn fetch_env_uncached(session_name: &str, key: &str, hidden: bool) -> Option<String> {
+fn fetch_env(session_name: &str, key: &str, hidden: bool) -> Option<String> {
     let mut command = crate::tmux::tmux_command();
     command.arg("show-environment");
     if hidden {
@@ -257,7 +258,7 @@ pub fn get_hidden_env_batch(session_names: &[&str], key: &str) -> Vec<(String, O
                 Some(value) => value,
                 None => {
                     repaired += 1;
-                    get_hidden_env_uncached(name, key)
+                    get_hidden_env(name, key)
                 }
             };
             (name.to_string(), value)

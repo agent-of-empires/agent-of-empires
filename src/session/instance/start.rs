@@ -260,10 +260,8 @@ impl Instance {
             &prepared.launch_env.container,
         )?;
         if let Some(metadata) = omp_capture_metadata.as_ref() {
-            let pane_generation = crate::tmux::env::get_env_uncached(
-                session.name(),
-                crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY,
-            );
+            let pane_generation =
+                crate::tmux::env::get_env(session.name(), crate::tmux::env::AOE_OMP_LAUNCH_ID_KEY);
             if !omp_generation_published
                 || pane_generation.as_deref() != Some(metadata.launch_id.as_str())
             {
