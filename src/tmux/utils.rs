@@ -254,6 +254,11 @@ pub(crate) fn pane_current_command(session_name: &str) -> Option<String> {
 
 /// The terminal title the pane's program published over OSC, for callers
 /// outside the batched poll that reads it as part of [`crate::tmux::PaneMetadata`].
+///
+/// Only `display-message`'s own trailing newline comes off, where the sibling
+/// helpers above trim: the batched read does not trim either, and a title is
+/// matched by `^`-anchored rules, so trimming here would let the same pane
+/// read one way through the poller and another through `aoe session capture`.
 pub(crate) fn pane_title(session_name: &str) -> Option<String> {
     let target = format!("{session_name}:^.0");
     crate::tmux::tmux_command()
@@ -261,7 +266,7 @@ pub(crate) fn pane_title(session_name: &str) -> Option<String> {
         .output()
         .ok()
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
+        .map(|s| s.trim_end_matches('\n').to_string())
         .filter(|s| !s.is_empty())
 }
 
@@ -914,5 +919,34 @@ mod tests {
             !exists,
             "session should be gone after kill_session_if_present"
         );
+    }
+
+    /// `aoe session capture` reads the pane title through this helper, and the
+    /// only test that covers that path runs an agent with no `osc_title`
+    /// rules: a wrong target here would silently restore the empty title
+    /// #3625 was about.
+    #[test]
+    #[serial_test::serial]
+    fn pane_title_reads_the_panes_published_title() {
+        if !tmux_available() {
+            return;
+        }
+        let name = "aoe_test_pane_title";
+        let _ = crate::tmux::tmux_command()
+            .args(["kill-session", "-t", name])
+            .output();
+        let spawn = crate::tmux::tmux_command()
+            .args(["new-session", "-d", "-s", name, "sleep", "30"])
+            .status();
+        if !spawn.map(|s| s.success()).unwrap_or(false) {
+            return;
+        }
+        let target = format!("{name}:^.0");
+        let _ = crate::tmux::tmux_command()
+            .args(["select-pane", "-t", &target, "-T", "aoe-title-probe"])
+            .output();
+        let title = pane_title(name);
+        let _ = kill_session_if_present(name);
+        assert_eq!(title.as_deref(), Some("aoe-title-probe"));
     }
 }
