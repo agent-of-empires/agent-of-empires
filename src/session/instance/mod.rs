@@ -255,16 +255,6 @@ pub struct Instance {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pre_trash_project_path: Option<String>,
 
-    /// Why the load-time trash reconcile gave up on relocating this row's
-    /// worktree into the holding area. Set only when `git worktree move`
-    /// fails on a checkout git no longer registers, which no retry can fix,
-    /// so the sweep stops re-running it on every launch and every daemon
-    /// startup (#3611). Cleared by `untrash`, since a restored row that is
-    /// trashed again starts from a fresh location. Additive: absent in older
-    /// `sessions.json` rows, so no migration is needed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub trash_relocation_failed: Option<String>,
-
     /// Durable ownership reservation for every in-flight lifecycle transition.
     /// Acquired atomically with a new `lifecycle_generation`; only that
     /// generation may perform the transition's irreversible phase, commit, or
